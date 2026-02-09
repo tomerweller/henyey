@@ -397,7 +397,7 @@ impl Work for DownloadBucketsWork {
         let to_download: Vec<_> = hashes
             .iter()
             .filter(|hash| {
-                let path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
+                let path = bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
                 !path.exists()
             })
             .cloned()
@@ -425,7 +425,7 @@ impl Work for DownloadBucketsWork {
                     let downloaded_count = &downloaded_count;
 
                     async move {
-                        let bucket_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
+                        let bucket_path = bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
 
                         // Try each archive until one succeeds
                         match archive.get_bucket(&hash).await {
@@ -1343,7 +1343,7 @@ impl Work for PublishBucketsWork {
             .collect();
 
         for hash in hashes {
-            let file_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
+            let file_path = bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
             let data = match std::fs::read(&file_path) {
                 Ok(d) => d,
                 Err(e) => {

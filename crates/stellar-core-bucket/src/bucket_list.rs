@@ -64,7 +64,7 @@ use crate::eviction::{
     StateArchivalSettings,
 };
 use crate::live_iterator::LiveEntriesIterator;
-use crate::manager::temp_merge_path;
+use crate::manager::{canonical_bucket_filename, temp_merge_path};
 use crate::merge::{merge_buckets_to_file, merge_buckets_with_options_and_shadows, merge_in_memory};
 use crate::{
     BucketError, Result, FIRST_PROTOCOL_SHADOWS_REMOVED,
@@ -268,7 +268,7 @@ impl AsyncMergeHandle {
                             // it by hash. Without this rename the file stays at
                             // merge-tmp-{pid}-{N}.xdr and is invisible to
                             // load_last_known_ledger().
-                            let permanent_path = dir.join(format!("{}.bucket.xdr", hash.to_hex()));
+                            let permanent_path = dir.join(canonical_bucket_filename(&hash));
                             if !permanent_path.exists() {
                                 match std::fs::rename(&temp_path, &permanent_path) {
                                     Ok(()) => Bucket::from_xdr_file_disk_backed(&permanent_path),
@@ -1576,7 +1576,7 @@ impl BucketList {
             for level in &self.levels {
                 for bucket in [&level.curr, &level.snap] {
                     if bucket.backing_file_path().is_none() && !bucket.hash().is_zero() {
-                        let permanent = dir.join(format!("{}.bucket.xdr", bucket.hash().to_hex()));
+                        let permanent = dir.join(canonical_bucket_filename(&bucket.hash()));
                         if !permanent.exists() {
                             if let Err(e) = bucket.save_to_xdr_file(&permanent) {
                                 tracing::warn!(
@@ -2020,7 +2020,7 @@ impl BucketList {
                                 Bucket::empty()
                             } else {
                                 // Rename to permanent canonical path for restart recovery.
-                                let permanent_path = dir.join(format!("{}.bucket.xdr", hash.to_hex()));
+                                let permanent_path = dir.join(canonical_bucket_filename(&hash));
                                 if !permanent_path.exists() {
                                     if let Err(e) = std::fs::rename(&temp_path, &permanent_path) {
                                         tracing::warn!(

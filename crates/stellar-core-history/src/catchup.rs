@@ -825,7 +825,7 @@ impl CatchupManager {
         self.progress.buckets_total = bucket_hashes.len() as u32;
         for (idx, hash) in bucket_hashes.iter().enumerate() {
             if !hash.is_zero() && *hash != empty_bucket_hash {
-                let bucket_path = data.bucket_dir.join(format!("{}.bucket", hash.to_hex()));
+                let bucket_path = data.bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
                 if !bucket_path.exists() {
                     return Err(HistoryError::BucketNotFound(*hash));
                 }
@@ -840,8 +840,8 @@ impl CatchupManager {
                 if hash.is_zero() || *hash == empty_bucket_hash {
                     continue;
                 }
-                let src = data.bucket_dir.join(format!("{}.bucket", hash.to_hex()));
-                let dst = bucket_mgr_dir.join(format!("{}.bucket", hash.to_hex()));
+                let src = data.bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
+                let dst = bucket_mgr_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
                 if src.exists() && !dst.exists() {
                     std::fs::copy(&src, &dst).map_err(|e| {
                         HistoryError::CatchupFailed(format!(
@@ -1100,7 +1100,7 @@ impl CatchupManager {
                 if hash.is_zero() || **hash == empty_bucket_hash {
                     return false;
                 }
-                let bucket_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
+                let bucket_path = bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
                 !bucket_path.exists()
             })
             .cloned()
@@ -1133,7 +1133,7 @@ impl CatchupManager {
                 let downloaded = &downloaded;
 
                 async move {
-                    let bucket_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
+                    let bucket_path = bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
 
                     // Try each archive until one succeeds
                     for archive in &archives {
@@ -1248,7 +1248,7 @@ impl CatchupManager {
             }
 
             // Construct path for this bucket
-            let bucket_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
+            let bucket_path = bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
 
             // Check if bucket already exists on disk as an XDR file.
             // Build the index eagerly so it's ready for lookups during live
@@ -1469,7 +1469,7 @@ impl CatchupManager {
                     }
 
                     // Check if we have the XDR data in the pre-downloaded cache
-                    let bucket_path = bucket_dir_clone.join(format!("{}.bucket", hash.to_hex()));
+                    let bucket_path = bucket_dir_clone.join(format!("{}.bucket.xdr", hash.to_hex()));
 
                     let xdr_data: Option<Vec<u8>> = if let Some(data) = {
                         let mut preloaded = preloaded_buckets.lock().unwrap();
@@ -2600,7 +2600,7 @@ fn load_disk_backed_bucket_closure(
         if hash.is_zero() {
             return Ok(Bucket::empty());
         }
-        let bucket_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
+        let bucket_path = bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
         if bucket_path.exists() {
             Bucket::from_xdr_file_disk_backed(&bucket_path)
         } else {
@@ -2625,7 +2625,7 @@ fn load_disk_backed_hot_archive_bucket_closure(
         if hash.is_zero() {
             return Ok(HotArchiveBucket::empty());
         }
-        let bucket_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
+        let bucket_path = bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
         if bucket_path.exists() {
             HotArchiveBucket::from_xdr_file_disk_backed(&bucket_path)
         } else {

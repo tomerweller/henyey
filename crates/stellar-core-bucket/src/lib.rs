@@ -163,7 +163,7 @@ pub use eviction::{
 // Bucket management
 // ============================================================================
 
-pub use manager::{BucketManager, BucketManagerStats};
+pub use manager::{canonical_bucket_filename, BucketManager, BucketManagerStats};
 
 // ============================================================================
 // Merge operations

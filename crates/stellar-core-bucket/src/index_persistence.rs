@@ -9,7 +9,7 @@
 //! Index files use bincode serialization with a version header:
 //!
 //! ```text
-//! bucket-{hash}.index
+//! {hash}.bucket.index
 //! ├── header
 //! │   ├── version: u32 (BUCKET_INDEX_VERSION)
 //! │   └── page_size: u64
@@ -293,9 +293,7 @@ pub fn save_disk_index(index: &DiskIndex, bucket_path: &Path) -> Result<(), Buck
         .collect();
 
     // Serialize bloom filter if present
-    let bloom_filter = index
-        .bloom_filter()
-        .map(|bf| bf.inner_filter().clone());
+    let bloom_filter = index.bloom_filter().map(|bf| bf.inner_filter().clone());
 
     // Serialize asset pool map if non-empty
     let asset_pool_map = {
@@ -823,12 +821,7 @@ mod tests {
         }
 
         let entries: Vec<(BucketEntry, u64)> = (0..num_entries)
-            .map(|i| {
-                (
-                    BucketEntry::Live(make_account_entry_for(i)),
-                    i as u64 * 100,
-                )
-            })
+            .map(|i| (BucketEntry::Live(make_account_entry_for(i)), i as u64 * 100))
             .collect();
 
         DiskIndex::from_entries(entries.into_iter(), bloom_seed, page_size)

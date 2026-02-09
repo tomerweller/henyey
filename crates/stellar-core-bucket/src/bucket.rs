@@ -1,7 +1,8 @@
 //! Individual bucket implementation.
 //!
-//! A bucket is an immutable container of sorted ledger entries, stored as gzipped XDR.
-//! Buckets are identified by their content hash (SHA-256 of uncompressed contents).
+//! A bucket is an immutable container of sorted ledger entries, stored as
+//! uncompressed XDR with record marks (RFC 5531). Buckets are identified by
+//! their content hash (SHA-256 of the file contents).
 //!
 //! # Storage Modes
 //!
@@ -30,13 +31,10 @@
 //! fresh for each operation to avoid contention.
 
 use std::collections::HashMap;
-use std::io::{BufReader, Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use stellar_xdr::curr::{LedgerEntry, LedgerKey, Limits, ReadXdr, WriteXdr};
 
 use stellar_core_common::Hash256;
@@ -71,7 +69,7 @@ enum BucketStorage {
 /// They are:
 /// - **Immutable** once created (content-addressable by hash)
 /// - **Identified** by their SHA-256 content hash
-/// - **Stored** as gzipped XDR on disk with record marking
+/// - **Stored** as uncompressed XDR on disk with record marking (RFC 5531)
 /// - **Sorted** by key for efficient merging and O(log n) binary search
 ///
 /// # Creating Buckets
@@ -80,7 +78,7 @@ enum BucketStorage {
 /// - [`Bucket::empty()`]: Create an empty bucket (zero hash)
 /// - [`Bucket::from_entries()`]: Create from a list of entries (will be sorted)
 /// - [`Bucket::from_sorted_entries()`]: Create from pre-sorted entries (preserves order)
-/// - [`Bucket::load_from_file()`]: Load from a gzipped bucket file
+/// - [`Bucket::load_from_xdr_file()`]: Load from an uncompressed XDR bucket file
 /// - [`Bucket::from_xdr_bytes()`]: Parse from uncompressed XDR bytes
 /// - [`Bucket::from_xdr_bytes_disk_backed()`]: Memory-efficient loading for catchup
 ///
@@ -310,7 +308,13 @@ impl Bucket {
     }
 
     /// Load a bucket from a gzipped XDR file.
+    ///
+    /// Only used in tests; production code uses `load_from_xdr_file()`.
+    #[cfg(test)]
     pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self> {
+        use flate2::read::GzDecoder;
+        use std::io::{BufReader, Read};
+
         let path = path.as_ref();
         let file = std::fs::File::open(path)?;
         let reader = BufReader::new(file);
@@ -616,49 +620,6 @@ impl Bucket {
         Ok(path)
     }
 
-    /// Streaming migration: decompress a `.bucket.gz` file directly to a
-    /// `.bucket.xdr` file without loading all entries into memory.
-    ///
-    /// Reads the gzipped XDR stream one record at a time and writes each
-    /// record (with its record mark) directly to the output file. Peak memory
-    /// usage is one XDR record (typically < 1 KB, at most a few MB).
-    pub fn migrate_gz_to_xdr(gz_path: impl AsRef<Path>, xdr_path: impl AsRef<Path>) -> Result<()> {
-        use std::io::Write;
-
-        let gz_file = std::fs::File::open(gz_path.as_ref())?;
-        let mut decoder = BufReader::new(GzDecoder::new(BufReader::new(gz_file)));
-        let mut output = std::io::BufWriter::new(std::fs::File::create(xdr_path.as_ref())?);
-
-        // Stream through the decompressed data, copying record marks + data
-        loop {
-            // Read 4-byte record mark
-            let mut mark_buf = [0u8; 4];
-            match decoder.read_exact(&mut mark_buf) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e.into()),
-            }
-
-            let record_mark = u32::from_be_bytes(mark_buf);
-            let record_len = (record_mark & 0x7FFFFFFF) as usize;
-
-            // Read record data
-            let mut record_data = vec![0u8; record_len];
-            decoder.read_exact(&mut record_data)?;
-
-            // Write record mark + data to output
-            output.write_all(&mark_buf)?;
-            output.write_all(&record_data)?;
-        }
-
-        output.flush()?;
-        output
-            .into_inner()
-            .map_err(|e| e.into_error())?
-            .sync_all()?;
-        Ok(())
-    }
-
     /// Load a bucket from an uncompressed XDR file.
     ///
     /// This reads the bucket file directly without any decompression. The file
@@ -671,9 +632,12 @@ impl Bucket {
 
     /// Save this bucket to a gzipped file.
     ///
-    /// This is the legacy format used for backward compatibility and archive publishing.
-    /// For normal on-disk storage, use `save_to_xdr_file` instead.
+    /// Only used in tests; production code uses `save_to_xdr_file()`.
+    #[cfg(test)]
     pub fn save_to_file(&self, path: impl AsRef<Path>) -> Result<PathBuf> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
         let path = path.as_ref().to_path_buf();
 
         match &self.storage {

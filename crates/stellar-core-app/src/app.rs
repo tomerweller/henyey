@@ -1750,14 +1750,9 @@ impl App {
                 if bucket_path.exists() {
                     stellar_core_bucket::Bucket::from_xdr_file_disk_backed(&bucket_path)
                 } else {
-                    let catchup_path = bucket_dir.join(format!("{}.bucket", hash.to_hex()));
-                    if catchup_path.exists() {
-                        stellar_core_bucket::Bucket::from_xdr_file_disk_backed(&catchup_path)
-                    } else {
-                        Err(stellar_core_bucket::BucketError::NotFound(format!(
-                            "bucket {} not found on disk", hash.to_hex()
-                        )))
-                    }
+                    Err(stellar_core_bucket::BucketError::NotFound(format!(
+                        "bucket {} not found on disk", hash.to_hex()
+                    )))
                 }
             };
             bucket_list

@@ -20,10 +20,10 @@
 //! <bucket_dir>/
 //!   <hash1>.bucket.xdr
 //!   <hash2>.bucket.xdr
-//!   <hash3>.bucket        (from catchup, renamed to .bucket.xdr on load)
 //!   ...
 //! ```
 //!
+//! All bucket files use the single canonical `.bucket.xdr` extension.
 //! Files are uncompressed XDR with record marks (RFC 5531). The hash is
 //! computed from these contents. This format supports random-access seeks
 //! for efficient disk-backed indexing and streaming iteration.
@@ -57,6 +57,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Global counter for generating unique temp file names.
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Return the canonical bucket filename for a given hash.
+///
+/// All bucket files use the single `.bucket.xdr` extension: uncompressed XDR
+/// with record marks (RFC 5531).  The hash is the hex-encoded SHA-256 of the
+/// file contents.
+pub fn canonical_bucket_filename(hash: &Hash256) -> String {
+    format!("{}.bucket.xdr", hash.to_hex())
+}
 
 /// Generate a unique temporary file path in the given directory.
 pub(crate) fn temp_merge_path(bucket_dir: &Path) -> PathBuf {
@@ -177,23 +186,7 @@ impl BucketManager {
     /// Returns the path using the canonical `.bucket.xdr` extension
     /// (uncompressed XDR with record marks).
     pub fn bucket_path(&self, hash: &Hash256) -> PathBuf {
-        self.bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()))
-    }
-
-    /// Get the legacy gzip file path for a bucket with the given hash.
-    ///
-    /// Used for migration from the old `.bucket.gz` format.
-    fn legacy_bucket_path(&self, hash: &Hash256) -> PathBuf {
-        self.bucket_dir.join(format!("{}.bucket.gz", hash.to_hex()))
-    }
-
-    /// Get the catchup bucket path for a bucket with the given hash.
-    ///
-    /// During catchup, buckets are saved with a plain `.bucket` extension.
-    /// This path is used as a fallback when the canonical `.bucket.xdr`
-    /// file is not found.
-    fn catchup_bucket_path(&self, hash: &Hash256) -> PathBuf {
-        self.bucket_dir.join(format!("{}.bucket", hash.to_hex()))
+        self.bucket_dir.join(canonical_bucket_filename(hash))
     }
 
     /// Create a bucket from entries.
@@ -248,8 +241,7 @@ impl BucketManager {
     /// Load a bucket by its hash.
     ///
     /// First checks the cache, then loads from disk if not cached.
-    /// Supports both the canonical `.bucket.xdr` format and the legacy
-    /// `.bucket.gz` format (with automatic migration).
+    /// The bucket must exist as a `.bucket.xdr` file in the bucket directory.
     ///
     /// Files larger than `DISK_BACKED_THRESHOLD` are loaded as DiskBacked
     /// buckets (only the index is in memory); smaller files are loaded entirely
@@ -268,33 +260,10 @@ impl BucketManager {
             }
         }
 
-        // Try canonical .bucket.xdr path first, then catchup .bucket, then legacy .bucket.gz
+        // Load from canonical .bucket.xdr path
         let xdr_path = self.bucket_path(hash);
         if !xdr_path.exists() {
-            // Try catchup .bucket path (same XDR format, just different extension)
-            let catchup_path = self.catchup_bucket_path(hash);
-            if catchup_path.exists() {
-                // Rename to canonical path for consistency
-                std::fs::rename(&catchup_path, &xdr_path)?;
-                tracing::info!(
-                    hash = %hash,
-                    "Renamed catchup bucket from .bucket to .bucket.xdr"
-                );
-            } else {
-                // Fall back to legacy .bucket.gz format with migration
-                let gz_path = self.legacy_bucket_path(hash);
-                if !gz_path.exists() {
-                    return Err(BucketError::NotFound(hash.to_hex()));
-                }
-
-                // Streaming migration: decompress gz → xdr without loading all entries
-                Bucket::migrate_gz_to_xdr(&gz_path, &xdr_path)?;
-                std::fs::remove_file(&gz_path)?;
-                tracing::info!(
-                    hash = %hash,
-                    "Migrated bucket from .bucket.gz to .bucket.xdr"
-                );
-            }
+            return Err(BucketError::NotFound(hash.to_hex()));
         }
 
         // Load from .bucket.xdr based on file size
@@ -368,7 +337,7 @@ impl BucketManager {
     ///
     /// Hot archive buckets contain `HotArchiveBucketEntry` instead of `BucketEntry`.
     /// This method loads and parses the bucket file with the correct entry type.
-    /// Supports both canonical `.bucket.xdr` and legacy `.bucket.gz` formats.
+    /// The bucket must exist as a `.bucket.xdr` file in the bucket directory.
     ///
     /// For files larger than `DISK_BACKED_THRESHOLD`, creates a DiskBacked bucket
     /// that only holds an index in memory (matching C++ behavior for hot archive).
@@ -383,33 +352,10 @@ impl BucketManager {
             return Ok(crate::hot_archive::HotArchiveBucket::empty());
         }
 
-        // Try canonical .bucket.xdr path first, then catchup .bucket, then legacy .bucket.gz
+        // Load from canonical .bucket.xdr path
         let xdr_path = self.bucket_path(hash);
         if !xdr_path.exists() {
-            // Try catchup .bucket path (same XDR format, just different extension)
-            let catchup_path = self.catchup_bucket_path(hash);
-            if catchup_path.exists() {
-                // Rename to canonical path for consistency
-                std::fs::rename(&catchup_path, &xdr_path)?;
-                tracing::info!(
-                    hash = %hash,
-                    "Renamed catchup hot archive bucket from .bucket to .bucket.xdr"
-                );
-            } else {
-                // Fall back to legacy .bucket.gz format and migrate
-                let gz_path = self.legacy_bucket_path(hash);
-                if !gz_path.exists() {
-                    return Err(BucketError::NotFound(hash.to_hex()));
-                }
-
-                // Streaming migration: decompress gz → xdr without loading all entries
-                Bucket::migrate_gz_to_xdr(&gz_path, &xdr_path)?;
-                std::fs::remove_file(&gz_path)?;
-                tracing::info!(
-                    hash = %hash,
-                    "Migrated hot archive bucket from .bucket.gz to .bucket.xdr"
-                );
-            }
+            return Err(BucketError::NotFound(hash.to_hex()));
         }
 
         // Load based on file size: DiskBacked for large files, InMemory for small
@@ -432,8 +378,6 @@ impl BucketManager {
     }
 
     /// Check if a bucket exists (in cache or on disk).
-    ///
-    /// Checks both the canonical `.bucket.xdr` and legacy `.bucket.gz` paths.
     pub fn bucket_exists(&self, hash: &Hash256) -> bool {
         if hash.is_zero() {
             return true; // Empty bucket always "exists"
@@ -447,10 +391,8 @@ impl BucketManager {
             }
         }
 
-        // Check disk (canonical path first, then catchup, then legacy)
+        // Check disk (canonical path only)
         self.bucket_path(hash).exists()
-            || self.catchup_bucket_path(hash).exists()
-            || self.legacy_bucket_path(hash).exists()
     }
 
     /// Merge two buckets and create a new bucket.
@@ -603,8 +545,6 @@ impl BucketManager {
     }
 
     /// List all bucket files in the directory.
-    ///
-    /// Finds both canonical `.bucket.xdr` and legacy `.bucket.gz` files.
     pub fn list_buckets(&self) -> Result<Vec<Hash256>> {
         let mut hashes = Vec::new();
 
@@ -613,21 +553,9 @@ impl BucketManager {
             let path = entry.path();
 
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                let hash_str = if name.ends_with(".bucket.xdr") {
-                    Some(name.trim_end_matches(".bucket.xdr"))
-                } else if name.ends_with(".bucket.gz") {
-                    Some(name.trim_end_matches(".bucket.gz"))
-                } else if name.ends_with(".bucket") && !name.ends_with(".index") {
-                    Some(name.trim_end_matches(".bucket"))
-                } else {
-                    None
-                };
-
-                if let Some(hash_str) = hash_str {
+                if let Some(hash_str) = name.strip_suffix(".bucket.xdr") {
                     if let Ok(hash) = Hash256::from_hex(hash_str) {
-                        if !hashes.contains(&hash) {
-                            hashes.push(hash);
-                        }
+                        hashes.push(hash);
                     }
                 }
             }
@@ -640,7 +568,6 @@ impl BucketManager {
     ///
     /// This also removes the bucket from the cache and deletes the
     /// associated `.index` file when `persist_index` is true.
-    /// Removes both `.bucket.xdr` and legacy `.bucket.gz` files if present.
     pub fn delete_bucket(&self, hash: &Hash256) -> Result<()> {
         // Remove from cache
         {
@@ -656,21 +583,6 @@ impl BucketManager {
                 let _ = crate::index_persistence::delete_index(&xdr_path);
             }
             std::fs::remove_file(&xdr_path)?;
-        }
-
-        // Delete legacy .bucket.gz file if it exists
-        let gz_path = self.legacy_bucket_path(hash);
-        if gz_path.exists() {
-            if self.persist_index {
-                let _ = crate::index_persistence::delete_index(&gz_path);
-            }
-            std::fs::remove_file(&gz_path)?;
-        }
-
-        // Delete catchup .bucket file if it exists
-        let catchup_path = self.catchup_bucket_path(hash);
-        if catchup_path.exists() {
-            std::fs::remove_file(&catchup_path)?;
         }
 
         Ok(())
@@ -1050,22 +962,13 @@ impl BucketManager {
                 continue;
             }
 
-            // Try canonical path first, then catchup, then legacy
+            // Only check canonical .bucket.xdr path
             let xdr_path = self.bucket_path(expected_hash);
-            let catchup_path = self.catchup_bucket_path(expected_hash);
-            let gz_path = self.legacy_bucket_path(expected_hash);
-
-            let load_result = if xdr_path.exists() {
-                Bucket::load_from_xdr_file(&xdr_path)
-            } else if catchup_path.exists() {
-                Bucket::load_from_xdr_file(&catchup_path)
-            } else if gz_path.exists() {
-                Bucket::load_from_file(&gz_path)
-            } else {
+            if !xdr_path.exists() {
                 continue; // Skip missing files (use verify_buckets_exist for that check)
-            };
+            }
 
-            match load_result {
+            match Bucket::load_from_xdr_file(&xdr_path) {
                 Ok(bucket) => {
                     let actual_hash = bucket.hash();
                     if actual_hash != *expected_hash {
