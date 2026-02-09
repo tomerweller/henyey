@@ -870,17 +870,6 @@ fn cross_offer_v10(
     }
 
     // Step 8: Add ClaimAtom (C++ always adds one, even for 0-0 exchanges)
-    // However, for PathPaymentStrictSend with wheat_received=0 but sheep_send>0,
-    // don't add a ClaimAtom - the caller handles this case specially.
-    if round == RoundingType::PathPaymentStrictSend && num_wheat_received == 0 && num_sheep_send > 0
-    {
-        // Special case: strict send with rounding to 0 on receive side.
-        // Return the amounts without a ClaimAtom - the path payment will complete
-        // and then fail with UnderDestmin.
-        return Ok((num_wheat_received, num_sheep_send, wheat_stays));
-    }
-
-    // For normal cases, add the ClaimAtom
     offer_trail.push(ClaimAtom::OrderBook(ClaimOfferAtom {
         seller_id: seller,
         offer_id: offer.offer_id,
