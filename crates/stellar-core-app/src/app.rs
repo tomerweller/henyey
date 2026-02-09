@@ -2925,27 +2925,7 @@ impl App {
                 drop(tx);
                 rx
             }
-        };
-        let (overlay_tx, mut overlay_rx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            loop {
-                match message_rx.recv().await {
-                    Ok(overlay_msg) => {
-                        if overlay_tx.send(overlay_msg).is_err() {
-                            tracing::warn!("BRIDGE: Failed to send to overlay_tx (receiver dropped)");
-                            break;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(skipped = n, "Overlay receiver lagged");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        tracing::info!("BRIDGE: Broadcast channel closed");
-                        break;
-                    }
-                }
-            }
-        });
+         };
 
         // Main run loop
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -2998,9 +2978,9 @@ impl App {
                 }
 
                 // Process overlay messages
-                msg = overlay_rx.recv() => {
+                msg = message_rx.recv() => {
                     match msg {
-                        Some(overlay_msg) => {
+                        Ok(overlay_msg) => {
                             let delivery_latency = overlay_msg.received_at.elapsed();
                             let msg_type = match &overlay_msg.message {
                                 StellarMessage::ScpMessage(_) => "SCP",
@@ -3022,8 +3002,11 @@ impl App {
                             tracing::debug!(msg_type, latency_ms = delivery_latency.as_millis(), "Received overlay message");
                             self.handle_overlay_message(overlay_msg).await;
                         }
-                        None => {
-                            tracing::info!("Overlay message channel closed");
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(skipped = n, "Overlay receiver lagged, messages dropped");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            tracing::info!("Overlay broadcast channel closed");
                             break;
                         }
                     }
@@ -3062,9 +3045,17 @@ impl App {
                     // This ensures tx_sets that arrived via broadcast are processed before we
                     // decide whether to trigger catchup due to missing tx_sets.
                     let mut drained = 0;
-                    while let Ok(overlay_msg) = overlay_rx.try_recv() {
-                        drained += 1;
-                        self.handle_overlay_message(overlay_msg).await;
+                    loop {
+                        match message_rx.try_recv() {
+                            Ok(overlay_msg) => {
+                                drained += 1;
+                                self.handle_overlay_message(overlay_msg).await;
+                            }
+                            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                                tracing::warn!(skipped = n, "Overlay receiver lagged during drain");
+                            }
+                            Err(_) => break, // Empty or Closed
+                        }
                     }
                     if drained > 0 {
                         tracing::debug!(drained, "Drained pending overlay messages before consensus tick");
