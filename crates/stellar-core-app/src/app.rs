@@ -2931,12 +2931,6 @@ impl App {
             loop {
                 match message_rx.recv().await {
                     Ok(overlay_msg) => {
-                        // Log GeneralizedTxSet forwarding for debugging
-                        if let StellarMessage::GeneralizedTxSet(ref ts) = overlay_msg.message {
-                            let xdr_bytes = stellar_xdr::curr::WriteXdr::to_xdr(ts, stellar_xdr::curr::Limits::none()).unwrap_or_default();
-                            let hash = stellar_core_common::Hash256::hash(&xdr_bytes);
-                            tracing::info!(hash = %hash, "BRIDGE: Forwarding GeneralizedTxSet from broadcast to mpsc");
-                        }
                         if overlay_tx.send(overlay_msg).is_err() {
                             tracing::warn!("BRIDGE: Failed to send to overlay_tx (receiver dropped)");
                             break;
@@ -3007,23 +3001,25 @@ impl App {
                 msg = overlay_rx.recv() => {
                     match msg {
                         Some(overlay_msg) => {
+                            let delivery_latency = overlay_msg.received_at.elapsed();
                             let msg_type = match &overlay_msg.message {
                                 StellarMessage::ScpMessage(_) => "SCP",
                                 StellarMessage::Transaction(_) => "TX",
                                 StellarMessage::TxSet(_) => "TxSet",
-                                StellarMessage::GeneralizedTxSet(ref ts) => {
-                                    // Log the hash for debugging tx_set processing issues
-                                    let xdr_bytes = stellar_xdr::curr::WriteXdr::to_xdr(ts, stellar_xdr::curr::Limits::none()).unwrap_or_default();
-                                    let hash = stellar_core_common::Hash256::hash(&xdr_bytes);
-                                    tracing::info!(hash = %hash, "MAIN_LOOP: Received GeneralizedTxSet from mpsc");
+                                StellarMessage::GeneralizedTxSet(_) => {
+                                    tracing::info!(latency_ms = delivery_latency.as_millis(), "Overlay delivery latency for GeneralizedTxSet");
                                     "GeneralizedTxSet"
+                                },
+                                StellarMessage::ScpQuorumset(_) => {
+                                    tracing::info!(latency_ms = delivery_latency.as_millis(), "Overlay delivery latency for ScpQuorumset");
+                                    "ScpQuorumset"
                                 },
                                 StellarMessage::GetTxSet(_) => "GetTxSet",
                                 StellarMessage::Hello(_) => "Hello",
                                 StellarMessage::Peers(_) => "Peers",
                                 _ => "Other",
                             };
-                            tracing::debug!(msg_type, "Received overlay message");
+                            tracing::debug!(msg_type, latency_ms = delivery_latency.as_millis(), "Received overlay message");
                             self.handle_overlay_message(overlay_msg).await;
                         }
                         None => {
@@ -3068,11 +3064,6 @@ impl App {
                     let mut drained = 0;
                     while let Ok(overlay_msg) = overlay_rx.try_recv() {
                         drained += 1;
-                        if let StellarMessage::GeneralizedTxSet(ref ts) = overlay_msg.message {
-                            let xdr_bytes = stellar_xdr::curr::WriteXdr::to_xdr(ts, stellar_xdr::curr::Limits::none()).unwrap_or_default();
-                            let hash = stellar_core_common::Hash256::hash(&xdr_bytes);
-                            tracing::info!(hash = %hash, drained, "DRAIN: Processing GeneralizedTxSet before consensus tick");
-                        }
                         self.handle_overlay_message(overlay_msg).await;
                     }
                     if drained > 0 {
@@ -3343,136 +3334,6 @@ impl App {
                 }
             }
         }
-
-        // Register direct callback for tx_sets to bypass the broadcast channel queue.
-        // This is critical for timely tx_set processing - the broadcast channel can have
-        // 1000+ messages queued, causing tx_sets to be processed minutes late.
-        let herder_clone = self.herder.clone();
-        let tx_set_callback: stellar_core_overlay::TxSetCallback = std::sync::Arc::new(
-            move |_peer_id: stellar_core_overlay::PeerId,
-                  hash: stellar_core_common::Hash256,
-                  gen_tx_set: stellar_xdr::curr::GeneralizedTransactionSet| {
-                use stellar_core_herder::TransactionSet;
-                use stellar_xdr::curr::{GeneralizedTransactionSet, TransactionPhase, TxSetComponent};
-
-                tracing::info!(
-                    hash = %hash,
-                    "DIRECT_TX_SET: Processing tx_set immediately via callback"
-                );
-
-                // Extract transactions from GeneralizedTransactionSet
-                let prev_hash = match &gen_tx_set {
-                    GeneralizedTransactionSet::V1(v1) => {
-                        stellar_core_common::Hash256::from_bytes(v1.previous_ledger_hash.0)
-                    }
-                };
-
-                let transactions: Vec<stellar_xdr::curr::TransactionEnvelope> = match &gen_tx_set {
-                    GeneralizedTransactionSet::V1(v1) => {
-                        v1.phases
-                            .iter()
-                            .flat_map(|phase| match phase {
-                                TransactionPhase::V0(components) => components
-                                    .iter()
-                                    .flat_map(|component| match component {
-                                        TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) => {
-                                            comp.txs.to_vec()
-                                        }
-                                    })
-                                    .collect::<Vec<_>>(),
-                                TransactionPhase::V1(parallel) => parallel
-                                    .execution_stages
-                                    .iter()
-                                    .flat_map(|stage| stage.0.iter().flat_map(|cluster| cluster.0.to_vec()))
-                                    .collect(),
-                            })
-                            .collect()
-                    }
-                };
-
-                let internal_tx_set = TransactionSet {
-                    hash,
-                    previous_ledger_hash: prev_hash,
-                    transactions,
-                    generalized_tx_set: Some(gen_tx_set.clone()),
-                };
-
-                // Check if we need this tx_set
-                if !herder_clone.needs_tx_set(&internal_tx_set.hash) {
-                    tracing::debug!(
-                        hash = %internal_tx_set.hash,
-                        "DIRECT_TX_SET: TxSet not pending, but caching anyway"
-                    );
-                }
-
-                // Directly call receive_tx_set on the herder
-                let received_slot = herder_clone.receive_tx_set(internal_tx_set.clone());
-                if let Some(slot) = received_slot {
-                    tracing::info!(
-                        slot,
-                        hash = %internal_tx_set.hash,
-                        "DIRECT_TX_SET: Received pending TxSet for slot"
-                    );
-                    // Note: We can't call process_externalized_slots here because we don't have
-                    // async context. The main loop will pick this up on the next tick.
-                    // But the critical thing is the tx_set is now in the herder's cache.
-                } else {
-                    tracing::debug!(
-                        hash = %internal_tx_set.hash,
-                        "DIRECT_TX_SET: TxSet cached (not pending for any slot)"
-                    );
-                }
-            },
-        );
-        overlay.set_tx_set_callback(tx_set_callback);
-        tracing::info!("Registered direct tx_set callback on overlay");
-
-        // Register direct callback for quorum_sets to avoid queue delays
-        let herder_clone2 = self.herder.clone();
-        let db_clone = self.db.clone();
-        let ledger_manager_clone = self.ledger_manager.clone();
-        let quorum_set_callback: stellar_core_overlay::QuorumSetCallback = std::sync::Arc::new(
-            move |_peer_id: stellar_core_overlay::PeerId,
-                  hash: stellar_core_common::Hash256,
-                  quorum_set: stellar_xdr::curr::ScpQuorumSet| {
-                tracing::info!(
-                    hash = %hash,
-                    "DIRECT_QS: Processing quorum_set immediately via callback"
-                );
-
-                // Store in database
-                if let Err(e) = db_clone.store_scp_quorum_set(
-                    &hash,
-                    ledger_manager_clone.current_ledger_seq(),
-                    &quorum_set,
-                ) {
-                    tracing::warn!(error = %e, "DIRECT_QS: Failed to store quorum set");
-                }
-
-                // Notify fetching_envelopes that we received this quorum set
-                let was_needed = herder_clone2.recv_quorum_set(hash, quorum_set.clone());
-                if was_needed {
-                    tracing::info!(
-                        hash = %hash,
-                        "DIRECT_QS: QuorumSet was needed by fetching_envelopes"
-                    );
-                }
-
-                // Get pending node_ids and store for them
-                let node_ids = herder_clone2.get_pending_quorum_set_node_ids(&hash);
-                for node_id in &node_ids {
-                    tracing::debug!(
-                        hash = %hash,
-                        node_id = ?node_id,
-                        "DIRECT_QS: Storing quorum set for node"
-                    );
-                    herder_clone2.store_quorum_set(node_id, quorum_set.clone());
-                }
-                herder_clone2.clear_quorum_set_request(&hash);
-            },
-        );
-        overlay.set_quorum_set_callback(quorum_set_callback);
-        tracing::info!("Registered direct quorum_set callback on overlay");
 
         overlay.start().await?;
 
