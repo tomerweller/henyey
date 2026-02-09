@@ -3971,6 +3971,7 @@ async fn test_parallel_soroban_multi_cluster_execution() {
         execute_soroban_parallel_phase(
             &snapshot,
             &phase,
+            0,          // classic_tx_count
             1,          // ledger_seq
             1_000,      // close_time
             100,        // base_fee
@@ -4032,6 +4033,7 @@ async fn test_parallel_soroban_matches_sequential() {
     let common_args = |phase: &SorobanPhaseStructure| {
         (
             phase.clone(),
+            0usize,     // classic_tx_count
             1u32,       // ledger_seq
             1_000u64,   // close_time
             100u32,     // base_fee
@@ -4058,9 +4060,9 @@ async fn test_parallel_soroban_matches_sequential() {
         execute_soroban_parallel_phase(
             &snapshot,
             &args.0,
-            args.1, args.2, args.3, args.4, args.5, args.6,
+            args.1, args.2, args.3, args.4, args.5, args.6, args.7,
             &mut parallel_delta,
-            args.7, args.8, args.9,
+            args.8, args.9, args.10,
             None, None,
             None,
         )
@@ -4080,9 +4082,9 @@ async fn test_parallel_soroban_matches_sequential() {
         execute_soroban_parallel_phase(
             &snapshot,
             &args.0,
-            args.1, args.2, args.3, args.4, args.5, args.6,
+            args.1, args.2, args.3, args.4, args.5, args.6, args.7,
             &mut sequential_delta,
-            args.7, args.8, args.9,
+            args.8, args.9, args.10,
             None, None,
             None,
         )
@@ -4155,7 +4157,7 @@ async fn test_parallel_soroban_deterministic() {
             execute_soroban_parallel_phase(
                 &snapshot,
                 &phase,
-                1, 1_000, 100, 5_000_000, 25, network_id,
+                0, 1, 1_000, 100, 5_000_000, 25, network_id,
                 &mut delta,
                 SorobanConfig::default(),
                 [0u8; 32],
@@ -4226,6 +4228,7 @@ async fn test_parallel_soroban_from_spawn_blocking() {
             execute_soroban_parallel_phase(
                 &snapshot,
                 &phase,
+                0,
                 1,
                 1_000,
                 100,
@@ -4289,6 +4292,7 @@ async fn test_parallel_soroban_spawn_blocking_matches_worker() {
     let (results_worker, tx_results_worker, _, _, _) = execute_soroban_parallel_phase(
         &snapshot,
         &phase,
+        0,
         1,
         1_000,
         100,
@@ -4324,6 +4328,7 @@ async fn test_parallel_soroban_spawn_blocking_matches_worker() {
             let (results, tx_results, _, _, _) = execute_soroban_parallel_phase(
                 &snapshot2,
                 &phase2,
+                0,
                 1,
                 1_000,
                 100,

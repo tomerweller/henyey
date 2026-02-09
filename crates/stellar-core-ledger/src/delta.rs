@@ -30,7 +30,8 @@
 use crate::{LedgerError, Result};
 use std::collections::HashMap;
 use stellar_xdr::curr::{
-    AccountId, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyAccount, Limits, WriteXdr,
+    AccountId, LedgerEntry, LedgerEntryChange, LedgerEntryChanges, LedgerEntryData, LedgerKey,
+    LedgerKeyAccount, Limits, VecM, WriteXdr,
 };
 
 /// Represents a single change to a ledger entry.
@@ -401,6 +402,127 @@ impl LedgerDelta {
     /// Record a total coins change (e.g., from inflation).
     pub fn record_total_coins_delta(&mut self, delta: i64) {
         self.total_coins_delta += delta;
+    }
+
+    /// Pre-deduct a fee from an account entry in the delta, or create/update the
+    /// entry from the snapshot if not yet present.
+    ///
+    /// Returns `(charged_fee, fee_changes)` where `charged_fee = min(balance, fee)`.
+    /// `fee_changes` contains the `[State(before), Updated(after)]` LedgerEntryChanges
+    /// needed for the transaction result metadata.
+    ///
+    /// This is used by parallel Soroban execution to pre-deduct all fees before
+    /// cluster execution, matching C++'s `processFeesSeqNums` behavior.
+    pub fn deduct_fee_from_account(
+        &mut self,
+        account_id: &AccountId,
+        fee: i64,
+        snapshot: &crate::snapshot::SnapshotHandle,
+        ledger_seq: u32,
+    ) -> Result<(i64, LedgerEntryChanges)> {
+        let key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: account_id.clone(),
+        });
+        let key_bytes = key_to_bytes(&key)?;
+
+        // Get the current entry from the delta, or load from snapshot.
+        let (mut entry, is_new) = if let Some(change) = self.changes.get(&key_bytes) {
+            if let Some(current) = change.current_entry() {
+                (current.clone(), false)
+            } else {
+                // Entry was deleted — shouldn't happen for fee accounts, but handle gracefully.
+                return Ok((0, LedgerEntryChanges(VecM::default())));
+            }
+        } else if let Some(entry) = snapshot.get_entry(&key).map_err(|e| {
+            LedgerError::Internal(format!("snapshot lookup failed: {}", e))
+        })? {
+            (entry, true)
+        } else {
+            // Account not found at all — no fee to deduct.
+            return Ok((0, LedgerEntryChanges(VecM::default())));
+        };
+
+        // Build STATE entry (before fee deduction).
+        let state_entry = entry.clone();
+
+        // Deduct fee from balance.
+        let balance = if let LedgerEntryData::Account(ref acc) = entry.data {
+            acc.balance
+        } else {
+            return Ok((0, LedgerEntryChanges(VecM::default())));
+        };
+        let charged_fee = std::cmp::min(balance, fee);
+        if let LedgerEntryData::Account(ref mut acc) = entry.data {
+            acc.balance -= charged_fee;
+        }
+        // Stamp last_modified_ledger_seq to match C++ LedgerTxn behavior.
+        if charged_fee > 0 {
+            entry.last_modified_ledger_seq = ledger_seq;
+        }
+
+        // Build fee_changes: [State(before), Updated(after)].
+        let fee_changes = if charged_fee > 0 {
+            let changes_vec = vec![
+                LedgerEntryChange::State(state_entry.clone()),
+                LedgerEntryChange::Updated(entry.clone()),
+            ];
+            LedgerEntryChanges(changes_vec.try_into().map_err(|_| {
+                LedgerError::Internal("fee changes vec conversion failed".to_string())
+            })?)
+        } else {
+            LedgerEntryChanges(VecM::default())
+        };
+
+        // Update the delta with the post-fee-deduction entry.
+        if is_new {
+            // First time this account appears in the delta — record as Update.
+            self.change_order.push(key_bytes.clone());
+            self.changes.insert(
+                key_bytes,
+                EntryChange::Updated {
+                    previous: state_entry,
+                    current: Box::new(entry),
+                },
+            );
+        } else {
+            // Already in delta — update the current value in place.
+            if let Some(change) = self.changes.get_mut(&key_bytes) {
+                match change {
+                    EntryChange::Created(ref mut e) => {
+                        if let LedgerEntryData::Account(ref mut acc) = e.data {
+                            acc.balance -= charged_fee;
+                            // Re-add charged_fee to state_entry balance since Created
+                            // doesn't have a previous.
+                        }
+                        // Actually, we need to just replace the entry data entirely
+                        *e = entry;
+                    }
+                    EntryChange::Updated {
+                        ref mut current, ..
+                    } => {
+                        **current = entry;
+                    }
+                    EntryChange::Deleted { .. } => {
+                        // Shouldn't happen — already handled above.
+                    }
+                }
+            }
+        }
+
+        Ok((charged_fee, fee_changes))
+    }
+
+    /// Get the current entry value for a given key from the delta's changes, if it exists.
+    ///
+    /// Returns `Some(entry)` if the key has a Created or Updated change.
+    /// Returns `None` if the key is Deleted or not present in the delta.
+    pub fn get_current_entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
+        let key_bytes = key_to_bytes(key)?;
+        if let Some(change) = self.changes.get(&key_bytes) {
+            Ok(change.current_entry().cloned())
+        } else {
+            Ok(None)
+        }
     }
 
     /// Apply a fee refund to an account entry already in the delta.

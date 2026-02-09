@@ -5753,6 +5753,76 @@ fn fee_source_account_id(env: &TransactionEnvelope) -> AccountId {
     }
 }
 
+/// Pre-charged fee information for a single Soroban transaction.
+///
+/// Computed during the pre-deduction pass (matching C++ `processFeesSeqNums`)
+/// and consumed during cluster execution to provide fee metadata without
+/// re-deducting fees.
+struct PreChargedFee {
+    /// The fee actually charged (min(balance, computed_fee)).
+    charged_fee: i64,
+    /// Whether the transaction should be applied (charged_fee >= computed_fee).
+    should_apply: bool,
+    /// Fee processing LedgerEntryChanges: [State(before), Updated(after)].
+    fee_changes: LedgerEntryChanges,
+}
+
+/// Pre-deduct fees for all Soroban transactions across all stages/clusters.
+///
+/// This matches C++ `processFeesSeqNums` which deducts ALL transaction fees
+/// (classic + Soroban) sequentially before any transaction is applied.
+/// For the parallel phase, classic fees are already deducted by `execute_transaction_set`.
+/// This function deducts Soroban fees from the main delta so cluster executors
+/// see the correct post-fee-deduction account balances.
+///
+/// Returns `(pre_charged_fees, total_fee_pool_delta)` where `pre_charged_fees`
+/// is indexed in flattened order (stage 0 cluster 0 TX 0, ..., stage N cluster M TX K).
+fn pre_deduct_soroban_fees(
+    snapshot: &SnapshotHandle,
+    phase: &crate::close::SorobanPhaseStructure,
+    base_fee: u32,
+    network_id: NetworkId,
+    ledger_seq: u32,
+    delta: &mut LedgerDelta,
+) -> Result<(Vec<PreChargedFee>, i64)> {
+    let mut pre_charged: Vec<PreChargedFee> = Vec::new();
+    let mut total_fee_pool = 0i64;
+
+    for stage in &phase.stages {
+        for cluster in stage {
+            for (tx, tx_base_fee) in cluster {
+                let tx_fee = tx_base_fee.unwrap_or(base_fee);
+                let frame = TransactionFrame::with_network(tx.clone(), network_id);
+                let fee_source = fee_source_account_id(tx);
+
+                // Compute the fee using the same logic as execute_transaction_with_fee_mode.
+                let num_ops = std::cmp::max(1, frame.operation_count() as i64);
+                let required_fee = if frame.is_fee_bump() {
+                    tx_fee as i64 * (num_ops + 1)
+                } else {
+                    tx_fee as i64 * num_ops
+                };
+                let inclusion_fee = frame.inclusion_fee();
+                let computed_fee = frame.declared_soroban_resource_fee()
+                    + std::cmp::min(inclusion_fee, required_fee);
+
+                let (charged_fee, fee_changes) =
+                    delta.deduct_fee_from_account(&fee_source, computed_fee, snapshot, ledger_seq)?;
+                let should_apply = charged_fee >= computed_fee;
+
+                total_fee_pool += charged_fee;
+                pre_charged.push(PreChargedFee {
+                    charged_fee,
+                    should_apply,
+                    fee_changes,
+                });
+            }
+        }
+    }
+
+    Ok((pre_charged, total_fee_pool))
+}
+
 /// Execute a full Soroban parallel phase (all stages sequentially,
 /// clusters within each stage in parallel).
 ///
@@ -5797,6 +5867,17 @@ pub fn execute_soroban_parallel_phase(
     // so Soroban TXs start at classic_tx_count.
     let mut global_tx_offset: usize = classic_tx_count;
 
+    // Pre-deduct all Soroban TX fees from the main delta BEFORE any cluster execution.
+    // This matches C++ processFeesSeqNums which deducts ALL fees upfront.
+    let (pre_charged_fees, total_pre_deducted) =
+        pre_deduct_soroban_fees(snapshot, phase, base_fee, network_id, ledger_seq, delta)?;
+    if total_pre_deducted != 0 {
+        delta.record_fee_pool_delta(total_pre_deducted);
+    }
+
+    // Track position in the flattened pre_charged_fees vector.
+    let mut pre_charge_offset: usize = 0;
+
     for (stage_idx, stage) in phase.stages.iter().enumerate() {
         if stage.is_empty() {
             continue;
@@ -5808,7 +5889,12 @@ pub fn execute_soroban_parallel_phase(
         // has classic TX changes committed, so even stage 0 clusters see classic
         // modifications (e.g., fee deductions on shared accounts).  We always
         // pass delta.current_entries() to match this behavior.
+        // NOTE: After pre-deduction, these entries include the post-fee balances.
         let prior_stage_entries = delta.current_entries();
+
+        // Slice pre_charged_fees for this stage's clusters.
+        let stage_tx_count: usize = stage.iter().map(|c| c.len()).sum();
+        let stage_pre_charged = &pre_charged_fees[pre_charge_offset..pre_charge_offset + stage_tx_count];
 
         // Execute each cluster with its own executor, then merge results.
         // Clusters within a stage are independent (no footprint conflicts)
@@ -5832,6 +5918,7 @@ pub fn execute_soroban_parallel_phase(
             delta,
             runtime_handle.clone(),
             &prior_stage_entries,
+            stage_pre_charged,
         )?;
 
         // Merge cluster results. Use max id_pool across clusters.
@@ -5846,9 +5933,9 @@ pub fn execute_soroban_parallel_phase(
                 .extend(cr.hot_archive_restored_keys.iter().cloned());
         }
 
-        // Advance global TX offset for next stage.
-        let stage_tx_count: usize = stage.iter().map(|c| c.len()).sum();
+        // Advance global TX offset and pre_charge_offset for next stage.
         global_tx_offset += stage_tx_count;
+        pre_charge_offset += stage_tx_count;
 
         tracing::debug!(
             ledger_seq = ledger_seq,
@@ -5898,6 +5985,8 @@ pub fn execute_soroban_parallel_phase(
 /// Execute a single cluster of transactions independently.
 ///
 /// Creates its own `TransactionExecutor` and `LedgerDelta`.
+/// Fees are NOT deducted by the executor (deduct_fee=false) because they
+/// were pre-deducted from the main delta by `pre_deduct_soroban_fees`.
 /// Returns `(ClusterResult, per_cluster_delta, total_fees)`.
 #[allow(clippy::too_many_arguments)]
 fn execute_single_cluster(
@@ -5917,6 +6006,7 @@ fn execute_single_cluster(
     hot_archive: Option<&std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
     id_pool: u64,
     prior_stage_entries: &[LedgerEntry],
+    pre_charged_fees: &[PreChargedFee],
 ) -> Result<(ClusterResult, LedgerDelta, i64)> {
     let mut executor = TransactionExecutor::new(
         ledger_seq,
@@ -5952,13 +6042,31 @@ fn execute_single_cluster(
         let tx_fee = tx_base_fee.unwrap_or(base_fee);
         let global_idx = cluster_offset + local_idx;
         let tx_prng_seed = sub_sha256(&soroban_base_prng_seed, global_idx as u32);
-        let result = executor.execute_transaction_with_fee_mode(
+
+        // Execute with deduct_fee=false — fees were already pre-deducted from
+        // the main delta by pre_deduct_soroban_fees().
+        let mut result = executor.execute_transaction_with_fee_mode(
             snapshot,
             tx,
             tx_fee,
             Some(tx_prng_seed),
-            true,
+            false,
         )?;
+
+        // Override fee_charged and fee_changes from pre-deduction.
+        // The executor computed fee_refund correctly (based on resource consumption),
+        // but fee_charged=0 because deduct_fee=false. We use the pre-charged values.
+        let pre = &pre_charged_fees[local_idx];
+        result.fee_charged = pre.charged_fee.saturating_sub(result.fee_refund);
+        result.fee_changes = Some(pre.fee_changes.clone());
+
+        // If pre-deduction determined insufficient balance, force the TX to fail.
+        if !pre.should_apply && result.success {
+            result.success = false;
+            result.failure = Some(ExecutionFailure::InsufficientBalance);
+            result.error = Some("Insufficient balance for fee".into());
+        }
+
         let frame = TransactionFrame::with_network(tx.clone(), executor.network_id);
         let tx_result = build_tx_result_pair(
             &frame,
@@ -6050,13 +6158,18 @@ fn execute_stage_clusters(
     delta: &mut LedgerDelta,
     runtime_handle: Option<tokio::runtime::Handle>,
     prior_stage_entries: &[LedgerEntry],
+    pre_charged_fees: &[PreChargedFee],
 ) -> Result<Vec<ClusterResult>> {
-    // Compute per-cluster global offsets.
+    // Compute per-cluster global offsets and pre_charged_fees slicing.
     let mut offsets = Vec::with_capacity(clusters.len());
+    let mut pre_charge_offsets = Vec::with_capacity(clusters.len());
     let mut offset = global_tx_offset;
+    let mut pc_offset = 0usize;
     for cluster in clusters {
         offsets.push(offset);
+        pre_charge_offsets.push(pc_offset);
         offset += cluster.len();
+        pc_offset += cluster.len();
     }
 
     tracing::debug!(
@@ -6070,6 +6183,7 @@ fn execute_stage_clusters(
     if clusters.len() <= 1 {
         let mut cluster_results = Vec::with_capacity(clusters.len());
         for (cluster_idx, cluster) in clusters.iter().enumerate() {
+            let cluster_pc = &pre_charged_fees[pre_charge_offsets[cluster_idx]..pre_charge_offsets[cluster_idx] + cluster.len()];
             let (cr, cluster_delta, total_fees) = execute_single_cluster(
                 snapshot,
                 cluster,
@@ -6087,6 +6201,7 @@ fn execute_stage_clusters(
                 hot_archive.as_ref(),
                 id_pool,
                 prior_stage_entries,
+                cluster_pc,
             )?;
             delta.merge(cluster_delta)?;
             if total_fees != 0 {
@@ -6106,6 +6221,25 @@ fn execute_stage_clusters(
         std::sync::Arc::new(clusters.to_vec());
     let prior_entries: std::sync::Arc<Vec<LedgerEntry>> =
         std::sync::Arc::new(prior_stage_entries.to_vec());
+    // For multi-cluster parallel execution, we need to split pre_charged_fees per cluster.
+    // Each cluster gets its own Vec since the spawn_blocking closure needs 'static data.
+    let per_cluster_fees: Vec<std::sync::Arc<Vec<PreChargedFee>>> = {
+        let mut result = Vec::with_capacity(clusters.len());
+        for (idx, cluster) in clusters.iter().enumerate() {
+            let start = pre_charge_offsets[idx];
+            let end = start + cluster.len();
+            let fees: Vec<PreChargedFee> = pre_charged_fees[start..end]
+                .iter()
+                .map(|f| PreChargedFee {
+                    charged_fee: f.charged_fee,
+                    should_apply: f.should_apply,
+                    fee_changes: f.fee_changes.clone(),
+                })
+                .collect();
+            result.push(std::sync::Arc::new(fees));
+        }
+        result
+    };
 
     // Build the async future that spawns per-cluster tasks and collects results.
     let spawn_and_collect = async {
@@ -6118,6 +6252,7 @@ fn execute_stage_clusters(
             let clusters = clusters.clone();
             let prior_entries = prior_entries.clone();
             let cluster_offset = offsets[idx];
+            let cluster_fees = per_cluster_fees[idx].clone();
 
             tasks.push(tokio::task::spawn_blocking(move || {
                 execute_single_cluster(
@@ -6137,6 +6272,7 @@ fn execute_stage_clusters(
                     ha.as_ref(),
                     id_pool,
                     &prior_entries,
+                    &cluster_fees,
                 )
             }));
         }
