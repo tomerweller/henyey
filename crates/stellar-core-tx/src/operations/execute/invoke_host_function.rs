@@ -292,7 +292,7 @@ fn execute_contract_invocation(
             let result_hash =
                 compute_success_preimage_hash(&result.return_value, &result.contract_events);
 
-            tracing::info!(
+            tracing::debug!(
                 cpu_insns = result.cpu_insns,
                 mem_bytes = result.mem_bytes,
                 events_count = result.contract_events.len(),
@@ -1756,10 +1756,7 @@ mod tests {
             key: contract_key,
             durability: ContractDataDurability::Persistent,
         }));
-        state
-            .get_ttl_mut(&key_hash2)
-            .unwrap()
-            .live_until_ledger_seq = context.sequence - 1; // Expired
+        state.get_ttl_mut(&key_hash2).unwrap().live_until_ledger_seq = context.sequence - 1; // Expired
 
         let exceeded = disk_read_bytes_exceeded(
             &state,

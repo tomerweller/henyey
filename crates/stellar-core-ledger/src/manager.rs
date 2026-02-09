@@ -1983,7 +1983,7 @@ impl<'a> LedgerCloseContext<'a> {
                 id_pool = id_pool.max(soroban_id_pool);
                 hot_archive_restored_keys.extend(soroban_restored_keys);
 
-                tracing::info!(
+                tracing::debug!(
                     ledger_seq = self.close_data.ledger_seq,
                     classic_tx_count = classic_txs.len(),
                     soroban_stages = phase.stages.len(),
@@ -2076,7 +2076,7 @@ impl<'a> LedgerCloseContext<'a> {
         let tx_result_hash = Hash256::hash_xdr(&result_set).unwrap_or(Hash256::ZERO);
 
         // Log transaction results for debugging - helps identify tx execution differences
-        tracing::info!(
+        tracing::debug!(
             ledger_seq = self.close_data.ledger_seq,
             tx_count = self.tx_results.len(),
             tx_result_hash = %tx_result_hash.to_hex(),
@@ -2087,7 +2087,7 @@ impl<'a> LedgerCloseContext<'a> {
         self.upgrade_ctx.apply_to_header(&mut upgraded_header);
         let protocol_version = upgraded_header.ledger_version;
         let prev_version = self.prev_header.ledger_version;
-        tracing::info!(
+        tracing::debug!(
             ledger_seq = self.close_data.ledger_seq,
             prev_protocol_version = prev_version,
             upgraded_protocol_version = protocol_version,
@@ -2251,7 +2251,7 @@ impl<'a> LedgerCloseContext<'a> {
                 }
             }
         }
-        tracing::info!(
+        tracing::debug!(
             ledger_seq = self.close_data.ledger_seq,
             delta_count_final = self.delta.num_changes(),
             init_count = self.delta.init_entries().len(),
@@ -2871,6 +2871,10 @@ impl<'a> LedgerCloseContext<'a> {
             total_coins = new_header.total_coins,
             fee_pool = new_header.fee_pool,
             close_time = new_header.scp_value.close_time.0,
+            "Ledger closed"
+        );
+        debug!(
+            ledger_seq = new_header.ledger_seq,
             tx_set_hash = %Hash256::from(new_header.scp_value.tx_set_hash.0).to_hex(),
             upgrades_count = new_header.scp_value.upgrades.len(),
             stellar_value_ext = %stellar_value_ext_desc,
@@ -2884,7 +2888,7 @@ impl<'a> LedgerCloseContext<'a> {
             base_fee = new_header.base_fee,
             base_reserve = new_header.base_reserve,
             max_tx_set_size = new_header.max_tx_set_size,
-            "Ledger closed"
+            "Ledger closed details"
         );
 
         let meta = build_ledger_close_meta(

@@ -71,7 +71,7 @@ use stellar_xdr::curr::{
     TransactionResultMetaV1, TransactionResultPair, TransactionResultResult, TrustLineAsset,
     TrustLineFlags, VecM, WriteXdr,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::delta::LedgerDelta;
 use crate::snapshot::SnapshotHandle;
@@ -2885,7 +2885,7 @@ impl TransactionExecutor {
                         // Debug: Log operation result for Soroban operations
                         if op_type.is_soroban() {
                             let is_success_before_refund_check = is_operation_success(&op_result);
-                            tracing::info!(
+                            tracing::debug!(
                                 ledger_seq = self.ledger_seq,
                                 op_index,
                                 op_type = ?op_type,
@@ -3027,7 +3027,7 @@ impl TransactionExecutor {
                             let ha_after = hot_archive_for_meta.len();
                             // Log when we filter out entries
                             if ha_before != ha_after {
-                                tracing::info!(
+                                tracing::debug!(
                                     ha_before,
                                     ha_after_live_bl,
                                     ha_after,
@@ -3257,7 +3257,7 @@ impl TransactionExecutor {
                 .map(|(op, (us, count))| format!("{:?}:{}us×{}", op, us, count))
                 .collect::<Vec<_>>()
                 .join(",");
-            tracing::info!(
+            tracing::debug!(
                 ledger_seq = self.ledger_seq,
                 total_us,
                 validation_us,
@@ -5637,7 +5637,7 @@ pub fn execute_transaction_set_with_fee_mode(
             post_tx_apply_fee_processing: post_fee_changes,
         };
 
-        info!(
+        debug!(
             success = result.success,
             fee = result.fee_charged,
             fee_refund = result.fee_refund,

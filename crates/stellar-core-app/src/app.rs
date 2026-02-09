@@ -2987,11 +2987,11 @@ impl App {
                                 StellarMessage::Transaction(_) => "TX",
                                 StellarMessage::TxSet(_) => "TxSet",
                                 StellarMessage::GeneralizedTxSet(_) => {
-                                    tracing::info!(latency_ms = delivery_latency.as_millis(), "Overlay delivery latency for GeneralizedTxSet");
+                                    tracing::debug!(latency_ms = delivery_latency.as_millis(), "Overlay delivery latency for GeneralizedTxSet");
                                     "GeneralizedTxSet"
                                 },
                                 StellarMessage::ScpQuorumset(_) => {
-                                    tracing::info!(latency_ms = delivery_latency.as_millis(), "Overlay delivery latency for ScpQuorumset");
+                                    tracing::debug!(latency_ms = delivery_latency.as_millis(), "Overlay delivery latency for ScpQuorumset");
                                     "ScpQuorumset"
                                 },
                                 StellarMessage::GetTxSet(_) => "GetTxSet",
@@ -3896,7 +3896,7 @@ impl App {
     /// Try to close a specific slot directly when we receive its tx set.
     /// This feeds the buffered ledger pipeline and attempts sequential apply.
     async fn try_close_slot_directly(&self, slot: u64) {
-        tracing::info!(slot, "Attempting to close specific slot directly");
+        tracing::debug!(slot, "Attempting to close specific slot directly");
         let close_info = match self.herder.check_ledger_close(slot) {
             Some(info) => info,
             None => {
@@ -4069,7 +4069,7 @@ impl App {
                 return;
             }
             entry.tx_set = Some(tx_set);
-            tracing::info!(slot, "Buffered tx set attached");
+            tracing::debug!(slot, "Buffered tx set attached");
         } else {
             tracing::debug!(slot, "Received tx set for unbuffered slot");
         }
@@ -4080,7 +4080,7 @@ impl App {
         for (slot, entry) in buffer.iter_mut() {
             if entry.tx_set.is_none() && entry.tx_set_hash == tx_set.hash {
                 entry.tx_set = Some(tx_set.clone());
-                tracing::info!(slot, hash = %tx_set.hash, "Attached tx set to buffered slot");
+                tracing::debug!(slot, hash = %tx_set.hash, "Attached tx set to buffered slot");
                 return true;
             }
         }
@@ -4106,7 +4106,7 @@ impl App {
         }
         self.update_buffered_tx_set(slot as u32, Some(tx_set.clone()))
             .await;
-        tracing::info!(
+        tracing::debug!(
             slot,
             hash = %tx_set.hash,
             "Buffered tx set after externalized lookup"
@@ -4191,7 +4191,7 @@ impl App {
                     let is_externalized =
                         self.herder.get_externalized(next_seq as u64).is_some();
                     if is_externalized {
-                        tracing::warn!(
+                        tracing::debug!(
                             next_seq,
                             current_ledger,
                             "Next slot externalized but not in syncing_ledgers buffer"
@@ -7239,14 +7239,14 @@ impl App {
             }
         };
 
-        tracing::info!(
+        tracing::debug!(
             hash = %hash,
             tx_count = transactions.len(),
             "Processing GeneralizedTxSet"
         );
 
         if !self.herder.needs_tx_set(&hash) {
-            tracing::info!(hash = %hash, "GeneralizedTxSet not pending");
+            tracing::debug!(hash = %hash, "GeneralizedTxSet not pending");
         }
 
         let phase_check = match &gen_tx_set {
@@ -7357,7 +7357,7 @@ impl App {
 
         let received_slot = self.herder.receive_tx_set(internal_tx_set.clone());
         if let Some(slot) = received_slot {
-            tracing::info!(
+            tracing::debug!(
                 slot,
                 "Received pending GeneralizedTxSet, attempting ledger close"
             );

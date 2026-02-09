@@ -304,7 +304,7 @@ impl ScpDriver {
                 request_count: 1,
             },
         );
-        info!(%hash, slot, "Registered pending tx set request");
+        debug!(%hash, slot, "Registered pending tx set request");
         true
     }
 
@@ -405,7 +405,7 @@ impl ScpDriver {
         self.cache_tx_set(tx_set);
 
         if let Some(s) = slot {
-            info!(%hash, slot = s, "Received pending tx set");
+            debug!(%hash, slot = s, "Received pending tx set");
         } else {
             debug!(%hash, "Received tx set (not pending)");
         }
@@ -754,7 +754,7 @@ impl ScpDriver {
             *latest = Some(slot);
         }
 
-        info!("Externalized slot {} with close time {}", slot, close_time);
+        debug!("Externalized slot {} with close time {}", slot, close_time);
     }
 
     /// Emit an envelope to the network.

@@ -712,7 +712,7 @@ impl Herder {
             if lcl.map_or(true, |l| slot > l) {
                 // Request this tx set immediately - don't wait for ledger close
                 if self.scp_driver.request_tx_set(tx_set_hash, slot) {
-                    info!(slot, hash = %tx_set_hash, "Immediately requesting tx set from EXTERNALIZE");
+                    debug!(slot, hash = %tx_set_hash, "Immediately requesting tx set from EXTERNALIZE");
                 }
             }
 
@@ -847,7 +847,7 @@ impl Herder {
                 }
 
                 // Record this externalization so we can close the gap ledger
-                info!(
+                debug!(
                     slot,
                     current_slot,
                     lcl = lcl.unwrap_or(0),
@@ -1325,7 +1325,7 @@ impl Herder {
     ///
     /// Called after the application has applied the ledger.
     pub fn ledger_closed(&self, slot: SlotIndex, applied_tx_hashes: &[Hash256]) {
-        info!(slot, txs = applied_tx_hashes.len(), "Ledger closed");
+        debug!(slot, txs = applied_tx_hashes.len(), "Ledger closed");
 
         // Remove applied transactions from queue
         self.tx_queue.remove_applied_by_hash(applied_tx_hashes);
@@ -1699,7 +1699,7 @@ impl Herder {
         }
 
         if processed > 0 {
-            info!(processed, "Processed envelopes after tx set arrival");
+            debug!(processed, "Processed envelopes after tx set arrival");
         }
 
         processed
