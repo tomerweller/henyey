@@ -760,6 +760,22 @@ impl HotArchiveBucketLevel {
         self.next.as_ref()
     }
 
+    /// Get the hash of the pending merge output, if any.
+    ///
+    /// Hot archive merges are always synchronous, so if there is a pending
+    /// merge it is always resolved. Returns the output hash for HAS
+    /// serialization (state=1).
+    pub fn pending_merge_output_hash(&self) -> Option<Hash256> {
+        self.next.as_ref().and_then(|bucket| {
+            let h = bucket.hash();
+            if h.is_zero() {
+                None
+            } else {
+                Some(h)
+            }
+        })
+    }
+
     /// Commit the staged merge.
     fn commit(&mut self) {
         if let Some(next) = self.next.take() {

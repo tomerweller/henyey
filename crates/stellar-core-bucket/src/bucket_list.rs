@@ -121,6 +121,20 @@ pub enum PendingMerge {
     Async(AsyncMergeHandle),
 }
 
+/// Describes the serializable state of a pending merge for HAS persistence.
+///
+/// Matches the three states of C++ FutureBucket:
+/// - State 0 (clear): no pending merge (represented by `None` at call site)
+/// - State 1 (output): merge completed, output hash known
+/// - State 2 (inputs): merge in progress, input hashes known
+#[derive(Debug, Clone)]
+pub enum PendingMergeState {
+    /// State 1: merge completed, output bucket hash is known
+    Output(Hash256),
+    /// State 2: merge in progress, input curr/snap hashes are known
+    Inputs { curr: Hash256, snap: Hash256 },
+}
+
 impl std::fmt::Debug for PendingMerge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -169,6 +183,12 @@ pub struct AsyncMergeHandle {
     /// These paths are needed for garbage collection - we can't delete files that
     /// are being read by in-flight merges.
     input_file_paths: Vec<std::path::PathBuf>,
+    /// Hash of the "curr" input bucket for this merge.
+    /// Stored so we can serialize in-progress merges as HAS state 2 (input hashes),
+    /// matching C++ FutureBucket's hasHashes() behavior.
+    input_curr_hash: Hash256,
+    /// Hash of the "snap" input bucket for this merge.
+    input_snap_hash: Hash256,
 }
 
 impl AsyncMergeHandle {
@@ -193,6 +213,13 @@ impl AsyncMergeHandle {
         bucket_dir: Option<std::path::PathBuf>,
     ) -> Self {
         let (sender, receiver) = oneshot::channel();
+
+        // Capture input hashes BEFORE the merge starts. These are needed for
+        // HAS serialization: if the merge is still in progress when we persist
+        // the HAS, we store these as state=2 (FB_HASH_INPUTS) so that
+        // restart_merges_from_has can reconstruct the exact merge.
+        let input_curr_hash = curr.hash();
+        let input_snap_hash = snap.hash();
 
         // Capture input bucket file paths for garbage collection tracking.
         // These files must not be deleted while this merge is in progress.
@@ -311,6 +338,8 @@ impl AsyncMergeHandle {
             level,
             result: None,
             input_file_paths,
+            input_curr_hash,
+            input_snap_hash,
         }
     }
 
@@ -474,23 +503,43 @@ impl BucketLevel {
         self.next.is_some()
     }
 
-    /// Get the hash of the pending merge output, if any.
+    /// Get the full pending merge state for HAS serialization.
     ///
-    /// Returns the resolved output hash for use in HAS serialization.
-    /// For InMemory merges, returns the bucket hash directly.
-    /// For Async merges, returns the cached result hash if resolved.
-    /// Returns `None` if there is no pending merge or the async merge hasn't resolved.
-    pub fn pending_merge_output_hash(&self) -> Option<Hash256> {
+    /// Returns the state needed to serialize this level's `next` field in the
+    /// History Archive State JSON, matching C++ FutureBucket serialization:
+    ///
+    /// - `None` → state 0 (clear): no pending merge
+    /// - `Some(PendingMergeState::Output(hash))` → state 1: merge completed, output hash known
+    /// - `Some(PendingMergeState::Inputs { curr, snap })` → state 2: merge in progress, input hashes known
+    pub fn pending_merge_state(&self) -> Option<PendingMergeState> {
         match &self.next {
-            Some(pending) => {
-                let h = pending.hash();
+            None => None,
+            Some(PendingMerge::InMemory(bucket)) => {
+                // InMemory merges are always resolved; emit state 1 (output)
+                let h = bucket.hash();
                 if h.is_zero() {
-                    None // Unresolved async merge
+                    None
                 } else {
-                    Some(h)
+                    Some(PendingMergeState::Output(h))
                 }
             }
-            None => None,
+            Some(PendingMerge::Async(handle)) => {
+                if let Some(ref bucket) = handle.result {
+                    // Async merge has resolved; emit state 1 (output)
+                    let h = bucket.hash();
+                    if h.is_zero() {
+                        None
+                    } else {
+                        Some(PendingMergeState::Output(h))
+                    }
+                } else {
+                    // Async merge still in progress; emit state 2 (input hashes)
+                    Some(PendingMergeState::Inputs {
+                        curr: handle.input_curr_hash,
+                        snap: handle.input_snap_hash,
+                    })
+                }
+            }
         }
     }
 

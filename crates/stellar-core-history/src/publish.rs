@@ -49,7 +49,7 @@ use crate::{
     paths, verify, HistoryError, Result,
 };
 use std::path::{Path, PathBuf};
-use stellar_core_bucket::BucketList;
+use stellar_core_bucket::{BucketList, PendingMergeState};
 use stellar_core_common::Hash256;
 use stellar_core_ledger::TransactionSetVariant;
 use stellar_xdr::curr::{
@@ -118,9 +118,11 @@ pub struct PublishManager {
 
 /// Build a history archive state from a bucket list snapshot.
 ///
-/// Captures the full bucket list state including any pending merge outputs.
-/// Pending merges are recorded as state=1 (output hash known) in the HAS,
-/// matching C++ stellar-core behavior for restart recovery.
+/// Captures the full bucket list state including any pending merges.
+/// Pending merges are recorded matching C++ FutureBucket serialization:
+/// - state=1 (output hash known) for completed merges
+/// - state=2 (input hashes known) for in-progress async merges
+/// - state=0 (clear) for levels with no pending merge
 pub fn build_history_archive_state(
     ledger_seq: u32,
     bucket_list: &BucketList,
@@ -131,12 +133,19 @@ pub fn build_history_archive_state(
         .levels()
         .iter()
         .map(|level| {
-            let next = match level.pending_merge_output_hash() {
-                Some(hash) => HASBucketNext {
+            let next = match level.pending_merge_state() {
+                Some(PendingMergeState::Output(hash)) => HASBucketNext {
                     state: 1, // FB_HASH_OUTPUT
                     output: Some(hash.to_hex()),
                     curr: None,
                     snap: None,
+                    shadow: None,
+                },
+                Some(PendingMergeState::Inputs { curr, snap }) => HASBucketNext {
+                    state: 2, // FB_HASH_INPUTS
+                    output: None,
+                    curr: Some(curr.to_hex()),
+                    snap: Some(snap.to_hex()),
                     shadow: None,
                 },
                 None => HASBucketNext::default(),
@@ -152,10 +161,22 @@ pub fn build_history_archive_state(
     let hot_archive_buckets = hot_archive_bucket_list.map(|habl| {
         habl.levels()
             .iter()
-            .map(|level| HASBucketLevel {
-                curr: level.curr.hash().to_hex(),
-                snap: level.snap.hash().to_hex(),
-                next: HASBucketNext::default(),
+            .map(|level| {
+                let next = match level.pending_merge_output_hash() {
+                    Some(hash) => HASBucketNext {
+                        state: 1, // FB_HASH_OUTPUT
+                        output: Some(hash.to_hex()),
+                        curr: None,
+                        snap: None,
+                        shadow: None,
+                    },
+                    None => HASBucketNext::default(),
+                };
+                HASBucketLevel {
+                    curr: level.curr.hash().to_hex(),
+                    snap: level.snap.hash().to_hex(),
+                    next,
+                }
             })
             .collect()
     });
