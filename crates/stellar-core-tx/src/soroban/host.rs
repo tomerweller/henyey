@@ -2364,7 +2364,7 @@ fn execute_host_function_p25(
         Err(ref e) => {
             let cpu_insns_consumed = budget.get_cpu_insns_consumed().unwrap_or(0);
             let mem_bytes_consumed = budget.get_mem_bytes_consumed().unwrap_or(0);
-            tracing::warn!(
+            tracing::debug!(
                 cpu_consumed = cpu_insns_consumed,
                 mem_consumed = mem_bytes_consumed,
                 diagnostic_events = diagnostic_events.len(),
@@ -2375,7 +2375,7 @@ fn execute_host_function_p25(
             for (i, event) in diagnostic_events.iter().enumerate() {
                 use soroban_env_host25::xdr::WriteXdr as _;
                 if let Ok(encoded) = event.to_xdr(soroban_env_host25::xdr::Limits::none()) {
-                    tracing::warn!(
+                    tracing::debug!(
                         event_idx = i,
                         event_hex = hex::encode(&encoded),
                         "P25: Diagnostic event from invoke_result error"
