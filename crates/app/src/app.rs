@@ -3666,7 +3666,7 @@ impl App {
                         tracing::debug!(slot, tracking, "SCP envelope too old");
                     }
                     EnvelopeState::Invalid => {
-                        tracing::warn!(slot, peer = %msg.from_peer, "Invalid SCP envelope");
+                        tracing::debug!(slot, peer = %msg.from_peer, "Invalid SCP envelope");
                     }
                     EnvelopeState::InvalidSignature => {
                         tracing::warn!(slot, peer = %msg.from_peer, "SCP envelope with invalid signature");

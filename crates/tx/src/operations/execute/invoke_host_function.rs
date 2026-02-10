@@ -305,7 +305,7 @@ fn execute_contract_invocation(
             ))
         }
         Err(exec_error) => {
-            tracing::warn!(
+            tracing::debug!(
                 error = %exec_error.host_error,
                 cpu_consumed = exec_error.cpu_insns_consumed,
                 cpu_specified = soroban_data.resources.instructions,

@@ -732,7 +732,7 @@ fn convert_with_offers(
 
     let total_us = loop_start.elapsed().as_micros() as u64;
     if total_us > 1000 {
-        tracing::info!(
+        tracing::trace!(
             offers_crossed,
             total_us,
             best_offer_us,

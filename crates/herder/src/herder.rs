@@ -1143,7 +1143,7 @@ impl Herder {
                     return self.process_scp_envelope(envelope_clone);
                 }
                 PendingResult::BufferFull => {
-                    warn!("Pending envelope buffer full");
+                    debug!("Pending envelope buffer full");
                     return EnvelopeState::Invalid;
                 }
             }
