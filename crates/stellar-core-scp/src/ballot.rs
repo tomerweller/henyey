@@ -2151,7 +2151,10 @@ impl BallotProtocol {
             driver.sign_envelope(&mut envelope);
             if self.record_local_envelope(local_node_id, envelope.clone()) {
                 self.last_envelope = Some(envelope.clone());
-                self.send_latest_envelope(driver);
+                // Note: send_latest_envelope is NOT called here.
+                // It's called in emit_current_state after self-processing,
+                // matching C++ where sendLatestEnvelope() is called after
+                // processEnvelope(self) in emitCurrentStateStatement().
                 return Some(statement);
             }
         }
@@ -2190,7 +2193,7 @@ impl BallotProtocol {
             driver.sign_envelope(&mut envelope);
             if self.record_local_envelope(local_node_id, envelope.clone()) {
                 self.last_envelope = Some(envelope.clone());
-                self.send_latest_envelope(driver);
+                // Note: send_latest_envelope deferred to emit_current_state (see emit_prepare)
                 return Some(statement);
             }
         }
@@ -2227,7 +2230,7 @@ impl BallotProtocol {
             driver.sign_envelope(&mut envelope);
             if self.record_local_envelope(local_node_id, envelope.clone()) {
                 self.last_envelope = Some(envelope.clone());
-                self.send_latest_envelope(driver);
+                // Note: send_latest_envelope deferred to emit_current_state (see emit_prepare)
                 return Some(statement);
             }
         }
@@ -2271,6 +2274,15 @@ impl BallotProtocol {
                 slot_index,
             );
         }
+        // Emit the latest envelope after self-processing completes.
+        // If advance_slot caused cascading state changes, last_envelope
+        // was updated to the final envelope and already emitted via
+        // advance_slot's send_latest_envelope call. The dedup check in
+        // send_latest_envelope (last_envelope_emit) prevents double-emit.
+        // If no cascading happened, this ensures the original envelope
+        // is emitted. Matches C++ sendLatestEnvelope() in
+        // emitCurrentStateStatement after processEnvelope(self).
+        self.send_latest_envelope(driver);
     }
 
     fn record_local_envelope(&mut self, local_node_id: &NodeId, envelope: ScpEnvelope) -> bool {
