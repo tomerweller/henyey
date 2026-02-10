@@ -1244,7 +1244,8 @@ fn exchange_with_pool(
             // result = A*Q + floor(A*R/C)
             let value = a * q + (a * r) / c;
             if value > i64::MAX as u128 {
-                return Err(TxError::Internal("pool exchange overflow".into()));
+                // C++ hugeDivide returns false on overflow; exchange is not possible
+                return Ok(false);
             }
             *from_pool = value as i64;
 
@@ -1282,7 +1283,8 @@ fn exchange_with_pool(
             let value = a * q + (a * r).div_ceil(c);
 
             if value > i64::MAX as u128 {
-                return Err(TxError::Internal("pool exchange overflow".into()));
+                // C++ hugeDivide returns false on overflow; exchange is not possible
+                return Ok(false);
             }
             *to_pool = value as i64;
 
@@ -2303,5 +2305,61 @@ mod tests {
         let r = b_large % denominator;
         let expected = a * q + (a * r) / denominator;
         assert_eq!(from_pool, expected as i64);
+    }
+
+    /// Regression test for pool exchange overflow returning Ok(false) instead of Err.
+    /// Found at mainnet ledger 61170102: PathPaymentStrictReceive hit overflow in
+    /// hugeDivide, causing TxNotSupported instead of TooFewOffers.
+    /// C++ hugeDivide returns false on overflow; the exchange is simply not possible.
+    #[test]
+    fn test_pool_exchange_overflow_returns_false_strict_receive() {
+        // Set up values that cause the hugeDivide result to overflow i64:
+        // Large reserves_to_pool and from_pool, small denominator (reserves_from_pool - from_pool)
+        let reserves_to_pool: i64 = i64::MAX / 2;
+        let reserves_from_pool: i64 = i64::MAX / 2;
+        let max_receive_from_pool: i64 = reserves_from_pool - 1; // just under reserves
+        let fee_bps: i64 = 30;
+        let mut to_pool: i64 = 0;
+        let mut from_pool: i64 = 0;
+
+        let result = exchange_with_pool(
+            reserves_to_pool,
+            i64::MAX, // max_send_to_pool = INT64_MAX for strict receive
+            &mut to_pool,
+            reserves_from_pool,
+            max_receive_from_pool,
+            &mut from_pool,
+            fee_bps,
+            RoundingType::PathPaymentStrictReceive,
+        );
+
+        // Must return Ok(false) — exchange not possible — NOT Err
+        assert!(result.is_ok(), "Overflow must not return Err: {:?}", result.err());
+        assert!(!result.unwrap(), "Overflow exchange should return false");
+    }
+
+    #[test]
+    fn test_pool_exchange_overflow_returns_false_strict_send() {
+        // Similarly for strict send: values that cause overflow in the result
+        let reserves_to_pool: i64 = 1; // tiny reserves
+        let reserves_from_pool: i64 = i64::MAX;
+        let max_send_to_pool: i64 = i64::MAX - 1; // near-overflow reserves
+        let fee_bps: i64 = 30;
+        let mut to_pool: i64 = 0;
+        let mut from_pool: i64 = 0;
+
+        let result = exchange_with_pool(
+            reserves_to_pool,
+            max_send_to_pool,
+            &mut to_pool,
+            reserves_from_pool,
+            i64::MAX, // max_receive_from_pool = INT64_MAX for strict send
+            &mut from_pool,
+            fee_bps,
+            RoundingType::PathPaymentStrictSend,
+        );
+
+        // Must return Ok — exchange result (true or false) — NOT Err
+        assert!(result.is_ok(), "Overflow must not return Err: {:?}", result.err());
     }
 }

@@ -2008,28 +2008,81 @@ async fn cmd_verify_execution(
                     if !header_matches {
                         println!("    Header hash: ours={} expected={}",
                             result.header_hash.to_hex(), expected_header_hash.to_hex());
-                        // Show bucket list hash comparison when header diverges
-                        let our_bl_hash = Hash256::from(result.header.bucket_list_hash.0);
-                        let expected_bl_hash = Hash256::from(cdp_header.bucket_list_hash.0);
+                        // Exhaustive header field comparison
+                        let h = &result.header;
+                        let c = &cdp_header;
+                        if h.ledger_version != c.ledger_version {
+                            println!("    DIFF ledger_version: ours={} expected={}", h.ledger_version, c.ledger_version);
+                        }
+                        if h.previous_ledger_hash != c.previous_ledger_hash {
+                            println!("    DIFF previous_ledger_hash: ours={} expected={}",
+                                hex::encode(&h.previous_ledger_hash.0), hex::encode(&c.previous_ledger_hash.0));
+                        }
+                        if h.scp_value != c.scp_value {
+                            println!("    DIFF scp_value");
+                            if h.scp_value.tx_set_hash != c.scp_value.tx_set_hash {
+                                println!("      tx_set_hash: ours={} expected={}",
+                                    hex::encode(&h.scp_value.tx_set_hash.0), hex::encode(&c.scp_value.tx_set_hash.0));
+                            }
+                            if h.scp_value.close_time != c.scp_value.close_time {
+                                println!("      close_time: ours={} expected={}", h.scp_value.close_time.0, c.scp_value.close_time.0);
+                            }
+                            if h.scp_value.upgrades != c.scp_value.upgrades {
+                                println!("      upgrades: ours={:?} expected={:?}", h.scp_value.upgrades, c.scp_value.upgrades);
+                            }
+                            if h.scp_value.ext != c.scp_value.ext {
+                                println!("      ext: differs");
+                            }
+                        }
+                        let our_bl_hash = Hash256::from(h.bucket_list_hash.0);
+                        let expected_bl_hash = Hash256::from(c.bucket_list_hash.0);
                         if our_bl_hash != expected_bl_hash {
-                            println!("    Bucket list hash: ours={} expected={}",
+                            println!("    DIFF bucket_list_hash: ours={} expected={}",
                                 our_bl_hash.to_hex(), expected_bl_hash.to_hex());
-                            // Print per-level bucket hashes for debugging
                             let level_info = ledger_manager.bucket_list_levels();
                             for (i, (curr_hash, snap_hash)) in level_info.iter().enumerate() {
                                 println!("      Level {}: curr={} snap={}",
                                     i, curr_hash.to_hex(), snap_hash.to_hex());
                             }
                         }
-                        // Show all other header fields that differ
-                        if result.tx_result_hash() == expected_tx_result_hash {
-                            // TX results match - the divergence is in bucket list or other header fields
-                            if result.header.total_coins != cdp_header.total_coins {
-                                println!("    total_coins: ours={} expected={}", result.header.total_coins, cdp_header.total_coins);
+                        if h.tx_set_result_hash != c.tx_set_result_hash {
+                            println!("    DIFF tx_set_result_hash: ours={} expected={}",
+                                hex::encode(&h.tx_set_result_hash.0), hex::encode(&c.tx_set_result_hash.0));
+                        }
+                        if h.ledger_seq != c.ledger_seq {
+                            println!("    DIFF ledger_seq: ours={} expected={}", h.ledger_seq, c.ledger_seq);
+                        }
+                        if h.total_coins != c.total_coins {
+                            println!("    DIFF total_coins: ours={} expected={}", h.total_coins, c.total_coins);
+                        }
+                        if h.fee_pool != c.fee_pool {
+                            println!("    DIFF fee_pool: ours={} expected={}", h.fee_pool, c.fee_pool);
+                        }
+                        if h.inflation_seq != c.inflation_seq {
+                            println!("    DIFF inflation_seq: ours={} expected={}", h.inflation_seq, c.inflation_seq);
+                        }
+                        if h.id_pool != c.id_pool {
+                            println!("    DIFF id_pool: ours={} expected={}", h.id_pool, c.id_pool);
+                        }
+                        if h.base_fee != c.base_fee {
+                            println!("    DIFF base_fee: ours={} expected={}", h.base_fee, c.base_fee);
+                        }
+                        if h.base_reserve != c.base_reserve {
+                            println!("    DIFF base_reserve: ours={} expected={}", h.base_reserve, c.base_reserve);
+                        }
+                        if h.max_tx_set_size != c.max_tx_set_size {
+                            println!("    DIFF max_tx_set_size: ours={} expected={}", h.max_tx_set_size, c.max_tx_set_size);
+                        }
+                        if h.skip_list != c.skip_list {
+                            println!("    DIFF skip_list:");
+                            for (i, (ours, exp)) in h.skip_list.iter().zip(c.skip_list.iter()).enumerate() {
+                                if ours != exp {
+                                    println!("      [{}]: ours={} expected={}", i, hex::encode(&ours.0), hex::encode(&exp.0));
+                                }
                             }
-                            if result.header.fee_pool != cdp_header.fee_pool {
-                                println!("    fee_pool: ours={} expected={}", result.header.fee_pool, cdp_header.fee_pool);
-                            }
+                        }
+                        if h.ext != c.ext {
+                            println!("    DIFF ext: ours={:?} expected={:?}", h.ext, c.ext);
                         }
                     }
                     if !tx_result_matches {
@@ -2154,6 +2207,17 @@ async fn cmd_verify_execution(
                                                 println!("            Ours: {:?}", our_op);
                                                 println!("            CDP:  {:?}", cdp_op);
                                             }
+                                        }
+                                    }
+                                }
+
+                                // Show CDP ops when ours is TxNotSupported or other non-standard result
+                                if !matches!(our_result, TransactionResultResult::TxSuccess(_) | TransactionResultResult::TxFailed(_)
+                                    | TransactionResultResult::TxFeeBumpInnerSuccess(_) | TransactionResultResult::TxFeeBumpInnerFailed(_)) {
+                                    if let TransactionResultResult::TxFailed(cdp_ops) = cdp_result {
+                                        println!("        CDP txFailed ops ({}):", cdp_ops.len());
+                                        for (j, op) in cdp_ops.iter().enumerate() {
+                                            println!("          Op {}: {:?}", j, op);
                                         }
                                     }
                                 }
