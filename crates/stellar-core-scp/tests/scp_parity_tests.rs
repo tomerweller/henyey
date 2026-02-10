@@ -409,6 +409,21 @@ impl TestSCP {
     fn nominate_timeout(&self, slot: u64, value: Value, prev_value: &Value) -> bool {
         self.scp.nominate_timeout(slot, value, prev_value)
     }
+
+    /// Get the current envelope for a specific node in a slot, including self
+    /// even when not fully validated. Matches C++ `getCurrentEnvelope(index, nodeID)`.
+    fn get_current_envelope(&self, slot_index: u64, node_id: &NodeId) -> ScpEnvelope {
+        let envs = self.scp.get_entire_current_state(slot_index);
+        envs.into_iter()
+            .find(|e| &e.statement.node_id == node_id)
+            .expect("getCurrentEnvelope: envelope not found for node")
+    }
+
+    /// Set SCP state from a saved envelope (for crash recovery testing).
+    /// Matches C++ `mSCP.setStateFromEnvelope(slotIndex, envelope)`.
+    fn set_state_from_envelope(&self, envelope: &ScpEnvelope) {
+        self.scp.set_state_from_envelope(envelope);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2778,117 +2793,7 @@ fn test_ballot_core5_conflicting_prepared_b_higher_counter_mixed() {
 fn test_ballot_core5_confirm_prepared_mixed_a2() {
     let (x_value, _y, z_value, _zz) = setup_values();
     let qs = make_core5_quorum_set();
-    let qs_hash = quorum_set_hash(&qs);
-    let qs_hash0 = qs_hash;
-    let scp = TestSCP::new(v0_id(), qs.clone());
-    scp.store_quorum_set(&qs);
 
-    let a_value = x_value;
-    let b_value = z_value;
-    let a1 = ScpBallot {
-        counter: 1,
-        value: a_value.clone(),
-    };
-    let a2 = ScpBallot {
-        counter: 2,
-        value: a_value.clone(),
-    };
-    let b2 = ScpBallot {
-        counter: 2,
-        value: b_value.clone(),
-    };
-
-    // Start → prepared A1 → bump → prepared A2
-    assert!(scp.bump_state(0, a_value.clone()));
-    recv_quorum_ex(
-        &scp,
-        &make_prepare_gen(qs_hash, a1.clone(), None, 0, 0, None),
-        true,
-    );
-    scp.bump_timer_offset();
-    scp.scp.force_bump_state(0, a_value.clone());
-    recv_quorum_ex(
-        &scp,
-        &make_prepare_gen(qs_hash, a2.clone(), None, 0, 0, None),
-        true,
-    );
-    // 4 envs at this point
-
-    // a few nodes prepared B2 (v-blocking)
-    recv_v_blocking(
-        &scp,
-        &make_prepare_gen(
-            qs_hash,
-            b2.clone(),
-            Some(b2.clone()),
-            0,
-            0,
-            Some(a2.clone()),
-        ),
-    );
-    assert_eq!(scp.envs_len(), 5);
-    verify_prepare(
-        &scp.get_env(4),
-        &v0_id(),
-        qs_hash0,
-        0,
-        &a2,
-        Some(&b2),
-        0,
-        0,
-        Some(&a2),
-    );
-    assert!(!scp.has_ballot_timer_upcoming());
-
-    // mixed A2: causes h=A2 but c=0 as p >!~ h
-    scp.bump_timer_offset();
-    scp.receive_envelope(make_prepare(
-        &v3_id(),
-        qs_hash,
-        0,
-        &a2,
-        Some(&a2),
-        0,
-        0,
-        None,
-    ));
-    assert_eq!(scp.envs_len(), 6);
-    verify_prepare(
-        &scp.get_env(5),
-        &v0_id(),
-        qs_hash0,
-        0,
-        &a2,
-        Some(&b2),
-        0,
-        2,
-        Some(&a2),
-    );
-    assert!(!scp.has_ballot_timer_upcoming());
-
-    scp.bump_timer_offset();
-    scp.receive_envelope(make_prepare(
-        &v4_id(),
-        qs_hash,
-        0,
-        &a2,
-        Some(&a2),
-        0,
-        0,
-        None,
-    ));
-    assert_eq!(scp.envs_len(), 6);
-    assert!(!scp.has_ballot_timer_upcoming());
-}
-
-// ---------------------------------------------------------------------------
-// Confirm prepared mixed > mixed B2 (C++ line 1300)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_ballot_core5_confirm_prepared_mixed_b2() {
-    let (x_value, _y, z_value, _zz) = setup_values();
-    let qs = make_core5_quorum_set();
     let qs_hash = quorum_set_hash(&qs);
     let qs_hash0 = qs_hash;
     let scp = TestSCP::new(v0_id(), qs.clone());
@@ -5613,5 +5518,1392 @@ fn test_ballot_pristine_confirm_vblocking_via_externalize() {
         &a_inf,
         3,
         u32::MAX,
+    );
+}
+
+// ===========================================================================
+// "normal round (1,x)" — C++ lines 2201-2301
+// ===========================================================================
+
+#[test]
+fn test_ballot_normal_round_1x() {
+    let (x_value, _y, _z, _zz) = setup_values();
+    let qs = make_core5_quorum_set();
+    let qs_hash = quorum_set_hash(&qs);
+
+    let scp = TestSCP::new(v0_id(), qs.clone());
+    scp.store_quorum_set(&qs);
+    let qs_hash0 = quorum_set_hash(&scp.scp.local_quorum_set());
+
+    nodes_all_pledge_to_commit(&scp, &x_value, qs_hash);
+    assert_eq!(scp.envs_len(), 3);
+
+    let b = ScpBallot {
+        counter: 1,
+        value: x_value.clone(),
+    };
+
+    // bunch of prepare messages with "commit b"
+    let prepared_c1 = make_prepare(
+        &v1_id(),
+        qs_hash,
+        0,
+        &b,
+        Some(&b),
+        b.counter,
+        b.counter,
+        None,
+    );
+    let prepared_c2 = make_prepare(
+        &v2_id(),
+        qs_hash,
+        0,
+        &b,
+        Some(&b),
+        b.counter,
+        b.counter,
+        None,
+    );
+    let prepared_c3 = make_prepare(
+        &v3_id(),
+        qs_hash,
+        0,
+        &b,
+        Some(&b),
+        b.counter,
+        b.counter,
+        None,
+    );
+    let _prepared_c4 = make_prepare(
+        &v4_id(),
+        qs_hash,
+        0,
+        &b,
+        Some(&b),
+        b.counter,
+        b.counter,
+        None,
+    );
+
+    // those should not trigger anything just yet
+    scp.receive_envelope(prepared_c1);
+    scp.receive_envelope(prepared_c2);
+    assert_eq!(scp.envs_len(), 3);
+
+    // this should cause the node to accept 'commit b' (quorum)
+    // and therefore send a "CONFIRM" message
+    scp.receive_envelope(prepared_c3);
+    assert_eq!(scp.envs_len(), 4);
+
+    verify_confirm(
+        &scp.get_env(3),
+        &v0_id(),
+        qs_hash0,
+        0,
+        1,
+        &b,
+        b.counter,
+        b.counter,
+    );
+
+    // bunch of confirm messages
+    let confirm1 = make_confirm(&v1_id(), qs_hash, 0, b.counter, &b, b.counter, b.counter);
+    let confirm2 = make_confirm(&v2_id(), qs_hash, 0, b.counter, &b, b.counter, b.counter);
+    let confirm3 = make_confirm(&v3_id(), qs_hash, 0, b.counter, &b, b.counter, b.counter);
+    let confirm4 = make_confirm(&v4_id(), qs_hash, 0, b.counter, &b, b.counter, b.counter);
+
+    // those should not trigger anything just yet
+    scp.receive_envelope(confirm1);
+    scp.receive_envelope(confirm2.clone());
+    assert_eq!(scp.envs_len(), 4);
+
+    scp.receive_envelope(confirm3);
+    // this causes our node to externalize (confirm commit c)
+    assert_eq!(scp.envs_len(), 5);
+
+    // The slot should have externalized the value
+    assert_eq!(scp.externalized_value_count(), 1);
+    assert_eq!(scp.externalized_value(0), Some(x_value.clone()));
+
+    verify_externalize(&scp.get_env(4), &v0_id(), qs_hash0, 0, &b, b.counter);
+
+    // extra vote should not do anything
+    scp.receive_envelope(confirm4);
+    assert_eq!(scp.envs_len(), 5);
+    assert_eq!(scp.externalized_value_count(), 1);
+
+    // duplicate should just no-op
+    scp.receive_envelope(confirm2);
+    assert_eq!(scp.envs_len(), 5);
+    assert_eq!(scp.externalized_value_count(), 1);
+}
+
+/// Helper to set up a fully externalized normal round, returning the TestSCP.
+fn setup_normal_round_externalized(
+    x_value: &Value,
+    qs: &ScpQuorumSet,
+    qs_hash: Hash256,
+) -> TestSCP {
+    let qs_hash0 = qs_hash;
+    let scp = TestSCP::new(v0_id(), qs.clone());
+    scp.store_quorum_set(qs);
+
+    nodes_all_pledge_to_commit(&scp, x_value, qs_hash);
+    assert_eq!(scp.envs_len(), 3);
+
+    let b = ScpBallot {
+        counter: 1,
+        value: x_value.clone(),
+    };
+
+    // Accept commit via quorum of prepares with commit
+    let prepared_c1 = make_prepare(
+        &v1_id(),
+        qs_hash,
+        0,
+        &b,
+        Some(&b),
+        b.counter,
+        b.counter,
+        None,
+    );
+    let prepared_c2 = make_prepare(
+        &v2_id(),
+        qs_hash,
+        0,
+        &b,
+        Some(&b),
+        b.counter,
+        b.counter,
+        None,
+    );
+    let prepared_c3 = make_prepare(
+        &v3_id(),
+        qs_hash,
+        0,
+        &b,
+        Some(&b),
+        b.counter,
+        b.counter,
+        None,
+    );
+
+    scp.receive_envelope(prepared_c1);
+    scp.receive_envelope(prepared_c2);
+    scp.receive_envelope(prepared_c3);
+    assert_eq!(scp.envs_len(), 4);
+    verify_confirm(
+        &scp.get_env(3),
+        &v0_id(),
+        qs_hash0,
+        0,
+        1,
+        &b,
+        b.counter,
+        b.counter,
+    );
+
+    // Externalize via quorum of confirms
+    let confirm1 = make_confirm(&v1_id(), qs_hash, 0, b.counter, &b, b.counter, b.counter);
+    let confirm2 = make_confirm(&v2_id(), qs_hash, 0, b.counter, &b, b.counter, b.counter);
+    let confirm3 = make_confirm(&v3_id(), qs_hash, 0, b.counter, &b, b.counter, b.counter);
+
+    scp.receive_envelope(confirm1);
+    scp.receive_envelope(confirm2);
+    scp.receive_envelope(confirm3);
+    assert_eq!(scp.envs_len(), 5);
+    assert_eq!(scp.externalized_value_count(), 1);
+    assert_eq!(scp.externalized_value(0), Some(x_value.clone()));
+    verify_externalize(&scp.get_env(4), &v0_id(), qs_hash0, 0, &b, b.counter);
+
+    scp
+}
+
+/// Helper to verify that bumpToBallot is prevented after externalization.
+fn verify_bump_to_ballot_prevented(
+    scp: &TestSCP,
+    _x_value: &Value,
+    _z_value: &Value,
+    b2: &ScpBallot,
+    qs_hash: Hash256,
+) {
+    let confirm1b2 = make_confirm(&v1_id(), qs_hash, 0, b2.counter, b2, b2.counter, b2.counter);
+    let confirm2b2 = make_confirm(&v2_id(), qs_hash, 0, b2.counter, b2, b2.counter, b2.counter);
+    let confirm3b2 = make_confirm(&v3_id(), qs_hash, 0, b2.counter, b2, b2.counter, b2.counter);
+    let confirm4b2 = make_confirm(&v4_id(), qs_hash, 0, b2.counter, b2, b2.counter, b2.counter);
+
+    scp.receive_envelope(confirm1b2);
+    scp.receive_envelope(confirm2b2);
+    scp.receive_envelope(confirm3b2);
+    scp.receive_envelope(confirm4b2);
+    assert_eq!(scp.envs_len(), 5);
+    assert_eq!(scp.externalized_value_count(), 1);
+}
+
+#[test]
+fn test_ballot_bump_to_ballot_prevented_by_value() {
+    let (x_value, _y, z_value, _zz) = setup_values();
+    let qs = make_core5_quorum_set();
+    let qs_hash = quorum_set_hash(&qs);
+    let scp = setup_normal_round_externalized(&x_value, &qs, qs_hash);
+
+    // b2 = (1, zValue) — different value, same counter
+    let b2 = ScpBallot {
+        counter: 1,
+        value: z_value.clone(),
+    };
+    verify_bump_to_ballot_prevented(&scp, &x_value, &z_value, &b2, qs_hash);
+}
+
+#[test]
+fn test_ballot_bump_to_ballot_prevented_by_counter() {
+    let (x_value, _y, z_value, _zz) = setup_values();
+    let qs = make_core5_quorum_set();
+    let qs_hash = quorum_set_hash(&qs);
+    let scp = setup_normal_round_externalized(&x_value, &qs, qs_hash);
+
+    // b2 = (2, xValue) — same value, higher counter
+    let b2 = ScpBallot {
+        counter: 2,
+        value: x_value.clone(),
+    };
+    verify_bump_to_ballot_prevented(&scp, &x_value, &z_value, &b2, qs_hash);
+}
+
+#[test]
+fn test_ballot_bump_to_ballot_prevented_by_value_and_counter() {
+    let (x_value, _y, z_value, _zz) = setup_values();
+    let qs = make_core5_quorum_set();
+    let qs_hash = quorum_set_hash(&qs);
+    let scp = setup_normal_round_externalized(&x_value, &qs, qs_hash);
+
+    // b2 = (2, zValue) — different value and higher counter
+    let b2 = ScpBallot {
+        counter: 2,
+        value: z_value.clone(),
+    };
+    verify_bump_to_ballot_prevented(&scp, &x_value, &z_value, &b2, qs_hash);
+}
+
+// ===========================================================================
+// "range check" — C++ lines 2304-2368
+// ===========================================================================
+
+#[test]
+fn test_ballot_range_check() {
+    let (x_value, _y, _z, _zz) = setup_values();
+    let qs = make_core5_quorum_set();
+    let qs_hash = quorum_set_hash(&qs);
+
+    let scp = TestSCP::new(v0_id(), qs.clone());
+    scp.store_quorum_set(&qs);
+    let qs_hash0 = quorum_set_hash(&scp.scp.local_quorum_set());
+
+    nodes_all_pledge_to_commit(&scp, &x_value, qs_hash);
+    assert_eq!(scp.envs_len(), 3);
+
+    let b = ScpBallot {
+        counter: 1,
+        value: x_value.clone(),
+    };
+
+    // bunch of prepare messages with "commit b"
+    let prepared_c1 = make_prepare(
+        &v1_id(),
+        qs_hash,
+        0,
+        &b,
+        Some(&b),
+        b.counter,
+        b.counter,
+        None,
+    );
+    let prepared_c2 = make_prepare(
+        &v2_id(),
+        qs_hash,
+        0,
+        &b,
+        Some(&b),
+        b.counter,
+        b.counter,
+        None,
+    );
+    let prepared_c3 = make_prepare(
+        &v3_id(),
+        qs_hash,
+        0,
+        &b,
+        Some(&b),
+        b.counter,
+        b.counter,
+        None,
+    );
+
+    // those should not trigger anything just yet
+    scp.receive_envelope(prepared_c1);
+    scp.receive_envelope(prepared_c2);
+    assert_eq!(scp.envs_len(), 3);
+
+    // this should cause the node to accept 'commit b' (quorum)
+    // and therefore send a "CONFIRM" message
+    scp.receive_envelope(prepared_c3);
+    assert_eq!(scp.envs_len(), 4);
+
+    verify_confirm(
+        &scp.get_env(3),
+        &v0_id(),
+        qs_hash0,
+        0,
+        1,
+        &b,
+        b.counter,
+        b.counter,
+    );
+
+    // bunch of confirm messages with different ranges
+    let confirm1 = make_confirm(
+        &v1_id(),
+        qs_hash,
+        0,
+        4,
+        &ScpBallot {
+            counter: 4,
+            value: x_value.clone(),
+        },
+        2,
+        4,
+    );
+    let confirm2 = make_confirm(
+        &v2_id(),
+        qs_hash,
+        0,
+        6,
+        &ScpBallot {
+            counter: 6,
+            value: x_value.clone(),
+        },
+        2,
+        6,
+    );
+    let _confirm3 = make_confirm(
+        &v3_id(),
+        qs_hash,
+        0,
+        5,
+        &ScpBallot {
+            counter: 5,
+            value: x_value.clone(),
+        },
+        3,
+        5,
+    );
+    let confirm4 = make_confirm(
+        &v4_id(),
+        qs_hash,
+        0,
+        6,
+        &ScpBallot {
+            counter: 6,
+            value: x_value.clone(),
+        },
+        3,
+        6,
+    );
+
+    // this should not trigger anything just yet
+    scp.receive_envelope(confirm1);
+
+    // v-blocking
+    //   * b gets bumped to (4,x)
+    //   * p gets bumped to (4,x)
+    //   * (c,h) gets bumped to (2,4)
+    scp.receive_envelope(confirm2);
+    assert_eq!(scp.envs_len(), 5);
+    verify_confirm(
+        &scp.get_env(4),
+        &v0_id(),
+        qs_hash0,
+        0,
+        4,
+        &ScpBallot {
+            counter: 4,
+            value: x_value.clone(),
+        },
+        2,
+        4,
+    );
+
+    // this causes to externalize
+    // range is [3,4]
+    scp.receive_envelope(confirm4);
+    assert_eq!(scp.envs_len(), 6);
+
+    // The slot should have externalized the value
+    assert_eq!(scp.externalized_value_count(), 1);
+    assert_eq!(scp.externalized_value(0), Some(x_value.clone()));
+
+    verify_externalize(
+        &scp.get_env(5),
+        &v0_id(),
+        qs_hash0,
+        0,
+        &ScpBallot {
+            counter: 3,
+            value: x_value.clone(),
+        },
+        4,
+    );
+}
+
+// ===========================================================================
+// "timeout when h is set -> stay locked on h" — C++ lines 2370-2389
+// ===========================================================================
+
+#[test]
+fn test_ballot_timeout_h_set_stay_locked() {
+    let (x_value, y_value, _z, _zz) = setup_values();
+    let qs = make_core5_quorum_set();
+    let qs_hash = quorum_set_hash(&qs);
+
+    let scp = TestSCP::new(v0_id(), qs.clone());
+    scp.store_quorum_set(&qs);
+    let qs_hash0 = quorum_set_hash(&scp.scp.local_quorum_set());
+
+    let bx = ScpBallot {
+        counter: 1,
+        value: x_value.clone(),
+    };
+    assert!(scp.bump_state(0, x_value.clone()));
+    assert_eq!(scp.envs_len(), 1);
+
+    // v-blocking -> prepared
+    // quorum -> confirm prepared
+    recv_quorum(
+        &scp,
+        &make_prepare_gen(qs_hash, bx.clone(), Some(bx.clone()), 0, 0, None),
+    );
+    assert_eq!(scp.envs_len(), 3);
+    verify_prepare(
+        &scp.get_env(2),
+        &v0_id(),
+        qs_hash0,
+        0,
+        &bx,
+        Some(&bx),
+        bx.counter,
+        bx.counter,
+        None,
+    );
+
+    // now, see if we can timeout and move to a different value
+    assert!(scp.bump_state(0, y_value.clone()));
+    assert_eq!(scp.envs_len(), 4);
+    let newbx = ScpBallot {
+        counter: 2,
+        value: x_value.clone(),
+    };
+    verify_prepare(
+        &scp.get_env(3),
+        &v0_id(),
+        qs_hash0,
+        0,
+        &newbx,
+        Some(&bx),
+        bx.counter,
+        bx.counter,
+        None,
+    );
+}
+
+// ===========================================================================
+// "timeout when h exists but can't be set -> vote for h" — C++ lines 2390-2415
+// ===========================================================================
+
+#[test]
+fn test_ballot_timeout_h_cant_be_set_vote_for_h() {
+    let (x_value, y_value, _z, _zz) = setup_values();
+    let qs = make_core5_quorum_set();
+    let qs_hash = quorum_set_hash(&qs);
+
+    let scp = TestSCP::new(v0_id(), qs.clone());
+    scp.store_quorum_set(&qs);
+    let qs_hash0 = quorum_set_hash(&scp.scp.local_quorum_set());
+
+    // start with (1,y)
+    let by = ScpBallot {
+        counter: 1,
+        value: y_value.clone(),
+    };
+    assert!(scp.bump_state(0, y_value.clone()));
+    assert_eq!(scp.envs_len(), 1);
+
+    let bx = ScpBallot {
+        counter: 1,
+        value: x_value.clone(),
+    };
+    // but quorum goes with (1,x)
+    // v-blocking -> prepared
+    recv_v_blocking(
+        &scp,
+        &make_prepare_gen(qs_hash, bx.clone(), Some(bx.clone()), 0, 0, None),
+    );
+    assert_eq!(scp.envs_len(), 2);
+    verify_prepare(
+        &scp.get_env(1),
+        &v0_id(),
+        qs_hash0,
+        0,
+        &by,
+        Some(&bx),
+        0,
+        0,
+        None,
+    );
+    // quorum -> confirm prepared (no-op as b > h)
+    recv_quorum_checks_ex(
+        &scp,
+        &make_prepare_gen(qs_hash, bx.clone(), Some(bx.clone()), 0, 0, None),
+        false,
+        false,
+        false,
+    );
+    assert_eq!(scp.envs_len(), 2);
+
+    assert!(scp.bump_state(0, y_value.clone()));
+    assert_eq!(scp.envs_len(), 3);
+    let newbx = ScpBallot {
+        counter: 2,
+        value: x_value.clone(),
+    };
+    // on timeout:
+    // * we should move to the quorum's h value
+    // * c can't be set yet as b > h
+    verify_prepare(
+        &scp.get_env(2),
+        &v0_id(),
+        qs_hash0,
+        0,
+        &newbx,
+        Some(&bx),
+        0,
+        bx.counter,
+        None,
+    );
+}
+
+// ===========================================================================
+// "timeout from multiple nodes" — C++ lines 2417-2460
+// ===========================================================================
+
+#[test]
+fn test_ballot_timeout_from_multiple_nodes() {
+    let (x_value, _y, _z, _zz) = setup_values();
+    let qs = make_core5_quorum_set();
+    let qs_hash = quorum_set_hash(&qs);
+
+    let scp = TestSCP::new(v0_id(), qs.clone());
+    scp.store_quorum_set(&qs);
+    let qs_hash0 = quorum_set_hash(&scp.scp.local_quorum_set());
+
+    assert!(scp.bump_state(0, x_value.clone()));
+
+    let x1 = ScpBallot {
+        counter: 1,
+        value: x_value.clone(),
+    };
+
+    assert_eq!(scp.envs_len(), 1);
+    verify_prepare(
+        &scp.get_env(0),
+        &v0_id(),
+        qs_hash0,
+        0,
+        &x1,
+        None,
+        0,
+        0,
+        None,
+    );
+
+    recv_quorum(
+        &scp,
+        &make_prepare_gen(qs_hash, x1.clone(), None, 0, 0, None),
+    );
+    // quorum -> prepared (1,x)
+    assert_eq!(scp.envs_len(), 2);
+    verify_prepare(
+        &scp.get_env(1),
+        &v0_id(),
+        qs_hash0,
+        0,
+        &x1,
+        Some(&x1),
+        0,
+        0,
+        None,
+    );
+
+    let x2 = ScpBallot {
+        counter: 2,
+        value: x_value.clone(),
+    };
+    // timeout from local node
+    assert!(scp.bump_state(0, x_value.clone()));
+    // prepares (2,x)
+    assert_eq!(scp.envs_len(), 3);
+    verify_prepare(
+        &scp.get_env(2),
+        &v0_id(),
+        qs_hash0,
+        0,
+        &x2,
+        Some(&x1),
+        0,
+        0,
+        None,
+    );
+
+    recv_quorum(
+        &scp,
+        &make_prepare_gen(qs_hash, x1.clone(), Some(x1.clone()), 0, 0, None),
+    );
+    // quorum -> set nH=1
+    assert_eq!(scp.envs_len(), 4);
+    verify_prepare(
+        &scp.get_env(3),
+        &v0_id(),
+        qs_hash0,
+        0,
+        &x2,
+        Some(&x1),
+        0,
+        1,
+        None,
+    );
+    assert_eq!(scp.envs_len(), 4);
+
+    recv_v_blocking(
+        &scp,
+        &make_prepare_gen(qs_hash, x2.clone(), Some(x2.clone()), 1, 1, None),
+    );
+    // v-blocking prepared (2,x) -> prepared (2,x)
+    assert_eq!(scp.envs_len(), 5);
+    verify_prepare(
+        &scp.get_env(4),
+        &v0_id(),
+        qs_hash0,
+        0,
+        &x2,
+        Some(&x2),
+        0,
+        1,
+        None,
+    );
+
+    recv_quorum(
+        &scp,
+        &make_prepare_gen(qs_hash, x2.clone(), Some(x2.clone()), 1, 1, None),
+    );
+    // quorum (including us) confirms (2,x) prepared -> set h=c=x2
+    // we also get extra message: a quorum not including us confirms
+    // (1,x) prepared
+    //  -> we confirm c=h=x1
+    assert_eq!(scp.envs_len(), 7);
+    verify_prepare(
+        &scp.get_env(5),
+        &v0_id(),
+        qs_hash0,
+        0,
+        &x2,
+        Some(&x2),
+        2,
+        2,
+        None,
+    );
+    verify_confirm(&scp.get_env(6), &v0_id(), qs_hash0, 0, 2, &x2, 1, 1);
+}
+
+// ===========================================================================
+// "timeout after prepare, receive old messages to prepare" — C++ lines 2462-2508
+// ===========================================================================
+
+#[test]
+fn test_ballot_timeout_after_prepare_receive_old_messages() {
+    let (x_value, _y, _z, _zz) = setup_values();
+    let qs = make_core5_quorum_set();
+    let qs_hash = quorum_set_hash(&qs);
+
+    let scp = TestSCP::new(v0_id(), qs.clone());
+    scp.store_quorum_set(&qs);
+    let qs_hash0 = quorum_set_hash(&scp.scp.local_quorum_set());
+
+    assert!(scp.bump_state(0, x_value.clone()));
+
+    let x1 = ScpBallot {
+        counter: 1,
+        value: x_value.clone(),
+    };
+
+    assert_eq!(scp.envs_len(), 1);
+    verify_prepare(
+        &scp.get_env(0),
+        &v0_id(),
+        qs_hash0,
+        0,
+        &x1,
+        None,
+        0,
+        0,
+        None,
+    );
+
+    scp.receive_envelope(make_prepare(&v1_id(), qs_hash, 0, &x1, None, 0, 0, None));
+    scp.receive_envelope(make_prepare(&v2_id(), qs_hash, 0, &x1, None, 0, 0, None));
+    scp.receive_envelope(make_prepare(&v3_id(), qs_hash, 0, &x1, None, 0, 0, None));
+
+    // quorum -> prepared (1,x)
+    assert_eq!(scp.envs_len(), 2);
+    verify_prepare(
+        &scp.get_env(1),
+        &v0_id(),
+        qs_hash0,
+        0,
+        &x1,
+        Some(&x1),
+        0,
+        0,
+        None,
+    );
+
+    let x2 = ScpBallot {
+        counter: 2,
+        value: x_value.clone(),
+    };
+    // timeout from local node
+    assert!(scp.bump_state(0, x_value.clone()));
+    // prepares (2,x)
+    assert_eq!(scp.envs_len(), 3);
+    verify_prepare(
+        &scp.get_env(2),
+        &v0_id(),
+        qs_hash0,
+        0,
+        &x2,
+        Some(&x1),
+        0,
+        0,
+        None,
+    );
+
+    let x3 = ScpBallot {
+        counter: 3,
+        value: x_value.clone(),
+    };
+    // timeout again
+    assert!(scp.bump_state(0, x_value.clone()));
+    // prepares (3,x)
+    assert_eq!(scp.envs_len(), 4);
+    verify_prepare(
+        &scp.get_env(3),
+        &v0_id(),
+        qs_hash0,
+        0,
+        &x3,
+        Some(&x1),
+        0,
+        0,
+        None,
+    );
+
+    // other nodes moved on with x2
+    scp.receive_envelope(make_prepare(
+        &v1_id(),
+        qs_hash,
+        0,
+        &x2,
+        Some(&x2),
+        1,
+        2,
+        None,
+    ));
+    scp.receive_envelope(make_prepare(
+        &v2_id(),
+        qs_hash,
+        0,
+        &x2,
+        Some(&x2),
+        1,
+        2,
+        None,
+    ));
+    // v-blocking -> prepared x2
+    assert_eq!(scp.envs_len(), 5);
+    verify_prepare(
+        &scp.get_env(4),
+        &v0_id(),
+        qs_hash0,
+        0,
+        &x3,
+        Some(&x2),
+        0,
+        0,
+        None,
+    );
+
+    scp.receive_envelope(make_prepare(
+        &v3_id(),
+        qs_hash,
+        0,
+        &x2,
+        Some(&x2),
+        1,
+        2,
+        None,
+    ));
+    // quorum -> set nH=2
+    assert_eq!(scp.envs_len(), 6);
+    verify_prepare(
+        &scp.get_env(5),
+        &v0_id(),
+        qs_hash0,
+        0,
+        &x3,
+        Some(&x2),
+        0,
+        2,
+        None,
+    );
+}
+
+// ===========================================================================
+// "non validator watching the network" — C++ lines 2510-2538
+// ===========================================================================
+
+#[test]
+fn test_non_validator_watching_the_network() {
+    let (x_value, _y, _z, _zz) = setup_values();
+    let qs = make_core5_quorum_set();
+    let qs_hash = quorum_set_hash(&qs);
+
+    // Create a non-validator node (NV) using a distinct node ID
+    let nv_id = make_node_id(10); // distinct from v0-v4
+    let scp = TestSCP::new_non_validator(nv_id.clone(), qs.clone());
+    scp.store_quorum_set(&qs);
+    let qs_hash_nv = quorum_set_hash(&scp.scp.local_quorum_set());
+
+    let b = ScpBallot {
+        counter: 1,
+        value: x_value.clone(),
+    };
+
+    // Non-validator bumps state — no envelopes emitted
+    assert!(scp.bump_state(0, x_value.clone()));
+    assert_eq!(scp.envs_len(), 0);
+
+    // But internally it should have moved to PREPARE
+    verify_prepare(
+        &scp.get_current_envelope(0, &nv_id),
+        &nv_id,
+        qs_hash_nv,
+        0,
+        &b,
+        None,
+        0,
+        0,
+        None,
+    );
+
+    // Receive 4 EXTERNALIZE envelopes from v1-v4
+    let ext1 = make_externalize(&v1_id(), qs_hash, 0, &b, 1);
+    let ext2 = make_externalize(&v2_id(), qs_hash, 0, &b, 1);
+    let ext3 = make_externalize(&v3_id(), qs_hash, 0, &b, 1);
+    let ext4 = make_externalize(&v4_id(), qs_hash, 0, &b, 1);
+
+    scp.receive_envelope(ext1);
+    scp.receive_envelope(ext2);
+    scp.receive_envelope(ext3);
+    // After 3 EXTERNALIZE envelopes: no emitted envelopes (non-validator)
+    assert_eq!(scp.envs_len(), 0);
+
+    // Internal state should be CONFIRM (accept commit via v-blocking,
+    // quorum confirms -> CONFIRM with UINT32_MAX)
+    let b_inf = ScpBallot {
+        counter: u32::MAX,
+        value: x_value.clone(),
+    };
+    verify_confirm(
+        &scp.get_current_envelope(0, &nv_id),
+        &nv_id,
+        qs_hash_nv,
+        0,
+        u32::MAX,
+        &b_inf,
+        1,
+        u32::MAX,
+    );
+
+    scp.receive_envelope(ext4);
+    // Still no emitted envelopes
+    assert_eq!(scp.envs_len(), 0);
+
+    // Internal state should be EXTERNALIZE
+    verify_externalize(
+        &scp.get_current_envelope(0, &nv_id),
+        &nv_id,
+        qs_hash_nv,
+        0,
+        &b,
+        u32::MAX,
+    );
+
+    // Value should be externalized
+    assert_eq!(scp.externalized_value(0), Some(x_value.clone()));
+}
+
+// ===========================================================================
+// "restore ballot protocol" — C++ lines 2540-2563
+// Tests that setStateFromEnvelope doesn't crash for PREPARE/CONFIRM/EXTERNALIZE
+// ===========================================================================
+
+#[test]
+fn test_restore_ballot_protocol_prepare() {
+    let (x_value, _y, _z, _zz) = setup_values();
+    let qs = make_core5_quorum_set();
+    let qs_hash = quorum_set_hash(&qs);
+
+    let scp = TestSCP::new(v0_id(), qs.clone());
+    scp.store_quorum_set(&qs);
+
+    let b = ScpBallot {
+        counter: 2,
+        value: x_value.clone(),
+    };
+
+    let envelope = make_prepare(&v0_id(), qs_hash, 0, &b, None, 0, 0, None);
+    scp.set_state_from_envelope(&envelope);
+}
+
+#[test]
+fn test_restore_ballot_protocol_confirm() {
+    let (x_value, _y, _z, _zz) = setup_values();
+    let qs = make_core5_quorum_set();
+    let qs_hash = quorum_set_hash(&qs);
+
+    let scp = TestSCP::new(v0_id(), qs.clone());
+    scp.store_quorum_set(&qs);
+
+    let b = ScpBallot {
+        counter: 2,
+        value: x_value.clone(),
+    };
+
+    let envelope = make_confirm(&v0_id(), qs_hash, 0, 2, &b, 1, 2);
+    scp.set_state_from_envelope(&envelope);
+}
+
+#[test]
+fn test_restore_ballot_protocol_externalize() {
+    let (x_value, _y, _z, _zz) = setup_values();
+    let qs = make_core5_quorum_set();
+    let qs_hash = quorum_set_hash(&qs);
+
+    let scp = TestSCP::new(v0_id(), qs.clone());
+    scp.store_quorum_set(&qs);
+
+    let b = ScpBallot {
+        counter: 2,
+        value: x_value.clone(),
+    };
+
+    let envelope = make_externalize(&v0_id(), qs_hash, 0, &b, 2);
+    scp.set_state_from_envelope(&envelope);
+}
+
+// ===========================================================================
+// "ballot protocol core3" — C++ lines 2569-2757
+// Core3 has an edge case where v-blocking and quorum can be the same
+// v-blocking set size: 2, threshold: 2 = 1 + self or 2 others
+// ===========================================================================
+
+/// Core3 helper: recv_quorum for a 3-node quorum where receiving from v1
+/// alone forms a quorum (with self). The `min_quorum` flag skips sending e2.
+fn recv_quorum_checks_ex_core3(
+    scp: &TestSCP,
+    gen: &dyn Fn(&NodeId) -> ScpEnvelope,
+    with_checks: bool,
+    delayed_quorum: bool,
+    check_upcoming: bool,
+    min_quorum: bool,
+) {
+    let e1 = gen(&v1_id());
+    let e2 = gen(&v2_id());
+
+    scp.bump_timer_offset();
+
+    let i = scp.envs_len() + 1;
+    scp.receive_envelope(e1);
+    if with_checks && !delayed_quorum {
+        assert_eq!(scp.envs_len(), i);
+    }
+    if check_upcoming {
+        assert!(scp.has_ballot_timer_upcoming());
+    }
+    if !min_quorum {
+        // nothing happens with an extra vote (unless we're in delayedQuorum)
+        scp.receive_envelope(e2);
+        if with_checks {
+            assert_eq!(scp.envs_len(), i);
+        }
+    }
+}
+
+/// Core3 helper: standard quorum check (no min_quorum)
+fn recv_quorum_checks_core3(
+    scp: &TestSCP,
+    gen: &dyn Fn(&NodeId) -> ScpEnvelope,
+    with_checks: bool,
+    delayed_quorum: bool,
+) {
+    recv_quorum_checks_ex_core3(scp, gen, with_checks, delayed_quorum, false, false);
+}
+
+// ---------------------------------------------------------------------------
+// "prepared B1 (quorum votes B1) local aValue" — C++ lines 2659-2703
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_core3_prepared_b1_quorum_votes_b1_local_a_value() {
+    let (x_value, _y, z_value, _zz) = setup_values();
+    let qs = make_core3_quorum_set();
+    let qs_hash = quorum_set_hash(&qs);
+    let qs_hash0 = qs_hash;
+
+    let scp = TestSCP::new(v0_id(), qs.clone());
+    scp.store_quorum_set(&qs);
+
+    // core3: aValue = zValue, bValue = xValue
+    let a_value = &z_value;
+    let b_value = &x_value;
+
+    let a1 = ScpBallot {
+        counter: 1,
+        value: a_value.clone(),
+    };
+    let b1 = ScpBallot {
+        counter: 1,
+        value: b_value.clone(),
+    };
+
+    // no timer is set
+    assert!(!scp.has_ballot_timer());
+
+    assert!(scp.bump_state(0, a_value.clone()));
+    assert_eq!(scp.envs_len(), 1);
+    assert!(!scp.has_ballot_timer());
+
+    // quorum votes B1 -> prepared B1
+    scp.bump_timer_offset();
+    recv_quorum_checks_core3(
+        &scp,
+        &|node_id| make_prepare(node_id, qs_hash, 0, &b1, None, 0, 0, None),
+        true,
+        true,
+    );
+    assert_eq!(scp.envs_len(), 2);
+    verify_prepare(
+        &scp.get_env(1),
+        &v0_id(),
+        qs_hash0,
+        0,
+        &a1,
+        Some(&b1),
+        0,
+        0,
+        None,
+    );
+    assert!(scp.has_ballot_timer_upcoming());
+}
+
+// ---------------------------------------------------------------------------
+// "prepared B1 (quorum votes B1) -> quorum prepared B1 -> quorum bumps to A1"
+// C++ lines 2670-2701
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_core3_quorum_prepared_b1_then_bumps_to_a1() {
+    let (x_value, _y, z_value, _zz) = setup_values();
+    let qs = make_core3_quorum_set();
+    let qs_hash = quorum_set_hash(&qs);
+    let qs_hash0 = qs_hash;
+
+    let scp = TestSCP::new(v0_id(), qs.clone());
+    scp.store_quorum_set(&qs);
+
+    let a_value = &z_value;
+    let b_value = &x_value;
+
+    let a1 = ScpBallot {
+        counter: 1,
+        value: a_value.clone(),
+    };
+    let a2 = ScpBallot {
+        counter: 2,
+        value: a_value.clone(),
+    };
+    let b1 = ScpBallot {
+        counter: 1,
+        value: b_value.clone(),
+    };
+
+    assert!(scp.bump_state(0, a_value.clone()));
+    assert_eq!(scp.envs_len(), 1);
+
+    // quorum votes B1 -> prepared B1
+    scp.bump_timer_offset();
+    recv_quorum_checks_core3(
+        &scp,
+        &|node_id| make_prepare(node_id, qs_hash, 0, &b1, None, 0, 0, None),
+        true,
+        true,
+    );
+    assert_eq!(scp.envs_len(), 2);
+    verify_prepare(
+        &scp.get_env(1),
+        &v0_id(),
+        qs_hash0,
+        0,
+        &a1,
+        Some(&b1),
+        0,
+        0,
+        None,
+    );
+    assert!(scp.has_ballot_timer_upcoming());
+
+    // quorum prepared B1
+    scp.bump_timer_offset();
+    recv_quorum_checks_core3(
+        &scp,
+        &|node_id| make_prepare(node_id, qs_hash, 0, &b1, Some(&b1), 0, 0, None),
+        false,
+        false,
+    );
+    assert_eq!(scp.envs_len(), 2);
+    // nothing happens:
+    // computed_h = B1 (2)
+    //    does not actually update h as b > computed_h
+    //    also skips (3)
+    assert!(!scp.has_ballot_timer_upcoming());
+
+    // quorum bumps to A1 (min_quorum = true)
+    scp.bump_timer_offset();
+    recv_quorum_checks_ex_core3(
+        &scp,
+        &|node_id| make_prepare(node_id, qs_hash, 0, &a1, Some(&b1), 0, 0, None),
+        false,
+        false,
+        false,
+        true,
+    );
+    assert_eq!(scp.envs_len(), 3);
+    // still does not set h as b > computed_h
+    verify_prepare(
+        &scp.get_env(2),
+        &v0_id(),
+        qs_hash0,
+        0,
+        &a1,
+        Some(&a1),
+        0,
+        0,
+        Some(&b1),
+    );
+    assert!(!scp.has_ballot_timer_upcoming());
+
+    // quorum commits A1
+    scp.bump_timer_offset();
+    recv_quorum_checks_ex_core3(
+        &scp,
+        &|node_id| make_prepare(node_id, qs_hash, 0, &a2, Some(&a1), 1, 1, Some(&b1)),
+        false,
+        false,
+        false,
+        true,
+    );
+    assert_eq!(scp.envs_len(), 4);
+    verify_confirm(&scp.get_env(3), &v0_id(), qs_hash0, 0, 2, &a1, 1, 1);
+    assert!(!scp.has_ballot_timer_upcoming());
+}
+
+// ---------------------------------------------------------------------------
+// "prepared A1 with timeout" — C++ lines 2705-2730
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_core3_prepared_a1_with_timeout() {
+    let (x_value, _y, z_value, _zz) = setup_values();
+    let qs = make_core3_quorum_set();
+    let qs_hash = quorum_set_hash(&qs);
+    let qs_hash0 = qs_hash;
+
+    let scp = TestSCP::new(v0_id(), qs.clone());
+    scp.store_quorum_set(&qs);
+
+    let a_value = &z_value;
+    let b_value = &x_value;
+
+    let a1 = ScpBallot {
+        counter: 1,
+        value: a_value.clone(),
+    };
+    let a2 = ScpBallot {
+        counter: 2,
+        value: a_value.clone(),
+    };
+    let b2 = ScpBallot {
+        counter: 2,
+        value: b_value.clone(),
+    };
+
+    // starts with bValue (smallest)
+    assert!(scp.bump_state(0, b_value.clone()));
+    assert_eq!(scp.envs_len(), 1);
+
+    // setup: quorum votes prepare A1 with p'=A1, nC=0, nH=1
+    recv_quorum_checks_core3(
+        &scp,
+        &|node_id| make_prepare(node_id, qs_hash, 0, &a1, Some(&a1), 0, 1, None),
+        false,
+        false,
+    );
+    assert_eq!(scp.envs_len(), 2);
+    verify_prepare(
+        &scp.get_env(1),
+        &v0_id(),
+        qs_hash0,
+        0,
+        &a1,
+        Some(&a1),
+        1,
+        1,
+        None,
+    );
+
+    // now, receive bumped votes
+    recv_quorum_checks_core3(
+        &scp,
+        &|node_id| make_prepare(node_id, qs_hash, 0, &a2, Some(&b2), 0, 1, Some(&a1)),
+        true,
+        true,
+    );
+    assert_eq!(scp.envs_len(), 3);
+    // p=B2, p'=A1 (1)
+    // computed_h = B2 (2)
+    //   does not update h as b < computed_h
+    // v-blocking ahead -> b = computed_h = B2 (9)
+    // h = B2 (2) (now possible)
+    // c = 0 (1)
+    verify_prepare(
+        &scp.get_env(2),
+        &v0_id(),
+        qs_hash0,
+        0,
+        &b2,
+        Some(&a2),
+        0,
+        2,
+        Some(&b2),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// "node without self - quorum timeout" — C++ lines 2731-2754
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_core3_node_without_self_quorum_timeout() {
+    let (x_value, _y, z_value, _zz) = setup_values();
+    let qs = make_core3_quorum_set();
+    let qs_hash = quorum_set_hash(&qs);
+
+    let a_value = &z_value;
+
+    let a1 = ScpBallot {
+        counter: 1,
+        value: a_value.clone(),
+    };
+    let a2 = ScpBallot {
+        counter: 2,
+        value: a_value.clone(),
+    };
+    let b2 = ScpBallot {
+        counter: 2,
+        value: x_value.clone(),
+    };
+
+    // Create a node that is NOT in the quorum set (NodeNS)
+    let ns_id = make_node_id(20); // distinct from v0-v2
+    let scp_nns = TestSCP::new(ns_id.clone(), qs.clone());
+    scp_nns.store_quorum_set(&qs);
+    let qs_hash_ns = quorum_set_hash(&scp_nns.scp.local_quorum_set());
+
+    // Receive envelopes from v1 and v2 (forms quorum without self since
+    // NodeNS is not in the quorum set, so threshold is met by v1+v2 alone)
+    scp_nns.receive_envelope(make_prepare(
+        &v1_id(),
+        qs_hash,
+        0,
+        &a2,
+        Some(&b2),
+        0,
+        1,
+        Some(&a1),
+    ));
+    scp_nns.receive_envelope(make_prepare(
+        &v2_id(),
+        qs_hash,
+        0,
+        &a1,
+        Some(&a1),
+        1,
+        1,
+        None,
+    ));
+
+    assert_eq!(scp_nns.envs_len(), 1);
+    verify_prepare(
+        &scp_nns.get_env(0),
+        &ns_id,
+        qs_hash_ns,
+        0,
+        &a1,
+        Some(&a1),
+        1,
+        1,
+        None,
+    );
+
+    scp_nns.receive_envelope(make_prepare(
+        &v0_id(),
+        qs_hash,
+        0,
+        &a2,
+        Some(&b2),
+        0,
+        1,
+        Some(&a1),
+    ));
+
+    assert_eq!(scp_nns.envs_len(), 2);
+    verify_prepare(
+        &scp_nns.get_env(1),
+        &ns_id,
+        qs_hash_ns,
+        0,
+        &b2,
+        Some(&a2),
+        0,
+        2,
+        Some(&b2),
     );
 }

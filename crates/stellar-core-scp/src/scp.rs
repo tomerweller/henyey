@@ -750,6 +750,25 @@ impl<D: SCPDriver> SCP<D> {
         envelopes
     }
 
+    /// Get ALL current envelopes for a slot, including self even when not fully validated.
+    /// This matches C++ `getEntireCurrentState()` / `getCurrentEnvelope()` pattern.
+    pub fn get_entire_current_state(&self, slot_index: u64) -> Vec<ScpEnvelope> {
+        let slots = self.slots.read();
+        let mut envelopes = Vec::new();
+
+        if let Some(slot) = slots.get(&slot_index) {
+            slot.process_current_state(
+                |envelope| {
+                    envelopes.push(envelope.clone());
+                    true
+                },
+                true,
+            );
+        }
+
+        envelopes
+    }
+
     /// Get JSON-serializable information for a slot.
     ///
     /// Returns slot info that can be serialized to JSON for debugging
