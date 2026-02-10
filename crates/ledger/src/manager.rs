@@ -171,6 +171,12 @@ struct LevelScanResult {
     entries: HashMap<LedgerKey, LedgerEntry>,
     /// TTL entries keyed by TTL key hash (separate because TTLs need special handling).
     ttl_entries: HashMap<[u8; 32], (stellar_xdr::curr::LedgerKeyTtl, crate::soroban_state::TtlData)>,
+    /// Keys that were DEAD at this level — used for cross-level shadowing.
+    /// A dead entry at a lower level must prevent live entries at higher levels
+    /// from being included in the final result.
+    dead_keys: HashSet<LedgerKey>,
+    /// TTL key hashes that were DEAD at this level.
+    dead_ttl_keys: HashSet<[u8; 32]>,
 }
 
 /// Scan a single bucket level (curr + snap) for entries of the given types.
@@ -188,6 +194,8 @@ fn scan_single_level(
     let mut entries: HashMap<LedgerKey, LedgerEntry> = HashMap::new();
     let mut ttl_entries: HashMap<[u8; 32], (stellar_xdr::curr::LedgerKeyTtl, crate::soroban_state::TtlData)> = HashMap::new();
     let mut seen_keys: HashSet<LedgerKey> = HashSet::new();
+    let mut dead_keys: HashSet<LedgerKey> = HashSet::new();
+    let mut dead_ttl_keys: HashSet<[u8; 32]> = HashSet::new();
 
     // Scan curr first, then snap (curr shadows snap within a level)
     for bucket in [curr, snap] {
@@ -241,14 +249,22 @@ fn scan_single_level(
                 } else {
                     entries.insert(key, le.clone());
                 }
+            } else if let BucketEntry::Dead(_) = entry {
+                // Track dead keys so they shadow live entries at higher (older) levels.
+                // For TTL entries, also track in the TTL-specific dead set.
+                if let LedgerKey::Ttl(ref ttl_key) = key {
+                    dead_ttl_keys.insert(ttl_key.key_hash.0);
+                }
+                dead_keys.insert(key);
             }
-            // Dead entries: already added to seen_keys, so they shadow higher levels
         }
     }
 
     LevelScanResult {
         entries,
         ttl_entries,
+        dead_keys,
+        dead_ttl_keys,
     }
 }
 
@@ -274,6 +290,16 @@ fn merge_level_results(
     let mut config_count = 0u64;
 
     for level_result in level_results {
+        // Register dead keys from this level into the global seen set.
+        // Dead entries at lower (newer) levels must shadow live entries at
+        // higher (older) levels, preventing stale data from being included.
+        for dead_key in level_result.dead_keys {
+            global_seen.insert(dead_key);
+        }
+        for dead_ttl_hash in level_result.dead_ttl_keys {
+            global_ttl_seen.insert(dead_ttl_hash);
+        }
+
         // Process non-TTL entries
         for (key, entry) in level_result.entries {
             if !global_seen.insert(key) {
@@ -3196,10 +3222,14 @@ mod tests {
         let level0 = LevelScanResult {
             entries: [(key.clone(), entry_v2)].into_iter().collect(),
             ttl_entries: HashMap::new(),
+            dead_keys: HashSet::new(),
+            dead_ttl_keys: HashSet::new(),
         };
         let level1 = LevelScanResult {
             entries: [(key.clone(), entry_v1)].into_iter().collect(),
             ttl_entries: HashMap::new(),
+            dead_keys: HashSet::new(),
+            dead_ttl_keys: HashSet::new(),
         };
 
         let result = merge_level_results(
@@ -3234,14 +3264,51 @@ mod tests {
         let level0 = LevelScanResult {
             entries: [(key1, offer1)].into_iter().collect(),
             ttl_entries: HashMap::new(),
+            dead_keys: HashSet::new(),
+            dead_ttl_keys: HashSet::new(),
         };
         let level1 = LevelScanResult {
             entries: [(key2, offer2)].into_iter().collect(),
             ttl_entries: HashMap::new(),
+            dead_keys: HashSet::new(),
+            dead_ttl_keys: HashSet::new(),
         };
 
         let result = merge_level_results(vec![level0, level1], None, TEST_PROTOCOL, &None);
         assert_eq!(result.offers.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_level_results_dead_key_shadows_older_level() {
+        // Regression test: a dead entry at a lower (newer) level must prevent
+        // a live entry at a higher (older) level from appearing in the result.
+        // This was the root cause of the soroban_state_size inflation bug.
+        let offer = make_offer_entry(1, [1u8; 32]);
+        let key = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+            seller_id: make_account_id([1u8; 32]),
+            offer_id: 1,
+        });
+
+        // Level 0 (newer): has the dead key, no live entries
+        let level0 = LevelScanResult {
+            entries: HashMap::new(),
+            ttl_entries: HashMap::new(),
+            dead_keys: [key.clone()].into_iter().collect(),
+            dead_ttl_keys: HashSet::new(),
+        };
+        // Level 1 (older): has the live entry that should be shadowed
+        let level1 = LevelScanResult {
+            entries: [(key, offer)].into_iter().collect(),
+            ttl_entries: HashMap::new(),
+            dead_keys: HashSet::new(),
+            dead_ttl_keys: HashSet::new(),
+        };
+
+        let result = merge_level_results(vec![level0, level1], None, TEST_PROTOCOL, &None);
+        assert!(
+            result.offers.is_empty(),
+            "dead key at level 0 should shadow live entry at level 1"
+        );
     }
 
     #[test]
