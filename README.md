@@ -1,4 +1,4 @@
-# rs-stellar-core
+# henyey
 
 A Rust reimplementation of [Stellar Core](https://github.com/stellar/stellar-core) focused on protocol v25 behavior and testnet sync. This is an educational experiment and **not** production-grade software.
 
@@ -17,13 +17,13 @@ This Rust implementation aims to mirror stellar-core v25.x behavior for educatio
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                              rs-stellar-core                                │
+│                              henyey                                │
 │                           (CLI + entrypoint)                                │
 └─────────────────────────────────────────────────────────────────────────────┘
                                      │
                                      ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                            stellar-core-app                                 │
+│                            henyey-app                                 │
 │                    (orchestration, config, commands)                        │
 └─────────────────────────────────────────────────────────────────────────────┘
            │                         │                         │
@@ -77,7 +77,7 @@ Supporting crates: crypto, common, work, historywork
 cargo build --release
 ```
 
-The binary is at `./target/release/rs-stellar-core`.
+The binary is at `./target/release/henyey`.
 
 ## Test
 
@@ -86,7 +86,7 @@ The binary is at `./target/release/rs-stellar-core`.
 cargo test --all
 
 # Run tests for a specific crate
-cargo test -p stellar-core-scp
+cargo test -p henyey-scp
 
 # Run with output
 cargo test --all -- --nocapture
@@ -100,10 +100,10 @@ An observer syncs the ledger without participating in consensus:
 
 ```bash
 # Catch up to current ledger
-./target/release/rs-stellar-core --config configs/testnet.toml catchup current
+./target/release/henyey --config configs/testnet.toml catchup current
 
 # Run and follow the network
-./target/release/rs-stellar-core --config configs/testnet.toml run
+./target/release/henyey --config configs/testnet.toml run
 ```
 
 ### Validator Mode (Testnet)
@@ -112,15 +112,15 @@ A validator participates in consensus. Requires a secret key and quorum configur
 
 ```bash
 # Use the validator config
-./target/release/rs-stellar-core --config configs/validator-testnet.toml catchup current
-./target/release/rs-stellar-core --config configs/validator-testnet.toml run
+./target/release/henyey --config configs/validator-testnet.toml catchup current
+./target/release/henyey --config configs/validator-testnet.toml run
 ```
 
 ### Mainnet
 
 ```bash
-./target/release/rs-stellar-core --config configs/mainnet.toml catchup current
-./target/release/rs-stellar-core --config configs/mainnet.toml run
+./target/release/henyey --config configs/mainnet.toml catchup current
+./target/release/henyey --config configs/mainnet.toml run
 ```
 
 ## Configuration
@@ -128,7 +128,7 @@ A validator participates in consensus. Requires a secret key and quorum configur
 Generate a sample config to customize:
 
 ```bash
-./target/release/rs-stellar-core sample-config > my-config.toml
+./target/release/henyey sample-config > my-config.toml
 ```
 
 ### Key Configuration Options
@@ -166,22 +166,22 @@ backfill_stellar_asset_events = false
 ## Repository Layout
 
 ```
-rs-stellar-core/
+henyey/
 ├── crates/
-│   ├── rs-stellar-core/          # CLI binary
-│   ├── stellar-core-app/         # App orchestration
-│   ├── stellar-core-overlay/     # P2P networking
-│   ├── stellar-core-scp/         # Consensus protocol
-│   ├── stellar-core-herder/      # Consensus coordination
-│   ├── stellar-core-ledger/      # Ledger close pipeline
-│   ├── stellar-core-tx/          # Transaction execution
-│   ├── stellar-core-bucket/      # BucketList state
-│   ├── stellar-core-history/     # History archives
-│   ├── stellar-core-historywork/ # History work scheduling
-│   ├── stellar-core-db/          # SQLite persistence
-│   ├── stellar-core-crypto/      # Cryptographic primitives
-│   ├── stellar-core-common/      # Shared types
-│   └── stellar-core-work/        # Work scheduler
+│   ├── henyey/          # CLI binary
+│   ├── henyey-app/         # App orchestration
+│   ├── henyey-overlay/     # P2P networking
+│   ├── henyey-scp/         # Consensus protocol
+│   ├── henyey-herder/      # Consensus coordination
+│   ├── henyey-ledger/      # Ledger close pipeline
+│   ├── henyey-tx/          # Transaction execution
+│   ├── henyey-bucket/      # BucketList state
+│   ├── henyey-history/     # History archives
+│   ├── henyey-historywork/ # History work scheduling
+│   ├── henyey-db/          # SQLite persistence
+│   ├── henyey-crypto/      # Cryptographic primitives
+│   ├── henyey-common/      # Shared types
+│   └── henyey-work/        # Work scheduler
 └── configs/                      # Example configurations
 ```
 
@@ -191,40 +191,40 @@ rs-stellar-core/
 
 | Crate | Purpose | Parity |
 |-------|---------|--------|
-| [`rs-stellar-core`](crates/rs-stellar-core/README.md) | CLI entrypoint, argument parsing, command dispatch | [~88%](crates/rs-stellar-core/PARITY_STATUS.md) |
-| [`stellar-core-app`](crates/stellar-core-app/README.md) | Application wiring, lifecycle management, run/catchup orchestration | [~75%](crates/stellar-core-app/PARITY_STATUS.md) |
-| [`stellar-core-common`](crates/stellar-core-common/README.md) | Shared types, config helpers, time utilities | [~92%](crates/stellar-core-common/PARITY_STATUS.md) |
-| [`stellar-core-crypto`](crates/stellar-core-crypto/README.md) | Ed25519 signing, SHA-256 hashing, strkey encoding | [~95%](crates/stellar-core-crypto/PARITY_STATUS.md) |
-| [`stellar-core-db`](crates/stellar-core-db/README.md) | SQLite schema, migrations, query layer | [~95%](crates/stellar-core-db/PARITY_STATUS.md) |
+| [`henyey`](crates/henyey/README.md) | CLI entrypoint, argument parsing, command dispatch | [~88%](crates/henyey/PARITY_STATUS.md) |
+| [`henyey-app`](crates/henyey-app/README.md) | Application wiring, lifecycle management, run/catchup orchestration | [~75%](crates/henyey-app/PARITY_STATUS.md) |
+| [`henyey-common`](crates/henyey-common/README.md) | Shared types, config helpers, time utilities | [~92%](crates/henyey-common/PARITY_STATUS.md) |
+| [`henyey-crypto`](crates/henyey-crypto/README.md) | Ed25519 signing, SHA-256 hashing, strkey encoding | [~95%](crates/henyey-crypto/PARITY_STATUS.md) |
+| [`henyey-db`](crates/henyey-db/README.md) | SQLite schema, migrations, query layer | [~95%](crates/henyey-db/PARITY_STATUS.md) |
 
 ### Consensus Layer
 
 | Crate | Purpose | Parity |
 |-------|---------|--------|
-| [`stellar-core-scp`](crates/stellar-core-scp/README.md) | Stellar Consensus Protocol: nomination, balloting, quorum logic | [~90%](crates/stellar-core-scp/PARITY_STATUS.md) |
-| [`stellar-core-herder`](crates/stellar-core-herder/README.md) | Consensus coordination, transaction queue, ledger close triggers | [~82%](crates/stellar-core-herder/PARITY_STATUS.md) |
-| [`stellar-core-overlay`](crates/stellar-core-overlay/README.md) | P2P overlay network, peer management, message flooding | [~88%](crates/stellar-core-overlay/PARITY_STATUS.md) |
+| [`henyey-scp`](crates/henyey-scp/README.md) | Stellar Consensus Protocol: nomination, balloting, quorum logic | [~90%](crates/henyey-scp/PARITY_STATUS.md) |
+| [`henyey-herder`](crates/henyey-herder/README.md) | Consensus coordination, transaction queue, ledger close triggers | [~82%](crates/henyey-herder/PARITY_STATUS.md) |
+| [`henyey-overlay`](crates/henyey-overlay/README.md) | P2P overlay network, peer management, message flooding | [~88%](crates/henyey-overlay/PARITY_STATUS.md) |
 
 ### Execution Layer
 
 | Crate | Purpose | Parity |
 |-------|---------|--------|
-| [`stellar-core-ledger`](crates/stellar-core-ledger/README.md) | Ledger close pipeline, per-operation savepoints, state snapshots, delta tracking | [~85%](crates/stellar-core-ledger/PARITY_STATUS.md) |
-| [`stellar-core-tx`](crates/stellar-core-tx/README.md) | Transaction validation and execution (classic + Soroban), savepoint-based rollback | [100%](crates/stellar-core-tx/PARITY_STATUS.md) |
-| [`stellar-core-bucket`](crates/stellar-core-bucket/README.md) | BucketList implementation, merges, on-disk state | [~98%](crates/stellar-core-bucket/PARITY_STATUS.md) |
+| [`henyey-ledger`](crates/henyey-ledger/README.md) | Ledger close pipeline, per-operation savepoints, state snapshots, delta tracking | [~85%](crates/henyey-ledger/PARITY_STATUS.md) |
+| [`henyey-tx`](crates/henyey-tx/README.md) | Transaction validation and execution (classic + Soroban), savepoint-based rollback | [100%](crates/henyey-tx/PARITY_STATUS.md) |
+| [`henyey-bucket`](crates/henyey-bucket/README.md) | BucketList implementation, merges, on-disk state | [~98%](crates/henyey-bucket/PARITY_STATUS.md) |
 
 ### History & Sync
 
 | Crate | Purpose | Parity |
 |-------|---------|--------|
-| [`stellar-core-history`](crates/stellar-core-history/README.md) | History archive I/O, catchup, replay, verification | [~85%](crates/stellar-core-history/PARITY_STATUS.md) |
-| [`stellar-core-historywork`](crates/stellar-core-historywork/README.md) | History work scheduling, publish/catchup task management | [~82%](crates/stellar-core-historywork/PARITY_STATUS.md) |
+| [`henyey-history`](crates/henyey-history/README.md) | History archive I/O, catchup, replay, verification | [~85%](crates/henyey-history/PARITY_STATUS.md) |
+| [`henyey-historywork`](crates/henyey-historywork/README.md) | History work scheduling, publish/catchup task management | [~82%](crates/henyey-historywork/PARITY_STATUS.md) |
 
 ### Utilities
 
 | Crate | Purpose | Parity |
 |-------|---------|--------|
-| [`stellar-core-work`](crates/stellar-core-work/README.md) | Generic DAG-based work scheduler | [~90%](crates/stellar-core-work/PARITY_STATUS.md) |
+| [`henyey-work`](crates/henyey-work/README.md) | Generic DAG-based work scheduler | [~90%](crates/henyey-work/PARITY_STATUS.md) |
 
 ## Design Constraints
 
@@ -244,20 +244,20 @@ This implementation intentionally limits scope:
 
 ```bash
 # History replay tests (requires network)
-cargo test -p stellar-core-history --test replay_integration
+cargo test -p henyey-history --test replay_integration
 
 # Catchup integration tests
-cargo test -p stellar-core-history --test catchup_integration
+cargo test -p henyey-history --test catchup_integration
 ```
 
 ### Debugging
 
 ```bash
 # Enable trace logging
-RUST_LOG=trace ./target/release/rs-stellar-core --config configs/testnet.toml run
+RUST_LOG=trace ./target/release/henyey --config configs/testnet.toml run
 
 # Log specific modules
-RUST_LOG=stellar_core_scp=debug,stellar_core_herder=debug ./target/release/rs-stellar-core ...
+RUST_LOG=henyey_scp=debug,henyey_herder=debug ./target/release/henyey ...
 ```
 
 ### Adding a New Crate
@@ -269,7 +269,7 @@ RUST_LOG=stellar_core_scp=debug,stellar_core_herder=debug ./target/release/rs-st
 
 ## Related Resources
 
-- [stellar-core (C++)](https://github.com/stellar/stellar-core) — Upstream implementation
+- [stellar-core (stellar-core)](https://github.com/stellar/stellar-core) — Upstream implementation
 - [Stellar Docs](https://developers.stellar.org/) — Protocol documentation
 - [SCP Whitepaper](https://stellar.org/papers/stellar-consensus-protocol) — Consensus protocol specification
 - [stellar-xdr](https://github.com/stellar/stellar-xdr-next) — XDR type definitions

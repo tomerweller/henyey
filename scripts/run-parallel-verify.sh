@@ -21,10 +21,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Ensure binary is built
-BINARY="${BINARY:-$REPO_DIR/target/release/rs-stellar-core}"
+BINARY="${BINARY:-$REPO_DIR/target/release/henyey}"
 if [ ! -f "$BINARY" ]; then
     echo "ERROR: Binary not found at $BINARY"
-    echo "Run: cargo build --release -p rs-stellar-core"
+    echo "Run: cargo build --release -p henyey"
     exit 1
 fi
 

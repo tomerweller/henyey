@@ -1,0 +1,28 @@
+[package]
+name = "henyey-scp"
+description = "Stellar Consensus Protocol implementation for henyey"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+stellar-xdr.workspace = true
+stellar-strkey.workspace = true
+henyey-common.workspace = true
+henyey-crypto.workspace = true
+
+# Serialization
+serde.workspace = true
+
+# Error handling
+thiserror.workspace = true
+tracing.workspace = true
+
+# Utilities
+parking_lot.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json.workspace = true

@@ -9,7 +9,7 @@
 ## Summary
 
 Replace the in-memory `Vec<LedgerEntry>` offer cache with a SQLite-backed offers table,
-matching C++ stellar-core's architecture. This eliminates offer-related memory usage and
+matching stellar-core's architecture. This eliminates offer-related memory usage and
 provides efficient indexed queries for order book operations.
 
 ## Motivation
@@ -32,9 +32,9 @@ offer_cache: Arc<RwLock<Vec<LedgerEntry>>>,
 - Full scan required for order book matching
 - Memory grows unbounded with offer count
 
-### C++ Architecture (What We're Matching)
+### stellar-core Architecture (What We're Matching)
 
-C++ stellar-core stores offers in SQLite with indexed queries:
+stellar-core stores offers in SQLite with indexed queries:
 
 ```cpp
 // From LedgerTxnOfferSQL.cpp
@@ -53,7 +53,7 @@ Key operations are backed by SQL:
 ### Database Schema
 
 ```sql
--- Matches C++ LedgerTxnOfferSQL.cpp exactly
+-- Matches stellar-core LedgerTxnOfferSQL.cpp exactly
 CREATE TABLE offers (
     sellerid         TEXT NOT NULL,      -- StrKey-encoded AccountID
     offerid          INTEGER NOT NULL PRIMARY KEY,
@@ -76,10 +76,10 @@ CREATE INDEX bestofferindex ON offers (sellingasset, buyingasset, price, offerid
 CREATE INDEX offerbyseller ON offers (sellerid);
 ```
 
-### New Module: `stellar-core-ledger/src/offers_db.rs`
+### New Module: `henyey-ledger/src/offers_db.rs`
 
 ```rust
-//! SQL-backed offer storage matching C++ stellar-core.
+//! SQL-backed offer storage matching stellar-core.
 //!
 //! This module provides efficient offer queries using SQLite indexes,
 //! replacing the in-memory offer cache for mainnet scalability.
@@ -97,7 +97,7 @@ pub fn load_offer(
 /// Load the N best offers for an asset pair, ordered by price.
 ///
 /// This is the primary order book query. Returns offers sorted by
-/// (price ASC, offerid ASC) to match C++ behavior where older offers
+/// (price ASC, offerid ASC) to match stellar-core behavior where older offers
 /// have priority at the same price.
 pub fn load_best_offers(
     conn: &Connection,
@@ -252,9 +252,9 @@ impl SnapshotHandle {
 }
 ```
 
-### Price Comparison (Matching C++)
+### Price Comparison (Matching stellar-core)
 
-C++ uses a computed `price` column (DOUBLE PRECISION) for sorting:
+stellar-core uses a computed `price` column (DOUBLE PRECISION) for sorting:
 
 ```cpp
 double price = double(offer.price.n) / double(offer.price.d);
@@ -263,7 +263,7 @@ double price = double(offer.price.n) / double(offer.price.d);
 Order is `(price ASC, offerid ASC)` - lower prices are better, and at equal prices,
 older offers (lower offerid) have priority.
 
-The `isBetterOffer()` function from C++:
+The `isBetterOffer()` function from stellar-core:
 ```cpp
 bool isBetterOffer(OfferDescriptor const& lhs, OfferDescriptor const& rhs) {
     double lhsPrice = double(lhs.price.n) / double(lhs.price.d);
@@ -299,11 +299,11 @@ bool isBetterOffer(OfferDescriptor const& lhs, OfferDescriptor const& rhs) {
 
 | File | Action |
 |------|--------|
-| `crates/stellar-core-ledger/src/offers_db.rs` | **Create** - SQL offer operations |
-| `crates/stellar-core-ledger/src/lib.rs` | Add `pub mod offers_db` |
-| `crates/stellar-core-ledger/src/manager.rs` | Remove `offer_cache`, integrate SQL |
-| `crates/stellar-core-ledger/src/snapshot.rs` | Update offer queries |
-| `crates/stellar-core-db/src/migrations.rs` | Add offers table migration |
+| `crates/henyey-ledger/src/offers_db.rs` | **Create** - SQL offer operations |
+| `crates/henyey-ledger/src/lib.rs` | Add `pub mod offers_db` |
+| `crates/henyey-ledger/src/manager.rs` | Remove `offer_cache`, integrate SQL |
+| `crates/henyey-ledger/src/snapshot.rs` | Update offer queries |
+| `crates/henyey-db/src/migrations.rs` | Add offers table migration |
 
 ## Memory Impact
 
@@ -318,7 +318,7 @@ bool isBetterOffer(OfferDescriptor const& lhs, OfferDescriptor const& rhs) {
 
 | Risk | Mitigation |
 |------|------------|
-| SQL query performance | Proper indexes; benchmark against C++ |
+| SQL query performance | Proper indexes; benchmark against stellar-core |
 | Transaction overhead | Batch operations; single transaction per ledger close |
 | Schema migration | Automatic rebuild during catchup if table missing |
 
@@ -328,17 +328,17 @@ bool isBetterOffer(OfferDescriptor const& lhs, OfferDescriptor const& rhs) {
 2. **Integration tests**: Catchup populates offers correctly
 3. **Ledger close tests**: Delta changes applied correctly
 4. **Order book tests**: Best offer queries return correct order
-5. **Comparison tests**: Results match C++ stellar-core behavior
+5. **Comparison tests**: Results match stellar-core behavior
 
 ## Success Criteria
 
 1. All offer operations use SQL instead of in-memory cache
 2. Memory usage reduced (no offer-related RAM growth)
-3. Order book queries return identical results to C++
+3. Order book queries return identical results to stellar-core
 4. No regression in ledger close performance
 
 ## References
 
-- C++ Implementation: `.upstream-v25/src/ledger/LedgerTxnOfferSQL.cpp`
+- stellar-core Implementation: `.upstream-v25/src/ledger/LedgerTxnOfferSQL.cpp`
 - RFC-001: Streaming Iterator (completed)
 - Roadmap: `docs/BUCKET_LIST_DB_ROADMAP.md`

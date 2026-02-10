@@ -1,0 +1,34 @@
+[package]
+name = "henyey-tx"
+description = "Transaction processing for henyey"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+stellar-xdr.workspace = true
+henyey-common.workspace = true
+henyey-crypto.workspace = true
+henyey-db.workspace = true
+
+# Soroban integration
+soroban-env-host-p24.workspace = true
+soroban-env-host-p25.workspace = true
+
+# Serialization
+serde.workspace = true
+
+# Error handling
+thiserror.workspace = true
+tracing.workspace = true
+
+# Utilities
+sha2.workspace = true
+hex.workspace = true
+
+# WASM parsing for cost input extraction
+wasmparser = "0.116.1"
+
+[dev-dependencies]
+tempfile.workspace = true

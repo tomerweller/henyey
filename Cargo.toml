@@ -1,20 +1,20 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/rs-stellar-core",
-    "crates/stellar-core-app",
-    "crates/stellar-core-common",
-    "crates/stellar-core-crypto",
-    "crates/stellar-core-db",
-    "crates/stellar-core-bucket",
-    "crates/stellar-core-history",
-    "crates/stellar-core-overlay",
-    "crates/stellar-core-scp",
-    "crates/stellar-core-herder",
-    "crates/stellar-core-ledger",
-    "crates/stellar-core-tx",
-    "crates/stellar-core-work",
-    "crates/stellar-core-historywork",
+    "crates/henyey",
+    "crates/app",
+    "crates/common",
+    "crates/crypto",
+    "crates/db",
+    "crates/bucket",
+    "crates/history",
+    "crates/overlay",
+    "crates/scp",
+    "crates/herder",
+    "crates/ledger",
+    "crates/tx",
+    "crates/work",
+    "crates/historywork",
 ]
 
 [workspace.package]
@@ -22,7 +22,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Stellar Contributors"]
 license = "Apache-2.0"
-repository = "https://github.com/stellar/rs-stellar-core"
+repository = "https://github.com/stellar/henyey"
 rust-version = "1.76"
 
 [workspace.dependencies]
@@ -43,19 +43,19 @@ soroban-env-host-p25 = { package = "soroban-env-host", git = "https://github.com
 soroban-env-common-p25 = { package = "soroban-env-common", git = "https://github.com/stellar/rs-soroban-env", rev = "d2ff024b72f7f3f75737402ac74ca5d0093a4690" }
 
 # Workspace crates
-stellar-core-common = { path = "crates/stellar-core-common" }
-stellar-core-app = { path = "crates/stellar-core-app" }
-stellar-core-crypto = { path = "crates/stellar-core-crypto" }
-stellar-core-db = { path = "crates/stellar-core-db" }
-stellar-core-bucket = { path = "crates/stellar-core-bucket" }
-stellar-core-history = { path = "crates/stellar-core-history" }
-stellar-core-overlay = { path = "crates/stellar-core-overlay" }
-stellar-core-scp = { path = "crates/stellar-core-scp" }
-stellar-core-herder = { path = "crates/stellar-core-herder" }
-stellar-core-ledger = { path = "crates/stellar-core-ledger" }
-stellar-core-tx = { path = "crates/stellar-core-tx" }
-stellar-core-work = { path = "crates/stellar-core-work" }
-stellar-core-historywork = { path = "crates/stellar-core-historywork" }
+henyey-common = { path = "crates/common" }
+henyey-app = { path = "crates/app" }
+henyey-crypto = { path = "crates/crypto" }
+henyey-db = { path = "crates/db" }
+henyey-bucket = { path = "crates/bucket" }
+henyey-history = { path = "crates/history" }
+henyey-overlay = { path = "crates/overlay" }
+henyey-scp = { path = "crates/scp" }
+henyey-herder = { path = "crates/herder" }
+henyey-ledger = { path = "crates/ledger" }
+henyey-tx = { path = "crates/tx" }
+henyey-work = { path = "crates/work" }
+henyey-historywork = { path = "crates/historywork" }
 
 # Crypto - pure Rust implementations
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core", "zeroize"] }

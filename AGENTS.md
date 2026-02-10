@@ -2,8 +2,8 @@
 
 ## Project Structure & Module Organization
 
-- `crates/` contains the Rust workspace crates. Each module is a crate (e.g., `crates/stellar-core-ledger`, `crates/stellar-core-tx`, `crates/stellar-core-history`).
-- `crates/rs-stellar-core/` is the main binary crate; other crates are libraries.
+- `crates/` contains the Rust workspace crates. Each module is a crate (e.g., `crates/ledger`, `crates/tx`, `crates/history`).
+- `crates/henyey/` is the main binary crate; other crates are libraries.
 - Tests live alongside code in `crates/*/src` and in `crates/*/tests` for integration tests.
 - Docs live in crate `README.md` files plus top-level `README.md` and `SPEC.md`.
 - Config examples are in `configs/` and `*.toml` at the repo root.
@@ -12,7 +12,7 @@
 
 - `cargo build --all` — build the entire workspace.
 - `cargo test --all` — run all unit and integration tests.
-- `cargo test -p stellar-core-ledger --tests` — run a focused crate’s integration tests.
+- `cargo test -p henyey-ledger --tests` — run a focused crate’s integration tests.
 - `cargo clippy --all` — run lint checks (recommended before PRs).
 
 ## Coding Style & Naming Conventions
@@ -27,7 +27,7 @@
 - Any observable behavior must be deterministic and identical to stellar-core (v25.x / p25).
 - Align behavior by comparing against upstream test vectors and edge cases; do not introduce new semantics.
 - For protocol or consensus behavior, consult `.upstream-v25/` to mirror upstream decisions and sequencing.
-- Update the relevant crate's `PARITY_STATUS.md` and the parity column in the main `README.md` Crate Overview when implementing or removing functionality that affects C++ parity.
+- Update the relevant crate's `PARITY_STATUS.md` and the parity column in the main `README.md` Crate Overview when implementing or removing functionality that affects stellar-core parity.
 
 ## Testing Guidelines
 
@@ -68,4 +68,4 @@
 
 - SQLite is the only supported database backend.
 - Protocol support is 24+ only; do not add legacy protocol behavior.
-- The Stellar Core v25 C++ upstream is available locally under `.upstream-v25/` for parity checks.
+- The stellar-core v25 upstream is available locally under `.upstream-v25/` for parity checks.

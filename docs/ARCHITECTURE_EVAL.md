@@ -1,16 +1,16 @@
 # Architecture
 
-This document describes the high-level architecture of rs-stellar-core.
+This document describes the high-level architecture of henyey.
 
 ## Overview
 
-rs-stellar-core is organized as a Cargo workspace with 14 crates following a layered architecture. Dependencies flow strictly downward with no circular dependencies.
+henyey is organized as a Cargo workspace with 14 crates following a layered architecture. Dependencies flow strictly downward with no circular dependencies.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                            ORCHESTRATION LAYER                               │
 │  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ rs-stellar-core (CLI)              stellar-core-app (App coordinator)   ││
+│  │ henyey (CLI)              henyey-app (App coordinator)   ││
 │  └─────────────────────────────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────────────────────┘
                                        │
@@ -18,7 +18,7 @@ rs-stellar-core is organized as a Cargo workspace with 14 crates following a lay
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                            COORDINATION LAYER                                │
 │  ┌─────────────────────────┐    ┌──────────────────────────────────────────┐│
-│  │ stellar-core-herder     │    │ stellar-core-historywork                 ││
+│  │ henyey-herder     │    │ henyey-historywork                 ││
 │  │ (consensus coordinator) │    │ (history work scheduling)                ││
 │  └─────────────────────────┘    └──────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -42,7 +42,7 @@ rs-stellar-core is organized as a Cargo workspace with 14 crates following a lay
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                          INFRASTRUCTURE LAYER                                │
 │  ┌─────────────────────────────────┐    ┌──────────────────────────────────┐│
-│  │ stellar-core-db                 │    │ stellar-core-overlay             ││
+│  │ henyey-db                 │    │ henyey-overlay             ││
 │  │ (SQLite persistence)            │    │ (P2P networking)                 ││
 │  └─────────────────────────────────┘    └──────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -51,7 +51,7 @@ rs-stellar-core is organized as a Cargo workspace with 14 crates following a lay
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                           FOUNDATION LAYER                                   │
 │  ┌───────────────────┐  ┌───────────────────┐  ┌───────────────────────────┐│
-│  │ stellar-core-     │  │ stellar-core-     │  │ stellar-core-work         ││
+│  │ stellar-core-     │  │ stellar-core-     │  │ henyey-work         ││
 │  │ common            │  │ crypto            │  │ (async scheduler)         ││
 │  │ (shared types)    │  │ (cryptography)    │  │                           ││
 │  └───────────────────┘  └───────────────────┘  └───────────────────────────┘│
@@ -64,33 +64,33 @@ Internal dependencies (excluding external crates):
 
 | Crate | Dependencies |
 |-------|--------------|
-| stellar-core-common | (none) |
-| stellar-core-crypto | common |
-| stellar-core-work | (none) |
-| stellar-core-db | common |
-| stellar-core-overlay | common, crypto |
-| stellar-core-scp | common, crypto |
-| stellar-core-tx | common, crypto, db |
-| stellar-core-bucket | common, crypto, db |
-| stellar-core-ledger | common, crypto, db, bucket, tx |
-| stellar-core-history | common, crypto, db, bucket, ledger, tx |
-| stellar-core-historywork | common, history, ledger, work |
-| stellar-core-herder | common, crypto, db, scp, overlay, ledger, tx |
-| stellar-core-app | (all of the above) |
-| rs-stellar-core | app (CLI binary) |
+| henyey-common | (none) |
+| henyey-crypto | common |
+| henyey-work | (none) |
+| henyey-db | common |
+| henyey-overlay | common, crypto |
+| henyey-scp | common, crypto |
+| henyey-tx | common, crypto, db |
+| henyey-bucket | common, crypto, db |
+| henyey-ledger | common, crypto, db, bucket, tx |
+| henyey-history | common, crypto, db, bucket, ledger, tx |
+| henyey-historywork | common, history, ledger, work |
+| henyey-herder | common, crypto, db, scp, overlay, ledger, tx |
+| henyey-app | (all of the above) |
+| henyey | app (CLI binary) |
 
 ## Layer Responsibilities
 
 ### Foundation Layer
 
-**stellar-core-common** - Shared types and utilities with no I/O dependencies
+**henyey-common** - Shared types and utilities with no I/O dependencies
 - `Hash256`, `NetworkId`, `Config` types
 - Protocol version utilities
 - Resource accounting for surge pricing
 - Metadata normalization
 - Math utilities (bigDivide, saturating ops)
 
-**stellar-core-crypto** - Pure Rust cryptographic primitives (no libsodium)
+**henyey-crypto** - Pure Rust cryptographic primitives (no libsodium)
 - Ed25519 signing and verification
 - SHA-256 and BLAKE2 hashing
 - HMAC-SHA256, HKDF key derivation
@@ -99,20 +99,20 @@ Internal dependencies (excluding external crates):
 - Curve25519 ECDH for P2P authentication
 - Sealed boxes for survey encryption
 
-**stellar-core-work** - Async work scheduler
+**henyey-work** - Async work scheduler
 - `Work` trait for composable async tasks
 - DAG-based dependency resolution
 - Retry logic and cancellation propagation
 
 ### Infrastructure Layer
 
-**stellar-core-db** - SQLite persistence
+**henyey-db** - SQLite persistence
 - Connection pooling via r2d2
 - Schema migrations
 - Trait-based query API: `LedgerQueries`, `ScpQueries`, `PeerQueries`
 - Stores: ledger headers, transactions, SCP state, peer records
 
-**stellar-core-overlay** - P2P networking
+**henyey-overlay** - P2P networking
 - X25519/HMAC-SHA256 authenticated connections
 - FloodGate for duplicate message detection
 - TCP with length-prefixed XDR encoding
@@ -120,60 +120,60 @@ Internal dependencies (excluding external crates):
 
 ### Domain Layer
 
-**stellar-core-scp** - Stellar Consensus Protocol implementation
+**henyey-scp** - Stellar Consensus Protocol implementation
 - Ballot tracking and nomination phases
 - Quorum intersection validation
 - Slot-based ledger advancement
 
-**stellar-core-tx** - Transaction execution (largest crate, 44 files)
+**henyey-tx** - Transaction execution (largest crate, 44 files)
 - Transaction frame validation
 - All operation types (payments, offers, Soroban, etc.)
 - Fee and fee-bump handling
 - Soroban WASM contract execution
-- `Savepoint` mechanism for per-operation state rollback (matches C++ nested `LedgerTxn`)
+- `Savepoint` mechanism for per-operation state rollback (matches stellar-core nested `LedgerTxn`)
 - `LedgerStateManager` with savepoint-based rollback for all entry types
 
-**stellar-core-bucket** - BucketList state management
+**henyey-bucket** - BucketList state management
 - 11-level bucket list with live/dead/init entries
 - CAP-0020 merge semantics
 - Bloom filters for negative lookups
 - Hot archive for Soroban state eviction
 - Disk-backed bucket storage
 
-**stellar-core-ledger** - Ledger close pipeline
+**henyey-ledger** - Ledger close pipeline
 - `LedgerManager` orchestration
 - `LedgerDelta` for accumulating state changes
 - Transaction application and fee charging
-- Per-operation savepoints in the execution loop (wraps each operation with `create_savepoint`/`rollback_to_savepoint` to match C++ nested `LedgerTxn` behavior)
+- Per-operation savepoints in the execution loop (wraps each operation with `create_savepoint`/`rollback_to_savepoint` to match stellar-core nested `LedgerTxn` behavior)
 - Bucket list merging and Merkle root computation
 - Inline invariant validation during ledger close
 
-**stellar-core-history** - History archive operations
+**henyey-history** - History archive operations
 - Catchup from history archives
 - Replay verification
 - Checkpoint publishing
 
 ### Coordination Layer
 
-**stellar-core-herder** - Consensus coordination
+**henyey-herder** - Consensus coordination
 - `TransactionQueue` with surge pricing
 - `PendingEnvelopes` for future SCP slots
 - SCP driver callback orchestration
 - State machine: Booting → Syncing → Tracking ↔ Validating
 
-**stellar-core-historywork** - History work scheduling
+**henyey-historywork** - History work scheduling
 - Work-based pipeline for history operations
 - Integrates WorkScheduler with CatchupManager
 
 ### Orchestration Layer
 
-**stellar-core-app** - Application coordinator
+**henyey-app** - Application coordinator
 - Central `App` owning all subsystems
 - Lifecycle: Initialize → Catchup → Run → Shutdown
 - Message routing from Overlay → Herder → Ledger
 - Survey management for network topology
 
-**rs-stellar-core** - CLI binary
+**henyey** - CLI binary
 - Command dispatch: run, catchup, new-db, verify-history, etc.
 - Configuration loading and validation
 - Logging initialization
@@ -196,7 +196,7 @@ HERDER (Consensus Coordinator)
     ▼
 LEDGER MANAGER
     ├─→ LedgerCloseContext (transactional context)
-    ├─→ Transaction Execution (stellar-core-tx)
+    ├─→ Transaction Execution (henyey-tx)
     │     └─→ Per-operation savepoints (rollback on failure)
     ├─→ LedgerDelta (accumulate state changes)
     └─→ BucketList Application
@@ -232,7 +232,7 @@ HISTORY ARCHIVE (Async)
 
 ### Pure Rust Cryptography
 - No C dependencies (libsodium-free)
-- All crypto is deterministic and bit-compatible with C++ stellar-core
+- All crypto is deterministic and bit-compatible with stellar-core
 - Keys are zeroized on drop via `zeroize` crate
 
 ### Trait-Based Composition
@@ -248,12 +248,12 @@ HISTORY ARCHIVE (Async)
 ### Per-Operation Savepoints
 - Each operation in a transaction is wrapped with a savepoint before execution
 - Failed operations have all state mutations rolled back via `rollback_to_savepoint()`
-- This matches C++ stellar-core's nested `LedgerTxn` commit/rollback behavior
+- This matches stellar-core's nested `LedgerTxn` commit/rollback behavior
 - The `Savepoint` struct captures entry maps, delta vector lengths, and created entry sets
-- Simpler than C++'s general-purpose nested transactions while providing the same isolation guarantees for the operation execution loop
+- Simpler than stellar-core's general-purpose nested transactions while providing the same isolation guarantees for the operation execution loop
 
 ### Determinism
-- All observable behavior matches C++ stellar-core
+- All observable behavior matches stellar-core
 - Byte-for-byte compatible hashes and signatures
 - Identical sorting and tie-breaking rules
 
@@ -297,7 +297,7 @@ Largest files (potential complexity hotspots):
 
 ### Low Priority
 
-1. **Consider merging stellar-core-historywork into stellar-core-history**
+1. **Consider merging henyey-historywork into henyey-history**
    - Single-file crate, closely related functionality
 
 2. **Soroban version abstraction**
@@ -317,5 +317,5 @@ cargo test --all
 
 Run specific crate tests:
 ```bash
-cargo test -p stellar-core-ledger
+cargo test -p henyey-ledger
 ```

@@ -1,0 +1,45 @@
+[package]
+name = "henyey-overlay"
+description = "P2P networking for henyey"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+stellar-xdr.workspace = true
+henyey-common.workspace = true
+henyey-crypto.workspace = true
+
+# Async runtime
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+
+# Crypto for X25519 key exchange and HMAC
+x25519-dalek.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+blake2.workspace = true
+
+# Serialization
+serde.workspace = true
+
+# Error handling
+thiserror.workspace = true
+tracing.workspace = true
+
+# Utilities
+bytes.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+hex.workspace = true
+stellar-strkey.workspace = true
+
+# Database
+rusqlite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

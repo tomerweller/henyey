@@ -1,7 +1,7 @@
 # Quickstart Docker Readiness Analysis
 
 Analysis of what Stellar's [quickstart Docker image](https://github.com/stellar/quickstart)
-relies on from stellar-core, and how ready rs-stellar-core is to serve as a drop-in replacement.
+relies on from stellar-core, and how ready henyey is to serve as a drop-in replacement.
 
 ## Quickstart Architecture
 
@@ -45,7 +45,7 @@ Prints version at startup.
 stellar-core version 2>/dev/null | sed 's/^/    /'
 ```
 
-**rs-stellar-core status:** Missing. clap provides `--version` but no `version` subcommand.
+**henyey status:** Missing. clap provides `--version` but no `version` subcommand.
 
 ### `stellar-core convert-id <hash>`
 
@@ -57,7 +57,7 @@ stellar-core convert-id $NETWORK_ID | awk -F': ' '/strKey: /{print $2}' | tail -
 
 Output is parsed to extract `NETWORK_ROOT_SECRET_KEY` and `NETWORK_ROOT_ACCOUNT_ID`.
 
-**rs-stellar-core status:** Missing with these semantics. `offline convert-key` exists but
+**henyey status:** Missing with these semantics. `offline convert-key` exists but
 converts strkeys, not raw SHA256-to-strkey.
 
 ### `stellar-core new-db --conf <path>`
@@ -68,8 +68,8 @@ Initializes a fresh database. Runs on first initialization only.
 sudo -u stellar stellar-core new-db --conf etc/stellar-core.cfg
 ```
 
-**rs-stellar-core status:** Partial. `new-db` exists but uses `--config` (global flag),
-not `--conf`. Config format is TOML, not C++ `.cfg`.
+**henyey status:** Partial. `new-db` exists but uses `--config` (global flag),
+not `--conf`. Config format is TOML, not stellar-core `.cfg`.
 
 ### `stellar-core force-scp --conf <path>`
 
@@ -79,7 +79,7 @@ Forces SCP to start nominating on next startup. Used for local network only.
 sudo -u stellar stellar-core force-scp --conf $COREHOME/etc/stellar-core.cfg
 ```
 
-**rs-stellar-core status:** Missing. No equivalent command.
+**henyey status:** Missing. No equivalent command.
 
 ### `stellar-core new-hist <name> --conf <path>`
 
@@ -89,7 +89,7 @@ Initializes a local history archive. Used for local network only.
 sudo -u stellar stellar-core new-hist vs --conf $COREHOME/etc/stellar-core.cfg
 ```
 
-**rs-stellar-core status:** Missing. No equivalent command.
+**henyey status:** Missing. No equivalent command.
 
 ### `stellar-core --conf <path> run`
 
@@ -99,8 +99,8 @@ The long-running node process, managed by supervisord.
 exec /usr/bin/stellar-core --conf "/opt/stellar/core/etc/stellar-core.cfg" run
 ```
 
-**rs-stellar-core status:** Partial. `run` exists but config flag is `--config/-c`, not
-`--conf`. Config format is TOML, not C++ `.cfg`.
+**henyey status:** Partial. `run` exists but config flag is `--config/-c`, not
+`--conf`. Config format is TOML, not stellar-core `.cfg`.
 
 ### `stellar-core get-settings-upgrade-txs`
 
@@ -115,11 +115,11 @@ echo $NETWORK_ROOT_SECRET_KEY \
     --signtxs
 ```
 
-**rs-stellar-core status:** Missing. No equivalent command.
+**henyey status:** Missing. No equivalent command.
 
 ### CLI Command Summary
 
-| Command                    | rs-stellar-core | Notes                                      |
+| Command                    | henyey | Notes                                      |
 |----------------------------|-----------------|---------------------------------------------|
 | `version`                  | Missing         | Need subcommand (not just `--version`)      |
 | `convert-id`              | Missing         | Different semantics than `offline convert-key` |
@@ -150,7 +150,7 @@ curl -s http://localhost:11626/info | jq -r '"\([.info.state] + (.info.status //
 
 Fields consumed: `.info.state`, `.info.ledger.version`, `.info.status[]`
 
-**rs-stellar-core status:** Partial. Endpoint exists but returns a different JSON shape.
+**henyey status:** Partial. Endpoint exists but returns a different JSON shape.
 Current response has top-level `version`, `node_name`, `state`, etc. Missing the nested
 `.info.ledger.version` and `.info.status` array.
 
@@ -169,7 +169,7 @@ curl -sG 'http://localhost:11626/upgrades?mode=set&upgradetime=1970-01-01T00:00:
 
 Parameters: `mode=set`, `upgradetime`, `protocolversion`, `basereserve`, `configupgradesetkey`
 
-**rs-stellar-core status:** Missing. Only a read-only `GET /upgrades` exists. No
+**henyey status:** Missing. Only a read-only `GET /upgrades` exists. No
 `mode=set` support for scheduling upgrades via HTTP.
 
 ### `GET /tx?blob=<xdr>`
@@ -180,7 +180,7 @@ Submits encoded transaction blobs via GET query parameter.
 curl -sG 'http://localhost:11626/tx' --data-urlencode "blob=$tx" | jq -r '.status'
 ```
 
-**rs-stellar-core status:** Incompatible. `/tx` exists but expects `POST` with JSON body
+**henyey status:** Incompatible. `/tx` exists but expects `POST` with JSON body
 `{"tx": "<base64>"}`, not `GET` with `blob` query param.
 
 ### `GET /metrics`
@@ -191,18 +191,18 @@ Reads transaction count metrics to confirm transaction confirmation.
 curl -s http://localhost:11626/metrics | jq -r '.metrics."ledger.transaction.count".count'
 ```
 
-**rs-stellar-core status:** Partial. `/metrics` exists but returns Prometheus text format
-with different metric names (`stellar_*`), not the C++ JSON format with
+**henyey status:** Partial. `/metrics` exists but returns Prometheus text format
+with different metric names (`stellar_*`), not stellar-core JSON format with
 `.metrics."ledger.transaction.count".count`.
 
 ### HTTP Endpoint Summary
 
-| Endpoint                  | rs-stellar-core | Notes                                  |
+| Endpoint                  | henyey | Notes                                  |
 |---------------------------|-----------------|----------------------------------------|
 | `GET /info`               | Partial         | Different JSON shape                   |
 | `GET /upgrades?mode=set`  | Missing         | No write/set support                   |
 | `GET /tx?blob=`           | Incompatible    | Expects POST + JSON, not GET + query   |
-| `GET /metrics`            | Partial         | Prometheus text, not C++ JSON format   |
+| `GET /metrics`            | Partial         | Prometheus text, not stellar-core JSON format   |
 
 ---
 
@@ -210,11 +210,11 @@ with different metric names (`stellar_*`), not the C++ JSON format with
 
 ### Config File Format
 
-C++ stellar-core uses a custom `.cfg` format. rs-stellar-core uses TOML. These are
+stellar-core uses a custom `.cfg` format. henyey uses TOML. These are
 **completely incompatible** -- every config file would need to be rewritten or a
 compatibility layer added.
 
-C++ example:
+stellar-core example:
 ```
 HTTP_PORT=11626
 PUBLIC_HTTP_PORT=true
@@ -234,7 +234,7 @@ put="cp {0} /tmp/stellar-core/history/vs/{1}"
 mkdir="mkdir -p /tmp/stellar-core/history/vs/{0}"
 ```
 
-rs-stellar-core TOML equivalent:
+henyey TOML equivalent:
 ```toml
 [http]
 port = 11626
@@ -252,11 +252,11 @@ passphrase = "Test SDF Network ; September 2015"
 
 ### CLI Flag Name
 
-C++ uses `--conf`. rs-stellar-core uses `--config` / `-c`.
+stellar-core uses `--conf`. henyey uses `--config` / `-c`.
 
 ### Config Property Coverage
 
-| C++ Config Property                          | rs-stellar-core    | Status                        |
+| stellar-core Config Property                          | henyey    | Status                        |
 |----------------------------------------------|--------------------|-------------------------------|
 | `HTTP_PORT`                                  | `http.port`        | Present                       |
 | `PUBLIC_HTTP_PORT`                           | `http.enabled`     | Present (different semantics) |
@@ -284,7 +284,7 @@ C++ uses `--conf`. rs-stellar-core uses `--config` / `-c`.
 The **single largest blocker** for the standalone node:
 
 - Quickstart main node uses **PostgreSQL** (`postgresql://dbname=core host=localhost`)
-- rs-stellar-core supports **SQLite only**
+- henyey supports **SQLite only**
 - Captive-core instances use SQLite (compatible)
 - Horizon has its own PostgreSQL database independent of stellar-core
 
@@ -295,13 +295,13 @@ The **single largest blocker** for the standalone node:
 Horizon and stellar-rpc spawn stellar-core as a captive-core subprocess. The Go SDK
 (`stellar/go/ingest/ledgerbackend`) manages this by:
 
-1. Writing a config file in C++ `.cfg` format
+1. Writing a config file in stellar-core `.cfg` format
 2. Running `stellar-core new-db --conf <path>`
 3. Running `stellar-core run --conf <path> --metadata-output-stream fd:N`
 4. Reading `LedgerCloseMeta` frames from the pipe (fd:N)
 5. Polling `/info` for status
 
-| Requirement                        | rs-stellar-core Status                |
+| Requirement                        | henyey Status                |
 |------------------------------------|---------------------------------------|
 | Binary at `STELLAR_CORE_BINARY_PATH` | OK                                  |
 | Accepts `--conf <path>`           | **Incompatible** -- uses `--config`   |
@@ -309,13 +309,13 @@ Horizon and stellar-rpc spawn stellar-core as a captive-core subprocess. The Go 
 | `new-db` subcommand               | OK (different flag style)             |
 | SQLite support                     | OK                                    |
 | `--metadata-output-stream fd:N`   | OK (just implemented)                 |
-| C++ `.cfg` config format          | **Incompatible** -- expects TOML      |
+| stellar-core `.cfg` config format          | **Incompatible** -- expects TOML      |
 | `/info` HTTP response shape       | **Partially incompatible**            |
 | `ENABLE_SOROBAN_DIAGNOSTIC_EVENTS` | **Missing** config option             |
 
 The `--metadata-output-stream` feature (including `fd:N` support) is now implemented and
-wire-format compatible with C++, which enables the core data flow. However, the config
-format and CLI flag names prevent the Go SDK from driving rs-stellar-core without
+wire-format compatible with stellar-core, which enables the core data flow. However, the config
+format and CLI flag names prevent the Go SDK from driving henyey without
 modifications to either side.
 
 ---
@@ -324,14 +324,14 @@ modifications to either side.
 
 | Category                        | Ready? | Notes                                                        |
 |---------------------------------|--------|--------------------------------------------------------------|
-| Core ledger close + meta stream | Yes    | Wire-format compatible with C++                              |
+| Core ledger close + meta stream | Yes    | Wire-format compatible with stellar-core                              |
 | SQLite database                 | Yes    | Fully supported                                              |
 | PostgreSQL database             | No     | Not supported; blocker for standalone node                   |
-| Config file format              | No     | TOML vs C++ `.cfg` -- completely incompatible                |
+| Config file format              | No     | TOML vs stellar-core `.cfg` -- completely incompatible                |
 | CLI flag names                  | No     | `--config` vs `--conf`                                       |
 | CLI commands (quickstart needs) | Partial | 3/7 missing, 2/7 partial                                   |
 | HTTP API compatibility          | No     | Different response shapes, missing endpoints                 |
-| Captive-core integration        | No     | Go SDK writes C++ config format and uses `--conf`            |
+| Captive-core integration        | No     | Go SDK writes stellar-core config format and uses `--conf`            |
 | Local network support           | No     | Missing `force-scp`, `new-hist`, accelerated time, unsafe quorum |
 | Testnet/pubnet watcher          | Partial | Core sync works but config/CLI incompatible                 |
 | Protocol upgrades via HTTP      | No     | `/upgrades?mode=set` not implemented                         |
@@ -343,10 +343,10 @@ modifications to either side.
 
 ### Tier 1 -- Blockers (required for any quickstart integration)
 
-1. **Config compatibility layer** -- either support C++ `.cfg` format or provide a
+1. **Config compatibility layer** -- either support stellar-core `.cfg` format or provide a
    translation tool; quickstart scripts (and the Go captive-core SDK) generate `.cfg` files
 2. **CLI flag alias** -- add `--conf` as an alias for `--config`
-3. **`/info` response parity** -- match C++ JSON shape: `.info.state`,
+3. **`/info` response parity** -- match stellar-core JSON shape: `.info.state`,
    `.info.ledger.version`, `.info.status[]`
 4. **`/tx` GET compatibility** -- accept `?blob=<xdr>` query parameter in addition to
    POST JSON
@@ -370,7 +370,7 @@ modifications to either side.
 
 14. PostgreSQL support (only needed if keeping the standalone main node pattern)
 15. `CATCHUP_RECENT` config option
-16. `/metrics` JSON format parity with C++ (currently Prometheus text)
+16. `/metrics` JSON format parity with stellar-core (currently Prometheus text)
 
 ### Recommended Approach
 
@@ -379,6 +379,6 @@ SQLite, and the quickstart scripts that manage them are simpler. The standalone 
 swap (requiring PostgreSQL or a quickstart restructure) can come later.
 
 Alternatively, the quickstart repository could be modified with a parallel code path that
-generates TOML configs and uses `--config` when detecting rs-stellar-core as the binary.
-This avoids adding C++ config parsing to the Rust codebase at the cost of quickstart
+generates TOML configs and uses `--config` when detecting henyey as the binary.
+This avoids adding stellar-core config parsing to the Rust codebase at the cost of quickstart
 complexity.

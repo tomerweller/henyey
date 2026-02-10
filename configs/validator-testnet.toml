@@ -1,13 +1,13 @@
-# rs-stellar-core Testnet Validator Configuration
+# henyey Testnet Validator Configuration
 #
 # To run as a validator:
 #   1. Generate a keypair using `stellar-core gen-seed` or similar tool
 #   2. Replace the node_seed below with your secret seed (S...)
-#   3. Run: rs-stellar-core --config configs/validator-testnet.toml run
+#   3. Run: henyey --config configs/validator-testnet.toml run
 
 [node]
 # Node display name (for logging)
-name = "rs-stellar-core-validator"
+name = "henyey-validator"
 
 # Run as validator (requires keypair)
 is_validator = true

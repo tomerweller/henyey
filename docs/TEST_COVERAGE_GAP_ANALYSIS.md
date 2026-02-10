@@ -1,17 +1,17 @@
-# C++ to Rust Transaction Test Coverage Gap Analysis
+# stellar-core to Rust Transaction Test Coverage Gap Analysis
 
-Analysis of test coverage gaps between C++ stellar-core v25 and rs-stellar-core transaction tests.
+Analysis of test coverage gaps between stellar-core v25 and henyey transaction tests.
 This document identifies test scenarios present in upstream that are missing in the Rust implementation.
 
 ## Executive Summary
 
-| Metric | C++ (stellar-core v25) | Rust (rs-stellar-core) |
+| Metric | stellar-core (v25) | Rust (henyey) |
 |--------|----------------------|----------------------|
 | Test Files | 32 | 20 |
 | TEST_CASE/SECTION count | ~1,813 | ~181 |
 | Estimated Test Scenarios | ~500+ | ~150+ |
 
-**Overall Coverage Gap: Approximately 65-70% of C++ test scenarios are NOT covered in Rust tests.**
+**Overall Coverage Gap: Approximately 65-70% of stellar-core test scenarios are NOT covered in Rust tests.**
 
 ---
 
@@ -29,7 +29,7 @@ Missing scenarios:
 - AccountMerge destination reaching INT64_MAX
 - Pool share calculation overflow in LiquidityPoolDeposit
 
-**C++ References:**
+**stellar-core References:**
 - `PaymentTests.cpp`: "issuer large amounts" section
 - `PathPaymentTests.cpp`: overflow sections
 - `MergeTests.cpp`: "destination with native buying liabilities"
@@ -46,7 +46,7 @@ Missing scenarios:
 - [ ] ManageData creating entry at limit
 - [ ] ClaimableBalance creation at limit
 
-**C++ References:**
+**stellar-core References:**
 - `SponsorshipTestUtils.cpp`: `tooManySubentries()` helper used across all operations
 - `ChangeTrustTests.cpp:282`: `tooManySubentries(*app, acc1, changeTrust(idr, 1), ...)`
 - `SetOptionsTests.cpp:334`: `tooManySubentries(*app, a1, setOptions(setSigner(signer1)), ...)`
@@ -60,7 +60,7 @@ Missing scenarios:
 - [ ] BumpSequence to INT64_MAX
 - [ ] BumpSequence with sponsored account
 
-**C++ References:**
+**stellar-core References:**
 - `MergeTests.cpp`: "merge too far" and "merge too far due to MAX_SEQ_NUM_TO_APPLY"
 - `BumpSequenceTests.cpp`: comprehensive sequence tests
 
@@ -75,7 +75,7 @@ Missing scenarios:
 - [ ] Source account deleted mid-transaction
 - [ ] "Two payments, first breaking second" ledger test
 
-**C++ References:**
+**stellar-core References:**
 - `PaymentTests.cpp`: Multi-op test sections
 - `MergeTests.cpp`: "merge, create, merge back" and similar
 - `ChangeTrustTests.cpp:287-303`: "create and delete trustline in same tx"
@@ -86,7 +86,7 @@ Missing scenarios:
 
 ### CreateAccount
 
-| Test Scenario | C++ | Rust | Gap |
+| Test Scenario | stellar-core | Rust | Gap |
 |---------------|-----|------|-----|
 | Basic success | YES | YES | - |
 | Account already exists | YES | YES | - |
@@ -98,12 +98,12 @@ Missing scenarios:
 | With sponsorship | YES | NO | **Missing** |
 | Too many sponsoring | YES | NO | **Missing** |
 
-**C++ File:** `CreateAccountTests.cpp` (11 test sections)
+**stellar-core File:** `CreateAccountTests.cpp` (11 test sections)
 **Rust File:** `create_account.rs` (3 tests)
 
 ### Payment
 
-| Test Scenario | C++ | Rust | Gap |
+| Test Scenario | stellar-core | Rust | Gap |
 |---------------|-----|------|-----|
 | Native payment success | YES | YES | - |
 | No destination | YES | YES | - |
@@ -116,12 +116,12 @@ Missing scenarios:
 | Credit missing issuer (v13+) | YES | NO | **Missing** |
 | Authorize flag interactions | YES | NO | **Missing** |
 
-**C++ File:** `PaymentTests.cpp` (78 test sections)
+**stellar-core File:** `PaymentTests.cpp` (78 test sections)
 **Rust File:** `payment.rs` (14 tests)
 
 ### AccountMerge
 
-| Test Scenario | C++ | Rust | Gap |
+| Test Scenario | stellar-core | Rust | Gap |
 |---------------|-----|------|-----|
 | Basic success | YES | YES | - |
 | Merge into self (MALFORMED) | YES | YES | - |
@@ -139,12 +139,12 @@ Missing scenarios:
 | Destination native buying liab overflow | YES | NO | **Critical** |
 | Complex sponsorship scenarios | YES | NO | **Missing** |
 
-**C++ File:** `MergeTests.cpp` (48 test sections)
+**stellar-core File:** `MergeTests.cpp` (48 test sections)
 **Rust File:** `account_merge.rs` (5 tests)
 
 ### ChangeTrust
 
-| Test Scenario | C++ | Rust | Gap |
+| Test Scenario | stellar-core | Rust | Gap |
 |---------------|-----|------|-----|
 | Basic create/update/delete | YES | YES | - |
 | Invalid limit | YES | YES | - |
@@ -160,12 +160,12 @@ Missing scenarios:
 | Complex sponsorship | YES | NO | **Missing** |
 | Pool share with sponsorship | YES | NO | **Missing** |
 
-**C++ File:** `ChangeTrustTests.cpp` (39 test sections)
+**stellar-core File:** `ChangeTrustTests.cpp` (39 test sections)
 **Rust File:** `change_trust.rs` (18 tests including new regression tests)
 
 ### ManageOffer (Sell + Buy)
 
-| Test Scenario | C++ | Rust | Gap |
+| Test Scenario | stellar-core | Rust | Gap |
 |---------------|-----|------|-----|
 | Basic CRUD | YES | YES | - |
 | Error conditions | YES | YES | - |
@@ -178,12 +178,12 @@ Missing scenarios:
 | Self-trade edge cases | YES | NO | **Missing** |
 | Offer at INT64_MAX price | YES | NO | **Critical** |
 
-**C++ Files:** `OfferTests.cpp`, `ManageBuyOfferTests.cpp` (180+ test sections)
+**stellar-core Files:** `OfferTests.cpp`, `ManageBuyOfferTests.cpp` (180+ test sections)
 **Rust File:** `manage_offer.rs` (17 tests)
 
 ### PathPayment (Strict Receive + Strict Send)
 
-| Test Scenario | C++ | Rust | Gap |
+| Test Scenario | stellar-core | Rust | Gap |
 |---------------|-----|------|-----|
 | Basic success/failure | YES | YES | - |
 | Limited error conditions | YES | YES | - |
@@ -194,12 +194,12 @@ Missing scenarios:
 | Missing issuer scenarios | YES | NO | **Missing** |
 | Path through liquidity pool | YES | NO | **Missing** |
 
-**C++ Files:** `PathPaymentTests.cpp`, `PathPaymentStrictSendTests.cpp` (185+ test sections)
+**stellar-core Files:** `PathPaymentTests.cpp`, `PathPaymentStrictSendTests.cpp` (185+ test sections)
 **Rust File:** `path_payment.rs` (6 tests)
 
 ### SetOptions
 
-| Test Scenario | C++ | Rust | Gap |
+| Test Scenario | stellar-core | Rust | Gap |
 |---------------|-----|------|-----|
 | Basic flag/threshold/signer | YES | YES | - |
 | Home domain tests | YES | YES | - |
@@ -210,12 +210,12 @@ Missing scenarios:
 | Signer deletion with sponsorship | YES | NO | **Missing** |
 | Master key as alternate signer | YES | NO | **Missing** |
 
-**C++ File:** `SetOptionsTests.cpp` (22 test sections)
+**stellar-core File:** `SetOptionsTests.cpp` (22 test sections)
 **Rust File:** `set_options.rs` (15 tests)
 
 ### ClaimableBalance
 
-| Test Scenario | C++ | Rust | Gap |
+| Test Scenario | stellar-core | Rust | Gap |
 |---------------|-----|------|-----|
 | Basic create/claim | YES | YES | - |
 | Predicate tests | YES | YES | - |
@@ -226,12 +226,12 @@ Missing scenarios:
 | Claimant limit tests | YES | NO | **Missing** |
 | Reserve calculation edge cases | YES | NO | **Missing** |
 
-**C++ File:** `ClaimableBalanceTests.cpp` (73 test sections)
+**stellar-core File:** `ClaimableBalanceTests.cpp` (73 test sections)
 **Rust File:** `claimable_balance.rs` (18 tests)
 
 ### Liquidity Pool Operations
 
-| Test Scenario | C++ | Rust | Gap |
+| Test Scenario | stellar-core | Rust | Gap |
 |---------------|-----|------|-----|
 | Basic deposit/withdraw | YES | YES | - |
 | Pool share calculation overflow | YES | NO | **Critical** |
@@ -240,12 +240,12 @@ Missing scenarios:
 | Pool full scenarios | YES | NO | **Missing** |
 | Price bounds validation | YES | NO | **Missing** |
 
-**C++ Files:** `LiquidityPoolDepositTests.cpp`, `LiquidityPoolWithdrawTests.cpp`, `LiquidityPoolTradeTests.cpp` (88+ test sections)
+**stellar-core Files:** `LiquidityPoolDepositTests.cpp`, `LiquidityPoolWithdrawTests.cpp`, `LiquidityPoolTradeTests.cpp` (88+ test sections)
 **Rust File:** `liquidity_pool.rs` (7 tests)
 
 ### Sponsorship Operations
 
-| Test Scenario | C++ | Rust | Gap |
+| Test Scenario | stellar-core | Rust | Gap |
 |---------------|-----|------|-----|
 | Basic begin/end sponsoring | YES | YES | - |
 | Some revoke scenarios | YES | YES | - |
@@ -254,12 +254,12 @@ Missing scenarios:
 | Low reserve edge cases | YES | NO | **Missing** |
 | Nested sponsorship | YES | NO | **Missing** |
 
-**C++ Files:** `RevokeSponsorshipTests.cpp`, `BeginSponsoringFutureReservesTests.cpp`, etc. (66+ test sections)
+**stellar-core Files:** `RevokeSponsorshipTests.cpp`, `BeginSponsoringFutureReservesTests.cpp`, etc. (66+ test sections)
 **Rust File:** `sponsorship.rs` (11 tests)
 
 ### Other Operations Summary
 
-| Operation | C++ Depth | Rust Depth | Gap Level |
+| Operation | stellar-core Depth | Rust Depth | Gap Level |
 |-----------|-----------|------------|-----------|
 | BumpSequence | 12 sections | 3 tests | Medium |
 | ManageData | 5 sections | 12 tests | OK |
@@ -327,13 +327,13 @@ These tests should be added immediately as they test scenarios that could cause 
 
 ## Test Infrastructure Gaps
 
-Beyond individual test cases, the Rust test infrastructure lacks some patterns from C++:
+Beyond individual test cases, the Rust test infrastructure lacks some patterns from stellar-core:
 
-1. **No equivalent to `for_versions_from(N, app, [&] { ... })`** - Many C++ tests run across multiple protocol versions
+1. **No equivalent to `for_versions_from(N, app, [&] { ... })`** - Many stellar-core tests run across multiple protocol versions
 
-2. **No `SponsorshipTestUtils` equivalent** - C++ has reusable helpers like `tooManySubentries()`, `tooManySponsoring()`
+2. **No `SponsorshipTestUtils` equivalent** - stellar-core has reusable helpers like `tooManySubentries()`, `tooManySponsoring()`
 
-3. **No ledger-level transaction tests** - C++ tests transactions at the ledger level, verifying dependent transaction invalidation
+3. **No ledger-level transaction tests** - stellar-core tests transactions at the ledger level, verifying dependent transaction invalidation
 
 4. **Limited multi-operation transaction testing** - Most Rust tests are single-operation
 
@@ -341,7 +341,7 @@ Beyond individual test cases, the Rust test infrastructure lacks some patterns f
 
 ## References
 
-### C++ Test Files
+### stellar-core Test Files
 
 ```
 .upstream-v25/src/transactions/test/
@@ -377,7 +377,7 @@ Beyond individual test cases, the Rust test infrastructure lacks some patterns f
 ### Rust Test Files
 
 ```
-crates/stellar-core-tx/src/operations/execute/
+crates/henyey-tx/src/operations/execute/
 ├── create_account.rs (3 tests)
 ├── payment.rs (14 tests)
 ├── account_merge.rs (5 tests)

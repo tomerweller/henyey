@@ -1,0 +1,27 @@
+[package]
+name = "henyey-historywork"
+description = "History work items for henyey"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+henyey-common.workspace = true
+henyey-history.workspace = true
+henyey-ledger.workspace = true
+henyey-work.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+stellar-xdr.workspace = true
+flate2.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+flate2.workspace = true
+henyey-bucket.workspace = true
+stellar-xdr.workspace = true
+tempfile.workspace = true

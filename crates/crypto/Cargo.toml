@@ -1,0 +1,49 @@
+[package]
+name = "henyey-crypto"
+description = "Pure Rust cryptographic primitives for henyey"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+stellar-xdr.workspace = true
+henyey-common.workspace = true
+
+# Ed25519 - pure Rust implementation
+ed25519-dalek.workspace = true
+
+# X25519 for key exchange - pure Rust
+x25519-dalek.workspace = true
+
+# SHA-256 - pure Rust (RustCrypto)
+sha2.workspace = true
+
+# BLAKE2 - pure Rust (RustCrypto)
+blake2.workspace = true
+
+# HMAC for message authentication
+hmac.workspace = true
+
+# HKDF for key derivation
+hkdf = "0.12"
+
+# Sealed box encryption for surveys (X25519 + XSalsa20-Poly1305)
+crypto_box.workspace = true
+
+# Random number generation - pure Rust
+rand.workspace = true
+rand_chacha.workspace = true
+getrandom.workspace = true
+
+# Encoding - pure Rust
+hex.workspace = true
+base32.workspace = true
+
+# Utilities
+thiserror.workspace = true
+zeroize.workspace = true
+siphasher = "0.3"
+
+[dev-dependencies]
+tempfile.workspace = true

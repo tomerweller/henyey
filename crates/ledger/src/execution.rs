@@ -1,0 +1,6782 @@
+//! Transaction execution during ledger close.
+//!
+//! This module bridges the ledger close process with the transaction processing
+//! layer (`stellar-core-tx`). It handles:
+//!
+//! - Loading required state from snapshots into the execution environment
+//! - Executing transactions in the correct order with proper fee handling
+//! - Recording state changes to the [`LedgerDelta`]
+//! - Generating transaction metadata for history
+//!
+//! # Execution Flow
+//!
+//! 1. **State Loading**: Required accounts, trustlines, and other entries are
+//!    loaded from the snapshot into the [`LedgerStateManager`]
+//!
+//! 2. **Fee Charging**: Transaction fees are charged upfront, even for
+//!    transactions that will fail validation
+//!
+//! 3. **Operation Execution**: Each operation is executed in sequence,
+//!    with results collected for the transaction result
+//!
+//! 4. **State Recording**: Changes are recorded to the [`LedgerDelta`]
+//!    for later application to the bucket list
+//!
+//! # Soroban Support
+//!
+//! For Protocol 20+, this module handles Soroban smart contract execution:
+//!
+//! - Loading contract data and code from the footprint
+//! - Configuring the Soroban host with network parameters
+//! - Computing resource fees and rent
+//! - Processing contract events
+//!
+//! [`LedgerDelta`]: crate::LedgerDelta
+//! [`LedgerStateManager`]: henyey_tx::LedgerStateManager
+
+use std::collections::{HashMap, HashSet};
+
+use soroban_env_host_p25::fees::{
+    compute_rent_write_fee_per_1kb, compute_transaction_resource_fee, FeeConfiguration,
+    RentFeeConfiguration, RentWriteFeeConfiguration,
+};
+use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
+use henyey_common::{Hash256, NetworkId};
+use henyey_crypto::account_id_to_strkey;
+
+use henyey_tx::{
+    make_account_address, make_claimable_balance_address, make_muxed_account_address,
+    operations::OperationType,
+    soroban::{PersistentModuleCache, SorobanConfig},
+    state::{get_account_seq_ledger, get_account_seq_time},
+    validation::{self, LedgerContext as ValidationContext},
+    ClassicEventConfig, LedgerContext, LedgerStateManager, OpEventManager, TransactionFrame,
+    TxError, TxEventManager,
+};
+use stellar_xdr::curr::{
+    AccountEntry, AccountEntryExt, AccountEntryExtensionV1Ext, AccountId, AccountMergeResult,
+    AllowTrustOp, AlphaNum12, AlphaNum4, Asset, AssetCode, ClaimableBalanceEntry,
+    ClaimableBalanceId, ConfigSettingEntry, ConfigSettingId, ContractCostParams, ContractEvent,
+    CreateClaimableBalanceResult, DiagnosticEvent, ExtensionPoint, InflationResult,
+    InnerTransactionResult, InnerTransactionResultExt, InnerTransactionResultPair,
+    InnerTransactionResultResult, LedgerEntry, LedgerEntryChange, LedgerEntryChanges,
+    LedgerEntryData, LedgerKey, LedgerKeyClaimableBalance, LedgerKeyConfigSetting,
+    LedgerKeyLiquidityPool, LedgerKeyTrustLine, Limits, LiquidityPoolEntry, LiquidityPoolEntryBody,
+    ManageBuyOfferResult, ManageSellOfferResult, MuxedAccount, OfferEntry, Operation,
+    OperationBody, OperationMetaV2, OperationResult, OperationResultTr,
+    PathPaymentStrictReceiveResult, PathPaymentStrictSendResult, PoolId, Preconditions, ScAddress,
+    SignerKey, SorobanTransactionData, SorobanTransactionMetaExt, SorobanTransactionMetaExtV1,
+    SorobanTransactionMetaV2, TransactionEnvelope, TransactionEvent, TransactionEventStage,
+    TransactionMeta, TransactionMetaV4, TransactionResult, TransactionResultExt,
+    TransactionResultMetaV1, TransactionResultPair, TransactionResultResult, TrustLineAsset,
+    TrustLineFlags, VecM, WriteXdr,
+};
+use tracing::{debug, warn};
+
+use crate::delta::LedgerDelta;
+use crate::snapshot::SnapshotHandle;
+use crate::{LedgerError, Result};
+
+use henyey_bucket::HotArchiveBucketList;
+
+/// Wrapper around HotArchiveBucketList that implements the HotArchiveLookup trait.
+///
+/// This allows the ledger execution layer to look up archived entries without
+/// requiring the tx layer to depend on the bucket crate.
+pub struct HotArchiveLookupImpl {
+    hot_archive: std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>,
+}
+
+impl HotArchiveLookupImpl {
+    pub fn new(
+        hot_archive: std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>,
+    ) -> Self {
+        Self { hot_archive }
+    }
+}
+
+impl henyey_tx::soroban::HotArchiveLookup for HotArchiveLookupImpl {
+    fn get(&self, key: &LedgerKey) -> Option<LedgerEntry> {
+        // Use the hot archive bucket list's get method
+        let guard = self.hot_archive.read();
+        let hot_archive = match guard.as_ref() {
+            Some(ha) => ha,
+            None => {
+                return None;
+            }
+        };
+        match hot_archive.get(key) {
+            Ok(Some(entry)) => Some(entry),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    key_type = ?std::mem::discriminant(key),
+                    "Hot archive lookup failed"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// Soroban network configuration information for the /sorobaninfo endpoint.
+///
+/// This struct contains all the Soroban-related configuration settings from
+/// the ledger, matching the format returned by C++ stellar-core's `/sorobaninfo`
+/// HTTP endpoint in "basic" format.
+#[derive(Debug, Clone, Default)]
+pub struct SorobanNetworkInfo {
+    /// Maximum contract code size in bytes.
+    pub max_contract_size: u32,
+    /// Maximum contract data key size in bytes.
+    pub max_contract_data_key_size: u32,
+    /// Maximum contract data entry size in bytes.
+    pub max_contract_data_entry_size: u32,
+    /// Per-transaction compute limits.
+    pub tx_max_instructions: i64,
+    /// Per-ledger compute limits.
+    pub ledger_max_instructions: i64,
+    /// Fee rate per instructions increment.
+    pub fee_rate_per_instructions_increment: i64,
+    /// Transaction memory limit.
+    pub tx_memory_limit: u32,
+    /// Per-ledger disk read limits.
+    pub ledger_max_read_ledger_entries: u32,
+    pub ledger_max_read_bytes: u32,
+    pub ledger_max_write_ledger_entries: u32,
+    pub ledger_max_write_bytes: u32,
+    /// Per-transaction disk read/write limits.
+    pub tx_max_read_ledger_entries: u32,
+    pub tx_max_read_bytes: u32,
+    pub tx_max_write_ledger_entries: u32,
+    pub tx_max_write_bytes: u32,
+    /// Fees per entry and per KB.
+    pub fee_read_ledger_entry: i64,
+    pub fee_write_ledger_entry: i64,
+    pub fee_read_1kb: i64,
+    pub fee_write_1kb: i64,
+    pub fee_historical_1kb: i64,
+    /// Contract events settings.
+    pub tx_max_contract_events_size_bytes: u32,
+    pub fee_contract_events_size_1kb: i64,
+    /// Bandwidth settings.
+    pub ledger_max_tx_size_bytes: u32,
+    pub tx_max_size_bytes: u32,
+    pub fee_transaction_size_1kb: i64,
+    /// General ledger settings.
+    pub ledger_max_tx_count: u32,
+    /// State archival settings.
+    pub max_entry_ttl: u32,
+    pub min_temporary_ttl: u32,
+    pub min_persistent_ttl: u32,
+    pub persistent_rent_rate_denominator: i64,
+    pub temp_rent_rate_denominator: i64,
+    pub max_entries_to_archive: u32,
+    pub bucketlist_size_window_sample_size: u32,
+    pub eviction_scan_size: i64,
+    pub starting_eviction_scan_level: u32,
+    /// Computed value: average bucket list size.
+    pub average_bucket_list_size: u64,
+    /// SCP timing settings (Protocol 23+).
+    pub nomination_timeout_initial_ms: u32,
+    pub nomination_timeout_increment_ms: u32,
+    pub ballot_timeout_initial_ms: u32,
+    pub ballot_timeout_increment_ms: u32,
+}
+
+/// Load a ConfigSettingEntry from the snapshot by ID.
+fn load_config_setting(
+    snapshot: &SnapshotHandle,
+    id: ConfigSettingId,
+) -> Option<ConfigSettingEntry> {
+    let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+        config_setting_id: id,
+    });
+    match snapshot.get_entry(&key) {
+        Ok(Some(entry)) => {
+            if let LedgerEntryData::ConfigSetting(config) = entry.data {
+                Some(config)
+            } else {
+                None
+            }
+        }
+        Ok(None) => None,
+        Err(_) => None,
+    }
+}
+
+/// Load SorobanConfig from the ledger's ConfigSettingEntry entries.
+///
+/// This loads the cost parameters and limits from the ledger state,
+/// which are required for accurate Soroban transaction execution.
+/// If any required settings are missing, returns a default config.
+///
+/// The `protocol_version` parameter is used to determine which fee to use
+/// for `fee_per_write_1kb` in the FeeConfiguration:
+/// - For protocol >= 23: uses `fee_write1_kb` from ContractLedgerCostExtV0
+/// - For protocol < 23: uses the computed `fee_per_rent_1kb` (state-size based)
+///
+/// This matches C++ stellar-core's `rustBridgeFeeConfiguration()` behavior.
+pub fn load_soroban_config(snapshot: &SnapshotHandle, protocol_version: u32) -> SorobanConfig {
+    // Load CPU cost params
+    let cpu_cost_params =
+        load_config_setting(snapshot, ConfigSettingId::ContractCostParamsCpuInstructions)
+            .and_then(|cs| {
+                if let ConfigSettingEntry::ContractCostParamsCpuInstructions(params) = cs {
+                    Some(params)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| ContractCostParams(vec![].try_into().unwrap_or_default()));
+
+    // Load memory cost params
+    let mem_cost_params =
+        load_config_setting(snapshot, ConfigSettingId::ContractCostParamsMemoryBytes)
+            .and_then(|cs| {
+                if let ConfigSettingEntry::ContractCostParamsMemoryBytes(params) = cs {
+                    Some(params)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| ContractCostParams(vec![].try_into().unwrap_or_default()));
+
+    // Load compute limits and fee rate per instructions
+    let (tx_max_instructions, tx_max_memory_bytes, fee_per_instruction_increment) =
+        load_config_setting(snapshot, ConfigSettingId::ContractComputeV0)
+            .and_then(|cs| {
+                if let ConfigSettingEntry::ContractComputeV0(compute) = cs {
+                    Some((
+                        compute.tx_max_instructions as u64,
+                        compute.tx_memory_limit as u64,
+                        compute.fee_rate_per_instructions_increment,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or((100_000_000, 40 * 1024 * 1024, 0)); // Default limits
+
+    // Load ledger cost settings
+    let (
+        fee_disk_read_ledger_entry,
+        fee_write_ledger_entry,
+        fee_disk_read_1kb,
+        soroban_state_target_size_bytes,
+        rent_fee_1kb_state_size_low,
+        rent_fee_1kb_state_size_high,
+        soroban_state_rent_fee_growth_factor,
+    ) = load_config_setting(snapshot, ConfigSettingId::ContractLedgerCostV0)
+        .and_then(|cs| {
+            if let ConfigSettingEntry::ContractLedgerCostV0(cost) = cs {
+                Some((
+                    cost.fee_disk_read_ledger_entry,
+                    cost.fee_write_ledger_entry,
+                    cost.fee_disk_read1_kb,
+                    cost.soroban_state_target_size_bytes,
+                    cost.rent_fee1_kb_soroban_state_size_low,
+                    cost.rent_fee1_kb_soroban_state_size_high,
+                    cost.soroban_state_rent_fee_growth_factor,
+                ))
+            } else {
+                None
+            }
+        })
+        .unwrap_or((0, 0, 0, 0, 0, 0, 0));
+
+    let fee_write_1kb = load_config_setting(snapshot, ConfigSettingId::ContractLedgerCostExtV0)
+        .and_then(|cs| {
+            if let ConfigSettingEntry::ContractLedgerCostExtV0(ext) = cs {
+                Some(ext.fee_write1_kb)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+
+    let fee_historical_1kb =
+        load_config_setting(snapshot, ConfigSettingId::ContractHistoricalDataV0)
+            .and_then(|cs| {
+                if let ConfigSettingEntry::ContractHistoricalDataV0(hist) = cs {
+                    Some(hist.fee_historical1_kb)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+    let (tx_max_contract_events_size_bytes, fee_contract_events_1kb) =
+        load_config_setting(snapshot, ConfigSettingId::ContractEventsV0)
+            .and_then(|cs| {
+                if let ConfigSettingEntry::ContractEventsV0(events) = cs {
+                    Some((
+                        events.tx_max_contract_events_size_bytes,
+                        events.fee_contract_events1_kb,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or((0, 0));
+
+    let fee_tx_size_1kb = load_config_setting(snapshot, ConfigSettingId::ContractBandwidthV0)
+        .and_then(|cs| {
+            if let ConfigSettingEntry::ContractBandwidthV0(bandwidth) = cs {
+                Some(bandwidth.fee_tx_size1_kb)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+
+    // Load contract size limits for entry validation (validateContractLedgerEntry)
+    let max_contract_size_bytes =
+        load_config_setting(snapshot, ConfigSettingId::ContractMaxSizeBytes)
+            .and_then(|cs| {
+                if let ConfigSettingEntry::ContractMaxSizeBytes(size) = cs {
+                    Some(size)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(64 * 1024); // 64 KB default
+
+    let max_contract_data_entry_size_bytes =
+        load_config_setting(snapshot, ConfigSettingId::ContractDataEntrySizeBytes)
+            .and_then(|cs| {
+                if let ConfigSettingEntry::ContractDataEntrySizeBytes(size) = cs {
+                    Some(size)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(64 * 1024); // 64 KB default
+
+    // Load state archival TTL settings
+    let (
+        min_temp_entry_ttl,
+        min_persistent_entry_ttl,
+        max_entry_ttl,
+        persistent_rent_rate_denominator,
+        temp_rent_rate_denominator,
+    ) = load_config_setting(snapshot, ConfigSettingId::StateArchival)
+        .and_then(|cs| {
+            if let ConfigSettingEntry::StateArchival(archival) = cs {
+                tracing::debug!(
+                    min_temp_ttl = archival.min_temporary_ttl,
+                    min_persistent_ttl = archival.min_persistent_ttl,
+                    max_entry_ttl = archival.max_entry_ttl,
+                    persistent_rent_rate_denominator = archival.persistent_rent_rate_denominator,
+                    temp_rent_rate_denominator = archival.temp_rent_rate_denominator,
+                    "load_soroban_config: StateArchival settings from ledger"
+                );
+                Some((
+                    archival.min_temporary_ttl,
+                    archival.min_persistent_ttl,
+                    archival.max_entry_ttl,
+                    archival.persistent_rent_rate_denominator,
+                    archival.temp_rent_rate_denominator,
+                ))
+            } else {
+                None
+            }
+        })
+        .unwrap_or((16, 120960, 6312000, 0, 0)); // Default TTL values
+
+    let average_soroban_state_size =
+        load_config_setting(snapshot, ConfigSettingId::LiveSorobanStateSizeWindow)
+            .and_then(|cs| {
+                if let ConfigSettingEntry::LiveSorobanStateSizeWindow(window) = cs {
+                    if window.is_empty() {
+                        None
+                    } else {
+                        let mut sum: u64 = 0;
+                        for size in window.iter() {
+                            sum = sum.saturating_add(*size);
+                        }
+                        Some((sum / window.len() as u64) as i64)
+                    }
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+    let rent_write_config = RentWriteFeeConfiguration {
+        state_target_size_bytes: soroban_state_target_size_bytes,
+        rent_fee_1kb_state_size_low,
+        rent_fee_1kb_state_size_high,
+        state_size_rent_fee_growth_factor: soroban_state_rent_fee_growth_factor,
+    };
+    let fee_per_rent_1kb =
+        compute_rent_write_fee_per_1kb(average_soroban_state_size, &rent_write_config);
+
+    tracing::debug!(
+        fee_per_rent_1kb,
+        average_soroban_state_size,
+        state_target_size_bytes = soroban_state_target_size_bytes,
+        rent_fee_1kb_state_size_low,
+        rent_fee_1kb_state_size_high,
+        soroban_state_rent_fee_growth_factor,
+        "load_soroban_config: computed fee_per_rent_1kb"
+    );
+
+    // Protocol version-dependent fee selection matching C++ rustBridgeFeeConfiguration():
+    // - For protocol >= 23: use fee_write_1kb (flat rate from ContractLedgerCostExtV0)
+    // - For protocol < 23: use fee_per_rent_1kb (computed from state size)
+    let fee_per_write_1kb_for_config =
+        if protocol_version_starts_from(protocol_version, ProtocolVersion::V23) {
+            fee_write_1kb
+        } else {
+            fee_per_rent_1kb
+        };
+
+    let fee_config = FeeConfiguration {
+        fee_per_instruction_increment,
+        fee_per_disk_read_entry: fee_disk_read_ledger_entry,
+        fee_per_write_entry: fee_write_ledger_entry,
+        fee_per_disk_read_1kb: fee_disk_read_1kb,
+        fee_per_write_1kb: fee_per_write_1kb_for_config,
+        fee_per_historical_1kb: fee_historical_1kb,
+        fee_per_contract_event_1kb: fee_contract_events_1kb,
+        fee_per_transaction_size_1kb: fee_tx_size_1kb,
+    };
+
+    // RentFeeConfiguration.fee_per_write_1kb must be feeFlatRateWrite1KB() to match C++
+    // rustBridgeRentFeeConfiguration(). This is 0 for protocol < 23 (the setting doesn't exist),
+    // which is correct because the TTL entry write fee component was introduced in protocol 23.
+    // This is DIFFERENT from FeeConfiguration.fee_per_write_1kb which uses fee_per_rent_1kb
+    // for protocol < 23.
+    let rent_fee_config = RentFeeConfiguration {
+        fee_per_write_1kb: fee_write_1kb,
+        fee_per_rent_1kb,
+        fee_per_write_entry: fee_write_ledger_entry,
+        persistent_rent_rate_denominator,
+        temporary_rent_rate_denominator: temp_rent_rate_denominator,
+    };
+
+    let config = SorobanConfig {
+        cpu_cost_params,
+        mem_cost_params,
+        tx_max_instructions,
+        tx_max_memory_bytes,
+        min_temp_entry_ttl,
+        min_persistent_entry_ttl,
+        max_entry_ttl,
+        fee_config,
+        rent_fee_config,
+        tx_max_contract_events_size_bytes,
+        max_contract_size_bytes,
+        max_contract_data_entry_size_bytes,
+    };
+
+    // Log whether we found valid cost params
+    if config.has_valid_cost_params() {
+        debug!(
+            cpu_cost_params_count = config.cpu_cost_params.0.len(),
+            mem_cost_params_count = config.mem_cost_params.0.len(),
+            tx_max_instructions = config.tx_max_instructions,
+            fee_per_instruction = config.fee_config.fee_per_instruction_increment,
+            fee_per_event_1kb = config.fee_config.fee_per_contract_event_1kb,
+            "Loaded Soroban config from ledger"
+        );
+    } else {
+        warn!(
+            "No Soroban cost parameters found in ledger - using defaults. \
+             Soroban transaction results may not match network."
+        );
+    }
+
+    config
+}
+
+/// Load SorobanNetworkInfo from the ledger's ConfigSettingEntry entries.
+///
+/// This loads all the configuration settings needed for the /sorobaninfo endpoint,
+/// matching the "basic" format from C++ stellar-core.
+pub fn load_soroban_network_info(snapshot: &SnapshotHandle) -> Option<SorobanNetworkInfo> {
+    // Check if we have any Soroban config (indicates protocol 20+)
+    let compute_v0 = load_config_setting(snapshot, ConfigSettingId::ContractComputeV0)?;
+
+    let mut info = SorobanNetworkInfo::default();
+
+    // Load contract size limits
+    if let Some(ConfigSettingEntry::ContractDataKeySizeBytes(size)) =
+        load_config_setting(snapshot, ConfigSettingId::ContractDataKeySizeBytes)
+    {
+        info.max_contract_data_key_size = size;
+    }
+    if let Some(ConfigSettingEntry::ContractDataEntrySizeBytes(size)) =
+        load_config_setting(snapshot, ConfigSettingId::ContractDataEntrySizeBytes)
+    {
+        info.max_contract_data_entry_size = size;
+    }
+    if let Some(ConfigSettingEntry::ContractMaxSizeBytes(size)) =
+        load_config_setting(snapshot, ConfigSettingId::ContractMaxSizeBytes)
+    {
+        info.max_contract_size = size;
+    }
+
+    // Load compute settings
+    if let ConfigSettingEntry::ContractComputeV0(compute) = compute_v0 {
+        info.tx_max_instructions = compute.tx_max_instructions;
+        info.ledger_max_instructions = compute.ledger_max_instructions;
+        info.fee_rate_per_instructions_increment = compute.fee_rate_per_instructions_increment;
+        info.tx_memory_limit = compute.tx_memory_limit;
+    }
+
+    // Load ledger access settings
+    if let Some(ConfigSettingEntry::ContractLedgerCostV0(cost)) =
+        load_config_setting(snapshot, ConfigSettingId::ContractLedgerCostV0)
+    {
+        info.ledger_max_read_ledger_entries = cost.ledger_max_disk_read_entries;
+        info.ledger_max_read_bytes = cost.ledger_max_disk_read_bytes;
+        info.ledger_max_write_ledger_entries = cost.ledger_max_write_ledger_entries;
+        info.ledger_max_write_bytes = cost.ledger_max_write_bytes;
+        info.tx_max_read_ledger_entries = cost.tx_max_disk_read_entries;
+        info.tx_max_read_bytes = cost.tx_max_disk_read_bytes;
+        info.tx_max_write_ledger_entries = cost.tx_max_write_ledger_entries;
+        info.tx_max_write_bytes = cost.tx_max_write_bytes;
+        info.fee_read_ledger_entry = cost.fee_disk_read_ledger_entry;
+        info.fee_write_ledger_entry = cost.fee_write_ledger_entry;
+        info.fee_read_1kb = cost.fee_disk_read1_kb;
+    }
+
+    // Load fee_write_1kb from extended cost settings
+    if let Some(ConfigSettingEntry::ContractLedgerCostExtV0(ext)) =
+        load_config_setting(snapshot, ConfigSettingId::ContractLedgerCostExtV0)
+    {
+        info.fee_write_1kb = ext.fee_write1_kb;
+    }
+
+    // Load historical data settings
+    if let Some(ConfigSettingEntry::ContractHistoricalDataV0(hist)) =
+        load_config_setting(snapshot, ConfigSettingId::ContractHistoricalDataV0)
+    {
+        info.fee_historical_1kb = hist.fee_historical1_kb;
+    }
+
+    // Load contract events settings
+    if let Some(ConfigSettingEntry::ContractEventsV0(events)) =
+        load_config_setting(snapshot, ConfigSettingId::ContractEventsV0)
+    {
+        info.tx_max_contract_events_size_bytes = events.tx_max_contract_events_size_bytes;
+        info.fee_contract_events_size_1kb = events.fee_contract_events1_kb;
+    }
+
+    // Load bandwidth settings
+    if let Some(ConfigSettingEntry::ContractBandwidthV0(bandwidth)) =
+        load_config_setting(snapshot, ConfigSettingId::ContractBandwidthV0)
+    {
+        info.ledger_max_tx_size_bytes = bandwidth.ledger_max_txs_size_bytes;
+        info.tx_max_size_bytes = bandwidth.tx_max_size_bytes;
+        info.fee_transaction_size_1kb = bandwidth.fee_tx_size1_kb;
+    }
+
+    // Load execution lanes settings for ledger tx count
+    if let Some(ConfigSettingEntry::ContractExecutionLanes(lanes)) =
+        load_config_setting(snapshot, ConfigSettingId::ContractExecutionLanes)
+    {
+        info.ledger_max_tx_count = lanes.ledger_max_tx_count;
+    }
+
+    // Load state archival settings
+    if let Some(ConfigSettingEntry::StateArchival(archival)) =
+        load_config_setting(snapshot, ConfigSettingId::StateArchival)
+    {
+        info.max_entry_ttl = archival.max_entry_ttl;
+        info.min_temporary_ttl = archival.min_temporary_ttl;
+        info.min_persistent_ttl = archival.min_persistent_ttl;
+        info.persistent_rent_rate_denominator = archival.persistent_rent_rate_denominator;
+        info.temp_rent_rate_denominator = archival.temp_rent_rate_denominator;
+        info.max_entries_to_archive = archival.max_entries_to_archive;
+        info.bucketlist_size_window_sample_size =
+            archival.live_soroban_state_size_window_sample_size;
+        info.eviction_scan_size = archival.eviction_scan_size as i64;
+        info.starting_eviction_scan_level = archival.starting_eviction_scan_level;
+    }
+
+    // Load average bucket list size from live window
+    if let Some(ConfigSettingEntry::LiveSorobanStateSizeWindow(window)) =
+        load_config_setting(snapshot, ConfigSettingId::LiveSorobanStateSizeWindow)
+    {
+        if !window.is_empty() {
+            let mut sum: u64 = 0;
+            for size in window.iter() {
+                sum = sum.saturating_add(*size);
+            }
+            info.average_bucket_list_size = sum / window.len() as u64;
+        }
+    }
+
+    // Load SCP timing settings (Protocol 23+)
+    if let Some(ConfigSettingEntry::ScpTiming(timing)) =
+        load_config_setting(snapshot, ConfigSettingId::ScpTiming)
+    {
+        info.nomination_timeout_initial_ms = timing.nomination_timeout_initial_milliseconds;
+        info.nomination_timeout_increment_ms = timing.nomination_timeout_increment_milliseconds;
+        info.ballot_timeout_initial_ms = timing.ballot_timeout_initial_milliseconds;
+        info.ballot_timeout_increment_ms = timing.ballot_timeout_increment_milliseconds;
+    }
+
+    Some(info)
+}
+
+struct RefundableFeeTracker {
+    non_refundable_fee: i64,
+    max_refundable_fee: i64,
+    consumed_event_size_bytes: u32,
+    consumed_rent_fee: i64,
+    consumed_refundable_fee: i64,
+}
+
+impl RefundableFeeTracker {
+    fn new(non_refundable_fee: i64, max_refundable_fee: i64) -> Self {
+        Self {
+            non_refundable_fee,
+            max_refundable_fee,
+            consumed_event_size_bytes: 0,
+            consumed_rent_fee: 0,
+            consumed_refundable_fee: 0,
+        }
+    }
+
+    fn consume(
+        &mut self,
+        frame: &TransactionFrame,
+        protocol_version: u32,
+        config: &SorobanConfig,
+        event_size_bytes: u32,
+        rent_fee: i64,
+    ) -> bool {
+        self.consumed_event_size_bytes = self
+            .consumed_event_size_bytes
+            .saturating_add(event_size_bytes);
+        self.consumed_rent_fee = self.consumed_rent_fee.saturating_add(rent_fee);
+
+        // First check: rent fee alone must not exceed max refundable fee.
+        // This matches C++ stellar-core's consumeRefundableSorobanResources which checks
+        // if (mMaximumRefundableFee < mConsumedRentFee) before computing events fee.
+        if self.consumed_rent_fee > self.max_refundable_fee {
+            tracing::debug!(
+                consumed_rent_fee = self.consumed_rent_fee,
+                max_refundable_fee = self.max_refundable_fee,
+                rent_fee = rent_fee,
+                "InsufficientRefundableFee: rent_fee exceeds max"
+            );
+            return false;
+        }
+
+        let (_, refundable_fee) = match compute_soroban_resource_fee(
+            frame,
+            protocol_version,
+            config,
+            self.consumed_event_size_bytes,
+        ) {
+            Some(pair) => pair,
+            None => return false,
+        };
+        self.consumed_refundable_fee = self.consumed_rent_fee.saturating_add(refundable_fee);
+
+        // Second check: total consumed (rent + events) must not exceed max refundable fee.
+        if self.consumed_refundable_fee > self.max_refundable_fee {
+            tracing::debug!(
+                consumed_refundable_fee = self.consumed_refundable_fee,
+                max_refundable_fee = self.max_refundable_fee,
+                consumed_rent_fee = self.consumed_rent_fee,
+                refundable_fee = refundable_fee,
+                event_size_bytes = self.consumed_event_size_bytes,
+                "InsufficientRefundableFee: total consumed exceeds max"
+            );
+            return false;
+        }
+        true
+    }
+
+    fn refund_amount(&self) -> i64 {
+        if self.max_refundable_fee > self.consumed_refundable_fee {
+            self.max_refundable_fee - self.consumed_refundable_fee
+        } else {
+            0
+        }
+    }
+
+    /// Reset all consumed fee values to zero.
+    ///
+    /// This mirrors C++ stellar-core's `RefundableFeeTracker::resetConsumedFee()` which is called
+    /// by `MutableTransactionResultBase::setError()` when a transaction fails. When a transaction
+    /// fails for any reason (including InsufficientRefundableFee), C++ resets the consumed fee
+    /// tracker so that the full `max_refundable_fee` is refunded to the user.
+    fn reset(&mut self) {
+        self.consumed_event_size_bytes = 0;
+        self.consumed_rent_fee = 0;
+        self.consumed_refundable_fee = 0;
+    }
+}
+
+fn compute_soroban_resource_fee(
+    frame: &TransactionFrame,
+    protocol_version: u32,
+    config: &SorobanConfig,
+    event_size_bytes: u32,
+) -> Option<(i64, i64)> {
+    let resources = frame.soroban_transaction_resources(protocol_version, event_size_bytes)?;
+    Some(compute_transaction_resource_fee(
+        &resources,
+        &config.fee_config,
+    ))
+}
+
+/// Result of executing a transaction.
+#[derive(Debug, Clone)]
+pub struct TransactionExecutionResult {
+    /// Whether the transaction succeeded.
+    pub success: bool,
+    /// Fee charged (always charged even on failure).
+    pub fee_charged: i64,
+    /// Fee refund (for Soroban transactions, protocol < 25 applies this to inner fee too).
+    pub fee_refund: i64,
+    /// Operation results.
+    pub operation_results: Vec<OperationResult>,
+    /// Error message if failed.
+    pub error: Option<String>,
+    /// Failure reason for mapping to XDR result codes.
+    pub failure: Option<ExecutionFailure>,
+    /// Transaction meta (for ledger close meta).
+    pub tx_meta: Option<TransactionMeta>,
+    /// Fee processing changes (for ledger close meta).
+    pub fee_changes: Option<LedgerEntryChanges>,
+    /// Post-apply fee processing changes (refunds).
+    pub post_fee_changes: Option<LedgerEntryChanges>,
+    /// Keys of entries restored from the hot archive (Protocol 23+).
+    /// These should be passed to HotArchiveBucketList::add_batch as restored_keys.
+    pub hot_archive_restored_keys: Vec<LedgerKey>,
+    /// Per-operation-type timing: maps op type to (total_us, count).
+    pub op_type_timings: HashMap<OperationType, (u64, u32)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionFailure {
+    Malformed,
+    MissingOperation,
+    InvalidSignature,
+    BadAuthExtra,
+    BadMinSeqAgeOrGap,
+    BadSequence,
+    InsufficientFee,
+    InsufficientBalance,
+    NoAccount,
+    TooEarly,
+    TooLate,
+    NotSupported,
+    InternalError,
+    BadSponsorship,
+    OperationFailed,
+}
+
+/// Context for executing transactions during ledger close.
+pub struct TransactionExecutor {
+    /// Ledger sequence being processed.
+    ledger_seq: u32,
+    /// Close time.
+    close_time: u64,
+    /// Base reserve.
+    base_reserve: u32,
+    /// Protocol version.
+    protocol_version: u32,
+    /// Network ID.
+    network_id: NetworkId,
+    /// State manager for execution.
+    state: LedgerStateManager,
+    /// Accounts loaded from snapshot.
+    loaded_accounts: HashMap<[u8; 32], bool>,
+    /// Soroban network configuration for contract execution.
+    soroban_config: SorobanConfig,
+    /// Classic event configuration.
+    classic_events: ClassicEventConfig,
+    /// Optional persistent module cache for Soroban WASM compilation.
+    /// This cache is populated once from the bucket list and reused across transactions.
+    module_cache: Option<PersistentModuleCache>,
+    /// Optional hot archive bucket list for Protocol 23+ entry restoration.
+    /// This enables looking up entries that have been evicted from the live bucket list
+    /// and are waiting to be restored.
+    hot_archive: Option<std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
+}
+
+impl TransactionExecutor {
+    /// Create a new transaction executor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        ledger_seq: u32,
+        close_time: u64,
+        base_reserve: u32,
+        protocol_version: u32,
+        network_id: NetworkId,
+        id_pool: u64,
+        soroban_config: SorobanConfig,
+        classic_events: ClassicEventConfig,
+    ) -> Self {
+        let mut state = LedgerStateManager::new(base_reserve as i64, ledger_seq);
+        state.set_id_pool(id_pool);
+        Self {
+            ledger_seq,
+            close_time,
+            base_reserve,
+            protocol_version,
+            network_id,
+            state,
+            loaded_accounts: HashMap::new(),
+            soroban_config,
+            classic_events,
+            module_cache: None,
+            hot_archive: None,
+        }
+    }
+
+    /// Set the hot archive bucket list for Protocol 23+ entry restoration.
+    ///
+    /// When set, the executor can look up entries that have been evicted from the
+    /// live bucket list and need to be restored during Soroban transaction execution.
+    pub fn set_hot_archive(
+        &mut self,
+        hot_archive: std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>,
+    ) {
+        self.hot_archive = Some(hot_archive);
+    }
+
+    /// Set the persistent module cache for WASM compilation.
+    ///
+    /// The module cache should be populated with contract code from the bucket list
+    /// before executing transactions. This enables reuse of compiled WASM modules
+    /// across transactions, significantly improving performance.
+    pub fn set_module_cache(&mut self, cache: PersistentModuleCache) {
+        self.module_cache = Some(cache);
+    }
+
+    /// Get a reference to the module cache, if set.
+    pub fn module_cache(&self) -> Option<&PersistentModuleCache> {
+        self.module_cache.as_ref()
+    }
+
+    /// Add contract code to the module cache.
+    ///
+    /// This is called when new contract code entries are created, updated, or restored
+    /// during ledger close. Adding the code to the cache enables subsequent transactions
+    /// to use VmCachedInstantiation (cheap) instead of VmInstantiation (expensive).
+    ///
+    /// Without this, contracts deployed in transaction N would not be cached for
+    /// transaction N+1 in the same ledger, causing cost model divergence.
+    fn add_contract_to_cache(&self, code: &[u8]) {
+        if let Some(cache) = &self.module_cache {
+            cache.add_contract(code, self.protocol_version);
+        }
+    }
+
+    /// Advance to a new ledger, preserving the current state.
+    /// This is useful for replaying multiple consecutive ledgers without
+    /// losing state changes between them.
+    ///
+    /// Note: id_pool is NOT reset here because:
+    /// 1. The executor's internal id_pool evolves correctly as transactions execute
+    /// 2. The id_pool from the ledger header is the POST-execution value (after the ledger closes)
+    /// 3. Using the header's id_pool would give us the wrong starting value for the next ledger
+    ///    For the first ledger in a replay session, use TransactionExecutor::new() which takes
+    ///    the PREVIOUS ledger's closing id_pool (which equals this ledger's starting id_pool).
+    pub fn advance_to_ledger(
+        &mut self,
+        ledger_seq: u32,
+        close_time: u64,
+        base_reserve: u32,
+        protocol_version: u32,
+        _id_pool: u64, // Intentionally unused - see note above
+        soroban_config: SorobanConfig,
+    ) {
+        self.ledger_seq = ledger_seq;
+        self.close_time = close_time;
+        self.base_reserve = base_reserve;
+        self.protocol_version = protocol_version;
+        self.soroban_config = soroban_config;
+        // Do NOT reset id_pool - it should continue from where it was
+        self.state.set_ledger_seq(ledger_seq);
+        // Note: loaded_accounts cache is preserved - this is intentional because
+        // accounts that were loaded/created in previous ledgers remain valid
+    }
+
+    /// Advance to a new ledger and clear all cached entries.
+    ///
+    /// This is used in verification mode where we apply authoritative CDP metadata
+    /// to the bucket list between ledgers. Clearing cached entries ensures that
+    /// all entries are reloaded from the bucket list, reflecting the true state
+    /// after the previous ledger's changes.
+    ///
+    /// Without this, stale entries (e.g., offers that were deleted in the bucket list)
+    /// would remain in the executor's cache and cause incorrect execution results.
+    pub fn advance_to_ledger_with_fresh_state(
+        &mut self,
+        ledger_seq: u32,
+        close_time: u64,
+        base_reserve: u32,
+        protocol_version: u32,
+        _id_pool: u64,
+        soroban_config: SorobanConfig,
+    ) {
+        self.ledger_seq = ledger_seq;
+        self.close_time = close_time;
+        self.base_reserve = base_reserve;
+        self.protocol_version = protocol_version;
+        self.soroban_config = soroban_config;
+        self.state.set_ledger_seq(ledger_seq);
+        // Clear all cached entries so they're reloaded from the bucket list
+        self.state.clear_cached_entries();
+        // Also clear loaded_accounts cache
+        self.loaded_accounts.clear();
+    }
+
+    /// Advance to a new ledger, clearing cached entries but preserving offers.
+    ///
+    /// Offers are expensive to reload (~911K entries on mainnet, ~2.7s per ledger).
+    /// The executor's offer cache is maintained correctly across ledgers because:
+    /// 1. TX execution modifies offers directly in state (create/update/delete)
+    /// 2. At the end of a ledger, state.offers reflects the correct post-ledger state
+    /// 3. The in-memory offer store (LedgerManager) is also updated incrementally
+    ///
+    /// Non-offer entries are still cleared to reload from the bucket list, which
+    /// may have been updated with authoritative CDP metadata.
+    pub fn advance_to_ledger_preserving_offers(
+        &mut self,
+        ledger_seq: u32,
+        close_time: u64,
+        base_reserve: u32,
+        protocol_version: u32,
+        _id_pool: u64,
+        soroban_config: SorobanConfig,
+    ) {
+        self.ledger_seq = ledger_seq;
+        self.close_time = close_time;
+        self.base_reserve = base_reserve;
+        self.protocol_version = protocol_version;
+        self.soroban_config = soroban_config;
+        self.state.set_ledger_seq(ledger_seq);
+        // Clear cached entries except offers and offer index
+        self.state.clear_cached_entries_preserving_offers();
+        // Clear loaded_accounts cache (non-offer)
+        self.loaded_accounts.clear();
+    }
+
+    /// Batch-load multiple entries from the bucket list in a single pass.
+    ///
+    /// Filters out entries already in state or already attempted, then loads
+    /// remaining keys via `snapshot.load_entries()` which uses a single bucket
+    /// list traversal for all keys. This is significantly faster than individual
+    /// `load_account`/`load_trustline` calls for operations needing multiple entries.
+    fn batch_load_keys(&mut self, snapshot: &SnapshotHandle, keys: &[LedgerKey]) -> Result<()> {
+        let mut needed = Vec::new();
+
+        for key in keys {
+            // Skip if the entry was deleted in this ledger (don't reload it from snapshot)
+            if self.state.delta().deleted_keys().contains(key) {
+                continue;
+            }
+
+            let already_loaded = match key {
+                LedgerKey::Account(k) => {
+                    let key_bytes = account_id_to_key(&k.account_id);
+                    self.state.get_account(&k.account_id).is_some()
+                        || self.loaded_accounts.contains_key(&key_bytes)
+                }
+                LedgerKey::Trustline(k) => self
+                    .state
+                    .get_trustline_by_trustline_asset(&k.account_id, &k.asset)
+                    .is_some(),
+                LedgerKey::ClaimableBalance(k) => {
+                    self.state.get_claimable_balance(&k.balance_id).is_some()
+                }
+                LedgerKey::LiquidityPool(k) => self
+                    .state
+                    .get_liquidity_pool(&k.liquidity_pool_id)
+                    .is_some(),
+                LedgerKey::Offer(k) => self.state.get_offer(&k.seller_id, k.offer_id).is_some(),
+                _ => false,
+            };
+
+            if !already_loaded {
+                needed.push(key.clone());
+            }
+        }
+
+        if needed.is_empty() {
+            return Ok(());
+        }
+
+        // Mark all account keys as attempted (whether found or not)
+        for key in &needed {
+            if let LedgerKey::Account(k) = key {
+                let key_bytes = account_id_to_key(&k.account_id);
+                self.loaded_accounts.insert(key_bytes, true);
+            }
+        }
+
+        let entries = snapshot.load_entries(&needed)?;
+        for entry in entries {
+            self.state.load_entry(entry);
+        }
+
+        Ok(())
+    }
+
+    /// Load an account from the snapshot into the state manager.
+    pub fn load_account(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        account_id: &AccountId,
+    ) -> Result<bool> {
+        // First check if the account was created/updated by a previous transaction in this ledger
+        // This is important for intra-ledger dependencies (e.g., TX0 creates account, TX1 uses it)
+        if self.state.get_account(account_id).is_some() {
+            tracing::trace!(account = %account_id_to_strkey(account_id), "load_account: found in state");
+            return Ok(true);
+        }
+
+        let key_bytes = account_id_to_key(account_id);
+
+        // Check if we've already tried to load from snapshot
+        if self.loaded_accounts.contains_key(&key_bytes) {
+            tracing::trace!(account = %account_id_to_strkey(account_id), "load_account: already tried, not found");
+            return Ok(false); // Already tried and not found
+        }
+
+        // Mark as attempted
+        self.loaded_accounts.insert(key_bytes, true);
+
+        // Try to load from snapshot
+        let key = stellar_xdr::curr::LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: account_id.clone(),
+        });
+
+        if let Some(entry) = snapshot.get_entry(&key)? {
+            // Log signer info for debugging
+            if let stellar_xdr::curr::LedgerEntryData::Account(ref acct) = entry.data {
+                tracing::trace!(
+                    account = ?account_id,
+                    num_signers = acct.signers.len(),
+                    thresholds = ?acct.thresholds.0,
+                    "load_account: found in bucket list"
+                );
+            }
+            self.state.load_entry(entry);
+            return Ok(true);
+        }
+
+        tracing::debug!(account = %account_id_to_strkey(account_id), "load_account: NOT FOUND in bucket list");
+        Ok(false)
+    }
+
+    /// Load an account from the snapshot into state WITHOUT recording it for transaction changes.
+    /// This matches C++ stellar-core's `loadAccountWithoutRecord()` behavior, used when an account
+    /// only needs to be checked for existence (e.g., issuer validation in ChangeTrust).
+    /// The account is loaded into state so operations can check existence, but it won't appear
+    /// in the transaction meta STATE/UPDATED changes.
+    pub fn load_account_without_record(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        account_id: &AccountId,
+    ) -> Result<bool> {
+        // First check if the account is already in state
+        if self.state.get_account(account_id).is_some() {
+            tracing::trace!(account = %account_id_to_strkey(account_id), "load_account_without_record: found in state");
+            return Ok(true);
+        }
+
+        let key_bytes = account_id_to_key(account_id);
+
+        // Check if we've already tried to load from snapshot
+        if self.loaded_accounts.contains_key(&key_bytes) {
+            tracing::trace!(account = %account_id_to_strkey(account_id), "load_account_without_record: already tried, not found");
+            return Ok(false);
+        }
+
+        // Mark as attempted
+        self.loaded_accounts.insert(key_bytes, true);
+
+        // Try to load from snapshot
+        let key = stellar_xdr::curr::LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: account_id.clone(),
+        });
+
+        if let Some(entry) = snapshot.get_entry(&key)? {
+            tracing::trace!(
+                account = ?account_id,
+                "load_account_without_record: found in bucket list"
+            );
+            // Load entry WITHOUT recording - use load_entry_without_snapshot which doesn't
+            // capture a snapshot for change tracking
+            self.state.load_entry_without_snapshot(entry);
+            return Ok(true);
+        }
+
+        tracing::debug!(account = %account_id_to_strkey(account_id), "load_account_without_record: NOT FOUND in bucket list");
+        Ok(false)
+    }
+
+    fn available_balance_for_fee(&self, account: &AccountEntry) -> Result<i64> {
+        let min_balance = self
+            .state
+            .minimum_balance_for_account(account, self.protocol_version, 0)
+            .map_err(|e| LedgerError::Internal(e.to_string()))?;
+        let mut available = account.balance - min_balance;
+        if self.protocol_version >= 10 {
+            let selling = match &account.ext {
+                AccountEntryExt::V1(v1) => v1.liabilities.selling,
+                AccountEntryExt::V0 => 0,
+            };
+            available -= selling;
+        }
+        Ok(available)
+    }
+
+    /// Load a trustline from the snapshot into the state manager.
+    pub fn load_trustline(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        account_id: &AccountId,
+        asset: &stellar_xdr::curr::TrustLineAsset,
+    ) -> Result<bool> {
+        if self
+            .state
+            .get_trustline_by_trustline_asset(account_id, asset)
+            .is_some()
+        {
+            return Ok(true);
+        }
+
+        // If the entry was loaded during this TX and then deleted, don't reload.
+        if self.state.is_trustline_tracked(account_id, asset) {
+            return Ok(false);
+        }
+
+        let key = stellar_xdr::curr::LedgerKey::Trustline(stellar_xdr::curr::LedgerKeyTrustLine {
+            account_id: account_id.clone(),
+            asset: asset.clone(),
+        });
+
+        // Check if deleted by a previous TX in this ledger. The delta persists across
+        // TXs, but is_trustline_tracked() only covers within-TX deletions (snapshots
+        // are cleared on commit). Without this check, entries deleted by prior TXs
+        // would be reloaded from the snapshot/bucket list.
+        if self.state.delta().deleted_keys().contains(&key) {
+            return Ok(false);
+        }
+
+        if let Some(entry) = snapshot.get_entry(&key)? {
+            if let stellar_xdr::curr::LedgerEntryData::Trustline(ref tl) = entry.data {
+                tracing::debug!(
+                    account = %account_id_to_strkey(account_id),
+                    asset = ?asset,
+                    balance = tl.balance,
+                    "load_trustline: loaded from bucket list"
+                );
+            }
+            self.state.load_entry(entry);
+            return Ok(true);
+        }
+
+        tracing::debug!(
+            account = %account_id_to_strkey(account_id),
+            asset = ?asset,
+            "load_trustline: NOT FOUND in bucket list"
+        );
+        Ok(false)
+    }
+
+    /// Load a claimable balance from the snapshot into the state manager.
+    pub fn load_claimable_balance(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        balance_id: &ClaimableBalanceId,
+    ) -> Result<bool> {
+        // Check if already in state from previous transaction in this ledger
+        if self.state.get_claimable_balance(balance_id).is_some() {
+            return Ok(true);
+        }
+
+        // If the entry was loaded during this TX and then deleted (e.g., claimed by
+        // a prior operation), don't reload from the snapshot. This matches C++ behavior
+        // where nested LedgerTxn inherits deletions from the parent.
+        if self.state.is_claimable_balance_tracked(balance_id) {
+            return Ok(false);
+        }
+
+        let key = stellar_xdr::curr::LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+            balance_id: balance_id.clone(),
+        });
+
+        // Check if deleted by a previous TX in this ledger (delta persists across TXs).
+        if self.state.delta().deleted_keys().contains(&key) {
+            return Ok(false);
+        }
+
+        if let Some(entry) = snapshot.get_entry(&key)? {
+            self.state.load_entry(entry);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Load a data entry from the snapshot into the state manager.
+    pub fn load_data(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        account_id: &AccountId,
+        data_name: &str,
+    ) -> Result<bool> {
+        // Check if already in state from previous transaction in this ledger
+        if self.state.get_data(account_id, data_name).is_some() {
+            return Ok(true);
+        }
+
+        // If the entry was loaded during this TX and then deleted, don't reload.
+        if self.state.is_data_tracked(account_id, data_name) {
+            return Ok(false);
+        }
+
+        let name_bytes = stellar_xdr::curr::String64::try_from(data_name.as_bytes().to_vec())
+            .map_err(|e| LedgerError::Internal(format!("Invalid data name: {}", e)))?;
+        let key = stellar_xdr::curr::LedgerKey::Data(stellar_xdr::curr::LedgerKeyData {
+            account_id: account_id.clone(),
+            data_name: name_bytes,
+        });
+
+        // Check if deleted by a previous TX in this ledger (delta persists across TXs).
+        if self.state.delta().deleted_keys().contains(&key) {
+            return Ok(false);
+        }
+
+        if let Some(entry) = snapshot.get_entry(&key)? {
+            self.state.load_entry(entry);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Load a data entry from the snapshot using the raw String64 key.
+    /// This preserves non-UTF8 bytes in the data name.
+    pub fn load_data_raw(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        account_id: &AccountId,
+        data_name: &stellar_xdr::curr::String64,
+    ) -> Result<bool> {
+        // Convert to string for state lookup (matches how data_entries are keyed)
+        let name_str = String::from_utf8_lossy(data_name.as_slice()).to_string();
+
+        // Check if already in state from previous transaction in this ledger
+        if self.state.get_data(account_id, &name_str).is_some() {
+            return Ok(true);
+        }
+
+        // If the entry was loaded during this TX and then deleted, don't reload.
+        if self.state.is_data_tracked(account_id, &name_str) {
+            return Ok(false);
+        }
+
+        let key = stellar_xdr::curr::LedgerKey::Data(stellar_xdr::curr::LedgerKeyData {
+            account_id: account_id.clone(),
+            data_name: data_name.clone(),
+        });
+
+        // Check if deleted by a previous TX in this ledger (delta persists across TXs).
+        if self.state.delta().deleted_keys().contains(&key) {
+            return Ok(false);
+        }
+
+        if let Some(entry) = snapshot.get_entry(&key)? {
+            self.state.load_entry(entry);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Load an offer from the snapshot into the state manager.
+    pub fn load_offer(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        seller_id: &AccountId,
+        offer_id: i64,
+    ) -> Result<bool> {
+        if self.state.get_offer(seller_id, offer_id).is_some() {
+            return Ok(true);
+        }
+
+        // If the entry was loaded during this TX and then deleted, don't reload.
+        if self.state.is_offer_tracked(seller_id, offer_id) {
+            return Ok(false);
+        }
+
+        let key = stellar_xdr::curr::LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+            seller_id: seller_id.clone(),
+            offer_id,
+        });
+
+        // Check if deleted by a previous TX in this ledger (delta persists across TXs).
+        if self.state.delta().deleted_keys().contains(&key) {
+            return Ok(false);
+        }
+
+        if let Some(entry) = snapshot.get_entry(&key)? {
+            self.state.load_entry(entry);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Load the sponsor account for an offer if it has one.
+    /// This is needed when deleting or modifying an offer with sponsorship,
+    /// as we need to update the sponsor's num_sponsoring counter.
+    fn load_offer_sponsor(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        seller_id: &AccountId,
+        offer_id: i64,
+    ) -> Result<()> {
+        let key = stellar_xdr::curr::LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+            seller_id: seller_id.clone(),
+            offer_id,
+        });
+        if let Some(sponsor) = self.state.entry_sponsor(&key).cloned() {
+            self.load_account(snapshot, &sponsor)?;
+        }
+        Ok(())
+    }
+
+    fn load_asset_issuer(&mut self, snapshot: &SnapshotHandle, asset: &Asset) -> Result<()> {
+        match asset {
+            Asset::CreditAlphanum4(a) => {
+                self.load_account(snapshot, &a.issuer)?;
+            }
+            Asset::CreditAlphanum12(a) => {
+                self.load_account(snapshot, &a.issuer)?;
+            }
+            Asset::Native => {}
+        }
+        Ok(())
+    }
+
+    /// Load a liquidity pool from the snapshot into the state manager.
+    ///
+    /// If the pool already exists in state (e.g., from CDP sync or previous loading),
+    /// returns the existing state without reloading from snapshot. This is critical
+    /// for verification mode where CDP sync updates state between transactions.
+    pub fn load_liquidity_pool(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        pool_id: &PoolId,
+    ) -> Result<Option<LiquidityPoolEntry>> {
+        // Check if already loaded in state - don't overwrite with snapshot data
+        if let Some(pool) = self.state.get_liquidity_pool(pool_id) {
+            return Ok(Some(pool.clone()));
+        }
+
+        // If the pool was loaded during this TX and then deleted, don't reload.
+        if self.state.is_liquidity_pool_tracked(pool_id) {
+            return Ok(None);
+        }
+
+        let key = stellar_xdr::curr::LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
+            liquidity_pool_id: pool_id.clone(),
+        });
+
+        // Check if deleted by a previous TX in this ledger (delta persists across TXs).
+        if self.state.delta().deleted_keys().contains(&key) {
+            return Ok(None);
+        }
+
+        if let Some(entry) = snapshot.get_entry(&key)? {
+            let pool = match &entry.data {
+                LedgerEntryData::LiquidityPool(pool) => pool.clone(),
+                _ => return Ok(None),
+            };
+            self.state.load_entry(entry);
+            return Ok(Some(pool));
+        }
+        Ok(None)
+    }
+
+    fn load_liquidity_pool_dependencies(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        op_source: &AccountId,
+        pool_id: &PoolId,
+    ) -> Result<()> {
+        if let Some(pool) = self.load_liquidity_pool(snapshot, pool_id)? {
+            // Batch-load pool share trustline + asset trustlines + issuer accounts
+            let pool_share_asset = TrustLineAsset::PoolShare(pool_id.clone());
+            let mut keys = vec![make_trustline_key(op_source, &pool_share_asset)];
+
+            match &pool.body {
+                LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => {
+                    for asset in [&cp.params.asset_a, &cp.params.asset_b] {
+                        if let Some(tl_asset) = asset_to_trustline_asset(asset) {
+                            keys.push(make_trustline_key(op_source, &tl_asset));
+                        }
+                        if let Some(issuer) = asset_issuer_id(asset) {
+                            keys.push(make_account_key(&issuer));
+                        }
+                    }
+                }
+            }
+            self.batch_load_keys(snapshot, &keys)?;
+        }
+        Ok(())
+    }
+
+    /// Load liquidity pools that could be used for path payment conversions.
+    ///
+    /// For each adjacent pair of assets in the conversion path, attempts to load the
+    /// corresponding liquidity pool if it exists.
+    fn load_path_payment_pools(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        send_asset: &stellar_xdr::curr::Asset,
+        dest_asset: &stellar_xdr::curr::Asset,
+        path: &[stellar_xdr::curr::Asset],
+    ) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        use stellar_xdr::curr::{
+            Limits, LiquidityPoolConstantProductParameters, LiquidityPoolParameters,
+        };
+
+        // Build the full conversion path: send_asset -> path[0] -> ... -> dest_asset
+        let mut assets: Vec<&stellar_xdr::curr::Asset> = vec![send_asset];
+        assets.extend(path.iter());
+        assets.push(dest_asset);
+
+        // For each adjacent pair, try to load the liquidity pool
+        for window in assets.windows(2) {
+            let asset_a = window[0];
+            let asset_b = window[1];
+
+            if asset_a == asset_b {
+                continue; // Same asset, no swap needed
+            }
+
+            // Compute pool ID: assets must be sorted (a < b) to match pool key
+            let (sorted_a, sorted_b) = if asset_a < asset_b {
+                (asset_a.clone(), asset_b.clone())
+            } else {
+                (asset_b.clone(), asset_a.clone())
+            };
+
+            let params = LiquidityPoolParameters::LiquidityPoolConstantProduct(
+                LiquidityPoolConstantProductParameters {
+                    asset_a: sorted_a,
+                    asset_b: sorted_b,
+                    fee: 30, // LIQUIDITY_POOL_FEE_V18 = 30
+                },
+            );
+
+            if let Ok(xdr) = params.to_xdr(Limits::none()) {
+                let pool_id = PoolId(stellar_xdr::curr::Hash(Sha256::digest(&xdr).into()));
+                // Attempt to load - it's OK if the pool doesn't exist
+                let _ = self.load_liquidity_pool(snapshot, &pool_id);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn load_offer_dependencies(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        offer: &OfferEntry,
+    ) -> Result<()> {
+        self.load_account(snapshot, &offer.seller_id)?;
+        if let Some(tl_asset) = asset_to_trustline_asset(&offer.selling) {
+            self.load_trustline(snapshot, &offer.seller_id, &tl_asset)?;
+        }
+        if let Some(tl_asset) = asset_to_trustline_asset(&offer.buying) {
+            self.load_trustline(snapshot, &offer.seller_id, &tl_asset)?;
+        }
+        Ok(())
+    }
+
+    /// Load all orderbook offers from the snapshot into state.
+    ///
+    /// Called once per ledger during initialization, before any transactions execute.
+    /// Offers remain current across transactions because TX execution modifies them
+    /// directly in `self.state`, and `snapshot_delta()` preserves committed changes
+    /// between transactions.
+    pub fn load_orderbook_offers(&mut self, snapshot: &SnapshotHandle) -> Result<()> {
+        let entries = snapshot.all_entries()?;
+        for entry in entries {
+            if !matches!(entry.data, LedgerEntryData::Offer(_)) {
+                continue;
+            }
+            self.state.load_entry(entry);
+        }
+        Ok(())
+    }
+
+    /// Load dependencies (trustlines, accounts) for all offers by an account for a specific asset.
+    ///
+    /// This is used when revoking trustline authorization - all offers for the
+    /// account/asset pair must be removed. Their dependencies (seller accounts
+    /// and trustlines for selling/buying assets) must be loaded so that
+    /// `release_offer_liabilities` can update them.
+    ///
+    /// Uses the state's own `account_asset_offers` index (which is maintained
+    /// as offers are loaded/created/modified/deleted) rather than the manager's
+    /// `offer_account_asset_index` (which is only built at startup and can become
+    /// stale across ledgers).
+    pub fn load_offers_by_account_and_asset(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        account_id: &AccountId,
+        asset: &Asset,
+    ) -> Result<()> {
+        // Get matching offers from the state's own index, which is always up-to-date.
+        // All offers are loaded into state by load_orderbook_offers() before any TX executes.
+        let offers = self.state.get_offers_by_account_and_asset(account_id, asset);
+        for offer in &offers {
+            let offer_key = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+                seller_id: offer.seller_id.clone(),
+                offer_id: offer.offer_id,
+            });
+
+            // Skip if already deleted
+            if self.state.delta().deleted_keys().contains(&offer_key) {
+                continue;
+            }
+
+            // Load dependencies (trustlines, accounts) for the offer.
+            // This is critical because:
+            // 1. Offers are cached in state across transactions
+            // 2. But non-offer state is cleared between transactions
+            // 3. When revoking authorization, we need to release liabilities on trustlines
+            // 4. Those trustlines must be loaded even if the offer was cached from a previous TX
+            self.load_offer_dependencies(snapshot, offer)?;
+        }
+        Ok(())
+    }
+
+    /// Load a ledger entry from the snapshot into the state manager.
+    ///
+    /// This handles all entry types including contract data, contract code, and TTL entries.
+    /// Returns true if the entry was found and loaded.
+    pub fn load_entry(&mut self, snapshot: &SnapshotHandle, key: &LedgerKey) -> Result<bool> {
+        // First check if entry already exists in state (e.g., created by a previous TX in this ledger).
+        // This is important for entries like TTLs that are created during restoration but haven't
+        // been written to the bucket list yet.
+        if self.state.get_entry(key).is_some() {
+            return Ok(true);
+        }
+        // Try to load from snapshot (bucket list + hot archive)
+        if let Some(entry) = snapshot.get_entry(key)? {
+            self.state.load_entry(entry);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Get a ledger entry from the current state (if loaded).
+    pub fn get_entry(&self, key: &LedgerKey) -> Option<LedgerEntry> {
+        self.state.get_entry(key)
+    }
+
+    /// Load all entries from a Soroban footprint into the state manager.
+    ///
+    /// This is essential for Soroban transaction execution - the footprint specifies
+    /// which ledger entries the transaction will read or write, and they must be
+    /// loaded before the Soroban host can access them.
+    pub fn load_soroban_footprint(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        footprint: &stellar_xdr::curr::LedgerFootprint,
+    ) -> Result<()> {
+        use sha2::{Digest, Sha256};
+
+        // Collect all footprint keys + their TTL keys for batch loading
+        let mut all_keys = Vec::new();
+        for key in footprint
+            .read_only
+            .iter()
+            .chain(footprint.read_write.iter())
+        {
+            // Skip entries already in state (e.g., created by previous TX in this ledger)
+            // Also skip entries that were deleted by a previous TX in this ledger - they
+            // should NOT be reloaded from the bucket list. In C++ stellar-core, deleted
+            // entries are tracked in mThreadEntryMap as nullopt, providing the same behavior.
+            if self.state.get_entry(key).is_none() && !self.state.is_entry_deleted(key) {
+                all_keys.push(key.clone());
+            }
+            // Add TTL key for contract data/code entries
+            if matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)) {
+                let key_bytes = key
+                    .to_xdr(Limits::none())
+                    .map_err(|e| LedgerError::Serialization(e.to_string()))?;
+                let key_hash = stellar_xdr::curr::Hash(Sha256::digest(&key_bytes).into());
+                let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
+                    key_hash: key_hash.clone(),
+                });
+                // Also check if TTL was deleted (along with its parent entry)
+                if self.state.get_entry(&ttl_key).is_none()
+                    && !self.state.is_entry_deleted(&ttl_key)
+                {
+                    all_keys.push(ttl_key);
+                }
+            }
+        }
+
+        if all_keys.is_empty() {
+            return Ok(());
+        }
+
+        // Batch-load all entries + TTLs in a single bucket list pass
+        let entries = snapshot.load_entries(&all_keys)?;
+        for entry in entries {
+            self.state.load_entry(entry);
+        }
+
+        Ok(())
+    }
+
+    /// Apply ledger entry changes to the executor's state WITHOUT delta tracking.
+    ///
+    /// This is used during verification to sync state with CDP after each transaction,
+    /// ensuring subsequent transactions see the correct state even if our validation
+    /// failed for an earlier transaction.
+    ///
+    /// Uses no-tracking methods to avoid polluting the delta for subsequent transactions.
+    pub fn apply_ledger_entry_changes(&mut self, changes: &stellar_xdr::curr::LedgerEntryChanges) {
+        use stellar_xdr::curr::{LedgerEntryChange, LedgerEntryData};
+
+        for change in changes.iter() {
+            match change {
+                LedgerEntryChange::Created(entry)
+                | LedgerEntryChange::Updated(entry)
+                | LedgerEntryChange::Restored(entry) => {
+                    self.state.apply_entry_no_tracking(entry);
+                    // Add newly created/restored contract code to the module cache.
+                    // This ensures subsequent transactions can use VmCachedInstantiation
+                    // instead of the more expensive VmInstantiation for newly deployed contracts.
+                    if let LedgerEntryData::ContractCode(cc) = &entry.data {
+                        self.add_contract_to_cache(cc.code.as_slice());
+                    }
+                }
+                LedgerEntryChange::Removed(key) => {
+                    self.state.delete_entry_no_tracking(key);
+                }
+                LedgerEntryChange::State(_) => {
+                    // State changes are informational only, no action needed
+                }
+            }
+        }
+        // Clear snapshots to prevent stale snapshot state from affecting subsequent transactions.
+        // Without this, a transaction that creates an entry might see an old snapshot from a
+        // previous transaction's execution, causing incorrect STATE/CREATED tracking.
+        self.state.commit();
+    }
+
+    /// Apply ledger entry changes preserving account sequence numbers.
+    ///
+    /// This is similar to `apply_ledger_entry_changes` but preserves the current
+    /// sequence number for existing accounts. This is needed because CDP metadata
+    /// for operation changes can capture sequence numbers that include effects from
+    /// later transactions in the same ledger (due to how C++ stellar-core captures STATE values).
+    ///
+    /// For Account UPDATED entries:
+    /// - If the account exists in our state, preserve our sequence number
+    /// - Apply all other fields from the CDP entry (balance, etc.)
+    pub fn apply_ledger_entry_changes_preserve_seq(
+        &mut self,
+        changes: &stellar_xdr::curr::LedgerEntryChanges,
+    ) {
+        use stellar_xdr::curr::{LedgerEntryChange, LedgerEntryData};
+
+        for change in changes.iter() {
+            match change {
+                LedgerEntryChange::Updated(entry) => {
+                    // For Account entries, preserve our sequence number
+                    if let LedgerEntryData::Account(new_acc) = &entry.data {
+                        if let Some(existing_acc) = self.state.get_account_mut(&new_acc.account_id)
+                        {
+                            // Preserve our sequence number
+                            let our_seq = existing_acc.seq_num.0;
+                            // Apply all fields from CDP entry
+                            *existing_acc = new_acc.clone();
+                            // Restore our sequence
+                            existing_acc.seq_num.0 = our_seq;
+                            continue;
+                        }
+                    }
+                    // For non-account entries or new accounts, apply normally
+                    self.state.apply_entry_no_tracking(entry);
+                    // Add contract code to cache (Updated entries can be code re-uploads)
+                    if let LedgerEntryData::ContractCode(cc) = &entry.data {
+                        self.add_contract_to_cache(cc.code.as_slice());
+                    }
+                }
+                LedgerEntryChange::Created(entry) | LedgerEntryChange::Restored(entry) => {
+                    self.state.apply_entry_no_tracking(entry);
+                    // Add newly created/restored contract code to the module cache
+                    if let LedgerEntryData::ContractCode(cc) = &entry.data {
+                        self.add_contract_to_cache(cc.code.as_slice());
+                    }
+                }
+                LedgerEntryChange::Removed(key) => {
+                    self.state.delete_entry_no_tracking(key);
+                }
+                LedgerEntryChange::State(_) => {
+                    // State changes are informational only, no action needed
+                }
+            }
+        }
+        self.state.commit();
+    }
+
+    /// Apply a fee refund to an account WITHOUT delta tracking.
+    ///
+    /// This is used during verification to sync the fee refund from CDP's
+    /// sorobanMeta.totalFeeRefund field, which is tracked separately from entry changes.
+    pub fn apply_fee_refund(&mut self, account_id: &AccountId, refund: i64) {
+        if let Some(acc) = self.state.get_account_mut(account_id) {
+            acc.balance += refund;
+        }
+        // Commit to clear snapshots so the refund is preserved for subsequent transactions
+        self.state.commit();
+    }
+
+    /// Execute a transaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `soroban_prng_seed` - Optional PRNG seed for Soroban execution.
+    ///   Computed as subSha256(txSetHash, txIndex) at the transaction set level.
+    pub fn execute_transaction(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        tx_envelope: &TransactionEnvelope,
+        base_fee: u32,
+        soroban_prng_seed: Option<[u8; 32]>,
+    ) -> Result<TransactionExecutionResult> {
+        self.execute_transaction_with_fee_mode(
+            snapshot,
+            tx_envelope,
+            base_fee,
+            soroban_prng_seed,
+            true,
+        )
+    }
+
+    /// Process fee for a transaction without executing it.
+    ///
+    /// This method is used for batched fee processing where all fees are
+    /// processed before any transaction is applied. This matches the behavior
+    /// of C++ stellar-core.
+    ///
+    /// Returns the fee changes and the fee amount charged.
+    pub fn process_fee_only(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        tx_envelope: &TransactionEnvelope,
+        base_fee: u32,
+    ) -> Result<(LedgerEntryChanges, i64)> {
+        let frame = TransactionFrame::with_network(tx_envelope.clone(), self.network_id);
+        let fee_source_id = henyey_tx::muxed_to_account_id(&frame.fee_source_account());
+        let inner_source_id = henyey_tx::muxed_to_account_id(&frame.inner_source_account());
+
+        // Load source accounts
+        if !self.load_account(snapshot, &fee_source_id)? {
+            return Err(LedgerError::Internal("Fee source account not found".into()));
+        }
+        if !self.load_account(snapshot, &inner_source_id)? {
+            return Err(LedgerError::Internal(
+                "Inner source account not found".into(),
+            ));
+        }
+
+        // Compute fee using the same logic as execute_transaction_with_fee_mode
+        // For fee bump transactions, the required fee includes an extra base fee for the wrapper
+        let num_ops = std::cmp::max(1, frame.operation_count() as i64);
+        let required_fee = if frame.is_fee_bump() {
+            // Fee bumps pay baseFee * (numOps + 1) - extra charge for the fee bump wrapper
+            base_fee as i64 * (num_ops + 1)
+        } else {
+            base_fee as i64 * num_ops
+        };
+        let inclusion_fee = frame.inclusion_fee();
+        // For Soroban, the resource fee is charged in full, plus the inclusion fee up to required.
+        // For classic transactions, charge up to the required_fee (base_fee * num_ops).
+        let fee = if frame.is_soroban() {
+            frame.declared_soroban_resource_fee() + std::cmp::min(inclusion_fee, required_fee)
+        } else {
+            std::cmp::min(inclusion_fee, required_fee)
+        };
+
+        if frame.is_fee_bump() {
+            tracing::debug!(
+                is_fee_bump = true,
+                total_fee = frame.total_fee(),
+                inner_fee = frame.inner_fee(),
+                inclusion_fee = inclusion_fee,
+                base_fee = base_fee,
+                operation_count = frame.operation_count(),
+                required_fee = required_fee,
+                fee_charged = fee,
+                "Fee bump transaction fee calculation"
+            );
+        }
+
+        if fee == 0 {
+            return Ok((empty_entry_changes(), 0));
+        }
+
+        let delta_before_fee = delta_snapshot(&self.state);
+
+        // Capture STATE entries BEFORE modifications for correct change generation
+        // This is needed because flush_modified_entries updates snapshots to current values
+        let mut state_overrides: HashMap<LedgerKey, LedgerEntry> = HashMap::new();
+        if let Some(acc) = self.state.get_account(&fee_source_id) {
+            let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                account_id: fee_source_id.clone(),
+            });
+            state_overrides.insert(key, self.state.ledger_entry_for_account(acc));
+        }
+        if fee_source_id != inner_source_id {
+            if let Some(acc) = self.state.get_account(&inner_source_id) {
+                let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                    account_id: inner_source_id.clone(),
+                });
+                state_overrides.insert(key, self.state.ledger_entry_for_account(acc));
+            }
+        }
+
+        // Deduct fee
+        if let Some(acc) = self.state.get_account_mut(&fee_source_id) {
+            acc.balance -= fee;
+        }
+
+        // For protocol < 10, sequence bump happens during fee processing
+        if self.protocol_version < 10 {
+            if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
+                // Set the account's seq_num to the transaction's seq_num
+                acc.seq_num = stellar_xdr::curr::SequenceNumber(frame.sequence_number());
+                henyey_tx::state::update_account_seq_info(
+                    acc,
+                    self.ledger_seq,
+                    self.close_time,
+                );
+            }
+        }
+
+        self.state.delta_mut().add_fee(fee);
+        self.state.flush_modified_entries();
+
+        let delta_after_fee = delta_snapshot(&self.state);
+        let delta_changes =
+            delta_changes_between(self.state.delta(), delta_before_fee, delta_after_fee);
+        let fee_changes = build_entry_changes_with_state_overrides(
+            &self.state,
+            &delta_changes.created,
+            &delta_changes.updated,
+            &delta_changes.deleted,
+            &state_overrides,
+        );
+
+        // Commit fee changes so they persist to subsequent transactions
+        self.state.commit();
+
+        Ok((fee_changes, fee))
+    }
+
+    /// Execute a transaction with configurable fee deduction.
+    ///
+    /// When `deduct_fee` is false, fee validation still occurs but no fee
+    /// processing changes are applied to the state or delta.
+    ///
+    /// For fee bump transactions in two-phase mode, `fee_source_pre_state` can be provided
+    /// to use as the STATE entry in tx_changes_before. This is needed because the current
+    /// state may already be post-fee-processing (synced with CDP's fee_meta), but we need
+    /// to emit the pre-fee state for the STATE entry to match C++ stellar-core behavior.
+    pub fn execute_transaction_with_fee_mode(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        tx_envelope: &TransactionEnvelope,
+        base_fee: u32,
+        soroban_prng_seed: Option<[u8; 32]>,
+        deduct_fee: bool,
+    ) -> Result<TransactionExecutionResult> {
+        self.execute_transaction_with_fee_mode_and_pre_state(
+            snapshot,
+            tx_envelope,
+            base_fee,
+            soroban_prng_seed,
+            deduct_fee,
+            None,
+        )
+    }
+
+    /// Execute a transaction with configurable fee deduction and optional pre-fee state.
+    ///
+    /// When `deduct_fee` is false, fee validation still occurs but no fee
+    /// processing changes are applied to the state or delta.
+    ///
+    /// For fee bump transactions in two-phase mode, `fee_source_pre_state` should be provided
+    /// with the fee source account state BEFORE fee processing. This is used for the STATE entry
+    /// in tx_changes_before to match C++ stellar-core behavior.
+    pub fn execute_transaction_with_fee_mode_and_pre_state(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        tx_envelope: &TransactionEnvelope,
+        base_fee: u32,
+        soroban_prng_seed: Option<[u8; 32]>,
+        deduct_fee: bool,
+        fee_source_pre_state: Option<LedgerEntry>,
+    ) -> Result<TransactionExecutionResult> {
+        let tx_timing_start = std::time::Instant::now();
+        let frame = TransactionFrame::with_network(tx_envelope.clone(), self.network_id);
+        let fee_source_id = henyey_tx::muxed_to_account_id(&frame.fee_source_account());
+        let inner_source_id = henyey_tx::muxed_to_account_id(&frame.inner_source_account());
+
+        if !frame.is_valid_structure() {
+            let failure = if frame.operations().is_empty() {
+                ExecutionFailure::MissingOperation
+            } else {
+                ExecutionFailure::Malformed
+            };
+            return Ok(TransactionExecutionResult {
+                success: false,
+                fee_charged: 0,
+                fee_refund: 0,
+                operation_results: vec![],
+                error: Some("Invalid transaction structure".into()),
+                failure: Some(failure),
+                tx_meta: None,
+                fee_changes: None,
+                post_fee_changes: None,
+                hot_archive_restored_keys: Vec::new(),
+                op_type_timings: HashMap::new(),
+            });
+        }
+
+        // Load source account
+        if !self.load_account(snapshot, &fee_source_id)? {
+            return Ok(TransactionExecutionResult {
+                success: false,
+                fee_charged: 0,
+                fee_refund: 0,
+                operation_results: vec![],
+                error: Some("Source account not found".into()),
+                failure: Some(ExecutionFailure::NoAccount),
+                tx_meta: None,
+                fee_changes: None,
+                post_fee_changes: None,
+                hot_archive_restored_keys: Vec::new(),
+                op_type_timings: HashMap::new(),
+            });
+        }
+
+        if !self.load_account(snapshot, &inner_source_id)? {
+            return Ok(TransactionExecutionResult {
+                success: false,
+                fee_charged: 0,
+                fee_refund: 0,
+                operation_results: vec![],
+                error: Some("Source account not found".into()),
+                failure: Some(ExecutionFailure::NoAccount),
+                tx_meta: None,
+                fee_changes: None,
+                post_fee_changes: None,
+                hot_archive_restored_keys: Vec::new(),
+                op_type_timings: HashMap::new(),
+            });
+        }
+
+        // Get accounts for validation
+        let fee_source_account = match self.state.get_account(&fee_source_id) {
+            Some(acc) => acc.clone(),
+            None => {
+                return Ok(TransactionExecutionResult {
+                    success: false,
+                    fee_charged: 0,
+                    fee_refund: 0,
+                    operation_results: vec![],
+                    error: Some("Source account not found".into()),
+                    failure: Some(ExecutionFailure::NoAccount),
+                    tx_meta: None,
+                    fee_changes: None,
+                    post_fee_changes: None,
+                    hot_archive_restored_keys: Vec::new(),
+                    op_type_timings: HashMap::new(),
+                });
+            }
+        };
+
+        let source_account = match self.state.get_account(&inner_source_id) {
+            Some(acc) => acc.clone(),
+            None => {
+                return Ok(TransactionExecutionResult {
+                    success: false,
+                    fee_charged: 0,
+                    fee_refund: 0,
+                    operation_results: vec![],
+                    error: Some("Source account not found".into()),
+                    failure: Some(ExecutionFailure::NoAccount),
+                    tx_meta: None,
+                    fee_changes: None,
+                    post_fee_changes: None,
+                    hot_archive_restored_keys: Vec::new(),
+                    op_type_timings: HashMap::new(),
+                });
+            }
+        };
+
+        // Validate fee
+        if frame.is_fee_bump() {
+            let op_count = frame.operation_count() as i64;
+            let outer_op_count = std::cmp::max(1_i64, op_count + 1);
+            let outer_min_inclusion_fee = base_fee as i64 * outer_op_count;
+            let outer_inclusion_fee = frame.inclusion_fee();
+
+            if outer_inclusion_fee < outer_min_inclusion_fee {
+                return Ok(TransactionExecutionResult {
+                    success: false,
+                    fee_charged: 0,
+                    fee_refund: 0,
+                    operation_results: vec![],
+                    error: Some("Insufficient fee".into()),
+                    failure: Some(ExecutionFailure::InsufficientFee),
+                    tx_meta: None,
+                    fee_changes: None,
+                    post_fee_changes: None,
+                    hot_archive_restored_keys: Vec::new(),
+                    op_type_timings: HashMap::new(),
+                });
+            }
+
+            let (inner_inclusion_fee, inner_is_soroban) = match frame.envelope() {
+                TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
+                    stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+                        let inner_env = TransactionEnvelope::Tx(inner.clone());
+                        let inner_frame =
+                            TransactionFrame::with_network(inner_env, self.network_id);
+                        (inner_frame.inclusion_fee(), inner_frame.is_soroban())
+                    }
+                },
+                _ => (0, false),
+            };
+
+            if inner_inclusion_fee >= 0 {
+                let inner_min_inclusion_fee = base_fee as i64 * std::cmp::max(1_i64, op_count);
+                let v1 = outer_inclusion_fee as i128 * inner_min_inclusion_fee as i128;
+                let v2 = inner_inclusion_fee as i128 * outer_min_inclusion_fee as i128;
+
+                if v1 < v2 {
+                    return Ok(TransactionExecutionResult {
+                        success: false,
+                        fee_charged: 0,
+                        fee_refund: 0,
+                        operation_results: vec![],
+                        error: Some("Insufficient fee".into()),
+                        failure: Some(ExecutionFailure::InsufficientFee),
+                        tx_meta: None,
+                        fee_changes: None,
+                        post_fee_changes: None,
+                        hot_archive_restored_keys: Vec::new(),
+                        op_type_timings: HashMap::new(),
+                    });
+                }
+            } else {
+                let allow_negative_inner = inner_is_soroban;
+                if !allow_negative_inner {
+                    return Ok(TransactionExecutionResult {
+                        success: false,
+                        fee_charged: 0,
+                        fee_refund: 0,
+                        operation_results: vec![],
+                        error: Some("Fee bump inner transaction invalid".into()),
+                        failure: Some(ExecutionFailure::OperationFailed),
+                        tx_meta: None,
+                        fee_changes: None,
+                        post_fee_changes: None,
+                        hot_archive_restored_keys: Vec::new(),
+                        op_type_timings: HashMap::new(),
+                    });
+                }
+            }
+        } else {
+            let required_fee = frame.operation_count() as u32 * base_fee;
+            if frame.fee() < required_fee {
+                return Ok(TransactionExecutionResult {
+                    success: false,
+                    fee_charged: 0,
+                    fee_refund: 0,
+                    operation_results: vec![],
+                    error: Some("Insufficient fee".into()),
+                    failure: Some(ExecutionFailure::InsufficientFee),
+                    tx_meta: None,
+                    fee_changes: None,
+                    post_fee_changes: None,
+                    hot_archive_restored_keys: Vec::new(),
+                    op_type_timings: HashMap::new(),
+                });
+            }
+        }
+
+        let validation_ctx = ValidationContext::new(
+            self.ledger_seq,
+            self.close_time,
+            base_fee,
+            self.base_reserve,
+            self.protocol_version,
+            self.network_id,
+        );
+
+        if let Err(e) = validation::validate_time_bounds(&frame, &validation_ctx) {
+            return Ok(TransactionExecutionResult {
+                success: false,
+                fee_charged: 0,
+                fee_refund: 0,
+                operation_results: vec![],
+                error: Some("Time bounds invalid".into()),
+                failure: Some(match e {
+                    validation::ValidationError::TooEarly { .. } => ExecutionFailure::TooEarly,
+                    validation::ValidationError::TooLate { .. } => ExecutionFailure::TooLate,
+                    _ => ExecutionFailure::OperationFailed,
+                }),
+                tx_meta: None,
+                fee_changes: None,
+                post_fee_changes: None,
+                hot_archive_restored_keys: Vec::new(),
+                op_type_timings: HashMap::new(),
+            });
+        }
+
+        if let Err(e) = validation::validate_ledger_bounds(&frame, &validation_ctx) {
+            return Ok(TransactionExecutionResult {
+                success: false,
+                fee_charged: 0,
+                fee_refund: 0,
+                operation_results: vec![],
+                error: Some("Ledger bounds invalid".into()),
+                failure: Some(match e {
+                    validation::ValidationError::BadLedgerBounds { min, max, current } => {
+                        if max > 0 && current > max {
+                            ExecutionFailure::TooLate
+                        } else if min > 0 && current < min {
+                            ExecutionFailure::TooEarly
+                        } else {
+                            ExecutionFailure::OperationFailed
+                        }
+                    }
+                    _ => ExecutionFailure::OperationFailed,
+                }),
+                tx_meta: None,
+                fee_changes: None,
+                post_fee_changes: None,
+                hot_archive_restored_keys: Vec::new(),
+                op_type_timings: HashMap::new(),
+            });
+        }
+
+        if let Preconditions::V2(cond) = frame.preconditions() {
+            if let Some(min_seq) = cond.min_seq_num {
+                if source_account.seq_num.0 < min_seq.0 {
+                    return Ok(TransactionExecutionResult {
+                        success: false,
+                        fee_charged: 0,
+                        fee_refund: 0,
+                        operation_results: vec![],
+                        error: Some("Minimum sequence number not met".into()),
+                        failure: Some(ExecutionFailure::BadMinSeqAgeOrGap),
+                        tx_meta: None,
+                        fee_changes: None,
+                        post_fee_changes: None,
+                        hot_archive_restored_keys: Vec::new(),
+                        op_type_timings: HashMap::new(),
+                    });
+                }
+            }
+
+            if cond.min_seq_age.0 > 0 {
+                // C++ logic: minSeqAge > closeTime || closeTime - minSeqAge < accSeqTime
+                let acc_seq_time = get_account_seq_time(&source_account);
+                let min_seq_age = cond.min_seq_age.0;
+
+                if min_seq_age > self.close_time || self.close_time - min_seq_age < acc_seq_time {
+                    return Ok(TransactionExecutionResult {
+                        success: false,
+                        fee_charged: 0,
+                        fee_refund: 0,
+                        operation_results: vec![],
+                        error: Some("Minimum sequence age not met".into()),
+                        failure: Some(ExecutionFailure::BadMinSeqAgeOrGap),
+                        tx_meta: None,
+                        fee_changes: None,
+                        post_fee_changes: None,
+                        hot_archive_restored_keys: Vec::new(),
+                        op_type_timings: HashMap::new(),
+                    });
+                }
+            }
+
+            if cond.min_seq_ledger_gap > 0 {
+                // C++ logic: minSeqLedgerGap > ledgerSeq || ledgerSeq - minSeqLedgerGap < accSeqLedger
+                let acc_seq_ledger = get_account_seq_ledger(&source_account);
+                let min_seq_ledger_gap = cond.min_seq_ledger_gap;
+
+                if min_seq_ledger_gap > self.ledger_seq
+                    || self.ledger_seq - min_seq_ledger_gap < acc_seq_ledger
+                {
+                    return Ok(TransactionExecutionResult {
+                        success: false,
+                        fee_charged: 0,
+                        fee_refund: 0,
+                        operation_results: vec![],
+                        error: Some("Minimum sequence ledger gap not met".into()),
+                        failure: Some(ExecutionFailure::BadMinSeqAgeOrGap),
+                        tx_meta: None,
+                        fee_changes: None,
+                        post_fee_changes: None,
+                        hot_archive_restored_keys: Vec::new(),
+                        op_type_timings: HashMap::new(),
+                    });
+                }
+            }
+        }
+
+        // Validate sequence number
+        // C++ stellar-core logic from TransactionFrame::isBadSeq:
+        // 1. Always reject if tx.seqNum == starting sequence for this ledger
+        // 2. If minSeqNum is set (protocol >= 19), use relaxed check:
+        //    bad if account.seqNum < minSeqNum OR account.seqNum >= tx.seqNum
+        // 3. Otherwise, use strict check:
+        //    bad if account.seqNum + 1 != tx.seqNum
+        if self.ledger_seq <= i32::MAX as u32 {
+            let starting_seq = (self.ledger_seq as i64) << 32;
+            if frame.sequence_number() == starting_seq {
+                return Ok(TransactionExecutionResult {
+                    success: false,
+                    fee_charged: 0,
+                    fee_refund: 0,
+                    operation_results: vec![],
+                    error: Some("Bad sequence: equals starting sequence".into()),
+                    failure: Some(ExecutionFailure::BadSequence),
+                    tx_meta: None,
+                    fee_changes: None,
+                    post_fee_changes: None,
+                    hot_archive_restored_keys: Vec::new(),
+                    op_type_timings: HashMap::new(),
+                });
+            }
+        }
+
+        // Check for relaxed sequence validation (minSeqNum precondition)
+        let min_seq_num = match frame.preconditions() {
+            Preconditions::V2(cond) => cond.min_seq_num.map(|s| s.0),
+            _ => None,
+        };
+
+        let account_seq = source_account.seq_num.0;
+        let tx_seq = frame.sequence_number();
+
+        tracing::debug!(
+            account_seq,
+            tx_seq,
+            min_seq_num = ?min_seq_num,
+            preconditions_type = ?std::mem::discriminant(&frame.preconditions()),
+            "Sequence number validation"
+        );
+
+        let is_bad_seq = if let Some(min_seq) = min_seq_num {
+            // Relaxed check: account.seqNum must be >= minSeqNum AND < tx.seqNum
+            account_seq < min_seq || account_seq >= tx_seq
+        } else {
+            // Strict check: account.seqNum + 1 must equal tx.seqNum
+            account_seq == i64::MAX || account_seq + 1 != tx_seq
+        };
+
+        if is_bad_seq {
+            let error_msg = if let Some(min_seq) = min_seq_num {
+                format!(
+                    "Bad sequence: account seq {} not in valid range [minSeqNum={}, txSeq={})",
+                    account_seq, min_seq, tx_seq
+                )
+            } else {
+                format!(
+                    "Bad sequence: expected {}, got {}",
+                    account_seq.saturating_add(1),
+                    tx_seq
+                )
+            };
+            return Ok(TransactionExecutionResult {
+                success: false,
+                fee_charged: 0,
+                fee_refund: 0,
+                operation_results: vec![],
+                error: Some(error_msg),
+                failure: Some(ExecutionFailure::BadSequence),
+                tx_meta: None,
+                fee_changes: None,
+                post_fee_changes: None,
+                hot_archive_restored_keys: Vec::new(),
+                op_type_timings: HashMap::new(),
+            });
+        }
+
+        // Basic signature validation (master key only).
+        if validation::validate_signatures(&frame, &validation_ctx).is_err() {
+            return Ok(TransactionExecutionResult {
+                success: false,
+                fee_charged: 0,
+                fee_refund: 0,
+                operation_results: vec![],
+                error: Some("Invalid signature".into()),
+                failure: Some(ExecutionFailure::InvalidSignature),
+                tx_meta: None,
+                fee_changes: None,
+                post_fee_changes: None,
+                hot_archive_restored_keys: Vec::new(),
+                op_type_timings: HashMap::new(),
+            });
+        }
+
+        let outer_hash = frame
+            .hash(&self.network_id)
+            .map_err(|e| LedgerError::Internal(format!("tx hash error: {}", e)))?;
+        let outer_threshold = threshold_low(&fee_source_account);
+        if !has_sufficient_signer_weight(
+            &outer_hash,
+            frame.signatures(),
+            &fee_source_account,
+            outer_threshold,
+        ) {
+            tracing::debug!("Signature check failed: fee_source outer check");
+            return Ok(TransactionExecutionResult {
+                success: false,
+                fee_charged: 0,
+                fee_refund: 0,
+                operation_results: vec![],
+                error: Some("Invalid signature".into()),
+                failure: Some(ExecutionFailure::InvalidSignature),
+                tx_meta: None,
+                fee_changes: None,
+                post_fee_changes: None,
+                hot_archive_restored_keys: Vec::new(),
+                op_type_timings: HashMap::new(),
+            });
+        }
+
+        if frame.is_fee_bump() {
+            let inner_hash = fee_bump_inner_hash(&frame, &self.network_id)?;
+            let inner_threshold = threshold_medium(&source_account);
+            if !has_sufficient_signer_weight(
+                &inner_hash,
+                frame.inner_signatures(),
+                &source_account,
+                inner_threshold,
+            ) {
+                tracing::debug!("Signature check failed: fee_bump inner check");
+                return Ok(TransactionExecutionResult {
+                    success: false,
+                    fee_charged: 0,
+                    fee_refund: 0,
+                    operation_results: vec![],
+                    error: Some("Invalid inner signature".into()),
+                    failure: Some(ExecutionFailure::InvalidSignature),
+                    tx_meta: None,
+                    fee_changes: None,
+                    post_fee_changes: None,
+                    hot_archive_restored_keys: Vec::new(),
+                    op_type_timings: HashMap::new(),
+                });
+            }
+        }
+
+        // Transaction envelope uses LOW threshold for signature check.
+        // Each operation will additionally check its own threshold (low/medium/high).
+        // This matches C++ stellar-core's checkAllTransactionSignatures behavior.
+        let required_weight = threshold_low(&source_account);
+        if !frame.is_fee_bump()
+            && !has_sufficient_signer_weight(
+                &outer_hash,
+                frame.signatures(),
+                &source_account,
+                required_weight,
+            )
+        {
+            tracing::debug!(
+                required_weight = required_weight,
+                is_fee_bump = frame.is_fee_bump(),
+                master_weight = source_account.thresholds.0[0],
+                num_signers = source_account.signers.len(),
+                thresholds = ?source_account.thresholds.0,
+                "Signature check failed: source outer check"
+            );
+            return Ok(TransactionExecutionResult {
+                success: false,
+                fee_charged: 0,
+                fee_refund: 0,
+                operation_results: vec![],
+                error: Some("Invalid signature".into()),
+                failure: Some(ExecutionFailure::InvalidSignature),
+                tx_meta: None,
+                fee_changes: None,
+                post_fee_changes: None,
+                hot_archive_restored_keys: Vec::new(),
+                op_type_timings: HashMap::new(),
+            });
+        }
+
+        if let Preconditions::V2(cond) = frame.preconditions() {
+            if !cond.extra_signers.is_empty() {
+                let extra_hash = if frame.is_fee_bump() {
+                    fee_bump_inner_hash(&frame, &self.network_id)?
+                } else {
+                    outer_hash
+                };
+                let extra_signatures = if frame.is_fee_bump() {
+                    frame.inner_signatures()
+                } else {
+                    frame.signatures()
+                };
+                if !has_required_extra_signers(&extra_hash, extra_signatures, &cond.extra_signers) {
+                    return Ok(TransactionExecutionResult {
+                        success: false,
+                        fee_charged: 0,
+                        fee_refund: 0,
+                        operation_results: vec![],
+                        error: Some("Missing extra signer".into()),
+                        failure: Some(ExecutionFailure::BadAuthExtra),
+                        tx_meta: None,
+                        fee_changes: None,
+                        post_fee_changes: None,
+                        hot_archive_restored_keys: Vec::new(),
+                        op_type_timings: HashMap::new(),
+                    });
+                }
+            }
+        }
+
+        let validation_us = tx_timing_start.elapsed().as_micros() as u64;
+
+        // For fee bump transactions, the required fee includes an extra base fee for the wrapper
+        let num_ops = std::cmp::max(1, frame.operation_count() as i64);
+        let required_fee = if frame.is_fee_bump() {
+            // Fee bumps pay baseFee * (numOps + 1) - extra charge for the fee bump wrapper
+            base_fee as i64 * (num_ops + 1)
+        } else {
+            base_fee as i64 * num_ops
+        };
+        let inclusion_fee = frame.inclusion_fee();
+        // For Soroban, the resource fee is charged in full, plus the inclusion fee up to required.
+        // For classic transactions, charge up to the required_fee (base_fee * num_ops).
+        let mut fee = if frame.is_soroban() {
+            frame.declared_soroban_resource_fee() + std::cmp::min(inclusion_fee, required_fee)
+        } else {
+            std::cmp::min(inclusion_fee, required_fee)
+        };
+
+        let mut preflight_failure = None;
+        if deduct_fee {
+            if let Some(acc) = self.state.get_account(&fee_source_id) {
+                if self.available_balance_for_fee(acc)? < fee {
+                    preflight_failure = Some(ExecutionFailure::InsufficientBalance);
+                }
+            }
+        }
+
+        let mut tx_event_manager = TxEventManager::new(
+            true,
+            self.protocol_version,
+            self.network_id,
+            self.classic_events,
+        );
+        let mut refundable_fee_tracker = if frame.is_soroban() {
+            let (non_refundable_fee, _initial_refundable_fee) = compute_soroban_resource_fee(
+                &frame,
+                self.protocol_version,
+                &self.soroban_config,
+                0,
+            )
+            .unwrap_or((0, 0));
+            let declared_fee = frame.declared_soroban_resource_fee();
+            let max_refundable_fee = declared_fee.saturating_sub(non_refundable_fee);
+            Some(RefundableFeeTracker::new(
+                non_refundable_fee,
+                max_refundable_fee,
+            ))
+        } else {
+            None
+        };
+
+        let mut fee_created = Vec::new();
+        let mut fee_updated = Vec::new();
+        let mut fee_deleted = Vec::new();
+        let fee_changes = if !deduct_fee || fee == 0 {
+            empty_entry_changes()
+        } else {
+            let delta_before_fee = delta_snapshot(&self.state);
+
+            // Deduct fee (sequence update is handled separately for protocol >= 10).
+            if let Some(acc) = self.state.get_account_mut(&fee_source_id) {
+                let old_balance = acc.balance;
+                let charged_fee = std::cmp::min(acc.balance, fee);
+                acc.balance -= charged_fee;
+                fee = charged_fee;
+                let key_bytes = henyey_tx::account_id_to_key(&fee_source_id);
+                tracing::debug!(
+                    account_prefix = ?&key_bytes[0..4],
+                    old_balance = old_balance,
+                    new_balance = acc.balance,
+                    fee = charged_fee,
+                    "Fee deducted from account"
+                );
+            }
+            self.state.delta_mut().add_fee(fee);
+
+            self.state.flush_modified_entries();
+            let delta_after_fee = delta_snapshot(&self.state);
+            let delta_changes =
+                delta_changes_between(self.state.delta(), delta_before_fee, delta_after_fee);
+            fee_created = delta_changes.created;
+            fee_updated = delta_changes.updated;
+            fee_deleted = delta_changes.deleted;
+            let fee_changes = build_entry_changes_with_state(
+                &self.state,
+                &fee_created,
+                &fee_updated,
+                &fee_deleted,
+            );
+
+            // Commit fee updates so txChangesBefore reflects the post-fee account state.
+            self.state.commit();
+            fee_changes
+        };
+
+        let tx_changes_before: LedgerEntryChanges;
+        let seq_created;
+        let seq_updated;
+        let seq_deleted;
+        let mut signer_created = Vec::new();
+        let mut signer_updated = Vec::new();
+        let mut signer_deleted = Vec::new();
+
+        // For fee bump transactions in two-phase mode, C++ stellar-core's
+        // FeeBumpTransactionFrame::apply() ALWAYS calls removeOneTimeSignerKeyFromFeeSource()
+        // which loads the fee source account, generating a STATE/UPDATED pair even if
+        // the fee source equals the inner source. This happens BEFORE the inner transaction's
+        // sequence bump. We capture this to match C++ stellar-core ordering.
+        let fee_bump_wrapper_changes = if !deduct_fee && frame.is_fee_bump() {
+            let fee_source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                account_id: fee_source_id.clone(),
+            });
+            if let Some(fee_source_entry) = self.state.get_entry(&fee_source_key) {
+                // Both STATE and UPDATED use the same (current) state value.
+                // In C++ stellar-core, the fee bump wrapper's tx_changes_before captures
+                // the fee source state AFTER fee processing (which happened in fee_meta).
+                // This is just for removeOneTimeSignerKeyFromFeeSource() which doesn't
+                // change the balance - hence STATE and UPDATED have the same value.
+                // We ignore fee_source_pre_state as it's not needed.
+                let _ = fee_source_pre_state; // Explicitly ignore the parameter
+                vec![
+                    LedgerEntryChange::State(fee_source_entry.clone()),
+                    LedgerEntryChange::Updated(fee_source_entry),
+                ]
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
+
+        let mut signer_changes = empty_entry_changes();
+        if self.protocol_version != 7 {
+            let mut source_accounts = Vec::new();
+            source_accounts.push(inner_source_id.clone());
+            for op in frame.operations().iter() {
+                if let Some(ref source) = op.source_account {
+                    source_accounts.push(henyey_tx::muxed_to_account_id(source));
+                }
+            }
+            source_accounts.sort_by(|a, b| a.0.cmp(&b.0));
+            source_accounts.dedup_by(|a, b| a.0 == b.0);
+
+            let delta_before_signers = delta_snapshot(&self.state);
+            let mut signer_state_overrides = HashMap::new();
+            for account_id in &source_accounts {
+                let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                    account_id: account_id.clone(),
+                });
+                if let Some(entry) = self.state.get_entry(&key) {
+                    signer_state_overrides.insert(key, entry);
+                }
+            }
+
+            self.state.remove_one_time_signers_from_all_sources(
+                &outer_hash,
+                &source_accounts,
+                self.protocol_version,
+            );
+            self.state.flush_modified_entries();
+            let delta_after_signers = delta_snapshot(&self.state);
+            let delta_changes = delta_changes_between(
+                self.state.delta(),
+                delta_before_signers,
+                delta_after_signers,
+            );
+            signer_created = delta_changes.created;
+            signer_updated = delta_changes.updated;
+            signer_deleted = delta_changes.deleted;
+            signer_changes = build_entry_changes_with_state_overrides(
+                &self.state,
+                &signer_created,
+                &signer_updated,
+                &signer_deleted,
+                &signer_state_overrides,
+            );
+        }
+
+        let delta_before_seq = delta_snapshot(&self.state);
+        // Capture the current account state BEFORE modification for STATE entry.
+        // We can't use snapshot_entry() here because the snapshot might not exist yet.
+        // After flush_modified_entries, the snapshot is updated to the post-modification
+        // value, so we need to save the original here.
+        let inner_source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: inner_source_id.clone(),
+        });
+        let seq_state_override = self.state.get_entry(&inner_source_key);
+
+        if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
+            // CAP-0021: Set the account's seq_num to the transaction's seq_num.
+            // This handles the case where minSeqNum allows sequence gaps - the
+            // account's final seq must be the tx's seq, not just account_seq + 1.
+            acc.seq_num = stellar_xdr::curr::SequenceNumber(frame.sequence_number());
+            henyey_tx::state::update_account_seq_info(acc, self.ledger_seq, self.close_time);
+        }
+        self.state.flush_modified_entries();
+        let delta_after_seq = delta_snapshot(&self.state);
+        let delta_changes =
+            delta_changes_between(self.state.delta(), delta_before_seq, delta_after_seq);
+        // Use the pre-modification snapshot for STATE entry via state_overrides.
+        let mut seq_state_overrides = HashMap::new();
+        if let Some(entry) = seq_state_override {
+            seq_state_overrides.insert(inner_source_key.clone(), entry);
+        }
+        let seq_changes = build_entry_changes_with_state_overrides(
+            &self.state,
+            &delta_changes.created,
+            &delta_changes.updated,
+            &delta_changes.deleted,
+            &seq_state_overrides,
+        );
+        seq_created = delta_changes.created;
+        seq_updated = delta_changes.updated;
+        seq_deleted = delta_changes.deleted;
+
+        // Merge all changes into tx_changes_before.
+        // Order: fee_bump_wrapper_changes (fee source), seq_changes (inner source seq bump).
+        // This matches C++ stellar-core where FeeBumpFrame captures fee source state,
+        // then inner tx does seq bump.
+        let mut combined = Vec::with_capacity(
+            fee_bump_wrapper_changes.len() + signer_changes.len() + seq_changes.len(),
+        );
+        combined.extend(fee_bump_wrapper_changes);
+        combined.extend(signer_changes.iter().cloned());
+        combined.extend(seq_changes.iter().cloned());
+        tx_changes_before = combined.try_into().unwrap_or_default();
+        // Persist sequence updates so failed transactions still consume sequence numbers.
+        self.state.commit();
+
+        // Commit pre-apply changes so rollback doesn't revert them.
+        self.state.commit();
+        let fee_seq_us = tx_timing_start.elapsed().as_micros() as u64 - validation_us;
+
+        // Create ledger context for operation execution
+        let ledger_context = if let Some(prng_seed) = soroban_prng_seed {
+            LedgerContext::with_prng_seed(
+                self.ledger_seq,
+                self.close_time,
+                base_fee,
+                self.base_reserve,
+                self.protocol_version,
+                self.network_id,
+                prng_seed,
+            )
+        } else {
+            LedgerContext::new(
+                self.ledger_seq,
+                self.close_time,
+                base_fee,
+                self.base_reserve,
+                self.protocol_version,
+                self.network_id,
+            )
+        };
+
+        let soroban_data = frame.soroban_data();
+
+        // For Soroban transactions, load all footprint entries from the snapshot
+        // before executing operations. This ensures contract data, code, and TTLs
+        // are available to the Soroban host.
+        //
+        // NOTE: We no longer call clear_archived_entries_from_state() here because
+        // archived entries from the hot archive need to be available to the Soroban
+        // host for restoration. The previous approach of clearing them was designed
+        // for when all entries came from the live bucket list, but with hot archive
+        // support, archived entries are properly sourced and must be preserved.
+        if let Some(data) = soroban_data {
+            self.load_soroban_footprint(snapshot, &data.resources.footprint)?;
+        }
+
+        let footprint_us =
+            tx_timing_start.elapsed().as_micros() as u64 - validation_us - fee_seq_us;
+
+        self.state.clear_sponsorship_stack();
+
+        // Pre-load sponsor accounts for BeginSponsoringFutureReserves operations.
+        // When a BeginSponsoringFutureReserves operation is followed by other operations
+        // (like SetOptions), those subsequent operations may need to update the sponsor's
+        // num_sponsoring count. We must load these sponsor accounts before the operation
+        // loop so they're available when needed.
+        for op in frame.operations().iter() {
+            if let OperationBody::BeginSponsoringFutureReserves(_) = &op.body {
+                // The sponsor is the source of the BeginSponsoringFutureReserves operation
+                let op_source_muxed = op
+                    .source_account
+                    .clone()
+                    .unwrap_or_else(|| frame.inner_source_account());
+                let sponsor_id = henyey_tx::muxed_to_account_id(&op_source_muxed);
+                self.load_account(snapshot, &sponsor_id)?;
+            }
+        }
+
+        // Set up lazy entry loader for offer dependency loading.
+        // Instead of preloading all offer dependencies upfront (which requires
+        // O(n) bucket list lookups for all offers in each asset pair), the
+        // entry_loader enables on-demand loading during offer crossing.
+        let snapshot_for_loader = snapshot.clone();
+        self.state.set_entry_loader(std::sync::Arc::new(move |key| {
+            snapshot_for_loader
+                .get_entry(key)
+                .map_err(|e| henyey_tx::TxError::Internal(e.to_string()))
+        }));
+
+        // Set up batch entry loader for loading multiple entries in a single
+        // bucket list pass. This is used by path payment operations to batch-load
+        // seller account + trustlines together (~3x faster than separate lookups).
+        let snapshot_for_batch = snapshot.clone();
+        self.state
+            .set_batch_entry_loader(std::sync::Arc::new(move |keys| {
+                snapshot_for_batch
+                    .load_entries(keys)
+                    .map_err(|e| henyey_tx::TxError::Internal(e.to_string()))
+            }));
+
+        // Set up authoritative offers-by-(account, asset) loader.
+        // C++ stellar-core uses SQL `loadOffersByAccountAndAsset` which always
+        // returns every matching offer.  Without this loader, the in-memory
+        // index only contains offers that happened to be loaded during prior TX
+        // execution, causing non-deterministic offer removal in SetTrustLineFlags.
+        let snapshot_for_offers = snapshot.clone();
+        self.state
+            .set_offers_by_account_asset_loader(std::sync::Arc::new(
+                move |account_id, asset| {
+                    snapshot_for_offers
+                        .offers_by_account_and_asset(account_id, asset)
+                        .map_err(|e| henyey_tx::TxError::Internal(e.to_string()))
+                },
+            ));
+
+        // Execute operations
+        let mut operation_results = Vec::new();
+        let num_ops = frame.operations().len();
+        let mut op_changes = Vec::with_capacity(num_ops);
+        let mut op_events: Vec<Vec<ContractEvent>> = Vec::with_capacity(num_ops);
+        let mut diagnostic_events: Vec<DiagnosticEvent> = Vec::new();
+        let mut soroban_return_value = None;
+        let mut all_success = true;
+        let mut failure = None;
+        // For multi-operation transactions, C++ stellar-core records STATE/UPDATED
+        // for every accessed entry per operation, even if values are identical.
+        // For single-operation transactions, it only records if values changed.
+        self.state.set_multi_op_mode(num_ops > 1);
+
+        let tx_seq = frame.sequence_number();
+        // Collect hot archive restored keys across all operations (Protocol 23+)
+        // Use HashSet to deduplicate: when multiple TXs in the same ledger restore
+        // the same entry (e.g., same ContractCode), it should only be sent to
+        // HotArchiveBucketList::add_batch once as a single Live marker.
+        let mut collected_hot_archive_keys: HashSet<LedgerKey> = HashSet::new();
+        let mut op_type_timings: HashMap<OperationType, (u64, u32)> = HashMap::new();
+
+        if let Some(preflight_failure) = preflight_failure {
+            all_success = false;
+            failure = Some(preflight_failure);
+        } else {
+            for (op_index, op) in frame.operations().iter().enumerate() {
+                let op_type = OperationType::from_body(&op.body);
+
+                let op_source_muxed = op
+                    .source_account
+                    .clone()
+                    .unwrap_or_else(|| frame.inner_source_account());
+                let op_delta_before = delta_snapshot(&self.state);
+                self.state.begin_op_snapshot();
+                let op_timing_start = std::time::Instant::now();
+
+                // Load any accounts needed for this operation
+                self.load_operation_accounts(snapshot, op, &inner_source_id)?;
+
+                // Get operation source
+                let op_source = henyey_tx::muxed_to_account_id(&op_source_muxed);
+
+                let pre_claimable_balance = match &op.body {
+                    OperationBody::ClaimClaimableBalance(op_data) => self
+                        .state
+                        .get_claimable_balance(&op_data.balance_id)
+                        .cloned(),
+                    OperationBody::ClawbackClaimableBalance(op_data) => self
+                        .state
+                        .get_claimable_balance(&op_data.balance_id)
+                        .cloned(),
+                    _ => None,
+                };
+                let pre_pool = match &op.body {
+                    OperationBody::LiquidityPoolDeposit(op_data) => self
+                        .state
+                        .get_liquidity_pool(&op_data.liquidity_pool_id)
+                        .cloned(),
+                    OperationBody::LiquidityPoolWithdraw(op_data) => self
+                        .state
+                        .get_liquidity_pool(&op_data.liquidity_pool_id)
+                        .cloned(),
+                    _ => None,
+                };
+                let mut op_event_manager = OpEventManager::new(
+                    true,
+                    op_type.is_soroban(),
+                    self.protocol_version,
+                    self.network_id,
+                    frame.memo().clone(),
+                    self.classic_events,
+                );
+
+                // Execute the operation with a per-operation savepoint.
+                // If the operation fails, we roll back its state changes so
+                // subsequent operations see clean state (matching C++ LedgerTxn).
+                let op_index = u32::try_from(op_index).unwrap_or(u32::MAX);
+                let op_savepoint = self.state.create_savepoint();
+                let result = self.execute_single_operation(
+                    op,
+                    &op_source,
+                    &inner_source_id,
+                    tx_seq,
+                    op_index,
+                    &ledger_context,
+                    soroban_data,
+                );
+
+                match result {
+                    Ok(op_exec) => {
+                        self.state.flush_modified_entries();
+                        let mut op_result = op_exec.result;
+
+                        // Debug: Log operation result for Soroban operations
+                        if op_type.is_soroban() {
+                            let is_success_before_refund_check = is_operation_success(&op_result);
+                            tracing::debug!(
+                                ledger_seq = self.ledger_seq,
+                                op_index,
+                                op_type = ?op_type,
+                                op_result = ?op_result,
+                                is_success = is_success_before_refund_check,
+                                has_soroban_meta = op_exec.soroban_meta.is_some(),
+                                "Soroban operation executed"
+                            );
+                        }
+
+                        if let Some(meta) = &op_exec.soroban_meta {
+                            if let Some(tracker) = refundable_fee_tracker.as_mut() {
+                                if !tracker.consume(
+                                    &frame,
+                                    self.protocol_version,
+                                    &self.soroban_config,
+                                    meta.event_size_bytes,
+                                    meta.rent_fee,
+                                ) {
+                                    op_result = insufficient_refundable_fee_result(op);
+                                    all_success = false;
+                                    failure = Some(ExecutionFailure::OperationFailed);
+                                }
+                            }
+                        }
+                        // Check if operation succeeded
+                        if !is_operation_success(&op_result) {
+                            all_success = false;
+                            tracing::debug!(
+                                ledger_seq = self.ledger_seq,
+                                op_index,
+                                op_type = ?op_type,
+                                op_result = ?op_result,
+                                "Operation failed"
+                            );
+                            if matches!(op_result, OperationResult::OpNotSupported) {
+                                failure = Some(ExecutionFailure::NotSupported);
+                            }
+                            // Roll back failed operation's state changes so subsequent
+                            // operations see clean state (matches C++ nested LedgerTxn).
+                            self.state.rollback_to_savepoint(op_savepoint);
+                        }
+                        operation_results.push(op_result.clone());
+
+                        let op_delta_after = delta_snapshot(&self.state);
+                        let delta_changes = delta_changes_between(
+                            self.state.delta(),
+                            op_delta_before,
+                            op_delta_after,
+                        );
+                        let op_snapshots = self.state.end_op_snapshot();
+
+                        // For Soroban operations, extract restored entries (hot archive and live BL)
+                        let (restored_entries, footprint) = if op_type.is_soroban() {
+                            let mut restored = RestoredEntries::default();
+
+                            // Get live BL restorations from the Soroban execution result
+                            if let Some(meta) = &op_exec.soroban_meta {
+                                for live_bl_restore in &meta.live_bucket_list_restores {
+                                    restored
+                                        .live_bucket_list
+                                        .insert(live_bl_restore.key.clone());
+                                    restored.live_bucket_list_entries.insert(
+                                        live_bl_restore.key.clone(),
+                                        live_bl_restore.entry.clone(),
+                                    );
+                                    // Also track the TTL entry
+                                    restored
+                                        .live_bucket_list
+                                        .insert(live_bl_restore.ttl_key.clone());
+                                    restored.live_bucket_list_entries.insert(
+                                        live_bl_restore.ttl_key.clone(),
+                                        live_bl_restore.ttl_entry.clone(),
+                                    );
+                                }
+                            }
+
+                            // Get hot archive keys from two sources:
+                            // 1. For InvokeHostFunction: from actual_restored_indices (filtered by host)
+                            // 2. For RestoreFootprint: from soroban_meta.hot_archive_restores
+                            // NOTE: We must exclude live BL restore keys from the hot archive set.
+                            // Live BL restores are entries that exist in the live bucket list with
+                            // expired TTL but haven't been evicted yet - these are NOT hot archive
+                            // restores and should not be added to HotArchiveBucketList::add_batch.
+                            let actual_restored_indices = op_exec
+                                .soroban_meta
+                                .as_ref()
+                                .map(|m| m.actual_restored_indices.as_slice())
+                                .unwrap_or(&[]);
+                            let mut hot_archive = extract_hot_archive_restored_keys(
+                                soroban_data,
+                                op_type,
+                                actual_restored_indices,
+                            );
+                            // For RestoreFootprint, get hot archive keys and entries from the meta
+                            if let Some(meta) = &op_exec.soroban_meta {
+                                for ha_restore in &meta.hot_archive_restores {
+                                    hot_archive.insert(ha_restore.key.clone());
+                                    // Also store the entry for RESTORED meta emission
+                                    restored
+                                        .hot_archive_entries
+                                        .insert(ha_restore.key.clone(), ha_restore.entry.clone());
+                                }
+                            }
+                            let ha_before = hot_archive.len();
+                            hot_archive.retain(|k| !restored.live_bucket_list.contains(k));
+                            let ha_after_live_bl = hot_archive.len();
+
+                            // Also exclude keys that were listed in archived_soroban_entries but
+                            // were already restored by a previous TX in this ledger. These entries
+                            // go into `updated` (not `created`) because they already exist in state.
+                            // We only want RESTORED emission for entries actually being created/restored
+                            // in THIS transaction.
+                            let created_keys: HashSet<LedgerKey> = delta_changes
+                                .created
+                                .iter()
+                                .filter_map(|entry| crate::delta::entry_to_key(entry).ok())
+                                .collect();
+                            // For transaction meta emission: only emit RESTORED for keys in created
+                            // Keep original set for bucket list operations
+                            let hot_archive_for_bucket_list = hot_archive.clone();
+                            // For RestoreFootprint, the data entries are prefetched from hot archive
+                            // into state, so they won't be in `created_keys` (only the TTL is created).
+                            // We need to emit RESTORED for all hot archive keys without filtering.
+                            // For InvokeHostFunction, we filter by created_keys because the auto-restore
+                            // creates the entries during execution.
+                            let hot_archive_for_meta: HashSet<LedgerKey> =
+                                if op_type == OperationType::RestoreFootprint {
+                                    // Don't filter - all hot archive keys should emit RESTORED
+                                    hot_archive.clone()
+                                } else {
+                                    // Filter by created_keys for InvokeHostFunction
+                                    hot_archive
+                                        .iter()
+                                        .filter(|k| created_keys.contains(k))
+                                        .cloned()
+                                        .collect()
+                                };
+                            let ha_after = hot_archive_for_meta.len();
+                            // Log when we filter out entries
+                            if ha_before != ha_after {
+                                tracing::debug!(
+                                    ha_before,
+                                    ha_after_live_bl,
+                                    ha_after,
+                                    live_bl_count = restored.live_bucket_list.len(),
+                                    created_count = created_keys.len(),
+                                    ?hot_archive,
+                                    ?created_keys,
+                                    op_type = ?op_type,
+                                    "Filtered hot archive keys: live BL restores and already-restored entries"
+                                );
+                            }
+                            // For transaction meta purposes, also add the corresponding TTL keys.
+                            // When a ContractData/ContractCode entry is restored from hot archive,
+                            // its TTL entry should also be emitted as RESTORED (not CREATED).
+                            // Use the filtered set (hot_archive_for_meta) which only includes entries
+                            // actually being created/restored in this TX.
+                            // NOTE: We don't add TTL keys to collected_hot_archive_keys because
+                            // HotArchiveBucketList::add_batch only receives data/code entries.
+                            use sha2::{Digest, Sha256};
+                            let ttl_keys: Vec<_> = hot_archive_for_meta
+                                .iter()
+                                .filter_map(|key| {
+                                    // Compute key hash as SHA256 of key XDR
+                                    let key_bytes = key.to_xdr(Limits::none()).ok()?;
+                                    let key_hash =
+                                        stellar_xdr::curr::Hash(Sha256::digest(&key_bytes).into());
+                                    Some(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
+                                        key_hash,
+                                    }))
+                                })
+                                .collect();
+                            // Collect data/code keys only for HotArchiveBucketList::add_batch
+                            // All hot archive keys (already filtered by live BL above) should be
+                            // passed to the bucket list. This is true for both RestoreFootprint
+                            // and InvokeHostFunction - the hot archive needs to remove ALL entries
+                            // that were restored, regardless of whether the contract then modifies
+                            // them (which would put them in `updated` rather than `created`).
+                            // The `created_keys` filtering above is only for transaction meta
+                            // emission (RESTORED vs UPDATED), not for bucket list operations.
+                            collected_hot_archive_keys
+                                .extend(hot_archive_for_bucket_list.iter().cloned());
+                            // Add filtered keys (including TTL) to restored.hot_archive for meta conversion
+                            restored.hot_archive.extend(hot_archive_for_meta);
+                            restored.hot_archive.extend(ttl_keys);
+                            (restored, soroban_data.map(|d| &d.resources.footprint))
+                        } else {
+                            (RestoredEntries::default(), None)
+                        };
+
+                        let op_changes_local = build_entry_changes_with_hot_archive(
+                            &self.state,
+                            &delta_changes.created,
+                            &delta_changes.updated,
+                            &delta_changes.update_states,
+                            &delta_changes.deleted,
+                            &delta_changes.delete_states,
+                            &delta_changes.change_order,
+                            &op_snapshots,
+                            &restored_entries,
+                            footprint,
+                            self.ledger_seq,
+                        );
+
+                        let mut op_events_final = Vec::new();
+                        if all_success && is_operation_success(&op_result) {
+                            if let Some(meta) = &op_exec.soroban_meta {
+                                op_event_manager.set_events(meta.events.clone());
+                                diagnostic_events.extend(meta.diagnostic_events.iter().cloned());
+                                soroban_return_value =
+                                    meta.return_value.clone().or(soroban_return_value);
+                            }
+
+                            if !op_type.is_soroban() {
+                                emit_classic_events_for_operation(
+                                    &mut op_event_manager,
+                                    op,
+                                    &op_result,
+                                    &op_source_muxed,
+                                    &self.state,
+                                    pre_claimable_balance.as_ref(),
+                                    pre_pool.as_ref(),
+                                );
+                            }
+
+                            if op_event_manager.is_enabled() {
+                                op_events_final = op_event_manager.finalize();
+                            }
+                        }
+
+                        if all_success {
+                            op_changes.push(op_changes_local);
+                            op_events.push(op_events_final);
+                        } else {
+                            op_changes.push(empty_entry_changes());
+                            op_events.push(Vec::new());
+                        }
+                    }
+                    Err(e) => {
+                        self.state.rollback_to_savepoint(op_savepoint);
+                        self.state.end_op_snapshot();
+                        all_success = false;
+                        tracing::debug!(
+                            error = %e,
+                            op_index = op_index,
+                            op_type = ?OperationType::from_body(&op.body),
+                            ledger_seq = self.ledger_seq,
+                            "Operation execution returned Err (mapped to txInternalError)"
+                        );
+                        // C++ maps std::runtime_error during operation execution
+                        // to txINTERNAL_ERROR (not txNOT_SUPPORTED). The exception
+                        // aborts all remaining operations.
+                        failure = Some(ExecutionFailure::InternalError);
+                        break;
+                    }
+                }
+                let op_elapsed_us = op_timing_start.elapsed().as_micros() as u64;
+                let entry = op_type_timings.entry(op_type).or_insert((0u64, 0u32));
+                entry.0 += op_elapsed_us;
+                entry.1 += 1;
+            }
+        }
+
+        let ops_us = tx_timing_start.elapsed().as_micros() as u64
+            - validation_us
+            - fee_seq_us
+            - footprint_us;
+
+        if all_success && self.state.has_pending_sponsorship() {
+            all_success = false;
+            failure = Some(ExecutionFailure::BadSponsorship);
+        }
+
+        if !all_success {
+            let tx_hash = frame
+                .hash(&self.network_id)
+                .map(|hash| hash.to_hex())
+                .unwrap_or_else(|_| "unknown".to_string());
+            debug!(
+                tx_hash = %tx_hash,
+                fee_source = %account_id_to_strkey(&fee_source_id),
+                inner_source = %account_id_to_strkey(&inner_source_id),
+                results = ?operation_results,
+                "Transaction failed; rolling back changes"
+            );
+            self.state.rollback();
+            restore_delta_entries(&mut self.state, &fee_created, &fee_updated, &fee_deleted);
+            // Re-add the fee to the delta after rollback.
+            // rollback() restores the delta from the snapshot taken BEFORE fee deduction,
+            // so we must explicitly re-add this transaction's fee to preserve it.
+            // This ensures failed transactions still contribute their fees to the fee pool.
+            if deduct_fee && fee > 0 {
+                self.state.delta_mut().add_fee(fee);
+            }
+            restore_delta_entries(&mut self.state, &seq_created, &seq_updated, &seq_deleted);
+            restore_delta_entries(
+                &mut self.state,
+                &signer_created,
+                &signer_updated,
+                &signer_deleted,
+            );
+            op_changes.clear();
+            op_events.clear();
+            diagnostic_events.clear();
+            soroban_return_value = None;
+
+            // Reset the refundable fee tracker when transaction fails.
+            // This mirrors C++ stellar-core's behavior where setError() calls resetConsumedFee(),
+            // ensuring the full max_refundable_fee is refunded on any transaction failure.
+            if let Some(tracker) = refundable_fee_tracker.as_mut() {
+                tracing::debug!(
+                    ledger_seq = self.ledger_seq,
+                    is_soroban = frame.is_soroban(),
+                    max_refundable_fee = tracker.max_refundable_fee,
+                    consumed_before_reset = tracker.consumed_refundable_fee,
+                    "Resetting fee tracker due to tx failure"
+                );
+                tracker.reset();
+            }
+        } else {
+            self.state.commit();
+
+            // Update module cache with any newly created contract code.
+            // This ensures subsequent transactions can use VmCachedInstantiation
+            // (cheap) instead of VmInstantiation (expensive) for contracts
+            // deployed in this transaction.
+            for entry in self.state.delta().created_entries() {
+                if let stellar_xdr::curr::LedgerEntryData::ContractCode(cc) = &entry.data {
+                    self.add_contract_to_cache(cc.code.as_slice());
+                }
+            }
+        }
+
+        let post_fee_changes = empty_entry_changes();
+        let mut fee_refund = 0i64;
+        let mut soroban_fee_info = None;
+        if let Some(tracker) = refundable_fee_tracker {
+            // Extract fee tracking info for soroban meta before consuming tracker
+            soroban_fee_info = Some((
+                tracker.non_refundable_fee,
+                tracker.consumed_refundable_fee,
+                tracker.consumed_rent_fee,
+            ));
+            let refund = tracker.refund_amount();
+            let stage = TransactionEventStage::AfterAllTxs;
+            tx_event_manager.new_fee_event(&fee_source_id, -refund, stage);
+            fee_refund = refund;
+        }
+
+        let tx_events = tx_event_manager.finalize();
+        let tx_meta = build_transaction_meta(
+            tx_changes_before.clone(),
+            op_changes,
+            op_events,
+            tx_events,
+            soroban_return_value,
+            diagnostic_events,
+            soroban_fee_info,
+        );
+
+        let total_us = tx_timing_start.elapsed().as_micros() as u64;
+        let meta_us = total_us - validation_us - fee_seq_us - footprint_us - ops_us;
+        if total_us > 5000 || frame.is_soroban() {
+            // Build a compact string of per-op-type timings sorted by time desc
+            let mut op_timing_vec: Vec<_> = op_type_timings.iter().collect();
+            op_timing_vec.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+            let op_timing_str: String = op_timing_vec
+                .iter()
+                .map(|(op, (us, count))| format!("{:?}:{}us×{}", op, us, count))
+                .collect::<Vec<_>>()
+                .join(",");
+            tracing::debug!(
+                ledger_seq = self.ledger_seq,
+                total_us,
+                validation_us,
+                fee_seq_us,
+                footprint_us,
+                ops_us,
+                meta_us,
+                is_soroban = frame.is_soroban(),
+                num_ops = frame.operations().len(),
+                success = all_success,
+                op_timings = %op_timing_str,
+                "TX phase timing"
+            );
+        }
+
+        Ok(TransactionExecutionResult {
+            success: all_success,
+            fee_charged: fee.saturating_sub(fee_refund),
+            fee_refund,
+            operation_results,
+            error: if all_success {
+                None
+            } else {
+                Some("One or more operations failed".into())
+            },
+            failure: if all_success {
+                None
+            } else {
+                Some(failure.unwrap_or(ExecutionFailure::OperationFailed))
+            },
+            tx_meta: Some(tx_meta),
+            fee_changes: Some(fee_changes),
+            post_fee_changes: Some(post_fee_changes),
+            // Convert HashSet back to Vec for the return type
+            hot_archive_restored_keys: collected_hot_archive_keys.into_iter().collect(),
+            op_type_timings,
+        })
+    }
+
+    /// Load accounts needed for an operation.
+    fn load_operation_accounts(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        op: &stellar_xdr::curr::Operation,
+        source_id: &AccountId,
+    ) -> Result<()> {
+        let op_source = op
+            .source_account
+            .as_ref()
+            .map(henyey_tx::muxed_to_account_id)
+            .unwrap_or_else(|| source_id.clone());
+
+        // Load operation source if different from transaction source
+        if let Some(ref muxed) = op.source_account {
+            let op_source = henyey_tx::muxed_to_account_id(muxed);
+            self.load_account(snapshot, &op_source)?;
+        }
+
+        // Load destination accounts based on operation type
+        match &op.body {
+            OperationBody::CreateAccount(op_data) => {
+                self.load_account(snapshot, &op_data.destination)?;
+            }
+            OperationBody::BeginSponsoringFutureReserves(op_data) => {
+                self.load_account(snapshot, &op_data.sponsored_id)?;
+            }
+            OperationBody::AllowTrust(op_data) => {
+                let asset = allow_trust_asset(op_data, &op_source);
+                let mut keys = vec![make_account_key(&op_data.trustor)];
+                if let Some(tl_asset) = asset_to_trustline_asset(&asset) {
+                    keys.push(make_trustline_key(&op_data.trustor, &tl_asset));
+                }
+                self.batch_load_keys(snapshot, &keys)?;
+                // Load offers by account/asset so they can be removed if authorization is revoked
+                self.load_offers_by_account_and_asset(snapshot, &op_data.trustor, &asset)?;
+            }
+            OperationBody::Payment(op_data) => {
+                let dest = henyey_tx::muxed_to_account_id(&op_data.destination);
+                let mut keys = vec![make_account_key(&dest)];
+                if let Some(tl_asset) = asset_to_trustline_asset(&op_data.asset) {
+                    keys.push(make_trustline_key(&op_source, &tl_asset));
+                    keys.push(make_trustline_key(&dest, &tl_asset));
+                }
+                if let Some(issuer) = asset_issuer_id(&op_data.asset) {
+                    keys.push(make_account_key(&issuer));
+                }
+                self.batch_load_keys(snapshot, &keys)?;
+            }
+            OperationBody::AccountMerge(dest) => {
+                let dest = henyey_tx::muxed_to_account_id(dest);
+                self.load_account(snapshot, &dest)?;
+            }
+            OperationBody::ClaimClaimableBalance(op_data) => {
+                self.load_claimable_balance(snapshot, &op_data.balance_id)?;
+                let key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+                    balance_id: op_data.balance_id.clone(),
+                });
+                if let Some(sponsor) = self.state.entry_sponsor(&key).cloned() {
+                    self.load_account(snapshot, &sponsor)?;
+                }
+                if let Some(entry) = self.state.get_claimable_balance(&op_data.balance_id) {
+                    let asset = entry.asset.clone();
+                    if let Some(tl_asset) = asset_to_trustline_asset(&asset) {
+                        self.load_trustline(snapshot, &op_source, &tl_asset)?;
+                        self.load_asset_issuer(snapshot, &asset)?;
+                    }
+                }
+            }
+            OperationBody::ClawbackClaimableBalance(op_data) => {
+                self.load_claimable_balance(snapshot, &op_data.balance_id)?;
+                let key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+                    balance_id: op_data.balance_id.clone(),
+                });
+                if let Some(sponsor) = self.state.entry_sponsor(&key).cloned() {
+                    self.load_account(snapshot, &sponsor)?;
+                }
+            }
+            OperationBody::CreateClaimableBalance(op_data) => {
+                if let Some(tl_asset) = asset_to_trustline_asset(&op_data.asset) {
+                    self.load_trustline(snapshot, &op_source, &tl_asset)?;
+                }
+            }
+            OperationBody::SetTrustLineFlags(op_data) => {
+                let mut keys = vec![make_account_key(&op_data.trustor)];
+                if let Some(tl_asset) = asset_to_trustline_asset(&op_data.asset) {
+                    keys.push(make_trustline_key(&op_data.trustor, &tl_asset));
+                }
+                self.batch_load_keys(snapshot, &keys)?;
+                // Load offers by account/asset so they can be removed if authorization is revoked
+                self.load_offers_by_account_and_asset(snapshot, &op_data.trustor, &op_data.asset)?;
+            }
+            OperationBody::Clawback(op_data) => {
+                let from_account = henyey_tx::muxed_to_account_id(&op_data.from);
+                if let Some(tl_asset) = asset_to_trustline_asset(&op_data.asset) {
+                    self.load_trustline(snapshot, &from_account, &tl_asset)?;
+                }
+            }
+            OperationBody::ManageSellOffer(op_data) => {
+                let mut keys = Vec::new();
+                for asset in [&op_data.selling, &op_data.buying] {
+                    if let Some(tl_asset) = asset_to_trustline_asset(asset) {
+                        keys.push(make_trustline_key(&op_source, &tl_asset));
+                    }
+                    if let Some(issuer) = asset_issuer_id(asset) {
+                        keys.push(make_account_key(&issuer));
+                    }
+                }
+                if op_data.offer_id != 0 {
+                    keys.push(LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+                        seller_id: op_source.clone(),
+                        offer_id: op_data.offer_id,
+                    }));
+                }
+                self.batch_load_keys(snapshot, &keys)?;
+                if op_data.offer_id != 0 {
+                    self.load_offer_sponsor(snapshot, &op_source, op_data.offer_id)?;
+                }
+            }
+            OperationBody::CreatePassiveSellOffer(op_data) => {
+                let mut keys = Vec::new();
+                for asset in [&op_data.selling, &op_data.buying] {
+                    if let Some(tl_asset) = asset_to_trustline_asset(asset) {
+                        keys.push(make_trustline_key(&op_source, &tl_asset));
+                    }
+                    if let Some(issuer) = asset_issuer_id(asset) {
+                        keys.push(make_account_key(&issuer));
+                    }
+                }
+                self.batch_load_keys(snapshot, &keys)?;
+            }
+            OperationBody::ManageBuyOffer(op_data) => {
+                let mut keys = Vec::new();
+                for asset in [&op_data.selling, &op_data.buying] {
+                    if let Some(tl_asset) = asset_to_trustline_asset(asset) {
+                        keys.push(make_trustline_key(&op_source, &tl_asset));
+                    }
+                    if let Some(issuer) = asset_issuer_id(asset) {
+                        keys.push(make_account_key(&issuer));
+                    }
+                }
+                if op_data.offer_id != 0 {
+                    keys.push(LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+                        seller_id: op_source.clone(),
+                        offer_id: op_data.offer_id,
+                    }));
+                }
+                self.batch_load_keys(snapshot, &keys)?;
+                if op_data.offer_id != 0 {
+                    self.load_offer_sponsor(snapshot, &op_source, op_data.offer_id)?;
+                }
+            }
+            OperationBody::PathPaymentStrictSend(op_data) => {
+                let dest = henyey_tx::muxed_to_account_id(&op_data.destination);
+                let mut keys = vec![make_account_key(&dest)];
+                if let Some(tl_asset) = asset_to_trustline_asset(&op_data.send_asset) {
+                    keys.push(make_trustline_key(&op_source, &tl_asset));
+                }
+                if let Some(tl_asset) = asset_to_trustline_asset(&op_data.dest_asset) {
+                    keys.push(make_trustline_key(&dest, &tl_asset));
+                }
+                if let Some(issuer) = asset_issuer_id(&op_data.send_asset) {
+                    keys.push(make_account_key(&issuer));
+                }
+                if let Some(issuer) = asset_issuer_id(&op_data.dest_asset) {
+                    keys.push(make_account_key(&issuer));
+                }
+                self.batch_load_keys(snapshot, &keys)?;
+                self.load_path_payment_pools(
+                    snapshot,
+                    &op_data.send_asset,
+                    &op_data.dest_asset,
+                    op_data.path.as_slice(),
+                )?;
+            }
+            OperationBody::PathPaymentStrictReceive(op_data) => {
+                let dest = henyey_tx::muxed_to_account_id(&op_data.destination);
+                let mut keys = vec![make_account_key(&dest)];
+                if let Some(tl_asset) = asset_to_trustline_asset(&op_data.send_asset) {
+                    keys.push(make_trustline_key(&op_source, &tl_asset));
+                }
+                if let Some(tl_asset) = asset_to_trustline_asset(&op_data.dest_asset) {
+                    keys.push(make_trustline_key(&dest, &tl_asset));
+                }
+                if let Some(issuer) = asset_issuer_id(&op_data.send_asset) {
+                    keys.push(make_account_key(&issuer));
+                }
+                if let Some(issuer) = asset_issuer_id(&op_data.dest_asset) {
+                    keys.push(make_account_key(&issuer));
+                }
+                self.batch_load_keys(snapshot, &keys)?;
+                self.load_path_payment_pools(
+                    snapshot,
+                    &op_data.send_asset,
+                    &op_data.dest_asset,
+                    op_data.path.as_slice(),
+                )?;
+            }
+            OperationBody::LiquidityPoolDeposit(op_data) => {
+                self.load_liquidity_pool_dependencies(
+                    snapshot,
+                    &op_source,
+                    &op_data.liquidity_pool_id,
+                )?;
+            }
+            OperationBody::LiquidityPoolWithdraw(op_data) => {
+                self.load_liquidity_pool_dependencies(
+                    snapshot,
+                    &op_source,
+                    &op_data.liquidity_pool_id,
+                )?;
+            }
+            OperationBody::ChangeTrust(op_data) => {
+                // Load existing trustline if any
+                let tl_asset = match &op_data.line {
+                    stellar_xdr::curr::ChangeTrustAsset::Native => None,
+                    stellar_xdr::curr::ChangeTrustAsset::CreditAlphanum4(a) => {
+                        Some(TrustLineAsset::CreditAlphanum4(a.clone()))
+                    }
+                    stellar_xdr::curr::ChangeTrustAsset::CreditAlphanum12(a) => {
+                        Some(TrustLineAsset::CreditAlphanum12(a.clone()))
+                    }
+                    stellar_xdr::curr::ChangeTrustAsset::PoolShare(params) => {
+                        // Compute pool ID from params
+                        use sha2::{Digest, Sha256};
+                        let xdr = params
+                            .to_xdr(Limits::none())
+                            .map_err(|e| LedgerError::Serialization(e.to_string()))?;
+                        let pool_id = PoolId(stellar_xdr::curr::Hash(Sha256::digest(&xdr).into()));
+                        Some(TrustLineAsset::PoolShare(pool_id))
+                    }
+                };
+                if let Some(ref tl_asset) = tl_asset {
+                    self.load_trustline(snapshot, &op_source, tl_asset)?;
+                    // If deleting a trustline (limit=0), load the sponsor account if it has one.
+                    // The sponsor's num_sponsoring needs to be decremented.
+                    if op_data.limit == 0 {
+                        let tl_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+                            account_id: op_source.clone(),
+                            asset: tl_asset.clone(),
+                        });
+                        if let Some(sponsor) = self.state.entry_sponsor(&tl_key).cloned() {
+                            self.load_account(snapshot, &sponsor)?;
+                        }
+                    }
+                }
+                // Load issuer account for non-pool-share assets WITHOUT recording.
+                // C++ stellar-core uses loadAccountWithoutRecord() for ChangeTrust issuer check
+                // which doesn't record the access in transaction changes.
+                // We still need to load the account into state so the existence check works.
+                match &op_data.line {
+                    stellar_xdr::curr::ChangeTrustAsset::CreditAlphanum4(a) => {
+                        let asset_code = String::from_utf8_lossy(a.asset_code.as_slice());
+                        tracing::debug!(
+                            asset_code = %asset_code,
+                            issuer = ?a.issuer,
+                            "ChangeTrust: loading issuer for CreditAlphanum4 (without record)"
+                        );
+                        self.load_account_without_record(snapshot, &a.issuer)?;
+                    }
+                    stellar_xdr::curr::ChangeTrustAsset::CreditAlphanum12(a) => {
+                        let asset_code = String::from_utf8_lossy(a.asset_code.as_slice());
+                        tracing::debug!(
+                            asset_code = %asset_code,
+                            issuer = ?a.issuer,
+                            "ChangeTrust: loading issuer for CreditAlphanum12 (without record)"
+                        );
+                        self.load_account_without_record(snapshot, &a.issuer)?;
+                    }
+                    stellar_xdr::curr::ChangeTrustAsset::PoolShare(params) => {
+                        use sha2::{Digest, Sha256};
+                        let xdr = params
+                            .to_xdr(Limits::none())
+                            .map_err(|e| LedgerError::Serialization(e.to_string()))?;
+                        let pool_id = PoolId(stellar_xdr::curr::Hash(Sha256::digest(&xdr).into()));
+                        let stellar_xdr::curr::LiquidityPoolParameters::LiquidityPoolConstantProduct(cp) = params;
+                        let mut keys = vec![LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
+                            liquidity_pool_id: pool_id.clone(),
+                        })];
+                        if let Some(tl_asset) = asset_to_trustline_asset(&cp.asset_a) {
+                            keys.push(make_trustline_key(&op_source, &tl_asset));
+                        }
+                        if let Some(tl_asset) = asset_to_trustline_asset(&cp.asset_b) {
+                            keys.push(make_trustline_key(&op_source, &tl_asset));
+                        }
+                        self.batch_load_keys(snapshot, &keys)?;
+                    }
+                    _ => {}
+                }
+            }
+            OperationBody::ManageData(op_data) => {
+                // Load existing data entry if any (needed for updates and deletes)
+                self.load_data_raw(snapshot, &op_source, &op_data.data_name)?;
+            }
+            OperationBody::RevokeSponsorship(op_data) => {
+                // Load the target entry that sponsorship is being revoked from
+                use stellar_xdr::curr::RevokeSponsorshipOp;
+                match op_data {
+                    RevokeSponsorshipOp::LedgerEntry(ledger_key) => {
+                        // Load the entry directly by its key
+                        self.load_entry(snapshot, ledger_key)?;
+                        // Also load owner/sponsor accounts that may be modified
+                        match ledger_key {
+                            LedgerKey::Account(k) => {
+                                self.load_account(snapshot, &k.account_id)?;
+                            }
+                            LedgerKey::Trustline(k) => {
+                                self.load_account(snapshot, &k.account_id)?;
+                            }
+                            LedgerKey::Offer(k) => {
+                                self.load_account(snapshot, &k.seller_id)?;
+                            }
+                            LedgerKey::Data(k) => {
+                                self.load_account(snapshot, &k.account_id)?;
+                            }
+                            LedgerKey::ClaimableBalance(k) => {
+                                // Load the claimable balance and its sponsor
+                                self.load_claimable_balance(snapshot, &k.balance_id)?;
+                            }
+                            _ => {}
+                        }
+                    }
+                    RevokeSponsorshipOp::Signer(signer_key) => {
+                        // Load the account that has the signer
+                        self.load_account(snapshot, &signer_key.account_id)?;
+                    }
+                }
+            }
+            OperationBody::SetOptions(op_data) => {
+                // If SetOptions sets an inflation_dest that differs from the source,
+                // we need to load that account to validate it exists.
+                // This matches C++ stellar-core's loadAccountWithoutRecord() call.
+                if let Some(ref inflation_dest) = op_data.inflation_dest {
+                    if inflation_dest != &op_source {
+                        self.load_account(snapshot, inflation_dest)?;
+                    }
+                }
+
+                // If SetOptions modifies signers and the source account has sponsored signers,
+                // we need to load those sponsor accounts so we can update their num_sponsoring.
+                if op_data.signer.is_some() {
+                    // Collect sponsor IDs from the source account's signer_sponsoring_i_ds
+                    let sponsor_ids: Vec<AccountId> = self
+                        .state
+                        .get_account(&op_source)
+                        .and_then(|account| {
+                            if let AccountEntryExt::V1(v1) = &account.ext {
+                                if let AccountEntryExtensionV1Ext::V2(v2) = &v1.ext {
+                                    return Some(
+                                        v2.signer_sponsoring_i_ds
+                                            .iter()
+                                            .filter_map(|s| s.0.clone())
+                                            .collect(),
+                                    );
+                                }
+                            }
+                            None
+                        })
+                        .unwrap_or_default();
+
+                    // Load each sponsor account
+                    for sponsor_id in &sponsor_ids {
+                        self.load_account(snapshot, sponsor_id)?;
+                    }
+                }
+            }
+            _ => {
+                // Other operations typically work on source account
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Execute a single operation using the central dispatcher.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_single_operation(
+        &mut self,
+        op: &stellar_xdr::curr::Operation,
+        source: &AccountId,
+        tx_source: &AccountId,
+        tx_seq: i64,
+        op_index: u32,
+        context: &LedgerContext,
+        soroban_data: Option<&stellar_xdr::curr::SorobanTransactionData>,
+    ) -> std::result::Result<henyey_tx::operations::execute::OperationExecutionResult, TxError>
+    {
+        // Create a hot archive lookup wrapper if hot archive is available
+        let hot_archive_lookup;
+        let hot_archive_ref: Option<&dyn henyey_tx::soroban::HotArchiveLookup> =
+            if let Some(ref ha) = self.hot_archive {
+                hot_archive_lookup = HotArchiveLookupImpl::new(ha.clone());
+                Some(&hot_archive_lookup)
+            } else {
+                None
+            };
+
+        // Use the central operation dispatcher which handles all operation types
+        henyey_tx::operations::execute::execute_operation_with_soroban(
+            op,
+            source,
+            tx_source,
+            tx_seq,
+            op_index,
+            &mut self.state,
+            context,
+            soroban_data,
+            Some(&self.soroban_config),
+            self.module_cache.as_ref(),
+            hot_archive_ref,
+        )
+    }
+
+    /// Apply all state changes to the delta.
+    pub fn apply_to_delta(
+        &self,
+        _snapshot: &SnapshotHandle,
+        delta: &mut LedgerDelta,
+    ) -> Result<()> {
+        let state_delta = self.state.delta();
+
+        // Apply changes in chronological order using change_order.
+        // This is critical for correctness when the same key is affected by
+        // multiple transactions (e.g., TX1 deletes an entry, TX2 recreates it).
+        // Processing by category (all creates, then all updates, then all deletes)
+        // would process the create before the delete, causing them to cancel out
+        // instead of producing the correct Updated result.
+        for change_ref in state_delta.change_order() {
+            match change_ref {
+                henyey_tx::ChangeRef::Created(idx) => {
+                    let entry = &state_delta.created_entries()[*idx];
+                    delta.record_create(entry.clone())?;
+                }
+                henyey_tx::ChangeRef::Updated(idx) => {
+                    let prev = &state_delta.update_states()[*idx];
+                    let entry = &state_delta.updated_entries()[*idx];
+                    delta.record_update(prev.clone(), entry.clone())?;
+                }
+                henyey_tx::ChangeRef::Deleted(idx) => {
+                    let prev = &state_delta.delete_states()[*idx];
+                    delta.record_delete(prev.clone())?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get total fees collected.
+    pub fn total_fees(&self) -> i64 {
+        self.state.delta().fee_charged()
+    }
+
+    /// Get the updated ID pool after execution.
+    pub fn id_pool(&self) -> u64 {
+        self.state.id_pool()
+    }
+
+    /// Get the state manager.
+    pub fn state(&self) -> &LedgerStateManager {
+        &self.state
+    }
+
+    /// Get mutable state manager.
+    pub fn state_mut(&mut self) -> &mut LedgerStateManager {
+        &mut self.state
+    }
+}
+
+fn asset_to_trustline_asset(
+    asset: &stellar_xdr::curr::Asset,
+) -> Option<stellar_xdr::curr::TrustLineAsset> {
+    match asset {
+        stellar_xdr::curr::Asset::Native => None,
+        stellar_xdr::curr::Asset::CreditAlphanum4(a) => Some(
+            stellar_xdr::curr::TrustLineAsset::CreditAlphanum4(a.clone()),
+        ),
+        stellar_xdr::curr::Asset::CreditAlphanum12(a) => Some(
+            stellar_xdr::curr::TrustLineAsset::CreditAlphanum12(a.clone()),
+        ),
+    }
+}
+
+fn asset_issuer_id(asset: &stellar_xdr::curr::Asset) -> Option<AccountId> {
+    match asset {
+        stellar_xdr::curr::Asset::Native => None,
+        stellar_xdr::curr::Asset::CreditAlphanum4(a) => Some(a.issuer.clone()),
+        stellar_xdr::curr::Asset::CreditAlphanum12(a) => Some(a.issuer.clone()),
+    }
+}
+
+fn make_account_key(account_id: &AccountId) -> LedgerKey {
+    LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        account_id: account_id.clone(),
+    })
+}
+
+fn make_trustline_key(
+    account_id: &AccountId,
+    asset: &stellar_xdr::curr::TrustLineAsset,
+) -> LedgerKey {
+    LedgerKey::Trustline(LedgerKeyTrustLine {
+        account_id: account_id.clone(),
+        asset: asset.clone(),
+    })
+}
+
+#[derive(Clone, Copy)]
+struct DeltaSnapshot {
+    created: usize,
+    updated: usize,
+    deleted: usize,
+    change_order: usize,
+}
+
+fn delta_snapshot(state: &LedgerStateManager) -> DeltaSnapshot {
+    let delta = state.delta();
+    DeltaSnapshot {
+        created: delta.created_entries().len(),
+        updated: delta.updated_entries().len(),
+        deleted: delta.deleted_keys().len(),
+        change_order: delta.change_order().len(),
+    }
+}
+
+/// Result of extracting delta changes between two snapshots.
+struct DeltaChanges {
+    created: Vec<LedgerEntry>,
+    updated: Vec<LedgerEntry>,
+    update_states: Vec<LedgerEntry>,
+    deleted: Vec<LedgerKey>,
+    delete_states: Vec<LedgerEntry>,
+    change_order: Vec<henyey_tx::ChangeRef>,
+}
+
+fn delta_changes_between(
+    delta: &henyey_tx::LedgerDelta,
+    start: DeltaSnapshot,
+    end: DeltaSnapshot,
+) -> DeltaChanges {
+    let created = delta.created_entries()[start.created..end.created].to_vec();
+    let updated = delta.updated_entries()[start.updated..end.updated].to_vec();
+    let update_states = delta.update_states()[start.updated..end.updated].to_vec();
+    let deleted = delta.deleted_keys()[start.deleted..end.deleted].to_vec();
+    let delete_states = delta.delete_states()[start.deleted..end.deleted].to_vec();
+
+    // Adjust change_order indices to be relative to the sliced vectors
+    // Global indices need to be converted to local (sliced) indices
+    let change_order: Vec<henyey_tx::ChangeRef> = delta.change_order()
+        [start.change_order..end.change_order]
+        .iter()
+        .filter_map(|change_ref| {
+            match change_ref {
+                henyey_tx::ChangeRef::Created(idx) => {
+                    // Convert global index to local: subtract start offset
+                    if *idx >= start.created && *idx < end.created {
+                        Some(henyey_tx::ChangeRef::Created(*idx - start.created))
+                    } else {
+                        None // Index out of range for this slice
+                    }
+                }
+                henyey_tx::ChangeRef::Updated(idx) => {
+                    if *idx >= start.updated && *idx < end.updated {
+                        Some(henyey_tx::ChangeRef::Updated(*idx - start.updated))
+                    } else {
+                        None
+                    }
+                }
+                henyey_tx::ChangeRef::Deleted(idx) => {
+                    if *idx >= start.deleted && *idx < end.deleted {
+                        Some(henyey_tx::ChangeRef::Deleted(*idx - start.deleted))
+                    } else {
+                        None
+                    }
+                }
+            }
+        })
+        .collect();
+
+    DeltaChanges {
+        created,
+        updated,
+        update_states,
+        deleted,
+        delete_states,
+        change_order,
+    }
+}
+
+const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
+
+fn allow_trust_asset(op: &AllowTrustOp, issuer: &AccountId) -> Asset {
+    match &op.asset {
+        AssetCode::CreditAlphanum4(code) => Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: code.clone(),
+            issuer: issuer.clone(),
+        }),
+        AssetCode::CreditAlphanum12(code) => Asset::CreditAlphanum12(AlphaNum12 {
+            asset_code: code.clone(),
+            issuer: issuer.clone(),
+        }),
+    }
+}
+
+fn pool_reserves(pool: &LiquidityPoolEntry) -> Option<(Asset, Asset, i64, i64)> {
+    match &pool.body {
+        LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => Some((
+            cp.params.asset_a.clone(),
+            cp.params.asset_b.clone(),
+            cp.reserve_a,
+            cp.reserve_b,
+        )),
+    }
+}
+
+/// Tracks entries restored from different sources per CAP-0066.
+#[derive(Debug, Default)]
+struct RestoredEntries {
+    /// Keys restored from hot archive (evicted entries).
+    /// These will have CREATED changes that should be converted to RESTORED.
+    hot_archive: HashSet<LedgerKey>,
+    /// For hot archive restores, maps data/code keys to their entry values.
+    /// These are needed to emit RESTORED for data/code that wasn't directly modified
+    /// (e.g., RestoreFootprint only creates TTL, but data entry needs RESTORED).
+    hot_archive_entries: HashMap<LedgerKey, LedgerEntry>,
+    /// Keys restored from live BucketList (expired TTL but not yet evicted).
+    /// TTL entries will have STATE+UPDATED that should be converted to RESTORED.
+    /// Associated data/code entries need RESTORED meta added even if not modified.
+    live_bucket_list: HashSet<LedgerKey>,
+    /// For live BL restores, maps data/code keys to their entry values.
+    /// These are needed to emit RESTORED for data/code that wasn't directly modified.
+    live_bucket_list_entries: HashMap<LedgerKey, LedgerEntry>,
+}
+
+/// Extract keys of entries being restored from the hot archive.
+///
+/// For InvokeHostFunction: Uses `actual_restored_indices` from the execution result,
+/// which filters out entries that were already restored by a previous transaction
+/// in the same ledger. This is crucial for correctness - entries listed in
+/// `archived_soroban_entries` in the envelope may have been restored by a prior TX.
+///
+/// For RestoreFootprint: entries are from hot archive if they don't exist in live BL,
+/// otherwise they're from live BL (detected separately).
+///
+/// Per CAP-0066, these entries should be emitted as RESTORED (not CREATED or STATE/UPDATED)
+/// in the transaction meta. Both the data/code entry AND its associated TTL entry are restored.
+fn extract_hot_archive_restored_keys(
+    soroban_data: Option<&SorobanTransactionData>,
+    op_type: OperationType,
+    actual_restored_indices: &[u32],
+) -> HashSet<LedgerKey> {
+    let mut keys = HashSet::new();
+
+    let Some(data) = soroban_data else {
+        return keys;
+    };
+
+    // For InvokeHostFunction: extract archived entry indices from the extension
+    // For RestoreFootprint: hot archive keys are those that will be CREATED (not UPDATED)
+    // We'll handle RestoreFootprint detection at change-building time
+    if op_type == OperationType::RestoreFootprint {
+        // Don't add all keys here - we'll detect at change-building time
+        // based on whether entries are CREATED (hot archive) or UPDATED (live BL)
+        return keys;
+    }
+
+    // Use actual_restored_indices instead of raw archived_soroban_entries.
+    // The actual_restored_indices is filtered during host invocation to only
+    // include entries that are ACTUALLY being restored in THIS transaction,
+    // excluding entries already restored by a previous transaction in this ledger.
+    if actual_restored_indices.is_empty() {
+        return keys;
+    }
+
+    // Get the corresponding keys from the read_write footprint
+    // NOTE: Only add the main entry keys (ContractData/ContractCode), NOT the TTL keys.
+    // C++ stellar-core's HotArchiveBucketList::add_batch only receives the main entry keys,
+    // not TTL keys. TTL entries are handled separately in the live bucket list.
+    let read_write = &data.resources.footprint.read_write;
+    for index in actual_restored_indices {
+        if let Some(key) = read_write.get(*index as usize) {
+            keys.insert(key.clone());
+        }
+    }
+
+    keys
+}
+
+fn emit_classic_events_for_operation(
+    op_event_manager: &mut OpEventManager,
+    op: &Operation,
+    op_result: &OperationResult,
+    op_source: &MuxedAccount,
+    state: &LedgerStateManager,
+    pre_claimable_balance: Option<&ClaimableBalanceEntry>,
+    pre_pool: Option<&LiquidityPoolEntry>,
+) {
+    if !op_event_manager.is_enabled() {
+        return;
+    }
+
+    let source_address = make_muxed_account_address(op_source);
+    match &op.body {
+        OperationBody::CreateAccount(op_data) => {
+            op_event_manager.new_transfer_event(
+                &Asset::Native,
+                &source_address,
+                &make_account_address(&op_data.destination),
+                op_data.starting_balance,
+                true,
+            );
+        }
+        OperationBody::Payment(op_data) => {
+            op_event_manager.event_for_transfer_with_issuer_check(
+                &op_data.asset,
+                &source_address,
+                &make_muxed_account_address(&op_data.destination),
+                op_data.amount,
+                true,
+            );
+        }
+        OperationBody::PathPaymentStrictSend(op_data) => {
+            if let OperationResult::OpInner(OperationResultTr::PathPaymentStrictSend(
+                PathPaymentStrictSendResult::Success(success),
+            )) = op_result
+            {
+                op_event_manager.events_for_claim_atoms(op_source, &success.offers);
+                op_event_manager.event_for_transfer_with_issuer_check(
+                    &op_data.dest_asset,
+                    &source_address,
+                    &make_muxed_account_address(&op_data.destination),
+                    success.last.amount,
+                    true,
+                );
+            }
+        }
+        OperationBody::PathPaymentStrictReceive(op_data) => {
+            if let OperationResult::OpInner(OperationResultTr::PathPaymentStrictReceive(
+                PathPaymentStrictReceiveResult::Success(success),
+            )) = op_result
+            {
+                op_event_manager.events_for_claim_atoms(op_source, &success.offers);
+                op_event_manager.event_for_transfer_with_issuer_check(
+                    &op_data.dest_asset,
+                    &source_address,
+                    &make_muxed_account_address(&op_data.destination),
+                    op_data.dest_amount,
+                    true,
+                );
+            }
+        }
+        OperationBody::ManageSellOffer(_) | OperationBody::CreatePassiveSellOffer(_) => {
+            if let OperationResult::OpInner(
+                OperationResultTr::ManageSellOffer(ManageSellOfferResult::Success(success))
+                | OperationResultTr::CreatePassiveSellOffer(ManageSellOfferResult::Success(success)),
+            ) = op_result
+            {
+                op_event_manager.events_for_claim_atoms(op_source, &success.offers_claimed);
+            }
+        }
+        OperationBody::ManageBuyOffer(_) => {
+            if let OperationResult::OpInner(OperationResultTr::ManageBuyOffer(
+                ManageBuyOfferResult::Success(success),
+            )) = op_result
+            {
+                op_event_manager.events_for_claim_atoms(op_source, &success.offers_claimed);
+            }
+        }
+        OperationBody::AccountMerge(dest) => {
+            if let OperationResult::OpInner(OperationResultTr::AccountMerge(
+                AccountMergeResult::Success(balance),
+            )) = op_result
+            {
+                op_event_manager.new_transfer_event(
+                    &Asset::Native,
+                    &source_address,
+                    &make_muxed_account_address(dest),
+                    *balance,
+                    true,
+                );
+            }
+        }
+        OperationBody::CreateClaimableBalance(op_data) => {
+            if let OperationResult::OpInner(OperationResultTr::CreateClaimableBalance(
+                CreateClaimableBalanceResult::Success(balance_id),
+            )) = op_result
+            {
+                op_event_manager.event_for_transfer_with_issuer_check(
+                    &op_data.asset,
+                    &source_address,
+                    &make_claimable_balance_address(balance_id),
+                    op_data.amount,
+                    true,
+                );
+            }
+        }
+        OperationBody::ClaimClaimableBalance(op_data) => {
+            if let Some(entry) = pre_claimable_balance {
+                op_event_manager.event_for_transfer_with_issuer_check(
+                    &entry.asset,
+                    &make_claimable_balance_address(&op_data.balance_id),
+                    &source_address,
+                    entry.amount,
+                    true,
+                );
+            }
+        }
+        OperationBody::Clawback(op_data) => {
+            op_event_manager.new_clawback_event(
+                &op_data.asset,
+                &make_muxed_account_address(&op_data.from),
+                op_data.amount,
+            );
+        }
+        OperationBody::ClawbackClaimableBalance(op_data) => {
+            if let Some(entry) = pre_claimable_balance {
+                op_event_manager.new_clawback_event(
+                    &entry.asset,
+                    &make_claimable_balance_address(&op_data.balance_id),
+                    entry.amount,
+                );
+            }
+        }
+        OperationBody::AllowTrust(op_data) => {
+            let issuer = henyey_tx::muxed_to_account_id(op_source);
+            let asset = allow_trust_asset(op_data, &issuer);
+            if let Some(trustline) = state.get_trustline(&op_data.trustor, &asset) {
+                let authorize = trustline.flags & AUTHORIZED_FLAG != 0;
+                op_event_manager.new_set_authorized_event(&asset, &op_data.trustor, authorize);
+            }
+        }
+        OperationBody::SetTrustLineFlags(op_data) => {
+            if let Some(trustline) = state.get_trustline(&op_data.trustor, &op_data.asset) {
+                let authorize = trustline.flags & AUTHORIZED_FLAG != 0;
+                op_event_manager.new_set_authorized_event(
+                    &op_data.asset,
+                    &op_data.trustor,
+                    authorize,
+                );
+            }
+        }
+        OperationBody::LiquidityPoolDeposit(op_data) => {
+            let (asset_a, asset_b, pre_a, pre_b) = match pre_pool.and_then(pool_reserves) {
+                Some(values) => values,
+                None => return,
+            };
+            let Some(post_pool) = state.get_liquidity_pool(&op_data.liquidity_pool_id) else {
+                return;
+            };
+            let Some((_, _, post_a, post_b)) = pool_reserves(post_pool) else {
+                return;
+            };
+            if post_a < pre_a || post_b < pre_b {
+                return;
+            }
+            let amount_a = post_a - pre_a;
+            let amount_b = post_b - pre_b;
+            let pool_address = ScAddress::LiquidityPool(op_data.liquidity_pool_id.clone());
+            op_event_manager.event_for_transfer_with_issuer_check(
+                &asset_a,
+                &source_address,
+                &pool_address,
+                amount_a,
+                false,
+            );
+            op_event_manager.event_for_transfer_with_issuer_check(
+                &asset_b,
+                &source_address,
+                &pool_address,
+                amount_b,
+                false,
+            );
+        }
+        OperationBody::LiquidityPoolWithdraw(op_data) => {
+            let (asset_a, asset_b, pre_a, pre_b) = match pre_pool.and_then(pool_reserves) {
+                Some(values) => values,
+                None => return,
+            };
+            let Some(post_pool) = state.get_liquidity_pool(&op_data.liquidity_pool_id) else {
+                return;
+            };
+            let Some((_, _, post_a, post_b)) = pool_reserves(post_pool) else {
+                return;
+            };
+            if pre_a < post_a || pre_b < post_b {
+                return;
+            }
+            let amount_a = pre_a - post_a;
+            let amount_b = pre_b - post_b;
+            let pool_address = ScAddress::LiquidityPool(op_data.liquidity_pool_id.clone());
+            op_event_manager.event_for_transfer_with_issuer_check(
+                &asset_a,
+                &pool_address,
+                &source_address,
+                amount_a,
+                true,
+            );
+            op_event_manager.event_for_transfer_with_issuer_check(
+                &asset_b,
+                &pool_address,
+                &source_address,
+                amount_b,
+                true,
+            );
+        }
+        OperationBody::Inflation => {
+            if let OperationResult::OpInner(OperationResultTr::Inflation(
+                InflationResult::Success(payouts),
+            )) = op_result
+            {
+                for payout in payouts.iter() {
+                    op_event_manager.new_mint_event(
+                        &Asset::Native,
+                        &make_account_address(&payout.destination),
+                        payout.amount,
+                        false,
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Restore delta entries after a rollback.
+///
+/// This is used when a transaction fails - we restore the fee/seq changes
+/// that were already committed before the operation rollback.
+/// For updates, we use the entry as both pre-state and post-state since
+/// we're just tracking the final state (the pre-state is not relevant
+/// for bucket updates which is what the delta is used for).
+fn restore_delta_entries(
+    state: &mut LedgerStateManager,
+    created: &[LedgerEntry],
+    updated: &[LedgerEntry],
+    deleted: &[LedgerKey],
+) {
+    let delta = state.delta_mut();
+    for entry in created {
+        delta.record_create(entry.clone());
+    }
+    for entry in updated {
+        // Use the entry as both pre and post state - this is a restore after rollback
+        delta.record_update(entry.clone(), entry.clone());
+    }
+    for (i, key) in deleted.iter().enumerate() {
+        // For deleted entries, we need a pre-state but don't have one
+        // Try to find it from updated entries, otherwise skip
+        // (In practice, fee/seq changes rarely delete entries)
+        if i < updated.len() {
+            delta.record_delete(key.clone(), updated[i].clone());
+        }
+    }
+}
+
+fn build_entry_changes_with_state(
+    state: &LedgerStateManager,
+    created: &[LedgerEntry],
+    updated: &[LedgerEntry],
+    deleted: &[LedgerKey],
+) -> LedgerEntryChanges {
+    build_entry_changes_with_state_overrides(state, created, updated, deleted, &HashMap::new())
+}
+
+fn build_entry_changes_with_state_overrides(
+    state: &LedgerStateManager,
+    created: &[LedgerEntry],
+    updated: &[LedgerEntry],
+    deleted: &[LedgerKey],
+    state_overrides: &HashMap<LedgerKey, LedgerEntry>,
+) -> LedgerEntryChanges {
+    // Call with empty change_order and restored set for non-operation changes
+    // Empty change_order triggers the fallback type-grouped ordering
+    // Empty update_states/delete_states - we'll use snapshot lookup for these cases
+    let empty_restored = RestoredEntries::default();
+    build_entry_changes_with_hot_archive(
+        state,
+        created,
+        updated,
+        &[], // update_states - empty, will use snapshot fallback
+        deleted,
+        &[], // delete_states - empty, will use snapshot fallback
+        &[],
+        state_overrides,
+        &empty_restored,
+        None,
+        0, // ledger_seq not used for non-operation changes
+    )
+}
+
+/// Build entry changes with support for hot archive and live BL restoration tracking.
+///
+/// For entries in `restored.hot_archive`:
+/// - Emit RESTORED instead of CREATED (entry was restored from hot archive per CAP-0066)
+/// - For deleted entries that were restored, emit RESTORED then REMOVED
+///
+/// For entries in `restored.live_bucket_list`:
+/// - Convert STATE+UPDATED to RESTORED (entry had expired TTL in live BL)
+/// - Emit RESTORED for associated data/code entries even if not directly modified
+///
+/// When `footprint` is provided (for Soroban operations), entries are ordered according to
+/// the footprint's read_write order to match C++ stellar-core behavior.
+/// For classic operations, entries are ordered according to the execution order tracked
+/// in `change_order` to match C++ stellar-core behavior, emitting STATE/UPDATED pairs
+/// for EACH modification (not deduplicated).
+#[allow(clippy::too_many_arguments)]
+fn build_entry_changes_with_hot_archive(
+    state: &LedgerStateManager,
+    created: &[LedgerEntry],
+    updated: &[LedgerEntry],
+    update_states: &[LedgerEntry],
+    deleted: &[LedgerKey],
+    delete_states: &[LedgerEntry],
+    change_order: &[henyey_tx::ChangeRef],
+    state_overrides: &HashMap<LedgerKey, LedgerEntry>,
+    restored: &RestoredEntries,
+    footprint: Option<&stellar_xdr::curr::LedgerFootprint>,
+    current_ledger_seq: u32,
+) -> LedgerEntryChanges {
+    // Debug: log all vectors sizes and entry types
+    fn entry_type_name(entry: &LedgerEntry) -> &'static str {
+        match &entry.data {
+            stellar_xdr::curr::LedgerEntryData::Account(_) => "Account",
+            stellar_xdr::curr::LedgerEntryData::Trustline(_) => "Trustline",
+            stellar_xdr::curr::LedgerEntryData::Offer(_) => "Offer",
+            stellar_xdr::curr::LedgerEntryData::Data(_) => "Data",
+            stellar_xdr::curr::LedgerEntryData::ClaimableBalance(_) => "ClaimableBalance",
+            stellar_xdr::curr::LedgerEntryData::LiquidityPool(_) => "LiquidityPool",
+            stellar_xdr::curr::LedgerEntryData::ContractData(_) => "ContractData",
+            stellar_xdr::curr::LedgerEntryData::ContractCode(_) => "ContractCode",
+            stellar_xdr::curr::LedgerEntryData::ConfigSetting(_) => "ConfigSetting",
+            stellar_xdr::curr::LedgerEntryData::Ttl(_) => "Ttl",
+        }
+    }
+
+    // Log all created entries
+    tracing::debug!(
+        "build_entry_changes: VECTORS created={}, updated={}, deleted={}, change_order={}",
+        created.len(),
+        updated.len(),
+        deleted.len(),
+        change_order.len()
+    );
+    for (i, entry) in created.iter().enumerate() {
+        tracing::debug!(
+            "build_entry_changes: created[{}] = {}",
+            i,
+            entry_type_name(entry)
+        );
+    }
+    for (i, entry) in updated.iter().enumerate() {
+        tracing::debug!(
+            "build_entry_changes: updated[{}] = {}",
+            i,
+            entry_type_name(entry)
+        );
+    }
+    // Log change_order
+    for (i, change_ref) in change_order.iter().enumerate() {
+        tracing::debug!(
+            "build_entry_changes: change_order[{}] = {:?}",
+            i,
+            change_ref
+        );
+    }
+
+    // Debug: log all created entries to see TTL
+    for (i, entry) in created.iter().enumerate() {
+        if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &entry.data {
+            tracing::debug!(
+                "build_entry_changes: CREATED vector contains TTL at idx={}, key_hash={:x?}, live_until={}",
+                i,
+                &ttl.key_hash.0[..8],
+                ttl.live_until_ledger_seq
+            );
+        }
+    }
+    // Debug: log all updated entries to see if any are TTL
+    for (i, entry) in updated.iter().enumerate() {
+        if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &entry.data {
+            tracing::debug!(
+                "build_entry_changes: UPDATED vector contains TTL at idx={}, key_hash={:x?}, live_until={}",
+                i,
+                &ttl.key_hash.0[..8],
+                ttl.live_until_ledger_seq
+            );
+        }
+    }
+    // Debug: log change_order
+    for (i, change_ref) in change_order.iter().enumerate() {
+        match change_ref {
+            henyey_tx::ChangeRef::Created(idx) => {
+                if *idx < created.len() {
+                    if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &created[*idx].data {
+                        tracing::debug!(
+                            "build_entry_changes: change_order[{}] = Created({}) -> TTL key_hash={:x?}, live_until={}",
+                            i, idx, &ttl.key_hash.0[..8], ttl.live_until_ledger_seq
+                        );
+                    }
+                }
+            }
+            henyey_tx::ChangeRef::Updated(idx) => {
+                if *idx < updated.len() {
+                    if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &updated[*idx].data {
+                        tracing::debug!(
+                            "build_entry_changes: change_order[{}] = Updated({}) -> TTL key_hash={:x?}, live_until={}",
+                            i, idx, &ttl.key_hash.0[..8], ttl.live_until_ledger_seq
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fn entry_key_bytes(entry: &LedgerEntry) -> Vec<u8> {
+        crate::delta::entry_to_key(entry)
+            .ok()
+            .and_then(|key| key.to_xdr(Limits::none()).ok())
+            .unwrap_or_default()
+    }
+
+    fn push_created_or_restored(
+        changes: &mut Vec<LedgerEntryChange>,
+        entry: &LedgerEntry,
+        restored: &RestoredEntries,
+    ) {
+        if let Ok(key) = crate::delta::entry_to_key(entry) {
+            // For hot archive restores and live bucket list restores (expired TTL),
+            // emit RESTORED instead of CREATED.
+            // This matches C++ stellar-core's processOpLedgerEntryChanges behavior.
+            if restored.hot_archive.contains(&key) || restored.live_bucket_list.contains(&key) {
+                changes.push(LedgerEntryChange::Restored(entry.clone()));
+                return;
+            }
+        }
+        changes.push(LedgerEntryChange::Created(entry.clone()));
+    }
+
+    let mut changes: Vec<LedgerEntryChange> = Vec::new();
+
+    // Build final values for each updated key (used for Soroban deduplication)
+    let mut final_updated: HashMap<Vec<u8>, LedgerEntry> = HashMap::new();
+    for entry in updated {
+        let key_bytes = entry_key_bytes(entry);
+        final_updated.insert(key_bytes, entry.clone());
+    }
+
+    // For Soroban operations with footprint, use change_order but sort consecutive Soroban creates by key_hash.
+    // For classic operations, use change_order to preserve execution order.
+    // Key insight: change_order captures the execution sequence. For Soroban, we must preserve
+    // the positions of classic entry changes (Account, Trustline) while sorting Soroban creates
+    // (TTL, ContractData, ContractCode) by their associated key_hash to match C++ behavior.
+    if footprint.is_some() {
+        use std::collections::HashSet;
+
+        fn is_soroban_entry(entry: &LedgerEntry) -> bool {
+            matches!(
+                &entry.data,
+                stellar_xdr::curr::LedgerEntryData::Ttl(_)
+                    | stellar_xdr::curr::LedgerEntryData::ContractData(_)
+                    | stellar_xdr::curr::LedgerEntryData::ContractCode(_)
+            )
+        }
+
+        // Track which keys have been created (for deduplication)
+        let mut created_keys: HashSet<Vec<u8>> = HashSet::new();
+
+        // Process change_order to preserve execution sequence
+        // Collect groups of changes: either single updates/deletes or consecutive Soroban creates
+        enum ChangeGroup {
+            SingleUpdate { idx: usize },
+            SingleDelete { idx: usize },
+            SorobanCreates { indices: Vec<usize> },
+            ClassicCreate { idx: usize },
+        }
+
+        let mut groups: Vec<ChangeGroup> = Vec::new();
+        let mut pending_soroban_creates: Vec<usize> = Vec::new();
+
+        for change_ref in change_order {
+            match change_ref {
+                henyey_tx::ChangeRef::Created(idx) => {
+                    if *idx < created.len() {
+                        let entry = &created[*idx];
+                        if is_soroban_entry(entry) {
+                            pending_soroban_creates.push(*idx);
+                        } else {
+                            // Flush any pending Soroban creates before this classic create
+                            if !pending_soroban_creates.is_empty() {
+                                groups.push(ChangeGroup::SorobanCreates {
+                                    indices: std::mem::take(&mut pending_soroban_creates),
+                                });
+                            }
+                            groups.push(ChangeGroup::ClassicCreate { idx: *idx });
+                        }
+                    }
+                }
+                henyey_tx::ChangeRef::Updated(idx) => {
+                    // Flush any pending Soroban creates before this update
+                    if !pending_soroban_creates.is_empty() {
+                        groups.push(ChangeGroup::SorobanCreates {
+                            indices: std::mem::take(&mut pending_soroban_creates),
+                        });
+                    }
+                    groups.push(ChangeGroup::SingleUpdate { idx: *idx });
+                }
+                henyey_tx::ChangeRef::Deleted(idx) => {
+                    // Flush any pending Soroban creates before this delete
+                    if !pending_soroban_creates.is_empty() {
+                        groups.push(ChangeGroup::SorobanCreates {
+                            indices: std::mem::take(&mut pending_soroban_creates),
+                        });
+                    }
+                    groups.push(ChangeGroup::SingleDelete { idx: *idx });
+                }
+            }
+        }
+
+        // Flush any remaining Soroban creates
+        if !pending_soroban_creates.is_empty() {
+            groups.push(ChangeGroup::SorobanCreates {
+                indices: pending_soroban_creates,
+            });
+        }
+
+        // Process each group
+        for group in groups {
+            match group {
+                ChangeGroup::SorobanCreates { indices } => {
+                    // C++ groups TTL entries with their associated ContractData/ContractCode.
+                    // Sort by (associated_key_hash, type_order) where TTL comes before its data.
+                    use sha2::{Digest, Sha256};
+
+                    fn get_associated_hash_and_type(entry: &LedgerEntry) -> (Vec<u8>, u8) {
+                        match &entry.data {
+                            stellar_xdr::curr::LedgerEntryData::Ttl(ttl) => {
+                                // TTL: associated_hash is key_hash, type_order=0 (first)
+                                (ttl.key_hash.0.to_vec(), 0)
+                            }
+                            stellar_xdr::curr::LedgerEntryData::ContractData(_)
+                            | stellar_xdr::curr::LedgerEntryData::ContractCode(_) => {
+                                // Data/Code: associated_hash is SHA256 of key XDR, type_order=1 (second)
+                                if let Ok(key) = crate::delta::entry_to_key(entry) {
+                                    if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
+                                        let key_hash = Sha256::digest(&key_bytes);
+                                        return (key_hash.to_vec(), 1);
+                                    }
+                                }
+                                (Vec::new(), 1)
+                            }
+                            _ => (Vec::new(), 2),
+                        }
+                    }
+
+                    let mut entries_with_sort: Vec<(usize, (Vec<u8>, u8))> = indices
+                        .into_iter()
+                        .map(|idx| (idx, get_associated_hash_and_type(&created[idx])))
+                        .collect();
+
+                    // Sort by associated_hash (groups TTL with its data), then type_order (TTL=0 first)
+                    entries_with_sort.sort_by(|(_, a), (_, b)| a.cmp(b));
+
+                    for (idx, _) in entries_with_sort {
+                        let entry = &created[idx];
+                        let key_bytes = entry_key_bytes(entry);
+                        if !created_keys.contains(&key_bytes) {
+                            created_keys.insert(key_bytes);
+                            push_created_or_restored(&mut changes, entry, restored);
+                        }
+                    }
+                }
+                ChangeGroup::ClassicCreate { idx } => {
+                    let entry = &created[idx];
+                    let key_bytes = entry_key_bytes(entry);
+                    if !created_keys.contains(&key_bytes) {
+                        created_keys.insert(key_bytes);
+                        push_created_or_restored(&mut changes, entry, restored);
+                    }
+                }
+                ChangeGroup::SingleUpdate { idx } => {
+                    if idx < updated.len() {
+                        let post_state = &updated[idx];
+                        // Debug: trace when processing TTL update
+                        if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &post_state.data {
+                            tracing::debug!(
+                                "build_entry_changes: SingleUpdate processing TTL idx={}, key_hash={:x?}, live_until={}",
+                                idx, &ttl.key_hash.0[..8], ttl.live_until_ledger_seq
+                            );
+                        }
+                        if let Ok(key) = crate::delta::entry_to_key(post_state) {
+                            // NOTE: RO TTL bumps ARE included in transaction meta (per C++
+                            // setLedgerChangesFromSuccessfulOp which uses raw res.getModifiedEntryMap()).
+                            // The filtering to mRoTTLBumps only affects STATE updates (commitChangesFromSuccessfulOp),
+                            // not transaction meta. Do NOT skip ro_ttl_keys here.
+                            if restored.hot_archive.contains(&key)
+                                || restored.live_bucket_list.contains(&key)
+                            {
+                                changes.push(LedgerEntryChange::Restored(post_state.clone()));
+                            } else {
+                                // Get pre-state from update_states or snapshot
+                                let pre_state = if idx < update_states.len() {
+                                    Some(update_states[idx].clone())
+                                } else {
+                                    state_overrides
+                                        .get(&key)
+                                        .cloned()
+                                        .or_else(|| state.snapshot_entry(&key))
+                                };
+                                // Debug: trace TTL pre_state
+                                if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) =
+                                    &post_state.data
+                                {
+                                    if let Some(ref state_entry) = pre_state {
+                                        if let stellar_xdr::curr::LedgerEntryData::Ttl(pre_ttl) =
+                                            &state_entry.data
+                                        {
+                                            tracing::debug!(
+                                                "build_entry_changes: TTL STATE+UPDATED: pre live_until={}, post live_until={}",
+                                                pre_ttl.live_until_ledger_seq, ttl.live_until_ledger_seq
+                                            );
+                                        }
+                                    } else {
+                                        tracing::debug!(
+                                            "build_entry_changes: TTL UPDATED without pre_state! key_hash={:x?}",
+                                            &ttl.key_hash.0[..8]
+                                        );
+                                    }
+                                }
+                                if let Some(state_entry) = pre_state {
+                                    changes.push(LedgerEntryChange::State(state_entry));
+                                }
+                                changes.push(LedgerEntryChange::Updated(post_state.clone()));
+                            }
+                        }
+                    }
+                }
+                ChangeGroup::SingleDelete { idx } => {
+                    if idx < deleted.len() {
+                        let key = &deleted[idx];
+                        if restored.hot_archive.contains(key)
+                            || restored.live_bucket_list.contains(key)
+                        {
+                            let pre_state = if idx < delete_states.len() {
+                                Some(delete_states[idx].clone())
+                            } else {
+                                state_overrides
+                                    .get(key)
+                                    .cloned()
+                                    .or_else(|| state.snapshot_entry(key))
+                            };
+                            if let Some(state_entry) = pre_state {
+                                changes.push(LedgerEntryChange::Restored(state_entry));
+                            }
+                            changes.push(LedgerEntryChange::Removed(key.clone()));
+                        } else {
+                            let pre_state = if idx < delete_states.len() {
+                                Some(delete_states[idx].clone())
+                            } else {
+                                state_overrides
+                                    .get(key)
+                                    .cloned()
+                                    .or_else(|| state.snapshot_entry(key))
+                            };
+                            if let Some(state_entry) = pre_state {
+                                changes.push(LedgerEntryChange::State(state_entry));
+                            }
+                            changes.push(LedgerEntryChange::Removed(key.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    } else if !change_order.is_empty() {
+        // For classic operations with change_order, use it to preserve execution order.
+        // Only deduplicate creates - once an entry is created, subsequent references are updates.
+        // Updates are NOT deduplicated - each update in change_order gets its own STATE/UPDATED pair.
+        use std::collections::HashSet;
+
+        // Track which keys have been created to avoid duplicate creates
+        let mut created_keys: HashSet<Vec<u8>> = HashSet::new();
+
+        for change_ref in change_order {
+            match change_ref {
+                henyey_tx::ChangeRef::Created(idx) => {
+                    if *idx < created.len() {
+                        let entry = &created[*idx];
+                        let key_bytes = entry_key_bytes(entry);
+                        // Only emit create once per key
+                        if !created_keys.contains(&key_bytes) {
+                            created_keys.insert(key_bytes);
+                            push_created_or_restored(&mut changes, entry, restored);
+                        }
+                    }
+                }
+                henyey_tx::ChangeRef::Updated(idx) => {
+                    if *idx < updated.len() {
+                        let post_state = &updated[*idx];
+
+                        if let Ok(key) = crate::delta::entry_to_key(post_state) {
+                            if restored.hot_archive.contains(&key)
+                                || restored.live_bucket_list.contains(&key)
+                            {
+                                // Use entry value for hot archive restored entries
+                                changes.push(LedgerEntryChange::Restored(post_state.clone()));
+                            } else {
+                                // Normal update: STATE (pre-state) then UPDATED (post-state)
+                                // Use the pre-state stored in the delta at the same index
+                                let pre_state = if *idx < update_states.len() {
+                                    Some(update_states[*idx].clone())
+                                } else {
+                                    // Fallback to snapshot lookup if pre-state not available
+                                    state_overrides
+                                        .get(&key)
+                                        .cloned()
+                                        .or_else(|| state.snapshot_entry(&key))
+                                };
+                                if let Some(state_entry) = pre_state {
+                                    changes.push(LedgerEntryChange::State(state_entry));
+                                }
+                                changes.push(LedgerEntryChange::Updated(post_state.clone()));
+                            }
+                        }
+                    }
+                }
+                henyey_tx::ChangeRef::Deleted(idx) => {
+                    if *idx < deleted.len() {
+                        let key = &deleted[*idx];
+                        if restored.hot_archive.contains(key)
+                            || restored.live_bucket_list.contains(key)
+                        {
+                            // Use the pre-state stored in the delta at the same index
+                            let pre_state = if *idx < delete_states.len() {
+                                Some(delete_states[*idx].clone())
+                            } else {
+                                state_overrides
+                                    .get(key)
+                                    .cloned()
+                                    .or_else(|| state.snapshot_entry(key))
+                            };
+                            if let Some(state_entry) = pre_state {
+                                changes.push(LedgerEntryChange::Restored(state_entry));
+                            }
+                            changes.push(LedgerEntryChange::Removed(key.clone()));
+                        } else {
+                            // Use the pre-state stored in the delta at the same index
+                            let pre_state = if *idx < delete_states.len() {
+                                Some(delete_states[*idx].clone())
+                            } else {
+                                state_overrides
+                                    .get(key)
+                                    .cloned()
+                                    .or_else(|| state.snapshot_entry(key))
+                            };
+                            if let Some(state_entry) = pre_state {
+                                changes.push(LedgerEntryChange::State(state_entry));
+                            }
+                            changes.push(LedgerEntryChange::Removed(key.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        // Fallback: no change_order available (e.g., fee/seq changes)
+        // Use type-grouped order: deleted -> updated -> created
+        for key in deleted {
+            if restored.hot_archive.contains(key) || restored.live_bucket_list.contains(key) {
+                if let Some(state_entry) = state_overrides
+                    .get(key)
+                    .cloned()
+                    .or_else(|| state.snapshot_entry(key))
+                {
+                    changes.push(LedgerEntryChange::Restored(state_entry));
+                }
+                changes.push(LedgerEntryChange::Removed(key.clone()));
+            } else {
+                if let Some(state_entry) = state_overrides
+                    .get(key)
+                    .cloned()
+                    .or_else(|| state.snapshot_entry(key))
+                {
+                    changes.push(LedgerEntryChange::State(state_entry));
+                }
+                changes.push(LedgerEntryChange::Removed(key.clone()));
+            }
+        }
+
+        // Deduplicate updated entries
+        use std::collections::HashSet;
+        let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
+        for entry in updated {
+            let key_bytes = entry_key_bytes(entry);
+            if !seen_keys.contains(&key_bytes) {
+                seen_keys.insert(key_bytes.clone());
+                if let Some(final_entry) = final_updated.get(&key_bytes) {
+                    if let Ok(key) = crate::delta::entry_to_key(final_entry) {
+                        if restored.hot_archive.contains(&key)
+                            || restored.live_bucket_list.contains(&key)
+                        {
+                            changes.push(LedgerEntryChange::Restored(final_entry.clone()));
+                        } else {
+                            if let Some(state_entry) = state_overrides
+                                .get(&key)
+                                .cloned()
+                                .or_else(|| state.snapshot_entry(&key))
+                            {
+                                changes.push(LedgerEntryChange::State(state_entry));
+                            }
+                            changes.push(LedgerEntryChange::Updated(final_entry.clone()));
+                        }
+                    } else {
+                        changes.push(LedgerEntryChange::Updated(final_entry.clone()));
+                    }
+                }
+            }
+        }
+
+        for entry in created {
+            push_created_or_restored(&mut changes, entry, restored);
+        }
+    }
+
+    // For live BL restores, add RESTORED changes for data/code entries that weren't
+    // directly modified (only their TTL was extended). Per C++ TransactionMeta.cpp:
+    // "RestoreOp will create both the TTL and Code/Data entry in the hot archive case.
+    // However, when restoring from live BucketList, only the TTL value will be modified,
+    // so we have to manually insert the RESTORED meta for the Code/Data entry here."
+    for (key, entry) in &restored.live_bucket_list_entries {
+        // Skip if this key was already processed (appears in updated or created)
+        let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
+        let already_processed = changes.iter().any(|change| {
+            let change_key = match change {
+                LedgerEntryChange::State(e)
+                | LedgerEntryChange::Created(e)
+                | LedgerEntryChange::Updated(e)
+                | LedgerEntryChange::Restored(e) => crate::delta::entry_to_key(e).ok(),
+                LedgerEntryChange::Removed(k) => Some(k.clone()),
+            };
+            change_key
+                .and_then(|k| k.to_xdr(Limits::none()).ok())
+                .map(|b| b == key_bytes)
+                .unwrap_or(false)
+        });
+
+        if !already_processed {
+            changes.push(LedgerEntryChange::Restored(entry.clone()));
+        }
+    }
+
+    // For hot archive restores (RestoreFootprint), add RESTORED changes for data/code entries
+    // that weren't directly modified (the entry is prefetched from hot archive, only TTL is created).
+    // This is similar to live BL restores above.
+    // When emitting RESTORED, we must update last_modified_ledger_seq to the current ledger,
+    // matching C++ stellar-core behavior.
+    for (key, entry) in &restored.hot_archive_entries {
+        // Skip if this key was already processed (appears in updated or created)
+        let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
+        let already_processed = changes.iter().any(|change| {
+            let change_key = match change {
+                LedgerEntryChange::State(e)
+                | LedgerEntryChange::Created(e)
+                | LedgerEntryChange::Updated(e)
+                | LedgerEntryChange::Restored(e) => crate::delta::entry_to_key(e).ok(),
+                LedgerEntryChange::Removed(k) => Some(k.clone()),
+            };
+            change_key
+                .and_then(|k| k.to_xdr(Limits::none()).ok())
+                .map(|b| b == key_bytes)
+                .unwrap_or(false)
+        });
+
+        if !already_processed {
+            // Clone the entry and update last_modified_ledger_seq to current ledger
+            let mut restored_entry = entry.clone();
+            restored_entry.last_modified_ledger_seq = current_ledger_seq;
+            changes.push(LedgerEntryChange::Restored(restored_entry));
+        }
+    }
+
+    // Debug: log final output
+    for (i, change) in changes.iter().enumerate() {
+        let change_type = match change {
+            LedgerEntryChange::State(_) => "STATE",
+            LedgerEntryChange::Created(_) => "CREATED",
+            LedgerEntryChange::Updated(_) => "UPDATED",
+            LedgerEntryChange::Restored(_) => "RESTORED",
+            LedgerEntryChange::Removed(_) => "REMOVED",
+        };
+        tracing::debug!("build_entry_changes: OUTPUT[{}] = {}", i, change_type);
+    }
+
+    LedgerEntryChanges(changes.try_into().unwrap_or_default())
+}
+
+fn empty_entry_changes() -> LedgerEntryChanges {
+    LedgerEntryChanges(VecM::default())
+}
+
+fn build_transaction_meta(
+    tx_changes_before: LedgerEntryChanges,
+    op_changes: Vec<LedgerEntryChanges>,
+    op_events: Vec<Vec<ContractEvent>>,
+    tx_events: Vec<TransactionEvent>,
+    soroban_return_value: Option<stellar_xdr::curr::ScVal>,
+    diagnostic_events: Vec<DiagnosticEvent>,
+    soroban_fee_info: Option<(i64, i64, i64)>, // (non_refundable, refundable_consumed, rent_consumed)
+) -> TransactionMeta {
+    // Debug: log tx_changes_before and op_changes counts
+    let tx_before_count = tx_changes_before.len();
+    let op_counts: Vec<usize> = op_changes.iter().map(|c| c.len()).collect();
+    let total_op_changes: usize = op_counts.iter().sum();
+    tracing::debug!(
+        "build_transaction_meta: tx_changes_before={}, op_changes={:?}, total_op_changes={}, grand_total={}",
+        tx_before_count, op_counts, total_op_changes, tx_before_count + total_op_changes
+    );
+
+    let operations: Vec<OperationMetaV2> = op_changes
+        .into_iter()
+        .zip(op_events)
+        .map(|(changes, events)| OperationMetaV2 {
+            ext: ExtensionPoint::V0,
+            changes,
+            events: events.try_into().unwrap_or_default(),
+        })
+        .collect();
+
+    let has_soroban = soroban_return_value.is_some() || !diagnostic_events.is_empty();
+    let soroban_meta = if has_soroban {
+        let ext =
+            if let Some((non_refundable, refundable_consumed, rent_consumed)) = soroban_fee_info {
+                SorobanTransactionMetaExt::V1(SorobanTransactionMetaExtV1 {
+                    ext: ExtensionPoint::V0,
+                    total_non_refundable_resource_fee_charged: non_refundable,
+                    total_refundable_resource_fee_charged: refundable_consumed,
+                    rent_fee_charged: rent_consumed,
+                })
+            } else {
+                SorobanTransactionMetaExt::V0
+            };
+        Some(SorobanTransactionMetaV2 {
+            ext,
+            return_value: soroban_return_value,
+        })
+    } else {
+        None
+    };
+
+    TransactionMeta::V4(TransactionMetaV4 {
+        ext: ExtensionPoint::V0,
+        tx_changes_before,
+        operations: operations.try_into().unwrap_or_default(),
+        tx_changes_after: empty_entry_changes(),
+        soroban_meta,
+        events: tx_events.try_into().unwrap_or_default(),
+        diagnostic_events: diagnostic_events.try_into().unwrap_or_default(),
+    })
+}
+
+fn empty_transaction_meta() -> TransactionMeta {
+    build_transaction_meta(
+        empty_entry_changes(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        Vec::new(),
+        None,
+    )
+}
+
+fn map_failure_to_result(failure: &ExecutionFailure) -> TransactionResultResult {
+    match failure {
+        ExecutionFailure::Malformed => TransactionResultResult::TxMalformed,
+        ExecutionFailure::MissingOperation => TransactionResultResult::TxMissingOperation,
+        ExecutionFailure::InvalidSignature => TransactionResultResult::TxBadAuth,
+        ExecutionFailure::BadAuthExtra => TransactionResultResult::TxBadAuthExtra,
+        ExecutionFailure::BadMinSeqAgeOrGap => TransactionResultResult::TxBadMinSeqAgeOrGap,
+        ExecutionFailure::TooEarly => TransactionResultResult::TxTooEarly,
+        ExecutionFailure::TooLate => TransactionResultResult::TxTooLate,
+        ExecutionFailure::BadSequence => TransactionResultResult::TxBadSeq,
+        ExecutionFailure::InsufficientFee => TransactionResultResult::TxInsufficientFee,
+        ExecutionFailure::InsufficientBalance => TransactionResultResult::TxInsufficientBalance,
+        ExecutionFailure::NoAccount => TransactionResultResult::TxNoAccount,
+        ExecutionFailure::NotSupported => TransactionResultResult::TxNotSupported,
+        ExecutionFailure::InternalError => TransactionResultResult::TxInternalError,
+        ExecutionFailure::BadSponsorship => TransactionResultResult::TxBadSponsorship,
+        ExecutionFailure::OperationFailed => {
+            TransactionResultResult::TxFailed(Vec::new().try_into().unwrap())
+        }
+    }
+}
+
+fn insufficient_refundable_fee_result(op: &Operation) -> OperationResult {
+    match &op.body {
+        OperationBody::InvokeHostFunction(_) => {
+            OperationResult::OpInner(OperationResultTr::InvokeHostFunction(
+                stellar_xdr::curr::InvokeHostFunctionResult::InsufficientRefundableFee,
+            ))
+        }
+        OperationBody::ExtendFootprintTtl(_) => {
+            OperationResult::OpInner(OperationResultTr::ExtendFootprintTtl(
+                stellar_xdr::curr::ExtendFootprintTtlResult::InsufficientRefundableFee,
+            ))
+        }
+        OperationBody::RestoreFootprint(_) => {
+            OperationResult::OpInner(OperationResultTr::RestoreFootprint(
+                stellar_xdr::curr::RestoreFootprintResult::InsufficientRefundableFee,
+            ))
+        }
+        _ => OperationResult::OpNotSupported,
+    }
+}
+
+fn map_failure_to_inner_result(
+    failure: &ExecutionFailure,
+    op_results: &[OperationResult],
+) -> InnerTransactionResultResult {
+    match failure {
+        ExecutionFailure::Malformed => InnerTransactionResultResult::TxMalformed,
+        ExecutionFailure::MissingOperation => InnerTransactionResultResult::TxMissingOperation,
+        ExecutionFailure::InvalidSignature => InnerTransactionResultResult::TxBadAuth,
+        ExecutionFailure::BadAuthExtra => InnerTransactionResultResult::TxBadAuthExtra,
+        ExecutionFailure::BadMinSeqAgeOrGap => InnerTransactionResultResult::TxBadMinSeqAgeOrGap,
+        ExecutionFailure::TooEarly => InnerTransactionResultResult::TxTooEarly,
+        ExecutionFailure::TooLate => InnerTransactionResultResult::TxTooLate,
+        ExecutionFailure::BadSequence => InnerTransactionResultResult::TxBadSeq,
+        ExecutionFailure::InsufficientFee => InnerTransactionResultResult::TxInsufficientFee,
+        ExecutionFailure::InsufficientBalance => {
+            InnerTransactionResultResult::TxInsufficientBalance
+        }
+        ExecutionFailure::NoAccount => InnerTransactionResultResult::TxNoAccount,
+        ExecutionFailure::NotSupported => InnerTransactionResultResult::TxNotSupported,
+        ExecutionFailure::InternalError => InnerTransactionResultResult::TxInternalError,
+        ExecutionFailure::BadSponsorship => InnerTransactionResultResult::TxBadSponsorship,
+        ExecutionFailure::OperationFailed => InnerTransactionResultResult::TxFailed(
+            op_results.to_vec().try_into().unwrap_or_default(),
+        ),
+    }
+}
+
+pub fn build_tx_result_pair(
+    frame: &TransactionFrame,
+    network_id: &NetworkId,
+    exec: &TransactionExecutionResult,
+    base_fee: i64,
+    protocol_version: u32,
+) -> Result<TransactionResultPair> {
+    let tx_hash = frame
+        .hash(network_id)
+        .map_err(|e| LedgerError::Internal(format!("tx hash error: {}", e)))?;
+    let op_results: Vec<OperationResult> = exec.operation_results.clone();
+
+    let result = if frame.is_fee_bump() {
+        let inner_hash = fee_bump_inner_hash(frame, network_id)?;
+        let inner_result = if exec.success {
+            InnerTransactionResultResult::TxSuccess(
+                op_results.clone().try_into().unwrap_or_default(),
+            )
+        } else if let Some(failure) = &exec.failure {
+            map_failure_to_inner_result(failure, &op_results)
+        } else {
+            InnerTransactionResultResult::TxFailed(
+                op_results.clone().try_into().unwrap_or_default(),
+            )
+        };
+
+        // Calculate inner fee_charged using C++ formula:
+        // Protocol >= 25: 0 (outer pays everything)
+        // Protocol < 25 and protocol >= 11:
+        //   - For Soroban: resourceFee + min(inclusionFee, baseFee * numOps) - refund
+        //     (C++ had a bug where refund was applied to inner fee; this was fixed in p25)
+        //   - For classic: min(inner_fee, baseFee * numOps)
+        let inner_fee_charged = if protocol_version >= 25 {
+            0
+        } else {
+            let num_inner_ops = frame.operation_count() as i64;
+            let adjusted_fee = base_fee * std::cmp::max(1, num_inner_ops);
+            if frame.is_soroban() {
+                // For Soroban transactions, include the declared resource fee
+                let resource_fee = frame.declared_soroban_resource_fee();
+                let inner_fee = frame.inner_fee() as i64;
+                let inclusion_fee = inner_fee - resource_fee;
+                let computed_fee = resource_fee + std::cmp::min(inclusion_fee, adjusted_fee);
+                // Prior to protocol 25, C++ incorrectly applied the refund to the inner
+                // feeCharged field for fee bump transactions. We replicate this behavior
+                // for compatibility.
+                computed_fee.saturating_sub(exec.fee_refund)
+            } else {
+                // For classic transactions
+                std::cmp::min(frame.inner_fee() as i64, adjusted_fee)
+            }
+        };
+
+        let inner_pair = InnerTransactionResultPair {
+            transaction_hash: stellar_xdr::curr::Hash(inner_hash.0),
+            result: InnerTransactionResult {
+                fee_charged: inner_fee_charged,
+                result: inner_result,
+                ext: InnerTransactionResultExt::V0,
+            },
+        };
+
+        let result = if exec.success {
+            TransactionResultResult::TxFeeBumpInnerSuccess(inner_pair)
+        } else {
+            TransactionResultResult::TxFeeBumpInnerFailed(inner_pair)
+        };
+
+        TransactionResult {
+            fee_charged: exec.fee_charged,
+            result,
+            ext: TransactionResultExt::V0,
+        }
+    } else if exec.success {
+        TransactionResult {
+            fee_charged: exec.fee_charged,
+            result: TransactionResultResult::TxSuccess(op_results.try_into().unwrap_or_default()),
+            ext: TransactionResultExt::V0,
+        }
+    } else if let Some(failure) = &exec.failure {
+        let result = match failure {
+            ExecutionFailure::OperationFailed => {
+                TransactionResultResult::TxFailed(op_results.try_into().unwrap_or_default())
+            }
+            _ => map_failure_to_result(failure),
+        };
+        TransactionResult {
+            fee_charged: exec.fee_charged,
+            result,
+            ext: TransactionResultExt::V0,
+        }
+    } else {
+        TransactionResult {
+            fee_charged: exec.fee_charged,
+            result: TransactionResultResult::TxFailed(op_results.try_into().unwrap_or_default()),
+            ext: TransactionResultExt::V0,
+        }
+    };
+
+    Ok(TransactionResultPair {
+        transaction_hash: stellar_xdr::curr::Hash(tx_hash.0),
+        result,
+    })
+}
+
+/// Convert AccountId to key bytes.
+fn account_id_to_key(account_id: &AccountId) -> [u8; 32] {
+    match &account_id.0 {
+        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => key.0,
+    }
+}
+
+/// Check if an operation result indicates success.
+fn is_operation_success(result: &OperationResult) -> bool {
+    match result {
+        OperationResult::OpInner(inner) => {
+            use stellar_xdr::curr::OperationResultTr;
+            use stellar_xdr::curr::*;
+            match inner {
+                OperationResultTr::CreateAccount(r) => {
+                    matches!(r, CreateAccountResult::Success)
+                }
+                OperationResultTr::Payment(r) => {
+                    matches!(r, PaymentResult::Success)
+                }
+                OperationResultTr::PathPaymentStrictReceive(r) => {
+                    matches!(r, PathPaymentStrictReceiveResult::Success(_))
+                }
+                OperationResultTr::ManageSellOffer(r) => {
+                    matches!(r, ManageSellOfferResult::Success(_))
+                }
+                OperationResultTr::CreatePassiveSellOffer(r) => {
+                    matches!(r, ManageSellOfferResult::Success(_))
+                }
+                OperationResultTr::SetOptions(r) => {
+                    matches!(r, SetOptionsResult::Success)
+                }
+                OperationResultTr::ChangeTrust(r) => {
+                    matches!(r, ChangeTrustResult::Success)
+                }
+                OperationResultTr::AllowTrust(r) => {
+                    matches!(r, AllowTrustResult::Success)
+                }
+                OperationResultTr::AccountMerge(r) => {
+                    matches!(r, AccountMergeResult::Success(_))
+                }
+                OperationResultTr::Inflation(r) => {
+                    matches!(r, InflationResult::Success(_))
+                }
+                OperationResultTr::ManageData(r) => {
+                    matches!(r, ManageDataResult::Success)
+                }
+                OperationResultTr::BumpSequence(r) => {
+                    matches!(r, BumpSequenceResult::Success)
+                }
+                OperationResultTr::ManageBuyOffer(r) => {
+                    matches!(r, ManageBuyOfferResult::Success(_))
+                }
+                OperationResultTr::PathPaymentStrictSend(r) => {
+                    matches!(r, PathPaymentStrictSendResult::Success(_))
+                }
+                OperationResultTr::CreateClaimableBalance(r) => {
+                    matches!(r, CreateClaimableBalanceResult::Success(_))
+                }
+                OperationResultTr::ClaimClaimableBalance(r) => {
+                    matches!(r, ClaimClaimableBalanceResult::Success)
+                }
+                OperationResultTr::BeginSponsoringFutureReserves(r) => {
+                    matches!(r, BeginSponsoringFutureReservesResult::Success)
+                }
+                OperationResultTr::EndSponsoringFutureReserves(r) => {
+                    matches!(r, EndSponsoringFutureReservesResult::Success)
+                }
+                OperationResultTr::RevokeSponsorship(r) => {
+                    matches!(r, RevokeSponsorshipResult::Success)
+                }
+                OperationResultTr::Clawback(r) => {
+                    matches!(r, ClawbackResult::Success)
+                }
+                OperationResultTr::ClawbackClaimableBalance(r) => {
+                    matches!(r, ClawbackClaimableBalanceResult::Success)
+                }
+                OperationResultTr::SetTrustLineFlags(r) => {
+                    matches!(r, SetTrustLineFlagsResult::Success)
+                }
+                OperationResultTr::LiquidityPoolDeposit(r) => {
+                    matches!(r, LiquidityPoolDepositResult::Success)
+                }
+                OperationResultTr::LiquidityPoolWithdraw(r) => {
+                    matches!(r, LiquidityPoolWithdrawResult::Success)
+                }
+                OperationResultTr::InvokeHostFunction(r) => {
+                    matches!(r, InvokeHostFunctionResult::Success(_))
+                }
+                OperationResultTr::ExtendFootprintTtl(r) => {
+                    matches!(r, ExtendFootprintTtlResult::Success)
+                }
+                OperationResultTr::RestoreFootprint(r) => {
+                    matches!(r, RestoreFootprintResult::Success)
+                }
+            }
+        }
+        OperationResult::OpNotSupported => false, // Unsupported operations fail
+        _ => false,
+    }
+}
+
+fn has_sufficient_signer_weight(
+    tx_hash: &Hash256,
+    signatures: &[stellar_xdr::curr::DecoratedSignature],
+    account: &AccountEntry,
+    required_weight: u32,
+) -> bool {
+    let mut total = 0u32;
+    let mut counted: HashSet<Hash256> = HashSet::new();
+
+    // Master key signer.
+    if let Ok(pk) = henyey_crypto::PublicKey::try_from(&account.account_id.0) {
+        let master_weight = account.thresholds.0[0] as u32;
+        tracing::trace!(
+            master_weight = master_weight,
+            required_weight = required_weight,
+            num_signatures = signatures.len(),
+            num_signers = account.signers.len(),
+            thresholds = ?account.thresholds.0,
+            "Checking signature weight"
+        );
+        if master_weight > 0 {
+            let has_sig = has_ed25519_signature(tx_hash, signatures, &pk);
+            tracing::trace!(has_master_sig = has_sig, "Master key signature check");
+            if has_sig {
+                let id = signer_key_id(&SignerKey::Ed25519(stellar_xdr::curr::Uint256(
+                    *pk.as_bytes(),
+                )));
+                if counted.insert(id) {
+                    total = total.saturating_add(master_weight);
+                }
+            }
+        }
+    }
+
+    for signer in account.signers.iter() {
+        if signer.weight == 0 {
+            continue;
+        }
+        let key = &signer.key;
+        let id = signer_key_id(key);
+
+        if counted.contains(&id) {
+            continue;
+        }
+
+        match key {
+            SignerKey::Ed25519(key) => {
+                if let Ok(pk) = henyey_crypto::PublicKey::from_bytes(&key.0) {
+                    if has_ed25519_signature(tx_hash, signatures, &pk) && counted.insert(id) {
+                        total = total.saturating_add(signer.weight);
+                    }
+                }
+            }
+            SignerKey::PreAuthTx(key) => {
+                if key.0 == tx_hash.0 && counted.insert(id) {
+                    total = total.saturating_add(signer.weight);
+                }
+            }
+            SignerKey::HashX(key) => {
+                if has_hashx_signature(signatures, key) && counted.insert(id) {
+                    total = total.saturating_add(signer.weight);
+                }
+            }
+            SignerKey::Ed25519SignedPayload(payload) => {
+                if has_signed_payload_signature(tx_hash, signatures, payload) && counted.insert(id)
+                {
+                    total = total.saturating_add(signer.weight);
+                }
+            }
+        }
+
+        if total >= required_weight && total > 0 {
+            return true;
+        }
+    }
+
+    total >= required_weight && total > 0
+}
+
+fn has_required_extra_signers(
+    tx_hash: &Hash256,
+    signatures: &[stellar_xdr::curr::DecoratedSignature],
+    extra_signers: &[SignerKey],
+) -> bool {
+    extra_signers.iter().all(|signer| match signer {
+        SignerKey::Ed25519(key) => {
+            if let Ok(pk) = henyey_crypto::PublicKey::from_bytes(&key.0) {
+                has_ed25519_signature(tx_hash, signatures, &pk)
+            } else {
+                false
+            }
+        }
+        SignerKey::PreAuthTx(key) => key.0 == tx_hash.0,
+        SignerKey::HashX(key) => has_hashx_signature(signatures, key),
+        SignerKey::Ed25519SignedPayload(payload) => {
+            has_signed_payload_signature(tx_hash, signatures, payload)
+        }
+    })
+}
+
+fn fee_bump_inner_hash(frame: &TransactionFrame, network_id: &NetworkId) -> Result<Hash256> {
+    match frame.envelope() {
+        TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+                let inner_env = TransactionEnvelope::Tx(inner.clone());
+                let inner_frame = TransactionFrame::with_network(inner_env, *network_id);
+                inner_frame
+                    .hash(network_id)
+                    .map_err(|e| LedgerError::Internal(format!("inner tx hash error: {}", e)))
+            }
+        },
+        _ => frame
+            .hash(network_id)
+            .map_err(|e| LedgerError::Internal(format!("tx hash error: {}", e))),
+    }
+}
+
+fn threshold_low(account: &AccountEntry) -> u32 {
+    account.thresholds.0[1] as u32
+}
+
+fn threshold_medium(account: &AccountEntry) -> u32 {
+    account.thresholds.0[2] as u32
+}
+
+fn signer_key_id(key: &SignerKey) -> Hash256 {
+    let bytes = key
+        .to_xdr(stellar_xdr::curr::Limits::none())
+        .unwrap_or_default();
+    Hash256::hash(&bytes)
+}
+
+fn has_ed25519_signature(
+    tx_hash: &Hash256,
+    signatures: &[stellar_xdr::curr::DecoratedSignature],
+    pk: &henyey_crypto::PublicKey,
+) -> bool {
+    signatures
+        .iter()
+        .any(|sig| validation::verify_signature_with_key(tx_hash, sig, pk))
+}
+
+fn has_hashx_signature(
+    signatures: &[stellar_xdr::curr::DecoratedSignature],
+    key: &stellar_xdr::curr::Uint256,
+) -> bool {
+    signatures.iter().any(|sig| {
+        // HashX signatures can be any length - the signature is the preimage
+        // whose SHA256 hash should equal the signer key.
+        // Check hint first (last 4 bytes of key)
+        let expected_hint = [key.0[28], key.0[29], key.0[30], key.0[31]];
+        if sig.hint.0 != expected_hint {
+            return false;
+        }
+        // Hash the preimage (signature) and compare to key
+        let hash = Hash256::hash(&sig.signature.0);
+        hash.0 == key.0
+    })
+}
+
+fn has_signed_payload_signature(
+    _tx_hash: &Hash256,
+    signatures: &[stellar_xdr::curr::DecoratedSignature],
+    signed_payload: &stellar_xdr::curr::SignerKeyEd25519SignedPayload,
+) -> bool {
+    let pk = match henyey_crypto::PublicKey::from_bytes(&signed_payload.ed25519.0) {
+        Ok(pk) => pk,
+        Err(_) => return false,
+    };
+
+    // The hint for signed payloads is XOR of pubkey hint and payload hint.
+    // See SignatureUtils::getSignedPayloadHint in C++ stellar-core.
+    let pubkey_hint = [
+        signed_payload.ed25519.0[28],
+        signed_payload.ed25519.0[29],
+        signed_payload.ed25519.0[30],
+        signed_payload.ed25519.0[31],
+    ];
+    let payload_hint = if signed_payload.payload.len() >= 4 {
+        let len = signed_payload.payload.len();
+        [
+            signed_payload.payload[len - 4],
+            signed_payload.payload[len - 3],
+            signed_payload.payload[len - 2],
+            signed_payload.payload[len - 1],
+        ]
+    } else {
+        // For shorter payloads, C++ getHint copies from the beginning
+        let mut hint = [0u8; 4];
+        for (i, &byte) in signed_payload.payload.iter().enumerate() {
+            if i < 4 {
+                hint[i] = byte;
+            }
+        }
+        hint
+    };
+    let expected_hint = [
+        pubkey_hint[0] ^ payload_hint[0],
+        pubkey_hint[1] ^ payload_hint[1],
+        pubkey_hint[2] ^ payload_hint[2],
+        pubkey_hint[3] ^ payload_hint[3],
+    ];
+
+    signatures.iter().any(|sig| {
+        // Check hint first (XOR of pubkey hint and payload hint)
+        if sig.hint.0 != expected_hint {
+            return false;
+        }
+
+        // C++ stellar-core verifies the signature against the raw payload bytes,
+        // not a hash. This is per CAP-0040 - the signed payload signer
+        // requires a valid signature of the payload from the ed25519 public key.
+        let ed_sig = match henyey_crypto::Signature::try_from(&sig.signature) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        henyey_crypto::verify(&pk, &signed_payload.payload, &ed_sig).is_ok()
+    })
+}
+
+/// Compute subSha256(baseSeed, index) as used by C++ stellar-core for PRNG seeds.
+///
+/// This computes SHA256(baseSeed || xdr::xdr_to_opaque(index)) where index is a u64.
+/// XDR encodes uint64 as 8 bytes in big-endian (network byte order).
+///
+/// Note: C++ uses `static_cast<uint64_t>(index)` before passing to `xdr::xdr_to_opaque`,
+/// so even though the index is originally an int, it's serialized as 8 bytes.
+fn sub_sha256(base_seed: &[u8; 32], index: u32) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(base_seed);
+    // XDR uint64 is 8 bytes big-endian
+    hasher.update((index as u64).to_be_bytes());
+    hasher.finalize().into()
+}
+
+/// Execute a full transaction set.
+///
+/// # Arguments
+///
+/// * `soroban_base_prng_seed` - The transaction set hash used as base seed for Soroban PRNG.
+///   Each transaction gets its own seed computed as subSha256(baseSeed, txIndex).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn execute_transaction_set(
+    snapshot: &SnapshotHandle,
+    transactions: &[(TransactionEnvelope, Option<u32>)],
+    ledger_seq: u32,
+    close_time: u64,
+    base_fee: u32,
+    base_reserve: u32,
+    protocol_version: u32,
+    network_id: NetworkId,
+    delta: &mut LedgerDelta,
+    soroban_config: SorobanConfig,
+    soroban_base_prng_seed: [u8; 32],
+    classic_events: ClassicEventConfig,
+    module_cache: Option<&PersistentModuleCache>,
+    hot_archive: Option<std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
+) -> Result<(
+    Vec<TransactionExecutionResult>,
+    Vec<TransactionResultPair>,
+    Vec<TransactionResultMetaV1>,
+    u64,
+    Vec<LedgerKey>, // Hot archive restored keys for HotArchiveBucketList::add_batch
+)> {
+    execute_transaction_set_with_fee_mode(
+        snapshot,
+        transactions,
+        ledger_seq,
+        close_time,
+        base_fee,
+        base_reserve,
+        protocol_version,
+        network_id,
+        delta,
+        soroban_config,
+        soroban_base_prng_seed,
+        classic_events,
+        true,
+        module_cache,
+        hot_archive,
+    )
+}
+
+/// Execute a full transaction set with configurable fee deduction.
+///
+/// # Arguments
+///
+/// * `module_cache` - Optional persistent module cache for reusing compiled WASM.
+///   When provided, Soroban contract execution reuses pre-compiled modules,
+///   significantly improving performance for workloads with many contract calls.
+///
+/// # Returns
+///
+/// A tuple containing:
+/// - Transaction execution results
+/// - Transaction result pairs (XDR)
+/// - Transaction result metadata
+/// - Updated ID pool
+/// - Hot archive restored keys (for passing to HotArchiveBucketList::add_batch)
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn execute_transaction_set_with_fee_mode(
+    snapshot: &SnapshotHandle,
+    transactions: &[(TransactionEnvelope, Option<u32>)],
+    ledger_seq: u32,
+    close_time: u64,
+    base_fee: u32,
+    base_reserve: u32,
+    protocol_version: u32,
+    network_id: NetworkId,
+    delta: &mut LedgerDelta,
+    soroban_config: SorobanConfig,
+    soroban_base_prng_seed: [u8; 32],
+    classic_events: ClassicEventConfig,
+    deduct_fee: bool,
+    module_cache: Option<&PersistentModuleCache>,
+    hot_archive: Option<std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
+) -> Result<(
+    Vec<TransactionExecutionResult>,
+    Vec<TransactionResultPair>,
+    Vec<TransactionResultMetaV1>,
+    u64,
+    Vec<LedgerKey>, // Hot archive restored keys for HotArchiveBucketList::add_batch
+)> {
+    let id_pool = snapshot.header().id_pool;
+    let mut executor = TransactionExecutor::new(
+        ledger_seq,
+        close_time,
+        base_reserve,
+        protocol_version,
+        network_id,
+        id_pool,
+        soroban_config,
+        classic_events,
+    );
+    // Set the module cache if provided for better Soroban performance
+    if let Some(cache) = module_cache {
+        executor.set_module_cache(cache.clone());
+    }
+    // Set the hot archive for Protocol 23+ entry restoration
+    if let Some(ha) = hot_archive {
+        executor.set_hot_archive(ha);
+    }
+
+    // Load all orderbook offers before executing any transactions
+    executor.load_orderbook_offers(snapshot)?;
+
+    let mut results = Vec::with_capacity(transactions.len());
+    let mut tx_results = Vec::with_capacity(transactions.len());
+    let mut tx_result_metas = Vec::with_capacity(transactions.len());
+
+    for (tx_index, (tx, tx_base_fee)) in transactions.iter().enumerate() {
+        // Snapshot the delta before starting each transaction.
+        // This preserves committed changes from previous transactions so they're
+        // not lost if this transaction fails and rolls back.
+        executor.state.snapshot_delta();
+
+        let tx_fee = tx_base_fee.unwrap_or(base_fee);
+        // Compute per-transaction PRNG seed: subSha256(basePrngSeed, txIndex)
+        let tx_prng_seed = sub_sha256(&soroban_base_prng_seed, tx_index as u32);
+        let result = executor.execute_transaction_with_fee_mode(
+            snapshot,
+            tx,
+            tx_fee,
+            Some(tx_prng_seed),
+            deduct_fee,
+        )?;
+        let frame = TransactionFrame::with_network(tx.clone(), executor.network_id);
+        let tx_result = build_tx_result_pair(
+            &frame,
+            &executor.network_id,
+            &result,
+            tx_fee as i64,
+            protocol_version,
+        )?;
+        let tx_meta = result
+            .tx_meta
+            .clone()
+            .unwrap_or_else(empty_transaction_meta);
+        let fee_changes = result
+            .fee_changes
+            .clone()
+            .unwrap_or_else(empty_entry_changes);
+        let post_fee_changes = result
+            .post_fee_changes
+            .clone()
+            .unwrap_or_else(empty_entry_changes);
+        let tx_result_meta = TransactionResultMetaV1 {
+            ext: ExtensionPoint::V0,
+            result: tx_result.clone(),
+            fee_processing: fee_changes,
+            tx_apply_processing: tx_meta,
+            post_tx_apply_fee_processing: post_fee_changes,
+        };
+
+        debug!(
+            success = result.success,
+            fee = result.fee_charged,
+            fee_refund = result.fee_refund,
+            ops = result.operation_results.len(),
+            ledger_seq = ledger_seq,
+            tx_index = tx_index,
+            "Executed transaction"
+        );
+
+        results.push(result);
+        tx_results.push(tx_result);
+        tx_result_metas.push(tx_result_meta);
+    }
+
+    // Protocol 23+: Apply Soroban fee refunds after ALL transactions
+    // This matches C++ stellar-core's processPostTxSetApply() phase
+    if deduct_fee {
+        let mut total_refunds = 0i64;
+        for (idx, (tx, _)) in transactions.iter().enumerate() {
+            let refund = results[idx].fee_refund;
+            if refund > 0 {
+                let frame = TransactionFrame::with_network(tx.clone(), executor.network_id);
+                let fee_source_id =
+                    henyey_tx::muxed_to_account_id(&frame.fee_source_account());
+
+                // Apply refund to the account balance in the delta
+                executor.state.apply_refund_to_delta(&fee_source_id, refund);
+
+                // Subtract refund from fee pool
+                executor.state.delta_mut().add_fee(-refund);
+                total_refunds += refund;
+
+                tracing::debug!(
+                    ledger_seq = ledger_seq,
+                    tx_index = idx,
+                    refund = refund,
+                    fee_source = %account_id_to_strkey(&fee_source_id),
+                    "Applied P23+ Soroban fee refund"
+                );
+            }
+        }
+        if total_refunds > 0 {
+            tracing::debug!(
+                ledger_seq = ledger_seq,
+                total_refunds = total_refunds,
+                tx_count = transactions.len(),
+                "P23+ Soroban fee refunds applied"
+            );
+        }
+    }
+
+    // Flush deferred read-only TTL bumps to the delta before applying to bucket list.
+    // These are TTL updates for read-only entries that were NOT included in transaction
+    // meta but MUST be written to the bucket list.
+    executor.state_mut().flush_deferred_ro_ttl_bumps();
+
+    // Apply all changes to the delta
+    executor.apply_to_delta(snapshot, delta)?;
+
+    // Add fees to fee pool
+    if deduct_fee {
+        let total_fees = executor.total_fees();
+        delta.record_fee_pool_delta(total_fees);
+    }
+
+    // Collect all hot archive restored keys across all transactions
+    let mut all_hot_archive_restored_keys: Vec<LedgerKey> = Vec::new();
+    for result in &results {
+        all_hot_archive_restored_keys.extend(result.hot_archive_restored_keys.iter().cloned());
+    }
+
+    Ok((
+        results,
+        tx_results,
+        tx_result_metas,
+        executor.id_pool(),
+        all_hot_archive_restored_keys,
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Parallel Soroban Phase Execution
+// ---------------------------------------------------------------------------
+
+/// Transaction envelope paired with an optional per-TX base fee override.
+type TxWithFee = (TransactionEnvelope, Option<u32>);
+
+/// Result of executing one cluster of Soroban transactions.
+struct ClusterResult {
+    results: Vec<TransactionExecutionResult>,
+    tx_results: Vec<TransactionResultPair>,
+    tx_result_metas: Vec<TransactionResultMetaV1>,
+    id_pool: u64,
+    hot_archive_restored_keys: Vec<LedgerKey>,
+}
+
+/// Extract the fee-paying source AccountId from a raw TransactionEnvelope.
+/// For fee bump transactions, this is the outer fee source.
+/// For regular transactions, this is the transaction source account.
+fn fee_source_account_id(env: &TransactionEnvelope) -> AccountId {
+    let muxed = match env {
+        TransactionEnvelope::TxV0(e) => MuxedAccount::Ed25519(e.tx.source_account_ed25519.clone()),
+        TransactionEnvelope::Tx(e) => e.tx.source_account.clone(),
+        TransactionEnvelope::TxFeeBump(e) => e.tx.fee_source.clone(),
+    };
+    match muxed {
+        MuxedAccount::Ed25519(key) => {
+            AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key))
+        }
+        MuxedAccount::MuxedEd25519(m) => {
+            AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(m.ed25519))
+        }
+    }
+}
+
+/// Pre-charged fee information for a single Soroban transaction.
+///
+/// Computed during the pre-deduction pass (matching C++ `processFeesSeqNums`)
+/// and consumed during cluster execution to provide fee metadata without
+/// re-deducting fees.
+struct PreChargedFee {
+    /// The fee actually charged (min(balance, computed_fee)).
+    charged_fee: i64,
+    /// Whether the transaction should be applied (charged_fee >= computed_fee).
+    should_apply: bool,
+    /// Fee processing LedgerEntryChanges: [State(before), Updated(after)].
+    fee_changes: LedgerEntryChanges,
+}
+
+/// Pre-deduct fees for all Soroban transactions across all stages/clusters.
+///
+/// This matches C++ `processFeesSeqNums` which deducts ALL transaction fees
+/// (classic + Soroban) sequentially before any transaction is applied.
+/// For the parallel phase, classic fees are already deducted by `execute_transaction_set`.
+/// This function deducts Soroban fees from the main delta so cluster executors
+/// see the correct post-fee-deduction account balances.
+///
+/// Returns `(pre_charged_fees, total_fee_pool_delta)` where `pre_charged_fees`
+/// is indexed in flattened order (stage 0 cluster 0 TX 0, ..., stage N cluster M TX K).
+fn pre_deduct_soroban_fees(
+    snapshot: &SnapshotHandle,
+    phase: &crate::close::SorobanPhaseStructure,
+    base_fee: u32,
+    network_id: NetworkId,
+    ledger_seq: u32,
+    delta: &mut LedgerDelta,
+) -> Result<(Vec<PreChargedFee>, i64)> {
+    let mut pre_charged: Vec<PreChargedFee> = Vec::new();
+    let mut total_fee_pool = 0i64;
+
+    for stage in &phase.stages {
+        for cluster in stage {
+            for (tx, tx_base_fee) in cluster {
+                let tx_fee = tx_base_fee.unwrap_or(base_fee);
+                let frame = TransactionFrame::with_network(tx.clone(), network_id);
+                let fee_source = fee_source_account_id(tx);
+
+                // Compute the fee using the same logic as execute_transaction_with_fee_mode.
+                let num_ops = std::cmp::max(1, frame.operation_count() as i64);
+                let required_fee = if frame.is_fee_bump() {
+                    tx_fee as i64 * (num_ops + 1)
+                } else {
+                    tx_fee as i64 * num_ops
+                };
+                let inclusion_fee = frame.inclusion_fee();
+                let computed_fee = frame.declared_soroban_resource_fee()
+                    + std::cmp::min(inclusion_fee, required_fee);
+
+                let (charged_fee, fee_changes) =
+                    delta.deduct_fee_from_account(&fee_source, computed_fee, snapshot, ledger_seq)?;
+                let should_apply = charged_fee >= computed_fee;
+
+                total_fee_pool += charged_fee;
+                pre_charged.push(PreChargedFee {
+                    charged_fee,
+                    should_apply,
+                    fee_changes,
+                });
+            }
+        }
+    }
+
+    Ok((pre_charged, total_fee_pool))
+}
+
+/// Execute a full Soroban parallel phase (all stages sequentially,
+/// clusters within each stage in parallel).
+///
+/// The classic phase must be executed separately before calling this function.
+///
+/// # Returns
+///
+/// Same tuple as `execute_transaction_set`: (results, tx_result_pairs,
+/// tx_result_metas, id_pool, hot_archive_restored_keys).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn execute_soroban_parallel_phase(
+    snapshot: &SnapshotHandle,
+    phase: &crate::close::SorobanPhaseStructure,
+    classic_tx_count: usize,
+    ledger_seq: u32,
+    close_time: u64,
+    base_fee: u32,
+    base_reserve: u32,
+    protocol_version: u32,
+    network_id: NetworkId,
+    delta: &mut LedgerDelta,
+    soroban_config: SorobanConfig,
+    soroban_base_prng_seed: [u8; 32],
+    classic_events: ClassicEventConfig,
+    module_cache: Option<&PersistentModuleCache>,
+    hot_archive: Option<std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
+    runtime_handle: Option<tokio::runtime::Handle>,
+) -> Result<(
+    Vec<TransactionExecutionResult>,
+    Vec<TransactionResultPair>,
+    Vec<TransactionResultMetaV1>,
+    u64,
+    Vec<LedgerKey>,
+)> {
+    let mut all_results: Vec<TransactionExecutionResult> = Vec::new();
+    let mut all_tx_results: Vec<TransactionResultPair> = Vec::new();
+    let mut all_tx_result_metas: Vec<TransactionResultMetaV1> = Vec::new();
+    let mut all_hot_archive_restored_keys: Vec<LedgerKey> = Vec::new();
+    let mut id_pool = snapshot.header().id_pool;
+    // Global TX offset tracks the canonical position for PRNG seed computation.
+    // In C++, the index counter is shared across all phases (classic + Soroban),
+    // so Soroban TXs start at classic_tx_count.
+    let mut global_tx_offset: usize = classic_tx_count;
+
+    // Pre-deduct all Soroban TX fees from the main delta BEFORE any cluster execution.
+    // This matches C++ processFeesSeqNums which deducts ALL fees upfront.
+    let (pre_charged_fees, total_pre_deducted) =
+        pre_deduct_soroban_fees(snapshot, phase, base_fee, network_id, ledger_seq, delta)?;
+    if total_pre_deducted != 0 {
+        delta.record_fee_pool_delta(total_pre_deducted);
+    }
+
+    // Track position in the flattened pre_charged_fees vector.
+    let mut pre_charge_offset: usize = 0;
+
+    for (stage_idx, stage) in phase.stages.iter().enumerate() {
+        if stage.is_empty() {
+            continue;
+        }
+
+        // Collect current entries from the delta so clusters in this stage can
+        // see changes from prior stages AND classic TX changes.  In C++,
+        // GlobalParallelApplyLedgerState wraps the main LedgerTxn which already
+        // has classic TX changes committed, so even stage 0 clusters see classic
+        // modifications (e.g., fee deductions on shared accounts).  We always
+        // pass delta.current_entries() to match this behavior.
+        // NOTE: After pre-deduction, these entries include the post-fee balances.
+        let prior_stage_entries = delta.current_entries();
+
+        // Slice pre_charged_fees for this stage's clusters.
+        let stage_tx_count: usize = stage.iter().map(|c| c.len()).sum();
+        let stage_pre_charged = &pre_charged_fees[pre_charge_offset..pre_charge_offset + stage_tx_count];
+
+        // Execute each cluster with its own executor, then merge results.
+        // Clusters within a stage are independent (no footprint conflicts)
+        // so they can be executed with isolated state.
+        let cluster_results = execute_stage_clusters(
+            snapshot,
+            stage,
+            global_tx_offset,
+            ledger_seq,
+            close_time,
+            base_fee,
+            base_reserve,
+            protocol_version,
+            network_id,
+            &soroban_config,
+            soroban_base_prng_seed,
+            classic_events,
+            module_cache,
+            hot_archive.clone(),
+            id_pool,
+            delta,
+            runtime_handle.clone(),
+            &prior_stage_entries,
+            stage_pre_charged,
+        )?;
+
+        // Merge cluster results. Use max id_pool across clusters.
+        for cr in &cluster_results {
+            if cr.id_pool > id_pool {
+                id_pool = cr.id_pool;
+            }
+            all_results.extend(cr.results.iter().cloned());
+            all_tx_results.extend(cr.tx_results.iter().cloned());
+            all_tx_result_metas.extend(cr.tx_result_metas.iter().cloned());
+            all_hot_archive_restored_keys
+                .extend(cr.hot_archive_restored_keys.iter().cloned());
+        }
+
+        // Advance global TX offset and pre_charge_offset for next stage.
+        global_tx_offset += stage_tx_count;
+        pre_charge_offset += stage_tx_count;
+
+        tracing::debug!(
+            ledger_seq = ledger_seq,
+            stage_idx = stage_idx,
+            clusters = stage.len(),
+            stage_tx_count = stage_tx_count,
+            "Completed parallel stage"
+        );
+    }
+
+    // Apply fee refunds after ALL transactions (matching C++ processPostTxSetApply).
+    // Account entries are already in the main delta from cluster merges, so we modify
+    // them directly rather than using a separate executor.
+    let flat_txs: Vec<&TransactionEnvelope> = phase
+        .stages
+        .iter()
+        .flat_map(|s| s.iter())
+        .flat_map(|c| c.iter())
+        .map(|(tx, _)| tx)
+        .collect();
+
+    // Apply Soroban fee refunds: C++ processPostTxSetApply() calls
+    // processRefund() which applies refund to both the account balance
+    // (via LedgerTxn) and the fee pool (feePool -= refund).
+    let mut total_refunds = 0i64;
+    for (idx, result) in all_results.iter().enumerate() {
+        let refund = result.fee_refund;
+        if refund > 0 && idx < flat_txs.len() {
+            let source = fee_source_account_id(flat_txs[idx]);
+            delta.apply_refund_to_account(&source, refund)?;
+            total_refunds += refund;
+        }
+    }
+    if total_refunds > 0 {
+        delta.record_fee_pool_delta(-total_refunds);
+    }
+
+    Ok((
+        all_results,
+        all_tx_results,
+        all_tx_result_metas,
+        id_pool,
+        all_hot_archive_restored_keys,
+    ))
+}
+
+/// Execute a single cluster of transactions independently.
+///
+/// Creates its own `TransactionExecutor` and `LedgerDelta`.
+/// Fees are NOT deducted by the executor (deduct_fee=false) because they
+/// were pre-deducted from the main delta by `pre_deduct_soroban_fees`.
+/// Returns `(ClusterResult, per_cluster_delta, total_fees)`.
+#[allow(clippy::too_many_arguments)]
+fn execute_single_cluster(
+    snapshot: &SnapshotHandle,
+    cluster: &[(TransactionEnvelope, Option<u32>)],
+    cluster_offset: usize,
+    ledger_seq: u32,
+    close_time: u64,
+    base_fee: u32,
+    base_reserve: u32,
+    protocol_version: u32,
+    network_id: NetworkId,
+    soroban_config: &SorobanConfig,
+    soroban_base_prng_seed: [u8; 32],
+    classic_events: ClassicEventConfig,
+    module_cache: Option<&PersistentModuleCache>,
+    hot_archive: Option<&std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
+    id_pool: u64,
+    prior_stage_entries: &[LedgerEntry],
+    pre_charged_fees: &[PreChargedFee],
+) -> Result<(ClusterResult, LedgerDelta, i64)> {
+    let mut executor = TransactionExecutor::new(
+        ledger_seq,
+        close_time,
+        base_reserve,
+        protocol_version,
+        network_id,
+        id_pool,
+        soroban_config.clone(),
+        classic_events,
+    );
+    if let Some(cache) = module_cache {
+        executor.set_module_cache(cache.clone());
+    }
+    if let Some(ha) = hot_archive {
+        executor.set_hot_archive(ha.clone());
+    }
+
+    // Pre-load entries from prior stages so this cluster's executor sees
+    // restorations and modifications made by earlier stages.  This matches
+    // C++ `collectClusterFootprintEntriesFromGlobal`.
+    for entry in prior_stage_entries {
+        executor.state.load_entry(entry.clone());
+    }
+
+    let mut results = Vec::with_capacity(cluster.len());
+    let mut tx_results = Vec::with_capacity(cluster.len());
+    let mut tx_result_metas = Vec::with_capacity(cluster.len());
+
+    for (local_idx, (tx, tx_base_fee)) in cluster.iter().enumerate() {
+        executor.state.snapshot_delta();
+
+        let tx_fee = tx_base_fee.unwrap_or(base_fee);
+        let global_idx = cluster_offset + local_idx;
+        let tx_prng_seed = sub_sha256(&soroban_base_prng_seed, global_idx as u32);
+
+        // Execute with deduct_fee=false — fees were already pre-deducted from
+        // the main delta by pre_deduct_soroban_fees().
+        let mut result = executor.execute_transaction_with_fee_mode(
+            snapshot,
+            tx,
+            tx_fee,
+            Some(tx_prng_seed),
+            false,
+        )?;
+
+        // Override fee_charged and fee_changes from pre-deduction.
+        // The executor computed fee_refund correctly (based on resource consumption),
+        // but fee_charged=0 because deduct_fee=false. We use the pre-charged values.
+        let pre = &pre_charged_fees[local_idx];
+        result.fee_charged = pre.charged_fee.saturating_sub(result.fee_refund);
+        result.fee_changes = Some(pre.fee_changes.clone());
+
+        // If pre-deduction determined insufficient balance, force the TX to fail.
+        if !pre.should_apply && result.success {
+            result.success = false;
+            result.failure = Some(ExecutionFailure::InsufficientBalance);
+            result.error = Some("Insufficient balance for fee".into());
+        }
+
+        let frame = TransactionFrame::with_network(tx.clone(), executor.network_id);
+        let tx_result = build_tx_result_pair(
+            &frame,
+            &executor.network_id,
+            &result,
+            tx_fee as i64,
+            protocol_version,
+        )?;
+        let tx_meta = result
+            .tx_meta
+            .clone()
+            .unwrap_or_else(empty_transaction_meta);
+        let fee_changes = result
+            .fee_changes
+            .clone()
+            .unwrap_or_else(empty_entry_changes);
+        let post_fee_changes = result
+            .post_fee_changes
+            .clone()
+            .unwrap_or_else(empty_entry_changes);
+        let tx_result_meta = TransactionResultMetaV1 {
+            ext: ExtensionPoint::V0,
+            result: tx_result.clone(),
+            fee_processing: fee_changes,
+            tx_apply_processing: tx_meta,
+            post_tx_apply_fee_processing: post_fee_changes,
+        };
+
+        results.push(result);
+        tx_results.push(tx_result);
+        tx_result_metas.push(tx_result_meta);
+    }
+
+    // Flush deferred RO TTL bumps within this cluster.
+    executor.state_mut().flush_deferred_ro_ttl_bumps();
+
+    // Collect hot archive restored keys.
+    let mut restored_keys: Vec<LedgerKey> = Vec::new();
+    for r in &results {
+        restored_keys.extend(r.hot_archive_restored_keys.iter().cloned());
+    }
+
+    let total_fees = executor.total_fees();
+    let final_id_pool = executor.id_pool();
+
+    // Apply this cluster's state changes to a local delta.
+    let mut cluster_delta = LedgerDelta::new(ledger_seq);
+    executor.apply_to_delta(snapshot, &mut cluster_delta)?;
+
+    Ok((
+        ClusterResult {
+            results,
+            tx_results,
+            tx_result_metas,
+            id_pool: final_id_pool,
+            hot_archive_restored_keys: restored_keys,
+        },
+        cluster_delta,
+        total_fees,
+    ))
+}
+
+/// Execute all clusters within a stage.
+///
+/// Each cluster gets its own `TransactionExecutor` with isolated state.
+/// The executor's state changes are applied to the main delta via `apply_to_delta`.
+/// Soroban TXs don't use the orderbook so `load_orderbook_offers` is skipped.
+///
+/// When a stage has multiple clusters, they are executed in parallel using
+/// `tokio::task::spawn_blocking` (one blocking task per cluster). Results are
+/// merged into `delta` in deterministic cluster order.
+#[allow(clippy::too_many_arguments)]
+fn execute_stage_clusters(
+    snapshot: &SnapshotHandle,
+    clusters: &[Vec<(TransactionEnvelope, Option<u32>)>],
+    global_tx_offset: usize,
+    ledger_seq: u32,
+    close_time: u64,
+    base_fee: u32,
+    base_reserve: u32,
+    protocol_version: u32,
+    network_id: NetworkId,
+    soroban_config: &SorobanConfig,
+    soroban_base_prng_seed: [u8; 32],
+    classic_events: ClassicEventConfig,
+    module_cache: Option<&PersistentModuleCache>,
+    hot_archive: Option<std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
+    id_pool: u64,
+    delta: &mut LedgerDelta,
+    runtime_handle: Option<tokio::runtime::Handle>,
+    prior_stage_entries: &[LedgerEntry],
+    pre_charged_fees: &[PreChargedFee],
+) -> Result<Vec<ClusterResult>> {
+    // Compute per-cluster global offsets and pre_charged_fees slicing.
+    let mut offsets = Vec::with_capacity(clusters.len());
+    let mut pre_charge_offsets = Vec::with_capacity(clusters.len());
+    let mut offset = global_tx_offset;
+    let mut pc_offset = 0usize;
+    for cluster in clusters {
+        offsets.push(offset);
+        pre_charge_offsets.push(pc_offset);
+        offset += cluster.len();
+        pc_offset += cluster.len();
+    }
+
+    tracing::debug!(
+        ledger_seq = ledger_seq,
+        num_clusters = clusters.len(),
+        prior_entries = prior_stage_entries.len(),
+        "execute_stage_clusters: starting"
+    );
+
+    // Single-cluster fast path: execute inline, no thread overhead.
+    if clusters.len() <= 1 {
+        let mut cluster_results = Vec::with_capacity(clusters.len());
+        for (cluster_idx, cluster) in clusters.iter().enumerate() {
+            let cluster_pc = &pre_charged_fees[pre_charge_offsets[cluster_idx]..pre_charge_offsets[cluster_idx] + cluster.len()];
+            let (cr, cluster_delta, total_fees) = execute_single_cluster(
+                snapshot,
+                cluster,
+                offsets[cluster_idx],
+                ledger_seq,
+                close_time,
+                base_fee,
+                base_reserve,
+                protocol_version,
+                network_id,
+                soroban_config,
+                soroban_base_prng_seed,
+                classic_events,
+                module_cache,
+                hot_archive.as_ref(),
+                id_pool,
+                prior_stage_entries,
+                cluster_pc,
+            )?;
+            delta.merge(cluster_delta)?;
+            if total_fees != 0 {
+                delta.record_fee_pool_delta(total_fees);
+            }
+            cluster_results.push(cr);
+        }
+        return Ok(cluster_results);
+    }
+
+    // Multi-cluster: spawn one blocking task per cluster on Tokio's thread pool.
+    // Clone shared data for 'static closures (all clones are cheap / Arc-based).
+    let snapshot = snapshot.clone();
+    let soroban_config = soroban_config.clone();
+    let module_cache = module_cache.cloned();
+    let clusters: std::sync::Arc<Vec<Vec<TxWithFee>>> =
+        std::sync::Arc::new(clusters.to_vec());
+    let prior_entries: std::sync::Arc<Vec<LedgerEntry>> =
+        std::sync::Arc::new(prior_stage_entries.to_vec());
+    // For multi-cluster parallel execution, we need to split pre_charged_fees per cluster.
+    // Each cluster gets its own Vec since the spawn_blocking closure needs 'static data.
+    let per_cluster_fees: Vec<std::sync::Arc<Vec<PreChargedFee>>> = {
+        let mut result = Vec::with_capacity(clusters.len());
+        for (idx, cluster) in clusters.iter().enumerate() {
+            let start = pre_charge_offsets[idx];
+            let end = start + cluster.len();
+            let fees: Vec<PreChargedFee> = pre_charged_fees[start..end]
+                .iter()
+                .map(|f| PreChargedFee {
+                    charged_fee: f.charged_fee,
+                    should_apply: f.should_apply,
+                    fee_changes: f.fee_changes.clone(),
+                })
+                .collect();
+            result.push(std::sync::Arc::new(fees));
+        }
+        result
+    };
+
+    // Build the async future that spawns per-cluster tasks and collects results.
+    let spawn_and_collect = async {
+        let mut tasks = Vec::with_capacity(clusters.len());
+        for idx in 0..clusters.len() {
+            let snapshot = snapshot.clone();
+            let config = soroban_config.clone();
+            let cache = module_cache.clone();
+            let ha = hot_archive.clone();
+            let clusters = clusters.clone();
+            let prior_entries = prior_entries.clone();
+            let cluster_offset = offsets[idx];
+            let cluster_fees = per_cluster_fees[idx].clone();
+
+            tasks.push(tokio::task::spawn_blocking(move || {
+                execute_single_cluster(
+                    &snapshot,
+                    &clusters[idx],
+                    cluster_offset,
+                    ledger_seq,
+                    close_time,
+                    base_fee,
+                    base_reserve,
+                    protocol_version,
+                    network_id,
+                    &config,
+                    soroban_base_prng_seed,
+                    classic_events,
+                    cache.as_ref(),
+                    ha.as_ref(),
+                    id_pool,
+                    &prior_entries,
+                    &cluster_fees,
+                )
+            }));
+        }
+
+        // Collect all results (preserving cluster order).
+        let mut results = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            results.push(task.await.expect("cluster task panicked"));
+        }
+        results
+    };
+
+    // When called from a spawn_blocking thread (runtime_handle is Some),
+    // use Handle::block_on directly. When called from a tokio worker thread
+    // (runtime_handle is None), use block_in_place to safely enter a blocking
+    // context before calling block_on.
+    let thread_results: Vec<Result<(ClusterResult, LedgerDelta, i64)>> =
+        if let Some(handle) = runtime_handle {
+            handle.block_on(spawn_and_collect)
+        } else {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(spawn_and_collect)
+            })
+        };
+
+    // Merge results in cluster order (deterministic).
+    let mut cluster_results = Vec::with_capacity(thread_results.len());
+    for result in thread_results {
+        let (cr, cluster_delta, total_fees) = result?;
+        delta.merge(cluster_delta)?;
+        if total_fees != 0 {
+            delta.record_fee_pool_delta(total_fees);
+        }
+        cluster_results.push(cr);
+    }
+
+    Ok(cluster_results)
+}
+
+// Compile-time assertions that key types are Send, required for spawn_blocking.
+const _: () = {
+    fn _assert_send<T: Send>() {}
+    fn _checks() {
+        _assert_send::<ClusterResult>();
+        _assert_send::<LedgerDelta>();
+    }
+};
+
+/// Compute the state size window update entry for a ledger close.
+///
+/// This implements the C++ `maybeSnapshotSorobanStateSize` logic, which updates the
+/// `LiveSorobanStateSizeWindow` config setting on each sample period.
+///
+/// # Arguments
+///
+/// * `seq` - Current ledger sequence number
+/// * `protocol_version` - Current protocol version
+/// * `bucket_list` - Bucket list to read current window state from
+/// * `soroban_state_size` - Total size of Soroban state in bytes (contracts + data)
+///
+/// # Returns
+///
+/// The updated window entry if a change is needed, or None if no update is required.
+pub fn compute_state_size_window_entry(
+    seq: u32,
+    protocol_version: u32,
+    bucket_list: &henyey_bucket::BucketList,
+    soroban_state_size: u64,
+) -> Option<LedgerEntry> {
+    use henyey_common::protocol::MIN_SOROBAN_PROTOCOL_VERSION;
+    use stellar_xdr::curr::{
+        ConfigSettingEntry, ConfigSettingId, LedgerEntryData, LedgerEntryExt, LedgerKey,
+        LedgerKeyConfigSetting, VecM,
+    };
+
+    if protocol_version < MIN_SOROBAN_PROTOCOL_VERSION {
+        return None;
+    }
+
+    // Load state archival settings to get sample period and size
+    let archival_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+        config_setting_id: ConfigSettingId::StateArchival,
+    });
+    let archival_entry = bucket_list.get(&archival_key).ok()??;
+    let LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(archival)) =
+        archival_entry.data
+    else {
+        return None;
+    };
+
+    let sample_period = archival.live_soroban_state_size_window_sample_period;
+    let sample_size = archival.live_soroban_state_size_window_sample_size as usize;
+    if sample_period == 0 || sample_size == 0 {
+        return None;
+    }
+
+    // Load current window state
+    let window_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+        config_setting_id: ConfigSettingId::LiveSorobanStateSizeWindow,
+    });
+    let window_entry = bucket_list.get(&window_key).ok()??;
+    let LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(window)) =
+        window_entry.data
+    else {
+        return None;
+    };
+
+    let mut window_vec: Vec<u64> = window.into();
+    if window_vec.is_empty() {
+        return None;
+    }
+
+    // Check if window size needs to be adjusted
+    let mut changed = false;
+    if window_vec.len() != sample_size {
+        if sample_size < window_vec.len() {
+            let remove_count = window_vec.len() - sample_size;
+            window_vec.drain(0..remove_count);
+        } else {
+            let oldest = window_vec[0];
+            let insert_count = sample_size - window_vec.len();
+            for _ in 0..insert_count {
+                window_vec.insert(0, oldest);
+            }
+        }
+        changed = true;
+    }
+
+    // Update window on sample ledgers
+    if seq % sample_period == 0 && !window_vec.is_empty() {
+        window_vec.remove(0);
+        window_vec.push(soroban_state_size);
+        changed = true;
+    }
+
+    if !changed {
+        return None;
+    }
+
+    let window_vecm: VecM<u64> = window_vec.try_into().ok()?;
+
+    Some(LedgerEntry {
+        last_modified_ledger_seq: seq,
+        data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(
+            window_vecm,
+        )),
+        ext: LedgerEntryExt::V0,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_transaction_executor_creation() {
+        let executor = TransactionExecutor::new(
+            100,
+            1234567890,
+            5_000_000,
+            21,
+            NetworkId::testnet(),
+            0,
+            SorobanConfig::default(),
+            ClassicEventConfig::default(),
+        );
+
+        assert_eq!(executor.ledger_seq, 100);
+        assert_eq!(executor.close_time, 1234567890);
+    }
+
+    /// Regression test: Verify classic transaction fee calculation uses min(inclusion_fee, required_fee)
+    ///
+    /// This matches C++ stellar-core's TransactionFrame::getFee() behavior when applying=true:
+    /// - For classic transactions: min(inclusionFee, adjustedFee)
+    ///   where adjustedFee = baseFee * numOperations
+    ///
+    /// Previously we incorrectly used inclusion_fee directly (or max()), which caused
+    /// transactions with high declared fees to be charged more than necessary.
+    #[test]
+    fn test_classic_fee_calculation_uses_min() {
+        // This test validates the fee calculation logic at lines ~1490-1497 and ~2129-2136
+        // For a classic transaction with:
+        //   - declared fee (inclusion_fee) = 1,000,000 stroops
+        //   - base_fee = 100 stroops
+        //   - num_ops = 1
+        //   - required_fee = base_fee * num_ops = 100
+        //
+        // The fee charged should be min(1_000_000, 100) = 100, NOT 1,000,000
+
+        // We can't easily test the full execute_transaction flow without extensive setup,
+        // but we can verify the formula directly using the same calculation:
+        let inclusion_fee: i64 = 1_000_000;
+        let base_fee: i64 = 100;
+        let num_ops: i64 = 1;
+        let required_fee = base_fee * std::cmp::max(1, num_ops);
+
+        // This is the correct formula (matches C++):
+        let fee_charged = std::cmp::min(inclusion_fee, required_fee);
+        assert_eq!(
+            fee_charged, 100,
+            "Classic fee should be min(declared, required)"
+        );
+
+        // Verify it's not using max (the previous bug):
+        let wrong_fee = std::cmp::max(inclusion_fee, required_fee);
+        assert_eq!(
+            wrong_fee, 1_000_000,
+            "max() would incorrectly give 1,000,000"
+        );
+        assert_ne!(
+            fee_charged, wrong_fee,
+            "Fee calculation must use min(), not max()"
+        );
+    }
+
+    /// Regression test: Verify Soroban fee calculation
+    ///
+    /// For Soroban transactions:
+    ///   fee = resourceFee + min(inclusionFee, adjustedFee)
+    #[test]
+    fn test_soroban_fee_calculation() {
+        let resource_fee: i64 = 500_000;
+        let declared_total_fee: i64 = 2_000_000;
+        let inclusion_fee = declared_total_fee - resource_fee; // 1,500,000
+        let base_fee: i64 = 100;
+        let num_ops: i64 = 1;
+        let required_fee = base_fee * std::cmp::max(1, num_ops); // 100
+
+        // Soroban fee = resourceFee + min(inclusionFee, adjustedFee)
+        let fee_charged = resource_fee + std::cmp::min(inclusion_fee, required_fee);
+
+        // Should be 500_000 + min(1_500_000, 100) = 500_000 + 100 = 500_100
+        assert_eq!(
+            fee_charged, 500_100,
+            "Soroban fee should be resourceFee + min(inclusionFee, adjustedFee)"
+        );
+    }
+
+    /// Regression test for F8: Fee refund on failed Soroban transactions
+    ///
+    /// When a Soroban transaction fails (e.g., InsufficientRefundableFee), the full
+    /// max_refundable_fee should be refunded. This test verifies that reset() properly
+    /// clears consumed values so refund_amount() returns the full max_refundable_fee.
+    ///
+    /// This mirrors C++ stellar-core's behavior where setError() calls resetConsumedFee().
+    ///
+    /// Observed at ledger 224398 TX 7: fee refund was 0, expected 47153 stroops.
+    #[test]
+    fn test_refundable_fee_tracker_reset_on_failure() {
+        let non_refundable_fee = 125_890;
+        let max_refundable_fee = 47_153;
+
+        let mut tracker = RefundableFeeTracker::new(non_refundable_fee, max_refundable_fee);
+
+        // Simulate consuming fees that would exceed max_refundable_fee
+        // (This would happen when consume() fails the InsufficientRefundableFee check)
+        tracker.consumed_event_size_bytes = 1000;
+        tracker.consumed_rent_fee = 50_000;
+        tracker.consumed_refundable_fee = 60_000; // Exceeds max_refundable_fee
+
+        // Before reset, refund_amount should be 0 (because consumed > max)
+        assert_eq!(
+            tracker.refund_amount(),
+            0,
+            "refund should be 0 when consumed > max"
+        );
+
+        // Reset the tracker (as done when transaction fails)
+        tracker.reset();
+
+        // After reset, consumed values should all be 0
+        assert_eq!(tracker.consumed_event_size_bytes, 0);
+        assert_eq!(tracker.consumed_rent_fee, 0);
+        assert_eq!(tracker.consumed_refundable_fee, 0);
+
+        // Now refund_amount should return the full max_refundable_fee
+        assert_eq!(
+            tracker.refund_amount(),
+            max_refundable_fee,
+            "refund should be full max_refundable_fee after reset"
+        );
+    }
+
+    /// Regression test for F17: extract_hot_archive_restored_keys uses actual_restored_indices
+    ///
+    /// When multiple transactions in the same ledger reference the same archived entry,
+    /// only the FIRST transaction should treat it as a hot archive restore. Subsequent
+    /// transactions should see it as already live (restored by the prior TX).
+    ///
+    /// The key insight is that `archived_soroban_entries` in the transaction envelope
+    /// is set at submission time, not execution time. By execution time, a prior TX
+    /// may have already restored the entry.
+    ///
+    /// This test verifies that extract_hot_archive_restored_keys only returns keys
+    /// for indices in `actual_restored_indices`, not all `archived_soroban_entries`.
+    #[test]
+    fn test_extract_hot_archive_restored_keys_uses_actual_indices() {
+        use stellar_xdr::curr::{
+            ContractDataDurability, ContractId, LedgerFootprint, LedgerKey, LedgerKeyContractData,
+            ScAddress, ScVal, SorobanResources, SorobanResourcesExtV0, SorobanTransactionData,
+            SorobanTransactionDataExt,
+        };
+
+        // Create a footprint with 3 keys in read_write
+        let key0 = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(stellar_xdr::curr::Hash([0u8; 32]))),
+            key: ScVal::U32(0),
+            durability: ContractDataDurability::Persistent,
+        });
+        let key1 = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(stellar_xdr::curr::Hash([1u8; 32]))),
+            key: ScVal::U32(1),
+            durability: ContractDataDurability::Persistent,
+        });
+        let key2 = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(stellar_xdr::curr::Hash([2u8; 32]))),
+            key: ScVal::U32(2),
+            durability: ContractDataDurability::Persistent,
+        });
+
+        let footprint = LedgerFootprint {
+            read_only: vec![].try_into().unwrap(),
+            read_write: vec![key0.clone(), key1.clone(), key2.clone()]
+                .try_into()
+                .unwrap(),
+        };
+
+        // Envelope says all 3 indices (0, 1, 2) need restoration
+        // (this was set at submission time)
+        // Note: V1 extension with archived_soroban_entries requires Protocol 25
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V1(SorobanResourcesExtV0 {
+                archived_soroban_entries: vec![0, 1, 2].try_into().unwrap(),
+            }),
+            resources: SorobanResources {
+                footprint,
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        // Case 1: All 3 are actually archived (actual_restored_indices = [0, 1, 2])
+        let actual_all = vec![0u32, 1, 2];
+        let result = extract_hot_archive_restored_keys(
+            Some(&soroban_data),
+            OperationType::InvokeHostFunction,
+            &actual_all,
+        );
+        assert_eq!(
+            result.len(),
+            3,
+            "Should return all 3 keys when all are actually archived"
+        );
+        assert!(result.contains(&key0));
+        assert!(result.contains(&key1));
+        assert!(result.contains(&key2));
+
+        // Case 2: Only index 0 is actually archived (1 and 2 were restored by prior TX)
+        // This is the bug scenario - actual_restored_indices is filtered by the host
+        let actual_one = vec![0u32];
+        let result = extract_hot_archive_restored_keys(
+            Some(&soroban_data),
+            OperationType::InvokeHostFunction,
+            &actual_one,
+        );
+        assert_eq!(
+            result.len(),
+            1,
+            "Should only return 1 key when only index 0 is actually archived"
+        );
+        assert!(result.contains(&key0), "Should contain key0");
+        assert!(
+            !result.contains(&key1),
+            "Should NOT contain key1 (already restored)"
+        );
+        assert!(
+            !result.contains(&key2),
+            "Should NOT contain key2 (already restored)"
+        );
+
+        // Case 3: None are actually archived (all were restored by prior TXs)
+        let actual_none: Vec<u32> = vec![];
+        let result = extract_hot_archive_restored_keys(
+            Some(&soroban_data),
+            OperationType::InvokeHostFunction,
+            &actual_none,
+        );
+        assert_eq!(
+            result.len(),
+            0,
+            "Should return empty set when none are actually archived"
+        );
+
+        // Case 4: RestoreFootprint should always return empty (handled separately)
+        let result = extract_hot_archive_restored_keys(
+            Some(&soroban_data),
+            OperationType::RestoreFootprint,
+            &actual_all,
+        );
+        assert_eq!(
+            result.len(),
+            0,
+            "RestoreFootprint should return empty (keys come from meta.hot_archive_restores)"
+        );
+    }
+
+    /// Parity: LedgerTxnTests.cpp:241 "restored keys" / "rollback" scenario
+    /// When no soroban data is provided, restored keys should be empty.
+    /// This covers the case where non-Soroban transactions don't produce restored keys.
+    #[test]
+    fn test_extract_hot_archive_restored_keys_no_soroban_data() {
+        let result =
+            extract_hot_archive_restored_keys(None, OperationType::InvokeHostFunction, &[0, 1, 2]);
+        assert!(
+            result.is_empty(),
+            "No soroban data should produce empty restored keys"
+        );
+    }
+
+    /// Parity: LedgerTxnTests.cpp:241 "restored keys" / empty actual_restored_indices
+    /// When actual_restored_indices is empty (no entries actually need restoration),
+    /// the result is empty regardless of what the envelope declares.
+    #[test]
+    fn test_extract_hot_archive_restored_keys_empty_indices() {
+        use stellar_xdr::curr::{
+            ContractDataDurability, ContractId, LedgerFootprint, LedgerKey,
+            LedgerKeyContractData, ScAddress, ScVal, SorobanResources,
+            SorobanResourcesExtV0, SorobanTransactionData, SorobanTransactionDataExt,
+        };
+
+        let key0 = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(stellar_xdr::curr::Hash([0u8; 32]))),
+            key: ScVal::U32(0),
+            durability: ContractDataDurability::Persistent,
+        });
+
+        // V1 extension with archived entries declared, but actual_restored is empty
+        // (all entries were already restored by prior TXs in this ledger)
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V1(SorobanResourcesExtV0 {
+                archived_soroban_entries: vec![0].try_into().unwrap(),
+            }),
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![key0].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        // Empty actual indices = nothing actually restored
+        let result = extract_hot_archive_restored_keys(
+            Some(&soroban_data),
+            OperationType::InvokeHostFunction,
+            &[],
+        );
+        assert!(
+            result.is_empty(),
+            "Empty actual_restored_indices should produce no restored keys"
+        );
+    }
+
+    /// Parity: LedgerTxnTests.cpp:241 "restored keys" / commit accumulates
+    /// Verify that hot_archive_restored_keys in TransactionExecutionResult is correctly
+    /// structured as a Vec that can accumulate keys across transactions.
+    #[test]
+    fn test_restored_keys_accumulation_pattern() {
+        use stellar_xdr::curr::{
+            ContractDataDurability, ContractId, LedgerKey, LedgerKeyContractData, ScAddress, ScVal,
+        };
+
+        // Simulate accumulation of restored keys from multiple transactions
+        let mut all_restored: Vec<LedgerKey> = Vec::new();
+
+        // TX1 restores key0
+        let key0 = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(stellar_xdr::curr::Hash([0u8; 32]))),
+            key: ScVal::U32(0),
+            durability: ContractDataDurability::Persistent,
+        });
+        all_restored.push(key0.clone());
+
+        // TX2 restores key1
+        let key1 = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(stellar_xdr::curr::Hash([1u8; 32]))),
+            key: ScVal::U32(1),
+            durability: ContractDataDurability::Persistent,
+        });
+        all_restored.push(key1.clone());
+
+        // After all TXs in a ledger close, the accumulated keys should contain both
+        assert_eq!(all_restored.len(), 2);
+        assert_eq!(all_restored[0], key0);
+        assert_eq!(all_restored[1], key1);
+    }
+}

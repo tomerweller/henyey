@@ -5,20 +5,20 @@
 ## Executive Summary
 
 Mainnet catchup currently peaks at ~12-13 GB, dominated by a single allocation: the
-`HashSet<LedgerKey>` dedup set in `LiveEntriesIterator` (~8.6 GB for 60M keys). C++
+`HashSet<LedgerKey>` dedup set in `LiveEntriesIterator` (~8.6 GB for 60M keys). stellar-core
 stellar-core achieves ~1-2 GB during catchup by using per-type scanning and only
 tracking the keys relevant to each operation.
 
-Five architectural differences from C++ account for the excess memory. Fixing the
+Five architectural differences from stellar-core account for the excess memory. Fixing the
 highest-priority issue (the dedup HashSet) saves ~8.4 GB and brings peak RSS to ~4 GB.
 
 ---
 
-## C++ Memory Profile During Catchup
+## stellar-core Memory Profile During Catchup
 
-C++ stellar-core (v25) uses a fundamentally different approach to state initialization:
+stellar-core (v25) uses a fundamentally different approach to state initialization:
 
-| Component | C++ Approach | Memory |
+| Component | stellar-core Approach | Memory |
 |-----------|-------------|--------|
 | Soroban state init | `InMemorySorobanState::initializeStateFromSnapshot()` — three per-type scans (`CONTRACT_DATA`, `TTL`, `CONTRACT_CODE`) with a `deletedKeys` set tracking only Soroban keys | ~240 MB |
 | Offer SQL population | `ApplyBucketsWork` — `mSeenKeys` tracks only ~2M offer keys | ~200-300 MB |
@@ -28,7 +28,7 @@ C++ stellar-core (v25) uses a fundamentally different approach to state initiali
 | Operating overhead | Allocator, stack, OS | ~1-2 GB |
 | **Total** | | **~1-2 GB** |
 
-Key C++ config defaults:
+Key stellar-core config defaults:
 - `BUCKETLIST_DB_INDEX_CUTOFF`: 20 MB (buckets below this get full InMemoryIndex)
 - `BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT`: 14 (16 KB pages)
 - `BUCKETLIST_DB_MEMORY_FOR_CACHING`: 0 (disabled by default)
@@ -42,13 +42,13 @@ Key C++ config defaults:
 
 **Status: FIXED** (see below)
 
-**File:** `crates/stellar-core-history/src/catchup.rs:2354`
+**File:** `crates/henyey-history/src/catchup.rs:2354`
 
 The function used `bucket_list.live_entries_iter()` which creates a `HashSet<LedgerKey>` for
 ALL ~60M keys in the bucket list, consuming ~8.6 GB. However, it only needs `ContractData`
 and `ContractCode` entries (~1.68M keys total).
 
-**C++ equivalent:** `InMemorySorobanState::initializeStateFromSnapshot()` does three per-type
+**stellar-core equivalent:** `InMemorySorobanState::initializeStateFromSnapshot()` does three per-type
 scans (`scanForEntriesOfType`) with a `deletedKeys` set tracking only Soroban-related keys.
 Memory: ~240 MB.
 
@@ -59,7 +59,7 @@ Memory: ~240 MB.
 
 ### ISSUE 2: DiskBucket index memory — ~200-400 MB
 
-**File:** `crates/stellar-core-bucket/src/disk_bucket.rs`
+**File:** `crates/henyey-bucket/src/disk_bucket.rs`
 
 The legacy flat `DiskBucketIndex` (`BTreeMap` per-key) was removed in favor of `LiveBucketIndex`
 which supports both `InMemoryIndex` (full key→offset map for small buckets) and `DiskIndex`
@@ -70,7 +70,7 @@ Current memory usage depends on bucket size distribution:
 - Small buckets (< 10K entries): `InMemoryIndex` with full key map
 - Large buckets (≥ 10K entries): `DiskIndex` with pages (~60K total) + bloom filter
 
-C++ uses page-based `DiskIndex` (~10 MB) + bloom filter (~138 MB) = ~148 MB.
+stellar-core uses page-based `DiskIndex` (~10 MB) + bloom filter (~138 MB) = ~148 MB.
 
 **Remaining work:** Phase 8 — Wire persisted index loading into `DiskBucket` to avoid
 full bucket scans on startup.
@@ -79,7 +79,7 @@ full bucket scans on startup.
 
 ### ISSUE 3: Bucket download buffers
 
-**File:** `crates/stellar-core-history/src/catchup.rs:1067`
+**File:** `crates/henyey-history/src/catchup.rs:1067`
 
 `archive.get_bucket(&hash).await` returns the full bucket as `Vec<u8>`, then writes to disk.
 With 16 parallel downloads (`buffer_unordered(16)`), multiple large buckets could be in
@@ -94,7 +94,7 @@ peak depends on download/write speed overlap. Worst case: 2-3 large buckets in f
 
 ### ~~ISSUE 4: Offer fallback closures use `live_entries_iter()`~~ (FIXED)
 
-**File:** `crates/stellar-core-ledger/src/manager.rs`
+**File:** `crates/henyey-ledger/src/manager.rs`
 
 Two fallback closures in `create_snapshot()` used `live_entries_iter()` when offers were not
 initialized. Replaced with `scan_for_entries_of_type(Offer, ...)`.
@@ -150,9 +150,9 @@ Removed dead functions that used `live_entries_iter()`:
 
 ## Technical Notes
 
-### How C++ Tracks Soroban State Size
+### How stellar-core Tracks Soroban State Size
 
-C++ uses `InMemorySorobanState` with two running counters:
+stellar-core uses `InMemorySorobanState` with two running counters:
 - `mContractCodeStateSize` (int64_t)
 - `mContractDataStateSize` (int64_t)
 
@@ -166,7 +166,7 @@ set (only Soroban keys) handles shadowing. Each entry's size is added to the run
 **Our Rust implementation matches this pattern:** `soroban_state.rs` has the same
 `contract_data_state_size` / `contract_code_state_size` fields, updated incrementally
 during ledger close via `process_entry_create/update/delete`. The `initialize_all_caches()`
-method in `manager.rs` uses per-type scanning (matching C++). The only outlier was
+method in `manager.rs` uses per-type scanning (matching stellar-core). The only outlier was
 `compute_initial_soroban_state_size()` in `catchup.rs`, which used the generic
 `live_entries_iter()` instead of per-type scanning.
 

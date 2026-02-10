@@ -1,6 +1,6 @@
 # Testnet Validation Status
 
-This document tracks the validation of rs-stellar-core against the Stellar testnet using the `verify-execution` command.
+This document tracks the validation of henyey against the Stellar testnet using the `verify-execution` command.
 
 **Last Updated:** 2026-01-27
 
@@ -10,13 +10,13 @@ This document tracks the validation of rs-stellar-core against the Stellar testn
 
 ```bash
 # Standard verification command
-cargo run --release --bin rs-stellar-core -- offline verify-execution --testnet --from <START> --to <END>
+cargo run --release --bin henyey -- offline verify-execution --testnet --from <START> --to <END>
 
 # With detailed diff output on mismatch
-cargo run --release --bin rs-stellar-core -- offline verify-execution --testnet --from 64 --to 50000 --show-diff
+cargo run --release --bin henyey -- offline verify-execution --testnet --from 64 --to 50000 --show-diff
 
 # Stop on first error for debugging
-cargo run --release --bin rs-stellar-core -- offline verify-execution --testnet --from 64 --to 50000 --stop-on-error
+cargo run --release --bin henyey -- offline verify-execution --testnet --from 64 --to 50000 --stop-on-error
 ```
 
 ## Verification Methodology
@@ -28,7 +28,7 @@ The `verify-execution` command performs true end-to-end verification:
 3. Updates bucket list using **our execution results** (not CDP metadata)
 4. Compares computed header hashes against expected values from CDP
 
-This is a strict verification that catches any execution divergence. If our transaction execution produces different state changes than C++ stellar-core, the bucket list hash will diverge.
+This is a strict verification that catches any execution divergence. If our transaction execution produces different state changes than stellar-core, the bucket list hash will diverge.
 
 ### Key Difference from Previous Approach
 
@@ -102,7 +102,7 @@ if op_data.limit == 0 {
 ```
 
 **Files changed:**
-- `crates/stellar-core-ledger/src/execution.rs` - Added sponsor loading in `load_operation_accounts()`
+- `crates/henyey-ledger/src/execution.rs` - Added sponsor loading in `load_operation_accounts()`
 
 **Regression tests:**
 - `test_change_trust_delete_sponsored_trustline_updates_sponsor`
@@ -113,7 +113,7 @@ if op_data.limit == 0 {
 
 #### 1. CreateClaimableBalance Check Order (Ledger 647352)
 
-The `CreateClaimableBalance` operation was incorrectly checking sponsor reserve (LowReserve) before available balance (Underfunded). C++ stellar-core checks available balance FIRST using the CURRENT minimum balance (without new sponsorship), then checks sponsor reserve AFTER balance deduction.
+The `CreateClaimableBalance` operation was incorrectly checking sponsor reserve (LowReserve) before available balance (Underfunded). stellar-core checks available balance FIRST using the CURRENT minimum balance (without new sponsorship), then checks sponsor reserve AFTER balance deduction.
 
 **Root Cause**: Our code was including `sponsorship_multiplier` in the available balance check when `sponsor == source`. This caused us to return `Underfunded` when the balance check should pass but the reserve check should fail.
 
@@ -122,11 +122,11 @@ The `CreateClaimableBalance` operation was incorrectly checking sponsor reserve 
 - CDP result: `CreateClaimableBalance(LowReserve)`
 
 **Fix**: 
-1. Changed available balance check to NOT include sponsorship (matching C++ `getAvailableBalance`)
+1. Changed available balance check to NOT include sponsorship (matching stellar-core `getAvailableBalance`)
 2. Moved sponsor reserve check (LowReserve) to AFTER balance deduction
 
 **Files changed:**
-- `crates/stellar-core-tx/src/operations/execute/claimable_balance.rs`
+- `crates/henyey-tx/src/operations/execute/claimable_balance.rs`
 
 **Regression tests:**
 - `test_create_claimable_balance_low_reserve_after_underfunded_check`
@@ -151,9 +151,9 @@ The `extract_hot_archive_restored_keys` function in `execution.rs` was incorrect
 3. Modified `extract_hot_archive_restored_keys` in `execution.rs` to use `actual_restored_indices` instead of envelope data
 
 **Files changed:**
-- `crates/stellar-core-tx/src/operations/execute/mod.rs` - Added field to struct
-- `crates/stellar-core-tx/src/operations/execute/invoke_host_function.rs` - Propagated field
-- `crates/stellar-core-ledger/src/execution.rs` - Updated function signature and call site
+- `crates/henyey-tx/src/operations/execute/mod.rs` - Added field to struct
+- `crates/henyey-tx/src/operations/execute/invoke_host_function.rs` - Propagated field
+- `crates/henyey-ledger/src/execution.rs` - Updated function signature and call site
 
 **Verification**: Ledgers 635729-635740 pass with 0 header mismatches. Combined with F16 (duplicate key fix), ledger 635730 is fully resolved.
 
@@ -170,12 +170,12 @@ When contracts are deployed via Soroban transactions, they need to be added to t
 - CPU consumed exceeded CPU limit by ~0.4% (18,260 instructions over)
 - Transaction succeeded in CDP but failed in our execution
 
-**Fix**: After `soroban_state.update_state()` for each ledger, iterate over `all_init` and `all_live` entries and add any new `ContractCode` entries to the persistent module cache. This matches upstream C++ `addAnyContractsToModuleCache()` behavior during the commit phase.
+**Fix**: After `soroban_state.update_state()` for each ledger, iterate over `all_init` and `all_live` entries and add any new `ContractCode` entries to the persistent module cache. This matches stellar-core `addAnyContractsToModuleCache()` behavior during the commit phase.
 
 **Files changed:**
-- `crates/rs-stellar-core/src/main.rs` - Add module cache update after soroban_state update
+- `crates/henyey/src/main.rs` - Add module cache update after soroban_state update
 
-**Regression test:** `test_apply_ledger_entry_changes_updates_module_cache` in `crates/stellar-core-ledger/tests/transaction_execution.rs` (existing test covers the code path)
+**Regression test:** `test_apply_ledger_entry_changes_updates_module_cache` in `crates/henyey-ledger/tests/transaction_execution.rs` (existing test covers the code path)
 
 **Verification**: Ledger 328879 and range 300000-365311 (65,312 ledgers) pass with 0 header mismatches.
 
@@ -183,7 +183,7 @@ When contracts are deployed via Soroban transactions, they need to be added to t
 
 The `SetOptions` operation was not validating that the inflation destination account exists on the ledger.
 
-**Root Cause**: In C++ stellar-core, `SetOptionsOpFrame::doApply()` calls `loadAccountWithoutRecord()` to verify the inflation destination exists (unless it's the source account itself). Our Rust implementation unconditionally accepted any `AccountId` without validation.
+**Root Cause**: In stellar-core, `SetOptionsOpFrame::doApply()` calls `loadAccountWithoutRecord()` to verify the inflation destination exists (unless it's the source account itself). Our Rust implementation unconditionally accepted any `AccountId` without validation.
 
 **Observed symptoms**:
 - Our result: `SetOptions(Success)`
@@ -193,7 +193,7 @@ The `SetOptions` operation was not validating that the inflation destination acc
 **Fix**: Added validation before setting inflation destination: if `inflation_dest` differs from `source`, check that `state.get_account(inflation_dest)` returns Some. If not found, return `make_result(SetOptionsResultCode::InvalidInflation)`.
 
 **Files changed:**
-- `crates/stellar-core-tx/src/operations/execute/set_options.rs` - Added inflation destination validation
+- `crates/henyey-tx/src/operations/execute/set_options.rs` - Added inflation destination validation
 
 **Regression tests:**
 - `test_set_options_inflation_dest_nonexistent_account` - Verifies InvalidInflation for non-existent
@@ -221,7 +221,7 @@ When `InvokeHostFunction` restores entries from the hot archive, ContractCode or
 Also skip entries already in `our_init` when processing `our_hot_archive_restored_keys` to avoid duplicates.
 
 **Files changed:**
-- `crates/rs-stellar-core/src/main.rs` - Duplicate detection and handling
+- `crates/henyey/src/main.rs` - Duplicate detection and handling
 
 **Regression tests:** 
 - `test_create_duplicate_contract_code_fails` - Verifies error on duplicate code
@@ -271,9 +271,9 @@ if op_type == OperationType::RestoreFootprint {
 ```
 
 **Files changed:**
-- `crates/stellar-core-ledger/src/execution.rs` - Conditional filtering for RestoreFootprint
+- `crates/henyey-ledger/src/execution.rs` - Conditional filtering for RestoreFootprint
 
-**Regression test:** `test_restore_footprint_hot_archive_ttl_pairing` in `crates/stellar-core-ledger/src/soroban_state.rs`
+**Regression test:** `test_restore_footprint_hot_archive_ttl_pairing` in `crates/henyey-ledger/src/soroban_state.rs`
 
 **Verification**: Ledger 327974 and range 327900-328100 (201 ledgers, 911 transactions) pass with 0 header mismatches.
 
@@ -286,7 +286,7 @@ When Soroban transactions restore entries from the hot archive, the entries shou
 **Fix**: Check if entry was already created in the **delta** (by a previous TX in same ledger) instead of checking state existence. Added `key_already_created_in_delta()` and `ttl_already_created_in_delta()` helpers.
 
 **Files changed:**
-- `crates/stellar-core-tx/src/operations/execute/invoke_host_function.rs`
+- `crates/henyey-tx/src/operations/execute/invoke_host_function.rs`
 
 **Regression test:** `test_hot_archive_restore_uses_create_not_update`
 
@@ -305,10 +305,10 @@ When multiple transactions in the same ledger reference the same archived entry 
 - `live_until < current_ledger` → Entry has expired TTL (live BL restore)
 - `live_until >= current_ledger` → Entry was already restored by a previous TX (treat as live)
 
-This matches C++ stellar-core's `previouslyRestoredFromHotArchive()` check.
+This matches stellar-core's `previouslyRestoredFromHotArchive()` check.
 
 **Files changed:**
-- `crates/stellar-core-tx/src/soroban/host.rs` - Both P24 and P25 code paths
+- `crates/henyey-tx/src/soroban/host.rs` - Both P24 and P25 code paths
 
 #### 4. Extra RESTORED Changes for Entries Already Restored by Earlier TX (Ledger 252453)
 
@@ -328,8 +328,8 @@ When multiple transactions in the same ledger restore the same archived entry, O
 4. Updated the call site to pass `result.actual_restored_indices`
 
 **Files changed:**
-- `crates/stellar-core-tx/src/soroban/host.rs` - Added field to struct, populated in P24/P25 paths
-- `crates/stellar-core-tx/src/operations/execute/invoke_host_function.rs` - Updated function signature and call site
+- `crates/henyey-tx/src/soroban/host.rs` - Added field to struct, populated in P24/P25 paths
+- `crates/henyey-tx/src/operations/execute/invoke_host_function.rs` - Updated function signature and call site
 
 **Verification**: Ledger 252453 and range 250000-253000 pass with 0 header mismatches.
 
@@ -339,7 +339,7 @@ When a Soroban transaction fails (e.g., due to `InsufficientRefundableFee`), the
 
 **Root Cause**: In `RefundableFeeTracker::consume()`, when the second check fails (`consumed > max`), `consumed_refundable_fee` has already been updated. Then `refund_amount()` returns 0 because `max - consumed` is negative.
 
-C++ stellar-core calls `resetConsumedFee()` in `setError()` when any error is set, which resets all consumed fees to 0, making the refund equal to the full `max_refundable_fee`.
+stellar-core calls `resetConsumedFee()` in `setError()` when any error is set, which resets all consumed fees to 0, making the refund equal to the full `max_refundable_fee`.
 
 **Observed symptoms**:
 - Fee refund mismatch: ours=0 vs cdp=47153 (diff=-47153)
@@ -347,14 +347,14 @@ C++ stellar-core calls `resetConsumedFee()` in `setError()` when any error is se
 - Account balance diff: -47153 stroops
 
 **Fix**:
-1. Added `reset()` method to `RefundableFeeTracker` that mirrors C++ `resetConsumedFee()`:
+1. Added `reset()` method to `RefundableFeeTracker` that mirrors stellar-core `resetConsumedFee()`:
    - Resets `consumed_event_size_bytes`, `consumed_rent_fee`, and `consumed_refundable_fee` to 0
 2. Call `tracker.reset()` in the `!all_success` branch when a transaction fails, before computing the refund
 
 **Files changed:**
-- `crates/stellar-core-ledger/src/execution.rs` - Added `reset()` method and call it on transaction failure
+- `crates/henyey-ledger/src/execution.rs` - Added `reset()` method and call it on transaction failure
 
-**Regression test:** `test_refundable_fee_tracker_reset_on_failure` in `crates/stellar-core-ledger/src/execution.rs`
+**Regression test:** `test_refundable_fee_tracker_reset_on_failure` in `crates/henyey-ledger/src/execution.rs`
 
 **Verification**: Ledger 224398 and range 224395-224400 pass with 0 header mismatches.
 
@@ -368,10 +368,10 @@ Soroban contracts calling `bn254_multi_pairing_check` were failing with "bn254 G
 
 **Files changed:**
 - `Cargo.toml` - Updated soroban-env-host-p25 and soroban-env-common-p25 revisions
-- `crates/stellar-core-tx/src/soroban/host.rs` - P25 XDR conversion, SnapshotSource impl
-- `crates/stellar-core-tx/src/soroban/protocol/p25.rs` - P25 XDR conversion, SnapshotSource impl
-- `crates/stellar-core-tx/src/operations/execute/mod.rs` - `convert_ledger_entry_to_p25`
-- `crates/stellar-core-ledger/src/soroban_state.rs` - `convert_ledger_entry_to_p25`
+- `crates/henyey-tx/src/soroban/host.rs` - P25 XDR conversion, SnapshotSource impl
+- `crates/henyey-tx/src/soroban/protocol/p25.rs` - P25 XDR conversion, SnapshotSource impl
+- `crates/henyey-tx/src/operations/execute/mod.rs` - `convert_ledger_entry_to_p25`
+- `crates/henyey-ledger/src/soroban_state.rs` - `convert_ledger_entry_to_p25`
 
 ### Issues Fixed (2026-01-23)
 
@@ -384,13 +384,13 @@ The hot archive bucket list was stored in `LedgerManager` but never passed to th
 **Fix**: Added `hot_archive` parameter to `execute_transaction_set()` and `execute_transaction_set_with_fee_mode()`, and wired it through from `LedgerCloseContext::apply_transactions()`.
 
 **Files changed:**
-- `crates/stellar-core-ledger/src/execution.rs` - Added hot_archive parameter, updated `HotArchiveLookupImpl` types
-- `crates/stellar-core-ledger/src/manager.rs` - Pass hot archive to execute_transaction_set
-- `crates/stellar-core-history/src/replay.rs` - Pass None (not needed during replay)
-- `crates/rs-stellar-core/src/main.rs` - Create compatible wrapper for offline verification
-- `crates/rs-stellar-core/Cargo.toml` - Added parking_lot dependency
+- `crates/henyey-ledger/src/execution.rs` - Added hot_archive parameter, updated `HotArchiveLookupImpl` types
+- `crates/henyey-ledger/src/manager.rs` - Pass hot archive to execute_transaction_set
+- `crates/henyey-history/src/replay.rs` - Pass None (not needed during replay)
+- `crates/henyey/src/main.rs` - Create compatible wrapper for offline verification
+- `crates/henyey/Cargo.toml` - Added parking_lot dependency
 
-**Regression test:** `test_execute_transaction_set_accepts_hot_archive_parameter` in `crates/stellar-core-ledger/tests/transaction_execution.rs`
+**Regression test:** `test_execute_transaction_set_accepts_hot_archive_parameter` in `crates/henyey-ledger/tests/transaction_execution.rs`
 
 #### 2. CAP-0021 Sequence Number Handling with minSeqNum Gaps
 
@@ -402,13 +402,13 @@ At ledger 28110, a transaction had:
 
 We incorrectly set account seq to 968+1=969 instead of 970.
 
-**Fix:** Changed all sequence number updates to use `acc.seq_num = tx.sequence_number()` instead of `acc.seq_num += 1`. This matches C++ stellar-core's `processSeqNum()` which does `sourceAccount.seqNum = getSeqNum()`.
+**Fix:** Changed all sequence number updates to use `acc.seq_num = tx.sequence_number()` instead of `acc.seq_num += 1`. This matches stellar-core's `processSeqNum()` which does `sourceAccount.seqNum = getSeqNum()`.
 
 **Files changed:**
-- `crates/stellar-core-ledger/src/execution.rs` - 3 locations
-- `crates/stellar-core-tx/src/live_execution.rs` - `update_sequence_number()` function
+- `crates/henyey-ledger/src/execution.rs` - 3 locations
+- `crates/henyey-tx/src/live_execution.rs` - `update_sequence_number()` function
 
-**Regression test:** `test_process_seq_num_with_sequence_gap_cap_0021` in `crates/stellar-core-tx/src/live_execution.rs`
+**Regression test:** `test_process_seq_num_with_sequence_gap_cap_0021` in `crates/henyey-tx/src/live_execution.rs`
 
 #### 2. Soroban Transaction Meta Missing V1 Extension with Fee Values
 
@@ -427,7 +427,7 @@ For example at ledger 182057:
 - TX 6 extended an entry's TTL
 - TX 7 also touched the same entry and re-paid rent because it saw the old TTL value
 
-Fixed by changing `get_entry_ttl()` in `host.rs` to use the CURRENT TTL value (from `state.get_ttl()`) instead of the ledger-start TTL (from `state.get_ttl_at_ledger_start()`). This matches C++ stellar-core behavior where rent fee calculation uses live state.
+Fixed by changing `get_entry_ttl()` in `host.rs` to use the CURRENT TTL value (from `state.get_ttl()`) instead of the ledger-start TTL (from `state.get_ttl_at_ledger_start()`). This matches stellar-core behavior where rent fee calculation uses live state.
 
 #### 3. Extra TTL Changes in Transaction Meta (augment_soroban_ttl_metadata)
 
@@ -437,7 +437,7 @@ Fixed by disabling the `augment_soroban_ttl_metadata()` call - the proper TTL ch
 
 #### 4. Read-Only TTL Changes Suppression in Transaction Meta
 
-In C++ stellar-core, TTL updates for entries whose corresponding data/code key is in the **read-only footprint** are NOT emitted in transaction metadata. Instead, they're accumulated in a separate buffer (`mRoTTLBumps`) and handled at different points (see `buildRoTTLSet` and `commitChangeFromSuccessfulOp` in `ParallelApplyUtils.cpp`). We were emitting `STATE Ttl` and `UPDATED Ttl` changes for these read-only TTL entries, causing metadata mismatches.
+In stellar-core, TTL updates for entries whose corresponding data/code key is in the **read-only footprint** are NOT emitted in transaction metadata. Instead, they're accumulated in a separate buffer (`mRoTTLBumps`) and handled at different points (see `buildRoTTLSet` and `commitChangeFromSuccessfulOp` in `ParallelApplyUtils.cpp`). We were emitting `STATE Ttl` and `UPDATED Ttl` changes for these read-only TTL entries, causing metadata mismatches.
 
 **Fix:** Modified `build_entry_changes_with_hot_archive` to build a set of read-only TTL keys from the footprint and skip TTL updates for those keys.
 
@@ -445,7 +445,7 @@ In C++ stellar-core, TTL updates for entries whose corresponding data/code key i
 
 #### 5. Hot Archive TTL Entry RESTORED Meta Emission
 
-When entries are restored from the hot archive, C++ stellar-core emits `LEDGER_ENTRY_RESTORED` for both the data/code entry AND its associated TTL entry. We were only emitting `RESTORED` for data/code entries but `CREATED` for TTL entries.
+When entries are restored from the hot archive, stellar-core emits `LEDGER_ENTRY_RESTORED` for both the data/code entry AND its associated TTL entry. We were only emitting `RESTORED` for data/code entries but `CREATED` for TTL entries.
 
 **Fix:** Added TTL key computation for hot archive restores and updated `push_created_or_restored` to check both hot archive and live bucket list restored keys.
 
@@ -455,25 +455,25 @@ When entries are restored from the hot archive, C++ stellar-core emits `LEDGER_E
 
 #### 1. TTL Emission Skipped When Value Unchanged (Ledger 182022)
 
-When a Soroban contract modifies data (e.g., ContractData), we were always emitting a TTL update to the bucket list, even when the TTL value hadn't actually changed. C++ stellar-core only emits bucket list updates when there's an actual change in value.
+When a Soroban contract modifies data (e.g., ContractData), we were always emitting a TTL update to the bucket list, even when the TTL value hadn't actually changed. stellar-core only emits bucket list updates when there's an actual change in value.
 
-At ledger 182022 TX 4, a ContractData entry was modified but its TTL remained 226129. We were emitting a redundant TTL update, causing 1 extra LIVE entry compared to C++ stellar-core (10 vs 9 LIVE entries).
+At ledger 182022 TX 4, a ContractData entry was modified but its TTL remained 226129. We were emitting a redundant TTL update, causing 1 extra LIVE entry compared to stellar-core (10 vs 9 LIVE entries).
 
 Fixed by checking if the new TTL value differs from the existing TTL before calling `state.update_ttl()`.
 
-**Regression test:** `test_apply_soroban_storage_change_skips_ttl_when_unchanged` in `crates/stellar-core-tx/src/operations/execute/invoke_host_function.rs`
+**Regression test:** `test_apply_soroban_storage_change_skips_ttl_when_unchanged` in `crates/henyey-tx/src/operations/execute/invoke_host_function.rs`
 
 #### 2. Classic Transaction Fee Calculation
 
-Classic transactions were incorrectly charged the full declared fee instead of `min(declared_fee, base_fee * num_ops)`. This matches C++ stellar-core's `TransactionFrame::getFee()` behavior when `applying=true`.
+Classic transactions were incorrectly charged the full declared fee instead of `min(declared_fee, base_fee * num_ops)`. This matches stellar-core's `TransactionFrame::getFee()` behavior when `applying=true`.
 
-**Regression test:** `test_classic_fee_calculation_uses_min` in `crates/stellar-core-ledger/src/execution.rs` and `test_classic_fee_uses_min_not_max` in `crates/stellar-core-tx/src/live_execution.rs`
+**Regression test:** `test_classic_fee_calculation_uses_min` in `crates/henyey-ledger/src/execution.rs` and `test_classic_fee_uses_min_not_max` in `crates/henyey-tx/src/live_execution.rs`
 
 #### 2. Liquidity Pool Deletion on Last Trustline Removal
 
 When the last pool share trustline referencing a liquidity pool is deleted (causing `pool_shares_trust_line_count` to reach 0), the pool itself must be deleted from state. Previously the count was decremented but the pool was never removed.
 
-**Regression test:** `test_change_trust_pool_deleted_when_last_trustline_removed` in `crates/stellar-core-tx/src/operations/execute/change_trust.rs`
+**Regression test:** `test_change_trust_pool_deleted_when_last_trustline_removed` in `crates/henyey-tx/src/operations/execute/change_trust.rs`
 
 #### 3. INIT/LIVE/DEAD Coalescing for Created+Deleted Entries
 
@@ -495,7 +495,7 @@ When a transaction fails and rolls back, changes from previously committed trans
 
 #### 5. TTL Bucket List Snapshot for Soroban Execution
 
-Soroban transactions were seeing TTL values modified by previous transactions in the same ledger instead of the original bucket list values. C++ stellar-core uses the bucket list state at ledger start for Soroban snapshots. For example, at ledger 901:
+Soroban transactions were seeing TTL values modified by previous transactions in the same ledger instead of the original bucket list values. stellar-core uses the bucket list state at ledger start for Soroban snapshots. For example, at ledger 901:
 - TX0 extended a TTL from 1054979 → 1054980
 - TX1 saw TTL=1054980 instead of the original 1054979
 - This caused TX1 to extract only 4 rent changes instead of 5, resulting in a 10,165 stroops fee refund difference
@@ -508,7 +508,7 @@ Fixed by adding `ttl_bucket_list_snapshot` to capture TTL values when entries ar
 
 When an `AccountMerge` operation transfers 0 balance from a source account to a destination account, the destination account was accessed via `get_account_mut()` but the balance didn't actually change. The `flush_all_accounts_except()` function was checking `&entry != snapshot_entry` to decide whether to record the update, which was `false` when the balance was unchanged.
 
-C++ stellar-core records STATE/UPDATED pairs for every account accessed during an operation, even if the data doesn't change. This is because `loadAccount` calls create access records regardless of modifications.
+stellar-core records STATE/UPDATED pairs for every account accessed during an operation, even if the data doesn't change. This is because `loadAccount` calls create access records regardless of modifications.
 
 **Fix:** Modified `flush_all_accounts_except()` in `state.rs` to check if the entry was accessed during the current operation via `op_entry_snapshots`:
 
@@ -519,8 +519,8 @@ let should_record = accessed_in_op || self.multi_op_mode || &entry != snapshot_e
 ```
 
 **Files changed:**
-- `crates/stellar-core-tx/src/state.rs` - `flush_all_accounts_except()` logic
-- `crates/stellar-core-tx/Cargo.toml` - Added `hex` dependency
+- `crates/henyey-tx/src/state.rs` - `flush_all_accounts_except()` logic
+- `crates/henyey-tx/Cargo.toml` - Added `hex` dependency
 
 **Verification:** Ledgers 360000-360500 (501 ledgers, 2449 transactions) now pass with 100% header match. This includes ledger 360249 which previously failed due to missing account `2e824db9...` in the delta.
 
@@ -542,9 +542,9 @@ This caused `advance_to_ledger()` to apply hundreds of thousands of empty batche
 **Fix:** Added `set_ledger_seq()` method to both `BucketList` and `HotArchiveBucketList`, and call it after bucket list initialization in `initialize()` to set the correct ledger sequence.
 
 **Files changed:**
-- `crates/stellar-core-bucket/src/bucket_list.rs` - Added `set_ledger_seq()` method
-- `crates/stellar-core-bucket/src/hot_archive.rs` - Added `set_ledger_seq()` method
-- `crates/stellar-core-ledger/src/manager.rs` - Call `set_ledger_seq(header.ledger_seq)` after initialization
+- `crates/henyey-bucket/src/bucket_list.rs` - Added `set_ledger_seq()` method
+- `crates/henyey-bucket/src/hot_archive.rs` - Added `set_ledger_seq()` method
+- `crates/henyey-ledger/src/manager.rs` - Call `set_ledger_seq(header.ledger_seq)` after initialization
 
 **Regression test:** Ledgers 637245-637310 (previously had hash mismatches at 637247 and 637308) now pass verification.
 
@@ -556,7 +556,7 @@ When `SetTrustLineFlags` or `AllowTrust` is called by an issuer on another accou
 
 **Observed at**: Ledger 500254 (testnet) - Account `58ddce3f677cb3acb852f50752c4e7bcc2e8318f46701b1811903f8d5beae65f` appearing in our LIVE delta but not in CDP
 
-**Root Cause**: We had added `state.record_account_access(source)` calls to both `execute_allow_trust()` and `execute_set_trust_line_flags()` thinking it matched C++ behavior. However, C++ stellar-core loads the source account in a **nested LedgerTxn** (`ltxSource`) that gets rolled back:
+**Root Cause**: We had added `state.record_account_access(source)` calls to both `execute_allow_trust()` and `execute_set_trust_line_flags()` thinking it matched stellar-core behavior. However, stellar-core loads the source account in a **nested LedgerTxn** (`ltxSource`) that gets rolled back:
 
 ```cpp
 LedgerTxn ltxSource(ltx); // ltxSource will be rolled back
@@ -569,7 +569,7 @@ This means the source account access is NOT recorded in the transaction changes.
 **Fix**: Removed `state.record_account_access(source)` calls from both functions. The code now uses `state.get_account(source)` (read-only) which doesn't record the access.
 
 **Files changed:**
-- `crates/stellar-core-tx/src/operations/execute/trust_flags.rs` - Removed `record_account_access()` calls
+- `crates/henyey-tx/src/operations/execute/trust_flags.rs` - Removed `record_account_access()` calls
 
 **Regression tests:**
 - `test_set_trust_line_flags_does_not_record_issuer_in_delta`
@@ -579,19 +579,19 @@ This means the source account access is NOT recorded in the transaction changes.
 
 #### CreateClaimableBalance Source Account Not Recorded When Different from TX Source
 
-When a `CreateClaimableBalance` operation has an operation source different from the transaction source (e.g., an issuer account), C++ stellar-core calls `loadSourceAccount()` which records the access. Our implementation wasn't recording this access, causing the account to be missing from the delta.
+When a `CreateClaimableBalance` operation has an operation source different from the transaction source (e.g., an issuer account), stellar-core calls `loadSourceAccount()` which records the access. Our implementation wasn't recording this access, causing the account to be missing from the delta.
 
 **Observed at**: Ledger 203280 (testnet) - Account `94c035a17f8d6e30e27b5750f80ee88e6a1d8c9647058e4cff2a2401e9dbed15` missing from delta
 
-**Root Cause**: In C++, operations that need to load their source account call `loadSourceAccount()` which records the access. Our `execute_create_claimable_balance()` was calling `get_account()` (read-only) instead of recording the access.
+**Root Cause**: In stellar-core, operations that need to load their source account call `loadSourceAccount()` which records the access. Our `execute_create_claimable_balance()` was calling `get_account()` (read-only) instead of recording the access.
 
-**Fix**: Added `state.record_account_access(source)` call in `execute_create_claimable_balance()` to match C++ behavior.
+**Fix**: Added `state.record_account_access(source)` call in `execute_create_claimable_balance()` to match stellar-core behavior.
 
 **Files changed:**
-- `crates/stellar-core-tx/src/state.rs` - Added `record_account_access()` method
-- `crates/stellar-core-tx/src/operations/execute/claimable_balance.rs` - Call `record_account_access()`
+- `crates/henyey-tx/src/state.rs` - Added `record_account_access()` method
+- `crates/henyey-tx/src/operations/execute/claimable_balance.rs` - Call `record_account_access()`
 
-**Regression test:** `test_create_claimable_balance_records_source_account_access` in `crates/stellar-core-tx/src/operations/execute/claimable_balance.rs`
+**Regression test:** `test_create_claimable_balance_records_source_account_access` in `crates/henyey-tx/src/operations/execute/claimable_balance.rs`
 
 ### Issues Fixed (2026-01-26)
 
@@ -618,9 +618,9 @@ When entries are restored from hot archive during `InvokeHostFunction` execution
 3. In `main.rs` (offline verify): Filter `our_dead` to exclude keys in `our_hot_archive_restored_keys`
 
 **Files Changed**:
-- `crates/stellar-core-ledger/src/execution.rs` - Removed `created_keys` filtering for bucket list
-- `crates/stellar-core-ledger/src/manager.rs` - Added dead_entries filtering by hot_archive_restored_keys
-- `crates/rs-stellar-core/src/main.rs` - Added our_dead filtering by our_hot_archive_restored_keys
+- `crates/henyey-ledger/src/execution.rs` - Removed `created_keys` filtering for bucket list
+- `crates/henyey-ledger/src/manager.rs` - Added dead_entries filtering by hot_archive_restored_keys
+- `crates/henyey/src/main.rs` - Added our_dead filtering by our_hot_archive_restored_keys
 
 **Regression Test**: Testnet verification at ledgers 603325 and 610541 serves as the regression test. The fix involves complex integration between transaction execution and bucket list updates that's difficult to unit test in isolation.
 
@@ -632,7 +632,7 @@ When entries are restored from hot archive during `InvokeHostFunction` execution
 
 When an asset issuer deposits into or withdraws from a liquidity pool containing their own asset, the operation was incorrectly returning `NoTrust` because the code required a trustline.
 
-**Root Cause**: In Stellar, issuers don't need trustlines for their own assets - they can create/destroy assets from nothing with unlimited capacity. C++ stellar-core's `TrustLineWrapper` handles this via separate `IssuerImpl` and `NonIssuerImpl` implementations. Our Rust code was unconditionally requiring trustlines.
+**Root Cause**: In Stellar, issuers don't need trustlines for their own assets - they can create/destroy assets from nothing with unlimited capacity. stellar-core's `TrustLineWrapper` handles this via separate `IssuerImpl` and `NonIssuerImpl` implementations. Our Rust code was unconditionally requiring trustlines.
 
 **Observed symptoms**:
 - Our result: `LiquidityPoolDeposit(NoTrust)` - TX failed
@@ -645,7 +645,7 @@ When an asset issuer deposits into or withdraws from a liquidity pool containing
 - Deduct/credit balance: No-op for issuers
 
 **Files Changed**:
-- `crates/stellar-core-tx/src/operations/execute/liquidity_pool.rs`
+- `crates/henyey-tx/src/operations/execute/liquidity_pool.rs`
 
 **Regression Tests**:
 - `test_liquidity_pool_deposit_issuer_no_trustline`
@@ -659,7 +659,7 @@ When an asset issuer deposits into or withdraws from a liquidity pool containing
 
 Starting from checkpoint 364479, the bucket list hash was diverging at ledger 365312 (levels 0-7 all spill simultaneously). All transaction executions matched (0 TX mismatches), but the bucket list hash differed at the merge point.
 
-**Root Cause**: Incorrect protocol version handling in bucket merges. C++ stellar-core has two different behaviors:
+**Root Cause**: Incorrect protocol version handling in bucket merges. stellar-core has two different behaviors:
 1. **In-memory merge (level 0)**: Uses `maxProtocolVersion` directly
 2. **Disk-based merge (levels 1+)**: Uses `max(old_bucket_version, new_bucket_version)`
 
@@ -667,13 +667,13 @@ Our code was using `max_protocol_version` for ALL merges, causing metadata versi
 
 **Fix**: 
 - `build_output_metadata()` now uses `max(old, new)` with `max_protocol_version` as constraint only
-- `merge_in_memory()` uses `max_protocol_version` directly, matching C++ `LiveBucket::mergeInMemory()`
+- `merge_in_memory()` uses `max_protocol_version` directly, matching stellar-core `LiveBucket::mergeInMemory()`
 - `merge_hot_archive_buckets()` uses `max(curr, snap)` as output version
 
 **Files Changed**:
-- `crates/stellar-core-bucket/src/merge.rs`
-- `crates/stellar-core-bucket/src/hot_archive.rs`
-- `crates/stellar-core-bucket/src/bucket_list.rs`
+- `crates/henyey-bucket/src/merge.rs`
+- `crates/henyey-bucket/src/hot_archive.rs`
+- `crates/henyey-bucket/src/bucket_list.rs`
 
 **Regression Tests**: 11 new tests added covering protocol version handling.
 
@@ -689,7 +689,7 @@ The distinction matters for `HotArchiveBucketList::add_batch()` - only hot archi
 
 Two issues were fixed:
 1. **Live BL restore filtering**: The verify-execution command was extracting restored keys from CDP metadata which includes BOTH types. Fixed by using our execution's `hot_archive_restored_keys` which correctly filters out live BL restores.
-2. **TTL key exclusion**: The `extract_hot_archive_restored_keys` function was adding both main entry keys AND associated TTL keys. But C++ stellar-core's `isPersistentEntry()` only returns true for `CONTRACT_CODE` and `CONTRACT_DATA`, not TTL entries. Fixed by removing TTL key addition.
+2. **TTL key exclusion**: The `extract_hot_archive_restored_keys` function was adding both main entry keys AND associated TTL keys. But stellar-core's `isPersistentEntry()` only returns true for `CONTRACT_CODE` and `CONTRACT_DATA`, not TTL entries. Fixed by removing TTL key addition.
 
 **Regression test:** Ledgers 128051 (hot archive restore) and 134448 (live BL restore) serve as regression tests.
 
@@ -701,19 +701,19 @@ The bug was that `apply_soroban_storage_change` checked if an entry existed in s
 
 Per CAP-0066, hot archive restored entries should appear as INIT in the bucket list delta because they are being added back to the live bucket list.
 
-**Regression test:** `test_hot_archive_restore_uses_create_not_update` in `crates/stellar-core-tx/src/operations/execute/invoke_host_function.rs`
+**Regression test:** `test_hot_archive_restore_uses_create_not_update` in `crates/henyey-tx/src/operations/execute/invoke_host_function.rs`
 
 #### (RESOLVED) Ledger 84362: SetOptions Signer Sponsor Loading
 
 When SetOptions modifies signers on an account that has existing sponsored signers (from previous transactions), we need to load those sponsor accounts into state so we can update their `num_sponsoring` count. The sponsor accounts weren't being loaded, causing a "source account not found" error. Fixed by loading signer sponsor accounts from `signer_sponsoring_i_ds` in `load_operation_accounts` for SetOptions operations.
 
-**Regression test:** `test_set_options_loads_signer_sponsor_accounts` in `crates/stellar-core-ledger/tests/transaction_execution.rs`
+**Regression test:** `test_set_options_loads_signer_sponsor_accounts` in `crates/henyey-ledger/tests/transaction_execution.rs`
 
 #### (RESOLVED) Ledger 50034: Eviction Scan Results Not Used
 
 Fixed by using our own eviction scan results instead of CDP metadata. The `verify-execution` command was running the eviction scan but only using the iterator result - the evicted keys were being discarded. This caused 12 DEAD entries (6 ContractData + 6 Ttl entries with expired TTLs) to be missing from our bucket list update. Fixed by storing `scan_result.evicted_keys` and adding them to `our_dead` for bucket list updates.
 
-**Regression test:** The underlying `scan_for_eviction_incremental` function is already tested in `crates/stellar-core-bucket/tests/bucket_list_integration.rs`. The bug was in the CLI tool's integration, not the eviction scan itself. Testnet validation at ledger 50034+ serves as the regression test.
+**Regression test:** The underlying `scan_for_eviction_incremental` function is already tested in `crates/henyey-bucket/tests/bucket_list_integration.rs`. The bug was in the CLI tool's integration, not the eviction scan itself. Testnet validation at ledger 50034+ serves as the regression test.
 
 #### (RESOLVED) Ledger 7515: Offer Entry in Failed Transaction
 
@@ -725,7 +725,7 @@ Fixed by loading signer sponsor accounts from `signer_sponsoring_i_ds` in `load_
 
 #### (RESOLVED) Ledger 12502: AllowTrust Offer Removal
 
-Fixed by adding offer removal logic to `execute_allow_trust` to match C++ `TrustFlagsOpFrameBase::removeOffers`. When deauthorizing a trustline (removing maintain liabilities authorization), all offers owned by the account involving the asset must be removed, with proper liability clearing and sponsorship updates.
+Fixed by adding offer removal logic to `execute_allow_trust` to match stellar-core `TrustFlagsOpFrameBase::removeOffers`. When deauthorizing a trustline (removing maintain liabilities authorization), all offers owned by the account involving the asset must be removed, with proper liability clearing and sponsorship updates.
 
 ## Commands
 
@@ -733,16 +733,16 @@ Fixed by adding offer removal logic to `execute_allow_trust` to match C++ `Trust
 
 ```bash
 # Verify a range of ledgers
-./target/release/rs-stellar-core offline verify-execution --testnet --from 64 --to 705
+./target/release/henyey offline verify-execution --testnet --from 64 --to 705
 
 # Stop on first error
-./target/release/rs-stellar-core offline verify-execution --testnet --from 64 --to 705 --stop-on-error
+./target/release/henyey offline verify-execution --testnet --from 64 --to 705 --stop-on-error
 
 # Quiet mode (summary only)
-./target/release/rs-stellar-core offline verify-execution --testnet --from 64 --to 705 -q
+./target/release/henyey offline verify-execution --testnet --from 64 --to 705 -q
 
 # Show detailed diffs on mismatch
-./target/release/rs-stellar-core offline verify-execution --testnet --from 64 --to 705 --show-diff
+./target/release/henyey offline verify-execution --testnet --from 64 --to 705 --show-diff
 ```
 
 ### Diagnostic Output
@@ -757,7 +757,7 @@ The command outputs detailed delta comparisons:
 
 Achieve 100% header match for the entire testnet history (ledger 64 to present) using true end-to-end verification. This requires:
 
-1. Exact transaction execution parity with C++ stellar-core
+1. Exact transaction execution parity with stellar-core
 2. Correct bucket list update logic
 3. Correct header computation
 

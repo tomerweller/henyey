@@ -1,6 +1,6 @@
 # Known Issues
 
-This document tracks known issues, limitations, and technical debt in rs-stellar-core.
+This document tracks known issues, limitations, and technical debt in henyey.
 
 ## Performance Issues
 
@@ -10,9 +10,9 @@ This document tracks known issues, limitations, and technical debt in rs-stellar
 **Impact**: Medium - Potential performance regression during catchup/restart  
 **Added**: 2026-01-28
 
-The `BucketMergeMap` and `LiveMergeFutures` data structures are implemented and tested (matching C++ behavior), but they are **not integrated** into the `BucketList` merge workflow.
+The `BucketMergeMap` and `LiveMergeFutures` data structures are implemented and tested (matching stellar-core behavior), but they are **not integrated** into the `BucketList` merge workflow.
 
-**C++ Behavior:**
+**stellar-core Behavior:**
 - `BucketManager::getMergeFuture()` checks for in-progress merges, then cached completed merges
 - `recordMerge()` caches input→output mappings after merge completion
 - This allows skipping re-runs when the same inputs are requested (e.g., catchup retries)
@@ -27,9 +27,9 @@ The `BucketMergeMap` and `LiveMergeFutures` data structures are implemented and 
 - Potential regression during catchup/restart scenarios with repeated merge requests
 
 **Files:**
-- `crates/stellar-core-bucket/src/merge_map.rs` - Data structures (implemented)
-- `crates/stellar-core-bucket/src/bucket_list.rs` - Would need integration
-- `crates/stellar-core-bucket/PARITY_STATUS.md` - Detailed documentation
+- `crates/henyey-bucket/src/merge_map.rs` - Data structures (implemented)
+- `crates/henyey-bucket/src/bucket_list.rs` - Would need integration
+- `crates/henyey-bucket/PARITY_STATUS.md` - Detailed documentation
 
 **To Fix:**
 1. Add `BucketMergeMap` and `LiveMergeFutures` to `BucketManager`
@@ -46,7 +46,7 @@ The `BucketMergeMap` and `LiveMergeFutures` data structures are implemented and 
 **Status**: By Design
 
 This implementation is designed for testnet synchronization only. It should not be used on mainnet due to:
-- Potential parity gaps with C++ stellar-core
+- Potential parity gaps with stellar-core
 - Not yet production-hardened
 
 ---
@@ -172,7 +172,7 @@ Added `our_hot_archive_restored_keys.extend()` call in catch-up mode branch of v
 <details>
 <summary>F19: CreateClaimableBalance Check Order - Underfunded Before LowReserve (FIXED 2026-01-26)</summary>
 
-Fixed available balance check to not include sponsorship, and moved sponsor reserve check to after balance deduction, matching C++ stellar-core order.
+Fixed available balance check to not include sponsorship, and moved sponsor reserve check to after balance deduction, matching stellar-core order.
 </details>
 
 <details>

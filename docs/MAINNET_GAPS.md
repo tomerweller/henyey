@@ -1,6 +1,6 @@
 # Mainnet Validator Readiness Assessment
 
-This document evaluates the gaps between the current rs-stellar-core implementation and what's required for mainnet validator operation.
+This document evaluates the gaps between the current henyey implementation and what's required for mainnet validator operation.
 
 ## Executive Summary
 
@@ -189,14 +189,14 @@ Implemented:
 
 Only 3 TODO comments exist in production code:
 
-1. `crates/stellar-core-bucket/src/snapshot.rs:741`
+1. `crates/henyey-bucket/src/snapshot.rs:741`
    - Historical snapshot query methods (minor feature)
 
-2. `crates/stellar-core-history/src/catchup.rs:1740`
+2. `crates/henyey-history/src/catchup.rs:1740`
    - Module cache not passed during catchup replay (performance optimization)
    - Note: Module cache IS properly initialized after catchup completes
 
-3. `crates/stellar-core-herder/src/fetching_envelopes.rs:436`
+3. `crates/henyey-herder/src/fetching_envelopes.rs:436`
    - Quorum set fetching from peers
 
 ---
@@ -205,17 +205,17 @@ Only 3 TODO comments exist in production code:
 
 | Crate | Parity | Critical Gaps |
 |-------|--------|---------------|
-| stellar-core-tx | **100%** | None |
-| stellar-core-bucket | **~98%** | Shadow buckets (not needed) |
-| stellar-core-crypto | **~95%** | Signature cache |
-| stellar-core-scp | **~90%** | Test coverage |
-| stellar-core-overlay | **~88%** | VirtualClock, LoopbackPeer |
-| stellar-core-herder | **~82%** | Parallel TxSet, QuorumIntersection v2 |
-| stellar-core-history | **~85%** | Online catchup, FutureBucket |
-| stellar-core-ledger | **~90%** | Parallel apply |
-| stellar-core-historywork | **~82%** | Metrics, archive failover |
-| stellar-core-app | **~75%** | Metrics, ProcessManager |
-| rs-stellar-core CLI | **~88%** | Some utility commands |
+| henyey-tx | **100%** | None |
+| henyey-bucket | **~98%** | Shadow buckets (not needed) |
+| henyey-crypto | **~95%** | Signature cache |
+| henyey-scp | **~90%** | Test coverage |
+| henyey-overlay | **~88%** | VirtualClock, LoopbackPeer |
+| henyey-herder | **~82%** | Parallel TxSet, QuorumIntersection v2 |
+| henyey-history | **~85%** | Online catchup, FutureBucket |
+| henyey-ledger | **~90%** | Parallel apply |
+| henyey-historywork | **~82%** | Metrics, archive failover |
+| henyey-app | **~75%** | Metrics, ProcessManager |
+| henyey CLI | **~88%** | Some utility commands |
 
 ---
 
@@ -257,7 +257,7 @@ Only 3 TODO comments exist in production code:
 
 7. **Extended mainnet observer testing**
    - Run as observer for weeks
-   - Verify state consistency with C++ nodes
+   - Verify state consistency with stellar-core nodes
 
 8. **Testnet validator stress testing**
    - High-throughput scenarios
@@ -354,7 +354,7 @@ The current implementation loads the **entire bucket list into memory** after ca
 - ~5 GB RAM for ~70k Soroban entries + ~3k offers
 - Manageable because testnet state is much smaller
 
-### Current rs-stellar-core Behavior
+### Current henyey Behavior
 
 After catchup completes, `initialize_all_caches()` calls `live_entries()` which:
 
@@ -365,7 +365,7 @@ After catchup completes, `initialize_all_caches()` calls `live_entries()` which:
    - `soroban_state` - All Soroban entries (contracts, data, code, TTLs)
    - `module_cache` - Compiled WASM modules
 
-**Code path:** `crates/stellar-core-ledger/src/manager.rs:614-620`
+**Code path:** `crates/henyey-ledger/src/manager.rs:614-620`
 
 ```rust
 // Initialize all caches in a single pass over live_entries().
@@ -376,9 +376,9 @@ self.initialize_all_caches(header.ledger_version, ledger_seq)?;
 
 Even with the "optimization," this still loads everything into memory.
 
-### Upstream C++ Behavior (BucketListDB)
+### stellar-core Behavior (BucketListDB)
 
-The C++ stellar-core uses a fundamentally different approach:
+The stellar-core uses a fundamentally different approach:
 
 1. **Buckets stored on disk** as `bucket-<hash>.xdr` files
 2. **Two index types** per bucket:
@@ -388,7 +388,7 @@ The C++ stellar-core uses a fundamentally different approach:
 4. **RandomEvictionCache** - LRU cache for frequently accessed entries
 5. **No full materialization** - `live_entries()` equivalent doesn't exist for normal operation
 
-**Key config options in C++:**
+**Key config options in stellar-core:**
 - `BUCKETLIST_DB_INDEX_CUTOFF` - Bucket size threshold (default 250 MB)
 - `BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT` - Page size for RangeIndex
 - `BUCKETLIST_DB_MEMORY_FOR_CACHING` - Memory budget for entry cache
@@ -423,22 +423,22 @@ The C++ stellar-core uses a fundamentally different approach:
 
 ---
 
-## Architecture Differences from C++
+## Architecture Differences from stellar-core
 
 ### Concurrency Model
-- **C++**: Single-threaded with VirtualClock timers, callback-driven
+- **stellar-core**: Single-threaded with VirtualClock timers, callback-driven
 - **Rust**: Thread-safe with `RwLock`, `DashMap`; async with tokio
 
 ### Timer Management
-- **C++**: VirtualTimer with Application's VirtualClock
+- **stellar-core**: VirtualTimer with Application's VirtualClock
 - **Rust**: `TimerManager` with tokio channels; `SyncRecoveryManager` for tracking
 
 ### Memory Management
-- **C++**: Manual with RAII, shared_ptr
+- **stellar-core**: Manual with RAII, shared_ptr
 - **Rust**: Ownership system, Arc for shared state
 
 ### Database
-- **C++**: SQLite + PostgreSQL support
+- **stellar-core**: SQLite + PostgreSQL support
 - **Rust**: SQLite only (by design)
 
 ---
@@ -450,7 +450,7 @@ The C++ stellar-core uses a fundamentally different approach:
 3. **Network partition testing** - Simulate peer disconnections
 4. **Memory leak detection** - Valgrind/sanitizer runs
 5. **Fuzzing** - Transaction and SCP message fuzzing
-6. **Comparison testing** - Side-by-side with C++ stellar-core
+6. **Comparison testing** - Side-by-side with stellar-core
 
 ---
 

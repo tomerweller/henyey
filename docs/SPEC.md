@@ -1,4 +1,4 @@
-# rs-stellar-core Specification
+# henyey Specification
 
 **Version:** 0.1.0
 **Target Protocol:** v25.x (Protocol 24+ behavior)
@@ -6,7 +6,7 @@
 
 ## 1. Overview
 
-rs-stellar-core is a Rust implementation of Stellar Core intended for research and education. It targets deterministic, observable behavior compatible with stellar-core v25.x, with SQLite-only persistence and no production hardening.
+henyey is a Rust implementation of Stellar Core intended for research and education. It targets deterministic, observable behavior compatible with stellar-core v25.x, with SQLite-only persistence and no production hardening.
 
 This project is **not** production-grade.
 
@@ -32,7 +32,7 @@ This project is **not** production-grade.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                           rs-stellar-core                           │
+│                           henyey                           │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
 │  ┌─────────┐  ┌─────────┐  ┌──────────┐  ┌──────────┐             │
@@ -70,7 +70,7 @@ This project is **not** production-grade.
 ## 3. Workspace Layout
 
 ```
-rs-stellar-core/
+henyey/
 ├── Cargo.toml                 # Workspace root
 ├── README.md                  # Project overview
 ├── docs/                      # Specifications and architecture docs
@@ -84,22 +84,22 @@ Each crate contains a README with subsystem documentation and upstream mapping.
 
 ### 3.1 Module Mapping to stellar-core
 
-| rs-stellar-core crate | stellar-core directory | Description |
+| henyey crate | stellar-core directory | Description |
 |-----------------------|------------------------|-------------|
-| `stellar-core-app` | `src/main/` | Application orchestration and lifecycle |
-| `stellar-core-scp` | `src/scp/` | Stellar Consensus Protocol |
-| `stellar-core-herder` | `src/herder/` | SCP coordination, slot management |
-| `stellar-core-overlay` | `src/overlay/` | P2P networking |
-| `stellar-core-ledger` | `src/ledger/` | Ledger state, closing |
-| `stellar-core-bucket` | `src/bucket/` | BucketList storage |
-| `stellar-core-history` | `src/history/` | Archive publish/catchup |
-| `stellar-core-tx` | `src/transactions/` | Transaction validation/execution |
-| `stellar-core-crypto` | `src/crypto/` | Hashing, signatures, keys |
-| `stellar-core-db` | `src/database/` | SQLite persistence |
-| `stellar-core-common` | `src/util/` | Shared utilities |
-| `stellar-core-work` | `src/work/` | Async work scheduler |
-| `stellar-core-historywork` | `src/historywork/` | History work scheduling |
-| `rs-stellar-core` | `src/main/` | CLI binary |
+| `henyey-app` | `src/main/` | Application orchestration and lifecycle |
+| `henyey-scp` | `src/scp/` | Stellar Consensus Protocol |
+| `henyey-herder` | `src/herder/` | SCP coordination, slot management |
+| `henyey-overlay` | `src/overlay/` | P2P networking |
+| `henyey-ledger` | `src/ledger/` | Ledger state, closing |
+| `henyey-bucket` | `src/bucket/` | BucketList storage |
+| `henyey-history` | `src/history/` | Archive publish/catchup |
+| `henyey-tx` | `src/transactions/` | Transaction validation/execution |
+| `henyey-crypto` | `src/crypto/` | Hashing, signatures, keys |
+| `henyey-db` | `src/database/` | SQLite persistence |
+| `henyey-common` | `src/util/` | Shared utilities |
+| `henyey-work` | `src/work/` | Async work scheduler |
+| `henyey-historywork` | `src/historywork/` | History work scheduling |
+| `henyey` | `src/main/` | CLI binary |
 
 ## 4. Dependencies
 
@@ -126,15 +126,15 @@ Each crate contains a README with subsystem documentation and upstream mapping.
 
 ## 5.1 Transaction Execution and State Management
 
-Transaction execution uses a per-operation savepoint mechanism to match C++ stellar-core's nested `LedgerTxn` behavior:
+Transaction execution uses a per-operation savepoint mechanism to match stellar-core's nested `LedgerTxn` behavior:
 
-- **Savepoint creation**: Before each operation executes, a savepoint captures the current state (`LedgerStateManager::create_savepoint()` in `stellar-core-tx`).
+- **Savepoint creation**: Before each operation executes, a savepoint captures the current state (`LedgerStateManager::create_savepoint()` in `henyey-tx`).
 - **Automatic rollback**: If an operation fails, `rollback_to_savepoint()` reverts all state mutations from that operation so subsequent operations see clean state.
 - **Successful operations**: Keep their mutations in place without rollback.
 
-This design replaces C++ stellar-core's general-purpose nested `LedgerTxn` transactions with a simpler, targeted savepoint model. The savepoint captures all entry types (accounts, trustlines, offers, contract data, etc.) and their associated delta tracking, providing the same per-operation isolation guarantees as the C++ implementation.
+This design replaces stellar-core's general-purpose nested `LedgerTxn` transactions with a simpler, targeted savepoint model. The savepoint captures all entry types (accounts, trustlines, offers, contract data, etc.) and their associated delta tracking, providing the same per-operation isolation guarantees as the stellar-core implementation.
 
-The execution loop integration lives in `stellar-core-ledger` (`execution.rs`), while the `Savepoint` data structure and `LedgerStateManager` rollback methods are in `stellar-core-tx` (`state.rs`).
+The execution loop integration lives in `henyey-ledger` (`execution.rs`), while the `Savepoint` data structure and `LedgerStateManager` rollback methods are in `henyey-tx` (`state.rs`).
 
 ## 6. Testing Strategy
 
@@ -175,11 +175,11 @@ The following components are explicitly out of scope for this implementation:
 
 ### 9.1 Simulation Framework
 
-A deterministic multi-node simulation framework (`stellar-core-simulation`) is not included. The C++ stellar-core provides simulation capabilities for testing overlay and consensus behavior in controlled environments. This Rust implementation focuses on production-like execution paths rather than simulation infrastructure.
+A deterministic multi-node simulation framework (`stellar-core-simulation`) is not included. The stellar-core provides simulation capabilities for testing overlay and consensus behavior in controlled environments. This Rust implementation focuses on production-like execution paths rather than simulation infrastructure.
 
 ### 9.2 Transaction Metadata Baseline Testing
 
-Transaction metadata baseline tests that compare XDR hashes against reference values are not included. These tests verify byte-for-byte parity of transaction metadata output with C++ stellar-core. While useful for strict parity verification, they are not essential for functional correctness and add significant maintenance overhead.
+Transaction metadata baseline tests that compare XDR hashes against reference values are not included. These tests verify byte-for-byte parity of transaction metadata output with stellar-core. While useful for strict parity verification, they are not essential for functional correctness and add significant maintenance overhead.
 
 ## 10. References
 

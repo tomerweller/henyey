@@ -14,15 +14,15 @@ Significant foundational work is already in place:
 
 | Component | Location | Status |
 |-----------|----------|--------|
-| `LiveEntriesIterator` | `stellar-core-bucket/src/live_iterator.rs` | Complete — streaming iteration with `HashSet<LedgerKey>` dedup |
-| Offers SQL schema & queries | `stellar-core-db/src/queries/offers.rs` | Complete — schema, indexes, bulk ops, all query functions |
-| Offer population during catchup | `stellar-core-ledger/src/manager.rs` (`initialize_all_caches`, `initialize_offers_sql`) | Complete — batch inserts via streaming iterator |
-| Offer delta during ledger close | `stellar-core-ledger/src/manager.rs:1540-1576` | Complete — upserts/deletes from `EntryChange` |
-| `LiveBucketIndex` (InMemory + Disk) | `stellar-core-bucket/src/index.rs` | Complete — threshold at 10,000 entries, page size 1,024 |
-| `RandomEvictionCache` | `stellar-core-bucket/src/cache.rs` | Complete — 100 MB / 100k entry default, accounts only |
-| `BucketList::get()` point lookup | `stellar-core-bucket/src/bucket_list.rs` | Complete — searches levels 0-10 newest-first, cache-integrated |
-| Cache integration into BucketList | `stellar-core-bucket/src/bucket_list.rs` | Complete — cache checked before level scan, populated on miss, invalidated on add_batch |
-| Index persistence (save/load) | `stellar-core-bucket/src/index_persistence.rs` | Complete — bincode format, version 2; bloom filter + asset_pool_map persisted |
+| `LiveEntriesIterator` | `henyey-bucket/src/live_iterator.rs` | Complete — streaming iteration with `HashSet<LedgerKey>` dedup |
+| Offers SQL schema & queries | `henyey-db/src/queries/offers.rs` | Complete — schema, indexes, bulk ops, all query functions |
+| Offer population during catchup | `henyey-ledger/src/manager.rs` (`initialize_all_caches`, `initialize_offers_sql`) | Complete — batch inserts via streaming iterator |
+| Offer delta during ledger close | `henyey-ledger/src/manager.rs:1540-1576` | Complete — upserts/deletes from `EntryChange` |
+| `LiveBucketIndex` (InMemory + Disk) | `henyey-bucket/src/index.rs` | Complete — threshold at 10,000 entries, page size 1,024 |
+| `RandomEvictionCache` | `henyey-bucket/src/cache.rs` | Complete — 100 MB / 100k entry default, accounts only |
+| `BucketList::get()` point lookup | `henyey-bucket/src/bucket_list.rs` | Complete — searches levels 0-10 newest-first, cache-integrated |
+| Cache integration into BucketList | `henyey-bucket/src/bucket_list.rs` | Complete — cache checked before level scan, populated on miss, invalidated on add_batch |
+| Index persistence (save/load) | `henyey-bucket/src/index_persistence.rs` | Complete — bincode format, version 2; bloom filter + asset_pool_map persisted |
 
 ## Phase Summary
 
@@ -49,8 +49,8 @@ See `docs/RFC-001-STREAMING-LIVE-ENTRIES.md` for full design.
 
 ### What Was Delivered
 
-- `LiveEntriesIterator` in `stellar-core-bucket/src/live_iterator.rs` (571 lines)
-- Uses `HashSet<LedgerKey>` for deduplication (matches C++ `unordered_set<LedgerKey>`)
+- `LiveEntriesIterator` in `henyey-bucket/src/live_iterator.rs` (571 lines)
+- Uses `HashSet<LedgerKey>` for deduplication (matches stellar-core `unordered_set<LedgerKey>`)
 - Integrated into `initialize_all_caches()`, `initialize_offers_sql()`, and `initialize_soroban_state()`
 - Statistics tracking: `entries_yielded`, `entries_skipped`, `seen_keys_count`
 
@@ -73,7 +73,7 @@ does not retain this set.
 
 ### What Was Delivered
 
-**Schema** (`stellar-core-db/src/queries/offers.rs`):
+**Schema** (`henyey-db/src/queries/offers.rs`):
 
 ```sql
 CREATE TABLE offers (
@@ -121,7 +121,7 @@ more than the testnet ~500 MB figure.
 Per-transaction rollback semantics are achieved through `snapshot_delta()` + `rollback()`
 in `state.rs`. Offers created in Tx_i are visible to Tx_{i+1} via shared in-memory state
 (`executor.state`). The SQL offers table is batch-updated once at ledger close, matching
-C++ behavior. The mechanism differs from C++ (delta snapshots vs nested `LedgerTxn`
+stellar-core behavior. The mechanism differs from stellar-core (delta snapshots vs nested `LedgerTxn`
 hierarchy) but the observable semantics are identical.
 
 ---
@@ -187,10 +187,10 @@ memory_for_caching_mb = 100
 page_size = 1024
 ```
 
-**Note on units:** The C++ upstream uses a byte-size cutoff (`BUCKETLIST_DB_INDEX_CUTOFF`
+**Note on units:** The stellar-core upstream uses a byte-size cutoff (`BUCKETLIST_DB_INDEX_CUTOFF`
 defaults to 250 MB). The Rust implementation uses an entry-count threshold (10,000 entries).
 These are functionally equivalent but the Rust approach is simpler to reason about since
-entry sizes vary. If parity with the C++ byte-based cutoff is desired, this can be revisited.
+entry sizes vary. If parity with stellar-core byte-based cutoff is desired, this can be revisited.
 
 ### Memory Impact
 
@@ -237,9 +237,9 @@ Body:
    after catchup/merge. Loading falls back to rebuild if the index file is missing,
    corrupt, or has a version mismatch.
 
-### C++ Reference
+### stellar-core Reference
 
-C++ saves indexes as `.index` files alongside bucket `.xdr` files:
+stellar-core saves indexes as `.index` files alongside bucket `.xdr` files:
 ```
 buckets/
   <hash>.xdr.gz      # Bucket data
@@ -265,7 +265,7 @@ buckets/
 
 **Why:** Foundation for all subsequent phases. The current `.bucket.gz` (gzip compressed)
 format is not seekable — random-access reads are impossible without full decompression.
-C++ stellar-core stores buckets as uncompressed `.xdr` files with RFC 5531 record marks,
+stellar-core stores buckets as uncompressed `.xdr` files with RFC 5531 record marks,
 enabling page-based seeks for the DiskIndex.
 
 **Gap:** `BucketManager` stores files as `<hash>.bucket.gz`. `DiskBucket` stores
@@ -273,7 +273,7 @@ uncompressed `.xdr` separately. These are two disconnected paths.
 
 ### What Needs to Change
 
-**Files:** `stellar-core-bucket/src/bucket.rs`, `src/manager.rs`
+**Files:** `henyey-bucket/src/bucket.rs`, `src/manager.rs`
 
 1. **Canonical format**: `BucketManager::bucket_path()` returns `<hash>.bucket.xdr`
    (uncompressed, with XDR record marks) instead of `<hash>.bucket.gz`
@@ -305,12 +305,12 @@ This is already the internal format. Changing on-disk storage doesn't affect has
    entries from both buckets** into `Vec<BucketEntry>`. For two large mainnet buckets, this
    is 10-20 GB.
 
-C++ stellar-core uses `BucketInputIterator` / `BucketOutputIterator` that stream one entry
+stellar-core uses `BucketInputIterator` / `BucketOutputIterator` that stream one entry
 at a time from/to disk.
 
 ### What Needs to Change
 
-**Files:** `stellar-core-bucket/src/disk_bucket.rs`, `src/merge.rs`, `src/iterator.rs`
+**Files:** `henyey-bucket/src/disk_bucket.rs`, `src/merge.rs`, `src/iterator.rs`
 
 #### 6a: Streaming DiskBucket Iteration
 
@@ -340,7 +340,7 @@ Update `AsyncMergeHandle::start_merge()` to pass output directory for streaming 
 
 **Memory:** O(1) per merge (one entry from each input + output buffer) instead of O(entries)
 
-### C++ Reference
+### stellar-core Reference
 
 ```cpp
 // BucketBase::merge() in .upstream-v25/src/bucket/BucketBase.cpp
@@ -362,7 +362,7 @@ OOM on mainnet (60+ GB peak RSS, killed by OOM killer on a 62 GB machine).
 
 ### What Needs to Change
 
-**Files:** `stellar-core-bucket/src/manager.rs`, `src/bucket.rs`, `src/disk_bucket.rs`
+**Files:** `henyey-bucket/src/manager.rs`, `src/bucket.rs`, `src/disk_bucket.rs`
 
 1. **`BucketManager::load_bucket()` new flow:**
    - Check cache → return `Arc<Bucket>` if found
@@ -429,7 +429,7 @@ and cache is populated on miss. This is a simpler integration point than per-buc
 
 ### What Needs to Change
 
-**Files:** `stellar-core-bucket/src/disk_bucket.rs`, `src/index.rs`, `src/index_persistence.rs`
+**Files:** `henyey-bucket/src/disk_bucket.rs`, `src/index.rs`, `src/index_persistence.rs`
 
 1. **Wire `DiskBucket` to use persisted `LiveBucketIndex`:**
    - On load: check for `.bucket.index` file → deserialize via `index_persistence.rs`
@@ -454,7 +454,7 @@ and cache is populated on miss. This is a simpler integration point than per-buc
 | RandomEvictionCache (bounded) | ~256 MB (configurable) |
 | **Total** | **~400 MB** |
 
-### C++ Reference
+### stellar-core Reference
 
 ```cpp
 // DiskIndex<BucketT>::scan() in .upstream-v25/src/bucket/DiskIndex.cpp
@@ -470,13 +470,13 @@ if (mFilter && !mFilter->contain(keyHash)) return {ScanResult::NOT_FOUND};
 
 **Status: Not started**
 
-**Why:** `BucketList` currently owns `Bucket` directly. C++ uses `shared_ptr<Bucket>` so
+**Why:** `BucketList` currently owns `Bucket` directly. stellar-core uses `shared_ptr<Bucket>` so
 the same bucket object is shared by `BucketList`, `BucketManager`, snapshots, and merges.
 This eliminates copies and ensures deduplication.
 
 ### What Needs to Change
 
-**Files:** `stellar-core-bucket/src/bucket_list.rs`, `src/snapshot.rs`
+**Files:** `henyey-bucket/src/bucket_list.rs`, `src/snapshot.rs`
 
 1. `BucketLevel` fields become `curr: Arc<Bucket>`, `snap: Arc<Bucket>`
 2. `BucketSnapshot::new()` takes `Arc<Bucket>` directly (already supports this)
@@ -492,15 +492,15 @@ This eliminates copies and ensures deduplication.
 **Status: Not started**
 
 **Why:** `HotArchiveBucket` is always InMemory (`BTreeMap<LedgerKey, HotArchiveBucketEntry>`).
-On mainnet with persistent eviction (protocol 23+), the hot archive grows over time. C++
+On mainnet with persistent eviction (protocol 23+), the hot archive grows over time. stellar-core
 uses `HotArchiveBucketIndex` with `DiskIndex` (always disk-based, no cache).
 
 ### What Needs to Change
 
-**Files:** `stellar-core-bucket/src/hot_archive.rs`
+**Files:** `henyey-bucket/src/hot_archive.rs`
 
 1. Add `DiskBacked` storage variant to `HotArchiveBucket`
-2. Use `DiskIndex` (no `RandomEvictionCache`, matching C++)
+2. Use `DiskIndex` (no `RandomEvictionCache`, matching stellar-core)
 3. `BucketManager::load_hot_archive_bucket()` creates DiskBacked for large files
 4. Streaming merge and iteration for hot archive buckets (reuse Phase 6 patterns)
 
@@ -539,7 +539,7 @@ Phase 10 (HotArchive DiskBacked)     ← Reuses Phase 5-7 patterns
 ```
 
 **Minimum viable for mainnet (fixes OOM):** Phases 5-7 ✅
-**Full C++ parity:** All 10 phases
+**Full stellar-core parity:** All 10 phases
 
 ---
 
@@ -640,7 +640,7 @@ See [Phase Dependencies (Complete Picture)](#phase-dependencies-complete-picture
 | **SQL offer query latency** | Medium | High — DEX matching is latency-sensitive | SQLite with the `bestofferindex` composite index should handle order book queries efficiently. Benchmark with mainnet-scale offer counts (~12M) early. If latency is unacceptable, consider an in-memory order book index backed by SQL as source of truth. |
 | **Memory estimation off** | Medium | High — could exceed 16 GB target | Profile with real mainnet bucket archives. Per-type scanning reduced the transient dedup HashSet from ~8.6 GB to ~240 MB. If further reduction is needed, a bloom filter pre-screen could be added. |
 | **Index format changes** | Low | Medium — breaks existing persisted indexes | Version field in the index header allows backward-compatible updates. Fallback to rebuild ensures no data loss. |
-| **Regression in ledger close** | Low | Critical — consensus failure | Comprehensive comparison tests: run Rust and C++ side-by-side on the same ledger sequence and verify identical hashes for 1,000+ consecutive ledgers. |
+| **Regression in ledger close** | Low | Critical — consensus failure | Comprehensive comparison tests: run Rust and stellar-core side-by-side on the same ledger sequence and verify identical hashes for 1,000+ consecutive ledgers. |
 | **Lock contention on BucketList** | Low (mitigated) | Medium — slower lookups under load | Addressed: `create_snapshot()` now captures a `BucketListSnapshot` so point lookups during TX execution use an immutable snapshot with no lock acquisition. |
 | **Hot archive memory growth** | Low | Medium — unexpected memory pressure | Monitor hot archive size during extended mainnet observer runs. Flag for disk-backed treatment if it exceeds 1 GB. |
 
@@ -650,7 +650,7 @@ See [Phase Dependencies (Complete Picture)](#phase-dependencies-complete-picture
 
 1. **Memory (peak)**: RSS < 4 GB during catchup with mainnet bucket archives
 2. **Memory (steady-state)**: RSS < 4 GB during normal ledger close operation
-3. **Correctness**: Ledger hashes match C++ for 1,000+ consecutive ledgers on testnet
+3. **Correctness**: Ledger hashes match stellar-core for 1,000+ consecutive ledgers on testnet
 4. **Performance**: Ledger close time within 10% of current
 5. **Startup (warm)**: < 2 minutes from persisted state after clean shutdown
 6. **Startup (cold)**: < 10 minutes with full index rebuild after crash recovery
@@ -662,9 +662,9 @@ See [Phase Dependencies (Complete Picture)](#phase-dependencies-complete-picture
 
 - [RFC-001: Streaming Live Entries](./RFC-001-STREAMING-LIVE-ENTRIES.md)
 - [Mainnet Gaps Analysis](./MAINNET_GAPS.md)
-- C++ LedgerTxnOfferSQL: `.upstream-v25/src/ledger/LedgerTxnOfferSQL.cpp`
-- C++ LiveBucketIndex: `.upstream-v25/src/bucket/LiveBucketIndex.cpp`
-- C++ BucketApplicator: `.upstream-v25/src/bucket/BucketApplicator.cpp`
+- stellar-core LedgerTxnOfferSQL: `.upstream-v25/src/ledger/LedgerTxnOfferSQL.cpp`
+- stellar-core LiveBucketIndex: `.upstream-v25/src/bucket/LiveBucketIndex.cpp`
+- stellar-core BucketApplicator: `.upstream-v25/src/bucket/BucketApplicator.cpp`
 
 ---
 

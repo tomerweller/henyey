@@ -7,7 +7,7 @@
 set -e
 
 # Configuration
-BINARY="${BINARY:-./target/release/rs-stellar-core}"
+BINARY="${BINARY:-./target/release/henyey}"
 PARALLEL_JOBS="${PARALLEL_JOBS:-4}"      # Number of parallel verifications
 SEGMENT_SIZE="${SEGMENT_SIZE:-10000}"    # Ledgers per segment
 START_LEDGER="${START_LEDGER:-64}"       # First ledger (must be > 0, aligned to checkpoint)

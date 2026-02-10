@@ -26,9 +26,9 @@ Startup time (mainnet):
 - Time: ~30-60 minutes
 ```
 
-### C++ Architecture (What We're Matching)
+### stellar-core Architecture (What We're Matching)
 
-C++ stellar-core persists `DiskIndex` to `.index` files:
+stellar-core persists `DiskIndex` to `.index` files:
 
 ```cpp
 // File naming: bucket-{hash}.index
@@ -400,10 +400,10 @@ persist_index = true
 
 | File | Action |
 |------|--------|
-| `crates/stellar-core-bucket/src/disk_index.rs` | Add save/load methods |
-| `crates/stellar-core-bucket/src/bucket_index.rs` | Integrate persistence |
-| `crates/stellar-core-bucket/src/bucket_manager.rs` | Add `bucket_index_path()` |
-| `crates/stellar-core-bucket/src/serialization.rs` | **Create** - BinaryFuse16 serde |
+| `crates/henyey-bucket/src/disk_index.rs` | Add save/load methods |
+| `crates/henyey-bucket/src/bucket_index.rs` | Integrate persistence |
+| `crates/henyey-bucket/src/bucket_manager.rs` | Add `bucket_index_path()` |
+| `crates/henyey-bucket/src/serialization.rs` | **Create** - BinaryFuse16 serde |
 
 ## Disk Space Impact
 
@@ -451,6 +451,6 @@ Index files add approximately 2% overhead to bucket storage.
 
 ## References
 
-- C++ Implementation: `.upstream-v25/src/bucket/DiskIndex.cpp` (lines 323-372)
-- C++ Index Loading: `.upstream-v25/src/bucket/BucketIndexUtils.cpp`
+- stellar-core Implementation: `.upstream-v25/src/bucket/DiskIndex.cpp` (lines 323-372)
+- stellar-core Index Loading: `.upstream-v25/src/bucket/BucketIndexUtils.cpp`
 - RFC-003: BucketListDB Point Lookups

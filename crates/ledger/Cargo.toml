@@ -1,0 +1,36 @@
+[package]
+name = "henyey-ledger"
+description = "Ledger management for henyey"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+stellar-xdr.workspace = true
+henyey-common.workspace = true
+henyey-crypto.workspace = true
+henyey-bucket.workspace = true
+henyey-tx.workspace = true
+soroban-env-host-p25.workspace = true
+
+# Serialization
+serde.workspace = true
+
+# Error handling
+thiserror.workspace = true
+tracing.workspace = true
+
+# Async runtime
+tokio.workspace = true
+
+# Utilities
+parking_lot.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+base64.workspace = true
+hex-literal.workspace = true

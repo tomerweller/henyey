@@ -1,7 +1,7 @@
-# rs-stellar-core Testnet Validator Configuration
+# henyey Testnet Validator Configuration
 
 [node]
-name = "rs-stellar-core-validator"
+name = "henyey-validator"
 is_validator = true
 node_seed = "SDOLUIJZTDDTTN7DIRKKKJHQJVSUNUL5F43THPNY5OYYCLEFBHLPVUJV"
 

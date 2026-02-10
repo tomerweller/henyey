@@ -1,12 +1,12 @@
-# rs-stellar-core Testnet Configuration
+# henyey Testnet Configuration
 #
 # Usage:
-#   rs-stellar-core --config configs/testnet.toml run
-#   rs-stellar-core --config configs/testnet.toml catchup current
+#   henyey --config configs/testnet.toml run
+#   henyey --config configs/testnet.toml catchup current
 
 [node]
 # Node display name (for logging)
-name = "rs-stellar-core-testnet"
+name = "henyey-testnet"
 
 # Run as validator (requires keypair)
 is_validator = false

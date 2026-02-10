@@ -1,5 +1,5 @@
 [node]
-name = "rs-stellar-core-mainnet"
+name = "henyey-mainnet"
 is_validator = false
 
 # Mainnet tier 1 validators organized by organization

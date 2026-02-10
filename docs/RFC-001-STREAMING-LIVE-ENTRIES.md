@@ -36,14 +36,14 @@ This makes mainnet operation impossible.
 
 A streaming iterator that:
 1. Never materializes the full entry list
-2. Uses `HashSet<LedgerKey>` for deduplication (matching C++ upstream)
+2. Uses `HashSet<LedgerKey>` for deduplication (matching stellar-core upstream)
 3. Yields entries one-at-a-time for immediate processing
 
 ## Design
 
-### C++ Upstream Behavior (What We're Matching)
+### stellar-core Upstream Behavior (What We're Matching)
 
-C++ stellar-core uses `unordered_set<LedgerKey>` for deduplication during bucket iteration:
+stellar-core uses `unordered_set<LedgerKey>` for deduplication during bucket iteration:
 
 ```cpp
 // From BucketApplicator.cpp
@@ -57,17 +57,17 @@ if (!wasInserted) {
 ```
 
 Key observations:
-- **No bloom filter** - C++ uses a direct `unordered_set<LedgerKey>`
+- **No bloom filter** - stellar-core uses a direct `unordered_set<LedgerKey>`
 - **Typed keys** - Uses actual `LedgerKey` objects, not serialized bytes
 - **Streaming pattern** - Callback-based iteration, not materialization
 
 ### New Type: `LiveEntriesIterator`
 
 ```rust
-// crates/stellar-core-bucket/src/live_iterator.rs
+// crates/henyey-bucket/src/live_iterator.rs
 
 /// Streaming iterator over live bucket list entries.
-/// Matches C++ BucketApplicator's iteration pattern.
+/// Matches stellar-core BucketApplicator's iteration pattern.
 pub struct LiveEntriesIterator<'a> {
     /// Reference to the bucket list
     bucket_list: &'a BucketList,
@@ -81,7 +81,7 @@ pub struct LiveEntriesIterator<'a> {
     /// Iterator over the current bucket
     bucket_iter: Option<BucketIter<'a>>,
     
-    /// Deduplication set matching C++ unordered_set<LedgerKey>
+    /// Deduplication set matching stellar-core unordered_set<LedgerKey>
     seen_keys: HashSet<LedgerKey>,
     
     /// Statistics
@@ -105,7 +105,7 @@ impl<'a> Iterator for LiveEntriesIterator<'a> {
                 BucketEntry::Live(e) | BucketEntry::Init(e) => {
                     let key = ledger_entry_to_key(&e)?;
                     
-                    // C++ pattern: mSeenKeys.emplace(key).second
+                    // stellar-core pattern: mSeenKeys.emplace(key).second
                     if !self.seen_keys.insert(key) {
                         self.entries_skipped += 1;
                         continue;
@@ -221,12 +221,12 @@ for entry_result in bucket_list.read().live_entries_iter() {
 
 | File | Action |
 |------|--------|
-| `crates/stellar-core-bucket/src/live_iterator.rs` | **Create** - LiveEntriesIterator |
-| `crates/stellar-core-bucket/src/lib.rs` | Add `pub mod live_iterator` |
-| `crates/stellar-core-bucket/src/bucket_list.rs` | Add `live_entries_iter()`, deprecate `live_entries()` |
-| `crates/stellar-core-ledger/src/manager.rs` | Migrate `initialize_all_caches()` |
-| `crates/stellar-core-ledger/src/execution.rs` | Migrate `compute_soroban_state_size_from_bucket_list()` |
-| `crates/rs-stellar-core/src/main.rs` | Migrate CLI commands |
+| `crates/henyey-bucket/src/live_iterator.rs` | **Create** - LiveEntriesIterator |
+| `crates/henyey-bucket/src/lib.rs` | Add `pub mod live_iterator` |
+| `crates/henyey-bucket/src/bucket_list.rs` | Add `live_entries_iter()`, deprecate `live_entries()` |
+| `crates/henyey-ledger/src/manager.rs` | Migrate `initialize_all_caches()` |
+| `crates/henyey-ledger/src/execution.rs` | Migrate `compute_soroban_state_size_from_bucket_list()` |
+| `crates/henyey/src/main.rs` | Migrate CLI commands |
 
 ## Implementation Timeline
 
@@ -253,9 +253,9 @@ for entry_result in bucket_list.read().live_entries_iter() {
 Use a two-tier approach with bloom filter pre-screening and 8-byte hash storage.
 
 **Pros:** Lower memory (~615MB)  
-**Cons:** Doesn't match C++ behavior, adds complexity, potential for rare false positives
+**Cons:** Doesn't match stellar-core behavior, adds complexity, potential for rare false positives
 
-**Decision:** Match C++ upstream with `HashSet<LedgerKey>` for consistency and correctness.
+**Decision:** Match stellar-core upstream with `HashSet<LedgerKey>` for consistency and correctness.
 
 ### Alternative 2: Index-based Deduplication
 
@@ -279,7 +279,7 @@ Let consumers handle duplicates.
 
 This RFC is Phase 1 of the Bucket List DB Revamp. Subsequent phases:
 
-- **Phase 2:** SQL-backed offers (match C++ `LedgerTxnOfferSQL`)
+- **Phase 2:** SQL-backed offers (match stellar-core `LedgerTxnOfferSQL`)
 - **Phase 3:** BucketListDB on-demand lookups with caching
 - **Phase 4:** Index persistence
 
@@ -287,6 +287,6 @@ See `docs/MAINNET_GAPS.md` for the complete roadmap.
 
 ## References
 
-- C++ BucketApplicator: `.upstream-v25/src/bucket/BucketApplicator.cpp`
-- C++ loadInflationWinners: `.upstream-v25/src/bucket/SearchableBucketList.cpp`
+- stellar-core BucketApplicator: `.upstream-v25/src/bucket/BucketApplicator.cpp`
+- stellar-core loadInflationWinners: `.upstream-v25/src/bucket/SearchableBucketList.cpp`
 - Mainnet gaps analysis: `docs/MAINNET_GAPS.md`

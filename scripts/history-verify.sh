@@ -8,7 +8,7 @@
 # Usage: ./scripts/history-verify.sh <testnet|mainnet>
 #
 # Environment variables:
-#   BINARY       - Path to rs-stellar-core binary (default: ./target/release/rs-stellar-core)
+#   BINARY       - Path to henyey binary (default: ./target/release/henyey)
 #   BATCH_SIZE   - Override default batch size
 #   START_LEDGER - Override starting ledger (ignores progress file)
 #   CACHE_DIR    - Override cache directory
@@ -21,8 +21,8 @@ set -euo pipefail
 NETWORK="${1:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BINARY="${BINARY:-$REPO_DIR/target/release/rs-stellar-core}"
-PROGRESS_DIR="${HOME}/.rs-stellar-core"
+BINARY="${BINARY:-$REPO_DIR/target/release/henyey}"
+PROGRESS_DIR="${HOME}/.henyey"
 
 # Extended timeout for bash commands in OpenCode (4 hours for cargo builds)
 export OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS=14400000
@@ -39,26 +39,26 @@ case "$NETWORK" in
     testnet)
         DEFAULT_START_LEDGER=64
         DEFAULT_BATCH_SIZE=5000
-        DEFAULT_CACHE_DIR="${HOME}/data/rs-stellar-core/cache"
+        DEFAULT_CACHE_DIR="${HOME}/data/henyey/cache"
         HORIZON_URL="https://horizon-testnet.stellar.org"
         ;;
     mainnet)
         DEFAULT_START_LEDGER=59501299
         DEFAULT_BATCH_SIZE=10000
-        DEFAULT_CACHE_DIR="${HOME}/data/rs-stellar-core/cache"
+        DEFAULT_CACHE_DIR="${HOME}/data/henyey/cache"
         HORIZON_URL="https://horizon.stellar.org"
         ;;
     *)
         echo "Usage: $0 <testnet|mainnet>"
         echo ""
         echo "Runs verify-execution in batches, persisting progress to:"
-        echo "  ~/.rs-stellar-core/history-verify-<network>.progress"
+        echo "  ~/.henyey/history-verify-<network>.progress"
         echo ""
         echo "On header mismatch, invokes OpenCode to investigate and fix,"
         echo "then rebuilds and retries automatically."
         echo ""
         echo "Environment variables:"
-        echo "  BINARY        - Path to rs-stellar-core binary"
+        echo "  BINARY        - Path to henyey binary"
         echo "  BATCH_SIZE    - Override default batch size"
         echo "  START_LEDGER  - Override starting ledger (ignores progress)"
         echo "  CACHE_DIR     - Override cache directory"
@@ -104,7 +104,7 @@ get_latest_ledger() {
 # Check binary exists
 if [ ! -x "$BINARY" ]; then
     log_error "Binary not found or not executable: $BINARY"
-    echo "Run: cargo build --release -p rs-stellar-core"
+    echo "Run: cargo build --release -p henyey"
     exit 1
 fi
 
@@ -236,10 +236,10 @@ REPRO_CMD_PLACEHOLDER
    - Soroban/InvokeHostFunction issue (host function execution divergence)
 
 3. **Investigate**: Find the root cause in the appropriate crate:
-   - `stellar-core-tx` - Transaction/operation execution (ChangeTrust, PathPayment, ManageOffer, etc.)
-   - `stellar-core-ledger` - Ledger close, fee pool, header computation
-   - `stellar-core-bucket` - Bucket list computation
-   - `stellar-core-soroban` - Soroban host function execution
+   - `henyey-tx` - Transaction/operation execution (ChangeTrust, PathPayment, ManageOffer, etc.)
+   - `henyey-ledger` - Ledger close, fee pool, header computation
+   - `henyey-bucket` - Bucket list computation
+   - `henyey-soroban` - Soroban host function execution
 
 4. **Fix**: Implement the fix with clear comments explaining the bug
 
@@ -339,7 +339,7 @@ PROMPT_EOF
 
         echo ""
         log_info "OpenCode finished. Rebuilding binary..."
-        (cd "$REPO_DIR" && cargo build --release -p rs-stellar-core)
+        (cd "$REPO_DIR" && cargo build --release -p henyey)
 
         log_info "Retrying verification from ledger $CURRENT_LEDGER..."
         echo ""

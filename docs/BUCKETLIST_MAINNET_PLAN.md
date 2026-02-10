@@ -1,4 +1,4 @@
-# Comprehensive Plan: BucketList Parity with Upstream C++
+# Comprehensive Plan: BucketList Parity with stellar-core
 
 ## Executive Summary
 
@@ -16,7 +16,7 @@ The plan is organized into **phases** with clear dependencies, each containing s
 
 ### Current Gap Analysis
 
-| Feature | Upstream C++ | Our Rust | Gap |
+| Feature | stellar-core | Our Rust | Gap |
 |---------|-------------|----------|-----|
 | In-Memory Index | Full entries in `unordered_set` | Key-to-offset `BTreeMap` | ✅ Similar |
 | Disk Index | Page-based range index | 8-byte key hash index | ⚠️ Different design |
@@ -27,7 +27,7 @@ The plan is organized into **phases** with clear dependencies, each containing s
 ### Tasks
 
 #### 1.1: Page-Based DiskIndex (High Priority)
-**Files**: `crates/stellar-core-bucket/src/index.rs`, `disk_bucket.rs`
+**Files**: `crates/henyey-bucket/src/index.rs`, `disk_bucket.rs`
 
 Replace the 8-byte key hash index with upstream's page-based range index:
 
@@ -80,7 +80,7 @@ Persist DiskIndex to `.index` files for faster restarts:
 
 ### Current Gap Analysis
 
-| Feature | Upstream C++ | Our Rust | Gap |
+| Feature | stellar-core | Our Rust | Gap |
 |---------|-------------|----------|-----|
 | Cache Location | Per-bucket in `LiveBucketIndex` | Implemented but not integrated | ❌ Missing integration |
 | Cached Types | ACCOUNT only | ACCOUNT only | ✅ Same |
@@ -184,7 +184,7 @@ impl BucketList {
 
 ### Current Gap Analysis
 
-| Feature | Upstream C++ | Our Rust | Gap |
+| Feature | stellar-core | Our Rust | Gap |
 |---------|-------------|----------|-----|
 | Merge Memory | O(1) via streaming | O(entries) - loads all into Vec | ❌ Major gap |
 | Output Iterator | `BucketOutputIterator` with single-entry buffer | Implemented but not used in merge | ⚠️ Exists but not integrated |
@@ -254,7 +254,7 @@ impl FutureBucket {
 
 ### Current Gap Analysis
 
-| Feature | Upstream C++ | Our Rust | Gap |
+| Feature | stellar-core | Our Rust | Gap |
 |---------|-------------|----------|-----|
 | Parallel Downloads | Yes (via WorkScheduler) | Yes (via tokio) | ✅ Similar |
 | Parallel Index Building | Background threads | Sequential in main thread | ⚠️ Gap |
@@ -382,7 +382,7 @@ pub struct BucketListConfig {
 
 ## Phase 7: Testing and Validation
 
-**Goal**: Ensure all changes maintain hash parity with C++ and don't cause regressions.
+**Goal**: Ensure all changes maintain hash parity with stellar-core and don't cause regressions.
 
 ### Tasks
 
@@ -484,7 +484,7 @@ Phase 7: Testing and Validation ────────────────
 
 1. **Functional Parity**
    - `verify-execution` passes on testnet with 0 mismatches
-   - Bucket list hashes match C++ at all checkpoint ledgers
+   - Bucket list hashes match stellar-core at all checkpoint ledgers
 
 2. **Performance Targets (Mainnet Scale)**
    - Bucket list population: < 30 minutes for full archive

@@ -1,6 +1,6 @@
 # Test Implementation Plan
 
-Comprehensive plan to achieve full test parity with C++ stellar-core v25 transaction tests.
+Comprehensive plan to achieve full test parity with stellar-core v25 transaction tests.
 
 ## Overview
 
@@ -18,18 +18,18 @@ Comprehensive plan to achieve full test parity with C++ stellar-core v25 transac
 
 ## Phase 0: Test Infrastructure (Week 1)
 
-Before implementing individual tests, build reusable test infrastructure matching C++ patterns.
+Before implementing individual tests, build reusable test infrastructure matching stellar-core patterns.
 
 ### Task 0.1: Create Test Utilities Module
 
-**File:** `crates/stellar-core-tx/src/test_utils.rs`
+**File:** `crates/henyey-tx/src/test_utils.rs`
 
 ```rust
 //! Shared test utilities for transaction tests.
 //!
-//! Mirrors C++ SponsorshipTestUtils and TestUtils patterns.
+//! Mirrors stellar-core SponsorshipTestUtils and TestUtils patterns.
 
-/// Maximum account subentries (matches C++ ACCOUNT_SUBENTRY_LIMIT)
+/// Maximum account subentries (matches stellar-core ACCOUNT_SUBENTRY_LIMIT)
 pub const ACCOUNT_SUBENTRY_LIMIT: u32 = 1000;
 
 /// Create a test account with specified balance and subentries
@@ -52,10 +52,10 @@ pub fn create_account_near_subentry_limit(id: AccountId, balance: i64) -> Accoun
 
 ### Task 0.2: Create Sponsorship Test Helpers
 
-**File:** `crates/stellar-core-tx/src/test_utils/sponsorship.rs`
+**File:** `crates/henyey-tx/src/test_utils/sponsorship.rs`
 
 ```rust
-//! Sponsorship test helpers matching C++ SponsorshipTestUtils.cpp
+//! Sponsorship test helpers matching stellar-core SponsorshipTestUtils.cpp
 
 /// Test that an operation fails with OpTooManySubentries when account is at limit.
 ///
@@ -89,7 +89,7 @@ pub fn setup_sponsored_entry(
 
 ### Task 0.3: Create Multi-Operation Transaction Test Framework
 
-**File:** `crates/stellar-core-tx/src/test_utils/multi_op.rs`
+**File:** `crates/henyey-tx/src/test_utils/multi_op.rs`
 
 ```rust
 //! Multi-operation transaction test framework.
@@ -119,7 +119,7 @@ impl MultiOpTestRunner {
 
 ### Task 0.4: Create INT64_MAX Test Helpers
 
-**File:** `crates/stellar-core-tx/src/test_utils/overflow.rs`
+**File:** `crates/henyey-tx/src/test_utils/overflow.rs`
 
 ```rust
 //! Overflow and boundary test helpers.
@@ -139,14 +139,14 @@ pub fn create_account_with_max_buying_liabilities(...) -> AccountEntry { ... }
 
 ### Task 0.5: Protocol Version Test Macro
 
-**File:** `crates/stellar-core-tx/src/test_utils/versioned.rs`
+**File:** `crates/henyey-tx/src/test_utils/versioned.rs`
 
 ```rust
 //! Protocol version-aware test helpers.
 
 /// Run a test across multiple protocol versions.
 ///
-/// Equivalent to C++ `for_versions_from(N, app, [&] { ... })`
+/// Equivalent to stellar-core `for_versions_from(N, app, [&] { ... })`
 #[macro_export]
 macro_rules! for_protocol_versions_from {
     ($min_version:expr, $test_body:expr) => {
@@ -206,7 +206,7 @@ fn test_<operation>_too_many_subentries() {
 
 ### Task 1.2: INT64_MAX Overflow Tests
 
-**File:** `crates/stellar-core-tx/src/operations/execute/overflow_tests.rs` (new)
+**File:** `crates/henyey-tx/src/operations/execute/overflow_tests.rs` (new)
 
 ```rust
 //! INT64_MAX overflow tests for all operations.
@@ -274,7 +274,7 @@ mod offer_overflow {
 
 ### Task 1.3: Multi-Operation Transaction Tests
 
-**File:** `crates/stellar-core-tx/tests/multi_op_transactions.rs` (new integration test)
+**File:** `crates/henyey-tx/tests/multi_op_transactions.rs` (new integration test)
 
 ```rust
 //! Multi-operation transaction integration tests.
@@ -326,7 +326,7 @@ fn test_sponsor_and_use_sponsorship_same_tx() {
 
 ### Task 1.4: Sequence Number Edge Cases
 
-**File:** `crates/stellar-core-tx/src/operations/execute/account_merge.rs`
+**File:** `crates/henyey-tx/src/operations/execute/account_merge.rs`
 
 ```rust
 #[test]
@@ -351,7 +351,7 @@ fn test_merge_seqnum_one_over_limit() {
 }
 ```
 
-**File:** `crates/stellar-core-tx/src/operations/execute/bump_sequence.rs`
+**File:** `crates/henyey-tx/src/operations/execute/bump_sequence.rs`
 
 ```rust
 #[test]
@@ -374,7 +374,7 @@ fn test_bump_with_sponsorship() {
 
 ## Phase 2: CreateAccount Complete Coverage (Week 2)
 
-**C++ Reference:** `CreateAccountTests.cpp` (11 test sections)
+**stellar-core Reference:** `CreateAccountTests.cpp` (11 test sections)
 
 ### Task 2.1: Existing Tests (verify)
 - [x] `test_create_account_success`
@@ -433,7 +433,7 @@ fn test_create_account_too_many_subentries() {
 
 ## Phase 3: Payment Complete Coverage (Week 2)
 
-**C++ Reference:** `PaymentTests.cpp` (78 test sections)
+**stellar-core Reference:** `PaymentTests.cpp` (78 test sections)
 
 ### Task 3.1: Existing Tests (verify)
 - [x] `test_native_payment_success`
@@ -526,7 +526,7 @@ fn test_two_payments_first_underfunds_second() { }
 
 ## Phase 4: AccountMerge Complete Coverage (Week 2-3)
 
-**C++ Reference:** `MergeTests.cpp` (48 test sections)
+**stellar-core Reference:** `MergeTests.cpp` (48 test sections)
 
 ### Task 4.1: Existing Tests (verify)
 - [x] `test_account_merge_success`
@@ -620,7 +620,7 @@ fn test_merge_transfer_sponsorship_to_destination() {
 
 ## Phase 5: ChangeTrust Complete Coverage (Week 3)
 
-**C++ Reference:** `ChangeTrustTests.cpp` (39 test sections)
+**stellar-core Reference:** `ChangeTrustTests.cpp` (39 test sections)
 
 ### Task 5.1: Existing Tests (verify)
 - [x] Basic create/update/delete
@@ -685,7 +685,7 @@ fn test_change_trust_version_specific_self_trust() {
 
 ## Phase 6: ManageOffer Complete Coverage (Week 3)
 
-**C++ Reference:** `OfferTests.cpp`, `ManageBuyOfferTests.cpp` (180+ test sections)
+**stellar-core Reference:** `OfferTests.cpp`, `ManageBuyOfferTests.cpp` (180+ test sections)
 
 ### Task 6.1: Organize by Sub-Operation
 
@@ -790,7 +790,7 @@ fn test_offer_too_many_subentries() { }
 
 ## Phase 7: PathPayment Complete Coverage (Week 3-4)
 
-**C++ Reference:** `PathPaymentTests.cpp`, `PathPaymentStrictSendTests.cpp` (185+ test sections)
+**stellar-core Reference:** `PathPaymentTests.cpp`, `PathPaymentStrictSendTests.cpp` (185+ test sections)
 
 ### Task 7.1: Organize by Variant
 
@@ -889,7 +889,7 @@ fn test_path_self_with_path() { }
 
 ## Phase 8: SetOptions Complete Coverage (Week 4)
 
-**C++ Reference:** `SetOptionsTests.cpp` (22 test sections)
+**stellar-core Reference:** `SetOptionsTests.cpp` (22 test sections)
 
 ### Task 8.1: Missing Tests
 
@@ -968,7 +968,7 @@ fn test_set_options_home_domain_invalid_chars() { }
 
 ## Phase 9: ClaimableBalance Complete Coverage (Week 4)
 
-**C++ Reference:** `ClaimableBalanceTests.cpp` (73 test sections)
+**stellar-core Reference:** `ClaimableBalanceTests.cpp` (73 test sections)
 
 ### Task 9.1: Missing Tests
 
@@ -1043,7 +1043,7 @@ fn test_claim_destination_line_full() { }
 
 ## Phase 10: Liquidity Pool Complete Coverage (Week 4-5)
 
-**C++ Reference:** `LiquidityPoolDepositTests.cpp`, `LiquidityPoolWithdrawTests.cpp`, `LiquidityPoolTradeTests.cpp` (88+ test sections)
+**stellar-core Reference:** `LiquidityPoolDepositTests.cpp`, `LiquidityPoolWithdrawTests.cpp`, `LiquidityPoolTradeTests.cpp` (88+ test sections)
 
 ### Task 10.1: Deposit Tests
 
@@ -1121,7 +1121,7 @@ fn test_trade_pool_fee() { }
 
 ## Phase 11: Sponsorship Operations Complete Coverage (Week 5)
 
-**C++ Reference:** `RevokeSponsorshipTests.cpp`, `BeginSponsoringFutureReservesTests.cpp` (66+ test sections)
+**stellar-core Reference:** `RevokeSponsorshipTests.cpp`, `BeginSponsoringFutureReservesTests.cpp` (66+ test sections)
 
 ### Task 11.1: Begin/End Sponsoring
 
@@ -1307,7 +1307,7 @@ fn test_manage_data_too_many_subentries() { }
 
 ## Phase 13: Soroban/InvokeHostFunction (Week 6+)
 
-**C++ Reference:** `InvokeHostFunctionTests.cpp` (371 test sections)
+**stellar-core Reference:** `InvokeHostFunctionTests.cpp` (371 test sections)
 
 This is the largest test file and covers smart contract execution. Recommend treating as a separate project given complexity.
 
@@ -1378,8 +1378,8 @@ Key areas:
 
 2. **Test Naming Convention:** Follow pattern `test_<operation>_<scenario>` for consistency.
 
-3. **Documentation:** Each test should have a doc comment explaining what C++ test it corresponds to.
+3. **Documentation:** Each test should have a doc comment explaining what stellar-core test it corresponds to.
 
 4. **Regression Prevention:** When a bug is found via CDP verification, add a test that would have caught it.
 
-5. **Review Process:** Each phase should be reviewed against C++ test file to ensure no scenarios missed.
+5. **Review Process:** Each phase should be reviewed against stellar-core test file to ensure no scenarios missed.

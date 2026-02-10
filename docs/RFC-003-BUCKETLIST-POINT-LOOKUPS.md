@@ -32,9 +32,9 @@ for entry in bucket_list.live_entries_iter() {
 - Mainnet accounts alone: ~60M entries * ~200 bytes = ~12 GB
 - All entry types combined: 50+ GB
 
-### C++ Architecture (What We're Matching)
+### stellar-core Architecture (What We're Matching)
 
-C++ stellar-core uses a dual-index strategy:
+stellar-core uses a dual-index strategy:
 
 1. **InMemoryIndex** - For small buckets (< `BUCKETLIST_DB_INDEX_CUTOFF` MB, default 20 MB)
    - Stores all entries in a `HashSet<LedgerKey, BucketEntry>`
@@ -283,7 +283,7 @@ impl DiskIndex {
     }
     
     fn compute_page_size(config: &Config, bucket_size: u64) -> u64 {
-        // Match C++ logic: larger buckets get larger pages
+        // Match stellar-core logic: larger buckets get larger pages
         // Default: 4KB pages, scaled by bucket size
         config.bucketlist_db_page_size_kb as u64 * 1024
     }
@@ -522,14 +522,14 @@ persist_index = true
 
 | File | Action |
 |------|--------|
-| `crates/stellar-core-bucket/src/in_memory_index.rs` | **Create** |
-| `crates/stellar-core-bucket/src/disk_index.rs` | **Create** |
-| `crates/stellar-core-bucket/src/bucket_index.rs` | **Create** - enum + factory |
-| `crates/stellar-core-bucket/src/bucket_cache.rs` | **Create** |
-| `crates/stellar-core-bucket/src/live_bucket_index.rs` | **Create** |
-| `crates/stellar-core-bucket/src/bucket.rs` | Add index field |
-| `crates/stellar-core-bucket/src/bucket_list.rs` | Add `load()` API |
-| `crates/stellar-core-ledger/src/manager.rs` | Use point lookups |
+| `crates/henyey-bucket/src/in_memory_index.rs` | **Create** |
+| `crates/henyey-bucket/src/disk_index.rs` | **Create** |
+| `crates/henyey-bucket/src/bucket_index.rs` | **Create** - enum + factory |
+| `crates/henyey-bucket/src/bucket_cache.rs` | **Create** |
+| `crates/henyey-bucket/src/live_bucket_index.rs` | **Create** |
+| `crates/henyey-bucket/src/bucket.rs` | Add index field |
+| `crates/henyey-bucket/src/bucket_list.rs` | Add `load()` API |
+| `crates/henyey-ledger/src/manager.rs` | Use point lookups |
 
 ## Memory Impact
 
@@ -571,7 +571,7 @@ persist_index = true
 1. **Unit tests**: Each index type in isolation
 2. **Integration tests**: BucketList.load() returns correct entries
 3. **Stress tests**: Concurrent lookups with cache contention
-4. **Parity tests**: Results match C++ stellar-core
+4. **Parity tests**: Results match stellar-core
 5. **Memory tests**: Verify bounded memory under load
 
 ## Success Criteria
@@ -583,8 +583,8 @@ persist_index = true
 
 ## References
 
-- C++ Implementation: `.upstream-v25/src/bucket/LiveBucketIndex.h/cpp`
-- C++ DiskIndex: `.upstream-v25/src/bucket/DiskIndex.h/cpp`
-- C++ InMemoryIndex: `.upstream-v25/src/bucket/InMemoryIndex.h`
+- stellar-core Implementation: `.upstream-v25/src/bucket/LiveBucketIndex.h/cpp`
+- stellar-core DiskIndex: `.upstream-v25/src/bucket/DiskIndex.h/cpp`
+- stellar-core InMemoryIndex: `.upstream-v25/src/bucket/InMemoryIndex.h`
 - RFC-001: Streaming Iterator (completed)
 - RFC-002: SQL-Backed Offers (in progress)

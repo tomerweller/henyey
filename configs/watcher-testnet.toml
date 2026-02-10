@@ -1,11 +1,11 @@
-# rs-stellar-core Testnet Watcher Configuration
+# henyey Testnet Watcher Configuration
 #
 # Watcher mode: observes the network without participating in consensus
-# Run: rs-stellar-core --config configs/watcher-testnet.toml run --watcher
+# Run: henyey --config configs/watcher-testnet.toml run --watcher
 
 [node]
 # Node display name (for logging)
-name = "rs-stellar-core-watcher"
+name = "henyey-watcher"
 
 # Run as watcher (non-validator)
 is_validator = false

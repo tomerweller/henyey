@@ -1,5 +1,5 @@
 [node]
-name = "rs-stellar-core-validator"
+name = "henyey-validator"
 is_validator = true
 node_seed = "SAFTEV5U6QDFE2DRMSD7HBE76XG7SQZJD6VIUTHIXTJGO77RUQYVURLA"
 
