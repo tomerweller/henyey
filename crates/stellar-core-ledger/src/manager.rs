@@ -631,6 +631,31 @@ impl LedgerManager {
         self.bucket_list.read()
     }
 
+    /// Resolve all pending async merges in the bucket list.
+    ///
+    /// This must be called before cloning the bucket list, because
+    /// `BucketLevel::clone()` drops unresolved async merges. After calling
+    /// this, all pending merges are `PendingMerge::InMemory` and safe to clone.
+    pub fn resolve_pending_bucket_merges(&self) {
+        self.bucket_list.write().resolve_all_pending_merges();
+    }
+
+    /// Get the current total Soroban state size (contract data + code).
+    ///
+    /// Used to carry the pre-computed value across catchup cycles, avoiding
+    /// an expensive bucket list scan (~80s on mainnet).
+    pub fn soroban_state_total_size(&self) -> u64 {
+        self.soroban_state.read().total_size()
+    }
+
+    /// Get a snapshot of all offers in the in-memory offer store.
+    ///
+    /// Used to provide the order book to the replay path, which needs the same
+    /// offer set as close_ledger for correct offer matching behavior.
+    pub fn offer_entries(&self) -> Vec<LedgerEntry> {
+        self.offer_store.read().values().cloned().collect()
+    }
+
     /// Get a read lock on the hot archive bucket list.
     ///
     /// This is used during HAS serialization to capture the hot archive state

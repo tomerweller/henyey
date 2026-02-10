@@ -518,6 +518,7 @@ pub fn replay_ledger_with_execution(
     module_cache: Option<&PersistentModuleCache>,
     soroban_state_size: Option<u64>,
     prev_id_pool: u64,
+    offer_entries: Option<Vec<LedgerEntry>>,
 ) -> Result<LedgerReplayResult> {
     if config.verify_results {
         verify::verify_tx_set(header, tx_set)?;
@@ -532,9 +533,11 @@ pub fn replay_ledger_with_execution(
     let mut snapshot = LedgerSnapshot::empty(header.ledger_seq);
     snapshot.set_id_pool(prev_id_pool);
     let bucket_list_ref = std::sync::Arc::new(std::sync::RwLock::new(bucket_list.clone()));
-    // Also include hot archive bucket list for archived entries and their TTLs
-    let hot_archive_ref =
-        std::sync::Arc::new(std::sync::RwLock::new(hot_archive_bucket_list.clone()));
+    // Also include hot archive bucket list for archived entries and their TTLs.
+    // Use parking_lot::RwLock<Option<...>> to match the type expected by execute_transaction_set.
+    let hot_archive_ref: std::sync::Arc<parking_lot::RwLock<Option<stellar_core_bucket::HotArchiveBucketList>>> =
+        std::sync::Arc::new(parking_lot::RwLock::new(Some(hot_archive_bucket_list.clone())));
+    let hot_archive_for_lookup = hot_archive_ref.clone();
     let lookup_fn = std::sync::Arc::new(move |key: &LedgerKey| {
         // First try the live bucket list
         if let Some(entry) = bucket_list_ref
@@ -546,13 +549,24 @@ pub fn replay_ledger_with_execution(
             return Ok(Some(entry));
         }
         // If not found, search hot archive for archived entries and TTLs
-        hot_archive_ref
-            .read()
-            .map_err(|_| LedgerError::Snapshot("hot archive lock poisoned".to_string()))?
-            .get(key)
-            .map_err(LedgerError::Bucket)
+        let ha_guard = hot_archive_for_lookup.read();
+        match ha_guard.as_ref() {
+            Some(ha) => ha.get(key).map_err(LedgerError::Bucket),
+            None => Ok(None),
+        }
     });
-    let snapshot = SnapshotHandle::with_lookup(snapshot, lookup_fn);
+    let mut snapshot = SnapshotHandle::with_lookup(snapshot, lookup_fn);
+
+    // If offer entries are provided, set the entries_fn so that
+    // load_orderbook_offers() can populate the executor's order book.
+    // Without this, offer matching (ManageSellOffer, PathPayment, etc.) fails
+    // because the executor starts with an empty order book.
+    if let Some(offers) = offer_entries {
+        let offers = std::sync::Arc::new(offers);
+        let entries_fn: stellar_core_ledger::EntriesLookupFn =
+            std::sync::Arc::new(move || Ok((*offers).clone()));
+        snapshot.set_entries_lookup(entries_fn);
+    }
 
     let mut delta = LedgerDelta::new(header.ledger_seq);
     let transactions = tx_set.transactions_with_base_fee();
@@ -584,7 +598,7 @@ pub fn replay_ledger_with_execution(
             soroban_base_prng_seed.0,
             classic_events,
             module_cache,
-            None, // Hot archive not needed during replay - state is from history archives
+            Some(hot_archive_ref.clone()),
         )
         .map_err(|e| HistoryError::CatchupFailed(format!("replay execution failed: {}", e)))?;
 
@@ -769,12 +783,28 @@ pub fn replay_ledger_with_execution(
             "Incremental eviction scan results"
         );
 
-        // Resolve: apply max_entries limit (no TTL filtering needed during replay
-        // since we don't have the modified TTL keys from transaction execution).
-        let empty_ttl_keys = std::collections::HashSet::new();
+        // Resolution phase: apply TTL filtering + max_entries limit.
+        // This matches C++ resolveBackgroundEvictionScan which:
+        // 1. Filters out entries whose TTL was modified by TXs in this ledger
+        // 2. Evicts up to maxEntriesToArchive entries
+        // 3. Sets iterator based on whether the limit was hit
+        let modified_ttl_keys: std::collections::HashSet<LedgerKey> = init_entries
+            .iter()
+            .chain(live_entries.iter())
+            .filter_map(|entry| {
+                if let LedgerEntryData::Ttl(ttl) = &entry.data {
+                    Some(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
+                        key_hash: ttl.key_hash.clone(),
+                    }))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         let resolved = eviction_result.resolve(
             eviction_settings.max_entries_to_archive,
-            &empty_ttl_keys,
+            &modified_ttl_keys,
         );
 
         evicted_keys = resolved.evicted_keys;
@@ -1631,6 +1661,7 @@ mod tests {
             None, // module_cache
             None, // soroban_state_size
             0,    // prev_id_pool
+            None, // offer_entries
         );
 
         assert!(matches!(result, Err(HistoryError::VerificationFailed(_))));
@@ -1665,6 +1696,7 @@ mod tests {
             None, // module_cache
             None, // soroban_state_size
             0,    // prev_id_pool
+            None, // offer_entries
         );
 
         assert!(matches!(result, Err(HistoryError::InvalidTxSetHash { .. })));
@@ -1702,6 +1734,7 @@ mod tests {
             None, // module_cache
             None, // soroban_state_size
             0,    // prev_id_pool
+            None, // offer_entries
         );
 
         assert!(matches!(result, Err(HistoryError::VerificationFailed(_))));

@@ -233,6 +233,14 @@ pub struct ExistingBucketState {
     pub header: LedgerHeader,
     /// The network ID for transaction verification.
     pub network_id: NetworkId,
+    /// Pre-computed Soroban state size from the ledger manager.
+    /// When `Some`, `replay_ledgers` skips the expensive bucket list scan
+    /// (~80s on mainnet) and uses this value directly.
+    pub soroban_state_size: Option<u64>,
+    /// Pre-computed offer entries from the ledger manager's in-memory offer store.
+    /// Required for correct offer matching during replay (ManageSellOffer, PathPayment, etc.).
+    /// Without this, the replay executor starts with an empty order book and offer crossing fails.
+    pub offer_entries: Option<Vec<stellar_xdr::curr::LedgerEntry>>,
 }
 
 /// # Thread Safety
@@ -418,6 +426,10 @@ impl CatchupManager {
                 self.download_checkpoint_header(checkpoint_seq).await?;
             let checkpoint_id_pool = checkpoint_header.id_pool;
 
+            // Extract offers from cache_data for correct offer matching during replay.
+            let replay_offers: Vec<stellar_xdr::curr::LedgerEntry> =
+                cache_data.offers.values().cloned().collect();
+
             let final_state = self
                 .replay_ledgers(
                     &mut bucket_list,
@@ -425,6 +437,8 @@ impl CatchupManager {
                     &ledger_data,
                     network_id,
                     checkpoint_id_pool,
+                    None,
+                    Some(replay_offers),
                 )
                 .await?;
             let ledgers_applied = target - checkpoint_seq;
@@ -522,6 +536,10 @@ impl CatchupManager {
         let is_replay_from_existing = !range.apply_buckets() && existing_state.is_some();
         // Extract the LCL header's id_pool before consuming existing_state
         let existing_id_pool = existing_state.as_ref().map(|s| s.header.id_pool);
+        // Extract pre-computed Soroban state size (avoids ~80s bucket scan during replay)
+        let existing_soroban_state_size = existing_state.as_ref().and_then(|s| s.soroban_state_size);
+        // Extract offer entries for correct order book during replay
+        let existing_offer_entries = existing_state.as_ref().and_then(|s| s.offer_entries.clone());
 
         let (mut bucket_list, mut hot_archive_bucket_list, checkpoint_seq, network_id, cache_data) =
             if range.apply_buckets() {
@@ -653,6 +671,15 @@ impl CatchupManager {
             // Replay ledgers
             self.update_progress(CatchupStatus::Replaying, 6, "Replaying ledgers");
 
+            // Use offers from existing state (Case 1) or cache_data (Case 4).
+            let replay_offer_entries = if let Some(offers) = existing_offer_entries {
+                Some(offers)
+            } else if let Some(ref cd) = cache_data {
+                Some(cd.offers.values().cloned().collect())
+            } else {
+                None
+            };
+
             let final_state = self
                 .replay_ledgers(
                     &mut bucket_list,
@@ -660,6 +687,8 @@ impl CatchupManager {
                     &ledger_data,
                     network_id,
                     checkpoint_id_pool,
+                    existing_soroban_state_size,
+                    replay_offer_entries,
                 )
                 .await?;
 
@@ -868,6 +897,10 @@ impl CatchupManager {
             // Use the archive's pre-computed hash - it's the authoritative hash the network used
             (checkpoint_header, checkpoint_hash, 0)
         } else {
+            // Extract offers from cache_data for correct offer matching during replay.
+            let replay_offers: Vec<stellar_xdr::curr::LedgerEntry> =
+                cache_data.offers.values().cloned().collect();
+
             let final_state = self
                 .replay_ledgers(
                     &mut bucket_list,
@@ -875,6 +908,8 @@ impl CatchupManager {
                     &ledger_data,
                     network_id,
                     checkpoint_header.id_pool, // Use checkpoint's id_pool for correct offer IDs
+                    None,
+                    Some(replay_offers),
                 )
                 .await?;
             let ledgers_applied = target - checkpoint_seq;
@@ -2075,6 +2110,7 @@ impl CatchupManager {
     /// * `checkpoint_id_pool` - The ID pool value from the checkpoint header.
     ///   This is the starting `id_pool` for the first ledger being replayed.
     ///   Required for correct offer ID assignment during transaction execution.
+    #[allow(clippy::too_many_arguments)]
     async fn replay_ledgers(
         &mut self,
         bucket_list: &mut BucketList,
@@ -2082,6 +2118,8 @@ impl CatchupManager {
         ledger_data: &[LedgerData],
         network_id: NetworkId,
         checkpoint_id_pool: u64,
+        precomputed_soroban_state_size: Option<u64>,
+        mut offer_entries: Option<Vec<stellar_xdr::curr::LedgerEntry>>,
     ) -> Result<ReplayedLedgerState> {
         use stellar_core_bucket::EvictionIterator;
 
@@ -2116,19 +2154,29 @@ impl CatchupManager {
         };
 
         // Track Soroban state size for LiveSorobanStateSizeWindow updates.
-        // Compute initial size from checkpoint bucket list, then track delta.
-        // Use the protocol version from the first ledger being replayed.
+        // If a pre-computed value was passed (e.g., from a cloned ledger manager),
+        // skip the expensive bucket list scan (~80s on mainnet).
         let protocol_version = ledger_data
             .first()
             .map(|d| d.header.ledger_version)
             .unwrap_or(25);
-        let mut soroban_state_size: Option<u64> =
-            Some(compute_initial_soroban_state_size(bucket_list, protocol_version));
-        tracing::info!(
-            protocol_version,
-            initial_soroban_state_size = soroban_state_size,
-            "Computed initial Soroban state size from checkpoint"
-        );
+        let mut soroban_state_size: Option<u64> = if let Some(size) = precomputed_soroban_state_size
+        {
+            tracing::info!(
+                protocol_version,
+                initial_soroban_state_size = size,
+                "Using pre-computed Soroban state size (skipping bucket list scan)"
+            );
+            Some(size)
+        } else {
+            let size = compute_initial_soroban_state_size(bucket_list, protocol_version);
+            tracing::info!(
+                protocol_version,
+                initial_soroban_state_size = size,
+                "Computed initial Soroban state size from checkpoint"
+            );
+            Some(size)
+        };
 
         for (i, data) in ledger_data.iter().enumerate() {
             self.progress.current_ledger = data.header.ledger_seq;
@@ -2145,6 +2193,7 @@ impl CatchupManager {
                 None, // TODO: Initialize module cache for catchup performance
                 soroban_state_size, // Soroban state size for window updates
                 prev_id_pool, // ID pool from previous ledger for correct offer ID assignment
+                offer_entries.clone(), // Order book for correct offer matching
             )?;
             // Update Soroban state size tracking based on accurate delta from replay.
             // The replay result computes this delta from the full change records,
@@ -2159,6 +2208,44 @@ impl CatchupManager {
 
             // Update prev_id_pool for the next ledger
             prev_id_pool = data.header.id_pool;
+
+            // Incrementally update the offer set for the next ledger's replay.
+            // New/modified offers are added, deleted offers are removed.
+            if let Some(ref mut offers) = offer_entries {
+                use stellar_xdr::curr::LedgerEntryData;
+                // Add new offers from init_entries
+                for entry in &result.init_entries {
+                    if matches!(entry.data, LedgerEntryData::Offer(_)) {
+                        offers.push(entry.clone());
+                    }
+                }
+                // Update modified offers from live_entries
+                for entry in &result.live_entries {
+                    if let LedgerEntryData::Offer(ref offer) = entry.data {
+                        // Remove old version and add updated version
+                        offers.retain(|e| {
+                            if let LedgerEntryData::Offer(ref o) = e.data {
+                                o.offer_id != offer.offer_id || o.seller_id != offer.seller_id
+                            } else {
+                                true
+                            }
+                        });
+                        offers.push(entry.clone());
+                    }
+                }
+                // Remove deleted offers
+                for key in &result.dead_entries {
+                    if let stellar_xdr::curr::LedgerKey::Offer(ref offer_key) = key {
+                        offers.retain(|e| {
+                            if let LedgerEntryData::Offer(ref o) = e.data {
+                                o.offer_id != offer_key.offer_id || o.seller_id != offer_key.seller_id
+                            } else {
+                                true
+                            }
+                        });
+                    }
+                }
+            }
 
             debug!(
                 "Replayed ledger {}/{}: {} txs, {} ops",

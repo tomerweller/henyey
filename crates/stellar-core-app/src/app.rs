@@ -133,6 +133,13 @@ const OUT_OF_SYNC_RECOVERY_TIMER_SECS: u64 = 10;
 /// This prevents repeated network calls to the archive when we're stuck.
 const ARCHIVE_CHECKPOINT_CACHE_SECS: u64 = 60;
 
+/// Post-catchup recovery window: after completing catchup, prefer SCP recovery
+/// over triggering another catchup for at least one full checkpoint cycle (~5 min).
+/// The first checkpoint after initial catchup won't be published to archives for
+/// ~320s (64 ledgers * 5s). During this window, missing ledgers can only be filled
+/// via SCP state requests from peers, not from archive downloads.
+const POST_CATCHUP_RECOVERY_WINDOW_SECS: u64 = 300;
+
 fn build_generalized_tx_set(
     tx_set: &stellar_core_herder::TransactionSet,
 ) -> Option<stellar_xdr::curr::GeneralizedTransactionSet> {
@@ -1864,6 +1871,8 @@ impl App {
             hot_archive_bucket_list: hot_archive,
             header,
             network_id,
+            soroban_state_size: None, // Will be computed via bucket scan during replay
+            offer_entries: None, // Not available from persisted HAS rebuild
         })
     }
 
@@ -2318,39 +2327,75 @@ impl App {
             });
         }
 
-        // For replay-only catchup (Case 1: LCL > genesis), rebuild bucket lists
-        // from the persisted HAS in the database. This matches C++ stellar-core's
-        // approach: the HAS is the source of truth for bucket list state.
+        // For replay-only catchup (Case 1: LCL > genesis), we need the bucket
+        // lists at the current LCL to replay ledgers from LCL+1 to target.
         //
-        // We do NOT take bucket lists from the live ledger manager because:
-        // 1. Live bucket lists may have in-flight async pending merges that
-        //    don't serialize/restore deterministically
-        // 2. The persisted HAS captures pending merge state as hash records
-        //    (FB_HASH_INPUTS/FB_HASH_OUTPUT) which can be deterministically
-        //    reconstituted via restart_merges_from_has
-        // 3. This matches C++ loadLastKnownLedgerInternal() -> assumeState()
-        //    -> restartMerges() flow
+        // Fast path: if the ledger manager is already initialized, clone the
+        // bucket lists directly. This is instant (Bucket uses Arc internally)
+        // and avoids the expensive rebuild_bucket_lists_from_has path which
+        // loads all buckets from disk + runs full merge restarts (~2+ min on
+        // mainnet). It also ensures exact state parity — the HAS reconstruction
+        // path can produce subtly different pending merge states.
+        //
+        // Slow path: if the ledger manager is NOT initialized (e.g., first
+        // startup with existing DB), fall back to rebuilding from persisted HAS.
         let (existing_state, override_lcl) =
             if current > GENESIS_LEDGER_SEQ {
-                match self.rebuild_bucket_lists_from_has().await {
-                    Ok(state) => {
-                        tracing::info!(
-                            current_lcl = current,
-                            target_ledger,
-                            "Rebuilt bucket lists from persisted HAS for replay-only catchup (Case 1)"
-                        );
-                        // Reset ledger manager since we'll re-initialize after catchup
-                        if self.ledger_manager.is_initialized() {
-                            self.ledger_manager.reset();
+                if self.ledger_manager.is_initialized() {
+                    // Fast path: clone from live ledger manager.
+                    // Must resolve async merges first — structure-based restart_merges
+                    // creates PendingMerge::Async handles, and BucketLevel::clone()
+                    // drops unresolved async merges.
+                    self.ledger_manager.resolve_pending_bucket_merges();
+                    let bucket_list = self.ledger_manager.bucket_list().clone();
+                    let hot_archive = self.ledger_manager.hot_archive_bucket_list()
+                        .clone()
+                        .unwrap_or_default();
+                    let header = self.ledger_manager.current_header();
+                    let network_id = NetworkId(self.network_id());
+
+                    // Capture state size and offers BEFORE reset (reset preserves
+                    // warm caches, but capturing first is clearer).
+                    let soroban_state_size = self.ledger_manager.soroban_state_total_size();
+                    let offer_entries = self.ledger_manager.offer_entries();
+
+                    tracing::info!(
+                        current_lcl = current,
+                        target_ledger,
+                        bucket_list_hash = %bucket_list.hash().to_hex(),
+                        offer_count = offer_entries.len(),
+                        "Cloned bucket lists from ledger manager for replay-only catchup"
+                    );
+
+                    // Preserve warm caches for re-initialization after catchup
+                    self.ledger_manager.reset_for_recatchup();
+
+                    (Some(ExistingBucketState {
+                        bucket_list,
+                        hot_archive_bucket_list: hot_archive,
+                        header,
+                        network_id,
+                        soroban_state_size: Some(soroban_state_size),
+                        offer_entries: Some(offer_entries),
+                    }), Some(current))
+                } else {
+                    // Slow path: rebuild from persisted HAS
+                    match self.rebuild_bucket_lists_from_has().await {
+                        Ok(state) => {
+                            tracing::info!(
+                                current_lcl = current,
+                                target_ledger,
+                                "Rebuilt bucket lists from persisted HAS for replay-only catchup (Case 1)"
+                            );
+                            (Some(state), Some(current))
                         }
-                        (Some(state), Some(current))
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "Failed to rebuild bucket lists from HAS, falling back to full catchup"
-                        );
-                        (None, None)
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "Failed to rebuild bucket lists from HAS, falling back to full catchup"
+                            );
+                            (None, None)
+                        }
                     }
                 }
             } else {
@@ -4615,13 +4660,14 @@ impl App {
                                 .last_catchup_completed_at
                                 .read()
                                 .await
-                                .is_some_and(|t| t.elapsed().as_secs() < ARCHIVE_CHECKPOINT_CACHE_SECS);
+                                .is_some_and(|t| t.elapsed().as_secs() < POST_CATCHUP_RECOVERY_WINDOW_SECS);
 
-                            // When recently caught up, prefer recovery over catchup.
-                            // However, if recovery has failed (peers can't fill the
-                            // gap via SCP/tx_set requests), allow catchup. Case 1
-                            // replay is fast and doesn't re-download from archives.
-                            if recently_caught_up && !recovery_failed {
+                            // When recently caught up, ALWAYS prefer recovery over
+                            // catchup. The next checkpoint won't be published to
+                            // archives for ~5 min, so archive-based catchup (even
+                            // Case 1 replay) will fail trying to download unpublished
+                            // checkpoint data. Keep requesting SCP state from peers.
+                            if recently_caught_up {
                                 if since_recovery >= OUT_OF_SYNC_RECOVERY_TIMER_SECS {
                                     state.last_recovery_attempt = now;
                                     state.recovery_attempts += 1;
