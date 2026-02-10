@@ -771,6 +771,7 @@ pub enum ExecutionFailure {
     TooEarly,
     TooLate,
     NotSupported,
+    InternalError,
     BadSponsorship,
     OperationFailed,
 }
@@ -3134,12 +3135,13 @@ impl TransactionExecutor {
                             op_index = op_index,
                             op_type = ?OperationType::from_body(&op.body),
                             ledger_seq = self.ledger_seq,
-                            "Operation execution returned Err (mapped to OpNotSupported)"
+                            "Operation execution returned Err (mapped to txInternalError)"
                         );
-                        operation_results.push(OperationResult::OpNotSupported);
-                        op_changes.push(empty_entry_changes());
-                        op_events.push(Vec::new());
-                        failure = Some(ExecutionFailure::NotSupported);
+                        // C++ maps std::runtime_error during operation execution
+                        // to txINTERNAL_ERROR (not txNOT_SUPPORTED). The exception
+                        // aborts all remaining operations.
+                        failure = Some(ExecutionFailure::InternalError);
+                        break;
                     }
                 }
                 let op_elapsed_us = op_timing_start.elapsed().as_micros() as u64;
@@ -4981,6 +4983,7 @@ fn map_failure_to_result(failure: &ExecutionFailure) -> TransactionResultResult 
         ExecutionFailure::InsufficientBalance => TransactionResultResult::TxInsufficientBalance,
         ExecutionFailure::NoAccount => TransactionResultResult::TxNoAccount,
         ExecutionFailure::NotSupported => TransactionResultResult::TxNotSupported,
+        ExecutionFailure::InternalError => TransactionResultResult::TxInternalError,
         ExecutionFailure::BadSponsorship => TransactionResultResult::TxBadSponsorship,
         ExecutionFailure::OperationFailed => {
             TransactionResultResult::TxFailed(Vec::new().try_into().unwrap())
@@ -5028,6 +5031,7 @@ fn map_failure_to_inner_result(
         }
         ExecutionFailure::NoAccount => InnerTransactionResultResult::TxNoAccount,
         ExecutionFailure::NotSupported => InnerTransactionResultResult::TxNotSupported,
+        ExecutionFailure::InternalError => InnerTransactionResultResult::TxInternalError,
         ExecutionFailure::BadSponsorship => InnerTransactionResultResult::TxBadSponsorship,
         ExecutionFailure::OperationFailed => InnerTransactionResultResult::TxFailed(
             op_results.to_vec().try_into().unwrap_or_default(),

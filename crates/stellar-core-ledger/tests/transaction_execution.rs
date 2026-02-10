@@ -26,7 +26,7 @@ use stellar_xdr::curr::{
     LiquidityPoolEntry, LiquidityPoolEntryBody, LiquidityPoolEntryConstantProduct,
     LiquidityPoolWithdrawOp, ManageSellOfferOp, ManageSellOfferResult, Memo, MuxedAccount,
     MuxedAccountMed25519, OfferEntry, OfferEntryExt, Operation, OperationBody, OperationResult,
-    OperationResultTr, PathPaymentStrictSendOp, PathPaymentStrictSendResult,
+    OperationResultTr, PathPaymentStrictReceiveOp, PathPaymentStrictSendOp, PathPaymentStrictSendResult,
     PathPaymentStrictSendResultSuccess, PoolId, Preconditions, PreconditionsV2, Price, PublicKey,
     ScAddress, ScString, ScSymbol, ScVal, SequenceNumber, SetOptionsOp, SetOptionsResult,
     SetTrustLineFlagsOp, Signature as XdrSignature, SignatureHint, Signer, SignerKey,
@@ -4565,5 +4565,160 @@ fn test_cross_tx_deleted_trustline_not_reloaded() {
     assert_eq!(
         account.num_sub_entries, 0,
         "num_sub_entries should remain 0 (not underflow)"
+    );
+}
+
+/// Regression test: internal errors during operation execution must map to txInternalError.
+///
+/// In C++ stellar-core, when a std::runtime_error is thrown during operation execution
+/// (e.g. liabilities underflow during offer crossing), it propagates to
+/// TransactionFrame::applyOperations() which catches it and sets txINTERNAL_ERROR.
+///
+/// Previously our code mapped all operation Err values to OpNotSupported/TxNotSupported.
+/// This caused a parity mismatch found at mainnet ledger 61171083.
+///
+/// This test creates an inconsistent state where an offer's computed liabilities
+/// exceed the stored liabilities, triggering an underflow during releaseLiabilities.
+#[test]
+fn test_internal_error_maps_to_tx_internal_error() {
+    let source_secret = SecretKey::from_seed(&[210u8; 32]);
+    let source_id: AccountId = (&source_secret.public_key()).into();
+
+    let seller_secret = SecretKey::from_seed(&[211u8; 32]);
+    let seller_id: AccountId = (&seller_secret.public_key()).into();
+
+    let dest_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([212u8; 32])));
+
+    let issuer_secret = SecretKey::from_seed(&[213u8; 32]);
+    let issuer_id: AccountId = (&issuer_secret.public_key()).into();
+
+    let asset_usd = Asset::CreditAlphanum4(AlphaNum4 {
+        asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+        issuer: issuer_id.clone(),
+    });
+
+    // Create accounts
+    let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 500_000_000);
+    let (dest_key, dest_entry) = create_account_entry(dest_id.clone(), 1, 200_000_000);
+    let (issuer_key, issuer_entry) = create_account_entry(issuer_id.clone(), 1, 100_000_000);
+
+    // Seller account: has NO selling liabilities set (V0 ext = liabilities 0)
+    // but owns an offer selling 50 XLM. This is an inconsistent state that
+    // triggers liabilities underflow when the offer is crossed.
+    let (seller_key, seller_entry) = create_account_entry(seller_id.clone(), 1, 500_000_000);
+
+    // Source needs USD trustline to send
+    let (source_tl_key, source_tl_entry) = create_trustline_entry(
+        source_id.clone(),
+        TrustLineAsset::CreditAlphanum4(match &asset_usd {
+            Asset::CreditAlphanum4(a) => a.clone(),
+            _ => unreachable!(),
+        }),
+        100_000_000,
+        200_000_000,
+        TrustLineFlags::AuthorizedFlag as u32,
+    );
+
+    // Seller needs USD trustline (buying side)
+    let (seller_tl_key, seller_tl_entry) = create_trustline_entry(
+        seller_id.clone(),
+        TrustLineAsset::CreditAlphanum4(match &asset_usd {
+            Asset::CreditAlphanum4(a) => a.clone(),
+            _ => unreachable!(),
+        }),
+        0,
+        100_000_000,
+        TrustLineFlags::AuthorizedFlag as u32,
+    );
+    // NOTE: seller trustline buying liabilities are also 0 (inconsistent with offer)
+
+    // Offer: seller sells 50 XLM for USD at 1:1
+    // The offer exists but liabilities on account/trustline are 0 → underflow on cross
+    let offer_id: i64 = 99999;
+    let (offer_key, offer_entry) = create_offer_entry(
+        seller_id.clone(),
+        offer_id,
+        Asset::Native,
+        asset_usd.clone(),
+        50_000_000,
+        Price { n: 1, d: 1 },
+    );
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .expect("add source")
+        .add_entry(dest_key, dest_entry)
+        .expect("add dest")
+        .add_entry(seller_key, seller_entry)
+        .expect("add seller")
+        .add_entry(issuer_key, issuer_entry)
+        .expect("add issuer")
+        .add_entry(source_tl_key, source_tl_entry)
+        .expect("add source trustline")
+        .add_entry(seller_tl_key, seller_tl_entry)
+        .expect("add seller trustline")
+        .add_entry(offer_key, offer_entry)
+        .expect("add offer")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let network_id = NetworkId::testnet();
+
+    let mut executor = TransactionExecutor::new(
+        1,
+        1_000,
+        5_000_000,
+        25,
+        network_id,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+    executor
+        .load_orderbook_offers(&snapshot)
+        .expect("load orderbook");
+
+    // PathPaymentStrictReceive that will cross the offer
+    let op = Operation {
+        source_account: None,
+        body: OperationBody::PathPaymentStrictReceive(PathPaymentStrictReceiveOp {
+            send_asset: asset_usd.clone(),
+            send_max: 100_000_000,
+            destination: dest_id.into(),
+            dest_asset: Asset::Native,
+            dest_amount: 50_000_000,
+            path: VecM::default(),
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*source_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    let decorated = sign_envelope(&envelope, &source_secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute_transaction should not return Err");
+
+    // The transaction should fail with InternalError (not NotSupported)
+    assert!(!result.success, "TX should fail due to liabilities underflow");
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::InternalError),
+        "Internal errors must map to ExecutionFailure::InternalError, not NotSupported"
     );
 }
