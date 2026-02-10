@@ -32,7 +32,7 @@ passphrase = "Test SDF Network ; September 2015"
 
 [database]
 # Path to SQLite database file
-path = "watcher-testnet.db"
+path = "/home/tomer/data/testnet/testnet.db"
 
 # Connection pool size
 pool_size = 10

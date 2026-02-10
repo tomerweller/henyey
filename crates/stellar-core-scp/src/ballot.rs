@@ -614,14 +614,9 @@ impl BallotProtocol {
         slot_index: u64,
         composite_candidate: Option<&Value>,
     ) -> bool {
-        self.abandon_ballot_with_composite(
-            0,
-            composite_candidate,
-            local_node_id,
-            local_quorum_set,
-            driver,
-            slot_index,
-        )
+        // Sync composite candidate from caller before abandoning
+        self.composite_candidate = composite_candidate.cloned();
+        self.abandon_ballot(0, local_node_id, local_quorum_set, driver, slot_index)
     }
 
     /// Process a ballot protocol envelope.
@@ -1482,33 +1477,36 @@ impl BallotProtocol {
                 local_quorum_set,
                 driver,
             ) {
-                return self.abandon_ballot(counter);
+                return self.abandon_ballot(
+                    counter,
+                    local_node_id,
+                    local_quorum_set,
+                    driver,
+                    _slot_index,
+                );
             }
         }
 
         false
     }
 
-    fn abandon_ballot(&mut self, counter: u32) -> bool {
-        // Use composite candidate from nomination (set by Slot), then fall back to current ballot
-        self.abandon_ballot_internal(counter, self.composite_candidate.clone().as_ref())
-    }
-
-    /// Abandon the current ballot with access to composite candidate value.
+    /// Abandon the current ballot.
     ///
     /// Matches C++ `abandonBallot(n)` which checks `mSlot.getLatestCompositeCandidate()`
     /// first, then falls back to `mCurrentBallot->value`, then calls `bumpState(value, n)`.
-    fn abandon_ballot_with_composite<D: SCPDriver>(
+    /// This properly emits envelopes and checks heard-from-quorum (via `bump_state`).
+    fn abandon_ballot<D: SCPDriver>(
         &mut self,
         counter: u32,
-        composite_candidate: Option<&Value>,
         local_node_id: &NodeId,
         local_quorum_set: &ScpQuorumSet,
         driver: &Arc<D>,
         slot_index: u64,
     ) -> bool {
         // C++ priority: composite candidate first, then current ballot value
-        let value = composite_candidate
+        let value = self
+            .composite_candidate
+            .as_ref()
             .filter(|v| !v.0.is_empty())
             .cloned()
             .or_else(|| self.current_ballot.as_ref().map(|b| b.value.clone()));
@@ -1539,37 +1537,6 @@ impl BallotProtocol {
                     counter,
                 )
             }
-        } else {
-            false
-        }
-    }
-
-    fn abandon_ballot_internal(
-        &mut self,
-        counter: u32,
-        composite_candidate: Option<&Value>,
-    ) -> bool {
-        // Value priority: composite candidate, then current ballot value
-        let value = composite_candidate
-            .filter(|v| !v.0.is_empty())
-            .cloned()
-            .or_else(|| self.current_ballot.as_ref().map(|b| b.value.clone()));
-
-        if let Some(value) = value {
-            self.bump_to_ballot(
-                &ScpBallot {
-                    counter: if counter == 0 {
-                        self.current_ballot
-                            .as_ref()
-                            .map(|b| b.counter + 1)
-                            .unwrap_or(1)
-                    } else {
-                        counter
-                    },
-                    value,
-                },
-                true,
-            )
         } else {
             false
         }
@@ -2428,14 +2395,26 @@ impl BallotProtocol {
     ///
     /// This is a public wrapper around the internal abandon logic,
     /// used when we need to give up on the current ballot and try a new one.
+    /// Properly emits envelopes and checks heard-from-quorum via `bump_state`.
     ///
     /// # Arguments
     /// * `counter` - The counter for the new ballot (0 to auto-increment)
+    /// * `local_node_id` - The local node's identifier
+    /// * `local_quorum_set` - The local node's quorum set
+    /// * `driver` - The SCP driver
+    /// * `slot_index` - The slot index
     ///
     /// # Returns
     /// True if the ballot was abandoned successfully.
-    pub fn abandon_ballot_public(&mut self, counter: u32) -> bool {
-        self.abandon_ballot(counter)
+    pub fn abandon_ballot_public<D: SCPDriver>(
+        &mut self,
+        counter: u32,
+        local_node_id: &NodeId,
+        local_quorum_set: &ScpQuorumSet,
+        driver: &Arc<D>,
+        slot_index: u64,
+    ) -> bool {
+        self.abandon_ballot(counter, local_node_id, local_quorum_set, driver, slot_index)
     }
 }
 
@@ -3999,11 +3978,11 @@ mod tests {
         assert_eq!(ballot.current_ballot().map(|b| b.counter), Some(1));
 
         // Abandon to counter 5
-        assert!(ballot.abandon_ballot_public(5));
+        assert!(ballot.abandon_ballot_public(5, &node, &quorum_set, &driver, 1));
         assert_eq!(ballot.current_ballot().map(|b| b.counter), Some(5));
 
         // Abandon with counter 0 should auto-increment
-        assert!(ballot.abandon_ballot_public(0));
+        assert!(ballot.abandon_ballot_public(0, &node, &quorum_set, &driver, 1));
         assert_eq!(ballot.current_ballot().map(|b| b.counter), Some(6));
     }
 
@@ -4476,6 +4455,9 @@ mod tests {
     /// then falls back to mCurrentBallot->value.
     #[test]
     fn test_abandon_ballot_uses_composite_candidate() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(BallotParityDriver::new(quorum_set.clone()));
         let mut bp = BallotProtocol::new();
         let value_current = make_value(&[1]);
         let value_composite = make_value(&[99]);
@@ -4491,7 +4473,7 @@ mod tests {
         bp.set_composite_candidate(Some(value_composite.clone()));
 
         // Abandon should use composite candidate value
-        assert!(bp.abandon_ballot(0));
+        assert!(bp.abandon_ballot_public(0, &node, &quorum_set, &driver, 1));
         assert_eq!(
             bp.current_ballot.as_ref().unwrap().value,
             value_composite,
@@ -4503,6 +4485,9 @@ mod tests {
     /// B-abandon parity test: abandon_ballot falls back to current ballot value.
     #[test]
     fn test_abandon_ballot_falls_back_to_current_value() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(BallotParityDriver::new(quorum_set.clone()));
         let mut bp = BallotProtocol::new();
         let value_current = make_value(&[1]);
 
@@ -4514,7 +4499,7 @@ mod tests {
         bp.value = Some(value_current.clone());
 
         // No composite candidate set
-        assert!(bp.abandon_ballot(0));
+        assert!(bp.abandon_ballot_public(0, &node, &quorum_set, &driver, 1));
         assert_eq!(
             bp.current_ballot.as_ref().unwrap().value,
             value_current,
@@ -4526,6 +4511,9 @@ mod tests {
     /// B-abandon parity test: abandon_ballot with specific counter.
     #[test]
     fn test_abandon_ballot_with_specific_counter() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(BallotParityDriver::new(quorum_set.clone()));
         let mut bp = BallotProtocol::new();
         let value_current = make_value(&[1]);
 
@@ -4536,7 +4524,7 @@ mod tests {
         bp.value = Some(value_current.clone());
 
         // Abandon with specific counter
-        assert!(bp.abandon_ballot(10));
+        assert!(bp.abandon_ballot_public(10, &node, &quorum_set, &driver, 1));
         assert_eq!(
             bp.current_ballot.as_ref().unwrap().counter,
             10,

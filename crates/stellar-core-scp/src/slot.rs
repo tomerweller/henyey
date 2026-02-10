@@ -699,13 +699,20 @@ impl Slot {
     /// for example when we detect that consensus cannot be reached.
     ///
     /// # Arguments
+    /// * `driver` - The SCP driver
     /// * `counter` - The counter for the new ballot (0 to auto-increment)
     ///
     /// # Returns
     /// True if the ballot was abandoned successfully.
-    pub fn abandon_ballot(&mut self, counter: u32) -> bool {
+    pub fn abandon_ballot<D: SCPDriver>(&mut self, driver: &Arc<D>, counter: u32) -> bool {
         self.sync_composite_candidate();
-        self.ballot.abandon_ballot_public(counter)
+        self.ballot.abandon_ballot_public(
+            counter,
+            &self.local_node_id,
+            &self.local_quorum_set,
+            driver,
+            self.slot_index,
+        )
     }
 
     /// Bump the ballot to a specific counter value.
@@ -733,6 +740,21 @@ impl Slot {
             self.slot_index,
             value,
             counter,
+        )
+    }
+
+    /// Force-bump the ballot state, auto-computing the counter.
+    ///
+    /// This mirrors C++ `BallotProtocol::bumpState(value, force=true)`.
+    /// Counter is `current_counter + 1`, or 1 if no current ballot.
+    pub fn force_bump_state<D: SCPDriver>(&mut self, driver: &Arc<D>, value: Value) -> bool {
+        self.ballot.bump(
+            &self.local_node_id,
+            &self.local_quorum_set,
+            driver,
+            self.slot_index,
+            value,
+            true,
         )
     }
 
@@ -1022,6 +1044,45 @@ mod tests {
 
     #[test]
     fn test_abandon_ballot() {
+        use crate::driver::{SCPDriver, ValidationLevel};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        struct AbandonDriver;
+        impl SCPDriver for AbandonDriver {
+            fn validate_value(&self, _: u64, _: &Value, _: bool) -> ValidationLevel {
+                ValidationLevel::FullyValidated
+            }
+            fn combine_candidates(&self, _: u64, _: &[Value]) -> Option<Value> {
+                None
+            }
+            fn extract_valid_value(&self, _: u64, _: &Value) -> Option<Value> {
+                None
+            }
+            fn emit_envelope(&self, _: &ScpEnvelope) {}
+            fn get_quorum_set(&self, _: &NodeId) -> Option<ScpQuorumSet> {
+                None
+            }
+            fn nominating_value(&self, _: u64, _: &Value) {}
+            fn value_externalized(&self, _: u64, _: &Value) {}
+            fn ballot_did_prepare(&self, _: u64, _: &stellar_xdr::curr::ScpBallot) {}
+            fn ballot_did_confirm(&self, _: u64, _: &stellar_xdr::curr::ScpBallot) {}
+            fn compute_hash_node(&self, _: u64, _: &Value, _: bool, _: u32, _: &NodeId) -> u64 {
+                0
+            }
+            fn compute_value_hash(&self, _: u64, _: &Value, _: u32, _: &Value) -> u64 {
+                0
+            }
+            fn compute_timeout(&self, _: u32, _: bool) -> Duration {
+                Duration::from_secs(1)
+            }
+            fn sign_envelope(&self, _: &mut ScpEnvelope) {}
+            fn verify_envelope(&self, _: &ScpEnvelope) -> bool {
+                true
+            }
+        }
+        let driver = Arc::new(AbandonDriver);
+
         let node = make_node_id(1);
         let quorum_set = make_quorum_set();
         let mut slot = Slot::new(1, node.clone(), quorum_set.clone(), true);
@@ -1051,11 +1112,11 @@ mod tests {
         slot.set_state_from_envelope(&envelope);
 
         // Abandon to counter 5
-        assert!(slot.abandon_ballot(5));
+        assert!(slot.abandon_ballot(&driver, 5));
         assert_eq!(slot.ballot().current_ballot().map(|b| b.counter), Some(5));
 
         // Abandon with auto-increment
-        assert!(slot.abandon_ballot(0));
+        assert!(slot.abandon_ballot(&driver, 0));
         assert_eq!(slot.ballot().current_ballot().map(|b| b.counter), Some(6));
     }
 

@@ -616,7 +616,7 @@ impl<D: SCPDriver> SCP<D> {
     /// True if the ballot was abandoned successfully.
     pub fn abandon_ballot(&self, slot_index: u64, counter: u32) -> bool {
         if let Some(slot) = self.slots.write().get_mut(&slot_index) {
-            slot.abandon_ballot(counter)
+            slot.abandon_ballot(&self.driver, counter)
         } else {
             false
         }
@@ -632,11 +632,43 @@ impl<D: SCPDriver> SCP<D> {
     /// # Returns
     /// True if the ballot was bumped, false if the operation failed.
     pub fn bump_state(&self, slot_index: u64, value: Value, counter: u32) -> bool {
-        if let Some(slot) = self.slots.write().get_mut(&slot_index) {
-            slot.bump_state(&self.driver, value, counter)
-        } else {
-            false
-        }
+        let mut slots = self.slots.write();
+        let slot = slots.entry(slot_index).or_insert_with(|| {
+            Slot::new(
+                slot_index,
+                self.local_node_id.clone(),
+                self.local_quorum_set.clone(),
+                self.is_validator,
+            )
+        });
+        slot.bump_state(&self.driver, value, counter)
+    }
+
+    /// Force-bump the ballot state for a slot, auto-computing the counter.
+    ///
+    /// This mirrors the C++ `bumpState(slotIndex, value)` which calls
+    /// `BallotProtocol::bumpState(value, force=true)`. The counter is
+    /// automatically set to `current_counter + 1` (or 1 if no current ballot).
+    ///
+    /// Creates the slot if it doesn't already exist.
+    ///
+    /// # Arguments
+    /// * `slot_index` - The slot to bump
+    /// * `value` - The value for the ballot
+    ///
+    /// # Returns
+    /// True if the ballot was bumped, false if the operation failed.
+    pub fn force_bump_state(&self, slot_index: u64, value: Value) -> bool {
+        let mut slots = self.slots.write();
+        let slot = slots.entry(slot_index).or_insert_with(|| {
+            Slot::new(
+                slot_index,
+                self.local_node_id.clone(),
+                self.local_quorum_set.clone(),
+                self.is_validator,
+            )
+        });
+        slot.force_bump_state(&self.driver, value)
     }
 
     /// Get nodes that are missing from consensus for a slot.
