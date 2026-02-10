@@ -447,8 +447,10 @@ impl Slot {
         // Check if nomination has produced a composite value
         let composite = self.nomination.latest_composite().cloned();
         if let Some(composite) = composite {
-            // Stop nomination and cancel nomination timer
-            self.nomination.stop();
+            // C++ does NOT stop nomination here — nomination continues to run
+            // alongside the ballot protocol. stopNomination() is only called
+            // when the slot is externalized (from setConfirmCommit).
+            // Stop the nomination timer though (candidates already confirmed).
             driver.stop_timer(self.slot_index, crate::driver::SCPTimerType::Nomination);
 
             // Notify driver that ballot protocol is starting
@@ -545,6 +547,14 @@ impl Slot {
     /// Returns the set of nodes that are leaders for the current nomination round.
     pub fn get_nomination_leaders(&self) -> std::collections::HashSet<NodeId> {
         self.nomination.get_round_leaders().clone()
+    }
+
+    /// Get the latest composite candidate value for this slot.
+    ///
+    /// Returns the most recently computed composite value from the nomination protocol.
+    /// Matches C++ `Slot::getLatestCompositeCandidate()`.
+    pub fn get_latest_composite_candidate(&self) -> Option<Value> {
+        self.nomination.latest_composite().cloned()
     }
 
     /// Get the externalizing state for this slot.

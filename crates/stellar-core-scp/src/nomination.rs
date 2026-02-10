@@ -426,51 +426,11 @@ impl NominationProtocol {
         let mut state_changed = false;
 
         if self.started {
-            let mut modified = false;
-            let mut new_candidates = false;
+            // Collect the votes from the envelope for acceptance checks.
+            let votes_to_check: Vec<Value> = nomination.votes.iter().cloned().collect();
 
-            // Attempt to promote votes to accepted.
-            for value in nomination.votes.iter() {
-                if self.accepted.contains(value) {
-                    continue;
-                }
-
-                if self.should_accept_value(value, local_quorum_set, driver, slot_index) {
-                    match driver.validate_value(slot_index, value, true) {
-                        ValidationLevel::FullyValidated => {
-                            if Self::insert_unique(&mut self.accepted, value.clone()) {
-                                Self::insert_unique(&mut self.votes, value.clone());
-                                modified = true;
-                            }
-                        }
-                        ValidationLevel::MaybeValid => {
-                            if let Some(extracted) = driver.extract_valid_value(slot_index, value) {
-                                if Self::insert_unique(&mut self.votes, extracted) {
-                                    modified = true;
-                                }
-                            }
-                        }
-                        ValidationLevel::Invalid => {}
-                    }
-                }
-            }
-
-            // Attempt to promote accepted values to candidates.
-            for value in self.accepted.clone() {
-                if self.candidates.contains(&value) {
-                    continue;
-                }
-
-                if self.should_ratify_value(&value, local_quorum_set, driver)
-                    && Self::insert_unique(&mut self.candidates, value.clone())
-                {
-                    new_candidates = true;
-                    // N12: Stop the nomination timer when candidates are confirmed.
-                    // C++ (line 471-472): "Stop the timer, as there's no need to
-                    // continue nominating" per the whitepaper.
-                    driver.stop_timer(slot_index, crate::driver::SCPTimerType::Nomination);
-                }
-            }
+            let (mut modified, new_candidates) =
+                self.attempt_promote(&votes_to_check, local_quorum_set, driver, slot_index);
 
             // N13: Only take round leader votes if we're still looking for
             // candidates (C++ processEnvelope lines 476-489).
@@ -566,7 +526,88 @@ impl NominationProtocol {
         }
     }
 
+    /// Attempt to promote votes to accepted and accepted to candidates.
+    ///
+    /// This is the core acceptance/ratification logic extracted from
+    /// `process_envelope` so it can also be called from `emit_nomination`
+    /// (matching C++ where `emitNomination()` calls `processEnvelope(self)`).
+    ///
+    /// The `votes_to_check` parameter specifies which voted values to check
+    /// for acceptance. In C++, `processEnvelope` iterates `nom.votes` from
+    /// the envelope being processed — when called from `emitNomination`, those
+    /// are our own votes.
+    ///
+    /// # Returns
+    /// `(modified, new_candidates)` — whether votes/accepted changed, and
+    /// whether new candidates were confirmed.
+    fn attempt_promote<D: SCPDriver>(
+        &mut self,
+        votes_to_check: &[Value],
+        local_quorum_set: &ScpQuorumSet,
+        driver: &Arc<D>,
+        slot_index: u64,
+    ) -> (bool, bool) {
+        let mut modified = false;
+        let mut new_candidates = false;
+
+        // Attempt to promote votes to accepted.
+        for value in votes_to_check {
+            if self.accepted.contains(value) {
+                continue;
+            }
+
+            if self.should_accept_value(value, local_quorum_set, driver, slot_index) {
+                match driver.validate_value(slot_index, value, true) {
+                    ValidationLevel::FullyValidated => {
+                        if Self::insert_unique(&mut self.accepted, value.clone()) {
+                            Self::insert_unique(&mut self.votes, value.clone());
+                            modified = true;
+                        }
+                    }
+                    ValidationLevel::MaybeValid => {
+                        if let Some(extracted) = driver.extract_valid_value(slot_index, value) {
+                            if Self::insert_unique(&mut self.votes, extracted) {
+                                modified = true;
+                            }
+                        }
+                    }
+                    ValidationLevel::Invalid => {}
+                }
+            }
+        }
+
+        // Attempt to promote accepted values to candidates.
+        for value in self.accepted.clone() {
+            if self.candidates.contains(&value) {
+                continue;
+            }
+
+            if self.should_ratify_value(&value, local_quorum_set, driver)
+                && Self::insert_unique(&mut self.candidates, value.clone())
+            {
+                new_candidates = true;
+                // N12: Stop the nomination timer when candidates are confirmed.
+                driver.stop_timer(slot_index, crate::driver::SCPTimerType::Nomination);
+            }
+        }
+
+        (modified, new_candidates)
+    }
+
     /// Emit a nomination envelope.
+    ///
+    /// Matches C++ `emitNomination()` which creates the self-envelope then
+    /// calls `processEnvelope(self)` to re-run acceptance/ratification checks.
+    /// This can cascade: if acceptance modifies state, we emit again, and the
+    /// `isNewerStatement` check prevents duplicate emissions.
+    ///
+    /// C++ flow:
+    /// 1. Create envelope from current votes/accepted
+    /// 2. `processEnvelope(self)` — records envelope, runs acceptance/ratification,
+    ///    may recursively call `emitNomination()` (updating `mLastEnvelope`)
+    /// 3. AFTER processEnvelope returns, check `isNewerStatement` against
+    ///    `mLastEnvelope` (which the recursive call may have already updated)
+    /// 4. Only set `mLastEnvelope` and emit if still newer
     fn emit_nomination<D: SCPDriver>(
         &mut self,
         local_node_id: &NodeId,
@@ -578,14 +619,14 @@ impl NominationProtocol {
         let accepted = self.sorted_values(&self.accepted);
         let nomination = ScpNomination {
             quorum_set_hash: hash_quorum_set(local_quorum_set).into(),
-            votes: votes.try_into().unwrap_or_default(),
+            votes: votes.clone().try_into().unwrap_or_default(),
             accepted: accepted.try_into().unwrap_or_default(),
         };
 
         let statement = ScpStatement {
             node_id: local_node_id.clone(),
             slot_index,
-            pledges: ScpStatementPledges::Nominate(nomination),
+            pledges: ScpStatementPledges::Nominate(nomination.clone()),
         };
 
         let mut envelope = ScpEnvelope {
@@ -594,27 +635,52 @@ impl NominationProtocol {
         };
 
         driver.sign_envelope(&mut envelope);
-        if self.record_local_nomination(local_node_id, &statement, envelope.clone()) {
-            self.last_envelope = Some(envelope.clone());
-            self.send_latest_envelope(driver);
-        }
-    }
 
-    fn send_latest_envelope<D: SCPDriver>(&mut self, driver: &Arc<D>) {
-        if !self.fully_validated {
+        // Step 1: Record the envelope (C++ recordEnvelope inside processEnvelope).
+        // This stores in latest_nominations so quorum checks see our own state.
+        if !self.record_local_nomination(local_node_id, &statement, envelope.clone()) {
             return;
         }
 
-        let Some(envelope) = self.last_envelope.as_ref() else {
-            return;
+        // Step 2: Run self-processing (C++ processEnvelope body).
+        // This may recursively call emit_nomination, updating last_envelope.
+        if self.started {
+            let (modified, new_candidates) =
+                self.attempt_promote(&votes, local_quorum_set, driver, slot_index);
+
+            if modified {
+                // Cascade: C++ emitNomination -> processEnvelope -> emitNomination
+                self.emit_nomination(local_node_id, local_quorum_set, driver, slot_index);
+            }
+
+            if new_candidates {
+                self.update_composite(driver, slot_index);
+            }
+        }
+
+        // Step 3: After self-processing (and any recursive emitNomination calls),
+        // check if our envelope is still newer than last_envelope.
+        // C++: if (!mLastEnvelope || isNewerStatement(mLastEnvelope->nom, st.nom))
+        let is_newer = match &self.last_envelope {
+            None => true,
+            Some(last) => {
+                if let ScpStatementPledges::Nominate(last_nom) = &last.statement.pledges {
+                    self.is_newer_nomination(last_nom, &nomination)
+                } else {
+                    true
+                }
+            }
         };
 
-        if self.last_envelope_emit.as_ref() == Some(envelope) {
-            return;
+        if is_newer {
+            self.last_envelope = Some(envelope.clone());
+            if self.fully_validated {
+                if self.last_envelope_emit.as_ref() != Some(&envelope) {
+                    self.last_envelope_emit = Some(envelope.clone());
+                    driver.emit_envelope(&envelope);
+                }
+            }
         }
-
-        self.last_envelope_emit = Some(envelope.clone());
-        driver.emit_envelope(envelope);
     }
 
     fn record_local_nomination(
@@ -1250,7 +1316,10 @@ mod tests {
     #[test]
     fn test_nomination_timeout_requires_start() {
         let node = make_node_id(1);
-        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let node2 = make_node_id(2);
+        // Use a 2-of-2 quorum set so self-processing alone can't form quorum
+        // (prevents immediate acceptance/ratification that would fill candidates).
+        let quorum_set = make_quorum_set(vec![node.clone(), node2.clone()], 2);
         let driver = Arc::new(MockDriver::new(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
         let value = make_value(&[4]);
@@ -2060,8 +2129,13 @@ mod tests {
     /// for the stripped version.
     #[test]
     fn test_upgrade_stripping_after_timeout_limit() {
-        let node = make_node_id(1);
-        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        // Use seed=2 for local node so it wins round leader priority over node2.
+        // ParityMockDriver's compute_hash_node gives seed=2 priority 20568 vs seed=1's 12649.
+        let node = make_node_id(2);
+        let node2 = make_node_id(1);
+        // Use a 2-of-2 quorum set so self-processing alone can't form quorum
+        // (prevents immediate acceptance/ratification that would fill candidates).
+        let quorum_set = make_quorum_set(vec![node.clone(), node2.clone()], 2);
         let driver = Arc::new(ParityMockDriver::new(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
 
@@ -2202,7 +2276,10 @@ mod tests {
         // no candidates). The slot-level timer setup check happens in
         // slot.rs, so here we just verify the preconditions.
         let node = make_node_id(1);
-        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let node2 = make_node_id(2);
+        // Use a 2-of-2 quorum set so self-processing alone can't form quorum
+        // (prevents immediate acceptance/ratification that would fill candidates).
+        let quorum_set = make_quorum_set(vec![node.clone(), node2.clone()], 2);
         let driver = Arc::new(MockDriver::new(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
 

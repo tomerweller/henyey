@@ -769,6 +769,29 @@ impl<D: SCPDriver> SCP<D> {
         envelopes
     }
 
+    /// Get the nomination leaders for a slot.
+    ///
+    /// Returns the set of nodes that are leaders for the current nomination round.
+    /// Matches C++ `getNominationLeaders(slotIndex)` on the TestSCP wrapper.
+    pub fn get_nomination_leaders(&self, slot_index: u64) -> std::collections::HashSet<NodeId> {
+        let slots = self.slots.read();
+        slots
+            .get(&slot_index)
+            .map(|slot| slot.get_nomination_leaders())
+            .unwrap_or_default()
+    }
+
+    /// Get the latest composite candidate value for a slot.
+    ///
+    /// Returns the most recently computed composite value from the nomination protocol.
+    /// Matches C++ `getLatestCompositeCandidate(slotIndex)`.
+    pub fn get_latest_composite_candidate(&self, slot_index: u64) -> Option<Value> {
+        let slots = self.slots.read();
+        slots
+            .get(&slot_index)
+            .and_then(|slot| slot.get_latest_composite_candidate())
+    }
+
     /// Get JSON-serializable information for a slot.
     ///
     /// Returns slot info that can be serialized to JSON for debugging
