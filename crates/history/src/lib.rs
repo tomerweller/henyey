@@ -145,7 +145,7 @@ pub use paths::{
 pub use publish_queue::{PublishQueue, PublishQueueStats};
 pub use publish::build_history_archive_state;
 pub use remote_archive::{RemoteArchive, RemoteArchiveConfig};
-pub use replay::{LedgerReplayResult, ReplayConfig, ReplayedLedgerState};
+pub use replay::{ReplayConfig, ReplayedLedgerState};
 pub use verify::{compute_header_hash, verify_bucket_hash, verify_header_chain};
 
 /// Result type for history operations.
@@ -377,77 +377,14 @@ impl std::fmt::Display for CatchupResult {
     }
 }
 
-/// Complete output of a catchup operation, including state needed for initialization.
+/// Complete output of a catchup operation.
 ///
-/// This contains everything needed to initialize the ledger manager after catchup:
-/// - The bucket list representing current ledger state
-/// - The ledger header for the target ledger
-/// - Statistics about the catchup process
-///
-/// # Protocol 23+ Changes
-///
-/// Starting with protocol 23, Stellar introduced state archival. The ledger state is
-/// now split into:
-/// - **Live bucket list**: Active entries that can be accessed by transactions
-/// - **Hot archive bucket list**: Recently evicted entries that can be restored
-///
-/// The bucket list hash in the ledger header is computed as:
-/// `SHA256(live_hash || hot_archive_hash)` for protocol 23+.
+/// The `LedgerManager` is initialized directly inside the catchup pipeline,
+/// so this struct only carries summary statistics. The caller can query
+/// the `LedgerManager` for the current header, bucket lists, etc.
 pub struct CatchupOutput {
     /// Summary statistics of the catchup operation.
     pub result: CatchupResult,
-
-    /// The live bucket list state at the target ledger.
-    ///
-    /// This contains all active ledger entries (accounts, trustlines, offers,
-    /// contract data, etc.) that can be accessed by transactions.
-    pub bucket_list: henyey_bucket::BucketList,
-
-    /// The hot archive bucket list state.
-    ///
-    /// Contains recently evicted persistent entries that can be restored
-    /// via the `RestoreFootprint` operation. Empty for pre-Protocol 23 ledgers.
-    pub hot_archive_bucket_list: henyey_bucket::HotArchiveBucketList,
-
-    /// The ledger header at the target ledger.
-    ///
-    /// This header has been verified to match the downloaded state.
-    pub header: stellar_xdr::curr::LedgerHeader,
-
-    /// The pre-computed hash of the ledger header.
-    ///
-    /// This is the authoritative hash from the history archive, which should be
-    /// used instead of re-computing the hash from the header. Using the archive's
-    /// hash ensures consistency with what the network actually recorded.
-    pub header_hash: henyey_common::Hash256,
-
-    /// Pre-computed cache data from a background bucket list scan.
-    ///
-    /// When present, this can be passed to `LedgerManager::initialize_with_cache`
-    /// to skip the ~83 second synchronous cache initialization. The scan runs
-    /// concurrently with merge restarts during catchup.
-    pub cache_data: Option<henyey_ledger::CacheInitResult>,
-}
-
-impl CatchupOutput {
-    /// Compute the combined bucket list hash for verification.
-    ///
-    /// This is SHA256(live_hash || hot_archive_hash). For empty hot archives,
-    /// the hash is the SHA256 of all zeros.
-    pub fn combined_bucket_list_hash(&self) -> henyey_common::Hash256 {
-        use sha2::{Digest, Sha256};
-
-        let live_hash = self.bucket_list.hash();
-        let hot_hash = self.hot_archive_bucket_list.hash();
-
-        let mut hasher = Sha256::new();
-        hasher.update(live_hash.as_bytes());
-        hasher.update(hot_hash.as_bytes());
-        let result = hasher.finalize();
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&result);
-        henyey_common::Hash256::from_bytes(bytes)
-    }
 }
 
 /// Testnet archive configuration.

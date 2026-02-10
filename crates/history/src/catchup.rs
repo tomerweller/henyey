@@ -51,7 +51,7 @@ use crate::{
     archive_state::HistoryArchiveState,
     catchup_range::{CatchupMode, CatchupRange},
     checkpoint,
-    replay::{self, LedgerReplayResult, ReplayConfig, ReplayedLedgerState},
+    replay::ReplayConfig,
     verify, CatchupOutput, CatchupResult, HistoryError, Result,
 };
 use std::collections::HashMap;
@@ -60,10 +60,11 @@ use henyey_bucket::{Bucket, BucketList, BucketManager, HasNextState, HotArchiveB
 use henyey_common::{Hash256, NetworkId};
 use henyey_db::Database;
 
-use henyey_ledger::TransactionSetVariant;
+use henyey_ledger::{LedgerCloseData, LedgerManager, TransactionSetVariant};
 use henyey_tx::TransactionFrame;
 use stellar_xdr::curr::{
-    GeneralizedTransactionSet, LedgerEntryData, LedgerHeader, LedgerHeaderHistoryEntry,
+    GeneralizedTransactionSet, LedgerHeader, LedgerHeaderHistoryEntry,
+    LedgerUpgrade, Limits, ReadXdr,
     ScpHistoryEntry, TransactionHistoryEntry, TransactionHistoryEntryExt,
     TransactionHistoryResultEntry, TransactionHistoryResultEntryExt,
     TransactionResultPair, TransactionResultSet, TransactionSet, TransactionSetV1, WriteXdr,
@@ -203,14 +204,16 @@ pub struct CheckpointData {
 /// use henyey_history::{CatchupManager, archive::HistoryArchive};
 /// use henyey_bucket::BucketManager;
 /// use henyey_db::Database;
+/// use henyey_ledger::{LedgerManager, LedgerManagerConfig};
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let archive = HistoryArchive::new("https://history.stellar.org/prd/core-testnet/core_testnet_001")?;
 /// let bucket_manager = BucketManager::new("/tmp/buckets".into())?;
 /// let db = Database::open("/tmp/stellar.db")?;
+/// let ledger_manager = LedgerManager::new("Test SDF Network ; September 2015".to_string(), LedgerManagerConfig::default());
 ///
 /// let mut manager = CatchupManager::new(vec![archive], bucket_manager, db);
-/// let output = manager.catchup_to_ledger(1000000).await?;
+/// let output = manager.catchup_to_ledger(1000000, &ledger_manager).await?;
 ///
 /// println!("Caught up to ledger {}", output.result.ledger_seq);
 /// # Ok(())
@@ -229,18 +232,10 @@ pub struct ExistingBucketState {
     pub bucket_list: BucketList,
     /// The hot archive bucket list at the current LCL.
     pub hot_archive_bucket_list: HotArchiveBucketList,
-    /// The ledger header at the current LCL (needed for `id_pool`).
+    /// The ledger header at the current LCL.
     pub header: LedgerHeader,
     /// The network ID for transaction verification.
     pub network_id: NetworkId,
-    /// Pre-computed Soroban state size from the ledger manager.
-    /// When `Some`, `replay_ledgers` skips the expensive bucket list scan
-    /// (~80s on mainnet) and uses this value directly.
-    pub soroban_state_size: Option<u64>,
-    /// Pre-computed offer entries from the ledger manager's in-memory offer store.
-    /// Required for correct offer matching during replay (ManageSellOffer, PathPayment, etc.).
-    /// Without this, the replay executor starts with an empty order book and offer crossing fails.
-    pub offer_entries: Option<Vec<stellar_xdr::curr::LedgerEntry>>,
 }
 
 /// # Thread Safety
@@ -321,7 +316,11 @@ impl CatchupManager {
     /// # Returns
     ///
     /// A `CatchupOutput` containing the bucket list, header, and summary information.
-    pub async fn catchup_to_ledger(&mut self, target: u32) -> Result<CatchupOutput> {
+    pub async fn catchup_to_ledger(
+        &mut self,
+        target: u32,
+        ledger_manager: &LedgerManager,
+    ) -> Result<CatchupOutput> {
         info!("Starting catchup to ledger {}", target);
         self.progress.target_ledger = target;
 
@@ -375,18 +374,30 @@ impl CatchupManager {
         let (mut bucket_list, mut hot_archive_bucket_list, live_next_states, hot_next_states) =
             self.apply_buckets(&has, &buckets).await?;
 
-        // Restart merges and scan caches in parallel.
-        let cache_data = self
-            .restart_merges_and_scan_caches(
-                &mut bucket_list,
-                &mut hot_archive_bucket_list,
-                checkpoint_seq,
-                &live_next_states,
-                &hot_next_states,
-            )
-            .await?;
+        // Restart merges.
+        self.restart_merges(
+            &mut bucket_list,
+            &mut hot_archive_bucket_list,
+            checkpoint_seq,
+            &live_next_states,
+            &hot_next_states,
+        )
+        .await?;
 
         self.persist_bucket_list_snapshot(checkpoint_seq, &bucket_list)?;
+
+        // Initialize the LedgerManager at the checkpoint state.
+        let (checkpoint_header, checkpoint_hash) =
+            self.download_checkpoint_header(checkpoint_seq).await?;
+
+        if ledger_manager.is_initialized() {
+            ledger_manager.reset();
+        }
+        ledger_manager
+            .initialize(bucket_list, hot_archive_bucket_list, checkpoint_header.clone(), checkpoint_hash)
+            .map_err(|e| {
+                HistoryError::CatchupFailed(format!("Failed to initialize ledger manager: {}", e))
+            })?;
 
         // Step 5: Download ledger data from checkpoint to target
         self.update_progress(
@@ -406,63 +417,20 @@ impl CatchupManager {
             .map(|p| NetworkId::from_passphrase(p))
             .unwrap_or_else(NetworkId::testnet);
 
-        // Step 7: Replay ledgers from checkpoint to target (if any)
+        // Step 7: Replay ledgers from checkpoint to target using close_ledger
         self.update_progress(CatchupStatus::Replaying, 6, "Replaying ledgers");
 
         let (final_header, final_hash, ledgers_applied) = if ledger_data.is_empty() {
-            // Catching up to exactly a checkpoint - download and use the checkpoint header
-            // Use the archive's pre-computed hash - it's the authoritative hash the network used
-            info!(
-                "Catching up to checkpoint {} (no ledgers to replay)",
-                checkpoint_seq
-            );
-            let (checkpoint_header, header_hash) =
-                self.download_checkpoint_header(checkpoint_seq).await?;
-            (checkpoint_header, header_hash, 0)
+            (checkpoint_header, checkpoint_hash, 0)
         } else {
-            // Replay ledgers to reach target.
-            // First download the checkpoint header to get the starting id_pool.
-            let (checkpoint_header, _) =
-                self.download_checkpoint_header(checkpoint_seq).await?;
-            let checkpoint_id_pool = checkpoint_header.id_pool;
-
-            // Extract offers from cache_data for correct offer matching during replay.
-            let replay_offers: Vec<stellar_xdr::curr::LedgerEntry> =
-                cache_data.offers.values().cloned().collect();
-
-            let final_state = self
-                .replay_ledgers(
-                    &mut bucket_list,
-                    &mut hot_archive_bucket_list,
-                    &ledger_data,
-                    network_id,
-                    checkpoint_id_pool,
-                    None,
-                    Some(replay_offers),
-                )
-                .await?;
             let ledgers_applied = target - checkpoint_seq;
-            // Get the final header from replay - use archive's hash if available
-            let (final_header, final_hash) = match self.download_checkpoint_header(target).await {
-                Ok((header, hash)) => (header, hash),
-                Err(_) => {
-                    // Construct a minimal header from replay state if download fails
-                    warn!("Could not download final header, using replay state");
-                    let header = create_header_from_replay_state(
-                        &final_state,
-                        &bucket_list,
-                        &hot_archive_bucket_list,
-                    );
-                    // Fall back to the replay-computed hash
-                    (header, final_state.ledger_hash)
-                }
-            };
+            self.replay_via_close_ledger(ledger_manager, &ledger_data).await?;
+
+            // Get the final header from the ledger manager (already at target state)
+            let final_header = ledger_manager.current_header();
+            let final_hash = ledger_manager.current_header_hash();
             (final_header, final_hash, ledgers_applied)
         };
-
-        // Verify the final state matches expected bucket list hash
-        // Verify final state - bucket list hash must match the header
-        self.verify_final_state(&final_header, &bucket_list, &hot_archive_bucket_list)?;
 
         self.persist_ledger_history(&ledger_data, &network_id)?;
         if ledger_data.is_empty() {
@@ -484,11 +452,6 @@ impl CatchupManager {
                 ledgers_applied,
                 buckets_downloaded: buckets_total,
             },
-            bucket_list,
-            hot_archive_bucket_list,
-            header: final_header,
-            header_hash: final_hash,
-            cache_data: Some(cache_data),
         })
     }
 
@@ -515,6 +478,7 @@ impl CatchupManager {
         mode: CatchupMode,
         lcl: u32,
         existing_state: Option<ExistingBucketState>,
+        ledger_manager: &LedgerManager,
     ) -> Result<CatchupOutput> {
         info!(
             "Starting catchup to ledger {} with mode {:?}, lcl={}",
@@ -532,100 +496,104 @@ impl CatchupManager {
             range.replay_count()
         );
 
-        // Track whether this is a Case 1 replay-from-existing-state (LCL > genesis, no buckets)
-        let is_replay_from_existing = !range.apply_buckets() && existing_state.is_some();
-        // Extract the LCL header's id_pool before consuming existing_state
-        let existing_id_pool = existing_state.as_ref().map(|s| s.header.id_pool);
-        // Extract pre-computed Soroban state size (avoids ~80s bucket scan during replay)
-        let existing_soroban_state_size = existing_state.as_ref().and_then(|s| s.soroban_state_size);
-        // Extract offer entries for correct order book during replay
-        let existing_offer_entries = existing_state.as_ref().and_then(|s| s.offer_entries.clone());
+        let checkpoint_seq = if range.apply_buckets() {
+            // Apply buckets at the calculated checkpoint
+            let bucket_apply_at = range.bucket_apply_ledger();
+            info!("Applying buckets at checkpoint {}", bucket_apply_at);
 
-        let (mut bucket_list, mut hot_archive_bucket_list, checkpoint_seq, network_id, cache_data) =
-            if range.apply_buckets() {
-                // Apply buckets at the calculated checkpoint
-                let bucket_apply_at = range.bucket_apply_ledger();
-                info!("Applying buckets at checkpoint {}", bucket_apply_at);
+            // Download HAS
+            self.update_progress(
+                CatchupStatus::DownloadingHAS,
+                1,
+                "Downloading History Archive State",
+            );
+            let has = self.download_has(bucket_apply_at).await?;
+            verify::verify_has_structure(&has)?;
+            verify::verify_has_checkpoint(&has, bucket_apply_at)?;
 
-                // Download HAS
-                self.update_progress(
-                    CatchupStatus::DownloadingHAS,
-                    1,
-                    "Downloading History Archive State",
-                );
-                let has = self.download_has(bucket_apply_at).await?;
-                verify::verify_has_structure(&has)?;
-                verify::verify_has_checkpoint(&has, bucket_apply_at)?;
+            let scp_history = self.download_scp_history(bucket_apply_at).await?;
+            if !scp_history.is_empty() {
+                verify::verify_scp_history_entries(&scp_history)?;
+                self.persist_scp_history_entries(&scp_history)?;
+            }
 
-                let scp_history = self.download_scp_history(bucket_apply_at).await?;
-                if !scp_history.is_empty() {
-                    verify::verify_scp_history_entries(&scp_history)?;
-                    self.persist_scp_history_entries(&scp_history)?;
-                }
+            // Download buckets
+            self.update_progress(
+                CatchupStatus::DownloadingBuckets,
+                2,
+                "Downloading bucket files",
+            );
+            let bucket_hashes = has.unique_bucket_hashes();
+            self.progress.buckets_total = bucket_hashes.len() as u32;
+            let buckets = self.download_buckets(&bucket_hashes).await?;
 
-                // Download buckets
-                self.update_progress(
-                    CatchupStatus::DownloadingBuckets,
-                    2,
-                    "Downloading bucket files",
-                );
-                let bucket_hashes = has.unique_bucket_hashes();
-                self.progress.buckets_total = bucket_hashes.len() as u32;
-                let buckets = self.download_buckets(&bucket_hashes).await?;
+            // Apply buckets
+            self.update_progress(
+                CatchupStatus::ApplyingBuckets,
+                3,
+                "Applying buckets to build initial state",
+            );
+            let (mut bucket_list, mut hot_archive_bucket_list, live_next_states, hot_next_states) =
+                self.apply_buckets(&has, &buckets).await?;
 
-                // Apply buckets
-                self.update_progress(
-                    CatchupStatus::ApplyingBuckets,
-                    3,
-                    "Applying buckets to build initial state",
-                );
-                let (bl, hot_bl, live_next_states, hot_next_states) =
-                    self.apply_buckets(&has, &buckets).await?;
+            // Restart merges.
+            self.restart_merges(
+                &mut bucket_list,
+                &mut hot_archive_bucket_list,
+                bucket_apply_at,
+                &live_next_states,
+                &hot_next_states,
+            )
+            .await?;
 
-                let mut bucket_list = bl;
-                let mut hot_archive_bucket_list = hot_bl;
+            self.persist_bucket_list_snapshot(bucket_apply_at, &bucket_list)?;
 
-                // Restart merges and scan caches in parallel.
-                let cache_result = self
-                    .restart_merges_and_scan_caches(
-                        &mut bucket_list,
-                        &mut hot_archive_bucket_list,
-                        bucket_apply_at,
-                        &live_next_states,
-                        &hot_next_states,
-                    )
-                    .await?;
+            // Initialize the LedgerManager at the checkpoint state.
+            let (checkpoint_header, checkpoint_hash) =
+                self.download_checkpoint_header(bucket_apply_at).await?;
 
-                self.persist_bucket_list_snapshot(bucket_apply_at, &bucket_list)?;
+            if ledger_manager.is_initialized() {
+                ledger_manager.reset();
+            }
+            ledger_manager
+                .initialize(bucket_list, hot_archive_bucket_list, checkpoint_header, checkpoint_hash)
+                .map_err(|e| {
+                    HistoryError::CatchupFailed(format!("Failed to initialize ledger manager: {}", e))
+                })?;
 
-                let network_id = has
-                    .network_passphrase
-                    .as_ref()
-                    .map(|p| NetworkId::from_passphrase(p))
-                    .unwrap_or_else(NetworkId::testnet);
-
-                (bucket_list, hot_archive_bucket_list, bucket_apply_at, network_id, Some(cache_result))
-            } else {
-                // No bucket application - we're replaying from current state
-                // This only happens when LCL > genesis (case 1)
+            bucket_apply_at
+        } else {
+            // No bucket application - Case 1: replay from current state.
+            // The LedgerManager is already initialized at the current LCL.
+            if !ledger_manager.is_initialized() {
+                // If we have existing state but ledger manager is not initialized,
+                // initialize it with the existing bucket state.
                 match existing_state {
                     Some(state) => {
                         info!(
-                            "Case 1 replay: using existing bucket lists from LCL {} to replay to target {}",
-                            lcl, target
+                            "Case 1 replay: initializing ledger manager from existing state at LCL {}",
+                            lcl
                         );
-                        // The checkpoint_seq is the LCL itself - bucket lists are at LCL state
-                        (state.bucket_list, state.hot_archive_bucket_list, lcl, state.network_id, None)
+                        let (header, hash) = self.download_checkpoint_header(lcl).await?;
+                        ledger_manager
+                            .initialize(state.bucket_list, state.hot_archive_bucket_list, header, hash)
+                            .map_err(|e| {
+                                HistoryError::CatchupFailed(format!(
+                                    "Failed to initialize ledger manager from existing state: {}",
+                                    e
+                                ))
+                            })?;
                     }
                     None => {
                         return Err(HistoryError::CatchupFailed(
-                            "Catchup from LCL > genesis requires existing bucket lists \
-                             (pass ExistingBucketState for replay-only catchup)"
+                            "Catchup from LCL > genesis requires existing bucket lists or an initialized ledger manager"
                                 .to_string(),
                         ));
                     }
                 }
-            };
+            }
+            lcl
+        };
 
         // Download ledger data for replay range
         let replay_first = range.replay_first();
@@ -647,9 +615,6 @@ impl CatchupManager {
                 "Downloading ledger data",
             );
 
-            // We need to download ledgers from replay_first to target
-            // The download_ledger_data expects (checkpoint, target) where it downloads
-            // ledgers from checkpoint+1 to target. So we need to adjust.
             let download_from_checkpoint = replay_first - 1;
             let ledger_data = self.download_ledger_data(download_from_checkpoint, target).await?;
 
@@ -657,62 +622,17 @@ impl CatchupManager {
             self.update_progress(CatchupStatus::Verifying, 5, "Verifying header chain");
             self.verify_downloaded_data(&ledger_data)?;
 
-            // Get the starting id_pool from the checkpoint before replaying.
-            // For Case 1 (replay from existing state), we already have the LCL header
-            // and don't need to download it again from the archive.
-            let checkpoint_id_pool = if is_replay_from_existing {
-                existing_id_pool.unwrap_or(0)
-            } else {
-                let (checkpoint_header, _) =
-                    self.download_checkpoint_header(download_from_checkpoint).await?;
-                checkpoint_header.id_pool
-            };
-
-            // Replay ledgers
+            // Replay ledgers via close_ledger
             self.update_progress(CatchupStatus::Replaying, 6, "Replaying ledgers");
+            self.replay_via_close_ledger(ledger_manager, &ledger_data).await?;
 
-            // Use offers from existing state (Case 1) or cache_data (Case 4).
-            let replay_offer_entries = if let Some(offers) = existing_offer_entries {
-                Some(offers)
-            } else if let Some(ref cd) = cache_data {
-                Some(cd.offers.values().cloned().collect())
-            } else {
-                None
-            };
-
-            let final_state = self
-                .replay_ledgers(
-                    &mut bucket_list,
-                    &mut hot_archive_bucket_list,
-                    &ledger_data,
-                    network_id,
-                    checkpoint_id_pool,
-                    existing_soroban_state_size,
-                    replay_offer_entries,
-                )
-                .await?;
-
-            // Get final header
-            let (final_header, final_hash) = match self.download_checkpoint_header(target).await {
-                Ok((header, hash)) => (header, hash),
-                Err(_) => {
-                    warn!("Could not download final header, using replay state");
-                    let header = create_header_from_replay_state(
-                        &final_state,
-                        &bucket_list,
-                        &hot_archive_bucket_list,
-                    );
-                    (header, final_state.ledger_hash)
-                }
-            };
-
+            let network_id = NetworkId(ledger_manager.network_id().0);
             self.persist_ledger_history(&ledger_data, &network_id)?;
 
+            let final_header = ledger_manager.current_header();
+            let final_hash = ledger_manager.current_header_hash();
             (final_header, final_hash, replay_count)
         };
-
-        // Verify final state - bucket list hash must match the header
-        self.verify_final_state(&final_header, &bucket_list, &hot_archive_bucket_list)?;
 
         if replay_count == 0 {
             self.persist_header_only(&final_header)?;
@@ -733,11 +653,6 @@ impl CatchupManager {
                 ledgers_applied,
                 buckets_downloaded: self.progress.buckets_total,
             },
-            bucket_list,
-            hot_archive_bucket_list,
-            header: final_header,
-            header_hash: final_hash,
-            cache_data,
         })
     }
 
@@ -746,6 +661,7 @@ impl CatchupManager {
         &mut self,
         target: u32,
         data: CheckpointData,
+        ledger_manager: &LedgerManager,
     ) -> Result<CatchupOutput> {
         info!("Starting catchup to ledger {} with checkpoint data", target);
         self.progress.target_ledger = target;
@@ -831,18 +747,30 @@ impl CatchupManager {
         let (mut bucket_list, mut hot_archive_bucket_list, live_next_states, hot_next_states) =
             self.apply_buckets(&data.has, &[]).await?;
 
-        // Restart merges and scan caches in parallel.
-        let cache_data = self
-            .restart_merges_and_scan_caches(
-                &mut bucket_list,
-                &mut hot_archive_bucket_list,
-                checkpoint_seq,
-                &live_next_states,
-                &hot_next_states,
-            )
-            .await?;
+        // Restart merges.
+        self.restart_merges(
+            &mut bucket_list,
+            &mut hot_archive_bucket_list,
+            checkpoint_seq,
+            &live_next_states,
+            &hot_next_states,
+        )
+        .await?;
 
         self.persist_bucket_list_snapshot(checkpoint_seq, &bucket_list)?;
+
+        // Initialize the LedgerManager at the checkpoint state.
+        let (checkpoint_header, checkpoint_hash) =
+            checkpoint_header_from_headers(checkpoint_seq, &data.headers)?;
+
+        if ledger_manager.is_initialized() {
+            ledger_manager.reset();
+        }
+        ledger_manager
+            .initialize(bucket_list, hot_archive_bucket_list, checkpoint_header.clone(), checkpoint_hash)
+            .map_err(|e| {
+                HistoryError::CatchupFailed(format!("Failed to initialize ledger manager: {}", e))
+            })?;
 
         // Step 6: Build ledger data from checkpoint files
         self.update_progress(
@@ -871,8 +799,6 @@ impl CatchupManager {
                 verify::verify_tx_result_set(header, &xdr)?;
             }
         }
-        let (checkpoint_header, checkpoint_hash) =
-            checkpoint_header_from_headers(checkpoint_seq, &data.headers)?;
         let ledger_data = if target == checkpoint_seq {
             Vec::new()
         } else {
@@ -890,49 +816,19 @@ impl CatchupManager {
             .map(|p| NetworkId::from_passphrase(p))
             .unwrap_or_else(NetworkId::testnet);
 
-        // Step 7: Replay ledgers from checkpoint to target (if any)
+        // Step 7: Replay ledgers from checkpoint to target using close_ledger
         self.update_progress(CatchupStatus::Replaying, 6, "Replaying ledgers");
 
         let (final_header, final_hash, ledgers_applied) = if ledger_data.is_empty() {
-            // Use the archive's pre-computed hash - it's the authoritative hash the network used
             (checkpoint_header, checkpoint_hash, 0)
         } else {
-            // Extract offers from cache_data for correct offer matching during replay.
-            let replay_offers: Vec<stellar_xdr::curr::LedgerEntry> =
-                cache_data.offers.values().cloned().collect();
-
-            let final_state = self
-                .replay_ledgers(
-                    &mut bucket_list,
-                    &mut hot_archive_bucket_list,
-                    &ledger_data,
-                    network_id,
-                    checkpoint_header.id_pool, // Use checkpoint's id_pool for correct offer IDs
-                    None,
-                    Some(replay_offers),
-                )
-                .await?;
             let ledgers_applied = target - checkpoint_seq;
-            // Get the final header from replay - use archive's hash if available
-            let (final_header, final_hash) = match self.download_checkpoint_header(target).await {
-                Ok((header, hash)) => (header, hash),
-                Err(_) => {
-                    // Construct a minimal header from replay state if download fails
-                    warn!("Could not download final header, using replay state");
-                    let header = create_header_from_replay_state(
-                        &final_state,
-                        &bucket_list,
-                        &hot_archive_bucket_list,
-                    );
-                    // Fall back to the replay-computed hash
-                    (header, final_state.ledger_hash)
-                }
-            };
+            self.replay_via_close_ledger(ledger_manager, &ledger_data).await?;
+
+            let final_header = ledger_manager.current_header();
+            let final_hash = ledger_manager.current_header_hash();
             (final_header, final_hash, ledgers_applied)
         };
-
-        // Verify final state - bucket list hash must match the header
-        self.verify_final_state(&final_header, &bucket_list, &hot_archive_bucket_list)?;
 
         self.persist_ledger_history(&ledger_data, &network_id)?;
         if ledger_data.is_empty() {
@@ -948,35 +844,21 @@ impl CatchupManager {
                 ledgers_applied,
                 buckets_downloaded: bucket_hashes.len() as u32,
             },
-            bucket_list,
-            hot_archive_bucket_list,
-            header: final_header,
-            header_hash: final_hash,
-            cache_data: Some(cache_data),
         })
     }
 
-    /// Restart merges and scan caches in parallel.
+    /// Restart pending bucket merges from the HAS (without cache scanning).
     ///
-    /// Runs the background cache scan concurrently with live merge restarts and
-    /// hot archive merge restarts, then returns the pre-computed cache data.
-    async fn restart_merges_and_scan_caches(
+    /// Cache initialization is handled by `LedgerManager::initialize()`.
+    async fn restart_merges(
         &self,
         bucket_list: &mut BucketList,
         hot_archive_bucket_list: &mut HotArchiveBucketList,
         checkpoint_seq: u32,
         live_next_states: &[HasNextState],
         hot_next_states: &[HasNextState],
-    ) -> Result<henyey_ledger::CacheInitResult> {
+    ) -> Result<()> {
         let protocol_version = 25u32;
-
-        // Start background cache scan BEFORE merge restarts so it runs concurrently.
-        // The scan only reads curr/snap buckets (not pending merges), so it's safe to
-        // run on a clone taken before merges start. This saves ~83 seconds on mainnet.
-        let bl_clone = bucket_list.clone();
-        let cache_handle = tokio::task::spawn_blocking(move || {
-            henyey_ledger::scan_bucket_list_for_caches(&bl_clone, protocol_version)
-        });
 
         // Run live bucket list merge restarts in parallel (all levels concurrently).
         let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
@@ -1020,10 +902,7 @@ impl CatchupManager {
             bucket_list.hash()
         );
 
-        // Await the background cache scan result.
-        cache_handle.await.map_err(|e| {
-            HistoryError::CatchupFailed(format!("Cache scan task panicked: {}", e))
-        })
+        Ok(())
     }
 
     /// Update the progress status.
@@ -1831,73 +1710,6 @@ impl CatchupManager {
         Ok(())
     }
 
-    /// Verify the final ledger state matches the expected bucket list hash.
-    ///
-    /// For Protocol 23+, the bucket list hash in the header is:
-    /// SHA256(live_bucket_list.hash() || hot_archive_bucket_list.hash())
-    fn verify_final_state(
-        &self,
-        header: &LedgerHeader,
-        bucket_list: &BucketList,
-        hot_archive_bucket_list: &HotArchiveBucketList,
-    ) -> Result<()> {
-        if !self.replay_config.verify_bucket_list {
-            info!(
-                ledger_seq = header.ledger_seq,
-                "Skipping final state verification (bucket verification disabled)"
-            );
-            return Ok(());
-        }
-
-        use sha2::{Digest, Sha256};
-
-        let live_hash = bucket_list.hash();
-        let hot_hash = hot_archive_bucket_list.hash();
-        let expected_hash = Hash256::from(header.bucket_list_hash.0);
-
-        info!(
-            ledger_seq = header.ledger_seq,
-            live_hash = %live_hash.to_hex(),
-            hot_hash = %hot_hash.to_hex(),
-            expected_combined = %expected_hash.to_hex(),
-            "Catchup verify_final_state: computing combined bucket list hash"
-        );
-
-        // Log per-level hashes for hot archive
-        for (level_idx, level) in hot_archive_bucket_list.levels().iter().enumerate().take(5) {
-            info!(
-                level = level_idx,
-                curr_hash = %level.curr.hash().to_hex(),
-                snap_hash = %level.snap.hash().to_hex(),
-                "Hot archive level hash after catchup"
-            );
-        }
-
-        let mut hasher = Sha256::new();
-        hasher.update(live_hash.as_bytes());
-        hasher.update(hot_hash.as_bytes());
-        let result = hasher.finalize();
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&result);
-        let computed_hash = Hash256::from_bytes(bytes);
-
-        info!(
-            ledger_seq = header.ledger_seq,
-            computed = %computed_hash.to_hex(),
-            expected = %expected_hash.to_hex(),
-            matches = (computed_hash == expected_hash),
-            "Catchup verify_final_state: final comparison"
-        );
-
-        verify::verify_ledger_hash(header, &computed_hash)?;
-
-        info!(
-            "Verified bucket list hash at ledger {}: {}",
-            header.ledger_seq, computed_hash
-        );
-        Ok(())
-    }
-
     fn persist_ledger_history(
         &self,
         ledger_data: &[LedgerData],
@@ -2103,26 +1915,19 @@ impl CatchupManager {
         )))
     }
 
-    /// Replay ledgers and update the bucket list.
+    /// Replay ledgers by calling `LedgerManager::close_ledger()` for each one.
     ///
-    /// # Arguments
-    ///
-    /// * `checkpoint_id_pool` - The ID pool value from the checkpoint header.
-    ///   This is the starting `id_pool` for the first ledger being replayed.
-    ///   Required for correct offer ID assignment during transaction execution.
-    #[allow(clippy::too_many_arguments)]
-    async fn replay_ledgers(
+    /// This eliminates the duplicate replay implementation and uses the same
+    /// code path as live ledger close, ensuring consistent behavior for:
+    /// - Offer store maintenance (populated by `initialize()`, updated by `close_ledger()`)
+    /// - Soroban state size tracking
+    /// - Eviction scanning
+    /// - Bucket list updates
+    async fn replay_via_close_ledger(
         &mut self,
-        bucket_list: &mut BucketList,
-        hot_archive_bucket_list: &mut HotArchiveBucketList,
+        ledger_manager: &LedgerManager,
         ledger_data: &[LedgerData],
-        network_id: NetworkId,
-        checkpoint_id_pool: u64,
-        precomputed_soroban_state_size: Option<u64>,
-        mut offer_entries: Option<Vec<stellar_xdr::curr::LedgerEntry>>,
-    ) -> Result<ReplayedLedgerState> {
-        use henyey_bucket::EvictionIterator;
-
+    ) -> Result<()> {
         if ledger_data.is_empty() {
             return Err(HistoryError::CatchupFailed(
                 "no ledger data to replay".to_string(),
@@ -2130,167 +1935,57 @@ impl CatchupManager {
         }
 
         let total = ledger_data.len();
-        let mut last_result: Option<LedgerReplayResult> = None;
-        let mut last_header: Option<LedgerHeader> = None;
-
-        // Track the ID pool for correct offer ID assignment.
-        // Start with the checkpoint's id_pool and update from each ledger header.
-        let mut prev_id_pool = checkpoint_id_pool;
-
-        // Load eviction iterator from checkpoint state instead of starting fresh.
-        // The EvictionIterator ConfigSettingEntry tracks where the eviction scan was
-        // at the checkpoint, and we must continue from there for correct bucket list hash.
-        let mut eviction_iterator: Option<EvictionIterator> = if self.replay_config.run_eviction {
-            load_eviction_iterator_from_bucket_list(bucket_list).or_else(|| {
-                info!("No EvictionIterator found in checkpoint, starting fresh");
-                Some(EvictionIterator::new(
-                    self.replay_config
-                        .eviction_settings
-                        .starting_eviction_scan_level,
-                ))
-            })
-        } else {
-            None
-        };
-
-        // Track Soroban state size for LiveSorobanStateSizeWindow updates.
-        // If a pre-computed value was passed (e.g., from a cloned ledger manager),
-        // skip the expensive bucket list scan (~80s on mainnet).
-        let protocol_version = ledger_data
-            .first()
-            .map(|d| d.header.ledger_version)
-            .unwrap_or(25);
-        let mut soroban_state_size: Option<u64> = if let Some(size) = precomputed_soroban_state_size
-        {
-            tracing::info!(
-                protocol_version,
-                initial_soroban_state_size = size,
-                "Using pre-computed Soroban state size (skipping bucket list scan)"
-            );
-            Some(size)
-        } else {
-            let size = compute_initial_soroban_state_size(bucket_list, protocol_version);
-            tracing::info!(
-                protocol_version,
-                initial_soroban_state_size = size,
-                "Computed initial Soroban state size from checkpoint"
-            );
-            Some(size)
-        };
 
         for (i, data) in ledger_data.iter().enumerate() {
             self.progress.current_ledger = data.header.ledger_seq;
 
-            let result = replay::replay_ledger_with_execution(
-                &data.header,
-                &data.tx_set,
-                bucket_list,
-                hot_archive_bucket_list,
-                &network_id,
-                &self.replay_config,
-                Some(&data.tx_results),
-                eviction_iterator,
-                None, // TODO: Initialize module cache for catchup performance
-                soroban_state_size, // Soroban state size for window updates
-                prev_id_pool, // ID pool from previous ledger for correct offer ID assignment
-                offer_entries.clone(), // Order book for correct offer matching
-            )?;
-            // Update Soroban state size tracking based on accurate delta from replay.
-            // The replay result computes this delta from the full change records,
-            // which includes before/after state for updates and deletes.
-            soroban_state_size = Some(
-                (soroban_state_size.unwrap_or(0) as i64 + result.soroban_state_size_delta).max(0)
-                    as u64,
-            );
+            // Decode upgrades from the header's scp_value.upgrades
+            let upgrades = decode_upgrades_from_header(&data.header);
 
-            // Update eviction iterator for next ledger
-            eviction_iterator = result.eviction_iterator;
+            let close_data = LedgerCloseData::new(
+                data.header.ledger_seq,
+                data.tx_set.clone(),
+                data.header.scp_value.close_time.0,
+                ledger_manager.current_header_hash(),
+            )
+            .with_stellar_value_ext(data.header.scp_value.ext.clone())
+            .with_upgrades(upgrades);
 
-            // Update prev_id_pool for the next ledger
-            prev_id_pool = data.header.id_pool;
+            let result = ledger_manager.close_ledger(close_data, None).map_err(|e| {
+                HistoryError::CatchupFailed(format!(
+                    "close_ledger failed at ledger {}: {}",
+                    data.header.ledger_seq, e
+                ))
+            })?;
 
-            // Incrementally update the offer set for the next ledger's replay.
-            // New/modified offers are added, deleted offers are removed.
-            if let Some(ref mut offers) = offer_entries {
-                use stellar_xdr::curr::LedgerEntryData;
-                // Add new offers from init_entries
-                for entry in &result.init_entries {
-                    if matches!(entry.data, LedgerEntryData::Offer(_)) {
-                        offers.push(entry.clone());
-                    }
-                }
-                // Update modified offers from live_entries
-                for entry in &result.live_entries {
-                    if let LedgerEntryData::Offer(ref offer) = entry.data {
-                        // Remove old version and add updated version
-                        offers.retain(|e| {
-                            if let LedgerEntryData::Offer(ref o) = e.data {
-                                o.offer_id != offer.offer_id || o.seller_id != offer.seller_id
-                            } else {
-                                true
-                            }
-                        });
-                        offers.push(entry.clone());
-                    }
-                }
-                // Remove deleted offers
-                for key in &result.dead_entries {
-                    if let stellar_xdr::curr::LedgerKey::Offer(ref offer_key) = key {
-                        offers.retain(|e| {
-                            if let LedgerEntryData::Offer(ref o) = e.data {
-                                o.offer_id != offer_key.offer_id || o.seller_id != offer_key.seller_id
-                            } else {
-                                true
-                            }
-                        });
-                    }
+            // Verify computed header hash matches archive
+            if self.replay_config.verify_bucket_list {
+                let expected_hash =
+                    henyey_ledger::compute_header_hash(&data.header).map_err(|e| {
+                        HistoryError::CatchupFailed(format!(
+                            "Failed to compute header hash for ledger {}: {}",
+                            data.header.ledger_seq, e
+                        ))
+                    })?;
+                if result.header_hash != expected_hash {
+                    return Err(HistoryError::CatchupFailed(format!(
+                        "Header hash mismatch at ledger {}: computed={}, expected={}",
+                        data.header.ledger_seq,
+                        result.header_hash.to_hex(),
+                        expected_hash.to_hex()
+                    )));
                 }
             }
 
             debug!(
-                "Replayed ledger {}/{}: {} txs, {} ops",
+                "Replayed ledger {}/{} via close_ledger: seq={}",
                 i + 1,
                 total,
-                result.tx_count,
-                result.op_count
+                data.header.ledger_seq
             );
-
-            last_header = Some(data.header.clone());
-            last_result = Some(result);
         }
 
-        let final_result = last_result.unwrap();
-        let final_header = last_header.unwrap();
-
-        // Verify final bucket list hash only at checkpoints.
-        // During replay without TransactionMeta, our execution may produce
-        // different entry values, so per-ledger verification will fail.
-        // Checkpoint verification is reliable because we restore from archive.
-        let is_checkpoint = final_header.ledger_seq % 64 == 63;
-        if self.replay_config.verify_bucket_list && is_checkpoint {
-            use sha2::{Digest, Sha256};
-            let live_hash = bucket_list.hash();
-            let hot_hash = hot_archive_bucket_list.hash();
-            tracing::info!(
-                ledger_seq = final_header.ledger_seq,
-                live_hash = %live_hash,
-                hot_archive_hash = %hot_hash,
-                "Computing combined bucket list hash for verification"
-            );
-            let mut hasher = Sha256::new();
-            hasher.update(live_hash.as_bytes());
-            hasher.update(hot_hash.as_bytes());
-            let result = hasher.finalize();
-            let mut bytes = [0u8; 32];
-            bytes.copy_from_slice(&result);
-            let bucket_list_hash = Hash256::from_bytes(bytes);
-            replay::verify_replay_consistency(&final_header, &bucket_list_hash)?;
-        }
-
-        Ok(ReplayedLedgerState::from_header(
-            &final_header,
-            final_result.ledger_hash,
-        ))
+        Ok(())
     }
 }
 
@@ -2430,212 +2125,26 @@ impl Default for CatchupManagerBuilder {
     }
 }
 
-/// Create a header from replay state when the actual header download fails.
+/// Decode ledger upgrades from a header's SCP value.
 ///
-/// This is a fallback that constructs a minimal header from the replay results.
-fn create_header_from_replay_state(
-    replay_state: &ReplayedLedgerState,
-    bucket_list: &BucketList,
-    hot_archive_bucket_list: &HotArchiveBucketList,
-) -> LedgerHeader {
-    use sha2::{Digest, Sha256};
-    use stellar_xdr::curr::{
-        Hash, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
-    };
-
-    let mut hasher = Sha256::new();
-    hasher.update(bucket_list.hash().as_bytes());
-    hasher.update(hot_archive_bucket_list.hash().as_bytes());
-    let result = hasher.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&result);
-    let bucket_list_hash = Hash256::from_bytes(bytes);
-
-    LedgerHeader {
-        ledger_version: replay_state.protocol_version,
-        previous_ledger_hash: Hash([0u8; 32]), // Unknown, but not critical for init
-        scp_value: StellarValue {
-            tx_set_hash: Hash([0u8; 32]),
-            close_time: TimePoint(replay_state.close_time),
-            upgrades: VecM::default(),
-            ext: StellarValueExt::Basic,
-        },
-        tx_set_result_hash: Hash([0u8; 32]),
-        bucket_list_hash: Hash(bucket_list_hash.0),
-        ledger_seq: replay_state.sequence,
-        total_coins: 0,
-        fee_pool: 0,
-        inflation_seq: 0,
-        id_pool: 0,
-        base_fee: replay_state.base_fee,
-        base_reserve: replay_state.base_reserve,
-        max_tx_set_size: 1000,
-        skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
-        ext: LedgerHeaderExt::V0,
-    }
-}
-
-/// Compute the total Soroban state size from the bucket list.
-///
-/// This scans the bucket list for CONTRACT_DATA and CONTRACT_CODE entries and
-/// sums their sizes. For CONTRACT_DATA, uses XDR size. For CONTRACT_CODE,
-/// uses the same rent-adjusted size calculation as LedgerManager to include
-/// compiled module memory cost.
-///
-/// Cost parameters are loaded from the bucket list's ConfigSettingEntry to ensure
-/// correct compiled module memory cost calculation (matching stellar-core behavior).
-///
-/// # Memory Efficiency
-///
-/// Uses `scan_for_entries_of_types` instead of `live_entries_iter()` to only
-/// build a dedup `HashSet<LedgerKey>` over ContractData + ContractCode keys
-/// (~1.68M keys, ~240 MB) instead of all keys (~60M, ~8.6 GB). This matches
-/// the stellar-core approach in `InMemorySorobanState::initializeStateFromSnapshot()`
-/// which uses per-type `scanForEntriesOfType` calls.
-///
-/// Note: This only needs to run once per catchup.
-fn compute_initial_soroban_state_size(bucket_list: &BucketList, protocol_version: u32) -> u64 {
-    use henyey_bucket::BucketEntry;
-    use henyey_tx::operations::execute::entry_size_for_rent_by_protocol_with_cost_params;
-    use stellar_xdr::curr::{LedgerEntryType, WriteXdr};
-
-    // Load cost params from bucket list for accurate contract code size calculation
-    let cost_params = load_cost_params_from_bucket_list(bucket_list);
-    let cost_params_ref = cost_params.as_ref().map(|(cpu, mem)| (cpu, mem));
-
-    let mut total_size: u64 = 0;
-
-    // Scan only ContractData and ContractCode entries, avoiding a dedup set
-    // over all 60M keys. The dedup set only tracks ~1.68M Soroban keys.
-    bucket_list.scan_for_entries_of_types(
-        &[LedgerEntryType::ContractData, LedgerEntryType::ContractCode],
-        |be| {
-            if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
-                match &entry.data {
-                    LedgerEntryData::ContractData(_) => {
-                        // Contract data uses XDR size
-                        if let Ok(xdr_bytes) = entry.to_xdr(stellar_xdr::curr::Limits::none()) {
-                            total_size += xdr_bytes.len() as u64;
-                        }
-                    }
-                    LedgerEntryData::ContractCode(_) => {
-                        // Contract code uses rent-adjusted size (includes compiled module memory)
-                        if let Ok(xdr_bytes) = entry.to_xdr(stellar_xdr::curr::Limits::none()) {
-                            let xdr_size = xdr_bytes.len() as u32;
-                            let rent_size = entry_size_for_rent_by_protocol_with_cost_params(
-                                protocol_version,
-                                entry,
-                                xdr_size,
-                                cost_params_ref,
-                            );
-                            total_size += rent_size as u64;
-                        }
-                    }
-                    _ => {}
+/// Each `upgrade` in `header.scp_value.upgrades` is an XDR-encoded `LedgerUpgrade`.
+/// Invalid entries are skipped with a warning.
+fn decode_upgrades_from_header(header: &LedgerHeader) -> Vec<LedgerUpgrade> {
+    header
+        .scp_value
+        .upgrades
+        .iter()
+        .filter_map(|upgrade| {
+            let bytes = upgrade.0.as_slice();
+            match LedgerUpgrade::from_xdr(bytes, Limits::none()) {
+                Ok(decoded) => Some(decoded),
+                Err(err) => {
+                    warn!(error = %err, "Failed to decode ledger upgrade during replay");
+                    None
                 }
             }
-            true // continue scanning
-        },
-    );
-
-    total_size
-}
-
-/// Load CPU and memory cost parameters from the bucket list's ConfigSettingEntries.
-///
-/// Returns `Some((cpu_params, mem_params))` if both are found, or `None` if either
-/// is missing (e.g., for pre-Soroban checkpoints).
-fn load_cost_params_from_bucket_list(
-    bucket_list: &BucketList,
-) -> Option<(
-    stellar_xdr::curr::ContractCostParams,
-    stellar_xdr::curr::ContractCostParams,
-)> {
-    use stellar_xdr::curr::{
-        ConfigSettingEntry, ConfigSettingId, LedgerEntryData, LedgerKey, LedgerKeyConfigSetting,
-    };
-
-    let cpu_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-        config_setting_id: ConfigSettingId::ContractCostParamsCpuInstructions,
-    });
-    let cpu_params = bucket_list.get(&cpu_key).ok()?.and_then(|e| {
-        if let LedgerEntryData::ConfigSetting(
-            ConfigSettingEntry::ContractCostParamsCpuInstructions(params),
-        ) = e.data
-        {
-            Some(params)
-        } else {
-            None
-        }
-    })?;
-
-    let mem_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-        config_setting_id: ConfigSettingId::ContractCostParamsMemoryBytes,
-    });
-    let mem_params = bucket_list.get(&mem_key).ok()?.and_then(|e| {
-        if let LedgerEntryData::ConfigSetting(
-            ConfigSettingEntry::ContractCostParamsMemoryBytes(params),
-        ) = e.data
-        {
-            Some(params)
-        } else {
-            None
-        }
-    })?;
-
-    Some((cpu_params, mem_params))
-}
-
-/// Load the EvictionIterator from the bucket list's ConfigSettingEntry.
-///
-/// The EvictionIterator tracks where the incremental eviction scan was at a given
-/// checkpoint. When replaying ledgers, we must load this iterator and continue from
-/// that position to produce the correct bucket list hash.
-///
-/// Returns `Some(EvictionIterator)` if found in the bucket list, or `None` if no
-/// EvictionIterator entry exists (e.g., for pre-protocol 23 checkpoints).
-fn load_eviction_iterator_from_bucket_list(
-    bucket_list: &BucketList,
-) -> Option<henyey_bucket::EvictionIterator> {
-    use stellar_xdr::curr::{
-        ConfigSettingEntry, ConfigSettingId, LedgerEntryData, LedgerKey, LedgerKeyConfigSetting,
-    };
-
-    let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-        config_setting_id: ConfigSettingId::EvictionIterator,
-    });
-
-    match bucket_list.get(&key) {
-        Ok(Some(entry)) => {
-            if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(xdr_iter)) =
-                entry.data
-            {
-                let iter = henyey_bucket::EvictionIterator {
-                    bucket_file_offset: xdr_iter.bucket_file_offset,
-                    bucket_list_level: xdr_iter.bucket_list_level,
-                    is_curr_bucket: xdr_iter.is_curr_bucket,
-                };
-                info!(
-                    level = iter.bucket_list_level,
-                    is_curr = iter.is_curr_bucket,
-                    offset = iter.bucket_file_offset,
-                    "Loaded EvictionIterator from checkpoint"
-                );
-                Some(iter)
-            } else {
-                warn!("EvictionIterator entry has unexpected type");
-                None
-            }
-        }
-        Ok(None) => {
-            debug!("No EvictionIterator ConfigSettingEntry in bucket list");
-            None
-        }
-        Err(e) => {
-            warn!(error = %e, "Failed to query EvictionIterator from bucket list");
-            None
-        }
-    }
+        })
+        .collect()
 }
 
 /// Create a closure that loads live buckets from disk using streaming I/O.

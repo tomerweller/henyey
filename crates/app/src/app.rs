@@ -1871,8 +1871,6 @@ impl App {
             hot_archive_bucket_list: hot_archive,
             header,
             network_id,
-            soroban_state_size: None, // Will be computed via bucket scan during replay
-            offer_entries: None, // Not available from persisted HAS rebuild
         })
     }
 
@@ -2354,29 +2352,18 @@ impl App {
                     let header = self.ledger_manager.current_header();
                     let network_id = NetworkId(self.network_id());
 
-                    // Capture state size and offers BEFORE reset (reset preserves
-                    // warm caches, but capturing first is clearer).
-                    let soroban_state_size = self.ledger_manager.soroban_state_total_size();
-                    let offer_entries = self.ledger_manager.offer_entries();
-
                     tracing::info!(
                         current_lcl = current,
                         target_ledger,
                         bucket_list_hash = %bucket_list.hash().to_hex(),
-                        offer_count = offer_entries.len(),
                         "Cloned bucket lists from ledger manager for replay-only catchup"
                     );
-
-                    // Preserve warm caches for re-initialization after catchup
-                    self.ledger_manager.reset_for_recatchup();
 
                     (Some(ExistingBucketState {
                         bucket_list,
                         hot_archive_bucket_list: hot_archive,
                         header,
                         network_id,
-                        soroban_state_size: Some(soroban_state_size),
-                        offer_entries: Some(offer_entries),
                     }), Some(current))
                 } else {
                     // Slow path: rebuild from persisted HAS
@@ -2412,7 +2399,10 @@ impl App {
             )
             .await?;
 
-        // Persist the HAS and LCL to DB BEFORE initialize() consumes the output.
+        // Persist the HAS and LCL to DB after catchup.
+        // The LedgerManager is already initialized inside the catchup pipeline,
+        // so we read the current state from it.
+        //
         // This is critical: if a second catchup triggers before any ledger close
         // happens (e.g., when LCL+1 is missing from the buffer), rebuild_bucket_lists_from_has()
         // will read the HAS from the database. Without this persistence, it would
@@ -2422,93 +2412,36 @@ impl App {
         // This matches stellar-core's CatchupWork.cpp which calls
         // setLastClosedLedger() (persisting both LCL and HAS) after bucket apply.
         {
+            let final_header = self.ledger_manager.current_header();
+            let bucket_list = self.ledger_manager.bucket_list();
+            let hot_archive_guard = self.ledger_manager.hot_archive_bucket_list();
+            let default_hot_archive = HotArchiveBucketList::default();
+            let hot_archive_ref = hot_archive_guard.as_ref().unwrap_or(&default_hot_archive);
             let has = build_history_archive_state(
-                output.header.ledger_seq,
-                &output.bucket_list,
-                Some(&output.hot_archive_bucket_list),
+                final_header.ledger_seq,
+                &bucket_list,
+                Some(hot_archive_ref),
                 Some(self.config.network.passphrase.clone()),
             )
             .map_err(|e| anyhow::anyhow!("Failed to build HAS after catchup: {}", e))?;
             let has_json = has
                 .to_json()
                 .map_err(|e| anyhow::anyhow!("Failed to serialize HAS after catchup: {}", e))?;
-            let header_xdr = output
-                .header
+            let header_xdr = final_header
                 .to_xdr(stellar_xdr::curr::Limits::none())
                 .map_err(|e| anyhow::anyhow!("Failed to serialize header XDR after catchup: {}", e))?;
 
             self.db.transaction(|conn| {
-                conn.store_ledger_header(&output.header, &header_xdr)?;
+                conn.store_ledger_header(&final_header, &header_xdr)?;
                 conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
-                conn.set_last_closed_ledger(output.header.ledger_seq)?;
+                conn.set_last_closed_ledger(final_header.ledger_seq)?;
                 Ok(())
             })?;
 
             tracing::info!(
-                ledger_seq = output.header.ledger_seq,
+                ledger_seq = final_header.ledger_seq,
                 "Persisted HAS and LCL to DB after catchup"
             );
-        }
-
-        // Initialize ledger manager with catchup results.
-        // This validates that the bucket list hash matches the ledger header.
-        // Pass the pre-computed header hash from the history archive - this is authoritative.
-        //
-        // If caches are already warm from a prior catchup cycle, use the differential
-        // update path which only scans changed bucket levels (~2-5s) instead of
-        // rebuilding all caches from scratch (~120s on mainnet).
-        //
-        // Note: After rebuild_bucket_lists_from_has(), the ledger manager is reset
-        // so is_initialized() is false, but has_warm_caches() may still be true.
-        // We check warm caches independently.
-        if self.ledger_manager.has_warm_caches() {
-            tracing::info!("Re-catchup with warm caches: using differential cache update");
-            if self.ledger_manager.is_initialized() {
-                self.ledger_manager.reset_for_recatchup();
-            }
-            self.ledger_manager
-                .initialize_warm(
-                    output.bucket_list,
-                    output.hot_archive_bucket_list,
-                    output.header,
-                    output.header_hash,
-                )
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to initialize ledger manager (warm): {}", e)
-                })?;
-        } else {
-            if self.ledger_manager.is_initialized() {
-                self.ledger_manager.reset();
-            }
-            if let Some(cache_data) = output.cache_data {
-                // Use pre-computed cache data from the parallel catchup pipeline.
-                // This skips the ~83 second synchronous cache scan.
-                self.ledger_manager
-                    .initialize_with_cache(
-                        output.bucket_list,
-                        output.hot_archive_bucket_list,
-                        output.header,
-                        output.header_hash,
-                        cache_data,
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to initialize ledger manager (with cache): {}",
-                            e
-                        )
-                    })?;
-            } else {
-                self.ledger_manager
-                    .initialize(
-                        output.bucket_list,
-                        output.hot_archive_bucket_list,
-                        output.header,
-                        output.header_hash,
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to initialize ledger manager: {}", e)
-                    })?;
-            }
         }
 
         tracing::info!(
@@ -2813,13 +2746,13 @@ impl App {
             Some(data) => {
                 // With checkpoint data, use direct method (minimal mode behavior)
                 catchup_manager
-                    .catchup_to_ledger_with_checkpoint_data(target_ledger, data)
+                    .catchup_to_ledger_with_checkpoint_data(target_ledger, data, &self.ledger_manager)
                     .await
             }
             None => {
                 // Use mode-aware catchup
                 catchup_manager
-                    .catchup_to_ledger_with_mode(target_ledger, mode, lcl, existing_state)
+                    .catchup_to_ledger_with_mode(target_ledger, mode, lcl, existing_state, &self.ledger_manager)
                     .await
             }
         }

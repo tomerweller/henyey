@@ -204,6 +204,14 @@ async fn test_catchup_against_local_archive_checkpoint() {
         .expect("bucket manager");
     let db = Database::open_in_memory().expect("db");
 
+    let ledger_manager = henyey_ledger::LedgerManager::new(
+        "Test SDF Network ; September 2015".to_string(),
+        henyey_ledger::LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        },
+    );
+
     let mut manager = CatchupManagerBuilder::new()
         .add_archive(archive)
         .bucket_manager(bucket_manager)
@@ -217,7 +225,7 @@ async fn test_catchup_against_local_archive_checkpoint() {
         .expect("catchup manager");
 
     let output = manager
-        .catchup_to_ledger(checkpoint)
+        .catchup_to_ledger(checkpoint, &ledger_manager)
         .await
         .expect("catchup");
 

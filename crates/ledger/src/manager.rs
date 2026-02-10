@@ -151,15 +151,15 @@ const FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION: u32 = 23;
 /// during catchup. The scan runs on a `&BucketList` (read-only, `Send + Sync`)
 /// so it can execute on a background thread without interfering with bucket list
 /// mutations happening on other threads.
-pub struct CacheInitResult {
+struct CacheInitResult {
     /// All live offers indexed by offer_id.
-    pub offers: HashMap<i64, LedgerEntry>,
+    offers: HashMap<i64, LedgerEntry>,
     /// Secondary index: (account, asset) → set of offer_ids.
-    pub offer_index: OfferAccountAssetIndex,
+    offer_index: OfferAccountAssetIndex,
     /// Pre-compiled Soroban module cache (if Soroban is supported).
-    pub module_cache: Option<PersistentModuleCache>,
+    module_cache: Option<PersistentModuleCache>,
     /// In-memory Soroban state (contract data, code, TTLs, config).
-    pub soroban_state: crate::soroban_state::InMemorySorobanState,
+    soroban_state: crate::soroban_state::InMemorySorobanState,
 }
 
 /// Scan a bucket list and extract all cache data.
@@ -174,7 +174,7 @@ pub struct CacheInitResult {
 /// - ContractData → soroban state
 /// - TTL → soroban state
 /// - ConfigSetting → soroban state
-pub fn scan_bucket_list_for_caches(
+fn scan_bucket_list_for_caches(
     bucket_list: &BucketList,
     protocol_version: u32,
 ) -> CacheInitResult {
@@ -696,43 +696,7 @@ impl LedgerManager {
         Ok(())
     }
 
-    /// Initialize the ledger manager with pre-computed cache data.
-    ///
-    /// Same as `initialize` but installs cache data that was computed in the background
-    /// (via `scan_bucket_list_for_caches`) instead of scanning the bucket list synchronously.
-    /// This saves ~83 seconds on mainnet by overlapping the cache scan with merge restarts.
-    pub fn initialize_with_cache(
-        &self,
-        bucket_list: BucketList,
-        hot_archive_bucket_list: HotArchiveBucketList,
-        header: LedgerHeader,
-        header_hash: Hash256,
-        cache_data: CacheInitResult,
-    ) -> Result<()> {
-        self.verify_and_install_bucket_lists(bucket_list, hot_archive_bucket_list, header, header_hash)?;
-        self.install_cache_data(cache_data);
-
-        info!(
-            ledger_seq = self.state.read().header.ledger_seq,
-            header_hash = %self.state.read().header_hash.to_hex(),
-            "Ledger initialized from buckets (with pre-computed cache)"
-        );
-
-        Ok(())
-    }
-
-    /// Install pre-computed cache data into the ledger manager's caches.
-    fn install_cache_data(&self, cache_data: CacheInitResult) {
-        *self.offer_store.write() = cache_data.offers;
-        *self.offer_account_asset_index.write() = cache_data.offer_index;
-        *self.module_cache.write() = cache_data.module_cache;
-        *self.soroban_state.write() = cache_data.soroban_state;
-        *self.offers_initialized.write() = true;
-    }
-
     /// Verify bucket list hash against the header and install bucket lists + state.
-    ///
-    /// Shared by `initialize`, `initialize_with_cache`, and `initialize_warm`.
     fn verify_and_install_bucket_lists(
         &self,
         bucket_list: BucketList,
@@ -828,264 +792,6 @@ impl LedgerManager {
         debug!("Ledger manager reset complete");
     }
 
-    /// Reset only the bucket lists and initialized flag, preserving warm caches.
-    ///
-    /// This is used during re-catchup when caches (offer store, soroban state,
-    /// module cache) are already populated from a prior catchup cycle. The caches
-    /// will be updated differentially by `initialize_warm()` instead of being
-    /// rebuilt from scratch.
-    pub fn reset_for_recatchup(&self) {
-        info!("Resetting ledger manager for re-catchup (preserving warm caches)");
-
-        // Clear bucket lists only - they'll be replaced with new ones
-        *self.bucket_list.write() = BucketList::default();
-        *self.hot_archive_bucket_list.write() = None;
-
-        // Reset state but DON'T clear caches
-        let mut state = self.state.write();
-        // Preserve header info for logging
-        let old_seq = state.header.ledger_seq;
-        state.header = create_genesis_header();
-        state.header_hash = Hash256::ZERO;
-        state.initialized = false;
-
-        info!(
-            old_ledger_seq = old_seq,
-            "Ledger manager reset for re-catchup (caches preserved)"
-        );
-    }
-
-    /// Check if caches are warm (populated from a prior initialization).
-    ///
-    /// Returns true if the offer store and soroban state have been populated,
-    /// meaning we can use `initialize_warm()` instead of a full
-    /// `initialize_all_caches()` scan.
-    pub fn has_warm_caches(&self) -> bool {
-        let offers_init = *self.offers_initialized.read();
-        let soroban_populated = !self.soroban_state.read().is_empty();
-        offers_init && soroban_populated
-    }
-
-    /// Initialize with warm caches: replace bucket lists and update caches
-    /// differentially by scanning only changed bucket levels.
-    ///
-    /// This is dramatically faster than `initialize()` + `initialize_all_caches()`
-    /// because it only scans the lower bucket levels that changed between the
-    /// old and new checkpoints (~1-5% of total entries) instead of all 47M entries.
-    ///
-    /// # How it works
-    ///
-    /// 1. Stores the old bucket level hashes before replacing the bucket list
-    /// 2. Replaces the bucket list with the new one from catchup
-    /// 3. Compares level hashes to find which levels changed
-    /// 4. Scans ONLY the changed levels, upserting/deleting entries in the caches
-    /// 5. Updates soroban_state.last_closed_ledger_seq to match the new checkpoint
-    pub fn initialize_warm(
-        &self,
-        bucket_list: BucketList,
-        hot_archive_bucket_list: HotArchiveBucketList,
-        header: LedgerHeader,
-        header_hash: Hash256,
-    ) -> Result<()> {
-        let warm_start = std::time::Instant::now();
-        let protocol_version = header.ledger_version;
-        let ledger_seq = header.ledger_seq;
-
-        self.verify_and_install_bucket_lists(bucket_list, hot_archive_bucket_list, header, header_hash)?;
-
-        // Update caches differentially instead of full rebuild
-        self.update_caches_differentially(protocol_version, ledger_seq)?;
-
-        info!(
-            ledger_seq,
-            header_hash = %self.state.read().header_hash.to_hex(),
-            elapsed_ms = warm_start.elapsed().as_millis() as u64,
-            "Ledger initialized from buckets (warm cache path)"
-        );
-
-        Ok(())
-    }
-
-    /// Update caches by scanning only the lower bucket levels that contain
-    /// recent changes, instead of scanning the entire bucket list.
-    ///
-    /// The bucket list has 11 levels (0-10). Lower levels change more frequently:
-    /// - Level 0: changes every 2 ledgers
-    /// - Level 1: changes every 8 ledgers
-    /// - Level 2: changes every 32 ledgers
-    /// - Level 3: changes every 128 ledgers
-    /// - Level 4+: changes every 512+ ledgers
-    ///
-    /// For a 64-ledger checkpoint gap, only levels 0-3 can possibly change.
-    /// These lower levels contain a small fraction of total entries (~1-5%),
-    /// making this scan dramatically faster than a full scan.
-    ///
-    /// Correctness: entries in unchanged higher levels are already in our caches
-    /// from the previous initialization. Entries that were modified/created/deleted
-    /// in the last 64 ledgers will appear in the lower levels, which we scan.
-    /// The scan processes entries from level 0 (newest) upward, using deduplication
-    /// to ensure newest-wins semantics.
-    fn update_caches_differentially(&self, protocol_version: u32, ledger_seq: u32) -> Result<()> {
-        use henyey_common::MIN_SOROBAN_PROTOCOL_VERSION;
-
-        let bucket_list = self.bucket_list.read();
-        let diff_start = std::time::Instant::now();
-
-        // Determine which levels to scan. We scan levels 0-3 which covers
-        // up to 128 ledgers of changes (more than enough for a 64-ledger gap).
-        const MAX_DIFF_LEVELS: usize = 4; // levels 0-3
-
-        let soroban_enabled = protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION;
-
-        // Load rent config for code size calculation
-        let rent_config = self.load_soroban_rent_config(&bucket_list);
-
-        // Counters
-        let mut entries_scanned = 0u64;
-        let mut offers_upserted = 0u64;
-        let mut offers_deleted = 0u64;
-        let mut soroban_upserted = 0u64;
-        let mut soroban_deleted = 0u64;
-        let mut levels_scanned = 0usize;
-
-        // Dedup set for entries seen in lower (newer) levels.
-        // We only need to track keys seen in the levels we scan.
-        let mut seen_keys: HashSet<LedgerKey> = HashSet::new();
-
-        // Get write access to caches
-        let mut soroban_state = self.soroban_state.write();
-        let mut offer_store = self.offer_store.write();
-        let mut offer_idx = self.offer_account_asset_index.write();
-
-        // Scan only the lower levels of the new bucket list
-        let levels = bucket_list.levels();
-        let scan_count = MAX_DIFF_LEVELS.min(levels.len());
-
-        for level_idx in 0..scan_count {
-            let level = &levels[level_idx];
-            levels_scanned += 1;
-
-            for bucket in [&*level.curr, &*level.snap] {
-                for entry in bucket.iter() {
-                    if let Some(key) = entry.key() {
-                        // Skip if we've already seen this key in a lower (newer) level
-                        if seen_keys.contains(&key) {
-                            continue;
-                        }
-
-                        // Process the entry based on its type. Entries we don't
-                        // care about (accounts, trustlines, etc.) fall through
-                        // to the default arm and are skipped.
-                        let processed = match &entry {
-                            BucketEntry::Live(le) | BucketEntry::Init(le) => {
-                                match &le.data {
-                                    LedgerEntryData::Offer(offer) => {
-                                        // Remove old index entries if replacing
-                                        if let Some(old_entry) = offer_store.get(&offer.offer_id) {
-                                            if let LedgerEntryData::Offer(ref old_offer) =
-                                                old_entry.data
-                                            {
-                                                index_offer_remove(&mut offer_idx, old_offer);
-                                            }
-                                        }
-                                        offer_store.insert(offer.offer_id, le.clone());
-                                        index_offer_insert(&mut offer_idx, offer);
-                                        offers_upserted += 1;
-                                        true
-                                    }
-                                    LedgerEntryData::ContractData(_)
-                                    | LedgerEntryData::ContractCode(_)
-                                    | LedgerEntryData::Ttl(_)
-                                    | LedgerEntryData::ConfigSetting(_)
-                                        if soroban_enabled =>
-                                    {
-                                        // Use process_entry_update which handles create-or-update
-                                        let _ = soroban_state.process_entry_update(
-                                            le,
-                                            protocol_version,
-                                            rent_config.as_ref(),
-                                        );
-                                        soroban_upserted += 1;
-                                        true
-                                    }
-                                    _ => false,
-                                }
-                            }
-                            BucketEntry::Dead(dead_key) => match dead_key {
-                                LedgerKey::Offer(offer_key) => {
-                                    if let Some(old_entry) = offer_store.remove(&offer_key.offer_id)
-                                    {
-                                        if let LedgerEntryData::Offer(ref old_offer) =
-                                            old_entry.data
-                                        {
-                                            index_offer_remove(&mut offer_idx, old_offer);
-                                        }
-                                    }
-                                    offers_deleted += 1;
-                                    true
-                                }
-                                LedgerKey::ContractData(_)
-                                | LedgerKey::ContractCode(_)
-                                | LedgerKey::Ttl(_)
-                                | LedgerKey::ConfigSetting(_)
-                                    if soroban_enabled =>
-                                {
-                                    let _ = soroban_state.process_entry_delete(dead_key);
-                                    soroban_deleted += 1;
-                                    true
-                                }
-                                _ => false,
-                            },
-                            BucketEntry::Metadata(_) => false,
-                        };
-
-                        if processed {
-                            seen_keys.insert(key.clone());
-                            entries_scanned += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Update soroban state's last_closed_ledger_seq to match the new checkpoint
-        soroban_state.set_last_closed_ledger_seq(ledger_seq);
-
-        // Update module cache for any new/changed contract code
-        // We need to rebuild the module cache entries for changed contracts
-        if soroban_enabled {
-            if let Some(ref module_cache) = *self.module_cache.read() {
-                // The module cache was already populated from the prior init.
-                // New contract code entries were already processed above via
-                // process_entry_update → create_contract_code, but the module
-                // cache itself needs the WASM bytes compiled. We handle this
-                // by scanning only the contract code entries we just touched.
-                // For simplicity, we just ensure the module cache exists.
-                // New contracts will be compiled on first use.
-                let _ = module_cache;
-            }
-        }
-
-        drop(soroban_state);
-        drop(offer_store);
-        drop(offer_idx);
-        drop(bucket_list);
-
-        info!(
-            ledger_seq,
-            levels_scanned,
-            entries_scanned,
-            offers_upserted,
-            offers_deleted,
-            soroban_upserted,
-            soroban_deleted,
-            elapsed_ms = diff_start.elapsed().as_millis() as u64,
-            "Updated caches differentially (warm cache path)"
-        );
-
-        Ok(())
-    }
-
     /// Load Soroban rent config from bucket list for code size calculation.
     fn load_soroban_rent_config(
         &self,
@@ -1169,7 +875,13 @@ impl LedgerManager {
         let bucket_list = self.bucket_list.read();
         let cache_data = scan_bucket_list_for_caches(&bucket_list, protocol_version);
         drop(bucket_list);
-        self.install_cache_data(cache_data);
+
+        *self.offer_store.write() = cache_data.offers;
+        *self.offer_account_asset_index.write() = cache_data.offer_index;
+        *self.module_cache.write() = cache_data.module_cache;
+        *self.soroban_state.write() = cache_data.soroban_state;
+        *self.offers_initialized.write() = true;
+
         Ok(())
     }
 
