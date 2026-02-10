@@ -61,13 +61,13 @@ validators = [
 ]
 inner_sets = []
 
-# Whalestack (3 validators, 2-of-3)
+# Creit (3 validators, 2-of-3)
 [[node.quorum_set.inner_sets]]
 threshold_percent = 67
 validators = [
-    "GD6SZQV3WEJUH352NTVLKEV2JM2RH266VPEM7EH5QLLI7ZZAALMLNUVN",
-    "GAZ437J46SCFPZEDLVGDMKZPLFO77XJ4QVAURSJVRZK2T5S7XUFHXI2Z",
-    "GADLA6BJK6VK33EM2IDQM37L5KGVCY5MSHSHVJA4SCNGNUIEOTCR6J5T",
+    "GBPLJDBFZO2H7QQH7YFCH3HFT6EMC42Z2DNJ2QFROCKETAPY54V4DCZD",
+    "GDDANSYOYSY5EPSFHBRPCLX6XMHPPLIMHVIDXG6IPQLVVLRI2BN4HMH3",
+    "GBF7QOLFPTHUEDUPTT4ZTULDTA3QXDIO75JHKJN2IYD7YGQLYUTR75BT",
 ]
 inner_sets = []
 
@@ -141,10 +141,10 @@ known_peers = [
     "stellar-de-fra.satoshipay.io:11625",
     "stellar-sg-sin.satoshipay.io:11625",
     "stellar-us-iowa.satoshipay.io:11625",
-    # Whalestack
-    "germany.stellar.whalestack.com:11625",
-    "finland.stellar.whalestack.com:11625",
-    "hongkong.stellar.whalestack.com:11625",
+    # Creit
+    "alpha.validator.stellar.creit.tech:11625",
+    "beta.validator.stellar.creit.tech:11625",
+    "gamma.validator.stellar.creit.tech:11625",
     # PublicNode
     "bootes.publicnode.org:11625",
     "hercules.publicnode.org:11625",
