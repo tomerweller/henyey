@@ -2120,6 +2120,16 @@ impl BallotProtocol {
 
     /// Build and record a prepare statement envelope.
     /// Returns the statement if a new envelope was recorded (for self-processing).
+    ///
+    /// When `current_ballot` is `None` (pristine state, no `bumpState` call),
+    /// a PREPARE with `ballot = {0, ""}` is still created and recorded as a
+    /// self-envelope. This matches C++ `emitCurrentStateStatement` which always
+    /// calls `createStatement()` and `processEnvelope(self)`, even when
+    /// `mCurrentBallot` is null. The self-envelope is needed so that the local
+    /// node counts itself in subsequent quorum calculations (e.g., prepared
+    /// fields in the self-envelope contribute to `federated_accept`/`federated_ratify`).
+    /// However, the envelope is NOT emitted to the network when `current_ballot`
+    /// is `None` (matching C++ `canEmit = mCurrentBallot != nullptr`).
     fn emit_prepare<D: SCPDriver>(
         &mut self,
         local_node_id: &NodeId,
@@ -2127,36 +2137,47 @@ impl BallotProtocol {
         driver: &Arc<D>,
         slot_index: u64,
     ) -> Option<ScpStatement> {
-        if let Some(ref ballot) = self.current_ballot {
-            let prep = ScpStatementPrepare {
-                quorum_set_hash: hash_quorum_set(local_quorum_set).into(),
-                ballot: ballot.clone(),
-                prepared: self.prepared.clone(),
-                prepared_prime: self.prepared_prime.clone(),
-                n_c: self.commit.as_ref().map(|b| b.counter).unwrap_or(0),
-                n_h: self.high_ballot.as_ref().map(|b| b.counter).unwrap_or(0),
-            };
+        // Use the current ballot if set, otherwise use a default zero ballot
+        // (matching C++ which creates a PREPARE with default ballot {0, ""} when
+        // mCurrentBallot is null).
+        let can_emit = self.current_ballot.is_some();
+        let ballot = self.current_ballot.clone().unwrap_or_else(|| ScpBallot {
+            counter: 0,
+            value: Value(Vec::new().try_into().unwrap_or_default()),
+        });
 
-            let statement = ScpStatement {
-                node_id: local_node_id.clone(),
-                slot_index,
-                pledges: ScpStatementPledges::Prepare(prep),
-            };
+        let prep = ScpStatementPrepare {
+            quorum_set_hash: hash_quorum_set(local_quorum_set).into(),
+            ballot,
+            prepared: self.prepared.clone(),
+            prepared_prime: self.prepared_prime.clone(),
+            n_c: self.commit.as_ref().map(|b| b.counter).unwrap_or(0),
+            n_h: self.high_ballot.as_ref().map(|b| b.counter).unwrap_or(0),
+        };
 
-            let mut envelope = ScpEnvelope {
-                statement: statement.clone(),
-                signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
-            };
+        let statement = ScpStatement {
+            node_id: local_node_id.clone(),
+            slot_index,
+            pledges: ScpStatementPledges::Prepare(prep),
+        };
 
-            driver.sign_envelope(&mut envelope);
-            if self.record_local_envelope(local_node_id, envelope.clone()) {
+        let mut envelope = ScpEnvelope {
+            statement: statement.clone(),
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+
+        driver.sign_envelope(&mut envelope);
+        if self.record_local_envelope(local_node_id, envelope.clone()) {
+            // Only update last_envelope (for network emission) when we have a
+            // real ballot. Matches C++ `canEmit = mCurrentBallot != nullptr`.
+            if can_emit {
                 self.last_envelope = Some(envelope.clone());
-                // Note: send_latest_envelope is NOT called here.
-                // It's called in emit_current_state after self-processing,
-                // matching C++ where sendLatestEnvelope() is called after
-                // processEnvelope(self) in emitCurrentStateStatement().
-                return Some(statement);
             }
+            // Note: send_latest_envelope is NOT called here.
+            // It's called in emit_current_state after self-processing,
+            // matching C++ where sendLatestEnvelope() is called after
+            // processEnvelope(self) in emitCurrentStateStatement().
+            return Some(statement);
         }
         None
     }

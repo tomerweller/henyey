@@ -1154,7 +1154,12 @@ mod tests {
     fn test_get_scp_state_skips_self_when_not_fully_validated() {
         let node_a = make_node_id(1);
         let node_b = make_node_id(2);
-        let quorum_set = make_quorum_set_with(vec![node_a.clone(), node_b.clone()], 1);
+        let node_c = make_node_id(3);
+        // Use threshold=2 so that a single PREPARE from node_b doesn't form
+        // a quorum for federated_accept (which would cascade to externalization
+        // and set fully_validated=true, defeating the purpose of this test).
+        let quorum_set =
+            make_quorum_set_with(vec![node_a.clone(), node_b.clone(), node_c.clone()], 2);
         let driver = Arc::new(MaybeValidDriver::new(quorum_set.clone()));
         let scp = SCP::new(node_a.clone(), true, quorum_set.clone(), driver.clone());
 
