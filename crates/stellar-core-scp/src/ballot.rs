@@ -167,6 +167,12 @@ pub struct BallotProtocol {
     /// Used to ensure we commit the correct value when switching ballots.
     value_override: Option<Value>,
 
+    /// Latest composite candidate value from the nomination protocol.
+    ///
+    /// Set by the Slot before calling into ballot protocol methods, so that
+    /// `abandon_ballot` can access it (matching C++ `mSlot.getLatestCompositeCandidate()`).
+    composite_candidate: Option<Value>,
+
     /// Whether we've heard from a quorum for the current ballot.
     heard_from_quorum: bool,
 
@@ -181,6 +187,12 @@ pub struct BallotProtocol {
 
     /// Whether values are fully validated (affects envelope emission).
     fully_validated: bool,
+
+    /// Signal that nomination should be stopped (set by set_confirm_commit).
+    ///
+    /// In C++, `setConfirmCommit` calls `mSlot.stopNomination()` directly.
+    /// In Rust, we set this flag and let the Slot handle it.
+    needs_stop_nomination: bool,
 }
 
 impl BallotProtocol {
@@ -196,11 +208,13 @@ impl BallotProtocol {
             latest_envelopes: HashMap::new(),
             value: None,
             value_override: None,
+            composite_candidate: None,
             heard_from_quorum: false,
             current_message_level: 0,
             last_envelope: None,
             last_envelope_emit: None,
             fully_validated: true,
+            needs_stop_nomination: false,
         }
     }
 
@@ -232,6 +246,23 @@ impl BallotProtocol {
     /// Check if we're externalized.
     pub fn is_externalized(&self) -> bool {
         self.phase == BallotPhase::Externalize
+    }
+
+    /// Set the latest composite candidate from the nomination protocol.
+    ///
+    /// Called by the Slot before invoking ballot protocol methods, so that
+    /// `abandon_ballot` can use the composite candidate value.
+    pub fn set_composite_candidate(&mut self, value: Option<Value>) {
+        self.composite_candidate = value;
+    }
+
+    /// Check and clear the needs_stop_nomination flag.
+    ///
+    /// Returns true if nomination should be stopped (set by set_confirm_commit).
+    pub fn take_needs_stop_nomination(&mut self) -> bool {
+        let val = self.needs_stop_nomination;
+        self.needs_stop_nomination = false;
+        val
     }
 
     /// Process the latest ballot envelopes with a callback.
@@ -307,6 +338,44 @@ impl BallotProtocol {
     /// Get the latest envelope from a specific node.
     pub fn get_latest_envelope(&self, node_id: &NodeId) -> Option<&ScpEnvelope> {
         self.latest_envelopes.get(node_id)
+    }
+
+    /// Get envelopes that contributed to externalization.
+    ///
+    /// Matches C++ `BallotProtocol::getExternalizingState()`:
+    /// - Only returns envelopes when in EXTERNALIZE phase
+    /// - For other nodes: only includes envelopes with ballots compatible with commit
+    /// - For self: only includes if `fully_validated` is true
+    pub fn get_externalizing_state(
+        &self,
+        local_node_id: &NodeId,
+        fully_validated: bool,
+    ) -> Vec<ScpEnvelope> {
+        let mut res = Vec::new();
+        if self.phase != BallotPhase::Externalize {
+            return res;
+        }
+
+        let commit = match &self.commit {
+            Some(c) => c,
+            None => return res,
+        };
+
+        for (node_id, envelope) in &self.latest_envelopes {
+            if node_id != local_node_id {
+                // For other nodes: check ballot compatibility with commit
+                if let Some(working) = get_working_ballot(&envelope.statement) {
+                    if ballot_compatible(&working, commit) {
+                        res.push(envelope.clone());
+                    }
+                }
+            } else if fully_validated {
+                // Only return self messages if fully validated
+                res.push(envelope.clone());
+            }
+        }
+
+        res
     }
 
     /// Get the high ballot (highest confirmable).
@@ -513,10 +582,6 @@ impl BallotProtocol {
         value: Value,
         force: bool,
     ) -> bool {
-        if self.phase == BallotPhase::Externalize {
-            return false;
-        }
-
         if !force && self.current_ballot.is_some() {
             return false;
         }
@@ -528,43 +593,35 @@ impl BallotProtocol {
             .map(|current| current.counter + 1)
             .unwrap_or(1);
 
-        let ballot = ScpBallot {
+        self.bump_state(
+            local_node_id,
+            local_quorum_set,
+            driver,
+            slot_index,
+            value,
             counter,
-            value: value.clone(),
-        };
-
-        self.current_ballot = Some(ballot.clone());
-        self.value = Some(value);
-        self.heard_from_quorum = false;
-
-        // Emit prepare statement
-        self.emit_prepare(local_node_id, local_quorum_set, driver, slot_index);
-        self.check_heard_from_quorum(local_node_id, local_quorum_set, driver, slot_index);
-
-        true
+        )
     }
 
     /// Bump ballot counter on timeout.
+    ///
+    /// This matches the C++ `ballotProtocolTimerExpired` → `abandonBallot(0)` flow.
     pub fn bump_timeout<D: SCPDriver>(
         &mut self,
         local_node_id: &NodeId,
         local_quorum_set: &ScpQuorumSet,
         driver: &Arc<D>,
         slot_index: u64,
+        composite_candidate: Option<&Value>,
     ) -> bool {
-        if self.phase == BallotPhase::Externalize {
-            return false;
-        }
-
-        if let Some(ref mut ballot) = self.current_ballot {
-            ballot.counter += 1;
-            self.heard_from_quorum = false;
-            self.emit_current_state(local_node_id, local_quorum_set, driver, slot_index);
-            self.check_heard_from_quorum(local_node_id, local_quorum_set, driver, slot_index);
-            true
-        } else {
-            false
-        }
+        self.abandon_ballot_with_composite(
+            0,
+            composite_candidate,
+            local_node_id,
+            local_quorum_set,
+            driver,
+            slot_index,
+        )
     }
 
     /// Process a ballot protocol envelope.
@@ -915,9 +972,10 @@ impl BallotProtocol {
         slot_index: u64,
     ) -> EnvelopeState {
         self.current_message_level = self.current_message_level.saturating_add(1);
-        if self.current_message_level > 50 {
-            self.current_message_level = 0;
-            return EnvelopeState::Invalid;
+        if self.current_message_level >= 50 {
+            // C++ throws std::runtime_error here. We panic to match the behavior:
+            // this indicates a bug in the protocol state machine, not a recoverable error.
+            panic!("maximum number of transitions reached in advanceSlot");
         }
         let mut did_work = false;
 
@@ -1379,7 +1437,12 @@ impl BallotProtocol {
         self.phase = BallotPhase::Externalize;
 
         self.emit_current_state(local_node_id, local_quorum_set, driver, slot_index);
-        driver.value_externalized(slot_index, &h.value);
+
+        // Signal that nomination should be stopped (C++ calls mSlot.stopNomination() here)
+        self.needs_stop_nomination = true;
+
+        // C++ uses mCommit->getBallot().value (c.value) for valueExternalized
+        driver.value_externalized(slot_index, &c.value);
         true
     }
 
@@ -1427,12 +1490,73 @@ impl BallotProtocol {
     }
 
     fn abandon_ballot(&mut self, counter: u32) -> bool {
-        if let Some(value) = self
-            .value_override
-            .clone()
-            .or_else(|| self.current_ballot.as_ref().map(|b| b.value.clone()))
-        {
-            return self.bump_to_ballot(
+        // Use composite candidate from nomination (set by Slot), then fall back to current ballot
+        self.abandon_ballot_internal(counter, self.composite_candidate.clone().as_ref())
+    }
+
+    /// Abandon the current ballot with access to composite candidate value.
+    ///
+    /// Matches C++ `abandonBallot(n)` which checks `mSlot.getLatestCompositeCandidate()`
+    /// first, then falls back to `mCurrentBallot->value`, then calls `bumpState(value, n)`.
+    fn abandon_ballot_with_composite<D: SCPDriver>(
+        &mut self,
+        counter: u32,
+        composite_candidate: Option<&Value>,
+        local_node_id: &NodeId,
+        local_quorum_set: &ScpQuorumSet,
+        driver: &Arc<D>,
+        slot_index: u64,
+    ) -> bool {
+        // C++ priority: composite candidate first, then current ballot value
+        let value = composite_candidate
+            .filter(|v| !v.0.is_empty())
+            .cloned()
+            .or_else(|| self.current_ballot.as_ref().map(|b| b.value.clone()));
+
+        if let Some(value) = value {
+            if counter == 0 {
+                // bumpState(value, true) which computes counter = current+1
+                let n = self
+                    .current_ballot
+                    .as_ref()
+                    .map(|b| b.counter + 1)
+                    .unwrap_or(1);
+                self.bump_state(
+                    local_node_id,
+                    local_quorum_set,
+                    driver,
+                    slot_index,
+                    value,
+                    n,
+                )
+            } else {
+                self.bump_state(
+                    local_node_id,
+                    local_quorum_set,
+                    driver,
+                    slot_index,
+                    value,
+                    counter,
+                )
+            }
+        } else {
+            false
+        }
+    }
+
+    fn abandon_ballot_internal(
+        &mut self,
+        counter: u32,
+        composite_candidate: Option<&Value>,
+    ) -> bool {
+        // Value priority: composite candidate, then current ballot value
+        let value = composite_candidate
+            .filter(|v| !v.0.is_empty())
+            .cloned()
+            .or_else(|| self.current_ballot.as_ref().map(|b| b.value.clone()));
+
+        if let Some(value) = value {
+            self.bump_to_ballot(
                 &ScpBallot {
                     counter: if counter == 0 {
                         self.current_ballot
@@ -1445,9 +1569,10 @@ impl BallotProtocol {
                     value,
                 },
                 true,
-            );
+            )
+        } else {
+            false
         }
-        false
     }
 
     fn update_current_if_needed(&mut self, ballot: &ScpBallot) -> bool {
@@ -1462,6 +1587,38 @@ impl BallotProtocol {
         false
     }
 
+    /// Update current value enforcing invariants (matches C++ updateCurrentValue).
+    ///
+    /// This is more thorough than `update_current_if_needed`: it checks phase
+    /// and commit compatibility before bumping.
+    fn update_current_value(&mut self, ballot: &ScpBallot) -> bool {
+        if self.phase != BallotPhase::Prepare && self.phase != BallotPhase::Confirm {
+            return false;
+        }
+
+        if self.current_ballot.is_none() {
+            self.bump_to_ballot(ballot, true);
+            return true;
+        }
+
+        // If we have a commit and the new ballot is incompatible, reject
+        if let Some(ref commit) = self.commit {
+            if !ballot_compatible(&commit, ballot) {
+                return false;
+            }
+        }
+
+        let comp = ballot_compare(self.current_ballot.as_ref().unwrap(), ballot);
+
+        match comp {
+            std::cmp::Ordering::Less => {
+                self.bump_to_ballot(ballot, true);
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn bump_to_ballot(&mut self, ballot: &ScpBallot, check: bool) -> bool {
         if check {
             if let Some(current) = &self.current_ballot {
@@ -1471,9 +1628,27 @@ impl BallotProtocol {
             }
         }
 
+        let got_bumped = match &self.current_ballot {
+            None => true,
+            Some(current) => current.counter != ballot.counter,
+        };
+
         self.current_ballot = Some(ballot.clone());
         self.value = Some(ballot.value.clone());
-        self.heard_from_quorum = false;
+
+        // invariant: h.value = b.value
+        if let Some(high) = &self.high_ballot {
+            if !ballot_compatible(ballot, high) {
+                self.high_ballot = None;
+                // invariant: c set only when h is set
+                self.commit = None;
+            }
+        }
+
+        if got_bumped {
+            self.heard_from_quorum = false;
+        }
+
         true
     }
 
@@ -1940,9 +2115,18 @@ impl BallotProtocol {
             self.heard_from_quorum = true;
             if !old {
                 driver.ballot_did_hear_from_quorum(slot_index, &current);
+                // If we transition from not heard -> heard, start the ballot timer
+                if self.phase != BallotPhase::Externalize {
+                    let timeout = driver.compute_timeout(current.counter, false);
+                    driver.setup_timer(slot_index, crate::driver::SCPTimerType::Ballot, timeout);
+                }
+            }
+            if self.phase == BallotPhase::Externalize {
+                driver.stop_timer(slot_index, crate::driver::SCPTimerType::Ballot);
             }
         } else {
             self.heard_from_quorum = false;
+            driver.stop_timer(slot_index, crate::driver::SCPTimerType::Ballot);
         }
     }
 
@@ -2173,6 +2357,11 @@ impl BallotProtocol {
                     counter: u32::MAX,
                     value: ext.commit.value.clone(),
                 });
+                // C++ sets mPrepared = makeBallot(UINT32_MAX, v)
+                self.prepared = Some(ScpBallot {
+                    counter: u32::MAX,
+                    value: ext.commit.value.clone(),
+                });
                 self.value = Some(ext.commit.value.clone());
                 self.phase = BallotPhase::Externalize;
                 self.latest_envelopes
@@ -2208,30 +2397,31 @@ impl BallotProtocol {
         value: Value,
         counter: u32,
     ) -> bool {
-        if self.phase == BallotPhase::Externalize {
+        if self.phase != BallotPhase::Prepare && self.phase != BallotPhase::Confirm {
             return false;
         }
 
-        // Don't go backwards
-        if let Some(current) = &self.current_ballot {
-            if counter <= current.counter {
-                return false;
-            }
-        }
+        let effective_value = if let Some(ref override_val) = self.value_override {
+            // Use the value that we saw confirmed prepared
+            // or that we at least voted to commit to
+            override_val.clone()
+        } else {
+            value
+        };
 
         let ballot = ScpBallot {
             counter,
-            value: value.clone(),
+            value: effective_value,
         };
 
-        self.current_ballot = Some(ballot.clone());
-        self.value = Some(value);
-        self.heard_from_quorum = false;
+        let updated = self.update_current_value(&ballot);
 
-        self.emit_current_state(local_node_id, local_quorum_set, driver, slot_index);
-        self.check_heard_from_quorum(local_node_id, local_quorum_set, driver, slot_index);
+        if updated {
+            self.emit_current_state(local_node_id, local_quorum_set, driver, slot_index);
+            self.check_heard_from_quorum(local_node_id, local_quorum_set, driver, slot_index);
+        }
 
-        true
+        updated
     }
 
     /// Abandon the current ballot and move to a new one.
@@ -2285,6 +2475,26 @@ fn are_ballots_less_and_compatible(a: &ScpBallot, b: &ScpBallot) -> bool {
 
 fn are_ballots_less_and_incompatible(a: &ScpBallot, b: &ScpBallot) -> bool {
     ballot_compare(a, b) != std::cmp::Ordering::Greater && !ballot_compatible(a, b)
+}
+
+#[cfg(test)]
+impl BallotProtocol {
+    /// Test helper: set current_message_level to simulate deep recursion.
+    pub fn set_current_message_level_for_test(&mut self, level: u32) {
+        self.current_message_level = level;
+    }
+
+    /// Test helper: expose advance_slot for testing.
+    pub fn advance_slot_for_test<D: SCPDriver>(
+        &mut self,
+        hint: &ScpStatement,
+        local_node_id: &NodeId,
+        local_quorum_set: &ScpQuorumSet,
+        driver: &Arc<D>,
+        slot_index: u64,
+    ) -> EnvelopeState {
+        self.advance_slot(hint, local_node_id, local_quorum_set, driver, slot_index)
+    }
 }
 
 #[cfg(test)]
@@ -3007,7 +3217,7 @@ mod tests {
         assert!(ballot.bump(&node, &quorum_set, &driver, 3, value, false));
         assert_eq!(ballot.current_ballot_counter(), Some(1));
 
-        assert!(ballot.bump_timeout(&node, &quorum_set, &driver, 3));
+        assert!(ballot.bump_timeout(&node, &quorum_set, &driver, 3, None));
         assert_eq!(ballot.current_ballot_counter(), Some(2));
     }
 
@@ -3950,5 +4160,677 @@ mod tests {
         // Nomination statements don't have a working ballot
         let working = get_working_ballot(&statement);
         assert!(working.is_none());
+    }
+
+    // =========================================================================
+    // Ballot Protocol Parity Tests (Phase 3)
+    // =========================================================================
+
+    /// Mock driver that tracks timer operations, externalized values, etc.
+    struct BallotParityDriver {
+        quorum_set: ScpQuorumSet,
+        emit_count: AtomicU32,
+        timer_setups: std::sync::Mutex<Vec<(u64, crate::driver::SCPTimerType)>>,
+        timer_stops: std::sync::Mutex<Vec<(u64, crate::driver::SCPTimerType)>>,
+        externalized_values: std::sync::Mutex<Vec<(u64, Value)>>,
+    }
+
+    impl BallotParityDriver {
+        fn new(quorum_set: ScpQuorumSet) -> Self {
+            Self {
+                quorum_set,
+                emit_count: AtomicU32::new(0),
+                timer_setups: std::sync::Mutex::new(Vec::new()),
+                timer_stops: std::sync::Mutex::new(Vec::new()),
+                externalized_values: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn get_timer_setups(&self) -> Vec<(u64, crate::driver::SCPTimerType)> {
+            self.timer_setups.lock().unwrap().clone()
+        }
+
+        fn get_timer_stops(&self) -> Vec<(u64, crate::driver::SCPTimerType)> {
+            self.timer_stops.lock().unwrap().clone()
+        }
+
+        fn get_externalized_values(&self) -> Vec<(u64, Value)> {
+            self.externalized_values.lock().unwrap().clone()
+        }
+    }
+
+    impl SCPDriver for BallotParityDriver {
+        fn validate_value(
+            &self,
+            _slot_index: u64,
+            _value: &Value,
+            _nomination: bool,
+        ) -> ValidationLevel {
+            ValidationLevel::FullyValidated
+        }
+
+        fn combine_candidates(&self, _slot_index: u64, candidates: &[Value]) -> Option<Value> {
+            candidates.first().cloned()
+        }
+
+        fn extract_valid_value(&self, _slot_index: u64, value: &Value) -> Option<Value> {
+            Some(value.clone())
+        }
+
+        fn emit_envelope(&self, _envelope: &ScpEnvelope) {
+            self.emit_count.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn get_quorum_set(&self, _node_id: &NodeId) -> Option<ScpQuorumSet> {
+            Some(self.quorum_set.clone())
+        }
+
+        fn nominating_value(&self, _slot_index: u64, _value: &Value) {}
+
+        fn value_externalized(&self, slot_index: u64, value: &Value) {
+            self.externalized_values
+                .lock()
+                .unwrap()
+                .push((slot_index, value.clone()));
+        }
+
+        fn ballot_did_prepare(&self, _slot_index: u64, _ballot: &ScpBallot) {}
+        fn ballot_did_confirm(&self, _slot_index: u64, _ballot: &ScpBallot) {}
+        fn ballot_did_hear_from_quorum(&self, _slot_index: u64, _ballot: &ScpBallot) {}
+
+        fn compute_hash_node(
+            &self,
+            _slot_index: u64,
+            _prev_value: &Value,
+            _is_priority: bool,
+            _round: u32,
+            _node_id: &NodeId,
+        ) -> u64 {
+            1
+        }
+
+        fn compute_value_hash(
+            &self,
+            _slot_index: u64,
+            _prev_value: &Value,
+            _round: u32,
+            value: &Value,
+        ) -> u64 {
+            value.iter().map(|b| *b as u64).sum()
+        }
+
+        fn compute_timeout(&self, _round: u32, _is_nomination: bool) -> Duration {
+            Duration::from_millis(1000)
+        }
+
+        fn sign_envelope(&self, _envelope: &mut ScpEnvelope) {}
+
+        fn verify_envelope(&self, _envelope: &ScpEnvelope) -> bool {
+            true
+        }
+
+        fn setup_timer(
+            &self,
+            slot_index: u64,
+            timer_type: crate::driver::SCPTimerType,
+            _timeout: Duration,
+        ) {
+            self.timer_setups
+                .lock()
+                .unwrap()
+                .push((slot_index, timer_type));
+        }
+
+        fn stop_timer(&self, slot_index: u64, timer_type: crate::driver::SCPTimerType) {
+            self.timer_stops
+                .lock()
+                .unwrap()
+                .push((slot_index, timer_type));
+        }
+    }
+
+    /// B-bump parity test: bump_to_ballot resets high/commit when value is incompatible.
+    ///
+    /// C++ invariant: h.value == b.value. When bumping to a ballot with an
+    /// incompatible value, high_ballot and commit must be cleared.
+    #[test]
+    fn test_bump_to_ballot_resets_incompatible_high_commit() {
+        let mut bp = BallotProtocol::new();
+        let value_a = make_value(&[1]);
+        let value_b = make_value(&[2]);
+
+        // Set up state: current ballot with value_a, high and commit set
+        bp.current_ballot = Some(ScpBallot {
+            counter: 1,
+            value: value_a.clone(),
+        });
+        bp.high_ballot = Some(ScpBallot {
+            counter: 1,
+            value: value_a.clone(),
+        });
+        bp.commit = Some(ScpBallot {
+            counter: 1,
+            value: value_a.clone(),
+        });
+        bp.value = Some(value_a.clone());
+
+        // Bump to a ballot with incompatible value
+        let new_ballot = ScpBallot {
+            counter: 2,
+            value: value_b.clone(),
+        };
+        assert!(bp.bump_to_ballot(&new_ballot, false));
+
+        // h and c should be cleared because value_b != value_a
+        assert!(
+            bp.high_ballot.is_none(),
+            "high_ballot should be cleared on incompatible bump"
+        );
+        assert!(
+            bp.commit.is_none(),
+            "commit should be cleared on incompatible bump"
+        );
+        assert_eq!(bp.current_ballot.as_ref().unwrap().value, value_b);
+    }
+
+    /// B-bump parity test: bump_to_ballot preserves high/commit when value is compatible.
+    #[test]
+    fn test_bump_to_ballot_preserves_compatible_high_commit() {
+        let mut bp = BallotProtocol::new();
+        let value_a = make_value(&[1]);
+
+        // Set up state with high and commit
+        bp.current_ballot = Some(ScpBallot {
+            counter: 1,
+            value: value_a.clone(),
+        });
+        bp.high_ballot = Some(ScpBallot {
+            counter: 1,
+            value: value_a.clone(),
+        });
+        bp.commit = Some(ScpBallot {
+            counter: 1,
+            value: value_a.clone(),
+        });
+        bp.value = Some(value_a.clone());
+
+        // Bump to higher counter with same value (compatible)
+        let new_ballot = ScpBallot {
+            counter: 2,
+            value: value_a.clone(),
+        };
+        assert!(bp.bump_to_ballot(&new_ballot, false));
+
+        // h and c should be preserved because same value
+        assert!(
+            bp.high_ballot.is_some(),
+            "high_ballot should be preserved on compatible bump"
+        );
+        assert!(
+            bp.commit.is_some(),
+            "commit should be preserved on compatible bump"
+        );
+    }
+
+    /// B-bump parity test: heard_from_quorum only resets when counter changes.
+    #[test]
+    fn test_bump_to_ballot_heard_from_quorum_counter_change() {
+        let mut bp = BallotProtocol::new();
+        let value_a = make_value(&[1]);
+
+        // Set initial ballot and heard_from_quorum
+        bp.current_ballot = Some(ScpBallot {
+            counter: 1,
+            value: value_a.clone(),
+        });
+        bp.heard_from_quorum = true;
+
+        // Bump with same counter (different value) - should NOT reset heard_from_quorum
+        let same_counter_ballot = ScpBallot {
+            counter: 1,
+            value: make_value(&[2]),
+        };
+        bp.bump_to_ballot(&same_counter_ballot, false);
+        assert!(
+            bp.heard_from_quorum,
+            "heard_from_quorum should not reset when counter stays the same"
+        );
+
+        // Bump with different counter - SHOULD reset heard_from_quorum
+        let new_counter_ballot = ScpBallot {
+            counter: 2,
+            value: make_value(&[2]),
+        };
+        bp.bump_to_ballot(&new_counter_ballot, false);
+        assert!(
+            !bp.heard_from_quorum,
+            "heard_from_quorum should reset when counter changes"
+        );
+    }
+
+    /// B-override parity test: bump_state uses value_override when set.
+    ///
+    /// C++ bumpState checks mValueOverride and uses that instead of the
+    /// passed-in value when it's set (e.g., after confirming prepared).
+    #[test]
+    fn test_bump_state_uses_value_override() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(BallotParityDriver::new(quorum_set.clone()));
+        let mut bp = BallotProtocol::new();
+
+        let value_a = make_value(&[1]);
+        let value_override = make_value(&[99]);
+
+        // Start with a ballot
+        assert!(bp.bump(&node, &quorum_set, &driver, 1, value_a.clone(), false));
+        assert_eq!(bp.current_ballot().unwrap().counter, 1);
+        assert_eq!(bp.current_ballot().unwrap().value, value_a);
+
+        // Set value_override (as would happen during confirm phase)
+        bp.value_override = Some(value_override.clone());
+
+        // Now bump_state with value_a - should use value_override instead
+        assert!(bp.bump_state(&node, &quorum_set, &driver, 1, value_a.clone(), 2));
+        assert_eq!(
+            bp.current_ballot().unwrap().value,
+            value_override,
+            "bump_state should use value_override when set"
+        );
+    }
+
+    /// B-override parity test: bump_state goes through update_current_value.
+    ///
+    /// C++ bumpState(value, n) calls updateCurrentValue which checks phase
+    /// and commit compatibility. Verify that bump_state rejects incompatible
+    /// commit values.
+    #[test]
+    fn test_bump_state_rejects_incompatible_with_commit() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(BallotParityDriver::new(quorum_set.clone()));
+        let mut bp = BallotProtocol::new();
+
+        let value_a = make_value(&[1]);
+        let value_b = make_value(&[2]);
+
+        // Start with a ballot
+        assert!(bp.bump(&node, &quorum_set, &driver, 1, value_a.clone(), false));
+
+        // Set a commit ballot with value_a
+        bp.commit = Some(ScpBallot {
+            counter: 1,
+            value: value_a.clone(),
+        });
+
+        // bump_state with incompatible value_b should be rejected
+        assert!(
+            !bp.bump_state(&node, &quorum_set, &driver, 1, value_b.clone(), 5),
+            "bump_state should reject value incompatible with commit"
+        );
+    }
+
+    /// B-abandon parity test: abandon_ballot uses composite candidate over current ballot.
+    ///
+    /// C++ abandonBallot first checks mSlot.getLatestCompositeCandidate(),
+    /// then falls back to mCurrentBallot->value.
+    #[test]
+    fn test_abandon_ballot_uses_composite_candidate() {
+        let mut bp = BallotProtocol::new();
+        let value_current = make_value(&[1]);
+        let value_composite = make_value(&[99]);
+
+        // Set up current ballot
+        bp.current_ballot = Some(ScpBallot {
+            counter: 1,
+            value: value_current.clone(),
+        });
+        bp.value = Some(value_current.clone());
+
+        // Set composite candidate (simulating nomination output)
+        bp.set_composite_candidate(Some(value_composite.clone()));
+
+        // Abandon should use composite candidate value
+        assert!(bp.abandon_ballot(0));
+        assert_eq!(
+            bp.current_ballot.as_ref().unwrap().value,
+            value_composite,
+            "abandon_ballot should prefer composite candidate value"
+        );
+        assert_eq!(bp.current_ballot.as_ref().unwrap().counter, 2);
+    }
+
+    /// B-abandon parity test: abandon_ballot falls back to current ballot value.
+    #[test]
+    fn test_abandon_ballot_falls_back_to_current_value() {
+        let mut bp = BallotProtocol::new();
+        let value_current = make_value(&[1]);
+
+        // Set up current ballot, no composite candidate
+        bp.current_ballot = Some(ScpBallot {
+            counter: 1,
+            value: value_current.clone(),
+        });
+        bp.value = Some(value_current.clone());
+
+        // No composite candidate set
+        assert!(bp.abandon_ballot(0));
+        assert_eq!(
+            bp.current_ballot.as_ref().unwrap().value,
+            value_current,
+            "abandon_ballot should fall back to current ballot value"
+        );
+        assert_eq!(bp.current_ballot.as_ref().unwrap().counter, 2);
+    }
+
+    /// B-abandon parity test: abandon_ballot with specific counter.
+    #[test]
+    fn test_abandon_ballot_with_specific_counter() {
+        let mut bp = BallotProtocol::new();
+        let value_current = make_value(&[1]);
+
+        bp.current_ballot = Some(ScpBallot {
+            counter: 1,
+            value: value_current.clone(),
+        });
+        bp.value = Some(value_current.clone());
+
+        // Abandon with specific counter
+        assert!(bp.abandon_ballot(10));
+        assert_eq!(
+            bp.current_ballot.as_ref().unwrap().counter,
+            10,
+            "abandon_ballot should use specified counter"
+        );
+    }
+
+    /// B-stopnom parity test: set_confirm_commit signals nomination stop.
+    ///
+    /// C++ setConfirmCommit calls mSlot.stopNomination() between
+    /// emitCurrentStateStatement() and valueExternalized().
+    #[test]
+    fn test_set_confirm_commit_signals_stop_nomination() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(BallotParityDriver::new(quorum_set.clone()));
+        let mut bp = BallotProtocol::new();
+
+        let value = make_value(&[1]);
+
+        // Must have a current ballot first
+        bp.current_ballot = Some(ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        });
+        bp.value = Some(value.clone());
+
+        let c = ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        };
+        let h = ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        };
+
+        bp.set_confirm_commit(c, h, &node, &quorum_set, &driver, 1);
+
+        // Should signal that nomination needs to stop
+        assert!(
+            bp.needs_stop_nomination,
+            "set_confirm_commit should signal nomination stop"
+        );
+
+        // And take_needs_stop_nomination should clear the flag
+        assert!(bp.take_needs_stop_nomination());
+        assert!(!bp.take_needs_stop_nomination());
+    }
+
+    /// B-stopnom parity test: set_confirm_commit uses commit value for externalize.
+    ///
+    /// C++ uses mCommit->getBallot().value (c.value) for valueExternalized,
+    /// not h.value.
+    #[test]
+    fn test_set_confirm_commit_externalizes_commit_value() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(BallotParityDriver::new(quorum_set.clone()));
+        let mut bp = BallotProtocol::new();
+
+        let value = make_value(&[42]);
+
+        bp.current_ballot = Some(ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        });
+        bp.value = Some(value.clone());
+
+        let c = ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        };
+        let h = ScpBallot {
+            counter: 3,
+            value: value.clone(),
+        };
+
+        bp.set_confirm_commit(c.clone(), h, &node, &quorum_set, &driver, 1);
+
+        let externalized = driver.get_externalized_values();
+        assert_eq!(externalized.len(), 1);
+        assert_eq!(
+            externalized[0].1, c.value,
+            "valueExternalized should be called with c.value"
+        );
+    }
+
+    /// B-timer parity test: check_heard_from_quorum starts ballot timer on transition.
+    ///
+    /// C++ starts the ballot protocol timer when heard_from_quorum transitions
+    /// from false to true and phase is not Externalize.
+    #[test]
+    fn test_check_heard_from_quorum_starts_timer() {
+        let local = make_node_id(1);
+        let remote = make_node_id(2);
+        let quorum_set = make_quorum_set(vec![local.clone(), remote.clone()], 2);
+        let driver = Arc::new(BallotParityDriver::new(quorum_set.clone()));
+        let mut bp = BallotProtocol::new();
+
+        let value = make_value(&[1]);
+        let ballot = ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        };
+
+        // Start with a ballot
+        bp.current_ballot = Some(ballot.clone());
+        bp.value = Some(value.clone());
+        bp.heard_from_quorum = false;
+
+        // Add envelopes from both nodes (need quorum)
+        let env_local = make_prepare_envelope(local.clone(), 1, &quorum_set, ballot.clone());
+        let env_remote = make_prepare_envelope(remote.clone(), 1, &quorum_set, ballot.clone());
+        bp.latest_envelopes.insert(local.clone(), env_local);
+        bp.latest_envelopes.insert(remote.clone(), env_remote);
+
+        // Check heard from quorum
+        bp.check_heard_from_quorum(&local, &quorum_set, &driver, 1);
+
+        assert!(bp.heard_from_quorum);
+
+        // Ballot timer should have been set up
+        let setups = driver.get_timer_setups();
+        assert!(
+            setups
+                .iter()
+                .any(|(_, t)| *t == crate::driver::SCPTimerType::Ballot),
+            "Ballot timer should be started when heard_from_quorum transitions to true"
+        );
+    }
+
+    /// B-timer parity test: check_heard_from_quorum stops timer when not quorum.
+    ///
+    /// C++ stops the ballot timer when heard_from_quorum is false.
+    #[test]
+    fn test_check_heard_from_quorum_stops_timer_no_quorum() {
+        let local = make_node_id(1);
+        let remote = make_node_id(2);
+        let quorum_set = make_quorum_set(vec![local.clone(), remote.clone()], 2);
+        let driver = Arc::new(BallotParityDriver::new(quorum_set.clone()));
+        let mut bp = BallotProtocol::new();
+
+        let value = make_value(&[1]);
+        let ballot = ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        };
+
+        bp.current_ballot = Some(ballot.clone());
+        bp.value = Some(value.clone());
+        bp.heard_from_quorum = true; // Was previously true
+
+        // Only local envelope (not a quorum for threshold=2)
+        let env_local = make_prepare_envelope(local.clone(), 1, &quorum_set, ballot.clone());
+        bp.latest_envelopes.insert(local.clone(), env_local);
+
+        bp.check_heard_from_quorum(&local, &quorum_set, &driver, 1);
+
+        assert!(!bp.heard_from_quorum);
+
+        // Timer should have been stopped
+        let stops = driver.get_timer_stops();
+        assert!(
+            stops
+                .iter()
+                .any(|(_, t)| *t == crate::driver::SCPTimerType::Ballot),
+            "Ballot timer should be stopped when quorum is lost"
+        );
+    }
+
+    /// B-timer parity test: check_heard_from_quorum stops timer in Externalize phase.
+    ///
+    /// C++ stops the ballot timer when heard_from_quorum is true but phase is Externalize.
+    #[test]
+    fn test_check_heard_from_quorum_stops_timer_externalize() {
+        let local = make_node_id(1);
+        let remote = make_node_id(2);
+        let quorum_set = make_quorum_set(vec![local.clone(), remote.clone()], 2);
+        let driver = Arc::new(BallotParityDriver::new(quorum_set.clone()));
+        let mut bp = BallotProtocol::new();
+
+        let value = make_value(&[1]);
+        let ballot = ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        };
+
+        bp.current_ballot = Some(ballot.clone());
+        bp.value = Some(value.clone());
+        bp.phase = BallotPhase::Externalize;
+        bp.heard_from_quorum = false; // Will transition to true
+
+        // Add quorum of envelopes
+        let env_local = make_prepare_envelope(local.clone(), 1, &quorum_set, ballot.clone());
+        let env_remote = make_prepare_envelope(remote.clone(), 1, &quorum_set, ballot.clone());
+        bp.latest_envelopes.insert(local.clone(), env_local);
+        bp.latest_envelopes.insert(remote.clone(), env_remote);
+
+        bp.check_heard_from_quorum(&local, &quorum_set, &driver, 1);
+
+        assert!(bp.heard_from_quorum);
+
+        // Timer should NOT have been started (phase is Externalize)
+        let setups = driver.get_timer_setups();
+        assert!(
+            !setups
+                .iter()
+                .any(|(_, t)| *t == crate::driver::SCPTimerType::Ballot),
+            "Ballot timer should NOT be started in Externalize phase"
+        );
+
+        // Timer should have been stopped
+        let stops = driver.get_timer_stops();
+        assert!(
+            stops
+                .iter()
+                .any(|(_, t)| *t == crate::driver::SCPTimerType::Ballot),
+            "Ballot timer should be stopped in Externalize phase"
+        );
+    }
+
+    /// B-override parity test: update_current_value checks phase.
+    #[test]
+    fn test_update_current_value_rejects_externalize_phase() {
+        let mut bp = BallotProtocol::new();
+        let value = make_value(&[1]);
+
+        bp.phase = BallotPhase::Externalize;
+
+        let ballot = ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        };
+
+        assert!(
+            !bp.update_current_value(&ballot),
+            "update_current_value should reject in Externalize phase"
+        );
+    }
+
+    /// B-override parity test: update_current_value rejects commit-incompatible ballots.
+    #[test]
+    fn test_update_current_value_rejects_commit_incompatible() {
+        let mut bp = BallotProtocol::new();
+        let value_a = make_value(&[1]);
+        let value_b = make_value(&[2]);
+
+        bp.current_ballot = Some(ScpBallot {
+            counter: 1,
+            value: value_a.clone(),
+        });
+        bp.commit = Some(ScpBallot {
+            counter: 1,
+            value: value_a.clone(),
+        });
+
+        let incompatible_ballot = ScpBallot {
+            counter: 2,
+            value: value_b,
+        };
+
+        assert!(
+            !bp.update_current_value(&incompatible_ballot),
+            "update_current_value should reject ballot incompatible with commit"
+        );
+    }
+
+    /// B-bump parity test: bump delegates to bump_state.
+    ///
+    /// Since bump now delegates to bump_state, it inherits value_override
+    /// checking and update_current_value logic.
+    #[test]
+    fn test_bump_delegates_to_bump_state() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(BallotParityDriver::new(quorum_set.clone()));
+        let mut bp = BallotProtocol::new();
+
+        let value_a = make_value(&[1]);
+        let value_override = make_value(&[99]);
+
+        // Start with a ballot
+        assert!(bp.bump(&node, &quorum_set, &driver, 1, value_a.clone(), false));
+        assert_eq!(bp.current_ballot().unwrap().value, value_a);
+
+        // Set value_override
+        bp.value_override = Some(value_override.clone());
+
+        // Force bump should use value_override
+        assert!(bp.bump(&node, &quorum_set, &driver, 1, value_a.clone(), true));
+        assert_eq!(
+            bp.current_ballot().unwrap().value,
+            value_override,
+            "bump with force should use value_override"
+        );
     }
 }

@@ -506,7 +506,7 @@ fn test_purge_old_slots() {
     assert_eq!(sim.get_node(&node1).slot_count(), 10);
 
     // Purge slots older than 6
-    sim.get_node(&node1).purge_slots(6);
+    sim.get_node(&node1).purge_slots(6, None);
 
     assert_eq!(sim.get_node(&node1).slot_count(), 5);
     assert!(sim.get_node(&node1).get_externalized_value(5).is_none());
@@ -1578,7 +1578,7 @@ fn test_stress_slot_churn() {
 
         // Purge old slots, keeping only last 10
         if batch > 0 {
-            scp.purge_slots(end - 10);
+            scp.purge_slots(end - 10, None);
         }
     }
 

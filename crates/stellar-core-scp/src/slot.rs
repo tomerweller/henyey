@@ -86,6 +86,12 @@ pub struct Slot {
     /// This affects whether local envelopes are emitted to the network.
     /// When false, the node defers broadcasting its own statements.
     fully_validated: bool,
+
+    /// Whether we've heard from a v-blocking set for this slot.
+    ///
+    /// Set once when a v-blocking threshold of nodes have sent messages.
+    /// Matches C++ `mGotVBlocking`.
+    got_v_blocking: bool,
 }
 
 impl Slot {
@@ -112,6 +118,7 @@ impl Slot {
             externalized_value: None,
             nomination_started: false,
             fully_validated: is_validator,
+            got_v_blocking: false,
         }
     }
 
@@ -150,6 +157,41 @@ impl Slot {
         self.ballot.heard_from_quorum()
     }
 
+    /// Check if we've heard from a v-blocking set.
+    ///
+    /// Matches C++ `Slot::gotVBlocking()`.
+    pub fn got_v_blocking(&self) -> bool {
+        self.got_v_blocking
+    }
+
+    /// Check and set `got_v_blocking` if v-blocking threshold is met.
+    ///
+    /// Called after processing an envelope from a new node. If we've already
+    /// got v-blocking, this is a no-op. Otherwise, checks all nodes in our
+    /// quorum set that have sent messages and determines if they form a
+    /// v-blocking set.
+    ///
+    /// Matches C++ `Slot::maybeSetGotVBlocking()`.
+    fn maybe_set_got_v_blocking(&mut self) {
+        if self.got_v_blocking {
+            return;
+        }
+
+        // Collect nodes we've heard from (have latest message in ballot or nomination)
+        let mut heard_nodes = std::collections::HashSet::new();
+        let all_nodes = crate::quorum::get_all_nodes(&self.local_quorum_set);
+        for node_id in &all_nodes {
+            // Check ballot protocol first, then nomination (matching C++ getLatestMessage)
+            if self.ballot.latest_envelopes().contains_key(node_id)
+                || self.nomination.get_latest_nomination(node_id).is_some()
+            {
+                heard_nodes.insert(node_id.clone());
+            }
+        }
+
+        self.got_v_blocking = crate::quorum::is_v_blocking(&self.local_quorum_set, &heard_nodes);
+    }
+
     /// Process an incoming SCP envelope.
     ///
     /// # Returns
@@ -160,6 +202,11 @@ impl Slot {
         driver: &Arc<D>,
     ) -> EnvelopeState {
         let node_id = envelope.statement.node_id.clone();
+
+        // Check if this is the first message from this node
+        // C++ checks getLatestMessage(nodeID) which checks ballot then nomination
+        let prev = self.ballot.latest_envelopes().contains_key(&node_id)
+            || self.nomination.get_latest_nomination(&node_id).is_some();
 
         // Process based on statement type
         let result = match &envelope.statement.pledges {
@@ -176,6 +223,12 @@ impl Slot {
                 .entry(node_id.clone())
                 .or_default()
                 .push(envelope.clone());
+
+            // If this is the first valid message from this node,
+            // check if we now have a v-blocking set (matching C++)
+            if !prev {
+                self.maybe_set_got_v_blocking();
+            }
         }
 
         // Check if we need to transition from nomination to ballot
@@ -229,8 +282,15 @@ impl Slot {
             timedout,
         );
 
-        // Set up nomination timer for next round
-        if result && !self.nomination.is_stopped() {
+        // C++ always sets up the nomination timer after nominate() succeeds
+        // in reaching the main logic (i.e., didn't return early due to
+        // candidates already existing, stopped, or timed-out-before-started).
+        // The timer is NOT conditional on `updated`.
+        // We check the conditions that match C++ reaching line 654.
+        if self.nomination.is_started()
+            && !self.nomination.is_stopped()
+            && self.nomination.candidates().is_empty()
+        {
             let round = self.nomination.round();
             let timeout = driver.compute_timeout(round, true);
             driver.setup_timer(
@@ -250,6 +310,16 @@ impl Slot {
         driver.stop_timer(self.slot_index, crate::driver::SCPTimerType::Nomination);
     }
 
+    /// Sync the composite candidate from nomination into ballot protocol.
+    ///
+    /// The C++ BallotProtocol accesses `mSlot.getLatestCompositeCandidate()` directly,
+    /// but in Rust the ballot protocol doesn't hold a reference to the slot/nomination.
+    /// We sync it before any ballot operation that might call `abandon_ballot`.
+    fn sync_composite_candidate(&mut self) {
+        self.ballot
+            .set_composite_candidate(self.nomination.latest_composite().cloned());
+    }
+
     /// Bump the ballot on timeout.
     pub fn bump_ballot_on_timeout<D: SCPDriver>(&mut self, driver: &Arc<D>) -> bool {
         if !self.is_validator {
@@ -259,25 +329,14 @@ impl Slot {
         // Notify driver of timer expiration
         driver.timer_expired(self.slot_index, crate::driver::SCPTimerType::Ballot);
 
-        let result = self.ballot.bump_timeout(
+        let composite = self.nomination.latest_composite().cloned();
+        self.ballot.bump_timeout(
             &self.local_node_id,
             &self.local_quorum_set,
             driver,
             self.slot_index,
-        );
-
-        // Set up ballot timer for next round if not externalized
-        if result && self.ballot.phase() != BallotPhase::Externalize {
-            let counter = self.ballot.current_ballot().map(|b| b.counter).unwrap_or(1);
-            let timeout = driver.compute_timeout(counter, false);
-            driver.setup_timer(
-                self.slot_index,
-                crate::driver::SCPTimerType::Ballot,
-                timeout,
-            );
-        }
-
-        result
+            composite.as_ref(),
+        )
     }
 
     /// Get all envelopes received for this slot.
@@ -286,7 +345,7 @@ impl Slot {
     }
 
     /// Get the latest envelope from a specific node.
-    pub fn get_latest_envelope(&self, node_id: &NodeId) -> Option<&ScpEnvelope> {
+    pub fn get_latest_nomination(&self, node_id: &NodeId) -> Option<&ScpEnvelope> {
         self.envelopes.get(node_id).and_then(|v| v.last())
     }
 
@@ -357,13 +416,25 @@ impl Slot {
             self.ballot.set_fully_validated(false);
         }
 
-        self.ballot.process_envelope(
+        // Sync composite candidate so abandon_ballot can use it
+        self.sync_composite_candidate();
+
+        let result = self.ballot.process_envelope(
             envelope,
             &self.local_node_id,
             &self.local_quorum_set,
             driver,
             self.slot_index,
-        )
+        );
+
+        // Check if set_confirm_commit signaled that nomination should stop
+        // (matches C++ mSlot.stopNomination() call inside setConfirmCommit)
+        if self.ballot.take_needs_stop_nomination() {
+            self.nomination.stop();
+            driver.stop_timer(self.slot_index, crate::driver::SCPTimerType::Nomination);
+        }
+
+        result
     }
 
     /// Check if we should transition from nomination to ballot protocol.
@@ -392,17 +463,6 @@ impl Slot {
                 composite.clone(),
                 false,
             );
-
-            // Set up ballot timer for the first ballot round
-            if self.ballot.phase() != BallotPhase::Externalize {
-                let counter = self.ballot.current_ballot().map(|b| b.counter).unwrap_or(1);
-                let timeout = driver.compute_timeout(counter, false);
-                driver.setup_timer(
-                    self.slot_index,
-                    crate::driver::SCPTimerType::Ballot,
-                    timeout,
-                );
-            }
         }
     }
 
@@ -444,11 +504,28 @@ impl Slot {
         self.envelopes.values().map(|v| v.len()).sum()
     }
 
+    /// Get the latest envelope from a specific node.
+    ///
+    /// Checks ballot protocol first, then nomination protocol.
+    /// Matches C++ `Slot::getLatestMessage(NodeID const& id)`.
+    pub fn get_latest_envelope(&self, node_id: &NodeId) -> Option<&ScpEnvelope> {
+        self.ballot
+            .latest_envelopes()
+            .get(node_id)
+            .or_else(|| self.nomination.get_latest_nomination(node_id))
+    }
+
     /// Get the latest messages that would be sent for this slot.
     ///
     /// Returns the latest envelopes for both nomination and ballot protocols.
+    /// Only returns messages if the slot is fully validated (matching C++
+    /// `Slot::getLatestMessagesSend` which gates on `mFullyValidated`).
     pub fn get_latest_messages_send(&self) -> Vec<ScpEnvelope> {
         let mut messages = Vec::new();
+
+        if !self.fully_validated {
+            return messages;
+        }
 
         // Add latest nomination message if available
         if let Some(env) = self.nomination.get_last_envelope() {
@@ -472,35 +549,12 @@ impl Slot {
 
     /// Get the externalizing state for this slot.
     ///
-    /// Returns envelopes that contribute to the externalized state,
-    /// i.e., EXTERNALIZE messages from nodes.
+    /// Delegates to BallotProtocol::get_externalizing_state, matching C++
+    /// where `Slot::getExternalizingState()` calls
+    /// `mBallotProtocol.getExternalizingState()`.
     pub fn get_externalizing_state(&self) -> Vec<ScpEnvelope> {
-        let mut envelopes = Vec::new();
-
-        for envs in self.envelopes.values() {
-            for env in envs {
-                if matches!(env.statement.pledges, ScpStatementPledges::Externalize(_)) {
-                    envelopes.push(env.clone());
-                }
-            }
-        }
-
-        // Sort by node ID for deterministic ordering
-        envelopes.sort_by(|a, b| {
-            let a_bytes = match &a.statement.node_id.0 {
-                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
-                    bytes,
-                )) => bytes,
-            };
-            let b_bytes = match &b.statement.node_id.0 {
-                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
-                    bytes,
-                )) => bytes,
-            };
-            a_bytes.cmp(b_bytes)
-        });
-
-        envelopes
+        self.ballot
+            .get_externalizing_state(&self.local_node_id, self.fully_validated)
     }
 
     /// Record a historical statement for this slot.
@@ -585,13 +639,38 @@ impl Slot {
     /// when restarting after a crash. It routes the envelope to the appropriate
     /// protocol (nomination or ballot) for state restoration.
     ///
+    /// Matching C++ `Slot::setStateFromEnvelope`: validates that the envelope is
+    /// from the local node and for this slot, checks if it's a new node, and
+    /// calls `maybeSetGotVBlocking`.
+    ///
     /// # Arguments
     /// * `envelope` - The envelope to restore state from
     ///
     /// # Returns
     /// True if state was successfully restored, false if the envelope is invalid.
     pub fn set_state_from_envelope(&mut self, envelope: &ScpEnvelope) -> bool {
-        match &envelope.statement.pledges {
+        // C++ validates nodeID and slotIndex
+        if envelope.statement.node_id != self.local_node_id
+            || envelope.statement.slot_index != self.slot_index
+        {
+            tracing::trace!(
+                slot = self.slot_index,
+                "Slot::set_state_from_envelope invalid envelope"
+            );
+            return false;
+        }
+
+        // Check if this is first message from this node
+        let prev = self
+            .ballot
+            .latest_envelopes()
+            .contains_key(&envelope.statement.node_id)
+            || self
+                .nomination
+                .get_latest_nomination(&envelope.statement.node_id)
+                .is_some();
+
+        let result = match &envelope.statement.pledges {
             ScpStatementPledges::Nominate(_) => self.nomination.set_state_from_envelope(envelope),
             ScpStatementPledges::Prepare(_)
             | ScpStatementPledges::Confirm(_)
@@ -605,7 +684,13 @@ impl Slot {
                 }
                 result
             }
+        };
+
+        if result && !prev {
+            self.maybe_set_got_v_blocking();
         }
+
+        result
     }
 
     /// Abandon the current ballot and move to a new one.
@@ -619,6 +704,7 @@ impl Slot {
     /// # Returns
     /// True if the ballot was abandoned successfully.
     pub fn abandon_ballot(&mut self, counter: u32) -> bool {
+        self.sync_composite_candidate();
         self.ballot.abandon_ballot_public(counter)
     }
 
@@ -864,7 +950,8 @@ mod tests {
         };
 
         assert!(slot.set_state_from_envelope(&envelope));
-        assert!(slot.nomination().is_started());
+        // C++ setStateFromEnvelope does NOT set mNominationStarted = true
+        assert!(!slot.nomination().is_started());
     }
 
     #[test]
@@ -1096,5 +1183,584 @@ mod tests {
         set.insert(SCPTimerType::Nomination);
         set.insert(SCPTimerType::Ballot);
         assert_eq!(set.len(), 2);
+    }
+
+    // ==================== Phase 4 parity tests ====================
+
+    // S1: get_latest_messages_send returns empty when not fully validated
+    #[test]
+    fn test_get_latest_messages_send_not_fully_validated() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set();
+
+        // Create a slot that is NOT fully validated
+        let mut slot = Slot::new(1, node.clone(), quorum_set.clone(), false);
+
+        // Set up some state via set_state_from_envelope so there are messages
+        let value: Value = vec![1, 2, 3].try_into().unwrap();
+        let nomination = stellar_xdr::curr::ScpNomination {
+            quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
+            votes: vec![value.clone()].try_into().unwrap(),
+            accepted: vec![].try_into().unwrap(),
+        };
+        let statement = stellar_xdr::curr::ScpStatement {
+            node_id: node.clone(),
+            slot_index: 1,
+            pledges: ScpStatementPledges::Nominate(nomination),
+        };
+        let envelope = ScpEnvelope {
+            statement,
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+        slot.set_state_from_envelope(&envelope);
+
+        // Even though we have state, should return empty since not fully validated
+        let messages = slot.get_latest_messages_send();
+        assert!(
+            messages.is_empty(),
+            "get_latest_messages_send should return empty when not fully validated"
+        );
+
+        // Now test with fully validated slot
+        let mut slot2 = Slot::new(1, node.clone(), quorum_set.clone(), true);
+        slot2.set_state_from_envelope(&envelope);
+        let messages2 = slot2.get_latest_messages_send();
+        assert!(
+            !messages2.is_empty(),
+            "get_latest_messages_send should return messages when fully validated"
+        );
+    }
+
+    // S2: got_v_blocking transitions from false to true
+    #[test]
+    fn test_got_v_blocking_tracking() {
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+        let node3 = make_node_id(3);
+
+        // Quorum set: threshold 2 of {node1, node2, node3}
+        // V-blocking requires enough nodes to block any quorum slice from being satisfied.
+        // With threshold 2 of 3, any 2 nodes form a quorum slice.
+        // A v-blocking set is any set that intersects every quorum slice.
+        // With threshold=2, validators={n1,n2,n3}, v-blocking needs at least 2 nodes
+        // (since removing 2 nodes leaves 1, which doesn't meet threshold 2).
+        let quorum_set = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![node1.clone(), node2.clone(), node3.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let mut slot = Slot::new(1, node1.clone(), quorum_set.clone(), true);
+
+        // Initially not v-blocking
+        assert!(!slot.got_v_blocking(), "should not be v-blocking initially");
+
+        // Add a nomination envelope from self (node1).
+        // Since set_state_from_envelope validates node_id == local_node_id,
+        // we can only add our own envelope.
+        let value: Value = vec![1, 2, 3].try_into().unwrap();
+        let nomination = stellar_xdr::curr::ScpNomination {
+            quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
+            votes: vec![value.clone()].try_into().unwrap(),
+            accepted: vec![].try_into().unwrap(),
+        };
+        let own_envelope = ScpEnvelope {
+            statement: stellar_xdr::curr::ScpStatement {
+                node_id: node1.clone(),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Nominate(nomination.clone()),
+            },
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+        slot.set_state_from_envelope(&own_envelope);
+
+        // After adding one node (self), check got_v_blocking
+        // With threshold=2, one node out of 3 is not v-blocking
+        // (need 2 nodes to block, since any slice needs 2 of 3)
+        // Actually: for threshold=2 of 3 validators, v-blocking needs
+        // > (3 - 2) = 1 node, so 2 nodes. One node is NOT v-blocking.
+        assert!(
+            !slot.got_v_blocking(),
+            "one node should not be v-blocking for threshold 2 of 3"
+        );
+    }
+
+    // S4: get_externalizing_state filters properly
+    #[test]
+    fn test_get_externalizing_state_not_externalized() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set();
+        let slot = Slot::new(1, node.clone(), quorum_set.clone(), true);
+
+        // Not externalized, should return empty
+        let state = slot.get_externalizing_state();
+        assert!(
+            state.is_empty(),
+            "get_externalizing_state should return empty when not externalized"
+        );
+    }
+
+    #[test]
+    fn test_get_externalizing_state_externalized() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set();
+        let mut slot = Slot::new(1, node.clone(), quorum_set.clone(), true);
+
+        let value: Value = vec![7, 8, 9].try_into().unwrap();
+        let ext = stellar_xdr::curr::ScpStatementExternalize {
+            commit: stellar_xdr::curr::ScpBallot {
+                counter: 5,
+                value: value.clone(),
+            },
+            n_h: 7,
+            commit_quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
+        };
+        let statement = stellar_xdr::curr::ScpStatement {
+            node_id: node.clone(),
+            slot_index: 1,
+            pledges: ScpStatementPledges::Externalize(ext),
+        };
+        let envelope = ScpEnvelope {
+            statement,
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+        slot.set_state_from_envelope(&envelope);
+
+        assert!(slot.is_externalized());
+        // Since slot is fully validated and we externalized, should include our envelope
+        let state = slot.get_externalizing_state();
+        assert!(
+            !state.is_empty(),
+            "get_externalizing_state should include our envelope when externalized"
+        );
+    }
+
+    #[test]
+    fn test_get_externalizing_state_not_fully_validated() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set();
+        // Create NOT fully validated slot
+        let mut slot = Slot::new(1, node.clone(), quorum_set.clone(), false);
+
+        let value: Value = vec![7, 8, 9].try_into().unwrap();
+        let ext = stellar_xdr::curr::ScpStatementExternalize {
+            commit: stellar_xdr::curr::ScpBallot {
+                counter: 5,
+                value: value.clone(),
+            },
+            n_h: 7,
+            commit_quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
+        };
+        let statement = stellar_xdr::curr::ScpStatement {
+            node_id: node.clone(),
+            slot_index: 1,
+            pledges: ScpStatementPledges::Externalize(ext),
+        };
+        let envelope = ScpEnvelope {
+            statement,
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+
+        // Note: set_state_from_envelope for EXTERNALIZE sets fully_validated=true
+        // So we need to reset it after
+        slot.set_state_from_envelope(&envelope);
+        // Manually override fully_validated back to false for this test
+        slot.fully_validated = false;
+
+        // Our own envelope should NOT be included since not fully validated
+        let state = slot.get_externalizing_state();
+        assert!(
+            state.is_empty(),
+            "get_externalizing_state should exclude self envelope when not fully validated"
+        );
+    }
+
+    // S5: set_state_from_envelope rejects wrong node/slot
+    #[test]
+    fn test_set_state_from_envelope_rejects_wrong_node() {
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+        let quorum_set = make_quorum_set();
+        let mut slot = Slot::new(1, node1.clone(), quorum_set.clone(), true);
+
+        // Create envelope from wrong node
+        let value: Value = vec![1, 2, 3].try_into().unwrap();
+        let nomination = stellar_xdr::curr::ScpNomination {
+            quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
+            votes: vec![value.clone()].try_into().unwrap(),
+            accepted: vec![].try_into().unwrap(),
+        };
+        let statement = stellar_xdr::curr::ScpStatement {
+            node_id: node2.clone(), // Wrong node!
+            slot_index: 1,
+            pledges: ScpStatementPledges::Nominate(nomination),
+        };
+        let envelope = ScpEnvelope {
+            statement,
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+
+        assert!(
+            !slot.set_state_from_envelope(&envelope),
+            "set_state_from_envelope should reject envelope from wrong node"
+        );
+    }
+
+    #[test]
+    fn test_set_state_from_envelope_rejects_wrong_slot() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set();
+        let mut slot = Slot::new(1, node.clone(), quorum_set.clone(), true);
+
+        // Create envelope for wrong slot
+        let value: Value = vec![1, 2, 3].try_into().unwrap();
+        let nomination = stellar_xdr::curr::ScpNomination {
+            quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
+            votes: vec![value.clone()].try_into().unwrap(),
+            accepted: vec![].try_into().unwrap(),
+        };
+        let statement = stellar_xdr::curr::ScpStatement {
+            node_id: node.clone(),
+            slot_index: 999, // Wrong slot!
+            pledges: ScpStatementPledges::Nominate(nomination),
+        };
+        let envelope = ScpEnvelope {
+            statement,
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+
+        assert!(
+            !slot.set_state_from_envelope(&envelope),
+            "set_state_from_envelope should reject envelope for wrong slot"
+        );
+    }
+
+    // S6: EXTERNALIZE state restoration sets prepared field
+    #[test]
+    fn test_set_state_from_envelope_externalize_sets_prepared() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set();
+        let mut slot = Slot::new(1, node.clone(), quorum_set.clone(), true);
+
+        let value: Value = vec![7, 8, 9].try_into().unwrap();
+        let ext = stellar_xdr::curr::ScpStatementExternalize {
+            commit: stellar_xdr::curr::ScpBallot {
+                counter: 5,
+                value: value.clone(),
+            },
+            n_h: 7,
+            commit_quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
+        };
+        let statement = stellar_xdr::curr::ScpStatement {
+            node_id: node.clone(),
+            slot_index: 1,
+            pledges: ScpStatementPledges::Externalize(ext),
+        };
+        let envelope = ScpEnvelope {
+            statement,
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+
+        assert!(slot.set_state_from_envelope(&envelope));
+
+        // C++ sets mPrepared = makeBallot(UINT32_MAX, v) for EXTERNALIZE
+        let prepared = slot.ballot().prepared();
+        assert!(
+            prepared.is_some(),
+            "prepared should be set after EXTERNALIZE state restoration"
+        );
+        let prepared = prepared.unwrap();
+        assert_eq!(
+            prepared.counter,
+            u32::MAX,
+            "prepared counter should be UINT32_MAX for EXTERNALIZE"
+        );
+        assert_eq!(
+            prepared.value, value,
+            "prepared value should match commit value"
+        );
+    }
+
+    // S9: purge_slots keeps slot_to_keep
+    #[test]
+    fn test_purge_slots_keeps_slot_to_keep() {
+        use crate::driver::{SCPDriver, ValidationLevel};
+        use crate::SCP;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        struct DummyDriver;
+        impl SCPDriver for DummyDriver {
+            fn validate_value(&self, _: u64, _: &Value, _: bool) -> ValidationLevel {
+                ValidationLevel::FullyValidated
+            }
+            fn combine_candidates(&self, _: u64, _: &[Value]) -> Option<Value> {
+                None
+            }
+            fn emit_envelope(&self, _: &ScpEnvelope) {}
+            fn nominating_value(&self, _: u64, _: &Value) {}
+            fn extract_valid_value(&self, _: u64, _: &Value) -> Option<Value> {
+                None
+            }
+            fn value_externalized(&self, _: u64, _: &Value) {}
+            fn get_quorum_set(&self, _: &NodeId) -> Option<ScpQuorumSet> {
+                None
+            }
+            fn ballot_did_prepare(&self, _: u64, _: &stellar_xdr::curr::ScpBallot) {}
+            fn ballot_did_confirm(&self, _: u64, _: &stellar_xdr::curr::ScpBallot) {}
+            fn compute_hash_node(&self, _: u64, _: &Value, _: bool, _: u32, _: &NodeId) -> u64 {
+                1
+            }
+            fn compute_value_hash(&self, _: u64, _: &Value, _: u32, _: &Value) -> u64 {
+                1
+            }
+            fn compute_timeout(&self, _: u32, _: bool) -> Duration {
+                Duration::from_secs(1)
+            }
+            fn sign_envelope(&self, _: &mut ScpEnvelope) {}
+            fn verify_envelope(&self, _: &ScpEnvelope) -> bool {
+                true
+            }
+        }
+
+        let node = make_node_id(1);
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![node.clone()].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let driver = Arc::new(DummyDriver);
+        let scp = SCP::new(node, true, quorum_set, driver);
+
+        // Create slots 1 through 10
+        for i in 1..=10 {
+            let value: Value = vec![i as u8].try_into().unwrap();
+            scp.force_externalize(i, value);
+        }
+        assert_eq!(scp.slot_count(), 10);
+
+        // Purge slots older than 8, but keep slot 3
+        scp.purge_slots(8, Some(3));
+
+        let active = scp.active_slots();
+        // Should keep slots 8, 9, 10 (>= 8) and slot 3 (slot_to_keep)
+        assert!(active.contains(&3), "slot 3 should be kept as slot_to_keep");
+        assert!(active.contains(&8), "slot 8 should be kept (>= max)");
+        assert!(active.contains(&9), "slot 9 should be kept (>= max)");
+        assert!(active.contains(&10), "slot 10 should be kept (>= max)");
+        assert!(!active.contains(&1), "slot 1 should be purged");
+        assert!(!active.contains(&7), "slot 7 should be purged");
+        assert_eq!(active.len(), 4, "should have exactly 4 slots remaining");
+    }
+
+    // S9: purge_slots without slot_to_keep behaves normally
+    #[test]
+    fn test_purge_slots_without_keep() {
+        use crate::driver::{SCPDriver, ValidationLevel};
+        use crate::SCP;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        struct DummyDriver2;
+        impl SCPDriver for DummyDriver2 {
+            fn validate_value(&self, _: u64, _: &Value, _: bool) -> ValidationLevel {
+                ValidationLevel::FullyValidated
+            }
+            fn combine_candidates(&self, _: u64, _: &[Value]) -> Option<Value> {
+                None
+            }
+            fn emit_envelope(&self, _: &ScpEnvelope) {}
+            fn nominating_value(&self, _: u64, _: &Value) {}
+            fn extract_valid_value(&self, _: u64, _: &Value) -> Option<Value> {
+                None
+            }
+            fn value_externalized(&self, _: u64, _: &Value) {}
+            fn get_quorum_set(&self, _: &NodeId) -> Option<ScpQuorumSet> {
+                None
+            }
+            fn ballot_did_prepare(&self, _: u64, _: &stellar_xdr::curr::ScpBallot) {}
+            fn ballot_did_confirm(&self, _: u64, _: &stellar_xdr::curr::ScpBallot) {}
+            fn compute_hash_node(&self, _: u64, _: &Value, _: bool, _: u32, _: &NodeId) -> u64 {
+                1
+            }
+            fn compute_value_hash(&self, _: u64, _: &Value, _: u32, _: &Value) -> u64 {
+                1
+            }
+            fn compute_timeout(&self, _: u32, _: bool) -> Duration {
+                Duration::from_secs(1)
+            }
+            fn sign_envelope(&self, _: &mut ScpEnvelope) {}
+            fn verify_envelope(&self, _: &ScpEnvelope) -> bool {
+                true
+            }
+        }
+
+        let node = make_node_id(1);
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![node.clone()].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let driver = Arc::new(DummyDriver2);
+        let scp = SCP::new(node, true, quorum_set, driver);
+
+        for i in 1..=10 {
+            let value: Value = vec![i as u8].try_into().unwrap();
+            scp.force_externalize(i, value);
+        }
+        assert_eq!(scp.slot_count(), 10);
+
+        // Purge slots older than 8, no slot_to_keep
+        scp.purge_slots(8, None);
+
+        let active = scp.active_slots();
+        assert_eq!(active.len(), 3, "should have slots 8, 9, 10 remaining");
+        assert!(!active.contains(&3), "slot 3 should be purged (no keep)");
+    }
+
+    // S10: advanceSlot panics on recursion overflow
+    #[test]
+    #[should_panic(expected = "maximum number of transitions reached in advanceSlot")]
+    fn test_advance_slot_recursion_panic() {
+        use crate::ballot::BallotProtocol;
+        use crate::driver::{SCPDriver, ValidationLevel};
+        use std::time::Duration;
+
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set();
+        let mut ballot = BallotProtocol::new();
+
+        // Manually set current_message_level to 49 (one below threshold)
+        // then call advance_slot which will increment to 50 and panic (>= 50)
+        ballot.set_current_message_level_for_test(49);
+
+        // Create a dummy hint statement
+        let value: Value = vec![1, 2, 3].try_into().unwrap();
+        let prep = stellar_xdr::curr::ScpStatementPrepare {
+            quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
+            ballot: stellar_xdr::curr::ScpBallot {
+                counter: 1,
+                value: value.clone(),
+            },
+            prepared: None,
+            prepared_prime: None,
+            n_c: 0,
+            n_h: 0,
+        };
+        let statement = stellar_xdr::curr::ScpStatement {
+            node_id: node.clone(),
+            slot_index: 1,
+            pledges: ScpStatementPledges::Prepare(prep),
+        };
+
+        struct PanicDriver;
+        impl SCPDriver for PanicDriver {
+            fn validate_value(&self, _: u64, _: &Value, _: bool) -> ValidationLevel {
+                ValidationLevel::FullyValidated
+            }
+            fn combine_candidates(&self, _: u64, _: &[Value]) -> Option<Value> {
+                None
+            }
+            fn emit_envelope(&self, _: &ScpEnvelope) {}
+            fn nominating_value(&self, _: u64, _: &Value) {}
+            fn extract_valid_value(&self, _: u64, _: &Value) -> Option<Value> {
+                None
+            }
+            fn value_externalized(&self, _: u64, _: &Value) {}
+            fn get_quorum_set(&self, _: &NodeId) -> Option<ScpQuorumSet> {
+                None
+            }
+            fn ballot_did_prepare(&self, _: u64, _: &stellar_xdr::curr::ScpBallot) {}
+            fn ballot_did_confirm(&self, _: u64, _: &stellar_xdr::curr::ScpBallot) {}
+            fn compute_hash_node(&self, _: u64, _: &Value, _: bool, _: u32, _: &NodeId) -> u64 {
+                1
+            }
+            fn compute_value_hash(&self, _: u64, _: &Value, _: u32, _: &Value) -> u64 {
+                1
+            }
+            fn compute_timeout(&self, _: u32, _: bool) -> Duration {
+                Duration::from_secs(1)
+            }
+            fn sign_envelope(&self, _: &mut ScpEnvelope) {}
+            fn verify_envelope(&self, _: &ScpEnvelope) -> bool {
+                true
+            }
+        }
+
+        let driver = std::sync::Arc::new(PanicDriver);
+        ballot.advance_slot_for_test(&statement, &node, &quorum_set, &driver, 1);
+    }
+
+    // S-get_latest_envelope: checks ballot then nomination
+    #[test]
+    fn test_get_latest_envelope_checks_ballot_then_nomination() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set();
+        let mut slot = Slot::new(1, node.clone(), quorum_set.clone(), true);
+
+        // Initially no envelope
+        assert!(slot.get_latest_envelope(&node).is_none());
+
+        // Add nomination envelope
+        let value: Value = vec![1, 2, 3].try_into().unwrap();
+        let nomination = stellar_xdr::curr::ScpNomination {
+            quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
+            votes: vec![value.clone()].try_into().unwrap(),
+            accepted: vec![].try_into().unwrap(),
+        };
+        let nom_envelope = ScpEnvelope {
+            statement: stellar_xdr::curr::ScpStatement {
+                node_id: node.clone(),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Nominate(nomination),
+            },
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+        slot.set_state_from_envelope(&nom_envelope);
+
+        // Now should find the nomination envelope
+        let env = slot.get_latest_envelope(&node);
+        assert!(env.is_some(), "should find nomination envelope");
+        assert!(
+            matches!(
+                env.unwrap().statement.pledges,
+                ScpStatementPledges::Nominate(_)
+            ),
+            "should be a nomination envelope"
+        );
+
+        // Add ballot envelope - should prefer ballot over nomination
+        let prep = stellar_xdr::curr::ScpStatementPrepare {
+            quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
+            ballot: stellar_xdr::curr::ScpBallot {
+                counter: 1,
+                value: value.clone(),
+            },
+            prepared: None,
+            prepared_prime: None,
+            n_c: 0,
+            n_h: 0,
+        };
+        let ballot_envelope = ScpEnvelope {
+            statement: stellar_xdr::curr::ScpStatement {
+                node_id: node.clone(),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Prepare(prep),
+            },
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+        slot.set_state_from_envelope(&ballot_envelope);
+
+        // Now should find the ballot envelope (ballot protocol checked first)
+        let env = slot.get_latest_envelope(&node);
+        assert!(env.is_some(), "should find ballot envelope");
+        assert!(
+            matches!(
+                env.unwrap().statement.pledges,
+                ScpStatementPledges::Prepare(_)
+            ),
+            "should prefer ballot envelope over nomination"
+        );
     }
 }

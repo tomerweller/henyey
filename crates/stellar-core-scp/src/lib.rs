@@ -58,8 +58,8 @@ pub use nomination::NominationProtocol;
 pub use quorum::{
     find_closest_v_blocking, get_all_nodes, hash_quorum_set, is_blocking_set, is_quorum,
     is_quorum_set_sane, is_quorum_slice, is_v_blocking, is_valid_quorum_set, normalize_quorum_set,
-    simple_quorum_set, singleton_quorum_set, SingletonQuorumSetCache, MAXIMUM_QUORUM_NESTING_LEVEL,
-    MAXIMUM_QUORUM_NODES,
+    normalize_quorum_set_with_remove, simple_quorum_set, singleton_quorum_set,
+    SingletonQuorumSetCache, MAXIMUM_QUORUM_NESTING_LEVEL, MAXIMUM_QUORUM_NODES,
 };
 pub use quorum_config::{
     config_to_quorum_set, node_id_to_strkey, parse_node_id, testnet_quorum_config,

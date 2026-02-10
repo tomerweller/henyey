@@ -120,9 +120,13 @@ where
 
 /// Check if a set of nodes forms a quorum.
 ///
-/// A set Q is a quorum if:
-/// 1. Every node in Q has a quorum slice contained in Q
-/// 2. This is checked recursively
+/// Uses iterative pruning to find a quorum within the given set of nodes.
+/// Repeatedly removes nodes whose quorum slices aren't satisfied by the
+/// remaining set until the set stabilizes. Then checks if the local node's
+/// quorum slice is satisfied by the surviving set.
+///
+/// This matches the C++ `LocalNode::isQuorum()` behavior, which allows
+/// finding valid quorums as subsets of the input nodes.
 ///
 /// # Arguments
 /// * `quorum_set` - The local node's quorum set
@@ -130,29 +134,37 @@ where
 /// * `get_quorum_set` - Function to get quorum set for a node
 ///
 /// # Returns
-/// True if the nodes form a quorum.
+/// True if a subset of the nodes forms a quorum that satisfies the local
+/// node's quorum slice.
 pub fn is_quorum<F>(quorum_set: &ScpQuorumSet, nodes: &HashSet<NodeId>, get_quorum_set: F) -> bool
 where
     F: Fn(&NodeId) -> Option<ScpQuorumSet>,
 {
-    // First check if nodes satisfy our quorum slice
-    if !is_quorum_slice(quorum_set, nodes, &get_quorum_set) {
-        return false;
-    }
+    // Iteratively prune nodes whose quorum slices aren't satisfied
+    // until the set stabilizes (matches C++ do-while loop in LocalNode::isQuorum)
+    let mut remaining: Vec<NodeId> = nodes.iter().cloned().collect();
 
-    // Then check that all nodes in the set also have their quorum slices satisfied
-    for node in nodes {
-        if let Some(qs) = get_quorum_set(node) {
-            if !is_quorum_slice(&qs, nodes, &get_quorum_set) {
-                return false;
+    loop {
+        let count = remaining.len();
+
+        // Keep only nodes whose quorum slices are satisfied by the current set
+        let remaining_set: HashSet<NodeId> = remaining.iter().cloned().collect();
+        remaining.retain(|node_id| {
+            if let Some(qs) = get_quorum_set(node_id) {
+                is_quorum_slice(&qs, &remaining_set, &get_quorum_set)
+            } else {
+                false
             }
-        } else {
-            // Unknown node - can't verify quorum
-            return false;
+        });
+
+        if remaining.len() == count {
+            break;
         }
     }
 
-    true
+    // Check if the local node's quorum slice is satisfied by the surviving set
+    let remaining_set: HashSet<NodeId> = remaining.into_iter().collect();
+    is_quorum_slice(quorum_set, &remaining_set, &get_quorum_set)
 }
 
 /// Check if a set of nodes is a blocking set.
@@ -175,9 +187,9 @@ fn is_blocking_set_helper(quorum_set: &ScpQuorumSet, nodes: &HashSet<NodeId>) ->
     let total = quorum_set.validators.len() + quorum_set.inner_sets.len();
     let threshold = quorum_set.threshold as usize;
 
+    // There is no v-blocking set for the empty set (matches C++ LocalNode::isVBlockingInternal)
     if threshold == 0 {
-        // Empty quorum set is always blocked
-        return true;
+        return false;
     }
 
     // We need to block (total - threshold + 1) members to prevent any quorum slice
@@ -346,8 +358,26 @@ pub fn hash_quorum_set(quorum_set: &ScpQuorumSet) -> Hash256 {
 ///
 /// This ensures consistent hashing regardless of the order in which
 /// validators were added to the quorum set.
+///
+/// If `id_to_remove` is provided, removes that node from the quorum set
+/// at all levels and adjusts thresholds accordingly. This is used during
+/// the EXTERNALIZE phase and leader computation to exclude a node from
+/// the quorum set while maintaining correct semantics.
 pub fn normalize_quorum_set(quorum_set: &mut ScpQuorumSet) {
-    normalize_quorum_set_simplify(quorum_set);
+    normalize_quorum_set_with_remove(quorum_set, None);
+}
+
+/// Normalize a quorum set, optionally removing a node.
+///
+/// Like `normalize_quorum_set`, but accepts an optional `id_to_remove`
+/// parameter that removes the specified node from validators at all levels
+/// and decrements thresholds accordingly. Matches the C++ `normalizeQSet`
+/// function signature.
+pub fn normalize_quorum_set_with_remove(
+    quorum_set: &mut ScpQuorumSet,
+    id_to_remove: Option<&NodeId>,
+) {
+    normalize_quorum_set_simplify(quorum_set, id_to_remove);
 
     let mut validators: Vec<_> = quorum_set.validators.iter().cloned().collect();
     validators.sort_by(node_id_cmp);
@@ -355,20 +385,44 @@ pub fn normalize_quorum_set(quorum_set: &mut ScpQuorumSet) {
 
     let mut inner_sets: Vec<_> = quorum_set.inner_sets.iter().cloned().collect();
     for inner_set in &mut inner_sets {
-        normalize_quorum_set(inner_set);
+        // Only pass id_to_remove for the simplify step (already done above recursively),
+        // but the reorder step doesn't need it again
+        normalize_quorum_set_reorder(inner_set);
     }
 
     inner_sets.sort_by(quorum_set_cmp);
     quorum_set.inner_sets = inner_sets.try_into().unwrap_or_default();
 }
 
-fn normalize_quorum_set_simplify(quorum_set: &mut ScpQuorumSet) {
+fn normalize_quorum_set_reorder(quorum_set: &mut ScpQuorumSet) {
+    let mut validators: Vec<_> = quorum_set.validators.iter().cloned().collect();
+    validators.sort_by(node_id_cmp);
+    quorum_set.validators = validators.try_into().unwrap_or_default();
+
+    let mut inner_sets: Vec<_> = quorum_set.inner_sets.iter().cloned().collect();
+    for inner_set in &mut inner_sets {
+        normalize_quorum_set_reorder(inner_set);
+    }
+
+    inner_sets.sort_by(quorum_set_cmp);
+    quorum_set.inner_sets = inner_sets.try_into().unwrap_or_default();
+}
+
+fn normalize_quorum_set_simplify(quorum_set: &mut ScpQuorumSet, id_to_remove: Option<&NodeId>) {
     let mut inner_sets: Vec<ScpQuorumSet> = quorum_set.inner_sets.iter().cloned().collect();
     let mut merged_validators: Vec<NodeId> = quorum_set.validators.iter().cloned().collect();
 
+    // Remove the specified node from validators and adjust threshold
+    if let Some(id) = id_to_remove {
+        let original_len = merged_validators.len();
+        merged_validators.retain(|n| n != id);
+        let removed_count = original_len - merged_validators.len();
+        quorum_set.threshold = quorum_set.threshold.saturating_sub(removed_count as u32);
+    }
+
     let mut idx = 0;
     while idx < inner_sets.len() {
-        normalize_quorum_set_simplify(&mut inner_sets[idx]);
+        normalize_quorum_set_simplify(&mut inner_sets[idx], id_to_remove);
 
         let is_singleton = inner_sets[idx].threshold == 1
             && inner_sets[idx].validators.len() == 1
@@ -1264,5 +1318,171 @@ mod tests {
         nodes.insert(node0.clone());
         nodes.insert(node1.clone());
         assert!(is_quorum_slice(&qs, &nodes, &|_: &NodeId| None));
+    }
+
+    // ==================== Q1: Iterative pruning quorum tests ====================
+
+    #[test]
+    fn test_is_quorum_iterative_pruning() {
+        // Test that is_quorum uses iterative pruning to find quorums
+        // within the input set, matching C++ behavior.
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+        let node3 = make_node_id(3); // node3 has no quorum set (unknown)
+
+        // All known nodes have the same 2-of-3 quorum set
+        let qs = make_simple_quorum_set(2, &[node0.clone(), node1.clone(), node2.clone()]);
+
+        let get_qs = |n: &NodeId| -> Option<ScpQuorumSet> {
+            if n == &node0 || n == &node1 || n == &node2 {
+                Some(qs.clone())
+            } else {
+                None // node3 is unknown
+            }
+        };
+
+        // {node0, node1, node3} - node3 is unknown, but after pruning node3,
+        // {node0, node1} still forms a quorum. The iterative algorithm should find it.
+        let mut nodes = HashSet::new();
+        nodes.insert(node0.clone());
+        nodes.insert(node1.clone());
+        nodes.insert(node3.clone());
+        assert!(is_quorum(&qs, &nodes, &get_qs));
+    }
+
+    #[test]
+    fn test_is_quorum_iterative_pruning_cascade() {
+        // Test cascading pruning: removing one node makes another's slice unsatisfied
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+        let node3 = make_node_id(3);
+
+        // node0 and node1 have 2-of-3 (node0, node1, node2) - they trust each other
+        let qs01 = make_simple_quorum_set(2, &[node0.clone(), node1.clone(), node2.clone()]);
+
+        // node2 requires all three nodes (3-of-3) - very strict
+        let qs2 = make_simple_quorum_set(3, &[node0.clone(), node1.clone(), node2.clone()]);
+
+        // node3 requires node2 and node3 (unknown quorum set)
+        let get_qs = |n: &NodeId| -> Option<ScpQuorumSet> {
+            if n == &node0 || n == &node1 {
+                Some(qs01.clone())
+            } else if n == &node2 {
+                Some(qs2.clone())
+            } else {
+                None
+            }
+        };
+
+        // {node0, node1, node2, node3}: node3 gets pruned (unknown), then node2's
+        // slice (3-of-3 requiring node3) fails, so node2 gets pruned too.
+        // Remaining {node0, node1} satisfies the local 2-of-3 slice.
+        let mut nodes = HashSet::new();
+        nodes.insert(node0.clone());
+        nodes.insert(node1.clone());
+        nodes.insert(node2.clone());
+        nodes.insert(node3.clone());
+        assert!(is_quorum(&qs01, &nodes, &get_qs));
+    }
+
+    // ==================== Q2: normalize_quorum_set_with_remove tests ====================
+
+    #[test]
+    fn test_normalize_quorum_set_with_remove_basic() {
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+
+        // 2-of-3 quorum set: removing node1 should give 1-of-2
+        let mut qs = make_simple_quorum_set(2, &[node0.clone(), node1.clone(), node2.clone()]);
+        normalize_quorum_set_with_remove(&mut qs, Some(&node1));
+
+        assert_eq!(qs.threshold, 1);
+        let validators: Vec<NodeId> = qs.validators.iter().cloned().collect();
+        assert_eq!(validators.len(), 2);
+        assert!(validators.contains(&node0));
+        assert!(validators.contains(&node2));
+        assert!(!validators.contains(&node1));
+    }
+
+    #[test]
+    fn test_normalize_quorum_set_with_remove_inner_set() {
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+        let node3 = make_node_id(3);
+
+        // Outer: threshold=2, validators=[node0, node1]
+        // Inner: threshold=2, validators=[node1, node2, node3]
+        // Removing node1 should:
+        //   - Outer: threshold=1, validators=[node0]
+        //   - Inner: threshold=1, validators=[node2, node3]
+        let inner = make_simple_quorum_set(2, &[node1.clone(), node2.clone(), node3.clone()]);
+        let mut qs = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![node0.clone(), node1.clone()].try_into().unwrap(),
+            inner_sets: vec![inner].try_into().unwrap(),
+        };
+
+        normalize_quorum_set_with_remove(&mut qs, Some(&node1));
+
+        assert_eq!(qs.threshold, 1);
+        let validators: Vec<NodeId> = qs.validators.iter().cloned().collect();
+        assert!(!validators.contains(&node1));
+        assert!(validators.contains(&node0));
+
+        // Inner set should also have node1 removed
+        assert_eq!(qs.inner_sets.len(), 1);
+        let inner = &qs.inner_sets[0];
+        assert_eq!(inner.threshold, 1);
+        let inner_validators: Vec<NodeId> = inner.validators.iter().cloned().collect();
+        assert!(!inner_validators.contains(&node1));
+        assert!(inner_validators.contains(&node2));
+        assert!(inner_validators.contains(&node3));
+    }
+
+    #[test]
+    fn test_normalize_quorum_set_with_remove_none() {
+        // Passing None should behave identically to normalize_quorum_set
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+
+        let mut qs1 = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![node2.clone(), node0.clone(), node1.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let mut qs2 = qs1.clone();
+
+        normalize_quorum_set(&mut qs1);
+        normalize_quorum_set_with_remove(&mut qs2, None);
+
+        assert_eq!(hash_quorum_set(&qs1), hash_quorum_set(&qs2));
+    }
+
+    // ==================== Q3: is_v_blocking threshold==0 tests ====================
+
+    #[test]
+    fn test_is_v_blocking_empty_quorum_set() {
+        // Empty quorum set (threshold=0) should NOT be v-blocking
+        // (matches C++ "There is no v-blocking set for {\empty}")
+        let qs = ScpQuorumSet {
+            threshold: 0,
+            validators: vec![].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let nodes = HashSet::new();
+        assert!(!is_v_blocking(&qs, &nodes));
+
+        // Even with some nodes, threshold=0 means no v-blocking
+        let mut nodes = HashSet::new();
+        nodes.insert(make_node_id(1));
+        assert!(!is_v_blocking(&qs, &nodes));
     }
 }

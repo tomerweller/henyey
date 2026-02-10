@@ -72,6 +72,36 @@ use crate::Result;
 /// rejecting valid SCP envelopes as "too old".
 const MAX_SLOTS_TO_REMEMBER: u64 = 12;
 
+/// Maximum time slip allowed for close times in SCP values (in seconds).
+///
+/// Matches C++ `Herder::MAX_TIME_SLIP_SECONDS = 60`. A proposed close time
+/// can be at most 60 seconds ahead of the current wall-clock time.
+const MAX_TIME_SLIP_SECONDS: u64 = 60;
+
+/// Maximum ledger close time drift for envelope recency filtering (in seconds).
+///
+/// Matches C++ `Config::MAXIMUM_LEDGER_CLOSETIME_DRIFT`. When filtering
+/// incoming SCP envelopes for recency (during initial boot before any sync),
+/// close times must be within this window of the current wall-clock time.
+/// C++ computes this as `min((MAX_SLOTS_TO_REMEMBER + 2) * TARGET_CLOSE_TIME / 1000, 90)`.
+/// With default values: `min(14 * 5, 90) = 70` seconds.
+const MAXIMUM_LEDGER_CLOSETIME_DRIFT: u64 = 70;
+
+/// Maximum number of ledgers ahead of tracking that we accept SCP messages for.
+///
+/// Matches C++ `Herder::LEDGER_VALIDITY_BRACKET = 100`. When tracking consensus,
+/// we reject envelopes for slots more than this many ahead of our next consensus
+/// ledger index.
+const LEDGER_VALIDITY_BRACKET: u64 = 100;
+
+/// Genesis ledger sequence number.
+///
+/// Matches C++ `LedgerManager::GENESIS_LEDGER_SEQ = 1`.
+const GENESIS_LEDGER_SEQ: u64 = 1;
+
+/// Default checkpoint frequency (64 ledgers).
+const CHECKPOINT_FREQUENCY: u64 = 64;
+
 /// Result of receiving an SCP envelope.
 ///
 /// Indicates what happened when the Herder processed an incoming SCP envelope.
@@ -213,6 +243,9 @@ pub struct Herder {
     scp: Option<SCP<HerderScpCallback>>,
     /// Current tracking slot (ledger sequence as u64).
     tracking_slot: RwLock<u64>,
+    /// Consensus close time for the tracking slot.
+    /// Matches C++ `mTrackingSCP.mConsensusCloseTime`.
+    tracking_consensus_close_time: RwLock<u64>,
     /// When we started tracking.
     tracking_started_at: RwLock<Option<Instant>>,
     /// Secret key for signing (if validator).
@@ -235,13 +268,10 @@ impl Herder {
         pending_config.max_slots = pending_config.max_slots.min(max_slots);
         pending_config.max_slot_distance = pending_config.max_slot_distance.min(max_slots as u64);
 
-        let max_time_drift = (max_slots as u64)
-            .saturating_add(2)
-            .saturating_mul(config.ledger_close_time as u64);
         let scp_driver_config = ScpDriverConfig {
             node_id: config.node_public_key,
             max_tx_set_cache: 100,
-            max_time_drift,
+            max_time_drift: MAX_TIME_SLIP_SECONDS,
             local_quorum_set: config.local_quorum_set.clone(),
         };
 
@@ -257,7 +287,6 @@ impl Herder {
             fetching_envelopes.cache_quorum_set(qs_hash, quorum_set.clone());
         }
 
-        // SCP is None for non-validators (they just observe)
         let slot_quorum_tracker =
             SlotQuorumTracker::new(config.local_quorum_set.clone(), max_slots);
         let local_node_id = node_id_from_public_key(&config.node_public_key);
@@ -292,6 +321,7 @@ impl Herder {
             scp_driver,
             scp: None,
             tracking_slot: RwLock::new(0),
+            tracking_consensus_close_time: RwLock::new(0),
             tracking_started_at: RwLock::new(None),
             secret_key: None,
             ledger_manager: RwLock::new(None),
@@ -308,13 +338,10 @@ impl Herder {
         pending_config.max_slots = pending_config.max_slots.min(max_slots);
         pending_config.max_slot_distance = pending_config.max_slot_distance.min(max_slots as u64);
 
-        let max_time_drift = (max_slots as u64)
-            .saturating_add(2)
-            .saturating_mul(config.ledger_close_time as u64);
         let scp_driver_config = ScpDriverConfig {
             node_id: config.node_public_key,
             max_tx_set_cache: 100,
-            max_time_drift,
+            max_time_drift: MAX_TIME_SLIP_SECONDS,
             local_quorum_set: config.local_quorum_set.clone(),
         };
 
@@ -387,6 +414,7 @@ impl Herder {
             scp_driver,
             scp,
             tracking_slot: RwLock::new(0),
+            tracking_consensus_close_time: RwLock::new(0),
             tracking_started_at: RwLock::new(None),
             secret_key: Some(secret_key),
             ledger_manager: RwLock::new(None),
@@ -415,6 +443,42 @@ impl Herder {
     /// Get the current tracking slot.
     pub fn tracking_slot(&self) -> u64 {
         *self.tracking_slot.read()
+    }
+
+    /// Get the tracking consensus close time.
+    /// Matches C++ `HerderImpl::trackingConsensusCloseTime()`.
+    pub fn tracking_consensus_close_time(&self) -> u64 {
+        *self.tracking_consensus_close_time.read()
+    }
+
+    /// Get the next consensus ledger index.
+    /// Matches C++ `HerderImpl::nextConsensusLedgerIndex()`.
+    pub fn next_consensus_ledger_index(&self) -> u64 {
+        *self.tracking_slot.read()
+    }
+
+    /// Get the most recent checkpoint sequence.
+    ///
+    /// Matches C++ `HerderImpl::getMostRecentCheckpointSeq()` which returns
+    /// `HistoryManager::firstLedgerInCheckpointContaining(trackingConsensusLedgerIndex())`.
+    ///
+    /// With checkpoint frequency 64:
+    /// - ledger 1..63  → checkpoint starts at 1 (first checkpoint is size 63)
+    /// - ledger 64..127 → checkpoint starts at 64
+    /// - ledger 128..191 → checkpoint starts at 128
+    fn get_most_recent_checkpoint_seq(&self) -> u64 {
+        let tracking_consensus_index = self.tracking_slot().saturating_sub(1);
+        let freq = CHECKPOINT_FREQUENCY;
+        // checkpointContainingLedger: ((ledger / freq + 1) * freq) - 1
+        let last = ((tracking_consensus_index / freq) + 1) * freq - 1;
+        // sizeOfCheckpointContaining: first checkpoint is special (size freq-1), rest are freq
+        let size = if tracking_consensus_index < freq {
+            freq - 1
+        } else {
+            freq
+        };
+        // firstLedgerInCheckpointContaining
+        last - (size - 1)
     }
 
     /// Compute the minimum ledger sequence to ask peers for SCP state.
@@ -547,7 +611,6 @@ impl Herder {
     ///
     /// Returns the slot we purged below, or None if no purging was done.
     pub fn out_of_sync_recovery(&self, lcl: u64) -> Option<u64> {
-        const LEDGER_VALIDITY_BRACKET: u64 = 100;
 
         // Don't call this when tracking normally
         if self.state() == HerderState::Tracking {
@@ -586,7 +649,7 @@ impl Herder {
 
             // Purge SCP state
             if let Some(ref scp) = self.scp {
-                scp.purge_slots(purge_slot.saturating_sub(1));
+                scp.purge_slots(purge_slot.saturating_sub(1), None);
             }
 
             // Purge externalized values and pending tx set requests
@@ -611,11 +674,24 @@ impl Herder {
         *self.tracking_slot.write() = slot;
         *self.tracking_started_at.write() = Some(Instant::now());
 
+        // Set tracking consensus close time from LCL if available
+        // (matching C++ setTrackingSCPState which sets close time from externalized value)
+        let close_time = self
+            .ledger_manager
+            .read()
+            .as_ref()
+            .map(|lm| lm.current_header().scp_value.close_time.0)
+            .unwrap_or(0);
+        *self.tracking_consensus_close_time.write() = close_time;
+
         // Update pending envelopes current slot
         self.pending_envelopes.set_current_slot(slot);
 
         // Transition to tracking state
         *self.state.write() = HerderState::Tracking;
+
+        // Update ScpDriver with tracking state for close-time validation
+        self.scp_driver.set_tracking_state(true, slot, close_time);
 
         // Release any pending envelopes for this slot and previous
         let pending = self.pending_envelopes.release_up_to(slot);
@@ -640,6 +716,112 @@ impl Herder {
         *self.state.write() = HerderState::Syncing;
     }
 
+    /// Check close time of all values in an SCP envelope.
+    ///
+    /// Matches C++ `HerderImpl::checkCloseTime(SCPEnvelope, enforceRecent)`.
+    /// This is called BEFORE signature verification as a cheap pre-filter.
+    ///
+    /// When `enforce_recent` is true, values must have close times within
+    /// `MAXIMUM_LEDGER_CLOSETIME_DRIFT` seconds of the current wall-clock time.
+    ///
+    /// Returns true if at least one value in the envelope passes close-time checks.
+    fn check_envelope_close_time(&self, envelope: &ScpEnvelope, enforce_recent: bool) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // Compute close-time cutoff for recency check
+        let ct_cutoff = if enforce_recent {
+            now.saturating_sub(MAXIMUM_LEDGER_CLOSETIME_DRIFT)
+        } else {
+            0
+        };
+
+        let env_ledger_index = envelope.statement.slot_index;
+
+        // Get LCL data
+        let (lcl_seq, lcl_close_time) = self
+            .ledger_manager
+            .read()
+            .as_ref()
+            .map(|lm| {
+                let header = lm.current_header();
+                (header.ledger_seq as u64, header.scp_value.close_time.0)
+            })
+            .unwrap_or((0, 0));
+
+        let mut last_close_index = lcl_seq;
+        let mut last_close_time = lcl_close_time;
+
+        // Use tracking consensus data for a better estimate when available
+        // (matching C++ which upgrades lastCloseIndex/lastCloseTime from tracking)
+        // C++ uses trackingConsensusLedgerIndex() which is the LCL seq (= next_consensus - 1)
+        let state = self.state();
+        if state != HerderState::Booting {
+            let tracking_index = self.tracking_slot().saturating_sub(1);
+            if env_ledger_index >= tracking_index && tracking_index > last_close_index {
+                last_close_index = tracking_index;
+                last_close_time = self.tracking_consensus_close_time();
+            }
+        }
+
+        // Helper: check a single StellarValue's close time
+        let check_value = |value: &Value| -> bool {
+            let sv = match StellarValue::from_xdr(&value.0, Limits::none()) {
+                Ok(sv) => sv,
+                Err(_) => return false,
+            };
+            let close_time = sv.close_time.0;
+
+            // Recency check: close time must be after cutoff
+            if close_time < ct_cutoff {
+                return false;
+            }
+
+            // Three cases (any must pass):
+            // 1. Exact-match: envelope is for the same slot as last_close_index
+            if last_close_index == env_ledger_index && last_close_time == close_time {
+                return true;
+            }
+            // 2. Older slot: last_close_index > env_ledger_index and close_time < last_close_time
+            if last_close_index > env_ledger_index && last_close_time > close_time {
+                return true;
+            }
+            // 3. Future slot: use the simple check_close_time
+            self.scp_driver
+                .check_close_time(env_ledger_index, last_close_time, close_time)
+        };
+
+        // Check all values in the envelope based on statement type
+        // Returns true if ANY value passes (conservative / permissive)
+        use stellar_xdr::curr::ScpStatementPledges;
+        match &envelope.statement.pledges {
+            ScpStatementPledges::Nominate(nom) => {
+                nom.accepted.iter().any(|v| check_value(v))
+                    || nom.votes.iter().any(|v| check_value(v))
+            }
+            ScpStatementPledges::Prepare(prep) => {
+                if check_value(&prep.ballot.value) {
+                    return true;
+                }
+                if let Some(ref prepared) = prep.prepared {
+                    if check_value(&prepared.value) {
+                        return true;
+                    }
+                }
+                if let Some(ref prepared_prime) = prep.prepared_prime {
+                    if check_value(&prepared_prime.value) {
+                        return true;
+                    }
+                }
+                false
+            }
+            ScpStatementPledges::Confirm(conf) => check_value(&conf.ballot.value),
+            ScpStatementPledges::Externalize(ext) => check_value(&ext.commit.value),
+        }
+    }
+
     /// Receive an SCP envelope from the network.
     pub fn receive_scp_envelope(&self, envelope: ScpEnvelope) -> EnvelopeState {
         let state = self.state();
@@ -653,7 +835,74 @@ impl Herder {
             return EnvelopeState::Invalid;
         }
 
-        // Verify envelope signature
+        // **** First perform checks that do NOT require signature verification
+        // This allows fast-failing messages we'd throw away anyway (matching C++)
+
+        // Close-time pre-filter: reject envelopes with invalid close times
+        // before incurring the cost of signature verification
+        if !self.check_envelope_close_time(&envelope, false) {
+            debug!(
+                slot,
+                "Discarding envelope: incompatible close time with current state"
+            );
+            return EnvelopeState::Invalid;
+        }
+
+        let checkpoint = self.get_most_recent_checkpoint_seq();
+        let mut max_ledger_seq: u64 = u64::MAX;
+
+        if state.is_tracking() {
+            // When tracking, filter messages based on consensus information
+            max_ledger_seq = self.next_consensus_ledger_index() + LEDGER_VALIDITY_BRACKET;
+        } else {
+            // When not tracking, apply recency-based close-time filtering.
+            // Allow checkpoint messages through even if close time is stale.
+            // enforce_recent = true only if we've never been in sync (tracking index <= genesis)
+            let tracking_consensus_index = current_slot.saturating_sub(1);
+            let enforce_recent = tracking_consensus_index <= GENESIS_LEDGER_SEQ;
+            if !self.check_envelope_close_time(&envelope, enforce_recent)
+                && slot != checkpoint
+            {
+                debug!(
+                    slot,
+                    "Discarding envelope: invalid close time (MAXIMUM_LEDGER_CLOSETIME_DRIFT)"
+                );
+                return EnvelopeState::Invalid;
+            }
+        }
+
+        // Calculate the minimum acceptable slot
+        let min_ledger_seq = if current_slot > MAX_SLOTS_TO_REMEMBER {
+            current_slot - MAX_SLOTS_TO_REMEMBER + 1
+        } else {
+            1
+        };
+
+        // Early check: reject envelopes for already-closed slots (from catchup)
+        let lcl = self
+            .ledger_manager
+            .read()
+            .as_ref()
+            .map(|m| m.current_ledger_seq() as u64);
+
+        let effective_min = lcl.map_or(min_ledger_seq, |l| min_ledger_seq.max(l + 1));
+
+        // Range check: slot must be in [effective_min, max_ledger_seq], with
+        // checkpoint exception (matching C++)
+        if (slot > max_ledger_seq || slot < effective_min) && slot != checkpoint {
+            debug!(
+                slot,
+                current_slot,
+                min_ledger_seq,
+                effective_min,
+                max_ledger_seq,
+                checkpoint,
+                "Rejecting envelope: slot outside validity bracket"
+            );
+            return EnvelopeState::TooOld;
+        }
+
+        // **** From this point, we have to check signatures (matching C++)
         if let Err(e) = self.scp_driver.verify_envelope(&envelope) {
             debug!(slot, error = %e, "Invalid SCP envelope signature");
             return EnvelopeState::InvalidSignature;
@@ -662,13 +911,6 @@ impl Herder {
         self.slot_quorum_tracker
             .write()
             .record_envelope(slot, envelope.statement.node_id.clone());
-
-        // Early check: reject envelopes for already-closed slots (from catchup)
-        let lcl = self
-            .ledger_manager
-            .read()
-            .as_ref()
-            .map(|m| m.current_ledger_seq() as u64);
 
         // Special handling for EXTERNALIZE messages - they can fast-forward our state
         // even if from future slots, as they represent network consensus
@@ -863,33 +1105,6 @@ impl Herder {
 
                 return EnvelopeState::Valid;
             }
-        }
-
-        // Calculate the minimum acceptable slot using C++ stellar-core logic:
-        // minLedgerSeq = currSlot - MAX_SLOTS_TO_REMEMBER + 1
-        // This allows slots within MAX_SLOTS_TO_REMEMBER of tracking_slot to be processed,
-        // which is essential after catchup when we need to catch up on recent slots.
-        let min_acceptable_slot = if current_slot > MAX_SLOTS_TO_REMEMBER {
-            current_slot - MAX_SLOTS_TO_REMEMBER + 1
-        } else {
-            1 // Genesis ledger
-        };
-
-        // The effective minimum is the max of min_acceptable_slot and lcl+1
-        // (we never want to process slots we've already closed)
-        let effective_min = lcl.map_or(min_acceptable_slot, |l| min_acceptable_slot.max(l + 1));
-
-        // Reject slots that are too old (below the acceptable window)
-        if slot < effective_min {
-            debug!(
-                slot,
-                current_slot,
-                min_acceptable_slot,
-                effective_min,
-                lcl = lcl.unwrap_or(0),
-                "Rejecting envelope: slot below acceptable window"
-            );
-            return EnvelopeState::TooOld;
         }
 
         // Check if this is for a future slot
@@ -1107,11 +1322,27 @@ impl Herder {
 
     /// Advance tracking slot after externalization.
     fn advance_tracking_slot(&self, externalized_slot: u64) {
+        // Extract close time from the externalized value for tracking
+        let close_time = self
+            .scp_driver
+            .get_externalized_close_time(externalized_slot)
+            .unwrap_or(0);
+
         let mut tracking = self.tracking_slot.write();
         if externalized_slot >= *tracking {
             *tracking = externalized_slot + 1;
+            // Update tracking consensus close time (matching C++ setTrackingSCPState)
+            *self.tracking_consensus_close_time.write() = close_time;
             self.pending_envelopes
                 .set_current_slot(externalized_slot + 1);
+
+            // Update ScpDriver with tracking state for close-time validation
+            let is_tracking = self.state() == HerderState::Tracking;
+            self.scp_driver.set_tracking_state(
+                is_tracking,
+                externalized_slot + 1,
+                close_time,
+            );
 
             // Release any pending envelopes for the new slot
             drop(tracking);
@@ -1337,7 +1568,7 @@ impl Herder {
 
         // Clean up old SCP state
         if let Some(ref scp) = self.scp {
-            scp.purge_slots(slot.saturating_sub(10));
+            scp.purge_slots(slot.saturating_sub(10), None);
         }
 
         // Clean up old fetching envelopes and cached tx sets (keep a small buffer)
@@ -1883,9 +2114,9 @@ mod tests {
     use stellar_core_crypto::SecretKey;
     use stellar_core_scp::hash_quorum_set;
     use stellar_xdr::curr::{
-        Limits, NodeId as XdrNodeId, ScpBallot, ScpNomination, ScpStatement,
-        ScpStatementExternalize, ScpStatementPledges, Signature as XdrSignature, StellarValue,
-        TimePoint, Value, WriteXdr,
+        EnvelopeType, LedgerCloseValueSignature, Limits, NodeId as XdrNodeId, ScpBallot,
+        ScpNomination, ScpStatement, ScpStatementExternalize, ScpStatementPledges,
+        Signature as XdrSignature, StellarValue, StellarValueExt, TimePoint, Value, WriteXdr,
     };
 
     fn make_test_herder() -> Herder {
@@ -1918,16 +2149,40 @@ mod tests {
         (herder, secret_for_signing)
     }
 
-    fn make_valid_value_with_cached_tx_set(herder: &Herder) -> Value {
+    fn make_valid_value_with_cached_tx_set(herder: &Herder, secret_key: &SecretKey) -> Value {
         let tx_set = TransactionSet::new(Hash256::ZERO, Vec::new());
         let tx_set_hash = tx_set.hash;
         herder.scp_driver.cache_tx_set(tx_set);
 
+        let xdr_tx_set_hash = stellar_xdr::curr::Hash(tx_set_hash.0);
+        let close_time = TimePoint(1);
+
+        // Sign: (networkID, ENVELOPE_TYPE_SCPVALUE, txSetHash, closeTime)
+        let network_id = herder.scp_driver.network_id();
+        let mut sign_data = network_id.0.to_vec();
+        sign_data.extend_from_slice(
+            &EnvelopeType::Scpvalue
+                .to_xdr(Limits::none())
+                .expect("xdr"),
+        );
+        sign_data.extend_from_slice(&xdr_tx_set_hash.to_xdr(Limits::none()).expect("xdr"));
+        sign_data.extend_from_slice(&close_time.to_xdr(Limits::none()).expect("xdr"));
+        let sig = secret_key.sign(&sign_data);
+
+        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256(*secret_key.public_key().as_bytes()),
+        ));
+
         let stellar_value = StellarValue {
-            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
-            close_time: TimePoint(1),
+            tx_set_hash: xdr_tx_set_hash,
+            close_time,
             upgrades: vec![].try_into().unwrap(),
-            ext: stellar_xdr::curr::StellarValueExt::Basic,
+            ext: StellarValueExt::Signed(LedgerCloseValueSignature {
+                node_id,
+                signature: stellar_xdr::curr::Signature(
+                    sig.0.to_vec().try_into().unwrap_or_default(),
+                ),
+            }),
         };
         let value_bytes = stellar_value.to_xdr(Limits::none()).unwrap();
         Value(value_bytes.try_into().unwrap())
@@ -1997,12 +2252,20 @@ mod tests {
             stellar_xdr::curr::Uint256(*public.as_bytes()),
         ));
 
+        // Include a vote with a valid close time so the envelope passes
+        // check_envelope_close_time filtering (matching C++ which always has values)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let vote = make_value_with_close_time(now);
+
         let statement = ScpStatement {
             node_id: node_id.clone(),
             slot_index: slot,
             pledges: ScpStatementPledges::Nominate(ScpNomination {
                 quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                votes: vec![].try_into().unwrap(),
+                votes: vec![vote].try_into().unwrap(),
                 accepted: vec![].try_into().unwrap(),
             }),
         };
@@ -2114,9 +2377,13 @@ mod tests {
         ));
 
         // Create a minimal valid StellarValue for the externalized value
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let stellar_value = stellar_xdr::curr::StellarValue {
             tx_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
-            close_time: stellar_xdr::curr::TimePoint(1234567890),
+            close_time: stellar_xdr::curr::TimePoint(now),
             upgrades: vec![].try_into().unwrap(),
             ext: stellar_xdr::curr::StellarValueExt::Basic,
         };
@@ -2168,9 +2435,9 @@ mod tests {
 
     #[test]
     fn test_externalize_accepted_for_far_future_slot() {
-        // C++ stellar-core has no MAX_EXTERNALIZE_SLOT_DISTANCE — when not tracking,
-        // it accepts EXTERNALIZE for any slot (maxLedgerSeq = uint32::max).
-        // This test verifies we match that behavior.
+        // When tracking, C++ applies LEDGER_VALIDITY_BRACKET to limit how far
+        // ahead we accept messages. This test verifies EXTERNALIZE within the
+        // bracket is accepted, and that it advances our tracking slot.
         let secret = SecretKey::from_seed(&[1u8; 32]);
         let public = secret.public_key();
         let test_node_id = node_id_from_public_key(&public);
@@ -2197,10 +2464,10 @@ mod tests {
         };
         herder.quorum_tracker.write().expand(&test_node_id, test_qs);
 
-        // Create an EXTERNALIZE envelope for a slot far in the future (1200 ledgers ahead).
-        // This should now be ACCEPTED since we removed the distance check.
-        let far_future_slot = 100 + 1100; // 1200
-        let envelope = make_signed_externalize_envelope(far_future_slot, &herder);
+        // Create an EXTERNALIZE envelope within the validity bracket
+        // next_consensus_ledger_index() = 100, bracket = 100, so max = 200
+        let future_slot = 195;
+        let envelope = make_signed_externalize_envelope(future_slot, &herder);
 
         // Cache a dummy tx_set so the EXTERNALIZE handler can find it
         let dummy_tx_set = TransactionSet {
@@ -2213,10 +2480,10 @@ mod tests {
 
         let result = herder.receive_scp_envelope(envelope);
 
-        // Should be accepted — no distance limit exists (matching C++ behavior)
+        // Should be accepted — within LEDGER_VALIDITY_BRACKET
         assert_eq!(result, EnvelopeState::Valid);
         // Tracking slot should have advanced
-        assert_eq!(herder.tracking_slot(), far_future_slot + 1);
+        assert_eq!(herder.tracking_slot(), future_slot + 1);
     }
 
     #[test]
@@ -2272,13 +2539,13 @@ mod tests {
 
     #[test]
     fn test_nomination_timeout_requires_started() {
-        let (herder, _secret) = make_validator_herder();
+        let (herder, secret) = make_validator_herder();
         let scp = herder.scp().expect("validator scp");
         let slot = 1u64;
 
         assert!(herder.get_nomination_timeout(slot).is_none());
 
-        let value = make_valid_value_with_cached_tx_set(&herder);
+        let value = make_valid_value_with_cached_tx_set(&herder, &secret);
         let prev_value = value.clone();
         assert!(scp.nominate(slot, value, &prev_value));
 
@@ -2293,7 +2560,7 @@ mod tests {
 
         assert!(herder.get_ballot_timeout(slot).is_none());
 
-        let value = make_valid_value_with_cached_tx_set(&herder);
+        let value = make_valid_value_with_cached_tx_set(&herder, &secret);
         let prev_value = value.clone();
         assert!(scp.nominate(slot, value.clone(), &prev_value));
 
@@ -2314,13 +2581,191 @@ mod tests {
 
     #[test]
     fn test_ballot_timeout_none_when_externalized() {
-        let (herder, _secret) = make_validator_herder();
+        let (herder, secret) = make_validator_herder();
         let scp = herder.scp().expect("validator scp");
         let slot = 1u64;
 
-        let value = make_valid_value_with_cached_tx_set(&herder);
+        let value = make_valid_value_with_cached_tx_set(&herder, &secret);
         scp.force_externalize(slot, value);
 
         assert!(herder.get_ballot_timeout(slot).is_none());
+    }
+
+    // =========================================================================
+    // Phase 6 H1 parity tests — close-time validation in Herder
+    // =========================================================================
+
+    /// Create a StellarValue with a given close time and encode to Value.
+    fn make_value_with_close_time(close_time: u64) -> Value {
+        let sv = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            close_time: TimePoint(close_time),
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+        Value(sv.to_xdr(Limits::none()).unwrap().try_into().unwrap())
+    }
+
+    /// Create a nomination envelope with a specific close time in its voted values.
+    fn make_nomination_envelope_with_close_time(
+        slot: u64,
+        close_time: u64,
+    ) -> ScpEnvelope {
+        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256([1u8; 32]),
+        ));
+        let value = make_value_with_close_time(close_time);
+
+        ScpEnvelope {
+            statement: ScpStatement {
+                node_id,
+                slot_index: slot,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    votes: vec![value].try_into().unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
+            },
+            signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+        }
+    }
+
+    /// Create an EXTERNALIZE envelope with a specific close time.
+    #[allow(dead_code)]
+    fn make_externalize_envelope_with_close_time(
+        slot: u64,
+        close_time: u64,
+    ) -> ScpEnvelope {
+        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256([1u8; 32]),
+        ));
+        let value = make_value_with_close_time(close_time);
+
+        ScpEnvelope {
+            statement: ScpStatement {
+                node_id,
+                slot_index: slot,
+                pledges: ScpStatementPledges::Externalize(ScpStatementExternalize {
+                    commit: ScpBallot {
+                        counter: 1,
+                        value: value,
+                    },
+                    n_h: 1,
+                    commit_quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                }),
+            },
+            signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+        }
+    }
+
+    #[test]
+    fn test_get_most_recent_checkpoint_seq() {
+        // Test checkpoint computation matches C++ HistoryManager
+        let herder = make_test_herder();
+
+        // Default tracking_slot is 0, so tracking_consensus_index = 0
+        // first checkpoint: ((0/64 + 1) * 64) - 1 = 63, size = 63, first = 1
+        assert_eq!(herder.get_most_recent_checkpoint_seq(), 1);
+
+        // Bootstrap to slot 100 (tracking_slot = 101)
+        herder.bootstrap(100);
+        // tracking_consensus_index = 100
+        // checkpoint containing 100: ((100/64 + 1) * 64) - 1 = 127, size = 64, first = 64
+        assert_eq!(herder.get_most_recent_checkpoint_seq(), 64);
+
+        // Bootstrap to slot 127 (tracking_slot = 128)
+        herder.bootstrap(127);
+        // checkpoint containing 127: ((127/64 + 1) * 64) - 1 = 127, size = 64, first = 64
+        assert_eq!(herder.get_most_recent_checkpoint_seq(), 64);
+
+        // Bootstrap to slot 129 (tracking_slot = 129, LCL = 128)
+        herder.bootstrap(129);
+        // checkpoint containing 128: ((128/64 + 1) * 64) - 1 = 191, size = 64, first = 128
+        assert_eq!(herder.get_most_recent_checkpoint_seq(), 128);
+    }
+
+    #[test]
+    fn test_check_envelope_close_time_basic() {
+        // check_envelope_close_time(envelope, false) — basic structural check
+        let herder = make_test_herder();
+        herder.bootstrap(100);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Envelope for a future slot with valid close time should pass
+        let env = make_nomination_envelope_with_close_time(102, now);
+        assert!(herder.check_envelope_close_time(&env, false));
+
+        // Envelope with close time 0 (ancient) should fail for a future slot
+        // because check_close_time requires close_time > last_close_time
+        // Here last_close_time is tracking_consensus_close_time (0 from bootstrap)
+        // and close_time = 0, so 0 > 0 is false -> but the three-case logic:
+        // last_close_index(101) > env_ledger_index(1) for a very old slot
+        let env_old = make_nomination_envelope_with_close_time(1, 0);
+        // This is case 2 (older slot): last_close_index > env_ledger_index
+        // but last_close_time(0) > close_time(0) is false -> fails
+        // However last_close_index=101, env_ledger_index=1, so case 2 applies
+        // but last_close_time=0, close_time=0, so 0 > 0 fails
+        // So this should fail
+        assert!(!herder.check_envelope_close_time(&env_old, false));
+    }
+
+    #[test]
+    fn test_check_envelope_close_time_recency_enforcement() {
+        // check_envelope_close_time(envelope, true) — enforces recency
+        let herder = make_test_herder();
+        herder.bootstrap(100);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Recent close time should pass
+        let env_recent = make_nomination_envelope_with_close_time(102, now);
+        assert!(herder.check_envelope_close_time(&env_recent, true));
+
+        // Close time older than MAXIMUM_LEDGER_CLOSETIME_DRIFT should fail with enforce_recent
+        let env_stale = make_nomination_envelope_with_close_time(102, now - 200);
+        assert!(!herder.check_envelope_close_time(&env_stale, true));
+    }
+
+    #[test]
+    fn test_check_envelope_close_time_exact_match() {
+        // Case 1: envelope is for same slot as last_close_index and close time matches
+        // This represents a late message for an already-externalized slot
+        let herder = make_test_herder();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        herder.bootstrap(100);
+        // Set tracking consensus close time
+        *herder.tracking_consensus_close_time.write() = now;
+
+        // After bootstrap(100): tracking_slot=100, LCL=99
+        // check_envelope_close_time uses tracking_index = tracking_slot - 1 = 99
+        // So for exact match: envelope must be for slot 99 with close_time = now
+        let env = make_nomination_envelope_with_close_time(99, now);
+        assert!(herder.check_envelope_close_time(&env, false));
+    }
+
+    #[test]
+    fn test_receive_scp_envelope_rejects_bad_close_time_before_sig_verify() {
+        // Close-time filtering should happen before signature verification
+        // so even an envelope with an invalid signature should be rejected
+        // with Invalid (not InvalidSignature) if close time is bad
+        let herder = make_test_herder();
+        herder.bootstrap(100);
+
+        // Create envelope with close time 0 for a future slot (102)
+        // This has no valid signature, but close-time check should reject first
+        let env = make_nomination_envelope_with_close_time(102, 0);
+        let result = herder.receive_scp_envelope(env);
+        // Should be Invalid due to close-time, NOT InvalidSignature
+        assert_eq!(result, EnvelopeState::Invalid);
     }
 }

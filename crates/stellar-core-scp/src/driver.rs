@@ -358,4 +358,38 @@ pub trait SCPDriver: Send + Sync {
     fn timer_expired(&self, _slot_index: u64, _timer_type: SCPTimerType) {
         // Default: do nothing
     }
+
+    /// Check whether a value contains protocol upgrades.
+    ///
+    /// Used during nomination to detect when upgrade-containing values
+    /// are causing consensus timeouts. When too many timeouts occur,
+    /// upgrades may be stripped to allow consensus to proceed.
+    ///
+    /// # Default Implementation
+    /// Returns false (no upgrades).
+    fn has_upgrades(&self, _value: &Value) -> bool {
+        false
+    }
+
+    /// Strip all upgrades from a value.
+    ///
+    /// Returns a new value with all upgrades removed, or None if the
+    /// value cannot have upgrades stripped (e.g., it has no upgrades).
+    ///
+    /// # Default Implementation
+    /// Returns None.
+    fn strip_all_upgrades(&self, _value: &Value) -> Option<Value> {
+        None
+    }
+
+    /// Get the number of nomination timeouts before upgrades are stripped.
+    ///
+    /// When the nomination timer expires this many times, values with
+    /// upgrades will have their upgrades stripped to help consensus proceed.
+    ///
+    /// # Default Implementation
+    /// Returns `u32::MAX` (effectively never strip).
+    fn get_upgrade_nomination_timeout_limit(&self) -> u32 {
+        u32::MAX
+    }
 }

@@ -348,11 +348,14 @@ impl<D: SCPDriver> SCP<D> {
 
     /// Purge old slots to free memory.
     ///
-    /// Removes slots older than `max_slot_to_keep`.
-    pub fn purge_slots(&self, max_slot_to_keep: u64) {
-        self.slots
-            .write()
-            .retain(|&slot_index, _| slot_index >= max_slot_to_keep);
+    /// Removes slots older than `max_slot_index`, but keeps `slot_to_keep`
+    /// even if it's below the threshold.
+    ///
+    /// Matches C++ `SCP::purgeSlots(maxSlotIndex, slotToKeep)`.
+    pub fn purge_slots(&self, max_slot_index: u64, slot_to_keep: Option<u64>) {
+        self.slots.write().retain(|&slot_index, _| {
+            slot_index >= max_slot_index || slot_to_keep == Some(slot_index)
+        });
     }
 
     /// Get the number of active slots.
@@ -415,8 +418,7 @@ impl<D: SCPDriver> SCP<D> {
             return false;
         };
 
-        let nodes = slot.get_nodes_heard_from();
-        crate::quorum::is_blocking_set(&self.local_quorum_set, &nodes)
+        slot.got_v_blocking()
     }
 
     /// Get the cumulative statement count across all slots.
@@ -1208,7 +1210,7 @@ mod tests {
         assert_eq!(scp.slot_count(), 10);
 
         // Purge old slots
-        scp.purge_slots(6);
+        scp.purge_slots(6, None);
 
         assert_eq!(scp.slot_count(), 5);
         assert!(scp.get_externalized_value(5).is_none());

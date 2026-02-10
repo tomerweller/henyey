@@ -36,8 +36,8 @@ use stellar_core_crypto::{PublicKey, SecretKey, Signature};
 use stellar_core_ledger::LedgerManager;
 use stellar_core_scp::{hash_quorum_set, SCPDriver, SlotIndex, ValidationLevel};
 use stellar_xdr::curr::{
-    LedgerUpgrade, NodeId, ReadXdr, ScpEnvelope, ScpQuorumSet, ScpStatement, StellarValue, Value,
-    WriteXdr,
+    EnvelopeType, LedgerUpgrade, NodeId, ReadXdr, ScpEnvelope, ScpQuorumSet, ScpStatement,
+    StellarValue, StellarValueExt, Value, WriteXdr,
 };
 
 use crate::error::HerderError;
@@ -190,6 +190,13 @@ pub struct ScpDriver {
     local_quorum_set: RwLock<Option<ScpQuorumSet>>,
     /// Ledger manager for network configuration lookups.
     ledger_manager: RwLock<Option<Arc<LedgerManager>>>,
+    /// Whether we are in tracking state (matching C++ `mHerder.isTracking()`).
+    is_tracking: RwLock<bool>,
+    /// Next consensus ledger index (matches C++ `mHerder.nextConsensusLedgerIndex()`).
+    /// This is tracking_slot in Herder terms.
+    tracking_consensus_index: RwLock<u64>,
+    /// Tracking consensus close time (matches C++ `mHerder.trackingConsensusCloseTime()`).
+    tracking_consensus_close_time: RwLock<u64>,
 }
 
 impl ScpDriver {
@@ -218,6 +225,9 @@ impl ScpDriver {
             quorum_sets_by_hash,
             local_quorum_set: RwLock::new(local_quorum_set),
             ledger_manager: RwLock::new(None),
+            is_tracking: RwLock::new(false),
+            tracking_consensus_index: RwLock::new(0),
+            tracking_consensus_close_time: RwLock::new(0),
         }
     }
 
@@ -243,6 +253,21 @@ impl ScpDriver {
     /// Provide ledger manager access for network configuration lookups.
     pub fn set_ledger_manager(&self, manager: Arc<LedgerManager>) {
         *self.ledger_manager.write() = Some(manager);
+    }
+
+    /// Update the tracking consensus state from the Herder.
+    ///
+    /// Called by the Herder whenever tracking state changes (bootstrap, advance_tracking_slot).
+    /// This provides the ScpDriver with the state needed for C++-parity close-time validation.
+    pub fn set_tracking_state(
+        &self,
+        is_tracking: bool,
+        consensus_index: u64,
+        consensus_close_time: u64,
+    ) {
+        *self.is_tracking.write() = is_tracking;
+        *self.tracking_consensus_index.write() = consensus_index;
+        *self.tracking_consensus_close_time.write() = consensus_close_time;
     }
 
     /// Cache a transaction set.
@@ -498,10 +523,154 @@ impl ScpDriver {
         missing
     }
 
+    /// Validate close time against a last close time reference.
+    ///
+    /// Matches C++ `HerderSCPDriver::checkCloseTime(slotIndex, lastCloseTime, sv)`.
+    /// Returns true if:
+    /// 1. close_time > lastCloseTime (not too old)
+    /// 2. close_time <= now + MAX_TIME_SLIP_SECONDS (not too far in future)
+    pub fn check_close_time(
+        &self,
+        _slot_index: SlotIndex,
+        last_close_time: u64,
+        close_time: u64,
+    ) -> bool {
+        // Check closeTime (not too old)
+        if close_time <= last_close_time {
+            trace!(
+                "Close time {} not after last close time {}",
+                close_time,
+                last_close_time
+            );
+            return false;
+        }
+
+        // Check closeTime (not too far in future)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if close_time > now + self.config.max_time_drift {
+            trace!(
+                "Close time {} too far in future (now: {}, max_slip: {})",
+                close_time,
+                now,
+                self.config.max_time_drift
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Validate a value for a past or future slot (not LCL+1).
+    ///
+    /// Matches C++ `HerderSCPDriver::validatePastOrFutureValue`.
+    ///
+    /// # Arguments
+    /// * `slot_index` - The slot being validated
+    /// * `close_time` - The close time of the value
+    /// * `lcl_seq` - The LCL's ledger sequence
+    /// * `lcl_close_time` - The LCL's close time
+    /// * `is_tracking` - Whether we are in tracking state
+    /// * `tracking_index` - Next consensus ledger index (tracking_slot)
+    /// * `tracking_close_time` - Tracking consensus close time
+    #[allow(clippy::too_many_arguments)]
+    fn validate_past_or_future_value(
+        &self,
+        slot_index: SlotIndex,
+        close_time: u64,
+        lcl_seq: u64,
+        lcl_close_time: u64,
+        is_tracking: bool,
+        tracking_index: u64,
+        tracking_close_time: u64,
+    ) -> ValueValidation {
+        // slot_index must NOT be lcl_seq + 1 (that's the current ledger path)
+        if slot_index == lcl_seq + 1 {
+            debug!(
+                "validate_past_or_future_value called for current ledger {}",
+                slot_index
+            );
+            return ValueValidation::Invalid;
+        }
+
+        if slot_index == lcl_seq {
+            // Previous ledger: close time must exactly match LCL
+            if close_time != lcl_close_time {
+                trace!(
+                    "Bad close time for ledger {}: got {} vs LCL {}",
+                    slot_index,
+                    close_time,
+                    lcl_close_time
+                );
+                return ValueValidation::Invalid;
+            }
+        } else if slot_index < lcl_seq {
+            // Older than LCL: close time must be strictly less
+            if close_time >= lcl_close_time {
+                trace!(
+                    "Bad close time for old ledger {}: got {} vs LCL {}",
+                    slot_index,
+                    close_time,
+                    lcl_close_time
+                );
+                return ValueValidation::Invalid;
+            }
+        } else {
+            // Future slot (beyond LCL+1): use checkCloseTime with LCL as reference
+            if !self.check_close_time(slot_index, lcl_close_time, close_time) {
+                return ValueValidation::Invalid;
+            }
+        }
+
+        if !is_tracking {
+            // Can't validate further without tracking state
+            trace!("MaybeValidValue (not tracking) for slot {}", slot_index);
+            return ValueValidation::MaybeValid;
+        }
+
+        // Check slotIndex against tracking state
+        if tracking_index > slot_index {
+            // We already moved on from this slot
+            trace!(
+                "MaybeValidValue (already moved on) for slot {}, at {}",
+                slot_index,
+                tracking_index
+            );
+            return ValueValidation::MaybeValid;
+        }
+        if tracking_index < slot_index {
+            // Processing a future message while tracking -- should not happen
+            debug!(
+                "validateValue slot {} processing future message while tracking {}",
+                slot_index,
+                tracking_index.saturating_sub(1)
+            );
+            return ValueValidation::Invalid;
+        }
+
+        // tracking_index == slot_index: use tracking close time for tighter check
+        if !self.check_close_time(slot_index, tracking_close_time, close_time) {
+            return ValueValidation::Invalid;
+        }
+
+        trace!(
+            "Can't validate locally, value may be valid for slot {}",
+            slot_index
+        );
+        ValueValidation::MaybeValid
+    }
+
     /// Validate an SCP value.
     ///
     /// The value is the XDR-encoded StellarValue.
-    pub fn validate_value_impl(&self, _slot: SlotIndex, value: &Value) -> ValueValidation {
+    /// Matches C++ `HerderSCPDriver::validateValue` which:
+    /// 1. Deserializes to StellarValue
+    /// 2. Checks STELLAR_VALUE_SIGNED (required for ALL values)
+    /// 3. Verifies the signature
+    /// 4. Validates close time and tx set (via validateValueAgainstLocalState)
+    /// 5. Checks upgrade ordering
+    pub fn validate_value_impl(&self, slot_index: SlotIndex, value: &Value) -> ValueValidation {
         // Decode the StellarValue
         let stellar_value = match StellarValue::from_xdr(value, stellar_xdr::curr::Limits::none()) {
             Ok(v) => v,
@@ -511,52 +680,124 @@ impl ScpDriver {
             }
         };
 
-        // Check close time is reasonable
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        // C++ parity: check STELLAR_VALUE_SIGNED (required for both nomination and ballot)
+        let sig = match &stellar_value.ext {
+            StellarValueExt::Signed(sig) => sig,
+            StellarValueExt::Basic => {
+                debug!("Expected STELLAR_VALUE_SIGNED");
+                return ValueValidation::Invalid;
+            }
+        };
 
-        let close_time = stellar_value.close_time.0;
-        if close_time > now + self.config.max_time_drift {
-            debug!("Close time {} too far in future (now: {})", close_time, now);
+        // C++ parity: verify the stellar value signature
+        // Signs: (networkID, ENVELOPE_TYPE_SCPVALUE, txSetHash, closeTime)
+        if !self.verify_stellar_value_signature(
+            &sig.node_id,
+            &sig.signature,
+            &stellar_value.tx_set_hash,
+            stellar_value.close_time.clone(),
+        ) {
+            debug!("StellarValue signature verification failed");
             return ValueValidation::Invalid;
         }
-        if let Some(latest) = *self.latest_externalized.read() {
-            if let Some(externalized) = self.externalized.read().get(&latest) {
-                if close_time <= externalized.close_time {
-                    debug!(
-                        "Close time {} not after last externalized {}",
-                        close_time, externalized.close_time
-                    );
-                    return ValueValidation::Invalid;
-                }
-            }
+
+        // Validate against local state (close time, tx set, etc.)
+        let result = self.validate_value_against_local_state(slot_index, &stellar_value);
+        if result == ValueValidation::Invalid {
+            return ValueValidation::Invalid;
         }
 
-        // Check if we have the transaction set
-        let tx_set_hash = Hash256::from_bytes(stellar_value.tx_set_hash.0);
-        if !self.has_tx_set(&tx_set_hash) {
-            debug!("Missing transaction set: {}", tx_set_hash);
-            return ValueValidation::MaybeValid;
-        }
-        if let Some(tx_set) = self.tx_set_cache.get(&tx_set_hash) {
-            match tx_set.tx_set.recompute_hash() {
-                Some(computed) if computed == tx_set_hash => {}
-                Some(computed) => {
-                    debug!(
-                        "Tx set hash mismatch: expected {}, computed {}",
-                        tx_set_hash, computed
-                    );
-                    return ValueValidation::Invalid;
-                }
-                None => {
-                    debug!("Failed to recompute tx set hash");
-                    return ValueValidation::Invalid;
-                }
-            }
+        // Check upgrade ordering (regardless of local state result)
+        if !Self::check_upgrade_ordering(&stellar_value) {
+            return ValueValidation::Invalid;
         }
 
+        result
+    }
+
+    /// Validate a StellarValue against local state.
+    ///
+    /// Checks close time and transaction set validity.
+    /// Matches C++ `HerderSCPDriver::validateValueAgainstLocalState`.
+    ///
+    /// For LCL+1 (current ledger): performs full validation (close time + tx set).
+    /// For past/future slots: delegates to `validate_past_or_future_value`.
+    fn validate_value_against_local_state(
+        &self,
+        slot_index: SlotIndex,
+        stellar_value: &StellarValue,
+    ) -> ValueValidation {
+        let close_time = stellar_value.close_time.0;
+
+        // Get LCL data from ledger manager
+        let (lcl_seq, lcl_close_time) = if let Some(ref lm) = *self.ledger_manager.read() {
+            let header = lm.current_header();
+            (header.ledger_seq as u64, header.scp_value.close_time.0)
+        } else {
+            // No ledger manager available — fall back to externalized data
+            if let Some(latest) = *self.latest_externalized.read() {
+                if let Some(externalized) = self.externalized.read().get(&latest) {
+                    (externalized.slot, externalized.close_time)
+                } else {
+                    (0, 0)
+                }
+            } else {
+                (0, 0)
+            }
+        };
+
+        let is_current_ledger = slot_index == lcl_seq + 1;
+
+        if is_current_ledger {
+            // The value is for LCL+1 — perform all possible checks
+            if !self.check_close_time(slot_index, lcl_close_time, close_time) {
+                return ValueValidation::Invalid;
+            }
+
+            // Check if we have the transaction set
+            let tx_set_hash = Hash256::from_bytes(stellar_value.tx_set_hash.0);
+            if !self.has_tx_set(&tx_set_hash) {
+                debug!("Missing transaction set: {}", tx_set_hash);
+                return ValueValidation::MaybeValid;
+            }
+            if let Some(tx_set) = self.tx_set_cache.get(&tx_set_hash) {
+                match tx_set.tx_set.recompute_hash() {
+                    Some(computed) if computed == tx_set_hash => {}
+                    Some(computed) => {
+                        debug!(
+                            "Tx set hash mismatch: expected {}, computed {}",
+                            tx_set_hash, computed
+                        );
+                        return ValueValidation::Invalid;
+                    }
+                    None => {
+                        debug!("Failed to recompute tx set hash");
+                        return ValueValidation::Invalid;
+                    }
+                }
+            }
+
+            ValueValidation::Valid
+        } else {
+            // Past or future slot — partial validation
+            let is_tracking = *self.is_tracking.read();
+            let tracking_index = *self.tracking_consensus_index.read();
+            let tracking_close_time = *self.tracking_consensus_close_time.read();
+
+            self.validate_past_or_future_value(
+                slot_index,
+                close_time,
+                lcl_seq,
+                lcl_close_time,
+                is_tracking,
+                tracking_index,
+                tracking_close_time,
+            )
+        }
+    }
+
+    /// Check that upgrades in a StellarValue are in strictly increasing order.
+    fn check_upgrade_ordering(stellar_value: &StellarValue) -> bool {
         let mut last_upgrade_order = None;
         for upgrade in stellar_value.upgrades.iter() {
             let upgrade = match LedgerUpgrade::from_xdr(
@@ -566,7 +807,7 @@ impl ScpDriver {
                 Ok(upgrade) => upgrade,
                 Err(_) => {
                     debug!("Invalid ledger upgrade encountered");
-                    return ValueValidation::Invalid;
+                    return false;
                 }
             };
             let order = match upgrade {
@@ -580,17 +821,136 @@ impl ScpDriver {
             };
             if last_upgrade_order.is_some_and(|prev| order <= prev) {
                 debug!("Invalid ledger upgrade encountered");
-                return ValueValidation::Invalid;
+                return false;
             }
             last_upgrade_order = Some(order);
         }
+        true
+    }
 
-        ValueValidation::Valid
+    /// Verify a StellarValue signature.
+    ///
+    /// C++ signs: `(networkID, ENVELOPE_TYPE_SCPVALUE, txSetHash, closeTime)`.
+    fn verify_stellar_value_signature(
+        &self,
+        node_id: &NodeId,
+        signature: &stellar_xdr::curr::Signature,
+        tx_set_hash: &stellar_xdr::curr::Hash,
+        close_time: stellar_xdr::curr::TimePoint,
+    ) -> bool {
+        let public_key = match PublicKey::try_from(&node_id.0) {
+            Ok(pk) => pk,
+            Err(_) => return false,
+        };
+
+        // Build signed data: (networkID, ENVELOPE_TYPE_SCPVALUE, txSetHash, closeTime)
+        let mut data = self.network_id.0.to_vec();
+        if let Ok(env_type_bytes) = EnvelopeType::Scpvalue.to_xdr(stellar_xdr::curr::Limits::none())
+        {
+            data.extend_from_slice(&env_type_bytes);
+        } else {
+            return false;
+        }
+        if let Ok(hash_bytes) = tx_set_hash.to_xdr(stellar_xdr::curr::Limits::none()) {
+            data.extend_from_slice(&hash_bytes);
+        } else {
+            return false;
+        }
+        if let Ok(time_bytes) = close_time.to_xdr(stellar_xdr::curr::Limits::none()) {
+            data.extend_from_slice(&time_bytes);
+        } else {
+            return false;
+        }
+
+        let sig_bytes: [u8; 64] = match signature.0.as_slice().try_into() {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+
+        let sig = Signature::from_bytes(sig_bytes);
+        public_key.verify(&data, &sig).is_ok()
+    }
+
+    /// Extract a valid value from a potentially invalid composite.
+    ///
+    /// C++ parity: `HerderSCPDriver::extractValidValue`:
+    /// 1. Does NOT check STELLAR_VALUE_SIGNED or verify signature
+    /// 2. Calls validateValueAgainstLocalState with nomination=true
+    /// 3. Only returns a value when result is kFullyValidatedValue
+    /// 4. Strips invalid upgrades from the value
+    pub fn extract_valid_value_impl(&self, slot: SlotIndex, value: &Value) -> Option<Value> {
+        if value.0.is_empty() {
+            return None;
+        }
+
+        // Decode the StellarValue
+        let mut stellar_value =
+            match StellarValue::from_xdr(value, stellar_xdr::curr::Limits::none()) {
+                Ok(v) => v,
+                Err(_) => return None,
+            };
+
+        // C++ parity: only extract if fully validated against local state
+        // (does NOT check STELLAR_VALUE_SIGNED or signature)
+        let result = self.validate_value_against_local_state(slot, &stellar_value);
+        if result != ValueValidation::Valid {
+            return None;
+        }
+
+        // C++ parity: strip invalid upgrades, keeping valid ones in order
+        let mut valid_upgrades = Vec::new();
+        let mut last_upgrade_type = None;
+        for upgrade_bytes in stellar_value.upgrades.iter() {
+            if let Ok(upgrade) = LedgerUpgrade::from_xdr(
+                upgrade_bytes.0.as_slice(),
+                stellar_xdr::curr::Limits::none(),
+            ) {
+                let upgrade_type = Self::upgrade_type_order(&upgrade);
+                // Only keep if in strictly increasing order
+                let in_order = last_upgrade_type
+                    .map(|prev| upgrade_type > prev)
+                    .unwrap_or(true);
+                if in_order {
+                    // TODO: In C++, also checks mUpgrades.isValid(upgrade, nomination=true)
+                    // For now, keep all upgrades that parse and are in order
+                    last_upgrade_type = Some(upgrade_type);
+                    valid_upgrades.push(upgrade_bytes.clone());
+                }
+            }
+        }
+
+        // If upgrades changed, update the value
+        if valid_upgrades.len() != stellar_value.upgrades.len() {
+            stellar_value.upgrades = valid_upgrades.try_into().unwrap_or_default();
+            // Re-encode
+            stellar_value
+                .to_xdr(stellar_xdr::curr::Limits::none())
+                .ok()
+                .map(|bytes| Value(bytes.try_into().unwrap_or_default()))
+        } else {
+            Some(value.clone())
+        }
+    }
+
+    /// Get the ordering number for an upgrade type.
+    fn upgrade_type_order(upgrade: &LedgerUpgrade) -> u32 {
+        match upgrade {
+            LedgerUpgrade::Version(_) => 0,
+            LedgerUpgrade::BaseFee(_) => 1,
+            LedgerUpgrade::MaxTxSetSize(_) => 2,
+            LedgerUpgrade::BaseReserve(_) => 3,
+            LedgerUpgrade::Flags(_) => 4,
+            LedgerUpgrade::Config(_) => 5,
+            LedgerUpgrade::MaxSorobanTxSetSize(_) => 6,
+        }
     }
 
     /// Combine multiple candidate values into one.
     ///
-    /// This picks the value with the latest close time and highest tx set hash.
+    /// C++ parity: `HerderSCPDriver::combineCandidates`:
+    /// 1. Collect upgrades from ALL candidates, merging by taking max of each type
+    /// 2. Select the best tx set using compareTxSets (size comparison + tiebreak)
+    /// 3. Compose result: best candidate's txSetHash/closeTime + merged upgrades
     pub fn combine_candidates_impl(&self, _slot: SlotIndex, values: &[Value]) -> Value {
         if values.is_empty() {
             return Value::default();
@@ -601,30 +961,112 @@ impl ScpDriver {
         }
 
         // Decode all values
-        let mut decoded: Vec<(usize, StellarValue)> = values
+        let decoded: Vec<StellarValue> = values
             .iter()
-            .enumerate()
-            .filter_map(|(i, v)| {
-                StellarValue::from_xdr(v, stellar_xdr::curr::Limits::none())
-                    .ok()
-                    .map(|sv| (i, sv))
-            })
+            .filter_map(|v| StellarValue::from_xdr(v, stellar_xdr::curr::Limits::none()).ok())
             .collect();
 
         if decoded.is_empty() {
             return values[0].clone();
         }
 
-        // Sort by close time (desc) then by tx set hash (desc)
-        decoded.sort_by(|a, b| {
-            b.1.close_time
-                .0
-                .cmp(&a.1.close_time.0)
-                .then_with(|| b.1.tx_set_hash.0.cmp(&a.1.tx_set_hash.0))
-        });
+        // Step 1: Compute candidates hash (XOR of all candidate hashes) for tiebreaking
+        let mut candidates_hash = [0u8; 32];
+        for sv in &decoded {
+            let val_bytes = sv
+                .to_xdr(stellar_xdr::curr::Limits::none())
+                .unwrap_or_default();
+            let hash = Hash256::hash(&val_bytes);
+            for (i, byte) in candidates_hash.iter_mut().enumerate() {
+                *byte ^= hash.as_bytes()[i];
+            }
+        }
 
-        // Return the best value (original bytes)
-        values[decoded[0].0].clone()
+        // Step 2: Merge upgrades across all candidates (take max of each upgrade type)
+        let mut merged_upgrades: std::collections::BTreeMap<u32, LedgerUpgrade> =
+            std::collections::BTreeMap::new();
+        for sv in &decoded {
+            for upgrade_bytes in sv.upgrades.iter() {
+                if let Ok(upgrade) = LedgerUpgrade::from_xdr(
+                    upgrade_bytes.0.as_slice(),
+                    stellar_xdr::curr::Limits::none(),
+                ) {
+                    let order = Self::upgrade_type_order(&upgrade);
+                    merged_upgrades
+                        .entry(order)
+                        .and_modify(|existing| {
+                            if Self::compare_upgrades(&upgrade, existing) {
+                                *existing = upgrade.clone();
+                            }
+                        })
+                        .or_insert(upgrade);
+                }
+            }
+        }
+
+        // Step 3: Select best candidate (by tx set hash tiebreak with candidates_hash)
+        // C++ uses compareTxSets which compares size, fees, etc.
+        // We don't have full tx set metadata here, so we use the XOR tiebreak:
+        // lessThanXored(lh, rh, candidatesHash) as the primary comparison
+        let best_idx = decoded
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| {
+                // XOR tiebreak: XOR each hash with candidates_hash, compare
+                let a_xored = Self::xor_hash(&a.tx_set_hash.0, &candidates_hash);
+                let b_xored = Self::xor_hash(&b.tx_set_hash.0, &candidates_hash);
+                a_xored.cmp(&b_xored)
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        // Step 4: Compose result
+        let mut result = decoded[best_idx].clone();
+
+        // Replace upgrades with merged set (in order of upgrade type)
+        let upgrade_bytes: Vec<stellar_xdr::curr::UpgradeType> = merged_upgrades
+            .values()
+            .filter_map(|upgrade| {
+                upgrade
+                    .to_xdr(stellar_xdr::curr::Limits::none())
+                    .ok()
+                    .and_then(|bytes| stellar_xdr::curr::UpgradeType(bytes.try_into().ok()?).into())
+            })
+            .collect();
+        result.upgrades = upgrade_bytes.try_into().unwrap_or_default();
+
+        // Re-encode the result
+        result
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .map(|bytes| Value(bytes.try_into().unwrap_or_default()))
+            .unwrap_or_default()
+    }
+
+    /// Compare two upgrades of the same type, returning true if `new` > `existing`.
+    /// C++ takes the max of each upgrade type.
+    fn compare_upgrades(new: &LedgerUpgrade, existing: &LedgerUpgrade) -> bool {
+        match (new, existing) {
+            (LedgerUpgrade::Version(a), LedgerUpgrade::Version(b)) => a > b,
+            (LedgerUpgrade::BaseFee(a), LedgerUpgrade::BaseFee(b)) => a > b,
+            (LedgerUpgrade::MaxTxSetSize(a), LedgerUpgrade::MaxTxSetSize(b)) => a > b,
+            (LedgerUpgrade::BaseReserve(a), LedgerUpgrade::BaseReserve(b)) => a > b,
+            (LedgerUpgrade::Flags(a), LedgerUpgrade::Flags(b)) => a > b,
+            (LedgerUpgrade::Config(a), LedgerUpgrade::Config(b)) => {
+                // ConfigUpgradeSetKey derives Ord: compares contractID then contentHash
+                a > b
+            }
+            (LedgerUpgrade::MaxSorobanTxSetSize(a), LedgerUpgrade::MaxSorobanTxSetSize(b)) => a > b,
+            _ => false, // Different types shouldn't happen
+        }
+    }
+
+    /// XOR a 32-byte hash with another 32-byte value for tiebreaking.
+    fn xor_hash(hash: &[u8; 32], mask: &[u8; 32]) -> [u8; 32] {
+        let mut result = [0u8; 32];
+        for i in 0..32 {
+            result[i] = hash[i] ^ mask[i];
+        }
+        result
     }
 
     /// Sign an SCP envelope.
@@ -755,6 +1197,11 @@ impl ScpDriver {
         }
 
         debug!("Externalized slot {} with close time {}", slot, close_time);
+    }
+
+    /// Get the close time of an externalized slot.
+    pub fn get_externalized_close_time(&self, slot: SlotIndex) -> Option<u64> {
+        self.externalized.read().get(&slot).map(|e| e.close_time)
     }
 
     /// Emit an envelope to the network.
@@ -1286,14 +1733,7 @@ impl SCPDriver for HerderScpCallback {
     }
 
     fn extract_valid_value(&self, slot_index: u64, value: &Value) -> Option<Value> {
-        if value.0.is_empty() {
-            return None;
-        }
-
-        match self.driver.validate_value_impl(slot_index, value) {
-            ValueValidation::Invalid => None,
-            ValueValidation::MaybeValid | ValueValidation::Valid => Some(value.clone()),
-        }
+        self.driver.extract_valid_value_impl(slot_index, value)
     }
 
     fn emit_envelope(&self, envelope: &ScpEnvelope) {
@@ -1390,16 +1830,96 @@ impl SCPDriver for HerderScpCallback {
     fn verify_envelope(&self, envelope: &ScpEnvelope) -> bool {
         self.driver.verify_envelope(envelope).is_ok()
     }
+
+    /// C++ parity: check if a value contains protocol upgrades.
+    fn has_upgrades(&self, value: &Value) -> bool {
+        if let Ok(sv) = StellarValue::from_xdr(value, stellar_xdr::curr::Limits::none()) {
+            !sv.upgrades.is_empty()
+        } else {
+            false
+        }
+    }
+
+    /// C++ parity: strip all upgrades from a value.
+    fn strip_all_upgrades(&self, value: &Value) -> Option<Value> {
+        let mut sv = StellarValue::from_xdr(value, stellar_xdr::curr::Limits::none()).ok()?;
+        sv.upgrades = Vec::new().try_into().ok()?;
+        sv.to_xdr(stellar_xdr::curr::Limits::none())
+            .ok()
+            .map(|bytes| Value(bytes.try_into().unwrap_or_default()))
+    }
+
+    /// C++ parity: get the nomination timeout limit for upgrade stripping.
+    fn get_upgrade_nomination_timeout_limit(&self) -> u32 {
+        // In C++, this comes from mUpgrades.getParameters().mNominationTimeoutLimit
+        // Default is u32::MAX (never strip), which matches C++ default
+        u32::MAX
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{Limits, StellarValue, StellarValueExt, TimePoint, UpgradeType, VecM};
+    use stellar_xdr::curr::{
+        LedgerCloseValueSignature, Limits, StellarValue, StellarValueExt, TimePoint, UpgradeType,
+        VecM,
+    };
 
     fn make_test_driver() -> ScpDriver {
         let config = ScpDriverConfig::default();
         ScpDriver::new(config, Hash256::ZERO)
+    }
+
+    /// Create a test driver with a known secret key for signing.
+    fn make_test_driver_with_key() -> (ScpDriver, SecretKey) {
+        let secret_key = SecretKey::generate();
+        let public_key = secret_key.public_key();
+        let config = ScpDriverConfig {
+            node_id: public_key,
+            ..ScpDriverConfig::default()
+        };
+        let network_id = Hash256::ZERO;
+        let driver = ScpDriver::with_secret_key(config, network_id, secret_key.clone());
+        (driver, secret_key)
+    }
+
+    /// Create a properly SIGNED StellarValue using the given secret key and network ID.
+    fn make_signed_stellar_value(
+        tx_set_hash: stellar_xdr::curr::Hash,
+        close_time: u64,
+        upgrades: Vec<UpgradeType>,
+        secret_key: &SecretKey,
+        network_id: &Hash256,
+    ) -> StellarValue {
+        let close_time = TimePoint(close_time);
+        // Sign: (networkID, ENVELOPE_TYPE_SCPVALUE, txSetHash, closeTime)
+        let mut sign_data = network_id.0.to_vec();
+        sign_data.extend_from_slice(&EnvelopeType::Scpvalue.to_xdr(Limits::none()).expect("xdr"));
+        sign_data.extend_from_slice(&tx_set_hash.to_xdr(Limits::none()).expect("xdr"));
+        sign_data.extend_from_slice(&close_time.to_xdr(Limits::none()).expect("xdr"));
+        let sig = secret_key.sign(&sign_data);
+
+        let node_id =
+            stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::curr::Uint256(*secret_key.public_key().as_bytes()),
+            ));
+
+        StellarValue {
+            tx_set_hash,
+            close_time,
+            upgrades: upgrades.try_into().unwrap_or_default(),
+            ext: StellarValueExt::Signed(LedgerCloseValueSignature {
+                node_id,
+                signature: stellar_xdr::curr::Signature(
+                    sig.0.to_vec().try_into().unwrap_or_default(),
+                ),
+            }),
+        }
+    }
+
+    /// Encode a StellarValue to a Value.
+    fn encode_sv(sv: &StellarValue) -> Value {
+        Value(sv.to_xdr(Limits::none()).expect("xdr").try_into().unwrap())
     }
 
     #[test]
@@ -1472,7 +1992,7 @@ mod tests {
 
     #[test]
     fn test_invalid_upgrade_rejected() {
-        let driver = make_test_driver();
+        let (driver, secret_key) = make_test_driver_with_key();
 
         let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
         let tx_set_hash = tx_set.hash;
@@ -1484,20 +2004,14 @@ mod tests {
             .as_secs();
 
         let invalid_upgrade = UpgradeType(vec![0u8; 1].try_into().unwrap());
-        let stellar_value = StellarValue {
-            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
-            close_time: TimePoint(now),
-            upgrades: vec![invalid_upgrade].try_into().unwrap(),
-            ext: StellarValueExt::Basic,
-        };
-
-        let value = Value(
-            stellar_value
-                .to_xdr(Limits::none())
-                .expect("xdr")
-                .try_into()
-                .unwrap(),
+        let sv = make_signed_stellar_value(
+            stellar_xdr::curr::Hash(tx_set_hash.0),
+            now,
+            vec![invalid_upgrade],
+            &secret_key,
+            &driver.network_id,
         );
+        let value = encode_sv(&sv);
 
         assert_eq!(
             driver.validate_value_impl(1, &value),
@@ -1507,7 +2021,7 @@ mod tests {
 
     #[test]
     fn test_tx_set_hash_mismatch_rejected() {
-        let driver = make_test_driver();
+        let (driver, secret_key) = make_test_driver_with_key();
 
         let tx_set = TransactionSet::with_hash(Hash256::ZERO, Hash256::ZERO, vec![]);
         let tx_set_hash = tx_set.hash;
@@ -1518,20 +2032,14 @@ mod tests {
             .unwrap_or_default()
             .as_secs();
 
-        let stellar_value = StellarValue {
-            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
-            close_time: TimePoint(now),
-            upgrades: VecM::default(),
-            ext: StellarValueExt::Basic,
-        };
-
-        let value = Value(
-            stellar_value
-                .to_xdr(Limits::none())
-                .expect("xdr")
-                .try_into()
-                .unwrap(),
+        let sv = make_signed_stellar_value(
+            stellar_xdr::curr::Hash(tx_set_hash.0),
+            now,
+            vec![],
+            &secret_key,
+            &driver.network_id,
         );
+        let value = encode_sv(&sv);
 
         assert_eq!(
             driver.validate_value_impl(1, &value),
@@ -1541,13 +2049,14 @@ mod tests {
 
     #[test]
     fn test_close_time_must_increase() {
-        let driver = make_test_driver();
+        let (driver, secret_key) = make_test_driver_with_key();
 
         let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
         let tx_set_hash = tx_set.hash;
         driver.cache_tx_set(tx_set);
 
         let base_close_time = 100;
+        // Record externalized with Basic ext (record_externalized doesn't validate)
         let ext_value = StellarValue {
             tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
             close_time: TimePoint(base_close_time),
@@ -1563,19 +2072,15 @@ mod tests {
         );
         driver.record_externalized(1, ext);
 
-        let candidate = StellarValue {
-            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
-            close_time: TimePoint(base_close_time),
-            upgrades: VecM::default(),
-            ext: StellarValueExt::Basic,
-        };
-        let value = Value(
-            candidate
-                .to_xdr(Limits::none())
-                .expect("xdr")
-                .try_into()
-                .unwrap(),
+        // Now try to validate a value with same close time (should fail)
+        let sv = make_signed_stellar_value(
+            stellar_xdr::curr::Hash(tx_set_hash.0),
+            base_close_time,
+            vec![],
+            &secret_key,
+            &driver.network_id,
         );
+        let value = encode_sv(&sv);
 
         assert_eq!(
             driver.validate_value_impl(2, &value),
@@ -1585,7 +2090,7 @@ mod tests {
 
     #[test]
     fn test_invalid_upgrade_order_rejected() {
-        let driver = make_test_driver();
+        let (driver, secret_key) = make_test_driver_with_key();
 
         let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
         let tx_set_hash = tx_set.hash;
@@ -1607,24 +2112,553 @@ mod tests {
             UpgradeType(version.try_into().unwrap()),
         ];
 
+        let sv = make_signed_stellar_value(
+            stellar_xdr::curr::Hash(tx_set_hash.0),
+            now,
+            upgrades,
+            &secret_key,
+            &driver.network_id,
+        );
+        let value = encode_sv(&sv);
+
+        assert_eq!(
+            driver.validate_value_impl(1, &value),
+            ValueValidation::Invalid
+        );
+    }
+
+    // =========================================================================
+    // Phase 5 parity tests
+    // =========================================================================
+
+    #[test]
+    fn test_validate_rejects_basic_ext() {
+        // C++ parity: validateValue always requires STELLAR_VALUE_SIGNED
+        let driver = make_test_driver();
+
+        let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
+        let tx_set_hash = tx_set.hash;
+        driver.cache_tx_set(tx_set);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Create a value with Basic ext (no signature)
+        let stellar_value = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
+            close_time: TimePoint(now),
+            upgrades: VecM::default(),
+            ext: StellarValueExt::Basic,
+        };
+        let value = encode_sv(&stellar_value);
+
+        assert_eq!(
+            driver.validate_value_impl(1, &value),
+            ValueValidation::Invalid
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_bad_signature() {
+        // C++ parity: validateValue verifies the StellarValue signature
+        let (driver, secret_key) = make_test_driver_with_key();
+
+        let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
+        let tx_set_hash = tx_set.hash;
+        driver.cache_tx_set(tx_set);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Create a signed value but tamper with the signature
+        let mut sv = make_signed_stellar_value(
+            stellar_xdr::curr::Hash(tx_set_hash.0),
+            now,
+            vec![],
+            &secret_key,
+            &driver.network_id,
+        );
+        // Tamper with the signature
+        if let StellarValueExt::Signed(ref mut sig) = sv.ext {
+            let mut sig_bytes = sig.signature.to_vec();
+            sig_bytes[0] ^= 0xFF;
+            sig.signature = sig_bytes.try_into().expect("signature bytes");
+        }
+        let value = encode_sv(&sv);
+
+        assert_eq!(
+            driver.validate_value_impl(1, &value),
+            ValueValidation::Invalid
+        );
+    }
+
+    #[test]
+    fn test_validate_accepts_signed_value() {
+        // C++ parity: a properly signed StellarValue should be accepted
+        let (driver, secret_key) = make_test_driver_with_key();
+
+        let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
+        let tx_set_hash = tx_set.hash;
+        driver.cache_tx_set(tx_set);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let sv = make_signed_stellar_value(
+            stellar_xdr::curr::Hash(tx_set_hash.0),
+            now,
+            vec![],
+            &secret_key,
+            &driver.network_id,
+        );
+        let value = encode_sv(&sv);
+
+        assert_eq!(
+            driver.validate_value_impl(1, &value),
+            ValueValidation::Valid
+        );
+    }
+
+    #[test]
+    fn test_extract_valid_value_requires_fully_validated() {
+        // C++ parity: extractValidValue only returns value when
+        // validateValueAgainstLocalState returns kFullyValidatedValue.
+        // When tx set is missing, it returns MaybeValid -> extractValidValue returns None.
+        let driver = make_test_driver();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Value with missing tx set (MaybeValid from local state check)
+        let stellar_value = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash([1u8; 32]),
+            close_time: TimePoint(now),
+            upgrades: VecM::default(),
+            ext: StellarValueExt::Basic,
+        };
+        let value = encode_sv(&stellar_value);
+
+        // extractValidValue should return None since tx set is missing
+        assert!(driver.extract_valid_value_impl(1, &value).is_none());
+    }
+
+    #[test]
+    fn test_extract_valid_value_strips_invalid_upgrades() {
+        // C++ parity: extractValidValue strips invalid upgrades
+        let driver = make_test_driver();
+
+        let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
+        let tx_set_hash = tx_set.hash;
+        driver.cache_tx_set(tx_set);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Create value with an invalid upgrade + a valid upgrade
+        let version = LedgerUpgrade::Version(25)
+            .to_xdr(Limits::none())
+            .expect("xdr");
+        let base_fee = LedgerUpgrade::BaseFee(200)
+            .to_xdr(Limits::none())
+            .expect("xdr");
+        // Wrong order: base_fee (order 1) before version (order 0) -> invalid
+        let upgrades = vec![
+            UpgradeType(base_fee.try_into().unwrap()),
+            UpgradeType(version.try_into().unwrap()),
+        ];
+
         let stellar_value = StellarValue {
             tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
             close_time: TimePoint(now),
             upgrades: upgrades.try_into().unwrap(),
             ext: StellarValueExt::Basic,
         };
+        let value = encode_sv(&stellar_value);
 
-        let value = Value(
-            stellar_value
-                .to_xdr(Limits::none())
-                .expect("xdr")
+        // extractValidValue should strip the out-of-order upgrade
+        let result = driver.extract_valid_value_impl(1, &value);
+        assert!(result.is_some());
+
+        // The result should only have the first upgrade (base_fee at order 1)
+        // since version (order 0) is out of order after base_fee
+        let result_sv =
+            StellarValue::from_xdr(&result.unwrap(), Limits::none()).expect("decode result");
+        assert_eq!(result_sv.upgrades.len(), 1);
+    }
+
+    #[test]
+    fn test_combine_candidates_merges_upgrades() {
+        // C++ parity: combineCandidates merges upgrades from ALL candidates
+        let driver = make_test_driver();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Candidate 1: version upgrade
+        let version = LedgerUpgrade::Version(25)
+            .to_xdr(Limits::none())
+            .expect("xdr");
+        let sv1 = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash([1u8; 32]),
+            close_time: TimePoint(now),
+            upgrades: vec![UpgradeType(version.try_into().unwrap())]
                 .try_into()
                 .unwrap(),
-        );
+            ext: StellarValueExt::Basic,
+        };
 
+        // Candidate 2: base fee upgrade
+        let base_fee = LedgerUpgrade::BaseFee(200)
+            .to_xdr(Limits::none())
+            .expect("xdr");
+        let sv2 = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash([2u8; 32]),
+            close_time: TimePoint(now),
+            upgrades: vec![UpgradeType(base_fee.try_into().unwrap())]
+                .try_into()
+                .unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+
+        let v1 = encode_sv(&sv1);
+        let v2 = encode_sv(&sv2);
+
+        let result = driver.combine_candidates_impl(1, &[v1, v2]);
+        let result_sv = StellarValue::from_xdr(&result, Limits::none()).expect("decode");
+
+        // Result should have BOTH upgrades (merged)
+        assert_eq!(result_sv.upgrades.len(), 2);
+    }
+
+    #[test]
+    fn test_combine_candidates_takes_max_upgrade() {
+        // C++ parity: when multiple candidates have same upgrade type, take max
+        let driver = make_test_driver();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Candidate 1: version 24
+        let v24 = LedgerUpgrade::Version(24)
+            .to_xdr(Limits::none())
+            .expect("xdr");
+        let sv1 = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash([1u8; 32]),
+            close_time: TimePoint(now),
+            upgrades: vec![UpgradeType(v24.try_into().unwrap())]
+                .try_into()
+                .unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+
+        // Candidate 2: version 25
+        let v25 = LedgerUpgrade::Version(25)
+            .to_xdr(Limits::none())
+            .expect("xdr");
+        let sv2 = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash([2u8; 32]),
+            close_time: TimePoint(now),
+            upgrades: vec![UpgradeType(v25.try_into().unwrap())]
+                .try_into()
+                .unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+
+        let v1 = encode_sv(&sv1);
+        let v2 = encode_sv(&sv2);
+
+        let result = driver.combine_candidates_impl(1, &[v1, v2]);
+        let result_sv = StellarValue::from_xdr(&result, Limits::none()).expect("decode");
+
+        // Should have 1 version upgrade with value 25 (max)
+        assert_eq!(result_sv.upgrades.len(), 1);
+        let upgrade = LedgerUpgrade::from_xdr(result_sv.upgrades[0].0.as_slice(), Limits::none())
+            .expect("decode upgrade");
+        assert!(matches!(upgrade, LedgerUpgrade::Version(25)));
+    }
+
+    #[test]
+    fn test_has_upgrades_and_strip() {
+        // C++ parity: has_upgrades checks sv.upgrades.empty()
+        //             strip_all_upgrades clears sv.upgrades
+        let driver = Arc::new(make_test_driver());
+        let callback = HerderScpCallback::new(driver);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Value without upgrades
+        let sv_no_upgrades = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash([1u8; 32]),
+            close_time: TimePoint(now),
+            upgrades: VecM::default(),
+            ext: StellarValueExt::Basic,
+        };
+        let v_no = encode_sv(&sv_no_upgrades);
+        assert!(!callback.has_upgrades(&v_no));
+
+        // Value with upgrades
+        let version = LedgerUpgrade::Version(25)
+            .to_xdr(Limits::none())
+            .expect("xdr");
+        let sv_with_upgrades = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash([1u8; 32]),
+            close_time: TimePoint(now),
+            upgrades: vec![UpgradeType(version.try_into().unwrap())]
+                .try_into()
+                .unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+        let v_yes = encode_sv(&sv_with_upgrades);
+        assert!(callback.has_upgrades(&v_yes));
+
+        // Strip upgrades
+        let stripped = callback.strip_all_upgrades(&v_yes);
+        assert!(stripped.is_some());
+        let stripped_sv =
+            StellarValue::from_xdr(&stripped.unwrap(), Limits::none()).expect("decode");
+        assert!(stripped_sv.upgrades.is_empty());
+        // txSetHash and closeTime should be preserved
+        assert_eq!(stripped_sv.tx_set_hash, sv_with_upgrades.tx_set_hash);
+        assert_eq!(stripped_sv.close_time, sv_with_upgrades.close_time);
+    }
+
+    // =========================================================================
+    // Phase 6 H1 parity tests — close-time validation
+    // =========================================================================
+
+    #[test]
+    fn test_check_close_time_valid() {
+        let driver = make_test_driver();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Valid: close time is after last close time and within max_time_drift
+        assert!(driver.check_close_time(1, now - 10, now));
+        assert!(driver.check_close_time(1, now - 1, now));
+    }
+
+    #[test]
+    fn test_check_close_time_rejects_not_after_last() {
+        let driver = make_test_driver();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Invalid: close time is equal to last close time
+        assert!(!driver.check_close_time(1, now, now));
+        // Invalid: close time is before last close time
+        assert!(!driver.check_close_time(1, now, now - 1));
+    }
+
+    #[test]
+    fn test_check_close_time_rejects_too_far_future() {
+        let driver = make_test_driver();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Invalid: close time too far in future (max_time_drift defaults to MAX_TIME_SLIP_SECONDS = 60)
+        assert!(!driver.check_close_time(1, now - 1, now + 120));
+    }
+
+    #[test]
+    fn test_validate_past_or_future_value_same_as_lcl() {
+        let driver = make_test_driver();
+
+        // slot_index == lcl_seq: close time must match LCL exactly
         assert_eq!(
-            driver.validate_value_impl(1, &value),
+            driver.validate_past_or_future_value(100, 500, 100, 500, false, 0, 0),
+            ValueValidation::MaybeValid
+        );
+        // Close time doesn't match -> Invalid
+        assert_eq!(
+            driver.validate_past_or_future_value(100, 501, 100, 500, false, 0, 0),
             ValueValidation::Invalid
         );
+    }
+
+    #[test]
+    fn test_validate_past_or_future_value_older_than_lcl() {
+        let driver = make_test_driver();
+
+        // slot_index < lcl_seq: close time must be strictly less than LCL
+        assert_eq!(
+            driver.validate_past_or_future_value(99, 499, 100, 500, false, 0, 0),
+            ValueValidation::MaybeValid
+        );
+        // Close time >= LCL -> Invalid
+        assert_eq!(
+            driver.validate_past_or_future_value(99, 500, 100, 500, false, 0, 0),
+            ValueValidation::Invalid
+        );
+        assert_eq!(
+            driver.validate_past_or_future_value(99, 501, 100, 500, false, 0, 0),
+            ValueValidation::Invalid
+        );
+    }
+
+    #[test]
+    fn test_validate_past_or_future_value_future_not_tracking() {
+        let driver = make_test_driver();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // slot_index > lcl_seq + 1: delegates to check_close_time, then MaybeValid
+        assert_eq!(
+            driver.validate_past_or_future_value(
+                200,
+                now,      // close_time
+                100,      // lcl_seq
+                now - 10, // lcl_close_time
+                false,    // not tracking
+                0,
+                0
+            ),
+            ValueValidation::MaybeValid
+        );
+    }
+
+    #[test]
+    fn test_validate_past_or_future_value_tracking_moved_on() {
+        let driver = make_test_driver();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Tracking and tracking_index > slot_index -> already moved on -> MaybeValid
+        assert_eq!(
+            driver.validate_past_or_future_value(
+                150,
+                now,
+                100,
+                now - 50,
+                true, // tracking
+                200,  // tracking_index > slot_index
+                now - 5
+            ),
+            ValueValidation::MaybeValid
+        );
+    }
+
+    #[test]
+    fn test_validate_past_or_future_value_tracking_future_msg() {
+        let driver = make_test_driver();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Tracking and tracking_index < slot_index -> future message -> Invalid
+        assert_eq!(
+            driver.validate_past_or_future_value(
+                200,
+                now,
+                100,
+                now - 50,
+                true, // tracking
+                150,  // tracking_index < slot_index
+                now - 5
+            ),
+            ValueValidation::Invalid
+        );
+    }
+
+    #[test]
+    fn test_validate_past_or_future_value_tracking_same_slot() {
+        let driver = make_test_driver();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Tracking and tracking_index == slot_index -> re-check with tracking close time
+        assert_eq!(
+            driver.validate_past_or_future_value(
+                150,
+                now, // close_time > tracking_close_time, within drift
+                100,
+                now - 50,
+                true,
+                150,     // same as slot_index
+                now - 5  // tracking_close_time
+            ),
+            ValueValidation::MaybeValid
+        );
+        // If close_time <= tracking_close_time -> Invalid
+        assert_eq!(
+            driver.validate_past_or_future_value(
+                150,
+                now - 10, // close_time <= tracking_close_time
+                100,
+                now - 50,
+                true,
+                150,
+                now - 5 // tracking_close_time > close_time
+            ),
+            ValueValidation::Invalid
+        );
+    }
+
+    #[test]
+    fn test_validate_past_or_future_value_rejects_current_ledger() {
+        let driver = make_test_driver();
+
+        // slot_index == lcl_seq + 1 is the current ledger path -- should be Invalid
+        // (validate_past_or_future_value is not for the current ledger)
+        assert_eq!(
+            driver.validate_past_or_future_value(101, 500, 100, 490, false, 0, 0),
+            ValueValidation::Invalid
+        );
+    }
+
+    #[test]
+    fn test_validate_value_against_local_state_current_ledger() {
+        // When slot_index == lcl_seq + 1, validate_value_against_local_state
+        // does full validation including tx set hash check
+        let (driver, secret_key) = make_test_driver_with_key();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
+        let tx_set_hash = tx_set.hash;
+        driver.cache_tx_set(tx_set);
+
+        let sv = make_signed_stellar_value(
+            stellar_xdr::curr::Hash(tx_set_hash.0),
+            now,
+            vec![],
+            &secret_key,
+            &driver.network_id,
+        );
+
+        // slot 1 == lcl_seq(0) + 1 -> current ledger path
+        let result = driver.validate_value_against_local_state(1, &sv);
+        assert_eq!(result, ValueValidation::Valid);
     }
 }
