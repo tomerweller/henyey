@@ -2118,14 +2118,15 @@ impl BallotProtocol {
         driver.emit_envelope(envelope);
     }
 
-    /// Emit prepare statement.
+    /// Build and record a prepare statement envelope.
+    /// Returns the statement if a new envelope was recorded (for self-processing).
     fn emit_prepare<D: SCPDriver>(
         &mut self,
         local_node_id: &NodeId,
         local_quorum_set: &ScpQuorumSet,
         driver: &Arc<D>,
         slot_index: u64,
-    ) {
+    ) -> Option<ScpStatement> {
         if let Some(ref ballot) = self.current_ballot {
             let prep = ScpStatementPrepare {
                 quorum_set_hash: hash_quorum_set(local_quorum_set).into(),
@@ -2143,7 +2144,7 @@ impl BallotProtocol {
             };
 
             let mut envelope = ScpEnvelope {
-                statement,
+                statement: statement.clone(),
                 signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
             };
 
@@ -2151,18 +2152,21 @@ impl BallotProtocol {
             if self.record_local_envelope(local_node_id, envelope.clone()) {
                 self.last_envelope = Some(envelope.clone());
                 self.send_latest_envelope(driver);
+                return Some(statement);
             }
         }
+        None
     }
 
-    /// Emit confirm statement.
+    /// Build and record a confirm statement envelope.
+    /// Returns the statement if a new envelope was recorded (for self-processing).
     fn emit_confirm<D: SCPDriver>(
         &mut self,
         local_node_id: &NodeId,
         local_quorum_set: &ScpQuorumSet,
         driver: &Arc<D>,
         slot_index: u64,
-    ) {
+    ) -> Option<ScpStatement> {
         if let Some(ref ballot) = self.current_ballot {
             let conf = ScpStatementConfirm {
                 ballot: ballot.clone(),
@@ -2179,7 +2183,7 @@ impl BallotProtocol {
             };
 
             let mut envelope = ScpEnvelope {
-                statement,
+                statement: statement.clone(),
                 signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
             };
 
@@ -2187,18 +2191,21 @@ impl BallotProtocol {
             if self.record_local_envelope(local_node_id, envelope.clone()) {
                 self.last_envelope = Some(envelope.clone());
                 self.send_latest_envelope(driver);
+                return Some(statement);
             }
         }
+        None
     }
 
-    /// Emit externalize statement.
+    /// Build and record an externalize statement envelope.
+    /// Returns the statement if a new envelope was recorded (for self-processing).
     fn emit_externalize<D: SCPDriver>(
         &mut self,
         local_node_id: &NodeId,
         local_quorum_set: &ScpQuorumSet,
         driver: &Arc<D>,
         slot_index: u64,
-    ) {
+    ) -> Option<ScpStatement> {
         if let Some(ref commit) = self.commit {
             let ext = ScpStatementExternalize {
                 commit: commit.clone(),
@@ -2213,7 +2220,7 @@ impl BallotProtocol {
             };
 
             let mut envelope = ScpEnvelope {
-                statement,
+                statement: statement.clone(),
                 signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
             };
 
@@ -2221,11 +2228,19 @@ impl BallotProtocol {
             if self.record_local_envelope(local_node_id, envelope.clone()) {
                 self.last_envelope = Some(envelope.clone());
                 self.send_latest_envelope(driver);
+                return Some(statement);
             }
         }
+        None
     }
 
-    /// Emit current state (used after timeout).
+    /// Emit current state and recursively self-process (matching C++ emitCurrentStateStatement).
+    ///
+    /// After emitting, feeds the self-envelope back into `advance_slot` so that
+    /// cascading state transitions (e.g., accept-prepared → confirm-prepared →
+    /// accept-commit) can happen within a single top-level `receiveEnvelope` call.
+    /// The `current_message_level` guard in `send_latest_envelope` ensures only the
+    /// final envelope is actually emitted to the network.
     fn emit_current_state<D: SCPDriver>(
         &mut self,
         local_node_id: &NodeId,
@@ -2233,7 +2248,7 @@ impl BallotProtocol {
         driver: &Arc<D>,
         slot_index: u64,
     ) {
-        match self.phase {
+        let maybe_statement = match self.phase {
             BallotPhase::Prepare => {
                 self.emit_prepare(local_node_id, local_quorum_set, driver, slot_index)
             }
@@ -2243,6 +2258,18 @@ impl BallotProtocol {
             BallotPhase::Externalize => {
                 self.emit_externalize(local_node_id, local_quorum_set, driver, slot_index)
             }
+        };
+        // Recursive self-processing: feed the self-envelope back into advance_slot
+        // so cascading state transitions complete within a single receiveEnvelope.
+        // This matches C++ emitCurrentStateStatement() calling processEnvelope(self).
+        if let Some(statement) = maybe_statement {
+            self.advance_slot(
+                &statement,
+                local_node_id,
+                local_quorum_set,
+                driver,
+                slot_index,
+            );
         }
     }
 
@@ -3188,12 +3215,13 @@ mod tests {
     #[test]
     fn test_ballot_timeout_bumps_counter() {
         let node = make_node_id(1);
-        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let other = make_node_id(99);
+        let quorum_set = make_quorum_set(vec![node.clone(), other.clone()], 2);
         let driver = Arc::new(MockDriver::new(quorum_set.clone()));
         let mut ballot = BallotProtocol::new();
         let value = make_value(&[5]);
 
-        assert!(ballot.bump(&node, &quorum_set, &driver, 3, value, false));
+        assert!(ballot.bump(&node, &quorum_set, &driver, 3, value.clone(), false));
         assert_eq!(ballot.current_ballot_counter(), Some(1));
 
         assert!(ballot.bump_timeout(&node, &quorum_set, &driver, 3, None));
@@ -3908,7 +3936,8 @@ mod tests {
     #[test]
     fn test_bump_state_specific_counter() {
         let node = make_node_id(1);
-        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let other = make_node_id(99);
+        let quorum_set = make_quorum_set(vec![node.clone(), other.clone()], 2);
         let driver = Arc::new(MockDriver::new(quorum_set.clone()));
         let mut ballot = BallotProtocol::new();
 
@@ -3967,7 +3996,8 @@ mod tests {
     #[test]
     fn test_abandon_ballot_public() {
         let node = make_node_id(1);
-        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let other = make_node_id(99);
+        let quorum_set = make_quorum_set(vec![node.clone(), other.clone()], 2);
         let driver = Arc::new(MockDriver::new(quorum_set.clone()));
         let mut ballot = BallotProtocol::new();
 
@@ -4394,7 +4424,8 @@ mod tests {
     #[test]
     fn test_bump_state_uses_value_override() {
         let node = make_node_id(1);
-        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let other = make_node_id(99);
+        let quorum_set = make_quorum_set(vec![node.clone(), other.clone()], 2);
         let driver = Arc::new(BallotParityDriver::new(quorum_set.clone()));
         let mut bp = BallotProtocol::new();
 
@@ -4799,7 +4830,8 @@ mod tests {
     #[test]
     fn test_bump_delegates_to_bump_state() {
         let node = make_node_id(1);
-        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let other = make_node_id(99);
+        let quorum_set = make_quorum_set(vec![node.clone(), other.clone()], 2);
         let driver = Arc::new(BallotParityDriver::new(quorum_set.clone()));
         let mut bp = BallotProtocol::new();
 

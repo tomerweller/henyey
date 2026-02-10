@@ -2116,7 +2116,8 @@ mod tests {
     use stellar_xdr::curr::{
         EnvelopeType, LedgerCloseValueSignature, Limits, NodeId as XdrNodeId, ScpBallot,
         ScpNomination, ScpStatement, ScpStatementExternalize, ScpStatementPledges,
-        Signature as XdrSignature, StellarValue, StellarValueExt, TimePoint, Value, WriteXdr,
+        ScpStatementPrepare, Signature as XdrSignature, StellarValue, StellarValueExt, TimePoint,
+        Value, WriteXdr,
     };
 
     fn make_test_herder() -> Herder {
@@ -2207,6 +2208,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn make_signed_nomination_envelope(
         slot: u64,
         value: Value,
@@ -2554,19 +2556,78 @@ mod tests {
 
     #[test]
     fn test_ballot_timeout_requires_heard_from_quorum() {
-        let (herder, secret) = make_validator_herder();
+        // Use a 2-node quorum (threshold 2) so that the local node's self-envelope
+        // cannot cascade all the way to externalization via recursive self-processing.
+        // We then send a PREPARE from the second node so heard_from_quorum is satisfied.
+        let seed = [7u8; 32];
+        let secret_for_herder = SecretKey::from_seed(&seed);
+        let public = secret_for_herder.public_key();
+        let local_node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256(*public.as_bytes()),
+        ));
+
+        // Second node
+        let other_secret = SecretKey::from_seed(&[8u8; 32]);
+        let other_public = other_secret.public_key();
+        let other_node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256(*other_public.as_bytes()),
+        ));
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![local_node_id.clone(), other_node_id.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: public,
+            local_quorum_set: Some(quorum_set.clone()),
+            ..HerderConfig::default()
+        };
+
+        let herder = Herder::with_secret_key(config, secret_for_herder);
+        let secret = SecretKey::from_seed(&seed);
         let scp = herder.scp().expect("validator scp");
         let slot = 1u64;
 
         assert!(herder.get_ballot_timeout(slot).is_none());
 
+        // Create a valid value and start ballot protocol via bump_state
         let value = make_valid_value_with_cached_tx_set(&herder, &secret);
-        let prev_value = value.clone();
-        assert!(scp.nominate(slot, value.clone(), &prev_value));
+        assert!(scp.bump_state(slot, value.clone(), 1));
 
-        let env = make_signed_nomination_envelope(slot, value, true, &herder, &secret);
+        // Ballot started but no quorum heard yet (only local node's PREPARE)
+        assert!(
+            herder.get_ballot_timeout(slot).is_none(),
+            "should not have ballot timeout without quorum"
+        );
+
+        // Send a PREPARE from the second node to form quorum
+        let qs_hash = hash_quorum_set(&quorum_set);
+        let ballot = ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        };
+        let prepare = ScpStatementPrepare {
+            quorum_set_hash: qs_hash.into(),
+            ballot: ballot.clone(),
+            prepared: None,
+            prepared_prime: None,
+            n_c: 0,
+            n_h: 0,
+        };
+        let statement = ScpStatement {
+            node_id: other_node_id,
+            slot_index: slot,
+            pledges: ScpStatementPledges::Prepare(prepare),
+        };
+        let env = sign_statement(&statement, &herder, &other_secret);
         scp.receive_envelope(env);
 
+        // Now we should have heard from quorum (local + other = 2, threshold = 2)
         assert!(herder.get_ballot_timeout(slot).is_some());
     }
 
