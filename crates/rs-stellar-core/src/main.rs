@@ -1848,7 +1848,7 @@ async fn cmd_verify_execution(
         &live_next_states,
         |hash| bucket_manager.load_bucket(hash).map(|b| (*b).clone()),
         true, // restart_structure_based = true to match C++ online mode
-    )?;
+    ).await?;
 
     if let Some(ref ha_next_states) = hot_archive_next_states {
         hot_archive_bucket_list.restart_merges_from_has(

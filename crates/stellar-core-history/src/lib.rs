@@ -420,6 +420,13 @@ pub struct CatchupOutput {
     /// used instead of re-computing the hash from the header. Using the archive's
     /// hash ensures consistency with what the network actually recorded.
     pub header_hash: stellar_core_common::Hash256,
+
+    /// Pre-computed cache data from a background bucket list scan.
+    ///
+    /// When present, this can be passed to `LedgerManager::initialize_with_cache`
+    /// to skip the ~83 second synchronous cache initialization. The scan runs
+    /// concurrently with merge restarts during catchup.
+    pub cache_data: Option<stellar_core_ledger::CacheInitResult>,
 }
 
 impl CatchupOutput {

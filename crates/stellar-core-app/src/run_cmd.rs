@@ -251,7 +251,7 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
     // Attempt to restore node state from persisted DB + on-disk bucket files.
     // This avoids a full catchup when the node restarts with intact state.
     if !options.force_catchup {
-        match app.load_last_known_ledger() {
+        match app.load_last_known_ledger().await {
             Ok(true) => {
                 let (seq, _hash, _close_time, _protocol) = app.ledger_info();
                 tracing::info!(lcl_seq = seq, "Restored state from disk, skipping full catchup");

@@ -121,6 +121,7 @@ async fn test_catchup_replay_bucket_hash_verification() {
     let load_empty = |_hash: &Hash256| -> stellar_core_bucket::Result<Bucket> { Ok(Bucket::empty()) };
     bucket_list_after
         .restart_merges_from_has(checkpoint, 25, &default_next_states, load_empty, true)
+        .await
         .expect("restart merges");
     bucket_list_after
         .add_batch(

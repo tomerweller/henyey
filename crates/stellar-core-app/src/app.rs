@@ -1573,7 +1573,7 @@ impl App {
     ///
     /// Returns `true` if state was successfully restored, `false` if no persisted
     /// state is available (fresh node or corrupt state).
-    pub fn load_last_known_ledger(&self) -> anyhow::Result<bool> {
+    pub async fn load_last_known_ledger(&self) -> anyhow::Result<bool> {
         // Step 1: Read LCL sequence from DB
         let lcl_seq = self.db.with_connection(|conn| {
             conn.get_last_closed_ledger()
@@ -1674,7 +1674,7 @@ impl App {
         }
 
         // Step 6: Reconstruct bucket lists from HAS using shared helper
-        let (bucket_list, hot_archive) = self.reconstruct_bucket_lists(&has, &header, lcl_seq)?;
+        let (bucket_list, hot_archive) = self.reconstruct_bucket_lists(&has, &header, lcl_seq).await?;
 
         // Step 7: Initialize LedgerManager
         if self.ledger_manager.is_initialized() {
@@ -1699,7 +1699,7 @@ impl App {
     ///
     /// Shared helper used by both `load_last_known_ledger` (startup restore)
     /// and `rebuild_bucket_lists_from_has` (Case 1 replay).
-    fn reconstruct_bucket_lists(
+    async fn reconstruct_bucket_lists(
         &self,
         has: &HistoryArchiveState,
         header: &stellar_xdr::curr::LedgerHeader,
@@ -1763,6 +1763,7 @@ impl App {
                     load_bucket_for_merge,
                     true,
                 )
+                .await
                 .map_err(|e| anyhow::anyhow!("Failed to restart bucket merges: {}", e))?;
             tracing::info!(
                 bucket_list_hash = %bucket_list.hash().to_hex(),
@@ -1833,7 +1834,7 @@ impl App {
     ///
     /// This matches C++ stellar-core's approach for Case 1 catchup: the
     /// persisted HAS is the source of truth, not the live bucket list objects.
-    fn rebuild_bucket_lists_from_has(&self) -> anyhow::Result<ExistingBucketState> {
+    async fn rebuild_bucket_lists_from_has(&self) -> anyhow::Result<ExistingBucketState> {
         // Read persisted HAS from DB
         let has_json = self.db.with_connection(|conn| {
             conn.get_state(state_keys::HISTORY_ARCHIVE_STATE)
@@ -1847,7 +1848,7 @@ impl App {
         let header = self.db.get_ledger_header(lcl_seq)?
             .ok_or_else(|| anyhow::anyhow!("LCL header missing from DB at seq {}", lcl_seq))?;
 
-        let (bucket_list, hot_archive) = self.reconstruct_bucket_lists(&has, &header, lcl_seq)?;
+        let (bucket_list, hot_archive) = self.reconstruct_bucket_lists(&has, &header, lcl_seq).await?;
 
         let network_id = NetworkId(self.network_id());
 
@@ -2331,7 +2332,7 @@ impl App {
         //    -> restartMerges() flow
         let (existing_state, override_lcl) =
             if current > GENESIS_LEDGER_SEQ {
-                match self.rebuild_bucket_lists_from_has() {
+                match self.rebuild_bucket_lists_from_has().await {
                     Ok(state) => {
                         tracing::info!(
                             current_lcl = current,
@@ -2434,16 +2435,35 @@ impl App {
             if self.ledger_manager.is_initialized() {
                 self.ledger_manager.reset();
             }
-            self.ledger_manager
-                .initialize(
-                    output.bucket_list,
-                    output.hot_archive_bucket_list,
-                    output.header,
-                    output.header_hash,
-                )
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to initialize ledger manager: {}", e)
-                })?;
+            if let Some(cache_data) = output.cache_data {
+                // Use pre-computed cache data from the parallel catchup pipeline.
+                // This skips the ~83 second synchronous cache scan.
+                self.ledger_manager
+                    .initialize_with_cache(
+                        output.bucket_list,
+                        output.hot_archive_bucket_list,
+                        output.header,
+                        output.header_hash,
+                        cache_data,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Failed to initialize ledger manager (with cache): {}",
+                            e
+                        )
+                    })?;
+            } else {
+                self.ledger_manager
+                    .initialize(
+                        output.bucket_list,
+                        output.hot_archive_bucket_list,
+                        output.header,
+                        output.header_hash,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to initialize ledger manager: {}", e)
+                    })?;
+            }
         }
 
         tracing::info!(

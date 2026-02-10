@@ -96,7 +96,10 @@ pub use header::{
     is_before_protocol_version, protocol_version, skip_list_target_seq, verify_header_chain,
     verify_skip_list, SKIP_1, SKIP_2, SKIP_3, SKIP_4, SKIP_LIST_SIZE,
 };
-pub use manager::{prepend_fee_event, LedgerManager, LedgerManagerConfig};
+pub use manager::{
+    prepend_fee_event, scan_bucket_list_for_caches, CacheInitResult, LedgerManager,
+    LedgerManagerConfig,
+};
 pub use snapshot::{EntriesLookupFn, LedgerSnapshot, SnapshotBuilder, SnapshotHandle};
 pub use soroban_state::{
     ContractCodeMapEntry, ContractDataMapEntry, InMemorySorobanState, SharedSorobanState,
