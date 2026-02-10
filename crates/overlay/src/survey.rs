@@ -1,6 +1,6 @@
 //! Network topology survey management.
 //!
-//! This module implements the SurveyManager from C++ stellar-core, which orchestrates
+//! This module implements the SurveyManager from stellar-core, which orchestrates
 //! network topology surveys to collect data about the overlay network structure.
 //!
 //! # Overview

@@ -2483,14 +2483,14 @@ fn create_header_from_replay_state(
 /// compiled module memory cost.
 ///
 /// Cost parameters are loaded from the bucket list's ConfigSettingEntry to ensure
-/// correct compiled module memory cost calculation (matching C++ behavior).
+/// correct compiled module memory cost calculation (matching stellar-core behavior).
 ///
 /// # Memory Efficiency
 ///
 /// Uses `scan_for_entries_of_types` instead of `live_entries_iter()` to only
 /// build a dedup `HashSet<LedgerKey>` over ContractData + ContractCode keys
 /// (~1.68M keys, ~240 MB) instead of all keys (~60M, ~8.6 GB). This matches
-/// the C++ approach in `InMemorySorobanState::initializeStateFromSnapshot()`
+/// the stellar-core approach in `InMemorySorobanState::initializeStateFromSnapshot()`
 /// which uses per-type `scanForEntriesOfType` calls.
 ///
 /// Note: This only needs to run once per catchup.

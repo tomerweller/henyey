@@ -724,7 +724,7 @@ mod tests {
 
     // ============ P3-1: Merge Reattach to Running Merge ============
     //
-    // Upstream: BucketManagerTests.cpp "bucketmanager reattach to running merge"
+    // stellar-core: BucketManagerTests.cpp "bucketmanager reattach to running merge"
     // Tests that an in-progress merge can be serialized (snapshot),
     // deserialized, and restarted via make_live(), producing identical results.
 
@@ -906,7 +906,7 @@ mod tests {
 
     // ============ P3-2: Bucket Persistence Across Restart ============
     //
-    // Upstream: BucketManagerTests.cpp "bucket persistence over app restart"
+    // stellar-core: BucketManagerTests.cpp "bucket persistence over app restart"
     // Tests that bucket data persists through a simulated restart cycle:
     // create buckets, serialize merge state, clear in-memory state,
     // reload and verify results match.

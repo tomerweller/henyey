@@ -4,20 +4,20 @@
 
 ## Overview
 
-This crate provides SQLite-based database persistence for henyey, corresponding to stellar-core `src/database/` module and related SQL operations spread across the upstream codebase. The Rust implementation uses `rusqlite` with `r2d2` connection pooling, while stellar-core uses SOCI with support for both SQLite and PostgreSQL.
+This crate provides SQLite-based database persistence for henyey, corresponding to stellar-core `src/database/` module and related SQL operations spread across the stellar-core codebase. The Rust implementation uses `rusqlite` with `r2d2` connection pooling, while stellar-core uses SOCI with support for both SQLite and PostgreSQL.
 
-## Upstream References
+## stellar-core References
 
-- **Core Database**: `.upstream-v25/src/database/Database.{h,cpp}` - connection management, prepared statements, metrics
-- **Database Utilities**: `.upstream-v25/src/database/DatabaseUtils.{h,cpp}` - helper functions for bulk operations
-- **Connection String**: `.upstream-v25/src/database/DatabaseConnectionString.{h,cpp}` - connection string parsing
-- **Persistent State**: `.upstream-v25/src/main/PersistentState.{h,cpp}` - key-value state storage
-- **Ledger Headers**: `.upstream-v25/src/ledger/LedgerHeaderUtils.{h,cpp}` - ledger header SQL operations
-- **Peer Manager**: `.upstream-v25/src/overlay/PeerManager.{h,cpp}` - peer table operations
+- **Core Database**: `.upstream-v25/src/database/Database.` - connection management, prepared statements, metrics
+- **Database Utilities**: `.upstream-v25/src/database/DatabaseUtils.` - helper functions for bulk operations
+- **Connection String**: `.upstream-v25/src/database/DatabaseConnectionString.` - connection string parsing
+- **Persistent State**: `.upstream-v25/src/main/PersistentState.` - key-value state storage
+- **Ledger Headers**: `.upstream-v25/src/ledger/LedgerHeaderUtils.` - ledger header SQL operations
+- **Peer Manager**: `.upstream-v25/src/overlay/PeerManager.` - peer table operations
 - **Ban Manager**: `.upstream-v25/src/overlay/BanManager.h`, `BanManagerImpl.cpp` - ban list operations
-- **Herder Persistence**: `.upstream-v25/src/herder/HerderPersistence*.{h,cpp}` - SCP history storage
-- **History Manager**: `.upstream-v25/src/history/HistoryManager*.{h,cpp}` - history publishing queue
-- **Transaction SQL**: `.upstream-v25/src/transactions/TransactionSQL.{h,cpp}` - transaction history
+- **Herder Persistence**: `.upstream-v25/src/herder/HerderPersistence*.` - SCP history storage
+- **History Manager**: `.upstream-v25/src/history/HistoryManager*.` - history publishing queue
+- **Transaction SQL**: `.upstream-v25/src/transactions/TransactionSQL.` - transaction history
 
 ## Implemented Features
 
@@ -45,7 +45,7 @@ This crate provides SQLite-based database persistence for henyey, corresponding 
 
 ## Test Coverage Comparison
 
-### stellar-core Tests (upstream)
+### stellar-core Tests (
 
 | Test File | Test Name | Rust Equivalent | Status |
 |-----------|-----------|-----------------|--------|

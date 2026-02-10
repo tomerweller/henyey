@@ -356,33 +356,33 @@ In our Rust implementation:
 
 | stellar-core File | Rust Equivalent | Status |
 |----------|-----------------|--------|
-| BucketListBase.h/cpp | bucket_list.rs | Complete |
-| LiveBucketList.h/cpp | bucket_list.rs | Complete |
-| HotArchiveBucketList.h/cpp | hot_archive.rs | Complete |
-| BucketBase.h/cpp | bucket.rs | Complete |
-| LiveBucket.h/cpp | bucket.rs, merge.rs | Complete |
-| HotArchiveBucket.h/cpp | hot_archive.rs | Complete |
-| FutureBucket.h/cpp | future_bucket.rs | Complete (no shadow buckets) |
-| BucketManager.h/cpp | manager.rs | Complete (state operations) |
-| BucketInputIterator.h/cpp | iterator.rs | Complete |
-| BucketOutputIterator.h/cpp | iterator.rs | Complete |
-| LiveBucketIndex.h/cpp | index.rs | Complete |
-| HotArchiveBucketIndex.h/cpp | hot_archive.rs | Simplified |
-| DiskIndex.h/cpp | index.rs (DiskIndex) | Complete |
-| InMemoryIndex.h/cpp | index.rs (InMemoryIndex) | Complete |
-| BucketSnapshot.h/cpp | snapshot.rs | Complete |
-| BucketSnapshotManager.h/cpp | snapshot.rs | Complete |
-| SearchableBucketList.h/cpp | snapshot.rs | Complete |
-| BucketListSnapshotBase.h/cpp | snapshot.rs | Complete |
-| BucketApplicator.h/cpp | applicator.rs | Complete |
-| BucketMergeMap.h/cpp | merge_map.rs | Complete |
+| BucketListBase.h | bucket_list.rs | Complete |
+| LiveBucketList.h | bucket_list.rs | Complete |
+| HotArchiveBucketList.h | hot_archive.rs | Complete |
+| BucketBase.h | bucket.rs | Complete |
+| LiveBucket.h | bucket.rs, merge.rs | Complete |
+| HotArchiveBucket.h | hot_archive.rs | Complete |
+| FutureBucket.h | future_bucket.rs | Complete (no shadow buckets) |
+| BucketManager.h | manager.rs | Complete (state operations) |
+| BucketInputIterator.h | iterator.rs | Complete |
+| BucketOutputIterator.h | iterator.rs | Complete |
+| LiveBucketIndex.h | index.rs | Complete |
+| HotArchiveBucketIndex.h | hot_archive.rs | Simplified |
+| DiskIndex.h | index.rs (DiskIndex) | Complete |
+| InMemoryIndex.h | index.rs (InMemoryIndex) | Complete |
+| BucketSnapshot.h | snapshot.rs | Complete |
+| BucketSnapshotManager.h | snapshot.rs | Complete |
+| SearchableBucketList.h | snapshot.rs | Complete |
+| BucketListSnapshotBase.h | snapshot.rs | Complete |
+| BucketApplicator.h | applicator.rs | Complete |
+| BucketMergeMap.h | merge_map.rs | Complete |
 | BucketMergeAdapter.h | - | Not needed (Rust generics) |
-| BucketIndexUtils.h/cpp | index.rs | Complete |
+| BucketIndexUtils.h | index.rs | Complete |
 | LedgerCmp.h | entry.rs (compare_keys) | Complete |
-| MergeKey.h/cpp | future_bucket.rs (MergeKey) | Complete |
-| BucketUtils.h/cpp | entry.rs, eviction.rs | Complete |
-| BinaryFuseFilter.h/cpp | bloom_filter.rs, disk_bucket.rs | Complete |
-| RandomEvictionCache.h/cpp | cache.rs | Complete |
+| MergeKey.h | future_bucket.rs (MergeKey) | Complete |
+| BucketUtils.h | entry.rs, eviction.rs | Complete |
+| BinaryFuseFilter.h | bloom_filter.rs, disk_bucket.rs | Complete |
+| RandomEvictionCache.h | cache.rs | Complete |
 | (BucketApplicator iteration) | live_iterator.rs | Complete |
 | (BucketIndex persistence) | index_persistence.rs | Complete |
 
@@ -446,7 +446,7 @@ The Rust test suite has **210+ tests** (185+ unit tests + 19 integration tests +
 **Rust (`hot_archive.rs`)**: 12 unit tests:
 - ✅ `test_hot_archive_bucket_empty()` / `test_hot_archive_bucket_fresh()` - basic bucket properties
 - ✅ `test_hot_archive_bucket_fresh_metaentry_only()` - metaentry-only bucket (critical for hash parity)
-- ✅ `test_hot_archive_metaentry_only_hash_matches_cpp()` - exact hash verification against testnet
+- ✅ `test_hot_archive_metaentry_only_hash_matches_stellar_core()` - exact hash verification against testnet
 - ✅ `test_hot_archive_bucket_list_add_batch()` - adding entries to archive
 - ✅ `test_hot_archive_bucket_list_restoration()` - archive → restore → verify shadowed
 - ✅ `test_merge_newer_always_wins_archived_then_live()` - Archived + Live merge

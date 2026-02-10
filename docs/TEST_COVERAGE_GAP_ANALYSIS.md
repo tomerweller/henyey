@@ -1,7 +1,7 @@
 # stellar-core to Rust Transaction Test Coverage Gap Analysis
 
 Analysis of test coverage gaps between stellar-core v25 and henyey transaction tests.
-This document identifies test scenarios present in upstream that are missing in the Rust implementation.
+This document identifies test scenarios present in stellar-core that are missing in the Rust implementation.
 
 ## Executive Summary
 

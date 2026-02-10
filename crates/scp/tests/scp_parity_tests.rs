@@ -1,10 +1,10 @@
-//! SCP parity tests ported from upstream C++ SCPTests.cpp.
+//! SCP parity tests ported from SCPTests.cpp.
 //!
 //! These tests mirror the exact test scenarios from stellar-core v25's
 //! src/scp/test/SCPTests.cpp, ensuring behavioral parity between the
-//! C++ and Rust implementations of the SCP consensus protocol.
+//! stellar-core and Rust implementations of the SCP consensus protocol.
 //!
-//! The test harness (`TestSCP`) matches the C++ `TestSCP` class:
+//! The test harness (`TestSCP`) matches the stellar-core `TestSCP` class:
 //! - Single-node focus with controllable quorum/v-blocking delivery
 //! - Append-only envelope tracking for assertion counting
 //! - Simulated timer system
@@ -23,7 +23,7 @@ use stellar_xdr::curr::{
 };
 
 // ---------------------------------------------------------------------------
-// Test harness: TestSCP (mirrors C++ TestSCP class)
+// Test harness: TestSCP (mirrors stellar-core TestSCP class)
 // ---------------------------------------------------------------------------
 
 /// Timer data for simulated timers.
@@ -32,7 +32,7 @@ struct TimerData {
     // We don't store the callback; we just track existence and timing.
 }
 
-/// Test SCP driver that mirrors the C++ TestSCP class.
+/// Test SCP driver that mirrors the stellar-core TestSCP class.
 ///
 /// Key differences from the production driver:
 /// - Append-only `envs` vector (never cleared) — tests assert on `.len()`
@@ -45,7 +45,7 @@ struct TestSCPDriver {
     quorum_set: ScpQuorumSet,
     quorum_set_hash: Hash256,
 
-    /// All emitted envelopes (append-only, matching C++ mEnvs).
+    /// All emitted envelopes (append-only, matching stellar-core mEnvs).
     envs: RwLock<Vec<ScpEnvelope>>,
 
     /// Externalized values per slot.
@@ -72,10 +72,10 @@ struct TestSCPDriver {
     /// Custom priority lookup: returns priority for a given node.
     /// Default: local node gets 1000, others get 1.
     /// Mutable via RwLock so tests can change the priority node at runtime
-    /// (matching C++ mPriorityLookup which is a mutable std::function).
+    /// (matching stellar-core mPriorityLookup which is a mutable std::function).
     priority_node: RwLock<NodeId>,
 
-    /// Timeout parameters (matching C++ TestSCP).
+    /// Timeout parameters (matching stellar-core TestSCP).
     initial_ballot_timeout_ms: u32,
     increment_ballot_timeout_ms: u32,
     initial_nomination_timeout_ms: u32,
@@ -158,7 +158,7 @@ impl TestSCPDriver {
     }
 
     fn bump_timer_offset(&self) {
-        // Advance simulated time by 5 hours (matching C++)
+        // Advance simulated time by 5 hours (matching stellar-core)
         let mut offset = self.current_timer_offset.write().unwrap();
         *offset += 5 * 3600 * 1000;
     }
@@ -168,7 +168,7 @@ impl TestSCPDriver {
     }
 
     /// Change which node has highest priority (1000) in compute_hash_node.
-    /// Matches C++ `scp.mPriorityLookup = [&](NodeID const& n) { ... }`.
+    /// Matches stellar-core `scp.mPriorityLookup = [&](NodeID const& n) { ... }`.
     fn set_priority_node(&self, node: NodeId) {
         *self.priority_node.write().unwrap() = node;
     }
@@ -287,7 +287,7 @@ impl SCPDriver for TestSCPDriver {
     }
 
     fn sign_envelope(&self, _envelope: &mut ScpEnvelope) {
-        // No-op for tests (matching C++)
+        // No-op for tests (matching stellar-core)
     }
 
     fn verify_envelope(&self, _envelope: &ScpEnvelope) -> bool {
@@ -390,7 +390,7 @@ impl TestSCP {
     }
 
     fn fire_ballot_timer(&self) {
-        // Matches C++ getBallotProtocolTimer().mCallback() which calls abandonBallot(0)
+        // Matches stellar-core getBallotProtocolTimer().mCallback() which calls abandonBallot(0)
         self.scp.abandon_ballot(0, 0);
     }
 
@@ -411,7 +411,7 @@ impl TestSCP {
     }
 
     /// Get the current envelope for a specific node in a slot, including self
-    /// even when not fully validated. Matches C++ `getCurrentEnvelope(index, nodeID)`.
+    /// even when not fully validated. Matches stellar-core `getCurrentEnvelope(index, nodeID)`.
     fn get_current_envelope(&self, slot_index: u64, node_id: &NodeId) -> ScpEnvelope {
         let envs = self.scp.get_entire_current_state(slot_index);
         envs.into_iter()
@@ -420,27 +420,27 @@ impl TestSCP {
     }
 
     /// Set SCP state from a saved envelope (for crash recovery testing).
-    /// Matches C++ `mSCP.setStateFromEnvelope(slotIndex, envelope)`.
+    /// Matches stellar-core `mSCP.setStateFromEnvelope(slotIndex, envelope)`.
     fn set_state_from_envelope(&self, envelope: &ScpEnvelope) {
         self.scp.set_state_from_envelope(envelope);
     }
 
     /// Get the nomination leaders for slot 0.
-    /// Matches C++ `scp.getNominationLeaders(0)`.
+    /// Matches stellar-core `scp.getNominationLeaders(0)`.
     #[allow(dead_code)]
     fn get_nomination_leaders(&self) -> std::collections::HashSet<NodeId> {
         self.scp.get_nomination_leaders(0)
     }
 
     /// Get the latest composite candidate value for a slot.
-    /// Matches C++ `scp.getLatestCompositeCandidate(slotIndex)`.
+    /// Matches stellar-core `scp.getLatestCompositeCandidate(slotIndex)`.
     #[allow(dead_code)]
     fn get_latest_composite_candidate(&self, slot_index: u64) -> Option<Value> {
         self.scp.get_latest_composite_candidate(slot_index)
     }
 
     /// Check if a nomination timer is currently set for slot 0.
-    /// Matches C++ `scp.mTimers.find(Slot::NOMINATION_TIMER) != scp.mTimers.end()`.
+    /// Matches stellar-core `scp.mTimers.find(Slot::NOMINATION_TIMER) != scp.mTimers.end()`.
     #[allow(dead_code)]
     fn has_nomination_timer(&self) -> bool {
         self.driver()
@@ -457,7 +457,7 @@ impl TestSCP {
 
 /// Create a deterministic node ID from a seed byte.
 fn make_node_id(seed: u8) -> NodeId {
-    // Matches C++ SIMULATION_CREATE_NODE pattern with deterministic bytes
+    // Matches stellar-core SIMULATION_CREATE_NODE pattern with deterministic bytes
     let mut bytes = [0u8; 32];
     bytes[0] = seed;
     NodeId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
@@ -481,7 +481,7 @@ fn v4_id() -> NodeId {
 }
 
 // ---------------------------------------------------------------------------
-// Value setup (matching C++ setupValues)
+// Value setup (matching stellar-core setupValues)
 // ---------------------------------------------------------------------------
 
 /// Create deterministic test values where x_value < y_value < z_value < zz_value.
@@ -533,7 +533,7 @@ fn quorum_set_hash(qs: &ScpQuorumSet) -> Hash256 {
 }
 
 // ---------------------------------------------------------------------------
-// Envelope construction helpers (matching C++ makePrepare, etc.)
+// Envelope construction helpers (matching stellar-core makePrepare, etc.)
 // ---------------------------------------------------------------------------
 
 fn make_prepare(
@@ -636,7 +636,7 @@ fn make_nominate(
 }
 
 // ---------------------------------------------------------------------------
-// Verification helpers (matching C++ verifyPrepare, etc.)
+// Verification helpers (matching stellar-core verifyPrepare, etc.)
 // ---------------------------------------------------------------------------
 
 fn verify_prepare(
@@ -726,11 +726,11 @@ fn verify_nominate(
 }
 
 // ---------------------------------------------------------------------------
-// Envelope generator type (matching C++ genEnvelope)
+// Envelope generator type (matching stellar-core genEnvelope)
 // ---------------------------------------------------------------------------
 
 /// A generator that takes a node ID and produces an envelope.
-/// This mirrors the C++ `genEnvelope` typedef.
+/// This mirrors the stellar-core `genEnvelope` typedef.
 type GenEnvelope = Box<dyn Fn(&NodeId) -> ScpEnvelope>;
 
 /// Create a PREPARE envelope generator with pre-bound parameters.
@@ -775,7 +775,7 @@ fn make_externalize_gen(q_set_hash: Hash256, commit_ballot: ScpBallot, n_h: u32)
 }
 
 // ---------------------------------------------------------------------------
-// Multi-node message delivery helpers (matching C++ recvQuorum/recvVBlocking)
+// Multi-node message delivery helpers (matching stellar-core recvQuorum/recvVBlocking)
 // ---------------------------------------------------------------------------
 
 /// Deliver envelopes from a v-blocking set (v1, v2) to the test SCP node.
@@ -1391,7 +1391,7 @@ fn test_ballot_core5_non_validator_watching() {
         value: x_value.clone(),
     };
 
-    // In C++, bumpState returns true for non-validators (internal state is
+    // In stellar-core, bumpState returns true for non-validators (internal state is
     // updated via emitCurrentStateStatement, but sendLatestEnvelope is a no-op).
     assert!(scp.bump_state(0, x_value.clone()));
     // No envelopes emitted (non-validator doesn't broadcast)
@@ -1408,7 +1408,7 @@ fn test_ballot_core5_non_validator_watching() {
     scp.receive_envelope(ext3);
     // After quorum EXTERNALIZE, still no emitted envelopes (non-validator)
     assert_eq!(scp.envs_len(), 0);
-    // C++ verifies internal CONFIRM state here via getCurrentEnvelope
+    // stellar-core verifies internal CONFIRM state here via getCurrentEnvelope
 
     scp.receive_envelope(ext4);
     // Still no emitted envelopes
@@ -1770,7 +1770,7 @@ fn test_ballot_core3_prepared_b1_quorum_votes_b1() {
     // v0 voted A1, v1 votes B1, v2 votes B1.
     // v0 did NOT vote for B1 (incompatible value), so v0 is excluded from the
     // "voted to prepare B1" set. We need {v1, v2} to form a quorum for B1.
-    // C++ uses recvQuorumChecks which sends from both v1 and v2.
+    // stellar-core uses recvQuorumChecks which sends from both v1 and v2.
     let prepare1 = make_prepare(&v1_id(), qs_hash, 0, &b1, None, 0, 0, None);
     let prepare2 = make_prepare(&v2_id(), qs_hash, 0, &b1, None, 0, 0, None);
     scp.receive_envelope(prepare1);
@@ -2835,13 +2835,13 @@ fn test_nomination_core5_nomination_waits_for_v1() {
 #[test]
 fn test_nomination_core5_v1_dead_timeout_v0_becomes_top() {
     let (x_value, _y_value, _z_value, _zz_value) = setup_values();
-    // k_value is independent (matches C++ kValue = sha256(d))
+    // k_value is independent (matches stellar-core kValue = sha256(d))
     let k_value = Value(vec![0xFFu8; 32].try_into().unwrap());
     let qs = make_core5_quorum_set();
     let qs_hash = quorum_set_hash(&qs);
     let qs_hash0 = qs_hash;
 
-    // Create SCP where v1 has highest priority (matching C++ line 3150)
+    // Create SCP where v1 has highest priority (matching stellar-core line 3150)
     let scp = TestSCP::new_with_priority(v0_id(), qs.clone(), v1_id());
     scp.store_quorum_set(&qs);
 
@@ -2851,27 +2851,27 @@ fn test_nomination_core5_v1_dead_timeout_v0_becomes_top() {
     let mut votes_xk = vec![x_value.clone(), k_value.clone()];
     votes_xk.sort();
 
-    // nom2 = NOMINATE from v2 with votes [x, k] (C++ line 3188)
+    // nom2 = NOMINATE from v2 with votes [x, k] (stellar-core line 3188)
     let nom2 = make_nominate(&v2_id(), qs_hash, 0, votes_xk, vec![]);
 
-    // C++ line 3293: v0 is not leader (v1 is), so nominate returns false
+    // stellar-core line 3293: v0 is not leader (v1 is), so nominate returns false
     assert!(!scp.nominate(0, x_value.clone(), &empty_value));
     assert_eq!(scp.envs_len(), 0);
 
-    // C++ line 3297: receive nom2 from v2 (not leader, so no new envelopes)
+    // stellar-core line 3297: receive nom2 from v2 (not leader, so no new envelopes)
     scp.receive_envelope(nom2);
     assert_eq!(scp.envs_len(), 0);
 
-    // C++ line 3304: change priority to v0
+    // stellar-core line 3304: change priority to v0
     scp.set_priority_node(v0_id());
 
-    // C++ line 3308: timeout nomination — v0 is now top, should emit
+    // stellar-core line 3308: timeout nomination — v0 is now top, should emit
     assert!(scp.nominate_timeout(0, x_value.clone(), &empty_value));
 
-    // C++ line 3312: exactly 1 envelope emitted
+    // stellar-core line 3312: exactly 1 envelope emitted
     assert_eq!(scp.envs_len(), 1);
 
-    // C++ line 3313: NOMINATE(votes=[x], accepted=[])
+    // stellar-core line 3313: NOMINATE(votes=[x], accepted=[])
     verify_nominate(
         &scp.get_env(0),
         &v0_id(),
@@ -2911,16 +2911,16 @@ fn test_nomination_core5_v1_dead_timeout_v2_becomes_top() {
     scp.receive_envelope(nom2);
     assert_eq!(scp.envs_len(), 0);
 
-    // C++ line 3318: change priority to v2
+    // stellar-core line 3318: change priority to v2
     scp.set_priority_node(v2_id());
 
-    // C++ line 3322: timeout nomination — v2 is now top leader
+    // stellar-core line 3322: timeout nomination — v2 is now top leader
     assert!(scp.nominate_timeout(0, x_value.clone(), &empty_value));
 
-    // C++ line 3326: exactly 1 envelope emitted
+    // stellar-core line 3326: exactly 1 envelope emitted
     assert_eq!(scp.envs_len(), 1);
 
-    // C++ line 3327-3332: v2 votes for XK, but nomination only picks the highest value
+    // stellar-core line 3327-3332: v2 votes for XK, but nomination only picks the highest value
     // std::max(xValue, kValue) — pick the larger of x and k
     let v2_top = std::cmp::max(x_value.clone(), k_value.clone());
     verify_nominate(&scp.get_env(0), &v0_id(), qs_hash0, 0, vec![v2_top], vec![]);
@@ -2954,13 +2954,13 @@ fn test_nomination_core5_v1_dead_timeout_v3_becomes_top() {
     scp.receive_envelope(nom2);
     assert_eq!(scp.envs_len(), 0);
 
-    // C++ line 3336: change priority to v3
+    // stellar-core line 3336: change priority to v3
     scp.set_priority_node(v3_id());
 
-    // C++ line 3340: nothing happens — we don't have any message for v3
+    // stellar-core line 3340: nothing happens — we don't have any message for v3
     assert!(!scp.nominate_timeout(0, x_value.clone(), &empty_value));
 
-    // C++ line 3344: no envelopes emitted
+    // stellar-core line 3344: no envelopes emitted
     assert_eq!(scp.envs_len(), 0);
 }
 
@@ -2995,7 +2995,7 @@ fn setup_accept_commit_quorum_a2() -> (TestSCP, Value, Value, Value, Value, Hash
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
-// v-blocking prepared A3 (C++ line 1054)
+// v-blocking prepared A3 (stellar-core line 1054)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -3018,7 +3018,7 @@ fn test_ballot_core5_vblocking_prepared_a3() {
 }
 
 // ---------------------------------------------------------------------------
-// v-blocking prepared A3+B3 (C++ line 1063)
+// v-blocking prepared A3+B3 (stellar-core line 1063)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -3050,7 +3050,7 @@ fn test_ballot_core5_vblocking_prepared_a3_b3() {
 }
 
 // ---------------------------------------------------------------------------
-// v-blocking confirm A3 (C++ line 1072)
+// v-blocking confirm A3 (stellar-core line 1072)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -3070,7 +3070,7 @@ fn test_ballot_core5_vblocking_confirm_a3() {
 }
 
 // ---------------------------------------------------------------------------
-// Hang - does not switch to B in CONFIRM > Network EXTERNALIZE (C++ line 1084)
+// Hang - does not switch to B in CONFIRM > Network EXTERNALIZE (stellar-core line 1084)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -3109,7 +3109,7 @@ fn test_ballot_core5_hang_no_switch_externalize() {
 }
 
 // ---------------------------------------------------------------------------
-// Hang > Network CONFIRMS other ballot > at same counter (C++ line 1110)
+// Hang > Network CONFIRMS other ballot > at same counter (stellar-core line 1110)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -3135,7 +3135,7 @@ fn test_ballot_core5_hang_confirm_same_counter() {
 }
 
 // ---------------------------------------------------------------------------
-// Hang > Network CONFIRMS other ballot > at a different counter (C++ line 1125)
+// Hang > Network CONFIRMS other ballot > at a different counter (stellar-core line 1125)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -3174,7 +3174,7 @@ fn test_ballot_core5_hang_confirm_different_counter() {
 }
 
 // ---------------------------------------------------------------------------
-// v-blocking after Quorum prepared A3 > Confirm A3 (C++ line 1004)
+// v-blocking after Quorum prepared A3 > Confirm A3 (stellar-core line 1004)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -3215,7 +3215,7 @@ fn test_ballot_core5_vblocking_accept_more_a3_confirm() {
 }
 
 // ---------------------------------------------------------------------------
-// v-blocking after Quorum prepared A3 > Externalize A3 (C++ line 1015)
+// v-blocking after Quorum prepared A3 > Externalize A3 (stellar-core line 1015)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -3265,7 +3265,7 @@ fn test_ballot_core5_vblocking_accept_more_a3_externalize() {
 }
 
 // ---------------------------------------------------------------------------
-// v-blocking accept more A3 > other nodes moved to c=A4 h=A5 > Confirm A4..5 (C++ line 1029)
+// v-blocking accept more A3 > other nodes moved to c=A4 h=A5 > Confirm A4..5 (stellar-core line 1029)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -3306,7 +3306,7 @@ fn test_ballot_core5_vblocking_accept_more_a3_confirm_a4_a5() {
 }
 
 // ---------------------------------------------------------------------------
-// v-blocking accept more A3 > other nodes moved to c=A4 h=A5 > Externalize A4..5 (C++ line 1039)
+// v-blocking accept more A3 > other nodes moved to c=A4 h=A5 > Externalize A4..5 (stellar-core line 1039)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -3360,7 +3360,7 @@ fn test_ballot_core5_vblocking_accept_more_a3_externalize_a4_a5() {
 }
 
 // ---------------------------------------------------------------------------
-// Accept commit > v-blocking > CONFIRM A3..4 (C++ line 1164)
+// Accept commit > v-blocking > CONFIRM A3..4 (stellar-core line 1164)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -3380,7 +3380,7 @@ fn test_ballot_core5_accept_commit_vblocking_confirm_a3_a4() {
 }
 
 // ---------------------------------------------------------------------------
-// Accept commit > v-blocking > CONFIRM B2 (C++ line 1174)
+// Accept commit > v-blocking > CONFIRM B2 (stellar-core line 1174)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -3400,7 +3400,7 @@ fn test_ballot_core5_accept_commit_vblocking_confirm_b2() {
 }
 
 // ---------------------------------------------------------------------------
-// Accept commit > v-blocking > EXTERNALIZE B2 (C++ line 1197)
+// Accept commit > v-blocking > EXTERNALIZE B2 (stellar-core line 1197)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -3433,7 +3433,7 @@ fn test_ballot_core5_accept_commit_vblocking_externalize_b2() {
 }
 
 // ---------------------------------------------------------------------------
-// get conflicting prepared B > same counter (C++ line 1212)
+// get conflicting prepared B > same counter (stellar-core line 1212)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -3481,7 +3481,7 @@ fn test_ballot_core5_conflicting_prepared_b_same_counter() {
 }
 
 // ---------------------------------------------------------------------------
-// get conflicting prepared B > higher counter (C++ line 1228)
+// get conflicting prepared B > higher counter (stellar-core line 1228)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -3539,7 +3539,7 @@ fn test_ballot_core5_conflicting_prepared_b_higher_counter() {
 }
 
 // ---------------------------------------------------------------------------
-// get conflicting prepared B > higher counter mixed (C++ line 1244)
+// get conflicting prepared B > higher counter mixed (stellar-core line 1244)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -3608,7 +3608,7 @@ fn test_ballot_core5_conflicting_prepared_b_higher_counter_mixed() {
 }
 
 // ---------------------------------------------------------------------------
-// Confirm prepared mixed > mixed A2 (C++ line 1280)
+// Confirm prepared mixed > mixed A2 (stellar-core line 1280)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -3718,7 +3718,7 @@ fn test_ballot_core5_confirm_prepared_mixed_a2() {
 }
 
 // ---------------------------------------------------------------------------
-// switch prepared B1 from A1 > v-blocking switches to previous value of p (C++ line 1344)
+// switch prepared B1 from A1 > v-blocking switches to previous value of p (stellar-core line 1344)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -3850,7 +3850,7 @@ fn test_ballot_core5_switch_prepared_no_downgrade_p() {
 }
 
 // ---------------------------------------------------------------------------
-// switch prepared B1 from A1 > switch p' to Mid2 (C++ line 1361)
+// switch prepared B1 from A1 > switch p' to Mid2 (stellar-core line 1361)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -3935,7 +3935,7 @@ fn test_ballot_core5_switch_prepared_pprime_to_mid2() {
 }
 
 // ---------------------------------------------------------------------------
-// switch prepared B1 from A1 > switch again Big2 (C++ line 1371)
+// switch prepared B1 from A1 > switch again Big2 (stellar-core line 1371)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4020,7 +4020,7 @@ fn test_ballot_core5_switch_prepared_big2() {
 }
 
 // ---------------------------------------------------------------------------
-// switch prepare B1 (quorum, delayed) (C++ line 1383)
+// switch prepare B1 (quorum, delayed) (stellar-core line 1383)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4076,7 +4076,7 @@ fn test_ballot_core5_switch_prepare_b1_quorum() {
 }
 
 // ---------------------------------------------------------------------------
-// prepare higher counter (v-blocking) (C++ line 1391)
+// prepare higher counter (v-blocking) (stellar-core line 1391)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4154,7 +4154,7 @@ fn test_ballot_core5_prepare_higher_counter_vblocking() {
 }
 
 // ---------------------------------------------------------------------------
-// prepared B (v-blocking) — no prior prepared (C++ line 1407)
+// prepared B (v-blocking) — no prior prepared (stellar-core line 1407)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4201,7 +4201,7 @@ fn test_ballot_core5_prepared_b_vblocking_from_start() {
 }
 
 // ---------------------------------------------------------------------------
-// prepare B (quorum) — no prior prepared (C++ line 1414)
+// prepare B (quorum) — no prior prepared (stellar-core line 1414)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4250,7 +4250,7 @@ fn test_ballot_core5_prepare_b_quorum_from_start() {
 }
 
 // ---------------------------------------------------------------------------
-// confirm (v-blocking) > via CONFIRM (C++ line 1423)
+// confirm (v-blocking) > via CONFIRM (stellar-core line 1423)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4285,7 +4285,7 @@ fn test_ballot_core5_confirm_vblocking_via_confirm_higher() {
 }
 
 // ---------------------------------------------------------------------------
-// confirm (v-blocking) > via EXTERNALIZE (C++ line 1435)
+// confirm (v-blocking) > via EXTERNALIZE (stellar-core line 1435)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4332,7 +4332,7 @@ fn test_ballot_core5_confirm_vblocking_via_externalize_higher() {
 }
 
 // ===========================================================================
-// "start <1,z>" branch — C++ lines 1452-1975
+// "start <1,z>" branch — stellar-core lines 1452-1975
 //
 // This is the mirror of "start <1,x>" with inverted value ordering:
 //   aValue = zValue (larger), bValue = xValue (smaller)
@@ -4486,7 +4486,7 @@ fn setup_accept_commit_quorum_a2_z() -> (TestSCP, Value, Value, Value, Value, Ha
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > prepared A1 > bump prepared A2 > Confirm prepared A2 (C++ line 1513)
+// start <1,z> > prepared A1 > bump prepared A2 > Confirm prepared A2 (stellar-core line 1513)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4495,7 +4495,7 @@ fn test_ballot_core5_z_confirm_prepared_a2() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > Accept commit > Quorum A2 (C++ line 1523)
+// start <1,z> > Accept commit > Quorum A2 (stellar-core line 1523)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4504,7 +4504,7 @@ fn test_ballot_core5_z_accept_commit_quorum_a2() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > Accept commit > Quorum A2 > Quorum prepared A3 (C++ line 1532)
+// start <1,z> > Accept commit > Quorum A2 > Quorum prepared A3 (stellar-core line 1532)
 // ---------------------------------------------------------------------------
 
 /// Helper: drives from accept_commit_quorum_a2_z through "Quorum prepared A3"
@@ -4543,7 +4543,7 @@ fn setup_quorum_prepared_a3_z() -> (TestSCP, Value, Value, Value, Value, Hash256
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > Accept more commit A3 > Quorum externalize A3 (C++ line 1562)
+// start <1,z> > Accept more commit A3 > Quorum externalize A3 (stellar-core line 1562)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4579,7 +4579,7 @@ fn test_ballot_core5_z_quorum_externalize_a3() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > v-blocking accept more A3 > Confirm A3 (C++ line 1581)
+// start <1,z> > v-blocking accept more A3 > Confirm A3 (stellar-core line 1581)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4598,7 +4598,7 @@ fn test_ballot_core5_z_vblocking_accept_more_a3_confirm() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > v-blocking accept more A3 > Externalize A3 (C++ line 1592)
+// start <1,z> > v-blocking accept more A3 > Externalize A3 (stellar-core line 1592)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4630,7 +4630,7 @@ fn test_ballot_core5_z_vblocking_accept_more_a3_externalize() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > v-blocking accept more A3 > other nodes c=A4 h=A5 > Confirm (C++ line 1606)
+// start <1,z> > v-blocking accept more A3 > other nodes c=A4 h=A5 > Confirm (stellar-core line 1606)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4649,7 +4649,7 @@ fn test_ballot_core5_z_vblocking_accept_more_a3_confirm_a4_a5() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > v-blocking accept more A3 > other nodes c=A4 h=A5 > Externalize (C++ line 1616)
+// start <1,z> > v-blocking accept more A3 > other nodes c=A4 h=A5 > Externalize (stellar-core line 1616)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4681,7 +4681,7 @@ fn test_ballot_core5_z_vblocking_accept_more_a3_externalize_a4_a5() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > v-blocking prepared A3 (C++ line 1631)
+// start <1,z> > v-blocking prepared A3 (stellar-core line 1631)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4703,7 +4703,7 @@ fn test_ballot_core5_z_vblocking_prepared_a3() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > v-blocking prepared A3+B3 (C++ line 1640)
+// start <1,z> > v-blocking prepared A3+B3 (stellar-core line 1640)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4730,7 +4730,7 @@ fn test_ballot_core5_z_vblocking_prepared_a3_b3() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > v-blocking confirm A3 (C++ line 1649)
+// start <1,z> > v-blocking confirm A3 (stellar-core line 1649)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4749,7 +4749,7 @@ fn test_ballot_core5_z_vblocking_confirm_a3() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > Hang - does not switch to B in CONFIRM > Network EXTERNALIZE (C++ line 1661)
+// start <1,z> > Hang - does not switch to B in CONFIRM > Network EXTERNALIZE (stellar-core line 1661)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4787,7 +4787,7 @@ fn test_ballot_core5_z_hang_no_switch_externalize() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > Hang > Network CONFIRMS other ballot > at same counter (C++ line 1687)
+// start <1,z> > Hang > Network CONFIRMS other ballot > at same counter (stellar-core line 1687)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4813,7 +4813,7 @@ fn test_ballot_core5_z_hang_confirm_same_counter() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > Hang > Network CONFIRMS other ballot > at a different counter (C++ line 1702)
+// start <1,z> > Hang > Network CONFIRMS other ballot > at a different counter (stellar-core line 1702)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4849,7 +4849,7 @@ fn test_ballot_core5_z_hang_confirm_different_counter() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > Accept commit > v-blocking > CONFIRM A2 (C++ line 1731)
+// start <1,z> > Accept commit > v-blocking > CONFIRM A2 (stellar-core line 1731)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4868,7 +4868,7 @@ fn test_ballot_core5_z_accept_commit_vblocking_confirm_a2() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > Accept commit > v-blocking > CONFIRM A3..4 (C++ line 1741)
+// start <1,z> > Accept commit > v-blocking > CONFIRM A3..4 (stellar-core line 1741)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4887,7 +4887,7 @@ fn test_ballot_core5_z_accept_commit_vblocking_confirm_a3_a4() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > Accept commit > v-blocking > CONFIRM B2 (C++ line 1751)
+// start <1,z> > Accept commit > v-blocking > CONFIRM B2 (stellar-core line 1751)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4906,7 +4906,7 @@ fn test_ballot_core5_z_accept_commit_vblocking_confirm_b2() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > Accept commit > v-blocking > EXTERNALIZE A2 (C++ line 1764)
+// start <1,z> > Accept commit > v-blocking > EXTERNALIZE A2 (stellar-core line 1764)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4938,7 +4938,7 @@ fn test_ballot_core5_z_accept_commit_vblocking_externalize_a2() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > Accept commit > v-blocking > EXTERNALIZE B2 (C++ line 1774)
+// start <1,z> > Accept commit > v-blocking > EXTERNALIZE B2 (stellar-core line 1774)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4971,7 +4971,7 @@ fn test_ballot_core5_z_accept_commit_vblocking_externalize_b2() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > Conflicting prepared B > same counter (C++ line 1791)
+// start <1,z> > Conflicting prepared B > same counter (stellar-core line 1791)
 // messages are ignored as B2 < A2
 // ---------------------------------------------------------------------------
 
@@ -4997,7 +4997,7 @@ fn test_ballot_core5_z_conflicting_prepared_b_same_counter() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > Conflicting prepared B > higher counter (C++ line 1800)
+// start <1,z> > Conflicting prepared B > higher counter (stellar-core line 1800)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -5055,7 +5055,7 @@ fn test_ballot_core5_z_conflicting_prepared_b_higher_counter() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > Conflicting prepared B > higher counter mixed (C++ line 1820)
+// start <1,z> > Conflicting prepared B > higher counter mixed (stellar-core line 1820)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -5151,7 +5151,7 @@ fn test_ballot_core5_z_conflicting_prepared_b_higher_counter_mixed() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > Confirm prepared mixed > mixed A2 (C++ line 1864)
+// start <1,z> > Confirm prepared mixed > mixed A2 (stellar-core line 1864)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -5236,7 +5236,7 @@ fn test_ballot_core5_z_confirm_prepared_mixed_a2() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > Confirm prepared mixed > mixed B2 (C++ line 1883)
+// start <1,z> > Confirm prepared mixed > mixed B2 (stellar-core line 1883)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -5310,7 +5310,7 @@ fn test_ballot_core5_z_confirm_prepared_mixed_b2() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > switch prepared B1 from A1 (C++ line 1903)
+// start <1,z> > switch prepared B1 from A1 (stellar-core line 1903)
 // can't switch to B1 because B1 < A1
 // ---------------------------------------------------------------------------
 
@@ -5367,7 +5367,7 @@ fn test_ballot_core5_z_switch_prepared_b1_from_a1() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > switch prepare B1 (C++ line 1911)
+// start <1,z> > switch prepare B1 (stellar-core line 1911)
 // doesn't switch as B1 < A1
 // ---------------------------------------------------------------------------
 
@@ -5413,7 +5413,7 @@ fn test_ballot_core5_z_switch_prepare_b1_quorum() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > prepare higher counter (v-blocking) (C++ line 1919)
+// start <1,z> > prepare higher counter (v-blocking) (stellar-core line 1919)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -5497,7 +5497,7 @@ fn test_ballot_core5_z_prepare_higher_counter_vblocking() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > prepared B (v-blocking) (C++ line 1935)
+// start <1,z> > prepared B (v-blocking) (stellar-core line 1935)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -5542,7 +5542,7 @@ fn test_ballot_core5_z_prepared_b_vblocking_from_start() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > prepare B (quorum) (C++ line 1942)
+// start <1,z> > prepare B (quorum) (stellar-core line 1942)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -5589,7 +5589,7 @@ fn test_ballot_core5_z_prepare_b_quorum_from_start() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > confirm (v-blocking) > via CONFIRM (C++ line 1951)
+// start <1,z> > confirm (v-blocking) > via CONFIRM (stellar-core line 1951)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -5622,7 +5622,7 @@ fn test_ballot_core5_z_confirm_vblocking_via_confirm() {
 }
 
 // ---------------------------------------------------------------------------
-// start <1,z> > confirm (v-blocking) > via EXTERNALIZE (C++ line 1963)
+// start <1,z> > confirm (v-blocking) > via EXTERNALIZE (stellar-core line 1963)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -5667,7 +5667,7 @@ fn test_ballot_core5_z_confirm_vblocking_via_externalize() {
 }
 
 // ===========================================================================
-// "start from pristine" tests (C++ lines 1979-2199)
+// "start from pristine" tests (stellar-core lines 1979-2199)
 // Same test suite as "start <1,x>" but only keeping transitions observable
 // when starting from empty (no bumpState call).
 // aValue = xValue (smaller), bValue = zValue (larger)
@@ -6344,7 +6344,7 @@ fn test_ballot_pristine_confirm_vblocking_via_externalize() {
 }
 
 // ===========================================================================
-// "normal round (1,x)" — C++ lines 2201-2301
+// "normal round (1,x)" — stellar-core lines 2201-2301
 // ===========================================================================
 
 #[test]
@@ -6608,7 +6608,7 @@ fn test_ballot_bump_to_ballot_prevented_by_value_and_counter() {
 }
 
 // ===========================================================================
-// "range check" — C++ lines 2304-2368
+// "range check" — stellar-core lines 2304-2368
 // ===========================================================================
 
 #[test]
@@ -6778,7 +6778,7 @@ fn test_ballot_range_check() {
 }
 
 // ===========================================================================
-// "timeout when h is set -> stay locked on h" — C++ lines 2370-2389
+// "timeout when h is set -> stay locked on h" — stellar-core lines 2370-2389
 // ===========================================================================
 
 #[test]
@@ -6838,7 +6838,7 @@ fn test_ballot_timeout_h_set_stay_locked() {
 }
 
 // ===========================================================================
-// "timeout when h exists but can't be set -> vote for h" — C++ lines 2390-2415
+// "timeout when h exists but can't be set -> vote for h" — stellar-core lines 2390-2415
 // ===========================================================================
 
 #[test]
@@ -6914,7 +6914,7 @@ fn test_ballot_timeout_h_cant_be_set_vote_for_h() {
 }
 
 // ===========================================================================
-// "timeout from multiple nodes" — C++ lines 2417-2460
+// "timeout from multiple nodes" — stellar-core lines 2417-2460
 // ===========================================================================
 
 #[test]
@@ -7046,7 +7046,7 @@ fn test_ballot_timeout_from_multiple_nodes() {
 }
 
 // ===========================================================================
-// "timeout after prepare, receive old messages to prepare" — C++ lines 2462-2508
+// "timeout after prepare, receive old messages to prepare" — stellar-core lines 2462-2508
 // ===========================================================================
 
 #[test]
@@ -7198,7 +7198,7 @@ fn test_ballot_timeout_after_prepare_receive_old_messages() {
 }
 
 // ===========================================================================
-// "non validator watching the network" — C++ lines 2510-2538
+// "non validator watching the network" — stellar-core lines 2510-2538
 // ===========================================================================
 
 #[test]
@@ -7283,7 +7283,7 @@ fn test_non_validator_watching_the_network() {
 }
 
 // ===========================================================================
-// "restore ballot protocol" — C++ lines 2540-2563
+// "restore ballot protocol" — stellar-core lines 2540-2563
 // Tests that setStateFromEnvelope doesn't crash for PREPARE/CONFIRM/EXTERNALIZE
 // ===========================================================================
 
@@ -7342,7 +7342,7 @@ fn test_restore_ballot_protocol_externalize() {
 }
 
 // ===========================================================================
-// "ballot protocol core3" — C++ lines 2569-2757
+// "ballot protocol core3" — stellar-core lines 2569-2757
 // Core3 has an edge case where v-blocking and quorum can be the same
 // v-blocking set size: 2, threshold: 2 = 1 + self or 2 others
 // ===========================================================================
@@ -7390,7 +7390,7 @@ fn recv_quorum_checks_core3(
 }
 
 // ---------------------------------------------------------------------------
-// "prepared B1 (quorum votes B1) local aValue" — C++ lines 2659-2703
+// "prepared B1 (quorum votes B1) local aValue" — stellar-core lines 2659-2703
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -7448,7 +7448,7 @@ fn test_core3_prepared_b1_quorum_votes_b1_local_a_value() {
 
 // ---------------------------------------------------------------------------
 // "prepared B1 (quorum votes B1) -> quorum prepared B1 -> quorum bumps to A1"
-// C++ lines 2670-2701
+// stellar-core lines 2670-2701
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -7558,7 +7558,7 @@ fn test_core3_quorum_prepared_b1_then_bumps_to_a1() {
 }
 
 // ---------------------------------------------------------------------------
-// "prepared A1 with timeout" — C++ lines 2705-2730
+// "prepared A1 with timeout" — stellar-core lines 2705-2730
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -7639,7 +7639,7 @@ fn test_core3_prepared_a1_with_timeout() {
 }
 
 // ---------------------------------------------------------------------------
-// "node without self - quorum timeout" — C++ lines 2731-2754
+// "node without self - quorum timeout" — stellar-core lines 2731-2754
 // ---------------------------------------------------------------------------
 
 #[test]

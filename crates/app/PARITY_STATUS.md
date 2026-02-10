@@ -2,9 +2,9 @@
 
 **Overall Parity: ~75%**
 
-This document details the parity between this Rust implementation (`henyey-app`) and the stellar-core stellar-core `src/main/` directory (v25.x).
+This document details the parity between this Rust implementation (`henyey-app`) and the stellar-core `src/main/` directory (v25.x).
 
-## Upstream Mapping
+## stellar-core Mapping
 
 This crate corresponds to the following stellar-core components:
 

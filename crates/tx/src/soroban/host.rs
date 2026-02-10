@@ -118,7 +118,7 @@ pub struct StorageChange {
     pub is_rent_related: bool,
     /// Whether this is a read-only entry with only a TTL change (no data modification).
     /// Such changes should be applied to state (bucket list) but NOT included in transaction meta.
-    /// This matches C++ stellar-core's behavior per CAP-0063: read-only TTL bumps are accumulated
+    /// This matches stellar-core's behavior per CAP-0063: read-only TTL bumps are accumulated
     /// separately and flushed at write barriers, not in individual transaction meta.
     pub is_read_only_ttl_bump: bool,
 }
@@ -128,7 +128,7 @@ pub struct StorageChange {
 /// This enum wraps either a P24 or P25 module cache, allowing it to be
 /// passed through the execution layer without knowing the protocol version
 /// upfront. The cache is populated once at ledger start and reused for all
-/// transactions in that ledger, matching C++ stellar-core's SharedModuleCacheCompiler.
+/// transactions in that ledger, matching stellar-core's SharedModuleCacheCompiler.
 #[derive(Clone)]
 pub enum PersistentModuleCache {
     /// Protocol 24 module cache
@@ -446,7 +446,7 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
 
         // For ContractData and ContractCode, check TTL first.
         // If TTL has expired, the entry is considered to be in the hot archive
-        // and not accessible. This mimics C++ stellar-core behavior.
+        // and not accessible. This mimics stellar-core behavior.
         let live_until = get_entry_ttl(self.state, &current_key, self.current_ledger);
 
         let entry = match &current_key {
@@ -564,7 +564,7 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
         key: &LedgerKey,
     ) -> Result<Option<(Rc<LedgerEntry>, Option<u32>)>, HostErrorP25> {
         // For ContractData and ContractCode, check TTL from bucket list snapshot.
-        // This matches C++ stellar-core behavior for parallel Soroban execution:
+        // This matches stellar-core behavior for parallel Soroban execution:
         // - Entries with valid TTL (live_until >= current_ledger): pass to host
         // - Entries with expired TTL (live_until < current_ledger): archived, not accessible
         // - Entries without TTL in bucket list snapshot: created within ledger, not visible
@@ -786,7 +786,7 @@ impl<'a> soroban_env_host25::storage::SnapshotSource for LedgerSnapshotAdapterP2
 
         // For ContractData and ContractCode, check TTL first.
         // If TTL has expired, the entry is considered to be in the hot archive
-        // and not accessible. This mimics C++ stellar-core behavior.
+        // and not accessible. This mimics stellar-core behavior.
         let live_until = get_entry_ttl(self.state, &local_key, self.current_ledger);
 
         let entry = match &local_key {
@@ -868,7 +868,7 @@ impl<'a> soroban_env_host25::storage::SnapshotSource for LedgerSnapshotAdapterP2
 /// Get the TTL for a ledger entry.
 ///
 /// This function returns the CURRENT TTL value (after any modifications by earlier
-/// transactions in this ledger), not the ledger-start TTL. This matches C++ stellar-core
+/// transactions in this ledger), not the ledger-start TTL. This matches stellar-core
 /// behavior where the Soroban host computes rent fees based on the current state.
 ///
 /// If TX 6 extends an entry's TTL from 682237 → 700457, TX 7 accessing the same entry
@@ -884,7 +884,7 @@ fn get_entry_ttl(state: &LedgerStateManager, key: &LedgerKey, current_ledger: u3
         LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
             let key_hash = compute_key_hash(key);
             // Use current state TTL which includes updates from earlier TXs in this ledger.
-            // This matches C++ sequential execution where LedgerTxn reflects all prior
+            // This matches stellar-core sequential execution where LedgerTxn reflects all prior
             // changes, including TTL bumps from earlier transactions.
             let ttl = state
                 .get_ttl(&key_hash)
@@ -978,9 +978,9 @@ fn convert_contract_cost_params_to_p25(
 }
 
 /// Context for pre-compiling WASM modules outside of transaction execution.
-/// This mimics how C++ stellar-core pre-compiles all contracts with an unlimited budget.
+/// This mimics how stellar-core pre-compiles all contracts with an unlimited budget.
 /// We use very high budget limits (10B CPU, 1GB memory) to ensure compilation never fails
-/// due to budget constraints. C++ stellar-core's SharedModuleCacheCompiler compiles
+/// due to budget constraints. stellar-core's SharedModuleCacheCompiler compiles
 /// without any budget metering.
 #[derive(Clone)]
 struct WasmCompilationContext(Budget);
@@ -989,11 +989,11 @@ impl WasmCompilationContext {
     /// Create a new compilation context with very high budget limits.
     /// We use 10 billion CPU instructions and 1GB memory to ensure compilation
     /// never fails due to budget constraints. The actual compilation cost is
-    /// typically much lower, but we want to match C++ behavior which doesn't
+    /// typically much lower, but we want to match stellar-core behavior which doesn't
     /// meter compilation at all.
     fn new() -> Self {
         // Use a budget with very high limits to avoid ExceededLimit errors during pre-compilation.
-        // C++ stellar-core compiles without metering, so we use 10B instructions / 1GB memory.
+        // stellar-core compiles without metering, so we use 10B instructions / 1GB memory.
         let budget = Budget::try_from_configs(
             10_000_000_000,     // 10 billion CPU instructions
             1_000_000_000,      // 1 GB memory
@@ -1034,7 +1034,7 @@ impl CompilationContext for WasmCompilationContext {}
 
 /// Build a module cache by pre-compiling contract code entries from the footprint.
 ///
-/// This mimics C++ stellar-core's SharedModuleCacheCompiler which pre-compiles
+/// This mimics stellar-core's SharedModuleCacheCompiler which pre-compiles
 /// all WASM contracts outside of transaction budgets. Without this, each
 /// transaction pays the full VmInstantiation cost for parsing WASM, which
 /// causes budget exceeded errors for transactions that would succeed with caching.
@@ -1082,8 +1082,8 @@ fn build_module_cache_for_footprint(
                     <Sha256 as Digest>::digest(code_entry.code.as_slice()).into(),
                 );
 
-                // Use V0 cost inputs (just wasm_bytes) to match C++ stellar-core's behavior.
-                // C++ stellar-core's SharedModuleCacheCompiler always uses parse_and_cache_module_simple
+                // Use V0 cost inputs (just wasm_bytes) to match stellar-core's behavior.
+                // stellar-core's SharedModuleCacheCompiler always uses parse_and_cache_module_simple
                 // which only uses V0 cost inputs, regardless of what's in the ContractCodeEntry extension.
                 // Using V1 cost inputs would result in different cost calculations and budget exceeded errors.
                 let cost_inputs = VersionedContractCodeCostInputs::V0 {
@@ -1118,9 +1118,9 @@ fn build_module_cache_for_footprint(
 }
 
 /// Context for pre-compiling WASM modules outside of transaction execution (P25 version).
-/// This mimics how C++ stellar-core pre-compiles all contracts with an unlimited budget.
+/// This mimics how stellar-core pre-compiles all contracts with an unlimited budget.
 /// We use very high budget limits (10B CPU, 1GB memory) to ensure compilation never fails
-/// due to budget constraints. C++ stellar-core's SharedModuleCacheCompiler compiles
+/// due to budget constraints. stellar-core's SharedModuleCacheCompiler compiles
 /// without any budget metering.
 #[derive(Clone)]
 struct WasmCompilationContextP25(soroban_env_host25::budget::Budget);
@@ -1129,11 +1129,11 @@ impl WasmCompilationContextP25 {
     /// Create a new compilation context with very high budget limits.
     /// We use 10 billion CPU instructions and 1GB memory to ensure compilation
     /// never fails due to budget constraints. The actual compilation cost is
-    /// typically much lower, but we want to match C++ behavior which doesn't
+    /// typically much lower, but we want to match stellar-core behavior which doesn't
     /// meter compilation at all.
     fn new() -> Self {
         // Use a budget with very high limits to avoid ExceededLimit errors during pre-compilation.
-        // C++ stellar-core compiles without metering, so we use 10B instructions / 1GB memory.
+        // stellar-core compiles without metering, so we use 10B instructions / 1GB memory.
         let budget = soroban_env_host25::budget::Budget::try_from_configs(
             10_000_000_000,     // 10 billion CPU instructions
             1_000_000_000,      // 1 GB memory
@@ -1174,7 +1174,7 @@ impl CompilationContextP25 for WasmCompilationContextP25 {}
 
 /// Build a module cache by pre-compiling contract code entries from the footprint (P25 version).
 ///
-/// This mimics C++ stellar-core's SharedModuleCacheCompiler which pre-compiles
+/// This mimics stellar-core's SharedModuleCacheCompiler which pre-compiles
 /// all WASM contracts outside of transaction budgets.
 fn build_module_cache_for_footprint_p25(
     state: &LedgerStateManager,
@@ -1209,8 +1209,8 @@ fn build_module_cache_for_footprint_p25(
                     <Sha256 as Digest>::digest(code_entry.code.as_slice()).into(),
                 );
 
-                // Use V0 cost inputs (just wasm_bytes) to match C++ stellar-core's behavior.
-                // C++ stellar-core's SharedModuleCacheCompiler always uses parse_and_cache_module_simple
+                // Use V0 cost inputs (just wasm_bytes) to match stellar-core's behavior.
+                // stellar-core's SharedModuleCacheCompiler always uses parse_and_cache_module_simple
                 // which only uses V0 cost inputs, regardless of what's in the ContractCodeEntry extension.
                 // Using V1 cost inputs would result in different cost calculations and budget exceeded errors.
                 let cost_inputs = VersionedContractCodeCostInputsP25::V0 {
@@ -1247,7 +1247,7 @@ fn build_module_cache_for_footprint_p25(
 /// Compute rent_fee for a newly created Soroban entry.
 ///
 /// This is used by `execute_upload_wasm` to compute the rent fee for the new
-/// ContractCode entry being created, matching how C++ stellar-core computes
+/// ContractCode entry being created, matching how stellar-core computes
 /// rent fees via soroban-env-host.
 ///
 /// # Arguments
@@ -1316,7 +1316,7 @@ pub fn compute_rent_fee_for_new_entry(
 
 /// Execute a Soroban host function using soroban-env-host's e2e_invoke API.
 ///
-/// This uses the same high-level API that C++ stellar-core uses, which handles
+/// This uses the same high-level API that stellar-core uses, which handles
 /// all the internal setup correctly.
 ///
 /// # Arguments
@@ -1360,7 +1360,7 @@ pub fn execute_host_function(
 ///
 /// This is the same as `execute_host_function` but accepts an optional persistent
 /// module cache. When provided, the cache is reused across transactions, avoiding
-/// repeated WASM compilation. This matches C++ stellar-core's SharedModuleCacheCompiler.
+/// repeated WASM compilation. This matches stellar-core's SharedModuleCacheCompiler.
 ///
 /// # Arguments
 ///
@@ -1437,7 +1437,7 @@ fn execute_host_function_p24(
     };
 
     // Create budget with network cost parameters.
-    // C++ stellar-core passes the per-transaction specified instruction limit directly
+    // stellar-core passes the per-transaction specified instruction limit directly
     // to the host (mResources.instructions in InvokeHostFunctionOpFrame.cpp line 547).
     // The memory limit comes from the network config (ledger_info.memory_limit).
     let instruction_limit = soroban_data.resources.instructions as u64;
@@ -1501,8 +1501,8 @@ fn execute_host_function_p24(
         prng_seed.to_vec()
     } else {
         // Fallback: use ledger info to generate a deterministic but incorrect seed.
-        // This will cause Soroban contract results to differ from C++ stellar-core.
-        tracing::warn!("Using fallback PRNG seed - results may differ from C++ stellar-core");
+        // This will cause Soroban contract results to differ from stellar-core.
+        tracing::warn!("Using fallback PRNG seed - results may differ from stellar-core");
         let mut hasher = Sha256::new();
         hasher.update(context.network_id.0 .0);
         hasher.update(context.sequence.to_le_bytes());
@@ -1677,7 +1677,7 @@ fn execute_host_function_p24(
     // The transaction envelope's archived_soroban_entries may list indices that were
     // already restored by a previous transaction in the same ledger. We only want to
     // tell the host about entries that are ACTUALLY being restored now.
-    // This matches C++ stellar-core's previouslyRestoredFromHotArchive() check.
+    // This matches stellar-core's previouslyRestoredFromHotArchive() check.
     let mut actual_restored_indices: Vec<u32> = Vec::new();
 
     for (idx, key) in soroban_data
@@ -1896,7 +1896,7 @@ fn execute_host_function_p24(
     let storage_changes = result.ledger_changes
         .into_iter()
         .filter_map(|change| {
-            // C++ stellar-core behavior for transaction meta and state updates:
+            // stellar-core behavior for transaction meta and state updates:
             //
             // 1. Transaction meta (setLedgerChangesFromSuccessfulOp): Uses raw res.getModifiedEntryMap()
             //    which includes ALL entries, including RO TTL bumps. RO TTL bumps ARE in transaction meta.
@@ -1904,7 +1904,7 @@ fn execute_host_function_p24(
             //    (not the entry map) and flushes them at write barriers. This is for visibility ordering.
             //
             // We track read-only TTL bumps with is_read_only_ttl_bump flag so they can be:
-            // - Included in transaction meta (per C++ behavior)
+            // - Included in transaction meta (per stellar-core behavior)
             // - Deferred for state visibility (so subsequent TXs don't see the bump)
             
             let is_deletion = !change.read_only && change.encoded_new_value.is_none();
@@ -2022,7 +2022,7 @@ fn execute_host_function_p25(
         mem_bytes_consumed: 0,
     };
 
-    // C++ stellar-core passes the per-transaction specified instruction limit directly
+    // stellar-core passes the per-transaction specified instruction limit directly
     // to the host (mResources.instructions in InvokeHostFunctionOpFrame.cpp line 547).
     // The memory limit comes from the network config (ledger_info.memory_limit).
     let instruction_limit = soroban_data.resources.instructions as u64;
@@ -2078,7 +2078,7 @@ fn execute_host_function_p25(
     let seed: Vec<u8> = if let Some(prng_seed) = context.soroban_prng_seed {
         prng_seed.to_vec()
     } else {
-        tracing::warn!("P25: Using fallback PRNG seed - results may differ from C++ stellar-core");
+        tracing::warn!("P25: Using fallback PRNG seed - results may differ from stellar-core");
         let mut hasher = Sha256::new();
         hasher.update(context.network_id.0 .0);
         hasher.update(context.sequence.to_le_bytes());
@@ -2222,7 +2222,7 @@ fn execute_host_function_p25(
     // The transaction envelope's archived_soroban_entries may list indices that were
     // already restored by a previous transaction in the same ledger. We only want to
     // tell the host about entries that are ACTUALLY being restored now.
-    // This matches C++ stellar-core's previouslyRestoredFromHotArchive() check.
+    // This matches stellar-core's previouslyRestoredFromHotArchive() check.
     let mut actual_restored_indices: Vec<u32> = Vec::new();
 
     for (idx, key) in soroban_data
@@ -2406,7 +2406,7 @@ fn execute_host_function_p25(
         .ledger_changes
         .into_iter()
         .filter_map(|change| {
-            // C++ stellar-core behavior: RO TTL bumps ARE included in transaction meta.
+            // stellar-core behavior: RO TTL bumps ARE included in transaction meta.
             // State updates defer them to mRoTTLBumps for visibility ordering, but that's
             // separate from meta. See setLedgerChangesFromSuccessfulOp vs commitChangesFromSuccessfulOp.
             let is_deletion = !change.read_only && change.encoded_new_value.is_none();

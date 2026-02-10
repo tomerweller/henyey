@@ -1,6 +1,6 @@
 # stellar-core Parity Status
 
-This document tracks the parity between the Rust `henyey-scp` crate and the stellar-core stellar-core SCP implementation (v25.x).
+This document tracks the parity between the Rust `henyey-scp` crate and the stellar-core SCP implementation (v25.x).
 
 ## Summary
 
@@ -10,26 +10,26 @@ The Rust implementation provides full functional parity with stellar-core SCP im
 
 1. Architectural differences (Rust ownership model vs stellar-core shared pointers)
 2. Some debugging/monitoring features with different approaches
-3. Test coverage for edge cases from upstream test suites
+3. Test coverage for edge cases from stellar-core test suites
 
 ## File Mapping
 
 | stellar-core File | Rust File | Parity |
 |----------|-----------|--------|
-| `SCP.h/cpp` | `scp.rs` | Full |
-| `Slot.h/cpp` | `slot.rs` | Full |
-| `NominationProtocol.h/cpp` | `nomination.rs` | Full |
-| `BallotProtocol.h/cpp` | `ballot.rs` | Full |
-| `LocalNode.h/cpp` | `quorum.rs` (partial), `scp.rs` (embedded) | Full |
-| `QuorumSetUtils.h/cpp` | `quorum.rs` | Full |
-| `SCPDriver.h/cpp` | `driver.rs` | Full |
+| `SCP.h` | `scp.rs` | Full |
+| `Slot.h` | `slot.rs` | Full |
+| `NominationProtocol.h` | `nomination.rs` | Full |
+| `BallotProtocol.h` | `ballot.rs` | Full |
+| `LocalNode.h` | `quorum.rs` (partial), `scp.rs` (embedded) | Full |
+| `QuorumSetUtils.h` | `quorum.rs` | Full |
+| `SCPDriver.h` | `driver.rs` | Full |
 | `test/SCPTests.cpp` | `tests/multi_node_simulation.rs` | Partial |
 | `test/SCPUnitTests.cpp` | Unit tests in source files | Partial |
 | `test/QuorumSetTests.cpp` | `tests/quorum_intersection_json.rs` | Partial |
 
 ## Implemented Features
 
-### SCP Coordinator (`scp.rs` <- `SCP.h/cpp`)
+### SCP Coordinator (`scp.rs` <- `SCP.h`)
 
 | stellar-core Method | Rust Method | Status |
 |------------|-------------|--------|
@@ -65,7 +65,7 @@ The Rust implementation provides full functional parity with stellar-core SCP im
 | `envToStr()` | `envelope_to_str()` (in lib.rs) | Implemented |
 | `getSlot()` | Internal slot management | Implemented |
 
-### Slot (`slot.rs` <- `Slot.h/cpp`)
+### Slot (`slot.rs` <- `Slot.h`)
 
 | stellar-core Method | Rust Method | Status |
 |------------|-------------|--------|
@@ -100,7 +100,7 @@ The Rust implementation provides full functional parity with stellar-core SCP im
 | Force externalization (catchup) | `force_externalize()` | Implemented |
 | Timer IDs (NOMINATION_TIMER, BALLOT_PROTOCOL_TIMER) | `SCPTimerType` enum | Implemented |
 
-### Nomination Protocol (`nomination.rs` <- `NominationProtocol.h/cpp`)
+### Nomination Protocol (`nomination.rs` <- `NominationProtocol.h`)
 
 | stellar-core Method | Rust Method | Status |
 |------------|-------------|--------|
@@ -129,7 +129,7 @@ The Rust implementation provides full functional parity with stellar-core SCP im
 | Round management | `round()`, round progression | Implemented |
 | Timer expiration tracking | `timer_exp_count()` | Implemented |
 
-### Ballot Protocol (`ballot.rs` <- `BallotProtocol.h/cpp`)
+### Ballot Protocol (`ballot.rs` <- `BallotProtocol.h`)
 
 | stellar-core Method | Rust Method | Status |
 |------------|-------------|--------|
@@ -190,7 +190,7 @@ The Rust implementation provides full functional parity with stellar-core SCP im
 | Phase transitions (PREPARE->CONFIRM->EXTERNALIZE) | `BallotPhase` enum | Implemented |
 | heardFromQuorum tracking | `heard_from_quorum()` | Implemented |
 
-### LocalNode / Quorum Operations (`quorum.rs` <- `LocalNode.h/cpp`, `QuorumSetUtils.h/cpp`)
+### LocalNode / Quorum Operations (`quorum.rs` <- `LocalNode.h`, `QuorumSetUtils.h`)
 
 | stellar-core Method | Rust Method | Status |
 |------------|-------------|--------|
@@ -213,7 +213,7 @@ The Rust implementation provides full functional parity with stellar-core SCP im
 | `MAXIMUM_QUORUM_NESTING_LEVEL` | Constant | Implemented |
 | `MAXIMUM_QUORUM_NODES` | Constant | Implemented |
 
-### SCPDriver Trait (`driver.rs` <- `SCPDriver.h/cpp`)
+### SCPDriver Trait (`driver.rs` <- `SCPDriver.h`)
 
 | stellar-core Method | Rust Method | Status |
 |------------|-------------|--------|

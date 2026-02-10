@@ -6,7 +6,7 @@
 //!
 //! # Overview
 //!
-//! The signature checker implements the same logic as C++ stellar-core's
+//! The signature checker implements the same logic as stellar-core's
 //! `SignatureChecker` class, processing signers in a specific order:
 //!
 //! 1. Pre-auth TX signers (compared against transaction hash)
@@ -43,7 +43,7 @@ use stellar_xdr::curr::{DecoratedSignature, Signer, SignerKey, SignerKeyType};
 /// Signature checker that tracks which signatures have been used and
 /// accumulates weights when checking against account signers.
 ///
-/// This implements the same logic as C++ stellar-core's SignatureChecker class.
+/// This implements the same logic as stellar-core's SignatureChecker class.
 pub struct SignatureChecker<'a> {
     /// Hash of the transaction contents being signed.
     contents_hash: Hash256,
@@ -194,7 +194,7 @@ impl<'a> SignatureChecker<'a> {
 
     /// Cap weight at u8::MAX.
     ///
-    /// Per the C++ implementation, signer weights are capped at 255
+    /// Per the stellar-core implementation, signer weights are capped at 255
     /// to prevent overflow issues.
     fn cap_weight(&self, weight: u32) -> u32 {
         if weight > u8::MAX as u32 {
@@ -309,7 +309,7 @@ fn verify_ed25519_signed_payload(sig: &DecoratedSignature, signer: &Signer) -> b
     };
 
     // The hint for signed payloads is XOR of pubkey hint and payload hint.
-    // See SignatureUtils::getSignedPayloadHint in C++ stellar-core.
+    // See SignatureUtils::getSignedPayloadHint in stellar-core.
     let pubkey_hint = [
         signed_payload.ed25519.0[28],
         signed_payload.ed25519.0[29],
@@ -325,7 +325,7 @@ fn verify_ed25519_signed_payload(sig: &DecoratedSignature, signer: &Signer) -> b
             signed_payload.payload[len - 1],
         ]
     } else {
-        // For shorter payloads, C++ getHint copies from the beginning
+        // For shorter payloads, stellar-core getHint copies from the beginning
         let mut hint = [0u8; 4];
         for (i, &byte) in signed_payload.payload.iter().enumerate() {
             if i < 4 {
@@ -353,7 +353,7 @@ fn verify_ed25519_signed_payload(sig: &DecoratedSignature, signer: &Signer) -> b
         return false;
     };
 
-    // C++ stellar-core verifies the signature against the raw payload bytes,
+    // stellar-core verifies the signature against the raw payload bytes,
     // not a hash. This is per CAP-0040 - the signed payload signer
     // requires a valid signature of the payload from the ed25519 public key.
     henyey_crypto::verify(&public_key, &signed_payload.payload, &ed_sig).is_ok()

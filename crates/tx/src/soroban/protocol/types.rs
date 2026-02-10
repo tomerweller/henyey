@@ -60,7 +60,7 @@ pub struct TtlChange {
 
 impl TtlChange {
     /// Returns true if the TTL was actually extended (new > old).
-    /// C++ stellar-core only emits TTL changes when TTL is extended.
+    /// stellar-core only emits TTL changes when TTL is extended.
     pub fn is_extended(&self) -> bool {
         self.new_live_until_ledger > self.old_live_until_ledger
     }

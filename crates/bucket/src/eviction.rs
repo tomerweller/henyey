@@ -1,7 +1,7 @@
 //! Eviction scan implementation for Soroban state archival.
 //!
 //! This module implements the incremental eviction scan that matches
-//! C++ stellar-core's behavior. The eviction scan is responsible for
+//! stellar-core's behavior. The eviction scan is responsible for
 //! identifying expired Soroban entries (contract data, contract code)
 //! and processing them for archival or deletion.
 //!
@@ -73,7 +73,7 @@
 //!
 //! ## References
 //!
-//! - C++ implementation: `src/bucket/BucketListBase.cpp`, `src/bucket/BucketManager.cpp`
+//! - stellar-core implementation: `src/bucket/BucketListBase.cpp`, `src/bucket/BucketManager.cpp`
 //! - Eviction iterator: `src/ledger/NetworkConfig.h` (EvictionIterator struct)
 //! - State archival CAP: CAP-0046 (Soroban State Archival)
 
@@ -97,7 +97,7 @@ pub const DEFAULT_STARTING_EVICTION_SCAN_LEVEL: u32 = 6;
 /// # Persistence
 ///
 /// The iterator state is typically stored in the ledger header or network
-/// config so it persists across restarts. This matches C++ stellar-core's
+/// config so it persists across restarts. This matches stellar-core's
 /// `EvictionIterator` from NetworkConfig.
 ///
 /// # Scan Order
@@ -179,7 +179,7 @@ impl EvictionIterator {
 
 /// A candidate entry for eviction, collected during the scan phase.
 ///
-/// C++ stellar-core uses a two-phase eviction approach:
+/// stellar-core uses a two-phase eviction approach:
 /// 1. **Scan phase**: Collects ALL eligible candidates within the byte budget
 /// 2. **Resolution phase**: Applies TTL filtering and max_entries limit
 ///
@@ -236,7 +236,7 @@ pub struct ResolvedEviction {
 impl EvictionResult {
     /// Resolve eviction candidates by applying TTL filtering and max_entries limit.
     ///
-    /// This matches C++ stellar-core's `resolveBackgroundEvictionScan`:
+    /// This matches stellar-core's `resolveBackgroundEvictionScan`:
     /// 1. Filter out entries whose TTL was modified by transactions in this ledger
     /// 2. Evict up to `max_entries_to_archive` entries from the filtered set
     /// 3. Set the iterator position:
@@ -282,7 +282,7 @@ impl EvictionResult {
         }
 
         // Phase 3: Set iterator position
-        // C++ logic from resolveBackgroundEvictionScan:
+        // stellar-core logic from resolveBackgroundEvictionScan:
         //   newEvictionIterator is initialized to endOfRegionIterator
         //   Each eviction updates it to the evicted entry's position
         //   After the loop: if (remainingEntriesToEvict != 0) { use endOfRegionIterator }
@@ -429,7 +429,7 @@ pub fn update_starting_eviction_iterator(
         was_reset = true;
     }
 
-    // C++ checks spill activity from the previous ledger because the iterator
+    // stellar-core checks spill activity from the previous ledger because the iterator
     // is persisted before spills are applied.
     let prev_ledger = ledger_seq.saturating_sub(1);
 
@@ -464,7 +464,7 @@ mod tests {
 
     #[test]
     fn test_level_size() {
-        // Matches C++ BucketListBase::levelSize
+        // Matches stellar-core BucketListBase::levelSize
         assert_eq!(level_size(0), 4);
         assert_eq!(level_size(1), 16);
         assert_eq!(level_size(2), 64);
@@ -480,7 +480,7 @@ mod tests {
 
     #[test]
     fn test_level_half() {
-        // Matches C++ BucketListBase::levelHalf
+        // Matches stellar-core BucketListBase::levelHalf
         assert_eq!(level_half(0), 2);
         assert_eq!(level_half(1), 8);
         assert_eq!(level_half(2), 32);
@@ -519,7 +519,7 @@ mod tests {
 
     #[test]
     fn test_bucket_update_period() {
-        // Matches C++ bucketUpdatePeriod arithmetic test
+        // Matches stellar-core bucketUpdatePeriod arithmetic test
         // Curr bucket at level 0 updates every ledger
         assert_eq!(bucket_update_period(0, true), 1);
 
@@ -543,7 +543,7 @@ mod tests {
     #[test]
     fn test_bucket_update_period_arithmetic() {
         // Verify the relationship between update period and levelShouldSpill
-        // This matches the C++ "bucketUpdatePeriod arithmetic" test
+        // This matches the stellar-core "bucketUpdatePeriod arithmetic" test
         for level in 0..BUCKET_LIST_LEVELS as u32 {
             let curr_period = bucket_update_period(level, true);
             let snap_period = bucket_update_period(level, false);

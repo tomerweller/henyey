@@ -79,7 +79,7 @@ pub fn execute_create_claimable_balance(
         }
     }
 
-    // Check source account exists (C++ calls loadSourceAccount which records access)
+    // Check source account exists (stellar-core calls loadSourceAccount which records access)
     state.record_account_access(source);
     let account = match state.get_account(source) {
         Some(a) => a.clone(),
@@ -99,21 +99,21 @@ pub fn execute_create_claimable_balance(
     let _sponsor_is_source = sponsor == *source;
     let sponsorship_multiplier = op.claimants.len() as i64;
 
-    // C++ stellar-core order:
+    // stellar-core order:
     // 1. Check available balance (UNDERFUNDED) - before deducting
     // 2. Deduct balance
     // 3. Call createEntryWithPossibleSponsorship (LOW_RESERVE)
     //
-    // We must check UNDERFUNDED before LOW_RESERVE to match C++ behavior.
+    // We must check UNDERFUNDED before LOW_RESERVE to match stellar-core behavior.
 
-    // Check source has sufficient balance FIRST (matches C++ getAvailableBalance check)
-    // NOTE: C++ getAvailableBalance() uses getMinBalance() which does NOT include
+    // Check source has sufficient balance FIRST (matches stellar-core getAvailableBalance check)
+    // NOTE: stellar-core getAvailableBalance() uses getMinBalance() which does NOT include
     // the sponsorship for the new claimable balance. The sponsorship reserve check
     // happens separately in createEntryWithPossibleSponsorship AFTER deducting balance.
     match &op.asset {
         Asset::Native => {
             // For native assets, available = balance - minBalance(current state)
-            // Do NOT include sponsorship_multiplier here - matches C++ behavior
+            // Do NOT include sponsorship_multiplier here - matches stellar-core behavior
             let min_balance =
                 state.minimum_balance_for_account(&account, context.protocol_version, 0)?;
             let available = account.balance - min_balance;
@@ -157,7 +157,7 @@ pub fn execute_create_claimable_balance(
     // Generate the claimable balance ID
     let balance_id = generate_claimable_balance_id(tx_source, tx_seq, op_index)?;
 
-    // Deduct balance from source (matches C++ addBalance call)
+    // Deduct balance from source (matches stellar-core addBalance call)
     match &op.asset {
         Asset::Native => {
             if let Some(account) = state.get_account_mut(source) {
@@ -173,8 +173,8 @@ pub fn execute_create_claimable_balance(
         }
     }
 
-    // NOW check sponsor's reserve (matches C++ createEntryWithPossibleSponsorship)
-    // This happens AFTER balance deduction in C++
+    // NOW check sponsor's reserve (matches stellar-core createEntryWithPossibleSponsorship)
+    // This happens AFTER balance deduction in stellar-core
     let sponsor_account = state
         .get_account(&sponsor)
         .ok_or(TxError::SourceAccountNotFound)?;
@@ -296,7 +296,7 @@ pub fn execute_claim_claimable_balance(
         ));
     }
 
-    // Check source account exists (use mutable access to mirror C++ loadSourceAccount)
+    // Check source account exists (use mutable access to mirror stellar-core loadSourceAccount)
     if state.get_account_mut(source).is_none() {
         return Ok(make_claim_result(
             ClaimClaimableBalanceResultCode::CannotClaim,
@@ -322,7 +322,7 @@ pub fn execute_claim_claimable_balance(
                 Asset::Native => unreachable!(),
             };
 
-            // If source is the issuer, they don't need a trustline (C++ IssuerImpl behavior).
+            // If source is the issuer, they don't need a trustline (stellar-core IssuerImpl behavior).
             // Issuers have unlimited trust for their own assets - just skip the trustline check.
             if source == issuer {
                 // Issuer claiming their own asset: no trustline update needed
@@ -1034,7 +1034,7 @@ mod tests {
     #[test]
     fn test_claim_claimable_balance_issuer_success() {
         // Test that an issuer can claim their own claimable balance without a trustline.
-        // This matches C++ TrustLineWrapper::IssuerImpl behavior where issuers have
+        // This matches stellar-core TrustLineWrapper::IssuerImpl behavior where issuers have
         // unlimited trust for their own assets.
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
@@ -1220,7 +1220,7 @@ mod tests {
 
     /// Regression test for F2 bug at ledger 203280: when CreateClaimableBalance has an
     /// operation source different from the transaction source, the source account must
-    /// be recorded in the delta (matching C++ stellar-core's loadSourceAccount behavior).
+    /// be recorded in the delta (matching stellar-core's loadSourceAccount behavior).
     #[test]
     fn test_create_claimable_balance_records_source_account_access() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
@@ -1287,7 +1287,7 @@ mod tests {
 
     /// Test that CreateClaimableBalance checks available balance before sponsor reserve.
     ///
-    /// This is a regression test for ledger 647352 (testnet). In C++ stellar-core:
+    /// This is a regression test for ledger 647352 (testnet). In stellar-core:
     /// 1. First checks getAvailableBalance (available = balance - minBalance(current))
     ///    - Note: minBalance does NOT include the new sponsorship
     /// 2. Deducts balance via addBalance

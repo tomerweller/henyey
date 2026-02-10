@@ -1,10 +1,10 @@
 //! JSON API for Herder diagnostics and monitoring.
 //!
 //! This module provides JSON-serializable structures for exposing Herder
-//! state through admin endpoints. It matches the C++ `getJsonInfo()`,
+//! state through admin endpoints. It matches the stellar-core `getJsonInfo()`,
 //! `getJsonQuorumInfo()`, and related methods in `HerderImpl`.
 //!
-//! # C++ Parity
+//! # Parity
 //!
 //! This module corresponds to the JSON output methods in:
 //! - `HerderImpl::getJsonInfo()`

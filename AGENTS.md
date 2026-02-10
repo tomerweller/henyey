@@ -25,7 +25,7 @@
 ## Determinism & Parity
 
 - Any observable behavior must be deterministic and identical to stellar-core (v25.x / p25).
-- Align behavior by comparing against upstream test vectors and edge cases; do not introduce new semantics.
+- Align behavior by comparing against stellar-core test vectors and edge cases; do not introduce new semantics.
 - For protocol or consensus behavior, consult `.upstream-v25/` to mirror upstream decisions and sequencing.
 - Update the relevant crate's `PARITY_STATUS.md` and the parity column in the main `README.md` Crate Overview when implementing or removing functionality that affects stellar-core parity.
 
@@ -51,7 +51,7 @@
 - **Bug fixes**: As soon as a bug is fixed and its regression test passes, commit and push immediately. Do not wait to be told.
 - **Other changes**: Commit and push when explicitly directed by the user.
 - PRs should include: a clear description, the tests run, and documentation updates when behavior changes.
-- Link related issues or upstream references (e.g., stellar-core v25) where relevant.
+- Link related issues or stellar-core references where relevant.
 - When possible, fixes should be committed alongside regression tests that would have caught the bug.
 - If a push is rejected, pull with rebase and retry the push.
 

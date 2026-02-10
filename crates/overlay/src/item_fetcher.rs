@@ -1,6 +1,6 @@
 //! Item fetcher for TxSet and QuorumSet retrieval.
 //!
-//! This module implements the ItemFetcher and Tracker classes from C++ stellar-core.
+//! This module implements the ItemFetcher and Tracker classes from stellar-core.
 //! It manages asking peers for Transaction Sets and Quorum Sets during SCP consensus.
 //!
 //! # Overview
@@ -81,7 +81,7 @@ pub struct ItemFetcherConfig {
 impl Default for ItemFetcherConfig {
     fn default() -> Self {
         Self {
-            // Match C++ default: 1500ms
+            // Match stellar-core default: 1500ms
             fetch_reply_timeout: Duration::from_millis(1500),
             max_rebuild_fetch_list: 10,
         }
@@ -267,7 +267,7 @@ impl Tracker {
 
         if let Some(&peer) = candidates.first() {
             // For simplicity, just pick the first candidate
-            // In C++, there's latency-based selection, but we simplify here
+            // In stellar-core, there's latency-based selection, but we simplify here
             self.last_asked_peer = Some(peer.clone());
             self.peers_asked.insert(peer.clone(), false);
             self.last_ask_time = Some(Instant::now());
@@ -385,7 +385,7 @@ impl ItemFetcher {
             let mut tracker = Tracker::new(item_hash.clone(), self.config.clone());
             tracker.listen(envelope);
 
-            // Immediately try to fetch from a peer (like C++ stellar-core)
+            // Immediately try to fetch from a peer (like stellar-core)
             if let Some(ref ask_peer) = self.ask_peer {
                 match tracker.try_next_peer(&available_peers) {
                     NextPeerResult::AskPeer { ref peer, .. } => {
@@ -651,7 +651,7 @@ pub struct ItemFetcherStats {
 
 /// Compute hash of an SCP envelope for tracking.
 ///
-/// Uses the same approach as C++: BLAKE2 of the StellarMessage wrapping the envelope.
+/// Uses the same approach as stellar-core: BLAKE2 of the StellarMessage wrapping the envelope.
 fn compute_envelope_hash(env: &ScpEnvelope) -> Hash {
     use blake2::Digest;
 

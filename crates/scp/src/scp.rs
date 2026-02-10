@@ -288,7 +288,7 @@ impl<D: SCPDriver> SCP<D> {
     /// Handle ballot protocol timer expiration.
     ///
     /// This is an alias for [`bump_ballot`](Self::bump_ballot) that matches
-    /// the C++ `ballotProtocolTimerExpired()` naming convention.
+    /// the stellar-core `ballotProtocolTimerExpired()` naming convention.
     ///
     /// # Arguments
     /// * `slot_index` - The slot whose timer expired
@@ -351,7 +351,7 @@ impl<D: SCPDriver> SCP<D> {
     /// Removes slots older than `max_slot_index`, but keeps `slot_to_keep`
     /// even if it's below the threshold.
     ///
-    /// Matches C++ `SCP::purgeSlots(maxSlotIndex, slotToKeep)`.
+    /// Matches stellar-core `SCP::purgeSlots(maxSlotIndex, slotToKeep)`.
     pub fn purge_slots(&self, max_slot_index: u64, slot_to_keep: Option<u64>) {
         self.slots.write().retain(|&slot_index, _| {
             slot_index >= max_slot_index || slot_to_keep == Some(slot_index)
@@ -646,7 +646,7 @@ impl<D: SCPDriver> SCP<D> {
 
     /// Force-bump the ballot state for a slot, auto-computing the counter.
     ///
-    /// This mirrors the C++ `bumpState(slotIndex, value)` which calls
+    /// This mirrors the stellar-core `bumpState(slotIndex, value)` which calls
     /// `BallotProtocol::bumpState(value, force=true)`. The counter is
     /// automatically set to `current_counter + 1` (or 1 if no current ballot).
     ///
@@ -751,7 +751,7 @@ impl<D: SCPDriver> SCP<D> {
     }
 
     /// Get ALL current envelopes for a slot, including self even when not fully validated.
-    /// This matches C++ `getEntireCurrentState()` / `getCurrentEnvelope()` pattern.
+    /// This matches stellar-core `getEntireCurrentState()` / `getCurrentEnvelope()` pattern.
     pub fn get_entire_current_state(&self, slot_index: u64) -> Vec<ScpEnvelope> {
         let slots = self.slots.read();
         let mut envelopes = Vec::new();
@@ -772,7 +772,7 @@ impl<D: SCPDriver> SCP<D> {
     /// Get the nomination leaders for a slot.
     ///
     /// Returns the set of nodes that are leaders for the current nomination round.
-    /// Matches C++ `getNominationLeaders(slotIndex)` on the TestSCP wrapper.
+    /// Matches stellar-core `getNominationLeaders(slotIndex)` on the TestSCP wrapper.
     pub fn get_nomination_leaders(&self, slot_index: u64) -> std::collections::HashSet<NodeId> {
         let slots = self.slots.read();
         slots
@@ -784,7 +784,7 @@ impl<D: SCPDriver> SCP<D> {
     /// Get the latest composite candidate value for a slot.
     ///
     /// Returns the most recently computed composite value from the nomination protocol.
-    /// Matches C++ `getLatestCompositeCandidate(slotIndex)`.
+    /// Matches stellar-core `getLatestCompositeCandidate(slotIndex)`.
     pub fn get_latest_composite_candidate(&self, slot_index: u64) -> Option<Value> {
         let slots = self.slots.read();
         slots
@@ -795,7 +795,7 @@ impl<D: SCPDriver> SCP<D> {
     /// Get JSON-serializable information for a slot.
     ///
     /// Returns slot info that can be serialized to JSON for debugging
-    /// and monitoring, matching C++ `getJsonInfo()`.
+    /// and monitoring, matching stellar-core `getJsonInfo()`.
     ///
     /// # Arguments
     /// * `slot_index` - The slot to get info for
@@ -810,7 +810,7 @@ impl<D: SCPDriver> SCP<D> {
     /// Get JSON-serializable quorum information for a slot.
     ///
     /// Returns quorum info that can be serialized to JSON for debugging
-    /// and monitoring, matching C++ `getJsonQuorumInfo()`.
+    /// and monitoring, matching stellar-core `getJsonQuorumInfo()`.
     ///
     /// # Arguments
     /// * `slot_index` - The slot to get quorum info for
@@ -825,7 +825,7 @@ impl<D: SCPDriver> SCP<D> {
     /// Get JSON-serializable quorum information for a specific node in a slot.
     ///
     /// This returns information about a specific node's state in the consensus
-    /// process, matching C++ `getJsonQuorumInfo(NodeID const& id, ...)`.
+    /// process, matching stellar-core `getJsonQuorumInfo(NodeID const& id, ...)`.
     ///
     /// # Arguments
     /// * `slot_index` - The slot to query

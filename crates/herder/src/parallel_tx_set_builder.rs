@@ -1,7 +1,7 @@
 //! Parallel transaction set building for Soroban phases.
 //!
 //! This module partitions Soroban transactions into stages and clusters for
-//! parallel execution, matching the C++ `ParallelTxSetBuilder` behavior.
+//! parallel execution, matching the stellar-core `ParallelTxSetBuilder` behavior.
 //!
 //! # Algorithm Overview
 //!
@@ -460,7 +460,7 @@ fn tx_inclusion_fee(tx: &TransactionEnvelope) -> i64 {
     // For parallel builder fee tracking, we use the declared fee.
     // The actual inclusion fee = declared fee - resource fee, but for
     // stage count selection we just need relative ordering, so we use
-    // the total fee as a proxy (matching C++ behaviour where the
+    // the total fee as a proxy (matching stellar-core behaviour where the
     // SurgePricingPriorityQueue handles the real fee computation).
     match tx {
         TransactionEnvelope::TxV0(env) => env.tx.fee as i64,

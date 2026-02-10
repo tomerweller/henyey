@@ -1,6 +1,6 @@
 //! Overlay network metrics collection.
 //!
-//! This module implements the OverlayMetrics from C++ stellar-core, providing
+//! This module implements the OverlayMetrics from stellar-core, providing
 //! comprehensive metrics for monitoring overlay network operations.
 //!
 //! # Overview

@@ -75,7 +75,7 @@ use crate::{
 /// Number of levels in the BucketList (matches stellar-core's `kNumLevels`).
 pub const BUCKET_LIST_LEVELS: usize = 11;
 
-/// FutureBucket state constants (matches C++ stellar-core's FBStatus enum in HAS JSON).
+/// FutureBucket state constants (matches stellar-core's FBStatus enum in HAS JSON).
 /// HAS_NEXT_STATE_CLEAR: No pending merge
 /// HAS_NEXT_STATE_OUTPUT: Merge complete, output hash is known
 /// HAS_NEXT_STATE_INPUTS: Merge in progress, input hashes are stored
@@ -106,7 +106,7 @@ pub struct HasNextState {
 
 /// Pending merge result for a bucket level.
 ///
-/// This supports two modes matching C++ stellar-core:
+/// This supports two modes matching stellar-core:
 /// - `InMemory`: Synchronous merge result (used for level 0)
 /// - `Async`: Background merge in progress (used for levels 1+)
 ///
@@ -123,7 +123,7 @@ pub enum PendingMerge {
 
 /// Describes the serializable state of a pending merge for HAS persistence.
 ///
-/// Matches the three states of C++ FutureBucket:
+/// Matches the three states of stellar-core FutureBucket:
 /// - State 0 (clear): no pending merge (represented by `None` at call site)
 /// - State 1 (output): merge completed, output hash known
 /// - State 2 (inputs): merge in progress, input hashes known
@@ -185,7 +185,7 @@ pub struct AsyncMergeHandle {
     input_file_paths: Vec<std::path::PathBuf>,
     /// Hash of the "curr" input bucket for this merge.
     /// Stored so we can serialize in-progress merges as HAS state 2 (input hashes),
-    /// matching C++ FutureBucket's hasHashes() behavior.
+    /// matching stellar-core FutureBucket's hasHashes() behavior.
     input_curr_hash: Hash256,
     /// Hash of the "snap" input bucket for this merge.
     input_snap_hash: Hash256,
@@ -411,7 +411,7 @@ impl AsyncMergeHandle {
 /// merge result is retrieved when `commit()` is called, blocking only if the merge
 /// hasn't completed yet.
 ///
-/// This matches C++ stellar-core's FutureBucket design and allows merges for higher
+/// This matches stellar-core's FutureBucket design and allows merges for higher
 /// levels (which take longer) to run concurrently with other ledger close operations.
 #[derive(Debug)]
 pub struct BucketLevel {
@@ -472,7 +472,7 @@ impl BucketLevel {
     /// Promote the prepared bucket into curr, if any.
     ///
     /// For async merges, this will block until the merge completes.
-    /// This matches C++ stellar-core's BucketLevel::commit() behavior.
+    /// This matches stellar-core's BucketLevel::commit() behavior.
     fn commit(&mut self) {
         if let Some(pending) = self.next.take() {
             match pending {
@@ -506,7 +506,7 @@ impl BucketLevel {
     /// Get the full pending merge state for HAS serialization.
     ///
     /// Returns the state needed to serialize this level's `next` field in the
-    /// History Archive State JSON, matching C++ FutureBucket serialization:
+    /// History Archive State JSON, matching stellar-core FutureBucket serialization:
     ///
     /// - `None` → state 0 (clear): no pending merge
     /// - `Some(PendingMergeState::Output(hash))` → state 1: merge completed, output hash known
@@ -582,12 +582,12 @@ impl BucketLevel {
 
     /// Snap the current bucket to become the new snapshot.
     ///
-    /// This implements the bucket list spill behavior (matches C++ BucketLevel::snap):
+    /// This implements the bucket list spill behavior (matches stellar-core BucketLevel::snap):
     /// - Sets snap = curr (old curr becomes the new snap)
     /// - Clears curr (ready for new entries)
     /// - Returns the NEW snap (old curr), which flows to the next level
     ///
-    /// Note: Unlike commit(), snap() does NOT commit pending merges. In C++,
+    /// Note: Unlike commit(), snap() does NOT commit pending merges. In stellar-core,
     /// mNextCurr is a FutureBucket that stays pending until explicitly committed.
     fn snap(&mut self) -> Arc<Bucket> {
         // Move curr to snap, replacing curr with empty bucket
@@ -604,7 +604,7 @@ impl BucketLevel {
     /// higher levels first.
     ///
     /// - `normalize_init`: If true, INIT entries are converted to LIVE. Note: This should
-    ///   ALWAYS be false in production to match C++ stellar-core behavior. C++ never
+    ///   ALWAYS be false in production to match stellar-core behavior. stellar-core never
     ///   normalizes INIT entries to LIVE during merges. This parameter exists for
     ///   backward compatibility with tests.
     /// - `use_empty_curr`: If true, use an empty bucket instead of self.curr for the merge.
@@ -656,7 +656,7 @@ impl BucketLevel {
         );
 
         // For levels 1+, use async merging to run merges in background threads.
-        // This matches C++ stellar-core's FutureBucket design where merges for
+        // This matches stellar-core's FutureBucket design where merges for
         // higher levels (which have larger buckets) start immediately and run
         // concurrently with other operations. The merge result is retrieved when
         // commit() is called, blocking only if the merge hasn't finished yet.
@@ -1198,7 +1198,7 @@ impl BucketList {
     ///
     /// This is a memory-efficient alternative to [`live_entries()`](Self::live_entries)
     /// that avoids materializing all entries into a `Vec`. It uses `HashSet<LedgerKey>`
-    /// for deduplication, matching C++ stellar-core's approach.
+    /// for deduplication, matching stellar-core's approach.
     ///
     /// # Memory Efficiency
     ///
@@ -1487,7 +1487,7 @@ impl BucketList {
         // 1. This bucket will be immediately merged with level 0 curr
         // 2. Only the merged result's hash matters for the bucket list
         // 3. Skipping hash computation saves ~50% of the bucket update time
-        // This matches C++ stellar-core's freshInMemoryOnly optimization.
+        // This matches stellar-core's freshInMemoryOnly optimization.
         let new_bucket = Bucket::fresh_in_memory_only({
             let mut e = entries;
             e.sort_by(crate::entry::compare_entries);
@@ -1512,7 +1512,7 @@ impl BucketList {
         }
 
         // Step 1: Process spills from highest level down to level 1
-        // This matches C++ stellar-core's BucketListBase::addBatchInternal
+        // This matches stellar-core's BucketListBase::addBatchInternal
         //
         // The key insight is that snap() moves curr→snap and returns the NEW snap
         // (which is the old curr). This is the bucket that flows to the next level.
@@ -1715,20 +1715,20 @@ impl BucketList {
         value & !(modulus - 1)
     }
 
-    /// Half the idealized size of a level (matches C++ stellar-core's levelHalf).
+    /// Half the idealized size of a level (matches stellar-core's levelHalf).
     /// Level 0: 2, Level 1: 8, Level 2: 32, Level 3: 128, etc.
     fn level_half(level: usize) -> u32 {
         1u32 << (2 * level + 1)
     }
 
-    /// Idealized size of a level for spill boundaries (matches C++ stellar-core's levelSize).
+    /// Idealized size of a level for spill boundaries (matches stellar-core's levelSize).
     /// Level 0: 4, Level 1: 16, Level 2: 64, Level 3: 256, etc.
     fn level_size(level: usize) -> u32 {
         1u32 << (2 * (level + 1))
     }
 
     /// Returns true if a level should spill at a given ledger.
-    /// This matches C++ stellar-core's `levelShouldSpill`:
+    /// This matches stellar-core's `levelShouldSpill`:
     ///   return (ledger == roundDown(ledger, levelHalf(level)) ||
     ///           ledger == roundDown(ledger, levelSize(level)));
     ///
@@ -1776,12 +1776,12 @@ impl BucketList {
     ///
     /// # Synchronous vs Asynchronous
     ///
-    /// In C++ stellar-core, merges are asynchronous and the result stays in `mNextCurr`
+    /// In stellar-core, merges are asynchronous and the result stays in `mNextCurr`
     /// until committed. In our synchronous implementation, the result goes into `next`
     /// and we check `next` during lookups to make entries accessible. The key invariant
     /// is that `curr` is preserved until the level snaps.
     ///
-    /// Matches C++ stellar-core's `shouldMergeWithEmptyCurr` in BucketListBase.cpp.
+    /// Matches stellar-core's `shouldMergeWithEmptyCurr` in BucketListBase.cpp.
     fn should_merge_with_empty_curr(ledger_seq: u32, level: usize) -> bool {
         if level == 0 {
             // Level 0 always merges with its curr
@@ -1996,7 +1996,7 @@ impl BucketList {
     ///
     /// * `restart_structure_based` - If true, fall back to structure-based merge restart
     ///   for levels with no stored HAS hashes (state 0). This should be true for full
-    ///   startup mode but false for offline verification mode. C++ stellar-core only
+    ///   startup mode but false for offline verification mode. stellar-core only
     ///   calls restartMerges in full startup mode, not for standalone offline commands.
     ///
     /// # Panics
@@ -2132,10 +2132,10 @@ impl BucketList {
         // fall back to regular restart_merges which examines bucket structure
         // to determine if a merge should be in progress.
         //
-        // This matches C++ stellar-core behavior: when next.isClear() for a level,
+        // This matches stellar-core behavior: when next.isClear() for a level,
         // restartMerges() uses the previous level's snap to start a merge if needed.
         //
-        // Note: C++ only does structure-based restarts in full startup mode, not for
+        // Note: stellar-core only does structure-based restarts in full startup mode, not for
         // standalone offline commands. The caller controls this via restart_structure_based.
         if restart_structure_based {
             self.restart_merges(ledger, protocol_version)
@@ -2151,7 +2151,7 @@ impl BucketList {
     /// in progress at that checkpoint ledger. This function recreates those pending merges
     /// by examining the current and snap buckets and starting merges where appropriate.
     ///
-    /// This matches C++ stellar-core's BucketListBase::restartMerges().
+    /// This matches stellar-core's BucketListBase::restartMerges().
     ///
     /// For each level > 0 with no pending merge:
     /// 1. Check if the previous level's snap is non-empty
@@ -2196,10 +2196,10 @@ impl BucketList {
 
             // Determine merge parameters
             let merge_protocol_version = prev_snap.protocol_version().unwrap_or(protocol_version);
-            // Note: C++ never normalizes INIT to LIVE during merges - the keepTombstoneEntries
+            // Note: stellar-core never normalizes INIT to LIVE during merges - the keepTombstoneEntries
             // flag only affects DEAD entry filtering, not INIT entry transformation.
             let keep_dead = Self::keep_tombstone_entries(i);
-            let normalize_init = false; // C++ never normalizes INIT to LIVE during merges
+            let normalize_init = false; // stellar-core never normalizes INIT to LIVE during merges
             let use_empty_curr = Self::should_merge_with_empty_curr(merge_start_ledger, i);
 
             // Log detailed merge parameters for debugging
@@ -2391,7 +2391,7 @@ impl BucketList {
 
     /// Perform an incremental eviction scan starting from the given iterator position.
     ///
-    /// This matches C++ stellar-core's `scanForEviction` behavior:
+    /// This matches stellar-core's `scanForEviction` behavior:
     /// - Scans entries starting from the iterator's current position
     /// - Stops when `settings.eviction_scan_size` bytes have been scanned
     /// - Updates the iterator to the new position
@@ -3273,7 +3273,7 @@ mod tests {
 
     // ============ P1-1: BucketList sizes at ledger 1 ============
     //
-    // Upstream: BucketListTests.cpp "BucketList sizes at ledger 1"
+    // stellar-core: BucketListTests.cpp "BucketList sizes at ledger 1"
     // At ledger 1, level 0 curr should have exactly 1 entry,
     // all other buckets should be empty.
 
@@ -3362,7 +3362,7 @@ mod tests {
 
     // ============ P1-2: BucketList iterative size check ============
     //
-    // Upstream: BucketListTests.cpp "BucketList check bucket sizes"
+    // stellar-core: BucketListTests.cpp "BucketList check bucket sizes"
     // Validates that bucket entry counts match expected sizes across
     // many ledgers. Each ledger adds exactly one unique entry, so the
     // total entry count across all buckets should equal the ledger number.
@@ -3476,7 +3476,7 @@ mod tests {
 
     // ============ P1-3: Bucket list shadowing pre/post protocol 12 ============
     //
-    // Upstream: BucketListTests.cpp "bucket list shadowing pre/post proto 12"
+    // stellar-core: BucketListTests.cpp "bucket list shadowing pre/post proto 12"
     // Verifies that frequently-updated entries shadow correctly:
     // - Pre-protocol-12: entries shadowed at higher levels are filtered out
     // - Post-protocol-12: entries persist at all levels (no shadow filtering)

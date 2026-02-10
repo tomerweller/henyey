@@ -36,12 +36,12 @@ This makes mainnet operation impossible.
 
 A streaming iterator that:
 1. Never materializes the full entry list
-2. Uses `HashSet<LedgerKey>` for deduplication (matching stellar-core upstream)
+2. Uses `HashSet<LedgerKey>` for deduplication (matching stellar-core)
 3. Yields entries one-at-a-time for immediate processing
 
 ## Design
 
-### stellar-core Upstream Behavior (What We're Matching)
+### stellar-core Behavior (What We're Matching)
 
 stellar-core uses `unordered_set<LedgerKey>` for deduplication during bucket iteration:
 
@@ -255,7 +255,7 @@ Use a two-tier approach with bloom filter pre-screening and 8-byte hash storage.
 **Pros:** Lower memory (~615MB)  
 **Cons:** Doesn't match stellar-core behavior, adds complexity, potential for rare false positives
 
-**Decision:** Match stellar-core upstream with `HashSet<LedgerKey>` for consistency and correctness.
+**Decision:** Match stellar-core with `HashSet<LedgerKey>` for consistency and correctness.
 
 ### Alternative 2: Index-based Deduplication
 

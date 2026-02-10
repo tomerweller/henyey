@@ -150,7 +150,7 @@ pub struct TxQueueConfig {
     ///
     /// This allows nodes to exclude transactions with specific operation types
     /// from their mempool. This is configured via
-    /// `EXCLUDE_TRANSACTIONS_CONTAINING_OPERATION_TYPE` in C++.
+    /// `EXCLUDE_TRANSACTIONS_CONTAINING_OPERATION_TYPE` in stellar-core.
     pub filtered_operation_types: HashSet<OperationType>,
     /// Maximum ledger-wide Soroban instructions (from ContractComputeV0).
     /// Used for parallel phase building. Default 0 disables parallel building.
@@ -308,7 +308,7 @@ pub struct TimestampedTx {
 
 /// Per-account state in the transaction queue.
 ///
-/// C++ parity: An AccountID is tracked in mAccountStates if and only if:
+/// Parity: An AccountID is tracked in mAccountStates if and only if:
 /// - total_fees > 0 (account is fee-source for at least one tx), OR
 /// - transaction.is_some() (account is seq-number-source for a queued tx)
 ///
@@ -326,7 +326,7 @@ pub struct AccountState {
     /// Used for auto-ban: when age reaches pending_depth, the transaction is banned.
     pub age: u32,
     /// The single pending transaction for which this account is the sequence-number-source.
-    /// C++ enforces one transaction per account (non-fee-bump) in the queue.
+    /// stellar-core enforces one transaction per account (non-fee-bump) in the queue.
     pub transaction: Option<TimestampedTx>,
 }
 
@@ -848,7 +848,7 @@ fn summary_generalized_tx_set(gen: &GeneralizedTransactionSet) -> String {
 ///
 /// # Per-Account Limits
 ///
-/// C++ parity: The queue enforces one transaction per account (sequence-number-source).
+/// Parity: The queue enforces one transaction per account (sequence-number-source).
 /// This prevents spam and ensures predictable transaction ordering. Accounts can
 /// replace their pending transaction with a fee-bump (10x fee multiplier required).
 ///
@@ -1197,7 +1197,7 @@ impl TransactionQueue {
             };
             let dex_limit = self.config.max_queue_dex_ops.map(|dex_ops| {
                 if use_bytes {
-                    // Upstream uses MAX_CLASSIC_BYTE_ALLOWANCE for the DEX lane byte limit.
+                    // stellar-core uses MAX_CLASSIC_BYTE_ALLOWANCE for the DEX lane byte limit.
                     Resource::new(vec![dex_ops as i64, MAX_CLASSIC_BYTE_ALLOWANCE as i64])
                 } else {
                     Resource::new(vec![dex_ops as i64])
@@ -1266,7 +1266,7 @@ impl TransactionQueue {
             };
             let dex_limit = self.config.max_queue_dex_ops.map(|dex_ops| {
                 if use_bytes {
-                    // Upstream uses MAX_CLASSIC_BYTE_ALLOWANCE for the DEX lane byte limit.
+                    // stellar-core uses MAX_CLASSIC_BYTE_ALLOWANCE for the DEX lane byte limit.
                     Resource::new(vec![dex_ops as i64, MAX_CLASSIC_BYTE_ALLOWANCE as i64])
                 } else {
                     Resource::new(vec![dex_ops as i64])
@@ -1856,7 +1856,7 @@ impl TransactionQueue {
         };
         let dex_limit = self.config.max_dex_ops.map(|dex_ops| {
             if use_classic_bytes {
-                // Upstream uses MAX_CLASSIC_BYTE_ALLOWANCE for the DEX lane byte limit.
+                // stellar-core uses MAX_CLASSIC_BYTE_ALLOWANCE for the DEX lane byte limit.
                 Resource::new(vec![dex_ops as i64, MAX_CLASSIC_BYTE_ALLOWANCE as i64])
             } else {
                 Resource::new(vec![dex_ops as i64])
@@ -2056,7 +2056,7 @@ impl TransactionQueue {
         let max_age = self.config.max_age_secs;
         by_hash.retain(|_, tx| !tx.is_expired(max_age));
 
-        // Mirror upstream: clear eviction thresholds after aging to avoid
+        // Mirror stellar-core: clear eviction thresholds after aging to avoid
         // carrying stale min-fee requirements.
         self.classic_lane_evicted_inclusion_fee.write().clear();
         self.soroban_lane_evicted_inclusion_fee.write().clear();

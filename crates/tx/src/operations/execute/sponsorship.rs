@@ -40,7 +40,7 @@ pub fn execute_begin_sponsoring_future_reserves(
 
     // Note: We do NOT check if sponsored_id exists here because:
     // 1. The account may be created by a later CreateAccount operation
-    // 2. C++ stellar-core does not require the sponsored account to exist
+    // 2. stellar-core does not require the sponsored account to exist
 
     // Cannot sponsor yourself
     if source == &op.sponsored_id {

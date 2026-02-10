@@ -325,7 +325,7 @@ impl Work for GetHistoryArchiveStateWork {
 /// # Parallelism
 ///
 /// Downloads are performed concurrently with up to 16 parallel requests,
-/// matching the C++ stellar-core `MAX_CONCURRENT_SUBPROCESSES` limit.
+/// matching the stellar-core `MAX_CONCURRENT_SUBPROCESSES` limit.
 ///
 /// # Dependencies
 ///
@@ -2023,14 +2023,14 @@ impl BatchDownloadProgress {
 
 /// Work item to download files of a specific type for a checkpoint range.
 ///
-/// This is the Rust equivalent of the C++ `BatchDownloadWork` class. It downloads
+/// This is the Rust equivalent of the stellar-core `BatchDownloadWork` class. It downloads
 /// history archive files (ledger headers, transactions, results, or SCP history)
 /// for a contiguous range of checkpoints, with parallel downloads for efficiency.
 ///
 /// # Parallelism
 ///
 /// Downloads are performed concurrently with up to 16 parallel requests per
-/// batch, matching the C++ `MAX_CONCURRENT_SUBPROCESSES` limit.
+/// batch, matching the stellar-core `MAX_CONCURRENT_SUBPROCESSES` limit.
 ///
 /// # Dependencies
 ///

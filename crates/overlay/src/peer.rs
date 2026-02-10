@@ -362,7 +362,7 @@ impl Peer {
         );
 
         // Send SEND_MORE_EXTENDED to enable flow control
-        // Match C++ defaults: PEER_FLOOD_READING_CAPACITY=200, fcBytes=300000
+        // Match stellar-core defaults: PEER_FLOOD_READING_CAPACITY=200, fcBytes=300000
         let send_more = StellarMessage::SendMoreExtended(stellar_xdr::curr::SendMoreExtended {
             num_messages: 200,
             num_bytes: 300_000,
@@ -370,7 +370,7 @@ impl Peer {
         self.send(send_more).await?;
         debug!("Sent SEND_MORE_EXTENDED to {}", self.info.peer_id);
 
-        // Ask for SCP data _after_ the flow control message (matches C++ recvAuth behavior)
+        // Ask for SCP data _after_ the flow control message (matches stellar-core recvAuth behavior)
         // Use ledger seq 0 to request the latest SCP state
         let get_scp_state = StellarMessage::GetScpState(0);
         self.send(get_scp_state).await?;

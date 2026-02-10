@@ -284,9 +284,9 @@ impl TransactionFrame {
     /// refunded if not fully consumed during execution. For non-Soroban transactions,
     /// returns `None`.
     ///
-    /// # C++ Parity
+    /// # Parity
     ///
-    /// Matches `TransactionFrame::getRefundableFee()` in C++ stellar-core.
+    /// Matches `TransactionFrame::getRefundableFee()` in stellar-core.
     pub fn refundable_fee(&self) -> Option<i64> {
         if !self.is_soroban() {
             return None;
@@ -486,7 +486,7 @@ impl TransactionFrame {
     }
 
     /// Return the inner transaction envelope size for fee bump, or full envelope size for regular tx.
-    /// This is used for Soroban resource fee computation, matching C++ behavior where
+    /// This is used for Soroban resource fee computation, matching stellar-core behavior where
     /// FeeBumpTransactionFrame::getResources() delegates to mInnerTx->getResources().
     pub fn inner_tx_size_bytes(&self) -> u32 {
         match &self.envelope {
@@ -529,7 +529,7 @@ impl TransactionFrame {
             disk_read_bytes: data.resources.disk_read_bytes,
             write_bytes: data.resources.write_bytes,
             contract_events_size_bytes,
-            // Use inner_tx_size_bytes to match C++ behavior: FeeBumpTransactionFrame::getResources()
+            // Use inner_tx_size_bytes to match stellar-core behavior: FeeBumpTransactionFrame::getResources()
             // delegates to mInnerTx->getResources(), so the tx size is the inner tx envelope size.
             transaction_size_bytes: self.inner_tx_size_bytes(),
         })

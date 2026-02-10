@@ -493,7 +493,7 @@ fn issuer_for_asset(asset: &Asset) -> Option<&AccountId> {
 }
 
 /// Maximum number of offers that can be crossed per path payment operation.
-/// Matches C++ stellar-core's MAX_OFFERS_TO_CROSS (protocol 11+).
+/// Matches stellar-core's MAX_OFFERS_TO_CROSS (protocol 11+).
 const MAX_OFFERS_TO_CROSS: i64 = 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -556,7 +556,7 @@ fn convert_with_offers_and_pools(
         );
     }
 
-    // C++ fast-fails if maxOffersToCross == 0 and pool exchange would add to trail
+    // stellar-core fast-fails if maxOffersToCross == 0 and pool exchange would add to trail
     // (protocol 18+, but we only support 23+)
     if max_offers_to_cross == 0 {
         return Ok(ConvertResult::CrossedTooMany);
@@ -701,7 +701,7 @@ fn convert_with_offers(
             return Ok(ConvertResult::FilterStopCrossSelf);
         }
 
-        // Enforce max offers to cross limit (matches C++ stellar-core)
+        // Enforce max offers to cross limit (matches stellar-core)
         if offer_trail.len() as i64 >= max_offers_to_cross {
             return Ok(ConvertResult::CrossedTooMany);
         }
@@ -725,7 +725,7 @@ fn convert_with_offers(
         max_send -= send;
         max_recv -= recv;
 
-        // C++ logic for continuing the loop:
+        // stellar-core logic for continuing the loop:
         // needMore = !wheatStays && (maxWheatReceive > 0 && maxSheepSend > 0)
         need_more = !wheat_stays && max_send > 0 && max_recv > 0;
     }
@@ -766,7 +766,7 @@ fn cross_offer_v10(
     // re-traversing upper bucket list levels for each entry.
     state.ensure_offer_entries_loaded(&seller, &wheat, &sheep)?;
 
-    // Step 1: Release liabilities FIRST (matches C++ exactly)
+    // Step 1: Release liabilities FIRST (matches stellar-core exactly)
     // This is critical - the available balance calculation depends on liabilities
     // being released first.
     let (selling_liab, buying_liab) = offer_liabilities_sell(offer.amount, &offer.price)?;
@@ -785,7 +785,7 @@ fn cross_offer_v10(
         .min(can_sell_at_most(&seller, &wheat, state, context)?);
     let max_sheep_receive = can_buy_at_most(&seller, &sheep, state);
 
-    // Step 3: Adjust offer amount (C++ calls adjustOffer here as "preventative measure")
+    // Step 3: Adjust offer amount (stellar-core calls adjustOffer here as "preventative measure")
     let adjusted_offer_amount =
         adjust_offer_amount(offer.price.clone(), max_wheat_send, max_sheep_receive)
             .map_err(map_exchange_error)?;
@@ -869,7 +869,7 @@ fn cross_offer_v10(
         )?;
     }
 
-    // Step 8: Add ClaimAtom (C++ always adds one, even for 0-0 exchanges)
+    // Step 8: Add ClaimAtom (stellar-core always adds one, even for 0-0 exchanges)
     offer_trail.push(ClaimAtom::OrderBook(ClaimOfferAtom {
         seller_id: seller,
         offer_id: offer.offer_id,
@@ -1226,9 +1226,9 @@ fn exchange_with_pool(
             let denominator = u128::from(MAX_BPS as u64) * u128::from(reserves_to_pool as u64)
                 + u128::from((MAX_BPS - fee_bps) as u64) * u128::from(*to_pool as u64);
 
-            // Use hugeDivide algorithm matching C++ stellar-core exactly:
+            // Use hugeDivide algorithm matching stellar-core exactly:
             // result = floor(A * B / C) where A = (MAX_BPS - fee_bps), B and C are u128
-            // C++ computes: A*Q + floor(A*R/C) where Q = B/C, R = B%C
+            // stellar-core computes: A*Q + floor(A*R/C) where Q = B/C, R = B%C
             // This avoids overflow that would occur computing A*B directly in u128.
             let a = (MAX_BPS - fee_bps) as u128;
             let b = u128::from(reserves_from_pool as u64) * u128::from(*to_pool as u64);
@@ -1244,7 +1244,7 @@ fn exchange_with_pool(
             // result = A*Q + floor(A*R/C)
             let value = a * q + (a * r) / c;
             if value > i64::MAX as u128 {
-                // C++ hugeDivide returns false on overflow; exchange is not possible
+                // stellar-core hugeDivide returns false on overflow; exchange is not possible
                 return Ok(false);
             }
             *from_pool = value as i64;
@@ -1264,9 +1264,9 @@ fn exchange_with_pool(
             }
             *from_pool = max_receive_from_pool;
 
-            // Use hugeDivide algorithm matching C++ stellar-core exactly:
+            // Use hugeDivide algorithm matching stellar-core exactly:
             // result = ceil(A * B / C) where A = MAX_BPS (int32), B and C are u128
-            // C++ computes: A*Q + ceil(A*R/C) where Q = B/C, R = B%C
+            // stellar-core computes: A*Q + ceil(A*R/C) where Q = B/C, R = B%C
             let a = MAX_BPS as u128;
             let b = u128::from(reserves_to_pool as u64) * u128::from(*from_pool as u64);
             let c = u128::from((reserves_from_pool - *from_pool) as u64)
@@ -1283,7 +1283,7 @@ fn exchange_with_pool(
             let value = a * q + (a * r).div_ceil(c);
 
             if value > i64::MAX as u128 {
-                // C++ hugeDivide returns false on overflow; exchange is not possible
+                // stellar-core hugeDivide returns false on overflow; exchange is not possible
                 return Ok(false);
             }
             *to_pool = value as i64;
@@ -2310,7 +2310,7 @@ mod tests {
     /// Regression test for pool exchange overflow returning Ok(false) instead of Err.
     /// Found at mainnet ledger 61170102: PathPaymentStrictReceive hit overflow in
     /// hugeDivide, causing TxNotSupported instead of TooFewOffers.
-    /// C++ hugeDivide returns false on overflow; the exchange is simply not possible.
+    /// stellar-core hugeDivide returns false on overflow; the exchange is simply not possible.
     #[test]
     fn test_pool_exchange_overflow_returns_false_strict_receive() {
         // Set up values that cause the hugeDivide result to overflow i64:

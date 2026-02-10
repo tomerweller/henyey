@@ -628,7 +628,7 @@ The crate uses a layered error approach:
 2. **`ValidationError`**: Specific validation failures with context
 3. **`OperationValidationError`**: Per-operation validation errors
 
-## Upstream Mapping
+## stellar-core Mapping
 
 This crate corresponds to the following stellar-core components:
 

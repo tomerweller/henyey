@@ -5,7 +5,7 @@
 //! referencing data we don't have, we start fetching it and queue the envelope.
 //! Once all dependencies are received, the envelope is ready for processing.
 //!
-//! This is the Rust equivalent of C++ stellar-core's `PendingEnvelopes` fetching logic.
+//! This is the Rust equivalent of stellar-core's `PendingEnvelopes` fetching logic.
 
 use dashmap::DashMap;
 use parking_lot::RwLock;

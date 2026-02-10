@@ -1,6 +1,6 @@
-//! Integration tests for BucketList matching C++ BucketListTests.cpp
+//! Integration tests for BucketList matching stellar-core BucketListTests.cpp
 //!
-//! These tests verify parity with the upstream stellar-core bucket list behavior,
+//! These tests verify parity with the stellar-core bucket list behavior,
 //! particularly for eviction, hot archive operations, and bucket list mechanics.
 
 use henyey_bucket::{
@@ -128,14 +128,14 @@ fn make_account_key(seed: u8) -> LedgerKey {
 // Hot Archive Integration Tests
 // =============================================================================
 
-/// Test matching upstream: "hot archive bucket tombstones expire at bottom level"
+/// Test matching stellar-core: "hot archive bucket tombstones expire at bottom level"
 ///
 /// This test verifies that when entries are archived and tombstones (Live markers)
 /// are added for restoration, the tombstones expire at the bottom level while
 /// the archived entries remain.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_hot_archive_tombstones_expire_at_bottom_level() {
-    // Use a smaller depth for faster testing (matching C++ testutil::BucketListDepthModifier)
+    // Use a smaller depth for faster testing (matching stellar-core testutil::BucketListDepthModifier)
     // We'll manually control the number of levels we test
     let mut bl = HotArchiveBucketList::new();
 
@@ -190,7 +190,7 @@ async fn test_hot_archive_tombstones_expire_at_bottom_level() {
     }
 }
 
-/// Test matching upstream: "hot archive accepts multiple archives and restores for same key"
+/// Test matching stellar-core: "hot archive accepts multiple archives and restores for same key"
 ///
 /// Simulates: archive V0 → restore → re-archive V1 → verify V1 wins at bottom
 #[tokio::test(flavor = "multi_thread")]
@@ -266,7 +266,7 @@ async fn test_hot_archive_concurrent_archive_and_restore() {
 // BucketList Integration Tests
 // =============================================================================
 
-/// Test matching upstream: "bucket list" basic operations
+/// Test matching stellar-core: "bucket list" basic operations
 ///
 /// Adds batches to bucket list and verifies level sizes stay within bounds.
 #[tokio::test(flavor = "multi_thread")]
@@ -333,7 +333,7 @@ async fn test_bucket_list_basic_operations() {
     );
 }
 
-/// Test matching upstream: "BucketList snap reaches steady state"
+/// Test matching stellar-core: "BucketList snap reaches steady state"
 ///
 /// Verifies that after sufficient ledgers, snap bucket sizes stabilize.
 #[tokio::test(flavor = "multi_thread")]
@@ -369,7 +369,7 @@ async fn test_bucket_list_snap_steady_state() {
     }
 }
 
-/// Test matching upstream: "BucketList deepest curr accumulates"
+/// Test matching stellar-core: "BucketList deepest curr accumulates"
 ///
 /// Verifies that the deepest level's curr bucket accumulates entries.
 #[tokio::test(flavor = "multi_thread")]
@@ -410,7 +410,7 @@ async fn test_bucket_list_deepest_curr_accumulates() {
     );
 }
 
-/// Test matching upstream: "single entry bubbling up"
+/// Test matching stellar-core: "single entry bubbling up"
 ///
 /// Verifies that a single entry bubbles up through all levels correctly.
 #[tokio::test(flavor = "multi_thread")]
@@ -461,7 +461,7 @@ async fn test_single_entry_bubbling_up() {
     }
 }
 
-/// Test matching upstream: "bucket tombstones mutually-annihilate init entries"
+/// Test matching stellar-core: "bucket tombstones mutually-annihilate init entries"
 ///
 /// Verifies CAP-0020 semantics: INIT + DEAD = annihilation
 #[tokio::test(flavor = "multi_thread")]
@@ -532,7 +532,7 @@ async fn test_init_dead_annihilation() {
     assert!(!has_key, "Annihilated entry should not be in live_entries");
 }
 
-/// Test matching upstream: "live bucket tombstones expire at bottom level"
+/// Test matching stellar-core: "live bucket tombstones expire at bottom level"
 ///
 /// Verifies that DEAD entries (tombstones) are dropped at the bottom level.
 #[tokio::test(flavor = "multi_thread")]
@@ -604,7 +604,7 @@ async fn test_tombstones_expire_at_bottom_level() {
 // Searchable Snapshot Tests
 // =============================================================================
 
-/// Test matching upstream: "Searchable BucketListDB snapshots"
+/// Test matching stellar-core: "Searchable BucketListDB snapshots"
 ///
 /// Verifies that bucket list snapshots can be searched correctly.
 #[tokio::test(flavor = "multi_thread")]
@@ -709,10 +709,10 @@ async fn test_eviction_iterator_resets_on_spill() {
 }
 
 // =============================================================================
-// Full Eviction Scan Tests (Matching C++ "eviction scan" test)
+// Full Eviction Scan Tests (Matching stellar-core "eviction scan" test)
 // =============================================================================
 
-/// Test matching upstream: "eviction scan" -> "basic eviction test"
+/// Test matching stellar-core: "eviction scan" -> "basic eviction test"
 ///
 /// Creates Soroban entries with TTL, advances ledgers until they expire,
 /// then verifies they are properly evicted (temporary deleted, persistent archived).
@@ -811,7 +811,7 @@ async fn test_eviction_scan_basic() {
     }
 }
 
-/// Test matching upstream: "eviction scan" -> "shadowed entries not evicted"
+/// Test matching stellar-core: "eviction scan" -> "shadowed entries not evicted"
 ///
 /// Creates entries, updates their TTL before expiration, verifies they're not evicted.
 #[tokio::test(flavor = "multi_thread")]
@@ -957,7 +957,7 @@ async fn test_eviction_scan_incremental() {
 // BucketManager Persistence Tests
 // =============================================================================
 
-/// Test matching upstream: BucketManager persistence across restart
+/// Test matching stellar-core: BucketManager persistence across restart
 ///
 /// Creates a BucketManager, adds buckets, closes it, reopens it, and verifies
 /// the state is preserved.

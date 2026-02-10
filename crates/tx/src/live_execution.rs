@@ -6,7 +6,7 @@
 //!
 //! # Overview
 //!
-//! Live execution follows the C++ stellar-core transaction application flow:
+//! Live execution follows the stellar-core transaction application flow:
 //!
 //! 1. **Fee & Sequence Processing** ([`process_fee_seq_num`]): Charge the transaction fee
 //!    from the source account and update the sequence number.
@@ -26,9 +26,9 @@
 //! - **Pre-P23**: Refunds are applied in `process_post_apply` immediately after each transaction
 //! - **P23+**: Refunds are deferred to `process_post_tx_set_apply` after all transactions
 //!
-//! # C++ Parity
+//! # Parity
 //!
-//! This module matches the following C++ stellar-core functions:
+//! This module matches the following stellar-core functions:
 //! - `TransactionFrame::processFeeSeqNum()` in `TransactionFrame.cpp`
 //! - `TransactionFrame::processPostApply()` in `TransactionFrame.cpp`
 //! - `TransactionFrame::processPostTxSetApply()` in `TransactionFrame.cpp`
@@ -100,7 +100,7 @@ const PROTOCOL_VERSION_23: u32 = 23;
 /// # Fee Pool Tracking
 ///
 /// The fee pool accumulates all transaction fees and is decremented by refunds.
-/// In C++ stellar-core, this is stored in the ledger header and persisted to
+/// In stellar-core, this is stored in the ledger header and persisted to
 /// the database. Here, we track it in memory for the duration of ledger close.
 pub struct LiveExecutionContext {
     /// Base ledger context (sequence, close time, protocol version, etc.).
@@ -231,7 +231,7 @@ pub struct FeeSeqNumResult {
 /// 4. Adds the fee to the fee pool
 /// 5. Updates the sequence number (for pre-protocol 10)
 ///
-/// # C++ Parity
+/// # Parity
 ///
 /// Matches `TransactionFrame::processFeeSeqNum()` in `TransactionFrame.cpp`.
 ///
@@ -320,7 +320,7 @@ pub fn process_fee_seq_num(
 /// Fee bump transactions charge the outer fee source account, not the inner
 /// transaction's source account.
 ///
-/// # C++ Parity
+/// # Parity
 ///
 /// Matches `FeeBumpTransactionFrame::processFeeSeqNum()`.
 pub fn process_fee_seq_num_fee_bump(
@@ -395,7 +395,7 @@ pub fn process_fee_seq_num_fee_bump(
 /// Calculate the fee to charge for a transaction.
 /// Calculate the fee to charge for a transaction.
 ///
-/// This matches C++ stellar-core's `TransactionFrame::getFee()` behavior:
+/// This matches stellar-core's `TransactionFrame::getFee()` behavior:
 /// - For Soroban: resourceFee + min(inclusionFee, adjustedFee)
 /// - For Classic: min(inclusionFee, adjustedFee)
 ///
@@ -470,7 +470,7 @@ fn update_sequence_number(
 /// This is called after all operations in a transaction have been applied.
 /// For Soroban transactions in pre-protocol 23, this handles fee refunds.
 ///
-/// # C++ Parity
+/// # Parity
 ///
 /// Matches `TransactionFrame::processPostApply()` in `TransactionFrame.cpp`.
 ///
@@ -514,7 +514,7 @@ pub fn process_post_apply(
 /// For fee bump transactions, refunds go to the fee source account
 /// (the account that submitted the fee bump), not the inner transaction source.
 ///
-/// # C++ Parity
+/// # Parity
 ///
 /// Matches `FeeBumpTransactionFrame::processPostApply()`.
 pub fn process_post_apply_fee_bump(
@@ -547,7 +547,7 @@ pub fn process_post_apply_fee_bump(
 /// This is called after ALL transactions in a transaction set have been applied.
 /// For protocol 23+, this is where Soroban fee refunds are handled.
 ///
-/// # C++ Parity
+/// # Parity
 ///
 /// Matches `TransactionFrame::processPostTxSetApply()` in `TransactionFrame.cpp`.
 ///
@@ -583,7 +583,7 @@ pub fn process_post_tx_set_apply(
 
 /// Post-transaction-set processing for a fee bump transaction.
 ///
-/// # C++ Parity
+/// # Parity
 ///
 /// Matches `FeeBumpTransactionFrame::processPostTxSetApply()`.
 pub fn process_post_tx_set_apply_fee_bump(
@@ -617,7 +617,7 @@ pub fn process_post_tx_set_apply_fee_bump(
 /// 4. Subtracts the refund from the fee pool
 /// 5. Optionally emits a fee refund event
 ///
-/// # C++ Parity
+/// # Parity
 ///
 /// Matches `TransactionFrame::refundSorobanFee()` in `TransactionFrame.cpp`.
 ///
@@ -695,7 +695,7 @@ pub fn refund_soroban_fee(
 /// In protocol 10 and later, sequence number update is separated from fee
 /// charging and happens during the pre-apply phase.
 ///
-/// # C++ Parity
+/// # Parity
 ///
 /// Matches `TransactionFrame::processSeqNum()` in `TransactionFrame.cpp`.
 ///
@@ -731,7 +731,7 @@ pub fn process_seq_num(frame: &TransactionFrame, ctx: &mut LiveExecutionContext)
 /// Pre-auth transaction signers are removed from all source accounts after the
 /// transaction is applied, whether it succeeds or fails.
 ///
-/// # C++ Parity
+/// # Parity
 ///
 /// Matches `TransactionFrame::removeOneTimeSignerKeyFromAllSourceAccounts()`.
 ///
@@ -751,7 +751,7 @@ pub fn remove_one_time_signers(
 ) -> Result<()> {
     let protocol_version = ctx.protocol_version();
 
-    // Protocol 7 bypass (matches C++ behavior)
+    // Protocol 7 bypass (matches stellar-core behavior)
     if protocol_version == 7 {
         return Ok(());
     }
@@ -1218,7 +1218,7 @@ mod tests {
     }
 
     /// Regression test: Classic transactions should charge min(declared, required), not max
-    /// This matches C++ stellar-core's TransactionFrame::getFee() behavior when applying=true
+    /// This matches stellar-core's TransactionFrame::getFee() behavior when applying=true
     #[test]
     fn test_classic_fee_uses_min_not_max() {
         // A user declaring a fee of 1,000,000 stroops for a 1-op transaction

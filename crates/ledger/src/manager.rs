@@ -1703,7 +1703,7 @@ impl<'a> LedgerCloseContext<'a> {
 
     /// Load StateArchivalSettings from the delta (for upgraded values) falling back to snapshot.
     ///
-    /// Parity: In C++, the eviction scan runs after config upgrades are applied to the
+    /// Parity: In stellar-core, the eviction scan runs after config upgrades are applied to the
     /// LedgerTxn, so it sees the upgraded StateArchival settings. We must do the same
     /// by checking the delta first (which contains the upgrade), then falling back to
     /// the snapshot.
@@ -1873,7 +1873,7 @@ impl<'a> LedgerCloseContext<'a> {
     ///
     /// This is used during config upgrades where the new cost params are in the delta
     /// but haven't been applied to the bucket list yet.
-    /// Parity: C++ loads from LedgerTxn which reflects the just-applied upgrades.
+    /// Parity: stellar-core loads from LedgerTxn which reflects the just-applied upgrades.
     fn load_rent_config_from_delta_or_snapshot(
         &self,
     ) -> Option<crate::soroban_state::SorobanRentConfig> {
@@ -1967,7 +1967,7 @@ impl<'a> LedgerCloseContext<'a> {
         let hot_archive = Some(self.manager.hot_archive_bucket_list.clone());
 
         // Check if we have a structured Soroban phase (V1 TransactionPhase).
-        // In C++ stellar-core, the Soroban phase ALWAYS goes through
+        // In stellar-core, the Soroban phase ALWAYS goes through
         // applyParallelPhase() when it has V1 structure (isParallel()=true),
         // regardless of cluster count. Refunds are applied in
         // processPostTxSetApply() which only handles parallel phases.
@@ -2180,7 +2180,7 @@ impl<'a> LedgerCloseContext<'a> {
         }
 
         // Apply config upgrades to the delta BEFORE extracting entries for the bucket list.
-        // In C++ stellar-core, config upgrades are applied to the LedgerTxn before
+        // In stellar-core, config upgrades are applied to the LedgerTxn before
         // getAllEntries() and addBatch(), so the upgraded ConfigSetting entries are included
         // in the bucket list update. We must do the same here.
         let mut config_state_archival_changed = false;
@@ -2215,7 +2215,7 @@ impl<'a> LedgerCloseContext<'a> {
             && protocol_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION
         {
             // Load rent config from delta (new upgraded values) falling back to snapshot.
-            // C++ loads from LedgerTxn which reflects the just-applied upgrades.
+            // stellar-core loads from LedgerTxn which reflects the just-applied upgrades.
             let rent_config = self.load_rent_config_from_delta_or_snapshot();
 
             // Recompute contract code sizes with new cost params
@@ -2255,7 +2255,7 @@ impl<'a> LedgerCloseContext<'a> {
 
                 // Read the window from the delta first (it may have been resized
                 // by the config upgrade), falling back to the snapshot.
-                // Parity: C++ reads from LedgerTxn which includes prior modifications.
+                // Parity: stellar-core reads from LedgerTxn which includes prior modifications.
                 let (window_vec_base, previous_entry) = {
                     let delta_change = self.delta.get_change(&window_key)?;
                     if let Some(change) = delta_change {
@@ -2334,7 +2334,7 @@ impl<'a> LedgerCloseContext<'a> {
         // Load state archival settings BEFORE acquiring bucket list lock to avoid deadlock.
         // The snapshot's lookup_fn tries to acquire a read lock on bucket_list, which would
         // deadlock if we're already holding the write lock.
-        // Parity: In C++, eviction runs after config upgrades (sealLedgerTxnAndStoreInBucketsAndDB),
+        // Parity: In stellar-core, eviction runs after config upgrades (sealLedgerTxnAndStoreInBucketsAndDB),
         // so it reads the post-upgrade StateArchival settings. We use load_state_archival_settings()
         // which checks the delta first (containing any upgrade changes) before the snapshot.
         let eviction_settings = if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION
@@ -2431,7 +2431,7 @@ impl<'a> LedgerCloseContext<'a> {
             tracing::debug!(ledger_seq = self.close_data.ledger_seq, "Got delta entries");
 
             // Run incremental eviction scan for Protocol 23+
-            // This must happen BEFORE applying transaction changes to match C++ stellar-core
+            // This must happen BEFORE applying transaction changes to match stellar-core
             let mut archived_entries: Vec<LedgerEntry> = Vec::new();
 
             if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
@@ -2494,7 +2494,7 @@ impl<'a> LedgerCloseContext<'a> {
                     );
 
                     // Resolution phase: apply TTL filtering + max_entries limit.
-                    // This matches C++ resolveBackgroundEvictionScan which:
+                    // This matches stellar-core resolveBackgroundEvictionScan which:
                     // 1. Filters out entries whose TTL was modified by TXs
                     // 2. Evicts up to maxEntriesToArchive entries
                     // 3. Sets iterator based on whether the limit was hit
@@ -2546,7 +2546,7 @@ impl<'a> LedgerCloseContext<'a> {
             }
 
             // Update state size window (Protocol 20+)
-            // IMPORTANT: Per C++ stellar-core, we snapshot the state size BEFORE flushing
+            // IMPORTANT: Per stellar-core, we snapshot the state size BEFORE flushing
             // the updated entries into in-memory state. So the snapshot taken at ledger N
             // will have the state size for ledger N-1. This is a protocol implementation detail.
             if protocol_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION {
@@ -2590,7 +2590,7 @@ impl<'a> LedgerCloseContext<'a> {
 
                     if is_sample_ledger {
                         // Use in-memory Soroban state total_size() - this is the state BEFORE
-                        // this ledger's changes are applied (matching C++ behavior)
+                        // this ledger's changes are applied (matching stellar-core behavior)
                         let soroban_state_size = self.manager.soroban_state.read().total_size();
 
                         if let Some(window_entry) =
@@ -2863,7 +2863,7 @@ impl<'a> LedgerCloseContext<'a> {
         self.upgrade_ctx.apply_to_header(&mut new_header);
 
         // Log config upgrade effects (upgrades were already applied to the delta
-        // before bucket list add_batch, matching C++ ordering)
+        // before bucket list add_batch, matching stellar-core ordering)
         if config_state_archival_changed {
             tracing::info!(
                 ledger_seq = self.close_data.ledger_seq,

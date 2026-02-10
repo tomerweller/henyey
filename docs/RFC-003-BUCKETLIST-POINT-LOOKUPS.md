@@ -583,8 +583,8 @@ persist_index = true
 
 ## References
 
-- stellar-core Implementation: `.upstream-v25/src/bucket/LiveBucketIndex.h/cpp`
-- stellar-core DiskIndex: `.upstream-v25/src/bucket/DiskIndex.h/cpp`
+- stellar-core Implementation: `.upstream-v25/src/bucket/LiveBucketIndex.h`
+- stellar-core DiskIndex: `.upstream-v25/src/bucket/DiskIndex.h`
 - stellar-core InMemoryIndex: `.upstream-v25/src/bucket/InMemoryIndex.h`
 - RFC-001: Streaming Iterator (completed)
 - RFC-002: SQL-Backed Offers (in progress)

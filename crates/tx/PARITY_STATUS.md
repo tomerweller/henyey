@@ -2,7 +2,7 @@
 
 **Overall Parity: 100%** (14,651 transactions in testnet range 30000-36000)
 
-This document provides a detailed comparison between the Rust `henyey-tx` crate and the stellar-core stellar-core v25 implementation in `.upstream-v25/src/transactions/`.
+This document provides a detailed comparison between the Rust `henyey-tx` crate and the stellar-core v25 implementation in `.upstream-v25/src/transactions/`.
 
 ## Summary
 
@@ -24,7 +24,7 @@ This document provides a detailed comparison between the Rust `henyey-tx` crate 
 
 ### TransactionFrame (`frame.rs`)
 
-Corresponds to: `TransactionFrame.h/cpp`, `TransactionFrameBase.h/cpp`
+Corresponds to: `TransactionFrame.h`, `TransactionFrameBase.h`
 
 | stellar-core Function | Rust Implementation | Status |
 |-------------|---------------------|--------|
@@ -70,7 +70,7 @@ Corresponds to: `TransactionFrame::checkValid*()`, `TransactionFrame::commonVali
 
 ### SignatureChecker (`signature_checker.rs`)
 
-Corresponds to: `SignatureChecker.h/cpp`
+Corresponds to: `SignatureChecker.h`
 
 | stellar-core Function | Rust Implementation | Status |
 |-------------|---------------------|--------|
@@ -87,7 +87,7 @@ Corresponds to: `SignatureChecker.h/cpp`
 
 ### MutableTransactionResult (`result.rs`)
 
-Corresponds to: `MutableTransactionResult.h/cpp`
+Corresponds to: `MutableTransactionResult.h`
 
 | stellar-core Class/Function | Rust Implementation | Status |
 |-------------------|---------------------|--------|
@@ -107,7 +107,7 @@ Corresponds to: `MutableTransactionResult.h/cpp`
 
 ### FeeBumpTransactionFrame (`fee_bump.rs`)
 
-Corresponds to: `FeeBumpTransactionFrame.h/cpp`
+Corresponds to: `FeeBumpTransactionFrame.h`
 
 | stellar-core Function | Rust Implementation | Status |
 |-------------|---------------------|--------|
@@ -141,7 +141,7 @@ Corresponds to: `TransactionFrame::processFeeSeqNum()`, `processPostApply()`, et
 
 ### TransactionMetaBuilder (`meta_builder.rs`)
 
-Corresponds to: `TransactionMeta.h/cpp`
+Corresponds to: `TransactionMeta.h`
 
 | stellar-core Class/Function | Rust Implementation | Status |
 |-------------------|---------------------|--------|
@@ -157,7 +157,7 @@ Corresponds to: `TransactionMeta.h/cpp`
 
 ### Event Emission (`events.rs`, `lumen_reconciler.rs`)
 
-Corresponds to: `EventManager.h/cpp`, `LumenEventReconciler.h/cpp`
+Corresponds to: `EventManager.h`, `LumenEventReconciler.h`
 
 | stellar-core Class/Function | Rust Implementation | Status |
 |-------------------|---------------------|--------|
@@ -258,7 +258,7 @@ This matches stellar-core's `MultiOrderBook` functionality in `OrderBook.h/.cpp`
 
 ### Per-Operation Savepoint Rollback (`state.rs`)
 
-Corresponds to: `LedgerTxn.h/cpp` (nested commit/rollback)
+Corresponds to: `LedgerTxn.h` (nested commit/rollback)
 
 | stellar-core Concept | Rust Implementation | Status |
 |------------|---------------------|--------|
@@ -339,7 +339,7 @@ The Rust crate supports both live execution and catchup/replay modes as first-cl
 | #[test] functions | - | 309 | - |
 | Integration tests (real transactions) | ~200 | 14,651+ | Rust via testnet verification |
 
-### stellar-core Test Files (upstream)
+### stellar-core Test Files (
 
 | Test File | TEST_CASE | SECTION | Key Areas Covered |
 |-----------|-----------|---------|-------------------|
@@ -463,7 +463,7 @@ The Rust implementation includes tests without stellar-core equivalents:
 ## Verification Approach
 
 Parity is verified through:
-1. Comparison against upstream test vectors
+1. Comparison against stellar-core test vectors
 2. Review of stellar-core implementation behavior
 3. Integration testing with mainnet/testnet archive data
 4. Protocol-specific behavior testing (P10, P23, etc.)

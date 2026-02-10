@@ -223,7 +223,7 @@ When a flood message (transaction, SCP message) is received:
 
 The FloodGate enforces a soft rate limit on incoming messages (default 1000/sec). Messages beyond the limit are dropped to prevent resource exhaustion.
 
-## Upstream Mapping
+## stellar-core Mapping
 
 This crate corresponds to the following stellar-core components:
 

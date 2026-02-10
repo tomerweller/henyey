@@ -1,8 +1,8 @@
 //! Flow control constants and helpers for transaction size limits.
 //!
 //! This module provides constants and helper functions for flow control
-//! in the overlay network, matching the C++ implementation in
-//! `Herder.h/cpp` and `Peer.h`.
+//! in the overlay network, matching the stellar-core implementation in
+//! `Herder.h` and `Peer.h`.
 //!
 //! # Overview
 //!
@@ -18,7 +18,7 @@
 /// Maximum size in bytes for a classic (non-Soroban) transaction.
 ///
 /// This is a static limit that doesn't change with protocol upgrades.
-/// It matches `MAX_CLASSIC_TX_SIZE_BYTES` in C++ (`Peer.h`).
+/// It matches `MAX_CLASSIC_TX_SIZE_BYTES` in stellar-core (`Peer.h`).
 pub const MAX_CLASSIC_TX_SIZE_BYTES: u32 = 100 * 1024; // 100 KB
 
 /// Extra buffer added to Soroban transaction size limits.
@@ -27,7 +27,7 @@ pub const MAX_CLASSIC_TX_SIZE_BYTES: u32 = 100 * 1024; // 100 KB
 /// this buffer is added on top of the `txMaxSizeBytes` from the network
 /// config to account for envelope overhead.
 ///
-/// Matches `FLOW_CONTROL_BYTES_EXTRA_BUFFER` in C++ (`Herder.cpp`).
+/// Matches `FLOW_CONTROL_BYTES_EXTRA_BUFFER` in stellar-core (`Herder.cpp`).
 pub const FLOW_CONTROL_BYTES_EXTRA_BUFFER: u32 = 2000;
 
 /// Compute the maximum transaction size.

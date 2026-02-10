@@ -20,7 +20,7 @@
 //! # Design Goals
 //!
 //! This crate is designed to produce deterministic, bit-compatible results with
-//! the C++ stellar-core implementation. Key material is handled via explicit types
+//! the stellar-core implementation. Key material is handled via explicit types
 //! that provide safety guarantees:
 //!
 //! - [`SecretKey`] is zeroized on drop

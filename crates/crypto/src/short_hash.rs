@@ -215,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn test_seed_matches_upstream_key_derivation() {
+    fn test_seed_matches_stellar_core_key_derivation() {
         let _guard = test_guard();
         reset_state();
         let seed_value = 0x12345678;

@@ -94,7 +94,7 @@ pub fn checkpoint_start(seq: u32) -> u32 {
     (seq / CHECKPOINT_FREQUENCY) * CHECKPOINT_FREQUENCY
 }
 
-/// Alias for checkpoint_start to match C++ HistoryManager naming.
+/// Alias for checkpoint_start to match stellar-core HistoryManager naming.
 ///
 /// Returns the first ledger in the checkpoint containing `seq`.
 pub use checkpoint_start as first_ledger_in_checkpoint_containing;
@@ -210,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_containing_matches_upstream() {
+    fn test_checkpoint_containing_matches_stellar_core() {
         for seq in 0..=63 {
             assert_eq!(checkpoint_containing(seq), 63);
         }

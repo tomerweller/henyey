@@ -1,7 +1,7 @@
 //! Hex encoding and decoding utilities.
 //!
 //! This module provides hex encoding and decoding functions compatible with
-//! the C++ stellar-core `Hex.h/.cpp` implementation.
+//! the stellar-core `Hex.h/.cpp` implementation.
 //!
 //! # Functions
 //!
@@ -34,7 +34,7 @@ use crate::CryptoError;
 
 /// Hex-encode bytes as a lowercase hex string.
 ///
-/// This is equivalent to C++ `binToHex()`.
+/// This is equivalent to stellar-core `binToHex()`.
 ///
 /// # Arguments
 ///
@@ -59,7 +59,7 @@ pub fn bin_to_hex(data: &[u8]) -> String {
 
 /// Get a 6-character hex prefix of the data.
 ///
-/// This is equivalent to C++ `hexAbbrev()` and is used for logging
+/// This is equivalent to stellar-core `hexAbbrev()` and is used for logging
 /// to show a short identifier without the full hex string.
 ///
 /// # Arguments
@@ -90,7 +90,7 @@ pub fn hex_abbrev(data: &[u8]) -> String {
 
 /// Decode a hex string to bytes.
 ///
-/// This is equivalent to C++ `hexToBin()`.
+/// This is equivalent to stellar-core `hexToBin()`.
 ///
 /// # Arguments
 ///
@@ -115,7 +115,7 @@ pub fn hex_to_bin(hex_str: &str) -> Result<Vec<u8>, CryptoError> {
 
 /// Decode a hex string to exactly 32 bytes.
 ///
-/// This is equivalent to C++ `hexToBin256()`.
+/// This is equivalent to stellar-core `hexToBin256()`.
 ///
 /// # Arguments
 ///

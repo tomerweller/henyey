@@ -116,7 +116,7 @@ const PEER_TYPE_INBOUND: i32 = 0;
 const PEER_MAX_FAILURES_TO_SEND: u32 = 10;
 const TX_SET_REQUEST_WINDOW: u64 = 12;
 const MAX_TX_SET_REQUESTS_PER_TICK: usize = 32;
-/// Consensus stuck timeout matching C++ stellar-core's CONSENSUS_STUCK_TIMEOUT_SECONDS.
+/// Consensus stuck timeout matching stellar-core's CONSENSUS_STUCK_TIMEOUT_SECONDS.
 /// If no ledger closes within this time while we have buffered ledgers waiting,
 /// we trigger out-of-sync recovery.
 const CONSENSUS_STUCK_TIMEOUT_SECS: u64 = 35;
@@ -126,7 +126,7 @@ const CONSENSUS_STUCK_TIMEOUT_SECS: u64 = 35;
 const TX_SET_UNAVAILABLE_TIMEOUT_SECS: u64 = 5;
 
 /// Recovery timer for out-of-sync recovery attempts.
-/// Matches C++ stellar-core's OUT_OF_SYNC_RECOVERY_TIMER.
+/// Matches stellar-core's OUT_OF_SYNC_RECOVERY_TIMER.
 const OUT_OF_SYNC_RECOVERY_TIMER_SECS: u64 = 10;
 
 /// How long to cache the archive checkpoint before re-querying.
@@ -472,7 +472,7 @@ struct TxSetRequestState {
 }
 
 /// State for tracking consensus stuck condition.
-/// Matches C++ stellar-core's out-of-sync recovery behavior.
+/// Matches stellar-core's out-of-sync recovery behavior.
 #[derive(Debug, Clone)]
 struct ConsensusStuckState {
     /// Current ledger when stuck was detected.
@@ -955,7 +955,7 @@ impl App {
 
         // NOTE: Skip list entries store bucket_list_hash values (not header
         // hashes), so they cannot be verified by comparing against stored
-        // header hashes.  C++ stellar-core does not perform skip list
+        // header hashes.  stellar-core does not perform skip list
         // verification on startup either.
 
         Ok(())
@@ -1263,7 +1263,7 @@ impl App {
 
     /// Clear metrics registry.
     ///
-    /// In C++ stellar-core, this resets the medida metrics counters.
+    /// In stellar-core, this resets the medida metrics counters.
     /// In our Prometheus-style implementation, metrics are typically scraped externally
     /// and don't have explicit clear semantics. This method logs the request for
     /// operational visibility.
@@ -1279,7 +1279,7 @@ impl App {
         }
         // Note: Prometheus-style metrics don't have a clear operation.
         // The metrics are scraped externally and typically reset on node restart.
-        // We log the request for operational visibility and parity with C++.
+        // We log the request for operational visibility and parity with stellar-core.
     }
 
     /// Perform manual database maintenance.
@@ -1574,7 +1574,7 @@ impl App {
 
     /// Attempt to restore node state from persisted DB and on-disk bucket files.
     ///
-    /// This is the Rust equivalent of C++ stellar-core's `loadLastKnownLedger`.
+    /// This is the Rust equivalent of stellar-core's `loadLastKnownLedger`.
     /// On success, the ledger manager is initialized with the bucket list
     /// reconstructed from disk, avoiding a full catchup from history archives.
     ///
@@ -1745,7 +1745,7 @@ impl App {
         bucket_list.set_ledger_seq(lcl_seq);
 
         // Restart pending merges from HAS state.
-        // This matches C++ loadLastKnownLedgerInternal() which calls
+        // This matches stellar-core loadLastKnownLedgerInternal() which calls
         // AssumeStateWork -> assumeState() -> restartMerges().
         {
             let protocol_version = header.ledger_version;
@@ -1839,7 +1839,7 @@ impl App {
     /// `restart_merges_from_has` to deterministically reconstitute any pending
     /// merges from saved input/output hashes.
     ///
-    /// This matches C++ stellar-core's approach for Case 1 catchup: the
+    /// This matches stellar-core's approach for Case 1 catchup: the
     /// persisted HAS is the source of truth, not the live bucket list objects.
     async fn rebuild_bucket_lists_from_has(&self) -> anyhow::Result<ExistingBucketState> {
         // Read persisted HAS from DB
@@ -2419,7 +2419,7 @@ impl App {
         // read stale HAS from before the first catchup, producing wrong bucket list
         // hashes on replay.
         //
-        // This matches C++ stellar-core's CatchupWork.cpp which calls
+        // This matches stellar-core's CatchupWork.cpp which calls
         // setLastClosedLedger() (persisting both LCL and HAS) after bucket apply.
         {
             let has = build_history_archive_state(
@@ -2521,7 +2521,7 @@ impl App {
 
         // Trim buffered ledgers that are now stale (at or before the new LCL).
         // Keep ledgers AFTER the catchup target - they will be applied next.
-        // This matches C++ stellar-core's behavior in LedgerApplyManagerImpl::trimSyncingLedgers.
+        // This matches stellar-core's behavior in LedgerApplyManagerImpl::trimSyncingLedgers.
         {
             let mut buffer = self.syncing_ledgers.write().await;
             let old_count = buffer.len();
@@ -2595,7 +2595,7 @@ impl App {
         }
 
         // Drain all sequential buffered ledgers before returning.
-        // This matches C++ stellar-core's behavior: CatchupWork creates
+        // This matches stellar-core's behavior: CatchupWork creates
         // ApplyBufferedLedgersWork which applies all sequential buffered
         // ledgers before CatchupWork returns WORK_SUCCESS.
         // Without this, we'd transition to Synced with a gap (the next
@@ -2851,7 +2851,7 @@ impl App {
     ) -> anyhow::Result<CheckpointData> {
         let state = Arc::new(tokio::sync::Mutex::new(HistoryWorkState::default()));
         let mut scheduler = WorkScheduler::new(WorkSchedulerConfig {
-            max_concurrency: 16, // Match C++ MAX_CONCURRENT_SUBPROCESSES
+            max_concurrency: 16, // Match stellar-core MAX_CONCURRENT_SUBPROCESSES
             retry_delay: Duration::from_millis(200),
             event_tx: None,
         });
@@ -3267,7 +3267,7 @@ impl App {
                     }
 
                     // Out-of-sync recovery: purge old slots when we're too far behind.
-                    // This mirrors C++ stellar-core's outOfSyncRecovery() behavior.
+                    // This mirrors stellar-core's outOfSyncRecovery() behavior.
                     // When we have v-blocking slots that are >100 ahead of older slots,
                     // purge the old slots to free memory and allow recovery.
                     if !self.herder.state().can_receive_scp() || !heard_from_quorum {
@@ -3843,7 +3843,7 @@ impl App {
                     if self.herder.needs_tx_set(&hash) {
                         if all_peers_dont_have {
                             // All peers don't have this tx_set - log but DON'T trigger catchup.
-                            // Like C++ stellar-core, we rely on slot eviction to eventually
+                            // Like stellar-core, we rely on slot eviction to eventually
                             // clean up old slots when we're >100 slots behind the highest
                             // v-blocking slot. Triggering catchup on DontHave creates loops
                             // because catchup targets checkpoints, leaving gaps that also
@@ -4176,7 +4176,7 @@ impl App {
 
     /// Drain all sequential buffered ledgers synchronously.
     ///
-    /// Called at the end of catchup to match C++ stellar-core's
+    /// Called at the end of catchup to match stellar-core's
     /// `ApplyBufferedLedgersWork`: CatchupWork does not return success
     /// until all sequential buffered ledgers have been applied.
     ///
@@ -4600,7 +4600,7 @@ impl App {
 
         // Calculate gap and determine catchup strategy.
         //
-        // Upstream (C++) only triggers immediate catchup when the first buffered
+        // stellar-core only triggers immediate catchup when the first buffered
         // ledger sits at a checkpoint boundary AND there is at least one more
         // buffered ledger after it. The gap *size* alone is not a trigger — a
         // gap slightly larger than CHECKPOINT_FREQUENCY is expected right after
@@ -4608,7 +4608,7 @@ impl App {
         // Triggering on gap size alone caused unnecessary second catchup cycles
         // (see: "Buffered gap exceeds checkpoint; starting catchup" log spam).
         // First buffered is checkpoint boundary AND we have multiple buffered ledgers.
-        // This matches upstream: catchup to first_buffered - 1.
+        // This matches stellar-core: catchup to first_buffered - 1.
         let can_trigger_immediate =
             Self::is_first_ledger_in_checkpoint(first_buffered) && first_buffered < last_buffered;
 
@@ -4651,7 +4651,7 @@ impl App {
                             let recovery_failed = state.recovery_attempts >= 2;
 
                             // Cooldown: don't trigger catchup if we recently completed
-                            // catchup. C++ stellar-core does NOT have a stuck timeout
+                            // catchup. stellar-core does NOT have a stuck timeout
                             // that triggers catchup — it only triggers catchup when
                             // checkpoint boundary conditions are met (handled above by
                             // can_trigger_immediate). When recently caught up, only do
@@ -5242,7 +5242,7 @@ impl App {
             return;
         }
 
-        // Request SCP state from a low watermark similar to upstream behavior.
+        // Request SCP state from a low watermark similar to stellar-core behavior.
         let ledger_seq = self.herder.get_min_ledger_seq_to_ask_peers();
         match overlay.request_scp_state(ledger_seq).await {
             Ok(count) => {
@@ -5262,7 +5262,7 @@ impl App {
         }
     }
 
-    /// Perform out-of-sync recovery matching C++ stellar-core's outOfSyncRecovery().
+    /// Perform out-of-sync recovery matching stellar-core's outOfSyncRecovery().
     ///
     /// This broadcasts recent SCP messages to peers and requests SCP state,
     /// giving the network a chance to provide the missing data before we
@@ -8350,7 +8350,7 @@ mod tests {
 
     #[test]
     fn test_consensus_stuck_timeout_constants() {
-        // Verify constants match C++ stellar-core values
+        // Verify constants match stellar-core values
         assert_eq!(CONSENSUS_STUCK_TIMEOUT_SECS, 35);
         assert_eq!(OUT_OF_SYNC_RECOVERY_TIMER_SECS, 10);
     }

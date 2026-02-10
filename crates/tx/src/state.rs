@@ -23,7 +23,7 @@ type EntryLoaderFn = dyn Fn(&LedgerKey) -> Result<Option<LedgerEntry>>;
 type BatchEntryLoaderFn = dyn Fn(&[LedgerKey]) -> Result<Vec<LedgerEntry>>;
 /// Callback type for loading all offers by (account, asset) from the
 /// authoritative offer store.  Used by `remove_offers_by_account_and_asset`
-/// to mirror C++ `loadOffersByAccountAndAsset` which queries the SQL database.
+/// to mirror stellar-core `loadOffersByAccountAndAsset` which queries the SQL database.
 type OffersByAccountAssetLoaderFn =
     dyn Fn(&AccountId, &Asset) -> Result<Vec<LedgerEntry>> + Send + Sync;
 
@@ -195,7 +195,7 @@ impl AssetKey {
 // ==================== Offer Index ====================
 //
 // The OfferIndex provides O(log n) lookups for best offers by asset pair,
-// similar to C++ stellar-core's MultiOrderBook. This is critical for
+// similar to stellar-core's MultiOrderBook. This is critical for
 // performance when executing path payments and manage offer operations.
 
 use std::collections::BTreeMap;
@@ -223,8 +223,8 @@ impl OfferDescriptor {
 /// Comparator for offers: lower price is better, then lower offer ID.
 impl Ord for OfferDescriptor {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Use floating-point comparison to match C++ stellar-core behavior.
-        // The C++ code uses `double(price.n) / double(price.d)` for ordering.
+        // Use floating-point comparison to match stellar-core behavior.
+        // The stellar-core code uses `double(price.n) / double(price.d)` for ordering.
         let self_price = self.price.n as f64 / self.price.d as f64;
         let other_price = other.price.n as f64 / other.price.d as f64;
 
@@ -290,7 +290,7 @@ type OrderBook = BTreeMap<OfferDescriptor, OfferKey>;
 
 /// Index of all offers organized by asset pair for efficient best-offer queries.
 ///
-/// This mirrors C++ stellar-core's MultiOrderBook structure. Each asset pair
+/// This mirrors stellar-core's MultiOrderBook structure. Each asset pair
 /// has its own order book (BTreeMap) where offers are sorted by price and offer ID.
 ///
 /// # Performance
@@ -466,7 +466,7 @@ pub struct LedgerStateManager {
     ttl_entries: HashMap<[u8; 32], TtlEntry>,
     /// TTL values at ledger start (for Soroban execution).
     /// This is captured at the start of each ledger and remains read-only during execution.
-    /// Soroban uses these values instead of ttl_entries to match C++ behavior where
+    /// Soroban uses these values instead of ttl_entries to match stellar-core behavior where
     /// transactions see the bucket list state at ledger start, not changes from previous txs.
     ttl_bucket_list_snapshot: HashMap<[u8; 32], u32>,
     /// Claimable balance entries by balance ID.
@@ -506,7 +506,7 @@ pub struct LedgerStateManager {
     /// Track which TTL entries have been modified.
     modified_ttl: Vec<[u8; 32]>,
     /// Deferred read-only TTL bumps. These are TTL updates for read-only entries
-    /// where only the TTL changed. Per C++ stellar-core behavior:
+    /// where only the TTL changed. Per stellar-core behavior:
     /// - They should NOT appear in transaction meta
     /// - They should be flushed to the delta at end of ledger (for bucket list)
     ///   Key is TTL key hash, value is the new live_until_ledger_seq.
@@ -559,7 +559,7 @@ pub struct LedgerStateManager {
     created_liquidity_pools: HashSet<[u8; 32]>,
     /// Track contract data entries deleted in this ledger.
     /// Used to prevent reloading deleted entries from bucket list during footprint loading.
-    /// In C++ stellar-core, deleted entries are tracked in mThreadEntryMap as nullopt,
+    /// In stellar-core, deleted entries are tracked in mThreadEntryMap as nullopt,
     /// which prevents subsequent transactions from seeing them.
     deleted_contract_data: HashSet<ContractDataKey>,
     /// Track contract code entries deleted in this ledger.
@@ -573,7 +573,7 @@ pub struct LedgerStateManager {
     /// transactions so they're not lost when the current transaction fails.
     delta_snapshot: Option<LedgerDelta>,
     /// Index of offers by asset pair for efficient best-offer lookups.
-    /// This mirrors C++ stellar-core's MultiOrderBook structure.
+    /// This mirrors stellar-core's MultiOrderBook structure.
     offer_index: OfferIndex,
     /// Secondary index: (account_bytes, asset) → set of offer_ids.
     /// Each offer is indexed under both (seller, selling_asset) and (seller, buying_asset).
@@ -588,7 +588,7 @@ pub struct LedgerStateManager {
     /// account + trustline lookups for offer sellers.
     batch_entry_loader: Option<Arc<BatchEntryLoaderFn>>,
     /// Optional callback to load all offers for a given (account, asset) pair
-    /// from the authoritative offer store.  C++ stellar-core uses SQL
+    /// from the authoritative offer store.  stellar-core uses SQL
     /// `loadOffersByAccountAndAsset` which always returns every matching offer.
     /// Without this loader the in-memory `account_asset_offers` index would
     /// only contain offers that happened to be loaded during prior TX execution,
@@ -920,7 +920,7 @@ impl LedgerStateManager {
 
     /// Set the loader that returns all offers for a given (account, asset) pair.
     ///
-    /// This mirrors C++ `loadOffersByAccountAndAsset` and is used by
+    /// This mirrors stellar-core `loadOffersByAccountAndAsset` and is used by
     /// `remove_offers_by_account_and_asset` (called during authorization
     /// revocation) to ensure ALL matching offers are found, not just those
     /// that happened to be loaded during prior TX execution.
@@ -1426,14 +1426,14 @@ impl LedgerStateManager {
     ///
     /// # Note
     ///
-    /// This is a no-op for protocol version 7 (matches C++ behavior).
+    /// This is a no-op for protocol version 7 (matches stellar-core behavior).
     pub fn remove_one_time_signers_from_all_sources(
         &mut self,
         tx_hash: &henyey_common::Hash256,
         source_accounts: &[AccountId],
         protocol_version: u32,
     ) {
-        // Protocol 7 bypass (matches C++ behavior)
+        // Protocol 7 bypass (matches stellar-core behavior)
         if protocol_version == 7 {
             return;
         }
@@ -1743,7 +1743,7 @@ impl LedgerStateManager {
     }
 
     /// Load a single entry into state WITHOUT setting up change tracking.
-    /// This matches C++ stellar-core's `loadWithoutRecord()` behavior.
+    /// This matches stellar-core's `loadWithoutRecord()` behavior.
     /// Use this for entries that only need existence checks, not modification tracking.
     ///
     /// IMPORTANT: Entries loaded this way will NOT appear in transaction meta changes
@@ -1844,7 +1844,7 @@ impl LedgerStateManager {
     /// Record that an account was accessed during operation execution.
     ///
     /// This captures an op snapshot for the account so it appears in the delta
-    /// even if only read (not modified). This matches C++ stellar-core behavior
+    /// even if only read (not modified). This matches stellar-core behavior
     /// where `load()` records entries vs `loadWithoutRecord()` which doesn't.
     ///
     /// Use this when an operation loads an account that must appear in the
@@ -2617,7 +2617,7 @@ impl LedgerStateManager {
     /// Returns the list of OfferEntry that were removed (before deletion) so callers can
     /// handle liability release, subentry updates, and sponsorship adjustments.
     ///
-    /// Mirrors C++ `removeOffersByAccountAndAsset` which calls
+    /// Mirrors stellar-core `removeOffersByAccountAndAsset` which calls
     /// `loadOffersByAccountAndAsset` to query the SQL database for ALL
     /// matching offers.  We first load all matching offers from the
     /// authoritative offer store so the in-memory index is complete.
@@ -3169,7 +3169,7 @@ impl LedgerStateManager {
     ///
     /// This returns the TTL value from the bucket list snapshot captured at the
     /// start of the ledger, before any transactions modified it. This is used
-    /// by Soroban execution to match C++ stellar-core behavior where transactions
+    /// by Soroban execution to match stellar-core behavior where transactions
     /// see the bucket list state at ledger start, not changes from previous txs.
     pub fn get_ttl_at_ledger_start(&self, key_hash: &Hash) -> Option<u32> {
         self.ttl_bucket_list_snapshot.get(&key_hash.0).copied()
@@ -3180,7 +3180,7 @@ impl LedgerStateManager {
     /// This should be called once at the start of each ledger, after loading
     /// state from the bucket list but before executing any transactions.
     /// The captured values will be used by Soroban for TTL lookups to ensure
-    /// consistent behavior with C++ stellar-core.
+    /// consistent behavior with stellar-core.
     pub fn capture_ttl_bucket_list_snapshot(&mut self) {
         self.ttl_bucket_list_snapshot.clear();
         for (key_hash, ttl) in &self.ttl_entries {
@@ -3267,7 +3267,7 @@ impl LedgerStateManager {
     /// This is critical for correct bucket list behavior: when multiple transactions
     /// in the same ledger access the same entry, later transactions may call update_ttl
     /// with a value that earlier transactions already set. Recording a no-op update
-    /// would cause bucket list divergence from C++ stellar-core.
+    /// would cause bucket list divergence from stellar-core.
     pub fn update_ttl(&mut self, entry: TtlEntry) {
         let key = entry.key_hash.0;
         let ledger_key = LedgerKey::Ttl(LedgerKeyTtl {
@@ -3336,7 +3336,7 @@ impl LedgerStateManager {
     /// Update an existing TTL entry without recording in the delta.
     ///
     /// This is used for TTL-only auto-bump changes where the data entry wasn't modified
-    /// but the TTL was extended. C++ stellar-core does NOT include these TTL updates
+    /// but the TTL was extended. stellar-core does NOT include these TTL updates
     /// in the transaction meta, so we must update state without creating delta entries.
     ///
     /// The state update is still needed for correct bucket list computation.
@@ -3378,7 +3378,7 @@ impl LedgerStateManager {
     /// Record a read-only TTL bump in the delta for transaction meta, then defer
     /// the actual state update.
     ///
-    /// Per C++ stellar-core behavior:
+    /// Per stellar-core behavior:
     /// - Transaction meta includes all TTL changes (including RO bumps)
     /// - RO TTL bumps are deferred for state visibility (subsequent TXs don't see them)
     /// - At end of ledger, deferred bumps are flushed to state for bucket list
@@ -3461,7 +3461,7 @@ impl LedgerStateManager {
     ///
     /// Read-only TTL bumps (TTL changes for entries in the read-only footprint where
     /// only the TTL changed) must NOT appear in transaction meta, but MUST be written
-    /// to the bucket list. This matches C++ stellar-core's behavior where RO TTL bumps
+    /// to the bucket list. This matches stellar-core's behavior where RO TTL bumps
     /// are accumulated in `mRoTTLBumps` and flushed at write barriers.
     ///
     /// Call `flush_deferred_ro_ttl_bumps()` at the end of ledger processing to add
@@ -3983,7 +3983,7 @@ impl LedgerStateManager {
     /// Check if an entry was deleted during this ledger (for Soroban entries).
     ///
     /// This is used to prevent reloading deleted entries from the bucket list.
-    /// In C++ stellar-core, deleted entries are tracked in mThreadEntryMap as nullopt,
+    /// In stellar-core, deleted entries are tracked in mThreadEntryMap as nullopt,
     /// which prevents subsequent transactions from seeing them. This method provides
     /// equivalent functionality.
     pub fn is_entry_deleted(&self, key: &LedgerKey) -> bool {
@@ -4137,7 +4137,7 @@ impl LedgerStateManager {
 
     /// Apply a fee refund to the most recent account update in the delta.
     ///
-    /// In C++ stellar-core, fee refunds are NOT separate meta changes - they're
+    /// In stellar-core, fee refunds are NOT separate meta changes - they're
     /// incorporated into the final account balance of the existing update.
     /// This method finds the most recent update to the account and adds the refund.
     pub fn apply_refund_to_delta(&mut self, account_id: &AccountId, refund: i64) {
@@ -4157,7 +4157,7 @@ impl LedgerStateManager {
     /// Used for two purposes:
     /// 1. **Per-operation rollback**: Each operation in a multi-op transaction gets
     ///    a savepoint. If the operation fails, `rollback_to_savepoint()` undoes all
-    ///    state changes so subsequent operations see clean state (matching C++ nested
+    ///    state changes so subsequent operations see clean state (matching stellar-core nested
     ///    `LedgerTxn` behavior).
     /// 2. **Path payment speculation**: `convert_with_offers_and_pools` runs the
     ///    orderbook path speculatively, rolling back if the pool provides a better rate.
@@ -4971,7 +4971,7 @@ impl LedgerStateManager {
                         account_id: entry.account_id.clone(),
                     });
                     // Record update if:
-                    // 1. Entry was accessed during operation (in op_entry_snapshots) - C++ records all loadAccount calls
+                    // 1. Entry was accessed during operation (in op_entry_snapshots) - stellar-core records all loadAccount calls
                     // 2. Entry actually changed - always record real value changes
                     // 3. multi_op_mode is enabled - record every access for multi-op transactions
                     let accessed_in_op = self.op_snapshots_active
@@ -5019,7 +5019,7 @@ impl LedgerStateManager {
                 if let Some(entry) = self.accounts.get(&key).cloned() {
                     // For single-operation transactions, only record if entry actually changed.
                     // For multi-operation transactions, record for every access (even if no change)
-                    // because C++ stellar-core records per-operation entries for multi-op txs.
+                    // because stellar-core records per-operation entries for multi-op txs.
                     let should_record = self.multi_op_mode || &entry != snapshot_entry;
                     if should_record {
                         let pre_state = self.account_to_ledger_entry(snapshot_entry);
@@ -5056,10 +5056,10 @@ impl LedgerStateManager {
                         account_id: entry.account_id.clone(),
                     });
                     // Record update if:
-                    // 1. Entry was accessed during operation (in op_entry_snapshots) - C++ records all loadAccount calls
+                    // 1. Entry was accessed during operation (in op_entry_snapshots) - stellar-core records all loadAccount calls
                     // 2. Entry actually changed - always record real value changes
                     // Note: We use accessed_in_op for both single-op and multi-op transactions because
-                    // C++ stellar-core records per-operation changes only for entries actually accessed.
+                    // stellar-core records per-operation changes only for entries actually accessed.
                     let accessed_in_op = self.op_snapshots_active
                         && self.op_entry_snapshots.contains_key(&ledger_key);
                     let should_record = accessed_in_op || &entry != snapshot_entry;
@@ -5091,7 +5091,7 @@ impl LedgerStateManager {
                         asset: entry.asset.clone(),
                     });
                     // Record update if:
-                    // 1. Entry was accessed during operation (in op_entry_snapshots) - C++ records all load calls
+                    // 1. Entry was accessed during operation (in op_entry_snapshots) - stellar-core records all load calls
                     // 2. Entry actually changed - always record real value changes
                     let accessed_in_op = self.op_snapshots_active
                         && self.op_entry_snapshots.contains_key(&ledger_key);
@@ -5123,7 +5123,7 @@ impl LedgerStateManager {
                         offer_id: entry.offer_id,
                     });
                     // Record update if:
-                    // 1. Entry was accessed during operation (in op_entry_snapshots) - C++ records all load calls
+                    // 1. Entry was accessed during operation (in op_entry_snapshots) - stellar-core records all load calls
                     //    This is important for sponsorship-only changes where the entry data doesn't change
                     //    but the ext (sponsor) changes.
                     // 2. Entry actually changed - always record real value changes
@@ -5157,7 +5157,7 @@ impl LedgerStateManager {
                         data_name: entry.data_name.clone(),
                     });
                     // Record update if:
-                    // 1. Entry was accessed during operation (in op_entry_snapshots) - C++ records all load calls
+                    // 1. Entry was accessed during operation (in op_entry_snapshots) - stellar-core records all load calls
                     // 2. Entry actually changed - always record real value changes
                     let accessed_in_op = self.op_snapshots_active
                         && self.op_entry_snapshots.contains_key(&ledger_key);
@@ -5289,7 +5289,7 @@ impl LedgerStateManager {
                         balance_id: entry.balance_id.clone(),
                     });
                     // Record update if:
-                    // 1. Entry was accessed during operation (in op_entry_snapshots) - C++ records all load calls
+                    // 1. Entry was accessed during operation (in op_entry_snapshots) - stellar-core records all load calls
                     //    This is important for sponsorship-only changes where the entry data doesn't change
                     //    but the ext (sponsor) changes.
                     // 2. Entry actually changed - always record real value changes
@@ -5321,7 +5321,7 @@ impl LedgerStateManager {
                         liquidity_pool_id: entry.liquidity_pool_id.clone(),
                     });
                     // Record update if:
-                    // 1. Entry was accessed during operation (in op_entry_snapshots) - C++ records all load calls
+                    // 1. Entry was accessed during operation (in op_entry_snapshots) - stellar-core records all load calls
                     //    This is important for sponsorship-only changes where the entry data doesn't change
                     //    but the ext (sponsor) changes.
                     // 2. Entry actually changed - always record real value changes
@@ -5514,8 +5514,8 @@ fn compare_offer(lhs: &OfferEntry, rhs: &OfferEntry) -> std::cmp::Ordering {
 
 #[allow(dead_code)]
 fn compare_price(lhs: &Price, rhs: &Price) -> std::cmp::Ordering {
-    // Use floating-point comparison to match C++ stellar-core behavior.
-    // The C++ code stores `price = double(price.n) / double(price.d)` in the database
+    // Use floating-point comparison to match stellar-core behavior.
+    // The stellar-core code stores `price = double(price.n) / double(price.d)` in the database
     // and uses `ORDER BY price` for offer ordering. The isBetterOffer function also
     // uses double comparison to match this SQL ordering.
     let lhs_price = lhs.n as f64 / lhs.d as f64;
@@ -6917,7 +6917,7 @@ mod tests {
     /// Regression test: remove_offers_by_account_and_asset must use the
     /// authoritative loader to discover offers not yet in the in-memory index.
     ///
-    /// Mirrors C++ `loadOffersByAccountAndAsset` which queries the SQL database
+    /// Mirrors stellar-core `loadOffersByAccountAndAsset` which queries the SQL database
     /// for ALL matching offers regardless of whether they were previously accessed.
     /// Without the loader, offers that exist in the bucket list but were never
     /// loaded into the state manager would be silently skipped, causing

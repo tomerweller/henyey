@@ -236,7 +236,7 @@ This implementation intentionally limits scope:
 | **SQLite-only** | Simplicity over PostgreSQL support |
 | **No metrics** | Prometheus integration out of scope |
 | **No admin API** | HTTP admin interface not implemented |
-| **Deterministic** | Observable behavior must match upstream |
+| **Deterministic** | Observable behavior must match stellar-core |
 
 ## Development
 

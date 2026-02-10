@@ -186,7 +186,7 @@ type Blake2b256 = Blake2b<blake2::digest::consts::U32>;
 /// Computes the BLAKE2b-256 hash of the given data.
 ///
 /// This uses BLAKE2b with a 32-byte (256-bit) output, matching the
-/// C++ stellar-core implementation.
+/// stellar-core implementation.
 ///
 /// # Example
 ///

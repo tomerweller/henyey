@@ -123,7 +123,7 @@ impl henyey_tx::soroban::HotArchiveLookup for HotArchiveLookupImpl {
 /// Soroban network configuration information for the /sorobaninfo endpoint.
 ///
 /// This struct contains all the Soroban-related configuration settings from
-/// the ledger, matching the format returned by C++ stellar-core's `/sorobaninfo`
+/// the ledger, matching the format returned by stellar-core's `/sorobaninfo`
 /// HTTP endpoint in "basic" format.
 #[derive(Debug, Clone, Default)]
 pub struct SorobanNetworkInfo {
@@ -217,7 +217,7 @@ fn load_config_setting(
 /// - For protocol >= 23: uses `fee_write1_kb` from ContractLedgerCostExtV0
 /// - For protocol < 23: uses the computed `fee_per_rent_1kb` (state-size based)
 ///
-/// This matches C++ stellar-core's `rustBridgeFeeConfiguration()` behavior.
+/// This matches stellar-core's `rustBridgeFeeConfiguration()` behavior.
 pub fn load_soroban_config(snapshot: &SnapshotHandle, protocol_version: u32) -> SorobanConfig {
     // Load CPU cost params
     let cpu_cost_params =
@@ -423,7 +423,7 @@ pub fn load_soroban_config(snapshot: &SnapshotHandle, protocol_version: u32) -> 
         "load_soroban_config: computed fee_per_rent_1kb"
     );
 
-    // Protocol version-dependent fee selection matching C++ rustBridgeFeeConfiguration():
+    // Protocol version-dependent fee selection matching stellar-core rustBridgeFeeConfiguration():
     // - For protocol >= 23: use fee_write_1kb (flat rate from ContractLedgerCostExtV0)
     // - For protocol < 23: use fee_per_rent_1kb (computed from state size)
     let fee_per_write_1kb_for_config =
@@ -444,7 +444,7 @@ pub fn load_soroban_config(snapshot: &SnapshotHandle, protocol_version: u32) -> 
         fee_per_transaction_size_1kb: fee_tx_size_1kb,
     };
 
-    // RentFeeConfiguration.fee_per_write_1kb must be feeFlatRateWrite1KB() to match C++
+    // RentFeeConfiguration.fee_per_write_1kb must be feeFlatRateWrite1KB() to match stellar-core
     // rustBridgeRentFeeConfiguration(). This is 0 for protocol < 23 (the setting doesn't exist),
     // which is correct because the TTL entry write fee component was introduced in protocol 23.
     // This is DIFFERENT from FeeConfiguration.fee_per_write_1kb which uses fee_per_rent_1kb
@@ -495,7 +495,7 @@ pub fn load_soroban_config(snapshot: &SnapshotHandle, protocol_version: u32) -> 
 /// Load SorobanNetworkInfo from the ledger's ConfigSettingEntry entries.
 ///
 /// This loads all the configuration settings needed for the /sorobaninfo endpoint,
-/// matching the "basic" format from C++ stellar-core.
+/// matching the "basic" format from stellar-core.
 pub fn load_soroban_network_info(snapshot: &SnapshotHandle) -> Option<SorobanNetworkInfo> {
     // Check if we have any Soroban config (indicates protocol 20+)
     let compute_v0 = load_config_setting(snapshot, ConfigSettingId::ContractComputeV0)?;
@@ -657,7 +657,7 @@ impl RefundableFeeTracker {
         self.consumed_rent_fee = self.consumed_rent_fee.saturating_add(rent_fee);
 
         // First check: rent fee alone must not exceed max refundable fee.
-        // This matches C++ stellar-core's consumeRefundableSorobanResources which checks
+        // This matches stellar-core's consumeRefundableSorobanResources which checks
         // if (mMaximumRefundableFee < mConsumedRentFee) before computing events fee.
         if self.consumed_rent_fee > self.max_refundable_fee {
             tracing::debug!(
@@ -705,9 +705,9 @@ impl RefundableFeeTracker {
 
     /// Reset all consumed fee values to zero.
     ///
-    /// This mirrors C++ stellar-core's `RefundableFeeTracker::resetConsumedFee()` which is called
+    /// This mirrors stellar-core's `RefundableFeeTracker::resetConsumedFee()` which is called
     /// by `MutableTransactionResultBase::setError()` when a transaction fails. When a transaction
-    /// fails for any reason (including InsufficientRefundableFee), C++ resets the consumed fee
+    /// fails for any reason (including InsufficientRefundableFee), stellar-core resets the consumed fee
     /// tracker so that the full `max_refundable_fee` is refunded to the user.
     fn reset(&mut self) {
         self.consumed_event_size_bytes = 0;
@@ -1074,7 +1074,7 @@ impl TransactionExecutor {
     }
 
     /// Load an account from the snapshot into state WITHOUT recording it for transaction changes.
-    /// This matches C++ stellar-core's `loadAccountWithoutRecord()` behavior, used when an account
+    /// This matches stellar-core's `loadAccountWithoutRecord()` behavior, used when an account
     /// only needs to be checked for existence (e.g., issuer validation in ChangeTrust).
     /// The account is loaded into state so operations can check existence, but it won't appear
     /// in the transaction meta STATE/UPDATED changes.
@@ -1202,7 +1202,7 @@ impl TransactionExecutor {
         }
 
         // If the entry was loaded during this TX and then deleted (e.g., claimed by
-        // a prior operation), don't reload from the snapshot. This matches C++ behavior
+        // a prior operation), don't reload from the snapshot. This matches stellar-core behavior
         // where nested LedgerTxn inherits deletions from the parent.
         if self.state.is_claimable_balance_tracked(balance_id) {
             return Ok(false);
@@ -1605,7 +1605,7 @@ impl TransactionExecutor {
         {
             // Skip entries already in state (e.g., created by previous TX in this ledger)
             // Also skip entries that were deleted by a previous TX in this ledger - they
-            // should NOT be reloaded from the bucket list. In C++ stellar-core, deleted
+            // should NOT be reloaded from the bucket list. In stellar-core, deleted
             // entries are tracked in mThreadEntryMap as nullopt, providing the same behavior.
             if self.state.get_entry(key).is_none() && !self.state.is_entry_deleted(key) {
                 all_keys.push(key.clone());
@@ -1683,7 +1683,7 @@ impl TransactionExecutor {
     /// This is similar to `apply_ledger_entry_changes` but preserves the current
     /// sequence number for existing accounts. This is needed because CDP metadata
     /// for operation changes can capture sequence numbers that include effects from
-    /// later transactions in the same ledger (due to how C++ stellar-core captures STATE values).
+    /// later transactions in the same ledger (due to how stellar-core captures STATE values).
     ///
     /// For Account UPDATED entries:
     /// - If the account exists in our state, preserve our sequence number
@@ -1773,7 +1773,7 @@ impl TransactionExecutor {
     ///
     /// This method is used for batched fee processing where all fees are
     /// processed before any transaction is applied. This matches the behavior
-    /// of C++ stellar-core.
+    /// of stellar-core.
     ///
     /// Returns the fee changes and the fee amount charged.
     pub fn process_fee_only(
@@ -1898,7 +1898,7 @@ impl TransactionExecutor {
     /// For fee bump transactions in two-phase mode, `fee_source_pre_state` can be provided
     /// to use as the STATE entry in tx_changes_before. This is needed because the current
     /// state may already be post-fee-processing (synced with CDP's fee_meta), but we need
-    /// to emit the pre-fee state for the STATE entry to match C++ stellar-core behavior.
+    /// to emit the pre-fee state for the STATE entry to match stellar-core behavior.
     pub fn execute_transaction_with_fee_mode(
         &mut self,
         snapshot: &SnapshotHandle,
@@ -1924,7 +1924,7 @@ impl TransactionExecutor {
     ///
     /// For fee bump transactions in two-phase mode, `fee_source_pre_state` should be provided
     /// with the fee source account state BEFORE fee processing. This is used for the STATE entry
-    /// in tx_changes_before to match C++ stellar-core behavior.
+    /// in tx_changes_before to match stellar-core behavior.
     pub fn execute_transaction_with_fee_mode_and_pre_state(
         &mut self,
         snapshot: &SnapshotHandle,
@@ -2200,7 +2200,7 @@ impl TransactionExecutor {
             }
 
             if cond.min_seq_age.0 > 0 {
-                // C++ logic: minSeqAge > closeTime || closeTime - minSeqAge < accSeqTime
+                // stellar-core logic: minSeqAge > closeTime || closeTime - minSeqAge < accSeqTime
                 let acc_seq_time = get_account_seq_time(&source_account);
                 let min_seq_age = cond.min_seq_age.0;
 
@@ -2222,7 +2222,7 @@ impl TransactionExecutor {
             }
 
             if cond.min_seq_ledger_gap > 0 {
-                // C++ logic: minSeqLedgerGap > ledgerSeq || ledgerSeq - minSeqLedgerGap < accSeqLedger
+                // stellar-core logic: minSeqLedgerGap > ledgerSeq || ledgerSeq - minSeqLedgerGap < accSeqLedger
                 let acc_seq_ledger = get_account_seq_ledger(&source_account);
                 let min_seq_ledger_gap = cond.min_seq_ledger_gap;
 
@@ -2247,7 +2247,7 @@ impl TransactionExecutor {
         }
 
         // Validate sequence number
-        // C++ stellar-core logic from TransactionFrame::isBadSeq:
+        // stellar-core logic from TransactionFrame::isBadSeq:
         // 1. Always reject if tx.seqNum == starting sequence for this ledger
         // 2. If minSeqNum is set (protocol >= 19), use relaxed check:
         //    bad if account.seqNum < minSeqNum OR account.seqNum >= tx.seqNum
@@ -2396,7 +2396,7 @@ impl TransactionExecutor {
 
         // Transaction envelope uses LOW threshold for signature check.
         // Each operation will additionally check its own threshold (low/medium/high).
-        // This matches C++ stellar-core's checkAllTransactionSignatures behavior.
+        // This matches stellar-core's checkAllTransactionSignatures behavior.
         let required_weight = threshold_low(&source_account);
         if !frame.is_fee_bump()
             && !has_sufficient_signer_weight(
@@ -2563,18 +2563,18 @@ impl TransactionExecutor {
         let mut signer_updated = Vec::new();
         let mut signer_deleted = Vec::new();
 
-        // For fee bump transactions in two-phase mode, C++ stellar-core's
+        // For fee bump transactions in two-phase mode, stellar-core's
         // FeeBumpTransactionFrame::apply() ALWAYS calls removeOneTimeSignerKeyFromFeeSource()
         // which loads the fee source account, generating a STATE/UPDATED pair even if
         // the fee source equals the inner source. This happens BEFORE the inner transaction's
-        // sequence bump. We capture this to match C++ stellar-core ordering.
+        // sequence bump. We capture this to match stellar-core ordering.
         let fee_bump_wrapper_changes = if !deduct_fee && frame.is_fee_bump() {
             let fee_source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
                 account_id: fee_source_id.clone(),
             });
             if let Some(fee_source_entry) = self.state.get_entry(&fee_source_key) {
                 // Both STATE and UPDATED use the same (current) state value.
-                // In C++ stellar-core, the fee bump wrapper's tx_changes_before captures
+                // In stellar-core, the fee bump wrapper's tx_changes_before captures
                 // the fee source state AFTER fee processing (which happened in fee_meta).
                 // This is just for removeOneTimeSignerKeyFromFeeSource() which doesn't
                 // change the balance - hence STATE and UPDATED have the same value.
@@ -2677,7 +2677,7 @@ impl TransactionExecutor {
 
         // Merge all changes into tx_changes_before.
         // Order: fee_bump_wrapper_changes (fee source), seq_changes (inner source seq bump).
-        // This matches C++ stellar-core where FeeBumpFrame captures fee source state,
+        // This matches stellar-core where FeeBumpFrame captures fee source state,
         // then inner tx does seq bump.
         let mut combined = Vec::with_capacity(
             fee_bump_wrapper_changes.len() + signer_changes.len() + seq_changes.len(),
@@ -2775,7 +2775,7 @@ impl TransactionExecutor {
             }));
 
         // Set up authoritative offers-by-(account, asset) loader.
-        // C++ stellar-core uses SQL `loadOffersByAccountAndAsset` which always
+        // stellar-core uses SQL `loadOffersByAccountAndAsset` which always
         // returns every matching offer.  Without this loader, the in-memory
         // index only contains offers that happened to be loaded during prior TX
         // execution, causing non-deterministic offer removal in SetTrustLineFlags.
@@ -2798,7 +2798,7 @@ impl TransactionExecutor {
         let mut soroban_return_value = None;
         let mut all_success = true;
         let mut failure = None;
-        // For multi-operation transactions, C++ stellar-core records STATE/UPDATED
+        // For multi-operation transactions, stellar-core records STATE/UPDATED
         // for every accessed entry per operation, even if values are identical.
         // For single-operation transactions, it only records if values changed.
         self.state.set_multi_op_mode(num_ops > 1);
@@ -2865,7 +2865,7 @@ impl TransactionExecutor {
 
                 // Execute the operation with a per-operation savepoint.
                 // If the operation fails, we roll back its state changes so
-                // subsequent operations see clean state (matching C++ LedgerTxn).
+                // subsequent operations see clean state (matching stellar-core LedgerTxn).
                 let op_index = u32::try_from(op_index).unwrap_or(u32::MAX);
                 let op_savepoint = self.state.create_savepoint();
                 let result = self.execute_single_operation(
@@ -2926,7 +2926,7 @@ impl TransactionExecutor {
                                 failure = Some(ExecutionFailure::NotSupported);
                             }
                             // Roll back failed operation's state changes so subsequent
-                            // operations see clean state (matches C++ nested LedgerTxn).
+                            // operations see clean state (matches stellar-core nested LedgerTxn).
                             self.state.rollback_to_savepoint(op_savepoint);
                         }
                         operation_results.push(op_result.clone());
@@ -3137,7 +3137,7 @@ impl TransactionExecutor {
                             ledger_seq = self.ledger_seq,
                             "Operation execution returned Err (mapped to txInternalError)"
                         );
-                        // C++ maps std::runtime_error during operation execution
+                        // stellar-core maps std::runtime_error during operation execution
                         // to txINTERNAL_ERROR (not txNOT_SUPPORTED). The exception
                         // aborts all remaining operations.
                         failure = Some(ExecutionFailure::InternalError);
@@ -3195,7 +3195,7 @@ impl TransactionExecutor {
             soroban_return_value = None;
 
             // Reset the refundable fee tracker when transaction fails.
-            // This mirrors C++ stellar-core's behavior where setError() calls resetConsumedFee(),
+            // This mirrors stellar-core's behavior where setError() calls resetConsumedFee(),
             // ensuring the full max_refundable_fee is refunded on any transaction failure.
             if let Some(tracker) = refundable_fee_tracker.as_mut() {
                 tracing::debug!(
@@ -3546,7 +3546,7 @@ impl TransactionExecutor {
                     }
                 }
                 // Load issuer account for non-pool-share assets WITHOUT recording.
-                // C++ stellar-core uses loadAccountWithoutRecord() for ChangeTrust issuer check
+                // stellar-core uses loadAccountWithoutRecord() for ChangeTrust issuer check
                 // which doesn't record the access in transaction changes.
                 // We still need to load the account into state so the existence check works.
                 match &op_data.line {
@@ -3630,7 +3630,7 @@ impl TransactionExecutor {
             OperationBody::SetOptions(op_data) => {
                 // If SetOptions sets an inflation_dest that differs from the source,
                 // we need to load that account to validate it exists.
-                // This matches C++ stellar-core's loadAccountWithoutRecord() call.
+                // This matches stellar-core's loadAccountWithoutRecord() call.
                 if let Some(ref inflation_dest) = op_data.inflation_dest {
                     if inflation_dest != &op_source {
                         self.load_account(snapshot, inflation_dest)?;
@@ -3975,7 +3975,7 @@ fn extract_hot_archive_restored_keys(
 
     // Get the corresponding keys from the read_write footprint
     // NOTE: Only add the main entry keys (ContractData/ContractCode), NOT the TTL keys.
-    // C++ stellar-core's HotArchiveBucketList::add_batch only receives the main entry keys,
+    // stellar-core's HotArchiveBucketList::add_batch only receives the main entry keys,
     // not TTL keys. TTL entries are handled separately in the live bucket list.
     let read_write = &data.resources.footprint.read_write;
     for index in actual_restored_indices {
@@ -4300,9 +4300,9 @@ fn build_entry_changes_with_state_overrides(
 /// - Emit RESTORED for associated data/code entries even if not directly modified
 ///
 /// When `footprint` is provided (for Soroban operations), entries are ordered according to
-/// the footprint's read_write order to match C++ stellar-core behavior.
+/// the footprint's read_write order to match stellar-core behavior.
 /// For classic operations, entries are ordered according to the execution order tracked
-/// in `change_order` to match C++ stellar-core behavior, emitting STATE/UPDATED pairs
+/// in `change_order` to match stellar-core behavior, emitting STATE/UPDATED pairs
 /// for EACH modification (not deduplicated).
 #[allow(clippy::too_many_arguments)]
 fn build_entry_changes_with_hot_archive(
@@ -4428,7 +4428,7 @@ fn build_entry_changes_with_hot_archive(
         if let Ok(key) = crate::delta::entry_to_key(entry) {
             // For hot archive restores and live bucket list restores (expired TTL),
             // emit RESTORED instead of CREATED.
-            // This matches C++ stellar-core's processOpLedgerEntryChanges behavior.
+            // This matches stellar-core's processOpLedgerEntryChanges behavior.
             if restored.hot_archive.contains(&key) || restored.live_bucket_list.contains(&key) {
                 changes.push(LedgerEntryChange::Restored(entry.clone()));
                 return;
@@ -4450,7 +4450,7 @@ fn build_entry_changes_with_hot_archive(
     // For classic operations, use change_order to preserve execution order.
     // Key insight: change_order captures the execution sequence. For Soroban, we must preserve
     // the positions of classic entry changes (Account, Trustline) while sorting Soroban creates
-    // (TTL, ContractData, ContractCode) by their associated key_hash to match C++ behavior.
+    // (TTL, ContractData, ContractCode) by their associated key_hash to match stellar-core behavior.
     if footprint.is_some() {
         use std::collections::HashSet;
 
@@ -4528,7 +4528,7 @@ fn build_entry_changes_with_hot_archive(
         for group in groups {
             match group {
                 ChangeGroup::SorobanCreates { indices } => {
-                    // C++ groups TTL entries with their associated ContractData/ContractCode.
+                    // stellar-core groups TTL entries with their associated ContractData/ContractCode.
                     // Sort by (associated_key_hash, type_order) where TTL comes before its data.
                     use sha2::{Digest, Sha256};
 
@@ -4589,7 +4589,7 @@ fn build_entry_changes_with_hot_archive(
                             );
                         }
                         if let Ok(key) = crate::delta::entry_to_key(post_state) {
-                            // NOTE: RO TTL bumps ARE included in transaction meta (per C++
+                            // NOTE: RO TTL bumps ARE included in transaction meta (per stellar-core
                             // setLedgerChangesFromSuccessfulOp which uses raw res.getModifiedEntryMap()).
                             // The filtering to mRoTTLBumps only affects STATE updates (commitChangesFromSuccessfulOp),
                             // not transaction meta. Do NOT skip ro_ttl_keys here.
@@ -4822,7 +4822,7 @@ fn build_entry_changes_with_hot_archive(
     }
 
     // For live BL restores, add RESTORED changes for data/code entries that weren't
-    // directly modified (only their TTL was extended). Per C++ TransactionMeta.cpp:
+    // directly modified (only their TTL was extended). Per stellar-core TransactionMeta.cpp:
     // "RestoreOp will create both the TTL and Code/Data entry in the hot archive case.
     // However, when restoring from live BucketList, only the TTL value will be modified,
     // so we have to manually insert the RESTORED meta for the Code/Data entry here."
@@ -4852,7 +4852,7 @@ fn build_entry_changes_with_hot_archive(
     // that weren't directly modified (the entry is prefetched from hot archive, only TTL is created).
     // This is similar to live BL restores above.
     // When emitting RESTORED, we must update last_modified_ledger_seq to the current ledger,
-    // matching C++ stellar-core behavior.
+    // matching stellar-core behavior.
     for (key, entry) in &restored.hot_archive_entries {
         // Skip if this key was already processed (appears in updated or created)
         let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
@@ -5065,11 +5065,11 @@ pub fn build_tx_result_pair(
             )
         };
 
-        // Calculate inner fee_charged using C++ formula:
+        // Calculate inner fee_charged using stellar-core formula:
         // Protocol >= 25: 0 (outer pays everything)
         // Protocol < 25 and protocol >= 11:
         //   - For Soroban: resourceFee + min(inclusionFee, baseFee * numOps) - refund
-        //     (C++ had a bug where refund was applied to inner fee; this was fixed in p25)
+        //     (stellar-core had a bug where refund was applied to inner fee; this was fixed in p25)
         //   - For classic: min(inner_fee, baseFee * numOps)
         let inner_fee_charged = if protocol_version >= 25 {
             0
@@ -5082,7 +5082,7 @@ pub fn build_tx_result_pair(
                 let inner_fee = frame.inner_fee() as i64;
                 let inclusion_fee = inner_fee - resource_fee;
                 let computed_fee = resource_fee + std::cmp::min(inclusion_fee, adjusted_fee);
-                // Prior to protocol 25, C++ incorrectly applied the refund to the inner
+                // Prior to protocol 25, stellar-core incorrectly applied the refund to the inner
                 // feeCharged field for fee bump transactions. We replicate this behavior
                 // for compatibility.
                 computed_fee.saturating_sub(exec.fee_refund)
@@ -5417,7 +5417,7 @@ fn has_signed_payload_signature(
     };
 
     // The hint for signed payloads is XOR of pubkey hint and payload hint.
-    // See SignatureUtils::getSignedPayloadHint in C++ stellar-core.
+    // See SignatureUtils::getSignedPayloadHint in stellar-core.
     let pubkey_hint = [
         signed_payload.ed25519.0[28],
         signed_payload.ed25519.0[29],
@@ -5433,7 +5433,7 @@ fn has_signed_payload_signature(
             signed_payload.payload[len - 1],
         ]
     } else {
-        // For shorter payloads, C++ getHint copies from the beginning
+        // For shorter payloads, stellar-core getHint copies from the beginning
         let mut hint = [0u8; 4];
         for (i, &byte) in signed_payload.payload.iter().enumerate() {
             if i < 4 {
@@ -5455,7 +5455,7 @@ fn has_signed_payload_signature(
             return false;
         }
 
-        // C++ stellar-core verifies the signature against the raw payload bytes,
+        // stellar-core verifies the signature against the raw payload bytes,
         // not a hash. This is per CAP-0040 - the signed payload signer
         // requires a valid signature of the payload from the ed25519 public key.
         let ed_sig = match henyey_crypto::Signature::try_from(&sig.signature) {
@@ -5466,12 +5466,12 @@ fn has_signed_payload_signature(
     })
 }
 
-/// Compute subSha256(baseSeed, index) as used by C++ stellar-core for PRNG seeds.
+/// Compute subSha256(baseSeed, index) as used by stellar-core for PRNG seeds.
 ///
 /// This computes SHA256(baseSeed || xdr::xdr_to_opaque(index)) where index is a u64.
 /// XDR encodes uint64 as 8 bytes in big-endian (network byte order).
 ///
-/// Note: C++ uses `static_cast<uint64_t>(index)` before passing to `xdr::xdr_to_opaque`,
+/// Note: stellar-core uses `static_cast<uint64_t>(index)` before passing to `xdr::xdr_to_opaque`,
 /// so even though the index is originally an int, it's serialized as 8 bytes.
 fn sub_sha256(base_seed: &[u8; 32], index: u32) -> [u8; 32] {
     use sha2::{Digest, Sha256};
@@ -5657,7 +5657,7 @@ pub fn execute_transaction_set_with_fee_mode(
     }
 
     // Protocol 23+: Apply Soroban fee refunds after ALL transactions
-    // This matches C++ stellar-core's processPostTxSetApply() phase
+    // This matches stellar-core's processPostTxSetApply() phase
     if deduct_fee {
         let mut total_refunds = 0i64;
         for (idx, (tx, _)) in transactions.iter().enumerate() {
@@ -5759,7 +5759,7 @@ fn fee_source_account_id(env: &TransactionEnvelope) -> AccountId {
 
 /// Pre-charged fee information for a single Soroban transaction.
 ///
-/// Computed during the pre-deduction pass (matching C++ `processFeesSeqNums`)
+/// Computed during the pre-deduction pass (matching stellar-core `processFeesSeqNums`)
 /// and consumed during cluster execution to provide fee metadata without
 /// re-deducting fees.
 struct PreChargedFee {
@@ -5773,7 +5773,7 @@ struct PreChargedFee {
 
 /// Pre-deduct fees for all Soroban transactions across all stages/clusters.
 ///
-/// This matches C++ `processFeesSeqNums` which deducts ALL transaction fees
+/// This matches stellar-core `processFeesSeqNums` which deducts ALL transaction fees
 /// (classic + Soroban) sequentially before any transaction is applied.
 /// For the parallel phase, classic fees are already deducted by `execute_transaction_set`.
 /// This function deducts Soroban fees from the main delta so cluster executors
@@ -5867,12 +5867,12 @@ pub fn execute_soroban_parallel_phase(
     let mut all_hot_archive_restored_keys: Vec<LedgerKey> = Vec::new();
     let mut id_pool = snapshot.header().id_pool;
     // Global TX offset tracks the canonical position for PRNG seed computation.
-    // In C++, the index counter is shared across all phases (classic + Soroban),
+    // In stellar-core, the index counter is shared across all phases (classic + Soroban),
     // so Soroban TXs start at classic_tx_count.
     let mut global_tx_offset: usize = classic_tx_count;
 
     // Pre-deduct all Soroban TX fees from the main delta BEFORE any cluster execution.
-    // This matches C++ processFeesSeqNums which deducts ALL fees upfront.
+    // This matches stellar-core processFeesSeqNums which deducts ALL fees upfront.
     let (pre_charged_fees, total_pre_deducted) =
         pre_deduct_soroban_fees(snapshot, phase, base_fee, network_id, ledger_seq, delta)?;
     if total_pre_deducted != 0 {
@@ -5888,7 +5888,7 @@ pub fn execute_soroban_parallel_phase(
         }
 
         // Collect current entries from the delta so clusters in this stage can
-        // see changes from prior stages AND classic TX changes.  In C++,
+        // see changes from prior stages AND classic TX changes.  In stellar-core,
         // GlobalParallelApplyLedgerState wraps the main LedgerTxn which already
         // has classic TX changes committed, so even stage 0 clusters see classic
         // modifications (e.g., fee deductions on shared accounts).  We always
@@ -5950,7 +5950,7 @@ pub fn execute_soroban_parallel_phase(
         );
     }
 
-    // Apply fee refunds after ALL transactions (matching C++ processPostTxSetApply).
+    // Apply fee refunds after ALL transactions (matching stellar-core processPostTxSetApply).
     // Account entries are already in the main delta from cluster merges, so we modify
     // them directly rather than using a separate executor.
     let flat_txs: Vec<&TransactionEnvelope> = phase
@@ -5961,7 +5961,7 @@ pub fn execute_soroban_parallel_phase(
         .map(|(tx, _)| tx)
         .collect();
 
-    // Apply Soroban fee refunds: C++ processPostTxSetApply() calls
+    // Apply Soroban fee refunds: stellar-core processPostTxSetApply() calls
     // processRefund() which applies refund to both the account balance
     // (via LedgerTxn) and the fee pool (feePool -= refund).
     let mut total_refunds = 0i64;
@@ -6031,7 +6031,7 @@ fn execute_single_cluster(
 
     // Pre-load entries from prior stages so this cluster's executor sees
     // restorations and modifications made by earlier stages.  This matches
-    // C++ `collectClusterFootprintEntriesFromGlobal`.
+    // stellar-core `collectClusterFootprintEntriesFromGlobal`.
     for entry in prior_stage_entries {
         executor.state.load_entry(entry.clone());
     }
@@ -6327,7 +6327,7 @@ const _: () = {
 
 /// Compute the state size window update entry for a ledger close.
 ///
-/// This implements the C++ `maybeSnapshotSorobanStateSize` logic, which updates the
+/// This implements the stellar-core `maybeSnapshotSorobanStateSize` logic, which updates the
 /// `LiveSorobanStateSizeWindow` config setting on each sample period.
 ///
 /// # Arguments
@@ -6450,7 +6450,7 @@ mod tests {
 
     /// Regression test: Verify classic transaction fee calculation uses min(inclusion_fee, required_fee)
     ///
-    /// This matches C++ stellar-core's TransactionFrame::getFee() behavior when applying=true:
+    /// This matches stellar-core's TransactionFrame::getFee() behavior when applying=true:
     /// - For classic transactions: min(inclusionFee, adjustedFee)
     ///   where adjustedFee = baseFee * numOperations
     ///
@@ -6474,7 +6474,7 @@ mod tests {
         let num_ops: i64 = 1;
         let required_fee = base_fee * std::cmp::max(1, num_ops);
 
-        // This is the correct formula (matches C++):
+        // This is the correct formula (matches stellar-core):
         let fee_charged = std::cmp::min(inclusion_fee, required_fee);
         assert_eq!(
             fee_charged, 100,
@@ -6522,7 +6522,7 @@ mod tests {
     /// max_refundable_fee should be refunded. This test verifies that reset() properly
     /// clears consumed values so refund_amount() returns the full max_refundable_fee.
     ///
-    /// This mirrors C++ stellar-core's behavior where setError() calls resetConsumedFee().
+    /// This mirrors stellar-core's behavior where setError() calls resetConsumedFee().
     ///
     /// Observed at ledger 224398 TX 7: fee refund was 0, expected 47153 stroops.
     #[test]

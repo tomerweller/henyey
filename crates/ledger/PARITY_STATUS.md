@@ -1,6 +1,6 @@
 ## stellar-core Parity Status
 
-This section documents the implementation status compared to stellar-core upstream in `.upstream-v25/src/ledger/`.
+This section documents the implementation status compared to stellar-core in `.upstream-v25/src/ledger/`.
 
 ### Implemented
 

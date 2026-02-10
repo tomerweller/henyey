@@ -1,6 +1,6 @@
 //! XDR output stream writer for size-prefixed binary frames.
 //!
-//! Implements the same wire format as C++ stellar-core's `XDROutputFileStream`,
+//! Implements the same wire format as stellar-core's `XDROutputFileStream`,
 //! enabling binary-compatible metadata streaming to downstream consumers
 //! (Horizon, ingestion pipelines).
 //!
@@ -22,7 +22,7 @@ use stellar_xdr::curr::WriteXdr;
 ///
 /// Each value is serialized to XDR, then written as a 4-byte big-endian
 /// size header (with bit 31 set) followed by the XDR payload bytes.
-/// This matches the wire format produced by C++ stellar-core's
+/// This matches the wire format produced by stellar-core's
 /// `XDROutputFileStream::writeOne`.
 pub struct XdrOutputStream {
     writer: BufWriter<Box<dyn Write + Send>>,
@@ -85,7 +85,7 @@ impl XdrOutputStream {
     /// # Panics
     ///
     /// Panics if the serialized XDR payload is >= 0x80000000 bytes (2 GiB),
-    /// matching C++ stellar-core's `releaseAssertOrThrow`.
+    /// matching stellar-core's `releaseAssertOrThrow`.
     pub fn write_one<T: WriteXdr>(&mut self, value: &T) -> io::Result<usize> {
         let payload = value
             .to_xdr(stellar_xdr::curr::Limits::none())

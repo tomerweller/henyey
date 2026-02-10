@@ -174,7 +174,7 @@ pub fn entry_size_for_rent_by_protocol(
 /// computing WASM module memory cost matches the network configuration.
 ///
 /// When `cost_params` is `None`, falls back to `Budget::default()` which uses
-/// hard-coded cost model parameters. For deterministic parity with C++
+/// hard-coded cost model parameters. For deterministic parity with stellar-core
 /// stellar-core, callers should pass the actual on-chain cost params whenever
 /// available.
 pub fn entry_size_for_rent_by_protocol_with_cost_params(
@@ -512,7 +512,7 @@ pub fn execute_operation_with_soroban(
         .unwrap_or_else(|| source_account_id.clone());
 
     // Check that the operation's source account exists.
-    // This matches C++ stellar-core's OperationFrame::checkSourceAccount().
+    // This matches stellar-core's OperationFrame::checkSourceAccount().
     // If the source account doesn't exist (e.g., it was merged by a prior operation),
     // return opNO_ACCOUNT.
     if state.get_account(&op_source).is_none() {
@@ -616,9 +616,9 @@ pub fn execute_operation_with_soroban(
             let default_config = SorobanConfig::default();
             let config = soroban_config.unwrap_or(&default_config);
             // For RestoreFootprint, we need to track which entries are ACTUALLY restored.
-            // C++ stellar-core only computes rent for entries that need restoration (not already live).
+            // stellar-core only computes rent for entries that need restoration (not already live).
             //
-            // Per C++ RestoreFootprintOpFrame::doApply():
+            // Per stellar-core RestoreFootprintOpFrame::doApply():
             // 1. If TTL exists and isLive (TTL >= current_ledger) -> skip (already live)
             // 2. If no TTL exists -> check hot archive
             //    - If hot archive entry found -> include (restore from hot archive)
@@ -667,7 +667,7 @@ pub fn execute_operation_with_soroban(
                         }
                     } else {
                         // Case 2: No TTL -> check hot archive
-                        // Per C++ createEntryRentChangeWithoutModification():
+                        // Per stellar-core createEntryRentChangeWithoutModification():
                         // When entryLiveUntilLedger is std::nullopt (no previous TTL):
                         //   - old_size_bytes = 0
                         //   - old_live_until_ledger = 0

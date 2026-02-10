@@ -1,6 +1,6 @@
 //! Integration tests for pool share trustline queries.
 //!
-//! These tests match the behavior of the upstream C++ BucketIndexTests.cpp
+//! These tests match the behavior of the BucketIndexTests.cpp
 //! loadPoolShareTrustLinesByAccountAndAsset tests to ensure parity with stellar-core.
 
 use std::collections::BTreeMap;

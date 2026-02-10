@@ -1039,7 +1039,7 @@ pub fn extract_evicted_keys(meta: &LedgerCloseMeta) -> Vec<stellar_xdr::curr::Le
 /// For the hot archive, these become "Live" markers indicating the entry was restored.
 ///
 /// **Important**: Only CONTRACT_DATA and CONTRACT_CODE keys are recorded in the hot archive
-/// bucket list. TTL keys are NOT included, matching C++ behavior from LedgerManagerImpl.cpp:
+/// bucket list. TTL keys are NOT included, matching stellar-core behavior from LedgerManagerImpl.cpp:
 /// ```cpp
 /// // TTL keys are not recorded in the hot archive BucketList
 /// if (key.type() == CONTRACT_DATA || key.type() == CONTRACT_CODE)
@@ -1062,7 +1062,7 @@ pub fn extract_restored_keys(
             if let Some(key) = henyey_bucket::ledger_entry_to_key(entry) {
                 // Only CONTRACT_DATA and CONTRACT_CODE keys go to hot archive.
                 // TTL keys are NOT recorded in the hot archive bucket list,
-                // matching C++ behavior in LedgerManagerImpl.cpp.
+                // matching stellar-core behavior in LedgerManagerImpl.cpp.
                 match &key {
                     LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
                         restored_keys.push(key);

@@ -340,7 +340,7 @@ impl BucketManager {
     /// The bucket must exist as a `.bucket.xdr` file in the bucket directory.
     ///
     /// For files larger than `DISK_BACKED_THRESHOLD`, creates a DiskBacked bucket
-    /// that only holds an index in memory (matching C++ behavior for hot archive).
+    /// that only holds an index in memory (matching stellar-core behavior for hot archive).
     ///
     /// Note: Hot archive buckets are not cached (they use a different entry type).
     pub fn load_hot_archive_bucket(
@@ -808,7 +808,7 @@ impl BucketManager {
     /// building a map of all live entries. Dead entries shadow older versions.
     /// The result is a complete view of ledger state at the bucket list snapshot.
     ///
-    /// This is the Rust equivalent of C++ `loadCompleteLedgerState`.
+    /// This is the Rust equivalent of stellar-core `loadCompleteLedgerState`.
     ///
     /// # Arguments
     ///
@@ -876,7 +876,7 @@ impl BucketManager {
     /// This creates a consolidated bucket containing all live entries from
     /// the bucket list. Useful for creating offline archives or testing.
     ///
-    /// This is the Rust equivalent of C++ `mergeBuckets` (the standalone function
+    /// This is the Rust equivalent of stellar-core `mergeBuckets` (the standalone function
     /// that merges an entire bucket list).
     ///
     /// # Arguments
@@ -942,7 +942,7 @@ impl BucketManager {
     /// This performs a full hash verification by reading and decompressing
     /// each bucket file. This is expensive and should be used sparingly.
     ///
-    /// This is a simplified version of C++ `scheduleVerifyReferencedBucketsWork`.
+    /// This is a simplified version of stellar-core `scheduleVerifyReferencedBucketsWork`.
     ///
     /// # Arguments
     ///
@@ -1674,7 +1674,7 @@ mod tests {
 
     // ============ P2-1: Bucket Manager Ownership / GC Lifecycle ============
     //
-    // Upstream: BucketManagerTests.cpp "bucketmanager ownership"
+    // stellar-core: BucketManagerTests.cpp "bucketmanager ownership"
     // Tests Arc reference counting and cleanup of bucket files.
 
     #[test]
@@ -1767,7 +1767,7 @@ mod tests {
 
     // ============ P2-2: Missing Bucket Startup Failure ============
     //
-    // Upstream: BucketManagerTests.cpp "bucketmanager missing buckets fail"
+    // stellar-core: BucketManagerTests.cpp "bucketmanager missing buckets fail"
     // Tests that verify_buckets_exist correctly detects missing bucket files.
 
     #[test]
@@ -1812,7 +1812,7 @@ mod tests {
 
     // ============ P2-3: Merge Reattach to Finished Merge ============
     //
-    // Upstream: BucketManagerTests.cpp "bucketmanager reattach to finished merge"
+    // stellar-core: BucketManagerTests.cpp "bucketmanager reattach to finished merge"
     // Tests FutureBucket snapshot serialization roundtrip.
 
     #[test]

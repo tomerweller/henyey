@@ -187,7 +187,7 @@ memory_for_caching_mb = 100
 page_size = 1024
 ```
 
-**Note on units:** The stellar-core upstream uses a byte-size cutoff (`BUCKETLIST_DB_INDEX_CUTOFF`
+**Note on units:** The stellar-core uses a byte-size cutoff (`BUCKETLIST_DB_INDEX_CUTOFF`
 defaults to 250 MB). The Rust implementation uses an entry-count threshold (10,000 entries).
 These are functionally equivalent but the Rust approach is simpler to reason about since
 entry sizes vary. If parity with stellar-core byte-based cutoff is desired, this can be revisited.

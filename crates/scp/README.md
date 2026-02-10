@@ -215,7 +215,7 @@ src/
   error.rs         - Error types
 ```
 
-## Upstream Reference
+## stellar-core Reference
 
 This implementation corresponds to the stellar-core SCP implementation in `src/scp/`.
 

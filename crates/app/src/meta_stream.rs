@@ -18,7 +18,7 @@
 //!
 //! # Wire Format
 //!
-//! Both streams use the same size-prefixed XDR framing as C++ stellar-core's
+//! Both streams use the same size-prefixed XDR framing as stellar-core's
 //! `XDROutputFileStream`, implemented by [`XdrOutputStream`].
 
 use std::io;

@@ -190,12 +190,12 @@ pub struct ScpDriver {
     local_quorum_set: RwLock<Option<ScpQuorumSet>>,
     /// Ledger manager for network configuration lookups.
     ledger_manager: RwLock<Option<Arc<LedgerManager>>>,
-    /// Whether we are in tracking state (matching C++ `mHerder.isTracking()`).
+    /// Whether we are in tracking state (matching stellar-core `mHerder.isTracking()`).
     is_tracking: RwLock<bool>,
-    /// Next consensus ledger index (matches C++ `mHerder.nextConsensusLedgerIndex()`).
+    /// Next consensus ledger index (matches stellar-core `mHerder.nextConsensusLedgerIndex()`).
     /// This is tracking_slot in Herder terms.
     tracking_consensus_index: RwLock<u64>,
-    /// Tracking consensus close time (matches C++ `mHerder.trackingConsensusCloseTime()`).
+    /// Tracking consensus close time (matches stellar-core `mHerder.trackingConsensusCloseTime()`).
     tracking_consensus_close_time: RwLock<u64>,
 }
 
@@ -258,7 +258,7 @@ impl ScpDriver {
     /// Update the tracking consensus state from the Herder.
     ///
     /// Called by the Herder whenever tracking state changes (bootstrap, advance_tracking_slot).
-    /// This provides the ScpDriver with the state needed for C++-parity close-time validation.
+    /// This provides the ScpDriver with the state needed for stellar-core-parity close-time validation.
     pub fn set_tracking_state(
         &self,
         is_tracking: bool,
@@ -525,7 +525,7 @@ impl ScpDriver {
 
     /// Validate close time against a last close time reference.
     ///
-    /// Matches C++ `HerderSCPDriver::checkCloseTime(slotIndex, lastCloseTime, sv)`.
+    /// Matches stellar-core `HerderSCPDriver::checkCloseTime(slotIndex, lastCloseTime, sv)`.
     /// Returns true if:
     /// 1. close_time > lastCloseTime (not too old)
     /// 2. close_time <= now + MAX_TIME_SLIP_SECONDS (not too far in future)
@@ -564,7 +564,7 @@ impl ScpDriver {
 
     /// Validate a value for a past or future slot (not LCL+1).
     ///
-    /// Matches C++ `HerderSCPDriver::validatePastOrFutureValue`.
+    /// Matches stellar-core `HerderSCPDriver::validatePastOrFutureValue`.
     ///
     /// # Arguments
     /// * `slot_index` - The slot being validated
@@ -664,7 +664,7 @@ impl ScpDriver {
     /// Validate an SCP value.
     ///
     /// The value is the XDR-encoded StellarValue.
-    /// Matches C++ `HerderSCPDriver::validateValue` which:
+    /// Matches stellar-core `HerderSCPDriver::validateValue` which:
     /// 1. Deserializes to StellarValue
     /// 2. Checks STELLAR_VALUE_SIGNED (required for ALL values)
     /// 3. Verifies the signature
@@ -680,7 +680,7 @@ impl ScpDriver {
             }
         };
 
-        // C++ parity: check STELLAR_VALUE_SIGNED (required for both nomination and ballot)
+        // Parity: check STELLAR_VALUE_SIGNED (required for both nomination and ballot)
         let sig = match &stellar_value.ext {
             StellarValueExt::Signed(sig) => sig,
             StellarValueExt::Basic => {
@@ -689,7 +689,7 @@ impl ScpDriver {
             }
         };
 
-        // C++ parity: verify the stellar value signature
+        // Parity: verify the stellar value signature
         // Signs: (networkID, ENVELOPE_TYPE_SCPVALUE, txSetHash, closeTime)
         if !self.verify_stellar_value_signature(
             &sig.node_id,
@@ -718,7 +718,7 @@ impl ScpDriver {
     /// Validate a StellarValue against local state.
     ///
     /// Checks close time and transaction set validity.
-    /// Matches C++ `HerderSCPDriver::validateValueAgainstLocalState`.
+    /// Matches stellar-core `HerderSCPDriver::validateValueAgainstLocalState`.
     ///
     /// For LCL+1 (current ledger): performs full validation (close time + tx set).
     /// For past/future slots: delegates to `validate_past_or_future_value`.
@@ -830,7 +830,7 @@ impl ScpDriver {
 
     /// Verify a StellarValue signature.
     ///
-    /// C++ signs: `(networkID, ENVELOPE_TYPE_SCPVALUE, txSetHash, closeTime)`.
+    /// stellar-core signs: `(networkID, ENVELOPE_TYPE_SCPVALUE, txSetHash, closeTime)`.
     fn verify_stellar_value_signature(
         &self,
         node_id: &NodeId,
@@ -873,7 +873,7 @@ impl ScpDriver {
 
     /// Extract a valid value from a potentially invalid composite.
     ///
-    /// C++ parity: `HerderSCPDriver::extractValidValue`:
+    /// Parity: `HerderSCPDriver::extractValidValue`:
     /// 1. Does NOT check STELLAR_VALUE_SIGNED or verify signature
     /// 2. Calls validateValueAgainstLocalState with nomination=true
     /// 3. Only returns a value when result is kFullyValidatedValue
@@ -890,14 +890,14 @@ impl ScpDriver {
                 Err(_) => return None,
             };
 
-        // C++ parity: only extract if fully validated against local state
+        // Parity: only extract if fully validated against local state
         // (does NOT check STELLAR_VALUE_SIGNED or signature)
         let result = self.validate_value_against_local_state(slot, &stellar_value);
         if result != ValueValidation::Valid {
             return None;
         }
 
-        // C++ parity: strip invalid upgrades, keeping valid ones in order
+        // Parity: strip invalid upgrades, keeping valid ones in order
         let mut valid_upgrades = Vec::new();
         let mut last_upgrade_type = None;
         for upgrade_bytes in stellar_value.upgrades.iter() {
@@ -911,7 +911,7 @@ impl ScpDriver {
                     .map(|prev| upgrade_type > prev)
                     .unwrap_or(true);
                 if in_order {
-                    // TODO: In C++, also checks mUpgrades.isValid(upgrade, nomination=true)
+                    // TODO: In stellar-core, also checks mUpgrades.isValid(upgrade, nomination=true)
                     // For now, keep all upgrades that parse and are in order
                     last_upgrade_type = Some(upgrade_type);
                     valid_upgrades.push(upgrade_bytes.clone());
@@ -947,7 +947,7 @@ impl ScpDriver {
 
     /// Combine multiple candidate values into one.
     ///
-    /// C++ parity: `HerderSCPDriver::combineCandidates`:
+    /// Parity: `HerderSCPDriver::combineCandidates`:
     /// 1. Collect upgrades from ALL candidates, merging by taking max of each type
     /// 2. Select the best tx set using compareTxSets (size comparison + tiebreak)
     /// 3. Compose result: best candidate's txSetHash/closeTime + merged upgrades
@@ -1005,7 +1005,7 @@ impl ScpDriver {
         }
 
         // Step 3: Select best candidate (by tx set hash tiebreak with candidates_hash)
-        // C++ uses compareTxSets which compares size, fees, etc.
+        // stellar-core uses compareTxSets which compares size, fees, etc.
         // We don't have full tx set metadata here, so we use the XOR tiebreak:
         // lessThanXored(lh, rh, candidatesHash) as the primary comparison
         let best_idx = decoded
@@ -1043,7 +1043,7 @@ impl ScpDriver {
     }
 
     /// Compare two upgrades of the same type, returning true if `new` > `existing`.
-    /// C++ takes the max of each upgrade type.
+    /// stellar-core takes the max of each upgrade type.
     fn compare_upgrades(new: &LedgerUpgrade, existing: &LedgerUpgrade) -> bool {
         match (new, existing) {
             (LedgerUpgrade::Version(a), LedgerUpgrade::Version(b)) => a > b,
@@ -1831,7 +1831,7 @@ impl SCPDriver for HerderScpCallback {
         self.driver.verify_envelope(envelope).is_ok()
     }
 
-    /// C++ parity: check if a value contains protocol upgrades.
+    /// Parity: check if a value contains protocol upgrades.
     fn has_upgrades(&self, value: &Value) -> bool {
         if let Ok(sv) = StellarValue::from_xdr(value, stellar_xdr::curr::Limits::none()) {
             !sv.upgrades.is_empty()
@@ -1840,7 +1840,7 @@ impl SCPDriver for HerderScpCallback {
         }
     }
 
-    /// C++ parity: strip all upgrades from a value.
+    /// Parity: strip all upgrades from a value.
     fn strip_all_upgrades(&self, value: &Value) -> Option<Value> {
         let mut sv = StellarValue::from_xdr(value, stellar_xdr::curr::Limits::none()).ok()?;
         sv.upgrades = Vec::new().try_into().ok()?;
@@ -1849,10 +1849,10 @@ impl SCPDriver for HerderScpCallback {
             .map(|bytes| Value(bytes.try_into().unwrap_or_default()))
     }
 
-    /// C++ parity: get the nomination timeout limit for upgrade stripping.
+    /// Parity: get the nomination timeout limit for upgrade stripping.
     fn get_upgrade_nomination_timeout_limit(&self) -> u32 {
-        // In C++, this comes from mUpgrades.getParameters().mNominationTimeoutLimit
-        // Default is u32::MAX (never strip), which matches C++ default
+        // In stellar-core, this comes from mUpgrades.getParameters().mNominationTimeoutLimit
+        // Default is u32::MAX (never strip), which matches stellar-core default
         u32::MAX
     }
 }
@@ -2133,7 +2133,7 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_basic_ext() {
-        // C++ parity: validateValue always requires STELLAR_VALUE_SIGNED
+        // Parity: validateValue always requires STELLAR_VALUE_SIGNED
         let driver = make_test_driver();
 
         let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
@@ -2162,7 +2162,7 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_bad_signature() {
-        // C++ parity: validateValue verifies the StellarValue signature
+        // Parity: validateValue verifies the StellarValue signature
         let (driver, secret_key) = make_test_driver_with_key();
 
         let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
@@ -2198,7 +2198,7 @@ mod tests {
 
     #[test]
     fn test_validate_accepts_signed_value() {
-        // C++ parity: a properly signed StellarValue should be accepted
+        // Parity: a properly signed StellarValue should be accepted
         let (driver, secret_key) = make_test_driver_with_key();
 
         let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
@@ -2227,7 +2227,7 @@ mod tests {
 
     #[test]
     fn test_extract_valid_value_requires_fully_validated() {
-        // C++ parity: extractValidValue only returns value when
+        // Parity: extractValidValue only returns value when
         // validateValueAgainstLocalState returns kFullyValidatedValue.
         // When tx set is missing, it returns MaybeValid -> extractValidValue returns None.
         let driver = make_test_driver();
@@ -2252,7 +2252,7 @@ mod tests {
 
     #[test]
     fn test_extract_valid_value_strips_invalid_upgrades() {
-        // C++ parity: extractValidValue strips invalid upgrades
+        // Parity: extractValidValue strips invalid upgrades
         let driver = make_test_driver();
 
         let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
@@ -2298,7 +2298,7 @@ mod tests {
 
     #[test]
     fn test_combine_candidates_merges_upgrades() {
-        // C++ parity: combineCandidates merges upgrades from ALL candidates
+        // Parity: combineCandidates merges upgrades from ALL candidates
         let driver = make_test_driver();
 
         let now = std::time::SystemTime::now()
@@ -2344,7 +2344,7 @@ mod tests {
 
     #[test]
     fn test_combine_candidates_takes_max_upgrade() {
-        // C++ parity: when multiple candidates have same upgrade type, take max
+        // Parity: when multiple candidates have same upgrade type, take max
         let driver = make_test_driver();
 
         let now = std::time::SystemTime::now()
@@ -2393,7 +2393,7 @@ mod tests {
 
     #[test]
     fn test_has_upgrades_and_strip() {
-        // C++ parity: has_upgrades checks sv.upgrades.empty()
+        // Parity: has_upgrades checks sv.upgrades.empty()
         //             strip_all_upgrades clears sv.upgrades
         let driver = Arc::new(make_test_driver());
         let callback = HerderScpCallback::new(driver);

@@ -1,6 +1,6 @@
 //! Ban manager for persistent peer banning.
 //!
-//! This module implements the BanManager from C++ stellar-core, which maintains
+//! This module implements the BanManager from stellar-core, which maintains
 //! a persistent list of banned nodes in a SQLite database.
 //!
 //! # Overview

@@ -1,7 +1,7 @@
 //! Remote archive operations using configurable shell commands.
 //!
 //! This module provides the ability to upload files to remote history archives
-//! using configurable shell commands, matching the C++ stellar-core behavior.
+//! using configurable shell commands, matching the stellar-core behavior.
 //!
 //! # Command Templates
 //!

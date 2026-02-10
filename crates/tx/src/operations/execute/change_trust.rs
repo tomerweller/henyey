@@ -96,7 +96,7 @@ pub fn execute_change_trust(
         }
 
         // Decrease sub-entries BEFORE deleting trustline.
-        // C++ stellar-core records account STATE/UPDATED before trustline STATE/REMOVED.
+        // stellar-core records account STATE/UPDATED before trustline STATE/REMOVED.
         if let Some(account) = state.get_account_mut(source) {
             if account.num_sub_entries >= multiplier as u32 {
                 account.num_sub_entries -= multiplier as u32;
@@ -107,7 +107,7 @@ pub fn execute_change_trust(
             }
         }
         // Flush ALL account changes before recording trustline deletion.
-        // C++ stellar-core records all pending account STATE/UPDATED pairs before
+        // stellar-core records all pending account STATE/UPDATED pairs before
         // trustline deletions, which may include accounts modified in earlier ops.
         state.flush_all_accounts();
 
@@ -162,7 +162,7 @@ pub fn execute_change_trust(
         }
 
         // Check source can afford new sub-entry
-        // C++ uses getAvailableBalance which deducts selling liabilities
+        // stellar-core uses getAvailableBalance which deducts selling liabilities
         let sponsor = state.active_sponsor_for(source);
         if let Some(sponsor) = &sponsor {
             let sponsor_account = state
@@ -526,7 +526,7 @@ fn manage_pool_on_deleted_trustline(
         cp.pool_shares_trust_line_count == 0
     };
 
-    // Delete the pool if count reached 0 (matching C++ behavior)
+    // Delete the pool if count reached 0 (matching stellar-core behavior)
     if should_delete {
         state.delete_liquidity_pool(&pool_id);
     }
@@ -1150,7 +1150,7 @@ mod tests {
     /// Regression test: When the last pool share trustline is deleted, the liquidity pool
     /// itself should be deleted (pool_shares_trust_line_count reaches 0).
     ///
-    /// This matches C++ stellar-core's behavior where removing the last trustline
+    /// This matches stellar-core's behavior where removing the last trustline
     /// that references a liquidity pool causes the pool to be removed from state.
     #[test]
     fn test_change_trust_pool_deleted_when_last_trustline_removed() {
@@ -1437,7 +1437,7 @@ mod tests {
     /// Test ChangeTrust with source account having native selling liabilities.
     ///
     /// Selling liabilities don't affect the reserve check for creating trustlines.
-    /// C++ uses getAvailableBalance (balance - sellingLiabilities) for the reserve check.
+    /// stellar-core uses getAvailableBalance (balance - sellingLiabilities) for the reserve check.
     /// This test verifies that selling liabilities are deducted when checking reserves,
     /// but that the trustline creation succeeds when available balance is sufficient.
     ///
@@ -1670,7 +1670,7 @@ mod tests {
     /// to create new trustlines even when their available balance (balance - liabilities)
     /// was below the reserve requirement.
     ///
-    /// Found at mainnet ledger 59501777: a ChangeTrust succeeded in our code but C++
+    /// Found at mainnet ledger 59501777: a ChangeTrust succeeded in our code but stellar-core
     /// correctly returned LowReserve because getAvailableBalance deducts selling liabilities.
     #[test]
     fn test_change_trust_low_reserve_with_selling_liabilities() {

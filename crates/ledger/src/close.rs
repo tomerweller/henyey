@@ -526,7 +526,7 @@ fn sorted_stages_for_parallel(
         for cluster in stage.iter_mut() {
             cluster.sort_by(|a, b| apply_sort_cmp(a, b, &set_hash));
         }
-        // C++ does NOT sort clusters within a stage. Clusters are independent,
+        // stellar-core does NOT sort clusters within a stage. Clusters are independent,
         // so their execution order doesn't matter, and the original XDR order
         // is preserved. Sorting clusters would change the transaction result
         // ordering and produce a different result hash.
@@ -567,7 +567,7 @@ fn sorted_for_apply_parallel(
         for cluster in stage.iter_mut() {
             cluster.sort_by(|a, b| apply_sort_cmp(a, b, &set_hash));
         }
-        // C++ does NOT sort clusters within a stage. Clusters are independent,
+        // stellar-core does NOT sort clusters within a stage. Clusters are independent,
         // so their execution order doesn't matter, and the original XDR order
         // is preserved. Sorting clusters would change the transaction result
         // ordering and produce a different result hash.
@@ -1180,7 +1180,7 @@ mod tests {
             for cluster in stage.iter_mut() {
                 cluster.sort_by(|a, b| apply_sort_cmp(a, b, &set_hash));
             }
-            // C++ does NOT sort clusters within a stage - preserve XDR order.
+            // stellar-core does NOT sort clusters within a stage - preserve XDR order.
         }
         stage_vec.sort_by(|a, b| {
             if a.is_empty() || b.is_empty() {
@@ -1354,10 +1354,10 @@ mod tests {
     }
 
     /// Regression test: clusters within a parallel stage must preserve their
-    /// original XDR order. C++ does NOT sort clusters within a stage because
+    /// original XDR order. stellar-core does NOT sort clusters within a stage because
     /// clusters are independent and their execution order doesn't affect
     /// correctness. Sorting clusters would change the transaction result
-    /// ordering and produce a different result hash than C++.
+    /// ordering and produce a different result hash than stellar-core.
     #[test]
     fn parallel_clusters_preserve_xdr_order_within_stage() {
         // Find seeds where sorting clusters would produce a different order

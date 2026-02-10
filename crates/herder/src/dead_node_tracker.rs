@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 
 use stellar_xdr::curr::NodeId;
 
-/// Interval for checking dead nodes (15 minutes, matching C++ stellar-core).
+/// Interval for checking dead nodes (15 minutes, matching stellar-core).
 pub const CHECK_FOR_DEAD_NODES_MINUTES: u64 = 15;
 
 /// Tracker for detecting nodes that haven't participated in consensus.

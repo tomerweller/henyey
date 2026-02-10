@@ -1,7 +1,7 @@
 //! Multi-node SCP simulation tests.
 //!
 //! These tests simulate multiple SCP nodes reaching consensus, matching
-//! the patterns from upstream C++ SCPTests.cpp. They verify:
+//! the patterns from SCPTests.cpp. They verify:
 //! - Basic consensus with multiple nodes
 //! - Nomination round advancement
 //! - Ballot protocol phase transitions

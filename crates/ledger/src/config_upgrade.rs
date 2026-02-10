@@ -1,6 +1,6 @@
 //! Soroban configuration upgrade handling.
 //!
-//! This module implements the ConfigUpgradeSetFrame from C++ stellar-core.
+//! This module implements the ConfigUpgradeSetFrame from stellar-core.
 //! It handles loading, validating, and applying Soroban network configuration
 //! upgrades that are stored in CONTRACT_DATA ledger entries.
 //!
@@ -48,7 +48,7 @@ pub enum ConfigUpgradeValidity {
 
 /// Minimum values for Soroban network configuration.
 ///
-/// These match the C++ MinimumSorobanNetworkConfig values from NetworkConfig.h.
+/// These match the stellar-core MinimumSorobanNetworkConfig values from NetworkConfig.h.
 /// These are intentionally low floor values that allow the network flexibility
 /// to configure settings via upgrades. They are NOT the initial/production
 /// values.
@@ -105,7 +105,7 @@ pub mod min_config {
 
 /// Maximum values for Soroban network configuration.
 ///
-/// These match the C++ MaximumSorobanNetworkConfig values from NetworkConfig.h.
+/// These match the stellar-core MaximumSorobanNetworkConfig values from NetworkConfig.h.
 pub mod max_config {
     /// Maximum ledger target close time.
     pub const LEDGER_TARGET_CLOSE_TIME_MILLISECONDS: u32 = 5_000;
@@ -339,7 +339,7 @@ impl ConfigUpgradeSetFrame {
     /// Apply the configuration upgrades to the ledger.
     ///
     /// Updates all CONFIG_SETTING entries in the upgrade set. Also handles
-    /// secondary effects that C++ stellar-core performs during config upgrade:
+    /// secondary effects that stellar-core performs during config upgrade:
     /// - Resizing the LiveSorobanStateSizeWindow when sample size changes
     ///   (parity: Upgrades.cpp:1443 `maybeUpdateSorobanStateSizeWindowSize`)
     ///
@@ -582,7 +582,7 @@ impl ConfigUpgradeSetFrame {
 
     /// Validate a config setting entry against constraints.
     ///
-    /// Matches C++ `SorobanNetworkConfig::isValidConfigSettingEntry` from
+    /// Matches stellar-core `SorobanNetworkConfig::isValidConfigSettingEntry` from
     /// NetworkConfig.cpp.
     #[allow(clippy::absurd_extreme_comparisons)]
     fn is_valid_config_setting_entry(entry: &ConfigSettingEntry, ledger_version: u32) -> bool {
@@ -629,7 +629,7 @@ impl ConfigUpgradeSetFrame {
                     && cost.fee_disk_read1_kb >= 0
                     && cost.soroban_state_target_size_bytes > 0
                     && cost.rent_fee1_kb_soroban_state_size_high >= 0
-                // Note: C++ also checks sorobanStateRentFeeGrowthFactor >= 0,
+                // Note: stellar-core also checks sorobanStateRentFeeGrowthFactor >= 0,
                 // but the field is u32 in Rust so it's always >= 0.
             }
             ConfigSettingEntry::ContractEventsV0(events) => {
@@ -763,23 +763,23 @@ mod tests {
     }
 
     /// Regression test: config upgrade validation must accept values at the
-    /// C++ MinimumSorobanNetworkConfig floor, not the higher initial/production
+    /// stellar-core MinimumSorobanNetworkConfig floor, not the higher initial/production
     /// values. Testnet ledger 427 has a ContractLedgerCostV0 upgrade with values
-    /// below the (incorrect) old Rust minimums but above the real C++ minimums.
+    /// below the (incorrect) old Rust minimums but above the real stellar-core minimums.
     #[test]
-    fn test_contract_ledger_cost_v0_accepts_cpp_minimum_values() {
+    fn test_contract_ledger_cost_v0_accepts_stellar_core_minimum_values() {
         use stellar_xdr::curr::ConfigSettingContractLedgerCostV0;
 
-        // Values at the C++ minimum floor - must be accepted
+        // Values at the stellar-core minimum floor - must be accepted
         let cost_at_minimum =
             ConfigSettingEntry::ContractLedgerCostV0(ConfigSettingContractLedgerCostV0 {
-                tx_max_disk_read_entries: 3, // C++ min: 3
+                tx_max_disk_read_entries: 3, // stellar-core min: 3
                 ledger_max_disk_read_entries: 3,
-                tx_max_disk_read_bytes: 3200, // C++ min: 3200
+                tx_max_disk_read_bytes: 3200, // stellar-core min: 3200
                 ledger_max_disk_read_bytes: 3200,
-                tx_max_write_ledger_entries: 2, // C++ min: 2
+                tx_max_write_ledger_entries: 2, // stellar-core min: 2
                 ledger_max_write_ledger_entries: 2,
-                tx_max_write_bytes: 3200, // C++ min: 3200
+                tx_max_write_bytes: 3200, // stellar-core min: 3200
                 ledger_max_write_bytes: 3200,
                 fee_disk_read_ledger_entry: 0,
                 fee_write_ledger_entry: 0,
@@ -791,13 +791,13 @@ mod tests {
             });
         assert!(
             ConfigUpgradeSetFrame::is_valid_config_setting_entry(&cost_at_minimum, 25),
-            "ContractLedgerCostV0 at C++ minimum values must be accepted"
+            "ContractLedgerCostV0 at stellar-core minimum values must be accepted"
         );
 
-        // Values below the C++ minimum - must be rejected
+        // Values below the stellar-core minimum - must be rejected
         let cost_below_minimum =
             ConfigSettingEntry::ContractLedgerCostV0(ConfigSettingContractLedgerCostV0 {
-                tx_max_disk_read_entries: 2, // Below C++ min of 3
+                tx_max_disk_read_entries: 2, // Below stellar-core min of 3
                 ledger_max_disk_read_entries: 2,
                 tx_max_disk_read_bytes: 3200,
                 ledger_max_disk_read_bytes: 3200,
@@ -815,24 +815,24 @@ mod tests {
             });
         assert!(
             !ConfigUpgradeSetFrame::is_valid_config_setting_entry(&cost_below_minimum, 25),
-            "ContractLedgerCostV0 below C++ minimum values must be rejected"
+            "ContractLedgerCostV0 below stellar-core minimum values must be rejected"
         );
     }
 
-    /// Regression test: all config setting types must use the correct C++
+    /// Regression test: all config setting types must use the correct stellar-core
     /// MinimumSorobanNetworkConfig floor values, not the higher initial values.
     #[test]
-    fn test_all_config_settings_accept_cpp_minimum_values() {
+    fn test_all_config_settings_accept_stellar_core_minimum_values() {
         use stellar_xdr::curr::{
             ConfigSettingContractBandwidthV0, ConfigSettingContractComputeV0,
             ConfigSettingContractEventsV0, StateArchivalSettings,
         };
 
-        // ContractMaxSizeBytes at C++ min of 2000
+        // ContractMaxSizeBytes at stellar-core min of 2000
         let entry = ConfigSettingEntry::ContractMaxSizeBytes(2000);
         assert!(
             ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
-            "ContractMaxSizeBytes=2000 must be accepted (C++ min)"
+            "ContractMaxSizeBytes=2000 must be accepted (stellar-core min)"
         );
         let entry = ConfigSettingEntry::ContractMaxSizeBytes(1999);
         assert!(
@@ -840,69 +840,69 @@ mod tests {
             "ContractMaxSizeBytes=1999 must be rejected"
         );
 
-        // ContractDataKeySizeBytes at C++ min of 200
+        // ContractDataKeySizeBytes at stellar-core min of 200
         let entry = ConfigSettingEntry::ContractDataKeySizeBytes(200);
         assert!(
             ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
-            "ContractDataKeySizeBytes=200 must be accepted (C++ min)"
+            "ContractDataKeySizeBytes=200 must be accepted (stellar-core min)"
         );
 
-        // ContractDataEntrySizeBytes at C++ min of 2000
+        // ContractDataEntrySizeBytes at stellar-core min of 2000
         let entry = ConfigSettingEntry::ContractDataEntrySizeBytes(2000);
         assert!(
             ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
-            "ContractDataEntrySizeBytes=2000 must be accepted (C++ min)"
+            "ContractDataEntrySizeBytes=2000 must be accepted (stellar-core min)"
         );
 
-        // ContractBandwidthV0 at C++ min
+        // ContractBandwidthV0 at stellar-core min
         let entry = ConfigSettingEntry::ContractBandwidthV0(ConfigSettingContractBandwidthV0 {
             fee_tx_size1_kb: 0,
-            tx_max_size_bytes: 10_000, // C++ min
+            tx_max_size_bytes: 10_000, // stellar-core min
             ledger_max_txs_size_bytes: 10_000,
         });
         assert!(
             ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
-            "ContractBandwidthV0 at C++ min must be accepted"
+            "ContractBandwidthV0 at stellar-core min must be accepted"
         );
 
-        // ContractComputeV0 at C++ min
+        // ContractComputeV0 at stellar-core min
         let entry = ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
             fee_rate_per_instructions_increment: 0,
-            tx_max_instructions: 2_500_000, // C++ min
+            tx_max_instructions: 2_500_000, // stellar-core min
             ledger_max_instructions: 2_500_000,
-            tx_memory_limit: 2_000_000, // C++ min
+            tx_memory_limit: 2_000_000, // stellar-core min
         });
         assert!(
             ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
-            "ContractComputeV0 at C++ min must be accepted"
+            "ContractComputeV0 at stellar-core min must be accepted"
         );
 
-        // ContractEventsV0 at C++ min
+        // ContractEventsV0 at stellar-core min
         let entry = ConfigSettingEntry::ContractEventsV0(ConfigSettingContractEventsV0 {
-            tx_max_contract_events_size_bytes: 200, // C++ min
+            tx_max_contract_events_size_bytes: 200, // stellar-core min
             fee_contract_events1_kb: 0,
         });
         assert!(
             ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
-            "ContractEventsV0 at C++ min must be accepted"
+            "ContractEventsV0 at stellar-core min must be accepted"
         );
 
-        // StateArchival at C++ min
+        // StateArchival at stellar-core min
         let entry = ConfigSettingEntry::StateArchival(StateArchivalSettings {
-            max_entry_ttl: 1_054_080, // C++ min
-            min_temporary_ttl: 16,    // C++ min
-            min_persistent_ttl: 10,   // C++ min
+            max_entry_ttl: 1_054_080, // stellar-core min
+            min_temporary_ttl: 16,    // stellar-core min
+            min_persistent_ttl: 10,   // stellar-core min
             persistent_rent_rate_denominator: 1,
             temp_rent_rate_denominator: 1,
-            max_entries_to_archive: 0,                     // C++ min
-            live_soroban_state_size_window_sample_size: 1, // C++ min
-            eviction_scan_size: 0,                         // C++ min (was 1000)
-            starting_eviction_scan_level: 1,               // C++ min (was 7)
+            max_entries_to_archive: 0,                     // stellar-core min
+            live_soroban_state_size_window_sample_size: 1, // stellar-core min
+            eviction_scan_size: 0,                         // stellar-core min (was 1000)
+            starting_eviction_scan_level: 1,               // stellar-core min (was 7)
             live_soroban_state_size_window_sample_period: 1,
         });
         assert!(
             ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
-            "StateArchival at C++ min must be accepted"
+            "StateArchival at stellar-core min must be accepted"
         );
     }
 }

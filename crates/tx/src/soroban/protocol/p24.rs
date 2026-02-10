@@ -2,7 +2,7 @@
 //!
 //! This module provides Soroban execution for protocol versions 20-24.
 //! It uses soroban-env-host-p24 which is pinned to the exact git revision
-//! used by C++ stellar-core for protocol 24.
+//! used by stellar-core for protocol 24.
 
 use std::rc::Rc;
 
@@ -61,7 +61,7 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
         // For ContractData and ContractCode, check TTL first.
         // If TTL has expired, the entry is considered to be in the hot archive
         // and not accessible (unless being explicitly restored).
-        // This mimics C++ stellar-core behavior where archived entries are not
+        // This mimics stellar-core behavior where archived entries are not
         // in the live bucket list.
         let live_until = get_entry_ttl(self.state, &current_key, self.current_ledger);
 
@@ -145,7 +145,7 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
 /// Get the TTL for a ledger entry.
 ///
 /// Uses `get_ttl_at_ledger_start()` to return the TTL value from the bucket
-/// list snapshot at ledger start. This matches C++ stellar-core behavior for
+/// list snapshot at ledger start. This matches stellar-core behavior for
 /// parallel Soroban execution (V1 phases): transactions in different clusters
 /// should NOT see each other's TTL changes.
 fn get_entry_ttl(state: &LedgerStateManager, key: &LedgerKey, current_ledger: u32) -> Option<u32> {
@@ -343,7 +343,7 @@ pub fn invoke_host_function(
     let seed: Vec<u8> = if let Some(prng_seed) = context.soroban_prng_seed {
         prng_seed.to_vec()
     } else {
-        tracing::warn!("P24: Using fallback PRNG seed - results may differ from C++ stellar-core");
+        tracing::warn!("P24: Using fallback PRNG seed - results may differ from stellar-core");
         let mut hasher = Sha256::new();
         hasher.update(context.network_id.0 .0);
         hasher.update(context.sequence.to_le_bytes());
@@ -575,7 +575,7 @@ pub fn invoke_host_function(
     // - Had their content modified (encoded_new_value.is_some())
     // - Are involved in rent calculations (old_entry_size_bytes_for_rent > 0)
     // - Had their TTL actually extended (new > old)
-    // Note: C++ stellar-core only includes TTL changes when TTL is extended, not just
+    // Note: stellar-core only includes TTL changes when TTL is extended, not just
     // when ttl_change is present. See extract_ledger_effects in soroban_proto_any.rs.
     let ledger_changes = result
         .ledger_changes

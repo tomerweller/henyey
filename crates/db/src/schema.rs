@@ -1,7 +1,7 @@
 //! Database schema definitions.
 //!
 //! This module contains the complete SQL schema for the stellar-core database.
-//! The schema is designed to be compatible with the C++ stellar-core database
+//! The schema is designed to be compatible with the stellar-core database
 //! structure while being optimized for Rust access patterns.
 //!
 //! # Tables

@@ -1,7 +1,7 @@
 //! Utility functions for Herder operations.
 //!
-//! This module provides helper functions that match the C++ stellar-core
-//! `HerderUtils.h/cpp` functionality:
+//! This module provides helper functions that match the stellar-core
+//! `HerderUtils.h` functionality:
 //!
 //! - [`get_stellar_values`]: Extract StellarValue from SCP statements
 //! - [`get_tx_set_hashes`]: Get transaction set hashes from SCP envelopes
@@ -78,7 +78,7 @@ pub fn get_tx_set_hashes_from_envelope(envelope: &ScpEnvelope) -> Vec<Hash256> {
 /// Render a NodeID as a short human-readable string.
 ///
 /// Returns the first 5 characters of the hex-encoded public key.
-/// This matches the C++ `toShortString` behavior when no config is provided.
+/// This matches the stellar-core `toShortString` behavior when no config is provided.
 ///
 /// # Arguments
 ///

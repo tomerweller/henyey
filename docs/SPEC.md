@@ -13,7 +13,7 @@ This project is **not** production-grade.
 ### 1.1 Goals
 
 1. Deterministic parity with stellar-core v25.x for observable behavior.
-2. Modular 1:1 mapping between upstream subsystems and crates.
+2. Modular 1:1 mapping between stellar-core subsystems and crates.
 3. Protocol 24+ only to reduce legacy complexity.
 4. Educational, auditable Rust implementation.
 
@@ -80,7 +80,7 @@ henyey/
 └── crates/                    # Subsystem crates (14 crates)
 ```
 
-Each crate contains a README with subsystem documentation and upstream mapping.
+Each crate contains a README with subsystem documentation and stellar-core mapping.
 
 ### 3.1 Module Mapping to stellar-core
 
@@ -139,7 +139,7 @@ The execution loop integration lives in `henyey-ledger` (`execution.rs`), while 
 ## 6. Testing Strategy
 
 - Unit and integration tests live within each crate (`crates/*/src` and `crates/*/tests`).
-- Upstream test vectors should be ported where possible.
+- stellar-core test vectors should be ported where possible.
 - Parity gaps are tracked in each crate's `PARITY_STATUS.md`.
 
 ## 7. Configuration
@@ -183,7 +183,7 @@ Transaction metadata baseline tests that compare XDR hashes against reference va
 
 ## 10. References
 
-- stellar-core (upstream): https://github.com/stellar/stellar-core
+- stellar-core (: https://github.com/stellar/stellar-core
 - CAPs: https://github.com/stellar/stellar-protocol/tree/master/core
 - stellar-xdr: https://github.com/stellar/rs-stellar-xdr
 - soroban-env-host: https://github.com/stellar/rs-soroban-env

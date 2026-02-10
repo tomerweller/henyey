@@ -4570,7 +4570,7 @@ fn test_cross_tx_deleted_trustline_not_reloaded() {
 
 /// Regression test: internal errors during operation execution must map to txInternalError.
 ///
-/// In C++ stellar-core, when a std::runtime_error is thrown during operation execution
+/// In stellar-core, when a std::runtime_error is thrown during operation execution
 /// (e.g. liabilities underflow during offer crossing), it propagates to
 /// TransactionFrame::applyOperations() which catches it and sets txINTERNAL_ERROR.
 ///

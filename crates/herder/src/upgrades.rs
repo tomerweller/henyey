@@ -1,7 +1,7 @@
 //! Ledger upgrade scheduling and validation.
 //!
 //! This module provides support for protocol upgrades in Stellar. It matches
-//! the C++ `Upgrades` class in `Upgrades.h/cpp`.
+//! the stellar-core `Upgrades` class in `Upgrades.h`.
 //!
 //! # Overview
 //!

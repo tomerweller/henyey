@@ -72,7 +72,7 @@ fn ttl_already_created_in_delta(
 
 /// Validate CONTRACT_CODE and CONTRACT_DATA entry sizes against network config limits.
 ///
-/// This matches C++ stellar-core's `validateContractLedgerEntry()` in TransactionUtils.cpp.
+/// This matches stellar-core's `validateContractLedgerEntry()` in TransactionUtils.cpp.
 /// Returns false (invalid) if the entry exceeds the configured limits.
 fn validate_contract_ledger_entry(
     key: &LedgerKey,
@@ -158,7 +158,7 @@ pub fn execute_invoke_host_function(
         }
     };
 
-    // All host functions go through soroban-env-host, matching C++ stellar-core behavior.
+    // All host functions go through soroban-env-host, matching stellar-core behavior.
     // This ensures rent calculation and other host-computed values are consistent.
     execute_contract_invocation(
         op,
@@ -227,7 +227,7 @@ fn execute_contract_invocation(
         hot_archive,
     ) {
         Ok(result) => {
-            // C++ stellar-core check: event size (done first in collectEvents before
+            // stellar-core check: event size (done first in collectEvents before
             // recordStorageChanges in doApply, but logically we need this check)
             if soroban_config.tx_max_contract_events_size_bytes > 0
                 && result.contract_events_and_return_value_size
@@ -239,7 +239,7 @@ fn execute_contract_invocation(
                 )));
             }
 
-            // C++ stellar-core check: write bytes (recordStorageChanges lines 639-652)
+            // stellar-core check: write bytes (recordStorageChanges lines 639-652)
             // Sum the XDR sizes of all non-TTL entries being written and check against
             // the specified write_bytes limit. Also validates entry sizes against
             // network config limits (validateContractLedgerEntry).
@@ -314,7 +314,7 @@ fn execute_contract_invocation(
                 "Soroban contract execution failed"
             );
 
-            // Map error to result code using C++ stellar-core logic:
+            // Map error to result code using stellar-core logic:
             // - RESOURCE_LIMIT_EXCEEDED if actual CPU > specified instructions
             // - RESOURCE_LIMIT_EXCEEDED if actual mem > network's txMemoryLimit
             // - TRAPPED for all other failures
@@ -359,7 +359,7 @@ fn execute_upload_wasm(
     );
 
     // Compute the success preimage hash (return value + empty events).
-    // This is what C++ stellar-core uses as the Success result hash.
+    // This is what stellar-core uses as the Success result hash.
     let result_hash = compute_success_preimage_hash(&return_value, &[]);
 
     // Compute the return value size for fee calculation.
@@ -384,7 +384,7 @@ fn execute_upload_wasm(
     if let Some(existing_code) = state.get_contract_code(&code_hash).cloned() {
         // Code already exists.
         // If the key is in the read-write footprint, we need to "touch" it to
-        // record STATE/UPDATED changes. This matches C++ stellar-core behavior
+        // record STATE/UPDATED changes. This matches stellar-core behavior
         // where entries in the read-write footprint are always returned by the
         // host and recorded by recordStorageChanges.
         if code_in_rw_footprint {
@@ -406,9 +406,9 @@ fn execute_upload_wasm(
         ));
     }
 
-    // Create TTL for the code FIRST (matches C++ stellar-core ordering).
+    // Create TTL for the code FIRST (matches stellar-core ordering).
     // Contract code is a persistent entry, so it uses min_persistent_entry_ttl.
-    // The live_until is inclusive, so we subtract 1 to match C++ stellar-core.
+    // The live_until is inclusive, so we subtract 1 to match stellar-core.
     let code_key_hash = compute_contract_code_key_hash(&code_hash);
     let live_until = context.sequence + soroban_config.min_persistent_entry_ttl - 1;
     let ttl_entry = TtlEntry {
@@ -418,10 +418,10 @@ fn execute_upload_wasm(
     state.create_ttl(ttl_entry);
 
     // Extract cost inputs from the WASM for V1 extension.
-    // This matches C++ stellar-core behavior for protocol 22+.
+    // This matches stellar-core behavior for protocol 22+.
     let cost_inputs = extract_wasm_cost_inputs(wasm.as_slice());
 
-    // Create the contract code entry SECOND (matches C++ stellar-core ordering).
+    // Create the contract code entry SECOND (matches stellar-core ordering).
     let code_entry = ContractCodeEntry {
         ext: ContractCodeEntryExt::V1(ContractCodeEntryV1 {
             ext: ExtensionPoint::V0,
@@ -474,7 +474,7 @@ fn execute_upload_wasm(
 /// Extract cost inputs from WASM bytecode.
 ///
 /// This parses the WASM module and extracts various metrics needed for
-/// cost calculation, matching how C++ stellar-core (via soroban-env-host)
+/// cost calculation, matching how stellar-core (via soroban-env-host)
 /// computes these values.
 ///
 /// Note: This function is currently unused because all host functions now go through
@@ -572,7 +572,7 @@ enum StorageChangeValidation {
 
 /// Validate storage changes and compute total write bytes.
 ///
-/// This matches C++ stellar-core's recordStorageChanges() which:
+/// This matches stellar-core's recordStorageChanges() which:
 /// 1. Validates entry sizes against network config limits (validateContractLedgerEntry)
 /// 2. Sums the XDR size of all non-TTL entries being written
 ///
@@ -594,7 +594,7 @@ fn validate_and_compute_write_bytes(
             if let Ok(bytes) = entry.to_xdr(Limits::none()) {
                 let entry_size = bytes.len();
 
-                // Validate entry size against network config limits (C++ validateContractLedgerEntry)
+                // Validate entry size against network config limits (stellar-core validateContractLedgerEntry)
                 if !validate_contract_ledger_entry(
                     &change.key,
                     entry_size,
@@ -715,9 +715,9 @@ fn disk_read_bytes_exceeded(
                     if !is_soroban_key(key) {
                         continue;
                     }
-                    // Match C++ behavior: only meter archived entries that are
+                    // Match stellar-core behavior: only meter archived entries that are
                     // actually still archived. If a previous TX in this ledger
-                    // restored the entry, its TTL is now live, and C++ treats
+                    // restored the entry, its TTL is now live, and stellar-core treats
                     // it as an in-memory soroban entry (no disk read metering).
                     let key_hash = compute_key_hash(key);
                     let is_still_archived = match state.get_ttl(&key_hash) {
@@ -745,7 +745,7 @@ fn disk_read_bytes_exceeded(
 
 /// Compute the hash of the success preimage (return value + events).
 ///
-/// This matches how C++ stellar-core computes the InvokeHostFunction success result:
+/// This matches how stellar-core computes the InvokeHostFunction success result:
 /// the hash is SHA256 of the XDR-encoded InvokeHostFunctionSuccessPreImage,
 /// which contains both the return value and the contract events.
 fn compute_success_preimage_hash(return_value: &ScVal, events: &[ContractEvent]) -> Hash {
@@ -881,7 +881,7 @@ fn apply_soroban_storage_changes(
         apply_soroban_storage_change(state, change, hot_archive_restored_keys);
     }
 
-    // C++ stellar-core behavior: delete any read-write footprint entries that weren't
+    // stellar-core behavior: delete any read-write footprint entries that weren't
     // returned by the host. This handles entries that were explicitly deleted by the
     // host or had expired TTL. The host passes through all entries it touches, so
     // entries NOT returned are considered deleted.
@@ -1020,7 +1020,7 @@ fn apply_soroban_storage_change(
         // - TX 7's host sees old_ttl=682237, new_ttl=700457, so ttl_extended=true
         // - But our state already has 700457 from TX 5
         // - If we compare against state, we'd skip emission (700457==700457)
-        // - But C++ emits it because from the ledger-start perspective, TTL WAS extended
+        // - But stellar-core emits it because from the ledger-start perspective, TTL WAS extended
         //
         // For hot archive restores, the TTL entry is also being restored so we use create.
         // Note: TTL keys are not directly in archived_soroban_entries, but when the associated
@@ -1107,10 +1107,10 @@ fn apply_soroban_storage_change(
                 live_until_ledger_seq: live_until,
             };
 
-            // Read-only TTL bumps: C++ includes them in transaction meta but defers state updates.
+            // Read-only TTL bumps: stellar-core includes them in transaction meta but defers state updates.
             // Transaction meta is built from the op result (which has all TTL changes).
             // State visibility is deferred so subsequent TXs don't see the bump.
-            // Per C++ stellar-core, RO TTL bumps ARE in transaction meta but deferred for state.
+            // Per stellar-core, RO TTL bumps ARE in transaction meta but deferred for state.
             if change.is_read_only_ttl_bump {
                 tracing::debug!(
                     ?key_hash,
@@ -1210,7 +1210,7 @@ fn footprint_has_unrestored_archived_entries(
 ///
 /// Parity: InvokeHostFunctionOpFrame.cpp `addReads()` lines 378-445
 ///
-/// The check follows the C++ logic:
+/// The check follows the stellar-core logic:
 /// 1. Look up the TTL in the live state. If found and expired → archived.
 /// 2. If TTL not found in live state (entry was evicted), check the hot
 ///    archive (P23+). If found there → archived.
@@ -1299,18 +1299,18 @@ fn make_result(code: InvokeHostFunctionResultCode, success_hash: Hash) -> Operat
     OperationResult::OpInner(OperationResultTr::InvokeHostFunction(result))
 }
 
-/// Map execution error to result code using C++ stellar-core logic.
+/// Map execution error to result code using stellar-core logic.
 ///
-/// C++ stellar-core checks if the failure was due to exceeding specified resource limits:
+/// stellar-core checks if the failure was due to exceeding specified resource limits:
 /// - If actual CPU instructions > specified instructions -> RESOURCE_LIMIT_EXCEEDED
 /// - If actual memory > network's txMemoryLimit -> RESOURCE_LIMIT_EXCEEDED
 /// - Otherwise -> TRAPPED (for any other failure like auth errors, panics, storage errors, etc.)
 ///
-/// The key insight is that C++ checks raw resource consumption regardless of error type.
+/// The key insight is that stellar-core checks raw resource consumption regardless of error type.
 /// Even if the host returns an Auth error, if CPU exceeded the specified limit, the
 /// result is RESOURCE_LIMIT_EXCEEDED.
 ///
-/// Note: C++ does NOT check the host error type - it purely checks measured consumption
+/// Note: stellar-core does NOT check the host error type - it purely checks measured consumption
 /// against limits. A host error of Budget/ExceededLimit does NOT automatically become
 /// ResourceLimitExceeded; only actual limit violations trigger that result code.
 fn map_host_error_to_result_code(
@@ -1318,7 +1318,7 @@ fn map_host_error_to_result_code(
     specified_instructions: u32,
     tx_memory_limit: u64,
 ) -> InvokeHostFunctionResultCode {
-    // C++ stellar-core logic (InvokeHostFunctionOpFrame.cpp lines 579-602):
+    // stellar-core logic (InvokeHostFunctionOpFrame.cpp lines 579-602):
     // First check if CPU instructions exceeded the specified limit
     if exec_error.cpu_insns_consumed > specified_instructions as u64 {
         return InvokeHostFunctionResultCode::ResourceLimitExceeded;
@@ -1330,7 +1330,7 @@ fn map_host_error_to_result_code(
     }
 
     // All other failures are TRAPPED
-    // Note: C++ does NOT special-case Budget/ExceededLimit errors from the host.
+    // Note: stellar-core does NOT special-case Budget/ExceededLimit errors from the host.
     // Even if the host internally ran out of budget, if our measured consumption
     // is within limits, the result is Trapped (not ResourceLimitExceeded).
     InvokeHostFunctionResultCode::Trapped
@@ -1674,7 +1674,7 @@ mod tests {
     ///
     /// When a previous TX in the same ledger restores an archived soroban entry, the
     /// entry's TTL becomes live. Subsequent TXs that also reference the entry in their
-    /// `archived_soroban_entries` should NOT meter it for disk read bytes, because C++
+    /// `archived_soroban_entries` should NOT meter it for disk read bytes, because stellar-core
     /// stellar-core dynamically checks the TTL and treats restored entries as in-memory.
     /// Without this fix, the disk_read_bytes_exceeded check would incorrectly count the
     /// restored entry's bytes, causing spurious ResourceLimitExceeded failures.
@@ -1794,7 +1794,7 @@ mod tests {
     fn test_map_host_error_to_result_code_cpu_exceeded_with_storage_error() {
         use crate::soroban::SorobanExecutionError;
         // Storage error but CPU also exceeded -> RESOURCE_LIMIT_EXCEEDED
-        // C++ checks raw resource consumption regardless of error type
+        // stellar-core checks raw resource consumption regardless of error type
         let host_error = soroban_env_host_p25::HostError::from((
             soroban_env_host_p25::xdr::ScErrorType::Storage,
             soroban_env_host_p25::xdr::ScErrorCode::ExceededLimit,
@@ -1854,8 +1854,8 @@ mod tests {
     fn test_map_host_error_to_result_code_budget_error_within_limits() {
         use crate::soroban::SorobanExecutionError;
         // Budget/ExceededLimit error from host BUT measured consumption within limits -> TRAPPED
-        // This matches C++ stellar-core behavior: only measured consumption matters, not error type.
-        // The host may internally track budget differently, but C++ checks actual consumed values.
+        // This matches stellar-core behavior: only measured consumption matters, not error type.
+        // The host may internally track budget differently, but stellar-core checks actual consumed values.
         let host_error = soroban_env_host_p25::HostError::from((
             soroban_env_host_p25::xdr::ScErrorType::Budget,
             soroban_env_host_p25::xdr::ScErrorCode::ExceededLimit,
@@ -1958,9 +1958,9 @@ mod tests {
     ///
     /// At ledger 182022 TX 4, a Soroban InvokeHostFunction modified a ContractData entry
     /// but the TTL value remained the same (226129). We were incorrectly emitting a TTL
-    /// update to the bucket list, causing 1 extra LIVE entry compared to C++ stellar-core.
+    /// update to the bucket list, causing 1 extra LIVE entry compared to stellar-core.
     ///
-    /// C++ stellar-core only emits bucket list updates when there's an actual change in value.
+    /// stellar-core only emits bucket list updates when there's an actual change in value.
     /// This test verifies that when data is modified but TTL is unchanged, we don't emit
     /// a redundant TTL update.
     #[test]
@@ -2090,7 +2090,7 @@ mod tests {
     ///
     /// When a Soroban contract execution produces a CONTRACT_DATA entry that exceeds
     /// `maxContractDataEntrySizeBytes`, the result should be ResourceLimitExceeded.
-    /// This matches C++ stellar-core's `validateContractLedgerEntry()` behavior.
+    /// This matches stellar-core's `validateContractLedgerEntry()` behavior.
     #[test]
     fn test_validate_contract_data_entry_size_exceeded() {
         // Test the validate_contract_ledger_entry function directly

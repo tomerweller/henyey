@@ -9,7 +9,7 @@
 //! The crate supports two first-class modes of operation:
 //!
 //! 1. **Live Execution Mode**: Validates and executes transactions in real-time,
-//!    producing deterministic results that match C++ stellar-core. This is the
+//!    producing deterministic results that match stellar-core. This is the
 //!    mode used by validators to close ledgers.
 //!
 //! 2. **Catchup/Replay Mode**: Applies historical transactions from archives

@@ -19,7 +19,7 @@
 //!
 //! # Hash Function
 //!
-//! Keys are hashed using SipHash-2-4 for consistency with stellar-core C++.
+//! Keys are hashed using SipHash-2-4 for consistency with stellar-core.
 //! The hash seed must match the global short hash key to ensure deterministic
 //! behavior across nodes.
 //!
@@ -107,7 +107,7 @@ impl BucketBloomFilter {
 
         // The xorf BinaryFuse16 constructor can fail with out_of_range errors
         // if there are hash collisions. We retry with a modified seed similar
-        // to the C++ implementation.
+        // to the stellar-core implementation.
         let mut modified_seed = *seed;
         for attempt in 0..10 {
             // BinaryFuse16::try_from takes ownership, so we need to clone for retries
@@ -119,7 +119,7 @@ impl BucketBloomFilter {
                     });
                 }
                 Err(_) if attempt < 9 => {
-                    // Rotate the seed and retry (matches C++ behavior)
+                    // Rotate the seed and retry (matches stellar-core behavior)
                     modified_seed[0] = modified_seed[0].wrapping_add(1);
                 }
                 Err(e) => {
@@ -149,7 +149,7 @@ impl BucketBloomFilter {
 
     /// Computes the SipHash-2-4 hash of a ledger key.
     ///
-    /// This matches the C++ stellar-core hash computation for bloom filter keys.
+    /// This matches the stellar-core hash computation for bloom filter keys.
     pub fn hash_key(key: &LedgerKey, seed: &HashSeed) -> u64 {
         let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
         Self::hash_bytes(&key_bytes, seed)

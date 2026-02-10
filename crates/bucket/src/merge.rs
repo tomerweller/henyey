@@ -114,7 +114,7 @@ pub fn merge_buckets_with_options(
     normalize_init_entries: bool,
 ) -> Result<Bucket> {
     // Note: We intentionally do NOT use fast paths for empty buckets here.
-    // C++ stellar-core always goes through the full merge process even when
+    // stellar-core always goes through the full merge process even when
     // one input is empty. This is important because:
     // 1. The output bucket gets new metadata (protocol version)
     // 2. The bucket hash includes metadata
@@ -227,7 +227,7 @@ pub fn merge_buckets_with_options(
     }
 
     if merged.is_empty() {
-        // In C++, even a merge that results in no data entries still produces a bucket
+        // In stellar-core, even a merge that results in no data entries still produces a bucket
         // with a metadata entry (for protocol 11+). This ensures that the bucket list
         // hash is consistent. An uninitialized bucket has hash 0, but an initialized
         // empty bucket has the hash of its metadata.
@@ -432,7 +432,7 @@ fn advance_skip_metadata(
 /// for reading. The result is a new bucket with entries kept in memory for
 /// subsequent fast merges.
 ///
-/// This is the Rust equivalent of C++ `LiveBucket::mergeInMemory`.
+/// This is the Rust equivalent of stellar-core `LiveBucket::mergeInMemory`.
 ///
 /// # Requirements
 ///
@@ -483,7 +483,7 @@ pub fn merge_in_memory(
     );
 
     // Build output metadata using max_protocol_version directly.
-    // This matches C++ mergeInMemory behavior where meta.ledgerVersion = maxProtocolVersion
+    // This matches stellar-core mergeInMemory behavior where meta.ledgerVersion = maxProtocolVersion
     // without calling calculateMergeProtocolVersion.
     let output_meta = if max_protocol_version >= FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY {
         let mut meta = BucketMetadata {
@@ -1131,7 +1131,7 @@ fn build_output_metadata(
     max_protocol_version: u32,
 ) -> Result<(u32, Option<BucketEntry>)> {
     // Calculate the merge protocol version as max of input bucket versions.
-    // This matches C++ stellar-core's calculateMergeProtocolVersion() in BucketBase.cpp.
+    // This matches stellar-core's calculateMergeProtocolVersion() in BucketBase.cpp.
     let mut protocol_version = 0u32;
     if let Some(meta) = old_meta {
         protocol_version = protocol_version.max(meta.ledger_version);
@@ -1646,7 +1646,7 @@ mod tests {
     // These tests verify the fix for bucket list hash divergence caused by
     // incorrect protocol version handling in merges.
     //
-    // C++ stellar-core has TWO different merge behaviors:
+    // stellar-core has TWO different merge behaviors:
     // 1. In-memory merge (level 0): Uses maxProtocolVersion directly
     // 2. Disk-based merge (levels 1+): Uses max(old_bucket_version, new_bucket_version)
     //
@@ -1739,7 +1739,7 @@ mod tests {
     #[test]
     fn test_merge_in_memory_uses_max_protocol_version_directly() {
         // Regression test: merge_in_memory (level 0) uses max_protocol_version directly,
-        // matching C++ LiveBucket::mergeInMemory behavior.
+        // matching stellar-core LiveBucket::mergeInMemory behavior.
 
         // Create buckets with protocol version 20 metadata
         let old_meta = BucketMetadata {
@@ -1786,7 +1786,7 @@ mod tests {
     #[test]
     fn test_disk_merge_uses_max_of_inputs() {
         // Regression test: disk-based merge (merge_buckets) uses max(old, new) for version,
-        // matching C++ BucketBase::merge/calculateMergeProtocolVersion behavior.
+        // matching stellar-core BucketBase::merge/calculateMergeProtocolVersion behavior.
 
         // Create buckets with different protocol versions
         let old_meta = BucketMetadata {
@@ -1898,7 +1898,7 @@ mod tests {
 
     // ============ P0-1: Shadow + Protocol Version Merge Behavior ============
     //
-    // Upstream: BucketTests.cpp "merges proceed old-style despite newer shadows"
+    // stellar-core: BucketTests.cpp "merges proceed old-style despite newer shadows"
     // Tests that shadow filtering only applies pre-protocol-12 and that
     // protocol version constraints are respected.
 
@@ -1998,7 +1998,7 @@ mod tests {
 
     // ============ P0-2: Init Entry + Shadow Interaction ============
     //
-    // Upstream: BucketTests.cpp "merging bucket entries with initentry with shadows"
+    // stellar-core: BucketTests.cpp "merging bucket entries with initentry with shadows"
     // Tests that INIT and DEAD entries are preserved even when shadowed
     // (keep_shadowed_lifecycle_entries = true for protocol >= 11).
 
@@ -2127,7 +2127,7 @@ mod tests {
 
     #[test]
     fn test_shadow_does_not_revive_dead_entries() {
-        // Upstream: "shadowing does not revive dead entries"
+        // stellar-core: "shadowing does not revive dead entries"
         // Multi-level scenario: DEAD + INIT annihilation should still work
         // even with shadows present.
 
@@ -2171,7 +2171,7 @@ mod tests {
 
     #[test]
     fn test_shadow_does_not_eliminate_init_entries() {
-        // Upstream: shadows don't eliminate INIT entries
+        // stellar-core: shadows don't eliminate INIT entries
         // Even when an INIT entry is "shadowed" by a higher-level entry,
         // it must be kept for correct annihilation behavior at deeper levels.
 
@@ -2217,7 +2217,7 @@ mod tests {
 
     // ============ P0-3: Output Iterator Version Rejection ============
     //
-    // Upstream: BucketTests.cpp "bucket output iterator rejects wrong-version entries"
+    // stellar-core: BucketTests.cpp "bucket output iterator rejects wrong-version entries"
     // Tests that pre-protocol-11 merges do not produce INITENTRY or METAENTRY.
 
     #[test]
@@ -2250,7 +2250,7 @@ mod tests {
     fn test_pre_protocol_11_merge_normalizes_init_to_live() {
         // When crossing level boundaries (normalize_init=true), INIT entries from
         // the new (incoming) bucket should be normalized to LIVE.
-        // This matches C++ BucketOutputIterator behavior.
+        // This matches stellar-core BucketOutputIterator behavior.
         let old_entries = vec![BucketEntry::Live(make_account_entry([2u8; 32], 200))];
         let new_entries = vec![BucketEntry::Init(make_account_entry([1u8; 32], 100))];
 

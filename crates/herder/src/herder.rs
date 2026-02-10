@@ -66,7 +66,7 @@ use crate::Result;
 ///
 /// Maximum number of slots to accept behind the current tracking slot.
 ///
-/// This matches the C++ stellar-core MAX_SLOTS_TO_REMEMBER constant. Slots
+/// This matches the stellar-core MAX_SLOTS_TO_REMEMBER constant. Slots
 /// within this window of the tracking slot are accepted for processing.
 /// This allows the node to catch up on recent slots after catchup without
 /// rejecting valid SCP envelopes as "too old".
@@ -74,29 +74,29 @@ const MAX_SLOTS_TO_REMEMBER: u64 = 12;
 
 /// Maximum time slip allowed for close times in SCP values (in seconds).
 ///
-/// Matches C++ `Herder::MAX_TIME_SLIP_SECONDS = 60`. A proposed close time
+/// Matches stellar-core `Herder::MAX_TIME_SLIP_SECONDS = 60`. A proposed close time
 /// can be at most 60 seconds ahead of the current wall-clock time.
 const MAX_TIME_SLIP_SECONDS: u64 = 60;
 
 /// Maximum ledger close time drift for envelope recency filtering (in seconds).
 ///
-/// Matches C++ `Config::MAXIMUM_LEDGER_CLOSETIME_DRIFT`. When filtering
+/// Matches stellar-core `Config::MAXIMUM_LEDGER_CLOSETIME_DRIFT`. When filtering
 /// incoming SCP envelopes for recency (during initial boot before any sync),
 /// close times must be within this window of the current wall-clock time.
-/// C++ computes this as `min((MAX_SLOTS_TO_REMEMBER + 2) * TARGET_CLOSE_TIME / 1000, 90)`.
+/// stellar-core computes this as `min((MAX_SLOTS_TO_REMEMBER + 2) * TARGET_CLOSE_TIME / 1000, 90)`.
 /// With default values: `min(14 * 5, 90) = 70` seconds.
 const MAXIMUM_LEDGER_CLOSETIME_DRIFT: u64 = 70;
 
 /// Maximum number of ledgers ahead of tracking that we accept SCP messages for.
 ///
-/// Matches C++ `Herder::LEDGER_VALIDITY_BRACKET = 100`. When tracking consensus,
+/// Matches stellar-core `Herder::LEDGER_VALIDITY_BRACKET = 100`. When tracking consensus,
 /// we reject envelopes for slots more than this many ahead of our next consensus
 /// ledger index.
 const LEDGER_VALIDITY_BRACKET: u64 = 100;
 
 /// Genesis ledger sequence number.
 ///
-/// Matches C++ `LedgerManager::GENESIS_LEDGER_SEQ = 1`.
+/// Matches stellar-core `LedgerManager::GENESIS_LEDGER_SEQ = 1`.
 const GENESIS_LEDGER_SEQ: u64 = 1;
 
 /// Default checkpoint frequency (64 ledgers).
@@ -244,7 +244,7 @@ pub struct Herder {
     /// Current tracking slot (ledger sequence as u64).
     tracking_slot: RwLock<u64>,
     /// Consensus close time for the tracking slot.
-    /// Matches C++ `mTrackingSCP.mConsensusCloseTime`.
+    /// Matches stellar-core `mTrackingSCP.mConsensusCloseTime`.
     tracking_consensus_close_time: RwLock<u64>,
     /// When we started tracking.
     tracking_started_at: RwLock<Option<Instant>>,
@@ -446,20 +446,20 @@ impl Herder {
     }
 
     /// Get the tracking consensus close time.
-    /// Matches C++ `HerderImpl::trackingConsensusCloseTime()`.
+    /// Matches stellar-core `HerderImpl::trackingConsensusCloseTime()`.
     pub fn tracking_consensus_close_time(&self) -> u64 {
         *self.tracking_consensus_close_time.read()
     }
 
     /// Get the next consensus ledger index.
-    /// Matches C++ `HerderImpl::nextConsensusLedgerIndex()`.
+    /// Matches stellar-core `HerderImpl::nextConsensusLedgerIndex()`.
     pub fn next_consensus_ledger_index(&self) -> u64 {
         *self.tracking_slot.read()
     }
 
     /// Get the most recent checkpoint sequence.
     ///
-    /// Matches C++ `HerderImpl::getMostRecentCheckpointSeq()` which returns
+    /// Matches stellar-core `HerderImpl::getMostRecentCheckpointSeq()` which returns
     /// `HistoryManager::firstLedgerInCheckpointContaining(trackingConsensusLedgerIndex())`.
     ///
     /// With checkpoint frequency 64:
@@ -604,7 +604,7 @@ impl Herder {
 
     /// Perform out-of-sync recovery by purging old slots.
     ///
-    /// This mirrors C++ stellar-core's `outOfSyncRecovery()` function.
+    /// This mirrors stellar-core's `outOfSyncRecovery()` function.
     /// When we're out of sync, we scan v-blocking slots from highest to lowest
     /// and purge all slots more than LEDGER_VALIDITY_BRACKET (100) behind
     /// the highest v-blocking slot.
@@ -675,7 +675,7 @@ impl Herder {
         *self.tracking_started_at.write() = Some(Instant::now());
 
         // Set tracking consensus close time from LCL if available
-        // (matching C++ setTrackingSCPState which sets close time from externalized value)
+        // (matching stellar-core setTrackingSCPState which sets close time from externalized value)
         let close_time = self
             .ledger_manager
             .read()
@@ -718,7 +718,7 @@ impl Herder {
 
     /// Check close time of all values in an SCP envelope.
     ///
-    /// Matches C++ `HerderImpl::checkCloseTime(SCPEnvelope, enforceRecent)`.
+    /// Matches stellar-core `HerderImpl::checkCloseTime(SCPEnvelope, enforceRecent)`.
     /// This is called BEFORE signature verification as a cheap pre-filter.
     ///
     /// When `enforce_recent` is true, values must have close times within
@@ -755,8 +755,8 @@ impl Herder {
         let mut last_close_time = lcl_close_time;
 
         // Use tracking consensus data for a better estimate when available
-        // (matching C++ which upgrades lastCloseIndex/lastCloseTime from tracking)
-        // C++ uses trackingConsensusLedgerIndex() which is the LCL seq (= next_consensus - 1)
+        // (matching stellar-core which upgrades lastCloseIndex/lastCloseTime from tracking)
+        // stellar-core uses trackingConsensusLedgerIndex() which is the LCL seq (= next_consensus - 1)
         let state = self.state();
         if state != HerderState::Booting {
             let tracking_index = self.tracking_slot().saturating_sub(1);
@@ -836,7 +836,7 @@ impl Herder {
         }
 
         // **** First perform checks that do NOT require signature verification
-        // This allows fast-failing messages we'd throw away anyway (matching C++)
+        // This allows fast-failing messages we'd throw away anyway (matching stellar-core)
 
         // Close-time pre-filter: reject envelopes with invalid close times
         // before incurring the cost of signature verification
@@ -888,7 +888,7 @@ impl Herder {
         let effective_min = lcl.map_or(min_ledger_seq, |l| min_ledger_seq.max(l + 1));
 
         // Range check: slot must be in [effective_min, max_ledger_seq], with
-        // checkpoint exception (matching C++)
+        // checkpoint exception (matching stellar-core)
         if (slot > max_ledger_seq || slot < effective_min) && slot != checkpoint {
             debug!(
                 slot,
@@ -902,7 +902,7 @@ impl Herder {
             return EnvelopeState::TooOld;
         }
 
-        // **** From this point, we have to check signatures (matching C++)
+        // **** From this point, we have to check signatures (matching stellar-core)
         if let Err(e) = self.scp_driver.verify_envelope(&envelope) {
             debug!(slot, error = %e, "Invalid SCP envelope signature");
             return EnvelopeState::InvalidSignature;
@@ -976,11 +976,11 @@ impl Herder {
                     return EnvelopeState::Invalid;
                 }
 
-                // C++ stellar-core has no max distance check for EXTERNALIZE.
+                // stellar-core has no max distance check for EXTERNALIZE.
                 // The quorum check above is sufficient to prevent untrusted fast-forwards.
 
                 // CRITICAL: Don't externalize without the tx_set!
-                // Like C++ stellar-core, we must wait until the tx_set is available before
+                // Like stellar-core, we must wait until the tx_set is available before
                 // recording externalization. Otherwise we create buffered ledgers that can
                 // never close (no tx_set to apply).
                 if !self.scp_driver.has_tx_set(&tx_set_hash) {
@@ -1061,7 +1061,7 @@ impl Herder {
                 }
 
                 // CRITICAL: Don't externalize without the tx_set!
-                // Like C++ stellar-core, we must wait until the tx_set is available.
+                // Like stellar-core, we must wait until the tx_set is available.
                 if !self.scp_driver.has_tx_set(&tx_set_hash) {
                     debug!(
                         slot,
@@ -1155,7 +1155,7 @@ impl Herder {
 
     /// Process an SCP envelope (internal).
     ///
-    /// This follows the C++ stellar-core pattern: we only feed envelopes to SCP
+    /// This follows the stellar-core pattern: we only feed envelopes to SCP
     /// after their tx sets are available. This ensures that when SCP externalizes
     /// a slot, the tx set is already in cache and ready for ledger close.
     fn process_scp_envelope(&self, envelope: ScpEnvelope) -> EnvelopeState {
@@ -1331,7 +1331,7 @@ impl Herder {
         let mut tracking = self.tracking_slot.write();
         if externalized_slot >= *tracking {
             *tracking = externalized_slot + 1;
-            // Update tracking consensus close time (matching C++ setTrackingSCPState)
+            // Update tracking consensus close time (matching stellar-core setTrackingSCPState)
             *self.tracking_consensus_close_time.write() = close_time;
             self.pending_envelopes
                 .set_current_slot(externalized_slot + 1);
@@ -2255,7 +2255,7 @@ mod tests {
         ));
 
         // Include a vote with a valid close time so the envelope passes
-        // check_envelope_close_time filtering (matching C++ which always has values)
+        // check_envelope_close_time filtering (matching stellar-core which always has values)
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2366,8 +2366,8 @@ mod tests {
         assert!(!stats.is_validator);
     }
 
-    // MAX_EXTERNALIZE_SLOT_DISTANCE was removed — C++ stellar-core has no such limit.
-    // When not tracking, C++ accepts EXTERNALIZE for any slot (maxLedgerSeq = uint32::max).
+    // MAX_EXTERNALIZE_SLOT_DISTANCE was removed — stellar-core has no such limit.
+    // When not tracking, stellar-core accepts EXTERNALIZE for any slot (maxLedgerSeq = uint32::max).
 
     /// Creates a signed EXTERNALIZE envelope for testing.
     fn make_signed_externalize_envelope(slot: u64, herder: &Herder) -> ScpEnvelope {
@@ -2437,7 +2437,7 @@ mod tests {
 
     #[test]
     fn test_externalize_accepted_for_far_future_slot() {
-        // When tracking, C++ applies LEDGER_VALIDITY_BRACKET to limit how far
+        // When tracking, stellar-core applies LEDGER_VALIDITY_BRACKET to limit how far
         // ahead we accept messages. This test verifies EXTERNALIZE within the
         // bracket is accepted, and that it advances our tracking slot.
         let secret = SecretKey::from_seed(&[1u8; 32]);
@@ -2721,7 +2721,7 @@ mod tests {
 
     #[test]
     fn test_get_most_recent_checkpoint_seq() {
-        // Test checkpoint computation matches C++ HistoryManager
+        // Test checkpoint computation matches stellar-core HistoryManager
         let herder = make_test_herder();
 
         // Default tracking_slot is 0, so tracking_consensus_index = 0

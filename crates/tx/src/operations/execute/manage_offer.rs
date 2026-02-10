@@ -86,7 +86,7 @@ fn execute_manage_offer(
         ));
     }
 
-    // C++ stellar-core checks trustlines BEFORE checking offer existence.
+    // stellar-core checks trustlines BEFORE checking offer existence.
     // This is done in checkOfferValid() which is called before loadOffer().
     // We need to match this order to produce identical error codes.
 
@@ -161,7 +161,7 @@ fn execute_manage_offer(
         ));
     }
     // For new offers, check subentry limit FIRST (before any balance/reserve checks).
-    // This matches C++ stellar-core's check ordering.
+    // This matches stellar-core's check ordering.
     if old_offer.is_none() {
         let source_account = state
             .get_account(source)
@@ -179,7 +179,7 @@ fn execute_manage_offer(
     let reserve_subentry = old_offer.is_none() && sponsor.is_none();
 
     // For native selling asset with existing offers, check account has sufficient balance.
-    // For new offers, skip this check: C++ checks LowReserve (via
+    // For new offers, skip this check: stellar-core checks LowReserve (via
     // createEntryWithPossibleSponsorship) BEFORE Underfunded (via
     // computeOfferExchangeParameters). The later has_selling_capacity check
     // handles the Underfunded case for new offers after the LowReserve check.
@@ -432,13 +432,13 @@ fn execute_manage_offer(
             }
         } else {
             // New offer that was fully consumed during matching.
-            // In C++ (V14+), loadAccount is called before the exchange for
+            // In stellar-core (V14+), loadAccount is called before the exchange for
             // createEntryWithPossibleSponsorship (numSubEntries++), and again
             // after for removeEntryWithPossibleSponsorship (numSubEntries--).
             // The net effect on fields is zero, but the account is recorded
             // in the LedgerTxn and gets lastModified updated on commit.
             state.record_account_access(source);
-            // If there was a pending sponsor, C++ also loads the sponsor
+            // If there was a pending sponsor, stellar-core also loads the sponsor
             // account via createEntryWithPossibleSponsorship (numSponsoring++)
             // and removeEntryWithPossibleSponsorship (numSponsoring--).
             // Net effect is zero but the sponsor account gets lm stamped.
@@ -2131,7 +2131,7 @@ mod tests {
     }
 
     /// Regression test: new offer selling native with insufficient balance must
-    /// return LowReserve, not Underfunded. C++ checks LowReserve first (via
+    /// return LowReserve, not Underfunded. stellar-core checks LowReserve first (via
     /// createEntryWithPossibleSponsorship in doApply) before Underfunded (via
     /// computeOfferExchangeParameters). The early Underfunded check only applies
     /// to existing offers.
@@ -2145,7 +2145,7 @@ mod tests {
 
         // Account has exactly min_balance: can't afford the subentry reserve
         // for a new offer AND also has insufficient native balance to sell.
-        // C++ returns LowReserve (not Underfunded) because the reserve check
+        // stellar-core returns LowReserve (not Underfunded) because the reserve check
         // happens first.
         let min_balance = state
             .minimum_balance_with_counts(context.protocol_version, 0, 0, 0)
@@ -3028,7 +3028,7 @@ mod tests {
     /// Regression test for the "fully consumed new offer" bug.
     ///
     /// When a new ManageSellOffer (or ManageBuyOffer) is submitted and gets
-    /// fully consumed during matching against existing offers, C++ still
+    /// fully consumed during matching against existing offers, stellar-core still
     /// records the source account as accessed (via loadAccount before the
     /// exchange). Our code must also call record_account_access so the
     /// account appears in the delta with updated lastModified.
@@ -3188,7 +3188,7 @@ mod tests {
         );
 
         // Key assertion: the source account must appear in the op snapshot,
-        // meaning it was recorded as accessed. This matches C++ behavior where
+        // meaning it was recorded as accessed. This matches stellar-core behavior where
         // loadAccount is called before the exchange for new offers (V14+).
         let op_snapshots = state.end_op_snapshot();
         let source_account_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
@@ -3203,7 +3203,7 @@ mod tests {
     /// Test that when a sponsored new offer is fully consumed during matching,
     /// the sponsor account is recorded in the op snapshot (gets lm stamped).
     ///
-    /// In C++ (V14+), createEntryWithPossibleSponsorship is called before the
+    /// In stellar-core (V14+), createEntryWithPossibleSponsorship is called before the
     /// exchange (numSponsoring++ on sponsor), and removeEntryWithPossibleSponsorship
     /// is called after (numSponsoring-- on sponsor). The net effect on the sponsor
     /// is zero, but the account is loaded with tracking and gets lastModified updated.
@@ -3354,7 +3354,7 @@ mod tests {
         let op_snapshots = state.end_op_snapshot();
 
         // Key assertion: the SPONSOR account must appear in the op snapshot.
-        // In C++, createEntryWithPossibleSponsorship loads the sponsor (numSponsoring++),
+        // In stellar-core, createEntryWithPossibleSponsorship loads the sponsor (numSponsoring++),
         // and removeEntryWithPossibleSponsorship loads it again (numSponsoring--).
         // Net effect is zero but the sponsor gets lm stamped.
         let sponsor_account_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {

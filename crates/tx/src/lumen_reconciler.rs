@@ -26,7 +26,7 @@
 //! );
 //! ```
 //!
-//! # C++ Parity
+//! # Parity
 //!
 //! This module matches the behavior of `LumenEventReconciler.cpp` in stellar-core v25,
 //! including:

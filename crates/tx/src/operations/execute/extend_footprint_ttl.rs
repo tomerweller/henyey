@@ -20,7 +20,7 @@ const MAX_ENTRY_TTL: u32 = 6_312_000; // ~1 year at 5-second ledger close
 /// This operation extends the TTL of all entries in the transaction's footprint
 /// to at least the specified ledger sequence.
 ///
-/// Matches C++ ExtendFootprintTTLApplyHelper::apply() behavior:
+/// Matches stellar-core ExtendFootprintTTLApplyHelper::apply() behavior:
 /// - Skips missing entries (not found in state)
 /// - Skips archived/non-live entries (TTL < current_ledger)
 /// - Skips entries whose TTL already meets or exceeds the target
@@ -62,14 +62,14 @@ pub fn execute_extend_footprint_ttl(
     }
 
     // Calculate the target TTL ledger sequence
-    // C++: newLiveUntilLedgerSeq = getLedgerSeq() + mOpFrame.mExtendFootprintTTLOp.extendTo
+    // stellar-core: newLiveUntilLedgerSeq = getLedgerSeq() + mOpFrame.mExtendFootprintTTLOp.extendTo
     let current_ledger = context.sequence;
     let new_live_until = current_ledger.saturating_add(op.extend_to);
     let disk_read_bytes_limit = soroban_data.resources.disk_read_bytes;
     let mut accumulated_read_bytes: u32 = 0;
 
     // Extend TTL for all entries in the read-only footprint.
-    // Matches C++ ExtendFootprintTTLApplyHelper::apply():
+    // Matches stellar-core ExtendFootprintTTLApplyHelper::apply():
     // - Look up TTL key first; skip missing/non-live entries
     // - Skip entries whose TTL already meets target
     // - Check read bytes resource limit
@@ -80,25 +80,25 @@ pub fn execute_extend_footprint_ttl(
         let ttl_entry = state.get_ttl(&key_hash).cloned();
         match ttl_entry {
             None => {
-                // TTL entry not found - skip (C++: !ttlLeOpt -> continue)
+                // TTL entry not found - skip (stellar-core: !ttlLeOpt -> continue)
                 continue;
             }
             Some(ttl) => {
                 if ttl.live_until_ledger_seq < current_ledger {
                     // Entry is not live (archived/expired) - skip
-                    // C++: !isLive(*ttlLeOpt, getLedgerSeq()) -> continue
+                    // stellar-core: !isLive(*ttlLeOpt, getLedgerSeq()) -> continue
                     continue;
                 }
                 if ttl.live_until_ledger_seq >= new_live_until {
                     // TTL already sufficient - skip
-                    // C++: currLiveUntilLedgerSeq >= newLiveUntilLedgerSeq -> continue
+                    // stellar-core: currLiveUntilLedgerSeq >= newLiveUntilLedgerSeq -> continue
                     continue;
                 }
             }
         }
 
         // The main entry must exist (TTL exists and is live => entry exists)
-        // C++: releaseAssertOrThrow(entryOpt)
+        // stellar-core: releaseAssertOrThrow(entryOpt)
         let entry = state.get_entry(key);
         if entry.is_none() {
             // Should not happen if TTL is live, but be safe
@@ -106,7 +106,7 @@ pub fn execute_extend_footprint_ttl(
         }
 
         // Track read bytes and check limit
-        // C++: checkReadBytesResourceLimit(entrySize)
+        // stellar-core: checkReadBytesResourceLimit(entrySize)
         let entry_size = entry
             .and_then(|e| e.to_xdr(stellar_xdr::curr::Limits::none()).ok())
             .map(|bytes| bytes.len() as u32)

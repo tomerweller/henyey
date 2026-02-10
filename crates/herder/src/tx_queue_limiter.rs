@@ -9,9 +9,9 @@
 //! - Tracking of evicted transaction fees to prevent fee degradation
 //! - Separate priority ordering for flooding (highest fee first)
 //!
-//! # C++ Parity
+//! # Parity
 //!
-//! This module corresponds to `TxQueueLimiter.h/cpp` in stellar-core v25.
+//! This module corresponds to `TxQueueLimiter.h` in stellar-core v25.
 
 use henyey_common::{NetworkId, Resource};
 use henyey_tx::TransactionFrame;

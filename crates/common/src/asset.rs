@@ -2,7 +2,7 @@
 //!
 //! This module provides functions for working with Stellar assets, including
 //! validation, comparison, and string conversion utilities that match the
-//! C++ stellar-core implementation.
+//! stellar-core implementation.
 //!
 //! # Examples
 //!
@@ -36,7 +36,7 @@ pub const LIQUIDITY_POOL_FEE_V18: i32 = 30;
 
 /// Check if a character is ASCII alphanumeric (a-z, A-Z, 0-9).
 ///
-/// This is a locale-independent check matching the C++ implementation.
+/// This is a locale-independent check matching the stellar-core implementation.
 #[inline]
 pub fn is_ascii_alphanumeric(c: char) -> bool {
     let uc = c as u8;

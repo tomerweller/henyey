@@ -67,7 +67,7 @@ pub fn execute_clawback(
     };
 
     // Check trustline has TRUSTLINE_CLAWBACK_ENABLED flag set
-    // Per C++ stellar-core, we check the trustline flag, not the issuer account flag
+    // Per stellar-core, we check the trustline flag, not the issuer account flag
     if trustline.flags & TRUSTLINE_CLAWBACK_ENABLED_FLAG == 0 {
         return Ok(make_clawback_result(ClawbackResultCode::NotClawbackEnabled));
     }
@@ -114,7 +114,7 @@ pub fn execute_clawback_claimable_balance(
     }
 
     // Check source account exists and is the issuer.
-    // Use a mutable load to mirror C++ loadSourceAccount access patterns.
+    // Use a mutable load to mirror stellar-core loadSourceAccount access patterns.
     let issuer_flags = match state.get_account_mut(source) {
         Some(a) => a.flags,
         None => {

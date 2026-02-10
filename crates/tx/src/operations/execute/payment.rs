@@ -43,7 +43,7 @@ pub fn execute_payment(
         return Ok(make_result(PaymentResultCode::Malformed));
     }
 
-    // C++ stellar-core optimization: if sending native XLM to self, mark as instant success
+    // stellar-core optimization: if sending native XLM to self, mark as instant success
     // without accessing any ledger entries. This matches behavior from protocol v3+.
     // (Before v3, this applied to all asset types, but we only support v23+)
     if *source == dest && matches!(op.asset, Asset::Native) {
@@ -110,7 +110,7 @@ fn execute_native_payment(
 
 /// Execute a credit asset payment.
 ///
-/// The order of operations matches C++ stellar-core's PathPaymentStrictReceive implementation:
+/// The order of operations matches stellar-core's PathPaymentStrictReceive implementation:
 /// 1. Check destination exists
 /// 2. Check destination trustline exists and is authorized (NoTrust, NotAuthorized)
 /// 3. **Credit destination** (LineFull check happens here)
@@ -138,11 +138,11 @@ fn execute_credit_payment(
         return Ok(make_result(PaymentResultCode::NoDestination));
     }
 
-    // Note: C++ stellar-core only checks if issuer exists before protocol v13.
+    // Note: stellar-core only checks if issuer exists before protocol v13.
     // Since we only support protocol 23+, we skip the issuer existence check.
     // The NoIssuer error code is effectively unused in modern protocols.
 
-    // Step 1: Check and credit destination (updateDestBalance in C++)
+    // Step 1: Check and credit destination (updateDestBalance in stellar-core)
     if issuer != dest {
         let dest_trustline = match state.get_trustline(dest, asset) {
             Some(tl) => tl,
@@ -170,7 +170,7 @@ fn execute_credit_payment(
         dest_trustline_mut.balance += amount;
     }
 
-    // Step 2: Check and debit source (updateSourceBalance in C++)
+    // Step 2: Check and debit source (updateSourceBalance in stellar-core)
     if issuer != source {
         let source_trustline = match state.get_trustline(source, asset) {
             Some(tl) => tl,

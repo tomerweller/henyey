@@ -90,7 +90,7 @@ pub struct Slot {
     /// Whether we've heard from a v-blocking set for this slot.
     ///
     /// Set once when a v-blocking threshold of nodes have sent messages.
-    /// Matches C++ `mGotVBlocking`.
+    /// Matches stellar-core `mGotVBlocking`.
     got_v_blocking: bool,
 }
 
@@ -159,7 +159,7 @@ impl Slot {
 
     /// Check if we've heard from a v-blocking set.
     ///
-    /// Matches C++ `Slot::gotVBlocking()`.
+    /// Matches stellar-core `Slot::gotVBlocking()`.
     pub fn got_v_blocking(&self) -> bool {
         self.got_v_blocking
     }
@@ -171,7 +171,7 @@ impl Slot {
     /// quorum set that have sent messages and determines if they form a
     /// v-blocking set.
     ///
-    /// Matches C++ `Slot::maybeSetGotVBlocking()`.
+    /// Matches stellar-core `Slot::maybeSetGotVBlocking()`.
     fn maybe_set_got_v_blocking(&mut self) {
         if self.got_v_blocking {
             return;
@@ -181,7 +181,7 @@ impl Slot {
         let mut heard_nodes = std::collections::HashSet::new();
         let all_nodes = crate::quorum::get_all_nodes(&self.local_quorum_set);
         for node_id in &all_nodes {
-            // Check ballot protocol first, then nomination (matching C++ getLatestMessage)
+            // Check ballot protocol first, then nomination (matching stellar-core getLatestMessage)
             if self.ballot.latest_envelopes().contains_key(node_id)
                 || self.nomination.get_latest_nomination(node_id).is_some()
             {
@@ -204,7 +204,7 @@ impl Slot {
         let node_id = envelope.statement.node_id.clone();
 
         // Check if this is the first message from this node
-        // C++ checks getLatestMessage(nodeID) which checks ballot then nomination
+        // stellar-core checks getLatestMessage(nodeID) which checks ballot then nomination
         let prev = self.ballot.latest_envelopes().contains_key(&node_id)
             || self.nomination.get_latest_nomination(&node_id).is_some();
 
@@ -225,7 +225,7 @@ impl Slot {
                 .push(envelope.clone());
 
             // If this is the first valid message from this node,
-            // check if we now have a v-blocking set (matching C++)
+            // check if we now have a v-blocking set (matching stellar-core)
             if !prev {
                 self.maybe_set_got_v_blocking();
             }
@@ -282,11 +282,11 @@ impl Slot {
             timedout,
         );
 
-        // C++ always sets up the nomination timer after nominate() succeeds
+        // stellar-core always sets up the nomination timer after nominate() succeeds
         // in reaching the main logic (i.e., didn't return early due to
         // candidates already existing, stopped, or timed-out-before-started).
         // The timer is NOT conditional on `updated`.
-        // We check the conditions that match C++ reaching line 654.
+        // We check the conditions that match stellar-core reaching line 654.
         if self.nomination.is_started()
             && !self.nomination.is_stopped()
             && self.nomination.candidates().is_empty()
@@ -312,7 +312,7 @@ impl Slot {
 
     /// Sync the composite candidate from nomination into ballot protocol.
     ///
-    /// The C++ BallotProtocol accesses `mSlot.getLatestCompositeCandidate()` directly,
+    /// The stellar-core BallotProtocol accesses `mSlot.getLatestCompositeCandidate()` directly,
     /// but in Rust the ballot protocol doesn't hold a reference to the slot/nomination.
     /// We sync it before any ballot operation that might call `abandon_ballot`.
     fn sync_composite_candidate(&mut self) {
@@ -428,7 +428,7 @@ impl Slot {
         );
 
         // Check if set_confirm_commit signaled that nomination should stop
-        // (matches C++ mSlot.stopNomination() call inside setConfirmCommit)
+        // (matches stellar-core mSlot.stopNomination() call inside setConfirmCommit)
         if self.ballot.take_needs_stop_nomination() {
             self.nomination.stop();
             driver.stop_timer(self.slot_index, crate::driver::SCPTimerType::Nomination);
@@ -447,7 +447,7 @@ impl Slot {
         // Check if nomination has produced a composite value
         let composite = self.nomination.latest_composite().cloned();
         if let Some(composite) = composite {
-            // C++ does NOT stop nomination here — nomination continues to run
+            // stellar-core does NOT stop nomination here — nomination continues to run
             // alongside the ballot protocol. stopNomination() is only called
             // when the slot is externalized (from setConfirmCommit).
             // Stop the nomination timer though (candidates already confirmed).
@@ -509,7 +509,7 @@ impl Slot {
     /// Get the latest envelope from a specific node.
     ///
     /// Checks ballot protocol first, then nomination protocol.
-    /// Matches C++ `Slot::getLatestMessage(NodeID const& id)`.
+    /// Matches stellar-core `Slot::getLatestMessage(NodeID const& id)`.
     pub fn get_latest_envelope(&self, node_id: &NodeId) -> Option<&ScpEnvelope> {
         self.ballot
             .latest_envelopes()
@@ -520,7 +520,7 @@ impl Slot {
     /// Get the latest messages that would be sent for this slot.
     ///
     /// Returns the latest envelopes for both nomination and ballot protocols.
-    /// Only returns messages if the slot is fully validated (matching C++
+    /// Only returns messages if the slot is fully validated (matching stellar-core
     /// `Slot::getLatestMessagesSend` which gates on `mFullyValidated`).
     pub fn get_latest_messages_send(&self) -> Vec<ScpEnvelope> {
         let mut messages = Vec::new();
@@ -552,14 +552,14 @@ impl Slot {
     /// Get the latest composite candidate value for this slot.
     ///
     /// Returns the most recently computed composite value from the nomination protocol.
-    /// Matches C++ `Slot::getLatestCompositeCandidate()`.
+    /// Matches stellar-core `Slot::getLatestCompositeCandidate()`.
     pub fn get_latest_composite_candidate(&self) -> Option<Value> {
         self.nomination.latest_composite().cloned()
     }
 
     /// Get the externalizing state for this slot.
     ///
-    /// Delegates to BallotProtocol::get_externalizing_state, matching C++
+    /// Delegates to BallotProtocol::get_externalizing_state, matching stellar-core
     /// where `Slot::getExternalizingState()` calls
     /// `mBallotProtocol.getExternalizingState()`.
     pub fn get_externalizing_state(&self) -> Vec<ScpEnvelope> {
@@ -649,7 +649,7 @@ impl Slot {
     /// when restarting after a crash. It routes the envelope to the appropriate
     /// protocol (nomination or ballot) for state restoration.
     ///
-    /// Matching C++ `Slot::setStateFromEnvelope`: validates that the envelope is
+    /// Matching stellar-core `Slot::setStateFromEnvelope`: validates that the envelope is
     /// from the local node and for this slot, checks if it's a new node, and
     /// calls `maybeSetGotVBlocking`.
     ///
@@ -659,7 +659,7 @@ impl Slot {
     /// # Returns
     /// True if state was successfully restored, false if the envelope is invalid.
     pub fn set_state_from_envelope(&mut self, envelope: &ScpEnvelope) -> bool {
-        // C++ validates nodeID and slotIndex
+        // stellar-core validates nodeID and slotIndex
         if envelope.statement.node_id != self.local_node_id
             || envelope.statement.slot_index != self.slot_index
         {
@@ -755,7 +755,7 @@ impl Slot {
 
     /// Force-bump the ballot state, auto-computing the counter.
     ///
-    /// This mirrors C++ `BallotProtocol::bumpState(value, force=true)`.
+    /// This mirrors stellar-core `BallotProtocol::bumpState(value, force=true)`.
     /// Counter is `current_counter + 1`, or 1 if no current ballot.
     pub fn force_bump_state<D: SCPDriver>(&mut self, driver: &Arc<D>, value: Value) -> bool {
         self.ballot.bump(
@@ -824,7 +824,7 @@ impl Slot {
     /// Get JSON-serializable slot information.
     ///
     /// Returns a SlotInfo struct that can be serialized to JSON
-    /// for debugging and monitoring purposes, matching C++ `getJsonInfo()`.
+    /// for debugging and monitoring purposes, matching stellar-core `getJsonInfo()`.
     pub fn get_info(&self) -> crate::SlotInfo {
         let phase = if self.externalized_value.is_some() {
             "EXTERNALIZED"
@@ -858,7 +858,7 @@ impl Slot {
     /// Get JSON-serializable quorum information.
     ///
     /// Returns a QuorumInfo struct that can be serialized to JSON
-    /// for debugging and monitoring purposes, matching C++ `getJsonQuorumInfo()`.
+    /// for debugging and monitoring purposes, matching stellar-core `getJsonQuorumInfo()`.
     pub fn get_quorum_info(&self) -> crate::QuorumInfo {
         let node_states = self.get_all_node_states();
         let mut nodes = std::collections::HashMap::new();
@@ -982,7 +982,7 @@ mod tests {
         };
 
         assert!(slot.set_state_from_envelope(&envelope));
-        // C++ setStateFromEnvelope does NOT set mNominationStarted = true
+        // stellar-core setStateFromEnvelope does NOT set mNominationStarted = true
         assert!(!slot.nomination().is_started());
     }
 
@@ -1535,7 +1535,7 @@ mod tests {
 
         assert!(slot.set_state_from_envelope(&envelope));
 
-        // C++ sets mPrepared = makeBallot(UINT32_MAX, v) for EXTERNALIZE
+        // stellar-core sets mPrepared = makeBallot(UINT32_MAX, v) for EXTERNALIZE
         let prepared = slot.ballot().prepared();
         assert!(
             prepared.is_some(),

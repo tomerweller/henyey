@@ -329,7 +329,7 @@ pub struct EventsConfig {
 ///
 /// Controls how `LedgerCloseMeta` frames are streamed to external consumers
 /// (e.g., Horizon ingestion pipelines). This is the Rust equivalent of
-/// C++ stellar-core's `--metadata-output-stream` feature.
+/// stellar-core's `--metadata-output-stream` feature.
 ///
 /// # Example
 ///
@@ -360,7 +360,7 @@ fn default_metadata_debug_ledgers() -> u32 {
 /// Catchup behavior configuration.
 ///
 /// Controls how the node catches up to the network when joining or recovering.
-/// This matches the C++ stellar-core CATCHUP_COMPLETE and CATCHUP_RECENT settings.
+/// This matches the stellar-core CATCHUP_COMPLETE and CATCHUP_RECENT settings.
 ///
 /// # Examples
 ///
@@ -384,13 +384,13 @@ fn default_metadata_debug_ledgers() -> u32 {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CatchupConfig {
     /// If true, download complete history from genesis.
-    /// Equivalent to C++ CATCHUP_COMPLETE.
+    /// Equivalent to stellar-core CATCHUP_COMPLETE.
     /// Takes precedence over `recent` if both are set.
     #[serde(default)]
     pub complete: bool,
 
     /// Number of recent ledgers to download during catchup.
-    /// Equivalent to C++ CATCHUP_RECENT.
+    /// Equivalent to stellar-core CATCHUP_RECENT.
     /// Set to 0 for minimal catchup (default).
     #[serde(default)]
     pub recent: u32,
@@ -600,7 +600,7 @@ pub struct OverlayConfig {
     #[serde(default)]
     pub surveyor_keys: Vec<String>,
 
-    /// Enable automatic survey scheduling (non-upstream behavior).
+    /// Enable automatic survey scheduling (non-stellar-core behavior).
     #[serde(default)]
     pub auto_survey: bool,
 

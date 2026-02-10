@@ -592,15 +592,15 @@ impl OverlayManager {
         running: Arc<AtomicBool>,
     ) {
         // Flow control: track messages received and send SendMoreExtended frequently
-        // C++ sends FLOW_CONTROL_SEND_MORE_BATCH_SIZE=40 msgs / 100000 bytes after processing
+        // stellar-core sends FLOW_CONTROL_SEND_MORE_BATCH_SIZE=40 msgs / 100000 bytes after processing
         // a batch, NOT the full initial capacity. Match this behavior.
-        const SEND_MORE_THRESHOLD: u32 = 40; // Send flow control after 40 messages (C++ default)
+        const SEND_MORE_THRESHOLD: u32 = 40; // Send flow control after 40 messages (stellar-core default)
         let mut messages_since_send_more = 0u32;
         let mut last_send_more = std::time::Instant::now();
         const SEND_MORE_INTERVAL: Duration = Duration::from_secs(1); // Send every second
 
         // Ping/keepalive: send GetScpQuorumSet every 5 seconds to keep the connection alive.
-        // C++ stellar-core has a 5-second recurrent timer that calls pingPeer(), which sends
+        // stellar-core has a 5-second recurrent timer that calls pingPeer(), which sends
         // GetScpQuorumSet with a synthetic hash. Without this, the remote peer's idle timeout
         // (30s for authenticated peers) will eventually fire since we stop writing after the
         // initial handshake burst.
@@ -616,7 +616,7 @@ impl OverlayManager {
             if last_send_more.elapsed() >= SEND_MORE_INTERVAL {
                 let mut peer_lock = peer.lock().await;
                 if peer_lock.is_connected() {
-                    // Send batch flow control matching C++ FLOW_CONTROL_SEND_MORE_BATCH_SIZE
+                    // Send batch flow control matching stellar-core FLOW_CONTROL_SEND_MORE_BATCH_SIZE
                     if let Err(e) = peer_lock.send_more_extended(40, 100_000).await {
                         debug!("Failed to send periodic flow control to {}: {}", peer_id, e);
                     } else {
@@ -629,13 +629,13 @@ impl OverlayManager {
                 last_send_more = std::time::Instant::now();
             }
 
-            // Ping/keepalive: send GetScpQuorumSet every 5 seconds (matches C++ RECURRENT_TIMER_PERIOD)
-            // C++ sends GetScpQuorumSet with a hash derived from current time as a ping.
+            // Ping/keepalive: send GetScpQuorumSet every 5 seconds (matches stellar-core RECURRENT_TIMER_PERIOD)
+            // stellar-core sends GetScpQuorumSet with a hash derived from current time as a ping.
             // This resets the remote peer's mLastRead timer, preventing idle timeout disconnects.
             if last_ping.elapsed() >= PING_INTERVAL {
                 let mut peer_lock = peer.lock().await;
                 if peer_lock.is_connected() {
-                    // Generate a synthetic hash from the current time (same approach as C++ pingIDfromTimePoint)
+                    // Generate a synthetic hash from the current time (same approach as stellar-core pingIDfromTimePoint)
                     let now_nanos = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -803,7 +803,7 @@ impl OverlayManager {
             if messages_since_send_more >= SEND_MORE_THRESHOLD {
                 let mut peer_lock = peer.lock().await;
                 if peer_lock.is_connected() {
-                    // Send batch capacity matching C++ FLOW_CONTROL_SEND_MORE_BATCH_SIZE
+                    // Send batch capacity matching stellar-core FLOW_CONTROL_SEND_MORE_BATCH_SIZE
                     if let Err(e) = peer_lock.send_more_extended(40, 100_000).await {
                         debug!("Failed to send flow control to {}: {}", peer_id, e);
                     } else {
@@ -1055,7 +1055,7 @@ impl OverlayManager {
         }
 
         // NOTE: Do NOT send PEERS to outbound peers (peers we connected to).
-        // In C++, only the acceptor (REMOTE_CALLED_US) sends PEERS during recvAuth().
+        // In stellar-core, only the acceptor (REMOTE_CALLED_US) sends PEERS during recvAuth().
         // If we send PEERS to a peer we initiated a connection to, the remote will
         // drop us silently (Peer.cpp:1225-1230).
 
@@ -1117,7 +1117,7 @@ impl OverlayManager {
                 for entry in peers.iter() {
                     if let Ok(mut peer) = entry.value().try_lock() {
                         // Only send PEERS to inbound peers (peers that connected to us).
-                        // C++ drops connections from initiators that send PEERS (Peer.cpp:1225-1230).
+                        // stellar-core drops connections from initiators that send PEERS (Peer.cpp:1225-1230).
                         if peer.is_ready()
                             && peer.direction() == ConnectionDirection::Inbound
                         {

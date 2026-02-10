@@ -3,7 +3,7 @@
 //! This module provides protocol-versioned implementations of the Soroban host
 //! to ensure deterministic replay across protocol upgrades. Each protocol version
 //! has its own implementation that uses the exact same soroban-env-host version
-//! as C++ stellar-core.
+//! as stellar-core.
 //!
 //! The dispatch is done at runtime based on the ledger's protocol version.
 

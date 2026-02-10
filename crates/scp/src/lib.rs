@@ -150,7 +150,7 @@ pub struct HistoricalStatement {
 /// JSON-serializable SCP slot information for debugging and monitoring.
 ///
 /// This provides a structured view of slot state that can be serialized
-/// to JSON, matching the C++ `getJsonInfo()` functionality.
+/// to JSON, matching the stellar-core `getJsonInfo()` functionality.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SlotInfo {
     /// The slot index (ledger sequence).
@@ -262,7 +262,7 @@ pub struct NodeInfo {
 /// JSON-serializable quorum set for persistence and debugging.
 ///
 /// This provides a human-readable representation of a quorum set
-/// that can be serialized to JSON, matching C++ `toJson()` functionality.
+/// that can be serialized to JSON, matching stellar-core `toJson()` functionality.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct QuorumSetJson {
     /// Threshold required for this quorum set.
@@ -358,7 +358,7 @@ pub fn node_id_to_short_string(node_id: &NodeId) -> String {
 /// * `full_keys` - If true, returns the full 64-character hex encoding.
 ///   If false, returns the short 8-character format.
 ///
-/// This matches the C++ `toStrKey(NodeID, bool fullKeys)` method.
+/// This matches the stellar-core `toStrKey(NodeID, bool fullKeys)` method.
 pub fn node_id_to_string(node_id: &NodeId, full_keys: bool) -> String {
     match &node_id.0 {
         stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(bytes)) => {

@@ -264,7 +264,7 @@ enum OfflineCommands {
     /// Test transaction execution by comparing our results against CDP metadata
     ///
     /// This validates that our transaction execution (Soroban host, classic ops)
-    /// produces the same ledger entry changes as C++ stellar-core. Differences
+    /// produces the same ledger entry changes as stellar-core. Differences
     /// indicate execution divergence that needs investigation.
     VerifyExecution {
         /// Start ledger sequence (defaults to a recent checkpoint)
@@ -1573,7 +1573,7 @@ async fn download_buckets_parallel(
 /// Verifies transaction execution by comparing results against CDP metadata.
 ///
 /// This test re-executes transactions using `close_ledger` and compares the
-/// resulting ledger close metadata against what C++ stellar-core produced (from CDP).
+/// resulting ledger close metadata against what stellar-core produced (from CDP).
 /// Differences indicate execution divergence that needs investigation.
 ///
 /// # Verification Process
@@ -1833,13 +1833,13 @@ async fn cmd_verify_execution(
         .map(|h| h.header.ledger_version)
         .unwrap_or(25);
 
-    // Enable structure-based merge restarts to match C++ online mode behavior.
+    // Enable structure-based merge restarts to match stellar-core online mode behavior.
     //
-    // Although C++ standalone offline commands skip restartMerges, we are comparing
-    // our results against CDP headers produced by C++ in ONLINE mode. The C++ node
+    // Although stellar-core standalone offline commands skip restartMerges, we are comparing
+    // our results against CDP headers produced by stellar-core in ONLINE mode. The stellar-core node
     // that produced those headers had full structure-based merge restarts enabled.
     //
-    // In C++ online mode, restartMerges uses mLevels[i-1].getSnap() (the old snap
+    // In stellar-core online mode, restartMerges uses mLevels[i-1].getSnap() (the old snap
     // from HAS) to start merges. Without structure-based restarts, add_batch would
     // use snap() which returns the snapped curr (different input!).
     bucket_list.restart_merges_from_has(
@@ -1847,7 +1847,7 @@ async fn cmd_verify_execution(
         init_protocol_version,
         &live_next_states,
         |hash| bucket_manager.load_bucket(hash).map(|b| (*b).clone()),
-        true, // restart_structure_based = true to match C++ online mode
+        true, // restart_structure_based = true to match stellar-core online mode
     ).await?;
 
     if let Some(ref ha_next_states) = hot_archive_next_states {
@@ -1856,7 +1856,7 @@ async fn cmd_verify_execution(
             init_protocol_version,
             ha_next_states,
             |hash| bucket_manager.load_hot_archive_bucket(hash),
-            true, // restart_structure_based = true to match C++ online mode
+            true, // restart_structure_based = true to match stellar-core online mode
         )?;
     }
 
@@ -2783,7 +2783,7 @@ async fn cmd_offline(cmd: OfflineCommands, config: AppConfig) -> anyhow::Result<
     }
 }
 
-/// Converts Stellar IDs between formats (equivalent to C++ convert-id).
+/// Converts Stellar IDs between formats (equivalent to stellar-core convert-id).
 ///
 /// Handles the following input formats:
 /// - `G...` - Public key (account ID) -> displays strKey and hex
@@ -3122,7 +3122,7 @@ fn cmd_check_quorum_intersection(path: &std::path::Path) -> anyhow::Result<()> {
 /// Reads a transaction envelope (base64 or from file), prompts for a secret key,
 /// signs the transaction, and outputs the signed envelope.
 ///
-/// Equivalent to C++ stellar-core sign-transaction command.
+/// Equivalent to stellar-core sign-transaction command.
 fn sign_transaction(netid: &str, input: &str, output_base64: bool) -> anyhow::Result<()> {
     use henyey_crypto::{sha256, SecretKey};
     use stellar_xdr::curr::{
@@ -3262,7 +3262,7 @@ fn sign_transaction(netid: &str, input: &str, output_base64: bool) -> anyhow::Re
 /// Convert a secret key to its corresponding public key.
 ///
 /// Reads a secret key seed (S...) from stdin and prints the public key.
-/// Equivalent to C++ stellar-core sec-to-pub command.
+/// Equivalent to stellar-core sec-to-pub command.
 fn sec_to_pub() -> anyhow::Result<()> {
     use henyey_crypto::{encode_account_id, SecretKey};
 
@@ -3282,7 +3282,7 @@ fn sec_to_pub() -> anyhow::Result<()> {
 
 /// Dump ledger entries from the bucket list to a JSON file.
 ///
-/// This is equivalent to C++ stellar-core dump-ledger command.
+/// This is equivalent to stellar-core dump-ledger command.
 /// It iterates over all entries in the bucket list and outputs them as JSON.
 async fn cmd_dump_ledger(
     config: AppConfig,
@@ -3422,7 +3422,7 @@ async fn cmd_dump_ledger(
     Ok(())
 }
 
-/// Perform offline self-checks (equivalent to C++ self-check command).
+/// Perform offline self-checks (equivalent to stellar-core self-check command).
 ///
 /// This command performs comprehensive diagnostic checks:
 /// 1. Header chain verification - ensures ledger headers form a valid chain
@@ -3596,7 +3596,7 @@ async fn cmd_self_check(config: AppConfig) -> anyhow::Result<()> {
 /// Downloads checkpoint headers from history archives, verifies the header
 /// chain, and writes verified checkpoint hashes to a JSON file.
 ///
-/// Equivalent to C++ stellar-core verify-checkpoints.
+/// Equivalent to stellar-core verify-checkpoints.
 async fn cmd_verify_checkpoints(
     config: AppConfig,
     output: PathBuf,
@@ -3750,7 +3750,7 @@ async fn cmd_verify_checkpoints(
 /// Makes an HTTP GET request to http://127.0.0.1:{port}/{command}
 /// and prints the response. Query parameters are URL-encoded.
 ///
-/// Equivalent to C++ stellar-core http-command.
+/// Equivalent to stellar-core http-command.
 async fn cmd_http_command(command: &str, port: u16) -> anyhow::Result<()> {
     // Build the URL path, encoding special characters after the ?
     let mut path = String::from("/");

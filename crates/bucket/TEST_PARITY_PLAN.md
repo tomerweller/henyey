@@ -1,6 +1,6 @@
 # Bucket Crate Test Parity Plan
 
-Upstream: `.upstream-v25/src/bucket/test/` (5 files, ~42 top-level test cases, ~42 sub-sections)
+stellar-core: `.upstream-v25/src/bucket/test/` (5 files, ~42 top-level test cases, ~42 sub-sections)
 Rust: `crates/henyey-bucket/` (286 tests across 21 modules + 3 integration test files)
 
 ## Architecture Mapping
@@ -96,7 +96,7 @@ Rust: `crates/henyey-bucket/` (286 tests across 21 modules + 3 integration test 
 
 | # | stellar-core Test | Rust Equivalent | Status | Notes |
 |---|----------|-----------------|--------|-------|
-| 5.1 | `bucket merge map` - recording, lookup, caching | `merge_map.rs` (6 tests), `tests/test_merge_deduplication.rs` (7 tests) | **COVERED** | 13 tests including explicit upstream parity test |
+| 5.1 | `bucket merge map` - recording, lookup, caching | `merge_map.rs` (6 tests), `tests/test_merge_deduplication.rs` (7 tests) | **COVERED** | 13 tests including explicit stellar-core parity test |
 
 ---
 
@@ -121,7 +121,7 @@ Excluding NOT APPLICABLE:
 | **COVERED** | 38 | 100% |
 | **Total applicable** | 38 | 100% |
 
-### Existing Rust-Only Tests (no upstream equivalent)
+### Existing Rust-Only Tests (no stellar-core equivalent)
 
 The Rust bucket crate has extensive testing beyond what stellar-core tests cover:
 

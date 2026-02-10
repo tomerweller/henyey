@@ -170,7 +170,7 @@ pub struct BallotProtocol {
     /// Latest composite candidate value from the nomination protocol.
     ///
     /// Set by the Slot before calling into ballot protocol methods, so that
-    /// `abandon_ballot` can access it (matching C++ `mSlot.getLatestCompositeCandidate()`).
+    /// `abandon_ballot` can access it (matching stellar-core `mSlot.getLatestCompositeCandidate()`).
     composite_candidate: Option<Value>,
 
     /// Whether we've heard from a quorum for the current ballot.
@@ -190,7 +190,7 @@ pub struct BallotProtocol {
 
     /// Signal that nomination should be stopped (set by set_confirm_commit).
     ///
-    /// In C++, `setConfirmCommit` calls `mSlot.stopNomination()` directly.
+    /// In stellar-core, `setConfirmCommit` calls `mSlot.stopNomination()` directly.
     /// In Rust, we set this flag and let the Slot handle it.
     needs_stop_nomination: bool,
 }
@@ -342,7 +342,7 @@ impl BallotProtocol {
 
     /// Get envelopes that contributed to externalization.
     ///
-    /// Matches C++ `BallotProtocol::getExternalizingState()`:
+    /// Matches stellar-core `BallotProtocol::getExternalizingState()`:
     /// - Only returns envelopes when in EXTERNALIZE phase
     /// - For other nodes: only includes envelopes with ballots compatible with commit
     /// - For self: only includes if `fully_validated` is true
@@ -605,7 +605,7 @@ impl BallotProtocol {
 
     /// Bump ballot counter on timeout.
     ///
-    /// This matches the C++ `ballotProtocolTimerExpired` → `abandonBallot(0)` flow.
+    /// This matches the stellar-core `ballotProtocolTimerExpired` → `abandonBallot(0)` flow.
     pub fn bump_timeout<D: SCPDriver>(
         &mut self,
         local_node_id: &NodeId,
@@ -968,7 +968,7 @@ impl BallotProtocol {
     ) -> EnvelopeState {
         self.current_message_level = self.current_message_level.saturating_add(1);
         if self.current_message_level >= 50 {
-            // C++ throws std::runtime_error here. We panic to match the behavior:
+            // stellar-core throws std::runtime_error here. We panic to match the behavior:
             // this indicates a bug in the protocol state machine, not a recoverable error.
             panic!("maximum number of transitions reached in advanceSlot");
         }
@@ -1433,10 +1433,10 @@ impl BallotProtocol {
 
         self.emit_current_state(local_node_id, local_quorum_set, driver, slot_index);
 
-        // Signal that nomination should be stopped (C++ calls mSlot.stopNomination() here)
+        // Signal that nomination should be stopped (stellar-core calls mSlot.stopNomination() here)
         self.needs_stop_nomination = true;
 
-        // C++ uses mCommit->getBallot().value (c.value) for valueExternalized
+        // stellar-core uses mCommit->getBallot().value (c.value) for valueExternalized
         driver.value_externalized(slot_index, &c.value);
         true
     }
@@ -1492,7 +1492,7 @@ impl BallotProtocol {
 
     /// Abandon the current ballot.
     ///
-    /// Matches C++ `abandonBallot(n)` which checks `mSlot.getLatestCompositeCandidate()`
+    /// Matches stellar-core `abandonBallot(n)` which checks `mSlot.getLatestCompositeCandidate()`
     /// first, then falls back to `mCurrentBallot->value`, then calls `bumpState(value, n)`.
     /// This properly emits envelopes and checks heard-from-quorum (via `bump_state`).
     fn abandon_ballot<D: SCPDriver>(
@@ -1503,7 +1503,7 @@ impl BallotProtocol {
         driver: &Arc<D>,
         slot_index: u64,
     ) -> bool {
-        // C++ priority: composite candidate first, then current ballot value
+        // stellar-core priority: composite candidate first, then current ballot value
         let value = self
             .composite_candidate
             .as_ref()
@@ -1554,7 +1554,7 @@ impl BallotProtocol {
         false
     }
 
-    /// Update current value enforcing invariants (matches C++ updateCurrentValue).
+    /// Update current value enforcing invariants (matches stellar-core updateCurrentValue).
     ///
     /// This is more thorough than `update_current_if_needed`: it checks phase
     /// and commit compatibility before bumping.
@@ -2123,13 +2123,13 @@ impl BallotProtocol {
     ///
     /// When `current_ballot` is `None` (pristine state, no `bumpState` call),
     /// a PREPARE with `ballot = {0, ""}` is still created and recorded as a
-    /// self-envelope. This matches C++ `emitCurrentStateStatement` which always
+    /// self-envelope. This matches stellar-core `emitCurrentStateStatement` which always
     /// calls `createStatement()` and `processEnvelope(self)`, even when
     /// `mCurrentBallot` is null. The self-envelope is needed so that the local
     /// node counts itself in subsequent quorum calculations (e.g., prepared
     /// fields in the self-envelope contribute to `federated_accept`/`federated_ratify`).
     /// However, the envelope is NOT emitted to the network when `current_ballot`
-    /// is `None` (matching C++ `canEmit = mCurrentBallot != nullptr`).
+    /// is `None` (matching stellar-core `canEmit = mCurrentBallot != nullptr`).
     fn emit_prepare<D: SCPDriver>(
         &mut self,
         local_node_id: &NodeId,
@@ -2138,7 +2138,7 @@ impl BallotProtocol {
         slot_index: u64,
     ) -> Option<ScpStatement> {
         // Use the current ballot if set, otherwise use a default zero ballot
-        // (matching C++ which creates a PREPARE with default ballot {0, ""} when
+        // (matching stellar-core which creates a PREPARE with default ballot {0, ""} when
         // mCurrentBallot is null).
         let can_emit = self.current_ballot.is_some();
         let ballot = self.current_ballot.clone().unwrap_or_else(|| ScpBallot {
@@ -2169,13 +2169,13 @@ impl BallotProtocol {
         driver.sign_envelope(&mut envelope);
         if self.record_local_envelope(local_node_id, envelope.clone()) {
             // Only update last_envelope (for network emission) when we have a
-            // real ballot. Matches C++ `canEmit = mCurrentBallot != nullptr`.
+            // real ballot. Matches stellar-core `canEmit = mCurrentBallot != nullptr`.
             if can_emit {
                 self.last_envelope = Some(envelope.clone());
             }
             // Note: send_latest_envelope is NOT called here.
             // It's called in emit_current_state after self-processing,
-            // matching C++ where sendLatestEnvelope() is called after
+            // matching stellar-core where sendLatestEnvelope() is called after
             // processEnvelope(self) in emitCurrentStateStatement().
             return Some(statement);
         }
@@ -2258,7 +2258,7 @@ impl BallotProtocol {
         None
     }
 
-    /// Emit current state and recursively self-process (matching C++ emitCurrentStateStatement).
+    /// Emit current state and recursively self-process (matching stellar-core emitCurrentStateStatement).
     ///
     /// After emitting, feeds the self-envelope back into `advance_slot` so that
     /// cascading state transitions (e.g., accept-prepared → confirm-prepared →
@@ -2285,7 +2285,7 @@ impl BallotProtocol {
         };
         // Recursive self-processing: feed the self-envelope back into advance_slot
         // so cascading state transitions complete within a single receiveEnvelope.
-        // This matches C++ emitCurrentStateStatement() calling processEnvelope(self).
+        // This matches stellar-core emitCurrentStateStatement() calling processEnvelope(self).
         if let Some(statement) = maybe_statement {
             self.advance_slot(
                 &statement,
@@ -2301,7 +2301,7 @@ impl BallotProtocol {
         // advance_slot's send_latest_envelope call. The dedup check in
         // send_latest_envelope (last_envelope_emit) prevents double-emit.
         // If no cascading happened, this ensures the original envelope
-        // is emitted. Matches C++ sendLatestEnvelope() in
+        // is emitted. Matches stellar-core sendLatestEnvelope() in
         // emitCurrentStateStatement after processEnvelope(self).
         self.send_latest_envelope(driver);
     }
@@ -2384,7 +2384,7 @@ impl BallotProtocol {
                     counter: u32::MAX,
                     value: ext.commit.value.clone(),
                 });
-                // C++ sets mPrepared = makeBallot(UINT32_MAX, v)
+                // stellar-core sets mPrepared = makeBallot(UINT32_MAX, v)
                 self.prepared = Some(ScpBallot {
                     counter: u32::MAX,
                     value: ext.commit.value.clone(),
@@ -4333,7 +4333,7 @@ mod tests {
 
     /// B-bump parity test: bump_to_ballot resets high/commit when value is incompatible.
     ///
-    /// C++ invariant: h.value == b.value. When bumping to a ballot with an
+    /// stellar-core invariant: h.value == b.value. When bumping to a ballot with an
     /// incompatible value, high_ballot and commit must be cleared.
     #[test]
     fn test_bump_to_ballot_resets_incompatible_high_commit() {
@@ -4452,7 +4452,7 @@ mod tests {
 
     /// B-override parity test: bump_state uses value_override when set.
     ///
-    /// C++ bumpState checks mValueOverride and uses that instead of the
+    /// stellar-core bumpState checks mValueOverride and uses that instead of the
     /// passed-in value when it's set (e.g., after confirming prepared).
     #[test]
     fn test_bump_state_uses_value_override() {
@@ -4484,7 +4484,7 @@ mod tests {
 
     /// B-override parity test: bump_state goes through update_current_value.
     ///
-    /// C++ bumpState(value, n) calls updateCurrentValue which checks phase
+    /// stellar-core bumpState(value, n) calls updateCurrentValue which checks phase
     /// and commit compatibility. Verify that bump_state rejects incompatible
     /// commit values.
     #[test]
@@ -4515,7 +4515,7 @@ mod tests {
 
     /// B-abandon parity test: abandon_ballot uses composite candidate over current ballot.
     ///
-    /// C++ abandonBallot first checks mSlot.getLatestCompositeCandidate(),
+    /// stellar-core abandonBallot first checks mSlot.getLatestCompositeCandidate(),
     /// then falls back to mCurrentBallot->value.
     #[test]
     fn test_abandon_ballot_uses_composite_candidate() {
@@ -4598,7 +4598,7 @@ mod tests {
 
     /// B-stopnom parity test: set_confirm_commit signals nomination stop.
     ///
-    /// C++ setConfirmCommit calls mSlot.stopNomination() between
+    /// stellar-core setConfirmCommit calls mSlot.stopNomination() between
     /// emitCurrentStateStatement() and valueExternalized().
     #[test]
     fn test_set_confirm_commit_signals_stop_nomination() {
@@ -4640,7 +4640,7 @@ mod tests {
 
     /// B-stopnom parity test: set_confirm_commit uses commit value for externalize.
     ///
-    /// C++ uses mCommit->getBallot().value (c.value) for valueExternalized,
+    /// stellar-core uses mCommit->getBallot().value (c.value) for valueExternalized,
     /// not h.value.
     #[test]
     fn test_set_confirm_commit_externalizes_commit_value() {
@@ -4678,7 +4678,7 @@ mod tests {
 
     /// B-timer parity test: check_heard_from_quorum starts ballot timer on transition.
     ///
-    /// C++ starts the ballot protocol timer when heard_from_quorum transitions
+    /// stellar-core starts the ballot protocol timer when heard_from_quorum transitions
     /// from false to true and phase is not Externalize.
     #[test]
     fn test_check_heard_from_quorum_starts_timer() {
@@ -4722,7 +4722,7 @@ mod tests {
 
     /// B-timer parity test: check_heard_from_quorum stops timer when not quorum.
     ///
-    /// C++ stops the ballot timer when heard_from_quorum is false.
+    /// stellar-core stops the ballot timer when heard_from_quorum is false.
     #[test]
     fn test_check_heard_from_quorum_stops_timer_no_quorum() {
         let local = make_node_id(1);
@@ -4761,7 +4761,7 @@ mod tests {
 
     /// B-timer parity test: check_heard_from_quorum stops timer in Externalize phase.
     ///
-    /// C++ stops the ballot timer when heard_from_quorum is true but phase is Externalize.
+    /// stellar-core stops the ballot timer when heard_from_quorum is true but phase is Externalize.
     #[test]
     fn test_check_heard_from_quorum_stops_timer_externalize() {
         let local = make_node_id(1);

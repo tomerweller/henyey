@@ -246,7 +246,7 @@ pub fn ledger_entry_to_key(entry: &LedgerEntry) -> Option<LedgerKey> {
 /// # Determinism
 ///
 /// This function is deterministic and must produce the same ordering as
-/// stellar-core's C++ implementation to ensure bucket hashes match.
+/// stellar-core's implementation to ensure bucket hashes match.
 pub fn compare_keys(a: &LedgerKey, b: &LedgerKey) -> Ordering {
     let a_type = ledger_key_type(a);
     let b_type = ledger_key_type(b);
@@ -311,17 +311,17 @@ fn compare_sc_address(
     b: &stellar_xdr::curr::ScAddress,
 ) -> Ordering {
     // Compare by type discriminant first, then by content
-    // Use XDR byte comparison for correctness matching C++ xdrpp
+    // Use XDR byte comparison for correctness matching stellar-core xdrpp
     use stellar_xdr::curr::Limits;
     let a_bytes = a.to_xdr(Limits::none()).unwrap_or_default();
     let b_bytes = b.to_xdr(Limits::none()).unwrap_or_default();
     a_bytes.cmp(&b_bytes)
 }
 
-/// Compare two ScVal values using the same order as C++ stellar-core.
+/// Compare two ScVal values using the same order as stellar-core.
 ///
 /// This uses explicit type discriminant comparison followed by value comparison,
-/// matching the C++ xdrpp library's behavior. This is critical for bucket hash
+/// matching the stellar-core xdrpp library's behavior. This is critical for bucket hash
 /// determinism across implementations.
 fn compare_sc_val(a: &stellar_xdr::curr::ScVal, b: &stellar_xdr::curr::ScVal) -> Ordering {
     use stellar_xdr::curr::{Limits, ScVal::*};

@@ -153,7 +153,7 @@ impl BucketMergeMap {
     /// Removes all merge records that produce the given output hash.
     ///
     /// Returns the set of merge keys that were removed.
-    /// This is the Rust equivalent of C++ `forgetAllMergesProducing`.
+    /// This is the Rust equivalent of stellar-core `forgetAllMergesProducing`.
     pub fn forget_all_merges_producing(&mut self, output_hash: &Hash256) -> HashSet<MergeKey> {
         // Get all merge keys that produced this output
         let keys_to_remove: Vec<MergeKey> = self

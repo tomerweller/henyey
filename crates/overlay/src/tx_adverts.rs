@@ -1,6 +1,6 @@
 //! Transaction advertisement management.
 //!
-//! This module implements the TxAdverts class from C++ stellar-core, which handles
+//! This module implements the TxAdverts class from stellar-core, which handles
 //! batching and broadcasting of transaction hash advertisements in pull-mode flooding.
 //!
 //! # Overview

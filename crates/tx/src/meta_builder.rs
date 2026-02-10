@@ -1,7 +1,7 @@
 //! Transaction metadata building for live execution mode.
 //!
 //! This module provides builders for constructing transaction metadata during
-//! live transaction execution. It matches the C++ stellar-core implementation
+//! live transaction execution. It matches the stellar-core implementation
 //! in `.upstream-v25/src/transactions/TransactionMeta.cpp`.
 //!
 //! # Overview
@@ -56,9 +56,9 @@ pub struct DiagnosticConfig {
 /// resource exceedance, and execution metrics. They are primarily useful for
 /// Soroban transactions.
 ///
-/// # C++ Parity
+/// # Parity
 ///
-/// This matches the C++ `DiagnosticEventManager` in `EventManager.cpp`.
+/// This matches the stellar-core `DiagnosticEventManager` in `EventManager.cpp`.
 /// Key behaviors:
 /// - Disabled managers are complete no-ops for performance
 /// - Only enabled for Soroban transactions when configured
@@ -309,9 +309,9 @@ pub struct ExecutionMetrics {
 /// - Ledger entry changes (creates, updates, deletes)
 /// - Contract events (for Soroban or classic SAC events)
 ///
-/// # C++ Parity
+/// # Parity
 ///
-/// This matches the C++ `OperationMetaBuilder` in `TransactionMeta.cpp`.
+/// This matches the stellar-core `OperationMetaBuilder` in `TransactionMeta.cpp`.
 /// Key behaviors:
 /// - Captures ledger changes at operation completion
 /// - Manages operation-level contract events via OpEventManager
@@ -484,9 +484,9 @@ impl OperationMetaBuilder {
 /// - Diagnostic events via [`DiagnosticEventManager`]
 /// - Soroban-specific metadata (return value, resource fees)
 ///
-/// # C++ Parity
+/// # Parity
 ///
-/// This matches the C++ `TransactionMetaBuilder` in `TransactionMeta.cpp`.
+/// This matches the stellar-core `TransactionMetaBuilder` in `TransactionMeta.cpp`.
 /// Key behaviors:
 /// - Creates operation builders for each operation in the transaction
 /// - Manages transaction-level and operation-level events separately

@@ -1,6 +1,6 @@
 //! Integration tests for merge deduplication.
 //!
-//! These tests match the behavior of the upstream C++ BucketMergeMapTests.cpp
+//! These tests match the behavior of the BucketMergeMapTests.cpp
 //! to ensure parity with stellar-core.
 
 use std::collections::HashSet;
@@ -18,7 +18,7 @@ fn make_merge_key(curr: u8, snap: u8, keep_tombstones: bool) -> MergeKey {
     MergeKey::new(keep_tombstones, make_hash(curr), make_hash(snap))
 }
 
-/// Test matching upstream BucketMergeMapTests.cpp "bucket merge map" test case.
+/// Test matching stellar-core BucketMergeMapTests.cpp "bucket merge map" test case.
 ///
 /// This test verifies:
 /// - Recording merges with various input combinations
@@ -28,7 +28,7 @@ fn make_merge_key(curr: u8, snap: u8, keep_tombstones: bool) -> MergeKey {
 /// - Getting outputs by input hash
 /// - Forgetting merges by output hash
 #[test]
-fn test_bucket_merge_map_upstream_parity() {
+fn test_bucket_merge_map_stellar_core_parity() {
     // Create unique input bucket hashes
     // in1a, in1b, in1c are inputs for merge m1
     let in1a = make_hash(1);

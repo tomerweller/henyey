@@ -39,7 +39,7 @@ pub fn execute_allow_trust(
     _context: &LedgerContext,
 ) -> Result<OperationResult> {
     // Check source account exists (the issuer)
-    // NOTE: C++ stellar-core loads the source account in a nested LedgerTxn (ltxSource)
+    // NOTE: stellar-core loads the source account in a nested LedgerTxn (ltxSource)
     // that gets rolled back, so the source account access is NOT recorded in the
     // transaction changes. We use get_account() (read-only) to match this behavior.
     let issuer = match state.get_account(source) {
@@ -101,7 +101,7 @@ pub fn execute_allow_trust(
     }
 
     // Check if we need to remove offers (when revoking liabilities authorization)
-    // This matches C++ stellar-core behavior: when going from authorized-to-maintain-liabilities
+    // This matches stellar-core behavior: when going from authorized-to-maintain-liabilities
     // to not-authorized-to-maintain-liabilities, remove all offers by this account for this asset.
     let was_authorized_to_maintain = is_authorized_to_maintain_liabilities(trustline.flags);
     let will_be_authorized_to_maintain = is_authorized_to_maintain_liabilities(new_flags);
@@ -130,7 +130,7 @@ pub fn execute_set_trust_line_flags(
     _context: &LedgerContext,
 ) -> Result<OperationResult> {
     // Check source account exists (the issuer)
-    // NOTE: C++ stellar-core loads the source account in a nested LedgerTxn (ltxSource)
+    // NOTE: stellar-core loads the source account in a nested LedgerTxn (ltxSource)
     // that gets rolled back, so the source account access is NOT recorded in the
     // transaction changes. We use get_account() (read-only) to match this behavior.
     let source_account = match state.get_account(source) {
@@ -216,7 +216,7 @@ pub fn execute_set_trust_line_flags(
     }
 
     // Check if we need to remove offers (when revoking liabilities authorization)
-    // This matches C++ stellar-core behavior: when going from authorized-to-maintain-liabilities
+    // This matches stellar-core behavior: when going from authorized-to-maintain-liabilities
     // to not-authorized-to-maintain-liabilities, remove all offers by this account for this asset.
     let was_authorized_to_maintain = is_authorized_to_maintain_liabilities(trustline.flags);
     let will_be_authorized_to_maintain = is_authorized_to_maintain_liabilities(new_flags);
@@ -226,7 +226,7 @@ pub fn execute_set_trust_line_flags(
         // This also handles liability release, subentry updates, and sponsorship
         remove_offers_with_cleanup(state, &op.trustor, &op.asset);
         // Note: Pool share trustline redemption is not yet implemented.
-        // The C++ code also redeems pool share trustlines here (removeOffersAndPoolShareTrustLines).
+        // The stellar-core code also redeems pool share trustlines here (removeOffersAndPoolShareTrustLines).
     }
 
     // Update the trustline
@@ -727,7 +727,7 @@ mod tests {
     /// Regression test: Verify that SetTrustLineFlags does NOT record the issuer account
     /// in the delta when the issuer calls it on someone else's trustline.
     ///
-    /// C++ stellar-core loads the source account in a nested LedgerTxn that gets rolled back,
+    /// stellar-core loads the source account in a nested LedgerTxn that gets rolled back,
     /// so the source account access is NOT recorded in the transaction changes. We need to
     /// match this behavior to avoid bucket list hash mismatches.
     ///

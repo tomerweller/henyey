@@ -134,7 +134,7 @@ impl Bucket {
     ///
     /// # In-memory entries for empty buckets
     ///
-    /// In C++ stellar-core, empty buckets have `mEntries` initialized to an empty
+    /// In stellar-core, empty buckets have `mEntries` initialized to an empty
     /// vector. This means `hasInMemoryEntries()` returns true for empty buckets.
     /// We match this behavior by setting `level_zero_entries` to an empty vector
     /// rather than None. This is important because:
@@ -142,7 +142,7 @@ impl Bucket {
     /// 1. When level 0 snaps, curr becomes empty
     /// 2. On the next ledger, prepare_first_level merges this empty curr with new entries
     /// 3. If empty curr doesn't have "in-memory entries", we fall back to regular merge
-    /// 4. In C++, both empty curr and new entries have in-memory state, so in-memory merge is used
+    /// 4. In stellar-core, both empty curr and new entries have in-memory state, so in-memory merge is used
     /// 5. We need to match this behavior for bucket list hash parity
     pub fn empty() -> Self {
         Self {
@@ -151,7 +151,7 @@ impl Bucket {
                 entries: Arc::new(Vec::new()),
                 key_index: Arc::new(HashMap::new()),
             },
-            // Empty bucket with shared state at offset 0 - matches C++ where mEntries is empty vector
+            // Empty bucket with shared state at offset 0 - matches stellar-core where mEntries is empty vector
             level_zero_state: LevelZeroState::SharedWithStorage { metadata_count: 0 },
         }
     }
@@ -276,7 +276,7 @@ impl Bucket {
 
     /// Create a "shell" bucket for immediate in-memory merging.
     ///
-    /// This is an optimization matching C++ stellar-core's `freshInMemoryOnly`.
+    /// This is an optimization matching stellar-core's `freshInMemoryOnly`.
     /// It creates a bucket with entries for merging but WITHOUT computing the hash.
     /// The hash is set to zero since:
     /// 1. This bucket will be immediately merged with another bucket
@@ -920,7 +920,7 @@ impl Bucket {
     ///
     /// # Important: METAENTRY exclusion from in-memory state
     ///
-    /// Per C++ stellar-core (LiveBucket.h lines 35-38): "Stores all BucketEntries
+    /// Per stellar-core (LiveBucket.h lines 35-38): "Stores all BucketEntries
     /// (except METAENTRY) in the same order that they appear in the bucket file
     /// for level 0 entries."
     ///

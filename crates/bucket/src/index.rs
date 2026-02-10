@@ -1,6 +1,6 @@
 //! Advanced bucket indexing for efficient lookups.
 //!
-//! This module provides a hybrid indexing system that matches the C++ stellar-core
+//! This module provides a hybrid indexing system that matches the stellar-core
 //! `LiveBucketIndex` pattern. It supports both in-memory indexes for small buckets
 //! and disk-based page indexes for large buckets.
 //!
@@ -738,7 +738,7 @@ impl DiskIndex {
 /// A hybrid index that selects between in-memory and disk-based indexing.
 ///
 /// This facade automatically chooses the appropriate index type based on
-/// bucket size, matching the C++ `LiveBucketIndex` pattern.
+/// bucket size, matching the stellar-core `LiveBucketIndex` pattern.
 #[derive(Debug, Clone)]
 pub enum LiveBucketIndex {
     /// In-memory index for small buckets.
@@ -1029,7 +1029,7 @@ mod tests {
 
     // ============ P2-4: In-Memory Index Offer Positioning ============
     //
-    // Upstream: BucketIndexTests.cpp "in-memory index construction"
+    // stellar-core: BucketIndexTests.cpp "in-memory index construction"
     // Tests that offer entries at different positions in the bucket
     // are correctly indexed.
 
@@ -1133,7 +1133,7 @@ mod tests {
 
     // ============ P2-5: ContractData Key with Same ScVal ============
     //
-    // Upstream: BucketIndexTests.cpp "ContractData key with same ScVal"
+    // stellar-core: BucketIndexTests.cpp "ContractData key with same ScVal"
     // Tests that contract data entries with identical ScVal keys but
     // different contracts or durabilities are correctly distinguished.
 
@@ -1238,7 +1238,7 @@ mod tests {
 
     // ============ P2-6: Account Lookup by ID ============
     //
-    // Upstream: BucketIndexTests.cpp "loadAccountsByAccountID"
+    // stellar-core: BucketIndexTests.cpp "loadAccountsByAccountID"
     // Tests that account entries can be looked up by account ID.
 
     #[test]
@@ -1296,7 +1296,7 @@ mod tests {
 
     // ============ P2-7: Soroban Cache Population ============
     //
-    // Upstream: BucketIndexTests.cpp "soroban cache population"
+    // stellar-core: BucketIndexTests.cpp "soroban cache population"
     // Tests that contract code/data entries are correctly counted in
     // the index entry counters.
 

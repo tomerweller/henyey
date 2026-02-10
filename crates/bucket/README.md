@@ -341,7 +341,7 @@ The bucket hash is computed over the uncompressed XDR bytes, including record ma
 | Persistent Eviction (Soroban) | 23 |
 | Hot Archive Bucket List | 23 |
 
-## Upstream Mapping
+## stellar-core Mapping
 
 This crate corresponds to stellar-core's bucket implementation:
 

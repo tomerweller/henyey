@@ -67,7 +67,7 @@ pub fn execute_restore_footprint(
     }
 
     // Calculate the new TTL for restored entries
-    // Per C++ RestoreFootprintOpFrame.cpp line 115-116:
+    // Per stellar-core RestoreFootprintOpFrame.cpp line 115-116:
     //   restoredLiveUntilLedger = ledgerSeq + archivalSettings.minPersistentTTL - 1
     let current_ledger = context.sequence;
     let new_ttl = current_ledger
@@ -165,7 +165,7 @@ fn restore_entry(
             // Entry is archived or has no TTL entry
             // We need to check if the entry itself exists in state
             if state.get_entry(key).is_none() {
-                // Neither live nor archived entry exists; skip per upstream behavior.
+                // Neither live nor archived entry exists; skip per stellar-core behavior.
                 return Ok(());
             }
 

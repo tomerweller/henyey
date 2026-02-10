@@ -1,6 +1,6 @@
 //! Catchup range calculation for history synchronization.
 //!
-//! This module implements the C++ stellar-core algorithm for determining
+//! This module implements the stellar-core algorithm for determining
 //! which ledgers to download and replay during catchup operations.
 //!
 //! The algorithm handles five cases based on the current LCL (Last Closed Ledger),
@@ -63,11 +63,11 @@ impl LedgerRange {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CatchupMode {
     /// Download only the latest bucket state (fastest).
-    /// Equivalent to count=0 in C++.
+    /// Equivalent to count=0 in stellar-core.
     #[default]
     Minimal,
     /// Download complete history from genesis.
-    /// Equivalent to count=UINT32_MAX in C++.
+    /// Equivalent to count=UINT32_MAX in stellar-core.
     Complete,
     /// Download the last N ledgers of history.
     Recent(u32),

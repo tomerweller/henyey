@@ -2,7 +2,7 @@
 
 **Overall Parity: ~92%**
 
-This document details the parity between `henyey-common` and stellar-core upstream utilities found in `.upstream-v25/src/util/` and related modules.
+This document details the parity between `henyey-common` and stellar-core utilities found in `.upstream-v25/src/util/` and related modules.
 
 ## Summary
 

@@ -151,7 +151,7 @@ impl LogConfig {
     }
 }
 
-/// Known log partitions matching C++ stellar-core partition names.
+/// Known log partitions matching stellar-core partition names.
 ///
 /// These map to Rust module targets for filtering purposes.
 pub const LOG_PARTITIONS: &[(&str, &str)] = &[

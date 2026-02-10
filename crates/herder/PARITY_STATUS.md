@@ -1,10 +1,10 @@
 ## stellar-core Parity Status
 
-This section documents the parity between this Rust crate and the stellar-core stellar-core herder implementation (v25).
+This section documents the parity between this Rust crate and the stellar-core herder implementation (v25).
 
 ### Implemented
 
-#### Core Herder (`herder.rs` -> `Herder.h`, `HerderImpl.h/cpp`)
+#### Core Herder (`herder.rs` -> `Herder.h`, `HerderImpl.h`)
 - [x] State machine (Booting, Syncing, Tracking) - matches `HERDER_BOOTING_STATE`, `HERDER_SYNCING_STATE`, `HERDER_TRACKING_NETWORK_STATE`
 - [x] `receive_scp_envelope()` - SCP envelope processing with signature verification
 - [x] `receive_transaction()` - Transaction queue integration
@@ -26,7 +26,7 @@ This section documents the parity between this Rust crate and the stellar-core s
 - [x] `getFlowControlExtraBuffer()` - Flow control buffer sizing
 - [x] `getMaxQueueSizeOps()` - Queue size for demand calculation
 
-#### SCP State Persistence (`persistence.rs` -> `HerderPersistence.h/cpp`)
+#### SCP State Persistence (`persistence.rs` -> `HerderPersistence.h`)
 - [x] `PersistedSlotState` - Serializable SCP state for a slot
 - [x] `ScpStatePersistence` trait - Storage backend abstraction
 - [x] `InMemoryScpPersistence` - In-memory storage for testing
@@ -39,7 +39,7 @@ This section documents the parity between this Rust crate and the stellar-core s
 - [x] `get_quorum_set_hash()` - Extract quorum set hash from statements
 - [x] JSON/base64 serialization for state encoding
 
-#### SCP Driver (`scp_driver.rs` -> `HerderSCPDriver.h/cpp`)
+#### SCP Driver (`scp_driver.rs` -> `HerderSCPDriver.h`)
 - [x] `SCPDriver` trait implementation (`HerderScpCallback`)
 - [x] `validate_value()` - StellarValue validation (close time, tx set hash, upgrades)
 - [x] `combine_candidates()` - Value combination for consensus
@@ -56,7 +56,7 @@ This section documents the parity between this Rust crate and the stellar-core s
 - [x] Value upgrade order validation
 - [x] `toShortString()` - Short node ID formatting
 
-#### Transaction Queue (`tx_queue.rs` -> `TransactionQueue.h/cpp`, `TxSetFrame.h/cpp`)
+#### Transaction Queue (`tx_queue.rs` -> `TransactionQueue.h`, `TxSetFrame.h`)
 - [x] `TransactionQueue` with fee-based ordering
 - [x] `try_add()` - Transaction validation and addition
 - [x] Signature validation
@@ -77,7 +77,7 @@ This section documents the parity between this Rust crate and the stellar-core s
 - [x] `ban()` / `is_banned()` - Transaction banning mechanism
 - [x] `isFiltered()` / `mFilteredTypes` - Operation type filtering
 
-#### Surge Pricing (`surge_pricing.rs` -> `SurgePricingUtils.h/cpp`)
+#### Surge Pricing (`surge_pricing.rs` -> `SurgePricingUtils.h`)
 - [x] `SurgePricingLaneConfig` trait
 - [x] `DexLimitingLaneConfig` - DEX lane separation
 - [x] `SorobanGenericLaneConfig` - Soroban resource limits
@@ -90,7 +90,7 @@ This section documents the parity between this Rust crate and the stellar-core s
 - [x] `can_fit_with_eviction()` - Eviction planning
 - [x] Tie-breaking with seeded hash
 
-#### Pending Envelopes (`pending.rs` -> `PendingEnvelopes.h/cpp`)
+#### Pending Envelopes (`pending.rs` -> `PendingEnvelopes.h`)
 - [x] `PendingEnvelopes` with slot-based buffering
 - [x] Deduplication via envelope hash
 - [x] Slot distance limits
@@ -99,7 +99,7 @@ This section documents the parity between this Rust crate and the stellar-core s
 - [x] `evict_expired()` - Age-based cleanup
 - [x] Statistics tracking
 
-#### Fetching Envelopes (`fetching_envelopes.rs` -> `PendingEnvelopes.h/cpp` fetching logic)
+#### Fetching Envelopes (`fetching_envelopes.rs` -> `PendingEnvelopes.h` fetching logic)
 - [x] `FetchingEnvelopes` - SCP envelope dependency fetching manager
 - [x] `ItemFetcher` integration for TxSet and QuorumSet fetching from peers
 - [x] Per-slot envelope state tracking (fetching, ready, processed, discarded)
@@ -113,7 +113,7 @@ This section documents the parity between this Rust crate and the stellar-core s
 - [x] `process_pending()` - Process pending fetch requests
 - [x] `FetchingStats` - Statistics tracking
 
-#### Quorum Tracker (`quorum_tracker.rs` -> `QuorumTracker.h/cpp`)
+#### Quorum Tracker (`quorum_tracker.rs` -> `QuorumTracker.h`)
 - [x] `SlotQuorumTracker` - Per-slot quorum monitoring
 - [x] `has_quorum()` / `is_v_blocking()` checks
 - [x] `QuorumTracker` - Transitive quorum tracking
@@ -122,7 +122,7 @@ This section documents the parity between this Rust crate and the stellar-core s
 - [x] `rebuild()` - Full quorum reconstruction
 - [x] Distance and closest validators tracking
 
-#### Upgrades (`upgrades.rs` -> `Upgrades.h/cpp`)
+#### Upgrades (`upgrades.rs` -> `Upgrades.h`)
 - [x] `Upgrades` class - Upgrade scheduling and validation
 - [x] `UpgradeParameters` - Version, base fee, max tx size, base reserve, flags, Soroban config
 - [x] `create_upgrades_for()` - Create upgrade proposals based on scheduled time
@@ -132,18 +132,18 @@ This section documents the parity between this Rust crate and the stellar-core s
 - [x] `UpgradeValidity` enum - `VALID`, `XDR_INVALID`, `INVALID`
 - [x] JSON serialization for upgrade parameters
 
-#### HerderUtils (`herder_utils.rs` -> `HerderUtils.h/cpp`)
+#### HerderUtils (`herder_utils.rs` -> `HerderUtils.h`)
 - [x] `getStellarValues()` - Extract StellarValue from SCP statements
 - [x] `getTxSetHashes()` - Extract tx set hashes from SCP envelopes
 - [x] `toShortString()` - Short node ID rendering (hex and strkey formats)
 
-#### LedgerCloseData (`ledger_close_data.rs` -> `LedgerCloseData.h/cpp`)
+#### LedgerCloseData (`ledger_close_data.rs` -> `LedgerCloseData.h`)
 - [x] `LedgerCloseData` class - Complete ledger close information wrapper
 - [x] Expected hash tracking (`mExpectedLedgerHash`)
 - [x] XDR serialization (`to_xdr()`, `from_xdr()`)
 - [x] `stellarValueToString()` - Human-readable StellarValue formatting
 
-#### TxQueueLimiter (`tx_queue_limiter.rs` -> `TxQueueLimiter.h/cpp`)
+#### TxQueueLimiter (`tx_queue_limiter.rs` -> `TxQueueLimiter.h`)
 - [x] `TxQueueLimiter` class - Resource-aware queue limiting
 - [x] Multi-resource tracking (operations, bytes, Soroban resources)
 - [x] Eviction candidate selection (finding lowest-fee eviction targets)
@@ -202,7 +202,7 @@ This section documents the parity between this Rust crate and the stellar-core s
 - [ ] **Pending depth configuration**: `mPendingDepth` for per-account limits
 - [ ] **Pool ledger multiplier**: Queue sizing based on ledger multiplier
 
-#### TxSetFrame (`TxSetFrame.h/cpp`)
+#### TxSetFrame (`TxSetFrame.h`)
 - [ ] **ApplicableTxSetFrame**: Validated tx set ready for application with phase separation
 - [ ] **TxSetPhaseFrame**: Phase-level abstraction with parallel stage support
 - [ ] **Parallel execution stages**: `TxStageFrameList`, `ParallelSorobanOrder` for Soroban
@@ -223,7 +223,7 @@ This section documents the parity between this Rust crate and the stellar-core s
 - [ ] **Quorum tracker integration**: `rebuildQuorumTrackerState()`, `forceRebuildQuorum()`
 - [ ] **Value size caching**: `mValueSizeCache` for txset/qset sizes
 
-#### ConfigUpgradeSetFrame (`Upgrades.h/cpp`)
+#### ConfigUpgradeSetFrame (`Upgrades.h`)
 - [ ] **ConfigUpgradeSetFrame**: Soroban config upgrade handling
 - [ ] **makeFromKey()**: Retrieve config from ledger state
 - [ ] **getLedgerKey()**: Convert upgrade key to contract data key
@@ -231,7 +231,7 @@ This section documents the parity between this Rust crate and the stellar-core s
 - [ ] **applyTo()**: Apply config upgrade to ledger state
 - [ ] **isConsistentWith()**: Validate against scheduled upgrade
 
-#### Quorum Intersection Checker (`QuorumIntersectionChecker.h/cpp`)
+#### Quorum Intersection Checker (`QuorumIntersectionChecker.h`)
 - [ ] **QuorumIntersectionChecker**: Network safety analysis
 - [ ] **networkEnjoysQuorumIntersection()**: Check for quorum intersection
 - [ ] **getIntersectionCriticalGroups()**: Find critical node groups
@@ -239,7 +239,7 @@ This section documents the parity between this Rust crate and the stellar-core s
 - [ ] **Background analysis**: Async recalculation with interrupt support
 - [ ] **QuorumMapIntersectionState**: Result caching and status tracking
 
-#### Parallel TxSet Builder (`ParallelTxSetBuilder.h/cpp`)
+#### Parallel TxSet Builder (`ParallelTxSetBuilder.h`)
 - [ ] **buildSurgePricedParallelSorobanPhase()**: Parallel execution planning
 - [ ] **Stage construction**: Grouping transactions into parallel stages
 - [ ] **Cluster building**: Identifying dependent transaction clusters

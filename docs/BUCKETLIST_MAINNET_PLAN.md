@@ -12,7 +12,7 @@ The plan is organized into **phases** with clear dependencies, each containing s
 
 ## Phase 1: Index Architecture Alignment
 
-**Goal**: Align our indexing with upstream's two-tier index system (InMemoryIndex for small buckets, DiskIndex with page ranges for large buckets).
+**Goal**: Align our indexing with stellar-core's two-tier index system (InMemoryIndex for small buckets, DiskIndex with page ranges for large buckets).
 
 ### Current Gap Analysis
 
@@ -29,18 +29,18 @@ The plan is organized into **phases** with clear dependencies, each containing s
 #### 1.1: Page-Based DiskIndex (High Priority)
 **Files**: `crates/henyey-bucket/src/index.rs`, `disk_bucket.rs`
 
-Replace the 8-byte key hash index with upstream's page-based range index:
+Replace the 8-byte key hash index with stellar-core's page-based range index:
 
 ```
 Current: hash(key)[0:8] → (offset, length)
-Upstream: [lower_key, upper_key] → page_start_offset
+stellar-core: [lower_key, upper_key] → page_start_offset
 ```
 
 **Implementation**:
 - Add `RangeIndex` type: `Vec<(RangeEntry, u64)>` mapping key ranges to file offsets
 - Configure page size via `BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT` (default 2^14 = 16 KB)
 - Lookup: Binary search to find candidate page, then scan page for exact key
-- Benefits: Smaller index size, matches upstream semantics exactly
+- Benefits: Smaller index size, matches stellar-core semantics exactly
 
 **Estimated effort**: 2-3 days
 
@@ -53,7 +53,7 @@ Change index type selection from entry count to bucket file size:
 // Current
 if entry_count < 10_000 { InMemoryIndex } else { DiskIndex }
 
-// Upstream-aligned
+// stellar-core-aligned
 if bucket_file_size_mb < BUCKETLIST_DB_INDEX_CUTOFF { InMemoryIndex } else { DiskIndex }
 ```
 
@@ -132,7 +132,7 @@ impl DiskBucket {
 #### 2.2: Proportional Cache Sizing (Medium Priority)
 **Files**: `cache.rs`, `bucket_list.rs`
 
-Match upstream's cache sizing algorithm:
+Match stellar-core's cache sizing algorithm:
 
 ```rust
 pub fn maybe_initialize_cache(&self, total_bucket_list_account_bytes: usize, config: &Config) {
@@ -353,7 +353,7 @@ impl BucketManager {
 
 ## Phase 6: Configuration Parity
 
-**Goal**: Add configuration options matching upstream for tuning performance.
+**Goal**: Add configuration options matching stellar-core for tuning performance.
 
 ### Tasks
 

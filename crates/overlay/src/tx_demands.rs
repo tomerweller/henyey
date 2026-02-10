@@ -1,6 +1,6 @@
 //! Transaction demand manager for pull-mode flooding.
 //!
-//! This module implements the TxDemandsManager from C++ stellar-core, which handles
+//! This module implements the TxDemandsManager from stellar-core, which handles
 //! demand scheduling with retry logic and responds to incoming demands.
 //!
 //! # Overview

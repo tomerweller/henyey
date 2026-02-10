@@ -1,6 +1,6 @@
 //! Peer manager for persistent peer storage.
 //!
-//! This module implements the PeerManager from C++ stellar-core, which maintains
+//! This module implements the PeerManager from stellar-core, which maintains
 //! a persistent list of known peers in a SQLite database with failure tracking
 //! and backoff scheduling.
 //!

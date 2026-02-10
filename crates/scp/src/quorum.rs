@@ -55,7 +55,7 @@ use stellar_xdr::curr::{NodeId, ScpQuorumSet};
 /// in a quorum set. This limit prevents excessive recursion during
 /// quorum set validation and ensures bounded memory usage.
 ///
-/// The value matches the C++ stellar-core implementation.
+/// The value matches the stellar-core implementation.
 pub const MAXIMUM_QUORUM_NESTING_LEVEL: u32 = 4;
 
 /// Maximum allowed number of nodes in a quorum set.
@@ -64,7 +64,7 @@ pub const MAXIMUM_QUORUM_NESTING_LEVEL: u32 = 4;
 /// (validators) that can be referenced in a quorum set, including
 /// all nested inner sets.
 ///
-/// The value matches the C++ stellar-core implementation.
+/// The value matches the stellar-core implementation.
 pub const MAXIMUM_QUORUM_NODES: usize = 1000;
 
 /// Check if a set of nodes satisfies a quorum slice.
@@ -125,7 +125,7 @@ where
 /// remaining set until the set stabilizes. Then checks if the local node's
 /// quorum slice is satisfied by the surviving set.
 ///
-/// This matches the C++ `LocalNode::isQuorum()` behavior, which allows
+/// This matches the stellar-core `LocalNode::isQuorum()` behavior, which allows
 /// finding valid quorums as subsets of the input nodes.
 ///
 /// # Arguments
@@ -141,7 +141,7 @@ where
     F: Fn(&NodeId) -> Option<ScpQuorumSet>,
 {
     // Iteratively prune nodes whose quorum slices aren't satisfied
-    // until the set stabilizes (matches C++ do-while loop in LocalNode::isQuorum)
+    // until the set stabilizes (matches stellar-core do-while loop in LocalNode::isQuorum)
     let mut remaining: Vec<NodeId> = nodes.iter().cloned().collect();
 
     loop {
@@ -187,7 +187,7 @@ fn is_blocking_set_helper(quorum_set: &ScpQuorumSet, nodes: &HashSet<NodeId>) ->
     let total = quorum_set.validators.len() + quorum_set.inner_sets.len();
     let threshold = quorum_set.threshold as usize;
 
-    // There is no v-blocking set for the empty set (matches C++ LocalNode::isVBlockingInternal)
+    // There is no v-blocking set for the empty set (matches stellar-core LocalNode::isVBlockingInternal)
     if threshold == 0 {
         return false;
     }
@@ -371,7 +371,7 @@ pub fn normalize_quorum_set(quorum_set: &mut ScpQuorumSet) {
 ///
 /// Like `normalize_quorum_set`, but accepts an optional `id_to_remove`
 /// parameter that removes the specified node from validators at all levels
-/// and decrements thresholds accordingly. Matches the C++ `normalizeQSet`
+/// and decrements thresholds accordingly. Matches the stellar-core `normalizeQSet`
 /// function signature.
 pub fn normalize_quorum_set_with_remove(
     quorum_set: &mut ScpQuorumSet,
@@ -551,7 +551,7 @@ pub fn singleton_quorum_set(node_id: NodeId) -> ScpQuorumSet {
 /// Cache for singleton quorum sets to avoid repeated allocations.
 ///
 /// This struct provides efficient caching of singleton quorum sets,
-/// matching the C++ `getSingletonQSet()` optimization.
+/// matching the stellar-core `getSingletonQSet()` optimization.
 #[derive(Debug, Default)]
 pub struct SingletonQuorumSetCache {
     cache: std::sync::RwLock<std::collections::HashMap<NodeId, ScpQuorumSet>>,
@@ -1113,7 +1113,7 @@ mod tests {
         }
     }
 
-    // ==================== Additional C++ parity tests ====================
+    // ==================== Additional stellar-core parity tests ====================
 
     #[test]
     fn test_is_quorum_with_nested_sets() {
@@ -1325,7 +1325,7 @@ mod tests {
     #[test]
     fn test_is_quorum_iterative_pruning() {
         // Test that is_quorum uses iterative pruning to find quorums
-        // within the input set, matching C++ behavior.
+        // within the input set, matching stellar-core behavior.
         let node0 = make_node_id(0);
         let node1 = make_node_id(1);
         let node2 = make_node_id(2);
@@ -1470,7 +1470,7 @@ mod tests {
     #[test]
     fn test_is_v_blocking_empty_quorum_set() {
         // Empty quorum set (threshold=0) should NOT be v-blocking
-        // (matches C++ "There is no v-blocking set for {\empty}")
+        // (matches stellar-core "There is no v-blocking set for {\empty}")
         let qs = ScpQuorumSet {
             threshold: 0,
             validators: vec![].try_into().unwrap(),

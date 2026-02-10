@@ -56,14 +56,14 @@ use tracing::{debug, info, warn};
 
 use henyey_scp::SlotIndex;
 
-/// Timeout before declaring consensus stuck (matches C++ CONSENSUS_STUCK_TIMEOUT_SECONDS).
+/// Timeout before declaring consensus stuck (matches stellar-core CONSENSUS_STUCK_TIMEOUT_SECONDS).
 pub const CONSENSUS_STUCK_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// Interval for out-of-sync recovery attempts.
 pub const OUT_OF_SYNC_RECOVERY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Maximum number of slots to keep ahead when purging during recovery.
-/// Matches C++ LEDGER_VALIDITY_BRACKET.
+/// Matches stellar-core LEDGER_VALIDITY_BRACKET.
 pub const LEDGER_VALIDITY_BRACKET: u32 = 15;
 
 /// Commands sent to the sync recovery manager.

@@ -599,7 +599,7 @@ impl ThresholdLevel {
 /// Get the threshold level required for an operation.
 ///
 /// This determines how much signer weight is needed to authorize the operation,
-/// based on the C++ stellar-core implementation.
+/// based on the stellar-core implementation.
 ///
 /// # Threshold Assignments
 ///

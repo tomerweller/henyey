@@ -530,7 +530,7 @@ src/
 └── error.rs              # Error types (HerderError)
 ```
 
-## Upstream Mapping
+## stellar-core Mapping
 
 This crate corresponds to the following stellar-core components:
 

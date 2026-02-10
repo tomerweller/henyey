@@ -172,7 +172,7 @@ src/
   verify.rs             # Cryptographic verification (hashes, header chains)
 ```
 
-## Upstream Mapping
+## stellar-core Mapping
 
 This crate corresponds to these components in stellar-core:
 

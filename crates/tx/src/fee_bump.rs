@@ -18,9 +18,9 @@
 //! - [`validate_fee_bump`]: Fee bump-specific validation
 //! - Inner transaction hash computation for result reporting
 //!
-//! # C++ Parity
+//! # Parity
 //!
-//! This module mirrors the behavior of C++ `FeeBumpTransactionFrame` including:
+//! This module mirrors the behavior of stellar-core `FeeBumpTransactionFrame` including:
 //! - Outer fee >= inner fee validation (with base fee multiplier)
 //! - Inner signature cryptographic verification
 //! - Inner transaction hash in result pair
@@ -347,7 +347,7 @@ pub fn validate_fee_bump(
     context: &LedgerContext,
 ) -> std::result::Result<(), FeeBumpError> {
     // Validate inclusion fee against min fee and ensure the fee bump is actually bumping.
-    // This mirrors C++ FeeBumpTransactionFrame::commonValidPreSeqNum logic.
+    // This mirrors stellar-core FeeBumpTransactionFrame::commonValidPreSeqNum logic.
     let op_count = frame.operation_count() as i64;
     let outer_op_count = std::cmp::max(1_i64, op_count + 1);
     let outer_min_inclusion_fee = outer_op_count * context.base_fee as i64;
@@ -689,7 +689,7 @@ impl FeeBumpMutableTransactionResult {
 /// - Protocol < 25: Inner fee is charged to inner source account
 /// - Protocol >= 25: Inner fee is 0, outer pays everything
 ///
-/// This matches C++ `FeeBumpTransactionFrame::getInnerFullFee`.
+/// This matches stellar-core `FeeBumpTransactionFrame::getInnerFullFee`.
 pub fn calculate_inner_fee_charged(inner_declared_fee: u32, protocol_version: u32) -> i64 {
     if protocol_version >= 25 {
         // In protocol 25+, inner fee is always 0

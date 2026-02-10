@@ -119,7 +119,7 @@ pub struct PublishManager {
 /// Build a history archive state from a bucket list snapshot.
 ///
 /// Captures the full bucket list state including any pending merges.
-/// Pending merges are recorded matching C++ FutureBucket serialization:
+/// Pending merges are recorded matching stellar-core FutureBucket serialization:
 /// - state=1 (output hash known) for completed merges
 /// - state=2 (input hashes known) for in-progress async merges
 /// - state=0 (clear) for levels with no pending merge

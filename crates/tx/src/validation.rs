@@ -80,9 +80,9 @@ pub struct LedgerContext {
     pub network_id: NetworkId,
     /// PRNG seed for deterministic Soroban contract execution.
     ///
-    /// This is computed as `subSha256(txSetHash, txIndex)` per the C++ stellar-core
+    /// This is computed as `subSha256(txSetHash, txIndex)` per the stellar-core
     /// specification. If `None`, a fallback seed is used which may produce different
-    /// results from C++ stellar-core.
+    /// results from stellar-core.
     pub soroban_prng_seed: Option<[u8; 32]>,
 }
 
@@ -763,7 +763,7 @@ fn has_signed_payload_signature(
     };
 
     // The hint for signed payloads is XOR of pubkey hint and payload hint.
-    // See SignatureUtils::getSignedPayloadHint in C++ stellar-core.
+    // See SignatureUtils::getSignedPayloadHint in stellar-core.
     let pubkey_hint = [
         signed_payload.ed25519.0[28],
         signed_payload.ed25519.0[29],
@@ -779,7 +779,7 @@ fn has_signed_payload_signature(
             signed_payload.payload[len - 1],
         ]
     } else {
-        // For shorter payloads, C++ getHint copies from the beginning
+        // For shorter payloads, stellar-core getHint copies from the beginning
         let mut hint = [0u8; 4];
         for (i, &byte) in signed_payload.payload.iter().enumerate() {
             if i < 4 {
@@ -801,7 +801,7 @@ fn has_signed_payload_signature(
             return false;
         }
 
-        // C++ stellar-core verifies the signature against the raw payload bytes,
+        // stellar-core verifies the signature against the raw payload bytes,
         // not a hash. This is per CAP-0040 - the signed payload signer
         // requires a valid signature of the payload from the ed25519 public key.
         let ed_sig = match henyey_crypto::Signature::try_from(&sig.signature) {

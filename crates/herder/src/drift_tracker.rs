@@ -4,7 +4,7 @@
 //! and the network-agreed close time. If a node's clock drifts significantly
 //! from the network, it may affect its ability to participate in consensus.
 //!
-//! # C++ Parity
+//! # Parity
 //!
 //! This module corresponds to the `mDriftCTSlidingWindow` mechanism in
 //! `HerderImpl.cpp`, including:

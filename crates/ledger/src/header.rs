@@ -32,7 +32,7 @@ use stellar_xdr::curr::{Hash, LedgerHeader, Limits, WriteXdr};
 /// Number of entries in the skip list (fixed at 4 by protocol).
 pub const SKIP_LIST_SIZE: usize = 4;
 
-/// Skip list update intervals (from C++ stellar-core).
+/// Skip list update intervals (from stellar-core).
 /// The skip list stores bucket_list_hash values at these intervals.
 pub const SKIP_1: u32 = 50;
 pub const SKIP_2: u32 = 5000;
@@ -61,7 +61,7 @@ pub fn compute_header_hash(header: &LedgerHeader) -> Result<Hash256> {
 /// The skip list contains bucket_list_hash values at specific ledger intervals,
 /// enabling efficient verification of bucket list state at historical points.
 ///
-/// # Algorithm (from C++ stellar-core BucketManager::calculateSkipValues)
+/// # Algorithm (from stellar-core BucketManager::calculateSkipValues)
 ///
 /// The skip list is only updated when ledger_seq is divisible by SKIP_1 (50).
 /// At those points:

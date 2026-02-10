@@ -2,7 +2,7 @@
 //!
 //! This module provides the [`LedgerCloseData`] struct that encapsulates all
 //! the information needed to close a ledger after SCP consensus has been
-//! reached. This matches the C++ `LedgerCloseData` class.
+//! reached. This matches the stellar-core `LedgerCloseData` class.
 //!
 //! The key difference from the existing [`crate::LedgerCloseInfo`] is that
 //! `LedgerCloseData` includes the full XDR representation and expected hash
@@ -239,7 +239,7 @@ impl From<stellar_xdr::curr::Error> for LedgerCloseDataError {
 
 /// Render a StellarValue as a human-readable string.
 ///
-/// This matches the C++ `stellarValueToString` function.
+/// This matches the stellar-core `stellarValueToString` function.
 ///
 /// # Arguments
 ///

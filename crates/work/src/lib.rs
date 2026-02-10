@@ -1,7 +1,7 @@
 //! Work scheduler and orchestration primitives for rs-stellar-core.
 //!
 //! This crate provides a dependency-aware async work scheduler modeled after
-//! the work scheduling system in stellar-core (C++). It enables concurrent
+//! the work scheduling system in stellar-core. It enables concurrent
 //! execution of tasks with explicit dependencies, automatic retry support,
 //! and cancellation propagation.
 //!
@@ -494,7 +494,7 @@ impl Default for WorkSchedulerConfig {
 ///
 /// # Design
 ///
-/// The scheduler is modeled after the work scheduling system in stellar-core (C++).
+/// The scheduler is modeled after the work scheduling system in stellar-core.
 /// It uses a simple ready-queue approach: work items whose dependencies have all
 /// succeeded are eligible for execution. The scheduler spawns Tokio tasks for each
 /// work item and collects completion notifications via an internal channel.

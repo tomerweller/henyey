@@ -1931,7 +1931,7 @@ async fn sorobaninfo_handler(
 /// POST /clearmetrics?domain=stellar-core - clears metrics for a specific domain
 ///
 /// Note: Since we use Prometheus-style metrics that are typically scraped externally,
-/// this endpoint clears internal counter states. The behavior matches C++ stellar-core
+/// this endpoint clears internal counter states. The behavior matches stellar-core
 /// which resets medida metrics counters.
 async fn clearmetrics_handler(
     State(state): State<Arc<ServerState>>,
@@ -1940,7 +1940,7 @@ async fn clearmetrics_handler(
     let domain = params.domain.unwrap_or_default();
 
     // Clear metrics via the app (this is a no-op for Prometheus-style metrics,
-    // but we log the request for parity with C++ stellar-core)
+    // but we log the request for parity with stellar-core)
     state.app.clear_metrics(&domain);
 
     let message = if domain.is_empty() {
@@ -1958,11 +1958,11 @@ async fn clearmetrics_handler(
 ///
 /// Note: The Rust implementation uses `tracing` with `tracing-subscriber`.
 /// Log rotation depends on the logging backend configuration (e.g., tracing-appender).
-/// This endpoint signals a rotation request, matching C++ stellar-core behavior.
+/// This endpoint signals a rotation request, matching stellar-core behavior.
 async fn logrotate_handler() -> Json<LogRotateResponse> {
     // Log rotation in Rust is typically handled by the logging backend
     // (e.g., tracing-appender with time-based or size-based rotation).
-    // We log the request to match C++ behavior.
+    // We log the request to match stellar-core behavior.
     tracing::info!("Log rotate requested");
 
     Json(LogRotateResponse {

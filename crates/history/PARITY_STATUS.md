@@ -2,7 +2,7 @@
 
 **Overall Parity: ~85%**
 
-This document tracks the parity between this Rust crate (`henyey-history`) and stellar-core `stellar-core/src/history/` module. The upstream reference is `.upstream-v25/src/history/`.
+This document tracks the parity between this Rust crate (`henyey-history`) and stellar-core `stellar-core/src/history/` module. The reference is `.upstream-v25/src/history/`.
 
 ## Overview
 
@@ -42,12 +42,12 @@ The `henyey-history` crate provides history archive access, catchup, replay, and
 
 ## Test Coverage Comparison
 
-### stellar-core Tests (upstream: `.upstream-v25/src/history/test/`)
+### stellar-core Tests (`.upstream-v25/src/history/test/`)
 
 | Test File | Test Name | Rust Equivalent | Status |
 |-----------|-----------|-----------------|--------|
 | **HistoryTests.cpp** | | | |
-| | `checkpoint containing ledger` | `checkpoint.rs::test_checkpoint_containing_matches_upstream` | ✅ Covered |
+| | `checkpoint containing ledger` | `checkpoint.rs::test_checkpoint_containing_matches_stellar_core` | ✅ Covered |
 | | `HistoryManager compress` | `download_utils.rs::test_decompress_gzip_roundtrip` | ✅ Covered |
 | | `HistoryArchiveState get_put` | `lib.rs::archive_manager_tests` | 🔶 Partial |
 | | `History bucket verification` | `catchup_integration.rs::test_catchup_against_local_archive_checkpoint` | ✅ Covered |
@@ -165,12 +165,12 @@ These tests exist in Rust but have no direct stellar-core equivalent:
 | Rust Module | stellar-core File(s) | Status |
 |-------------|-------------|--------|
 | `lib.rs` | `HistoryManager.h`, `HistoryArchiveManager.h` | Complete |
-| `archive.rs` | `HistoryArchive.h/cpp` | Complete |
+| `archive.rs` | `HistoryArchive.h` | Complete |
 | `remote_archive.rs` | `HistoryArchive.h` (putFileCmd, mkdirCmd) | Complete |
 | `archive_state.rs` | `HistoryArchive.h` (HistoryArchiveState) | Complete |
 | `catchup.rs` | `historywork/*.cpp` (CatchupWork, etc.) | Partial |
 | `checkpoint.rs` | `HistoryManager.h` (static methods) | Complete |
-| `checkpoint_builder.rs` | `CheckpointBuilder.h/cpp` | Complete |
+| `checkpoint_builder.rs` | `CheckpointBuilder.h` | Complete |
 | `download.rs` | `historywork/GetRemoteFileWork.cpp` | Complete |
 | `paths.rs` | `HistoryArchive.h` (path helpers) | Complete |
 | `publish.rs` | `historywork/PublishWork.cpp`, `StateSnapshot.cpp` | Partial |

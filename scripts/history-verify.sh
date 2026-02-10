@@ -284,7 +284,7 @@ These bugs have been fixed previously - similar patterns may appear:
 - Always run the full test suite (`cargo test --all`) before committing
 - If you cannot fix an issue after thorough investigation, document what you found and exit
 - Prefer minimal, targeted fixes over broad refactoring
-- Check the C++ stellar-core reference in `.upstream-v25/` for expected behavior
+- Check the stellar-core reference in `.upstream-v25/` for expected behavior
 PROMPT_EOF
 )
         # Substitute placeholders

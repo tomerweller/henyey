@@ -2,7 +2,7 @@
 //!
 //! This module provides Soroban execution for protocol version 25.
 //! It uses soroban-env-host-p25 which is pinned to the exact git revision
-//! used by C++ stellar-core for protocol 25.
+//! used by stellar-core for protocol 25.
 //!
 //! Note: soroban-env-host v25.0.0 uses stellar-xdr 25.0.0 from crates.io,
 //! while our workspace uses a git revision of stellar-xdr. We convert between
@@ -54,7 +54,7 @@ impl<'a> LedgerSnapshotAdapter<'a> {
     /// soroban-env-host's XDR types.
     ///
     /// IMPORTANT: This function filters out expired Soroban entries (ContractData, ContractCode)
-    /// to match C++ stellar-core behavior. In C++, entries with expired TTL are not passed to
+    /// to match stellar-core behavior. In stellar-core, entries with expired TTL are not passed to
     /// the host during invoke_host_function - expired temporary entries are skipped entirely,
     /// and expired persistent entries are treated as archived (requiring restoration).
     #[allow(clippy::type_complexity)]
@@ -83,7 +83,7 @@ impl<'a> LedgerSnapshotAdapter<'a> {
                     ext: LedgerEntryExt::V0,
                 }),
             LedgerKey::ContractData(cd_key) => {
-                // Check TTL: In C++ stellar-core, ContractData entries are only passed to
+                // Check TTL: In stellar-core, ContractData entries are only passed to
                 // the host if they have a valid (non-expired) TTL entry. Entries without
                 // a TTL entry or with expired TTL are not passed to the host.
                 // - If TTL exists and is live (live_until >= current_ledger): pass to host
@@ -110,7 +110,7 @@ impl<'a> LedgerSnapshotAdapter<'a> {
                         None
                     }
                     None => {
-                        // No TTL entry found - in C++ this means the entry is not live
+                        // No TTL entry found - in stellar-core this means the entry is not live
                         tracing::debug!(
                             current_ledger = self.current_ledger,
                             "get_local: ContractData entry has no TTL, not passing to host"
@@ -183,7 +183,7 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
         // For ContractData and ContractCode, check TTL first.
         // If TTL has expired, the entry is considered to be in the hot archive
         // and not accessible (unless being explicitly restored).
-        // This mimics C++ stellar-core behavior where archived entries are not
+        // This mimics stellar-core behavior where archived entries are not
         // in the live bucket list.
         let live_until = get_entry_ttl(self.state, &local_key, self.current_ledger);
 
@@ -206,7 +206,7 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
                     ext: LedgerEntryExt::V0,
                 }),
             LedgerKey::ContractData(cd_key) => {
-                // Check TTL: In C++ stellar-core, ContractData entries are only accessible
+                // Check TTL: In stellar-core, ContractData entries are only accessible
                 // if they have a valid (non-expired) TTL entry. Entries without a TTL entry
                 // or with expired TTL are treated as archived and not accessible.
                 match live_until {
@@ -303,7 +303,7 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
 ///
 /// IMPORTANT: This function uses `get_ttl_at_ledger_start()` to return the TTL
 /// value from the bucket list snapshot at ledger start. This is critical for
-/// matching C++ stellar-core behavior in parallel Soroban execution (V1 phases):
+/// matching stellar-core behavior in parallel Soroban execution (V1 phases):
 ///
 /// - Transactions in different clusters of the same stage should NOT see each
 ///   other's changes (including newly created TTL entries)
@@ -316,7 +316,7 @@ fn get_entry_ttl(state: &LedgerStateManager, key: &LedgerKey, current_ledger: u3
     match key {
         LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
             let key_hash = compute_key_hash(key);
-            // Use get_ttl_at_ledger_start() to match C++ behavior for parallel Soroban.
+            // Use get_ttl_at_ledger_start() to match stellar-core behavior for parallel Soroban.
             // This returns the TTL from the bucket list snapshot at ledger start,
             // NOT the current TTL (which might include entries created by earlier TXs).
             let ttl = state.get_ttl_at_ledger_start(&key_hash);
@@ -566,7 +566,7 @@ pub fn invoke_host_function(
     let seed: Vec<u8> = if let Some(prng_seed) = context.soroban_prng_seed {
         prng_seed.to_vec()
     } else {
-        tracing::warn!("P25: Using fallback PRNG seed - results may differ from C++ stellar-core");
+        tracing::warn!("P25: Using fallback PRNG seed - results may differ from stellar-core");
         let mut hasher = Sha256::new();
         hasher.update(context.network_id.0 .0);
         hasher.update(context.sequence.to_le_bytes());
@@ -747,7 +747,7 @@ pub fn invoke_host_function(
     // - Had their content modified (encoded_new_value.is_some())
     // - Are involved in rent calculations (old_entry_size_bytes_for_rent > 0)
     // - Had their TTL actually extended (new > old)
-    // Note: C++ stellar-core only includes TTL changes when TTL is extended, not just
+    // Note: stellar-core only includes TTL changes when TTL is extended, not just
     // when ttl_change is present. See extract_ledger_effects in soroban_proto_any.rs.
     let ledger_changes = result
         .ledger_changes
@@ -896,7 +896,7 @@ mod tests {
 
     /// Test that get_local returns None when TTL is expired (live_until < current_ledger).
     ///
-    /// This matches C++ stellar-core behavior where entries with expired TTL are not
+    /// This matches stellar-core behavior where entries with expired TTL are not
     /// passed to the Soroban host during invoke_host_function.
     ///
     /// Note: We call capture_ttl_bucket_list_snapshot() to simulate entries that
@@ -937,7 +937,7 @@ mod tests {
 
     /// Test that get_local returns None when TTL entry doesn't exist.
     ///
-    /// This matches C++ stellar-core behavior where entries without a TTL entry
+    /// This matches stellar-core behavior where entries without a TTL entry
     /// are not considered live and are not passed to the Soroban host.
     #[test]
     fn test_get_local_without_ttl() {
@@ -1046,7 +1046,7 @@ mod tests {
     /// Test that entries created WITHIN the current ledger are NOT visible to Soroban.
     ///
     /// This is a critical regression test for parallel Soroban execution (V1 phases).
-    /// In C++ stellar-core, transactions in different clusters of the same stage
+    /// In stellar-core, transactions in different clusters of the same stage
     /// should NOT see each other's changes. This is achieved by using the bucket list
     /// snapshot at ledger start for TTL lookups.
     ///

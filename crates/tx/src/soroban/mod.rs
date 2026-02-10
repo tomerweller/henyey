@@ -43,7 +43,7 @@
 //!
 //! The `protocol` submodule provides protocol-versioned host implementations.
 //! Each protocol version uses the exact same `soroban-env-host` version as
-//! C++ stellar-core to ensure deterministic replay:
+//! stellar-core to ensure deterministic replay:
 //!
 //! | Protocol | soroban-env-host Version |
 //! |----------|-------------------------|
@@ -80,7 +80,7 @@
 //!   to the "hot archive" and can be restored via `RestoreFootprint`.
 //!
 //! The storage adapter checks TTL values and excludes expired entries from the
-//! snapshot, matching C++ stellar-core behavior.
+//! snapshot, matching stellar-core behavior.
 
 mod budget;
 mod error;

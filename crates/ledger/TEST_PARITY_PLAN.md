@@ -1,6 +1,6 @@
 # Ledger Crate Test Parity Plan
 
-Upstream: `.upstream-v25/src/ledger/test/` (6 files, ~42 top-level test cases)
+stellar-core: `.upstream-v25/src/ledger/test/` (6 files, ~42 top-level test cases)
 Rust: `crates/henyey-ledger/` (98 tests across src/ and tests/)
 
 ## Architecture Mapping

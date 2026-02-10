@@ -353,7 +353,7 @@ impl LedgerDelta {
     /// network-wide parameters that cannot be deleted, only updated via upgrades.
     /// Parity: LedgerTxnTests.cpp:853 "fails for configuration"
     pub fn record_delete(&mut self, entry: LedgerEntry) -> Result<()> {
-        // ConfigSetting entries cannot be erased (parity: C++ LedgerTxn::erase)
+        // ConfigSetting entries cannot be erased (parity: stellar-core LedgerTxn::erase)
         if matches!(entry.data, stellar_xdr::curr::LedgerEntryData::ConfigSetting(_)) {
             return Err(LedgerError::InvalidEntry(
                 "cannot delete ConfigSetting entries".to_string(),
@@ -412,7 +412,7 @@ impl LedgerDelta {
     /// needed for the transaction result metadata.
     ///
     /// This is used by parallel Soroban execution to pre-deduct all fees before
-    /// cluster execution, matching C++'s `processFeesSeqNums` behavior.
+    /// cluster execution, matching stellar-core's `processFeesSeqNums` behavior.
     pub fn deduct_fee_from_account(
         &mut self,
         account_id: &AccountId,
@@ -455,7 +455,7 @@ impl LedgerDelta {
         if let LedgerEntryData::Account(ref mut acc) = entry.data {
             acc.balance -= charged_fee;
         }
-        // Stamp last_modified_ledger_seq to match C++ LedgerTxn behavior.
+        // Stamp last_modified_ledger_seq to match stellar-core LedgerTxn behavior.
         if charged_fee > 0 {
             entry.last_modified_ledger_seq = ledger_seq;
         }
@@ -600,7 +600,7 @@ impl LedgerDelta {
     /// Get all current entry values (created + updated).
     ///
     /// Used to propagate prior-stage entries to subsequent stages in parallel
-    /// Soroban execution, matching C++ `collectClusterFootprintEntriesFromGlobal`.
+    /// Soroban execution, matching stellar-core `collectClusterFootprintEntriesFromGlobal`.
     pub fn current_entries(&self) -> Vec<LedgerEntry> {
         self.changes()
             .filter_map(|change| change.current_entry().cloned())
@@ -1381,7 +1381,7 @@ mod tests {
 
     /// Created then deleted = completely vanishes from delta (no-op).
     /// Parity: LedgerTxnTests.cpp "when key exists in grandparent, erased in parent"
-    /// In C++, erasing an entry erased by a parent throws. In Rust, created+deleted = removed.
+    /// In stellar-core, erasing an entry erased by a parent throws. In Rust, created+deleted = removed.
     #[test]
     fn test_created_then_deleted_vanishes() {
         let mut delta = LedgerDelta::new(1);

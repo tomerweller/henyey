@@ -653,7 +653,7 @@ mod tests {
     /// Parity: LedgerHeaderTests.cpp:97 "base reserve" - large sub-entry count
     #[test]
     fn test_minimum_balance_large_sub_entry_count() {
-        let base_reserve: u32 = 100_000_000; // 10 XLM (matches C++ test config baseReserve)
+        let base_reserve: u32 = 100_000_000; // 10 XLM (matches stellar-core test config baseReserve)
         let n: u32 = 20_000;
         let expected = (2 + n as i64) * base_reserve as i64; // 2000200000000
 
@@ -871,7 +871,7 @@ mod tests {
     // P1-5: Account add balance with liabilities
     // Parity: LiabilitiesTests.cpp:829 "balance with liabilities"
     //
-    // Tests the constraints on balance changes. The C++ tests use addBalance()
+    // Tests the constraints on balance changes. The stellar-core tests use addBalance()
     // which checks: new_balance >= min_balance + selling_liab (for decreases)
     // and new_balance + buying_liab <= INT64_MAX (for increases).
     // We test these constraints via available_to_send / available_to_receive.

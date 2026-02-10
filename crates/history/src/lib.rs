@@ -461,7 +461,7 @@ pub mod mainnet {
 }
 
 // ============================================================================
-// History Archive Manager (Parity with C++ HistoryArchiveManager)
+// History Archive Manager (Parity with stellar-core HistoryArchiveManager)
 // ============================================================================
 
 /// An entry in the archive manager combining read and write capabilities.
@@ -531,7 +531,7 @@ impl ArchiveEntry {
 
 /// Manager for history archives with support for reading and writing.
 ///
-/// This is the Rust equivalent of C++ `HistoryArchiveManager`. It manages
+/// This is the Rust equivalent of stellar-core `HistoryArchiveManager`. It manages
 /// multiple history archives and provides:
 ///
 /// - **Writable archive detection**: Determine which archives can be used for publishing

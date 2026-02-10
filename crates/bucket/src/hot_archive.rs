@@ -55,7 +55,7 @@ enum HotArchiveStorage {
         /// Entries indexed by key (for lookups).
         entries: BTreeMap<Vec<u8>, HotArchiveBucketEntry>,
         /// Entries in original/sorted order (for hash computation).
-        /// This preserves C++ stellar-core's entry order which uses semantic comparison,
+        /// This preserves stellar-core's entry order which uses semantic comparison,
         /// not XDR byte comparison.
         ordered_entries: Vec<HotArchiveBucketEntry>,
     },
@@ -153,7 +153,7 @@ impl HotArchiveBucket {
 
     /// Create a hot archive bucket from entries.
     ///
-    /// **Important**: The entries MUST be pre-sorted in C++ stellar-core order
+    /// **Important**: The entries MUST be pre-sorted in stellar-core order
     /// (using LedgerEntryIdCmp comparison). The entries are stored in the
     /// provided order for hash computation.
     pub fn from_entries(entries: Vec<HotArchiveBucketEntry>) -> Result<Self> {
@@ -182,13 +182,13 @@ impl HotArchiveBucket {
     /// are evicted from the live bucket list.
     ///
     /// Even when there are no data entries, a metaentry-only bucket is created
-    /// (matching C++ behavior where BucketOutputIterator always writes metaentry first).
+    /// (matching stellar-core behavior where BucketOutputIterator always writes metaentry first).
     pub fn fresh(
         protocol_version: u32,
         archived_entries: Vec<LedgerEntry>,
         restored_keys: Vec<LedgerKey>,
     ) -> Result<Self> {
-        // In C++, BucketOutputIterator constructor always writes a metaentry first,
+        // In stellar-core, BucketOutputIterator constructor always writes a metaentry first,
         // so fresh buckets always have at least a metaentry (even with no data entries).
         // mObjectsPut is 1 after writing metaentry, so getBucket() creates a bucket file.
         let mut entries = Vec::with_capacity(1 + archived_entries.len() + restored_keys.len());
@@ -210,7 +210,7 @@ impl HotArchiveBucket {
             entries.push(HotArchiveBucketEntry::Live(key));
         }
 
-        // Sort entries using C++ stellar-core's comparison order
+        // Sort entries using stellar-core's comparison order
         // This matches BucketEntryIdCmp<HotArchiveBucket>
         entries.sort_by(compare_hot_archive_entries);
 
@@ -253,7 +253,7 @@ impl HotArchiveBucket {
 
     /// Get the protocol version (bucket version) from the metadata entry.
     ///
-    /// This matches C++ stellar-core's `getBucketVersion()` method.
+    /// This matches stellar-core's `getBucketVersion()` method.
     /// Returns the ledger_version from the bucket's metadata entry, or 0 if no metadata.
     pub fn get_protocol_version(&self) -> u32 {
         match &self.storage {
@@ -329,13 +329,13 @@ impl HotArchiveBucket {
 
     /// Compute the hash of the bucket contents.
     ///
-    /// This must match C++ stellar-core's bucket hashing:
+    /// This must match stellar-core's bucket hashing:
     /// Each entry is written with an XDR record mark (4-byte size prefix with high bit set),
     /// and the hash is computed over the entire serialized content including record marks.
     ///
     /// **Important**: We iterate over `ordered_entries` which preserves the original
     /// entry order from the file or from fresh() sorting. This is critical because
-    /// C++ uses semantic comparison (LedgerEntryIdCmp) which differs from XDR byte order.
+    /// stellar-core uses semantic comparison (LedgerEntryIdCmp) which differs from XDR byte order.
     fn compute_hash(&self) -> Result<Hash256> {
         match &self.storage {
             HotArchiveStorage::InMemory {
@@ -783,7 +783,7 @@ impl HotArchiveBucketLevel {
         }
     }
 
-    /// Snap curr to snap and return the new snap (matches C++ BucketLevel::snap).
+    /// Snap curr to snap and return the new snap (matches stellar-core BucketLevel::snap).
     fn snap(&mut self) -> HotArchiveBucket {
         self.snap = std::mem::take(&mut self.curr);
         self.snap.clone()
@@ -955,7 +955,7 @@ impl HotArchiveBucketList {
             )));
         }
 
-        // In C++, HotArchiveBucket::fresh() always creates a bucket with a metaentry,
+        // In stellar-core, HotArchiveBucket::fresh() always creates a bucket with a metaentry,
         // even when there are no data entries. The metaentry is written in the
         // BucketOutputIterator constructor before any put() calls. So a bucket with
         // no archived/restored entries still has mObjectsPut=1 and returns a bucket
@@ -1090,7 +1090,7 @@ impl HotArchiveBucketList {
     }
 
     /// Returns true if a level should spill at a given ledger.
-    /// This matches C++ stellar-core's `levelShouldSpill`:
+    /// This matches stellar-core's `levelShouldSpill`:
     ///   return (ledger == roundDown(ledger, levelHalf(level)) ||
     ///           ledger == roundDown(ledger, levelSize(level)));
     ///
@@ -1118,7 +1118,7 @@ impl HotArchiveBucketList {
     /// This happens when the level is about to snap its curr bucket - in that case,
     /// we just propagate the snap from the previous level without merging with curr.
     ///
-    /// Matches C++ stellar-core's `shouldMergeWithEmptyCurr`.
+    /// Matches stellar-core's `shouldMergeWithEmptyCurr`.
     fn should_merge_with_empty_curr(ledger_seq: u32, level: usize) -> bool {
         if level == 0 {
             // Level 0 always merges with its curr
@@ -1304,14 +1304,14 @@ impl HotArchiveBucketList {
     /// This handles state 2 (HAS_NEXT_STATE_INPUTS) by restarting merges with the
     /// exact input curr and snap hashes stored in the HAS.
     ///
-    /// This matches C++ stellar-core's logic in restartMerges() for handling
+    /// This matches stellar-core's logic in restartMerges() for handling
     /// FutureBuckets with hasHashes() && !isLive().
     ///
     /// # Arguments
     ///
     /// * `restart_structure_based` - If true, fall back to structure-based merge restart
     ///   for levels with no stored HAS hashes (state 0). This should be true for full
-    ///   startup mode but false for offline verification mode. C++ stellar-core only
+    ///   startup mode but false for offline verification mode. stellar-core only
     ///   calls restartMerges in full startup mode, not for standalone offline commands.
     pub fn restart_merges_from_has<F>(
         &mut self,
@@ -1368,7 +1368,7 @@ impl HotArchiveBucketList {
 
                         // Perform the merge with the exact input hashes from HAS
                         // Use the caller's protocol_version (from ledger header) as the
-                        // max protocol version, matching C++ behavior in restartMerges
+                        // max protocol version, matching stellar-core behavior in restartMerges
                         // where makeLive() is called with maxProtocolVersion.
                         let keep_tombstones = Self::keep_tombstone_entries(i);
 
@@ -1396,10 +1396,10 @@ impl HotArchiveBucketList {
         // fall back to regular restart_merges which examines bucket structure
         // to determine if a merge should be in progress.
         //
-        // This matches C++ stellar-core behavior: when next.isClear() for a level,
+        // This matches stellar-core behavior: when next.isClear() for a level,
         // restartMerges() uses the previous level's snap to start a merge if needed.
         //
-        // Note: C++ only does structure-based restarts in full startup mode, not for
+        // Note: stellar-core only does structure-based restarts in full startup mode, not for
         // standalone offline commands. The caller controls this via restart_structure_based.
         if restart_structure_based {
             self.restart_merges(ledger, protocol_version)
@@ -1416,7 +1416,7 @@ impl HotArchiveBucketList {
     /// have been in progress at that checkpoint ledger. This function recreates those pending
     /// merges by examining the current and snap buckets and starting merges where appropriate.
     ///
-    /// This matches C++ stellar-core's BucketListBase::restartMerges() for hot archive.
+    /// This matches stellar-core's BucketListBase::restartMerges() for hot archive.
     pub fn restart_merges(&mut self, ledger: u32, protocol_version: u32) -> Result<()> {
         tracing::debug!(
             ledger = ledger,
@@ -1532,12 +1532,12 @@ fn hot_archive_entry_to_key(entry: &HotArchiveBucketEntry) -> Result<Vec<u8>> {
     }
 }
 
-/// Compare two hot archive bucket entries for sorting, matching C++ stellar-core's
+/// Compare two hot archive bucket entries for sorting, matching stellar-core's
 /// `BucketEntryIdCmp<HotArchiveBucket>`.
 ///
 /// Comparison order:
 /// 1. Metaentry always comes first
-/// 2. For other entries, compare by LedgerKey using the same order as C++
+/// 2. For other entries, compare by LedgerKey using the same order as stellar-core
 pub fn compare_hot_archive_entries(
     a: &HotArchiveBucketEntry,
     b: &HotArchiveBucketEntry,
@@ -1579,7 +1579,7 @@ pub fn compare_hot_archive_entries(
     }
 }
 
-/// Compare two LedgerKeys using the same order as C++ stellar-core's `LedgerEntryIdCmp`.
+/// Compare two LedgerKeys using the same order as stellar-core's `LedgerEntryIdCmp`.
 ///
 /// This matches the comparison order used in bucket files.
 fn compare_ledger_keys(a: &LedgerKey, b: &LedgerKey) -> std::cmp::Ordering {
@@ -1708,7 +1708,7 @@ fn compare_sc_address(
     a_bytes.cmp(&b_bytes)
 }
 
-/// Compare two ScVal values using the same order as C++ stellar-core.
+/// Compare two ScVal values using the same order as stellar-core.
 ///
 /// This uses XDR byte comparison as a fallback for complex types,
 /// which should be correct for most practical cases.
@@ -1880,14 +1880,14 @@ pub fn merge_hot_archive_buckets(
     );
 
     // NOTE: We intentionally do NOT optimize for empty buckets here.
-    // C++ stellar-core always goes through the full merge process even when
+    // stellar-core always goes through the full merge process even when
     // one input is empty. This is important because:
     // 1. The output bucket gets new metadata (protocol version)
     // 2. The bucket hash includes metadata
     // 3. Returning input unchanged would preserve old metadata and wrong hash
     //
     // The only optimization is when BOTH inputs are empty and protocol version is 0.
-    // In C++, even an empty merge produces a bucket with metadata.
+    // In stellar-core, even an empty merge produces a bucket with metadata.
     if snap.is_empty() && curr.is_empty() && protocol_version == 0 {
         tracing::trace!("hot_archive merge: both empty and no protocol, returning empty");
         return Ok(HotArchiveBucket::empty());
@@ -1906,7 +1906,7 @@ pub fn merge_hot_archive_buckets(
     }
 
     // Process snap entries (newer entries)
-    // C++ HotArchiveBucket::mergeCasesWithEqualKeys always takes the newer entry,
+    // stellar-core HotArchiveBucket::mergeCasesWithEqualKeys always takes the newer entry,
     // so snap entries always win when there's a key match.
     for entry in snap.iter() {
         if matches!(entry, HotArchiveBucketEntry::Metaentry(_)) {
@@ -1926,12 +1926,12 @@ pub fn merge_hot_archive_buckets(
 
     // Build result
     // NOTE: Even if merged_entries is empty, we still create a bucket with metaentry.
-    // In C++, BucketOutputIterator constructor ALWAYS writes a metaentry first,
+    // In stellar-core, BucketOutputIterator constructor ALWAYS writes a metaentry first,
     // so merge output always has at least a metaentry (mObjectsPut >= 1).
     // This is critical for hash consistency.
     let mut result_entries = Vec::with_capacity(merged_entries.len() + 1);
 
-    // Calculate output protocol version using max(curr, snap), matching C++ behavior
+    // Calculate output protocol version using max(curr, snap), matching stellar-core behavior
     // in calculateMergeProtocolVersion(). The passed protocol_version is only used as
     // a constraint (maxProtocolVersion), not as the output version.
     let output_version = curr.get_protocol_version().max(snap.get_protocol_version());
@@ -1958,8 +1958,8 @@ pub fn merge_hot_archive_buckets(
     // Add merged entries
     result_entries.extend(merged_entries.into_values());
 
-    // Sort entries using C++ stellar-core's comparison order
-    // This is critical for hash consistency with C++
+    // Sort entries using stellar-core's comparison order
+    // This is critical for hash consistency with stellar-core
     result_entries.sort_by(compare_hot_archive_entries);
 
     let result = HotArchiveBucket::from_entries(result_entries)?;
@@ -2023,7 +2023,7 @@ mod tests {
     #[test]
     fn test_hot_archive_bucket_fresh_metaentry_only() {
         // Fresh bucket with no data entries should still have metaentry
-        // This matches C++ behavior where BucketOutputIterator always writes metaentry first
+        // This matches stellar-core behavior where BucketOutputIterator always writes metaentry first
         let bucket = HotArchiveBucket::fresh(25, vec![], vec![]).unwrap();
 
         // Should have 1 entry (just the metaentry)
@@ -2039,7 +2039,7 @@ mod tests {
     #[test]
     fn test_hot_archive_merge_metaentry_only_buckets() {
         // Merging two metaentry-only buckets should produce a metaentry-only bucket
-        // This is critical for hash consistency with C++
+        // This is critical for hash consistency with stellar-core
         let bucket1 = HotArchiveBucket::fresh(25, vec![], vec![]).unwrap();
         let bucket2 = HotArchiveBucket::fresh(25, vec![], vec![]).unwrap();
 
@@ -2056,8 +2056,8 @@ mod tests {
     }
 
     #[test]
-    fn test_hot_archive_metaentry_only_hash_matches_cpp() {
-        // This test verifies the hash of a metaentry-only bucket matches C++ stellar-core
+    fn test_hot_archive_metaentry_only_hash_matches_stellar_core() {
+        // This test verifies the hash of a metaentry-only bucket matches stellar-core
         // Bucket 95079eba2ff8ef53c179aa3dedb62b78acd7aa9ba5ddcc391436812c5f7084aa from testnet
         // Contains only a METAENTRY with protocol version 25
         //
@@ -2073,7 +2073,7 @@ mod tests {
         assert_eq!(
             bucket.hash().to_hex(),
             expected_hash,
-            "Metaentry-only bucket hash should match C++ stellar-core"
+            "Metaentry-only bucket hash should match stellar-core"
         );
     }
 
@@ -2136,7 +2136,7 @@ mod tests {
         let key = make_contract_data_key([1u8; 32], b"key1");
 
         // curr (old) has Archived, snap (new) has Live
-        // C++ always takes newer entry, so Live should win
+        // stellar-core always takes newer entry, so Live should win
         let curr = HotArchiveBucket::from_entries(vec![
             HotArchiveBucketEntry::Metaentry(BucketMetadata {
                 ledger_version: 25,
@@ -2172,7 +2172,7 @@ mod tests {
         let key = make_contract_data_key([1u8; 32], b"key1");
 
         // curr (old) has Live, snap (new) has Archived
-        // C++ always takes newer entry, so Archived should win
+        // stellar-core always takes newer entry, so Archived should win
         let curr = HotArchiveBucket::from_entries(vec![
             HotArchiveBucketEntry::Metaentry(BucketMetadata {
                 ledger_version: 25,

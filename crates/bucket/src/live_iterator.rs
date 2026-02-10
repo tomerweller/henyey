@@ -1,7 +1,7 @@
 //! Streaming iterator for live bucket list entries.
 //!
 //! This module provides a memory-efficient iterator over all live entries in a bucket list,
-//! matching the C++ stellar-core's iteration pattern from `BucketApplicator`.
+//! matching the stellar-core's iteration pattern from `BucketApplicator`.
 //!
 //! # Overview
 //!
@@ -12,7 +12,7 @@
 //! # Memory Efficiency
 //!
 //! Instead of collecting all entries into a `Vec<LedgerEntry>`, this iterator uses a
-//! `HashSet<LedgerKey>` for deduplication, matching C++ stellar-core's approach:
+//! `HashSet<LedgerKey>` for deduplication, matching stellar-core's approach:
 //!
 //! ```cpp
 //! // From BucketApplicator.cpp
@@ -60,12 +60,12 @@ use crate::{BucketLevel, BucketList, Result};
 /// Streaming iterator over live bucket list entries.
 ///
 /// This iterator yields [`LedgerEntry`] values one at a time, using a `HashSet<LedgerKey>`
-/// for deduplication to match C++ stellar-core's approach. It's designed for memory-efficient
+/// for deduplication to match stellar-core's approach. It's designed for memory-efficient
 /// iteration over large bucket lists (mainnet scale).
 ///
 /// # Deduplication
 ///
-/// The iterator tracks seen keys using `HashSet<LedgerKey>`, matching C++ stellar-core:
+/// The iterator tracks seen keys using `HashSet<LedgerKey>`, matching stellar-core:
 ///
 /// ```cpp
 /// auto [_, wasInserted] = mSeenKeys.emplace(LedgerEntryKey(e.liveEntry()));
@@ -95,7 +95,7 @@ pub struct LiveEntriesIterator<'a> {
     /// Iterator over the current bucket's entries.
     bucket_iter: Option<BucketIter<'a>>,
 
-    /// Set of seen keys for deduplication (matches C++ `unordered_set<LedgerKey>`).
+    /// Set of seen keys for deduplication (matches stellar-core `unordered_set<LedgerKey>`).
     seen_keys: HashSet<LedgerKey>,
 
     /// Number of entries yielded (for statistics).
@@ -220,7 +220,7 @@ impl<'a> Iterator for LiveEntriesIterator<'a> {
                                 None => continue, // Skip entries without valid keys
                             };
 
-                            // C++ pattern: mSeenKeys.emplace(key).second
+                            // stellar-core pattern: mSeenKeys.emplace(key).second
                             // insert() returns true if the key was newly inserted
                             if !self.seen_keys.insert(key) {
                                 self.entries_skipped += 1;

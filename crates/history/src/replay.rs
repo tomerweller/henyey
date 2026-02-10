@@ -366,7 +366,7 @@ impl Default for ReplayConfig {
         Self {
             // Transaction result verification is disabled by default because during
             // replay we re-execute transactions without TransactionMeta from archives.
-            // Our execution may produce slightly different result codes than C++
+            // Our execution may produce slightly different result codes than stellar-core
             // stellar-core, especially for Soroban contracts (e.g., Trapped vs
             // ResourceLimitExceeded). The bucket list hash at checkpoints is the
             // authoritative verification of correct ledger state.
@@ -757,7 +757,7 @@ pub fn replay_ledger_with_execution(
     }
 
     // Run incremental eviction scan for protocol 23+ before applying transaction changes
-    // This matches C++ stellar-core's behavior: eviction is determined by TTL state
+    // This matches stellar-core's behavior: eviction is determined by TTL state
     // from the current bucket list, then evicted entries are added as DEAD entries
     let mut updated_eviction_iterator = eviction_iterator;
     let mut evicted_keys: Vec<LedgerKey> = Vec::new();
@@ -784,7 +784,7 @@ pub fn replay_ledger_with_execution(
         );
 
         // Resolution phase: apply TTL filtering + max_entries limit.
-        // This matches C++ resolveBackgroundEvictionScan which:
+        // This matches stellar-core resolveBackgroundEvictionScan which:
         // 1. Filters out entries whose TTL was modified by TXs in this ledger
         // 2. Evicts up to maxEntriesToArchive entries
         // 3. Sets iterator based on whether the limit was hit
@@ -818,7 +818,7 @@ pub fn replay_ledger_with_execution(
     all_dead_entries.extend(evicted_keys);
 
     // Build live entries including eviction iterator update.
-    // C++ stellar-core updates the EvictionIterator ConfigSettingEntry EVERY ledger
+    // stellar-core updates the EvictionIterator ConfigSettingEntry EVERY ledger
     // during eviction scan. We do the same for consistency.
     let mut all_live_entries = live_entries.clone();
     if eviction_actually_ran {
@@ -846,7 +846,7 @@ pub fn replay_ledger_with_execution(
     }
 
     // Update LiveSorobanStateSizeWindow if needed.
-    // C++ stellar-core calls snapshotSorobanStateSizeWindow() at the end of ledger close.
+    // stellar-core calls snapshotSorobanStateSizeWindow() at the end of ledger close.
     // This samples the current Soroban state size at periodic intervals.
     // Check if already present in live_entries (from transaction delta)
     let has_window_entry = all_live_entries.iter().any(|e| {
@@ -870,7 +870,7 @@ pub fn replay_ledger_with_execution(
         }
     }
 
-    // Update hot archive FIRST (matches C++ order: addHotArchiveBatch before addLiveBatch).
+    // Update hot archive FIRST (matches stellar-core order: addHotArchiveBatch before addLiveBatch).
     // IMPORTANT: Must always call add_batch for protocol 23+ even with empty entries,
     // because the hot archive bucket list needs to run spill logic at the same
     // ledger boundaries as the live bucket list.
@@ -965,7 +965,7 @@ pub fn replay_ledger_with_execution(
     if config.verify_bucket_list {
         // Bucket list verification during replay is only reliable at checkpoints.
         // This is because we re-execute transactions without TransactionMeta,
-        // which may produce slightly different entry values than C++ stellar-core.
+        // which may produce slightly different entry values than stellar-core.
         // At checkpoints, we restore the bucket list from the archive, so verification
         // is accurate. For per-ledger verification, we would need TransactionMeta
         // from the archives (available via LedgerCloseMeta in streaming/CDP format).
@@ -1551,7 +1551,7 @@ mod tests {
     fn test_replay_config_default() {
         let config = ReplayConfig::default();
         // verify_results is disabled by default because replay without TransactionMeta
-        // produces different results than C++ stellar-core
+        // produces different results than stellar-core
         assert!(!config.verify_results);
         assert!(config.verify_bucket_list);
     }

@@ -24,7 +24,7 @@ This document tracks the parity between the Rust `henyey-crypto` crate and the s
 
 ## Implemented Features
 
-### Ed25519 Keys and Signatures (SecretKey.h/cpp)
+### Ed25519 Keys and Signatures (SecretKey.h)
 
 | stellar-core Function | Rust Equivalent | Status |
 |--------------|-----------------|--------|
@@ -41,7 +41,7 @@ This document tracks the parity between the Rust `henyey-crypto` crate and the s
 | `PubKeyUtils::verifySig()` | `PublicKey::verify()` | Implemented (without cache) |
 | `PublicKey` XDR conversions | `TryFrom`/`From` impls | Implemented |
 
-### SHA-256 Hashing (SHA.h/cpp)
+### SHA-256 Hashing (SHA.h)
 
 | stellar-core Function | Rust Equivalent | Status |
 |--------------|-----------------|--------|
@@ -58,7 +58,7 @@ This document tracks the parity between the Rust `henyey-crypto` crate and the s
 | `hkdfExtract()` | `hkdf_extract()` | Implemented |
 | `hkdfExpand()` | `hkdf_expand()` | Implemented |
 
-### BLAKE2 Hashing (BLAKE2.h/cpp)
+### BLAKE2 Hashing (BLAKE2.h)
 
 | stellar-core Function | Rust Equivalent | Status |
 |--------------|-----------------|--------|
@@ -70,7 +70,7 @@ This document tracks the parity between the Rust `henyey-crypto` crate and the s
 | `xdrBlake2()` | `xdr_blake2()` | Implemented |
 | `XDRBLAKE2` (zero-alloc) | `XdrBlake2Hasher` | Partial (allocates XDR bytes) |
 
-### StrKey Encoding (StrKey.h/cpp)
+### StrKey Encoding (StrKey.h)
 
 | stellar-core Feature | Rust Equivalent | Status |
 |-------------|-----------------|--------|
@@ -86,7 +86,7 @@ This document tracks the parity between the Rust `henyey-crypto` crate and the s
 | CRC16-XModem | `crc16_xmodem()` (internal) | Implemented |
 | `getStrKeySize()` | Not exposed | Not Implemented |
 
-### Short Hash (ShortHash.h/cpp)
+### Short Hash (ShortHash.h)
 
 | stellar-core Function | Rust Equivalent | Status |
 |--------------|-----------------|--------|
@@ -99,7 +99,7 @@ This document tracks the parity between the Rust `henyey-crypto` crate and the s
 | Thread-safe global key | `OnceLock<Mutex<KeyState>>` | Implemented |
 | Seed conflict detection | `ShortHashSeedConflict` error | Implemented |
 
-### Random (Random.h/cpp)
+### Random (Random.h)
 
 | stellar-core Function | Rust Equivalent | Status |
 |--------------|-----------------|--------|
@@ -110,7 +110,7 @@ This document tracks the parity between the Rust `henyey-crypto` crate and the s
 | N/A | `random_u64()` | Implemented |
 | N/A | `fill_random()` | Implemented |
 
-### Curve25519 / Sealed Box (Curve25519.h/cpp)
+### Curve25519 / Sealed Box (Curve25519.h)
 
 | stellar-core Function | Rust Equivalent | Status |
 |--------------|-----------------|--------|
@@ -121,7 +121,7 @@ This document tracks the parity between the Rust `henyey-crypto` crate and the s
 | N/A | `seal_to_curve25519_public_key()` | Implemented |
 | N/A | `open_from_curve25519_secret_key()` | Implemented |
 
-### Curve25519 P2P Key Exchange (Curve25519.h/cpp)
+### Curve25519 P2P Key Exchange (Curve25519.h)
 
 | stellar-core Function | Rust Equivalent | Status |
 |--------------|-----------------|--------|
@@ -149,7 +149,7 @@ This document tracks the parity between the Rust `henyey-crypto` crate and the s
 
 ## Not Yet Implemented (Gaps)
 
-### Signature Verification Cache (SecretKey.h/cpp)
+### Signature Verification Cache (SecretKey.h)
 
 The stellar-core implementation includes a process-wide signature verification cache (`RandomEvictionCache<Hash, bool>`) that caches verification results keyed by BLAKE2 hash.
 
@@ -164,7 +164,7 @@ The stellar-core implementation includes a process-wide signature verification c
 
 **Note**: This is a performance optimization, not a correctness issue. The Rust implementation performs signature verification on every call.
 
-### SignerKey Utilities (SignerKey.h/cpp, SignerKeyUtils.h/cpp)
+### SignerKey Utilities (SignerKey.h, SignerKeyUtils.h)
 
 | stellar-core Feature | Rust Equivalent | Status |
 |-------------|-----------------|--------|
@@ -178,7 +178,7 @@ The stellar-core implementation includes a process-wide signature verification c
 | Signed Payload StrKey (P...) | `encode/decode_signed_payload()` | Implemented |
 | Contract StrKey (C...) | `encode/decode_contract()` | Implemented |
 
-### Key Utilities (KeyUtils.h/cpp)
+### Key Utilities (KeyUtils.h)
 
 | stellar-core Feature | Status | Priority |
 |-------------|--------|----------|
@@ -189,7 +189,7 @@ The stellar-core implementation includes a process-wide signature verification c
 | `KeyUtils::canConvert()` | Not Implemented | Low |
 | `KeyUtils::convertKey()` | Not Implemented | Low |
 
-### Hex Encoding (Hex.h/cpp)
+### Hex Encoding (Hex.h)
 
 **Status: Implemented** (in `hex.rs`)
 
@@ -213,7 +213,7 @@ The stellar-core implementation includes a process-wide signature verification c
 
 **Note**: Rust serializes XDR to bytes first, which allocates but is simpler. The CRTP pattern is a stellar-core optimization.
 
-### Testing and Benchmarking (SecretKey.h/cpp)
+### Testing and Benchmarking (SecretKey.h)
 
 | stellar-core Feature | Status | Priority |
 |-------------|--------|----------|

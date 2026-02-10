@@ -159,7 +159,7 @@ pub fn execute_set_options(
 
     // Validate inflation destination: if specified and not the source account itself,
     // the destination account must exist on the ledger.
-    // This matches C++ stellar-core's SetOptionsOpFrame::doApply() which calls
+    // This matches stellar-core's SetOptionsOpFrame::doApply() which calls
     // loadAccountWithoutRecord() and returns SET_OPTIONS_INVALID_INFLATION if not found.
     if let Some(ref inflation_dest) = op.inflation_dest {
         if inflation_dest != source && state.get_account(inflation_dest).is_none() {

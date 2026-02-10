@@ -190,7 +190,7 @@ All operations are deterministic to ensure consensus:
 - Transaction ordering follows protocol rules
 - Hash computations use canonical XDR encoding
 
-## Upstream Mapping
+## stellar-core Mapping
 
 This crate corresponds to the following stellar-core components:
 

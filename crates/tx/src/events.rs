@@ -26,12 +26,12 @@
 //! - [`ClassicEventConfig`]: Configuration for event emission behavior
 //! - [`EventManagerHierarchy`]: Composes all event managers for a transaction
 //!
-//! # C++ Parity
+//! # Parity
 //!
-//! This module provides full parity with C++ stellar-core's EventManager hierarchy:
-//! - `OpEventManager` matches C++ `OpEventManager` with issuer-aware transfer logic
-//! - `TxEventManager` matches C++ `TxEventManager` for fee events
-//! - `EventManagerHierarchy` composes managers like C++ `TransactionMetaBuilder`
+//! This module provides full parity with stellar-core's EventManager hierarchy:
+//! - `OpEventManager` matches stellar-core `OpEventManager` with issuer-aware transfer logic
+//! - `TxEventManager` matches stellar-core `TxEventManager` for fee events
+//! - `EventManagerHierarchy` composes managers like stellar-core `TransactionMetaBuilder`
 //! - Support for `insertAtBeginning` flag in mint events for lumen reconciliation
 
 use henyey_common::NetworkId;
@@ -625,7 +625,7 @@ impl TxEventManager {
 /// Composes all event managers for a transaction.
 ///
 /// `EventManagerHierarchy` provides a unified interface for managing events
-/// at both the operation and transaction levels. It matches the C++ stellar-core
+/// at both the operation and transaction levels. It matches the stellar-core
 /// architecture where `TransactionMetaBuilder` composes `TxEventManager` and
 /// multiple `OpEventManager` instances.
 ///

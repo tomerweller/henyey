@@ -2,35 +2,35 @@
 
 **Overall Parity: ~88%**
 
-This document tracks feature parity between this Rust crate and stellar-core upstream implementation in `.upstream-v25/src/overlay/`.
+This document tracks feature parity between this Rust crate and stellar-core implementation in `.upstream-v25/src/overlay/`.
 
 ### Parity Summary
 
 | Component | stellar-core Files | Rust Files | Status |
 |-----------|-----------|------------|--------|
 | OverlayManager | OverlayManager.h, OverlayManagerImpl.cpp/h | manager.rs | **Full** |
-| Peer | Peer.h/cpp, TCPPeer.h/cpp | peer.rs, connection.rs | **Full** |
-| PeerAuth | PeerAuth.h/cpp | auth.rs | **Full** |
-| Floodgate | Floodgate.h/cpp | flood.rs | **Full** |
-| FlowControl | FlowControl.h/cpp, FlowControlCapacity.h/cpp | flow_control.rs | **Full** |
-| ItemFetcher | ItemFetcher.h/cpp, Tracker.h/cpp | item_fetcher.rs | **Full** |
-| BanManager | BanManager.h, BanManagerImpl.h/cpp | ban_manager.rs | **Full** |
-| PeerManager | PeerManager.h/cpp, RandomPeerSource.h/cpp | peer_manager.rs | **Full** |
-| TxAdverts | TxAdverts.h/cpp | tx_adverts.rs | **Full** |
-| TxDemandsManager | TxDemandsManager.h/cpp | tx_demands.rs | **Full** |
-| OverlayMetrics | OverlayMetrics.h/cpp | metrics.rs | **Full** |
-| SurveyManager | SurveyManager.h/cpp, SurveyDataManager.h/cpp, SurveyMessageLimiter.h/cpp | survey.rs | **Full** |
+| Peer | Peer.h, TCPPeer.h | peer.rs, connection.rs | **Full** |
+| PeerAuth | PeerAuth.h | auth.rs | **Full** |
+| Floodgate | Floodgate.h | flood.rs | **Full** |
+| FlowControl | FlowControl.h, FlowControlCapacity.h | flow_control.rs | **Full** |
+| ItemFetcher | ItemFetcher.h, Tracker.h | item_fetcher.rs | **Full** |
+| BanManager | BanManager.h, BanManagerImpl.h | ban_manager.rs | **Full** |
+| PeerManager | PeerManager.h, RandomPeerSource.h | peer_manager.rs | **Full** |
+| TxAdverts | TxAdverts.h | tx_adverts.rs | **Full** |
+| TxDemandsManager | TxDemandsManager.h | tx_demands.rs | **Full** |
+| OverlayMetrics | OverlayMetrics.h | metrics.rs | **Full** |
+| SurveyManager | SurveyManager.h, SurveyDataManager.h, SurveyMessageLimiter.h | survey.rs | **Full** |
 | MessageCodec | (in Peer/TCPPeer) | codec.rs | **Full** |
-| HMAC | Hmac.h/cpp | (in auth.rs) | **Full** |
-| PeerDoor | PeerDoor.h/cpp | (in manager.rs) | **Full** |
-| PeerBareAddress | PeerBareAddress.h/cpp | (in lib.rs as PeerAddress) | **Full** |
-| PeerSharedKeyId | PeerSharedKeyId.h/cpp | (not needed - different cache approach) | N/A |
+| HMAC | Hmac.h | (in auth.rs) | **Full** |
+| PeerDoor | PeerDoor.h | (in manager.rs) | **Full** |
+| PeerBareAddress | PeerBareAddress.h | (in lib.rs as PeerAddress) | **Full** |
+| PeerSharedKeyId | PeerSharedKeyId.h | (not needed - different cache approach) | N/A |
 
 ### Implemented Features
 
 #### Core Infrastructure
 
-**OverlayManager** (`manager.rs`) - Corresponds to `OverlayManager.h`, `OverlayManagerImpl.h/cpp`
+**OverlayManager** (`manager.rs`) - Corresponds to `OverlayManager.h`, `OverlayManagerImpl.h`
 - Start/shutdown lifecycle management
 - Inbound/outbound connection limits with separate pools
 - Peer count tracking and statistics
@@ -43,7 +43,7 @@ This document tracks feature parity between this Rust crate and stellar-core ups
 - Message deduplication cache (`checkScheduledAndCache` equivalent)
 - Authenticated peer management (pending -> authenticated transition)
 
-**Peer** (`peer.rs`, `connection.rs`) - Corresponds to `Peer.h/cpp`, `TCPPeer.h/cpp`
+**Peer** (`peer.rs`, `connection.rs`) - Corresponds to `Peer.h`, `TCPPeer.h`
 - Full Hello/Auth handshake implementation
 - Message send/receive with MAC authentication
 - Peer state machine: `Connecting -> Handshaking -> Authenticated -> Closing -> Disconnected`
@@ -54,7 +54,7 @@ This document tracks feature parity between this Rust crate and stellar-core ups
 - Ping/pong for connection liveness (timer-based)
 - Capacity-tracked message processing
 
-**PeerAuth / AuthContext** (`auth.rs`) - Corresponds to `PeerAuth.h/cpp`
+**PeerAuth / AuthContext** (`auth.rs`) - Corresponds to `PeerAuth.h`
 - AuthCert creation and verification
 - Ephemeral X25519 key generation
 - Signature over network_id || envelope_type || expiration || pubkey
@@ -69,14 +69,14 @@ This document tracks feature parity between this Rust crate and stellar-core ups
 - Streaming decode state machine
 - Message size limits: `MAX_MESSAGE_SIZE` (16 MB)
 
-**Floodgate** (`flood.rs`) - Corresponds to `Floodgate.h/cpp`
+**Floodgate** (`flood.rs`) - Corresponds to `Floodgate.h`
 - Message hash tracking (BLAKE2 in stellar-core, SHA-256 in Rust - both valid)
 - Peer tracking per message (`mPeersTold` equivalent)
 - Ledger-based expiry (`clearBelow`)
 - Broadcast to peers excluding sender (`getPeersKnows`)
 - Record management (`addRecord`, `forgetRecord`)
 
-**FlowControl** (`flow_control.rs`) - Corresponds to `FlowControl.h/cpp`, `FlowControlCapacity.h/cpp`
+**FlowControl** (`flow_control.rs`) - Corresponds to `FlowControl.h`, `FlowControlCapacity.h`
 - Message and byte capacity tracking (local and outbound)
 - Priority queuing: SCP (0) > TX (1) > Demand (2) > Advert (3)
 - Load shedding when queues are full
@@ -87,7 +87,7 @@ This document tracks feature parity between this Rust crate and stellar-core ups
 - `addMsgAndMaybeTrimQueue` / `getNextBatchToSend` / `processSentMessages`
 - Outbound capacity timeout detection
 
-**ItemFetcher / Tracker** (`item_fetcher.rs`) - Corresponds to `ItemFetcher.h/cpp`, `Tracker.h/cpp`
+**ItemFetcher / Tracker** (`item_fetcher.rs`) - Corresponds to `ItemFetcher.h`, `Tracker.h`
 - Tracker for each item being fetched
 - Retry logic with timeout handling (`MS_TO_WAIT_FOR_FETCH_REPLY`)
 - Envelope tracking (which envelopes need which data)
@@ -102,13 +102,13 @@ This document tracks feature parity between this Rust crate and stellar-core ups
 - TxSet and QuorumSet caching
 - Callback integration for item receipt
 
-**BanManager** (`ban_manager.rs`) - Corresponds to `BanManager.h`, `BanManagerImpl.h/cpp`
+**BanManager** (`ban_manager.rs`) - Corresponds to `BanManager.h`, `BanManagerImpl.h`
 - In-memory ban list (matches stellar-core `mBanned` set)
 - SQLite persistence (matches stellar-core `ban` table)
 - `banNode`, `unbanNode`, `isBanned` APIs
 - `getBans` for listing banned nodes
 
-**PeerManager** (`peer_manager.rs`) - Corresponds to `PeerManager.h/cpp`
+**PeerManager** (`peer_manager.rs`) - Corresponds to `PeerManager.h`
 - SQLite persistence (matches stellar-core `peers` table schema)
 - Failure count tracking
 - Backoff scheduling (`BackOffUpdate`: HARD_RESET, RESET, INCREASE)
@@ -116,7 +116,7 @@ This document tracks feature parity between this Rust crate and stellar-core ups
 - Random peer selection from database
 - Peer query filters (`PeerTypeFilter`)
 
-**TxAdverts** (`tx_adverts.rs`) - Corresponds to `TxAdverts.h/cpp`
+**TxAdverts** (`tx_adverts.rs`) - Corresponds to `TxAdverts.h`
 - Incoming advert queuing for demanding
 - Outgoing advert batching with periodic flush
 - History cache for duplicate detection (`mAdvertHistory`)
@@ -125,7 +125,7 @@ This document tracks feature parity between this Rust crate and stellar-core ups
 - `queueOutgoingAdvert`, `queueIncomingAdvert`, `popIncomingAdvert`
 - `seenAdvert`, `clearBelow`
 
-**TxDemandsManager** (`tx_demands.rs`) - Corresponds to `TxDemandsManager.h/cpp`
+**TxDemandsManager** (`tx_demands.rs`) - Corresponds to `TxDemandsManager.h`
 - Demand status tracking (Demand, RetryLater, Discard)
 - Linear backoff for retries (up to `MAX_RETRY_COUNT = 15`)
 - Demand history per transaction and peer (`DemandHistory` struct)
@@ -133,7 +133,7 @@ This document tracks feature parity between this Rust crate and stellar-core ups
 - Cleanup of abandoned demands
 - Respond to incoming FloodDemand messages (`recvTxDemand`)
 
-**OverlayMetrics** (`metrics.rs`) - Corresponds to `OverlayMetrics.h/cpp`
+**OverlayMetrics** (`metrics.rs`) - Corresponds to `OverlayMetrics.h`
 - Message metrics (read, write, drop, broadcast)
 - Byte metrics (read, write)
 - Error and timeout counters
@@ -144,7 +144,7 @@ This document tracks feature parity between this Rust crate and stellar-core ups
 - Pull latency timers
 - Thread-safe atomic counters
 
-**SurveyManager** (`survey.rs`) - Corresponds to `SurveyManager.h/cpp`, `SurveyDataManager.h/cpp`, `SurveyMessageLimiter.h/cpp`
+**SurveyManager** (`survey.rs`) - Corresponds to `SurveyManager.h`, `SurveyDataManager.h`, `SurveyMessageLimiter.h`
 - Survey lifecycle (Collecting -> Reporting -> Inactive phases)
 - Node and peer data collection during surveys
 - Surveyor allowlist for authorization
@@ -213,7 +213,7 @@ This document tracks feature parity between this Rust crate and stellar-core ups
 ### Not Implemented / Out of Scope
 
 1. **LoopbackPeer** - Test-only construct for in-process peer simulation
-   - stellar-core: `LoopbackPeer.h/cpp` for testing
+   - stellar-core: `LoopbackPeer.h` for testing
    - Rust: Not implemented (not needed for production)
 
 2. **VirtualClock Integration** - Simulated time for testing

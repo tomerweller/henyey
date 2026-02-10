@@ -1,6 +1,6 @@
 //! Shared test utilities for transaction tests.
 //!
-//! This module provides common test helpers matching C++ SponsorshipTestUtils
+//! This module provides common test helpers matching stellar-core SponsorshipTestUtils
 //! and TestUtils patterns. It consolidates test utilities that were previously
 //! duplicated across individual operation test modules.
 
@@ -15,7 +15,7 @@ use stellar_xdr::curr::{
 use crate::validation::LedgerContext;
 
 /// Maximum number of sub-entries per account (trustlines, offers, data entries, signers).
-/// Matches C++ ACCOUNT_SUBENTRY_LIMIT.
+/// Matches stellar-core ACCOUNT_SUBENTRY_LIMIT.
 pub const ACCOUNT_SUBENTRY_LIMIT: u32 = 1000;
 
 /// Maximum number of signers per account.
@@ -308,7 +308,7 @@ pub fn assert_too_many_sponsoring(result: &stellar_xdr::curr::OperationResult) {
 }
 
 // ============================================================================
-// Account flag constants (matching C++ stellar-core)
+// Account flag constants (matching stellar-core)
 // ============================================================================
 
 /// AUTH_REQUIRED_FLAG - trustlines require authorization from issuer.

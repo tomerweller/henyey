@@ -53,7 +53,7 @@ pub struct HASBucketLevel {
 
 /// State of the next bucket merge operation.
 ///
-/// States (matching C++ FutureBucket::State):
+/// States (matching stellar-core FutureBucket::State):
 /// - 0 (FB_CLEAR): No pending merge
 /// - 1 (FB_HASH_OUTPUT): Merge complete, output hash is known
 /// - 2 (FB_HASH_INPUTS): Merge in progress, input hashes are stored

@@ -345,7 +345,7 @@ impl NominationProtocol {
             }
         }
 
-        // Check if we are a leader for this round (C++ lines 597-651).
+        // Check if we are a leader for this round (stellar-core lines 597-651).
         if self.round_leaders.contains(local_node_id) {
             let over_upgrade_timeout_limit =
                 self.timer_exp_count >= driver.get_upgrade_nomination_timeout_limit();
@@ -433,7 +433,7 @@ impl NominationProtocol {
                 self.attempt_promote(&votes_to_check, local_quorum_set, driver, slot_index);
 
             // N13: Only take round leader votes if we're still looking for
-            // candidates (C++ processEnvelope lines 476-489).
+            // candidates (stellar-core processEnvelope lines 476-489).
             if self.candidates.is_empty() && self.round_leaders.contains(node_id) {
                 if let Some(new_vote) =
                     self.get_new_value_from_nomination(nomination, driver, slot_index)
@@ -445,7 +445,7 @@ impl NominationProtocol {
                 }
             }
 
-            // C++ order: emit first, then composite update
+            // stellar-core order: emit first, then composite update
             if modified {
                 self.emit_nomination(local_node_id, local_quorum_set, driver, slot_index);
                 state_changed = true;
@@ -466,7 +466,7 @@ impl NominationProtocol {
 
     /// Stop nomination (transition to ballot protocol).
     ///
-    /// Matches C++ `stopNomination()` which sets `mNominationStarted = false`.
+    /// Matches stellar-core `stopNomination()` which sets `mNominationStarted = false`.
     /// This ensures `process_envelope` no longer does accept/ratify processing
     /// after nomination has been stopped.
     pub fn stop(&mut self) {
@@ -530,10 +530,10 @@ impl NominationProtocol {
     ///
     /// This is the core acceptance/ratification logic extracted from
     /// `process_envelope` so it can also be called from `emit_nomination`
-    /// (matching C++ where `emitNomination()` calls `processEnvelope(self)`).
+    /// (matching stellar-core where `emitNomination()` calls `processEnvelope(self)`).
     ///
     /// The `votes_to_check` parameter specifies which voted values to check
-    /// for acceptance. In C++, `processEnvelope` iterates `nom.votes` from
+    /// for acceptance. In stellar-core, `processEnvelope` iterates `nom.votes` from
     /// the envelope being processed — when called from `emitNomination`, those
     /// are our own votes.
     ///
@@ -596,12 +596,12 @@ impl NominationProtocol {
 
     /// Emit a nomination envelope.
     ///
-    /// Matches C++ `emitNomination()` which creates the self-envelope then
+    /// Matches stellar-core `emitNomination()` which creates the self-envelope then
     /// calls `processEnvelope(self)` to re-run acceptance/ratification checks.
     /// This can cascade: if acceptance modifies state, we emit again, and the
     /// `isNewerStatement` check prevents duplicate emissions.
     ///
-    /// C++ flow:
+    /// stellar-core flow:
     /// 1. Create envelope from current votes/accepted
     /// 2. `processEnvelope(self)` — records envelope, runs acceptance/ratification,
     ///    may recursively call `emitNomination()` (updating `mLastEnvelope`)
@@ -636,20 +636,20 @@ impl NominationProtocol {
 
         driver.sign_envelope(&mut envelope);
 
-        // Step 1: Record the envelope (C++ recordEnvelope inside processEnvelope).
+        // Step 1: Record the envelope ( stellar-core recordEnvelope inside processEnvelope).
         // This stores in latest_nominations so quorum checks see our own state.
         if !self.record_local_nomination(local_node_id, &statement, envelope.clone()) {
             return;
         }
 
-        // Step 2: Run self-processing (C++ processEnvelope body).
+        // Step 2: Run self-processing (stellar-core processEnvelope body).
         // This may recursively call emit_nomination, updating last_envelope.
         if self.started {
             let (modified, new_candidates) =
                 self.attempt_promote(&votes, local_quorum_set, driver, slot_index);
 
             if modified {
-                // Cascade: C++ emitNomination -> processEnvelope -> emitNomination
+                // Cascade: stellar-core emitNomination -> processEnvelope -> emitNomination
                 self.emit_nomination(local_node_id, local_quorum_set, driver, slot_index);
             }
 
@@ -660,7 +660,7 @@ impl NominationProtocol {
 
         // Step 3: After self-processing (and any recursive emitNomination calls),
         // check if our envelope is still newer than last_envelope.
-        // C++: if (!mLastEnvelope || isNewerStatement(mLastEnvelope->nom, st.nom))
+        // stellar-core: if (!mLastEnvelope || isNewerStatement(mLastEnvelope->nom, st.nom))
         let is_newer = match &self.last_envelope {
             None => true,
             Some(last) => {
@@ -829,7 +829,7 @@ impl NominationProtocol {
             };
 
             if let Some(candidate) = candidate {
-                // C++ sets foundValidValue = true for ANY valid value
+                // stellar-core sets foundValidValue = true for ANY valid value
                 // (FullyValidated or successfully extracted MaybeValid).
                 // This determines whether we also look at votes after accepted.
                 *found_valid = true;
@@ -871,8 +871,8 @@ impl NominationProtocol {
         slot_index: u64,
         prev_value: &Value,
     ) {
-        // C++ normalizes the quorum set, removing self and adjusting thresholds.
-        // This ensures weight calculations and leader selection match upstream.
+        // stellar-core normalizes the quorum set, removing self and adjusting thresholds.
+        // This ensures weight calculations and leader selection match stellar-core.
         let mut normalized_qs = local_quorum_set.clone();
         crate::quorum::normalize_quorum_set_with_remove(&mut normalized_qs, Some(local_node_id));
 
@@ -988,7 +988,7 @@ impl NominationProtocol {
         res as u64
     }
 
-    /// Iterate over all nodes in a quorum set (C++ `LocalNode::forAllNodes`).
+    /// Iterate over all nodes in a quorum set (stellar-core `LocalNode::forAllNodes`).
     ///
     /// Since the quorum set is already normalized with self removed,
     /// this iterates all validators without exclusions.
@@ -1004,7 +1004,7 @@ impl NominationProtocol {
         }
     }
 
-    /// Count all nodes in a quorum set (C++ `forAllNodes` with counter).
+    /// Count all nodes in a quorum set (stellar-core `forAllNodes` with counter).
     ///
     /// Since the quorum set is already normalized with self removed,
     /// this counts all validators without exclusions.
@@ -1022,7 +1022,7 @@ impl NominationProtocol {
     /// saved envelope when restarting after a crash. It sets up the internal state
     /// to match what it would have been after processing that envelope.
     ///
-    /// C++ `setStateFromEnvelope` throws if `mNominationStarted` is true and
+    /// stellar-core `setStateFromEnvelope` throws if `mNominationStarted` is true and
     /// does NOT set it to true. This should only be called before nomination starts.
     ///
     /// # Arguments
@@ -1033,7 +1033,7 @@ impl NominationProtocol {
     /// for state restoration or if nomination has already started.
     pub fn set_state_from_envelope(&mut self, envelope: &ScpEnvelope) -> bool {
         if self.started {
-            // C++ throws here: "Cannot set state after nomination is started"
+            // stellar-core throws here: "Cannot set state after nomination is started"
             return false;
         }
 
@@ -1046,7 +1046,7 @@ impl NominationProtocol {
         self.votes = nomination.votes.iter().cloned().collect();
         self.accepted = nomination.accepted.iter().cloned().collect();
 
-        // Note: C++ does NOT set mNominationStarted = true here.
+        // Note: stellar-core does NOT set mNominationStarted = true here.
         // The state is restored but nomination is not considered "started"
         // until an explicit call to nominate().
 
@@ -1575,7 +1575,7 @@ mod tests {
 
         assert!(!nom.is_started());
         assert!(nom.set_state_from_envelope(&envelope));
-        // C++ does NOT set mNominationStarted = true in setStateFromEnvelope
+        // stellar-core does NOT set mNominationStarted = true in setStateFromEnvelope
         assert!(!nom.is_started());
 
         // Verify votes were restored
@@ -1818,7 +1818,7 @@ mod tests {
     /// N3/15: After stop(), process_envelope should NOT do accept/ratify
     /// because `started` is set to false.
     ///
-    /// C++ `stopNomination()` sets `mNominationStarted = false`, which
+    /// stellar-core `stopNomination()` sets `mNominationStarted = false`, which
     /// means the `if (mNominationStarted)` check in `processEnvelope`
     /// will skip the accept/ratify logic.
     #[test]
@@ -1862,7 +1862,7 @@ mod tests {
     /// N7/8: update_round_leaders normalizes quorum set by removing self
     /// and adjusting thresholds before computing leaders.
     ///
-    /// C++ normalizes the quorum set via `normalize(qset, nodeID)` which
+    /// stellar-core normalizes the quorum set via `normalize(qset, nodeID)` which
     /// removes the local node from validators and decrements the threshold.
     /// This affects weight calculations and leader selection.
     #[test]
@@ -1910,7 +1910,7 @@ mod tests {
     /// N13: process_envelope adopts values from round leaders when
     /// no candidates exist yet.
     ///
-    /// C++ processEnvelope (lines 476-489): after accept/ratify processing,
+    /// stellar-core processEnvelope (lines 476-489): after accept/ratify processing,
     /// if candidates is empty AND the envelope sender is a round leader,
     /// adopt their best value via getNewValueFromNomination.
     #[test]
@@ -1965,7 +1965,7 @@ mod tests {
 
     /// N14: foundValidValue is set for MaybeValid extracted values too.
     ///
-    /// C++ sets foundValidValue=true for ANY value that produces a candidate
+    /// stellar-core sets foundValidValue=true for ANY value that produces a candidate
     /// (both FullyValidated and successfully-extracted MaybeValid). This
     /// controls whether we also look at the `votes` list after scanning
     /// `accepted`.
@@ -2031,7 +2031,7 @@ mod tests {
 
     /// N18: set_state_from_envelope rejects if nomination is already started.
     ///
-    /// C++ throws "Cannot set state after nomination is started" when
+    /// stellar-core throws "Cannot set state after nomination is started" when
     /// mNominationStarted is true.
     #[test]
     fn test_set_state_from_envelope_rejects_when_started() {
@@ -2056,7 +2056,7 @@ mod tests {
 
     /// N12: Nomination timer is stopped when candidates are confirmed.
     ///
-    /// C++ (lines 471-472): When a value is ratified (promoted to candidate),
+    /// stellar-core (lines 471-472): When a value is ratified (promoted to candidate),
     /// the nomination timer is stopped because "there's no need to continue
     /// nominating" per the whitepaper.
     #[test]
@@ -2123,7 +2123,7 @@ mod tests {
 
     /// N5: Upgrade stripping when timer_exp_count exceeds the limit.
     ///
-    /// C++ (lines 597-651): When the nomination timer has expired enough
+    /// stellar-core (lines 597-651): When the nomination timer has expired enough
     /// times (>= getUpgradeNominationTimeoutLimit), and all current votes
     /// have upgrades, the node strips upgrades from its value and votes
     /// for the stripped version.
@@ -2266,7 +2266,7 @@ mod tests {
     /// N6: Timer is set up unconditionally in nominate() when nomination
     /// is active and no candidates exist yet.
     ///
-    /// C++ always sets up the nomination timer (lines 654-659) regardless
+    /// stellar-core always sets up the nomination timer (lines 654-659) regardless
     /// of whether nomination updated. The condition is: nomination is
     /// started and not stopped and no candidates.
     #[test]

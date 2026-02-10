@@ -674,7 +674,7 @@ impl std::fmt::Debug for DiskBucket {
 /// entry at a time. Memory usage is O(1) — only the current entry and a
 /// small read buffer (~8 KB) are held in memory, regardless of file size.
 ///
-/// This matches the C++ `BucketInputIterator` behavior.
+/// This matches the stellar-core `BucketInputIterator` behavior.
 ///
 /// # Format Detection
 ///

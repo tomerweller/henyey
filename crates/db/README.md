@@ -193,7 +193,7 @@ fn test_ledger_storage() {
 }
 ```
 
-## Upstream Mapping
+## stellar-core Mapping
 
 This crate corresponds to the following stellar-core components:
 

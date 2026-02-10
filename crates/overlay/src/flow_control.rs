@@ -1,7 +1,7 @@
 //! Flow control for Stellar overlay connections.
 //!
-//! This module implements flow control as specified in the C++ stellar-core
-//! `FlowControl.h/cpp` and `FlowControlCapacity.h/cpp`. It manages message
+//! This module implements flow control as specified in the stellar-core
+//! `FlowControl.h` and `FlowControlCapacity.h`. It manages message
 //! throttling between peers to prevent overwhelming connections.
 //!
 //! # Overview
@@ -51,7 +51,7 @@ pub struct FlowControlConfig {
 impl Default for FlowControlConfig {
     fn default() -> Self {
         Self {
-            // Match C++ defaults from Config.cpp
+            // Match stellar-core defaults from Config.cpp
             peer_flood_reading_capacity: 200,
             peer_reading_capacity: 400,
             flow_control_send_more_batch_size: 40,
