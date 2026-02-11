@@ -282,6 +282,24 @@ pub mod helpers {
         )
     }
 
+    /// Returns true if this message should be dropped for watcher (non-validator) nodes.
+    ///
+    /// Watchers don't need transaction flood, pull-based flood control, or survey
+    /// messages. Dropping these at the overlay layer reduces broadcast channel
+    /// pressure by ~90% on mainnet, preventing SCP message loss.
+    pub fn is_watcher_droppable(message: &StellarMessage) -> bool {
+        matches!(
+            message,
+            StellarMessage::Transaction(_)
+                | StellarMessage::FloodAdvert(_)
+                | StellarMessage::FloodDemand(_)
+                | StellarMessage::TimeSlicedSurveyRequest(_)
+                | StellarMessage::TimeSlicedSurveyResponse(_)
+                | StellarMessage::TimeSlicedSurveyStartCollecting(_)
+                | StellarMessage::TimeSlicedSurveyStopCollecting(_)
+        )
+    }
+
     /// Returns true if this is a handshake message (Hello or Auth).
     ///
     /// Handshake messages are handled specially during connection setup

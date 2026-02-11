@@ -598,7 +598,7 @@ fn convert_with_offers_and_pools(
     if use_book {
         // Book wins — keep speculative changes (drop savepoint)
         if savepoint_us > 100 {
-            tracing::info!(
+            tracing::debug!(
                 savepoint_us,
                 rollback = false,
                 "savepoint profiling (book wins)"
@@ -616,7 +616,7 @@ fn convert_with_offers_and_pools(
     state.rollback_to_savepoint(savepoint);
     let rollback_us = t_rb.elapsed().as_micros() as u64;
     if savepoint_us > 100 || rollback_us > 100 {
-        tracing::info!(savepoint_us, rollback_us, "savepoint profiling (pool wins)");
+        tracing::debug!(savepoint_us, rollback_us, "savepoint profiling (pool wins)");
     }
 
     offer_trail.clear();
@@ -2299,8 +2299,7 @@ mod tests {
         assert!(from_pool > 0, "Should receive positive amount");
 
         // Verify the result matches manual calculation using the decomposition
-        let denominator = 10_000u128 * reserves_to_pool as u128
-            + 9970u128 * send_amount as u128;
+        let denominator = 10_000u128 * reserves_to_pool as u128 + 9970u128 * send_amount as u128;
         let q = b_large / denominator;
         let r = b_large % denominator;
         let expected = a * q + (a * r) / denominator;
@@ -2334,7 +2333,11 @@ mod tests {
         );
 
         // Must return Ok(false) — exchange not possible — NOT Err
-        assert!(result.is_ok(), "Overflow must not return Err: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Overflow must not return Err: {:?}",
+            result.err()
+        );
         assert!(!result.unwrap(), "Overflow exchange should return false");
     }
 
@@ -2360,6 +2363,10 @@ mod tests {
         );
 
         // Must return Ok — exchange result (true or false) — NOT Err
-        assert!(result.is_ok(), "Overflow must not return Err: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Overflow must not return Err: {:?}",
+            result.err()
+        );
     }
 }

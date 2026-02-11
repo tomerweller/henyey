@@ -2926,6 +2926,24 @@ impl App {
             }
          };
 
+        // Get dedicated SCP message receiver (never drops messages)
+        let scp_message_rx = {
+            let overlay = self.overlay.lock().await;
+            match overlay.as_ref() {
+                Some(o) => o.subscribe_scp().await,
+                None => None,
+            }
+        };
+
+        let mut scp_message_rx = match scp_message_rx {
+            Some(rx) => rx,
+            None => {
+                // Create a dummy receiver that never receives
+                let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<OverlayMessage>();
+                rx
+            }
+        };
+
         // Main run loop
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let mut consensus_interval = tokio::time::interval(Duration::from_secs(5));
@@ -2976,10 +2994,25 @@ impl App {
                     }
                 }
 
+                // Process SCP messages from dedicated never-drop channel.
+                // These are guaranteed to arrive even if the broadcast channel overflows.
+                Some(scp_msg) = scp_message_rx.recv() => {
+                    tracing::debug!(
+                        latency_ms = scp_msg.received_at.elapsed().as_millis(),
+                        "Received SCP message via dedicated channel"
+                    );
+                    self.handle_overlay_message(scp_msg).await;
+                }
+
                 // Process overlay messages
                 msg = message_rx.recv() => {
                     match msg {
                         Ok(overlay_msg) => {
+                            // Skip SCP messages from broadcast channel — they are already
+                            // handled via the dedicated SCP channel above.
+                            if matches!(overlay_msg.message, StellarMessage::ScpMessage(_)) {
+                                continue;
+                            }
                             let delivery_latency = overlay_msg.received_at.elapsed();
                             let msg_type = match &overlay_msg.message {
                                 StellarMessage::ScpMessage(_) => "SCP",
@@ -3044,9 +3077,21 @@ impl App {
                     // This ensures tx_sets that arrived via broadcast are processed before we
                     // decide whether to trigger catchup due to missing tx_sets.
                     let mut drained = 0;
+
+                    // Drain dedicated SCP channel first (highest priority)
+                    while let Ok(scp_msg) = scp_message_rx.try_recv() {
+                        drained += 1;
+                        self.handle_overlay_message(scp_msg).await;
+                    }
+
+                    // Drain broadcast channel (non-SCP messages only)
                     loop {
                         match message_rx.try_recv() {
                             Ok(overlay_msg) => {
+                                // Skip SCP messages — already handled via dedicated channel
+                                if matches!(overlay_msg.message, StellarMessage::ScpMessage(_)) {
+                                    continue;
+                                }
                                 drained += 1;
                                 self.handle_overlay_message(overlay_msg).await;
                             }
@@ -3255,6 +3300,7 @@ impl App {
         overlay_config.target_outbound_peers = self.config.overlay.target_outbound_peers;
         overlay_config.listen_port = self.config.overlay.peer_port;
         overlay_config.listen_enabled = self.is_validator; // Validators listen for connections
+        overlay_config.is_validator = self.is_validator; // Watchers filter non-essential messages
         overlay_config.network_passphrase = self.config.network.passphrase.clone();
 
         // Convert known peers from strings to PeerAddress
@@ -3374,12 +3420,14 @@ impl App {
     /// Returns a JoinHandle that can be aborted when catchup completes.
     /// This method starts a background task that caches GeneralizedTxSets
     /// and requests tx_sets for EXTERNALIZE messages during catchup.
+    /// Uses a dedicated mpsc channel (via subscribe_catchup) that never drops
+    /// messages, unlike the broadcast channel which overflows during high traffic.
     pub async fn start_catchup_message_caching(
         self: &Arc<Self>,
     ) -> Option<tokio::task::JoinHandle<()>> {
         let overlay = self.overlay.lock().await;
         if let Some(ref o) = *overlay {
-            let message_rx = o.subscribe();
+            let message_rx = o.subscribe_catchup();
             let app = Arc::clone(self);
             Some(tokio::spawn(async move {
                 app.cache_messages_during_catchup_impl(message_rx).await;
@@ -3395,10 +3443,11 @@ impl App {
     /// 1. Caching GeneralizedTxSets received from peers
     /// 2. Processing EXTERNALIZE messages to request their tx_sets
     ///
-    /// This helps close the gap ledgers between catchup checkpoint and live consensus.
+    /// Uses a dedicated mpsc channel that never drops messages, ensuring no
+    /// EXTERNALIZE or GeneralizedTxSet messages are lost during catchup.
     async fn cache_messages_during_catchup_impl(
         &self,
-        mut message_rx: tokio::sync::broadcast::Receiver<OverlayMessage>,
+        mut message_rx: tokio::sync::mpsc::UnboundedReceiver<OverlayMessage>,
     ) {
         use stellar_xdr::curr::{
             GeneralizedTransactionSet, Limits, ScpStatementPledges, TransactionPhase,
@@ -3414,7 +3463,7 @@ impl App {
 
         loop {
             match message_rx.recv().await {
-                Ok(msg) => {
+                Some(msg) => {
                     match msg.message {
                         StellarMessage::GeneralizedTxSet(gen_tx_set) => {
                             // Compute hash as SHA-256 of XDR-encoded GeneralizedTransactionSet
@@ -3552,10 +3601,8 @@ impl App {
                         }
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(skipped = n, "Catchup message receiver lagged");
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                None => {
+                    // Channel closed (sender dropped)
                     break;
                 }
             }

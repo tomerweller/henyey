@@ -202,6 +202,14 @@ pub struct OverlayConfig {
     /// Set to `false` for sync-only nodes that don't accept inbound peers.
     pub listen_enabled: bool,
 
+    /// Whether this node is a validator (participates in consensus).
+    ///
+    /// When `false` (watcher mode), the overlay filters out non-essential
+    /// flood messages (Transaction, FloodAdvert, FloodDemand, and Survey
+    /// messages) before they enter the broadcast channel, reducing channel
+    /// pressure by ~90% on mainnet. SCP and fetch messages are always kept.
+    pub is_validator: bool,
+
     /// Version info string for Hello messages.
     ///
     /// Identifies this node to peers during handshake.
@@ -249,6 +257,7 @@ impl Default for OverlayConfig {
             connect_timeout_secs: 10,
             flood_ttl_secs: 300,
             listen_enabled: true,
+            is_validator: true,
             version_string: "rs-stellar-core/0.1.0".to_string(),
             peer_event_tx: None,
         }

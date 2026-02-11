@@ -164,6 +164,16 @@ pub struct OverlayManager {
     shutdown_tx: Option<broadcast::Sender<()>>,
     /// Cache of peer info for connected peers (lock-free access).
     peer_info_cache: Arc<DashMap<PeerId, PeerInfo>>,
+    /// Dedicated channel for SCP messages (never drops).
+    /// Uses mpsc::unbounded so SCP EXTERNALIZE messages are never lost
+    /// even when the broadcast channel overflows during high traffic.
+    scp_message_tx: mpsc::UnboundedSender<OverlayMessage>,
+    /// Receiver end of the SCP channel. Taken once via `subscribe_scp()`.
+    scp_message_rx: Arc<TokioMutex<Option<mpsc::UnboundedReceiver<OverlayMessage>>>>,
+    /// Dynamic extra subscribers for catchup-critical messages (SCP + TxSet).
+    /// Created on demand via `subscribe_catchup()` and cleaned up when dropped.
+    /// Uses parking_lot::RwLock for minimal contention in the hot path (read-heavy).
+    extra_subscribers: Arc<RwLock<Vec<mpsc::UnboundedSender<OverlayMessage>>>>,
 }
 
 impl OverlayManager {
@@ -175,6 +185,7 @@ impl OverlayManager {
         // use several GB of memory. Receivers that lag will get Lagged errors.
         let (message_tx, _) = broadcast::channel(1024);
         let (shutdown_tx, _) = broadcast::channel(1);
+        let (scp_message_tx, scp_message_rx) = mpsc::unbounded_channel();
 
         Ok(Self {
             config: config.clone(),
@@ -199,6 +210,9 @@ impl OverlayManager {
             banned_peers: Arc::new(RwLock::new(HashSet::new())),
             shutdown_tx: Some(shutdown_tx),
             peer_info_cache: Arc::new(DashMap::new()),
+            scp_message_tx,
+            scp_message_rx: Arc::new(TokioMutex::new(Some(scp_message_rx))),
+            extra_subscribers: Arc::new(RwLock::new(Vec::new())),
         })
     }
 
@@ -243,6 +257,9 @@ impl OverlayManager {
         let peer_info_cache = Arc::clone(&self.peer_info_cache);
         let auth_timeout = self.config.auth_timeout_secs;
         let peer_event_tx = self.config.peer_event_tx.clone();
+        let scp_message_tx = self.scp_message_tx.clone();
+        let is_validator = self.config.is_validator;
+        let extra_subscribers_listener = Arc::clone(&self.extra_subscribers);
         let mut shutdown_rx = self.shutdown_tx.as_ref().unwrap().subscribe();
 
         let handle = tokio::spawn(async move {
@@ -271,6 +288,8 @@ impl OverlayManager {
                                 let dropped_authenticated_peers = Arc::clone(&dropped_authenticated_peers);
                                 let banned_peers = Arc::clone(&banned_peers);
                                 let peer_info_cache = Arc::clone(&peer_info_cache);
+                                let scp_message_tx = scp_message_tx.clone();
+                                let extra_subscribers = Arc::clone(&extra_subscribers_listener);
 
                                 let peer_handle = tokio::spawn(async move {
                                     let remote_addr = connection.remote_addr();
@@ -336,8 +355,11 @@ impl OverlayManager {
                                                 peer_id.clone(),
                                                 peer,
                                                 message_tx,
+                                                scp_message_tx,
                                                 flood_gate,
                                                 running,
+                                                is_validator,
+                                                extra_subscribers,
                                             ).await;
 
                                             // Cleanup
@@ -411,6 +433,9 @@ impl OverlayManager {
         let connect_timeout = self.config.connect_timeout_secs;
         let auth_timeout = self.config.auth_timeout_secs;
         let peer_event_tx = self.config.peer_event_tx.clone();
+        let scp_message_tx = self.scp_message_tx.clone();
+        let is_validator = self.config.is_validator;
+        let extra_subscribers_connector = Arc::clone(&self.extra_subscribers);
         let mut shutdown_rx = self.shutdown_tx.as_ref().unwrap().subscribe();
 
         let handle = tokio::spawn(async move {
@@ -478,8 +503,10 @@ impl OverlayManager {
                         peers,
                         pool,
                         message_tx,
+                        scp_message_tx.clone(),
                         flood_gate,
                         running,
+                        is_validator,
                         peer_handles,
                         Arc::clone(&advertised_outbound_peers),
                         Arc::clone(&advertised_inbound_peers),
@@ -488,6 +515,7 @@ impl OverlayManager {
                         Arc::clone(&banned_peers),
                         peer_event_tx.clone(),
                         Arc::clone(&peer_info_cache),
+                        Arc::clone(&extra_subscribers_connector),
                     )
                     .await
                     {
@@ -553,8 +581,10 @@ impl OverlayManager {
                         peers,
                         pool,
                         message_tx,
+                        scp_message_tx.clone(),
                         flood_gate,
                         running,
+                        is_validator,
                         peer_handles,
                         Arc::clone(&advertised_outbound_peers),
                         Arc::clone(&advertised_inbound_peers),
@@ -563,6 +593,7 @@ impl OverlayManager {
                         Arc::clone(&banned_peers),
                         peer_event_tx.clone(),
                         Arc::clone(&peer_info_cache),
+                        Arc::clone(&extra_subscribers_connector),
                     )
                     .await
                     {
@@ -588,8 +619,11 @@ impl OverlayManager {
         peer_id: PeerId,
         peer: Arc<TokioMutex<Peer>>,
         message_tx: broadcast::Sender<OverlayMessage>,
+        scp_message_tx: mpsc::UnboundedSender<OverlayMessage>,
         flood_gate: Arc<FloodGate>,
         running: Arc<AtomicBool>,
+        is_validator: bool,
+        extra_subscribers: Arc<RwLock<Vec<mpsc::UnboundedSender<OverlayMessage>>>>,
     ) {
         // Flow control: track messages received and send SendMoreExtended frequently
         // stellar-core sends FLOW_CONTROL_SEND_MORE_BATCH_SIZE=40 msgs / 100000 bytes after processing
@@ -721,6 +755,15 @@ impl OverlayManager {
                 continue;
             }
 
+            // Watcher filter: drop non-essential flood messages for non-validator nodes.
+            // This eliminates ~90% of mainnet traffic (TX, FloodAdvert, FloodDemand, Survey)
+            // before it enters the broadcast channel, preventing SCP message loss due to
+            // channel overflow.
+            if !is_validator && helpers::is_watcher_droppable(&message) {
+                trace!("Watcher: dropping {} from {}", msg_type, peer_id);
+                continue;
+            }
+
             if !flood_gate.allow_message() {
                 debug!("Dropping message due to rate limit");
                 continue;
@@ -796,6 +839,32 @@ impl OverlayManager {
                 received_at: std::time::Instant::now(),
             };
 
+            // Send SCP messages to the dedicated never-drop channel as well.
+            // This ensures SCP EXTERNALIZE messages are never lost even if the
+            // broadcast channel overflows during high-traffic periods.
+            if matches!(overlay_msg.message, StellarMessage::ScpMessage(_)) {
+                let _ = scp_message_tx.send(overlay_msg.clone());
+            }
+
+            // Send catchup-critical messages (SCP + TxSet) to any extra subscribers.
+            // These are used by the catchup message cacher to bridge the gap between
+            // catchup checkpoint and live consensus. Using mpsc channels ensures
+            // these messages are never lost, unlike the broadcast channel.
+            if matches!(
+                overlay_msg.message,
+                StellarMessage::ScpMessage(_)
+                    | StellarMessage::GeneralizedTxSet(_)
+                    | StellarMessage::TxSet(_)
+                    | StellarMessage::ScpQuorumset(_)
+            ) {
+                let subs = extra_subscribers.read();
+                if !subs.is_empty() {
+                    for sub in subs.iter() {
+                        let _ = sub.send(overlay_msg.clone());
+                    }
+                }
+            }
+
             let _ = message_tx.send(overlay_msg);
 
             // Flow control: send SendMoreExtended after receiving a batch of messages
@@ -845,8 +914,10 @@ impl OverlayManager {
             Arc::clone(&self.peers),
             Arc::clone(&self.outbound_pool),
             self.message_tx.clone(),
+            self.scp_message_tx.clone(),
             Arc::clone(&self.flood_gate),
             Arc::clone(&self.running),
+            self.config.is_validator,
             Arc::clone(&self.peer_handles),
             Arc::clone(&self.advertised_outbound_peers),
             Arc::clone(&self.advertised_inbound_peers),
@@ -855,6 +926,7 @@ impl OverlayManager {
             Arc::clone(&self.banned_peers),
             self.config.peer_event_tx.clone(),
             Arc::clone(&self.peer_info_cache),
+            Arc::clone(&self.extra_subscribers),
         )
         .await
     }
@@ -1006,8 +1078,10 @@ impl OverlayManager {
         peers: Arc<DashMap<PeerId, Arc<TokioMutex<Peer>>>>,
         pool: Arc<ConnectionPool>,
         message_tx: broadcast::Sender<OverlayMessage>,
+        scp_message_tx: mpsc::UnboundedSender<OverlayMessage>,
         flood_gate: Arc<FloodGate>,
         running: Arc<AtomicBool>,
+        is_validator: bool,
         peer_handles: Arc<RwLock<Vec<JoinHandle<()>>>>,
         _advertised_outbound_peers: Arc<RwLock<Vec<PeerAddress>>>,
         _advertised_inbound_peers: Arc<RwLock<Vec<PeerAddress>>>,
@@ -1016,6 +1090,7 @@ impl OverlayManager {
         banned_peers: Arc<RwLock<HashSet<PeerId>>>,
         peer_event_tx: Option<mpsc::Sender<PeerEvent>>,
         peer_info_cache: Arc<DashMap<PeerId, PeerInfo>>,
+        extra_subscribers: Arc<RwLock<Vec<mpsc::UnboundedSender<OverlayMessage>>>>,
     ) -> Result<PeerId> {
         let peer = match Peer::connect(addr, local_node, timeout_secs).await {
             Ok(peer) => peer,
@@ -1067,8 +1142,9 @@ impl OverlayManager {
         let running = Arc::clone(&running);
         let peer_info_cache_clone = Arc::clone(&peer_info_cache);
 
+        let extra_subscribers_clone = extra_subscribers;
         let handle = tokio::spawn(async move {
-            Self::run_peer_loop(peer_id_clone.clone(), peer, message_tx, flood_gate, running).await;
+            Self::run_peer_loop(peer_id_clone.clone(), peer, message_tx, scp_message_tx, flood_gate, running, is_validator, extra_subscribers_clone).await;
             peers_clone.remove(&peer_id_clone);
             peer_info_cache_clone.remove(&peer_id_clone);
             dropped_authenticated_peers.fetch_add(1, Ordering::Relaxed);
@@ -1253,6 +1329,35 @@ impl OverlayManager {
         self.message_tx.subscribe()
     }
 
+    /// Subscribe to the dedicated SCP message channel.
+    ///
+    /// Unlike the broadcast channel, SCP messages delivered through this channel
+    /// are never dropped due to overflow. This ensures that SCP EXTERNALIZE
+    /// messages are always received even during high mainnet traffic.
+    ///
+    /// Can only be called once (takes ownership of the receiver). Returns `None`
+    /// if already called.
+    pub async fn subscribe_scp(&self) -> Option<mpsc::UnboundedReceiver<OverlayMessage>> {
+        self.scp_message_rx.lock().await.take()
+    }
+
+    /// Subscribe to catchup-critical messages (SCP + TxSet) via a dedicated mpsc channel.
+    ///
+    /// Unlike `subscribe()` which uses a broadcast channel that drops messages on overflow,
+    /// this creates an unbounded mpsc channel that never loses messages. The channel is
+    /// automatically cleaned up when the receiver is dropped.
+    ///
+    /// Used by the catchup message cacher to ensure no EXTERNALIZE or GeneralizedTxSet
+    /// messages are lost during the catchup period.
+    pub fn subscribe_catchup(&self) -> mpsc::UnboundedReceiver<OverlayMessage> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut subs = self.extra_subscribers.write();
+        // Clean up any closed subscribers while we have the write lock
+        subs.retain(|s| !s.is_closed());
+        subs.push(tx);
+        rx
+    }
+
     /// Get flood gate statistics.
     pub fn flood_stats(&self) -> FloodGateStats {
         self.flood_gate.stats()
@@ -1398,8 +1503,11 @@ impl OverlayManager {
         let local_node = self.local_node.clone();
         let pool = Arc::clone(&self.outbound_pool);
         let message_tx = self.message_tx.clone();
+        let scp_message_tx = self.scp_message_tx.clone();
         let flood_gate = Arc::clone(&self.flood_gate);
         let running = Arc::clone(&self.running);
+        let is_validator = self.config.is_validator;
+        let extra_subscribers = Arc::clone(&self.extra_subscribers);
         let connect_timeout = self
             .config
             .connect_timeout_secs
@@ -1430,7 +1538,7 @@ impl OverlayManager {
                     // NOTE: Do NOT send PEERS to outbound peers — see Peer.cpp:1225-1230.
 
                     // Run peer loop
-                    Self::run_peer_loop(peer_id.clone(), peer, message_tx, flood_gate, running)
+                    Self::run_peer_loop(peer_id.clone(), peer, message_tx, scp_message_tx, flood_gate, running, is_validator, extra_subscribers)
                         .await;
 
                     // Cleanup
