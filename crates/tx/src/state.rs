@@ -19,8 +19,8 @@ use crate::apply::{DeltaLengths, LedgerDelta};
 use crate::{Result, TxError};
 
 /// Callback type for lazily loading ledger entries from the bucket list.
-type EntryLoaderFn = dyn Fn(&LedgerKey) -> Result<Option<LedgerEntry>>;
-type BatchEntryLoaderFn = dyn Fn(&[LedgerKey]) -> Result<Vec<LedgerEntry>>;
+type EntryLoaderFn = dyn Fn(&LedgerKey) -> Result<Option<LedgerEntry>> + Send + Sync;
+type BatchEntryLoaderFn = dyn Fn(&[LedgerKey]) -> Result<Vec<LedgerEntry>> + Send + Sync;
 /// Callback type for loading all offers by (account, asset) from the
 /// authoritative offer store.  Used by `remove_offers_by_account_and_asset`
 /// to mirror stellar-core `loadOffersByAccountAndAsset` which queries the SQL database.
@@ -2125,7 +2125,8 @@ impl LedgerStateManager {
     pub fn is_trustline_tracked(&self, account_id: &AccountId, asset: &TrustLineAsset) -> bool {
         let account_key = account_id_to_bytes(account_id);
         let asset_key = AssetKey::from_trustline_asset(asset);
-        self.trustline_snapshots.contains_key(&(account_key, asset_key))
+        self.trustline_snapshots
+            .contains_key(&(account_key, asset_key))
     }
 
     /// Get a mutable reference to a trustline by trustline asset.
@@ -2710,7 +2711,8 @@ impl LedgerStateManager {
     /// Check if a data entry was already loaded during this transaction.
     pub fn is_data_tracked(&self, account_id: &AccountId, name: &str) -> bool {
         let account_key = account_id_to_bytes(account_id);
-        self.data_snapshots.contains_key(&(account_key, name.to_string()))
+        self.data_snapshots
+            .contains_key(&(account_key, name.to_string()))
     }
 
     /// Get a mutable reference to a data entry.
@@ -3989,7 +3991,8 @@ impl LedgerStateManager {
     pub fn is_entry_deleted(&self, key: &LedgerKey) -> bool {
         match key {
             LedgerKey::ContractData(k) => {
-                let lookup_key = ContractDataKey::new(k.contract.clone(), k.key.clone(), k.durability);
+                let lookup_key =
+                    ContractDataKey::new(k.contract.clone(), k.key.clone(), k.durability);
                 self.deleted_contract_data.contains(&lookup_key)
             }
             LedgerKey::ContractCode(k) => self.deleted_contract_code.contains(&k.hash.0),
@@ -6649,10 +6652,7 @@ mod tests {
         if let Some(acc) = manager.get_account_mut(&account_id) {
             acc.balance = 100_000;
         }
-        assert_eq!(
-            manager.get_account(&account_id).unwrap().balance,
-            100_000
-        );
+        assert_eq!(manager.get_account(&account_id).unwrap().balance, 100_000);
 
         // Rollback — should restore to pre-savepoint value
         manager.rollback_to_savepoint(sp);
@@ -6678,11 +6678,15 @@ mod tests {
         };
         manager.create_data(data_entry);
 
-        assert!(manager.get_data(&create_test_account_id(1), "test_key").is_some());
+        assert!(manager
+            .get_data(&create_test_account_id(1), "test_key")
+            .is_some());
 
         // Rollback — data entry should be gone
         manager.rollback_to_savepoint(sp);
-        assert!(manager.get_data(&create_test_account_id(1), "test_key").is_none());
+        assert!(manager
+            .get_data(&create_test_account_id(1), "test_key")
+            .is_none());
     }
 
     #[test]
@@ -6814,12 +6818,16 @@ mod tests {
 
         // Create and verify exists
         manager.create_contract_data(cd.clone());
-        assert!(manager.get_contract_data(&cd.contract, &cd.key, cd.durability).is_some());
+        assert!(manager
+            .get_contract_data(&cd.contract, &cd.key, cd.durability)
+            .is_some());
         assert!(!manager.is_entry_deleted(&key));
 
         // Delete and verify tracking
         manager.delete_contract_data(&cd.contract, &cd.key, cd.durability);
-        assert!(manager.get_contract_data(&cd.contract, &cd.key, cd.durability).is_none());
+        assert!(manager
+            .get_contract_data(&cd.contract, &cd.key, cd.durability)
+            .is_none());
         assert!(manager.is_entry_deleted(&key));
     }
 
@@ -6912,6 +6920,97 @@ mod tests {
 
         // This is the key check: is_entry_deleted prevents footprint loading
         // from reloading the entry from bucket list
+    }
+
+    /// Regression test for clear_cached_entries_preserving_offers.
+    ///
+    /// Verifies that clearing cached entries with preserve_offers=true retains
+    /// the offer HashMap, OfferIndex, and account_asset_offers secondary index
+    /// while clearing everything else (accounts, trustlines, etc.).
+    ///
+    /// This is critical for the offer cache persistence optimization: after a
+    /// ledger close, the executor calls this to prepare for the next ledger
+    /// without reloading ~911K offers.
+    #[test]
+    fn test_clear_cached_entries_preserving_offers() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        // Add an account
+        let account = create_test_account_entry(1);
+        manager.create_account(account.clone());
+
+        // Add a trustline
+        let trustline = TrustLineEntry {
+            account_id: create_test_account_id(1),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+                issuer: create_test_account_id(99),
+            }),
+            balance: 1000,
+            limit: 10000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        manager.create_trustline(trustline);
+
+        // Add two offers
+        let offer1 = create_test_offer(1, 100, 1, 1);
+        let offer2 = create_test_offer(2, 200, 2, 1);
+        manager.create_offer(offer1.clone());
+        manager.create_offer(offer2.clone());
+
+        // Commit so entries are in the base state
+        manager.commit();
+
+        // Verify everything is present before clear
+        assert!(manager.get_account(&create_test_account_id(1)).is_some());
+        assert!(manager.get_offer(&create_test_account_id(1), 100).is_some());
+        assert!(manager.get_offer(&create_test_account_id(2), 200).is_some());
+
+        // Clear preserving offers
+        manager.clear_cached_entries_preserving_offers();
+
+        // Accounts and trustlines should be cleared
+        assert!(
+            manager.get_account(&create_test_account_id(1)).is_none(),
+            "Accounts should be cleared"
+        );
+
+        // Offers should be preserved
+        assert!(
+            manager.get_offer(&create_test_account_id(1), 100).is_some(),
+            "Offer 1 should be preserved"
+        );
+        assert!(
+            manager.get_offer(&create_test_account_id(2), 200).is_some(),
+            "Offer 2 should be preserved"
+        );
+
+        // Offer index should still work (best_offer lookup)
+        let best = manager.best_offer(&offer1.buying, &offer1.selling);
+        assert!(best.is_some(), "OfferIndex should be preserved");
+    }
+
+    /// Regression test: clear_cached_entries (without preserving) clears everything.
+    ///
+    /// Contrast with test_clear_cached_entries_preserving_offers: when
+    /// preserve_offers=false, all entries including offers should be cleared.
+    #[test]
+    fn test_clear_cached_entries_clears_offers() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        let offer1 = create_test_offer(1, 100, 1, 1);
+        manager.create_offer(offer1);
+        manager.commit();
+
+        assert!(manager.get_offer(&create_test_account_id(1), 100).is_some());
+
+        manager.clear_cached_entries();
+
+        assert!(
+            manager.get_offer(&create_test_account_id(1), 100).is_none(),
+            "Offers should be cleared when preserve_offers=false"
+        );
     }
 
     /// Regression test: remove_offers_by_account_and_asset must use the

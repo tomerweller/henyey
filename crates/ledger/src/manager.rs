@@ -31,14 +31,15 @@ use crate::{
     },
     delta::{EntryChange, LedgerDelta},
     execution::{
-        execute_soroban_parallel_phase, execute_transaction_set, load_soroban_network_info,
-        SorobanNetworkInfo, TransactionExecutionResult,
+        execute_soroban_parallel_phase, load_soroban_network_info,
+        run_transactions_on_executor, SorobanNetworkInfo, TransactionExecutionResult,
+        TransactionExecutor,
     },
     header::{compute_header_hash, create_next_header},
     snapshot::{LedgerSnapshot, SnapshotHandle},
     LedgerError, Result,
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use henyey_bucket::{
@@ -706,6 +707,18 @@ pub struct LedgerManager {
     /// ledger close. This avoids expensive full bucket list scans for state
     /// size computation (used for LiveSorobanStateSizeWindow).
     soroban_state: Arc<crate::soroban_state::SharedSorobanState>,
+
+    /// Persistent transaction executor reused across ledger closes.
+    ///
+    /// The executor's offer cache (~911K entries on mainnet) is expensive to
+    /// rebuild from scratch (~2.7s per ledger). By persisting the executor
+    /// across ledger closes and calling `advance_to_ledger_preserving_offers`,
+    /// offers are maintained incrementally while non-offer entries are cleared
+    /// and reloaded from the authoritative bucket list.
+    ///
+    /// Set to `None` before initialization and after `reset()`. Populated on
+    /// the first `close_ledger` call and reused on subsequent calls.
+    executor: Mutex<Option<TransactionExecutor>>,
 }
 
 // Compile-time assertion: LedgerManager must be Send + Sync for spawn_blocking.
@@ -740,6 +753,7 @@ impl LedgerManager {
             offer_store: Arc::new(RwLock::new(HashMap::new())),
             offer_account_asset_index: Arc::new(RwLock::new(HashMap::new())),
             soroban_state: Arc::new(crate::soroban_state::SharedSorobanState::new()),
+            executor: Mutex::new(None),
         }
     }
 
@@ -946,6 +960,9 @@ impl LedgerManager {
 
         *self.offers_initialized.write() = false;
         self.soroban_state.write().clear();
+
+        // Clear the persistent executor so offers are reloaded after re-initialization
+        *self.executor.lock() = None;
 
         // Reset state
         let mut state = self.state.write();
@@ -1819,6 +1836,13 @@ impl<'a> LedgerCloseContext<'a> {
     ///
     /// This executes all transactions in order, recording state changes
     /// to the delta and collecting results.
+    ///
+    /// The executor is persisted across ledger closes to avoid reloading ~911K
+    /// offers from the in-memory offer store on every ledger (~2.7s on mainnet).
+    /// On the first call after initialization (or reset), a new executor is
+    /// created and offers are loaded once. On subsequent calls, the executor is
+    /// advanced via `advance_to_ledger_preserving_offers` which clears non-offer
+    /// cached entries while keeping the offer index intact.
     fn apply_transactions(&mut self) -> Result<Vec<TransactionExecutionResult>> {
         use henyey_common::protocol::{
             protocol_version_starts_from, PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION,
@@ -1861,6 +1885,54 @@ impl<'a> LedgerCloseContext<'a> {
         let phase_structure = self.close_data.tx_set.soroban_phase_structure();
         let has_parallel = phase_structure.is_some();
 
+        // Take the persistent executor from the manager, or create a new one.
+        // The executor's offer cache is preserved across ledger closes to avoid
+        // reloading ~911K offers each time.
+        let mut executor = self.manager.executor.lock().take();
+        let is_new_executor = executor.is_none();
+        let id_pool = self.snapshot.header().id_pool;
+
+        let executor_ref = executor.get_or_insert_with(|| {
+            TransactionExecutor::new(
+                self.close_data.ledger_seq,
+                self.close_data.close_time,
+                self.prev_header.base_reserve,
+                self.prev_header.ledger_version,
+                self.manager.network_id,
+                id_pool,
+                soroban_config.clone(),
+                classic_events,
+            )
+        });
+
+        if is_new_executor {
+            // First ledger after init/reset: load all offers from snapshot
+            if let Some(cache) = module_cache {
+                executor_ref.set_module_cache(cache.clone());
+            }
+            if let Some(ref ha) = hot_archive {
+                executor_ref.set_hot_archive(ha.clone());
+            }
+            executor_ref.load_orderbook_offers(&self.snapshot)?;
+        } else {
+            // Subsequent ledgers: advance the executor, preserving offers
+            executor_ref.advance_to_ledger_preserving_offers(
+                self.close_data.ledger_seq,
+                self.close_data.close_time,
+                self.prev_header.base_reserve,
+                self.prev_header.ledger_version,
+                id_pool,
+                soroban_config.clone(),
+            );
+            // Update module cache and hot archive references (they may have changed)
+            if let Some(cache) = module_cache {
+                executor_ref.set_module_cache(cache.clone());
+            }
+            if let Some(ref ha) = hot_archive {
+                executor_ref.set_hot_archive(ha.clone());
+            }
+        }
+
         let (results, tx_results, mut tx_result_metas, id_pool, hot_archive_restored_keys) =
             if has_parallel
                 && protocol_version_starts_from(
@@ -1870,7 +1942,7 @@ impl<'a> LedgerCloseContext<'a> {
             {
                 let phase = phase_structure.unwrap();
 
-                // Execute classic phase first (sequential, unchanged).
+                // Execute classic phase first (sequential) using the persistent executor.
                 let classic_txs = self.close_data.tx_set.classic_phase_transactions();
                 let (
                     mut results,
@@ -1887,25 +1959,20 @@ impl<'a> LedgerCloseContext<'a> {
                         Vec::new(),
                     )
                 } else {
-                    execute_transaction_set(
+                    run_transactions_on_executor(
+                        executor_ref,
                         &self.snapshot,
                         &classic_txs,
-                        self.close_data.ledger_seq,
-                        self.close_data.close_time,
                         self.prev_header.base_fee,
-                        self.prev_header.base_reserve,
-                        self.prev_header.ledger_version,
-                        self.manager.network_id,
-                        &mut self.delta,
-                        soroban_config.clone(),
                         soroban_base_prng_seed.0,
-                        classic_events,
-                        module_cache,
-                        hot_archive.clone(),
+                        true,
+                        &mut self.delta,
                     )?
                 };
 
                 // Execute Soroban parallel phase.
+                // Soroban clusters use their own per-cluster executors (they don't
+                // load offers since Soroban TXs don't use the orderbook).
                 let (
                     soroban_results,
                     soroban_tx_results,
@@ -1954,24 +2021,20 @@ impl<'a> LedgerCloseContext<'a> {
                     hot_archive_restored_keys,
                 )
             } else {
-                // Existing sequential path (unchanged).
-                execute_transaction_set(
+                // Sequential path: run all transactions on the persistent executor.
+                run_transactions_on_executor(
+                    executor_ref,
                     &self.snapshot,
                     &transactions,
-                    self.close_data.ledger_seq,
-                    self.close_data.close_time,
                     self.prev_header.base_fee,
-                    self.prev_header.base_reserve,
-                    self.prev_header.ledger_version,
-                    self.manager.network_id,
-                    &mut self.delta,
-                    soroban_config,
                     soroban_base_prng_seed.0,
-                    classic_events,
-                    module_cache,
-                    hot_archive,
+                    true,
+                    &mut self.delta,
                 )?
             };
+
+        // Store the executor back for reuse on the next ledger close
+        *self.manager.executor.lock() = executor;
 
         // Prepend fee events for classic event emission.
         if classic_events.events_enabled(self.prev_header.ledger_version) {

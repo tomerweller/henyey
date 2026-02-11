@@ -4568,6 +4568,300 @@ fn test_cross_tx_deleted_trustline_not_reloaded() {
     );
 }
 
+/// Regression test for executor reuse across ledger closes via advance_to_ledger_preserving_offers.
+///
+/// When the executor is reused across ledger boundaries, offers must be preserved
+/// correctly: offers consumed in ledger N must not reappear in ledger N+1, and
+/// surviving offers must remain available for matching.
+///
+/// This test exercises the `advance_to_ledger_preserving_offers` path that avoids
+/// reloading ~911K offers from the bucket list on every ledger close.
+///
+/// The test flow:
+/// 1. Ledger 1: Load offers, execute a path payment that fully crosses offer A
+/// 2. advance_to_ledger_preserving_offers(ledger 2)
+/// 3. Ledger 2: Verify offer A is gone; execute a path payment that crosses offer B
+///    (which survived from ledger 1)
+#[test]
+fn test_advance_to_ledger_preserving_offers() {
+    // Accounts
+    let source_secret = SecretKey::from_seed(&[220u8; 32]);
+    let source_id: AccountId = (&source_secret.public_key()).into();
+
+    let owner_a_secret = SecretKey::from_seed(&[221u8; 32]);
+    let owner_a_id: AccountId = (&owner_a_secret.public_key()).into();
+
+    let owner_b_secret = SecretKey::from_seed(&[222u8; 32]);
+    let owner_b_id: AccountId = (&owner_b_secret.public_key()).into();
+
+    let dest_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([223u8; 32])));
+
+    let issuer_secret = SecretKey::from_seed(&[224u8; 32]);
+    let issuer_id: AccountId = (&issuer_secret.public_key()).into();
+
+    let asset_usd = Asset::CreditAlphanum4(AlphaNum4 {
+        asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+        issuer: issuer_id.clone(),
+    });
+
+    // Accounts
+    let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 500_000_000);
+    let (dest_key, dest_entry) = create_account_entry(dest_id.clone(), 1, 200_000_000);
+    let (issuer_key, issuer_entry) = create_account_entry(issuer_id.clone(), 1, 100_000_000);
+
+    // Offer owner A: sells 50 XLM for USD
+    let (owner_a_key, mut owner_a_entry) =
+        create_account_entry(owner_a_id.clone(), 1, 500_000_000);
+    set_account_liabilities(&mut owner_a_entry, 50_000_000, 0);
+
+    // Offer owner B: sells 30 XLM for USD
+    let (owner_b_key, mut owner_b_entry) =
+        create_account_entry(owner_b_id.clone(), 1, 500_000_000);
+    set_account_liabilities(&mut owner_b_entry, 30_000_000, 0);
+
+    // Source needs USD trustline
+    let (source_tl_key, source_tl_entry) = create_trustline_entry(
+        source_id.clone(),
+        TrustLineAsset::CreditAlphanum4(match &asset_usd {
+            Asset::CreditAlphanum4(a) => a.clone(),
+            _ => unreachable!(),
+        }),
+        200_000_000, // 200 USD
+        300_000_000,
+        TrustLineFlags::AuthorizedFlag as u32,
+    );
+
+    // Owner A USD trustline (buying side)
+    let (owner_a_tl_key, mut owner_a_tl_entry) = create_trustline_entry(
+        owner_a_id.clone(),
+        TrustLineAsset::CreditAlphanum4(match &asset_usd {
+            Asset::CreditAlphanum4(a) => a.clone(),
+            _ => unreachable!(),
+        }),
+        0,
+        100_000_000,
+        TrustLineFlags::AuthorizedFlag as u32,
+    );
+    set_trustline_liabilities(&mut owner_a_tl_entry, 0, 50_000_000);
+
+    // Owner B USD trustline (buying side)
+    let (owner_b_tl_key, mut owner_b_tl_entry) = create_trustline_entry(
+        owner_b_id.clone(),
+        TrustLineAsset::CreditAlphanum4(match &asset_usd {
+            Asset::CreditAlphanum4(a) => a.clone(),
+            _ => unreachable!(),
+        }),
+        0,
+        100_000_000,
+        TrustLineFlags::AuthorizedFlag as u32,
+    );
+    set_trustline_liabilities(&mut owner_b_tl_entry, 0, 30_000_000);
+
+    // Offer A: owner_a sells 50 XLM for USD at 1:1
+    let offer_a_id: i64 = 10001;
+    let (offer_a_key, offer_a_entry) = create_offer_entry(
+        owner_a_id.clone(),
+        offer_a_id,
+        Asset::Native,
+        asset_usd.clone(),
+        50_000_000,
+        Price { n: 1, d: 1 },
+    );
+
+    // Offer B: owner_b sells 30 XLM for USD at 1:1
+    let offer_b_id: i64 = 10002;
+    let (offer_b_key, offer_b_entry) = create_offer_entry(
+        owner_b_id.clone(),
+        offer_b_id,
+        Asset::Native,
+        asset_usd.clone(),
+        30_000_000,
+        Price { n: 1, d: 1 },
+    );
+
+    // Build snapshot
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .expect("add source")
+        .add_entry(dest_key, dest_entry)
+        .expect("add dest")
+        .add_entry(issuer_key, issuer_entry)
+        .expect("add issuer")
+        .add_entry(owner_a_key, owner_a_entry)
+        .expect("add owner_a")
+        .add_entry(owner_b_key, owner_b_entry)
+        .expect("add owner_b")
+        .add_entry(source_tl_key, source_tl_entry)
+        .expect("add source_tl")
+        .add_entry(owner_a_tl_key, owner_a_tl_entry)
+        .expect("add owner_a_tl")
+        .add_entry(owner_b_tl_key, owner_b_tl_entry)
+        .expect("add owner_b_tl")
+        .add_entry(offer_a_key.clone(), offer_a_entry)
+        .expect("add offer_a")
+        .add_entry(offer_b_key.clone(), offer_b_entry)
+        .expect("add offer_b")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let network_id = NetworkId::testnet();
+
+    // Create executor for ledger 1
+    let mut executor = TransactionExecutor::new(
+        1,         // ledger_seq
+        1_000,     // close_time
+        5_000_000, // base_reserve
+        25,        // protocol_version
+        network_id,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+    executor
+        .load_orderbook_offers(&snapshot)
+        .expect("load orderbook");
+
+    // ===== LEDGER 1: Path payment that fully crosses offer A =====
+    let path_payment_op1 = Operation {
+        source_account: None,
+        body: OperationBody::PathPaymentStrictSend(PathPaymentStrictSendOp {
+            send_asset: asset_usd.clone(),
+            send_amount: 50_000_000,
+            destination: dest_id.clone().into(),
+            dest_asset: Asset::Native,
+            dest_min: 1,
+            path: VecM::default(),
+        }),
+    };
+
+    let tx1 = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*source_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![path_payment_op1].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope1 = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: tx1,
+        signatures: VecM::default(),
+    });
+    let decorated1 = sign_envelope(&envelope1, &source_secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope1 {
+        env.signatures = vec![decorated1].try_into().unwrap();
+    }
+
+    let result1 = executor
+        .execute_transaction(&snapshot, &envelope1, 100, None)
+        .expect("TX1 execute");
+    assert!(
+        result1.success,
+        "TX1 (path payment crossing offer A) should succeed: {:?}",
+        result1.operation_results
+    );
+
+    // Verify offer A was crossed
+    match result1.operation_results.get(0) {
+        Some(OperationResult::OpInner(OperationResultTr::PathPaymentStrictSend(
+            PathPaymentStrictSendResult::Success(success),
+        ))) => {
+            assert!(
+                !success.offers.is_empty(),
+                "Should have crossed offer A"
+            );
+        }
+        other => panic!("Unexpected TX1 result: {:?}", other),
+    }
+
+    // Snapshot delta (as close_ledger would)
+    executor.state_mut().snapshot_delta();
+
+    // ===== ADVANCE TO LEDGER 2 =====
+    // This is the key operation under test: preserving offers across ledger boundaries
+    executor.advance_to_ledger_preserving_offers(
+        2,         // new ledger_seq
+        2_000,     // new close_time
+        5_000_000, // base_reserve
+        25,        // protocol_version
+        0,         // id_pool
+        SorobanConfig::default(),
+    );
+
+    // Verify offer A is NOT in the executor's state (it was consumed in ledger 1)
+    assert!(
+        executor.state().get_offer(&owner_a_id, offer_a_id).is_none(),
+        "Offer A should be gone after being fully crossed in ledger 1"
+    );
+
+    // Verify offer B IS still in the executor's state (it was not touched in ledger 1)
+    assert!(
+        executor.state().get_offer(&owner_b_id, offer_b_id).is_some(),
+        "Offer B should be preserved across ledger advance"
+    );
+
+    // ===== LEDGER 2: Path payment that crosses offer B =====
+    // This verifies the preserved offer B is actually usable for matching.
+    //
+    // After advance_to_ledger_preserving_offers, non-offer entries (accounts,
+    // trustlines) are cleared and will be reloaded from the snapshot. The
+    // snapshot still has the original source account with seq_num=1, so TX2
+    // must use seq_num=2 (the next valid seq for the reloaded state).
+    let path_payment_op2 = Operation {
+        source_account: None,
+        body: OperationBody::PathPaymentStrictSend(PathPaymentStrictSendOp {
+            send_asset: asset_usd.clone(),
+            send_amount: 30_000_000,
+            destination: dest_id.clone().into(),
+            dest_asset: Asset::Native,
+            dest_min: 1,
+            path: VecM::default(),
+        }),
+    };
+
+    let tx2 = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*source_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![path_payment_op2].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope2 = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: tx2,
+        signatures: VecM::default(),
+    });
+    let decorated2 = sign_envelope(&envelope2, &source_secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope2 {
+        env.signatures = vec![decorated2].try_into().unwrap();
+    }
+
+    let result2 = executor
+        .execute_transaction(&snapshot, &envelope2, 100, None)
+        .expect("TX2 execute");
+    assert!(
+        result2.success,
+        "TX2 (path payment crossing offer B in ledger 2) should succeed: {:?}",
+        result2.operation_results
+    );
+
+    // Verify offer B was crossed
+    match result2.operation_results.get(0) {
+        Some(OperationResult::OpInner(OperationResultTr::PathPaymentStrictSend(
+            PathPaymentStrictSendResult::Success(success),
+        ))) => {
+            assert!(
+                !success.offers.is_empty(),
+                "Should have crossed offer B"
+            );
+        }
+        other => panic!("Unexpected TX2 result: {:?}", other),
+    }
+}
+
 /// Regression test: internal errors during operation execution must map to txInternalError.
 ///
 /// In stellar-core, when a std::runtime_error is thrown during operation execution

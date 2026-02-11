@@ -5593,6 +5593,43 @@ pub fn execute_transaction_set_with_fee_mode(
     // Load all orderbook offers before executing any transactions
     executor.load_orderbook_offers(snapshot)?;
 
+    run_transactions_on_executor(
+        &mut executor,
+        snapshot,
+        transactions,
+        base_fee,
+        soroban_base_prng_seed,
+        deduct_fee,
+        delta,
+    )
+}
+
+/// Execute transactions on a pre-configured executor, apply results to delta.
+///
+/// This is the core transaction execution loop, separated from executor
+/// creation/setup so it can be used both by the free function
+/// `execute_transaction_set_with_fee_mode` (which creates a fresh executor)
+/// and by `LedgerCloseContext::apply_transactions` (which reuses a persistent
+/// executor across ledger closes to avoid reloading ~911K offers).
+#[allow(clippy::type_complexity)]
+pub fn run_transactions_on_executor(
+    executor: &mut TransactionExecutor,
+    snapshot: &SnapshotHandle,
+    transactions: &[(TransactionEnvelope, Option<u32>)],
+    base_fee: u32,
+    soroban_base_prng_seed: [u8; 32],
+    deduct_fee: bool,
+    delta: &mut LedgerDelta,
+) -> Result<(
+    Vec<TransactionExecutionResult>,
+    Vec<TransactionResultPair>,
+    Vec<TransactionResultMetaV1>,
+    u64,
+    Vec<LedgerKey>,
+)> {
+    let ledger_seq = executor.ledger_seq;
+    let protocol_version = executor.protocol_version;
+
     let mut results = Vec::with_capacity(transactions.len());
     let mut tx_results = Vec::with_capacity(transactions.len());
     let mut tx_result_metas = Vec::with_capacity(transactions.len());
