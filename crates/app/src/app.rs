@@ -140,6 +140,12 @@ const ARCHIVE_CHECKPOINT_CACHE_SECS: u64 = 60;
 /// via SCP state requests from peers, not from archive downloads.
 const POST_CATCHUP_RECOVERY_WINDOW_SECS: u64 = 300;
 
+/// Maximum number of recovery attempts after catchup before giving up on
+/// SCP-based gap filling and falling back to a second catchup. Peers only cache
+/// ~12 recent slots, so if the gap slots were evicted before we connected,
+/// recovery will never succeed. 3 attempts × 10s interval = 30s before fallback.
+const MAX_POST_CATCHUP_RECOVERY_ATTEMPTS: u32 = 3;
+
 fn build_generalized_tx_set(
     tx_set: &henyey_herder::TransactionSet,
 ) -> Option<stellar_xdr::curr::GeneralizedTransactionSet> {
@@ -4491,6 +4497,40 @@ impl App {
         let (first_buffered, last_buffered) = {
             let mut buffer = self.syncing_ledgers.write().await;
             Self::trim_syncing_ledgers(&mut buffer, current_ledger);
+
+            // When all peers have reported DontHave for tx_sets, evict buffered
+            // entries starting from current_ledger+1 that have no tx_set. These
+            // slots were externalized (we have the SCP value) but the tx_set data
+            // has been evicted from all peers' caches and will never arrive.
+            // Removing them creates a proper gap so the catchup target logic can
+            // compute a valid target (e.g., the next checkpoint boundary).
+            // Without this, the buffer looks like [N+1(no tx_set), N+25(tx_set), ...]
+            // and first_buffered = N+1 causes catchup target computation to fail
+            // (it thinks the gap is only 1 ledger).
+            if self.tx_set_all_peers_exhausted.load(Ordering::SeqCst) {
+                let mut evicted = 0u32;
+                let start = current_ledger.saturating_add(1);
+                // Evict consecutive entries from the front that lack tx_sets.
+                // Stop at the first entry that HAS a tx_set — those are still
+                // usable once we catch up past the gap.
+                for seq in start.. {
+                    match buffer.get(&seq) {
+                        Some(info) if info.tx_set.is_none() => {
+                            buffer.remove(&seq);
+                            evicted += 1;
+                        }
+                        _ => break, // gap in buffer or entry has tx_set
+                    }
+                }
+                if evicted > 0 {
+                    tracing::info!(
+                        current_ledger,
+                        evicted,
+                        "Evicted buffered entries with permanently unavailable tx_sets"
+                    );
+                }
+            }
+
             match (
                 buffer.keys().next().copied(),
                 buffer.keys().next_back().copied(),
@@ -4595,13 +4635,34 @@ impl App {
                                 .await
                                 .is_some_and(|t| t.elapsed().as_secs() < POST_CATCHUP_RECOVERY_WINDOW_SECS);
 
-                            // When recently caught up, ALWAYS prefer recovery over
-                            // catchup. The next checkpoint won't be published to
-                            // archives for ~5 min, so archive-based catchup (even
-                            // Case 1 replay) will fail trying to download unpublished
-                            // checkpoint data. Keep requesting SCP state from peers.
+                            // When recently caught up, prefer recovery over catchup.
+                            // The next checkpoint won't be published to archives for
+                            // ~5 min, so archive-based catchup will fail trying to
+                            // download unpublished checkpoint data. However, if
+                            // recovery has been attempted multiple times without
+                            // progress, the missing slots have likely been evicted
+                            // from peers' caches and recovery will never succeed.
+                            // In that case, fall through to catchup.
                             if recently_caught_up {
-                                if since_recovery >= OUT_OF_SYNC_RECOVERY_TIMER_SECS {
+                                if state.recovery_attempts >= MAX_POST_CATCHUP_RECOVERY_ATTEMPTS {
+                                    // Recovery is futile — same gap persists after
+                                    // multiple attempts. Peers don't have the missing
+                                    // EXTERNALIZE messages (they only cache ~12 recent
+                                    // slots). Trigger catchup instead of waiting the
+                                    // full POST_CATCHUP_RECOVERY_WINDOW.
+                                    tracing::warn!(
+                                        current_ledger,
+                                        first_buffered,
+                                        last_buffered,
+                                        elapsed_secs = elapsed,
+                                        recovery_attempts = state.recovery_attempts,
+                                        "Post-catchup recovery exhausted; \
+                                         missing slots unrecoverable via SCP. \
+                                         Triggering catchup."
+                                    );
+                                    state.catchup_triggered = true;
+                                    ConsensusStuckAction::TriggerCatchup
+                                } else if since_recovery >= OUT_OF_SYNC_RECOVERY_TIMER_SECS {
                                     state.last_recovery_attempt = now;
                                     state.recovery_attempts += 1;
                                     tracing::info!(
@@ -4609,6 +4670,7 @@ impl App {
                                         first_buffered,
                                         elapsed_secs = elapsed,
                                         recovery_attempts = state.recovery_attempts,
+                                        max_recovery_attempts = MAX_POST_CATCHUP_RECOVERY_ATTEMPTS,
                                         "Attempting out-of-sync recovery (post-catchup gap)"
                                     );
                                     ConsensusStuckAction::AttemptRecovery
@@ -4875,6 +4937,12 @@ impl App {
                     }
                     tracing::info!(ledger_seq = result.ledger_seq, "{} catchup complete", label);
                     self.try_apply_buffered_ledgers().await;
+                    // Request fresh SCP state from peers after catchup so the
+                    // node quickly learns which slots have been externalized
+                    // while it was catching up. Without this, the node relies
+                    // on the SyncRecoveryManager's next out-of-sync cycle
+                    // (~10-40s) to request state, delaying buffer population.
+                    self.request_scp_state_from_peers().await;
                 } else {
                     tracing::info!(
                         ledger_seq = result.ledger_seq,
@@ -4886,6 +4954,22 @@ impl App {
             }
             Err(err) => {
                 tracing::error!(error = %err, "{} catchup failed", label);
+                // Apply cooldown after failed catchup to prevent rapid-fire retries.
+                // Without this, a failed catchup (e.g., archive checkpoint not yet
+                // published) would re-trigger immediately on the next tick because
+                // the stuck state's recovery_attempts are already exhausted.
+                *self.last_catchup_completed_at.write().await = Some(Instant::now());
+                // Reset the stuck state so the recovery/timeout cycle re-arms.
+                // This provides natural backoff: 10s cooldown + 3 recovery attempts
+                // (30s) + catchup retry = ~40s per cycle while waiting for the
+                // archive to publish the next checkpoint.
+                if reset_stuck_state {
+                    if let Some(state) = self.consensus_stuck_state.write().await.as_mut() {
+                        state.catchup_triggered = false;
+                        state.recovery_attempts = 0;
+                        state.last_recovery_attempt = Instant::now();
+                    }
+                }
             }
         }
     }
