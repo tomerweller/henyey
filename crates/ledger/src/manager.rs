@@ -1098,9 +1098,15 @@ impl LedgerManager {
         close_data: LedgerCloseData,
         runtime_handle: Option<tokio::runtime::Handle>,
     ) -> Result<LedgerCloseResult> {
+        let begin_start = std::time::Instant::now();
         let mut ctx = self.begin_close(close_data)?;
         ctx.runtime_handle = runtime_handle;
+        ctx.timing_begin_close_us = begin_start.elapsed().as_micros() as u64;
+
+        let tx_start = std::time::Instant::now();
         ctx.apply_transactions()?;
+        ctx.timing_tx_exec_us = tx_start.elapsed().as_micros() as u64;
+
         ctx.commit()
     }
 
@@ -1305,6 +1311,10 @@ impl LedgerManager {
             hot_archive_restored_keys: Vec::new(),
             runtime_handle: None,
             start: std::time::Instant::now(),
+            timing_begin_close_us: 0,
+            timing_tx_exec_us: 0,
+            timing_classic_exec_us: 0,
+            timing_soroban_exec_us: 0,
         })
     }
 
@@ -1339,13 +1349,14 @@ impl LedgerManager {
         });
         let bls_for_lookup = bucket_list_snapshot.clone();
         let lookup_fn: crate::snapshot::EntryLookupFn = Arc::new(move |key: &LedgerKey| {
-            // Check in-memory Soroban state first for Soroban entry types
+            // For Soroban entry types, use in-memory state exclusively (no bucket list fallback)
             if crate::soroban_state::InMemorySorobanState::is_in_memory_type(key) {
-                if let Some(entry) = soroban_state_lookup.read().get(key) {
-                    return Ok(Some((*entry).clone()));
-                }
+                return Ok(soroban_state_lookup
+                    .read()
+                    .get(key)
+                    .map(|entry| (*entry).clone()));
             }
-            // Fall back to bucket list snapshot for non-Soroban types or if not found in memory
+            // Non-Soroban types: use bucket list snapshot
             Ok(bls_for_lookup.get(key))
         });
 
@@ -1360,15 +1371,17 @@ impl LedgerManager {
                 let mut result = Vec::new();
                 let mut bucket_list_keys = Vec::new();
 
-                // Check soroban state cache first for soroban types
+                // Check soroban state cache for soroban types — authoritative, no fallback
                 {
                     let soroban = soroban_state_batch.read();
                     for key in keys {
                         if crate::soroban_state::InMemorySorobanState::is_in_memory_type(key) {
                             if let Some(entry) = soroban.get(key) {
                                 result.push((*entry).clone());
-                                continue;
                             }
+                            // Whether found or not, soroban state is authoritative
+                            // for in-memory types — do not fall through to bucket list
+                            continue;
                         }
                         bucket_list_keys.push(key.clone());
                     }
@@ -1603,6 +1616,11 @@ struct LedgerCloseContext<'a> {
     runtime_handle: Option<tokio::runtime::Handle>,
     /// Timer started at `begin_close()` to measure the full ledger close lifecycle.
     start: std::time::Instant,
+    // Phase timing fields (microseconds), populated by close_ledger() and commit().
+    timing_begin_close_us: u64,
+    timing_tx_exec_us: u64,
+    timing_classic_exec_us: u64,
+    timing_soroban_exec_us: u64,
 }
 
 impl<'a> LedgerCloseContext<'a> {
@@ -1959,6 +1977,7 @@ impl<'a> LedgerCloseContext<'a> {
 
                 // Execute classic phase first (sequential) using the persistent executor.
                 let classic_txs = self.close_data.tx_set.classic_phase_transactions();
+                let classic_start = std::time::Instant::now();
                 let (
                     mut results,
                     mut tx_results,
@@ -1984,10 +2003,12 @@ impl<'a> LedgerCloseContext<'a> {
                         &mut self.delta,
                     )?
                 };
+                self.timing_classic_exec_us = classic_start.elapsed().as_micros() as u64;
 
                 // Execute Soroban parallel phase.
                 // Soroban clusters use their own per-cluster executors (they don't
                 // load offers since Soroban TXs don't use the orderbook).
+                let soroban_start = std::time::Instant::now();
                 let (
                     soroban_results,
                     soroban_tx_results,
@@ -2012,6 +2033,7 @@ impl<'a> LedgerCloseContext<'a> {
                     hot_archive,
                     self.runtime_handle.clone(),
                 )?;
+                self.timing_soroban_exec_us = soroban_start.elapsed().as_micros() as u64;
 
                 // Combine results: classic first, then Soroban.
                 results.extend(soroban_results);
@@ -2100,6 +2122,8 @@ impl<'a> LedgerCloseContext<'a> {
             ledger_seq = self.close_data.ledger_seq,
             "LedgerCloseContext::commit starting"
         );
+
+        let commit_start = std::time::Instant::now();
 
         // Compute transaction result hash
         let result_set = stellar_xdr::curr::TransactionResultSet {
@@ -2314,14 +2338,18 @@ impl<'a> LedgerCloseContext<'a> {
             None
         };
 
+        let commit_setup_us = commit_start.elapsed().as_micros() as u64;
+
         // Apply delta to bucket list FIRST, then compute its hash
         // This ensures the bucket_list_hash in the header matches the actual state
         tracing::debug!(
             ledger_seq = self.close_data.ledger_seq,
             "Acquiring bucket list write lock"
         );
-        let bucket_list_hash = {
+        let (bucket_list_hash, bucket_lock_wait_us, eviction_us, soroban_state_us, add_batch_us, hot_archive_us) = {
+            let lock_wait_start = std::time::Instant::now();
             let mut bucket_list = self.manager.bucket_list.write();
+            let bucket_lock_wait_us = lock_wait_start.elapsed().as_micros() as u64;
             tracing::debug!(
                 ledger_seq = self.close_data.ledger_seq,
                 "Acquired bucket list write lock"
@@ -2394,6 +2422,7 @@ impl<'a> LedgerCloseContext<'a> {
             // Run incremental eviction scan for Protocol 23+
             // This must happen BEFORE applying transaction changes to match stellar-core
             let mut archived_entries: Vec<LedgerEntry> = Vec::new();
+            let mut eviction_us: u64 = 0;
 
             if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
                 tracing::debug!(
@@ -2445,6 +2474,7 @@ impl<'a> LedgerCloseContext<'a> {
                         )
                         .map_err(LedgerError::Bucket)?;
                     let eviction_duration = eviction_start.elapsed();
+                    eviction_us = eviction_duration.as_micros() as u64;
 
                     tracing::debug!(
                         ledger_seq = self.close_data.ledger_seq,
@@ -2575,6 +2605,7 @@ impl<'a> LedgerCloseContext<'a> {
 
             // Update in-memory Soroban state with changes from this ledger.
             // This happens AFTER computing state size window (see comment above).
+            let soroban_state_start = std::time::Instant::now();
             if protocol_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION {
                 // Load rent config for accurate code size calculation
                 let rent_config = self.manager.load_soroban_rent_config(&bucket_list);
@@ -2631,6 +2662,7 @@ impl<'a> LedgerCloseContext<'a> {
                     "Updated in-memory Soroban state"
                 );
             }
+            let soroban_state_us = soroban_state_start.elapsed().as_micros() as u64;
 
             // CRITICAL: Advance the bucket list through any skipped ledgers.
             // The bucket list merge algorithm depends on being called for every ledger
@@ -2716,6 +2748,7 @@ impl<'a> LedgerCloseContext<'a> {
                 "Adding entries to live bucket list"
             );
 
+            let add_batch_start = std::time::Instant::now();
             bucket_list.add_batch(
                 self.close_data.ledger_seq,
                 protocol_version,
@@ -2724,11 +2757,13 @@ impl<'a> LedgerCloseContext<'a> {
                 live_entries,
                 dead_entries,
             )?;
+            let add_batch_us = add_batch_start.elapsed().as_micros() as u64;
 
             let live_hash = bucket_list.hash();
 
             // For Protocol 23+, update hot archive and combine bucket list hashes
-            if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
+            let hot_archive_start = std::time::Instant::now();
+            let final_hash = if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
                 let mut hot_archive_guard = self.manager.hot_archive_bucket_list.write();
                 if let Some(ref mut hot_archive) = *hot_archive_guard {
                     // Advance hot archive through any skipped ledgers (same as live bucket list)
@@ -2778,7 +2813,9 @@ impl<'a> LedgerCloseContext<'a> {
                 }
             } else {
                 live_hash
-            }
+            };
+            let hot_archive_us = hot_archive_start.elapsed().as_micros() as u64;
+            (final_hash, bucket_lock_wait_us, eviction_us, soroban_state_us, add_batch_us, hot_archive_us)
         };
 
         // Log all inputs to create_next_header for debugging header mismatch
@@ -2807,6 +2844,7 @@ impl<'a> LedgerCloseContext<'a> {
         );
 
         // Create the new header
+        let header_start = std::time::Instant::now();
         let mut new_header = create_next_header(
             &self.prev_header,
             self.prev_header_hash,
@@ -2872,6 +2910,7 @@ impl<'a> LedgerCloseContext<'a> {
             "Full header XDR for hash debugging"
         );
         let header_hash = compute_header_hash(&new_header)?;
+        let header_us = header_start.elapsed().as_micros() as u64;
 
         // Record stats
         let entries_created = self.delta.changes().filter(|c| c.is_created()).count();
@@ -2881,8 +2920,10 @@ impl<'a> LedgerCloseContext<'a> {
             .record_entry_changes(entries_created, entries_updated, entries_deleted);
 
         // Commit to manager
+        let commit_close_start = std::time::Instant::now();
         self.manager
             .commit_close(self.delta, new_header.clone(), header_hash)?;
+        let commit_close_us = commit_close_start.elapsed().as_micros() as u64;
 
         self.stats
             .set_close_time(self.start.elapsed().as_millis() as u64);
@@ -2946,11 +2987,35 @@ impl<'a> LedgerCloseContext<'a> {
             }
         }
 
+        let meta_start = std::time::Instant::now();
         let meta = build_ledger_close_meta(
             &self.close_data,
             &new_header,
             header_hash,
             &self.tx_result_metas,
+        );
+        let meta_us = meta_start.elapsed().as_micros() as u64;
+
+        // Emit single summary timing line for performance analysis
+        let total_us = self.start.elapsed().as_micros() as u64;
+        info!(
+            ledger_seq = new_header.ledger_seq,
+            total_us,
+            begin_close_us = self.timing_begin_close_us,
+            tx_exec_us = self.timing_tx_exec_us,
+            classic_exec_us = self.timing_classic_exec_us,
+            soroban_exec_us = self.timing_soroban_exec_us,
+            commit_setup_us,
+            bucket_lock_wait_us,
+            eviction_us,
+            soroban_state_us,
+            add_batch_us,
+            hot_archive_us,
+            header_us,
+            commit_close_us,
+            meta_us,
+            tx_count = self.stats.tx_count,
+            "Ledger close timing"
         );
 
         Ok(LedgerCloseResult::new(new_header, header_hash)

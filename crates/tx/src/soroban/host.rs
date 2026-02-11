@@ -1032,91 +1032,6 @@ impl AsBudget for WasmCompilationContext {
 
 impl CompilationContext for WasmCompilationContext {}
 
-/// Build a module cache by pre-compiling contract code entries from the footprint.
-///
-/// This mimics stellar-core's SharedModuleCacheCompiler which pre-compiles
-/// all WASM contracts outside of transaction budgets. Without this, each
-/// transaction pays the full VmInstantiation cost for parsing WASM, which
-/// causes budget exceeded errors for transactions that would succeed with caching.
-///
-/// # Arguments
-///
-/// * `state` - Ledger state to read contract code from
-/// * `footprint` - Transaction footprint containing entries to cache
-/// * `protocol_version` - Current protocol version for module compilation
-/// * `current_ledger` - Current ledger sequence for TTL checks
-///
-/// # Returns
-///
-/// A module cache with pre-compiled contracts, or None if compilation context creation fails.
-fn build_module_cache_for_footprint(
-    state: &LedgerStateManager,
-    footprint: &stellar_xdr::curr::LedgerFootprint,
-    protocol_version: u32,
-    current_ledger: u32,
-) -> Option<ModuleCache> {
-    let ctx = WasmCompilationContext::new();
-    let cache = ModuleCache::new(&ctx).ok()?;
-
-    // Process both read-only and read-write keys
-    let all_keys = footprint
-        .read_only
-        .iter()
-        .chain(footprint.read_write.iter());
-
-    for key in all_keys {
-        if let LedgerKey::ContractCode(cc_key) = key {
-            // Check TTL to see if entry is still live
-            let live_until = get_entry_ttl(state, key, current_ledger);
-            if let Some(ttl) = live_until {
-                if ttl < current_ledger {
-                    // Entry is archived, skip it - it will need to be restored first
-                    continue;
-                }
-            }
-
-            // Get the contract code
-            if let Some(code_entry) = state.get_contract_code(&cc_key.hash) {
-                // Compute the contract ID (hash of the WASM code)
-                let contract_id = soroban_env_host24::xdr::Hash(
-                    <Sha256 as Digest>::digest(code_entry.code.as_slice()).into(),
-                );
-
-                // Use V0 cost inputs (just wasm_bytes) to match stellar-core's behavior.
-                // stellar-core's SharedModuleCacheCompiler always uses parse_and_cache_module_simple
-                // which only uses V0 cost inputs, regardless of what's in the ContractCodeEntry extension.
-                // Using V1 cost inputs would result in different cost calculations and budget exceeded errors.
-                let cost_inputs = VersionedContractCodeCostInputs::V0 {
-                    wasm_bytes: code_entry.code.len(),
-                };
-
-                // Parse and cache the module
-                if let Err(e) = cache.parse_and_cache_module(
-                    &ctx,
-                    protocol_version,
-                    &contract_id,
-                    &code_entry.code,
-                    cost_inputs,
-                ) {
-                    tracing::warn!(
-                        hash = ?cc_key.hash,
-                        error = ?e,
-                        "Failed to pre-compile contract code for module cache"
-                    );
-                } else {
-                    tracing::debug!(
-                        hash = ?cc_key.hash,
-                        wasm_size = code_entry.code.len(),
-                        "Pre-compiled contract code for module cache"
-                    );
-                }
-            }
-        }
-    }
-
-    Some(cache)
-}
-
 /// Context for pre-compiling WASM modules outside of transaction execution (P25 version).
 /// This mimics how stellar-core pre-compiles all contracts with an unlimited budget.
 /// We use very high budget limits (10B CPU, 1GB memory) to ensure compilation never fails
@@ -1171,78 +1086,6 @@ impl AsBudgetP25 for WasmCompilationContextP25 {
 }
 
 impl CompilationContextP25 for WasmCompilationContextP25 {}
-
-/// Build a module cache by pre-compiling contract code entries from the footprint (P25 version).
-///
-/// This mimics stellar-core's SharedModuleCacheCompiler which pre-compiles
-/// all WASM contracts outside of transaction budgets.
-fn build_module_cache_for_footprint_p25(
-    state: &LedgerStateManager,
-    footprint: &stellar_xdr::curr::LedgerFootprint,
-    protocol_version: u32,
-    current_ledger: u32,
-) -> Option<ModuleCacheP25> {
-    let ctx = WasmCompilationContextP25::new();
-    let cache = ModuleCacheP25::new(&ctx).ok()?;
-
-    // Process both read-only and read-write keys
-    let all_keys = footprint
-        .read_only
-        .iter()
-        .chain(footprint.read_write.iter());
-
-    for key in all_keys {
-        if let LedgerKey::ContractCode(cc_key) = key {
-            // Check TTL to see if entry is still live
-            let live_until = get_entry_ttl(state, key, current_ledger);
-            if let Some(ttl) = live_until {
-                if ttl < current_ledger {
-                    // Entry is archived, skip it - it will need to be restored first
-                    continue;
-                }
-            }
-
-            // Get the contract code
-            if let Some(code_entry) = state.get_contract_code(&cc_key.hash) {
-                // Compute the contract ID (hash of the WASM code)
-                let contract_id = soroban_env_host25::xdr::Hash(
-                    <Sha256 as Digest>::digest(code_entry.code.as_slice()).into(),
-                );
-
-                // Use V0 cost inputs (just wasm_bytes) to match stellar-core's behavior.
-                // stellar-core's SharedModuleCacheCompiler always uses parse_and_cache_module_simple
-                // which only uses V0 cost inputs, regardless of what's in the ContractCodeEntry extension.
-                // Using V1 cost inputs would result in different cost calculations and budget exceeded errors.
-                let cost_inputs = VersionedContractCodeCostInputsP25::V0 {
-                    wasm_bytes: code_entry.code.len(),
-                };
-
-                // Parse and cache the module
-                if let Err(e) = cache.parse_and_cache_module(
-                    &ctx,
-                    protocol_version,
-                    &contract_id,
-                    &code_entry.code,
-                    cost_inputs,
-                ) {
-                    tracing::warn!(
-                        hash = ?cc_key.hash,
-                        error = ?e,
-                        "P25: Failed to pre-compile contract code for module cache"
-                    );
-                } else {
-                    tracing::debug!(
-                        hash = ?cc_key.hash,
-                        wasm_size = code_entry.code.len(),
-                        "P25: Pre-compiled contract code for module cache"
-                    );
-                }
-            }
-        }
-    }
-
-    Some(cache)
-}
 
 /// Compute rent_fee for a newly created Soroban entry.
 ///
@@ -1386,7 +1229,14 @@ pub fn execute_host_function_with_cache(
     hot_archive: Option<&dyn super::HotArchiveLookup>,
 ) -> Result<SorobanExecutionResult, SorobanExecutionError> {
     if context.protocol_version >= 25 {
-        let p25_cache = module_cache.and_then(|c| c.as_p25());
+        let cache = module_cache
+            .unwrap_or_else(|| panic!("Module cache must be provided for Soroban TX execution"));
+        let p25_cache = cache.as_p25().unwrap_or_else(|| {
+            panic!(
+                "Module cache is not P25 but protocol version is {}",
+                context.protocol_version
+            )
+        });
         return execute_host_function_p25(
             host_function,
             auth_entries,
@@ -1395,15 +1245,19 @@ pub fn execute_host_function_with_cache(
             context,
             soroban_data,
             soroban_config,
-            p25_cache,
+            Some(p25_cache),
             hot_archive,
         );
     }
-    let p24_cache = module_cache.and_then(|c| c.as_p24());
-    tracing::info!(
-        has_p24_cache = p24_cache.is_some(),
-        "Dispatching to P24 path"
-    );
+    let cache = module_cache
+        .unwrap_or_else(|| panic!("Module cache must be provided for Soroban TX execution"));
+    let p24_cache = cache.as_p24().unwrap_or_else(|| {
+        panic!(
+            "Module cache is not P24 but protocol version is {}",
+            context.protocol_version
+        )
+    });
+    tracing::info!("Dispatching to P24 path");
     execute_host_function_p24(
         host_function,
         auth_entries,
@@ -1412,7 +1266,7 @@ pub fn execute_host_function_with_cache(
         context,
         soroban_data,
         soroban_config,
-        p24_cache,
+        Some(p24_cache),
         hot_archive,
     )
 }
@@ -1775,24 +1629,18 @@ fn execute_host_function_p24(
         "P24: Prepared entries for e2e_invoke"
     );
 
-    // Use existing module cache if provided, otherwise build one from the footprint.
+    // Use existing module cache — it must always be provided.
     let cache_start = std::time::Instant::now();
-    let module_cache = if let Some(cache) = existing_cache {
-        tracing::info!("P24: Using existing persistent module cache");
-        Some(cache.clone())
-    } else {
-        tracing::info!("P24: FALLBACK - building per-TX module cache from footprint");
-        build_module_cache_for_footprint(
-            state,
-            &soroban_data.resources.footprint,
-            context.protocol_version,
-            context.sequence,
+    let module_cache = existing_cache.unwrap_or_else(|| {
+        panic!(
+            "P24: Module cache is not available — this is a bug. \
+            The persistent module cache should always be initialized before TX execution."
         )
-    };
+    });
+    let module_cache = Some(module_cache.clone());
     let cache_elapsed = cache_start.elapsed();
     tracing::info!(
         cache_ms = cache_elapsed.as_millis() as u64,
-        has_cache = module_cache.is_some(),
         "P24: Module cache ready"
     );
 
@@ -2298,17 +2146,14 @@ fn execute_host_function_p25(
         }
     }
 
-    // Use existing module cache if provided, otherwise build one from the footprint.
-    let module_cache = if let Some(cache) = existing_cache {
-        Some(cache.clone())
-    } else {
-        build_module_cache_for_footprint_p25(
-            state,
-            &soroban_data.resources.footprint,
-            context.protocol_version,
-            context.sequence,
+    // Use existing module cache — it must always be provided.
+    let module_cache = existing_cache.unwrap_or_else(|| {
+        panic!(
+            "P25: Module cache is not available — this is a bug. \
+            The persistent module cache should always be initialized before TX execution."
         )
-    };
+    });
+    let module_cache = Some(module_cache.clone());
 
     let mut diagnostic_events: Vec<soroban_env_host25::xdr::DiagnosticEvent> = Vec::new();
 
