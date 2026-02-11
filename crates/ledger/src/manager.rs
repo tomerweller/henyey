@@ -1292,6 +1292,7 @@ impl LedgerManager {
             tx_result_metas: Vec::new(),
             hot_archive_restored_keys: Vec::new(),
             runtime_handle: None,
+            start: std::time::Instant::now(),
         })
     }
 
@@ -1588,6 +1589,8 @@ struct LedgerCloseContext<'a> {
     hot_archive_restored_keys: Vec<LedgerKey>,
     /// Tokio runtime handle for spawning parallel work from non-worker threads.
     runtime_handle: Option<tokio::runtime::Handle>,
+    /// Timer started at `begin_close()` to measure the full ledger close lifecycle.
+    start: std::time::Instant,
 }
 
 impl<'a> LedgerCloseContext<'a> {
@@ -2081,7 +2084,6 @@ impl<'a> LedgerCloseContext<'a> {
 
     /// Commit the ledger close and produce the new header.
     fn commit(mut self) -> Result<LedgerCloseResult> {
-        let start = std::time::Instant::now();
         tracing::debug!(
             ledger_seq = self.close_data.ledger_seq,
             "LedgerCloseContext::commit starting"
@@ -2871,7 +2873,7 @@ impl<'a> LedgerCloseContext<'a> {
             .commit_close(self.delta, new_header.clone(), header_hash)?;
 
         self.stats
-            .set_close_time(start.elapsed().as_millis() as u64);
+            .set_close_time(self.start.elapsed().as_millis() as u64);
 
         // Describe the StellarValueExt for logging
         let stellar_value_ext_desc = match &new_header.scp_value.ext {
