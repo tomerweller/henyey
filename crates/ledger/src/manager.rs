@@ -161,6 +161,10 @@ struct CacheInitResult {
     module_cache: Option<PersistentModuleCache>,
     /// In-memory Soroban state (contract data, code, TTLs, config).
     soroban_state: crate::soroban_state::InMemorySorobanState,
+    /// Total unique entries found during the scan (offers + code + data + config).
+    /// This is a lower bound on the total bucket list size since accounts and
+    /// trustlines are not scanned. Used to activate the entry cache.
+    scanned_entry_count: u64,
 }
 
 /// Result of scanning a single bucket level's curr+snap buckets.
@@ -375,11 +379,14 @@ fn merge_level_results(
         }
     }
 
+    let scanned_entry_count = offer_count + code_count + data_count + ttl_count + config_count;
+
     CacheInitResult {
         offers: mem_offers,
         offer_index,
         module_cache,
         soroban_state,
+        scanned_entry_count,
     }
 }
 
@@ -1055,6 +1062,11 @@ impl LedgerManager {
     fn initialize_all_caches(&self, protocol_version: u32, _ledger_seq: u32) -> Result<()> {
         let bucket_list = self.bucket_list.read();
         let cache_data = scan_bucket_list_for_caches(&bucket_list, protocol_version);
+
+        // Activate the RandomEvictionCache for account/trustline lookups.
+        // The scanned_entry_count is a lower bound (only offers, code, data,
+        // TTL, config) — the real total includes accounts and trustlines too.
+        bucket_list.maybe_activate_cache(cache_data.scanned_entry_count);
         drop(bucket_list);
 
         *self.offer_store.write() = cache_data.offers;
@@ -2910,6 +2922,29 @@ impl<'a> LedgerCloseContext<'a> {
             max_tx_set_size = new_header.max_tx_set_size,
             "Ledger closed details"
         );
+
+        // Log entry cache stats (per-ledger) and reset counters
+        {
+            let bl = self.manager.bucket_list.read();
+            let cache = bl.cache();
+            if cache.is_active() {
+                let stats = cache.stats();
+                tracing::debug!(
+                    ledger_seq = new_header.ledger_seq,
+                    cache_entries = stats.entry_count,
+                    cache_bytes = stats.size_bytes,
+                    hits = stats.hits,
+                    misses = stats.misses,
+                    hit_rate = format!("{:.1}%", stats.hit_rate * 100.0),
+                    account_hits = stats.account_hits,
+                    account_misses = stats.account_misses,
+                    trustline_hits = stats.trustline_hits,
+                    trustline_misses = stats.trustline_misses,
+                    "Entry cache stats"
+                );
+                cache.reset_counters();
+            }
+        }
 
         let meta = build_ledger_close_meta(
             &self.close_data,

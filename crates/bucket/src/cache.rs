@@ -2,13 +2,13 @@
 //!
 //! This module provides an LRU-style cache for bucket entries that are
 //! frequently accessed during transaction validation. The cache is particularly
-//! useful for account entries, which are accessed repeatedly.
+//! useful for account and trustline entries, which are accessed repeatedly.
 //!
 //! # Design
 //!
 //! The cache uses a simple LRU eviction strategy with random sampling to
-//! maintain bounded memory usage. Only certain entry types (primarily accounts)
-//! are cached, as they are the most frequently accessed.
+//! maintain bounded memory usage. Only certain entry types (accounts and
+//! trustlines) are cached, as they are the most frequently accessed.
 //!
 //! # Thread Safety
 //!
@@ -28,7 +28,8 @@ use crate::entry::BucketEntry;
 pub const DEFAULT_MAX_CACHE_BYTES: usize = 100 * 1024 * 1024;
 
 /// Default maximum number of entries in the cache.
-pub const DEFAULT_MAX_CACHE_ENTRIES: usize = 100_000;
+/// Sized for both accounts and trustlines (the two cached types).
+pub const DEFAULT_MAX_CACHE_ENTRIES: usize = 200_000;
 
 /// Minimum bucket list size (in entries) before cache is initialized.
 /// Below this threshold, the bucket list is small enough that caching
@@ -116,7 +117,8 @@ impl CacheEntry {
 /// # Entry Type Filtering
 ///
 /// Only certain entry types are cached:
-/// - Account entries: Most frequently accessed, cached by default
+/// - Account entries: Most frequently accessed
+/// - Trustline entries: Second most frequently accessed
 /// - Other types can be optionally cached via configuration
 ///
 /// # Memory Management
@@ -146,6 +148,12 @@ struct CacheInner {
     hits: u64,
     /// Cache miss count for statistics.
     misses: u64,
+    /// Per-type hit counts.
+    account_hits: u64,
+    trustline_hits: u64,
+    /// Per-type miss counts.
+    account_misses: u64,
+    trustline_misses: u64,
 }
 
 impl RandomEvictionCache {
@@ -162,6 +170,10 @@ impl RandomEvictionCache {
                 access_counter: 0,
                 hits: 0,
                 misses: 0,
+                account_hits: 0,
+                trustline_hits: 0,
+                account_misses: 0,
+                trustline_misses: 0,
             }),
             max_bytes,
             max_entries,
@@ -198,10 +210,10 @@ impl RandomEvictionCache {
 
     /// Checks if an entry type should be cached.
     ///
-    /// Currently only Account entries are cached, as they are the most
-    /// frequently accessed entry type.
+    /// Account and Trustline entries are cached, as they are the most
+    /// frequently accessed entry types during transaction execution.
     pub fn is_cached_type(key: &LedgerKey) -> bool {
-        matches!(key, LedgerKey::Account(_))
+        matches!(key, LedgerKey::Account(_) | LedgerKey::Trustline(_))
     }
 
     /// Gets an entry from the cache.
@@ -220,9 +232,19 @@ impl RandomEvictionCache {
             entry.access_count = current_counter;
             let result = Arc::clone(&entry.entry);
             inner.hits += 1;
+            match key {
+                LedgerKey::Account(_) => inner.account_hits += 1,
+                LedgerKey::Trustline(_) => inner.trustline_hits += 1,
+                _ => {}
+            }
             Some(result)
         } else {
             inner.misses += 1;
+            match key {
+                LedgerKey::Account(_) => inner.account_misses += 1,
+                LedgerKey::Trustline(_) => inner.trustline_misses += 1,
+                _ => {}
+            }
             None
         }
     }
@@ -288,6 +310,10 @@ impl RandomEvictionCache {
         inner.entries.clear();
         inner.hits = 0;
         inner.misses = 0;
+        inner.account_hits = 0;
+        inner.trustline_hits = 0;
+        inner.account_misses = 0;
+        inner.trustline_misses = 0;
         self.current_bytes.store(0, Ordering::Relaxed);
     }
 
@@ -359,6 +385,10 @@ impl RandomEvictionCache {
                 0.0
             },
             active: self.is_active(),
+            account_hits: inner.account_hits,
+            account_misses: inner.account_misses,
+            trustline_hits: inner.trustline_hits,
+            trustline_misses: inner.trustline_misses,
         }
     }
 
@@ -375,6 +405,20 @@ impl RandomEvictionCache {
     /// Returns the current cache size in bytes.
     pub fn size_bytes(&self) -> usize {
         self.current_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Resets hit/miss counters without clearing cached entries.
+    ///
+    /// Useful for collecting per-ledger statistics: call `stats()` to snapshot
+    /// the counters, then `reset_counters()` to start fresh for the next ledger.
+    pub fn reset_counters(&self) {
+        let mut inner = self.inner.lock();
+        inner.hits = 0;
+        inner.misses = 0;
+        inner.account_hits = 0;
+        inner.trustline_hits = 0;
+        inner.account_misses = 0;
+        inner.trustline_misses = 0;
     }
 }
 
@@ -420,6 +464,14 @@ pub struct CacheStats {
     pub hit_rate: f64,
     /// Whether the cache is active.
     pub active: bool,
+    /// Account-specific hit count.
+    pub account_hits: u64,
+    /// Account-specific miss count.
+    pub account_misses: u64,
+    /// Trustline-specific hit count.
+    pub trustline_hits: u64,
+    /// Trustline-specific miss count.
+    pub trustline_misses: u64,
 }
 
 #[cfg(test)]
@@ -457,6 +509,34 @@ mod tests {
         })
     }
 
+    fn make_trustline_key(account_byte: u8, asset_code: &[u8; 4]) -> LedgerKey {
+        LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: make_account_id(account_byte),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*asset_code),
+                issuer: make_account_id(0),
+            }),
+        })
+    }
+
+    fn make_trustline_entry(account_byte: u8, asset_code: &[u8; 4]) -> BucketEntry {
+        BucketEntry::Live(LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Trustline(TrustLineEntry {
+                account_id: make_account_id(account_byte),
+                asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                    asset_code: AssetCode4(*asset_code),
+                    issuer: make_account_id(0),
+                }),
+                balance: 1000,
+                limit: 10000,
+                flags: TrustLineFlags::AuthorizedFlag as u32,
+                ext: TrustLineEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        })
+    }
+
     #[test]
     fn test_cache_basic_operations() {
         let cache = RandomEvictionCache::new();
@@ -491,19 +571,30 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_only_accounts() {
+    fn test_cache_accounts_and_trustlines() {
         let cache = RandomEvictionCache::new();
         cache.activate();
 
         // Account key should be cached
         assert!(RandomEvictionCache::is_cached_type(&make_account_key(1)));
 
-        // Trustline key should not be cached
-        let trustline_key = LedgerKey::Trustline(LedgerKeyTrustLine {
-            account_id: make_account_id(1),
-            asset: TrustLineAsset::Native,
+        // Trustline key should be cached
+        let trustline_key = make_trustline_key(1, b"USD\0");
+        assert!(RandomEvictionCache::is_cached_type(&trustline_key));
+
+        // Offer key should NOT be cached
+        let offer_key = LedgerKey::Offer(LedgerKeyOffer {
+            seller_id: make_account_id(1),
+            offer_id: 1,
         });
-        assert!(!RandomEvictionCache::is_cached_type(&trustline_key));
+        assert!(!RandomEvictionCache::is_cached_type(&offer_key));
+
+        // Data key should NOT be cached
+        let data_key = LedgerKey::Data(LedgerKeyData {
+            account_id: make_account_id(1),
+            data_name: String64::from(stellar_xdr::curr::StringM::default()),
+        });
+        assert!(!RandomEvictionCache::is_cached_type(&data_key));
     }
 
     #[test]
@@ -595,5 +686,74 @@ mod tests {
         // Size should be similar (same entry type)
         assert!((size1 as isize - size2 as isize).abs() < 100);
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn test_cache_trustline_basic_operations() {
+        let cache = RandomEvictionCache::new();
+        cache.activate();
+
+        let key = make_trustline_key(1, b"USD\0");
+        let entry = make_trustline_entry(1, b"USD\0");
+
+        // Initially empty
+        assert!(cache.get(&key).is_none());
+
+        // Insert and retrieve
+        cache.insert(key.clone(), entry);
+        assert!(cache.get(&key).is_some());
+
+        // Remove
+        cache.remove(&key);
+        assert!(cache.get(&key).is_none());
+    }
+
+    #[test]
+    fn test_cache_mixed_accounts_and_trustlines() {
+        let cache = RandomEvictionCache::new();
+        cache.activate();
+
+        let acct_key = make_account_key(1);
+        let acct_entry = make_account_entry(1);
+        let tl_key = make_trustline_key(1, b"USD\0");
+        let tl_entry = make_trustline_entry(1, b"USD\0");
+
+        cache.insert(acct_key.clone(), acct_entry);
+        cache.insert(tl_key.clone(), tl_entry);
+
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(&acct_key).is_some());
+        assert!(cache.get(&tl_key).is_some());
+
+        // Remove account, trustline should remain
+        cache.remove(&acct_key);
+        assert!(cache.get(&acct_key).is_none());
+        assert!(cache.get(&tl_key).is_some());
+
+        let stats = cache.stats();
+        // 2 misses (initial gets), 2 gets after insert = hits, 1 miss after remove, 1 hit after remove
+        assert!(stats.hits >= 2);
+    }
+
+    #[test]
+    fn test_cache_trustline_stats() {
+        let cache = RandomEvictionCache::new();
+        cache.activate();
+
+        let key = make_trustline_key(1, b"EUR\0");
+        let entry = make_trustline_entry(1, b"EUR\0");
+
+        // Miss
+        cache.get(&key);
+
+        // Insert
+        cache.insert(key.clone(), entry);
+
+        // Hit
+        cache.get(&key);
+
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
     }
 }

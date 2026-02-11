@@ -858,10 +858,10 @@ pub struct BucketList {
     /// When set, merges at level 1+ write to disk instead of collecting in memory,
     /// reducing peak memory from O(data_size) to O(index_size).
     bucket_dir: Option<std::path::PathBuf>,
-    /// Optional entry cache for frequently-accessed keys (currently Account entries).
+    /// Optional entry cache for frequently-accessed keys (Account and Trustline entries).
     /// When active, `get()` checks the cache before scanning levels, and populates
     /// it on miss. Cache entries are invalidated when new data is added via `add_batch()`.
-    /// Shared via `Arc` so clones of BucketList share the same cache.
+    /// Shared via `Arc` so clones of BucketList (and BucketListSnapshot) share the same cache.
     cache: Arc<RandomEvictionCache>,
 }
 

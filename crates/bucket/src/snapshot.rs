@@ -41,6 +41,7 @@
 //! ```
 
 use crate::{
+    cache::RandomEvictionCache,
     Bucket, BucketEntry, BucketLevel, BucketList, HotArchiveBucket, HotArchiveBucketLevel,
     HotArchiveBucketList,
 };
@@ -249,21 +250,38 @@ impl HotArchiveBucketLevelSnapshot {
 ///
 /// This captures the state of all 11 levels at the time the snapshot was taken,
 /// along with the ledger header that corresponds to this state.
+///
+/// The snapshot shares the parent `BucketList`'s `RandomEvictionCache` via `Arc`,
+/// so cache hits during snapshot reads avoid redundant level scans, and cache
+/// misses populate the cache for subsequent reads (within or across ledgers).
 #[derive(Clone)]
 pub struct BucketListSnapshot {
     levels: Vec<BucketLevelSnapshot>,
     header: LedgerHeader,
+    /// Shared entry cache from the parent BucketList. When present, `get()` and
+    /// `get_result()` check the cache before scanning levels and populate it on
+    /// miss. The cache is `Arc<RandomEvictionCache>` so it is shared with the
+    /// live `BucketList` and invalidated by `add_batch()`.
+    cache: Option<Arc<RandomEvictionCache>>,
 }
 
 impl BucketListSnapshot {
     /// Creates a new snapshot from a bucket list and header.
+    ///
+    /// Automatically captures the bucket list's entry cache so that lookups
+    /// on this snapshot benefit from (and populate) the shared cache.
     pub fn new(bucket_list: &BucketList, header: LedgerHeader) -> Self {
         let levels = bucket_list
             .levels()
             .iter()
             .map(BucketLevelSnapshot::from_level)
             .collect();
-        Self { levels, header }
+        let cache = Some(Arc::clone(bucket_list.cache()));
+        Self {
+            levels,
+            header,
+            cache,
+        }
     }
 
     /// Returns the ledger sequence number for this snapshot.
@@ -283,15 +301,35 @@ impl BucketListSnapshot {
 
     /// Looks up an entry by key in this snapshot.
     ///
+    /// If a shared cache is present, checks it first and populates it on miss.
     /// Searches from level 0 (most recent) to level 10 (oldest), returning
     /// the first live entry found or `None` if the key is dead or not present.
     pub fn get(&self, key: &LedgerKey) -> Option<LedgerEntry> {
+        // Check cache first for eligible key types.
+        if let Some(ref cache) = self.cache {
+            if cache.is_active() && RandomEvictionCache::is_cached_type(key) {
+                if let Some(cached) = cache.get(key) {
+                    return match cached.as_ref() {
+                        BucketEntry::Live(e) | BucketEntry::Init(e) => Some(e.clone()),
+                        BucketEntry::Dead(_) => None,
+                        BucketEntry::Metadata(_) => None,
+                    };
+                }
+            }
+        }
+
         use stellar_xdr::curr::{Limits, WriteXdr};
         let key_bytes = key.to_xdr(Limits::none()).ok()?;
         for level in &self.levels {
             for bucket in [&level.curr, &level.snap] {
                 if let Some(entry) = bucket.get_result_by_key_bytes(key, &key_bytes).ok().flatten()
                 {
+                    // Populate cache on miss for eligible types.
+                    if let Some(ref cache) = self.cache {
+                        if cache.is_active() && RandomEvictionCache::is_cached_type(key) {
+                            cache.insert(key.clone(), entry.clone());
+                        }
+                    }
                     match entry {
                         BucketEntry::Live(e) | BucketEntry::Init(e) => return Some(e),
                         BucketEntry::Dead(_) => return None,
@@ -308,9 +346,23 @@ impl BucketListSnapshot {
     /// Like [`get`](Self::get) but returns a `Result` instead of swallowing
     /// I/O or deserialization errors from disk-backed buckets.
     ///
+    /// If a shared cache is present, checks it first and populates it on miss.
     /// Serializes the key once and reuses the bytes across all bucket lookups
     /// to avoid redundant XDR serialization.
     pub fn get_result(&self, key: &LedgerKey) -> crate::Result<Option<LedgerEntry>> {
+        // Check cache first for eligible key types.
+        if let Some(ref cache) = self.cache {
+            if cache.is_active() && RandomEvictionCache::is_cached_type(key) {
+                if let Some(cached) = cache.get(key) {
+                    return match cached.as_ref() {
+                        BucketEntry::Live(e) | BucketEntry::Init(e) => Ok(Some(e.clone())),
+                        BucketEntry::Dead(_) => Ok(None),
+                        BucketEntry::Metadata(_) => Ok(None),
+                    };
+                }
+            }
+        }
+
         use stellar_xdr::curr::{Limits, WriteXdr};
         let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
             crate::BucketError::Serialization(format!("Failed to serialize key: {}", e))
@@ -318,6 +370,12 @@ impl BucketListSnapshot {
         for level in &self.levels {
             for bucket in [&level.curr, &level.snap] {
                 if let Some(entry) = bucket.get_result_by_key_bytes(key, &key_bytes)? {
+                    // Populate cache on miss for eligible types.
+                    if let Some(ref cache) = self.cache {
+                        if cache.is_active() && RandomEvictionCache::is_cached_type(key) {
+                            cache.insert(key.clone(), entry.clone());
+                        }
+                    }
                     match entry {
                         BucketEntry::Live(e) | BucketEntry::Init(e) => return Ok(Some(e)),
                         BucketEntry::Dead(_) => return Ok(None),
@@ -331,6 +389,10 @@ impl BucketListSnapshot {
 
     /// Batch-loads multiple entries by their keys in a single pass through the bucket list.
     ///
+    /// If a shared cache is present, cache-eligible keys are checked against the cache
+    /// first. Keys resolved from cache (or confirmed dead) are excluded from the level
+    /// scan. Cache misses found during the level scan are populated into the cache.
+    ///
     /// Pre-serializes all keys once and searches through levels from newest to oldest.
     /// Keys are removed from the search set as they are found (or confirmed dead),
     /// allowing early termination when all keys are resolved.
@@ -340,8 +402,40 @@ impl BucketListSnapshot {
     pub fn load_keys_result(&self, keys: &[LedgerKey]) -> crate::Result<Vec<LedgerEntry>> {
         use stellar_xdr::curr::{Limits, WriteXdr};
 
-        // Pre-serialize all keys once
-        let mut remaining: Vec<(&LedgerKey, Vec<u8>)> = keys
+        let mut result = Vec::with_capacity(keys.len());
+
+        // Check cache first for eligible keys, collecting remaining keys for level scan.
+        let mut uncached_keys: Vec<&LedgerKey> = Vec::with_capacity(keys.len());
+        if let Some(ref cache) = self.cache {
+            if cache.is_active() {
+                for key in keys {
+                    if RandomEvictionCache::is_cached_type(key) {
+                        if let Some(cached) = cache.get(key) {
+                            match cached.as_ref() {
+                                BucketEntry::Live(e) | BucketEntry::Init(e) => {
+                                    result.push(e.clone());
+                                    continue;
+                                }
+                                BucketEntry::Dead(_) => continue,
+                                BucketEntry::Metadata(_) => {}
+                            }
+                        }
+                    }
+                    uncached_keys.push(key);
+                }
+            } else {
+                uncached_keys.extend(keys.iter());
+            }
+        } else {
+            uncached_keys.extend(keys.iter());
+        }
+
+        if uncached_keys.is_empty() {
+            return Ok(result);
+        }
+
+        // Pre-serialize remaining keys once
+        let mut remaining: Vec<(&LedgerKey, Vec<u8>)> = uncached_keys
             .iter()
             .map(|k| {
                 let bytes = k.to_xdr(Limits::none()).map_err(|e| {
@@ -350,11 +444,9 @@ impl BucketListSnapshot {
                         e
                     ))
                 })?;
-                Ok((k, bytes))
+                Ok((*k, bytes))
             })
             .collect::<crate::Result<Vec<_>>>()?;
-
-        let mut result = Vec::with_capacity(keys.len());
 
         for level in &self.levels {
             if remaining.is_empty() {
@@ -367,11 +459,30 @@ impl BucketListSnapshot {
                 remaining.retain(|(key, key_bytes)| {
                     match bucket.get_result_by_key_bytes(key, key_bytes) {
                         Ok(Some(entry)) => match entry {
-                            BucketEntry::Live(e) | BucketEntry::Init(e) => {
-                                result.push(e);
+                            BucketEntry::Live(ref e) | BucketEntry::Init(ref e) => {
+                                // Populate cache on miss for eligible types.
+                                if let Some(ref cache) = self.cache {
+                                    if cache.is_active()
+                                        && RandomEvictionCache::is_cached_type(key)
+                                    {
+                                        cache.insert((*key).clone(), entry.clone());
+                                    }
+                                }
+                                result.push(e.clone());
                                 false
                             }
-                            BucketEntry::Dead(_) => false,
+                            BucketEntry::Dead(_) => {
+                                // Populate cache with dead entry so future lookups
+                                // short-circuit without scanning levels.
+                                if let Some(ref cache) = self.cache {
+                                    if cache.is_active()
+                                        && RandomEvictionCache::is_cached_type(key)
+                                    {
+                                        cache.insert((*key).clone(), entry);
+                                    }
+                                }
+                                false
+                            }
                             BucketEntry::Metadata(_) => true,
                         },
                         Ok(None) => true,
