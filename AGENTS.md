@@ -21,6 +21,7 @@
 - Keep modules small and focused; prefer adding logic inside the relevant crate instead of cross-crate helpers.
 - Use descriptive error messages and map to XDR result codes where applicable.
 - Fix cargo compiler warnings before submitting changes; keep the workspace warning-free where practical.
+- Never fail silently. If assumptions are not met, error out — do not gracefully recover.
 
 ## Determinism & Parity
 
