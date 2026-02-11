@@ -40,6 +40,16 @@
 - Perform testing on testnet, not mainnet.
 - **Bug investigation workflow**: When investigating a bug, always start by writing a narrow unit test that reproduces the bug and fails. Then fix the code until the test passes. Do not skip the failing-test-first step.
 - **Unit test coverage**: When writing new code, ensure it is thoroughly covered by unit tests. Every public function and significant code path should have corresponding tests.
+- **Henyey online & offline tests**: When asked to run the online (watcher) or offline (verify-execution) henyey tests, always run them in the background. Log output to a file and share the `tail -f` command with the user so they can follow along. For example:
+  ```bash
+  # Offline verification (background)
+  nohup ./target/release/henyey offline verify-execution --testnet --from <START> --to <END> --stop-on-error --show-diff > ~/data/<session>/offline-verify.log 2>&1 &
+  echo "Follow along: tail -f ~/data/<session>/offline-verify.log"
+
+  # Online watcher (background)
+  nohup ./target/release/henyey run --config configs/watcher-testnet.toml > ~/data/<session>/watcher.log 2>&1 &
+  echo "Follow along: tail -f ~/data/<session>/watcher.log"
+  ```
 
 ## Commit & Pull Request Guidelines
 
