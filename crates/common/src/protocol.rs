@@ -113,6 +113,12 @@ pub const AUTO_RESTORE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V23;
 /// reducing redundant compilation overhead.
 pub const REUSABLE_SOROBAN_MODULE_CACHE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V23;
 
+/// The minimum supported ledger protocol version.
+///
+/// This implementation only supports protocol versions 24 and above.
+/// Ledgers with lower versions will be rejected.
+pub const MIN_LEDGER_PROTOCOL_VERSION: u32 = 24;
+
 /// The current maximum supported ledger protocol version.
 ///
 /// This represents the highest protocol version that this implementation

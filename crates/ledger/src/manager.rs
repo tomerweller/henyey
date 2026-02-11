@@ -1085,14 +1085,22 @@ impl LedgerManager {
             return Err(LedgerError::NotInitialized);
         }
 
-        // Validate protocol version is supported
-        if state.header.ledger_version
-            > henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION
-        {
-            return Err(LedgerError::UnsupportedProtocolVersion {
-                version: state.header.ledger_version,
-                max_supported: henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION,
-            });
+        // Fatal: protocol version is unsupported
+        let version = state.header.ledger_version;
+        let min = henyey_common::protocol::MIN_LEDGER_PROTOCOL_VERSION;
+        let max = henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION;
+        if version < min || version > max {
+            tracing::error!(
+                version,
+                min_supported = min,
+                max_supported = max,
+                "FATAL: ledger protocol version is outside supported range. \
+                 The node cannot process this ledger."
+            );
+            panic!(
+                "unsupported protocol version: {} (supported range: {}..={})",
+                version, min, max,
+            );
         }
 
         // Validate sequence
@@ -3353,10 +3361,9 @@ mod tests {
     }
 
     /// Parity: LedgerTests.cpp:15 "cannot close ledger with unsupported ledger version"
-    /// Tests that begin_close rejects headers with protocol version > CURRENT.
-    /// The full integration test is in tests/ledger_close_integration.rs.
+    /// Tests that begin_close accepts the current protocol version.
     #[test]
-    fn test_cannot_close_with_unsupported_protocol_version() {
+    fn test_close_with_current_protocol_version() {
         use henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION;
 
         let manager = LedgerManager::new(
@@ -3367,7 +3374,6 @@ mod tests {
             },
         );
 
-        // Initialize with a header at the current protocol version
         let mut header = create_genesis_header();
         header.ledger_seq = 1;
         header.ledger_version = CURRENT_LEDGER_PROTOCOL_VERSION;
@@ -3395,19 +3401,46 @@ mod tests {
             1,
             header_hash,
         );
-        let result = manager.begin_close(close_data);
-        // Should pass version check (may fail for other reasons but NOT version)
-        if let Err(ref e) = result {
-            assert!(
-                !matches!(e, LedgerError::UnsupportedProtocolVersion { .. }),
-                "should not reject current protocol version"
-            );
-        }
+        // Should not panic — may fail for other reasons but NOT version
+        let _result = manager.begin_close(close_data);
+    }
 
-        // Set version to CURRENT + 1 and verify rejection
+    /// Parity: LedgerTests.cpp:15 "cannot close ledger with unsupported ledger version"
+    /// Tests that begin_close panics when protocol version exceeds max supported.
+    #[test]
+    #[should_panic(expected = "unsupported protocol version")]
+    fn test_close_panics_with_protocol_version_too_high() {
+        use henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION;
+
+        let manager = LedgerManager::new(
+            "Test SDF Network ; September 2015".to_string(),
+            LedgerManagerConfig {
+                validate_bucket_hash: false,
+                ..Default::default()
+            },
+        );
+
+        let mut header = create_genesis_header();
+        header.ledger_seq = 1;
+        header.ledger_version = CURRENT_LEDGER_PROTOCOL_VERSION;
+
+        let bucket_list = henyey_bucket::BucketList::new();
+        let hot_archive_bucket_list = henyey_bucket::HotArchiveBucketList::new();
+        let header_hash = crate::compute_header_hash(&header).expect("hash");
+
+        manager
+            .initialize(
+                bucket_list,
+                hot_archive_bucket_list,
+                header.clone(),
+                header_hash,
+            )
+            .expect("initialization should succeed");
+
+        // Set version beyond max supported
         manager.set_header_version_for_test(CURRENT_LEDGER_PROTOCOL_VERSION + 1);
 
-        let close_data2 = LedgerCloseData::new(
+        let close_data = LedgerCloseData::new(
             2,
             TransactionSetVariant::Classic(TransactionSet {
                 previous_ledger_hash: header_hash.into(),
@@ -3416,18 +3449,55 @@ mod tests {
             1,
             header_hash,
         );
-        let result2 = manager.begin_close(close_data2);
-        match result2 {
-            Err(LedgerError::UnsupportedProtocolVersion {
-                version,
-                max_supported,
-            }) => {
-                assert_eq!(version, CURRENT_LEDGER_PROTOCOL_VERSION + 1);
-                assert_eq!(max_supported, CURRENT_LEDGER_PROTOCOL_VERSION);
-            }
-            Err(e) => panic!("expected UnsupportedProtocolVersion, got: {}", e),
-            Ok(_) => panic!("expected error, got Ok"),
-        }
+        // This should panic
+        let _result = manager.begin_close(close_data);
+    }
+
+    /// Tests that begin_close panics when protocol version is below min supported.
+    #[test]
+    #[should_panic(expected = "unsupported protocol version")]
+    fn test_close_panics_with_protocol_version_too_low() {
+        use henyey_common::protocol::MIN_LEDGER_PROTOCOL_VERSION;
+
+        let manager = LedgerManager::new(
+            "Test SDF Network ; September 2015".to_string(),
+            LedgerManagerConfig {
+                validate_bucket_hash: false,
+                ..Default::default()
+            },
+        );
+
+        let mut header = create_genesis_header();
+        header.ledger_seq = 1;
+        header.ledger_version = MIN_LEDGER_PROTOCOL_VERSION;
+
+        let bucket_list = henyey_bucket::BucketList::new();
+        let hot_archive_bucket_list = henyey_bucket::HotArchiveBucketList::new();
+        let header_hash = crate::compute_header_hash(&header).expect("hash");
+
+        manager
+            .initialize(
+                bucket_list,
+                hot_archive_bucket_list,
+                header.clone(),
+                header_hash,
+            )
+            .expect("initialization should succeed");
+
+        // Set version below min supported
+        manager.set_header_version_for_test(MIN_LEDGER_PROTOCOL_VERSION - 1);
+
+        let close_data = LedgerCloseData::new(
+            2,
+            TransactionSetVariant::Classic(TransactionSet {
+                previous_ledger_hash: header_hash.into(),
+                txs: VecM::default(),
+            }),
+            1,
+            header_hash,
+        );
+        // This should panic
+        let _result = manager.begin_close(close_data);
     }
 
     #[test]

@@ -245,9 +245,10 @@ async fn test_multiple_consecutive_ledger_closes() {
 }
 
 /// Parity: LedgerTests.cpp:15 "cannot close ledger with unsupported ledger version"
-/// Tests protocol version rejection via integration test path.
+/// Tests that close_ledger panics when protocol version exceeds max supported.
 #[test]
-fn test_unsupported_protocol_version_integration() {
+#[should_panic(expected = "unsupported protocol version")]
+fn test_unsupported_protocol_version_too_high_integration() {
     use henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION;
 
     let config = LedgerManagerConfig {
@@ -279,7 +280,6 @@ fn test_unsupported_protocol_version_integration() {
     ledger.close_ledger(close_data, None).expect("close at current version");
 
     // Now force the stored header to have CURRENT + 1
-    // This simulates what would happen if the network upgraded beyond our support
     ledger.set_header_version_for_test(CURRENT_LEDGER_PROTOCOL_VERSION + 1);
 
     let prev_hash = ledger.current_header_hash();
@@ -293,17 +293,59 @@ fn test_unsupported_protocol_version_integration() {
         prev_hash,
     );
 
-    let result = ledger.close_ledger(close_data2, None);
-    assert!(
-        result.is_err(),
-        "should reject unsupported protocol version"
+    // This should panic
+    let _result = ledger.close_ledger(close_data2, None);
+}
+
+/// Tests that close_ledger panics when protocol version is below min supported.
+#[test]
+#[should_panic(expected = "unsupported protocol version")]
+fn test_unsupported_protocol_version_too_low_integration() {
+    use henyey_common::protocol::{CURRENT_LEDGER_PROTOCOL_VERSION, MIN_LEDGER_PROTOCOL_VERSION};
+
+    let config = LedgerManagerConfig {
+        validate_bucket_hash: false,
+        ..Default::default()
+    };
+    let ledger = LedgerManager::new("Test Network".to_string(), config);
+
+    let mut header = make_genesis_header();
+    header.ledger_version = CURRENT_LEDGER_PROTOCOL_VERSION;
+    let header_hash = compute_header_hash(&header).expect("hash");
+    let bucket_list = BucketList::new();
+    let hot_archive = HotArchiveBucketList::new();
+    ledger
+        .initialize(bucket_list, hot_archive, header, header_hash)
+        .expect("init");
+
+    // Close at current version should work
+    let close_data = LedgerCloseData::new(
+        1,
+        TransactionSetVariant::Classic(TransactionSet {
+            previous_ledger_hash: Hash::from(header_hash),
+            txs: VecM::default(),
+        }),
+        1,
+        header_hash,
     );
-    let err = result.unwrap_err();
-    assert!(
-        err.to_string().contains("unsupported protocol version"),
-        "error should mention unsupported protocol version, got: {}",
-        err
+    ledger.close_ledger(close_data, None).expect("close at current version");
+
+    // Force the stored header to have MIN - 1
+    ledger.set_header_version_for_test(MIN_LEDGER_PROTOCOL_VERSION - 1);
+
+    let prev_hash = ledger.current_header_hash();
+    let close_data2 = LedgerCloseData::new(
+        2,
+        TransactionSetVariant::Classic(TransactionSet {
+            previous_ledger_hash: Hash::from(prev_hash),
+            txs: VecM::default(),
+        }),
+        2,
+        prev_hash,
     );
+
+    // This should panic
+    let _result = ledger.close_ledger(close_data2, None);
 }
 
 /// Test that close_ledger works from a spawn_blocking thread with an explicit
