@@ -3526,7 +3526,7 @@ impl App {
                                             match overlay.request_tx_set(&tx_set_hash.0).await {
                                                 Ok(peer_count) => {
                                                     requested_tx_sets += 1;
-                                                    tracing::info!(
+                                                    tracing::debug!(
                                                         slot,
                                                         hash = %tx_set_hash,
                                                         peer_count,
@@ -4238,7 +4238,7 @@ impl App {
             return None;
         }
 
-        tracing::info!(
+        tracing::debug!(
             ledger_seq = next_seq,
             tx_count = tx_set.transactions.len(),
             close_time = close_info.close_time,
@@ -4463,12 +4463,6 @@ impl App {
 
         self.tx_set_all_peers_exhausted
             .store(false, Ordering::SeqCst);
-
-        tracing::info!(
-            ledger_seq = result.ledger_seq(),
-            hash = %result.header_hash.to_hex(),
-            "Ledger closed successfully"
-        );
 
         true
     }

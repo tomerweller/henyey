@@ -2998,7 +2998,7 @@ impl<'a> LedgerCloseContext<'a> {
 
         // Emit single summary timing line for performance analysis
         let total_us = self.start.elapsed().as_micros() as u64;
-        info!(
+        debug!(
             ledger_seq = new_header.ledger_seq,
             total_us,
             begin_close_us = self.timing_begin_close_us,
