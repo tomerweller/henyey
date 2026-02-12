@@ -967,7 +967,7 @@ impl Herder {
                     .read()
                     .is_node_definitely_in_quorum(sender);
                 if !in_quorum {
-                    warn!(
+                    debug!(
                         slot,
                         current_slot,
                         sender = ?sender,
