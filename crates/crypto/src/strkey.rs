@@ -321,51 +321,10 @@ fn encode_check(version: u8, data: &[u8]) -> String {
     base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &payload)
 }
 
-/// Decodes a fixed-length StrKey with version verification.
+/// Decodes a base32 StrKey, verifying the version byte and CRC16 checksum.
 ///
-/// Verifies the version byte matches and the checksum is valid.
-fn decode_check<const N: usize>(
-    expected_version: u8,
-    s: &str,
-    expected_len: usize,
-) -> Result<[u8; N], CryptoError> {
-    let decoded = base32::decode(base32::Alphabet::Rfc4648 { padding: false }, s)
-        .ok_or_else(|| CryptoError::InvalidStrKey("invalid base32".to_string()))?;
-
-    // Expected: 1 version byte + expected_len data bytes + 2 checksum bytes
-    if decoded.len() != 1 + expected_len + 2 {
-        return Err(CryptoError::InvalidStrKey(format!(
-            "length {} != {}",
-            decoded.len(),
-            1 + expected_len + 2
-        )));
-    }
-
-    let version = decoded[0];
-    if version != expected_version {
-        return Err(CryptoError::InvalidStrKey(format!(
-            "version byte {:02x} != {:02x}",
-            version, expected_version
-        )));
-    }
-
-    // Verify CRC16 checksum
-    let checksum_pos = decoded.len() - 2;
-    let checksum = u16::from_le_bytes([decoded[checksum_pos], decoded[checksum_pos + 1]]);
-    let computed = crc16_xmodem(&decoded[..checksum_pos]);
-    if checksum != computed {
-        return Err(CryptoError::InvalidStrKey("checksum mismatch".to_string()));
-    }
-
-    let mut key = [0u8; N];
-    key.copy_from_slice(&decoded[1..1 + expected_len]);
-    Ok(key)
-}
-
-/// Decodes a variable-length StrKey with version verification.
-///
-/// Used for key types with variable payload sizes (e.g., muxed accounts).
-fn decode_check_variable(expected_version: u8, s: &str) -> Result<Vec<u8>, CryptoError> {
+/// Returns the payload bytes (between the version byte and the checksum).
+fn decode_and_verify(expected_version: u8, s: &str) -> Result<Vec<u8>, CryptoError> {
     let decoded = base32::decode(base32::Alphabet::Rfc4648 { padding: false }, s)
         .ok_or_else(|| CryptoError::InvalidStrKey("invalid base32".to_string()))?;
 
@@ -391,6 +350,35 @@ fn decode_check_variable(expected_version: u8, s: &str) -> Result<Vec<u8>, Crypt
     }
 
     Ok(decoded[1..checksum_pos].to_vec())
+}
+
+/// Decodes a fixed-length StrKey with version verification.
+///
+/// Verifies the version byte matches, the checksum is valid, and the payload
+/// is exactly the expected length.
+fn decode_check<const N: usize>(
+    expected_version: u8,
+    s: &str,
+    expected_len: usize,
+) -> Result<[u8; N], CryptoError> {
+    let payload = decode_and_verify(expected_version, s)?;
+    if payload.len() != expected_len {
+        return Err(CryptoError::InvalidStrKey(format!(
+            "length {} != {}",
+            payload.len() + 3,
+            1 + expected_len + 2
+        )));
+    }
+    let mut key = [0u8; N];
+    key.copy_from_slice(&payload);
+    Ok(key)
+}
+
+/// Decodes a variable-length StrKey with version verification.
+///
+/// Used for key types with variable payload sizes (e.g., muxed accounts).
+fn decode_check_variable(expected_version: u8, s: &str) -> Result<Vec<u8>, CryptoError> {
+    decode_and_verify(expected_version, s)
 }
 
 /// Computes the CRC16-XModem checksum of data.

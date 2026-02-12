@@ -78,14 +78,8 @@ pub struct CdpDataLake {
     date_partition: String,
 }
 
-/// Configuration for the CDP data lake.
-#[derive(Debug, Clone, Default)]
-pub struct CdpConfig {
-    /// Number of ledgers per batch file (default: 1)
-    pub ledgers_per_batch: u32,
-    /// Number of batches per partition directory (default: 64000)
-    pub batches_per_partition: u32,
-}
+/// Number of ledgers per CDP partition directory.
+const CDP_PARTITION_SIZE: u32 = 64_000;
 
 impl CdpDataLake {
     /// Create a new CDP data lake client.
@@ -103,10 +97,10 @@ impl CdpDataLake {
 
     /// Calculate the partition directory name for a ledger sequence.
     ///
-    /// Partitions are 64000 ledgers each (configurable).
+    /// Partitions are [`CDP_PARTITION_SIZE`] ledgers each.
     /// Format: `{inverted_start}--{start}-{end}/`
     fn partition_for_ledger(&self, ledger_seq: u32) -> String {
-        let partition_size: u32 = 64000;
+        let partition_size = CDP_PARTITION_SIZE;
         let partition_start = (ledger_seq / partition_size) * partition_size;
         let partition_end = partition_start + partition_size - 1;
         let inverted = u32::MAX - partition_start;
@@ -304,9 +298,6 @@ pub struct CachedCdpDataLake {
     inner: CdpDataLake,
     /// Cache directory for storing downloaded metadata.
     cache_dir: std::path::PathBuf,
-    /// Network identifier for cache organization (e.g., "testnet", "mainnet").
-    #[allow(dead_code)]
-    network: String,
     /// Number of ledgers to prefetch ahead.
     prefetch_count: usize,
 }
@@ -335,7 +326,6 @@ impl CachedCdpDataLake {
         Ok(Self {
             inner: CdpDataLake::new(base_url, date_partition),
             cache_dir: cache_path,
-            network: network.to_string(),
             prefetch_count: 16, // Default prefetch count
         })
     }
@@ -519,19 +509,14 @@ impl CachedCdpDataLake {
 
     /// Get cache statistics.
     pub fn cache_stats(&self) -> CacheStats {
-        let entries = std::fs::read_dir(&self.cache_dir)
-            .map(|entries| entries.filter_map(|e| e.ok()).count())
-            .unwrap_or(0);
-
-        let size_bytes = std::fs::read_dir(&self.cache_dir)
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .filter_map(|e| e.metadata().ok())
-                    .map(|m| m.len())
-                    .sum()
+        let (entries, size_bytes) = std::fs::read_dir(&self.cache_dir)
+            .map(|dir| {
+                dir.filter_map(|e| e.ok()).fold((0usize, 0u64), |(count, size), entry| {
+                    let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    (count + 1, size + file_size)
+                })
             })
-            .unwrap_or(0);
+            .unwrap_or((0, 0));
 
         CacheStats {
             entries,
@@ -560,6 +545,20 @@ impl CdpDataLake {
     }
 }
 
+/// Map over `tx_processing` entries in any `LedgerCloseMeta` variant.
+///
+/// V0/V1 have `TransactionResultMeta` while V2 has `TransactionResultMetaV1`,
+/// but they share `tx_apply_processing`, `result`, and `fee_processing` fields.
+macro_rules! map_tx_processing {
+    ($meta:expr, $f:expr) => {
+        match $meta {
+            LedgerCloseMeta::V0(v0) => v0.tx_processing.iter().map($f).collect(),
+            LedgerCloseMeta::V1(v1) => v1.tx_processing.iter().map($f).collect(),
+            LedgerCloseMeta::V2(v2) => v2.tx_processing.iter().map($f).collect(),
+        }
+    };
+}
+
 /// Extract transaction metadata from a `LedgerCloseMeta`.
 ///
 /// Returns the `TransactionMeta` for each transaction in execution order.
@@ -578,23 +577,7 @@ impl CdpDataLake {
 pub fn extract_transaction_metas(
     meta: &LedgerCloseMeta,
 ) -> Vec<stellar_xdr::curr::TransactionMeta> {
-    match meta {
-        LedgerCloseMeta::V0(v0) => v0
-            .tx_processing
-            .iter()
-            .map(|tp| tp.tx_apply_processing.clone())
-            .collect(),
-        LedgerCloseMeta::V1(v1) => v1
-            .tx_processing
-            .iter()
-            .map(|tp| tp.tx_apply_processing.clone())
-            .collect(),
-        LedgerCloseMeta::V2(v2) => v2
-            .tx_processing
-            .iter()
-            .map(|tp| tp.tx_apply_processing.clone())
-            .collect(),
-    }
+    map_tx_processing!(meta, |tp| tp.tx_apply_processing.clone())
 }
 
 /// Complete transaction processing information in apply order.
@@ -847,40 +830,9 @@ pub fn build_tx_hash_map_with_network(
     txs: &[stellar_xdr::curr::TransactionEnvelope],
     network_id: &[u8; 32],
 ) -> std::collections::HashMap<[u8; 32], stellar_xdr::curr::TransactionEnvelope> {
-    use sha2::{Digest, Sha256};
-    use stellar_xdr::curr::{EnvelopeType, Limits, WriteXdr};
-
     txs.iter()
         .filter_map(|env| {
-            // Hash format: SHA256(network_id || envelope_type || transaction)
-            let mut hasher = Sha256::new();
-            hasher.update(network_id);
-
-            // Add envelope type discriminant
-            let envelope_type = match env {
-                stellar_xdr::curr::TransactionEnvelope::TxV0(_) => EnvelopeType::TxV0,
-                stellar_xdr::curr::TransactionEnvelope::Tx(_) => EnvelopeType::Tx,
-                stellar_xdr::curr::TransactionEnvelope::TxFeeBump(_) => EnvelopeType::TxFeeBump,
-            };
-            hasher.update((envelope_type as i32).to_be_bytes());
-
-            // Add the transaction body (not the full envelope)
-            match env {
-                stellar_xdr::curr::TransactionEnvelope::TxV0(tx_v0) => {
-                    let tx_xdr = tx_v0.tx.to_xdr(Limits::none()).ok()?;
-                    hasher.update(&tx_xdr);
-                }
-                stellar_xdr::curr::TransactionEnvelope::Tx(tx_v1) => {
-                    let tx_xdr = tx_v1.tx.to_xdr(Limits::none()).ok()?;
-                    hasher.update(&tx_xdr);
-                }
-                stellar_xdr::curr::TransactionEnvelope::TxFeeBump(fee_bump) => {
-                    let tx_xdr = fee_bump.tx.to_xdr(Limits::none()).ok()?;
-                    hasher.update(&tx_xdr);
-                }
-            }
-
-            let hash: [u8; 32] = hasher.finalize().into();
+            let hash = compute_tx_hash(env, network_id)?;
             Some((hash, env.clone()))
         })
         .collect()
@@ -943,23 +895,7 @@ fn extract_txs_from_generalized_set(
 pub fn extract_transaction_results(
     meta: &LedgerCloseMeta,
 ) -> Vec<stellar_xdr::curr::TransactionResultPair> {
-    match meta {
-        LedgerCloseMeta::V0(v0) => v0
-            .tx_processing
-            .iter()
-            .map(|tp| tp.result.clone())
-            .collect(),
-        LedgerCloseMeta::V1(v1) => v1
-            .tx_processing
-            .iter()
-            .map(|tp| tp.result.clone())
-            .collect(),
-        LedgerCloseMeta::V2(v2) => v2
-            .tx_processing
-            .iter()
-            .map(|tp| tp.result.clone())
-            .collect(),
-    }
+    map_tx_processing!(meta, |tp| tp.result.clone())
 }
 
 /// Extract the transaction set from LedgerCloseMeta.
@@ -1075,6 +1011,23 @@ pub fn extract_restored_keys(
         }
     }
 
+    /// Process tx_changes_before, operations, and tx_changes_after for V2+.
+    macro_rules! process_v2_plus {
+        ($v:expr, $out:expr) => {{
+            for change in $v.tx_changes_before.iter() {
+                process_change(change, $out);
+            }
+            for op_changes in $v.operations.iter() {
+                for change in op_changes.changes.iter() {
+                    process_change(change, $out);
+                }
+            }
+            for change in $v.tx_changes_after.iter() {
+                process_change(change, $out);
+            }
+        }};
+    }
+
     for meta in tx_metas {
         match meta {
             TransactionMeta::V0(operations) => {
@@ -1094,45 +1047,9 @@ pub fn extract_restored_keys(
                     }
                 }
             }
-            TransactionMeta::V2(v2) => {
-                for change in v2.tx_changes_before.iter() {
-                    process_change(change, &mut restored_keys);
-                }
-                for op_changes in v2.operations.iter() {
-                    for change in op_changes.changes.iter() {
-                        process_change(change, &mut restored_keys);
-                    }
-                }
-                for change in v2.tx_changes_after.iter() {
-                    process_change(change, &mut restored_keys);
-                }
-            }
-            TransactionMeta::V3(v3) => {
-                for change in v3.tx_changes_before.iter() {
-                    process_change(change, &mut restored_keys);
-                }
-                for op_changes in v3.operations.iter() {
-                    for change in op_changes.changes.iter() {
-                        process_change(change, &mut restored_keys);
-                    }
-                }
-                for change in v3.tx_changes_after.iter() {
-                    process_change(change, &mut restored_keys);
-                }
-            }
-            TransactionMeta::V4(v4) => {
-                for change in v4.tx_changes_before.iter() {
-                    process_change(change, &mut restored_keys);
-                }
-                for op_changes in v4.operations.iter() {
-                    for change in op_changes.changes.iter() {
-                        process_change(change, &mut restored_keys);
-                    }
-                }
-                for change in v4.tx_changes_after.iter() {
-                    process_change(change, &mut restored_keys);
-                }
-            }
+            TransactionMeta::V2(v) => process_v2_plus!(v, &mut restored_keys),
+            TransactionMeta::V3(v) => process_v2_plus!(v, &mut restored_keys),
+            TransactionMeta::V4(v) => process_v2_plus!(v, &mut restored_keys),
         }
     }
 

@@ -31,70 +31,21 @@
 //! // meta is now in canonical sorted order
 //! ```
 
+use crate::asset::ledger_entry_key;
 use crate::Hash256;
 use stellar_xdr::curr::{
-    LedgerCloseMeta, LedgerEntry, LedgerEntryChange, LedgerEntryChanges, LedgerEntryData,
-    LedgerKey, LedgerKeyAccount, LedgerKeyClaimableBalance, LedgerKeyContractCode,
-    LedgerKeyContractData, LedgerKeyData, LedgerKeyLiquidityPool, LedgerKeyOffer,
-    LedgerKeyTrustLine, LedgerKeyTtl, Limits, TransactionMeta, WriteXdr,
+    LedgerCloseMeta, LedgerEntryChange, LedgerEntryChanges, LedgerKey, Limits, TransactionMeta,
+    WriteXdr,
 };
-
-/// Extracts the ledger key from a ledger entry.
-///
-/// The ledger key uniquely identifies an entry in the ledger and is used
-/// for sorting ledger entry changes.
-fn ledger_entry_key(entry: &LedgerEntry) -> LedgerKey {
-    match &entry.data {
-        LedgerEntryData::Account(account) => LedgerKey::Account(LedgerKeyAccount {
-            account_id: account.account_id.clone(),
-        }),
-        LedgerEntryData::Trustline(trustline) => LedgerKey::Trustline(LedgerKeyTrustLine {
-            account_id: trustline.account_id.clone(),
-            asset: trustline.asset.clone(),
-        }),
-        LedgerEntryData::Offer(offer) => LedgerKey::Offer(LedgerKeyOffer {
-            seller_id: offer.seller_id.clone(),
-            offer_id: offer.offer_id,
-        }),
-        LedgerEntryData::Data(data) => LedgerKey::Data(LedgerKeyData {
-            account_id: data.account_id.clone(),
-            data_name: data.data_name.clone(),
-        }),
-        LedgerEntryData::ClaimableBalance(cb) => {
-            LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
-                balance_id: cb.balance_id.clone(),
-            })
-        }
-        LedgerEntryData::LiquidityPool(pool) => LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
-            liquidity_pool_id: pool.liquidity_pool_id.clone(),
-        }),
-        LedgerEntryData::ContractData(data) => LedgerKey::ContractData(LedgerKeyContractData {
-            contract: data.contract.clone(),
-            key: data.key.clone(),
-            durability: data.durability,
-        }),
-        LedgerEntryData::ContractCode(code) => LedgerKey::ContractCode(LedgerKeyContractCode {
-            hash: code.hash.clone(),
-        }),
-        LedgerEntryData::ConfigSetting(setting) => {
-            LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
-                config_setting_id: setting.discriminant(),
-            })
-        }
-        LedgerEntryData::Ttl(ttl) => LedgerKey::Ttl(LedgerKeyTtl {
-            key_hash: ttl.key_hash.clone(),
-        }),
-    }
-}
 
 /// Extracts the ledger key from a ledger entry change.
 fn change_key(change: &LedgerEntryChange) -> LedgerKey {
     match change {
-        LedgerEntryChange::State(entry) => ledger_entry_key(entry),
-        LedgerEntryChange::Created(entry) => ledger_entry_key(entry),
-        LedgerEntryChange::Updated(entry) => ledger_entry_key(entry),
+        LedgerEntryChange::State(entry)
+        | LedgerEntryChange::Created(entry)
+        | LedgerEntryChange::Updated(entry)
+        | LedgerEntryChange::Restored(entry) => ledger_entry_key(entry),
         LedgerEntryChange::Removed(key) => key.clone(),
-        LedgerEntryChange::Restored(entry) => ledger_entry_key(entry),
     }
 }
 

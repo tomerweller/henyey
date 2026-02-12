@@ -166,14 +166,8 @@ pub fn checkpoint_range(checkpoint_ledger_seq: u32) -> (u32, u32) {
 
 /// Build the HAS (History Archive State) path for a given checkpoint.
 ///
-/// The HAS file is stored at:
-/// `history/AA/BB/CC/history-AABBCCDD.json` (for specific checkpoint)
-pub fn has_path(checkpoint: u32) -> String {
-    checkpoint_path("history", checkpoint, "json")
-}
-
-/// Path to get the latest HAS from an archive.
-pub const LATEST_HAS_PATH: &str = ".well-known/stellar-history.json";
+/// Re-export of [`crate::paths::has_path`].
+pub use crate::paths::has_path;
 
 #[cfg(test)]
 mod tests {

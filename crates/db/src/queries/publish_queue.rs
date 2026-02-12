@@ -10,7 +10,7 @@
 
 use rusqlite::{params, Connection};
 
-use super::super::error::DbError;
+use crate::error::DbError;
 
 /// Query trait for the history publish queue.
 ///
@@ -52,25 +52,18 @@ impl PublishQueueQueries for Connection {
     }
 
     fn load_publish_queue(&self, limit: Option<usize>) -> Result<Vec<u32>, DbError> {
+        let row_fn = |row: &rusqlite::Row<'_>| row.get::<_, i64>(0).map(|v| v as u32);
         let mut sql = String::from("SELECT ledgerseq FROM publishqueue ORDER BY ledgerseq ASC");
         if limit.is_some() {
             sql.push_str(" LIMIT ?1");
         }
-        let mut results = Vec::new();
         let mut stmt = self.prepare(&sql)?;
-        if let Some(limit) = limit {
-            let rows = stmt.query_map(params![limit as i64], |row| {
-                row.get::<_, i64>(0).map(|value| value as u32)
-            })?;
-            for row in rows {
-                results.push(row?);
-            }
+        let rows = if let Some(limit) = limit {
+            stmt.query_map(params![limit as i64], row_fn)?
         } else {
-            let rows = stmt.query_map([], |row| row.get::<_, i64>(0).map(|value| value as u32))?;
-            for row in rows {
-                results.push(row?);
-            }
-        }
-        Ok(results)
+            stmt.query_map([], row_fn)?
+        };
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(DbError::from)
     }
 }

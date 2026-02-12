@@ -36,6 +36,7 @@ use crate::{
     codec::helpers,
     connection::{ConnectionDirection, ConnectionPool, Listener},
     flood::{compute_message_hash, FloodGate, FloodGateStats},
+    flow_control::msg_body_size,
     peer::{Peer, PeerInfo, PeerStatsSnapshot},
     LocalNode, OverlayConfig, OverlayError, PeerAddress, PeerEvent, PeerId, PeerType, Result,
 };
@@ -52,12 +53,6 @@ use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 use sha2::Digest;
 use tracing::{debug, error, info, trace, warn};
-
-fn message_len(message: &StellarMessage) -> u64 {
-    stellar_xdr::curr::WriteXdr::to_xdr(message, stellar_xdr::curr::Limits::none())
-        .map(|bytes| bytes.len() as u64)
-        .unwrap_or(0)
-}
 
 fn is_fetch_message(message: &StellarMessage) -> bool {
     matches!(
@@ -95,6 +90,31 @@ pub struct PeerSnapshot {
     pub info: PeerInfo,
     /// Message and byte counters.
     pub stats: PeerStatsSnapshot,
+}
+
+/// Shared state passed to spawned peer tasks.
+///
+/// Bundles all `Arc`-wrapped state that background tasks need, avoiding
+/// 20+ individual parameter lists on `connect_outbound_inner` and
+/// `run_peer_loop`.
+#[derive(Clone)]
+struct SharedPeerState {
+    peers: Arc<DashMap<PeerId, Arc<TokioMutex<Peer>>>>,
+    flood_gate: Arc<FloodGate>,
+    running: Arc<AtomicBool>,
+    message_tx: broadcast::Sender<OverlayMessage>,
+    scp_message_tx: mpsc::UnboundedSender<OverlayMessage>,
+    fetch_response_tx: mpsc::UnboundedSender<OverlayMessage>,
+    peer_handles: Arc<RwLock<Vec<JoinHandle<()>>>>,
+    advertised_outbound_peers: Arc<RwLock<Vec<PeerAddress>>>,
+    advertised_inbound_peers: Arc<RwLock<Vec<PeerAddress>>>,
+    added_authenticated_peers: Arc<std::sync::atomic::AtomicU64>,
+    dropped_authenticated_peers: Arc<std::sync::atomic::AtomicU64>,
+    banned_peers: Arc<RwLock<HashSet<PeerId>>>,
+    peer_info_cache: Arc<DashMap<PeerId, PeerInfo>>,
+    is_validator: bool,
+    peer_event_tx: Option<mpsc::Sender<PeerEvent>>,
+    extra_subscribers: Arc<RwLock<Vec<mpsc::UnboundedSender<OverlayMessage>>>>,
 }
 
 /// Central manager for all peer connections in the overlay network.
@@ -226,6 +246,28 @@ impl OverlayManager {
         })
     }
 
+    /// Create a snapshot of shared state for passing to spawned tasks.
+    fn shared_state(&self) -> SharedPeerState {
+        SharedPeerState {
+            peers: Arc::clone(&self.peers),
+            flood_gate: Arc::clone(&self.flood_gate),
+            running: Arc::clone(&self.running),
+            message_tx: self.message_tx.clone(),
+            scp_message_tx: self.scp_message_tx.clone(),
+            fetch_response_tx: self.fetch_response_tx.clone(),
+            peer_handles: Arc::clone(&self.peer_handles),
+            advertised_outbound_peers: Arc::clone(&self.advertised_outbound_peers),
+            advertised_inbound_peers: Arc::clone(&self.advertised_inbound_peers),
+            added_authenticated_peers: Arc::clone(&self.added_authenticated_peers),
+            dropped_authenticated_peers: Arc::clone(&self.dropped_authenticated_peers),
+            banned_peers: Arc::clone(&self.banned_peers),
+            peer_info_cache: Arc::clone(&self.peer_info_cache),
+            is_validator: self.config.is_validator,
+            peer_event_tx: self.config.peer_event_tx.clone(),
+            extra_subscribers: Arc::clone(&self.extra_subscribers),
+        }
+    }
+
     /// Start the overlay network (listening and connecting to peers).
     pub async fn start(&mut self) -> Result<()> {
         if self.running.load(Ordering::Relaxed) {
@@ -252,25 +294,11 @@ impl OverlayManager {
         let listener = Listener::bind(self.config.listen_port).await?;
         info!("Listening on port {}", self.config.listen_port);
 
-        let peers = Arc::clone(&self.peers);
+        let shared = self.shared_state();
         let local_node = self.local_node.clone();
         let pool = Arc::clone(&self.inbound_pool);
-        let running = Arc::clone(&self.running);
-        let message_tx = self.message_tx.clone();
-        let flood_gate = Arc::clone(&self.flood_gate);
         let peer_handles = Arc::clone(&self.peer_handles);
-        let advertised_outbound_peers = Arc::clone(&self.advertised_outbound_peers);
-        let advertised_inbound_peers = Arc::clone(&self.advertised_inbound_peers);
-        let added_authenticated_peers = Arc::clone(&self.added_authenticated_peers);
-        let dropped_authenticated_peers = Arc::clone(&self.dropped_authenticated_peers);
-        let banned_peers = Arc::clone(&self.banned_peers);
-        let peer_info_cache = Arc::clone(&self.peer_info_cache);
         let auth_timeout = self.config.auth_timeout_secs;
-        let peer_event_tx = self.config.peer_event_tx.clone();
-        let scp_message_tx = self.scp_message_tx.clone();
-        let fetch_response_tx_listener = self.fetch_response_tx.clone();
-        let is_validator = self.config.is_validator;
-        let extra_subscribers_listener = Arc::clone(&self.extra_subscribers);
         let mut shutdown_rx = self.shutdown_tx.as_ref().unwrap().subscribe();
 
         let handle = tokio::spawn(async move {
@@ -284,31 +312,16 @@ impl OverlayManager {
                                     continue;
                                 }
 
-                                let peers = Arc::clone(&peers);
+                                let shared = shared.clone();
                                 let local_node = local_node.clone();
                                 let pool = Arc::clone(&pool);
-                                let message_tx = message_tx.clone();
-                                let flood_gate = Arc::clone(&flood_gate);
-                                let running = Arc::clone(&running);
-                                let advertised_outbound_peers =
-                                    Arc::clone(&advertised_outbound_peers);
-                                let advertised_inbound_peers =
-                                    Arc::clone(&advertised_inbound_peers);
-                                let peer_event_tx = peer_event_tx.clone();
-                                let added_authenticated_peers = Arc::clone(&added_authenticated_peers);
-                                let dropped_authenticated_peers = Arc::clone(&dropped_authenticated_peers);
-                                let banned_peers = Arc::clone(&banned_peers);
-                                let peer_info_cache = Arc::clone(&peer_info_cache);
-                                let scp_message_tx = scp_message_tx.clone();
-                                let fetch_response_tx = fetch_response_tx_listener.clone();
-                                let extra_subscribers = Arc::clone(&extra_subscribers_listener);
 
                                 let peer_handle = tokio::spawn(async move {
                                     let remote_addr = connection.remote_addr();
                                     match Peer::accept(connection, local_node, auth_timeout).await {
                                         Ok(mut peer) => {
                                             let peer_id = peer.id().clone();
-                                            if banned_peers.read().contains(&peer_id) {
+                                            if shared.banned_peers.read().contains(&peer_id) {
                                                 warn!("Rejected banned peer {}", peer_id);
                                                 peer.close().await;
                                                 pool.release();
@@ -317,7 +330,7 @@ impl OverlayManager {
                                             info!("Accepted peer: {}", peer_id);
 
                                             let peer_info = peer.info().clone();
-                                            if let Some(tx) = peer_event_tx.clone() {
+                                            if let Some(tx) = shared.peer_event_tx.clone() {
                                                 let addr = peer_info.address;
                                                 let peer_addr = PeerAddress::new(
                                                     addr.ip().to_string(),
@@ -332,14 +345,14 @@ impl OverlayManager {
                                             }
 
                                             let peer = Arc::new(TokioMutex::new(peer));
-                                            peers.insert(peer_id.clone(), Arc::clone(&peer));
-                                            peer_info_cache.insert(peer_id.clone(), peer_info.clone());
-                                            added_authenticated_peers.fetch_add(1, Ordering::Relaxed);
+                                            shared.peers.insert(peer_id.clone(), Arc::clone(&peer));
+                                            shared.peer_info_cache.insert(peer_id.clone(), peer_info.clone());
+                                            shared.added_authenticated_peers.fetch_add(1, Ordering::Relaxed);
 
                                             let outbound_snapshot =
-                                                advertised_outbound_peers.read().clone();
+                                                shared.advertised_outbound_peers.read().clone();
                                             let inbound_snapshot =
-                                                advertised_inbound_peers.read().clone();
+                                                shared.advertised_inbound_peers.read().clone();
                                             let exclude = PeerAddress::new(
                                                 peer_info.address.ip().to_string(),
                                                 peer_info.address.port(),
@@ -366,24 +379,18 @@ impl OverlayManager {
                                             Self::run_peer_loop(
                                                 peer_id.clone(),
                                                 peer,
-                                                message_tx,
-                                                scp_message_tx,
-                                                fetch_response_tx,
-                                                flood_gate,
-                                                running,
-                                                is_validator,
-                                                extra_subscribers,
+                                                shared.clone(),
                                             ).await;
 
                                             // Cleanup
-                                            peers.remove(&peer_id);
-                                            peer_info_cache.remove(&peer_id);
-                                            dropped_authenticated_peers.fetch_add(1, Ordering::Relaxed);
+                                            shared.peers.remove(&peer_id);
+                                            shared.peer_info_cache.remove(&peer_id);
+                                            shared.dropped_authenticated_peers.fetch_add(1, Ordering::Relaxed);
                                             pool.release();
                                         }
                                         Err(e) => {
                                             warn!("Failed to accept peer: {}", e);
-                                            if let Some(tx) = peer_event_tx.clone() {
+                                            if let Some(tx) = shared.peer_event_tx.clone() {
                                                 let addr = remote_addr;
                                                 let peer_addr = PeerAddress::new(
                                                     addr.ip().to_string(),
@@ -414,7 +421,7 @@ impl OverlayManager {
                     }
                 }
 
-                if !running.load(Ordering::Relaxed) {
+                if !shared.running.load(Ordering::Relaxed) {
                     break;
                 }
             }
@@ -426,30 +433,15 @@ impl OverlayManager {
 
     /// Start the outbound connector.
     fn start_connector(&mut self) {
-        let peers = Arc::clone(&self.peers);
+        let shared = self.shared_state();
         let local_node = self.local_node.clone();
         let pool = Arc::clone(&self.outbound_pool);
-        let running = Arc::clone(&self.running);
-        let message_tx = self.message_tx.clone();
-        let flood_gate = Arc::clone(&self.flood_gate);
-        let peer_handles = Arc::clone(&self.peer_handles);
         let known_peers = Arc::clone(&self.known_peers);
-        let advertised_outbound_peers = Arc::clone(&self.advertised_outbound_peers);
-        let advertised_inbound_peers = Arc::clone(&self.advertised_inbound_peers);
-        let added_authenticated_peers = Arc::clone(&self.added_authenticated_peers);
-        let dropped_authenticated_peers = Arc::clone(&self.dropped_authenticated_peers);
-        let banned_peers = Arc::clone(&self.banned_peers);
-        let peer_info_cache = Arc::clone(&self.peer_info_cache);
         let preferred_peers = self.config.preferred_peers.clone();
         let target_outbound = self.config.target_outbound_peers;
         let max_outbound = self.config.max_outbound_peers;
         let connect_timeout = self.config.connect_timeout_secs;
         let auth_timeout = self.config.auth_timeout_secs;
-        let peer_event_tx = self.config.peer_event_tx.clone();
-        let scp_message_tx = self.scp_message_tx.clone();
-        let fetch_response_tx_connector = self.fetch_response_tx.clone();
-        let is_validator = self.config.is_validator;
-        let extra_subscribers_connector = Arc::clone(&self.extra_subscribers);
         let mut shutdown_rx = self.shutdown_tx.as_ref().unwrap().subscribe();
 
         let handle = tokio::spawn(async move {
@@ -465,12 +457,12 @@ impl OverlayManager {
                     _ = interval.tick() => {}
                 }
 
-                if !running.load(Ordering::Relaxed) {
+                if !shared.running.load(Ordering::Relaxed) {
                     break;
                 }
 
                 let now = Instant::now();
-                let outbound_count = Self::count_outbound_peers(&peers);
+                let outbound_count = Self::count_outbound_peers(&shared.peers);
                 let available = max_outbound.saturating_sub(outbound_count);
                 if available == 0 {
                     continue;
@@ -490,7 +482,7 @@ impl OverlayManager {
                         }
                     }
 
-                    if Self::has_outbound_connection_to(&peer_info_cache, addr) {
+                    if Self::has_outbound_connection_to(&shared.peer_info_cache, addr) {
                         continue;
                     }
 
@@ -500,52 +492,28 @@ impl OverlayManager {
                         break;
                     }
 
-                    let addr = addr.clone();
-                    let local_node = local_node.clone();
-                    let peers = Arc::clone(&peers);
-                    let pool = Arc::clone(&pool);
-                    let message_tx = message_tx.clone();
-                    let flood_gate = Arc::clone(&flood_gate);
-                    let running = Arc::clone(&running);
-                    let peer_handles = Arc::clone(&peer_handles);
                     let timeout = connect_timeout.max(auth_timeout);
-
                     match Self::connect_outbound_inner(
                         &addr,
-                        local_node,
+                        local_node.clone(),
                         timeout,
-                        peers,
-                        pool,
-                        message_tx,
-                        scp_message_tx.clone(),
-                        fetch_response_tx_connector.clone(),
-                        flood_gate,
-                        running,
-                        is_validator,
-                        peer_handles,
-                        Arc::clone(&advertised_outbound_peers),
-                        Arc::clone(&advertised_inbound_peers),
-                        Arc::clone(&added_authenticated_peers),
-                        Arc::clone(&dropped_authenticated_peers),
-                        Arc::clone(&banned_peers),
-                        peer_event_tx.clone(),
-                        Arc::clone(&peer_info_cache),
-                        Arc::clone(&extra_subscribers_connector),
+                        Arc::clone(&pool),
+                        shared.clone(),
                     )
                     .await
                     {
                         Ok(_) => {
-                            retry_after.remove(&addr);
+                            retry_after.remove(addr);
                             remaining = remaining.saturating_sub(1);
                         }
                         Err(e) => {
                             warn!("Failed to connect to preferred peer {}: {}", addr, e);
-                            retry_after.insert(addr, now + Duration::from_secs(10));
+                            retry_after.insert(addr.clone(), now + Duration::from_secs(10));
                         }
                     }
                 }
 
-                let outbound_count = Self::count_outbound_peers(&peers);
+                let outbound_count = Self::count_outbound_peers(&shared.peers);
                 if remaining == 0 || outbound_count >= target_outbound {
                     continue;
                 }
@@ -559,7 +527,7 @@ impl OverlayManager {
                         break;
                     }
 
-                    let outbound_now = Self::count_outbound_peers(&peers);
+                    let outbound_now = Self::count_outbound_peers(&shared.peers);
                     if outbound_now >= target_outbound {
                         break;
                     }
@@ -570,7 +538,7 @@ impl OverlayManager {
                         }
                     }
 
-                    if Self::has_outbound_connection_to(&peer_info_cache, addr) {
+                    if Self::has_outbound_connection_to(&shared.peer_info_cache, addr) {
                         continue;
                     }
 
@@ -579,47 +547,23 @@ impl OverlayManager {
                         break;
                     }
 
-                    let addr = addr.clone();
-                    let local_node = local_node.clone();
-                    let peers = Arc::clone(&peers);
-                    let pool = Arc::clone(&pool);
-                    let message_tx = message_tx.clone();
-                    let flood_gate = Arc::clone(&flood_gate);
-                    let running = Arc::clone(&running);
-                    let peer_handles = Arc::clone(&peer_handles);
                     let timeout = connect_timeout.max(auth_timeout);
-
                     match Self::connect_outbound_inner(
-                        &addr,
-                        local_node,
+                        addr,
+                        local_node.clone(),
                         timeout,
-                        peers,
-                        pool,
-                        message_tx,
-                        scp_message_tx.clone(),
-                        fetch_response_tx_connector.clone(),
-                        flood_gate,
-                        running,
-                        is_validator,
-                        peer_handles,
-                        Arc::clone(&advertised_outbound_peers),
-                        Arc::clone(&advertised_inbound_peers),
-                        Arc::clone(&added_authenticated_peers),
-                        Arc::clone(&dropped_authenticated_peers),
-                        Arc::clone(&banned_peers),
-                        peer_event_tx.clone(),
-                        Arc::clone(&peer_info_cache),
-                        Arc::clone(&extra_subscribers_connector),
+                        Arc::clone(&pool),
+                        shared.clone(),
                     )
                     .await
                     {
                         Ok(_) => {
-                            retry_after.remove(&addr);
+                            retry_after.remove(addr);
                             remaining = remaining.saturating_sub(1);
                         }
                         Err(e) => {
                             warn!("Failed to connect to peer {}: {}", addr, e);
-                            retry_after.insert(addr, now + Duration::from_secs(10));
+                            retry_after.insert(addr.clone(), now + Duration::from_secs(10));
                         }
                     }
                 }
@@ -630,22 +574,26 @@ impl OverlayManager {
     }
 
     /// Run the peer message loop.
-    #[allow(clippy::too_many_arguments)]
     async fn run_peer_loop(
         peer_id: PeerId,
         peer: Arc<TokioMutex<Peer>>,
-        message_tx: broadcast::Sender<OverlayMessage>,
-        scp_message_tx: mpsc::UnboundedSender<OverlayMessage>,
-        fetch_response_tx: mpsc::UnboundedSender<OverlayMessage>,
-        flood_gate: Arc<FloodGate>,
-        running: Arc<AtomicBool>,
-        is_validator: bool,
-        extra_subscribers: Arc<RwLock<Vec<mpsc::UnboundedSender<OverlayMessage>>>>,
+        state: SharedPeerState,
     ) {
+        let SharedPeerState {
+            message_tx,
+            scp_message_tx,
+            fetch_response_tx,
+            flood_gate,
+            running,
+            is_validator,
+            extra_subscribers,
+            ..
+        } = state;
         // Flow control: track messages received and send SendMoreExtended frequently
         // stellar-core sends FLOW_CONTROL_SEND_MORE_BATCH_SIZE=40 msgs / 100000 bytes after processing
         // a batch, NOT the full initial capacity. Match this behavior.
-        const SEND_MORE_THRESHOLD: u32 = 40; // Send flow control after 40 messages (stellar-core default)
+        const SEND_MORE_BATCH_SIZE: u32 = 40;
+        const SEND_MORE_BYTE_BATCH: u32 = 100_000;
         let mut messages_since_send_more = 0u32;
         let mut last_send_more = std::time::Instant::now();
         const SEND_MORE_INTERVAL: Duration = Duration::from_secs(1); // Send every second
@@ -668,11 +616,11 @@ impl OverlayManager {
                 let mut peer_lock = peer.lock().await;
                 if peer_lock.is_connected() {
                     // Send batch flow control matching stellar-core FLOW_CONTROL_SEND_MORE_BATCH_SIZE
-                    if let Err(e) = peer_lock.send_more_extended(40, 100_000).await {
+                    if let Err(e) = peer_lock.send_more_extended(SEND_MORE_BATCH_SIZE, SEND_MORE_BYTE_BATCH).await {
                         debug!("Failed to send periodic flow control to {}: {}", peer_id, e);
                     } else {
                         trace!(
-                            "Sent periodic flow control (SendMoreExtended 40/100KB) to {}",
+                            "Sent periodic SendMoreExtended to {}",
                             peer_id
                         );
                     }
@@ -692,7 +640,6 @@ impl OverlayManager {
                         .unwrap_or_default()
                         .as_nanos();
                     let ping_hash = {
-                        use sha2::Digest;
                         let mut hasher = sha2::Sha256::new();
                         hasher.update(now_nanos.to_le_bytes());
                         let result = hasher.finalize();
@@ -786,7 +733,7 @@ impl OverlayManager {
                 continue;
             }
 
-            let message_size = message_len(&message);
+            let message_size = msg_body_size(&message);
             if helpers::is_flood_message(&message) {
                 let hash = compute_message_hash(&message);
                 let unique = flood_gate.record_seen(hash, Some(peer_id.clone()));
@@ -899,15 +846,15 @@ impl OverlayManager {
 
             // Flow control: send SendMoreExtended after receiving a batch of messages
             messages_since_send_more += 1;
-            if messages_since_send_more >= SEND_MORE_THRESHOLD {
+            if messages_since_send_more >= SEND_MORE_BATCH_SIZE {
                 let mut peer_lock = peer.lock().await;
                 if peer_lock.is_connected() {
                     // Send batch capacity matching stellar-core FLOW_CONTROL_SEND_MORE_BATCH_SIZE
-                    if let Err(e) = peer_lock.send_more_extended(40, 100_000).await {
+                    if let Err(e) = peer_lock.send_more_extended(SEND_MORE_BATCH_SIZE, SEND_MORE_BYTE_BATCH).await {
                         debug!("Failed to send flow control to {}: {}", peer_id, e);
                     } else {
                         trace!(
-                            "Sent batch flow control (SendMoreExtended 40/100KB) to {}",
+                            "Sent batch SendMoreExtended to {}",
                             peer_id
                         );
                     }
@@ -941,23 +888,8 @@ impl OverlayManager {
             addr,
             self.local_node.clone(),
             timeout,
-            Arc::clone(&self.peers),
             Arc::clone(&self.outbound_pool),
-            self.message_tx.clone(),
-            self.scp_message_tx.clone(),
-            self.fetch_response_tx.clone(),
-            Arc::clone(&self.flood_gate),
-            Arc::clone(&self.running),
-            self.config.is_validator,
-            Arc::clone(&self.peer_handles),
-            Arc::clone(&self.advertised_outbound_peers),
-            Arc::clone(&self.advertised_inbound_peers),
-            Arc::clone(&self.added_authenticated_peers),
-            Arc::clone(&self.dropped_authenticated_peers),
-            Arc::clone(&self.banned_peers),
-            self.config.peer_event_tx.clone(),
-            Arc::clone(&self.peer_info_cache),
-            Arc::clone(&self.extra_subscribers),
+            self.shared_state(),
         )
         .await
     }
@@ -1101,34 +1033,18 @@ impl OverlayManager {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn connect_outbound_inner(
         addr: &PeerAddress,
         local_node: LocalNode,
         timeout_secs: u64,
-        peers: Arc<DashMap<PeerId, Arc<TokioMutex<Peer>>>>,
         pool: Arc<ConnectionPool>,
-        message_tx: broadcast::Sender<OverlayMessage>,
-        scp_message_tx: mpsc::UnboundedSender<OverlayMessage>,
-        fetch_response_tx: mpsc::UnboundedSender<OverlayMessage>,
-        flood_gate: Arc<FloodGate>,
-        running: Arc<AtomicBool>,
-        is_validator: bool,
-        peer_handles: Arc<RwLock<Vec<JoinHandle<()>>>>,
-        _advertised_outbound_peers: Arc<RwLock<Vec<PeerAddress>>>,
-        _advertised_inbound_peers: Arc<RwLock<Vec<PeerAddress>>>,
-        added_authenticated_peers: Arc<std::sync::atomic::AtomicU64>,
-        dropped_authenticated_peers: Arc<std::sync::atomic::AtomicU64>,
-        banned_peers: Arc<RwLock<HashSet<PeerId>>>,
-        peer_event_tx: Option<mpsc::Sender<PeerEvent>>,
-        peer_info_cache: Arc<DashMap<PeerId, PeerInfo>>,
-        extra_subscribers: Arc<RwLock<Vec<mpsc::UnboundedSender<OverlayMessage>>>>,
+        shared: SharedPeerState,
     ) -> Result<PeerId> {
         let peer = match Peer::connect(addr, local_node, timeout_secs).await {
             Ok(peer) => peer,
             Err(e) => {
                 pool.release();
-                if let Some(tx) = peer_event_tx {
+                if let Some(tx) = shared.peer_event_tx.clone() {
                     let _ = tx
                         .send(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
                         .await;
@@ -1138,12 +1054,12 @@ impl OverlayManager {
         };
 
         let peer_id = peer.id().clone();
-        if banned_peers.read().contains(&peer_id) {
+        if shared.banned_peers.read().contains(&peer_id) {
             pool.release();
             return Err(OverlayError::PeerBanned(peer_id.to_string()));
         }
 
-        if peers.contains_key(&peer_id) {
+        if shared.peers.contains_key(&peer_id) {
             pool.release();
             return Err(OverlayError::AlreadyConnected);
         }
@@ -1152,10 +1068,10 @@ impl OverlayManager {
 
         let peer_info = peer.info().clone();
         let peer = Arc::new(TokioMutex::new(peer));
-        peers.insert(peer_id.clone(), Arc::clone(&peer));
-        peer_info_cache.insert(peer_id.clone(), peer_info);
-        added_authenticated_peers.fetch_add(1, Ordering::Relaxed);
-        if let Some(tx) = peer_event_tx {
+        shared.peers.insert(peer_id.clone(), Arc::clone(&peer));
+        shared.peer_info_cache.insert(peer_id.clone(), peer_info);
+        shared.added_authenticated_peers.fetch_add(1, Ordering::Relaxed);
+        if let Some(tx) = shared.peer_event_tx.clone() {
             let _ = tx
                 .send(PeerEvent::Connected(addr.clone(), PeerType::Outbound))
                 .await;
@@ -1167,23 +1083,17 @@ impl OverlayManager {
         // drop us silently (Peer.cpp:1225-1230).
 
         let peer_id_clone = peer_id.clone();
-        let peers_clone = Arc::clone(&peers);
+        let shared_clone = shared.clone();
         let pool_clone = Arc::clone(&pool);
-        let message_tx = message_tx.clone();
-        let flood_gate = Arc::clone(&flood_gate);
-        let running = Arc::clone(&running);
-        let peer_info_cache_clone = Arc::clone(&peer_info_cache);
-
-        let extra_subscribers_clone = extra_subscribers;
         let handle = tokio::spawn(async move {
-            Self::run_peer_loop(peer_id_clone.clone(), peer, message_tx, scp_message_tx, fetch_response_tx, flood_gate, running, is_validator, extra_subscribers_clone).await;
-            peers_clone.remove(&peer_id_clone);
-            peer_info_cache_clone.remove(&peer_id_clone);
-            dropped_authenticated_peers.fetch_add(1, Ordering::Relaxed);
+            Self::run_peer_loop(peer_id_clone.clone(), peer, shared_clone.clone()).await;
+            shared_clone.peers.remove(&peer_id_clone);
+            shared_clone.peer_info_cache.remove(&peer_id_clone);
+            shared_clone.dropped_authenticated_peers.fetch_add(1, Ordering::Relaxed);
             pool_clone.release();
         });
 
-        peer_handles.write().push(handle);
+        shared.peer_handles.write().push(handle);
 
         Ok(peer_id)
     }
@@ -1506,15 +1416,6 @@ impl OverlayManager {
         self.connected_peers()
     }
 
-    /// Request peers from all connected peers.
-    /// Note: GetPeers was removed in Protocol 24. Peers are now pushed via the Peers message.
-    pub async fn request_peers(&self) -> Result<usize> {
-        // In the current protocol, peers are advertised via Peers messages
-        // There is no explicit request mechanism
-        warn!("request_peers called but GetPeers is no longer supported");
-        Ok(0)
-    }
-
     /// Add a peer to connect to.
     ///
     /// This is used for peer discovery when we receive a Peers message.
@@ -1544,33 +1445,22 @@ impl OverlayManager {
         }
 
         // Spawn connection task
-        let peers = Arc::clone(&self.peers);
+        let shared = self.shared_state();
         let local_node = self.local_node.clone();
         let pool = Arc::clone(&self.outbound_pool);
-        let message_tx = self.message_tx.clone();
-        let scp_message_tx = self.scp_message_tx.clone();
-        let fetch_response_tx = self.fetch_response_tx.clone();
-        let flood_gate = Arc::clone(&self.flood_gate);
-        let running = Arc::clone(&self.running);
-        let is_validator = self.config.is_validator;
-        let extra_subscribers = Arc::clone(&self.extra_subscribers);
         let connect_timeout = self
             .config
             .connect_timeout_secs
             .max(self.config.auth_timeout_secs);
-        let peer_handles = Arc::clone(&self.peer_handles);
-        let _advertised_outbound_peers = Arc::clone(&self.advertised_outbound_peers);
-        let _advertised_inbound_peers = Arc::clone(&self.advertised_inbound_peers);
-        let peer_event_tx = self.config.peer_event_tx.clone();
-        let peer_info_cache = Arc::clone(&self.peer_info_cache);
 
+        let peer_handles = Arc::clone(&shared.peer_handles);
         let peer_handle = tokio::spawn(async move {
             match Peer::connect(&addr, local_node, connect_timeout).await {
                 Ok(peer) => {
                     let peer_id = peer.id().clone();
                     info!("Connected to discovered peer: {} at {}", peer_id, addr);
 
-                    if let Some(tx) = peer_event_tx.clone() {
+                    if let Some(tx) = shared.peer_event_tx.clone() {
                         let _ = tx
                             .send(PeerEvent::Connected(addr.clone(), PeerType::Outbound))
                             .await;
@@ -1578,23 +1468,23 @@ impl OverlayManager {
 
                     let peer_info = peer.info().clone();
                     let peer = Arc::new(TokioMutex::new(peer));
-                    peers.insert(peer_id.clone(), Arc::clone(&peer));
-                    peer_info_cache.insert(peer_id.clone(), peer_info);
+                    shared.peers.insert(peer_id.clone(), Arc::clone(&peer));
+                    shared.peer_info_cache.insert(peer_id.clone(), peer_info);
 
                     // NOTE: Do NOT send PEERS to outbound peers — see Peer.cpp:1225-1230.
 
                     // Run peer loop
-                    Self::run_peer_loop(peer_id.clone(), peer, message_tx, scp_message_tx, fetch_response_tx, flood_gate, running, is_validator, extra_subscribers)
+                    Self::run_peer_loop(peer_id.clone(), peer, shared.clone())
                         .await;
 
                     // Cleanup
-                    peers.remove(&peer_id);
-                    peer_info_cache.remove(&peer_id);
+                    shared.peers.remove(&peer_id);
+                    shared.peer_info_cache.remove(&peer_id);
                     pool.release();
                 }
                 Err(e) => {
                     debug!("Failed to connect to discovered peer {}: {}", addr, e);
-                    if let Some(tx) = peer_event_tx.clone() {
+                    if let Some(tx) = shared.peer_event_tx.clone() {
                         let _ = tx
                             .send(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
                             .await;

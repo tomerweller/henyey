@@ -219,8 +219,8 @@ fn network_enjoys_quorum_intersection(qmap: &HashMap<NodeId, ScpQuorumSet>) -> b
 /// network (i.e., the node would be stuck and unable to reach consensus).
 pub fn check_quorum_intersection_from_json(path: &Path) -> anyhow::Result<bool> {
     let qmap = load_quorum_map(path)?;
+    let nodes: HashSet<NodeId> = qmap.keys().cloned().collect();
     for (node, qset) in &qmap {
-        let nodes: HashSet<NodeId> = qmap.keys().cloned().collect();
         if !is_quorum_slice(qset, &nodes, &|id| qmap.get(id).cloned()) {
             anyhow::bail!(
                 "quorum set for {} has no slice in network",

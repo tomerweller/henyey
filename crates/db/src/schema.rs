@@ -21,12 +21,6 @@
 //! The schema version is tracked in the `storestate` table and managed by
 //! the [`migrations`](crate::migrations) module.
 
-/// Schema version constant.
-///
-/// Note: This is the initial schema version. The current version is tracked
-/// by [`CURRENT_VERSION`](crate::migrations::CURRENT_VERSION) in the migrations module.
-pub const SCHEMA_VERSION: i32 = 3;
-
 /// Complete SQL schema for initializing a fresh database.
 ///
 /// This creates all tables and indexes needed for stellar-core operation.

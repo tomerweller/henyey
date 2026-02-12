@@ -98,12 +98,7 @@ pub fn is_string_valid(s: &str) -> bool {
 /// assert!(!iequals("foo", "bar"));
 /// ```
 pub fn iequals(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.chars()
-        .zip(b.chars())
-        .all(|(ca, cb)| to_ascii_lower(ca) == to_ascii_lower(cb))
+    a.eq_ignore_ascii_case(b)
 }
 
 // ============================================================================
@@ -205,10 +200,9 @@ fn is_asset_code4_valid(code: &AssetCode4) -> bool {
         } else if zeros {
             // zeros can only be trailing
             return false;
+        } else if b > 0x7f || !is_ascii_alphanumeric(b as char) {
+            return false;
         } else {
-            if b > 0x7f || !is_ascii_alphanumeric(b as char) {
-                return false;
-            }
             one_char = true;
         }
     }
@@ -231,10 +225,9 @@ fn is_asset_code12_valid(code: &AssetCode12) -> bool {
         } else if zeros {
             // zeros can only be trailing
             return false;
+        } else if b > 0x7f || !is_ascii_alphanumeric(b as char) {
+            return false;
         } else {
-            if b > 0x7f || !is_ascii_alphanumeric(b as char) {
-                return false;
-            }
             char_count += 1;
         }
     }
@@ -309,16 +302,7 @@ pub fn is_change_trust_asset_valid(asset: &ChangeTrustAsset, ledger_version: u32
 /// assert!(compare_asset(&native1, &native2));
 /// ```
 pub fn compare_asset(first: &Asset, second: &Asset) -> bool {
-    match (first, second) {
-        (Asset::Native, Asset::Native) => true,
-        (Asset::CreditAlphanum4(a), Asset::CreditAlphanum4(b)) => {
-            a.issuer == b.issuer && a.asset_code == b.asset_code
-        }
-        (Asset::CreditAlphanum12(a), Asset::CreditAlphanum12(b)) => {
-            a.issuer == b.issuer && a.asset_code == b.asset_code
-        }
-        _ => false,
-    }
+    first == second
 }
 
 // ============================================================================
@@ -373,20 +357,12 @@ pub fn get_trustline_asset_issuer(asset: &TrustLineAsset) -> Result<&AccountId, 
 ///
 /// Returns false for native assets.
 pub fn is_issuer(acc: &AccountId, asset: &Asset) -> bool {
-    match asset {
-        Asset::CreditAlphanum4(alpha4) => acc == &alpha4.issuer,
-        Asset::CreditAlphanum12(alpha12) => acc == &alpha12.issuer,
-        Asset::Native => false,
-    }
+    get_issuer(asset).is_ok_and(|issuer| issuer == acc)
 }
 
 /// Check if an account is the issuer of a TrustLineAsset.
 pub fn is_trustline_asset_issuer(acc: &AccountId, asset: &TrustLineAsset) -> bool {
-    match asset {
-        TrustLineAsset::CreditAlphanum4(alpha4) => acc == &alpha4.issuer,
-        TrustLineAsset::CreditAlphanum12(alpha12) => acc == &alpha12.issuer,
-        TrustLineAsset::Native | TrustLineAsset::PoolShare(_) => false,
-    }
+    get_trustline_asset_issuer(asset).is_ok_and(|issuer| issuer == acc)
 }
 
 // ============================================================================
@@ -583,11 +559,7 @@ where
 /// assert_eq!(unsigned_to_signed_32(2_147_483_648), None); // i32::MAX + 1
 /// ```
 pub fn unsigned_to_signed_32(v: u32) -> Option<i32> {
-    if v > i32::MAX as u32 {
-        None
-    } else {
-        Some(v as i32)
-    }
+    i32::try_from(v).ok()
 }
 
 /// Convert an unsigned 64-bit integer to signed, checking for overflow.
@@ -606,11 +578,7 @@ pub fn unsigned_to_signed_32(v: u32) -> Option<i32> {
 /// assert_eq!(unsigned_to_signed_64(9_223_372_036_854_775_808), None); // i64::MAX + 1
 /// ```
 pub fn unsigned_to_signed_64(v: u64) -> Option<i64> {
-    if v > i64::MAX as u64 {
-        None
-    } else {
-        Some(v as i64)
-    }
+    i64::try_from(v).ok()
 }
 
 /// Format a byte size with appropriate units.
@@ -677,7 +645,7 @@ pub fn price_gt(a: &Price, b: &Price) -> bool {
 
 /// Compare two prices for equality.
 pub fn price_eq(a: &Price, b: &Price) -> bool {
-    a.n == b.n && a.d == b.d
+    a == b
 }
 
 // ============================================================================
@@ -708,15 +676,7 @@ impl std::ops::BitXor for Hash256 {
 ///
 /// Returns true if `(l ^ x) < (r ^ x)` in lexicographic order.
 pub fn less_than_xored(l: &Hash256, r: &Hash256, x: &Hash256) -> bool {
-    let mut v1 = [0u8; 32];
-    let mut v2 = [0u8; 32];
-
-    for i in 0..32 {
-        v1[i] = x.0[i] ^ l.0[i];
-        v2[i] = x.0[i] ^ r.0[i];
-    }
-
-    v1 < v2
+    (*l ^ *x).0 < (*r ^ *x).0
 }
 
 #[cfg(test)]

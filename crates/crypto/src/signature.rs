@@ -110,7 +110,7 @@ impl SignedMessage {
 /// Stellar to help identify signers without including the full public key.
 pub fn signature_hint(public_key: &PublicKey) -> [u8; 4] {
     let key_bytes = public_key.as_bytes();
-    [key_bytes[28], key_bytes[29], key_bytes[30], key_bytes[31]]
+    key_bytes[28..32].try_into().expect("slice is exactly 4 bytes")
 }
 
 /// Signs a hash value.

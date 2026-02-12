@@ -1264,13 +1264,12 @@ fn build_scp_history_entries(
 
         let mut qset_hashes = HashSet::new();
         for envelope in &envelopes {
-            if let Some(hash) = scp_quorum_set_hash(&envelope.statement) {
-                qset_hashes.insert(Hash256::from_bytes(hash.0));
-            }
+            let hash = scp_quorum_set_hash(&envelope.statement);
+            qset_hashes.insert(Hash256::from_bytes(hash.0));
         }
 
         let mut qset_hashes = qset_hashes.into_iter().collect::<Vec<_>>();
-        qset_hashes.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        qset_hashes.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
 
         let mut qsets = Vec::new();
         for hash in qset_hashes {
@@ -1311,7 +1310,7 @@ fn write_scp_history_file(
     use flate2::Compression;
     use std::io::Write;
     use henyey_history::paths::checkpoint_path;
-    use stellar_xdr::curr::{Limits, WriteXdr};
+    use stellar_xdr::curr::Limits;
 
     let path = base_dir.join(checkpoint_path("scp", checkpoint, "xdr.gz"));
     if let Some(parent) = path.parent() {
@@ -1333,13 +1332,13 @@ fn write_scp_history_file(
 /// Different SCP pledge types store the quorum set hash in different fields.
 fn scp_quorum_set_hash(
     statement: &stellar_xdr::curr::ScpStatement,
-) -> Option<stellar_xdr::curr::Hash> {
+) -> stellar_xdr::curr::Hash {
     match &statement.pledges {
-        stellar_xdr::curr::ScpStatementPledges::Nominate(nom) => Some(nom.quorum_set_hash.clone()),
-        stellar_xdr::curr::ScpStatementPledges::Prepare(prep) => Some(prep.quorum_set_hash.clone()),
-        stellar_xdr::curr::ScpStatementPledges::Confirm(conf) => Some(conf.quorum_set_hash.clone()),
+        stellar_xdr::curr::ScpStatementPledges::Nominate(nom) => nom.quorum_set_hash.clone(),
+        stellar_xdr::curr::ScpStatementPledges::Prepare(prep) => prep.quorum_set_hash.clone(),
+        stellar_xdr::curr::ScpStatementPledges::Confirm(conf) => conf.quorum_set_hash.clone(),
         stellar_xdr::curr::ScpStatementPledges::Externalize(ext) => {
-            Some(ext.commit_quorum_set_hash.clone())
+            ext.commit_quorum_set_hash.clone()
         }
     }
 }
@@ -1373,12 +1372,12 @@ fn upload_publish_directory(
         let rel = file
             .strip_prefix(publish_dir)
             .map_err(|e| anyhow::anyhow!("invalid publish path: {}", e))?;
-        let rel_str = path_to_unix_string(rel)?;
+        let rel_str = path_to_unix_string(rel);
 
         if let Some(ref mkdir_cmd) = target.mkdir {
             if let Some(parent) = rel.parent() {
                 if !parent.as_os_str().is_empty() {
-                    let remote_dir = path_to_unix_string(parent)?;
+                    let remote_dir = path_to_unix_string(parent);
                     if created_dirs.insert(remote_dir.clone()) {
                         let cmd = render_mkdir_command(mkdir_cmd, &remote_dir);
                         run_shell_command(&cmd)?;
@@ -1415,13 +1414,11 @@ fn collect_files(root: &std::path::Path) -> anyhow::Result<Vec<std::path::PathBu
 }
 
 /// Converts a path to a Unix-style string with forward slashes.
-fn path_to_unix_string(path: &std::path::Path) -> anyhow::Result<String> {
-    let mut parts = Vec::new();
-    for component in path.components() {
-        let part = component.as_os_str().to_string_lossy();
-        parts.push(part.to_string());
-    }
-    Ok(parts.join("/"))
+fn path_to_unix_string(path: &std::path::Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Renders a put command template with local and remote paths.
@@ -1461,9 +1458,8 @@ fn run_shell_command(cmd: &str) -> anyhow::Result<()> {
 ///
 /// # Returns
 ///
-/// Returns `Ok(())` if all buckets were downloaded successfully, or an error
+/// Returns `(cached_count, downloaded_count)` on success, or an error
 /// if any download failed.
-/// Returns (cached_count, downloaded_count)
 async fn download_buckets_parallel(
     archive: &henyey_history::HistoryArchive,
     bucket_manager: std::sync::Arc<henyey_bucket::BucketManager>,
@@ -1570,6 +1566,19 @@ async fn download_buckets_parallel(
     Ok((cached_count, download_count))
 }
 
+/// Options for the verify-execution command.
+struct VerifyExecutionOptions {
+    from: Option<u32>,
+    to: Option<u32>,
+    stop_on_error: bool,
+    show_diff: bool,
+    cdp_url: Option<String>,
+    cdp_date: Option<String>,
+    cache_dir: Option<std::path::PathBuf>,
+    no_cache: bool,
+    quiet: bool,
+}
+
 /// Verifies transaction execution by comparing results against CDP metadata.
 ///
 /// This test re-executes transactions using `close_ledger` and compares the
@@ -1585,18 +1594,9 @@ async fn download_buckets_parallel(
 ///    - Transaction result hash
 ///    - Ledger close metadata (if both present)
 /// 4. Reports any mismatches in detail
-#[allow(clippy::too_many_arguments)]
 async fn cmd_verify_execution(
     config: AppConfig,
-    from: Option<u32>,
-    to: Option<u32>,
-    stop_on_error: bool,
-    show_diff: bool,
-    cdp_url: Option<String>,
-    cdp_date: Option<String>,
-    cache_dir: Option<std::path::PathBuf>,
-    no_cache: bool,
-    quiet: bool,
+    opts: VerifyExecutionOptions,
 ) -> anyhow::Result<()> {
     use std::sync::Arc;
     use henyey_bucket::{BucketList, BucketManager, HasNextState, HotArchiveBucketList};
@@ -1608,6 +1608,18 @@ async fn cmd_verify_execution(
     use henyey_history::{checkpoint, HistoryArchive};
     use henyey_ledger::{LedgerManager, LedgerManagerConfig};
 
+    let VerifyExecutionOptions {
+        from,
+        to,
+        stop_on_error,
+        show_diff,
+        cdp_url,
+        cdp_date,
+        cache_dir,
+        no_cache,
+        quiet,
+    } = opts;
+
     let init_start = std::time::Instant::now();
 
     if !quiet {
@@ -1617,11 +1629,11 @@ async fn cmd_verify_execution(
         println!();
     }
 
-    // Determine network ID and network name
-    let (_network_id, network_name, is_mainnet) = if config.network.passphrase.contains("Test") {
-        (henyey_common::NetworkId::testnet(), "testnet", false)
+    // Determine network name
+    let (network_name, is_mainnet) = if config.network.passphrase.contains("Test") {
+        ("testnet", false)
     } else {
-        (henyey_common::NetworkId::mainnet(), "mainnet", true)
+        ("mainnet", true)
     };
 
     // Set network-specific CDP defaults
@@ -1694,29 +1706,24 @@ async fn cmd_verify_execution(
     }
 
     // Create CDP client with caching
-    let _cdp_dir_holder: Box<dyn std::any::Any>;
-    let cdp = if let Some(ref cache) = cache_base {
-        _cdp_dir_holder = Box::new(());
-        CachedCdpDataLake::new(&cdp_url, &cdp_date, cache, network_name)?
+    let (_cdp_dir_holder, cdp) = if let Some(ref cache) = cache_base {
+        let cdp = CachedCdpDataLake::new(&cdp_url, &cdp_date, cache, network_name)?;
+        (None, cdp)
     } else {
         let temp = tempfile::tempdir()?;
         let cdp = CachedCdpDataLake::new(&cdp_url, &cdp_date, temp.path(), network_name)?;
-        _cdp_dir_holder = Box::new(temp);
-        cdp
+        (Some(temp), cdp)
     };
 
     // Setup bucket manager
-    let _bucket_dir_holder: Box<dyn std::any::Any>;
-    let bucket_path = if let Some(ref cache) = cache_base {
+    let (_bucket_dir_holder, bucket_path) = if let Some(ref cache) = cache_base {
         let path = cache.join("buckets").join(network_name);
         std::fs::create_dir_all(&path)?;
-        _bucket_dir_holder = Box::new(());
-        path
+        (None, path)
     } else {
         let temp = tempfile::tempdir()?;
         let path = temp.path().to_path_buf();
-        _bucket_dir_holder = Box::new(temp);
-        path
+        (Some(temp), path)
     };
     let bucket_manager = Arc::new(BucketManager::new(bucket_path.clone())?);
 
@@ -1970,15 +1977,9 @@ async fn cmd_verify_execution(
                 let our_tx_result_hash = result.tx_result_hash();
                 let tx_result_matches = our_tx_result_hash == expected_tx_result_hash;
 
-                // Compare meta (only if both present)
-                let meta_matches = match (&result.meta, true) {
-                    (Some(_our_meta), true) => {
-                        // For now, consider meta matching if tx results match
-                        // Full meta comparison would be more complex
-                        tx_result_matches
-                    }
-                    _ => true, // Tolerate missing meta on either side
-                };
+                // Compare meta: if present, consider it matching when tx results match.
+                // Full meta comparison would be more complex.
+                let meta_matches = result.meta.is_none() || tx_result_matches;
 
                 let all_match = header_matches && tx_result_matches && meta_matches;
 
@@ -2710,14 +2711,12 @@ async fn cmd_debug_bucket_entry(
     Ok(())
 }
 
-
 /// Sample config command handler.
 fn cmd_sample_config() -> anyhow::Result<()> {
     let sample = AppConfig::sample_config();
     println!("{}", sample);
     Ok(())
 }
-
 
 /// Offline commands handler.
 async fn cmd_offline(cmd: OfflineCommands, config: AppConfig) -> anyhow::Result<()> {
@@ -2739,15 +2738,17 @@ async fn cmd_offline(cmd: OfflineCommands, config: AppConfig) -> anyhow::Result<
         } => {
             cmd_verify_execution(
                 config,
-                from,
-                to,
-                stop_on_error,
-                show_diff,
-                cdp_url,
-                cdp_date,
-                cache_dir,
-                no_cache,
-                quiet,
+                VerifyExecutionOptions {
+                    from,
+                    to,
+                    stop_on_error,
+                    show_diff,
+                    cdp_url,
+                    cdp_date,
+                    cache_dir,
+                    no_cache,
+                    quiet,
+                },
             )
             .await
         }
@@ -2954,7 +2955,7 @@ fn decode_xdr(type_name: &str, value: &str) -> anyhow::Result<()> {
 /// AccountId, MuxedAccount, Asset, Hash, Uint256
 fn encode_xdr(type_name: &str, value: &str) -> anyhow::Result<()> {
     use base64::{engine::general_purpose::STANDARD, Engine};
-    use stellar_xdr::curr::{Limits, WriteXdr};
+    use stellar_xdr::curr::Limits;
 
     // Parse JSON and encode to XDR based on type
     match type_name.to_lowercase().as_str() {
@@ -3062,7 +3063,7 @@ fn encode_xdr(type_name: &str, value: &str) -> anyhow::Result<()> {
 ///
 /// If given a directory, lists all bucket files with their sizes.
 /// If given a single file, prints its metadata.
-fn bucket_info(path: &PathBuf) -> anyhow::Result<()> {
+fn bucket_info(path: &std::path::Path) -> anyhow::Result<()> {
     if !path.exists() {
         anyhow::bail!("Bucket path does not exist: {}", path.display());
     }

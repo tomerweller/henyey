@@ -108,6 +108,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+/// Capacity of the internal channel used for work completion notifications.
+const COMPLETION_CHANNEL_CAPACITY: usize = 128;
+
 /// Unique identifier for a work item within a scheduler.
 ///
 /// Work IDs are assigned sequentially starting from 1 when work items are
@@ -695,15 +698,21 @@ impl WorkScheduler {
         self.next_id += 1;
 
         let name = work.name().to_string();
+        debug!(work_id = id, name = %name, "registered work item");
+
+        for &dep in &deps {
+            self.dependents.entry(dep).or_default().push(id);
+        }
+
         let entry = WorkEntry {
-            name: name.clone(),
-            deps: deps.clone(),
+            name,
+            deps,
             retries_left: retries,
             attempts: 0,
             last_error: None,
             started_at: None,
             last_duration: None,
-            total_duration: Duration::from_secs(0),
+            total_duration: Duration::ZERO,
             cancel_token: CancellationToken::new(),
             work,
         };
@@ -711,11 +720,6 @@ impl WorkScheduler {
         self.entries.insert(id, entry);
         self.states.insert(id, WorkState::Pending);
 
-        for dep in deps {
-            self.dependents.entry(dep).or_default().push(id);
-        }
-
-        debug!(work_id = id, name = %name, "registered work item");
         id
     }
 
@@ -749,19 +753,14 @@ impl WorkScheduler {
         let Some(state) = self.states.get(&id).copied() else {
             return false;
         };
-        match state {
-            WorkState::Success | WorkState::Failed | WorkState::Blocked | WorkState::Cancelled => {
-                return false;
-            }
-            WorkState::Pending | WorkState::Running => {}
+        if state.is_terminal() {
+            return false;
         }
 
         if let Some(entry) = self.entries.get_mut(&id) {
             entry.cancel_token.cancel();
             let attempts = entry.attempts;
-            self.states.insert(id, WorkState::Cancelled);
-            self.emit_event(id, WorkState::Cancelled, attempts);
-            self.block_dependents(id);
+            self.fail_or_cancel(id, WorkState::Cancelled, attempts);
             return true;
         }
         false
@@ -826,8 +825,8 @@ impl WorkScheduler {
                 WorkState::Blocked => metrics.blocked += 1,
                 WorkState::Cancelled => metrics.cancelled += 1,
             }
-            metrics.attempts += entry.attempts as u64;
-            metrics.retries_left += entry.retries_left as u64;
+            metrics.attempts += u64::from(entry.attempts);
+            metrics.retries_left += u64::from(entry.retries_left);
         }
         metrics
     }
@@ -866,7 +865,7 @@ impl WorkScheduler {
     /// - Wait for running work items to complete (they should check for cancellation).
     /// - Return once all work has stopped.
     pub async fn run_until_done_with_cancel(&mut self, cancel: CancellationToken) {
-        let (tx, mut rx) = mpsc::channel::<WorkCompletion>(128);
+        let (tx, mut rx) = mpsc::channel::<WorkCompletion>(COMPLETION_CHANNEL_CAPACITY);
         let mut running: HashSet<WorkId> = HashSet::new();
         let mut queue = self.ready_queue();
         let mut queued: HashSet<WorkId> = queue.iter().copied().collect();
@@ -895,9 +894,7 @@ impl WorkScheduler {
                 };
                 if entry.cancel_token.is_cancelled() {
                     let attempts = entry.attempts;
-                    self.states.insert(id, WorkState::Cancelled);
-                    self.emit_event(id, WorkState::Cancelled, attempts);
-                    self.block_dependents(id);
+                    self.fail_or_cancel(id, WorkState::Cancelled, attempts);
                     continue;
                 }
                 entry.attempts += 1;
@@ -958,105 +955,89 @@ impl WorkScheduler {
 
             match completion.outcome {
                 WorkOutcome::Cancelled => {
-                    self.states.insert(completion.id, WorkState::Cancelled);
-                    self.emit_event(completion.id, WorkState::Cancelled, completion.attempt);
-                    self.block_dependents(completion.id);
-                    if let Some(entry) = self.entries.get_mut(&completion.id) {
-                        if let Some(work) = completion.work {
-                            entry.work = work;
-                        }
-                        if let Some(started_at) = entry.started_at.take() {
-                            let elapsed = started_at.elapsed();
-                            entry.last_duration = Some(elapsed);
-                            entry.total_duration += elapsed;
-                        }
-                    }
+                    self.fail_or_cancel(
+                        completion.id,
+                        WorkState::Cancelled,
+                        completion.attempt,
+                    );
+                    self.finalize_entry(completion.id, completion.work);
                 }
                 WorkOutcome::Success => {
                     if cancelled {
-                        self.states.insert(completion.id, WorkState::Cancelled);
-                        self.emit_event(completion.id, WorkState::Cancelled, completion.attempt);
-                        self.block_dependents(completion.id);
+                        self.fail_or_cancel(
+                            completion.id,
+                            WorkState::Cancelled,
+                            completion.attempt,
+                        );
                     } else {
                         self.states.insert(completion.id, WorkState::Success);
                         self.emit_event(completion.id, WorkState::Success, completion.attempt);
                     }
-                    if let Some(entry) = self.entries.get_mut(&completion.id) {
-                        if let Some(work) = completion.work {
-                            entry.work = work;
-                        }
-                        if let Some(started_at) = entry.started_at.take() {
-                            let elapsed = started_at.elapsed();
-                            entry.last_duration = Some(elapsed);
-                            entry.total_duration += elapsed;
-                        }
-                    }
+                    self.finalize_entry(completion.id, completion.work);
                     self.enqueue_ready(&mut queue, &mut queued, &running);
                 }
                 WorkOutcome::Retry { delay } => {
                     if cancelled {
-                        self.states.insert(completion.id, WorkState::Cancelled);
-                        self.emit_event(completion.id, WorkState::Cancelled, completion.attempt);
-                        self.block_dependents(completion.id);
+                        self.fail_or_cancel(
+                            completion.id,
+                            WorkState::Cancelled,
+                            completion.attempt,
+                        );
                         continue;
                     }
-                    let retry_delay = if delay == Duration::from_secs(0) {
+                    let no_retries = self
+                        .entries
+                        .get(&completion.id)
+                        .is_some_and(|e| e.retries_left == 0);
+                    if no_retries {
+                        self.finalize_entry(completion.id, completion.work);
+                        self.fail_or_cancel(
+                            completion.id,
+                            WorkState::Failed,
+                            completion.attempt,
+                        );
+                        continue;
+                    }
+                    if let Some(entry) = self.entries.get_mut(&completion.id) {
+                        entry.retries_left -= 1;
+                    }
+                    self.finalize_entry(completion.id, completion.work);
+                    let retry_delay = if delay == Duration::ZERO {
                         self.config.retry_delay
                     } else {
                         delay
                     };
-
-                    if let Some(entry) = self.entries.get_mut(&completion.id) {
-                        if entry.retries_left == 0 {
-                            self.states.insert(completion.id, WorkState::Failed);
-                            self.emit_event(completion.id, WorkState::Failed, completion.attempt);
-                            self.block_dependents(completion.id);
-                            continue;
-                        }
-                        entry.retries_left -= 1;
-                        if let Some(work) = completion.work {
-                            entry.work = work;
-                        }
-                        if let Some(started_at) = entry.started_at.take() {
-                            let elapsed = started_at.elapsed();
-                            entry.last_duration = Some(elapsed);
-                            entry.total_duration += elapsed;
-                        }
-                        self.emit_event(completion.id, WorkState::Pending, completion.attempt);
-                        let (wake_tx, wake_rx) = oneshot::channel::<WorkId>();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(retry_delay).await;
-                            let _ = wake_tx.send(completion.id);
-                        });
-                        if let Ok(id) = wake_rx.await {
-                            if queued.insert(id) {
-                                queue.push_back(id);
-                            }
+                    self.emit_event(completion.id, WorkState::Pending, completion.attempt);
+                    let (wake_tx, wake_rx) = oneshot::channel::<WorkId>();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(retry_delay).await;
+                        let _ = wake_tx.send(completion.id);
+                    });
+                    if let Ok(id) = wake_rx.await {
+                        if queued.insert(id) {
+                            queue.push_back(id);
                         }
                     }
                 }
                 WorkOutcome::Failed(err) => {
                     if cancelled {
-                        self.states.insert(completion.id, WorkState::Cancelled);
-                        self.emit_event(completion.id, WorkState::Cancelled, completion.attempt);
-                        self.block_dependents(completion.id);
+                        self.fail_or_cancel(
+                            completion.id,
+                            WorkState::Cancelled,
+                            completion.attempt,
+                        );
                         continue;
                     }
                     warn!(work_id = completion.id, error = %err, "work failed");
-                    self.states.insert(completion.id, WorkState::Failed);
-                    self.emit_event(completion.id, WorkState::Failed, completion.attempt);
-                    self.block_dependents(completion.id);
                     if let Some(entry) = self.entries.get_mut(&completion.id) {
                         entry.last_error = Some(err);
-                        if let Some(work) = completion.work {
-                            entry.work = work;
-                        }
-                        if let Some(started_at) = entry.started_at.take() {
-                            let elapsed = started_at.elapsed();
-                            entry.last_duration = Some(elapsed);
-                            entry.total_duration += elapsed;
-                        }
                     }
+                    self.finalize_entry(completion.id, completion.work);
+                    self.fail_or_cancel(
+                        completion.id,
+                        WorkState::Failed,
+                        completion.attempt,
+                    );
                 }
             }
         }
@@ -1125,6 +1106,32 @@ impl WorkScheduler {
                     self.states.insert(child, WorkState::Blocked);
                     self.emit_event(child, WorkState::Blocked, 0);
                 }
+            }
+        }
+    }
+
+    /// Transitions a work item to a non-success terminal state, emits the
+    /// event, and blocks its dependents.
+    fn fail_or_cancel(&mut self, id: WorkId, state: WorkState, attempt: u32) {
+        self.states.insert(id, state);
+        self.emit_event(id, state, attempt);
+        self.block_dependents(id);
+    }
+
+    /// Restores a work item after execution and records timing.
+    ///
+    /// Called after a spawned work task completes, regardless of outcome.
+    /// Moves the work implementation back into the entry (replacing the
+    /// placeholder) and records the elapsed execution time.
+    fn finalize_entry(&mut self, id: WorkId, work: Option<Box<dyn Work + Send>>) {
+        if let Some(entry) = self.entries.get_mut(&id) {
+            if let Some(work) = work {
+                entry.work = work;
+            }
+            if let Some(started_at) = entry.started_at.take() {
+                let elapsed = started_at.elapsed();
+                entry.last_duration = Some(elapsed);
+                entry.total_duration += elapsed;
             }
         }
     }
@@ -1248,9 +1255,6 @@ impl Work for EmptyWork {
 /// ```
 #[derive(Default)]
 pub struct WorkSequence {
-    /// The most recently added work item, used as the dependency for the next.
-    last: Option<WorkId>,
-
     /// All work IDs added to this sequence, in order of addition.
     ids: Vec<WorkId>,
 }
@@ -1281,9 +1285,8 @@ impl WorkSequence {
         work: Box<dyn Work + Send>,
         retries: u32,
     ) -> WorkId {
-        let deps = self.last.into_iter().collect();
+        let deps = self.ids.last().copied().into_iter().collect();
         let id = scheduler.add_work(work, deps, retries);
-        self.last = Some(id);
         self.ids.push(id);
         id
     }

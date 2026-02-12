@@ -80,12 +80,9 @@ pub fn bin_to_hex(data: &[u8]) -> String {
 /// assert_eq!(hex_abbrev(&[]), "");
 /// ```
 pub fn hex_abbrev(data: &[u8]) -> String {
-    let full_hex = bin_to_hex(data);
-    if full_hex.len() <= 6 {
-        full_hex
-    } else {
-        full_hex[..6].to_string()
-    }
+    // Only encode up to 3 bytes (producing up to 6 hex characters)
+    let prefix_len = data.len().min(3);
+    bin_to_hex(&data[..prefix_len])
 }
 
 /// Decode a hex string to bytes.
@@ -139,15 +136,12 @@ pub fn hex_to_bin(hex_str: &str) -> Result<Vec<u8>, CryptoError> {
 /// ```
 pub fn hex_to_bin_256(hex_str: &str) -> Result<[u8; 32], CryptoError> {
     let bytes = hex_to_bin(hex_str)?;
-    if bytes.len() != 32 {
-        return Err(CryptoError::InvalidLength {
+    bytes
+        .try_into()
+        .map_err(|v: Vec<u8>| CryptoError::InvalidLength {
             expected: 32,
-            got: bytes.len(),
-        });
-    }
-    let mut result = [0u8; 32];
-    result.copy_from_slice(&bytes);
-    Ok(result)
+            got: v.len(),
+        })
 }
 
 /// Decode a hex string to a `Hash256`.

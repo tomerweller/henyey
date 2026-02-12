@@ -8,8 +8,8 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use super::super::error::DbError;
-use super::super::schema::state_keys;
+use crate::error::DbError;
+use crate::schema::state_keys;
 
 /// Query trait for the storestate key-value table.
 ///

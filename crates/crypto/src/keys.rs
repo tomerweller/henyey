@@ -32,7 +32,6 @@ use crate::error::CryptoError;
 use crate::strkey;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::fmt;
-// Note: SigningKey from ed25519_dalek handles its own zeroization on drop
 
 /// An Ed25519 public key (verifying key).
 ///
@@ -165,14 +164,9 @@ impl From<&PublicKey> for stellar_xdr::curr::AccountId {
 /// let signature = secret.sign(b"message");
 /// ```
 pub struct SecretKey {
+    // SigningKey implements Zeroize internally when dropped,
+    // ensuring sensitive key material is cleared from memory.
     inner: SigningKey,
-}
-
-impl Drop for SecretKey {
-    fn drop(&mut self) {
-        // SigningKey implements Zeroize internally when dropped,
-        // ensuring sensitive key material is cleared from memory.
-    }
 }
 
 impl SecretKey {

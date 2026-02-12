@@ -378,12 +378,7 @@ impl Work for DownloadBucketsWork {
             return WorkOutcome::Failed("missing HAS".to_string());
         };
 
-        let empty_bucket_hash = Hash256::hash(&[]);
-        let hashes: Vec<_> = has
-            .unique_bucket_hashes()
-            .into_iter()
-            .filter(|h| !h.is_zero() && *h != empty_bucket_hash)
-            .collect();
+        let hashes = content_bucket_hashes(&has);
         let total = hashes.len();
         let archive = self.archive.clone();
         let bucket_dir = self.bucket_dir.clone();
@@ -454,7 +449,7 @@ impl Work for DownloadBucketsWork {
                         }
                     }
                 })
-                .buffer_unordered(16)
+                .buffer_unordered(MAX_CONCURRENT_DOWNLOADS)
                 .collect()
                 .await;
 
@@ -528,22 +523,21 @@ impl Work for DownloadLedgerHeadersWork {
             "downloading headers",
         )
         .await;
-        match self.archive.get_ledger_headers(self.checkpoint).await {
-            Ok(headers) => {
-                let header_chain: Vec<_> =
-                    headers.iter().map(|entry| entry.header.clone()).collect();
-                if let Err(err) = verify::verify_header_chain(&header_chain) {
-                    return WorkOutcome::Failed(format!(
-                        "header chain verification failed: {}",
-                        err
-                    ));
-                }
-                let mut guard = self.state.lock().await;
-                guard.headers = headers;
-                WorkOutcome::Success
+        let headers = match self.archive.get_ledger_headers(self.checkpoint).await {
+            Ok(headers) => headers,
+            Err(err) => {
+                return WorkOutcome::Failed(format!("failed to download headers: {}", err))
             }
-            Err(err) => WorkOutcome::Failed(format!("failed to download headers: {}", err)),
+        };
+
+        let header_chain: Vec<_> = headers.iter().map(|entry| entry.header.clone()).collect();
+        if let Err(err) = verify::verify_header_chain(&header_chain) {
+            return WorkOutcome::Failed(format!("header chain verification failed: {}", err));
         }
+
+        let mut guard = self.state.lock().await;
+        guard.headers = headers;
+        WorkOutcome::Success
     }
 }
 
@@ -601,36 +595,40 @@ impl Work for DownloadTransactionsWork {
             "downloading transactions",
         )
         .await;
-        match self.archive.get_transactions(self.checkpoint).await {
-            Ok(entries) => {
-                let headers = {
-                    let guard = self.state.lock().await;
-                    guard.headers.clone()
-                };
-                for entry in &entries {
-                    if let Some(header) = headers
-                        .iter()
-                        .find(|h| h.header.ledger_seq == entry.ledger_seq)
-                    {
-                        let tx_set = match &entry.ext {
-                            TransactionHistoryEntryExt::V0 => {
-                                TransactionSetVariant::Classic(entry.tx_set.clone())
-                            }
-                            TransactionHistoryEntryExt::V1(set) => {
-                                TransactionSetVariant::Generalized(set.clone())
-                            }
-                        };
-                        if let Err(err) = verify::verify_tx_set(&header.header, &tx_set) {
-                            return WorkOutcome::Failed(format!("tx set hash mismatch: {}", err));
-                        }
-                    }
-                }
-                let mut guard = self.state.lock().await;
-                guard.transactions = entries;
-                WorkOutcome::Success
+        let entries = match self.archive.get_transactions(self.checkpoint).await {
+            Ok(entries) => entries,
+            Err(err) => {
+                return WorkOutcome::Failed(format!("failed to download transactions: {}", err))
             }
-            Err(err) => WorkOutcome::Failed(format!("failed to download transactions: {}", err)),
+        };
+
+        let headers = {
+            let guard = self.state.lock().await;
+            guard.headers.clone()
+        };
+        for entry in &entries {
+            let Some(header) = headers
+                .iter()
+                .find(|h| h.header.ledger_seq == entry.ledger_seq)
+            else {
+                continue;
+            };
+            let tx_set = match &entry.ext {
+                TransactionHistoryEntryExt::V0 => {
+                    TransactionSetVariant::Classic(entry.tx_set.clone())
+                }
+                TransactionHistoryEntryExt::V1(set) => {
+                    TransactionSetVariant::Generalized(set.clone())
+                }
+            };
+            if let Err(err) = verify::verify_tx_set(&header.header, &tx_set) {
+                return WorkOutcome::Failed(format!("tx set hash mismatch: {}", err));
+            }
         }
+
+        let mut guard = self.state.lock().await;
+        guard.transactions = entries;
+        WorkOutcome::Success
     }
 }
 
@@ -696,32 +694,34 @@ impl Work for DownloadTxResultsWork {
             "downloading transaction results",
         )
         .await;
-        match self.archive.get_results(self.checkpoint).await {
-            Ok(results) => {
-                for entry in &results {
-                    if let Some(header) = headers
-                        .iter()
-                        .find(|h| h.header.ledger_seq == entry.ledger_seq)
-                    {
-                        if let Ok(xdr) = entry
-                            .tx_result_set
-                            .to_xdr(stellar_xdr::curr::Limits::none())
-                        {
-                            if let Err(err) = verify::verify_tx_result_set(&header.header, &xdr) {
-                                return WorkOutcome::Failed(format!(
-                                    "tx result set hash mismatch: {}",
-                                    err
-                                ));
-                            }
-                        }
-                    }
-                }
-                let mut guard = self.state.lock().await;
-                guard.tx_results = results;
-                WorkOutcome::Success
+        let results = match self.archive.get_results(self.checkpoint).await {
+            Ok(results) => results,
+            Err(err) => {
+                return WorkOutcome::Failed(format!("failed to download tx results: {}", err))
             }
-            Err(err) => WorkOutcome::Failed(format!("failed to download tx results: {}", err)),
+        };
+
+        for entry in &results {
+            let Some(header) = headers
+                .iter()
+                .find(|h| h.header.ledger_seq == entry.ledger_seq)
+            else {
+                continue;
+            };
+            let Ok(xdr) = entry
+                .tx_result_set
+                .to_xdr(stellar_xdr::curr::Limits::none())
+            else {
+                continue;
+            };
+            if let Err(err) = verify::verify_tx_result_set(&header.header, &xdr) {
+                return WorkOutcome::Failed(format!("tx result set hash mismatch: {}", err));
+            }
         }
+
+        let mut guard = self.state.lock().await;
+        guard.tx_results = results;
+        WorkOutcome::Success
     }
 }
 
@@ -876,8 +876,8 @@ impl ArchiveWriter for LocalArchiveWriter {
 /// History archive files are stored gzip-compressed to reduce bandwidth
 /// and storage requirements.
 fn gzip_bytes(data: &[u8]) -> Result<Vec<u8>> {
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     use std::io::Write;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(data)?;
     Ok(encoder.finish()?)
 }
@@ -893,6 +893,44 @@ fn serialize_entries<T: WriteXdr>(entries: &[T]) -> Result<Vec<u8>> {
         data.extend_from_slice(&xdr);
     }
     Ok(data)
+}
+
+/// Serializes XDR entries, gzip-compresses them, and writes to an archive path.
+///
+/// This is the common publish pipeline used by headers, transactions, results,
+/// and SCP history publish work items: serialize to XDR -> gzip -> write.
+async fn publish_xdr_entries<T: WriteXdr>(
+    writer: &dyn ArchiveWriter,
+    entries: &[T],
+    category: &str,
+    checkpoint: u32,
+    extension: &str,
+) -> Result<(), String> {
+    let data = serialize_entries(entries)
+        .map_err(|err| format!("failed to serialize {}: {}", category, err))?;
+    let gz =
+        gzip_bytes(&data).map_err(|err| format!("failed to gzip {}: {}", category, err))?;
+    let path = checkpoint_path(category, checkpoint, extension);
+    writer
+        .put_bytes(&path, &gz)
+        .await
+        .map_err(|err| format!("failed to publish {}: {}", category, err))
+}
+
+/// Maximum number of concurrent download requests, matching stellar-core's
+/// `MAX_CONCURRENT_SUBPROCESSES` limit.
+const MAX_CONCURRENT_DOWNLOADS: usize = 16;
+
+/// Returns non-empty, non-zero bucket hashes from a History Archive State.
+///
+/// Filters out the zero hash and the hash of the empty bucket, which are
+/// sentinel values that should not be downloaded or published.
+fn content_bucket_hashes(has: &HistoryArchiveState) -> Vec<Hash256> {
+    let empty_bucket_hash = Hash256::hash(&[]);
+    has.unique_bucket_hashes()
+        .into_iter()
+        .filter(|h| !h.is_zero() && *h != empty_bucket_hash)
+        .collect()
 }
 
 /// The well-known directory path for stellar history (RFC 5785).
@@ -1076,23 +1114,12 @@ impl Work for PublishLedgerHeadersWork {
             guard.headers.clone()
         };
 
-        let data = match serialize_entries(&headers) {
-            Ok(data) => data,
-            Err(err) => {
-                return WorkOutcome::Failed(format!("failed to serialize headers: {}", err))
-            }
-        };
-        let gz = match gzip_bytes(&data) {
-            Ok(gz) => gz,
-            Err(err) => return WorkOutcome::Failed(format!("failed to gzip headers: {}", err)),
-        };
-
-        let path = checkpoint_path("ledger", self.checkpoint, "xdr.gz");
-        if let Err(err) = self.writer.put_bytes(&path, &gz).await {
-            return WorkOutcome::Failed(format!("failed to publish headers: {}", err));
+        match publish_xdr_entries(&*self.writer, &headers, "ledger", self.checkpoint, "xdr.gz")
+            .await
+        {
+            Ok(()) => WorkOutcome::Success,
+            Err(err) => WorkOutcome::Failed(err),
         }
-
-        WorkOutcome::Success
     }
 }
 
@@ -1145,25 +1172,18 @@ impl Work for PublishTransactionsWork {
             guard.transactions.clone()
         };
 
-        let data = match serialize_entries(&transactions) {
-            Ok(data) => data,
-            Err(err) => {
-                return WorkOutcome::Failed(format!("failed to serialize transactions: {}", err))
-            }
-        };
-        let gz = match gzip_bytes(&data) {
-            Ok(gz) => gz,
-            Err(err) => {
-                return WorkOutcome::Failed(format!("failed to gzip transactions: {}", err))
-            }
-        };
-
-        let path = checkpoint_path("transactions", self.checkpoint, "xdr.gz");
-        if let Err(err) = self.writer.put_bytes(&path, &gz).await {
-            return WorkOutcome::Failed(format!("failed to publish transactions: {}", err));
+        match publish_xdr_entries(
+            &*self.writer,
+            &transactions,
+            "transactions",
+            self.checkpoint,
+            "xdr.gz",
+        )
+        .await
+        {
+            Ok(()) => WorkOutcome::Success,
+            Err(err) => WorkOutcome::Failed(err),
         }
-
-        WorkOutcome::Success
     }
 }
 
@@ -1248,23 +1268,12 @@ impl Work for PublishResultsWork {
             guard.tx_results.clone()
         };
 
-        let data = match serialize_entries(&results) {
-            Ok(data) => data,
-            Err(err) => {
-                return WorkOutcome::Failed(format!("failed to serialize results: {}", err))
-            }
-        };
-        let gz = match gzip_bytes(&data) {
-            Ok(gz) => gz,
-            Err(err) => return WorkOutcome::Failed(format!("failed to gzip results: {}", err)),
-        };
-
-        let path = checkpoint_path("results", self.checkpoint, "xdr.gz");
-        if let Err(err) = self.writer.put_bytes(&path, &gz).await {
-            return WorkOutcome::Failed(format!("failed to publish results: {}", err));
+        match publish_xdr_entries(&*self.writer, &results, "results", self.checkpoint, "xdr.gz")
+            .await
+        {
+            Ok(()) => WorkOutcome::Success,
+            Err(err) => WorkOutcome::Failed(err),
         }
-
-        WorkOutcome::Success
     }
 }
 
@@ -1290,23 +1299,11 @@ impl Work for PublishScpHistoryWork {
             return WorkOutcome::Failed("SCP history not available".to_string());
         }
 
-        let data = match serialize_entries(&entries) {
-            Ok(data) => data,
-            Err(err) => {
-                return WorkOutcome::Failed(format!("failed to serialize SCP history: {}", err))
-            }
-        };
-        let gz = match gzip_bytes(&data) {
-            Ok(gz) => gz,
-            Err(err) => return WorkOutcome::Failed(format!("failed to gzip SCP history: {}", err)),
-        };
-
-        let path = checkpoint_path("scp", self.checkpoint, "xdr.gz");
-        if let Err(err) = self.writer.put_bytes(&path, &gz).await {
-            return WorkOutcome::Failed(format!("failed to publish SCP history: {}", err));
+        match publish_xdr_entries(&*self.writer, &entries, "scp", self.checkpoint, "xdr.gz").await
+        {
+            Ok(()) => WorkOutcome::Success,
+            Err(err) => WorkOutcome::Failed(err),
         }
-
-        WorkOutcome::Success
     }
 }
 
@@ -1335,12 +1332,7 @@ impl Work for PublishBucketsWork {
             return WorkOutcome::Failed("HAS not available for publish".to_string());
         };
 
-        let empty_bucket_hash = Hash256::hash(&[]);
-        let hashes: Vec<_> = has
-            .unique_bucket_hashes()
-            .into_iter()
-            .filter(|h| !h.is_zero() && *h != empty_bucket_hash)
-            .collect();
+        let hashes = content_bucket_hashes(&has);
 
         for hash in hashes {
             let file_path = bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
@@ -1353,14 +1345,15 @@ impl Work for PublishBucketsWork {
                     ));
                 }
             };
-            match gzip_bytes(&data) {
-                Ok(gz) => {
-                    let path = bucket_path(&hash);
-                    if let Err(err) = self.writer.put_bytes(&path, &gz).await {
-                        return WorkOutcome::Failed(format!("failed to publish bucket: {}", err));
-                    }
+            let gz = match gzip_bytes(&data) {
+                Ok(gz) => gz,
+                Err(err) => {
+                    return WorkOutcome::Failed(format!("failed to gzip bucket: {}", err))
                 }
-                Err(err) => return WorkOutcome::Failed(format!("failed to gzip bucket: {}", err)),
+            };
+            let path = bucket_path(&hash);
+            if let Err(err) = self.writer.put_bytes(&path, &gz).await {
+                return WorkOutcome::Failed(format!("failed to publish bucket: {}", err));
             }
         }
 
@@ -1446,45 +1439,45 @@ impl Work for CheckSingleLedgerHeaderWork {
         }
 
         // Download the checkpoint containing this ledger
-        match self.archive.get_ledger_headers(ledger_seq).await {
-            Ok(headers) => {
-                // Find the header with the matching sequence
-                match headers.iter().find(|h| h.header.ledger_seq == ledger_seq) {
-                    Some(found) => {
-                        // Compare the headers
-                        if found.hash == self.expected.hash && found.header == self.expected.header
-                        {
-                            tracing::debug!(
-                                ledger_seq,
-                                hash = %Hash256::from(found.hash.0),
-                                "Ledger header verified against archive"
-                            );
-                            WorkOutcome::Success
-                        } else {
-                            let expected_hash = Hash256::from(self.expected.hash.0);
-                            let found_hash = Hash256::from(found.hash.0);
-                            tracing::error!(
-                                ledger_seq,
-                                expected_hash = %expected_hash,
-                                found_hash = %found_hash,
-                                "Ledger header mismatch"
-                            );
-                            WorkOutcome::Failed(format!(
-                                "ledger header mismatch at seq {}: expected hash {}, got {}",
-                                ledger_seq, expected_hash, found_hash
-                            ))
-                        }
-                    }
-                    None => WorkOutcome::Failed(format!(
-                        "ledger header {} not found in checkpoint",
-                        ledger_seq
-                    )),
-                }
+        let headers = match self.archive.get_ledger_headers(ledger_seq).await {
+            Ok(headers) => headers,
+            Err(err) => {
+                return WorkOutcome::Failed(format!(
+                    "failed to download headers for ledger {}: {}",
+                    ledger_seq, err
+                ))
             }
-            Err(err) => WorkOutcome::Failed(format!(
-                "failed to download headers for ledger {}: {}",
-                ledger_seq, err
-            )),
+        };
+
+        // Find the header with the matching sequence
+        let Some(found) = headers.iter().find(|h| h.header.ledger_seq == ledger_seq) else {
+            return WorkOutcome::Failed(format!(
+                "ledger header {} not found in checkpoint",
+                ledger_seq
+            ));
+        };
+
+        // Compare the headers
+        if found.hash == self.expected.hash && found.header == self.expected.header {
+            tracing::debug!(
+                ledger_seq,
+                hash = %Hash256::from(found.hash.0),
+                "Ledger header verified against archive"
+            );
+            WorkOutcome::Success
+        } else {
+            let expected_hash = Hash256::from(self.expected.hash.0);
+            let found_hash = Hash256::from(found.hash.0);
+            tracing::error!(
+                ledger_seq,
+                expected_hash = %expected_hash,
+                found_hash = %found_hash,
+                "Ledger header mismatch"
+            );
+            WorkOutcome::Failed(format!(
+                "ledger header mismatch at seq {}: expected hash {}, got {}",
+                ledger_seq, expected_hash, found_hash
+            ))
         }
     }
 }
@@ -1768,86 +1761,6 @@ impl HistoryWorkBuilder {
 // Helper functions for accessing shared state
 // ============================================================================
 
-/// Retrieves the History Archive State from shared state.
-///
-/// # Errors
-///
-/// Returns an error if the HAS has not been downloaded yet.
-pub async fn get_has(state: &SharedHistoryState) -> Result<HistoryArchiveState> {
-    let guard = state.lock().await;
-    guard
-        .has
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("HAS not available"))
-}
-
-/// Retrieves the bucket directory from shared state.
-///
-/// # Errors
-///
-/// Returns an error if the bucket directory has not been set yet.
-pub async fn get_bucket_dir(state: &SharedHistoryState) -> Result<PathBuf> {
-    let guard = state.lock().await;
-    guard
-        .bucket_dir
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("bucket directory not available"))
-}
-
-/// Retrieves downloaded ledger headers from shared state.
-///
-/// # Errors
-///
-/// Returns an error if headers have not been downloaded yet.
-pub async fn get_headers(state: &SharedHistoryState) -> Result<Vec<LedgerHeaderHistoryEntry>> {
-    let guard = state.lock().await;
-    if guard.headers.is_empty() {
-        anyhow::bail!("headers not available");
-    }
-    Ok(guard.headers.clone())
-}
-
-/// Retrieves downloaded transactions from shared state.
-///
-/// # Errors
-///
-/// Returns an error if transactions have not been downloaded yet.
-pub async fn get_transactions(state: &SharedHistoryState) -> Result<Vec<TransactionHistoryEntry>> {
-    let guard = state.lock().await;
-    if guard.transactions.is_empty() {
-        anyhow::bail!("transactions not available");
-    }
-    Ok(guard.transactions.clone())
-}
-
-/// Retrieves downloaded transaction results from shared state.
-///
-/// # Errors
-///
-/// Returns an error if transaction results have not been downloaded yet.
-pub async fn get_tx_results(
-    state: &SharedHistoryState,
-) -> Result<Vec<TransactionHistoryResultEntry>> {
-    let guard = state.lock().await;
-    if guard.tx_results.is_empty() {
-        anyhow::bail!("tx results not available");
-    }
-    Ok(guard.tx_results.clone())
-}
-
-/// Retrieves downloaded SCP history from shared state.
-///
-/// # Errors
-///
-/// Returns an error if SCP history has not been downloaded yet.
-pub async fn get_scp_history(state: &SharedHistoryState) -> Result<Vec<ScpHistoryEntry>> {
-    let guard = state.lock().await;
-    if guard.scp_history.is_empty() {
-        anyhow::bail!("scp history not available");
-    }
-    Ok(guard.scp_history.clone())
-}
-
 /// Retrieves the current progress indicator from shared state.
 ///
 /// This function never fails and returns default progress if no work
@@ -2124,7 +2037,7 @@ impl Work for BatchDownloadWork {
         let file_type = self.file_type;
         let state = self.state.clone();
 
-        // Download all checkpoints in parallel (16 concurrent)
+        // Download all checkpoints in parallel
         let results: Vec<Result<(u32, DownloadedCheckpointData), String>> =
             stream::iter(checkpoints)
                 .map(|checkpoint| {
@@ -2144,7 +2057,7 @@ impl Work for BatchDownloadWork {
                         result.map(|data| (checkpoint, data))
                     }
                 })
-                .buffer_unordered(16)
+                .buffer_unordered(MAX_CONCURRENT_DOWNLOADS)
                 .collect()
                 .await;
 
@@ -2353,7 +2266,7 @@ impl BatchDownloadWorkBuilder {
 }
 
 // ============================================================================
-// Helper functions for accessing shared state
+// Checkpoint Data Assembly
 // ============================================================================
 
 /// Builds a complete [`CheckpointData`] snapshot from shared state.

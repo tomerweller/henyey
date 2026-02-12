@@ -7,7 +7,8 @@ Work items for Stellar history archive download and publish workflows.
 This crate provides the building blocks for downloading and publishing Stellar
 history archive data. It implements a work-item based architecture that integrates
 with the `henyey-work` scheduler to orchestrate complex multi-step operations
-with proper dependency management and retry logic.
+with proper dependency management and retry logic. It corresponds to the
+stellar-core `src/historywork/` directory.
 
 History archives store snapshots of the Stellar ledger at regular checkpoint
 intervals (every 64 ledgers). This crate provides work items to:
@@ -18,34 +19,40 @@ intervals (every 64 ledgers). This crate provides work items to:
 
 ## Architecture
 
-Work items are organized as a directed acyclic graph (DAG) of dependencies:
+Work items form a directed acyclic graph (DAG) of dependencies, managed by
+the `henyey-work` scheduler:
 
+```mermaid
+graph TD
+    HAS[GetHistoryArchiveStateWork]
+    BKT[DownloadBucketsWork]
+    HDR[DownloadLedgerHeadersWork]
+    TX[DownloadTransactionsWork]
+    RES[DownloadTxResultsWork]
+    SCP[DownloadScpHistoryWork]
+
+    HAS --> BKT
+    HAS --> HDR
+    HDR --> TX
+    HDR --> RES
+    TX --> RES
+    HDR --> SCP
 ```
-                   +-------------+
-                   |  Fetch HAS  |
-                   +------+------+
-                          |
-              +-----------+-----------+
-              |                       |
-              v                       v
-       +------------+         +------------+
-       |  Download  |         |  Download  |
-       |  Buckets   |         |  Headers   |
-       +------------+         +------+-----+
-                                     |
-                          +----------+----------+
-                          |          |          |
-                          v          v          v
-                   +----------+ +----------+ +-------+
-                   | Download | | Download | |Download|
-                   |   Txs    | | Results  | |  SCP   |
-                   +----------+ +----+-----+ +-------+
-                                     |
-                            (depends on Txs too)
+
+For publish, each publish work item depends on its corresponding download:
+
+```mermaid
+graph TD
+    DL_HAS[Download HAS] --> PUB_HAS[PublishHistoryArchiveStateWork]
+    DL_BKT[Download Buckets] --> PUB_BKT[PublishBucketsWork]
+    DL_HDR[Download Headers] --> PUB_HDR[PublishLedgerHeadersWork]
+    DL_TX[Download Txs] --> PUB_TX[PublishTransactionsWork]
+    DL_RES[Download Results] --> PUB_RES[PublishResultsWork]
+    DL_SCP[Download SCP] --> PUB_SCP[PublishScpHistoryWork]
 ```
 
 All work items share state through `SharedHistoryState`, a thread-safe container
-that accumulates downloaded data as work progresses.
+(`Arc<Mutex<HistoryWorkState>>`) that accumulates downloaded data as work progresses.
 
 ## Key Types
 
@@ -57,6 +64,7 @@ that accumulates downloaded data as work progresses.
 | `HistoryWorkIds` | IDs returned by `HistoryWorkBuilder::register` for dependency tracking |
 | `PublishWorkIds` | IDs returned by `HistoryWorkBuilder::register_publish` |
 | `HistoryWorkStage` | Enum identifying the current work stage for progress |
+| `HistoryWorkProgress` | Progress snapshot with stage and human-readable message |
 | `ArchiveWriter` | Trait for publishing data to history archives |
 | `LocalArchiveWriter` | Filesystem implementation of `ArchiveWriter` |
 | `CheckpointRange` | Range of checkpoints for batch operations |
@@ -64,7 +72,6 @@ that accumulates downloaded data as work progresses.
 | `BatchDownloadWork` | Work item for downloading files across a checkpoint range |
 | `BatchDownloadWorkBuilder` | Factory for registering batch download work items |
 | `BatchDownloadState` | Shared container for multi-checkpoint download data |
-| `SharedBatchDownloadState` | Thread-safe handle to `BatchDownloadState` |
 | `CheckSingleLedgerHeaderWork` | Self-contained work item to verify a ledger header against the archive |
 
 ### Download Work Items
@@ -84,7 +91,7 @@ that accumulates downloaded data as work progresses.
 
 | Work Item | Description |
 |-----------|-------------|
-| `PublishHistoryArchiveStateWork` | Publishes HAS JSON |
+| `PublishHistoryArchiveStateWork` | Publishes HAS JSON to checkpoint path and `.well-known/` |
 | `PublishBucketsWork` | Publishes compressed bucket files |
 | `PublishLedgerHeadersWork` | Publishes compressed header XDR |
 | `PublishTransactionsWork` | Publishes compressed transaction XDR |
@@ -101,12 +108,15 @@ use henyey_historywork::{
 };
 use henyey_work::{WorkScheduler, WorkSchedulerConfig};
 use std::sync::Arc;
+use std::path::PathBuf;
 
 // Create shared state for work items
 let state: SharedHistoryState = Default::default();
 
 // Build and register work items
-let builder = HistoryWorkBuilder::new(archive, checkpoint, state.clone());
+let builder = HistoryWorkBuilder::new(
+    archive, checkpoint, state.clone(), PathBuf::from("/tmp/buckets"),
+);
 let mut scheduler = WorkScheduler::new(WorkSchedulerConfig::default());
 let work_ids = builder.register(&mut scheduler);
 
@@ -137,41 +147,7 @@ let publish_ids = builder.register_publish(&mut scheduler, writer, download_ids)
 scheduler.run_until_done().await;
 ```
 
-### Monitoring Progress
-
-```rust
-use henyey_historywork::get_progress;
-
-let progress = get_progress(&state).await;
-if let Some(stage) = progress.stage {
-    println!("Stage: {:?}, Status: {}", stage, progress.message);
-}
-```
-
-### Custom Archive Writers
-
-Implement `ArchiveWriter` for custom storage backends:
-
-```rust
-use henyey_historywork::ArchiveWriter;
-use async_trait::async_trait;
-
-struct S3ArchiveWriter {
-    bucket: String,
-    client: S3Client,
-}
-
-#[async_trait]
-impl ArchiveWriter for S3ArchiveWriter {
-    async fn put_bytes(&self, path: &str, data: &[u8]) -> Result<()> {
-        self.client.put_object(&self.bucket, path, data).await
-    }
-}
-```
-
 ### Batch Downloads (Multi-Checkpoint)
-
-For catching up across multiple checkpoints, use the batch download API:
 
 ```rust
 use henyey_historywork::{BatchDownloadWorkBuilder, CheckpointRange};
@@ -192,30 +168,49 @@ let guard = state.lock().await;
 let headers_for_checkpoint_128 = &guard.headers[&128];
 ```
 
+## Module Layout
+
+| Module | Description |
+|--------|-------------|
+| `lib.rs` | All types, work items, builders, and helpers for history download/publish workflows |
+
 ## Design Notes
 
-- **Parallel Downloads**: Bucket downloads use up to 16 concurrent requests,
-  matching the stellar-core `MAX_CONCURRENT_SUBPROCESSES` limit.
+- **Parallel Downloads**: Bucket and batch downloads use up to 16 concurrent requests,
+  matching the stellar-core `MAX_CONCURRENT_SUBPROCESSES` limit (see `MAX_CONCURRENT_DOWNLOADS`).
 
 - **Retry Logic**: Download work items are configured with 3 retries; publish
   work items use 2 retries.
 
 - **Verification**: All downloaded data is verified against known hashes before
-  being stored in shared state.
+  being stored in shared state. Verification is performed inline rather than in
+  background threads as in stellar-core.
 
-- **Memory Usage**: Downloaded data is held in memory. For large catchup ranges,
-  consider processing checkpoints incrementally.
+- **Bucket Disk Storage**: Bucket files are saved to disk during download to
+  avoid holding multi-GB bucket data in memory simultaneously. Each bucket is
+  verified, written to disk, and then dropped from memory.
 
----
+## stellar-core Mapping
 
-## stellar-core Parity Status
+| Rust | stellar-core |
+|------|--------------|
+| `GetHistoryArchiveStateWork` | `src/historywork/GetHistoryArchiveStateWork.cpp` |
+| `DownloadBucketsWork` | `src/historywork/DownloadBucketsWork.cpp` |
+| `DownloadLedgerHeadersWork` | `src/historywork/BatchDownloadWork.cpp` (ledger category) |
+| `DownloadTransactionsWork` | `src/historywork/BatchDownloadWork.cpp` (transactions category) |
+| `DownloadTxResultsWork` | `src/historywork/DownloadVerifyTxResultsWork.cpp` |
+| `DownloadScpHistoryWork` | `src/historywork/BatchDownloadWork.cpp` (SCP category) |
+| `PublishHistoryArchiveStateWork` | `src/historywork/PutHistoryArchiveStateWork.cpp` |
+| `PublishBucketsWork` | `src/historywork/PutSnapshotFilesWork.cpp` (buckets) |
+| `PublishLedgerHeadersWork` | `src/historywork/PutSnapshotFilesWork.cpp` (ledger) |
+| `PublishTransactionsWork` | `src/historywork/PutSnapshotFilesWork.cpp` (transactions) |
+| `PublishResultsWork` | `src/historywork/PutSnapshotFilesWork.cpp` (results) |
+| `PublishScpHistoryWork` | `src/historywork/PutSnapshotFilesWork.cpp` (SCP) |
+| `CheckSingleLedgerHeaderWork` | `src/historywork/CheckSingleLedgerHeaderWork.cpp` |
+| `BatchDownloadWork` | `src/historywork/BatchDownloadWork.cpp` |
+| `HistoryWorkProgress` | `src/historywork/Progress.cpp` |
+| `ArchiveWriter` / `LocalArchiveWriter` | `src/historywork/PutRemoteFileWork.cpp` |
+
+## Parity Status
 
 See [PARITY_STATUS.md](PARITY_STATUS.md) for detailed stellar-core parity analysis.
-
----
-
-## See Also
-
-- `henyey-history` - History archive access and data structures
-- `henyey-work` - Work scheduler for async task orchestration
-- `henyey-bucket` - Bucket list implementation

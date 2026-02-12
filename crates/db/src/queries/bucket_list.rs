@@ -15,7 +15,7 @@
 use rusqlite::{params, Connection};
 use henyey_common::Hash256;
 
-use super::super::error::DbError;
+use crate::error::DbError;
 
 /// Query trait for bucket list snapshot operations.
 ///

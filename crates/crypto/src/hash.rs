@@ -45,9 +45,12 @@ use sha2::{Digest, Sha256};
 use henyey_common::Hash256;
 use stellar_xdr::curr::WriteXdr;
 
-// =============================================================================
-// SHA-256
-// =============================================================================
+/// Converts a 32-byte digest output into a [`Hash256`].
+fn hash256_from_slice(slice: &[u8]) -> Hash256 {
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(slice);
+    Hash256(bytes)
+}
 
 /// Computes the SHA-256 hash of the given data.
 ///
@@ -85,10 +88,7 @@ pub fn sha256_multi(chunks: &[&[u8]]) -> Hash256 {
     for chunk in chunks {
         hasher.update(chunk);
     }
-    let result = hasher.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&result);
-    Hash256(bytes)
+    hash256_from_slice(&hasher.finalize())
 }
 
 /// Computes a sub-seed SHA-256 hash from a seed and counter.
@@ -114,10 +114,7 @@ pub fn sub_sha256(seed: &[u8], counter: u64) -> Hash256 {
     hasher.update(seed);
     // XDR encodes uint64 as 8 bytes big-endian (network byte order)
     hasher.update(counter.to_be_bytes());
-    let result = hasher.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&result);
-    Hash256(bytes)
+    hash256_from_slice(&hasher.finalize())
 }
 
 /// A streaming SHA-256 hasher for incremental hash computation.
@@ -163,10 +160,7 @@ impl Sha256Hasher {
     ///
     /// After calling this method, the hasher cannot be used again.
     pub fn finalize(self) -> Hash256 {
-        let result = self.inner.finalize();
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&result);
-        Hash256(bytes)
+        hash256_from_slice(&self.inner.finalize())
     }
 }
 
@@ -175,10 +169,6 @@ impl Default for Sha256Hasher {
         Self::new()
     }
 }
-
-// =============================================================================
-// BLAKE2
-// =============================================================================
 
 /// Type alias for BLAKE2b with 32-byte output (256 bits).
 type Blake2b256 = Blake2b<blake2::digest::consts::U32>;
@@ -199,10 +189,7 @@ type Blake2b256 = Blake2b<blake2::digest::consts::U32>;
 pub fn blake2(data: &[u8]) -> Hash256 {
     let mut hasher = Blake2b256::new();
     hasher.update(data);
-    let result = hasher.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&result);
-    Hash256(bytes)
+    hash256_from_slice(&hasher.finalize())
 }
 
 /// Computes the BLAKE2b-256 hash of multiple data chunks.
@@ -224,10 +211,7 @@ pub fn blake2_multi(chunks: &[&[u8]]) -> Hash256 {
     for chunk in chunks {
         hasher.update(chunk);
     }
-    let result = hasher.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&result);
-    Hash256(bytes)
+    hash256_from_slice(&hasher.finalize())
 }
 
 /// A streaming BLAKE2b-256 hasher for incremental hash computation.
@@ -273,10 +257,7 @@ impl Blake2Hasher {
     ///
     /// After calling this method, the hasher cannot be used again.
     pub fn finalize(self) -> Hash256 {
-        let result = self.inner.finalize();
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&result);
-        Hash256(bytes)
+        hash256_from_slice(&self.inner.finalize())
     }
 }
 
@@ -285,10 +266,6 @@ impl Default for Blake2Hasher {
         Self::new()
     }
 }
-
-// =============================================================================
-// HMAC-SHA256
-// =============================================================================
 
 /// Type alias for HMAC-SHA256.
 type HmacSha256 = Hmac<Sha256>;
@@ -373,10 +350,6 @@ pub fn hmac_sha256_verify(mac: &[u8; 32], key: &[u8; 32], data: &[u8]) -> bool {
     verifier.update(data);
     verifier.verify_slice(mac).is_ok()
 }
-
-// =============================================================================
-// HKDF (RFC 5869)
-// =============================================================================
 
 /// Performs HKDF-Extract with an all-zero salt.
 ///
@@ -474,10 +447,6 @@ pub fn hkdf(ikm: &[u8], info: &[u8]) -> [u8; 32] {
     let prk = hkdf_extract(ikm);
     hkdf_expand(&prk, info)
 }
-
-// =============================================================================
-// XDR Hashing
-// =============================================================================
 
 /// Computes the SHA-256 hash of an XDR-encoded value.
 ///
@@ -597,17 +566,9 @@ impl Default for XdrBlake2Hasher {
     }
 }
 
-// =============================================================================
-// Tests
-// =============================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -------------------------------------------------------------------------
-    // SHA-256 Tests
-    // -------------------------------------------------------------------------
 
     #[test]
     fn test_sha256() {
@@ -658,10 +619,6 @@ mod tests {
         assert_eq!(hash0, sub_sha256(&seed, 0));
     }
 
-    // -------------------------------------------------------------------------
-    // BLAKE2 Tests
-    // -------------------------------------------------------------------------
-
     #[test]
     fn test_blake2() {
         // Test that BLAKE2 produces 32-byte output
@@ -699,10 +656,6 @@ mod tests {
         let data = b"test data";
         assert_ne!(blake2(data), sha256(data));
     }
-
-    // -------------------------------------------------------------------------
-    // HMAC-SHA256 Tests
-    // -------------------------------------------------------------------------
 
     #[test]
     fn test_hmac_sha256() {
@@ -751,10 +704,6 @@ mod tests {
         assert_ne!(mac1, mac2);
     }
 
-    // -------------------------------------------------------------------------
-    // HKDF Tests
-    // -------------------------------------------------------------------------
-
     #[test]
     fn test_hkdf_extract() {
         let ikm = b"input keying material";
@@ -797,10 +746,6 @@ mod tests {
         // Zero salt should match hkdf_extract
         assert_eq!(prk1, hkdf_extract(ikm));
     }
-
-    // -------------------------------------------------------------------------
-    // XDR Hashing Tests
-    // -------------------------------------------------------------------------
 
     #[test]
     fn test_xdr_sha256() {

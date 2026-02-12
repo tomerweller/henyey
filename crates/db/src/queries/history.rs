@@ -14,11 +14,7 @@ use stellar_xdr::curr::{
     Limits, ReadXdr, TransactionHistoryEntry, TransactionHistoryResultEntry, WriteXdr,
 };
 
-use super::super::error::DbError;
-
-/// Database row type for transaction history queries.
-/// Fields: (ledgerseq, txindex, txbody, txresult, txmeta)
-type TxHistoryRow = (u32, u32, Vec<u8>, Vec<u8>, Option<Vec<u8>>);
+use crate::error::DbError;
 
 /// A stored transaction record.
 ///
@@ -124,7 +120,7 @@ impl HistoryQueries for Connection {
     }
 
     fn load_transaction(&self, tx_id: &str) -> Result<Option<TxRecord>, DbError> {
-        let result: Option<TxHistoryRow> = self
+        let result = self
             .query_row(
                 r#"
                 SELECT ledgerseq, txindex, txbody, txresult, txmeta
@@ -132,28 +128,18 @@ impl HistoryQueries for Connection {
                 "#,
                 params![tx_id],
                 |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
+                    Ok(TxRecord {
+                        tx_id: tx_id.to_string(),
+                        ledger_seq: row.get(0)?,
+                        tx_index: row.get(1)?,
+                        body: row.get(2)?,
+                        result: row.get(3)?,
+                        meta: row.get(4)?,
+                    })
                 },
             )
             .optional()?;
-
-        match result {
-            Some((ledger_seq, tx_index, body, result, meta)) => Ok(Some(TxRecord {
-                tx_id: tx_id.to_string(),
-                ledger_seq,
-                tx_index,
-                body,
-                result,
-                meta,
-            })),
-            None => Ok(None),
-        }
+        Ok(result)
     }
 
     fn store_tx_history_entry(

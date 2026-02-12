@@ -87,6 +87,16 @@ pub fn initialize() {
     state.key = random::random_bytes();
 }
 
+/// Expands a 32-bit seed to a 128-bit SipHash key by repeating the byte pattern.
+fn expand_seed_to_key(seed: u32) -> [u8; KEY_BYTES] {
+    let mut key = [0u8; KEY_BYTES];
+    for (i, byte) in key.iter_mut().enumerate() {
+        let shift = i % std::mem::size_of::<u32>();
+        *byte = (seed >> shift) as u8;
+    }
+    key
+}
+
 /// Seeds the short hash key with a deterministic value.
 ///
 /// This is used for tests and replay scenarios where deterministic ordering
@@ -112,22 +122,8 @@ pub fn seed(seed: u32) -> Result<(), CryptoError> {
         });
     }
     state.explicit_seed = seed;
-    // Expand the 32-bit seed to a 128-bit key by repeating the byte pattern.
-    for (i, byte) in state.key.iter_mut().enumerate() {
-        let shift = i % std::mem::size_of::<u32>();
-        *byte = (seed >> shift) as u8;
-    }
+    state.key = expand_seed_to_key(seed);
     Ok(())
-}
-
-#[cfg(test)]
-fn seed_key(seed: u32) -> [u8; KEY_BYTES] {
-    let mut key = [0u8; KEY_BYTES];
-    for (i, byte) in key.iter_mut().enumerate() {
-        let shift = i % std::mem::size_of::<u32>();
-        *byte = (seed >> shift) as u8;
-    }
-    key
 }
 
 /// Computes a SipHash-2-4 hash of raw bytes.
@@ -220,7 +216,7 @@ mod tests {
         reset_state();
         let seed_value = 0x12345678;
         seed(seed_value).expect("seed");
-        let key = seed_key(seed_value);
+        let key = expand_seed_to_key(seed_value);
         let expected = compute_hash_with_key(key, b"");
         let got = compute_hash(b"");
         assert_eq!(got, expected);

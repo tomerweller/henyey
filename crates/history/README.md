@@ -4,62 +4,84 @@ History archive access, catchup, replay, and publish support for Stellar Core.
 
 ## Overview
 
-This crate provides infrastructure for interacting with Stellar history archives, enabling nodes to synchronize with the network by downloading and verifying historical ledger data.
+This crate provides infrastructure for interacting with Stellar history archives,
+enabling nodes to synchronize with the network by downloading and verifying
+historical ledger data. It corresponds to stellar-core's `src/history/`,
+`src/catchup/`, and `src/historywork/` components, handling archive access,
+catchup orchestration, ledger replay, checkpoint publishing, and CDP
+(Composable Data Platform) integration.
 
-### Key Capabilities
+## Architecture
 
-- **Archive Access**: Download ledger headers, transactions, results, and bucket files from HTTP-accessible history archives
-- **Catchup**: Synchronize a node from genesis or a recent checkpoint to any target ledger
-- **Replay**: Re-execute transactions to verify state transitions match expected hashes
-- **Publishing**: Write checkpoint data to archives (for validators)
-- **CDP Integration**: Fetch detailed `LedgerCloseMeta` from Composable Data Platform (SEP-0054)
+```mermaid
+flowchart TD
+    subgraph "Archive Access"
+        HA[HistoryArchive]
+        HM[HistoryManager]
+        DL[download]
+        RA[RemoteArchive]
+    end
 
-## History Archive Structure
+    subgraph "Catchup"
+        CM[CatchupManager]
+        CR[CatchupRange]
+        RP[replay]
+        VR[verify]
+    end
 
-Stellar history archives organize data around **checkpoints** - snapshots taken every 64 ledgers (at sequences 63, 127, 191, ...).
+    subgraph "Publishing"
+        PM[PublishManager]
+        PQ[PublishQueue]
+        CB[CheckpointBuilder]
+    end
 
-```text
-archive/
-  .well-known/
-    stellar-history.json          # Root HAS (latest checkpoint)
-  history/
-    00/00/00/
-      history-0000003f.json       # HAS for checkpoint 63
-      history-0000007f.json       # HAS for checkpoint 127
-  ledger/
-    00/00/00/
-      ledger-0000003f.xdr.gz      # Ledger headers for checkpoint
-  transactions/
-    00/00/00/
-      transactions-0000003f.xdr.gz
-  results/
-    00/00/00/
-      results-0000003f.xdr.gz
-  bucket/
-    e1/13/f8/
-      bucket-e113f8cc...fd.xdr.gz # Bucket file (by content hash)
+    subgraph "External"
+        CDP[CdpDataLake]
+    end
+
+    subgraph "Shared"
+        HAS[HistoryArchiveState]
+        CP[checkpoint / paths]
+    end
+
+    HM -->|failover| HA
+    HA -->|HTTP| DL
+    CM -->|fetch| HM
+    CM -->|calculate| CR
+    CM -->|execute| RP
+    CM -->|check| VR
+    CM -->|parse| HAS
+    PM -->|write| CB
+    PM -->|queue| PQ
+    PM -->|upload| RA
+    PM -->|build| HAS
+    CDP -->|fetch meta| DL
+    HA -->|paths| CP
+    PM -->|paths| CP
 ```
 
 ## Key Types
 
 | Type | Description |
 |------|-------------|
-| `HistoryArchive` | Client for accessing a single history archive |
+| `HistoryArchive` | HTTP client for accessing a single history archive |
 | `HistoryManager` | Manages multiple archives with automatic failover |
-| `HistoryArchiveManager` | Full archive manager with read/write capability tracking and config validation |
-| `ArchiveEntry` | Single archive entry combining HTTP read and shell-command write capabilities |
-| `HistoryArchiveState` | Parsed History Archive State (HAS) file |
+| `HistoryArchiveManager` | Full archive manager with read/write capability tracking |
+| `ArchiveEntry` | Single archive entry combining HTTP read and shell-command write |
+| `HistoryArchiveState` | Parsed History Archive State (HAS) JSON file |
 | `CatchupManager` | Orchestrates the complete catchup process |
-| `CatchupMode` | Catchup strategy: Minimal, Complete, or Recent(N) |
+| `CatchupMode` | Catchup strategy: `Minimal`, `Complete`, or `Recent(N)` |
+| `CatchupRange` | Calculated range of ledgers to download and replay |
 | `CatchupOutput` | Full catchup result including bucket list state and ledger header |
-| `ReplayConfig` | Configuration for ledger replay and verification |
-| `CheckpointBuilder` | Crash-safe checkpoint file builder using dirty-file-then-rename pattern |
-| `PublishManager` | Publishes checkpoint data to archives |
-| `PublishQueue` | SQLite-backed persistent queue for pending checkpoint publications |
+| `ReplayConfig` | Configuration for ledger replay verification flags |
+| `CheckpointBuilder` | Crash-safe checkpoint file builder using dirty-then-rename |
+| `PublishManager` | Publishes checkpoint data to local and remote archives |
+| `PublishQueue` | SQLite-backed persistent queue for pending publications |
 | `RemoteArchive` | Shell-command-based archive upload client (put, mkdir) |
-| `CdpDataLake` | Fetches LedgerCloseMeta from CDP (SEP-0054) |
+| `CdpDataLake` | Fetches `LedgerCloseMeta` from CDP (SEP-0054) |
+| `CachedCdpDataLake` | Disk-caching wrapper around `CdpDataLake` with prefetch |
 
-## Quick Start
+## Usage
 
 ### Reading from an Archive
 
@@ -67,7 +89,6 @@ archive/
 use henyey_history::archive::HistoryArchive;
 
 async fn example() -> Result<(), henyey_history::HistoryError> {
-    // Connect to a testnet archive
     let archive = HistoryArchive::new(
         "https://history.stellar.org/prd/core-testnet/core_testnet_001"
     )?;
@@ -79,119 +100,107 @@ async fn example() -> Result<(), henyey_history::HistoryError> {
     // Download ledger headers for a checkpoint
     let headers = archive.get_ledger_headers(63).await?;
     println!("Got {} ledger headers", headers.len());
-
     Ok(())
 }
 ```
 
-### Catching Up
+### Catching Up to a Target Ledger
 
 ```rust
 use henyey_history::{CatchupManager, archive::HistoryArchive};
-use henyey_bucket::BucketManager;
-use henyey_db::Database;
 
 async fn catchup_example() -> Result<(), henyey_history::HistoryError> {
     let archive = HistoryArchive::new(
         "https://history.stellar.org/prd/core-testnet/core_testnet_001"
     )?;
-    let bucket_manager = BucketManager::new("/tmp/buckets".into());
-    let db = Database::open_or_create("/tmp/stellar.db")?;
 
-    let mut manager = CatchupManager::new(vec![archive], bucket_manager, db);
+    // CatchupManager downloads buckets, headers, and replays ledgers
+    // to reach the target ledger with a verified bucket list.
+    let mut manager = CatchupManager::new(/* archives, bucket_manager, db */);
     let output = manager.catchup_to_ledger(1000000).await?;
-
     println!("Caught up to ledger {}", output.result.ledger_seq);
-    println!("Downloaded {} buckets", output.result.buckets_downloaded);
-
     Ok(())
 }
 ```
 
-## Catchup Process
+### Fetching LedgerCloseMeta from CDP
 
-The catchup process follows these steps:
+```rust
+use henyey_history::cdp::CdpDataLake;
 
-1. **Find checkpoint**: Locate the latest checkpoint <= target ledger
-2. **Download HAS**: Fetch the History Archive State for that checkpoint
-3. **Download buckets**: Fetch all bucket files referenced in the HAS
-4. **Apply buckets**: Build initial ledger state from bucket entries
-5. **Download ledger data**: Fetch headers, transactions, and results
-6. **Verify chain**: Validate the cryptographic hash chain
-7. **Replay ledgers**: Re-execute transactions from checkpoint to target
+async fn cdp_example() -> Result<(), henyey_history::HistoryError> {
+    let cdp = CdpDataLake::new(
+        "https://aws-public-blockchain.s3.us-east-2.amazonaws.com/v1.1/stellar/ledgers/testnet",
+        "2025-01-07",
+    );
 
-### Re-execution vs Metadata Replay
-
-During catchup, we **re-execute** transactions against the bucket list rather than applying `TransactionMeta` directly. This approach:
-
-- Works with traditional archives that don't include TransactionMeta
-- Validates transaction set and result hashes against headers
-- May produce slightly different internal results than original execution
-
-For exact verification with TransactionMeta, use the CDP data source.
-
-## Protocol 23+ State Archival
-
-Starting with protocol 23, Stellar introduced state archival:
-
-- **Live bucket list**: Active entries accessible by transactions
-- **Hot archive bucket list**: Recently evicted entries that can be restored
-- **Eviction scan**: Runs each ledger to move expired entries to hot archive
-- **Combined hash**: `SHA256(live_hash || hot_archive_hash)`
-
-The catchup and replay code handles both bucket lists automatically.
-
-## Verification
-
-All downloaded data is cryptographically verified:
-
-1. **Bucket hashes**: `SHA256(content) == expected_hash`
-2. **Header chain**: Each header's `previous_ledger_hash` matches previous header
-3. **Transaction sets**: Hash matches `scp_value.tx_set_hash`
-4. **Transaction results**: Hash matches `tx_set_result_hash`
-5. **Bucket list**: Final hash matches `header.bucket_list_hash`
-
-## Module Organization
-
+    let meta = cdp.get_ledger_close_meta(310079).await?;
+    let header = henyey_history::cdp::extract_ledger_header(&meta);
+    println!("Ledger {} closed at {}", header.ledger_seq, header.scp_value.close_time.0);
+    Ok(())
+}
 ```
-src/
-  lib.rs                # Crate root, HistoryManager, HistoryArchiveManager, CatchupMode/Output
-  archive.rs            # HistoryArchive HTTP client
-  archive_state.rs      # HAS JSON parsing/serialization
-  catchup.rs            # CatchupManager orchestration
-  cdp.rs                # CDP data lake client (SEP-0054)
-  checkpoint.rs         # Checkpoint frequency, boundary, and range utilities
-  checkpoint_builder.rs # Crash-safe checkpoint file construction
-  download.rs           # HTTP download with retry, gzip decompression, XDR stream parsing
-  error.rs              # HistoryError type
-  paths.rs              # Archive URL path generation
-  publish.rs            # PublishManager for validators
-  publish_queue.rs      # SQLite-backed persistent publish queue
-  remote_archive.rs     # Shell-command-based archive upload (put/mkdir)
-  replay.rs             # Ledger replay and transaction re-execution
-  verify.rs             # Cryptographic verification (hashes, header chains)
-```
+
+## Module Layout
+
+| Module | Description |
+|--------|-------------|
+| `lib.rs` | Crate root: `HistoryManager`, `HistoryArchiveManager`, `ArchiveEntry`, `CatchupOutput` |
+| `archive.rs` | `HistoryArchive` HTTP client with testnet/mainnet presets |
+| `archive_state.rs` | `HistoryArchiveState` JSON parsing, bucket hash extraction helpers |
+| `catchup.rs` | `CatchupManager` orchestration, status tracking, progress reporting |
+| `catchup_range.rs` | `CatchupRange` calculation, `CatchupMode`, `LedgerRange` |
+| `cdp.rs` | `CdpDataLake` / `CachedCdpDataLake`, `LedgerCloseMeta` extraction functions |
+| `checkpoint.rs` | Checkpoint boundary utilities: `checkpoint_containing`, `checkpoint_range` |
+| `checkpoint_builder.rs` | `CheckpointBuilder`, `XdrStreamWriter` for crash-safe file construction |
+| `download.rs` | HTTP download with retries, gzip decompression, XDR stream parsing |
+| `error.rs` | `HistoryError` enum with network, parsing, verification, and catchup variants |
+| `paths.rs` | URL path generation: `checkpoint_path`, `bucket_path`, dirty file helpers |
+| `publish.rs` | `PublishManager`, `build_history_archive_state`, gzipped XDR file writing |
+| `publish_queue.rs` | `PublishQueue` SQLite-backed persistent publish queue with stats |
+| `remote_archive.rs` | `RemoteArchive` shell-command-based archive operations (put, mkdir, get) |
+| `replay.rs` | `replay_ledger_with_execution`, eviction scan, Soroban state size tracking |
+| `verify.rs` | Cryptographic verification: header chains, bucket hashes, tx set hashes |
+
+## Design Notes
+
+- **Re-execution replay**: During catchup the crate re-executes transactions against
+  the bucket list rather than applying `TransactionMeta`. This works with traditional
+  archives that omit `TransactionMeta` but may produce slightly different intermediate
+  results. The bucket list hash at each checkpoint is the authoritative correctness check.
+
+- **Dual bucket lists (Protocol 23+)**: Replay manages both a live bucket list and a
+  hot archive bucket list. Evicted entries move to the hot archive; restored entries
+  move back. The combined ledger hash is `SHA256(live_hash || hot_archive_hash)`.
+
+- **Crash-safe publishing**: `CheckpointBuilder` writes checkpoint files with a `.dirty`
+  suffix first, then atomically renames them to final paths on commit. This ensures
+  partially written checkpoints never appear as valid archive data.
+
+- **Catchup range cases**: `CatchupRange::calculate` implements five distinct cases
+  matching stellar-core's `CatchupConfiguration` logic, depending on whether the LCL
+  is at genesis, the target is a checkpoint boundary, and how many ledgers to replay.
 
 ## stellar-core Mapping
 
-This crate corresponds to these components in stellar-core:
+| Rust | stellar-core |
+|------|--------------|
+| `lib.rs` (`HistoryManager`) | `src/history/HistoryManagerImpl.cpp` |
+| `lib.rs` (`HistoryArchiveManager`) | `src/history/HistoryArchiveManager.cpp` |
+| `archive.rs` | `src/history/HistoryArchive.cpp` |
+| `archive_state.rs` | `src/history/HistoryArchive.cpp` (HAS serialization) |
+| `catchup.rs` | `src/catchup/CatchupWork.cpp` |
+| `catchup_range.rs` | `src/catchup/CatchupRange.cpp`, `CatchupConfiguration.cpp` |
+| `checkpoint.rs` / `paths.rs` | `src/history/HistoryUtils.cpp`, `FileTransferInfo.cpp` |
+| `checkpoint_builder.rs` | `src/history/CheckpointBuilder.cpp` |
+| `download.rs` | `src/historywork/GetAndUnzipRemoteFileWork.cpp`, `BatchDownloadWork.cpp` |
+| `publish.rs` | `src/history/StateSnapshot.cpp` |
+| `publish_queue.rs` | `src/history/HistoryManagerImpl.cpp` (publish queue logic) |
+| `remote_archive.rs` | `src/historywork/GetRemoteFileWork.cpp`, `PutRemoteFileWork.cpp` |
+| `replay.rs` | `src/catchup/ApplyCheckpointWork.cpp`, `ApplyLedgerWork.cpp` |
+| `verify.rs` | `src/historywork/VerifyBucketWork.cpp`, `CheckSingleLedgerHeaderWork.cpp` |
+| `cdp.rs` | No upstream equivalent (SEP-0054 is Rust-native) |
 
-- `src/history/` - History archive access and catchup
-- `src/catchup/` - Catchup state machine
-- `src/historywork/` - Download and verification workers
-
-## Tests
-
-Integration tests that require network access are in `tests/`. Unit tests are inline in each module.
-
-```bash
-# Run unit tests
-cargo test -p henyey-history
-
-# Run integration tests (requires network)
-cargo test -p henyey-history --test '*'
-```
-
-## stellar-core Parity Status
+## Parity Status
 
 See [PARITY_STATUS.md](PARITY_STATUS.md) for detailed stellar-core parity analysis.

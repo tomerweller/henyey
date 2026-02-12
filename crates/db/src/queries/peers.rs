@@ -12,9 +12,21 @@
 //! - 1: Preferred (configured preferred peers)
 //! - 2: Outbound (we connected to peer)
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 
-use super::super::error::DbError;
+use crate::error::DbError;
+
+/// Extracts a `(host, port, PeerRecord)` tuple from a row.
+fn peer_row(row: &Row<'_>) -> rusqlite::Result<(String, u16, PeerRecord)> {
+    let host: String = row.get(0)?;
+    let port: i64 = row.get(1)?;
+    let record = PeerRecord {
+        next_attempt: row.get(2)?,
+        num_failures: row.get::<_, i64>(3)? as u32,
+        peer_type: row.get(4)?,
+    };
+    Ok((host, port as u16, record))
+}
 
 /// Database representation of a peer record.
 ///
@@ -152,38 +164,14 @@ impl PeerQueries for Connection {
             sql.push_str(" LIMIT ?1");
         }
 
-        let mut results = Vec::new();
         let mut stmt = self.prepare(&sql)?;
-        if let Some(limit) = limit {
-            let rows = stmt.query_map(params![limit as i64], |row| {
-                let host: String = row.get(0)?;
-                let port: i64 = row.get(1)?;
-                let record = PeerRecord {
-                    next_attempt: row.get(2)?,
-                    num_failures: row.get::<_, i64>(3)? as u32,
-                    peer_type: row.get(4)?,
-                };
-                Ok((host, port as u16, record))
-            })?;
-            for row in rows {
-                results.push(row?);
-            }
+        let rows = if let Some(limit) = limit {
+            stmt.query_map(params![limit as i64], peer_row)?
         } else {
-            let rows = stmt.query_map([], |row| {
-                let host: String = row.get(0)?;
-                let port: i64 = row.get(1)?;
-                let record = PeerRecord {
-                    next_attempt: row.get(2)?,
-                    num_failures: row.get::<_, i64>(3)? as u32,
-                    peer_type: row.get(4)?,
-                };
-                Ok((host, port as u16, record))
-            })?;
-            for row in rows {
-                results.push(row?);
-            }
-        }
-        Ok(results)
+            stmt.query_map([], peer_row)?
+        };
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(DbError::from)
     }
 
     fn load_random_peers(
@@ -201,41 +189,17 @@ impl PeerQueries for Connection {
         }
         sql.push_str(" ORDER BY RANDOM() LIMIT ?4");
 
-        let mut results = Vec::new();
         let mut stmt = self.prepare(&sql)?;
-        if let Some(peer_type) = peer_type {
-            let rows = stmt.query_map(
+        let rows = if let Some(peer_type) = peer_type {
+            stmt.query_map(
                 params![max_failures as i64, now, peer_type, limit as i64],
-                |row| {
-                    let host: String = row.get(0)?;
-                    let port: i64 = row.get(1)?;
-                    let record = PeerRecord {
-                        next_attempt: row.get(2)?,
-                        num_failures: row.get::<_, i64>(3)? as u32,
-                        peer_type: row.get(4)?,
-                    };
-                    Ok((host, port as u16, record))
-                },
-            )?;
-            for row in rows {
-                results.push(row?);
-            }
+                peer_row,
+            )?
         } else {
-            let rows = stmt.query_map(params![max_failures as i64, now, limit as i64], |row| {
-                let host: String = row.get(0)?;
-                let port: i64 = row.get(1)?;
-                let record = PeerRecord {
-                    next_attempt: row.get(2)?,
-                    num_failures: row.get::<_, i64>(3)? as u32,
-                    peer_type: row.get(4)?,
-                };
-                Ok((host, port as u16, record))
-            })?;
-            for row in rows {
-                results.push(row?);
-            }
-        }
-        Ok(results)
+            stmt.query_map(params![max_failures as i64, now, limit as i64], peer_row)?
+        };
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(DbError::from)
     }
 
     fn load_random_peers_any_outbound(
@@ -251,23 +215,10 @@ impl PeerQueries for Connection {
         let mut stmt = self.prepare(sql)?;
         let rows = stmt.query_map(
             params![max_failures as i64, now, inbound_type, limit as i64],
-            |row| {
-                let host: String = row.get(0)?;
-                let port: i64 = row.get(1)?;
-                let record = PeerRecord {
-                    next_attempt: row.get(2)?,
-                    num_failures: row.get::<_, i64>(3)? as u32,
-                    peer_type: row.get(4)?,
-                };
-                Ok((host, port as u16, record))
-            },
+            peer_row,
         )?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(DbError::from)
     }
 
     fn load_random_peers_any_outbound_max_failures(
@@ -282,23 +233,10 @@ impl PeerQueries for Connection {
         let mut stmt = self.prepare(sql)?;
         let rows = stmt.query_map(
             params![max_failures as i64, inbound_type, limit as i64],
-            |row| {
-                let host: String = row.get(0)?;
-                let port: i64 = row.get(1)?;
-                let record = PeerRecord {
-                    next_attempt: row.get(2)?,
-                    num_failures: row.get::<_, i64>(3)? as u32,
-                    peer_type: row.get(4)?,
-                };
-                Ok((host, port as u16, record))
-            },
+            peer_row,
         )?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(DbError::from)
     }
 
     fn load_random_peers_by_type_max_failures(
@@ -313,23 +251,10 @@ impl PeerQueries for Connection {
         let mut stmt = self.prepare(sql)?;
         let rows = stmt.query_map(
             params![max_failures as i64, peer_type, limit as i64],
-            |row| {
-                let host: String = row.get(0)?;
-                let port: i64 = row.get(1)?;
-                let record = PeerRecord {
-                    next_attempt: row.get(2)?,
-                    num_failures: row.get::<_, i64>(3)? as u32,
-                    peer_type: row.get(4)?,
-                };
-                Ok((host, port as u16, record))
-            },
+            peer_row,
         )?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(DbError::from)
     }
 
     fn remove_peers_with_failures(&self, min_failures: u32) -> Result<(), DbError> {

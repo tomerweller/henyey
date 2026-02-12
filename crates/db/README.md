@@ -1,205 +1,135 @@
 # henyey-db
 
-SQLite persistence layer for henyey.
+SQLite persistence layer for the henyey Stellar blockchain node.
 
 ## Overview
 
-This crate provides database abstraction for the Stellar blockchain node, handling persistent storage of:
-
-- **Ledger headers**: Block metadata including sequence numbers, hashes, and timestamps
-- **Transaction history**: Transaction bodies, results, and execution metadata
-- **SCP state**: Stellar Consensus Protocol envelopes and quorum sets
-- **Bucket list snapshots**: Merkle tree state at checkpoint ledgers
-- **Peer records**: Network peer discovery and connection tracking
-- **Operational state**: Node configuration and runtime state
+This crate provides database abstraction for the henyey node, handling persistent storage and retrieval of ledger headers, transaction history, SCP consensus state, bucket list snapshots, peer records, and operational configuration. It corresponds to stellar-core's `src/database/` module and the SQL operations spread across its codebase. The Rust implementation uses `rusqlite` with `r2d2` connection pooling (SQLite only), whereas stellar-core uses SOCI with SQLite and PostgreSQL support.
 
 ## Architecture
 
-The crate is organized into the following modules:
+```mermaid
+graph TD
+    DB[Database<br/>pool.rs] -->|with_connection / transaction| POOL[r2d2 Pool]
+    POOL --> CONN[rusqlite::Connection]
 
-```
-crates/henyey-db/
-├── src/
-│   ├── lib.rs              # Main entry point and Database methods
-│   ├── error.rs            # Error types (DbError)
-│   ├── pool.rs             # Connection pool (Database struct)
-│   ├── schema.rs           # SQL schema definitions
-│   ├── migrations.rs       # Schema versioning and migrations
-│   ├── scp_persistence.rs  # SCP state persistence (SqliteScpPersistence)
-│   └── queries/            # Typed query traits
-│       ├── mod.rs
-│       ├── ban.rs          # Node ban list
-│       ├── bucket_list.rs  # Bucket list snapshots
-│       ├── history.rs      # Transaction history
-│       ├── ledger.rs       # Ledger headers
-│       ├── peers.rs        # Peer management
-│       ├── publish_queue.rs # History publishing queue
-│       ├── scp.rs          # SCP consensus state
-│       └── state.rs        # Key-value state storage
-└── README.md
+    CONN --> LQ[LedgerQueries]
+    CONN --> HQ[HistoryQueries]
+    CONN --> SQ[ScpQueries]
+    CONN --> STQ[StateQueries]
+    CONN --> PQ[PeerQueries]
+    CONN --> BLQ[BucketListQueries]
+    CONN --> PUB[PublishQueueQueries]
+    CONN --> BAN[BanQueries]
+    CONN --> SCP_P[ScpStatePersistenceQueries]
+
+    DB -->|initialize| MIG[migrations.rs]
+    MIG --> SCHEMA[schema.rs]
+
+    SCP_PERSIST[SqliteScpPersistence] --> DB
 ```
 
 ## Key Types
 
 | Type | Description |
 |------|-------------|
-| `Database` | Connection pool with high-level query methods |
-| `DbError` | Unified error type for all database operations |
-| `PooledConnection` | A connection borrowed from the pool |
-| `PeerRecord` | Network peer connection metadata |
+| `Database` | Connection pool handle with high-level query methods |
+| `DbError` | Unified error enum for all database operations |
+| `PooledConnection` | A connection borrowed from the r2d2 pool |
+| `PeerRecord` | Network peer connection metadata (next attempt, failures, type) |
+| `TxRecord` | Stored transaction with body, result, and optional metadata |
 | `SqliteScpPersistence` | SCP state persistence backed by SQLite |
-
-### Query Traits
-
-Query functionality is organized into domain-specific traits:
-
-| Trait | Purpose |
-|-------|---------|
-| `LedgerQueries` | Ledger header storage and retrieval |
-| `HistoryQueries` | Transaction history and results |
-| `ScpQueries` | SCP envelopes and quorum sets |
-| `ScpStatePersistenceQueries` | SCP slot state and tx set persistence for crash recovery |
-| `StateQueries` | Key-value state storage |
-| `PeerQueries` | Network peer tracking |
-| `BucketListQueries` | Bucket list snapshots |
-| `PublishQueueQueries` | History archive publish queue |
-| `BanQueries` | Node ban list management |
+| `LedgerQueries` | Trait for ledger header storage and retrieval |
+| `HistoryQueries` | Trait for transaction history and results |
+| `ScpQueries` | Trait for SCP envelopes and quorum sets |
+| `ScpStatePersistenceQueries` | Trait for SCP slot state and tx set persistence |
+| `StateQueries` | Trait for key-value state storage |
+| `PeerQueries` | Trait for network peer tracking |
+| `BucketListQueries` | Trait for bucket list snapshots |
+| `PublishQueueQueries` | Trait for history archive publish queue |
+| `BanQueries` | Trait for node ban list management |
 
 ## Usage
 
-### Opening a Database
+### Opening a database
 
 ```rust
 use henyey_db::Database;
 
-// Open a persistent database (creates if it doesn't exist)
+// Open a persistent database (creates file and parent dirs if needed)
 let db = Database::open("path/to/stellar.db")?;
 
 // Or use an in-memory database for testing
 let test_db = Database::open_in_memory()?;
 ```
 
-### Querying Data
-
-The `Database` type provides convenience methods for common operations:
+### Querying data
 
 ```rust
-// Get the latest ledger
+// High-level convenience methods on Database
 if let Some(seq) = db.get_latest_ledger_seq()? {
     println!("Latest ledger: {}", seq);
 }
 
-// Get a specific ledger header
 if let Some(header) = db.get_ledger_header(100)? {
     println!("Ledger {} closed at {}", header.ledger_seq, header.scp_value.close_time.0);
 }
-
-// Check network passphrase
-if let Some(passphrase) = db.get_network_passphrase()? {
-    println!("Network: {}", passphrase);
-}
 ```
 
-### Using Query Traits Directly
-
-For advanced use cases, you can use the query traits directly on connections:
+### Using query traits directly
 
 ```rust
 use henyey_db::{Database, queries::LedgerQueries};
 
 let db = Database::open_in_memory()?;
 db.with_connection(|conn| {
-    // Use trait methods directly
     let header = conn.load_ledger_header(100)?;
     Ok(header)
 })?;
-```
 
-### Transactions
-
-For atomic operations, use the transaction wrapper:
-
-```rust
+// Atomic multi-statement operations
 db.transaction(|tx| {
-    // Multiple operations in a single transaction
     tx.execute("INSERT INTO storestate (statename, state) VALUES ('key', 'value')", [])?;
     tx.execute("UPDATE storestate SET state = 'new' WHERE statename = 'key'", [])?;
     Ok(())
 })?;
 ```
 
-## Schema Management
+## Module Layout
 
-The database uses a versioned schema with automatic migrations:
+| Module | Description |
+|--------|-------------|
+| `lib.rs` | Crate root: re-exports, `Result` alias, `Database` convenience methods |
+| `error.rs` | `DbError` enum with conversions from rusqlite, r2d2, XDR, and I/O errors |
+| `pool.rs` | `Database` struct wrapping an r2d2 connection pool; `with_connection` and `transaction` helpers |
+| `schema.rs` | `CREATE_SCHEMA` SQL constant and `state_keys` module with well-known storestate keys |
+| `migrations.rs` | Versioned migration system: `CURRENT_VERSION`, `run_migrations`, `verify_schema` |
+| `scp_persistence.rs` | `SqliteScpPersistence` bridging herder persistence to database queries |
+| `queries/mod.rs` | Re-exports all query traits |
+| `queries/ledger.rs` | `LedgerQueries` trait: store/load headers, get latest seq, delete old entries |
+| `queries/history.rs` | `HistoryQueries` trait: individual txs, tx sets, tx results |
+| `queries/scp.rs` | `ScpQueries` and `ScpStatePersistenceQueries` traits: envelopes, quorum sets, slot state |
+| `queries/state.rs` | `StateQueries` trait: generic key-value get/set/delete on storestate table |
+| `queries/peers.rs` | `PeerQueries` trait: store/load peers, random peer selection with filters |
+| `queries/bucket_list.rs` | `BucketListQueries` trait: store/load bucket list levels at checkpoint ledgers |
+| `queries/publish_queue.rs` | `PublishQueueQueries` trait: enqueue/dequeue/load pending history checkpoints |
+| `queries/ban.rs` | `BanQueries` trait: ban/unban nodes, check ban status |
 
-- Schema version is tracked in the `storestate` table
-- Migrations run automatically when opening an existing database
-- New databases are initialized with the current schema version
+## Design Notes
 
-To manually check or upgrade the schema:
+- **Query traits on Connection**: All query methods are implemented as traits on `rusqlite::Connection`. This allows them to work with both raw connections and transactions (which deref to `Connection`), and lets `Database` provide thin wrappers via `with_connection`.
 
-```rust
-// Check current version
-let version = db.schema_version()?;
+- **Schema migrations**: Fresh databases get the full schema from `CREATE_SCHEMA`; existing databases are migrated incrementally. Each migration runs in its own transaction for atomicity.
 
-// Explicitly run migrations (usually not needed)
-db.upgrade()?;
-```
+- **SQLite tuning**: WAL journal mode, NORMAL synchronous, 64 MB cache, 30 s busy timeout, foreign keys ON, temp store in memory. The connection pool allows up to 10 concurrent connections for file-based databases and 1 for in-memory.
 
-## Database Tables
-
-### Core State
-- `storestate` - Key-value configuration and state
-- `ledgerheaders` - Block headers with sequence, hash, timestamp
-
-### History
-- `txhistory` - Individual transactions
-- `txsets` - Per-ledger transaction sets
-- `txresults` - Per-ledger transaction results
-
-### Consensus
-- `scphistory` - SCP envelopes per ledger
-- `scpquorums` - Quorum set definitions
-
-### Operations
-- `peers` - Known network peers
-- `ban` - Banned node IDs
-- `publishqueue` - Pending history publications
-- `bucketlist` - Checkpoint bucket hashes
-
-## Performance Notes
-
-The database is configured for optimal performance:
-
-- **WAL mode**: Enables concurrent reads during writes
-- **64MB cache**: Reduces disk I/O for frequently accessed data
-- **Connection pooling**: Up to 10 concurrent connections (file) or 1 (in-memory)
-
-For write-heavy operations, consider batching within transactions to reduce fsync overhead.
-
-## stellar-core Parity Status
-
-See [PARITY_STATUS.md](PARITY_STATUS.md) for detailed stellar-core parity analysis.
-
-## Testing
-
-Tests use in-memory databases for isolation and speed:
-
-```rust
-#[test]
-fn test_ledger_storage() {
-    let db = Database::open_in_memory().unwrap();
-    // Test operations...
-}
-```
+- **XDR storage**: Unlike stellar-core which stores XDR as base64 TEXT, this crate stores XDR as raw BLOB for efficiency. The exception is SCP slot state and tx set data in the storestate table, which use base64 encoding since they share the TEXT-valued storestate table.
 
 ## stellar-core Mapping
 
-This crate corresponds to the following stellar-core components:
-
-| Rust Module | stellar-core Component |
-|-------------|---------------|
-| `pool.rs` | `src/database/Database.cpp` (connection management) |
+| Rust | stellar-core |
+|------|--------------|
+| `pool.rs` | `src/database/Database.cpp` |
 | `schema.rs` | Various `dropAll()` functions across the codebase |
 | `migrations.rs` | `Database::upgradeToCurrentSchema()` |
 | `queries/state.rs` | `src/main/PersistentState.cpp` |
@@ -209,5 +139,9 @@ This crate corresponds to the following stellar-core components:
 | `queries/ban.rs` | `src/overlay/BanManagerImpl.cpp` |
 | `queries/history.rs` | `src/transactions/TransactionSQL.cpp` |
 | `queries/publish_queue.rs` | `src/history/HistoryManagerImpl.cpp` |
-| `queries/bucket_list.rs` | No direct stellar-core equivalent (new in Rust) |
-| `scp_persistence.rs` | `src/herder/HerderPersistenceImpl.cpp` (SCP state persistence) |
+| `queries/bucket_list.rs` | No direct stellar-core equivalent (Rust-specific) |
+| `scp_persistence.rs` | `src/herder/HerderPersistenceImpl.cpp` |
+
+## Parity Status
+
+See [PARITY_STATUS.md](PARITY_STATUS.md) for detailed stellar-core parity analysis.

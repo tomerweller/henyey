@@ -366,7 +366,7 @@ impl Default for ReplayConfig {
         Self {
             // Transaction result verification is disabled by default because during
             // replay we re-execute transactions without TransactionMeta from archives.
-            // Our execution may produce slightly different result codes than stellar-core
+            // Our execution may produce slightly different result codes than
             // stellar-core, especially for Soroban contracts (e.g., Trapped vs
             // ResourceLimitExceeded). The bucket list hash at checkpoints is the
             // authoritative verification of correct ledger state.

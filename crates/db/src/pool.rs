@@ -52,6 +52,7 @@ pub type PooledConnection = r2d2::PooledConnection<SqliteConnectionManager>;
 /// })?;
 /// # Ok::<(), henyey_db::DbError>(())
 /// ```
+#[derive(Clone)]
 pub struct Database {
     /// The underlying r2d2 connection pool.
     pub(crate) pool: Pool<SqliteConnectionManager>,
@@ -121,13 +122,5 @@ impl Database {
     {
         let conn = self.connection()?;
         f(&conn)
-    }
-}
-
-impl Clone for Database {
-    fn clone(&self) -> Self {
-        Self {
-            pool: self.pool.clone(),
-        }
     }
 }

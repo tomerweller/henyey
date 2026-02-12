@@ -37,6 +37,8 @@
 use std::cmp::Ordering;
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 
+use crate::math::is_representable_as_i64;
+
 /// Number of resource dimensions for classic transactions (operations only).
 pub const NUM_CLASSIC_TX_RESOURCES: usize = 1;
 
@@ -214,20 +216,18 @@ impl SubAssign for Resource {
 impl Add for Resource {
     type Output = Self;
 
-    fn add(self, other: Self) -> Self::Output {
-        let mut out = self.clone();
-        out += other;
-        out
+    fn add(mut self, other: Self) -> Self::Output {
+        self += other;
+        self
     }
 }
 
 impl Sub for Resource {
     type Output = Self;
 
-    fn sub(self, other: Self) -> Self::Output {
-        let mut out = self.clone();
-        out -= other;
-        out
+    fn sub(mut self, other: Self) -> Self::Output {
+        self -= other;
+        self
     }
 }
 
@@ -297,16 +297,7 @@ impl std::fmt::Display for Resource {
 
 impl std::fmt::Display for ResourceType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            ResourceType::Operations => "Operations",
-            ResourceType::Instructions => "Instructions",
-            ResourceType::TxByteSize => "TxByteSize",
-            ResourceType::DiskReadBytes => "DiskReadBytes",
-            ResourceType::WriteBytes => "WriteBytes",
-            ResourceType::ReadLedgerEntries => "ReadLedgerEntries",
-            ResourceType::WriteLedgerEntries => "WriteLedgerEntries",
-        };
-        write!(f, "{}", name)
+        f.write_str(self.as_str())
     }
 }
 
@@ -408,11 +399,6 @@ pub fn saturated_multiply_by_double(res: &Resource, m: f64) -> Resource {
         })
         .collect();
     Resource::new(values)
-}
-
-/// Check if a f64 value can be represented as an i64.
-fn is_representable_as_i64(v: f64) -> bool {
-    v >= i64::MIN as f64 && v <= i64::MAX as f64
 }
 
 /// Divides each dimension of a resource using big integer division.

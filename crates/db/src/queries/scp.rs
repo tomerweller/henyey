@@ -18,8 +18,8 @@ use stellar_xdr::curr::{
     Hash, Limits, NodeId, PublicKey, ReadXdr, ScpEnvelope, ScpQuorumSet, Uint256, WriteXdr,
 };
 
-use super::super::error::DbError;
-use super::super::schema::state_keys;
+use crate::error::DbError;
+use crate::schema::state_keys;
 
 /// Query trait for SCP consensus state operations.
 ///
@@ -268,19 +268,19 @@ impl ScpStatePersistenceQueries for Connection {
         let mut results = Vec::new();
         for row in rows {
             let (key, state) = row?;
-            // Parse slot from key (format: "scpstate:123")
-            if let Some(slot_str) = key.strip_prefix(&prefix) {
-                if let Ok(slot) = slot_str.parse::<u64>() {
-                    results.push((slot, state));
-                }
-            }
+            let Some(slot_str) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Ok(slot) = slot_str.parse::<u64>() else {
+                continue;
+            };
+            results.push((slot, state));
         }
         Ok(results)
     }
 
     fn delete_scp_slot_states_below(&self, slot: u64) -> Result<(), DbError> {
         let prefix = format!("{}:", state_keys::SCP_STATE);
-        // We need to get all keys and filter by slot number
         let mut stmt = self.prepare("SELECT statename FROM storestate WHERE statename LIKE ?1")?;
         let pattern = format!("{}%", prefix);
         let rows = stmt.query_map(params![pattern], |row| row.get::<_, String>(0))?;
@@ -288,12 +288,14 @@ impl ScpStatePersistenceQueries for Connection {
         let mut keys_to_delete = Vec::new();
         for row in rows {
             let key = row?;
-            if let Some(slot_str) = key.strip_prefix(&prefix) {
-                if let Ok(key_slot) = slot_str.parse::<u64>() {
-                    if key_slot < slot {
-                        keys_to_delete.push(key);
-                    }
-                }
+            let Some(slot_str) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Ok(key_slot) = slot_str.parse::<u64>() else {
+                continue;
+            };
+            if key_slot < slot {
+                keys_to_delete.push(key);
             }
         }
 
@@ -351,22 +353,22 @@ impl ScpStatePersistenceQueries for Connection {
         let mut results = Vec::new();
         for row in rows {
             let (key, encoded) = row?;
-            if let Some(hash_hex) = key.strip_prefix(prefix) {
-                if let Ok(hash_bytes) = hex::decode(hash_hex) {
-                    if hash_bytes.len() == 32 {
-                        let mut hash_arr = [0u8; 32];
-                        hash_arr.copy_from_slice(&hash_bytes);
-                        let hash = Hash(hash_arr);
-
-                        if let Ok(data) = base64::Engine::decode(
-                            &base64::engine::general_purpose::STANDARD,
-                            &encoded,
-                        ) {
-                            results.push((hash, data));
-                        }
-                    }
-                }
-            }
+            let Some(hash_hex) = key.strip_prefix(prefix) else {
+                continue;
+            };
+            let Ok(hash_bytes) = hex::decode(hash_hex) else {
+                continue;
+            };
+            let Ok(hash_arr): Result<[u8; 32], _> = hash_bytes.try_into() else {
+                continue;
+            };
+            let Ok(data) = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                &encoded,
+            ) else {
+                continue;
+            };
+            results.push((Hash(hash_arr), data));
         }
         Ok(results)
     }

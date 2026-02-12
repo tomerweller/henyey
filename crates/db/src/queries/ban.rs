@@ -8,7 +8,7 @@
 
 use rusqlite::{params, Connection};
 
-use super::super::error::DbError;
+use crate::error::DbError;
 
 /// Query trait for node ban list operations.
 ///
@@ -58,10 +58,7 @@ impl BanQueries for Connection {
     fn load_bans(&self) -> Result<Vec<String>, DbError> {
         let mut stmt = self.prepare("SELECT nodeid FROM ban")?;
         let rows = stmt.query_map([], |row| row.get(0))?;
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(DbError::from)
     }
 }

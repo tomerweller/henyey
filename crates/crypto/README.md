@@ -1,43 +1,61 @@
 # henyey-crypto
 
-Pure Rust cryptographic primitives for henyey.
+Pure Rust cryptographic primitives for henyey (Stellar Core).
 
 ## Overview
 
-This crate provides all cryptographic operations needed by Stellar Core, implemented entirely in Rust with no C dependencies (no libsodium). It is designed to produce deterministic, bit-compatible results with the stellar-core implementation.
+This crate provides all cryptographic operations needed by a Stellar Core
+implementation, entirely in Rust with no C/C++ dependencies (no libsodium).
+It corresponds to the `src/crypto/` directory in upstream stellar-core and is
+designed to produce deterministic, bit-compatible results with the C++
+implementation. Other henyey crates depend on `henyey-crypto` for signing,
+hashing, key encoding, and encryption.
 
-## Features
+## Architecture
 
-- **Ed25519 Signatures**: Key generation, signing, and verification
-- **SHA-256 Hashing**: Single-shot and streaming hash computation
-- **BLAKE2 Hashing**: Single-shot and streaming BLAKE2b-256 hash computation
-- **HMAC-SHA256**: Message authentication with constant-time verification
-- **HKDF**: Key derivation (extract, expand, and combined)
-- **XDR Hashing**: SHA-256 and BLAKE2 hashing of XDR-encoded values
-- **StrKey Encoding**: Stellar's base32 key format (G..., S..., T..., X..., M..., P..., C...)
-- **Short Hashing**: SipHash-2-4 for deterministic ordering in bucket lists
-- **Sealed Boxes**: Curve25519-based anonymous encryption for survey payloads
-- **Curve25519 ECDH**: Key exchange for P2P overlay authentication
-- **Hex Encoding**: Hex encode/decode utilities matching stellar-core `Hex.h`
-- **SignerKey Utilities**: Construction and inspection of transaction authorization signer keys
-- **Secure Random**: Cryptographically secure random number generation
+```mermaid
+graph TD
+    subgraph "henyey-crypto"
+        keys[keys.rs<br>PublicKey / SecretKey / Signature]
+        hash[hash.rs<br>SHA-256 / BLAKE2 / HMAC / HKDF / XDR hashing]
+        strkey[strkey.rs<br>StrKey encode/decode]
+        signer_key[signer_key.rs<br>SignerKey construction]
+        signature[signature.rs<br>Sign/verify helpers / SignedMessage]
+        short_hash[short_hash.rs<br>SipHash-2-4]
+        curve25519[curve25519.rs<br>ECDH key exchange]
+        sealed_box[sealed_box.rs<br>Sealed box encryption]
+        hex_mod[hex.rs<br>Hex encode/decode]
+        random[random.rs<br>Secure RNG]
+    end
+
+    keys --> strkey
+    signature --> keys
+    signer_key --> hash
+    sealed_box --> keys
+    curve25519 --> hash
+    short_hash --> random
+```
 
 ## Key Types
 
 | Type | Description |
 |------|-------------|
-| `PublicKey` | Ed25519 public key (32 bytes), encodes to account ID (G...) |
-| `SecretKey` | Ed25519 secret key (32 bytes), encodes to seed (S...), zeroized on drop |
+| `PublicKey` | Ed25519 public key (32 bytes); encodes to account ID (G...) |
+| `SecretKey` | Ed25519 secret key (32 bytes); encodes to seed (S...); zeroized on drop |
 | `Signature` | Ed25519 signature (64 bytes) |
-| `Curve25519Secret` | X25519 secret scalar for ECDH key exchange, zeroized on drop |
-| `Curve25519Public` | X25519 public point for ECDH key exchange |
-| `Hash256` | SHA-256 hash (32 bytes), re-exported from `henyey-common` |
 | `SignedMessage` | Message bundled with signature and signer hint |
+| `Curve25519Secret` | X25519 secret scalar for ECDH key exchange; zeroized on drop |
+| `Curve25519Public` | X25519 public point for ECDH key exchange |
+| `Hash256` | 32-byte hash value (re-exported from `henyey-common`) |
+| `Sha256Hasher` | Streaming SHA-256 hasher |
+| `Blake2Hasher` | Streaming BLAKE2b-256 hasher |
+| `XdrSha256Hasher` | Streaming SHA-256 hasher for XDR serialization |
+| `XdrBlake2Hasher` | Streaming BLAKE2b-256 hasher for XDR serialization |
 | `CryptoError` | Error type for all cryptographic operations |
 
 ## Usage
 
-### Key Generation and Signing
+### Key generation, signing, and verification
 
 ```rust
 use henyey_crypto::{SecretKey, PublicKey};
@@ -46,124 +64,98 @@ use henyey_crypto::{SecretKey, PublicKey};
 let secret = SecretKey::generate();
 let public = secret.public_key();
 
-// Sign a message
-let message = b"hello stellar";
-let signature = secret.sign(message);
+// Sign and verify
+let signature = secret.sign(b"hello stellar");
+assert!(public.verify(b"hello stellar", &signature).is_ok());
 
-// Verify the signature
-assert!(public.verify(message, &signature).is_ok());
-
-// Convert to StrKey format
+// StrKey round-trip
 let account_id = public.to_strkey();  // G...
-let seed = secret.to_strkey();         // S...
+let restored = PublicKey::from_strkey(&account_id).unwrap();
+assert_eq!(public, restored);
 ```
 
-### Hashing
+### Hashing and HMAC
 
 ```rust
-use henyey_crypto::{sha256, sha256_multi, Sha256Hasher};
+use henyey_crypto::{sha256, sha256_multi, Sha256Hasher, hmac_sha256, hmac_sha256_verify};
 
-// Single-shot hashing
+// Single-shot SHA-256
 let hash = sha256(b"hello world");
 
-// Multi-chunk hashing (avoids concatenation)
+// Multi-chunk (avoids intermediate allocation)
 let hash = sha256_multi(&[b"hello ", b"world"]);
 
-// Streaming hashing
+// Streaming
 let mut hasher = Sha256Hasher::new();
 hasher.update(b"hello ");
 hasher.update(b"world");
 let hash = hasher.finalize();
-```
 
-### StrKey Encoding
-
-```rust
-use henyey_crypto::{encode_account_id, decode_account_id};
-
+// HMAC-SHA256
 let key = [0u8; 32];
-let strkey = encode_account_id(&key);  // GAAAAAA...
-let decoded = decode_account_id(&strkey).unwrap();
-assert_eq!(decoded, key);
+let mac = hmac_sha256(&key, b"message");
+assert!(hmac_sha256_verify(&mac, &key, b"message"));
 ```
 
-### Short Hashing (SipHash)
-
-```rust
-use henyey_crypto::{compute_hash, seed};
-
-// Seed for deterministic tests (optional)
-seed(12345).unwrap();
-
-// Compute short hash
-let hash = compute_hash(b"some data");
-```
-
-### Sealed Box Encryption
+### Sealed box encryption (surveys)
 
 ```rust
 use henyey_crypto::{SecretKey, seal_to_public_key, open_from_secret_key};
 
-let recipient_secret = SecretKey::generate();
-let recipient_public = recipient_secret.public_key();
-
-// Encrypt
-let plaintext = b"secret message";
-let ciphertext = seal_to_public_key(&recipient_public, plaintext).unwrap();
-
-// Decrypt
-let decrypted = open_from_secret_key(&recipient_secret, &ciphertext).unwrap();
-assert_eq!(decrypted, plaintext);
+let recipient = SecretKey::generate();
+let ciphertext = seal_to_public_key(&recipient.public_key(), b"secret").unwrap();
+let plaintext = open_from_secret_key(&recipient, &ciphertext).unwrap();
+assert_eq!(plaintext, b"secret");
 ```
 
-## Module Structure
+## Module Layout
 
-```
-src/
-├── lib.rs          # Crate root, re-exports
-├── curve25519.rs   # Curve25519 ECDH key exchange for P2P overlay
-├── error.rs        # CryptoError type
-├── hash.rs         # SHA-256, BLAKE2, HMAC-SHA256, HKDF, XDR hashing
-├── hex.rs          # Hex encoding/decoding utilities
-├── keys.rs         # PublicKey, SecretKey, Signature
-├── random.rs       # Secure random generation
-├── sealed_box.rs   # Curve25519 sealed box encryption
-├── short_hash.rs   # SipHash-2-4 for deterministic ordering
-├── signature.rs    # Signing utilities, SignedMessage
-├── signer_key.rs   # SignerKey construction and inspection
-└── strkey.rs       # StrKey encode/decode
-```
+| Module | Description |
+|--------|-------------|
+| `lib.rs` | Crate root; module declarations and public re-exports |
+| `keys.rs` | `PublicKey`, `SecretKey`, `Signature` types with Ed25519 operations and XDR conversions |
+| `hash.rs` | SHA-256, BLAKE2b-256, HMAC-SHA256, HKDF, and XDR hashing (single-shot and streaming) |
+| `strkey.rs` | Stellar StrKey base32 encoding/decoding for all key types (G, S, T, X, M, P, C) |
+| `signature.rs` | Signing/verification convenience functions, signature hints, and `SignedMessage` |
+| `signer_key.rs` | Construction and inspection of XDR `SignerKey` variants (Ed25519, PreAuthTx, HashX, SignedPayload) |
+| `short_hash.rs` | Process-global SipHash-2-4 for deterministic bucket list ordering |
+| `curve25519.rs` | Curve25519 ECDH key exchange for P2P overlay session key agreement |
+| `sealed_box.rs` | Sealed box encryption/decryption for anonymous survey payloads |
+| `hex.rs` | Hex encoding/decoding utilities (`bin_to_hex`, `hex_abbrev`, `hex_to_bin`, `hex_to_bin_256`) |
+| `random.rs` | Cryptographically secure random byte/integer generation via OS RNG |
+| `error.rs` | `CryptoError` enum covering all failure modes |
 
-## Dependencies
+## Design Notes
 
-| Crate | Purpose |
-|-------|---------|
-| `ed25519-dalek` | Ed25519 signatures |
-| `x25519-dalek` | X25519 ECDH key exchange |
-| `sha2` | SHA-256 hashing |
-| `blake2` | BLAKE2b hashing |
-| `hmac` | HMAC-SHA256 message authentication |
-| `hkdf` | HKDF key derivation |
-| `siphasher` | SipHash-2-4 |
-| `crypto_box` | Sealed box encryption (X25519 + XSalsa20-Poly1305) |
-| `rand` | Random number generation |
-| `base32` | StrKey encoding |
-| `hex` | Hex encoding/decoding |
-| `zeroize` | Secure memory clearing for key material |
-| `thiserror` | Error type derivation |
+- **Key zeroization**: `SecretKey` relies on `ed25519-dalek`'s built-in
+  `Zeroize` on drop. `Curve25519Secret` uses the `ZeroizeOnDrop` derive.
+  Neither type exposes key material in `Debug` output.
+- **Short hash global state**: The SipHash key is stored in a `Mutex` behind
+  `OnceLock`. Once any hash is computed, the key is locked and cannot be
+  reseeded with a different value. This ensures deterministic ordering within
+  a process.
+- **XDR hashing allocates**: Unlike stellar-core's zero-allocation `XDRHasher`
+  CRTP pattern, the Rust implementation serializes XDR to a `Vec<u8>` first.
+  This is simpler and sufficient for current workloads.
+- **Constant-time HMAC verification**: `hmac_sha256_verify` delegates to the
+  `hmac` crate's `verify_slice`, which performs constant-time comparison.
 
-## Security Notes
+## stellar-core Mapping
 
-- **Key Zeroization**: `SecretKey` and `Curve25519Secret` are zeroized on drop to minimize key material exposure
-- **Debug Safety**: `SecretKey` and `Curve25519Secret` show `[REDACTED]` instead of key material in debug output
-- **Constant-Time HMAC Verification**: `hmac_sha256_verify` uses constant-time comparison to prevent timing attacks
-- **Deterministic Ordering**: Short hashes use a process-global key that cannot be changed after first use
-- **No Libsodium**: Pure Rust implementation ensures reproducible builds and auditable code
+| Rust | stellar-core |
+|------|--------------|
+| `keys.rs` | `src/crypto/SecretKey.h` / `SecretKey.cpp` |
+| `hash.rs` | `src/crypto/SHA.h` / `SHA.cpp`, `src/crypto/BLAKE2.h` / `BLAKE2.cpp` |
+| `strkey.rs` | `src/crypto/StrKey.h` / `StrKey.cpp` |
+| `signature.rs` | `src/crypto/SecretKey.h` (signing/verification helpers) |
+| `signer_key.rs` | `src/crypto/SignerKey.h` / `SignerKeyUtils.h` |
+| `short_hash.rs` | `src/crypto/ShortHash.h` / `ShortHash.cpp` |
+| `curve25519.rs` | `src/crypto/Curve25519.h` / `Curve25519.cpp` |
+| `sealed_box.rs` | `src/crypto/Curve25519.h` (sealed box functions) |
+| `hex.rs` | `src/crypto/Hex.h` / `Hex.cpp` |
+| `random.rs` | `src/crypto/Random.h` / `Random.cpp` |
+| `error.rs` | (no direct equivalent; C++ uses exceptions) |
 
-## Compatibility
-
-This crate is designed to be bit-compatible with stellar-core. Test vectors from the stellar-core implementation should produce identical results.
-
-## stellar-core Parity Status
+## Parity Status
 
 See [PARITY_STATUS.md](PARITY_STATUS.md) for detailed stellar-core parity analysis.

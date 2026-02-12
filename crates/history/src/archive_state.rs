@@ -8,6 +8,66 @@ use henyey_common::Hash256;
 
 use crate::error::HistoryError;
 
+/// The zero hash string used to identify empty bucket slots.
+const ZERO_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Try to parse a hex hash string, returning `Some(Hash256)` if non-empty and non-zero.
+fn parse_nonzero_hash(hex: &str) -> Option<Hash256> {
+    if hex.is_empty() || hex == ZERO_HASH {
+        return None;
+    }
+    Hash256::from_hex(hex).ok()
+}
+
+/// Collect all non-zero bucket hashes from a slice of bucket levels.
+fn collect_bucket_hashes(levels: &[HASBucketLevel], out: &mut Vec<Hash256>) {
+    for level in levels {
+        if let Some(h) = parse_nonzero_hash(&level.curr) {
+            out.push(h);
+        }
+        if let Some(h) = parse_nonzero_hash(&level.snap) {
+            out.push(h);
+        }
+        if let Some(ref output) = level.next.output {
+            if let Some(h) = parse_nonzero_hash(output) {
+                out.push(h);
+            }
+        }
+        if level.next.state == 2 {
+            if let Some(ref curr) = level.next.curr {
+                if let Some(h) = parse_nonzero_hash(curr) {
+                    out.push(h);
+                }
+            }
+            if let Some(ref snap) = level.next.snap {
+                if let Some(h) = parse_nonzero_hash(snap) {
+                    out.push(h);
+                }
+            }
+        }
+    }
+}
+
+/// Parse bucket hash pairs (curr, snap) from a slice of bucket levels.
+fn parse_bucket_hash_pairs(levels: &[HASBucketLevel]) -> Vec<(Hash256, Hash256)> {
+    levels
+        .iter()
+        .map(|level| {
+            let curr = parse_nonzero_hash(&level.curr).unwrap_or(Hash256::ZERO);
+            let snap = parse_nonzero_hash(&level.snap).unwrap_or(Hash256::ZERO);
+            (curr, snap)
+        })
+        .collect()
+}
+
+/// Parse bucket hashes at a specific level, returning (curr, snap) as Options.
+fn parse_level_hashes(level: &HASBucketLevel) -> (Option<Hash256>, Option<Hash256>) {
+    (
+        parse_nonzero_hash(&level.curr),
+        parse_nonzero_hash(&level.snap),
+    )
+}
+
 /// History Archive State - the root JSON file describing archive state.
 ///
 /// This is typically found at `.well-known/stellar-history.json` or at
@@ -136,93 +196,11 @@ impl HistoryArchiveState {
     ///
     /// A vector of all unique bucket hashes.
     pub fn all_bucket_hashes(&self) -> Vec<Hash256> {
-        let zero_hash = "0".repeat(64);
         let mut hashes = Vec::new();
-
-        for level in &self.current_buckets {
-            // Add current bucket hash if non-zero
-            if !level.curr.is_empty() && level.curr != zero_hash {
-                if let Ok(h) = Hash256::from_hex(&level.curr) {
-                    hashes.push(h);
-                }
-            }
-
-            // Add snapshot bucket hash if non-zero
-            if !level.snap.is_empty() && level.snap != zero_hash {
-                if let Ok(h) = Hash256::from_hex(&level.snap) {
-                    hashes.push(h);
-                }
-            }
-
-            // Add next output if present and non-zero (state == 1)
-            if let Some(ref output) = level.next.output {
-                if !output.is_empty() && output != &zero_hash {
-                    if let Ok(h) = Hash256::from_hex(output) {
-                        hashes.push(h);
-                    }
-                }
-            }
-
-            // Add next input hashes if present and non-zero (state == 2)
-            if level.next.state == 2 {
-                if let Some(ref curr) = level.next.curr {
-                    if !curr.is_empty() && curr != &zero_hash {
-                        if let Ok(h) = Hash256::from_hex(curr) {
-                            hashes.push(h);
-                        }
-                    }
-                }
-                if let Some(ref snap) = level.next.snap {
-                    if !snap.is_empty() && snap != &zero_hash {
-                        if let Ok(h) = Hash256::from_hex(snap) {
-                            hashes.push(h);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Also check hot archive buckets if present
+        collect_bucket_hashes(&self.current_buckets, &mut hashes);
         if let Some(ref hot_buckets) = self.hot_archive_buckets {
-            for level in hot_buckets {
-                if !level.curr.is_empty() && level.curr != zero_hash {
-                    if let Ok(h) = Hash256::from_hex(&level.curr) {
-                        hashes.push(h);
-                    }
-                }
-                if !level.snap.is_empty() && level.snap != zero_hash {
-                    if let Ok(h) = Hash256::from_hex(&level.snap) {
-                        hashes.push(h);
-                    }
-                }
-                // Add next output if present and non-zero (state == 1)
-                if let Some(ref output) = level.next.output {
-                    if !output.is_empty() && output != &zero_hash {
-                        if let Ok(h) = Hash256::from_hex(output) {
-                            hashes.push(h);
-                        }
-                    }
-                }
-                // Add next input hashes if present and non-zero (state == 2)
-                if level.next.state == 2 {
-                    if let Some(ref curr) = level.next.curr {
-                        if !curr.is_empty() && curr != &zero_hash {
-                            if let Ok(h) = Hash256::from_hex(curr) {
-                                hashes.push(h);
-                            }
-                        }
-                    }
-                    if let Some(ref snap) = level.next.snap {
-                        if !snap.is_empty() && snap != &zero_hash {
-                            if let Ok(h) = Hash256::from_hex(snap) {
-                                hashes.push(h);
-                            }
-                        }
-                    }
-                }
-            }
+            collect_bucket_hashes(hot_buckets, &mut hashes);
         }
-
         hashes
     }
 
@@ -264,23 +242,7 @@ impl HistoryArchiveState {
         &self,
         level: usize,
     ) -> Option<(Option<Hash256>, Option<Hash256>)> {
-        self.current_buckets.get(level).map(|bucket_level| {
-            let zero_hash = "0".repeat(64);
-
-            let curr = if bucket_level.curr != zero_hash {
-                Hash256::from_hex(&bucket_level.curr).ok()
-            } else {
-                None
-            };
-
-            let snap = if bucket_level.snap != zero_hash {
-                Hash256::from_hex(&bucket_level.snap).ok()
-            } else {
-                None
-            };
-
-            (curr, snap)
-        })
+        self.current_buckets.get(level).map(parse_level_hashes)
     }
 
     /// Get hot archive bucket hashes for a specific level.
@@ -297,23 +259,7 @@ impl HistoryArchiveState {
         level: usize,
     ) -> Option<(Option<Hash256>, Option<Hash256>)> {
         let hot_buckets = self.hot_archive_buckets.as_ref()?;
-        hot_buckets.get(level).map(|bucket_level| {
-            let zero_hash = "0".repeat(64);
-
-            let curr = if bucket_level.curr != zero_hash {
-                Hash256::from_hex(&bucket_level.curr).ok()
-            } else {
-                None
-            };
-
-            let snap = if bucket_level.snap != zero_hash {
-                Hash256::from_hex(&bucket_level.snap).ok()
-            } else {
-                None
-            };
-
-            (curr, snap)
-        })
+        hot_buckets.get(level).map(parse_level_hashes)
     }
 
     /// Check if this HAS contains hot archive buckets.
@@ -332,48 +278,16 @@ impl HistoryArchiveState {
     ///
     /// This format is suitable for `BucketList::restore_from_has`.
     pub fn bucket_hash_pairs(&self) -> Vec<(Hash256, Hash256)> {
-        let zero_hash = "0".repeat(64);
-        self.current_buckets
-            .iter()
-            .map(|level| {
-                let curr = if level.curr != zero_hash {
-                    Hash256::from_hex(&level.curr).unwrap_or(Hash256::ZERO)
-                } else {
-                    Hash256::ZERO
-                };
-                let snap = if level.snap != zero_hash {
-                    Hash256::from_hex(&level.snap).unwrap_or(Hash256::ZERO)
-                } else {
-                    Hash256::ZERO
-                };
-                (curr, snap)
-            })
-            .collect()
+        parse_bucket_hash_pairs(&self.current_buckets)
     }
 
     /// Get hot archive bucket hashes as (curr, snap) tuples for all levels.
     ///
     /// This format is suitable for `HotArchiveBucketList::restore_from_has`.
     pub fn hot_archive_bucket_hash_pairs(&self) -> Option<Vec<(Hash256, Hash256)>> {
-        let zero_hash = "0".repeat(64);
-        self.hot_archive_buckets.as_ref().map(|levels| {
-            levels
-                .iter()
-                .map(|level| {
-                    let curr = if level.curr != zero_hash {
-                        Hash256::from_hex(&level.curr).unwrap_or(Hash256::ZERO)
-                    } else {
-                        Hash256::ZERO
-                    };
-                    let snap = if level.snap != zero_hash {
-                        Hash256::from_hex(&level.snap).unwrap_or(Hash256::ZERO)
-                    } else {
-                        Hash256::ZERO
-                    };
-                    (curr, snap)
-                })
-                .collect()
-        })
+        self.hot_archive_buckets
+            .as_ref()
+            .map(|levels| parse_bucket_hash_pairs(levels))
     }
 
     /// Get the next bucket merge states for all live bucket levels.

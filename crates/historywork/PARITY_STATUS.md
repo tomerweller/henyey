@@ -24,7 +24,7 @@ stellar-core `src/historywork/` directory (v25.x).
 | stellar-core Class | Rust Equivalent | Parity Notes |
 |-----------|-----------------|--------------|
 | `GetHistoryArchiveStateWork` | `GetHistoryArchiveStateWork` | Full parity. Fetches HAS JSON from archive. |
-| `DownloadBucketsWork` | `DownloadBucketsWork` | Simplified. Downloads to memory instead of disk. No bucket indexing. Uses parallel async downloads (16 concurrent) matching stellar-core `MAX_CONCURRENT_SUBPROCESSES`. |
+| `DownloadBucketsWork` | `DownloadBucketsWork` | Simplified. Downloads to disk with hash verification. No bucket indexing. Uses parallel async downloads (16 concurrent) matching stellar-core `MAX_CONCURRENT_SUBPROCESSES`. |
 | (via BatchDownloadWork) | `DownloadLedgerHeadersWork` | Rust-specific. Downloads and verifies header chain in one step. |
 | (via BatchDownloadWork) | `DownloadTransactionsWork` | Rust-specific. Downloads and verifies tx sets against headers. |
 | (via BatchDownloadWork) | `DownloadTxResultsWork` | Rust-specific. Downloads and verifies tx results. |
@@ -133,7 +133,7 @@ The Rust `DownloadBucketsWork` downloads all bucket hashes from the HAS, includi
 |--------|-------------------|---------------------|
 | **File Downloads** | Shell commands (`curl`, `wget`) via `RunCommandWork` | Native async HTTP via `reqwest` |
 | **Compression** | Shell commands (`gzip`, `gunzip`) | In-memory via `flate2` |
-| **Bucket Storage** | Files on disk with indexing (`BucketManager.adoptFileAsBucket()`) | In-memory `HashMap<Hash256, Vec<u8>>` |
+| **Bucket Storage** | Files on disk with indexing (`BucketManager.adoptFileAsBucket()`) | Files on disk (`<hash>.bucket.xdr` in configurable bucket directory) |
 | **Work Orchestration** | `BasicWork`/`Work`/`BatchWork` hierarchy with state machine | `Work` trait with `WorkScheduler` DAG |
 | **Background Work** | `postOnBackgroundThread` for CPU-intensive tasks | All async, no dedicated background threads |
 | **Progress Reporting** | `fmtProgress()` with checkpoint-range math | `HistoryWorkStage` enum + message |
@@ -165,19 +165,14 @@ The stellar-core implementation includes extensive metrics via `medida`:
 ## Known Behavioral Differences
 
 1. **Bucket Indexing**: stellar-core builds a bucket index during verification for fast
-   lookups. Rust keeps raw bucket data in memory without indexing.
+   lookups. Rust stores raw bucket data on disk without indexing.
 
-2. **Disk Usage**: stellar-core downloads to temp files and cleans up. Rust keeps everything
-   in memory, which may limit catchup size on memory-constrained systems.
-
-3. **Archive Failover**: stellar-core randomly selects archives and fails over on error.
+2. **Archive Failover**: stellar-core randomly selects archives and fails over on error.
    Rust uses a single archive per builder with retry at the work level.
 
-4. **Empty Result Handling**: Rust publish work items fail if data is empty.
+3. **Empty Result Handling**: Rust publish work items fail if data is empty.
    stellar-core may handle this differently depending on the work type.
 
 ## Recommendations for Future Work
 
 1. **Low Priority**: Add metrics collection for monitoring and debugging.
-
-2. **Low Priority**: Consider disk-based bucket storage for large catchup operations.

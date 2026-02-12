@@ -25,6 +25,7 @@ use crate::{
     auth::AuthContext,
     codec::helpers,
     connection::{Connection, ConnectionDirection},
+    flow_control::msg_body_size,
     LocalNode, OverlayError, PeerAddress, PeerId, Result,
 };
 use std::net::SocketAddr;
@@ -34,12 +35,6 @@ use std::time::Instant;
 use stellar_xdr::curr::{Auth, Hello, StellarMessage};
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
-
-fn message_len(message: &StellarMessage) -> usize {
-    stellar_xdr::curr::WriteXdr::to_xdr(message, stellar_xdr::curr::Limits::none())
-        .map(|bytes| bytes.len())
-        .unwrap_or(0)
-}
 
 /// Current state of a peer connection.
 ///
@@ -413,25 +408,25 @@ impl Peer {
 
     /// Send a raw message (before authentication, e.g., Hello).
     async fn send_raw(&mut self, message: StellarMessage) -> Result<()> {
-        let size = message_len(&message);
+        let size = msg_body_size(&message);
         let auth_msg = self.auth.wrap_unauthenticated(message);
         self.connection.send(auth_msg).await?;
         self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
         self.stats
             .bytes_sent
-            .fetch_add(size as u64, Ordering::Relaxed);
+            .fetch_add(size, Ordering::Relaxed);
         Ok(())
     }
 
     /// Send an Auth message (with MAC but sequence 0).
     async fn send_auth(&mut self, message: StellarMessage) -> Result<()> {
-        let size = message_len(&message);
+        let size = msg_body_size(&message);
         let auth_msg = self.auth.wrap_auth_message(message)?;
         self.connection.send(auth_msg).await?;
         self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
         self.stats
             .bytes_sent
-            .fetch_add(size as u64, Ordering::Relaxed);
+            .fetch_add(size, Ordering::Relaxed);
         Ok(())
     }
 
@@ -446,13 +441,13 @@ impl Peer {
         let msg_type = helpers::message_type_name(&message);
         trace!("SEND {} to {}", msg_type, self.info.peer_id);
 
-        let size = message_len(&message);
+        let size = msg_body_size(&message);
         let auth_msg = self.auth.wrap_message(message)?;
         self.connection.send(auth_msg).await?;
         self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
         self.stats
             .bytes_sent
-            .fetch_add(size as u64, Ordering::Relaxed);
+            .fetch_add(size, Ordering::Relaxed);
 
         Ok(())
     }
@@ -595,11 +590,6 @@ impl Peer {
 
     /// Request peers from this peer.
     /// Note: GetPeers was removed in Protocol 24. This is a no-op.
-    pub async fn request_peers(&mut self) -> Result<()> {
-        // GetPeers is no longer supported - peers are pushed via Peers messages
-        Ok(())
-    }
-
     /// Send flow control message.
     pub async fn send_more(&mut self, num_messages: u32) -> Result<()> {
         let message = StellarMessage::SendMore(stellar_xdr::curr::SendMore { num_messages });

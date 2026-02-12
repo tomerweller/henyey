@@ -50,45 +50,12 @@ impl BanManager {
             OverlayError::DatabaseError(format!("Failed to open ban database: {}", e))
         })?;
 
-        // Create the ban table if it doesn't exist
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS ban (
-                nodeid CHARACTER(56) NOT NULL PRIMARY KEY
-            )",
-            [],
-        )
-        .map_err(|e| OverlayError::DatabaseError(format!("Failed to create ban table: {}", e)))?;
-
-        // Load existing bans into cache
-        let mut cache = HashSet::new();
-        {
-            let mut stmt = conn.prepare("SELECT nodeid FROM ban").map_err(|e| {
-                OverlayError::DatabaseError(format!("Failed to prepare query: {}", e))
-            })?;
-
-            let rows = stmt
-                .query_map([], |row| row.get::<_, String>(0))
-                .map_err(|e| OverlayError::DatabaseError(format!("Failed to query bans: {}", e)))?;
-
-            for row in rows.flatten() {
-                if let Ok(peer_id) = PeerId::from_strkey(&row) {
-                    cache.insert(peer_id);
-                }
-            }
-        }
-
-        let num_loaded = cache.len();
+        let manager = Self::from_connection(conn)?;
+        let num_loaded = manager.cache.read().len();
         if num_loaded > 0 {
             info!("Loaded {} banned nodes from database", num_loaded);
         }
-
-        #[allow(clippy::arc_with_non_send_sync)]
-        let db = Arc::new(RwLock::new(conn));
-
-        Ok(Self {
-            cache: RwLock::new(cache),
-            db: Some(db),
-        })
+        Ok(manager)
     }
 
     /// Create a ban manager using an existing database connection.

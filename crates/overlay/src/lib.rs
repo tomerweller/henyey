@@ -354,7 +354,7 @@ impl PeerAddress {
     ///
     /// The format is `host:port` which can be passed to `TcpStream::connect`.
     pub fn to_socket_addr(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        self.to_string()
     }
 
     /// Returns true if this address is a private/local network address.

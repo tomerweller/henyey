@@ -152,8 +152,6 @@ async fn compare_tx_results(
     ledger: u32,
     checkpoint: u32,
 ) -> anyhow::Result<()> {
-    use stellar_xdr::curr::WriteXdr;
-
     let local_entry = db
         .get_tx_result_entry(ledger)?
         .ok_or_else(|| anyhow::anyhow!("missing tx result entry {} in db", ledger))?;

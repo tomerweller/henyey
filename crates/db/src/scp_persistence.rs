@@ -15,8 +15,6 @@
 //! let manager = ScpPersistenceManager::new(Box::new(persistence));
 //! ```
 
-use std::sync::Arc;
-
 use stellar_xdr::curr::Hash;
 use tracing::debug;
 
@@ -38,23 +36,10 @@ impl SqliteScpPersistence {
         Self { db }
     }
 
-    /// Create a new SQLite SCP persistence instance from an `Arc<Database>`.
-    pub fn from_arc(db: Arc<Database>) -> Self {
-        // Clone the database handle (this clones the connection pool reference)
-        Self { db: (*db).clone() }
-    }
-
     fn map_error(e: DbError) -> String {
         format!("database error: {}", e)
     }
-}
 
-/// This module provides the trait implementation that bridges the herder's
-/// persistence trait with the database queries.
-///
-/// Note: The actual trait implementation is in the herder crate to avoid
-/// circular dependencies. This module provides the underlying functionality.
-impl SqliteScpPersistence {
     /// Save SCP state for a slot.
     pub fn save_scp_state(&self, slot: u64, state_json: &str) -> Result<(), String> {
         self.db

@@ -8,7 +8,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use henyey_common::Hash256;
 use stellar_xdr::curr::{LedgerHeader, Limits, ReadXdr};
 
-use super::super::error::DbError;
+use crate::error::DbError;
 
 /// Query trait for ledger header operations.
 ///

@@ -276,17 +276,17 @@ impl PublishManager {
 
         // Write ledger headers
         let headers_path = self.ledger_path(checkpoint_ledger, "ledger");
-        self.write_ledger_headers(&headers_path, headers)?;
+        self.write_xdr_gz(&headers_path, headers, "ledger headers")?;
         state.files_written += 1;
 
         // Write transaction sets
         let txset_path = self.ledger_path(checkpoint_ledger, "transactions");
-        self.write_transaction_entries(&txset_path, tx_entries)?;
+        self.write_xdr_gz(&txset_path, tx_entries, "transaction entries")?;
         state.files_written += 1;
 
         // Write transaction results
         let results_path = self.ledger_path(checkpoint_ledger, "results");
-        self.write_transaction_results(&results_path, tx_results)?;
+        self.write_xdr_gz(&results_path, tx_results, "result sets")?;
         state.files_written += 1;
 
         // Write bucket files from each level
@@ -366,11 +366,12 @@ impl PublishManager {
         base.join(paths::has_path(checkpoint_ledger))
     }
 
-    /// Write ledger headers to a file.
-    fn write_ledger_headers(
+    /// Write a slice of XDR-encodable items to a gzipped file.
+    fn write_xdr_gz<T: WriteXdr>(
         &self,
         path: &Path,
-        headers: &[LedgerHeaderHistoryEntry],
+        items: &[T],
+        label: &str,
     ) -> Result<()> {
         use flate2::write::GzEncoder;
         use flate2::Compression;
@@ -379,69 +380,15 @@ impl PublishManager {
         let file = std::fs::File::create(path.with_extension("xdr.gz"))?;
         let mut encoder = GzEncoder::new(file, Compression::default());
 
-        for header in headers {
-            let xdr = header
+        for item in items {
+            let xdr = item
                 .to_xdr(stellar_xdr::curr::Limits::none())
                 .map_err(|e| HistoryError::VerificationFailed(e.to_string()))?;
             encoder.write_all(&xdr)?;
         }
 
         encoder.finish()?;
-        debug!("Wrote {} ledger headers to {:?}", headers.len(), path);
-        Ok(())
-    }
-
-    /// Write transaction sets to a file.
-    fn write_transaction_entries(
-        &self,
-        path: &Path,
-        tx_entries: &[TransactionHistoryEntry],
-    ) -> Result<()> {
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
-        use std::io::Write;
-
-        let file = std::fs::File::create(path.with_extension("xdr.gz"))?;
-        let mut encoder = GzEncoder::new(file, Compression::default());
-
-        for entry in tx_entries {
-            let xdr = entry
-                .to_xdr(stellar_xdr::curr::Limits::none())
-                .map_err(|e| HistoryError::VerificationFailed(e.to_string()))?;
-            encoder.write_all(&xdr)?;
-        }
-
-        encoder.finish()?;
-        debug!(
-            "Wrote {} transaction entries to {:?}",
-            tx_entries.len(),
-            path
-        );
-        Ok(())
-    }
-
-    /// Write transaction results to a file.
-    fn write_transaction_results(
-        &self,
-        path: &Path,
-        results: &[TransactionHistoryResultEntry],
-    ) -> Result<()> {
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
-        use std::io::Write;
-
-        let file = std::fs::File::create(path.with_extension("xdr.gz"))?;
-        let mut encoder = GzEncoder::new(file, Compression::default());
-
-        for entry in results {
-            let xdr = entry
-                .to_xdr(stellar_xdr::curr::Limits::none())
-                .map_err(|e| HistoryError::VerificationFailed(e.to_string()))?;
-            encoder.write_all(&xdr)?;
-        }
-
-        encoder.finish()?;
-        debug!("Wrote {} result sets to {:?}", results.len(), path);
+        debug!("Wrote {} {} to {:?}", items.len(), label, path);
         Ok(())
     }
 

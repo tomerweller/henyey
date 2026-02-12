@@ -50,28 +50,17 @@ pub enum TxSetData {
 }
 
 impl TxSetData {
-    /// Get the hash of the transaction set.
+    /// Get the SHA-256 hash of the XDR-encoded transaction set.
     pub fn hash(&self) -> Hash {
         use sha2::{Digest, Sha256};
         use stellar_xdr::curr::WriteXdr;
 
-        match self {
-            TxSetData::Legacy(tx_set) => {
-                let bytes = tx_set
-                    .to_xdr(stellar_xdr::curr::Limits::none())
-                    .unwrap_or_default();
-                let hash = Sha256::digest(&bytes);
-                Hash(hash.into())
-            }
-            TxSetData::Generalized(tx_set) => {
-                // For generalized tx sets, use the contents hash
-                let bytes = tx_set
-                    .to_xdr(stellar_xdr::curr::Limits::none())
-                    .unwrap_or_default();
-                let hash = Sha256::digest(&bytes);
-                Hash(hash.into())
-            }
+        let bytes = match self {
+            TxSetData::Legacy(tx_set) => tx_set.to_xdr(stellar_xdr::curr::Limits::none()),
+            TxSetData::Generalized(tx_set) => tx_set.to_xdr(stellar_xdr::curr::Limits::none()),
         }
+        .unwrap_or_default();
+        Hash(Sha256::digest(&bytes).into())
     }
 }
 
@@ -135,11 +124,11 @@ impl MessageDispatcher {
         match message {
             StellarMessage::GetTxSet(hash) => self.handle_get_tx_set(from_peer, &Hash(hash.0)),
             StellarMessage::TxSet(tx_set) => {
-                self.handle_tx_set(from_peer, tx_set.clone());
+                self.handle_tx_set_data(from_peer, TxSetData::Legacy(tx_set.clone()));
                 None
             }
             StellarMessage::GeneralizedTxSet(tx_set) => {
-                self.handle_generalized_tx_set(from_peer, tx_set.clone());
+                self.handle_tx_set_data(from_peer, TxSetData::Generalized(tx_set.clone()));
                 None
             }
             StellarMessage::GetScpQuorumset(hash) => {
@@ -186,48 +175,15 @@ impl MessageDispatcher {
         }))
     }
 
-    /// Handle a TxSet response.
-    fn handle_tx_set(&self, from_peer: &PeerId, tx_set: TransactionSet) {
-        let data = TxSetData::Legacy(tx_set);
+    /// Handle a received transaction set (legacy or generalized).
+    fn handle_tx_set_data(&self, from_peer: &PeerId, data: TxSetData) {
         let hash = data.hash();
+        let label = match &data {
+            TxSetData::Legacy(_) => "TxSet",
+            TxSetData::Generalized(_) => "GeneralizedTxSet",
+        };
 
-        trace!("Received TxSet {} from {}", hex::encode(hash.0), from_peer);
-
-        // Cache it
-        {
-            let mut cache = self.tx_set_cache.lock().unwrap();
-            cache.insert(hash.clone(), data.clone());
-        }
-
-        // Notify fetcher
-        let envelopes = self.tx_set_fetcher.recv(&hash);
-
-        // Invoke callbacks
-        if let Some(ref callback) = self.on_tx_set {
-            callback(hash, data);
-        }
-
-        if !envelopes.is_empty() {
-            if let Some(ref callback) = self.on_envelopes_ready {
-                callback(envelopes);
-            }
-        }
-    }
-
-    /// Handle a GeneralizedTxSet response.
-    fn handle_generalized_tx_set(
-        &self,
-        from_peer: &PeerId,
-        tx_set: GeneralizedTransactionSet,
-    ) {
-        let data = TxSetData::Generalized(tx_set);
-        let hash = data.hash();
-
-        trace!(
-            "Received GeneralizedTxSet {} from {}",
-            hex::encode(hash.0),
-            from_peer
-        );
+        trace!("Received {} {} from {}", label, hex::encode(hash.0), from_peer);
 
         // Cache it
         {

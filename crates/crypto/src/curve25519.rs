@@ -41,7 +41,7 @@ use crate::hkdf_extract;
 use rand::RngCore;
 use std::hash::{Hash, Hasher};
 use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::ZeroizeOnDrop;
 
 /// A secret Curve25519 scalar for ECDH key exchange.
 ///
@@ -228,19 +228,12 @@ impl From<Curve25519Secret> for stellar_xdr::curr::Curve25519Secret {
     }
 }
 
-/// Clears Curve25519 key material by zeroizing both keys.
+/// Clears Curve25519 key material by replacing both keys with zeroed values.
 ///
 /// This is a security measure to ensure sensitive key material doesn't
-/// linger in memory after use.
+/// linger in memory after use. The previous `Curve25519Secret` is zeroized
+/// on drop via `ZeroizeOnDrop`.
 pub fn clear_curve25519_keys(public: &mut Curve25519Public, secret: &mut Curve25519Secret) {
-    // Secret is already zeroized on drop via ZeroizeOnDrop
-    // But we can explicitly create a new zeroed instance
-    let mut secret_bytes = secret.to_bytes();
-    let mut public_bytes = public.to_bytes();
-
-    secret_bytes.zeroize();
-    public_bytes.zeroize();
-
     *secret = Curve25519Secret::from_bytes([0u8; 32]);
     *public = Curve25519Public::from_bytes([0u8; 32]);
 }
