@@ -536,6 +536,7 @@ fn quorum_set_hash(qs: &ScpQuorumSet) -> Hash256 {
 // Envelope construction helpers (matching stellar-core makePrepare, etc.)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn make_prepare(
     node_id: &NodeId,
     q_set_hash: Hash256,
@@ -639,6 +640,7 @@ fn make_nominate(
 // Verification helpers (matching stellar-core verifyPrepare, etc.)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn verify_prepare(
     actual: &ScpEnvelope,
     expected_node: &NodeId,
@@ -667,6 +669,7 @@ fn verify_prepare(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_confirm(
     actual: &ScpEnvelope,
     expected_node: &NodeId,

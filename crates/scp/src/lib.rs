@@ -41,9 +41,14 @@
 //! let state = scp.receive_envelope(envelope);
 //! ```
 
+use std::sync::Arc;
+
 mod ballot;
+mod compare;
 mod driver;
 mod error;
+mod format;
+mod info;
 mod nomination;
 mod quorum;
 pub mod quorum_config;
@@ -52,8 +57,15 @@ mod slot;
 
 // Re-export main types
 pub use ballot::{get_working_ballot, BallotPhase, BallotProtocol};
+pub use compare::is_newer_nomination_or_ballot_st;
 pub use driver::{SCPDriver, SCPTimerType, ValidationLevel};
 pub use error::ScpError;
+pub use format::{
+    ballot_to_str, envelope_to_str, node_id_to_short_string, node_id_to_string, value_to_str,
+};
+pub use info::{
+    BallotInfo, BallotValue, CommitBounds, NominationInfo, NodeInfo, QuorumInfo, SlotInfo,
+};
 pub use nomination::NominationProtocol;
 pub use quorum::{
     find_closest_v_blocking, get_all_nodes, hash_quorum_set, is_blocking_set, is_quorum,
@@ -76,6 +88,51 @@ pub type SlotIndex = u64;
 
 /// SCP ballot number.
 pub type BallotCounter = u32;
+
+/// Shared context threaded through ballot and nomination protocol methods.
+///
+/// Groups the four parameters that nearly every internal SCP function needs:
+/// the local node identity, its quorum set, the application driver, and
+/// the slot index. Passing a single `&SlotContext<D>` instead of four
+/// separate arguments reduces parameter noise across ~40 call sites.
+pub(crate) struct SlotContext<'a, D: SCPDriver> {
+    pub local_node_id: &'a NodeId,
+    pub local_quorum_set: &'a ScpQuorumSet,
+    pub driver: &'a Arc<D>,
+    pub slot_index: u64,
+}
+
+/// Iterate envelopes in sorted node order, skipping self if not fully validated.
+///
+/// Shared implementation for `NominationProtocol::process_current_state` and
+/// `BallotProtocol::process_current_state`.
+pub(crate) fn process_envelopes_current_state<F>(
+    envelopes: &std::collections::HashMap<NodeId, ScpEnvelope>,
+    mut f: F,
+    local_node_id: &NodeId,
+    fully_validated: bool,
+    force_self: bool,
+) -> bool
+where
+    F: FnMut(&ScpEnvelope) -> bool,
+{
+    let mut nodes: Vec<_> = envelopes.keys().collect();
+    nodes.sort();
+
+    for node_id in nodes {
+        if !force_self && node_id == local_node_id && !fully_validated {
+            continue;
+        }
+
+        if let Some(envelope) = envelopes.get(node_id) {
+            if !f(envelope) {
+                return false;
+            }
+        }
+    }
+
+    true
+}
 
 /// The result of processing an SCP envelope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,118 +202,6 @@ pub struct HistoricalStatement {
     pub received_at: u64,
     /// Whether this statement was valid.
     pub valid: bool,
-}
-
-/// JSON-serializable SCP slot information for debugging and monitoring.
-///
-/// This provides a structured view of slot state that can be serialized
-/// to JSON, matching the stellar-core `getJsonInfo()` functionality.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SlotInfo {
-    /// The slot index (ledger sequence).
-    pub slot_index: u64,
-    /// Current phase of the slot.
-    pub phase: String,
-    /// Whether the slot is fully validated.
-    pub fully_validated: bool,
-    /// Nomination state if in nomination phase.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub nomination: Option<NominationInfo>,
-    /// Ballot state if in ballot phase.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ballot: Option<BallotInfo>,
-}
-
-/// JSON-serializable nomination protocol information.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct NominationInfo {
-    /// Whether nomination is currently running.
-    pub running: bool,
-    /// Current nomination round.
-    pub round: u32,
-    /// Values we've voted for (hex-encoded prefixes).
-    pub votes: Vec<String>,
-    /// Values we've accepted (hex-encoded prefixes).
-    pub accepted: Vec<String>,
-    /// Confirmed candidate values.
-    pub candidates: Vec<String>,
-    /// Number of nodes heard from.
-    pub node_count: usize,
-}
-
-/// JSON-serializable ballot protocol information.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct BallotInfo {
-    /// Current ballot phase (prepare/confirm/externalize).
-    pub phase: String,
-    /// Current ballot counter.
-    pub ballot_counter: u32,
-    /// Current ballot value (hex-encoded prefix).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ballot_value: Option<String>,
-    /// Prepared ballot info if any.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prepared: Option<BallotValue>,
-    /// Prepared prime ballot info if any.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prepared_prime: Option<BallotValue>,
-    /// Commit boundaries.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub commit: Option<CommitBounds>,
-    /// High ballot counter.
-    pub high: u32,
-    /// Number of nodes heard from.
-    pub node_count: usize,
-    /// Whether we've heard from a quorum.
-    pub heard_from_quorum: bool,
-}
-
-/// JSON-serializable ballot value.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct BallotValue {
-    /// Ballot counter.
-    pub counter: u32,
-    /// Ballot value (hex-encoded prefix).
-    pub value: String,
-}
-
-/// JSON-serializable commit bounds.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CommitBounds {
-    /// Low commit counter.
-    pub low: u32,
-    /// High commit counter.
-    pub high: u32,
-}
-
-/// JSON-serializable quorum information for a slot.
-///
-/// This provides a view of quorum state including which nodes
-/// are participating and in what states.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct QuorumInfo {
-    /// The slot index.
-    pub slot_index: u64,
-    /// Local node ID (short form).
-    pub local_node: String,
-    /// Quorum set hash.
-    pub quorum_set_hash: String,
-    /// Node states keyed by short node ID.
-    pub nodes: std::collections::HashMap<String, NodeInfo>,
-    /// Whether quorum is reached.
-    pub quorum_reached: bool,
-    /// Whether we have a v-blocking set.
-    pub v_blocking: bool,
-}
-
-/// JSON-serializable node information within quorum.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct NodeInfo {
-    /// The node's current state.
-    pub state: String,
-    /// The node's latest ballot counter if in ballot phase.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ballot_counter: Option<u32>,
 }
 
 /// JSON-serializable quorum set for persistence and debugging.
@@ -340,197 +285,6 @@ pub use stellar_xdr::curr::{
 // Re-export Hash256 for quorum set hashing
 pub use henyey_common::Hash256;
 
-/// Format a NodeId for display as a short string.
-///
-/// Returns the first 8 hex characters of the public key.
-pub fn node_id_to_short_string(node_id: &NodeId) -> String {
-    match &node_id.0 {
-        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(bytes)) => {
-            hex::encode(&bytes[..4])
-        }
-    }
-}
-
-/// Format a NodeId for display with optional full key.
-///
-/// # Arguments
-/// * `node_id` - The node ID to format
-/// * `full_keys` - If true, returns the full 64-character hex encoding.
-///   If false, returns the short 8-character format.
-///
-/// This matches the stellar-core `toStrKey(NodeID, bool fullKeys)` method.
-pub fn node_id_to_string(node_id: &NodeId, full_keys: bool) -> String {
-    match &node_id.0 {
-        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(bytes)) => {
-            if full_keys {
-                hex::encode(bytes)
-            } else {
-                hex::encode(&bytes[..4])
-            }
-        }
-    }
-}
-
-/// Format a ballot for display.
-pub fn ballot_to_str(ballot: &ScpBallot) -> String {
-    format!(
-        "({},{})",
-        ballot.counter,
-        hex::encode(&ballot.value.as_slice()[..4.min(ballot.value.len())])
-    )
-}
-
-/// Format a Value for display.
-pub fn value_to_str(value: &Value) -> String {
-    hex::encode(&value.as_slice()[..8.min(value.len())])
-}
-
-/// Format an envelope for display.
-pub fn envelope_to_str(envelope: &ScpEnvelope) -> String {
-    let node = node_id_to_short_string(&envelope.statement.node_id);
-    let slot = envelope.statement.slot_index;
-
-    match &envelope.statement.pledges {
-        ScpStatementPledges::Nominate(nom) => {
-            let votes: Vec<_> = nom.votes.iter().map(value_to_str).collect();
-            let accepted: Vec<_> = nom.accepted.iter().map(value_to_str).collect();
-            format!(
-                "NOMINATE<{}, slot={}, votes={:?}, accepted={:?}>",
-                node, slot, votes, accepted
-            )
-        }
-        ScpStatementPledges::Prepare(prep) => {
-            format!(
-                "PREPARE<{}, slot={}, b={}, p={:?}, p'={:?}, c={}, h={}>",
-                node,
-                slot,
-                ballot_to_str(&prep.ballot),
-                prep.prepared.as_ref().map(ballot_to_str),
-                prep.prepared_prime.as_ref().map(ballot_to_str),
-                prep.n_c,
-                prep.n_h
-            )
-        }
-        ScpStatementPledges::Confirm(conf) => {
-            format!(
-                "CONFIRM<{}, slot={}, b={}, p_n={}, c={}, h={}>",
-                node,
-                slot,
-                ballot_to_str(&conf.ballot),
-                conf.n_prepared,
-                conf.n_commit,
-                conf.n_h
-            )
-        }
-        ScpStatementPledges::Externalize(ext) => {
-            format!(
-                "EXTERNALIZE<{}, slot={}, c={}, h={}>",
-                node,
-                slot,
-                ballot_to_str(&ext.commit),
-                ext.n_h
-            )
-        }
-    }
-}
-
-/// Compare two nominations or ballot statements for ordering.
-///
-/// Returns true if `new_st` is newer than `old_st` for the same node.
-/// This is used to determine if a statement should replace an existing one.
-pub fn is_newer_nomination_or_ballot_st(old_st: &ScpStatement, new_st: &ScpStatement) -> bool {
-    use ScpStatementPledges::*;
-
-    // Different statement types have different ordering
-    let type_rank = |pledges: &ScpStatementPledges| -> u8 {
-        match pledges {
-            Nominate(_) => 0,
-            Prepare(_) => 1,
-            Confirm(_) => 2,
-            Externalize(_) => 3,
-        }
-    };
-
-    let old_rank = type_rank(&old_st.pledges);
-    let new_rank = type_rank(&new_st.pledges);
-
-    if old_rank != new_rank {
-        return new_rank > old_rank;
-    }
-
-    // Same type - compare within type
-    match (&old_st.pledges, &new_st.pledges) {
-        (Nominate(old), Nominate(new)) => {
-            // Nomination is newer if it has more votes or accepted
-            let old_votes: std::collections::HashSet<_> = old.votes.iter().collect();
-            let old_accepted: std::collections::HashSet<_> = old.accepted.iter().collect();
-            let new_votes: std::collections::HashSet<_> = new.votes.iter().collect();
-            let new_accepted: std::collections::HashSet<_> = new.accepted.iter().collect();
-
-            // New must be superset
-            if !old_votes.is_subset(&new_votes) || !old_accepted.is_subset(&new_accepted) {
-                return false;
-            }
-
-            // And must have at least one more element
-            new_votes.len() > old_votes.len() || new_accepted.len() > old_accepted.len()
-        }
-        (Prepare(old), Prepare(new)) => {
-            // Higher ballot counter is newer
-            if new.ballot.counter > old.ballot.counter {
-                return true;
-            }
-            if new.ballot.counter < old.ballot.counter {
-                return false;
-            }
-            // Same counter - check prepared fields
-            let cmp_opt_ballot =
-                |a: &Option<ScpBallot>, b: &Option<ScpBallot>| -> std::cmp::Ordering {
-                    match (a, b) {
-                        (None, None) => std::cmp::Ordering::Equal,
-                        (None, Some(_)) => std::cmp::Ordering::Less,
-                        (Some(_), None) => std::cmp::Ordering::Greater,
-                        (Some(a), Some(b)) => a
-                            .counter
-                            .cmp(&b.counter)
-                            .then_with(|| a.value.cmp(&b.value)),
-                    }
-                };
-
-            match cmp_opt_ballot(&old.prepared, &new.prepared) {
-                std::cmp::Ordering::Less => true,
-                std::cmp::Ordering::Greater => false,
-                std::cmp::Ordering::Equal => {
-                    match cmp_opt_ballot(&old.prepared_prime, &new.prepared_prime) {
-                        std::cmp::Ordering::Less => true,
-                        std::cmp::Ordering::Greater => false,
-                        std::cmp::Ordering::Equal => new.n_h > old.n_h,
-                    }
-                }
-            }
-        }
-        (Confirm(old), Confirm(new)) => {
-            if new.ballot.counter > old.ballot.counter {
-                return true;
-            }
-            if new.ballot.counter < old.ballot.counter {
-                return false;
-            }
-            if new.n_prepared > old.n_prepared {
-                return true;
-            }
-            if new.n_prepared < old.n_prepared {
-                return false;
-            }
-            new.n_h > old.n_h
-        }
-        (Externalize(_), Externalize(_)) => {
-            // Externalize statements are terminal - can't be newer
-            false
-        }
-        _ => false,
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -635,58 +389,6 @@ mod tests {
     }
 
     #[test]
-    fn test_node_id_to_short_string() {
-        let node = make_node_id(0xab);
-        let short = node_id_to_short_string(&node);
-        assert_eq!(short.len(), 8);
-        assert!(short.starts_with("ab"));
-    }
-
-    #[test]
-    fn test_ballot_to_str() {
-        let ballot = ScpBallot {
-            counter: 5,
-            value: make_value(&[0xde, 0xad, 0xbe, 0xef]),
-        };
-        let s = ballot_to_str(&ballot);
-        assert!(s.contains("5"));
-        assert!(s.contains("dead"));
-    }
-
-    #[test]
-    fn test_value_to_str() {
-        let value = make_value(&[0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0]);
-        let s = value_to_str(&value);
-        assert_eq!(s, "123456789abcdef0");
-    }
-
-    #[test]
-    fn test_envelope_to_str() {
-        let node = make_node_id(1);
-        let value = make_value(&[1, 2, 3, 4]);
-        let quorum_set = make_quorum_set(vec![node.clone()], 1);
-
-        let nom = ScpNomination {
-            quorum_set_hash: hash_quorum_set(&quorum_set).into(),
-            votes: vec![value.clone()].try_into().unwrap(),
-            accepted: vec![].try_into().unwrap(),
-        };
-        let statement = ScpStatement {
-            node_id: node.clone(),
-            slot_index: 42,
-            pledges: ScpStatementPledges::Nominate(nom),
-        };
-        let envelope = ScpEnvelope {
-            statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
-        };
-
-        let s = envelope_to_str(&envelope);
-        assert!(s.contains("NOMINATE"));
-        assert!(s.contains("slot=42"));
-    }
-
-    #[test]
     fn test_historical_statement() {
         let node = make_node_id(1);
         let value = make_value(&[1, 2, 3]);
@@ -717,159 +419,6 @@ mod tests {
         assert!(hist.valid);
         assert_eq!(hist.envelope.statement.slot_index, 1);
     }
-
-    #[test]
-    fn test_is_newer_nomination() {
-        let node = make_node_id(1);
-        let quorum_set = make_quorum_set(vec![node.clone()], 1);
-        let value1 = make_value(&[1]);
-        let value2 = make_value(&[2]);
-
-        let nom1 = ScpNomination {
-            quorum_set_hash: hash_quorum_set(&quorum_set).into(),
-            votes: vec![value1.clone()].try_into().unwrap(),
-            accepted: vec![].try_into().unwrap(),
-        };
-        let nom2 = ScpNomination {
-            quorum_set_hash: hash_quorum_set(&quorum_set).into(),
-            votes: vec![value1.clone(), value2.clone()].try_into().unwrap(),
-            accepted: vec![].try_into().unwrap(),
-        };
-
-        let st1 = ScpStatement {
-            node_id: node.clone(),
-            slot_index: 1,
-            pledges: ScpStatementPledges::Nominate(nom1),
-        };
-        let st2 = ScpStatement {
-            node_id: node.clone(),
-            slot_index: 1,
-            pledges: ScpStatementPledges::Nominate(nom2),
-        };
-
-        // st2 has more votes, so it's newer
-        assert!(is_newer_nomination_or_ballot_st(&st1, &st2));
-        assert!(!is_newer_nomination_or_ballot_st(&st2, &st1));
-    }
-
-    // ==================== Tests for JSON info types ====================
-
-    #[test]
-    fn test_slot_info_serialization() {
-        let info = SlotInfo {
-            slot_index: 42,
-            phase: "NOMINATION".to_string(),
-            fully_validated: true,
-            nomination: Some(NominationInfo {
-                running: true,
-                round: 1,
-                votes: vec!["abcd1234".to_string()],
-                accepted: vec![],
-                candidates: vec![],
-                node_count: 3,
-            }),
-            ballot: None,
-        };
-
-        // Test serialization
-        let json = serde_json::to_string(&info).unwrap();
-        assert!(json.contains("\"slot_index\":42"));
-        assert!(json.contains("\"phase\":\"NOMINATION\""));
-        assert!(json.contains("\"fully_validated\":true"));
-        assert!(json.contains("\"running\":true"));
-        assert!(json.contains("\"round\":1"));
-        assert!(!json.contains("\"ballot\"")); // Should be skipped due to None
-
-        // Test deserialization round-trip
-        let deserialized: SlotInfo = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.slot_index, 42);
-        assert_eq!(deserialized.phase, "NOMINATION");
-        assert!(deserialized.nomination.is_some());
-        assert!(deserialized.ballot.is_none());
-    }
-
-    #[test]
-    fn test_ballot_info_serialization() {
-        let info = BallotInfo {
-            phase: "Prepare".to_string(),
-            ballot_counter: 5,
-            ballot_value: Some("deadbeef".to_string()),
-            prepared: Some(BallotValue {
-                counter: 4,
-                value: "cafebabe".to_string(),
-            }),
-            prepared_prime: None,
-            commit: None,
-            high: 5,
-            node_count: 7,
-            heard_from_quorum: true,
-        };
-
-        let json = serde_json::to_string(&info).unwrap();
-        assert!(json.contains("\"phase\":\"Prepare\""));
-        assert!(json.contains("\"ballot_counter\":5"));
-        assert!(json.contains("\"heard_from_quorum\":true"));
-        assert!(json.contains("\"prepared\":{"));
-        assert!(!json.contains("\"prepared_prime\"")); // Skipped
-
-        let deserialized: BallotInfo = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.ballot_counter, 5);
-        assert!(deserialized.prepared.is_some());
-        assert!(deserialized.prepared_prime.is_none());
-    }
-
-    #[test]
-    fn test_quorum_info_serialization() {
-        let mut nodes = std::collections::HashMap::new();
-        nodes.insert(
-            "node1234".to_string(),
-            NodeInfo {
-                state: "PREPARING".to_string(),
-                ballot_counter: Some(3),
-            },
-        );
-        nodes.insert(
-            "node5678".to_string(),
-            NodeInfo {
-                state: "MISSING".to_string(),
-                ballot_counter: None,
-            },
-        );
-
-        let info = QuorumInfo {
-            slot_index: 100,
-            local_node: "localnode".to_string(),
-            quorum_set_hash: "abcd1234".to_string(),
-            nodes,
-            quorum_reached: true,
-            v_blocking: true,
-        };
-
-        let json = serde_json::to_string(&info).unwrap();
-        assert!(json.contains("\"slot_index\":100"));
-        assert!(json.contains("\"quorum_reached\":true"));
-        assert!(json.contains("\"v_blocking\":true"));
-
-        let deserialized: QuorumInfo = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.slot_index, 100);
-        assert_eq!(deserialized.nodes.len(), 2);
-        assert!(deserialized.quorum_reached);
-    }
-
-    #[test]
-    fn test_commit_bounds_serialization() {
-        let bounds = CommitBounds { low: 1, high: 5 };
-
-        let json = serde_json::to_string(&bounds).unwrap();
-        assert!(json.contains("\"low\":1"));
-        assert!(json.contains("\"high\":5"));
-
-        let deserialized: CommitBounds = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.low, 1);
-        assert_eq!(deserialized.high, 5);
-    }
-
-    // ==================== Tests for QuorumSetJson ====================
 
     #[test]
     fn test_quorum_set_json_simple() {
