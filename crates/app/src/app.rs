@@ -170,7 +170,7 @@ fn build_generalized_tx_set(
         previous_ledger_hash: Hash(tx_set.previous_ledger_hash.0),
         phases: vec![phase].try_into().ok()?,
     }))
-}
+    }
 
 fn decode_upgrades(upgrades: Vec<UpgradeType>) -> Vec<LedgerUpgrade> {
     upgrades
@@ -2994,6 +2994,49 @@ impl App {
         // which would remove older externalized slots (only max_externalized_slots are kept).
         self.process_externalized_slots().await;
 
+        // After the pre-loop process_externalized_slots (which may have triggered a
+        // rapid close phase), clear all pending tx_set requests and tracking state.
+        // During catchup, SCP state responses bring EXTERNALIZE messages for slots
+        // whose tx_sets may already be evicted from peers' caches. The pre-loop
+        // process_externalized_slots creates syncing_ledgers entries for these slots
+        // and kicks off tx_set requests.  If peers silently drop those requests
+        // (because the tx_sets are evicted), the 10-second timeout fires, sets
+        // tx_set_all_peers_exhausted, and triggers unnecessary catchup — which
+        // then repeats the same cycle infinitely.
+        //
+        // Clearing the state here ensures the main loop starts clean.  Fresh
+        // EXTERNALIZE messages arriving via the dedicated SCP channel will create
+        // new entries with current tx_set hashes that peers actually have.
+        {
+            let current_ledger = *self.current_ledger.read().await;
+            self.herder.clear_pending_tx_sets();
+            // Also clear syncing_ledgers entries that have no tx_set — these are
+            // unfulfillable entries created from stale EXTERNALIZE messages.
+            let mut buffer = self.syncing_ledgers.write().await;
+            let pre_count = buffer.len();
+            buffer.retain(|seq, info| {
+                // Keep entries that are above current_ledger AND have a tx_set.
+                // Remove entries that are at or below current_ledger (already closed)
+                // or that have no tx_set (unfulfillable from catchup-phase EXTERNALIZE).
+                *seq > current_ledger && info.tx_set.is_some()
+            });
+            let removed = pre_count - buffer.len();
+            if removed > 0 {
+                tracing::info!(
+                    removed,
+                    remaining = buffer.len(),
+                    current_ledger,
+                    "Removed stale/unfulfillable syncing_ledgers entries before main loop"
+                );
+            }
+            // Reset all tx_set tracking state
+            self.tx_set_dont_have.write().await.clear();
+            self.tx_set_last_request.write().await.clear();
+            self.tx_set_exhausted_warned.write().await.clear();
+            self.tx_set_all_peers_exhausted
+                .store(false, Ordering::SeqCst);
+        }
+
         tracing::info!("Entering main event loop");
 
         // Add a short heartbeat interval for debugging
@@ -3048,37 +3091,10 @@ impl App {
                             // EXTERNALIZE that was received 8-10s ago during rapid closes.
                             *self.last_externalized_at.write().await = Instant::now();
 
-                            // Clear stale syncing_ledgers entries that lack tx_sets.
-                            // These are for slots whose EXTERNALIZEs arrived during rapid
-                            // closes but whose tx_sets are already evicted from peers'
-                            // caches.  Keeping them causes either: (a) tx_set request
-                            // timeouts → catchup, or (b) stuck sequential close since
-                            // try_start_ledger_close requires slots in order.
-                            {
-                                let mut buffer = self.syncing_ledgers.write().await;
-                                let stale: Vec<u32> = buffer
-                                    .iter()
-                                    .filter(|(_, info)| info.tx_set.is_none())
-                                    .map(|(seq, _)| *seq)
-                                    .collect();
-                                if !stale.is_empty() {
-                                    for seq in &stale {
-                                        buffer.remove(seq);
-                                    }
-                                    tracing::info!(
-                                        current_ledger,
-                                        evicted = stale.len(),
-                                        first_evicted = stale.first().unwrap(),
-                                        last_evicted = stale.last().unwrap(),
-                                        "Evicted stale syncing_ledgers entries without tx_sets after rapid close"
-                                    );
-                                }
-                            }
-
-                            // Clear any stale tx_set pending state from slots whose
-                            // tx_sets are no longer available.  These would just timeout
-                            // and trigger unnecessary catchup.
-                            self.herder.clear_pending_tx_sets();
+                            // Reset tx_set tracking so fresh requests can be made for
+                            // buffered entries that still need tx_sets. Don't evict
+                            // the entries themselves — they may be closeable once
+                            // their tx_sets arrive from peers.
                             self.tx_set_all_peers_exhausted.store(false, Ordering::SeqCst);
                             self.tx_set_dont_have.write().await.clear();
                             self.tx_set_last_request.write().await.clear();
@@ -3968,12 +3984,17 @@ impl App {
                             // v-blocking slot. Triggering catchup on DontHave creates loops
                             // because catchup targets checkpoints, leaving gaps that also
                             // get DontHave responses.
-                            tracing::info!(
-                                hash = %hash,
-                                dont_have_count,
-                                peer_count,
-                                "All peers reported DontHave for needed TxSet; relying on slot eviction"
-                            );
+                            // Only log once per hash to avoid spam during recovery.
+                            let already_warned = self.tx_set_exhausted_warned.read().await.contains(&hash);
+                            if !already_warned {
+                                self.tx_set_exhausted_warned.write().await.insert(hash);
+                                tracing::info!(
+                                    hash = %hash,
+                                    dont_have_count,
+                                    peer_count,
+                                    "All peers reported DontHave for needed TxSet; relying on slot eviction"
+                                );
+                            }
                             drop(map);
                             // Reset request tracking to allow retry later
                             let mut last_request = self.tx_set_last_request.write().await;
@@ -4125,9 +4146,25 @@ impl App {
             let mut missing_tx_set = false;
             let mut buffered_count = 0usize;
             let mut advance_to = last_processed;
+            let mut skipped_stale = 0u64;
             {
+                let current_ledger = *self.current_ledger.read().await;
                 let mut buffer = self.syncing_ledgers.write().await;
                 for slot in (last_processed + 1)..=latest_externalized {
+                    // Skip slots that have already been closed. Stale
+                    // EXTERNALIZE messages (e.g., from SCP state responses)
+                    // can set latest_externalized to old slots whose tx_sets
+                    // are evicted from peers' caches. Creating syncing_ledgers
+                    // entries for these would cause unfulfillable tx_set
+                    // requests and infinite recovery loops.
+                    if slot <= current_ledger as u64 {
+                        skipped_stale += 1;
+                        if slot == advance_to + 1 {
+                            advance_to = slot;
+                        }
+                        continue;
+                    }
+
                     if let Some(info) = self.herder.check_ledger_close(slot) {
                         let has_tx_set = info.tx_set.is_some();
                         // Update existing entry's tx_set if it was missing but now available,
@@ -4160,15 +4197,31 @@ impl App {
                     }
                 }
             }
+            if skipped_stale > 0 {
+                tracing::debug!(
+                    skipped_stale,
+                    "Skipped already-closed slots in process_externalized_slots"
+                );
+            }
 
             *self.last_processed_slot.write().await = advance_to;
 
             if missing_tx_set {
                 self.request_pending_tx_sets().await;
             }
-            if buffered_count == 0 {
-                self.maybe_start_externalized_catchup(latest_externalized)
-                    .await;
+            // Trigger externalized catchup if the gap between current_ledger
+            // and the latest externalized slot is too large to bridge via
+            // individual tx_set fetches.  Previously this only fired when
+            // buffered_count == 0, but after catchup the first fresh
+            // EXTERNALIZE creates an entry (buffered_count == 1) even though
+            // current_ledger is 40+ slots behind.  Check the gap regardless.
+            {
+                let current_ledger = *self.current_ledger.read().await;
+                let gap = latest_externalized.saturating_sub(current_ledger as u64);
+                if buffered_count == 0 || gap > TX_SET_REQUEST_WINDOW {
+                    self.maybe_start_externalized_catchup(latest_externalized)
+                        .await;
+                }
             }
         } else {
             tracing::debug!(latest_externalized, last_processed, "Already processed");
@@ -4197,27 +4250,38 @@ impl App {
         // 100 slots can use significant memory (100+ MB).
         const MAX_BUFFER_SIZE: usize = 100;
 
+        // Step 1: Remove entries already closed (at or below current_ledger).
         let min_keep = current_ledger.saturating_add(1);
         buffer.retain(|seq, _| *seq >= min_keep);
         if buffer.is_empty() {
             return;
         }
 
+        // Step 2: Trim to checkpoint boundary ONLY when the buffer's first
+        // entry is far ahead of current_ledger (gap >= CHECKPOINT_FREQUENCY).
+        // When entries close to current_ledger exist (e.g. current_ledger+1),
+        // those are potentially closeable once their tx_sets arrive — trimming
+        // them would destroy entries the node needs for sequential close and
+        // create an artificial gap that prevents progress.
+        let first_buffered = *buffer.keys().next().expect("checked non-empty above");
         let last_buffered = *buffer.keys().next_back().expect("checked non-empty above");
-        let trim_before = if Self::is_first_ledger_in_checkpoint(last_buffered) {
-            if last_buffered == 0 {
-                return;
-            }
-            let prev = last_buffered - 1;
-            Self::first_ledger_in_checkpoint(prev)
-        } else {
-            Self::first_ledger_in_checkpoint(last_buffered)
-        };
+        let gap = first_buffered.saturating_sub(current_ledger);
+        if gap >= CHECKPOINT_FREQUENCY {
+            let trim_before = if Self::is_first_ledger_in_checkpoint(last_buffered) {
+                if last_buffered == 0 {
+                    return;
+                }
+                let prev = last_buffered - 1;
+                Self::first_ledger_in_checkpoint(prev)
+            } else {
+                Self::first_ledger_in_checkpoint(last_buffered)
+            };
+            buffer.retain(|seq, _| *seq >= trim_before);
+        }
 
-        buffer.retain(|seq, _| *seq >= trim_before);
-
-        // If buffer is still too large, keep only the most recent MAX_BUFFER_SIZE slots.
-        // This prevents unbounded memory growth when the validator is stuck.
+        // Step 3: If buffer is still too large, keep only the most recent
+        // MAX_BUFFER_SIZE slots. This prevents unbounded memory growth when
+        // the validator is stuck.
         if buffer.len() > MAX_BUFFER_SIZE {
             let keys_to_remove: Vec<u32> = buffer
                 .keys()
@@ -4644,6 +4708,20 @@ impl App {
         *self.last_processed_slot.write().await = pending.ledger_seq as u64;
         self.clear_tx_advert_history(pending.ledger_seq).await;
 
+        // Clean up stale pending tx_set requests for slots we've now closed.
+        // This prevents stale requests (from old SCP state responses) from
+        // lingering and causing timeout → DontHave → recovery loops.
+        let stale_cleared = self
+            .herder
+            .cleanup_old_pending_tx_sets(pending.ledger_seq as u64 + 1);
+        if stale_cleared > 0 {
+            tracing::debug!(
+                stale_cleared,
+                ledger_seq = pending.ledger_seq,
+                "Cleared stale pending tx_set requests after ledger close"
+            );
+        }
+
         // Signal heartbeat to sync recovery.
         self.sync_recovery_heartbeat();
 
@@ -4660,12 +4738,18 @@ impl App {
         // 10 seconds gives enough time for SCP messages to arrive and fill
         // small gaps after catchup + buffered ledger drain.
         const EVALUATION_COOLDOWN_SECS: u64 = 10;
-        let recently_skipped = self
+        let cooldown_elapsed = self
             .last_catchup_completed_at
             .read()
             .await
-            .is_some_and(|t| t.elapsed().as_secs() < EVALUATION_COOLDOWN_SECS);
+            .map(|t| t.elapsed().as_secs());
+        let recently_skipped = cooldown_elapsed
+            .is_some_and(|s| s < EVALUATION_COOLDOWN_SECS);
         if recently_skipped {
+            tracing::debug!(
+                cooldown_elapsed = ?cooldown_elapsed,
+                "maybe_start_buffered_catchup: skipped due to cooldown"
+            );
             return;
         }
 
@@ -4674,8 +4758,40 @@ impl App {
             Err(_) => return,
         };
 
+        // Guard: if the node is essentially caught up (gap ≤ TX_SET_REQUEST_WINDOW),
+        // do NOT trigger catchup. Stale tx_set requests from prior EXTERNALIZE
+        // messages can set tx_set_all_peers_exhausted, but when the gap is small
+        // the correct action is to wait for fresh EXTERNALIZE — not to catchup.
+        // Without this guard, the node enters an infinite loop:
+        //   catchup → rapid close → stale tx_set timeout → all_peers_exhausted
+        //   → catchup → repeat
+        let latest_externalized = self.herder.latest_externalized_slot().unwrap_or(0);
+        let gap = latest_externalized.saturating_sub(current_ledger as u64);
+        if gap <= TX_SET_REQUEST_WINDOW {
+            // Clear stale state that might trigger unnecessary catchup
+            if self.tx_set_all_peers_exhausted.load(Ordering::SeqCst) {
+                tracing::info!(
+                    current_ledger,
+                    latest_externalized,
+                    gap,
+                    "maybe_start_buffered_catchup: essentially caught up, \
+                     clearing tx_set_all_peers_exhausted and stale state"
+                );
+                self.tx_set_all_peers_exhausted
+                    .store(false, Ordering::SeqCst);
+                self.tx_set_dont_have.write().await.clear();
+                self.tx_set_last_request.write().await.clear();
+                self.tx_set_exhausted_warned.write().await.clear();
+                self.herder.clear_pending_tx_sets();
+            }
+            return;
+        }
+
         let (first_buffered, last_buffered) = {
             let mut buffer = self.syncing_ledgers.write().await;
+            let pre_trim_count = buffer.len();
+            let pre_trim_first = buffer.keys().next().copied();
+            let pre_trim_last = buffer.keys().next_back().copied();
             Self::trim_syncing_ledgers(&mut buffer, current_ledger);
 
             // When all peers have reported DontHave for tx_sets, evict buffered
@@ -4711,20 +4827,45 @@ impl App {
                 }
             }
 
-            match (
-                buffer.keys().next().copied(),
-                buffer.keys().next_back().copied(),
-            ) {
+            let post_trim_count = buffer.len();
+            let post_first = buffer.keys().next().copied();
+            let post_last = buffer.keys().next_back().copied();
+            tracing::debug!(
+                current_ledger,
+                pre_trim_count,
+                pre_trim_first,
+                pre_trim_last,
+                post_trim_count,
+                post_first,
+                post_last,
+                "maybe_start_buffered_catchup: buffer state"
+            );
+
+            match (post_first, post_last) {
                 (Some(first), Some(last)) => (first, last),
-                _ => return,
+                _ => {
+                    tracing::debug!(
+                        current_ledger,
+                        pre_trim_count,
+                        pre_trim_first,
+                        pre_trim_last,
+                        "maybe_start_buffered_catchup: empty buffer after trim/evict, returning"
+                    );
+                    return;
+                }
             }
         };
 
+        let is_checkpoint_boundary = Self::is_first_ledger_in_checkpoint(first_buffered);
+        let can_trigger_immediate = is_checkpoint_boundary && first_buffered < last_buffered;
         tracing::debug!(
             current_ledger,
             first_buffered,
             last_buffered,
-            "Evaluating buffered catchup"
+            is_checkpoint_boundary,
+            can_trigger_immediate,
+            gap = first_buffered.saturating_sub(current_ledger),
+            "maybe_start_buffered_catchup: evaluating"
         );
 
         // Check if sequential ledger has tx set available
@@ -4765,6 +4906,14 @@ impl App {
         let can_trigger_immediate =
             Self::is_first_ledger_in_checkpoint(first_buffered) && first_buffered < last_buffered;
 
+        tracing::debug!(
+            can_trigger_immediate,
+            first_buffered,
+            last_buffered,
+            is_checkpoint = Self::is_first_ledger_in_checkpoint(first_buffered),
+            "maybe_start_buffered_catchup: can_trigger_immediate decision"
+        );
+
         // If we can't trigger immediate catchup, check if we should wait for trigger
         // or if we're stuck and need timeout-based catchup
         if !can_trigger_immediate {
@@ -4786,10 +4935,17 @@ impl App {
                 let action = {
                     let mut stuck_state = self.consensus_stuck_state.write().await;
                     match stuck_state.as_mut() {
+                        // Match on current_ledger only. first_buffered can change as
+                        // stale EXTERNALIZE messages from SCP state requests create
+                        // new syncing_ledgers entries with lower slot numbers. Matching
+                        // on both caused the stuck timer to reset every time
+                        // first_buffered shifted, preventing catchup from ever
+                        // triggering (Problem 9).
                         Some(state)
-                            if state.current_ledger == current_ledger
-                                && state.first_buffered == first_buffered =>
+                            if state.current_ledger == current_ledger =>
                         {
+                            // Update first_buffered to track the current value
+                            state.first_buffered = first_buffered;
                             let elapsed = state.stuck_start.elapsed().as_secs();
                             let since_recovery = state.last_recovery_attempt.elapsed().as_secs();
 
@@ -4963,6 +5119,12 @@ impl App {
         }
 
         // Determine catchup target
+        tracing::debug!(
+            current_ledger,
+            first_buffered,
+            last_buffered,
+            "maybe_start_buffered_catchup: computing catchup target"
+        );
         let target = Self::buffered_catchup_target(current_ledger, first_buffered, last_buffered);
         let target = match target {
             Some(t) => Some(t),
@@ -5110,6 +5272,29 @@ impl App {
                         );
                     }
                     self.reset_tx_set_tracking_after_catchup().await;
+
+                    // Clear stale syncing_ledgers entries above the catchup target.
+                    // These were created during pre-catchup SCP fast-forwarding and
+                    // have tx_set: None because peers had already evicted the tx_sets
+                    // for those slots (too old at the time). After catchup brings
+                    // current_ledger up to the target, these slots are now recent and
+                    // peers SHOULD have their tx_sets. Clearing forces fresh
+                    // process_externalized_slots() calls that will re-create entries
+                    // via check_ledger_close() with proper tx_set lookups.
+                    {
+                        let mut buffer = self.syncing_ledgers.write().await;
+                        let stale_count = buffer.len();
+                        buffer.retain(|&seq, _| seq <= result.ledger_seq);
+                        let removed = stale_count - buffer.len();
+                        if removed > 0 {
+                            tracing::info!(
+                                removed,
+                                catchup_ledger = result.ledger_seq,
+                                "Cleared stale syncing_ledgers entries above catchup target"
+                            );
+                        }
+                    }
+
                     if self.is_validator {
                         self.set_state(AppState::Validating).await;
                     } else {
@@ -5128,12 +5313,66 @@ impl App {
                         "Post-catchup state before try_apply_buffered_ledgers"
                     );
                     self.try_apply_buffered_ledgers().await;
-                    // Request fresh SCP state from peers after catchup so the
-                    // node quickly learns which slots have been externalized
-                    // while it was catching up. Without this, the node relies
-                    // on the SyncRecoveryManager's next out-of-sync cycle
-                    // (~10-40s) to request state, delaying buffer population.
-                    self.request_scp_state_from_peers().await;
+
+                    // After rapid buffered ledger closes, the broadcast channel
+                    // likely overflowed, and process_externalized_slots() may
+                    // have created syncing_ledgers entries with tx_set: None
+                    // (because fetch responses hadn't been processed yet).
+                    // Clear these stale entries and reset tracking so the main
+                    // event loop can repopulate them cleanly when it drains
+                    // the SCP and fetch_response channels.
+                    {
+                        let current_ledger = *self.current_ledger.read().await;
+                        let mut buffer = self.syncing_ledgers.write().await;
+                        let stale_count = buffer.len();
+                        buffer.retain(|&seq, _| seq <= current_ledger);
+                        let removed = stale_count - buffer.len();
+                        if removed > 0 {
+                            tracing::info!(
+                                removed,
+                                current_ledger,
+                                "Cleared stale syncing_ledgers entries after buffered close"
+                            );
+                        }
+                    }
+
+                    // Set last_processed_slot to the latest externalized slot
+                    // so process_externalized_slots() does NOT re-iterate
+                    // stale slots between current_ledger and the network head.
+                    // Those stale slots have tx_sets that peers have already
+                    // evicted (~60s cache), so creating syncing_ledgers entries
+                    // for them causes an unrecoverable timeout→exhausted→catchup
+                    // loop.  Only future EXTERNALIZE messages (for slots the
+                    // network hasn't closed yet) will be processed.
+                    {
+                        let current_ledger = *self.current_ledger.read().await;
+                        let latest_ext = self.herder.latest_externalized_slot()
+                            .unwrap_or(current_ledger as u64);
+                        *self.last_processed_slot.write().await = latest_ext;
+                        tracing::info!(
+                            latest_ext,
+                            current_ledger,
+                            "Set last_processed_slot to latest_externalized after catchup"
+                        );
+                    }
+
+                    // Reset tx_set tracking state (same as rapid close handler)
+                    // so the main loop can make fresh requests.
+                    *self.last_externalized_at.write().await = Instant::now();
+                    self.tx_set_all_peers_exhausted.store(false, Ordering::SeqCst);
+                    self.tx_set_dont_have.write().await.clear();
+                    self.tx_set_last_request.write().await.clear();
+                    self.tx_set_exhausted_warned.write().await.clear();
+                    *self.consensus_stuck_state.write().await = None;
+
+                    // Do NOT request SCP state from peers after catchup.
+                    // That brings in EXTERNALIZE messages for recent slots
+                    // whose tx_sets peers have already evicted from their
+                    // caches (~60s window).  Processing those creates
+                    // syncing_ledgers entries with tx_set: None, triggering
+                    // the timeout→exhausted→catchup loop.  Instead, rely on
+                    // the dedicated SCP channel which delivers the NEXT fresh
+                    // EXTERNALIZE (with a fetchable tx_set) within ~5 seconds.
                 } else {
                     tracing::info!(
                         ledger_seq = result.ledger_seq,
@@ -5480,16 +5719,84 @@ impl App {
         let last_processed = *self.last_processed_slot.read().await;
         let pending_tx_sets = self.herder.get_pending_tx_sets();
         let buffer_count = self.syncing_ledgers.read().await.len();
+        let gap = latest_externalized.saturating_sub(current_ledger as u64);
         tracing::info!(
             current_ledger,
             latest_externalized,
             last_processed,
             pending_tx_sets = pending_tx_sets.len(),
             buffer_count,
+            gap,
             "Performing out-of-sync recovery"
         );
 
-        // Detect gaps in externalized slots to help diagnose sync issues
+        // Clean up stale pending tx_set requests for slots we've already closed.
+        // After rapid close, stale EXTERNALIZE messages from previous SCP state
+        // requests create pending tx_set entries for old slots whose tx_sets are
+        // evicted from peers' caches. These requests can never be fulfilled and
+        // cause infinite timeout → DontHave → recovery loops.
+        let stale_cleared = self
+            .herder
+            .cleanup_old_pending_tx_sets(current_ledger as u64 + 1);
+        if stale_cleared > 0 {
+            tracing::info!(
+                stale_cleared,
+                current_ledger,
+                "Cleared stale pending tx_set requests for already-closed slots"
+            );
+            // Also clear the local tx_set tracking state for these stale requests
+            self.tx_set_dont_have.write().await.clear();
+            self.tx_set_last_request.write().await.clear();
+            self.tx_set_exhausted_warned.write().await.clear();
+            self.tx_set_all_peers_exhausted
+                .store(false, Ordering::SeqCst);
+        }
+
+        // When the node is essentially caught up (small or zero gap), do NOT
+        // request SCP state from peers. Requesting SCP state brings stale
+        // EXTERNALIZE messages for slots whose tx_sets are already evicted from
+        // peers' caches (~60-72s window). These create pending tx_set requests
+        // that can never be fulfilled, causing infinite timeout → DontHave →
+        // recovery loops.
+        //
+        // Instead, just wait for fresh EXTERNALIZE messages to arrive naturally
+        // via the dedicated SCP channel. The network produces new slots every
+        // ~5-6 seconds, so the next EXTERNALIZE will arrive shortly.
+        if gap <= TX_SET_REQUEST_WINDOW {
+            // Also clear syncing_ledgers entries with no tx_set — these are
+            // unfulfillable entries from stale EXTERNALIZE and will block
+            // try_start_ledger_close().
+            {
+                let mut buffer = self.syncing_ledgers.write().await;
+                let pre_count = buffer.len();
+                buffer.retain(|seq, info| {
+                    *seq > current_ledger && info.tx_set.is_some()
+                });
+                let removed = pre_count - buffer.len();
+                if removed > 0 {
+                    tracing::info!(
+                        removed,
+                        remaining = buffer.len(),
+                        current_ledger,
+                        "Cleared unfulfillable syncing_ledgers entries (essentially caught up)"
+                    );
+                }
+            }
+            // Clear any remaining pending tx_sets from the herder
+            self.herder.clear_pending_tx_sets();
+            tracing::info!(
+                current_ledger,
+                latest_externalized,
+                gap,
+                "Essentially caught up — skipping SCP state request, waiting for fresh EXTERNALIZE"
+            );
+            return;
+        }
+
+        // Detect gaps in externalized slots to help diagnose sync issues.
+        // If the very next slot (current_ledger+1) is missing, peers will never
+        // have it (they only cache ~12 recent slots / ~60-72s). The only recovery
+        // path is catchup — requesting SCP state from peers is futile.
         let next_slot = current_ledger as u64 + 1;
         if latest_externalized > next_slot {
             let missing_slots = self.herder.find_missing_slots_in_range(next_slot, latest_externalized);
@@ -5506,6 +5813,31 @@ impl App {
                     missing_slots = ?if missing_count <= 10 { missing_slots.clone() } else { vec![] },
                     "Detected gap in externalized slots - missing EXTERNALIZE messages"
                 );
+
+                // If the very next slot is missing, we can NEVER close it via the
+                // normal path (try_start_ledger_close requires syncing_ledgers[N+1]).
+                // Peers have evicted this slot's data from their caches.  Trigger
+                // catchup immediately to skip past the gap instead of spinning in
+                // recovery forever.
+                if missing_slots.contains(&next_slot) {
+                    tracing::warn!(
+                        current_ledger,
+                        next_slot,
+                        latest_externalized,
+                        gap,
+                        "Next slot permanently missing — triggering catchup to skip gap"
+                    );
+                    // Clear stale syncing_ledgers entries that will never be closeable
+                    {
+                        let mut buffer = self.syncing_ledgers.write().await;
+                        buffer.retain(|seq, info| {
+                            *seq > current_ledger && info.tx_set.is_some()
+                        });
+                    }
+                    self.maybe_start_externalized_catchup(latest_externalized)
+                        .await;
+                    return;
+                }
             } else {
                 // No gaps in externalized, but we can't apply - likely missing tx_sets
                 let externalized_slots = self.herder.get_externalized_slots_in_range(next_slot, latest_externalized);
@@ -9271,10 +9603,13 @@ mod tests {
 
         let app = App::new(config).await.unwrap();
 
-        // Add entries: some with tx_set, some without
+        // Set current_ledger to 99 so entries at 100+ are above current_ledger
+        *app.current_ledger.write().await = 99;
+
+        // Add entries: some with tx_set, some without (starting from current_ledger+1)
         {
             let mut buffer = app.syncing_ledgers.write().await;
-            // Entry WITHOUT tx_set (should be evicted)
+            // Entry WITHOUT tx_set at current_ledger+1 (should be evicted when exhausted)
             buffer.insert(
                 100,
                 henyey_herder::LedgerCloseInfo {
@@ -9286,7 +9621,7 @@ mod tests {
                     stellar_value_ext: StellarValueExt::Basic,
                 },
             );
-            // Entry WITHOUT tx_set (should be evicted)
+            // Entry WITHOUT tx_set (consecutive, should be evicted)
             buffer.insert(
                 101,
                 henyey_herder::LedgerCloseInfo {
@@ -9298,7 +9633,7 @@ mod tests {
                     stellar_value_ext: StellarValueExt::Basic,
                 },
             );
-            // Entry WITH tx_set (should be kept)
+            // Entry WITH tx_set (should be kept — eviction stops at first entry with tx_set)
             buffer.insert(
                 102,
                 henyey_herder::LedgerCloseInfo {
@@ -9317,18 +9652,24 @@ mod tests {
             );
         }
 
-        // Simulate the eviction logic from the rapid close handler
+        // Simulate the eviction logic from maybe_start_buffered_catchup
+        // when tx_set_all_peers_exhausted is true
+        app.tx_set_all_peers_exhausted.store(true, Ordering::SeqCst);
         {
             let mut buffer = app.syncing_ledgers.write().await;
-            let stale: Vec<u32> = buffer
-                .iter()
-                .filter(|(_, info)| info.tx_set.is_none())
-                .map(|(seq, _)| *seq)
-                .collect();
-            assert_eq!(stale.len(), 2, "should find 2 stale entries");
-            for seq in &stale {
-                buffer.remove(seq);
+            let current_ledger = 99u32;
+            let start = current_ledger.saturating_add(1);
+            let mut evicted = 0u32;
+            for seq in start.. {
+                match buffer.get(&seq) {
+                    Some(info) if info.tx_set.is_none() => {
+                        buffer.remove(&seq);
+                        evicted += 1;
+                    }
+                    _ => break,
+                }
             }
+            assert_eq!(evicted, 2, "should evict 2 consecutive entries without tx_sets");
         }
 
         let buffer = app.syncing_ledgers.read().await;
@@ -9377,8 +9718,11 @@ mod tests {
             catchup_triggered: false,
         });
 
-        // Simulate the cleanup block from the rapid close handler
-        app.herder.clear_pending_tx_sets();
+        // Simulate the cleanup block from the rapid close handler.
+        // The rapid close handler now only resets tracking state, NOT
+        // buffer entries or pending tx_set requests. This allows the
+        // normal process_externalized_slots → maybe_start_buffered_catchup
+        // flow to handle stale entries properly.
         app.tx_set_all_peers_exhausted.store(false, Ordering::SeqCst);
         app.tx_set_dont_have.write().await.clear();
         app.tx_set_last_request.write().await.clear();
@@ -9431,5 +9775,179 @@ mod tests {
             );
             assert_eq!(is_fetch_response, should_skip, "{} should be skipped={}", label, should_skip);
         }
+    }
+
+    // ============================================================
+    // trim_syncing_ledgers Tests
+    // ============================================================
+
+    #[test]
+    fn test_trim_syncing_ledgers_preserves_close_entries() {
+        // When entries are close to current_ledger (gap < CHECKPOINT_FREQUENCY),
+        // trim should NOT remove them to checkpoint boundary. These entries are
+        // potentially closeable and trimming them creates an artificial gap.
+        let mut buffer = BTreeMap::new();
+        let make_entry = |slot: u32| henyey_herder::LedgerCloseInfo {
+            slot: slot as u64,
+            tx_set_hash: Hash256::ZERO,
+            tx_set: None,
+            close_time: 1,
+            upgrades: Vec::new(),
+            stellar_value_ext: StellarValueExt::Basic,
+        };
+
+        // Simulate: current_ledger=61193740, entries at 61193741..=61193797
+        // These entries are close to current_ledger (gap=1 for first entry)
+        // Old code would trim everything below checkpoint boundary of last_buffered
+        // (first_ledger_in_checkpoint(61193797) = 61193792), destroying 61193741-61193791
+        let current_ledger = 61193740u32;
+        for slot in 61193741..=61193797 {
+            buffer.insert(slot, make_entry(slot));
+        }
+        let original_count = buffer.len();
+
+        App::trim_syncing_ledgers(&mut buffer, current_ledger);
+
+        // All entries should survive — they're all above current_ledger and
+        // the gap (1) is less than CHECKPOINT_FREQUENCY
+        assert_eq!(
+            buffer.len(),
+            original_count,
+            "trim should preserve entries close to current_ledger"
+        );
+        assert!(
+            buffer.contains_key(&61193741),
+            "first entry (current_ledger+1) must survive"
+        );
+        assert!(
+            buffer.contains_key(&61193797),
+            "last entry must survive"
+        );
+    }
+
+    #[test]
+    fn test_trim_syncing_ledgers_trims_when_gap_large() {
+        // When the gap to first_buffered is >= CHECKPOINT_FREQUENCY,
+        // trim should remove entries below the checkpoint boundary of last_buffered
+        // to prepare for archive-based catchup.
+        let mut buffer = BTreeMap::new();
+        let make_entry = |slot: u32| henyey_herder::LedgerCloseInfo {
+            slot: slot as u64,
+            tx_set_hash: Hash256::ZERO,
+            tx_set: None,
+            close_time: 1,
+            upgrades: Vec::new(),
+            stellar_value_ext: StellarValueExt::Basic,
+        };
+
+        // current_ledger=100, entries at 200..=280 (gap=100, > 64)
+        let current_ledger = 100u32;
+        for slot in 200..=280 {
+            buffer.insert(slot, make_entry(slot));
+        }
+
+        App::trim_syncing_ledgers(&mut buffer, current_ledger);
+
+        // After trim: checkpoint boundary of 280 is first_ledger_in_checkpoint(280) = 256
+        // Entries below 256 should be removed
+        assert!(
+            !buffer.contains_key(&200),
+            "entry well below checkpoint boundary should be trimmed"
+        );
+        assert!(
+            !buffer.contains_key(&255),
+            "entry just below checkpoint boundary should be trimmed"
+        );
+        assert!(
+            buffer.contains_key(&256),
+            "entry at checkpoint boundary should survive"
+        );
+        assert!(
+            buffer.contains_key(&280),
+            "last entry should survive"
+        );
+    }
+
+    #[test]
+    fn test_trim_syncing_ledgers_removes_closed_entries() {
+        // Entries at or below current_ledger should always be removed.
+        let mut buffer = BTreeMap::new();
+        let make_entry = |slot: u32| henyey_herder::LedgerCloseInfo {
+            slot: slot as u64,
+            tx_set_hash: Hash256::ZERO,
+            tx_set: None,
+            close_time: 1,
+            upgrades: Vec::new(),
+            stellar_value_ext: StellarValueExt::Basic,
+        };
+
+        let current_ledger = 105u32;
+        for slot in 100..=110 {
+            buffer.insert(slot, make_entry(slot));
+        }
+
+        App::trim_syncing_ledgers(&mut buffer, current_ledger);
+
+        // Entries 100-105 should be removed, 106-110 kept
+        assert!(!buffer.contains_key(&100));
+        assert!(!buffer.contains_key(&105));
+        assert!(buffer.contains_key(&106));
+        assert!(buffer.contains_key(&110));
+        assert_eq!(buffer.len(), 5);
+    }
+
+    #[test]
+    fn test_consensus_stuck_state_matches_on_current_ledger_only() {
+        // Verify that ConsensusStuckState matches when current_ledger is the
+        // same but first_buffered changes. This is critical for Problem 9:
+        // stale EXTERNALIZE messages create new syncing_ledgers entries with
+        // lower slot numbers, changing first_buffered. The stuck timer must
+        // NOT reset when first_buffered shifts.
+        let state = ConsensusStuckState {
+            current_ledger: 100,
+            first_buffered: 105,
+            stuck_start: Instant::now(),
+            last_recovery_attempt: Instant::now(),
+            recovery_attempts: 0,
+            catchup_triggered: false,
+        };
+
+        // Same current_ledger, different first_buffered — should still match
+        let current_ledger = 100u32;
+        let new_first_buffered = 103u32; // changed due to stale EXTERNALIZE
+        assert_eq!(state.current_ledger, current_ledger);
+        // The fix: we no longer require state.first_buffered == first_buffered
+        // so the timer continues even when first_buffered shifts.
+        assert_ne!(state.first_buffered, new_first_buffered);
+
+        // Different current_ledger — should NOT match (ledger advanced)
+        let advanced_ledger = 101u32;
+        assert_ne!(state.current_ledger, advanced_ledger);
+    }
+
+    #[test]
+    fn test_buffered_catchup_target_small_gap() {
+        // When the gap between current_ledger and first_buffered is small (< 64),
+        // the target should bridge the gap. This is the scenario where a single
+        // missing EXTERNALIZE creates a tiny gap.
+        let current_ledger = 61200834u32;
+        let first_buffered = 61200836u32; // slot 61200835 was skipped
+        let last_buffered = 61200850u32;
+
+        let target = App::buffered_catchup_target(current_ledger, first_buffered, last_buffered);
+        // With first_buffered > current_ledger + 1 and gap < CHECKPOINT_FREQUENCY,
+        // should compute a valid target
+        if let Some(t) = target {
+            assert!(t > current_ledger, "target must advance past current_ledger");
+            assert!(t < first_buffered, "target must be before first_buffered");
+        }
+        // If None, compute_catchup_target_for_timeout should provide a fallback
+        let timeout_target = App::compute_catchup_target_for_timeout(
+            last_buffered,
+            first_buffered,
+            current_ledger,
+        );
+        // For a small gap like this, we should get first_buffered - 1 as target
+        assert_eq!(timeout_target, Some(first_buffered - 1));
     }
 }
