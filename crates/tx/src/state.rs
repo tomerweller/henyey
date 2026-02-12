@@ -1376,7 +1376,13 @@ impl LedgerStateManager {
     }
 
     /// Update num_sponsoring for an account.
+    ///
+    /// Lazily loads the account from the bucket list if not already in state.
+    /// This is necessary because sponsored entries may reference a sponsor
+    /// account that hasn't been loaded yet (e.g., during offer crossing when
+    /// a sponsored offer is fully consumed and deleted).
     pub fn update_num_sponsoring(&mut self, account_id: &AccountId, delta: i64) -> Result<()> {
+        self.ensure_account_loaded(account_id)?;
         let account = self
             .get_account_mut(account_id)
             .ok_or(TxError::SourceAccountNotFound)?;
@@ -1390,7 +1396,10 @@ impl LedgerStateManager {
     }
 
     /// Update num_sponsored for an account.
+    ///
+    /// Lazily loads the account from the bucket list if not already in state.
     pub fn update_num_sponsored(&mut self, account_id: &AccountId, delta: i64) -> Result<()> {
+        self.ensure_account_loaded(account_id)?;
         let account = self
             .get_account_mut(account_id)
             .ok_or(TxError::SourceAccountNotFound)?;
