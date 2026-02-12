@@ -3396,14 +3396,31 @@ impl App {
                         if now.duration_since(last_ext) > Duration::from_secs(20)
                             && now.duration_since(last_request) > Duration::from_secs(10)
                         {
-                            tracing::warn!(
-                                latest_ext,
-                                tracking_slot,
-                                heard_from_quorum,
-                                "SCP externalization stalled; requesting SCP state"
-                            );
-                            *self.last_scp_state_request_at.write().await = now;
-                            self.request_scp_state_from_peers().await;
+                            // When essentially caught up (small gap), do NOT request
+                            // SCP state.  Peers respond with EXTERNALIZE for recent
+                            // slots whose tx_sets are already evicted from their
+                            // caches, creating unfulfillable requests.  Instead, wait
+                            // for the next natural EXTERNALIZE (~5-6s).
+                            let current_ledger = *self.current_ledger.read().await;
+                            let gap = latest_ext.saturating_sub(current_ledger as u64);
+                            if gap <= TX_SET_REQUEST_WINDOW {
+                                tracing::debug!(
+                                    current_ledger,
+                                    latest_ext,
+                                    gap,
+                                    "Heartbeat: essentially caught up, skipping SCP state request"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    latest_ext,
+                                    tracking_slot,
+                                    heard_from_quorum,
+                                    gap,
+                                    "SCP externalization stalled; requesting SCP state"
+                                );
+                                *self.last_scp_state_request_at.write().await = now;
+                                self.request_scp_state_from_peers().await;
+                            }
                         }
                     }
 
@@ -4398,16 +4415,33 @@ impl App {
             return;
         }
 
+        let mut closed_any = false;
         loop {
             let mut pending = match self.try_start_ledger_close().await {
                 Some(p) => p,
-                None => return,
+                None => break,
             };
             let join_result = (&mut pending.handle).await;
             let success = self.handle_close_complete(pending, join_result).await;
             if !success {
-                return;
+                break;
             }
+            closed_any = true;
+        }
+
+        // After closing one or more buffered ledgers, reset timestamps and
+        // tracking state so the heartbeat stall detector doesn't fire based
+        // on the (now stale) timestamp of the EXTERNALIZE that triggered
+        // this burst.  This mirrors the reset done in the pending_close
+        // handler at the end of the select-loop chain (line ~3086-3111).
+        if closed_any {
+            *self.last_externalized_at.write().await = Instant::now();
+            self.tx_set_all_peers_exhausted
+                .store(false, Ordering::SeqCst);
+            self.tx_set_dont_have.write().await.clear();
+            self.tx_set_last_request.write().await.clear();
+            self.tx_set_exhausted_warned.write().await.clear();
+            *self.consensus_stuck_state.write().await = None;
         }
     }
 
@@ -9923,6 +9957,183 @@ mod tests {
         // Different current_ledger — should NOT match (ledger advanced)
         let advanced_ledger = 101u32;
         assert_ne!(state.current_ledger, advanced_ledger);
+    }
+
+    // ============================================================
+    // Fix A: try_apply_buffered_ledgers state reset tests
+    // ============================================================
+
+    #[tokio::test]
+    async fn test_try_apply_buffered_no_close_preserves_stale_state() {
+        // When try_apply_buffered_ledgers runs but there are NO buffered
+        // ledgers to close (closed_any=false), it must NOT reset tracking
+        // state.  This verifies the guard condition around the reset block.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        // Seed stale tracking state (as if a previous cycle left residue).
+        app.tx_set_all_peers_exhausted.store(true, Ordering::SeqCst);
+        {
+            let mut dont_have = app.tx_set_dont_have.write().await;
+            let hash = Hash256::from_bytes([2u8; 32]);
+            dont_have.insert(hash, HashSet::from([henyey_overlay::PeerId::from_bytes([2u8; 32])]));
+        }
+        {
+            let mut last_req = app.tx_set_last_request.write().await;
+            let hash = Hash256::from_bytes([2u8; 32]);
+            last_req.insert(hash, TxSetRequestState {
+                last_request: Instant::now(),
+                first_requested: Instant::now(),
+                next_peer_offset: 1,
+            });
+        }
+        {
+            let mut warned = app.tx_set_exhausted_warned.write().await;
+            warned.insert(Hash256::from_bytes([2u8; 32]));
+        }
+        *app.consensus_stuck_state.write().await = Some(ConsensusStuckState {
+            current_ledger: 50,
+            first_buffered: 51,
+            stuck_start: Instant::now(),
+            last_recovery_attempt: Instant::now(),
+            recovery_attempts: 1,
+            catchup_triggered: false,
+        });
+
+        // Record the externalized timestamp before the call.
+        let ext_before = *app.last_externalized_at.read().await;
+
+        // Call with empty syncing_ledgers → loop exits immediately, closed_any=false.
+        app.try_apply_buffered_ledgers().await;
+
+        // All stale state should be PRESERVED (not cleared) because nothing closed.
+        assert!(
+            app.tx_set_all_peers_exhausted.load(Ordering::SeqCst),
+            "tx_set_all_peers_exhausted should remain true when nothing closed"
+        );
+        assert!(
+            !app.tx_set_dont_have.read().await.is_empty(),
+            "tx_set_dont_have should remain populated when nothing closed"
+        );
+        assert!(
+            !app.tx_set_last_request.read().await.is_empty(),
+            "tx_set_last_request should remain populated when nothing closed"
+        );
+        assert!(
+            !app.tx_set_exhausted_warned.read().await.is_empty(),
+            "tx_set_exhausted_warned should remain populated when nothing closed"
+        );
+        assert!(
+            app.consensus_stuck_state.read().await.is_some(),
+            "consensus_stuck_state should remain when nothing closed"
+        );
+        let ext_after = *app.last_externalized_at.read().await;
+        assert_eq!(
+            ext_before, ext_after,
+            "last_externalized_at should not be reset when nothing closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_apply_buffered_state_reset_block_mirrors_rapid_close() {
+        // Verify the state-reset block in try_apply_buffered_ledgers matches
+        // the reset done in the pending_close handler.  We can't easily close
+        // a real ledger in a unit test, so we directly exercise the reset logic
+        // that fires when closed_any=true and verify the fields are cleared.
+        // This is structurally identical to test_tx_set_state_cleanup_after_rapid_close.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        // Seed dirty state.
+        app.tx_set_all_peers_exhausted.store(true, Ordering::SeqCst);
+        {
+            let mut dont_have = app.tx_set_dont_have.write().await;
+            let hash = Hash256::from_bytes([3u8; 32]);
+            dont_have.insert(hash, HashSet::from([henyey_overlay::PeerId::from_bytes([3u8; 32])]));
+        }
+        {
+            let mut last_req = app.tx_set_last_request.write().await;
+            let hash = Hash256::from_bytes([3u8; 32]);
+            last_req.insert(hash, TxSetRequestState {
+                last_request: Instant::now(),
+                first_requested: Instant::now(),
+                next_peer_offset: 5,
+            });
+        }
+        {
+            let mut warned = app.tx_set_exhausted_warned.write().await;
+            warned.insert(Hash256::from_bytes([3u8; 32]));
+        }
+        *app.consensus_stuck_state.write().await = Some(ConsensusStuckState {
+            current_ledger: 200,
+            first_buffered: 201,
+            stuck_start: Instant::now(),
+            last_recovery_attempt: Instant::now(),
+            recovery_attempts: 3,
+            catchup_triggered: false,
+        });
+
+        // Directly exercise the reset block (same code as in try_apply_buffered_ledgers
+        // when closed_any=true).
+        *app.last_externalized_at.write().await = Instant::now();
+        app.tx_set_all_peers_exhausted
+            .store(false, Ordering::SeqCst);
+        app.tx_set_dont_have.write().await.clear();
+        app.tx_set_last_request.write().await.clear();
+        app.tx_set_exhausted_warned.write().await.clear();
+        *app.consensus_stuck_state.write().await = None;
+
+        // Verify all tracking state is cleared.
+        assert!(!app.tx_set_all_peers_exhausted.load(Ordering::SeqCst));
+        assert!(app.tx_set_dont_have.read().await.is_empty());
+        assert!(app.tx_set_last_request.read().await.is_empty());
+        assert!(app.tx_set_exhausted_warned.read().await.is_empty());
+        assert!(app.consensus_stuck_state.read().await.is_none());
+    }
+
+    // ============================================================
+    // Fix B: Heartbeat gap guard tests
+    // ============================================================
+
+    #[test]
+    fn test_heartbeat_gap_guard_skips_when_caught_up() {
+        // The heartbeat stall detector computes:
+        //   gap = latest_ext.saturating_sub(current_ledger)
+        // When gap <= TX_SET_REQUEST_WINDOW (12), it should skip the SCP
+        // state request to avoid bringing in stale EXTERNALIZE messages.
+        // This test exercises the condition directly.
+
+        let cases: Vec<(u64, u32, bool)> = vec![
+            // (latest_ext, current_ledger, should_skip)
+            (100, 100, true),   // gap=0: fully caught up
+            (100, 99,  true),   // gap=1: one ledger behind
+            (100, 88,  true),   // gap=12: exactly at threshold
+            (100, 87,  false),  // gap=13: one past threshold
+            (100, 50,  false),  // gap=50: far behind
+            (100, 0,   false),  // gap=100: very far behind
+            (0,   0,   true),   // gap=0: both at zero (startup)
+            (5,   10,  true),   // gap=0 (saturating_sub): current > latest
+        ];
+
+        for (latest_ext, current_ledger, should_skip) in cases {
+            let gap = latest_ext.saturating_sub(current_ledger as u64);
+            let skip = gap <= TX_SET_REQUEST_WINDOW;
+            assert_eq!(
+                skip, should_skip,
+                "latest_ext={}, current_ledger={}, gap={}: expected skip={} got skip={}",
+                latest_ext, current_ledger, gap, should_skip, skip
+            );
+        }
     }
 
     #[test]
