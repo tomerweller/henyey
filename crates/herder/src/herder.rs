@@ -1336,10 +1336,24 @@ impl Herder {
             self.pending_envelopes
                 .set_current_slot(externalized_slot + 1);
 
+            // Transition to Tracking on successful externalization.
+            // Matches stellar-core's setTrackingSCPState(slotIndex, b, true)
+            // in HerderSCPDriver::valueExternalized which always sets
+            // HERDER_TRACKING_NETWORK_STATE on externalization.
+            {
+                let mut state = self.state.write();
+                if *state != HerderState::Tracking {
+                    info!(
+                        slot = externalized_slot,
+                        "Transitioning to Tracking on externalization"
+                    );
+                    *state = HerderState::Tracking;
+                }
+            }
+
             // Update ScpDriver with tracking state for close-time validation
-            let is_tracking = self.state() == HerderState::Tracking;
             self.scp_driver.set_tracking_state(
-                is_tracking,
+                true,
                 externalized_slot + 1,
                 close_time,
             );
@@ -2544,6 +2558,62 @@ mod tests {
         assert_eq!(result, EnvelopeState::Valid);
         // Tracking slot should have advanced (to slot + 1, since EXTERNALIZE completes that slot)
         assert_eq!(herder.tracking_slot(), acceptable_slot + 1);
+    }
+
+    #[test]
+    fn test_externalize_transitions_syncing_to_tracking() {
+        // Matches stellar-core behavior: setTrackingSCPState(slotIndex, b, true)
+        // always transitions to HERDER_TRACKING_NETWORK_STATE on externalization,
+        // even if the herder was previously in SYNCING state.
+        let secret = SecretKey::from_seed(&[1u8; 32]);
+        let public = secret.public_key();
+        let test_node_id = node_id_from_public_key(&public);
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![test_node_id.clone()].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let config = HerderConfig {
+            local_quorum_set: Some(quorum_set),
+            ..HerderConfig::default()
+        };
+        let herder = Herder::new(config);
+        herder.start_syncing();
+        herder.bootstrap(100);
+
+        // Add the test node to the quorum tracker
+        let test_qs = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![test_node_id.clone()].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        herder.quorum_tracker.write().expand(&test_node_id, test_qs);
+
+        // Simulate losing sync: force herder back to Syncing
+        herder.set_state(HerderState::Syncing);
+        assert_eq!(herder.state(), HerderState::Syncing);
+
+        // Cache a dummy tx_set so the EXTERNALIZE handler can find it
+        let dummy_tx_set = TransactionSet {
+            hash: Hash256([0u8; 32]),
+            previous_ledger_hash: Hash256::ZERO,
+            transactions: vec![],
+            generalized_tx_set: None,
+        };
+        herder.cache_tx_set(dummy_tx_set);
+
+        // Process an EXTERNALIZE — should transition back to Tracking
+        let envelope = make_signed_externalize_envelope(105, &herder);
+        let result = herder.receive_scp_envelope(envelope);
+
+        assert_eq!(result, EnvelopeState::Valid);
+        assert_eq!(
+            herder.state(),
+            HerderState::Tracking,
+            "Externalization should transition herder from Syncing to Tracking"
+        );
     }
 
     #[test]
