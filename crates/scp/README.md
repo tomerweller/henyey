@@ -1,71 +1,44 @@
 # henyey-scp
 
-Rust implementation of the Stellar Consensus Protocol (SCP) for henyey.
+Rust implementation of the Stellar Consensus Protocol (SCP).
 
 ## Overview
 
-SCP is a federated Byzantine agreement protocol that enables nodes to reach consensus without requiring a closed membership or central authority. This crate provides a complete implementation of SCP suitable for use in Stellar network nodes.
+SCP is a federated Byzantine agreement protocol that enables nodes to reach consensus without requiring a closed membership or central authority. This crate provides a complete, deterministic implementation of SCP suitable for use in Stellar network nodes. It corresponds to stellar-core's `src/scp/` and is the consensus engine used by `henyey-herder` to agree on transaction sets each ledger.
 
-## Key Concepts
-
-### Quorum Sets
-
-Each node defines its own **quorum set** - a configuration specifying which validators it trusts. A quorum set includes:
-- A **threshold**: minimum number of members that must agree
-- **Validators**: direct trusted nodes
-- **Inner sets**: nested quorum sets for hierarchical trust
-
-### Quorum and Blocking Sets
-
-- **Quorum**: A set of nodes where every member's quorum slice is satisfied. When a quorum agrees, the decision is irreversible.
-- **Blocking Set (V-Blocking)**: A set that intersects every quorum slice, able to prevent any quorum from forming.
-
-### Protocol Phases
-
-SCP operates in two phases:
-
-1. **Nomination**: Nodes propose and vote on candidate values
-   - Values progress from voted -> accepted -> confirmed (candidate)
-   - Confirmed candidates are combined into a composite value
-
-2. **Ballot Protocol**: Nodes agree on a single value through:
-   - **PREPARE**: Vote that a ballot is safe to commit
-   - **CONFIRM**: Agree on which ballot to commit
-   - **EXTERNALIZE**: Commit to the final value
+SCP operates in two phases per slot: **nomination** (propose and vote on candidate values) followed by the **ballot protocol** (commit to a single value through prepare, confirm, and externalize stages).
 
 ## Architecture
 
+```mermaid
+graph TD
+    SCP["SCP&lt;D&gt;<br/>coordinator"] --> Slot
+    Slot --> NP["NominationProtocol<br/>phase 1: value selection"]
+    Slot --> BP["BallotProtocol<br/>phase 2: commit"]
+    NP -->|candidates| BP
+    BP -->|externalized value| Driver["SCPDriver (trait)<br/>application callbacks"]
+    SCP -->|quorum checks| Quorum["quorum module"]
+    NP -->|quorum checks| Quorum
+    BP -->|quorum checks| Quorum
 ```
-+-------+     +------+     +--------------------+
-|  SCP  | --> | Slot | --> | NominationProtocol |
-+-------+     +------+     +--------------------+
-                  |
-                  +------> +----------------+
-                           | BallotProtocol |
-                           +----------------+
-```
-
-- `SCP`: Main coordinator managing multiple slots
-- `Slot`: Per-slot state (nomination + ballot)
-- `NominationProtocol`: First phase - value proposal and voting
-- `BallotProtocol`: Second phase - commit and externalization
 
 ## Key Types
 
 | Type | Description |
 |------|-------------|
-| `SCP<D>` | Main coordinator, parameterized by driver (`D: SCPDriver`) |
-| `Slot` | Per-slot consensus state |
-| `SCPDriver` | Trait for application callbacks |
-| `NominationProtocol` | Nomination phase state machine |
-| `BallotProtocol` | Ballot phase state machine |
-| `EnvelopeState` | Result of processing an SCP message |
-| `ValidationLevel` | Value validation result (Invalid/MaybeValid/FullyValidated) |
-| `BallotPhase` | Current phase (Prepare/Confirm/Externalize) |
-| `SCPTimerType` | Timer identifier (Nomination/Ballot) |
+| `SCP<D>` | Main coordinator managing multiple slots, parameterized by driver |
+| `Slot` | Per-slot state combining nomination and ballot protocols |
+| `SCPDriver` | Trait for application callbacks (validation, signing, timers) |
+| `NominationProtocol` | Nomination phase: propose, vote, accept, confirm candidates |
+| `BallotProtocol` | Ballot phase: prepare, confirm, externalize a value |
+| `SlotContext` | Internal context struct grouping node ID, quorum set, driver, slot index |
+| `EnvelopeState` | Result of processing an envelope (Valid, ValidNew, Invalid) |
+| `ValidationLevel` | Value validation result (Invalid, MaybeValid, FullyValidated) |
+| `BallotPhase` | Current ballot phase (Prepare, Confirm, Externalize) |
+| `SCPTimerType` | Timer identifier (Nomination, Ballot) |
 | `ScpError` | Error types for SCP operations |
-| `SlotState` | Debugging snapshot of slot consensus state |
 | `QuorumSetJson` | JSON-serializable quorum set for persistence and debugging |
+| `SlotInfo` / `BallotInfo` / `NominationInfo` | Diagnostic snapshot types |
 
 ## Usage
 
@@ -100,127 +73,61 @@ match state {
 
 // Check for externalized values
 if let Some(value) = scp.get_externalized_value(slot_index) {
-    // Consensus reached - apply the value
+    // Consensus reached
 }
 ```
 
 ### Catchup Mode
 
-During catchup from historical data, slots can be force-externalized:
+During catchup from historical data, slots can be force-externalized
+without running the consensus protocol:
 
 ```rust
-// Skip consensus and directly mark slot as externalized
 scp.force_externalize(ledger_seq, ledger_value);
 ```
 
-## The SCPDriver Trait
-
-The `SCPDriver` trait connects SCP to your application:
-
-```rust
-pub trait SCPDriver: Send + Sync {
-    // Validate a proposed value
-    fn validate_value(&self, slot_index: u64, value: &Value, nomination: bool) -> ValidationLevel;
-
-    // Combine multiple candidates into one
-    fn combine_candidates(&self, slot_index: u64, candidates: &[Value]) -> Option<Value>;
-
-    // Extract a valid value from a potentially invalid composite
-    fn extract_valid_value(&self, slot_index: u64, value: &Value) -> Option<Value>;
-
-    // Broadcast an envelope to peers
-    fn emit_envelope(&self, envelope: &ScpEnvelope);
-
-    // Get a node's quorum set
-    fn get_quorum_set(&self, node_id: &NodeId) -> Option<ScpQuorumSet>;
-
-    // Notification callbacks
-    fn nominating_value(&self, slot_index: u64, value: &Value);
-    fn value_externalized(&self, slot_index: u64, value: &Value);
-    fn ballot_did_prepare(&self, slot_index: u64, ballot: &ScpBallot);
-    fn ballot_did_confirm(&self, slot_index: u64, ballot: &ScpBallot);
-
-    // Deterministic hash computations (must match across all nodes)
-    fn compute_hash_node(&self, slot_index: u64, prev_value: &Value,
-        is_priority: bool, round: u32, node_id: &NodeId) -> u64;
-    fn compute_value_hash(&self, slot_index: u64, prev_value: &Value,
-        round: u32, value: &Value) -> u64;
-    fn compute_timeout(&self, round: u32, is_nomination: bool) -> Duration;
-
-    // Cryptographic operations
-    fn sign_envelope(&self, envelope: &mut ScpEnvelope);
-    fn verify_envelope(&self, envelope: &ScpEnvelope) -> bool;
-
-    // ... and more (with default implementations):
-    // get_quorum_set_by_hash, hash_quorum_set, get_node_weight,
-    // get_value_string, get_hash_of, setup_timer, stop_timer,
-    // accepted_ballot_prepared, confirmed_ballot_prepared,
-    // accepted_commit, ballot_did_hear_from_quorum,
-    // started_ballot_protocol, updated_candidate_value, timer_expired
-}
-```
-
-## Quorum Configuration
-
-Use the `quorum_config` module to set up quorum sets:
-
-```rust
-use henyey_scp::quorum_config::{testnet_quorum_config, config_to_quorum_set};
-
-// Use predefined testnet config
-let config = testnet_quorum_config();
-let quorum_set = config_to_quorum_set(&config)?;
-
-// Or create custom configuration (QuorumSetConfig is from henyey_common)
-use henyey_common::config::QuorumSetConfig;
-let config = QuorumSetConfig {
-    threshold_percent: 67.into(),
-    validators: vec![
-        "GDKXE2OZMJIPOSLNA6N6F2BVCI3O777I2OOC4BV7VOYUEHYX7RTRYA7Y".to_string(),
-        // ... more validators
-    ],
-    inner_sets: vec![],
-};
-```
-
-## Safety Guarantees
-
-SCP provides:
-- **Agreement**: If two nodes externalize values, they externalize the same value
-- **Validity**: Externalized values were proposed by some node
-- **Liveness**: If the network is well-behaved, nodes eventually externalize
-
-These guarantees hold as long as quorum sets have sufficient intersection.
-
-## Determinism
-
-For correct operation, the following must be deterministic:
-- Value validation
-- Hash computations
-- Value ordering and comparison
-- Timeout calculations (given the same inputs)
-
 ## Module Layout
 
-```
-src/
-  lib.rs           - Crate root, re-exports
-  scp.rs           - Main SCP coordinator
-  slot.rs          - Per-slot state
-  nomination.rs    - Nomination protocol
-  ballot.rs        - Ballot protocol
-  quorum.rs        - Quorum set operations
-  quorum_config.rs - Configuration utilities
-  driver.rs        - SCPDriver trait
-  error.rs         - Error types
-```
+| Module | Description |
+|--------|-------------|
+| `lib.rs` | Re-exports, shared helpers (`SlotContext`, `process_envelopes_current_state`) |
+| `scp.rs` | `SCP<D>` coordinator: slot management, envelope routing, purging |
+| `slot.rs` | `Slot`: per-slot state combining nomination + ballot |
+| `nomination.rs` | `NominationProtocol`: value proposal, leader election, round advancement |
+| `ballot.rs` | `BallotProtocol`: prepare/confirm/externalize state machine, envelope emission |
+| `quorum.rs` | Quorum set operations: `is_quorum`, `is_v_blocking`, normalization |
+| `quorum_config.rs` | Configuration parsing: threshold percent, validator strkeys |
+| `driver.rs` | `SCPDriver` trait definition and `SCPTimerType` |
+| `compare.rs` | Statement ordering and comparison functions |
+| `format.rs` | Display formatting for nodes, ballots, envelopes, values |
+| `info.rs` | Diagnostic snapshot types (`SlotInfo`, `BallotInfo`, `QuorumInfo`) |
+| `error.rs` | `ScpError` enum |
 
-## stellar-core Reference
+## Design Notes
 
-This implementation corresponds to the stellar-core SCP implementation in `src/scp/`.
+### Determinism
 
----
+All SCP operations must be deterministic across nodes: value validation, hash computations, value ordering, and timeout calculations. Non-determinism would cause consensus forks.
 
-## stellar-core Parity Status
+### Safety Guarantees
+
+SCP provides agreement (no two honest nodes externalize different values), validity (externalized values were proposed by some node), and liveness (nodes eventually externalize if the network is well-behaved). These hold as long as quorum sets have sufficient intersection.
+
+### SlotContext Pattern
+
+Nearly every internal SCP function needs the same four parameters: local node ID, local quorum set, driver, and slot index. The `SlotContext` struct groups these to reduce parameter noise across ~40 call sites.
+
+## stellar-core Mapping
+
+| Rust | stellar-core |
+|------|--------------|
+| `scp.rs` | `src/scp/SCP.cpp` |
+| `slot.rs` | `src/scp/Slot.cpp` |
+| `nomination.rs` | `src/scp/NominationProtocol.cpp` |
+| `ballot.rs` | `src/scp/BallotProtocol.cpp` |
+| `quorum.rs` | `src/scp/QuorumSetUtils.cpp` |
+| `driver.rs` | `src/scp/SCPDriver.h` |
+
+## Parity Status
 
 See [PARITY_STATUS.md](PARITY_STATUS.md) for detailed stellar-core parity analysis.
