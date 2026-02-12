@@ -18,10 +18,10 @@
 //! The generalized format supports parallel execution stages for Soroban
 //! transactions and per-component fee overrides.
 
-use std::cmp::Ordering;
-use std::collections::HashMap;
 use henyey_common::Hash256;
 use henyey_crypto::Sha256Hasher;
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use stellar_xdr::curr::{
     ConfigUpgradeSetKey, GeneralizedTransactionSet, LedgerCloseMeta, LedgerHeader, LedgerUpgrade,
     Limits, ScpHistoryEntry, StellarValueExt, TransactionEnvelope, TransactionResultPair,
@@ -390,8 +390,7 @@ impl TransactionSetVariant {
                 let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = set;
                 for phase in set_v1.phases.iter() {
                     if let stellar_xdr::curr::TransactionPhase::V1(parallel) = phase {
-                        let base_fee =
-                            parallel.base_fee.and_then(|fee| u32::try_from(fee).ok());
+                        let base_fee = parallel.base_fee.and_then(|fee| u32::try_from(fee).ok());
 
                         let stages = sorted_stages_for_parallel(
                             parallel.execution_stages.as_slice(),
@@ -449,9 +448,7 @@ fn tx_source_id(tx: &TransactionEnvelope) -> stellar_xdr::curr::AccountId {
         TransactionEnvelope::TxV0(env) => henyey_tx::muxed_to_account_id(
             &stellar_xdr::curr::MuxedAccount::Ed25519(env.tx.source_account_ed25519.clone()),
         ),
-        TransactionEnvelope::Tx(env) => {
-            henyey_tx::muxed_to_account_id(&env.tx.source_account)
-        }
+        TransactionEnvelope::Tx(env) => henyey_tx::muxed_to_account_id(&env.tx.source_account),
         TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
             stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
                 henyey_tx::muxed_to_account_id(&inner.tx.source_account)
@@ -995,8 +992,8 @@ impl LedgerCloseStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use henyey_crypto::Sha256Hasher;
+    use std::collections::HashMap;
     use stellar_xdr::curr::{
         DependentTxCluster, FeeBumpTransaction, FeeBumpTransactionEnvelope,
         FeeBumpTransactionInnerTx, GeneralizedTransactionSet, Hash, Limits, Memo, MuxedAccount,
@@ -1098,9 +1095,7 @@ mod tests {
             TransactionEnvelope::TxV0(env) => henyey_tx::muxed_to_account_id(
                 &MuxedAccount::Ed25519(env.tx.source_account_ed25519.clone()),
             ),
-            TransactionEnvelope::Tx(env) => {
-                henyey_tx::muxed_to_account_id(&env.tx.source_account)
-            }
+            TransactionEnvelope::Tx(env) => henyey_tx::muxed_to_account_id(&env.tx.source_account),
             TransactionEnvelope::TxFeeBump(env) => {
                 henyey_tx::muxed_to_account_id(&env.tx.fee_source)
             }
@@ -1112,9 +1107,7 @@ mod tests {
             TransactionEnvelope::TxV0(env) => henyey_tx::muxed_to_account_id(
                 &MuxedAccount::Ed25519(env.tx.source_account_ed25519.clone()),
             ),
-            TransactionEnvelope::Tx(env) => {
-                henyey_tx::muxed_to_account_id(&env.tx.source_account)
-            }
+            TransactionEnvelope::Tx(env) => henyey_tx::muxed_to_account_id(&env.tx.source_account),
             TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
                 FeeBumpTransactionInnerTx::Tx(inner) => {
                     henyey_tx::muxed_to_account_id(&inner.tx.source_account)
@@ -1370,10 +1363,8 @@ mod tests {
                 let tx_a = make_tx(seed_a, 1);
                 let tx_b = make_tx(seed_b, 1);
 
-                let cluster_first =
-                    DependentTxCluster(vec![tx_a.clone()].try_into().unwrap());
-                let cluster_second =
-                    DependentTxCluster(vec![tx_b.clone()].try_into().unwrap());
+                let cluster_first = DependentTxCluster(vec![tx_a.clone()].try_into().unwrap());
+                let cluster_second = DependentTxCluster(vec![tx_b.clone()].try_into().unwrap());
 
                 let stage = ParallelTxExecutionStage(
                     vec![cluster_first, cluster_second].try_into().unwrap(),

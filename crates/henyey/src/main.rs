@@ -1973,6 +1973,7 @@ async fn cmd_verify_execution(
 
                 // Compare tx result hash
                 let cdp_tx_results = extract_transaction_results(&lcm);
+
                 let expected_tx_result_hash = Hash256::from(cdp_header.tx_set_result_hash.0);
                 let our_tx_result_hash = result.tx_result_hash();
                 let tx_result_matches = our_tx_result_hash == expected_tx_result_hash;
@@ -2094,6 +2095,26 @@ async fn cmd_verify_execution(
                     if show_diff && !tx_result_matches {
                         println!("    TX count: ours={} CDP={}",
                             result.tx_results.len(), cdp_tx_results.len());
+
+                        // First: check if TX ordering differs (compare content hashes at each position)
+                        let mut order_diffs = 0;
+                        for (i, (our_tx, cdp_tx)) in result.tx_results.iter().zip(cdp_tx_results.iter()).enumerate() {
+                            if our_tx.transaction_hash != cdp_tx.transaction_hash {
+                                if order_diffs < 10 {
+                                    println!("    ORDER DIFF at position {}: ours={} CDP={}",
+                                        i,
+                                        hex::encode(&our_tx.transaction_hash.0),
+                                        hex::encode(&cdp_tx.transaction_hash.0));
+                                }
+                                order_diffs += 1;
+                            }
+                        }
+                        if order_diffs > 0 {
+                            println!("    Total TX ordering differences: {}", order_diffs);
+                        } else {
+                            println!("    TX ordering is IDENTICAL (same content hashes at every position)");
+                        }
+
                         // Detailed TX-by-TX comparison using full XDR
                         let mut diff_count = 0;
                         for (i, (our_tx, cdp_tx)) in result.tx_results.iter().zip(cdp_tx_results.iter()).enumerate() {
