@@ -170,6 +170,13 @@ pub struct OverlayManager {
     scp_message_tx: mpsc::UnboundedSender<OverlayMessage>,
     /// Receiver end of the SCP channel. Taken once via `subscribe_scp()`.
     scp_message_rx: Arc<TokioMutex<Option<mpsc::UnboundedReceiver<OverlayMessage>>>>,
+    /// Dedicated channel for fetch response messages (never drops).
+    /// Routes GeneralizedTxSet, TxSet, DontHave, and ScpQuorumset through
+    /// a dedicated mpsc channel so they are never lost when the broadcast
+    /// channel overflows during high traffic.
+    fetch_response_tx: mpsc::UnboundedSender<OverlayMessage>,
+    /// Receiver end of the fetch response channel. Taken once via `subscribe_fetch_responses()`.
+    fetch_response_rx: Arc<TokioMutex<Option<mpsc::UnboundedReceiver<OverlayMessage>>>>,
     /// Dynamic extra subscribers for catchup-critical messages (SCP + TxSet).
     /// Created on demand via `subscribe_catchup()` and cleaned up when dropped.
     /// Uses parking_lot::RwLock for minimal contention in the hot path (read-heavy).
@@ -186,6 +193,7 @@ impl OverlayManager {
         let (message_tx, _) = broadcast::channel(1024);
         let (shutdown_tx, _) = broadcast::channel(1);
         let (scp_message_tx, scp_message_rx) = mpsc::unbounded_channel();
+        let (fetch_response_tx, fetch_response_rx) = mpsc::unbounded_channel();
 
         Ok(Self {
             config: config.clone(),
@@ -212,6 +220,8 @@ impl OverlayManager {
             peer_info_cache: Arc::new(DashMap::new()),
             scp_message_tx,
             scp_message_rx: Arc::new(TokioMutex::new(Some(scp_message_rx))),
+            fetch_response_tx,
+            fetch_response_rx: Arc::new(TokioMutex::new(Some(fetch_response_rx))),
             extra_subscribers: Arc::new(RwLock::new(Vec::new())),
         })
     }
@@ -258,6 +268,7 @@ impl OverlayManager {
         let auth_timeout = self.config.auth_timeout_secs;
         let peer_event_tx = self.config.peer_event_tx.clone();
         let scp_message_tx = self.scp_message_tx.clone();
+        let fetch_response_tx_listener = self.fetch_response_tx.clone();
         let is_validator = self.config.is_validator;
         let extra_subscribers_listener = Arc::clone(&self.extra_subscribers);
         let mut shutdown_rx = self.shutdown_tx.as_ref().unwrap().subscribe();
@@ -289,6 +300,7 @@ impl OverlayManager {
                                 let banned_peers = Arc::clone(&banned_peers);
                                 let peer_info_cache = Arc::clone(&peer_info_cache);
                                 let scp_message_tx = scp_message_tx.clone();
+                                let fetch_response_tx = fetch_response_tx_listener.clone();
                                 let extra_subscribers = Arc::clone(&extra_subscribers_listener);
 
                                 let peer_handle = tokio::spawn(async move {
@@ -356,6 +368,7 @@ impl OverlayManager {
                                                 peer,
                                                 message_tx,
                                                 scp_message_tx,
+                                                fetch_response_tx,
                                                 flood_gate,
                                                 running,
                                                 is_validator,
@@ -434,6 +447,7 @@ impl OverlayManager {
         let auth_timeout = self.config.auth_timeout_secs;
         let peer_event_tx = self.config.peer_event_tx.clone();
         let scp_message_tx = self.scp_message_tx.clone();
+        let fetch_response_tx_connector = self.fetch_response_tx.clone();
         let is_validator = self.config.is_validator;
         let extra_subscribers_connector = Arc::clone(&self.extra_subscribers);
         let mut shutdown_rx = self.shutdown_tx.as_ref().unwrap().subscribe();
@@ -504,6 +518,7 @@ impl OverlayManager {
                         pool,
                         message_tx,
                         scp_message_tx.clone(),
+                        fetch_response_tx_connector.clone(),
                         flood_gate,
                         running,
                         is_validator,
@@ -582,6 +597,7 @@ impl OverlayManager {
                         pool,
                         message_tx,
                         scp_message_tx.clone(),
+                        fetch_response_tx_connector.clone(),
                         flood_gate,
                         running,
                         is_validator,
@@ -620,6 +636,7 @@ impl OverlayManager {
         peer: Arc<TokioMutex<Peer>>,
         message_tx: broadcast::Sender<OverlayMessage>,
         scp_message_tx: mpsc::UnboundedSender<OverlayMessage>,
+        fetch_response_tx: mpsc::UnboundedSender<OverlayMessage>,
         flood_gate: Arc<FloodGate>,
         running: Arc<AtomicBool>,
         is_validator: bool,
@@ -846,6 +863,19 @@ impl OverlayManager {
                 let _ = scp_message_tx.send(overlay_msg.clone());
             }
 
+            // Send fetch response messages to the dedicated never-drop channel.
+            // This ensures GeneralizedTxSet, TxSet, DontHave, and ScpQuorumset
+            // responses are never lost when the broadcast channel overflows.
+            if matches!(
+                overlay_msg.message,
+                StellarMessage::GeneralizedTxSet(_)
+                    | StellarMessage::TxSet(_)
+                    | StellarMessage::DontHave(_)
+                    | StellarMessage::ScpQuorumset(_)
+            ) {
+                let _ = fetch_response_tx.send(overlay_msg.clone());
+            }
+
             // Send catchup-critical messages (SCP + TxSet) to any extra subscribers.
             // These are used by the catchup message cacher to bridge the gap between
             // catchup checkpoint and live consensus. Using mpsc channels ensures
@@ -915,6 +945,7 @@ impl OverlayManager {
             Arc::clone(&self.outbound_pool),
             self.message_tx.clone(),
             self.scp_message_tx.clone(),
+            self.fetch_response_tx.clone(),
             Arc::clone(&self.flood_gate),
             Arc::clone(&self.running),
             self.config.is_validator,
@@ -1079,6 +1110,7 @@ impl OverlayManager {
         pool: Arc<ConnectionPool>,
         message_tx: broadcast::Sender<OverlayMessage>,
         scp_message_tx: mpsc::UnboundedSender<OverlayMessage>,
+        fetch_response_tx: mpsc::UnboundedSender<OverlayMessage>,
         flood_gate: Arc<FloodGate>,
         running: Arc<AtomicBool>,
         is_validator: bool,
@@ -1144,7 +1176,7 @@ impl OverlayManager {
 
         let extra_subscribers_clone = extra_subscribers;
         let handle = tokio::spawn(async move {
-            Self::run_peer_loop(peer_id_clone.clone(), peer, message_tx, scp_message_tx, flood_gate, running, is_validator, extra_subscribers_clone).await;
+            Self::run_peer_loop(peer_id_clone.clone(), peer, message_tx, scp_message_tx, fetch_response_tx, flood_gate, running, is_validator, extra_subscribers_clone).await;
             peers_clone.remove(&peer_id_clone);
             peer_info_cache_clone.remove(&peer_id_clone);
             dropped_authenticated_peers.fetch_add(1, Ordering::Relaxed);
@@ -1341,6 +1373,19 @@ impl OverlayManager {
         self.scp_message_rx.lock().await.take()
     }
 
+    /// Subscribe to the dedicated fetch response message channel.
+    ///
+    /// Routes GeneralizedTxSet, TxSet, DontHave, and ScpQuorumset messages
+    /// through a dedicated mpsc channel that never drops messages, even when
+    /// the broadcast channel overflows during high traffic. This prevents
+    /// the node from losing tx_set responses needed to close ledgers.
+    ///
+    /// Can only be called once (takes ownership of the receiver). Returns `None`
+    /// if already called.
+    pub async fn subscribe_fetch_responses(&self) -> Option<mpsc::UnboundedReceiver<OverlayMessage>> {
+        self.fetch_response_rx.lock().await.take()
+    }
+
     /// Subscribe to catchup-critical messages (SCP + TxSet) via a dedicated mpsc channel.
     ///
     /// Unlike `subscribe()` which uses a broadcast channel that drops messages on overflow,
@@ -1504,6 +1549,7 @@ impl OverlayManager {
         let pool = Arc::clone(&self.outbound_pool);
         let message_tx = self.message_tx.clone();
         let scp_message_tx = self.scp_message_tx.clone();
+        let fetch_response_tx = self.fetch_response_tx.clone();
         let flood_gate = Arc::clone(&self.flood_gate);
         let running = Arc::clone(&self.running);
         let is_validator = self.config.is_validator;
@@ -1538,7 +1584,7 @@ impl OverlayManager {
                     // NOTE: Do NOT send PEERS to outbound peers — see Peer.cpp:1225-1230.
 
                     // Run peer loop
-                    Self::run_peer_loop(peer_id.clone(), peer, message_tx, scp_message_tx, flood_gate, running, is_validator, extra_subscribers)
+                    Self::run_peer_loop(peer_id.clone(), peer, message_tx, scp_message_tx, fetch_response_tx, flood_gate, running, is_validator, extra_subscribers)
                         .await;
 
                     // Cleanup
@@ -1696,5 +1742,39 @@ mod tests {
         assert_eq!(stats.connected_peers, 0);
         assert_eq!(stats.inbound_peers, 0);
         assert_eq!(stats.outbound_peers, 0);
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_fetch_responses_returns_receiver_once() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let manager = OverlayManager::new(config, local_node).unwrap();
+
+        // First call should return Some
+        let rx = manager.subscribe_fetch_responses().await;
+        assert!(rx.is_some(), "first subscribe_fetch_responses() should return Some");
+
+        // Second call should return None (already taken)
+        let rx2 = manager.subscribe_fetch_responses().await;
+        assert!(rx2.is_none(), "second subscribe_fetch_responses() should return None");
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_scp_returns_receiver_once() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let manager = OverlayManager::new(config, local_node).unwrap();
+
+        // First call should return Some
+        let rx = manager.subscribe_scp().await;
+        assert!(rx.is_some(), "first subscribe_scp() should return Some");
+
+        // Second call should return None (already taken)
+        let rx2 = manager.subscribe_scp().await;
+        assert!(rx2.is_none(), "second subscribe_scp() should return None");
     }
 }

@@ -1877,6 +1877,13 @@ impl Herder {
         self.scp_driver.get_pending_tx_sets()
     }
 
+    /// Clear all pending tx set requests.
+    /// Used after rapid close cycles to discard stale requests whose tx_sets
+    /// are no longer available from peers.
+    pub fn clear_pending_tx_sets(&self) {
+        self.scp_driver.clear_pending_tx_sets()
+    }
+
     /// Drop pending tx set requests for slots older than the given slot.
     pub fn cleanup_old_pending_tx_sets(&self, current_slot: SlotIndex) -> usize {
         self.scp_driver.cleanup_old_pending_slots(current_slot)

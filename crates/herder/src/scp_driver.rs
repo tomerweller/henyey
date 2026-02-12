@@ -399,6 +399,17 @@ impl ScpDriver {
             .collect()
     }
 
+    /// Clear all pending tx set requests.
+    /// Used after rapid close cycles to discard stale requests whose tx_sets
+    /// are no longer available from peers.
+    pub fn clear_pending_tx_sets(&self) {
+        let count = self.pending_tx_sets.len();
+        self.pending_tx_sets.clear();
+        if count > 0 {
+            info!(cleared = count, "Cleared stale pending tx_set requests");
+        }
+    }
+
     /// Check if we need a tx set.
     pub fn needs_tx_set(&self, hash: &Hash256) -> bool {
         self.pending_tx_sets.contains_key(hash) && !self.tx_set_cache.contains_key(hash)
@@ -1432,9 +1443,9 @@ impl ScpDriver {
 mod cache_tests {
     use super::*;
     use crate::tx_queue::TransactionSet;
+    use henyey_scp::hash_quorum_set;
     use std::thread;
     use std::time::Duration;
-    use henyey_scp::hash_quorum_set;
 
     fn make_config(max_cache: usize) -> ScpDriverConfig {
         ScpDriverConfig {
@@ -1670,6 +1681,54 @@ mod cache_tests {
         // Verify externalized slots
         let ext_slots = driver.get_externalized_slots_in_range(0, 200);
         assert_eq!(ext_slots, vec![101, 105]);
+    }
+
+    #[test]
+    fn test_clear_pending_tx_sets_removes_all() {
+        let driver = ScpDriver::new(make_config(4), Hash256::hash(b"network"));
+        let tx_set_a = make_tx_set(10);
+        let tx_set_b = make_tx_set(11);
+        let tx_set_c = make_tx_set(12);
+
+        driver.request_tx_set(tx_set_a.hash, 100);
+        driver.request_tx_set(tx_set_b.hash, 101);
+        driver.request_tx_set(tx_set_c.hash, 102);
+        assert_eq!(driver.get_pending_tx_sets().len(), 3);
+
+        driver.clear_pending_tx_sets();
+        assert!(driver.get_pending_tx_sets().is_empty());
+        assert!(driver.get_pending_tx_set_hashes().is_empty());
+    }
+
+    #[test]
+    fn test_clear_pending_tx_sets_noop_when_empty() {
+        let driver = ScpDriver::new(make_config(4), Hash256::hash(b"network"));
+        assert!(driver.get_pending_tx_sets().is_empty());
+
+        // Should not panic when called on empty map
+        driver.clear_pending_tx_sets();
+        assert!(driver.get_pending_tx_sets().is_empty());
+    }
+
+    #[test]
+    fn test_clear_pending_tx_sets_does_not_affect_cache() {
+        let driver = ScpDriver::new(make_config(4), Hash256::hash(b"network"));
+        let tx_set = make_tx_set(20);
+
+        // Request and then receive the tx_set (puts it in cache)
+        driver.request_tx_set(tx_set.hash, 200);
+        driver.receive_tx_set(tx_set.clone());
+        assert!(driver.has_tx_set(&tx_set.hash));
+
+        // Add another pending request
+        let tx_set_b = make_tx_set(21);
+        driver.request_tx_set(tx_set_b.hash, 201);
+
+        // Clear pending — should not affect the cached tx_set
+        driver.clear_pending_tx_sets();
+        assert!(driver.has_tx_set(&tx_set.hash));
+        assert!(driver.get_tx_set(&tx_set.hash).is_some());
+        assert!(driver.get_pending_tx_sets().is_empty());
     }
 }
 

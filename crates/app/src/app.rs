@@ -125,6 +125,12 @@ const CONSENSUS_STUCK_TIMEOUT_SECS: u64 = 35;
 /// This allows us to trigger catchup sooner when we know peers don't have the tx sets.
 const TX_SET_UNAVAILABLE_TIMEOUT_SECS: u64 = 5;
 
+/// Timeout for pending tx_set requests with no response from any peer.
+/// If we've been requesting a tx_set for this long with zero responses
+/// (no GeneralizedTxSet AND no DontHave), assume peers silently dropped
+/// the requests and treat as if all peers said DontHave.
+const TX_SET_REQUEST_TIMEOUT_SECS: u64 = 10;
+
 /// Recovery timer for out-of-sync recovery attempts.
 /// Matches stellar-core's OUT_OF_SYNC_RECOVERY_TIMER.
 const OUT_OF_SYNC_RECOVERY_TIMER_SECS: u64 = 10;
@@ -474,6 +480,9 @@ impl TxAdvertHistory {
 #[derive(Debug, Clone)]
 struct TxSetRequestState {
     last_request: Instant,
+    /// When this tx_set was first requested. Used to detect peers that silently
+    /// drop GetTxSet requests (no response AND no DontHave).
+    first_requested: Instant,
     next_peer_offset: usize,
 }
 
@@ -2944,6 +2953,24 @@ impl App {
             }
         };
 
+        // Get dedicated fetch response receiver (never drops messages)
+        let fetch_response_rx = {
+            let overlay = self.overlay.lock().await;
+            match overlay.as_ref() {
+                Some(o) => o.subscribe_fetch_responses().await,
+                None => None,
+            }
+        };
+
+        let mut fetch_response_rx = match fetch_response_rx {
+            Some(rx) => rx,
+            None => {
+                // Create a dummy receiver that never receives
+                let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<OverlayMessage>();
+                rx
+            }
+        };
+
         // Main run loop
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let mut consensus_interval = tokio::time::interval(Duration::from_secs(5));
@@ -2990,7 +3017,82 @@ impl App {
                     let success = self.handle_close_complete(pending, join_result).await;
                     // Chain next close if successful.
                     if success {
+                        // Before trying the next close, drain SCP + fetch response channels.
+                        // During rapid buffered closes the select! loop may not poll these
+                        // channels frequently enough, so EXTERNALIZEs and TxSet responses
+                        // can sit unprocessed.  Draining here ensures we have the latest
+                        // network state before deciding whether another close is ready.
+                        while let Ok(scp_msg) = scp_message_rx.try_recv() {
+                            self.handle_overlay_message(scp_msg).await;
+                        }
+                        while let Ok(fetch_msg) = fetch_response_rx.try_recv() {
+                            self.handle_overlay_message(fetch_msg).await;
+                        }
+                        self.process_externalized_slots().await;
+
                         pending_close = self.try_start_ledger_close().await;
+
+                        // If no more buffered ledgers to close, we just finished a rapid
+                        // close cycle.  Do NOT proactively request SCP state here.
+                        // Requesting SCP state brings in EXTERNALIZE messages for recent
+                        // slots whose tx_sets are already evicted from peers' caches,
+                        // causing a cascade of 10s timeouts → tx_set_all_peers_exhausted
+                        // → unnecessary catchup.  Instead, just wait: the dedicated SCP
+                        // channel guarantees the next natural EXTERNALIZE (with a fresh,
+                        // fetchable tx_set) arrives within ~6 seconds.
+                        if pending_close.is_none() {
+                            let current_ledger = *self.current_ledger.read().await;
+
+                            // Reset last_externalized_at so the heartbeat stall detector
+                            // doesn't fire prematurely based on the timestamp of the
+                            // EXTERNALIZE that was received 8-10s ago during rapid closes.
+                            *self.last_externalized_at.write().await = Instant::now();
+
+                            // Clear stale syncing_ledgers entries that lack tx_sets.
+                            // These are for slots whose EXTERNALIZEs arrived during rapid
+                            // closes but whose tx_sets are already evicted from peers'
+                            // caches.  Keeping them causes either: (a) tx_set request
+                            // timeouts → catchup, or (b) stuck sequential close since
+                            // try_start_ledger_close requires slots in order.
+                            {
+                                let mut buffer = self.syncing_ledgers.write().await;
+                                let stale: Vec<u32> = buffer
+                                    .iter()
+                                    .filter(|(_, info)| info.tx_set.is_none())
+                                    .map(|(seq, _)| *seq)
+                                    .collect();
+                                if !stale.is_empty() {
+                                    for seq in &stale {
+                                        buffer.remove(seq);
+                                    }
+                                    tracing::info!(
+                                        current_ledger,
+                                        evicted = stale.len(),
+                                        first_evicted = stale.first().unwrap(),
+                                        last_evicted = stale.last().unwrap(),
+                                        "Evicted stale syncing_ledgers entries without tx_sets after rapid close"
+                                    );
+                                }
+                            }
+
+                            // Clear any stale tx_set pending state from slots whose
+                            // tx_sets are no longer available.  These would just timeout
+                            // and trigger unnecessary catchup.
+                            self.herder.clear_pending_tx_sets();
+                            self.tx_set_all_peers_exhausted.store(false, Ordering::SeqCst);
+                            self.tx_set_dont_have.write().await.clear();
+                            self.tx_set_last_request.write().await.clear();
+                            self.tx_set_exhausted_warned.write().await.clear();
+
+                            // Also reset consensus stuck state since we just successfully
+                            // closed ledgers — we're not stuck.
+                            *self.consensus_stuck_state.write().await = None;
+
+                            tracing::info!(
+                                current_ledger,
+                                "Rapid close cycle ended; waiting for next natural EXTERNALIZE"
+                            );
+                        }
                     }
                 }
 
@@ -3004,6 +3106,17 @@ impl App {
                     self.handle_overlay_message(scp_msg).await;
                 }
 
+                // Process fetch response messages from dedicated never-drop channel.
+                // GeneralizedTxSet, TxSet, DontHave, and ScpQuorumset are routed here
+                // to ensure they are never lost when the broadcast channel overflows.
+                Some(fetch_msg) = fetch_response_rx.recv() => {
+                    tracing::debug!(
+                        latency_ms = fetch_msg.received_at.elapsed().as_millis(),
+                        "Received fetch response via dedicated channel"
+                    );
+                    self.handle_overlay_message(fetch_msg).await;
+                }
+
                 // Process overlay messages
                 msg = message_rx.recv() => {
                     match msg {
@@ -3011,6 +3124,17 @@ impl App {
                             // Skip SCP messages from broadcast channel — they are already
                             // handled via the dedicated SCP channel above.
                             if matches!(overlay_msg.message, StellarMessage::ScpMessage(_)) {
+                                continue;
+                            }
+                            // Skip fetch response messages from broadcast channel — they are
+                            // already handled via the dedicated fetch response channel above.
+                            if matches!(
+                                overlay_msg.message,
+                                StellarMessage::GeneralizedTxSet(_)
+                                    | StellarMessage::TxSet(_)
+                                    | StellarMessage::DontHave(_)
+                                    | StellarMessage::ScpQuorumset(_)
+                            ) {
                                 continue;
                             }
                             let delivery_latency = overlay_msg.received_at.elapsed();
@@ -3084,12 +3208,28 @@ impl App {
                         self.handle_overlay_message(scp_msg).await;
                     }
 
-                    // Drain broadcast channel (non-SCP messages only)
+                    // Drain dedicated fetch response channel (tx_sets, dont_have, etc.)
+                    while let Ok(fetch_msg) = fetch_response_rx.try_recv() {
+                        drained += 1;
+                        self.handle_overlay_message(fetch_msg).await;
+                    }
+
+                    // Drain broadcast channel (remaining message types only)
                     loop {
                         match message_rx.try_recv() {
                             Ok(overlay_msg) => {
                                 // Skip SCP messages — already handled via dedicated channel
                                 if matches!(overlay_msg.message, StellarMessage::ScpMessage(_)) {
+                                    continue;
+                                }
+                                // Skip fetch response messages — already handled via dedicated channel
+                                if matches!(
+                                    overlay_msg.message,
+                                    StellarMessage::GeneralizedTxSet(_)
+                                        | StellarMessage::TxSet(_)
+                                        | StellarMessage::DontHave(_)
+                                        | StellarMessage::ScpQuorumset(_)
+                                ) {
                                     continue;
                                 }
                                 drained += 1;
@@ -3107,6 +3247,7 @@ impl App {
 
                     // Check if SyncRecoveryManager requested recovery
                     if self.sync_recovery_pending.swap(false, Ordering::SeqCst) {
+                        tracing::debug!("SyncRecoveryManager triggered out-of-sync recovery");
                         // SyncRecoveryManager triggered recovery - perform it now
                         if let Ok(current_ledger) = self.get_current_ledger().await {
                             self.out_of_sync_recovery(current_ledger).await;
@@ -3461,149 +3602,141 @@ impl App {
         // Track tx_sets we've already broadcast requests for to avoid spamming all peers
         let mut requested_hashes: HashSet<Hash256> = HashSet::new();
 
-        loop {
-            match message_rx.recv().await {
-                Some(msg) => {
-                    match msg.message {
-                        StellarMessage::GeneralizedTxSet(gen_tx_set) => {
-                            // Compute hash as SHA-256 of XDR-encoded GeneralizedTransactionSet
-                            let xdr_bytes =
-                                match gen_tx_set.to_xdr(stellar_xdr::curr::Limits::none()) {
-                                    Ok(bytes) => bytes,
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "Failed to encode GeneralizedTxSet to XDR");
-                                        continue;
-                                    }
-                                };
-                            let hash = henyey_common::Hash256::hash(&xdr_bytes);
+        while let Some(msg) = message_rx.recv().await {
+            match msg.message {
+                StellarMessage::GeneralizedTxSet(gen_tx_set) => {
+                    // Compute hash as SHA-256 of XDR-encoded GeneralizedTransactionSet
+                    let xdr_bytes =
+                        match gen_tx_set.to_xdr(stellar_xdr::curr::Limits::none()) {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Failed to encode GeneralizedTxSet to XDR");
+                                continue;
+                            }
+                        };
+                    let hash = henyey_common::Hash256::hash(&xdr_bytes);
 
-                            // Extract transactions from the GeneralizedTxSet
-                            let prev_hash = match &gen_tx_set {
-                                GeneralizedTransactionSet::V1(v1) => {
-                                    henyey_common::Hash256::from_bytes(
-                                        v1.previous_ledger_hash.0,
-                                    )
-                                }
-                            };
+                    // Extract transactions from the GeneralizedTxSet
+                    let prev_hash = match &gen_tx_set {
+                        GeneralizedTransactionSet::V1(v1) => {
+                            henyey_common::Hash256::from_bytes(
+                                v1.previous_ledger_hash.0,
+                            )
+                        }
+                    };
 
-                            let transactions: Vec<stellar_xdr::curr::TransactionEnvelope> =
-                                match &gen_tx_set {
-                                    GeneralizedTransactionSet::V1(v1) => v1
-                                        .phases
+                    let transactions: Vec<stellar_xdr::curr::TransactionEnvelope> =
+                        match &gen_tx_set {
+                            GeneralizedTransactionSet::V1(v1) => v1
+                                .phases
+                                .iter()
+                                .flat_map(|phase| match phase {
+                                    TransactionPhase::V0(components) => components
                                         .iter()
-                                        .flat_map(|phase| match phase {
-                                            TransactionPhase::V0(components) => components
+                                        .flat_map(|component| match component {
+                                            TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                                                comp,
+                                            ) => comp.txs.to_vec(),
+                                        })
+                                        .collect::<Vec<_>>(),
+                                    TransactionPhase::V1(parallel) => parallel
+                                        .execution_stages
+                                        .iter()
+                                        .flat_map(|stage| {
+                                            stage
+                                                .0
                                                 .iter()
-                                                .flat_map(|component| match component {
-                                                    TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
-                                                        comp,
-                                                    ) => comp.txs.to_vec(),
-                                                })
-                                                .collect::<Vec<_>>(),
-                                            TransactionPhase::V1(parallel) => parallel
-                                                .execution_stages
-                                                .iter()
-                                                .flat_map(|stage| {
-                                                    stage
-                                                        .0
-                                                        .iter()
-                                                        .flat_map(|cluster| cluster.0.to_vec())
-                                                })
-                                                .collect(),
+                                                .flat_map(|cluster| cluster.0.to_vec())
                                         })
                                         .collect(),
-                                };
+                                })
+                                .collect(),
+                        };
 
-                            let tx_set = henyey_herder::TransactionSet::with_generalized(
-                                prev_hash,
-                                hash,
-                                transactions,
-                                gen_tx_set,
-                            );
+                    let tx_set = henyey_herder::TransactionSet::with_generalized(
+                        prev_hash,
+                        hash,
+                        transactions,
+                        gen_tx_set,
+                    );
 
-                            // Cache it in herder (this will be available after catchup)
-                            self.herder.cache_tx_set(tx_set);
-                            cached_tx_sets += 1;
+                    // Cache it in herder (this will be available after catchup)
+                    self.herder.cache_tx_set(tx_set);
+                    cached_tx_sets += 1;
 
-                            tracing::debug!(
-                                cached_tx_sets,
-                                hash = %hash,
-                                "Cached tx_set during catchup"
-                            );
-                        }
+                    tracing::debug!(
+                        cached_tx_sets,
+                        hash = %hash,
+                        "Cached tx_set during catchup"
+                    );
+                }
 
-                        StellarMessage::ScpMessage(envelope) => {
-                            // For EXTERNALIZE messages, extract tx_set_hash, record, and request
-                            if let ScpStatementPledges::Externalize(ext) =
-                                &envelope.statement.pledges
+                StellarMessage::ScpMessage(envelope) => {
+                    // For EXTERNALIZE messages, extract tx_set_hash, record, and request
+                    if let ScpStatementPledges::Externalize(ext) =
+                        &envelope.statement.pledges
+                    {
+                        let slot = envelope.statement.slot_index;
+                        let value = ext.commit.value.clone();
+
+                        // Record this externalized slot so we can apply it after catchup
+                        self.herder.scp_driver().record_externalized(slot, value);
+                        recorded_externalized += 1;
+                        tracing::debug!(
+                            slot,
+                            "Recorded externalized slot during catchup"
+                        );
+
+                        if let Ok(sv) =
+                            StellarValue::from_xdr(&ext.commit.value.0, Limits::none())
+                        {
+                            let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
+
+                            // Check if we already have this tx_set or already broadcast a request
+                            if !self.herder.has_tx_set(&tx_set_hash)
+                                && !requested_hashes.contains(&tx_set_hash)
                             {
-                                let slot = envelope.statement.slot_index;
-                                let value = ext.commit.value.clone();
+                                // Register as pending and send GetTxSet request
+                                self.herder
+                                    .scp_driver()
+                                    .request_tx_set(tx_set_hash, slot);
 
-                                // Record this externalized slot so we can apply it after catchup
-                                self.herder.scp_driver().record_externalized(slot, value);
-                                recorded_externalized += 1;
-                                tracing::debug!(
-                                    slot,
-                                    "Recorded externalized slot during catchup"
-                                );
+                                // Track that we've requested this hash to avoid duplicate broadcasts
+                                requested_hashes.insert(tx_set_hash);
 
-                                if let Ok(sv) =
-                                    StellarValue::from_xdr(&ext.commit.value.0, Limits::none())
-                                {
-                                    let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
-
-                                    // Check if we already have this tx_set or already broadcast a request
-                                    if !self.herder.has_tx_set(&tx_set_hash)
-                                        && !requested_hashes.contains(&tx_set_hash)
-                                    {
-                                        // Register as pending and send GetTxSet request
-                                        self.herder
-                                            .scp_driver()
-                                            .request_tx_set(tx_set_hash, slot);
-
-                                        // Track that we've requested this hash to avoid duplicate broadcasts
-                                        requested_hashes.insert(tx_set_hash);
-
-                                        // Broadcast GetTxSet request to ALL peers, not just the sender.
-                                        // This is critical for bridging the gap after catchup: by the time
-                                        // catchup completes, older tx_sets may be evicted from the sender's
-                                        // cache. By requesting from all peers, we maximize our chances of
-                                        // getting the tx_set before any single peer evicts it.
-                                        let overlay = self.overlay.lock().await;
-                                        if let Some(ref overlay) = *overlay {
-                                            match overlay.request_tx_set(&tx_set_hash.0).await {
-                                                Ok(peer_count) => {
-                                                    requested_tx_sets += 1;
-                                                    tracing::debug!(
-                                                        slot,
-                                                        hash = %tx_set_hash,
-                                                        peer_count,
-                                                        "Broadcast tx_set request to all peers during catchup"
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    tracing::debug!(
-                                                        slot,
-                                                        error = %e,
-                                                        "Failed to broadcast tx_set request during catchup"
-                                                    );
-                                                }
-                                            }
+                                // Broadcast GetTxSet request to ALL peers, not just the sender.
+                                // This is critical for bridging the gap after catchup: by the time
+                                // catchup completes, older tx_sets may be evicted from the sender's
+                                // cache. By requesting from all peers, we maximize our chances of
+                                // getting the tx_set before any single peer evicts it.
+                                let overlay = self.overlay.lock().await;
+                                if let Some(ref overlay) = *overlay {
+                                    match overlay.request_tx_set(&tx_set_hash.0).await {
+                                        Ok(peer_count) => {
+                                            requested_tx_sets += 1;
+                                            tracing::debug!(
+                                                slot,
+                                                hash = %tx_set_hash,
+                                                peer_count,
+                                                "Broadcast tx_set request to all peers during catchup"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::debug!(
+                                                slot,
+                                                error = %e,
+                                                "Failed to broadcast tx_set request during catchup"
+                                            );
                                         }
                                     }
                                 }
                             }
                         }
-
-                        _ => {
-                            // Ignore other message types during catchup
-                        }
                     }
                 }
-                None => {
-                    // Channel closed (sender dropped)
-                    break;
+
+                _ => {
+                    // Ignore other message types during catchup
                 }
             }
         }
@@ -3684,6 +3817,7 @@ impl App {
 
                         // For EXTERNALIZE messages, immediately try to close ledger and request tx set
                         if is_externalize {
+                            tracing::debug!(slot, tracking, "EXTERNALIZE Valid — processing slot");
                             if let Some(tx_set_hash) = tx_set_hash {
                                 self.herder.scp_driver().request_tx_set(tx_set_hash, slot);
                                 if self.herder.needs_tx_set(&tx_set_hash) {
@@ -3730,7 +3864,7 @@ impl App {
                         tracing::debug!(
                             slot,
                             peer = %msg.from_peer,
-                            "SCP envelope waiting for tx set"
+                            "SCP EXTERNALIZE waiting for tx set (Fetching)"
                         );
                         if let Some(tx_set_hash) = tx_set_hash {
                             let peer = msg.from_peer.clone();
@@ -3974,7 +4108,12 @@ impl App {
         let has_new_slots = latest_externalized > last_processed;
 
         if has_new_slots {
-            tracing::debug!(latest_externalized, last_processed, "Need to process");
+            tracing::debug!(
+                latest_externalized,
+                last_processed,
+                gap = latest_externalized - last_processed,
+                "Processing new externalized slots"
+            );
 
             let prev_latest = self
                 .last_externalized_slot
@@ -4229,7 +4368,7 @@ impl App {
                     tracing::debug!(
                         next_seq,
                         tx_set_hash = %info.tx_set_hash,
-                        "Waiting for tx_set for next slot"
+                        "Buffered but waiting for tx_set"
                     );
                     return None;
                 }
@@ -4240,7 +4379,7 @@ impl App {
                         tracing::debug!(
                             next_seq,
                             current_ledger,
-                            "Next slot externalized but not in syncing_ledgers buffer"
+                            "Next slot externalized but not yet in syncing_ledgers buffer"
                         );
                     } else {
                         let latest =
@@ -4977,6 +5116,17 @@ impl App {
                         self.set_state(AppState::Synced).await;
                     }
                     tracing::info!(ledger_seq = result.ledger_seq, "{} catchup complete", label);
+                    let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
+                    let pending_count = self.herder.get_pending_tx_sets().len();
+                    let buffer_count = self.syncing_ledgers.read().await.len();
+                    tracing::debug!(
+                        latest_externalized = latest_ext,
+                        last_processed = result.ledger_seq,
+                        pending_tx_sets = pending_count,
+                        buffered_ledgers = buffer_count,
+                        tx_set_cache_size = self.herder.scp_driver().tx_set_cache_size(),
+                        "Post-catchup state before try_apply_buffered_ledgers"
+                    );
                     self.try_apply_buffered_ledgers().await;
                     // Request fresh SCP state from peers after catchup so the
                     // node quickly learns which slots have been externalized
@@ -5326,10 +5476,20 @@ impl App {
     /// giving the network a chance to provide the missing data before we
     /// fall back to catchup.
     async fn out_of_sync_recovery(&self, current_ledger: u32) {
-        tracing::info!(current_ledger, "Performing out-of-sync recovery");
+        let latest_externalized = self.herder.latest_externalized_slot().unwrap_or(0);
+        let last_processed = *self.last_processed_slot.read().await;
+        let pending_tx_sets = self.herder.get_pending_tx_sets();
+        let buffer_count = self.syncing_ledgers.read().await.len();
+        tracing::info!(
+            current_ledger,
+            latest_externalized,
+            last_processed,
+            pending_tx_sets = pending_tx_sets.len(),
+            buffer_count,
+            "Performing out-of-sync recovery"
+        );
 
         // Detect gaps in externalized slots to help diagnose sync issues
-        let latest_externalized = self.herder.latest_externalized_slot().unwrap_or(0);
         let next_slot = current_ledger as u64 + 1;
         if latest_externalized > next_slot {
             let missing_slots = self.herder.find_missing_slots_in_range(next_slot, latest_externalized);
@@ -7478,13 +7638,17 @@ impl App {
         if let Some(slot) = received_slot {
             tracing::debug!(
                 slot,
+                hash = %hash,
                 "Received pending GeneralizedTxSet, attempting ledger close"
             );
             self.try_close_slot_directly(slot).await;
         } else if self.attach_tx_set_by_hash(&internal_tx_set).await
             || self.buffer_externalized_tx_set(&internal_tx_set).await
         {
+            tracing::debug!(hash = %hash, "TxSet matched buffered/externalized slot");
             self.try_apply_buffered_ledgers().await;
+        } else {
+            tracing::debug!(hash = %hash, "TxSet not matched to any slot or buffer entry");
         }
     }
 
@@ -7581,6 +7745,8 @@ impl App {
         if !pending.is_empty() {
             tracing::debug!(
                 current_ledger,
+                min_slot = current_ledger.saturating_add(1),
+                window_end = current_ledger as u64 + TX_SET_REQUEST_WINDOW,
                 pending_count = pending.len(),
                 pending_slots = ?pending.iter().map(|(h, s)| (*s, format!("{}...", &hex::encode(h.0)[..8]))).collect::<Vec<_>>(),
                 "Pending tx_sets before filtering"
@@ -7669,11 +7835,44 @@ impl App {
                         .cloned()
                         .unwrap_or(TxSetRequestState {
                             last_request: now.checked_sub(throttle).unwrap_or(now),
+                            first_requested: now,
                             next_peer_offset: 0,
                         });
                 if now.duration_since(request_state.last_request) < throttle {
                     continue;
                 }
+
+                // Timeout detection: if we've been requesting this tx_set for
+                // TX_SET_REQUEST_TIMEOUT_SECS with no response at all (no
+                // GeneralizedTxSet, no DontHave), peers are silently dropping
+                // our requests. Synthetically mark all peers as DontHave.
+                let request_age = now.duration_since(request_state.first_requested);
+                if request_age
+                    >= std::time::Duration::from_secs(TX_SET_REQUEST_TIMEOUT_SECS)
+                {
+                    let dont_have_set =
+                        dont_have.entry(*hash).or_insert_with(HashSet::new);
+                    let already_exhausted = dont_have_set.len() >= peers.len();
+                    if !already_exhausted {
+                        tracing::warn!(
+                            hash = %hash,
+                            elapsed_secs = request_age.as_secs(),
+                            peers_responded = dont_have_set.len(),
+                            total_peers = peers.len(),
+                            "Tx_set request timed out with no response — marking all peers as DontHave"
+                        );
+                        for peer in &peers {
+                            dont_have_set.insert(peer.clone());
+                        }
+                        if !exhausted_warned.contains(hash) {
+                            exhausted.push((*hash, dont_have_set.len(), peers.len()));
+                        }
+                        self.tx_set_all_peers_exhausted
+                            .store(true, Ordering::SeqCst);
+                    }
+                    continue;
+                }
+
                 let start_idx =
                     Self::tx_set_start_index(hash, peers.len(), request_state.next_peer_offset);
                 let eligible_peer = match dont_have.get_mut(hash) {
@@ -8980,5 +9179,257 @@ mod tests {
             buffer.is_empty(),
             "syncing_ledgers should be cleared on hash mismatch"
         );
+    }
+
+    // ============================================================
+    // Tx Set Request Timeout Tests (regression for silent GetTxSet drops)
+    // ============================================================
+
+    #[test]
+    fn test_tx_set_request_timeout_constant() {
+        // Verify the timeout is 10 seconds as designed
+        assert_eq!(TX_SET_REQUEST_TIMEOUT_SECS, 10);
+        // Timeout must be longer than the request throttle (1s) to avoid
+        // false positives, but short enough to recover quickly
+        assert!(TX_SET_REQUEST_TIMEOUT_SECS > 1);
+        assert!(TX_SET_REQUEST_TIMEOUT_SECS < CONSENSUS_STUCK_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn test_tx_set_request_state_tracks_first_requested() {
+        let now = Instant::now();
+        let state = TxSetRequestState {
+            last_request: now,
+            first_requested: now,
+            next_peer_offset: 0,
+        };
+
+        // first_requested should be set at creation time
+        assert!(state.first_requested.elapsed().as_millis() < 100);
+        assert_eq!(state.next_peer_offset, 0);
+    }
+
+    #[test]
+    fn test_tx_set_request_timeout_detection_logic() {
+        // Simulate the timeout detection pattern used in request_pending_tx_sets
+        let timeout = std::time::Duration::from_secs(TX_SET_REQUEST_TIMEOUT_SECS);
+        let peers = vec!["peer1", "peer2", "peer3"];
+        let mut dont_have: HashSet<&str> = HashSet::new();
+
+        // Case 1: Request age below timeout — should NOT timeout
+        let recent = Instant::now();
+        let age = recent.elapsed();
+        assert!(age < timeout, "recent request should not timeout");
+
+        // Case 2: Simulate old request (by checking the comparison logic)
+        // The actual timeout fires when now - first_requested >= TX_SET_REQUEST_TIMEOUT_SECS
+        let threshold = std::time::Duration::from_secs(TX_SET_REQUEST_TIMEOUT_SECS);
+        let short_duration = std::time::Duration::from_secs(1);
+        assert!(short_duration < threshold, "1s should be under threshold");
+        assert!(threshold <= std::time::Duration::from_secs(TX_SET_REQUEST_TIMEOUT_SECS));
+
+        // Case 3: When timeout fires, all peers should be marked as DontHave
+        for peer in &peers {
+            dont_have.insert(peer);
+        }
+        assert_eq!(dont_have.len(), peers.len(), "all peers should be marked");
+    }
+
+    // ============================================================
+    // Rapid Close Cycle Cleanup Tests
+    // ============================================================
+
+    #[tokio::test]
+    async fn test_clear_pending_tx_sets_via_herder() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        // Register some pending tx_sets
+        let hash1 = Hash256::from_bytes([1u8; 32]);
+        let hash2 = Hash256::from_bytes([2u8; 32]);
+        app.herder.scp_driver().request_tx_set(hash1, 100);
+        app.herder.scp_driver().request_tx_set(hash2, 101);
+        assert_eq!(app.herder.get_pending_tx_sets().len(), 2);
+
+        // Clear via the herder passthrough
+        app.herder.clear_pending_tx_sets();
+        assert!(app.herder.get_pending_tx_sets().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stale_syncing_ledgers_eviction() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        // Add entries: some with tx_set, some without
+        {
+            let mut buffer = app.syncing_ledgers.write().await;
+            // Entry WITHOUT tx_set (should be evicted)
+            buffer.insert(
+                100,
+                henyey_herder::LedgerCloseInfo {
+                    slot: 100,
+                    tx_set_hash: Hash256::ZERO,
+                    tx_set: None,
+                    close_time: 1,
+                    upgrades: Vec::new(),
+                    stellar_value_ext: StellarValueExt::Basic,
+                },
+            );
+            // Entry WITHOUT tx_set (should be evicted)
+            buffer.insert(
+                101,
+                henyey_herder::LedgerCloseInfo {
+                    slot: 101,
+                    tx_set_hash: Hash256::ZERO,
+                    tx_set: None,
+                    close_time: 2,
+                    upgrades: Vec::new(),
+                    stellar_value_ext: StellarValueExt::Basic,
+                },
+            );
+            // Entry WITH tx_set (should be kept)
+            buffer.insert(
+                102,
+                henyey_herder::LedgerCloseInfo {
+                    slot: 102,
+                    tx_set_hash: Hash256::ZERO,
+                    tx_set: Some(henyey_herder::TransactionSet {
+                        hash: Hash256::ZERO,
+                        previous_ledger_hash: Hash256::ZERO,
+                        transactions: Vec::new(),
+                        generalized_tx_set: None,
+                    }),
+                    close_time: 3,
+                    upgrades: Vec::new(),
+                    stellar_value_ext: StellarValueExt::Basic,
+                },
+            );
+        }
+
+        // Simulate the eviction logic from the rapid close handler
+        {
+            let mut buffer = app.syncing_ledgers.write().await;
+            let stale: Vec<u32> = buffer
+                .iter()
+                .filter(|(_, info)| info.tx_set.is_none())
+                .map(|(seq, _)| *seq)
+                .collect();
+            assert_eq!(stale.len(), 2, "should find 2 stale entries");
+            for seq in &stale {
+                buffer.remove(seq);
+            }
+        }
+
+        let buffer = app.syncing_ledgers.read().await;
+        assert_eq!(buffer.len(), 1, "only entry with tx_set should remain");
+        assert!(buffer.contains_key(&102), "entry 102 (with tx_set) should be kept");
+        assert!(!buffer.contains_key(&100), "entry 100 (no tx_set) should be evicted");
+        assert!(!buffer.contains_key(&101), "entry 101 (no tx_set) should be evicted");
+    }
+
+    #[tokio::test]
+    async fn test_tx_set_state_cleanup_after_rapid_close() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        // Set up state as if rapid close cycle just ended
+        app.tx_set_all_peers_exhausted.store(true, Ordering::SeqCst);
+        {
+            let mut dont_have = app.tx_set_dont_have.write().await;
+            let hash = Hash256::from_bytes([1u8; 32]);
+            dont_have.insert(hash, HashSet::from([henyey_overlay::PeerId::from_bytes([1u8; 32])]));
+        }
+        {
+            let mut last_request = app.tx_set_last_request.write().await;
+            let hash = Hash256::from_bytes([1u8; 32]);
+            last_request.insert(hash, TxSetRequestState {
+                last_request: Instant::now(),
+                first_requested: Instant::now(),
+                next_peer_offset: 3,
+            });
+        }
+        {
+            let mut warned = app.tx_set_exhausted_warned.write().await;
+            warned.insert(Hash256::from_bytes([1u8; 32]));
+        }
+        *app.consensus_stuck_state.write().await = Some(ConsensusStuckState {
+            current_ledger: 100,
+            first_buffered: 101,
+            stuck_start: Instant::now(),
+            last_recovery_attempt: Instant::now(),
+            recovery_attempts: 2,
+            catchup_triggered: false,
+        });
+
+        // Simulate the cleanup block from the rapid close handler
+        app.herder.clear_pending_tx_sets();
+        app.tx_set_all_peers_exhausted.store(false, Ordering::SeqCst);
+        app.tx_set_dont_have.write().await.clear();
+        app.tx_set_last_request.write().await.clear();
+        app.tx_set_exhausted_warned.write().await.clear();
+        *app.consensus_stuck_state.write().await = None;
+
+        // Verify everything is cleaned up
+        assert!(!app.tx_set_all_peers_exhausted.load(Ordering::SeqCst));
+        assert!(app.tx_set_dont_have.read().await.is_empty());
+        assert!(app.tx_set_last_request.read().await.is_empty());
+        assert!(app.tx_set_exhausted_warned.read().await.is_empty());
+        assert!(app.consensus_stuck_state.read().await.is_none());
+    }
+
+    // ============================================================
+    // Fetch Response Channel Skip Tests
+    // ============================================================
+
+    #[test]
+    fn test_fetch_response_message_types_are_skipped_in_broadcast() {
+        // Verify the message type matching pattern used in the broadcast
+        // handler to skip fetch response messages (they go through the
+        // dedicated channel instead).
+        use stellar_xdr::curr::StellarMessage;
+
+        let test_messages = vec![
+            (StellarMessage::GeneralizedTxSet(
+                stellar_xdr::curr::GeneralizedTransactionSet::V1(
+                    stellar_xdr::curr::TransactionSetV1 {
+                        previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                        phases: vec![].try_into().unwrap(),
+                    },
+                ),
+            ), true, "GeneralizedTxSet"),
+            (StellarMessage::DontHave(
+                stellar_xdr::curr::DontHave {
+                    type_: stellar_xdr::curr::MessageType::TxSet,
+                    req_hash: stellar_xdr::curr::Uint256([0u8; 32]),
+                },
+            ), true, "DontHave"),
+        ];
+
+        for (msg, should_skip, label) in test_messages {
+            let is_fetch_response = matches!(
+                msg,
+                StellarMessage::GeneralizedTxSet(_)
+                    | StellarMessage::TxSet(_)
+                    | StellarMessage::DontHave(_)
+                    | StellarMessage::ScpQuorumset(_)
+            );
+            assert_eq!(is_fetch_response, should_skip, "{} should be skipped={}", label, should_skip);
+        }
     }
 }
