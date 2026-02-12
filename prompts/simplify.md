@@ -16,8 +16,11 @@ Review the Rust crate at `$TARGET` and identify concrete simplifications.
 For each finding, classify it into exactly one category:
 
 ### Structure
- 1. **LARGE MODULE** — any single .rs file over 500 lines. Suggest how to split it
-    into focused submodules with clear responsibilities.
+ 1. **LARGE MODULE** — any single .rs file over 500 lines (excluding tests).
+    Suggest how to reduce size via extraction of helpers, deduplication, or
+    dead-code removal. Only recommend converting to a directory module
+    (`foo/mod.rs`) when the *implementation* has 3+ clearly separable concerns
+    that each exceed ~200 lines. Never split a file solely to extract tests.
  2. **GOD FUNCTION** — any function over 80 lines or with cyclomatic complexity
     that makes it hard to follow. Suggest extraction points and names for the
     extracted functions.
@@ -66,6 +69,12 @@ For each finding, classify it into exactly one category:
 
 Rank findings by impact: how much each fix would reduce complexity, improve
 readability, or prevent bugs. High-impact first.
+
+## Conventions
+
+- **Inline tests**: Unit tests belong in `#[cfg(test)] mod tests { }` at the
+  bottom of the source file. Do not extract tests into separate files or
+  directory modules.
 
 ## Scope
 
