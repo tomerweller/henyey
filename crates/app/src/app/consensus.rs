@@ -38,12 +38,31 @@ impl App {
     /// This broadcasts recent SCP messages to peers and requests SCP state,
     /// giving the network a chance to provide the missing data before we
     /// fall back to catchup.
+    ///
+    /// Tracks consecutive recovery attempts without ledger progress.  After
+    /// `RECOVERY_ESCALATION_SCP_REQUEST` attempts (~30s) we actively request
+    /// SCP state from peers even with a small gap.  After
+    /// `RECOVERY_ESCALATION_CATCHUP` attempts (~60s) we trigger a full catchup.
     pub(super) async fn out_of_sync_recovery(&self, current_ledger: u32) {
         let latest_externalized = self.herder.latest_externalized_slot().unwrap_or(0);
         let last_processed = *self.last_processed_slot.read().await;
         let pending_tx_sets = self.herder.get_pending_tx_sets();
         let buffer_count = self.syncing_ledgers.read().await.len();
         let gap = latest_externalized.saturating_sub(current_ledger as u64);
+
+        // Track consecutive recovery attempts without progress.
+        let baseline = self.recovery_baseline_ledger.load(Ordering::SeqCst);
+        if current_ledger as u64 > baseline {
+            // Progress!  Reset the counter.
+            self.recovery_baseline_ledger
+                .store(current_ledger as u64, Ordering::SeqCst);
+            self.recovery_attempts_without_progress
+                .store(0, Ordering::SeqCst);
+        }
+        let attempts = self
+            .recovery_attempts_without_progress
+            .fetch_add(1, Ordering::SeqCst);
+
         tracing::info!(
             current_ledger,
             latest_externalized,
@@ -51,6 +70,7 @@ impl App {
             pending_tx_sets = pending_tx_sets.len(),
             buffer_count,
             gap,
+            attempts,
             "Performing out-of-sync recovery"
         );
 
@@ -76,16 +96,62 @@ impl App {
                 .store(false, Ordering::SeqCst);
         }
 
-        // When the node is essentially caught up (small or zero gap), do NOT
-        // request SCP state from peers. Requesting SCP state brings stale
+        // --- Escalation: after many failed attempts, force catchup ---
+        if attempts >= RECOVERY_ESCALATION_CATCHUP {
+            tracing::warn!(
+                current_ledger,
+                latest_externalized,
+                gap,
+                attempts,
+                "Recovery stalled for too long — forcing catchup"
+            );
+            // Clear all stale state
+            {
+                let mut buffer = self.syncing_ledgers.write().await;
+                buffer.clear();
+            }
+            self.herder.clear_pending_tx_sets();
+            self.tx_set_dont_have.write().await.clear();
+            self.tx_set_last_request.write().await.clear();
+            self.tx_set_exhausted_warned.write().await.clear();
+            self.tx_set_all_peers_exhausted
+                .store(false, Ordering::SeqCst);
+            // Reset the counter so we don't immediately re-escalate after catchup
+            self.recovery_attempts_without_progress
+                .store(0, Ordering::SeqCst);
+
+            // Guard against concurrent catchup
+            if !self.catchup_in_progress.swap(true, Ordering::SeqCst) {
+                self.set_state(AppState::CatchingUp).await;
+                self.herder
+                    .set_state(henyey_herder::HerderState::Syncing);
+
+                let catchup_message_handle =
+                    self.start_catchup_message_caching_from_self().await;
+
+                let catchup_result = self.catchup(CatchupTarget::Current).await;
+
+                if let Some(handle) = catchup_message_handle {
+                    handle.abort();
+                }
+                self.catchup_in_progress.store(false, Ordering::SeqCst);
+
+                self.handle_catchup_result(catchup_result, true, "RecoveryEscalation")
+                    .await;
+            }
+            return;
+        }
+
+        // When the node is essentially caught up (small or zero gap), normally
+        // do NOT request SCP state from peers. Requesting SCP state brings stale
         // EXTERNALIZE messages for slots whose tx_sets are already evicted from
         // peers' caches (~60-72s window). These create pending tx_set requests
         // that can never be fulfilled, causing infinite timeout → DontHave →
         // recovery loops.
         //
-        // Instead, just wait for fresh EXTERNALIZE messages to arrive naturally
-        // via the dedicated SCP channel. The network produces new slots every
-        // ~5-6 seconds, so the next EXTERNALIZE will arrive shortly.
+        // HOWEVER, after RECOVERY_ESCALATION_SCP_REQUEST failed attempts we
+        // escalate and request SCP state anyway — the node clearly isn't
+        // receiving fresh EXTERNALIZE messages on its own.
         if gap <= TX_SET_REQUEST_WINDOW {
             // Also clear syncing_ledgers entries with no tx_set — these are
             // unfulfillable entries from stale EXTERNALIZE and will block
@@ -108,13 +174,27 @@ impl App {
             }
             // Clear any remaining pending tx_sets from the herder
             self.herder.clear_pending_tx_sets();
-            tracing::info!(
+
+            if attempts < RECOVERY_ESCALATION_SCP_REQUEST {
+                tracing::info!(
+                    current_ledger,
+                    latest_externalized,
+                    gap,
+                    attempts,
+                    "Essentially caught up — waiting for fresh EXTERNALIZE"
+                );
+                return;
+            }
+
+            // Escalation: request SCP state despite small gap
+            tracing::warn!(
                 current_ledger,
                 latest_externalized,
                 gap,
-                "Essentially caught up — skipping SCP state request, waiting for fresh EXTERNALIZE"
+                attempts,
+                "Essentially caught up but no progress — requesting SCP state from peers"
             );
-            return;
+            // Fall through to the SCP state request below
         }
 
         // Detect gaps in externalized slots to help diagnose sync issues.
@@ -228,6 +308,7 @@ impl App {
                 tracing::info!(
                     ledger_seq,
                     peers_requested = count,
+                    attempts,
                     "Requested SCP state during out-of-sync recovery"
                 );
             }

@@ -33,7 +33,6 @@ type OffersByAccountAssetLoaderFn =
 /// orderbook exchange comparison against liquidity pools. By temporarily
 /// extracting the large Soroban collections (which are never accessed during
 /// orderbook exchange), the clone becomes much cheaper.
-
 mod entries;
 pub mod offer_index;
 mod sponsorship;
@@ -2225,7 +2224,6 @@ impl LedgerStateManager {
     }
 
     // ==================== Helper Methods ====================
-
 }
 
 // ==================== Helper Functions ====================

@@ -126,6 +126,15 @@ const CONSENSUS_STUCK_TIMEOUT_SECS: u64 = 35;
 /// This allows us to trigger catchup sooner when we know peers don't have the tx sets.
 const TX_SET_UNAVAILABLE_TIMEOUT_SECS: u64 = 5;
 
+/// Number of consecutive recovery attempts without ledger progress before
+/// escalating from passive waiting to actively requesting SCP state from
+/// peers.  At the 5s SyncRecoveryManager interval this equals ~30s.
+const RECOVERY_ESCALATION_SCP_REQUEST: u64 = 6;
+
+/// Number of consecutive recovery attempts without progress before
+/// triggering a full catchup.  At the 5s interval this equals ~60s.
+const RECOVERY_ESCALATION_CATCHUP: u64 = 12;
+
 /// Timeout for pending tx_set requests with no response from any peer.
 /// If we've been requesting a tx_set for this long with zero responses
 /// (no GeneralizedTxSet AND no DontHave), assume peers silently dropped
@@ -432,6 +441,15 @@ pub struct App {
     /// Flag set by SyncRecoveryManager to request recovery from the main loop.
     /// The main loop checks this and triggers buffered catchup when set.
     sync_recovery_pending: AtomicBool,
+
+    /// Consecutive recovery attempts without progress.  Reset to 0 whenever
+    /// `current_ledger` advances.  When this exceeds a threshold the node
+    /// escalates from passive waiting to actively requesting SCP state or
+    /// triggering catchup.
+    recovery_attempts_without_progress: AtomicU64,
+    /// The ledger sequence at which recovery_attempts_without_progress was
+    /// last reset.  Used to detect progress.
+    recovery_baseline_ledger: AtomicU64,
 
     /// Total number of times the node lost sync.
     lost_sync_count: AtomicU64,
@@ -943,6 +961,8 @@ impl App {
             sync_recovery_handle: parking_lot::RwLock::new(None), // Initialized in run() when needed
             is_applying_ledger: AtomicBool::new(false),
             sync_recovery_pending: AtomicBool::new(false),
+            recovery_attempts_without_progress: AtomicU64::new(0),
+            recovery_baseline_ledger: AtomicU64::new(0),
             lost_sync_count: AtomicU64::new(0),
             max_tx_size_bytes: AtomicU32::new(henyey_herder::flow_control::MAX_CLASSIC_TX_SIZE_BYTES),
             ping_counter: AtomicU64::new(0),

@@ -591,7 +591,7 @@ impl App {
     /// This can be called from `&self` methods unlike `start_catchup_message_caching`.
     ///
     /// Returns a JoinHandle that can be aborted when catchup completes.
-    async fn start_catchup_message_caching_from_self(
+    pub(super) async fn start_catchup_message_caching_from_self(
         &self,
     ) -> Option<tokio::task::JoinHandle<()>> {
         tracing::info!("Attempting to start catchup message caching from self_arc");
@@ -1321,7 +1321,7 @@ impl App {
 
     /// Process the result of a catchup operation: update state, bootstrap herder,
     /// and apply buffered ledgers. Shared by buffered and externalized catchup paths.
-    async fn handle_catchup_result(
+    pub(super) async fn handle_catchup_result(
         &self,
         catchup_result: anyhow::Result<CatchupResult>,
         reset_stuck_state: bool,
