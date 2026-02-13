@@ -202,14 +202,14 @@ henyey/
 | Crate | Purpose | Parity |
 |-------|---------|--------|
 | [`henyey-scp`](crates/henyey-scp/README.md) | Stellar Consensus Protocol: nomination, balloting, quorum logic | [100%](crates/henyey-scp/PARITY_STATUS.md) |
-| [`henyey-herder`](crates/henyey-herder/README.md) | Consensus coordination, transaction queue, ledger close triggers | [69%](crates/henyey-herder/PARITY_STATUS.md) |
-| [`henyey-overlay`](crates/henyey-overlay/README.md) | P2P overlay network, peer management, message flooding | [82%](crates/henyey-overlay/PARITY_STATUS.md) |
+| [`henyey-herder`](crates/henyey-herder/README.md) | Consensus coordination, transaction queue, ledger close triggers | [71%](crates/henyey-herder/PARITY_STATUS.md) |
+| [`henyey-overlay`](crates/henyey-overlay/README.md) | P2P overlay network, peer management, message flooding | [83%](crates/henyey-overlay/PARITY_STATUS.md) |
 
 ### Execution Layer
 
 | Crate | Purpose | Parity |
 |-------|---------|--------|
-| [`henyey-ledger`](crates/henyey-ledger/README.md) | Ledger close pipeline, per-operation savepoints, state snapshots, delta tracking | [63%](crates/henyey-ledger/PARITY_STATUS.md) |
+| [`henyey-ledger`](crates/henyey-ledger/README.md) | Ledger close pipeline, per-operation savepoints, state snapshots, delta tracking | [64%](crates/henyey-ledger/PARITY_STATUS.md) |
 | [`henyey-tx`](crates/henyey-tx/README.md) | Transaction validation and execution (classic + Soroban), savepoint-based rollback | [95%](crates/henyey-tx/PARITY_STATUS.md) |
 | [`henyey-bucket`](crates/henyey-bucket/README.md) | BucketList implementation, merges, on-disk state | [92%](crates/henyey-bucket/PARITY_STATUS.md) |
 

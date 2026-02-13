@@ -2,7 +2,7 @@
 
 **Crate**: `henyey-overlay`
 **Upstream**: `.upstream-v25/src/overlay/`
-**Overall Parity**: 82%
+**Overall Parity**: 83%
 **Last Updated**: 2026-02-13
 
 ## Summary
@@ -10,8 +10,8 @@
 | Area | Status | Notes |
 |------|--------|-------|
 | Authentication (PeerAuth, Hmac) | Full | HKDF key derivation, HMAC-SHA256 MAC |
-| Peer Connection (Peer, TCPPeer) | Partial | Missing ping/pong, IO timeout, recurrent timer |
-| OverlayManager | Partial | Missing tick, purgeDeadPeers, DNS resolution |
+| Peer Connection (Peer, TCPPeer) | Partial | Missing ping/pong latency tracking |
+| OverlayManager | Partial | Missing DNS re-resolution, some peer list queries |
 | Floodgate | Full | Message deduplication and forwarding |
 | FlowControl | Full | Capacity tracking, throttling, priority queues |
 | ItemFetcher / Tracker | Full | Fetch lifecycle, retry, envelope tracking |
@@ -197,9 +197,9 @@ Corresponds to: `Peer.h`, `TCPPeer.h`
 | `handleMaxTxSizeIncrease()` | N/A | None |
 | `pingPeer()` | N/A | None |
 | `maybeProcessPingResponse()` | N/A | None |
-| `startRecurrentTimer()` | N/A | None |
-| `recurrentTimerExpired()` | N/A | None |
-| `getIOTimeout()` | N/A | None |
+| `startRecurrentTimer()` | 5s check in `run_peer_loop()` | Full |
+| `recurrentTimerExpired()` | Idle/straggler timeout in `run_peer_loop()` | Full |
+| `getIOTimeout()` | Idle/straggler timeout in `run_peer_loop()` | Full |
 | `beginMessageProcessing()` | `FlowControl::begin_message_processing()` | Full |
 | `endMessageProcessing()` | `FlowControl::end_message_processing()` | Full |
 | `process()` (query throttle) | N/A | None |
@@ -495,13 +495,11 @@ Features not yet implemented. These ARE counted against parity %.
 | `Peer::getJsonInfo()` | Low | JSON info for admin API |
 | `Peer::handleMaxTxSizeIncrease()` | Medium | Protocol upgrade handling |
 | `Peer::process()` (query throttle) | Low | Rate limiting GetTxSet/GetQuorumSet |
-| `Peer::startRecurrentTimer()` / `recurrentTimerExpired()` | Medium | Periodic peer maintenance |
-| `Peer::getIOTimeout()` | Medium | Idle/straggler timeout detection |
 | `CapacityTrackedMessage` (RAII tracker) | Medium | Automatic capacity release on drop |
-| `OverlayManagerImpl::tick()` | Medium | Periodic maintenance (connect, purge) |
-| `OverlayManagerImpl::updateTimerAndMaybeDropRandomPeer()` | Medium | Random peer rotation |
+| `OverlayManagerImpl::tick()` | Low | Idle/straggler timeout now in `run_peer_loop()`; connect in connector task; remaining: cleanupPeers, random peer drop |
+| `OverlayManagerImpl::updateTimerAndMaybeDropRandomPeer()` | Low | Random peer rotation |
 | `OverlayManagerImpl::storeConfigPeers()` | Low | Persist config peers to DB |
-| `OverlayManagerImpl::purgeDeadPeers()` | Medium | Remove stale peers from DB |
+| `OverlayManagerImpl::purgeDeadPeers()` | Low | `remove_peers_with_many_failures()` exists; needs wiring at startup |
 | `OverlayManagerImpl::triggerPeerResolution()` / `resolvePeers()` | Low | Async DNS with retry |
 | `OverlayManagerImpl::clearLedgersBelow()` | Medium | Ledger-based cleanup coordination |
 | `OverlayManagerImpl::getRandomInboundAuthenticatedPeers()` | Low | Separate inbound peer list |
@@ -600,7 +598,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 247 |
-| Gaps (None + Partial) | 55 |
+| Implemented (Full) | 250 |
+| Gaps (None + Partial) | 52 |
 | Intentional Omissions | 10 |
-| **Parity** | **247 / (247 + 55) = 82%** |
+| **Parity** | **250 / (250 + 52) = 83%** |

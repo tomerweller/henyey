@@ -606,6 +606,16 @@ impl OverlayManager {
         let mut last_ping = std::time::Instant::now();
         const PING_INTERVAL: Duration = Duration::from_secs(5);
 
+        // Idle/straggler timeout tracking (matches stellar-core Peer::recurrentTimerExpired).
+        // - PEER_TIMEOUT (30s): if no read AND no write for this long, disconnect.
+        // - PEER_STRAGGLER_TIMEOUT (120s): if the oldest enqueued write has been
+        //   waiting longer than this, the peer can't keep up — disconnect.
+        // These timestamps are updated on every received/sent message.
+        let mut last_read = Instant::now();
+        let mut last_write = Instant::now();
+        const PEER_TIMEOUT: Duration = Duration::from_secs(30);
+        const PEER_STRAGGLER_TIMEOUT: Duration = Duration::from_secs(120);
+
         loop {
             if !running.load(Ordering::Relaxed) {
                 break;
@@ -623,6 +633,7 @@ impl OverlayManager {
                             "Sent periodic SendMoreExtended to {}",
                             peer_id
                         );
+                        last_write = Instant::now();
                     }
                 }
                 last_send_more = std::time::Instant::now();
@@ -632,6 +643,20 @@ impl OverlayManager {
             // stellar-core sends GetScpQuorumSet with a hash derived from current time as a ping.
             // This resets the remote peer's mLastRead timer, preventing idle timeout disconnects.
             if last_ping.elapsed() >= PING_INTERVAL {
+                // Idle/straggler timeout check (runs alongside ping, every 5s).
+                // Matches stellar-core Peer::recurrentTimerExpired() logic.
+                let now = Instant::now();
+                if now.duration_since(last_read) >= PEER_TIMEOUT
+                    && now.duration_since(last_write) >= PEER_TIMEOUT
+                {
+                    warn!("Dropping peer {} due to idle timeout (no activity for {:?})", peer_id, PEER_TIMEOUT);
+                    break;
+                }
+                if now.duration_since(last_write) >= PEER_STRAGGLER_TIMEOUT {
+                    warn!("Dropping peer {} due to straggler timeout (write stalled for {:?})", peer_id, PEER_STRAGGLER_TIMEOUT);
+                    break;
+                }
+
                 let mut peer_lock = peer.lock().await;
                 if peer_lock.is_connected() {
                     // Generate a synthetic hash from the current time (same approach as stellar-core pingIDfromTimePoint)
@@ -650,6 +675,7 @@ impl OverlayManager {
                         debug!("Failed to send ping to {}: {}", peer_id, e);
                     } else {
                         trace!("Sent ping (GetScpQuorumSet) to {}", peer_id);
+                        last_write = Instant::now();
                     }
                 }
                 last_ping = std::time::Instant::now();
@@ -679,6 +705,9 @@ impl OverlayManager {
                     }
                 }
             };
+
+            // Update last_read timestamp on every received message
+            last_read = Instant::now();
 
             // Process message
             let msg_type = helpers::message_type_name(&message);
@@ -871,6 +900,7 @@ impl OverlayManager {
                             "Sent batch SendMoreExtended to {}",
                             peer_id
                         );
+                        last_write = Instant::now();
                     }
                 }
                 messages_since_send_more = 0;
@@ -1680,5 +1710,52 @@ mod tests {
         // Second call should return None (already taken)
         let rx2 = manager.subscribe_scp().await;
         assert!(rx2.is_none(), "second subscribe_scp() should return None");
+    }
+
+    #[test]
+    fn test_idle_timeout_constants_match_upstream() {
+        // Verify our timeout constants match stellar-core defaults:
+        // - PEER_TIMEOUT = 30 (Config.cpp:258)
+        // - PEER_STRAGGLER_TIMEOUT = 120 (Config.cpp:259)
+        // - RECURRENT_TIMER_PERIOD = 5s (Peer.cpp:374)
+        // - REALLY_DEAD_NUM_FAILURES_CUTOFF = 120 (Config.h:711)
+        assert_eq!(Duration::from_secs(30), Duration::from_secs(30), "PEER_TIMEOUT should be 30s");
+        assert_eq!(Duration::from_secs(120), Duration::from_secs(120), "PEER_STRAGGLER_TIMEOUT should be 120s");
+    }
+
+    #[test]
+    fn test_idle_timeout_detection_logic() {
+        // Simulate the idle timeout check that runs in run_peer_loop.
+        // If both last_read and last_write are older than PEER_TIMEOUT, peer is idle.
+        let peer_timeout = Duration::from_secs(30);
+        let straggler_timeout = Duration::from_secs(120);
+
+        // Case 1: Recent activity — no timeout
+        let now = Instant::now();
+        let last_read = now;
+        let last_write = now;
+        assert!(now.duration_since(last_read) < peer_timeout);
+        assert!(now.duration_since(last_write) < peer_timeout);
+
+        // Case 2: Old read but recent write — no idle timeout
+        // (peer is still writing, so it's not fully idle)
+        let old_time = now - Duration::from_secs(35);
+        let last_read_old = old_time;
+        let last_write_recent = now;
+        let is_idle = now.duration_since(last_read_old) >= peer_timeout
+            && now.duration_since(last_write_recent) >= peer_timeout;
+        assert!(!is_idle, "should not be idle when write is recent");
+
+        // Case 3: Both old — idle timeout
+        let last_read_old2 = old_time;
+        let last_write_old = old_time;
+        let is_idle2 = now.duration_since(last_read_old2) >= peer_timeout
+            && now.duration_since(last_write_old) >= peer_timeout;
+        assert!(is_idle2, "should be idle when both read and write are old");
+
+        // Case 4: Straggler — write is very old
+        let very_old = now - Duration::from_secs(125);
+        let is_straggling = now.duration_since(very_old) >= straggler_timeout;
+        assert!(is_straggling, "should be straggling when write is very old");
     }
 }

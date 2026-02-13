@@ -2,7 +2,7 @@
 
 **Crate**: `henyey-ledger`
 **Upstream**: `.upstream-v25/src/ledger/`
-**Overall Parity**: 63%
+**Overall Parity**: 64%
 **Last Updated**: 2026-02-13
 
 ## Summary
@@ -23,7 +23,7 @@
 | LedgerTxn Nested Transactions | Partial | Savepoints cover operation rollback |
 | Parallel Apply / Threading | None | Single-threaded execution |
 | Soroban Metrics | None | No metrics collection |
-| Shared Module Cache | None | No WASM module caching |
+| Shared Module Cache | Partial | Per-TX caching via `PersistentModuleCache` in `henyey-tx`; no global shared cache |
 
 ## File Mapping
 
@@ -83,7 +83,7 @@ Corresponds to: `LedgerManager.h`, `LedgerManagerImpl.h`
 | `LedgerManager::getModuleCache()` | Not implemented | None |
 | `LedgerManager::isApplying()` | Not applicable (single-threaded) | None |
 | `LedgerManager::markApplyStateReset()` | Not applicable (single-threaded) | None |
-| `LedgerManager::handleUpgradeAffectingSorobanInMemoryStateSize()` | Not implemented | None |
+| `LedgerManager::handleUpgradeAffectingSorobanInMemoryStateSize()` | `recompute_contract_code_sizes()` | Full |
 | `LedgerManagerImpl::processFeesSeqNums()` | `charge_fees()` in execution | Full |
 | `LedgerManagerImpl::applyTransactions()` | `run_transactions_on_executor()` | Full |
 | `LedgerManagerImpl::sealLedgerTxnAndStoreInBucketsAndDB()` | Part of `close_ledger()` | Full |
@@ -306,7 +306,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
-| `SharedModuleCacheCompiler` (WASM module caching) | Medium | Performance optimization for Soroban execution |
+| `SharedModuleCacheCompiler` (WASM module caching) | Low | Per-TX `PersistentModuleCache` in `henyey-tx` provides functionally equivalent caching; architectural difference (per-TX vs global) |
 | `LedgerManagerImpl::ApplyState` phase machine | Medium | Multi-threaded apply coordination |
 | `applySorobanStages()` / parallel Soroban threads | Medium | Multi-threaded Soroban execution |
 | `SorobanMetrics` class | Low | Observability, not correctness |
@@ -320,8 +320,6 @@ Features not yet implemented. These ARE counted against parity %.
 | `LedgerManager::getExpectedLedgerCloseTime()` | Low | Timing utility |
 | `LedgerManager::secondsSinceLastLedgerClose()` | Low | Timing utility |
 | `LedgerManager::syncMetrics()` | Low | Metrics publishing |
-| `LedgerManager::handleUpgradeAffectingSorobanInMemoryStateSize()` | Medium | Upgrade-triggered recomputation |
-| Eviction scan processing | Medium | Live eviction during ledger apply |
 | `LedgerManagerImpl::prefetchTransactionData()` | Low | Performance optimization |
 | `CompleteConstLedgerState` as unified type | Low | Immutable state wrapper |
 
@@ -377,13 +375,13 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 79 |
-| Gaps (None + Partial) | 47 |
+| Implemented (Full) | 81 |
+| Gaps (None + Partial) | 45 |
 | Intentional Omissions | 20 |
-| **Parity** | **79 / (79 + 47) = 63%** |
+| **Parity** | **81 / (81 + 45) = 64%** |
 
 The 79 implemented items cover: LedgerManager core operations (20), header utilities (8), delta/change tracking (13), close data (8), snapshots (8), execution pipeline (20), config upgrade (6), offer utilities (5), in-memory Soroban state (15), fee/reserve calculations (9), trustline utilities (7). Note that some items map to the same Rust function.
 
-The 47 gap items include: LedgerManager threading/metrics methods (10), SQL-backend header utilities (7 counted but reclassified), NetworkConfig creation functions (5), parallel apply infrastructure (3), module cache (1), nested transaction model (2), checkpoint utilities (1), eviction processing (1), entry tracking (2), timing/metrics utilities (4), and other minor components.
+The 45 gap items include: LedgerManager threading/metrics methods (10), SQL-backend header utilities (7 counted but reclassified), NetworkConfig creation functions (5), parallel apply infrastructure (3), module cache (1), nested transaction model (2), checkpoint utilities (1), entry tracking (2), timing/metrics utilities (4), and other minor components.
 
 The 20 intentional omissions are primarily SQL backend features, debug tooling, deprecated functionality (inflation), and mainnet-specific historical bug fixes.

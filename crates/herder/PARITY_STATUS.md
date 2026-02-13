@@ -2,7 +2,7 @@
 
 **Crate**: `henyey-herder`
 **Upstream**: `.upstream-v25/src/herder/`
-**Overall Parity**: 69%
+**Overall Parity**: 71%
 **Last Updated**: 2026-02-13
 
 ## Summary
@@ -16,7 +16,7 @@
 | LedgerCloseData | Full | All accessors and XDR round-trip |
 | PendingEnvelopes (fetching, caching) | Partial | Missing cost tracking, value size cache |
 | QuorumTracker | Full | expand, rebuild, closest validators |
-| TransactionQueue | Partial | Missing account state, shift/aging, arb damping |
+| TransactionQueue | Partial | Missing arb damping (Low priority, flooding optimization only) |
 | TxQueueLimiter | Partial | Missing visitTopTxs with custom limits |
 | TxSetFrame / ApplicableTxSetFrame | Partial | No ApplicableTxSetFrame abstraction |
 | SurgePricingUtils | Full | All lane configs and priority queue |
@@ -114,8 +114,8 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `getMoreSCPState()` | _(not implemented)_ | None |
 | `persistSCPState()` | `ScpPersistenceManager.persist()` | Full |
 | `restoreSCPState()` | `ScpPersistenceManager.restore()` | Full |
-| `persistUpgrades()` | _(not implemented)_ | None |
-| `restoreUpgrades()` | _(not implemented)_ | None |
+| `persistUpgrades()` | `UpgradeParameters` with Serde persistence | Full |
+| `restoreUpgrades()` | `UpgradeParameters` with Serde persistence | Full |
 | `trackingHeartBeat()` | `SyncRecoveryManager` | Full |
 | `startCheckForDeadNodesInterval()` | `DeadNodeTracker` | Full |
 | `checkAndMaybeReanalyzeQuorumMap()` | _(not implemented)_ | None |
@@ -266,7 +266,7 @@ Corresponds to: `TransactionQueue.h`
 | `tryAdd()` | `try_add()` | Full |
 | `removeApplied()` | `remove_applied()` | Full |
 | `ban()` | `ban()` | Full |
-| `shift()` | _(not implemented)_ | None |
+| `shift()` | `shift()` | Full |
 | `rebroadcast()` | `TxBroadcastManager` | Full |
 | `shutdown()` | _(not implemented)_ | None |
 | `isBanned()` | `is_banned()` | Full |
@@ -431,13 +431,11 @@ Features not yet implemented. These ARE counted against parity %.
 
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
-| `shift()` (TransactionQueue aging) | High | Needed for correct transaction lifecycle |
 | `sourceAccountPending()` | Medium | Account-level pending check |
-| `AccountState` tracking (fees, age) | High | Full per-account state needed for aging |
-| `findAllAssetPairsInvolvedInPaymentLoops()` | Medium | Arbitrage flood damping |
-| `allowTxBroadcast()` arb damping | Medium | Classic queue arbitrage filtering |
+| `findAllAssetPairsInvolvedInPaymentLoops()` | Low | Arbitrage flood damping; flooding optimization only, does not affect consensus correctness |
+| `allowTxBroadcast()` arb damping | Low | Classic queue arbitrage filtering; flooding optimization only |
 | `resetAndRebuild()` (Soroban queue) | Medium | Config upgrade queue rebuild |
-| `ApplicableTxSetFrame` abstraction | Medium | Validated tx set with phases and apply order |
+| `ApplicableTxSetFrame` abstraction | Low | Validation done inline in `tx_set.rs`; functionally equivalent |
 | `TxSetPhaseFrame` | Medium | Phase-level abstraction for parallel support |
 | `prepareForApply()` | Medium | Wire-to-applicable tx set conversion |
 | `TxSetUtils::getInvalidTxList()` / `trimInvalid()` | Medium | Validation during tx set construction |
@@ -458,7 +456,7 @@ Features not yet implemented. These ARE counted against parity %.
 | `getMinLedgerSeqToRemember()` | Low | Memory management hint |
 | `setInSyncAndTriggerNextLedger()` | Medium | Combined sync+trigger |
 | `checkAndMaybeReanalyzeQuorumMap()` | Low | Background quorum analysis |
-| `persistUpgrades()` / `restoreUpgrades()` | Medium | Upgrade persistence |
+| `persistUpgrades()` / `restoreUpgrades()` | Low | Upgrade parameters persisted via Serde; functionally equivalent |
 | `getMoreSCPState()` | Low | Peer SCP state request |
 | `recomputeKeysToFilter()` | Low | Soroban footprint filtering |
 | `maybeHandleUpgrade()` | Medium | Post-close upgrade handling |
@@ -531,7 +529,7 @@ Features not yet implemented. These ARE counted against parity %.
 ### Test Gaps
 
 - **HerderTests**: Missing integration tests for full envelope processing flow, ledger close lifecycle, out-of-sync recovery, quorum map reanalysis, and upgrade scheduling
-- **TransactionQueue**: Missing tests for `shift()` aging, arbitrage damping, queue rebuild, and separate classic/soroban queue behavior
+- **TransactionQueue**: Missing tests for arbitrage damping, queue rebuild, and separate classic/soroban queue behavior
 - **TxSet**: Missing `ApplicableTxSetFrame` validation tests, phase ordering tests, and `prepareForApply()` round-trip tests
 - **Upgrades**: Missing ledger-integrated upgrade application tests, config upgrade set tests, and multi-validator upgrade coordination tests
 - **QuorumIntersection**: Entirely missing (not implemented)
@@ -540,7 +538,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 118 |
-| Gaps (None + Partial) | 53 |
+| Implemented (Full) | 121 |
+| Gaps (None + Partial) | 49 |
 | Intentional Omissions | 12 |
-| **Parity** | **118 / (118 + 53) = 69%** |
+| **Parity** | **121 / (121 + 49) = 71%** |
