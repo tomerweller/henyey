@@ -31,7 +31,12 @@
 //! - **publish-history**: Publish history to archives (validators only)
 //! - **check-quorum-intersection**: Verify quorum intersection from JSON
 //! - **sample-config**: Print sample configuration
-//! - **offline**: Offline utilities (XDR tools, replay testing)
+//! - **verify-execution**: Test transaction execution against CDP metadata
+//! - **self-check**: Perform diagnostic self-checks
+//! - **bucket-info**: Print bucket list information
+//! - **dump-ledger**: Dump ledger entries to JSON
+//! - **verify-checkpoints**: Write verified checkpoint hashes to a file
+//! - **debug-bucket-entry**: Inspect an account in the bucket list
 //!
 //! # Configuration
 //!
@@ -221,40 +226,6 @@ enum Commands {
         port: u16,
     },
 
-    /// Offline commands (no network required)
-    #[command(subcommand)]
-    Offline(OfflineCommands),
-}
-
-/// Offline commands that don't require network access
-#[derive(Subcommand)]
-enum OfflineCommands {
-    /// Convert Stellar keys between formats
-    ConvertKey {
-        /// The key to convert
-        key: String,
-    },
-
-    /// Decode an XDR value
-    DecodeXdr {
-        /// XDR type name
-        #[arg(long, value_name = "TYPE")]
-        r#type: String,
-
-        /// Base64-encoded XDR
-        value: String,
-    },
-
-    /// Encode a value to XDR
-    EncodeXdr {
-        /// XDR type name
-        #[arg(long, value_name = "TYPE")]
-        r#type: String,
-
-        /// JSON value to encode
-        value: String,
-    },
-
     /// Print bucket list information
     BucketInfo {
         /// Path to bucket directory
@@ -314,29 +285,6 @@ enum OfflineCommands {
         #[arg(long)]
         account: String,
     },
-
-    /// Add a signature to a transaction envelope
-    ///
-    /// Reads a transaction envelope (base64), prompts for a secret key,
-    /// and outputs the signed envelope.
-    SignTransaction {
-        /// Network passphrase for signing (required)
-        #[arg(long)]
-        netid: String,
-
-        /// Input transaction envelope in base64 (or "-" for stdin)
-        #[arg(default_value = "-")]
-        input: String,
-
-        /// Output as base64 (default: true)
-        #[arg(long, default_value = "true")]
-        base64: bool,
-    },
-
-    /// Print the public key corresponding to a secret key
-    ///
-    /// Reads a secret key seed (S...) from stdin and prints the public key.
-    SecToPub,
 
     /// Dump ledger entries to JSON
     ///
@@ -437,7 +385,62 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::HttpCommand { command, port } => cmd_http_command(&command, port).await,
 
-        Commands::Offline(cmd) => cmd_offline(cmd, config).await,
+        Commands::BucketInfo { path } => bucket_info(&path),
+
+        Commands::VerifyExecution {
+            from,
+            to,
+            stop_on_error,
+            show_diff,
+            cdp_url,
+            cdp_date,
+            cache_dir,
+            no_cache,
+            quiet,
+        } => {
+            cmd_verify_execution(
+                config,
+                VerifyExecutionOptions {
+                    from,
+                    to,
+                    stop_on_error,
+                    show_diff,
+                    cdp_url,
+                    cdp_date,
+                    cache_dir,
+                    no_cache,
+                    quiet,
+                },
+            )
+            .await
+        }
+
+        Commands::DebugBucketEntry {
+            checkpoint,
+            account,
+        } => cmd_debug_bucket_entry(config, checkpoint, &account).await,
+
+        Commands::DumpLedger {
+            output,
+            entry_type,
+            limit,
+            last_modified_ledger_count,
+        } => {
+            cmd_dump_ledger(
+                config,
+                output,
+                entry_type,
+                limit,
+                last_modified_ledger_count,
+            )
+            .await
+        }
+
+        Commands::SelfCheck => cmd_self_check(config).await,
+
+        Commands::VerifyCheckpoints { output, from, to } => {
+            cmd_verify_checkpoints(config, output, from, to).await
+        }
     }
 }
 
@@ -2740,346 +2743,6 @@ fn cmd_sample_config() -> anyhow::Result<()> {
 }
 
 /// Offline commands handler.
-async fn cmd_offline(cmd: OfflineCommands, config: AppConfig) -> anyhow::Result<()> {
-    match cmd {
-        OfflineCommands::ConvertKey { key } => convert_key(&key),
-        OfflineCommands::DecodeXdr { r#type, value } => decode_xdr(&r#type, &value),
-        OfflineCommands::EncodeXdr { r#type, value } => encode_xdr(&r#type, &value),
-        OfflineCommands::BucketInfo { path } => bucket_info(&path),
-        OfflineCommands::VerifyExecution {
-            from,
-            to,
-            stop_on_error,
-            show_diff,
-            cdp_url,
-            cdp_date,
-            cache_dir,
-            no_cache,
-            quiet,
-        } => {
-            cmd_verify_execution(
-                config,
-                VerifyExecutionOptions {
-                    from,
-                    to,
-                    stop_on_error,
-                    show_diff,
-                    cdp_url,
-                    cdp_date,
-                    cache_dir,
-                    no_cache,
-                    quiet,
-                },
-            )
-            .await
-        }
-        OfflineCommands::DebugBucketEntry {
-            checkpoint,
-            account,
-        } => cmd_debug_bucket_entry(config, checkpoint, &account).await,
-        OfflineCommands::SignTransaction {
-            netid,
-            input,
-            base64,
-        } => sign_transaction(&netid, &input, base64),
-        OfflineCommands::SecToPub => sec_to_pub(),
-        OfflineCommands::DumpLedger {
-            output,
-            entry_type,
-            limit,
-            last_modified_ledger_count,
-        } => {
-            cmd_dump_ledger(
-                config,
-                output,
-                entry_type,
-                limit,
-                last_modified_ledger_count,
-            )
-            .await
-        }
-        OfflineCommands::SelfCheck => cmd_self_check(config).await,
-        OfflineCommands::VerifyCheckpoints { output, from, to } => {
-            cmd_verify_checkpoints(config, output, from, to).await
-        }
-    }
-}
-
-/// Converts Stellar IDs between formats (equivalent to stellar-core convert-id).
-///
-/// Handles the following input formats:
-/// - `G...` - Public key (account ID) -> displays strKey and hex
-/// - `S...` - Secret seed -> displays seed strKey and derived public key
-/// - `T...` - Pre-auth transaction hash -> displays type and hex
-/// - `X...` - SHA256 hash -> displays type and hex
-/// - `M...` - Muxed account -> displays type, account ID, and memo ID
-/// - `C...` - Contract address -> displays type and hex
-/// - `P...` - Signed payload -> displays type and hex
-/// - 64 hex chars - 32-byte hex -> displays all possible interpretations
-fn convert_key(key: &str) -> anyhow::Result<()> {
-    use henyey_crypto::{
-        decode_contract, decode_muxed_account, decode_pre_auth_tx, decode_sha256_hash,
-        decode_signed_payload, encode_account_id, encode_contract, encode_muxed_account,
-        encode_pre_auth_tx, encode_sha256_hash,
-    };
-
-    let key = key.trim();
-
-    // Try public key (G...)
-    if key.starts_with('G') {
-        let pk = henyey_crypto::PublicKey::from_strkey(key)?;
-        println!("PublicKey:");
-        println!("  strKey: {}", pk.to_strkey());
-        println!("  hex: {}", hex::encode(pk.as_bytes()));
-        return Ok(());
-    }
-
-    // Try secret seed (S...)
-    if key.starts_with('S') {
-        let sk = henyey_crypto::SecretKey::from_strkey(key)?;
-        let pk = sk.public_key();
-        println!("Seed:");
-        println!("  strKey: {}", sk.to_strkey());
-        println!("PublicKey:");
-        println!("  strKey: {}", pk.to_strkey());
-        println!("  hex: {}", hex::encode(pk.as_bytes()));
-        return Ok(());
-    }
-
-    // Try pre-auth transaction hash (T...)
-    if key.starts_with('T') {
-        let hash = decode_pre_auth_tx(key)?;
-        println!("StrKey:");
-        println!("  type: STRKEY_PRE_AUTH_TX");
-        println!("  hex: {}", hex::encode(hash));
-        return Ok(());
-    }
-
-    // Try SHA256 hash (X...)
-    if key.starts_with('X') {
-        let hash = decode_sha256_hash(key)?;
-        println!("StrKey:");
-        println!("  type: STRKEY_HASH_X");
-        println!("  hex: {}", hex::encode(hash));
-        return Ok(());
-    }
-
-    // Try muxed account (M...)
-    if key.starts_with('M') {
-        let (account_id, memo_id) = decode_muxed_account(key)?;
-        println!("StrKey:");
-        println!("  type: STRKEY_MUXED_ACCOUNT_ED25519");
-        println!("  accountId: {}", encode_account_id(&account_id));
-        println!("  memoId: {}", memo_id);
-        println!("  hex: {}", hex::encode(account_id));
-        return Ok(());
-    }
-
-    // Try contract address (C...)
-    if key.starts_with('C') {
-        let hash = decode_contract(key)?;
-        println!("StrKey:");
-        println!("  type: STRKEY_CONTRACT");
-        println!("  hex: {}", hex::encode(hash));
-        return Ok(());
-    }
-
-    // Try signed payload (P...)
-    if key.starts_with('P') {
-        let (signer, payload) = decode_signed_payload(key)?;
-        println!("StrKey:");
-        println!("  type: STRKEY_SIGNED_PAYLOAD_ED25519");
-        println!("  signer: {}", hex::encode(signer));
-        println!("  payload: {}", hex::encode(payload));
-        return Ok(());
-    }
-
-    // Try 64-character hex string (32 bytes)
-    if key.len() == 64 {
-        if let Ok(bytes) = hex::decode(key) {
-            if bytes.len() == 32 {
-                let data: [u8; 32] = bytes.try_into().unwrap();
-
-                // Show all possible interpretations
-                println!("Interpreted as PublicKey:");
-                println!("  strKey: {}", encode_account_id(&data));
-                println!("  hex: {}", key);
-
-                // Show as seed -> public key derivation
-                let sk = henyey_crypto::SecretKey::from_seed(&data);
-                let pk = sk.public_key();
-                println!();
-                println!("Interpreted as Seed:");
-                println!("  strKey: {}", sk.to_strkey());
-                println!("PublicKey:");
-                println!("  strKey: {}", pk.to_strkey());
-                println!("  hex: {}", hex::encode(pk.as_bytes()));
-
-                println!();
-                println!("Other interpretations:");
-                println!("  STRKEY_PRE_AUTH_TX: {}", encode_pre_auth_tx(&data));
-                println!("  STRKEY_HASH_X: {}", encode_sha256_hash(&data));
-                println!("  STRKEY_MUXED_ACCOUNT: {}", encode_muxed_account(&data, 0));
-                println!("  STRKEY_CONTRACT: {}", encode_contract(&data));
-
-                return Ok(());
-            }
-        }
-    }
-
-    anyhow::bail!("Unknown key format: {}. Expected G.../S.../T.../X.../M.../C.../P... strkey or 64-character hex", key);
-}
-
-/// Decodes XDR from base64 and prints it in debug format.
-///
-/// Supports: LedgerHeader, TransactionEnvelope, TransactionResult
-fn decode_xdr(type_name: &str, value: &str) -> anyhow::Result<()> {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    use stellar_xdr::curr::ReadXdr;
-
-    let bytes = STANDARD.decode(value)?;
-
-    // This is a simplified version - a full implementation would handle all XDR types
-    match type_name.to_lowercase().as_str() {
-        "ledgerheader" => {
-            let header = stellar_xdr::curr::LedgerHeader::from_xdr(
-                &bytes,
-                stellar_xdr::curr::Limits::none(),
-            )?;
-            println!("{:#?}", header);
-        }
-        "transactionenvelope" => {
-            let env = stellar_xdr::curr::TransactionEnvelope::from_xdr(
-                &bytes,
-                stellar_xdr::curr::Limits::none(),
-            )?;
-            println!("{:#?}", env);
-        }
-        "transactionresult" => {
-            let result = stellar_xdr::curr::TransactionResult::from_xdr(
-                &bytes,
-                stellar_xdr::curr::Limits::none(),
-            )?;
-            println!("{:#?}", result);
-        }
-        _ => {
-            anyhow::bail!("Unknown XDR type: {}. Supported types: LedgerHeader, TransactionEnvelope, TransactionResult", type_name);
-        }
-    }
-
-    Ok(())
-}
-
-/// Encodes a value to XDR and prints it as base64.
-///
-/// Supports: LedgerHeader, TransactionEnvelope, TransactionResult,
-/// AccountId, MuxedAccount, Asset, Hash, Uint256
-fn encode_xdr(type_name: &str, value: &str) -> anyhow::Result<()> {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    use stellar_xdr::curr::Limits;
-
-    // Parse JSON and encode to XDR based on type
-    match type_name.to_lowercase().as_str() {
-        "ledgerheader" => {
-            let header: stellar_xdr::curr::LedgerHeader = serde_json::from_str(value)
-                .map_err(|e| anyhow::anyhow!("Invalid JSON for LedgerHeader: {}", e))?;
-            let xdr_bytes = header.to_xdr(Limits::none())?;
-            println!("{}", STANDARD.encode(&xdr_bytes));
-        }
-        "transactionenvelope" => {
-            let env: stellar_xdr::curr::TransactionEnvelope = serde_json::from_str(value)
-                .map_err(|e| anyhow::anyhow!("Invalid JSON for TransactionEnvelope: {}", e))?;
-            let xdr_bytes = env.to_xdr(Limits::none())?;
-            println!("{}", STANDARD.encode(&xdr_bytes));
-        }
-        "transactionresult" => {
-            let result: stellar_xdr::curr::TransactionResult = serde_json::from_str(value)
-                .map_err(|e| anyhow::anyhow!("Invalid JSON for TransactionResult: {}", e))?;
-            let xdr_bytes = result.to_xdr(Limits::none())?;
-            println!("{}", STANDARD.encode(&xdr_bytes));
-        }
-        "accountid" => {
-            // Parse from strkey (G...) format
-            let pk = henyey_crypto::PublicKey::from_strkey(value.trim())?;
-            let account_id =
-                stellar_xdr::curr::AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                    stellar_xdr::curr::Uint256(*pk.as_bytes()),
-                ));
-            let xdr_bytes = account_id.to_xdr(Limits::none())?;
-            println!("{}", STANDARD.encode(&xdr_bytes));
-        }
-        "muxedaccount" => {
-            // Parse from strkey (G... or M...) format
-            let value = value.trim();
-            let muxed = if value.starts_with('G') {
-                let pk = henyey_crypto::PublicKey::from_strkey(value)?;
-                stellar_xdr::curr::MuxedAccount::Ed25519(stellar_xdr::curr::Uint256(*pk.as_bytes()))
-            } else {
-                // For M... addresses, parse the muxed account
-                anyhow::bail!("Muxed account (M...) parsing not yet supported");
-            };
-            let xdr_bytes = muxed.to_xdr(Limits::none())?;
-            println!("{}", STANDARD.encode(&xdr_bytes));
-        }
-        "asset" => {
-            // Parse asset in format "native" or "CODE:ISSUER"
-            let value = value.trim();
-            let asset = if value.to_lowercase() == "native" {
-                stellar_xdr::curr::Asset::Native
-            } else if let Some((code, issuer)) = value.split_once(':') {
-                let issuer_pk = henyey_crypto::PublicKey::from_strkey(issuer)?;
-                let issuer_id = stellar_xdr::curr::AccountId(
-                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
-                        *issuer_pk.as_bytes(),
-                    )),
-                );
-
-                if code.len() <= 4 {
-                    let mut asset_code = [0u8; 4];
-                    asset_code[..code.len()].copy_from_slice(code.as_bytes());
-                    stellar_xdr::curr::Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
-                        asset_code: stellar_xdr::curr::AssetCode4(asset_code),
-                        issuer: issuer_id,
-                    })
-                } else if code.len() <= 12 {
-                    let mut asset_code = [0u8; 12];
-                    asset_code[..code.len()].copy_from_slice(code.as_bytes());
-                    stellar_xdr::curr::Asset::CreditAlphanum12(stellar_xdr::curr::AlphaNum12 {
-                        asset_code: stellar_xdr::curr::AssetCode12(asset_code),
-                        issuer: issuer_id,
-                    })
-                } else {
-                    anyhow::bail!("Asset code too long (max 12 characters)");
-                }
-            } else {
-                anyhow::bail!("Invalid asset format. Use 'native' or 'CODE:ISSUER'");
-            };
-            let xdr_bytes = asset.to_xdr(Limits::none())?;
-            println!("{}", STANDARD.encode(&xdr_bytes));
-        }
-        "hash" | "uint256" => {
-            // Parse from hex
-            let value = value.trim();
-            let bytes = hex::decode(value).map_err(|e| anyhow::anyhow!("Invalid hex: {}", e))?;
-            if bytes.len() != 32 {
-                anyhow::bail!("Hash must be exactly 32 bytes (64 hex characters)");
-            }
-            let hash = stellar_xdr::curr::Uint256(bytes.try_into().unwrap());
-            let xdr_bytes = hash.to_xdr(Limits::none())?;
-            println!("{}", STANDARD.encode(&xdr_bytes));
-        }
-        _ => {
-            anyhow::bail!(
-                "Unknown XDR type: {}. Supported types: LedgerHeader, TransactionEnvelope, \
-                TransactionResult, AccountId, MuxedAccount, Asset, Hash, Uint256",
-                type_name
-            );
-        }
-    }
-
-    Ok(())
-}
-
 /// Prints information about bucket files.
 ///
 /// If given a directory, lists all bucket files with their sizes.
@@ -3137,169 +2800,6 @@ fn cmd_check_quorum_intersection(path: &std::path::Path) -> anyhow::Result<()> {
     } else {
         anyhow::bail!("quorum sets do not have intersection");
     }
-}
-
-/// Sign a transaction envelope with a secret key.
-///
-/// Reads a transaction envelope (base64 or from file), prompts for a secret key,
-/// signs the transaction, and outputs the signed envelope.
-///
-/// Equivalent to stellar-core sign-transaction command.
-fn sign_transaction(netid: &str, input: &str, output_base64: bool) -> anyhow::Result<()> {
-    use henyey_crypto::{sha256, SecretKey};
-    use stellar_xdr::curr::{
-        DecoratedSignature, ReadXdr, SignatureHint, TransactionEnvelope,
-        TransactionSignaturePayload, TransactionSignaturePayloadTaggedTransaction,
-    };
-
-    // Read the transaction envelope
-    let envelope_bytes = if input == "-" {
-        // Read from stdin
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line)?;
-        let trimmed = line.trim();
-        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, trimmed)?
-    } else {
-        // Treat input as base64 string
-        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, input)?
-    };
-
-    let mut tx_env =
-        TransactionEnvelope::from_xdr(envelope_bytes, stellar_xdr::curr::Limits::none())?;
-
-    // Prompt for secret key
-    eprint!("Secret key seed [network id: '{}']: ", netid);
-    let mut secret_line = String::new();
-    std::io::stdin().read_line(&mut secret_line)?;
-    let secret_str = secret_line.trim();
-
-    let secret_key = SecretKey::from_strkey(secret_str)
-        .map_err(|e| anyhow::anyhow!("Invalid secret key: {:?}", e))?;
-
-    // Compute the network ID hash
-    let network_id_hash = sha256(netid.as_bytes());
-
-    // Create the signature payload
-    let payload = match &tx_env {
-        TransactionEnvelope::TxV0(v0) => {
-            // Convert V0 to V1 for signing (same signature semantics)
-            let tx = stellar_xdr::curr::Transaction {
-                source_account: stellar_xdr::curr::MuxedAccount::Ed25519(
-                    v0.tx.source_account_ed25519.clone(),
-                ),
-                fee: v0.tx.fee,
-                seq_num: v0.tx.seq_num.clone(),
-                cond: stellar_xdr::curr::Preconditions::Time(v0.tx.time_bounds.clone().unwrap_or(
-                    stellar_xdr::curr::TimeBounds {
-                        min_time: 0.into(),
-                        max_time: 0.into(),
-                    },
-                )),
-                memo: v0.tx.memo.clone(),
-                operations: v0.tx.operations.clone(),
-                ext: stellar_xdr::curr::TransactionExt::V0,
-            };
-            TransactionSignaturePayload {
-                network_id: stellar_xdr::curr::Hash(network_id_hash.0),
-                tagged_transaction: TransactionSignaturePayloadTaggedTransaction::Tx(tx),
-            }
-        }
-        TransactionEnvelope::Tx(v1) => TransactionSignaturePayload {
-            network_id: stellar_xdr::curr::Hash(network_id_hash.0),
-            tagged_transaction: TransactionSignaturePayloadTaggedTransaction::Tx(v1.tx.clone()),
-        },
-        TransactionEnvelope::TxFeeBump(fee_bump) => TransactionSignaturePayload {
-            network_id: stellar_xdr::curr::Hash(network_id_hash.0),
-            tagged_transaction: TransactionSignaturePayloadTaggedTransaction::TxFeeBump(
-                fee_bump.tx.clone(),
-            ),
-        },
-    };
-
-    // Serialize and hash the payload
-    let payload_bytes = payload.to_xdr(stellar_xdr::curr::Limits::none())?;
-    let payload_hash = sha256(&payload_bytes);
-
-    // Sign the hash
-    let signature = secret_key.sign(&payload_hash.0);
-
-    // Create the decorated signature
-    let public_key = secret_key.public_key();
-    let hint_bytes = public_key.as_bytes();
-    let hint = SignatureHint([
-        hint_bytes[28],
-        hint_bytes[29],
-        hint_bytes[30],
-        hint_bytes[31],
-    ]);
-    let decorated_sig = DecoratedSignature {
-        hint,
-        signature: stellar_xdr::curr::Signature(signature.as_bytes().to_vec().try_into()?),
-    };
-
-    // Add the signature to the envelope
-    // VecM doesn't support direct mutation, so we convert to Vec, modify, and convert back
-    match &mut tx_env {
-        TransactionEnvelope::TxV0(v0) => {
-            let mut sigs: Vec<_> = v0.signatures.to_vec();
-            if sigs.len() >= 20 {
-                anyhow::bail!("Envelope already contains maximum number of signatures");
-            }
-            sigs.push(decorated_sig);
-            v0.signatures = sigs.try_into()?;
-        }
-        TransactionEnvelope::Tx(v1) => {
-            let mut sigs: Vec<_> = v1.signatures.to_vec();
-            if sigs.len() >= 20 {
-                anyhow::bail!("Envelope already contains maximum number of signatures");
-            }
-            sigs.push(decorated_sig);
-            v1.signatures = sigs.try_into()?;
-        }
-        TransactionEnvelope::TxFeeBump(fee_bump) => {
-            let mut sigs: Vec<_> = fee_bump.signatures.to_vec();
-            if sigs.len() >= 20 {
-                anyhow::bail!("Envelope already contains maximum number of signatures");
-            }
-            sigs.push(decorated_sig);
-            fee_bump.signatures = sigs.try_into()?;
-        }
-    }
-
-    // Output the signed envelope
-    let out_bytes = tx_env.to_xdr(stellar_xdr::curr::Limits::none())?;
-    if output_base64 {
-        println!(
-            "{}",
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &out_bytes)
-        );
-    } else {
-        use std::io::Write;
-        std::io::stdout().write_all(&out_bytes)?;
-    }
-
-    Ok(())
-}
-
-/// Convert a secret key to its corresponding public key.
-///
-/// Reads a secret key seed (S...) from stdin and prints the public key.
-/// Equivalent to stellar-core sec-to-pub command.
-fn sec_to_pub() -> anyhow::Result<()> {
-    use henyey_crypto::{encode_account_id, SecretKey};
-
-    eprint!("Secret key seed: ");
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    let secret_str = line.trim();
-
-    let secret_key = SecretKey::from_strkey(secret_str)
-        .map_err(|e| anyhow::anyhow!("Invalid secret key: {:?}", e))?;
-
-    let public_key = secret_key.public_key();
-    println!("{}", encode_account_id(public_key.as_bytes()));
-
-    Ok(())
 }
 
 /// Dump ledger entries from the bucket list to a JSON file.
