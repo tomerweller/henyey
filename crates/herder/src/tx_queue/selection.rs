@@ -1,0 +1,493 @@
+use super::*;
+
+impl TransactionQueue {
+    /// Get a transaction set for the next ledger.
+    ///
+    /// Returns the highest-fee transactions up to the specified limit.
+    pub fn get_transaction_set(
+        &self,
+        previous_ledger_hash: Hash256,
+        max_ops: usize,
+    ) -> TransactionSet {
+        let SelectedTxs { transactions, .. } =
+            self.select_transactions_with_starting_seq(max_ops, None);
+        TransactionSet::new(previous_ledger_hash, transactions)
+    }
+
+    pub fn get_transaction_set_with_starting_seq(
+        &self,
+        previous_ledger_hash: Hash256,
+        max_ops: usize,
+        starting_seq: Option<&HashMap<Vec<u8>, i64>>,
+    ) -> TransactionSet {
+        let SelectedTxs { transactions, .. } =
+            self.select_transactions_with_starting_seq(max_ops, starting_seq);
+        TransactionSet::new(previous_ledger_hash, transactions)
+    }
+
+    /// Build a GeneralizedTransactionSet (protocol 20+) and return it with the correct hash.
+    ///
+    /// The hash is SHA-256 of the XDR-encoded GeneralizedTransactionSet.
+    pub fn build_generalized_tx_set(
+        &self,
+        previous_ledger_hash: Hash256,
+        max_ops: usize,
+    ) -> (TransactionSet, stellar_xdr::curr::GeneralizedTransactionSet) {
+        self.build_generalized_tx_set_with_starting_seq(previous_ledger_hash, max_ops, None)
+    }
+
+    pub fn build_generalized_tx_set_with_starting_seq(
+        &self,
+        previous_ledger_hash: Hash256,
+        max_ops: usize,
+        starting_seq: Option<&HashMap<Vec<u8>, i64>>,
+    ) -> (TransactionSet, stellar_xdr::curr::GeneralizedTransactionSet) {
+        use stellar_xdr::curr::{
+            DependentTxCluster, GeneralizedTransactionSet, ParallelTxExecutionStage,
+            ParallelTxsComponent, TransactionPhase, TxSetComponent,
+            TxSetComponentTxsMaybeDiscountedFee, VecM, WriteXdr,
+        };
+
+        let SelectedTxs {
+            transactions,
+            soroban_limited,
+            dex_limited,
+            classic_limited,
+        } = self.select_transactions_with_starting_seq(max_ops, starting_seq);
+        let base_fee = self.validation_context.read().base_fee as i64;
+        let mut classic_txs = Vec::new();
+        let mut soroban_txs = Vec::new();
+        for tx in &transactions {
+            let frame =
+                henyey_tx::TransactionFrame::with_network(tx.clone(), self.config.network_id);
+            if frame.is_soroban() {
+                soroban_txs.push(tx.clone());
+            } else {
+                classic_txs.push(tx.clone());
+            }
+        }
+
+        sort_txs_by_hash(&mut soroban_txs);
+
+        let mut classic_components: Vec<TxSetComponent> = Vec::new();
+        if !classic_txs.is_empty() {
+            let has_dex_lane = self.config.max_dex_ops.is_some();
+            let lane_count = if has_dex_lane { 2 } else { 1 };
+            let mut lowest_lane_fee = vec![i64::MAX; lane_count];
+            let mut lane_for_tx = Vec::with_capacity(classic_txs.len());
+
+            for tx in &classic_txs {
+                let frame = henyey_tx::TransactionFrame::with_network(
+                    tx.clone(),
+                    self.config.network_id,
+                );
+                let lane = if has_dex_lane && frame.has_dex_operations() {
+                    crate::surge_pricing::DEX_LANE
+                } else {
+                    GENERIC_LANE
+                };
+                if let Some((per_op, _, _)) = envelope_fee_per_op(tx) {
+                    let lane_fee = &mut lowest_lane_fee[lane];
+                    let fee = per_op as i64;
+                    if fee < *lane_fee {
+                        *lane_fee = fee;
+                    }
+                }
+                lane_for_tx.push(lane);
+            }
+
+            let min_lane_fee = lowest_lane_fee
+                .iter()
+                .copied()
+                .filter(|fee| *fee != i64::MAX)
+                .min()
+                .unwrap_or(base_fee);
+            let mut lane_base_fee = vec![base_fee; lane_count];
+            if classic_limited {
+                lane_base_fee.fill(min_lane_fee);
+            }
+            if has_dex_lane && dex_limited {
+                let dex_fee = lowest_lane_fee[crate::surge_pricing::DEX_LANE];
+                if dex_fee != i64::MAX {
+                    lane_base_fee[crate::surge_pricing::DEX_LANE] = dex_fee;
+                }
+            }
+
+            let mut components_by_fee: BTreeMap<i64, Vec<TransactionEnvelope>> = BTreeMap::new();
+            for (tx, lane) in classic_txs.into_iter().zip(lane_for_tx.into_iter()) {
+                let fee = lane_base_fee[lane];
+                components_by_fee.entry(fee).or_default().push(tx);
+            }
+
+            for (fee, mut txs) in components_by_fee {
+                sort_txs_by_hash(&mut txs);
+                classic_components.push(TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                    TxSetComponentTxsMaybeDiscountedFee {
+                        base_fee: Some(fee),
+                        txs: txs.try_into().unwrap_or_default(),
+                    },
+                ));
+            }
+        }
+        let classic_phase = TransactionPhase::V0(classic_components.try_into().unwrap_or_default());
+
+        let soroban_base_fee = if soroban_limited {
+            soroban_txs
+                .iter()
+                .filter_map(|tx| envelope_fee_per_op(tx).map(|(per_op, _, _)| per_op as i64))
+                .min()
+                .or(Some(base_fee))
+        } else if soroban_txs.is_empty() {
+            None
+        } else {
+            Some(base_fee)
+        };
+
+        let use_parallel_builder = !soroban_txs.is_empty()
+            && self.config.ledger_max_instructions > 0
+            && self.config.ledger_max_dependent_tx_clusters > 0
+            && self.config.soroban_phase_max_stage_count > 0;
+
+        let soroban_phase = if soroban_txs.is_empty() {
+            TransactionPhase::V1(ParallelTxsComponent {
+                base_fee: soroban_base_fee,
+                execution_stages: VecM::default(),
+            })
+        } else if use_parallel_builder {
+            let stages = crate::parallel_tx_set_builder::build_parallel_soroban_phase(
+                &soroban_txs,
+                self.config.network_id,
+                self.config.ledger_max_instructions,
+                self.config.ledger_max_dependent_tx_clusters,
+                self.config.soroban_phase_min_stage_count,
+                self.config.soroban_phase_max_stage_count,
+            );
+            crate::parallel_tx_set_builder::stages_to_xdr_phase(stages, soroban_base_fee)
+        } else {
+            let cluster = DependentTxCluster(soroban_txs.try_into().unwrap_or_default());
+            let stage = ParallelTxExecutionStage(vec![cluster].try_into().unwrap_or_default());
+            TransactionPhase::V1(ParallelTxsComponent {
+                base_fee: soroban_base_fee,
+                execution_stages: vec![stage].try_into().unwrap_or_default(),
+            })
+        };
+
+        let gen_tx_set = GeneralizedTransactionSet::V1(stellar_xdr::curr::TransactionSetV1 {
+            previous_ledger_hash: stellar_xdr::curr::Hash(previous_ledger_hash.0),
+            phases: vec![classic_phase, soroban_phase]
+                .try_into()
+                .unwrap_or_default(),
+        });
+
+        // Compute hash as SHA-256 of XDR-encoded GeneralizedTransactionSet
+        let hash = if let Ok(xdr_bytes) = gen_tx_set.to_xdr(stellar_xdr::curr::Limits::none()) {
+            Hash256::hash(&xdr_bytes)
+        } else {
+            Hash256::ZERO
+        };
+
+        let tx_set = TransactionSet::with_generalized(
+            previous_ledger_hash,
+            hash,
+            transactions,
+            gen_tx_set.clone(),
+        );
+        (tx_set, gen_tx_set)
+    }
+
+    #[cfg(test)]
+    pub(super) fn select_transactions(&self, max_ops: usize) -> SelectedTxs {
+        self.select_transactions_with_starting_seq(max_ops, None)
+    }
+
+    fn select_transactions_with_starting_seq(
+        &self,
+        max_ops: usize,
+        starting_seq: Option<&HashMap<Vec<u8>, i64>>,
+    ) -> SelectedTxs {
+        let seed = if cfg!(test) {
+            0
+        } else {
+            rand::thread_rng().gen()
+        };
+        let by_hash = self.by_hash.read();
+        let mut per_account: HashMap<Vec<u8>, Vec<QueuedTransaction>> = HashMap::new();
+
+        for tx in by_hash.values() {
+            if tx.is_expired(self.config.max_age_secs) {
+                continue;
+            }
+            let key = account_key(&tx.envelope);
+            per_account.entry(key).or_default().push(tx.clone());
+        }
+
+        let mut layered: HashMap<Vec<u8>, Vec<QueuedTransaction>> = HashMap::new();
+        for (account, mut txs) in per_account {
+            txs.sort_by(|a, b| {
+                a.sequence_number()
+                    .cmp(&b.sequence_number())
+                    .then_with(|| fee_rate_cmp(b.total_fee, b.op_count, a.total_fee, a.op_count))
+                    .then_with(|| a.hash.0.cmp(&b.hash.0))
+            });
+
+            let mut deduped: HashMap<i64, QueuedTransaction> = HashMap::new();
+            for tx in txs {
+                let seq = tx.sequence_number();
+                match deduped.get(&seq) {
+                    None => {
+                        deduped.insert(seq, tx);
+                    }
+                    Some(existing) => {
+                        let replace = better_fee_ratio(&tx, existing);
+                        if replace {
+                            deduped.insert(seq, tx);
+                        }
+                    }
+                }
+            }
+
+            let mut seqs: Vec<_> = deduped.keys().copied().collect();
+            seqs.sort();
+            let mut contiguous = Vec::new();
+            let mut expected = starting_seq
+                .and_then(|map| map.get(&account).copied())
+                .map(|seq| seq.saturating_add(1));
+            for seq in seqs {
+                if let Some(exp) = expected {
+                    if seq < exp {
+                        continue;
+                    }
+                    if seq != exp {
+                        break;
+                    }
+                }
+                let Some(tx) = deduped.remove(&seq) else {
+                    break;
+                };
+                contiguous.push(tx);
+                expected = Some(seq.saturating_add(1));
+            }
+
+            if !contiguous.is_empty() {
+                layered.insert(account, contiguous);
+            }
+        }
+
+        let max_ops = u32::try_from(max_ops).unwrap_or(u32::MAX);
+        let use_classic_bytes =
+            self.config.max_classic_bytes.is_some() || self.config.max_dex_bytes.is_some();
+        let ledger_version = self.validation_context.read().protocol_version;
+
+        let mut classic_accounts: HashMap<Vec<u8>, Vec<QueuedTransaction>> = HashMap::new();
+        let mut soroban_accounts: HashMap<Vec<u8>, Vec<QueuedTransaction>> = HashMap::new();
+        let mut accounts: Vec<_> = layered.keys().cloned().collect();
+        accounts.sort();
+        for account in accounts {
+            if let Some(txs) = layered.get(&account) {
+                let mut seen_soroban = false;
+                for tx in txs {
+                    let frame = henyey_tx::TransactionFrame::with_network(
+                        tx.envelope.clone(),
+                        self.config.network_id,
+                    );
+                    let is_soroban = frame.is_soroban();
+                    if !seen_soroban {
+                        if is_soroban {
+                            seen_soroban = true;
+                            soroban_accounts
+                                .entry(account.clone())
+                                .or_default()
+                                .push(tx.clone());
+                        } else {
+                            classic_accounts
+                                .entry(account.clone())
+                                .or_default()
+                                .push(tx.clone());
+                        }
+                    } else {
+                        if !is_soroban {
+                            break;
+                        }
+                        soroban_accounts
+                            .entry(account.clone())
+                            .or_default()
+                            .push(tx.clone());
+                    }
+                }
+            }
+        }
+
+        let classic_bytes = self
+            .config
+            .max_classic_bytes
+            .unwrap_or(MAX_CLASSIC_BYTE_ALLOWANCE) as i64;
+        let classic_limit = if use_classic_bytes {
+            Resource::new(vec![max_ops as i64, classic_bytes])
+        } else {
+            Resource::new(vec![max_ops as i64])
+        };
+        let dex_limit = self.config.max_dex_ops.map(|dex_ops| {
+            if use_classic_bytes {
+                // stellar-core uses MAX_CLASSIC_BYTE_ALLOWANCE for the DEX lane byte limit.
+                Resource::new(vec![dex_ops as i64, MAX_CLASSIC_BYTE_ALLOWANCE as i64])
+            } else {
+                Resource::new(vec![dex_ops as i64])
+            }
+        });
+
+        let classic_lane_config = DexLimitingLaneConfig::new(classic_limit, dex_limit);
+        let mut classic_had_not_fitting = Vec::new();
+        let mut classic_queue = SurgePricingPriorityQueue::new(Box::new(classic_lane_config), seed);
+        let mut classic_positions: HashMap<Vec<u8>, usize> = HashMap::new();
+        for (account, txs) in classic_accounts.iter() {
+            if let Some(first) = txs.first() {
+                classic_queue.add(first.clone(), &self.config.network_id, ledger_version);
+                classic_positions.insert(account.clone(), 0);
+            }
+        }
+
+        let mut classic_selected = Vec::new();
+        let lane_count = classic_queue.get_num_lanes();
+        let mut classic_lane_left: Vec<Resource> = (0..lane_count)
+            .map(|lane| classic_queue.lane_limits(lane))
+            .collect();
+        classic_had_not_fitting.resize(lane_count, false);
+        while let Some((lane, entry)) = classic_queue.peek_top() {
+            let frame = henyey_tx::TransactionFrame::with_network(
+                entry.tx.envelope.clone(),
+                self.config.network_id,
+            );
+            let resources = classic_queue.tx_resources(&frame, ledger_version);
+            let exceeds_lane = any_greater(&resources, &classic_lane_left[lane]);
+            let exceeds_generic = any_greater(&resources, &classic_lane_left[GENERIC_LANE]);
+            if exceeds_lane || exceeds_generic {
+                if exceeds_lane {
+                    classic_had_not_fitting[lane] = true;
+                } else {
+                    classic_had_not_fitting[GENERIC_LANE] = true;
+                }
+                classic_queue.remove_entry(lane, &entry, ledger_version, &self.config.network_id);
+                continue;
+            }
+
+            classic_selected.push(entry.tx.clone());
+            classic_lane_left[GENERIC_LANE] -= resources.clone();
+            if lane != GENERIC_LANE {
+                classic_lane_left[lane] -= resources;
+            }
+
+            classic_queue.remove_entry(lane, &entry, ledger_version, &self.config.network_id);
+            let account = account_key(&entry.tx.envelope);
+            if let Some(txs) = classic_accounts.get(&account) {
+                let next_index = classic_positions
+                    .get(&account)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                if next_index < txs.len() {
+                    classic_positions.insert(account.clone(), next_index);
+                    classic_queue.add(
+                        txs[next_index].clone(),
+                        &self.config.network_id,
+                        ledger_version,
+                    );
+                }
+            }
+        }
+        let classic_limited = classic_had_not_fitting
+            .get(GENERIC_LANE)
+            .copied()
+            .unwrap_or(false);
+        let dex_limited = classic_had_not_fitting
+            .get(crate::surge_pricing::DEX_LANE)
+            .copied()
+            .unwrap_or(false);
+
+        let mut soroban_limit = self.config.max_soroban_resources.clone();
+        if soroban_limit.is_none() {
+            if let Some(byte_limit) = self.config.max_soroban_bytes {
+                let mut values = vec![i64::MAX; NUM_SOROBAN_TX_RESOURCES];
+                values[ResourceType::TxByteSize as usize] = byte_limit as i64;
+                soroban_limit = Some(Resource::new(values));
+            }
+        }
+        if let (Some(limit), Some(byte_limit)) =
+            (soroban_limit.as_mut(), self.config.max_soroban_bytes)
+        {
+            let current = limit.get_val(ResourceType::TxByteSize);
+            let clamped = (byte_limit as i64).min(current);
+            limit.set_val(ResourceType::TxByteSize, clamped);
+        }
+        let (soroban_selected, soroban_limited) = if let Some(limit) = soroban_limit {
+            let mut had_not_fitting = [false];
+            let lane_config = SorobanGenericLaneConfig::new(limit);
+            let mut queue = SurgePricingPriorityQueue::new(Box::new(lane_config), seed);
+            let mut positions: HashMap<Vec<u8>, usize> = HashMap::new();
+            for (account, txs) in soroban_accounts.iter() {
+                if let Some(first) = txs.first() {
+                    queue.add(first.clone(), &self.config.network_id, ledger_version);
+                    positions.insert(account.clone(), 0);
+                }
+            }
+
+            let mut selected = Vec::new();
+            let mut lane_left = [queue.lane_limits(GENERIC_LANE)];
+            while let Some((lane, entry)) = queue.peek_top() {
+                let frame = henyey_tx::TransactionFrame::with_network(
+                    entry.tx.envelope.clone(),
+                    self.config.network_id,
+                );
+                let resources = queue.tx_resources(&frame, ledger_version);
+                let exceeds = any_greater(&resources, &lane_left[GENERIC_LANE]);
+                if exceeds {
+                    had_not_fitting[GENERIC_LANE] = true;
+                    queue.remove_entry(lane, &entry, ledger_version, &self.config.network_id);
+                    continue;
+                }
+                selected.push(entry.tx.clone());
+                lane_left[GENERIC_LANE] -= resources;
+                queue.remove_entry(lane, &entry, ledger_version, &self.config.network_id);
+                let account = account_key(&entry.tx.envelope);
+                if let Some(txs) = soroban_accounts.get(&account) {
+                    let next_index = positions
+                        .get(&account)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    if next_index < txs.len() {
+                        positions.insert(account.clone(), next_index);
+                        queue.add(
+                            txs[next_index].clone(),
+                            &self.config.network_id,
+                            ledger_version,
+                        );
+                    }
+                }
+            }
+            let limited = had_not_fitting.get(GENERIC_LANE).copied().unwrap_or(false);
+            (selected, limited)
+        } else {
+            let mut selected = Vec::new();
+            let mut accounts: Vec<_> = soroban_accounts.keys().cloned().collect();
+            accounts.sort();
+            for account in accounts {
+                if let Some(txs) = soroban_accounts.get(&account) {
+                    selected.extend(txs.iter().cloned());
+                }
+            }
+            (selected, false)
+        };
+
+        let mut transactions = Vec::new();
+        transactions.extend(classic_selected.into_iter().map(|tx| tx.envelope.clone()));
+        transactions.extend(soroban_selected.into_iter().map(|tx| tx.envelope.clone()));
+
+        SelectedTxs {
+            transactions,
+            soroban_limited,
+            dex_limited,
+            classic_limited,
+        }
+    }
+
+}
