@@ -764,6 +764,272 @@ impl TransactionQueue {
             .map(|evictions| evictions.into_iter().collect())
     }
 
+    /// Check per-account limit: one pending transaction per sequence-number source.
+    ///
+    /// Returns `Ok(None)` if no existing transaction, `Ok(Some(replaced))` if a
+    /// fee-bump replacement is valid, or `Err(result)` for early rejection.
+    fn check_account_limit(
+        &self,
+        queued: &QueuedTransaction,
+        seq_source_key: &[u8],
+        new_seq: i64,
+        is_fee_bump: bool,
+    ) -> std::result::Result<Option<QueuedTransaction>, TxQueueResult> {
+        let account_states = self.account_states.read();
+        if let Some(state) = account_states.get(seq_source_key) {
+            if let Some(ref timestamped) = state.transaction {
+                let current_tx = &timestamped.tx;
+
+                if current_tx.hash == queued.hash {
+                    return Err(TxQueueResult::Duplicate);
+                }
+
+                let current_seq = envelope_seq_num(&current_tx.envelope);
+                if new_seq < current_seq {
+                    return Err(TxQueueResult::Invalid);
+                }
+
+                if !is_fee_bump {
+                    return Err(TxQueueResult::TryAgainLater);
+                }
+
+                if new_seq != current_seq {
+                    return Err(TxQueueResult::TryAgainLater);
+                }
+
+                if let Err(_min_fee) = can_replace_by_fee(
+                    queued.total_fee,
+                    queued.op_count,
+                    current_tx.total_fee,
+                    current_tx.op_count,
+                ) {
+                    return Err(TxQueueResult::FeeTooLow);
+                }
+
+                return Ok(Some(current_tx.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Check lane-based eviction fees and collect evictions for all applicable lanes.
+    ///
+    /// Returns the list of transactions to evict, or an early rejection result.
+    fn check_and_collect_evictions(
+        &self,
+        by_hash: &HashMap<Hash256, QueuedTransaction>,
+        queued: &QueuedTransaction,
+        queued_is_soroban: bool,
+        queued_frame: &henyey_tx::TransactionFrame,
+        ledger_version: u32,
+        seed: u64,
+    ) -> std::result::Result<Vec<QueuedTransaction>, TxQueueResult> {
+        // Phase 1: Check minimum inclusion fee for each lane (cheap, read-only)
+        if !queued_is_soroban
+            && (self.config.max_queue_classic_bytes.is_some()
+                || self.config.max_queue_dex_ops.is_some())
+        {
+            let use_bytes = self.config.max_queue_classic_bytes.is_some();
+            let ops_limit = i64::MAX;
+            let generic_limit = if use_bytes {
+                let bytes_limit = self.config.max_queue_classic_bytes.unwrap_or(u32::MAX) as i64;
+                Resource::new(vec![ops_limit, bytes_limit])
+            } else {
+                Resource::new(vec![ops_limit])
+            };
+            let dex_limit = self.config.max_queue_dex_ops.map(|dex_ops| {
+                if use_bytes {
+                    Resource::new(vec![dex_ops as i64, MAX_CLASSIC_BYTE_ALLOWANCE as i64])
+                } else {
+                    Resource::new(vec![dex_ops as i64])
+                }
+            });
+            let lane_config = DexLimitingLaneConfig::new(generic_limit.clone(), dex_limit.clone());
+            let lane = lane_config.get_lane(queued_frame);
+            {
+                let mut lane_fees = self.classic_lane_evicted_inclusion_fee.write();
+                if lane_fees.len() != lane_config.lane_limits().len() {
+                    lane_fees.resize(lane_config.lane_limits().len(), (0, 0));
+                }
+                let global_fee = *self.global_evicted_inclusion_fee.read();
+                let mut min_fee = min_inclusion_fee_to_beat(lane_fees[lane], queued);
+                min_fee = min_fee.max(min_inclusion_fee_to_beat(lane_fees[GENERIC_LANE], queued));
+                if self.config.max_queue_ops.is_some() {
+                    min_fee = min_fee.max(min_inclusion_fee_to_beat(global_fee, queued));
+                }
+                if min_fee > 0 {
+                    return Err(TxQueueResult::FeeTooLow);
+                }
+            }
+        }
+
+        if queued_is_soroban {
+            if let Some(limit) = &self.config.max_queue_soroban_resources {
+                let lane_config = SorobanGenericLaneConfig::new(limit.clone());
+                let lane = lane_config.get_lane(queued_frame);
+                {
+                    let mut lane_fees = self.soroban_lane_evicted_inclusion_fee.write();
+                    if lane_fees.len() != lane_config.lane_limits().len() {
+                        lane_fees.resize(lane_config.lane_limits().len(), (0, 0));
+                    }
+                    let global_fee = *self.global_evicted_inclusion_fee.read();
+                    let mut min_fee = min_inclusion_fee_to_beat(lane_fees[lane], queued);
+                    min_fee =
+                        min_fee.max(min_inclusion_fee_to_beat(lane_fees[GENERIC_LANE], queued));
+                    if self.config.max_queue_ops.is_some() {
+                        min_fee = min_fee.max(min_inclusion_fee_to_beat(global_fee, queued));
+                    }
+                    if min_fee > 0 {
+                        return Err(TxQueueResult::FeeTooLow);
+                    }
+                }
+            }
+        }
+
+        if self.config.max_queue_ops.is_some() {
+            let global_fee = *self.global_evicted_inclusion_fee.read();
+            if min_inclusion_fee_to_beat(global_fee, queued) > 0 {
+                return Err(TxQueueResult::FeeTooLow);
+            }
+        }
+
+        // Phase 2: Collect evictions (more expensive, involves scanning queue)
+        let mut pending_evictions: HashSet<Hash256> = HashSet::new();
+        let mut pending_eviction_list: Vec<QueuedTransaction> = Vec::new();
+
+        if !queued_is_soroban
+            && (self.config.max_queue_classic_bytes.is_some()
+                || self.config.max_queue_dex_ops.is_some())
+        {
+            let use_bytes = self.config.max_queue_classic_bytes.is_some();
+            let ops_limit = i64::MAX;
+            let generic_limit = if use_bytes {
+                let bytes_limit = self.config.max_queue_classic_bytes.unwrap_or(u32::MAX) as i64;
+                Resource::new(vec![ops_limit, bytes_limit])
+            } else {
+                Resource::new(vec![ops_limit])
+            };
+            let dex_limit = self.config.max_queue_dex_ops.map(|dex_ops| {
+                if use_bytes {
+                    Resource::new(vec![dex_ops as i64, MAX_CLASSIC_BYTE_ALLOWANCE as i64])
+                } else {
+                    Resource::new(vec![dex_ops as i64])
+                }
+            });
+            let lane_config = DexLimitingLaneConfig::new(generic_limit.clone(), dex_limit.clone());
+            let filter = |tx: &QueuedTransaction| {
+                let frame = henyey_tx::TransactionFrame::with_network(
+                    tx.envelope.clone(),
+                    self.config.network_id,
+                );
+                !frame.is_soroban()
+            };
+            let Some(evictions) = self.collect_evictions_for_lane_config(
+                by_hash,
+                queued,
+                Box::new(lane_config),
+                ledger_version,
+                &pending_evictions,
+                filter,
+                seed,
+            ) else {
+                return Err(TxQueueResult::QueueFull);
+            };
+            let lane_config = DexLimitingLaneConfig::new(generic_limit, dex_limit);
+            for (evicted, evicted_due_to_lane_limit) in evictions {
+                if !pending_evictions.insert(evicted.hash) {
+                    continue;
+                }
+                pending_eviction_list.push(evicted.clone());
+                let frame = henyey_tx::TransactionFrame::with_network(
+                    evicted.envelope.clone(),
+                    self.config.network_id,
+                );
+                let lane = lane_config.get_lane(&frame);
+                let mut lane_fees = self.classic_lane_evicted_inclusion_fee.write();
+                if lane_fees.len() != lane_config.lane_limits().len() {
+                    lane_fees.resize(lane_config.lane_limits().len(), (0, 0));
+                }
+                if evicted_due_to_lane_limit {
+                    lane_fees[lane] = (evicted.total_fee, evicted.op_count);
+                } else {
+                    lane_fees[GENERIC_LANE] = (evicted.total_fee, evicted.op_count);
+                }
+            }
+        }
+
+        if queued_is_soroban {
+            if let Some(limit) = &self.config.max_queue_soroban_resources {
+                let lane_config = SorobanGenericLaneConfig::new(limit.clone());
+                let filter = |tx: &QueuedTransaction| {
+                    let frame = henyey_tx::TransactionFrame::with_network(
+                        tx.envelope.clone(),
+                        self.config.network_id,
+                    );
+                    frame.is_soroban()
+                };
+                let Some(evictions) = self.collect_evictions_for_lane_config(
+                    by_hash,
+                    queued,
+                    Box::new(lane_config),
+                    ledger_version,
+                    &pending_evictions,
+                    filter,
+                    seed,
+                ) else {
+                    return Err(TxQueueResult::QueueFull);
+                };
+                let lane_config = SorobanGenericLaneConfig::new(limit.clone());
+                for (evicted, evicted_due_to_lane_limit) in evictions {
+                    if !pending_evictions.insert(evicted.hash) {
+                        continue;
+                    }
+                    pending_eviction_list.push(evicted.clone());
+                    let frame = henyey_tx::TransactionFrame::with_network(
+                        evicted.envelope.clone(),
+                        self.config.network_id,
+                    );
+                    let lane = lane_config.get_lane(&frame);
+                    let mut lane_fees = self.soroban_lane_evicted_inclusion_fee.write();
+                    if lane_fees.len() != lane_config.lane_limits().len() {
+                        lane_fees.resize(lane_config.lane_limits().len(), (0, 0));
+                    }
+                    if evicted_due_to_lane_limit {
+                        lane_fees[lane] = (evicted.total_fee, evicted.op_count);
+                    } else {
+                        lane_fees[GENERIC_LANE] = (evicted.total_fee, evicted.op_count);
+                    }
+                }
+            }
+        }
+
+        if let Some(limit) = self.config.max_queue_ops {
+            let lane_config = OpsOnlyLaneConfig::new(Resource::new(vec![limit as i64]));
+            let filter = |_tx: &QueuedTransaction| true;
+            let Some(evictions) = self.collect_evictions_for_lane_config(
+                by_hash,
+                queued,
+                Box::new(lane_config),
+                ledger_version,
+                &pending_evictions,
+                filter,
+                seed,
+            ) else {
+                return Err(TxQueueResult::QueueFull);
+            };
+            for (evicted, _evicted_due_to_lane_limit) in evictions {
+                if !pending_evictions.insert(evicted.hash) {
+                    continue;
+                }
+                pending_eviction_list.push(evicted.clone());
+                let mut global_fee = self.global_evicted_inclusion_fee.write();
+                *global_fee = (evicted.total_fee, evicted.op_count);
+            }
+        }
+
+        Ok(pending_eviction_list)
+    }
+
     /// Try to add a transaction to the queue.
     pub fn try_add(&self, envelope: TransactionEnvelope) -> TxQueueResult {
         // Validate transaction before queueing
@@ -819,260 +1085,28 @@ impl TransactionQueue {
         let is_fee_bump = is_fee_bump_envelope(&queued.envelope);
         let new_fee_source_key = fee_source_key(&queued.envelope);
 
-        // Track the transaction being replaced (for fee-bump replace-by-fee)
-        let mut replaced_tx: Option<QueuedTransaction> = None;
+        let replaced_tx = match self.check_account_limit(&queued, &seq_source_key, new_seq, is_fee_bump) {
+            Ok(replaced) => replaced,
+            Err(result) => return result,
+        };
 
-        {
-            let account_states = self.account_states.read();
-            if let Some(state) = account_states.get(&seq_source_key) {
-                if let Some(ref timestamped) = state.transaction {
-                    let current_tx = &timestamped.tx;
-
-                    // Check if it's a duplicate (same hash)
-                    if current_tx.hash == queued.hash {
-                        return TxQueueResult::Duplicate;
-                    }
-
-                    // Any transaction older than the current one is invalid
-                    let current_seq = envelope_seq_num(&current_tx.envelope);
-                    if new_seq < current_seq {
-                        return TxQueueResult::Invalid;
-                    }
-
-                    // If not a fee-bump, reject (only one tx per account allowed)
-                    if !is_fee_bump {
-                        return TxQueueResult::TryAgainLater;
-                    }
-
-                    // Fee-bump must have the same sequence number to replace
-                    if new_seq != current_seq {
-                        return TxQueueResult::TryAgainLater;
-                    }
-
-                    // Check if fee-bump meets the 10x fee multiplier requirement
-                    if let Err(_min_fee) = can_replace_by_fee(
-                        queued.total_fee,
-                        queued.op_count,
-                        current_tx.total_fee,
-                        current_tx.op_count,
-                    ) {
-                        // Fee is insufficient for replace-by-fee
-                        return TxQueueResult::FeeTooLow;
-                    }
-
-                    // Fee-bump replacement is valid - mark the current tx for replacement
-                    replaced_tx = Some(current_tx.clone());
-                }
-            }
-        }
-
-        let mut pending_evictions: HashSet<Hash256> = HashSet::new();
-        let mut pending_eviction_list: Vec<QueuedTransaction> = Vec::new();
         let seed = if cfg!(test) {
             0
         } else {
             rand::thread_rng().gen()
         };
 
-        if !queued_is_soroban
-            && (self.config.max_queue_classic_bytes.is_some()
-                || self.config.max_queue_dex_ops.is_some())
-        {
-            let use_bytes = self.config.max_queue_classic_bytes.is_some();
-            let ops_limit = i64::MAX;
-            let generic_limit = if use_bytes {
-                let bytes_limit = self.config.max_queue_classic_bytes.unwrap_or(u32::MAX) as i64;
-                Resource::new(vec![ops_limit, bytes_limit])
-            } else {
-                Resource::new(vec![ops_limit])
-            };
-            let dex_limit = self.config.max_queue_dex_ops.map(|dex_ops| {
-                if use_bytes {
-                    // stellar-core uses MAX_CLASSIC_BYTE_ALLOWANCE for the DEX lane byte limit.
-                    Resource::new(vec![dex_ops as i64, MAX_CLASSIC_BYTE_ALLOWANCE as i64])
-                } else {
-                    Resource::new(vec![dex_ops as i64])
-                }
-            });
-            let lane_config = DexLimitingLaneConfig::new(generic_limit.clone(), dex_limit.clone());
-            let lane = lane_config.get_lane(&queued_frame);
-            {
-                let mut lane_fees = self.classic_lane_evicted_inclusion_fee.write();
-                if lane_fees.len() != lane_config.lane_limits().len() {
-                    lane_fees.resize(lane_config.lane_limits().len(), (0, 0));
-                }
-                let global_fee = *self.global_evicted_inclusion_fee.read();
-                let mut min_fee = min_inclusion_fee_to_beat(lane_fees[lane], &queued);
-                min_fee = min_fee.max(min_inclusion_fee_to_beat(lane_fees[GENERIC_LANE], &queued));
-                if self.config.max_queue_ops.is_some() {
-                    min_fee = min_fee.max(min_inclusion_fee_to_beat(global_fee, &queued));
-                }
-                if min_fee > 0 {
-                    return TxQueueResult::FeeTooLow;
-                }
-            }
-        }
-
-        if queued_is_soroban {
-            if let Some(limit) = &self.config.max_queue_soroban_resources {
-                let lane_config = SorobanGenericLaneConfig::new(limit.clone());
-                let lane = lane_config.get_lane(&queued_frame);
-                {
-                    let mut lane_fees = self.soroban_lane_evicted_inclusion_fee.write();
-                    if lane_fees.len() != lane_config.lane_limits().len() {
-                        lane_fees.resize(lane_config.lane_limits().len(), (0, 0));
-                    }
-                    let global_fee = *self.global_evicted_inclusion_fee.read();
-                    let mut min_fee = min_inclusion_fee_to_beat(lane_fees[lane], &queued);
-                    min_fee =
-                        min_fee.max(min_inclusion_fee_to_beat(lane_fees[GENERIC_LANE], &queued));
-                    if self.config.max_queue_ops.is_some() {
-                        min_fee = min_fee.max(min_inclusion_fee_to_beat(global_fee, &queued));
-                    }
-                    if min_fee > 0 {
-                        return TxQueueResult::FeeTooLow;
-                    }
-                }
-            }
-        }
-
-        if self.config.max_queue_ops.is_some() {
-            let global_fee = *self.global_evicted_inclusion_fee.read();
-            if min_inclusion_fee_to_beat(global_fee, &queued) > 0 {
-                return TxQueueResult::FeeTooLow;
-            }
-        }
-
-        if !queued_is_soroban
-            && (self.config.max_queue_classic_bytes.is_some()
-                || self.config.max_queue_dex_ops.is_some())
-        {
-            let use_bytes = self.config.max_queue_classic_bytes.is_some();
-            let ops_limit = i64::MAX;
-            let generic_limit = if use_bytes {
-                let bytes_limit = self.config.max_queue_classic_bytes.unwrap_or(u32::MAX) as i64;
-                Resource::new(vec![ops_limit, bytes_limit])
-            } else {
-                Resource::new(vec![ops_limit])
-            };
-            let dex_limit = self.config.max_queue_dex_ops.map(|dex_ops| {
-                if use_bytes {
-                    // stellar-core uses MAX_CLASSIC_BYTE_ALLOWANCE for the DEX lane byte limit.
-                    Resource::new(vec![dex_ops as i64, MAX_CLASSIC_BYTE_ALLOWANCE as i64])
-                } else {
-                    Resource::new(vec![dex_ops as i64])
-                }
-            });
-            let lane_config = DexLimitingLaneConfig::new(generic_limit.clone(), dex_limit.clone());
-            let filter = |tx: &QueuedTransaction| {
-                let frame = henyey_tx::TransactionFrame::with_network(
-                    tx.envelope.clone(),
-                    self.config.network_id,
-                );
-                !frame.is_soroban()
-            };
-            let Some(evictions) = self.collect_evictions_for_lane_config(
-                &by_hash,
-                &queued,
-                Box::new(lane_config),
-                ledger_version,
-                &pending_evictions,
-                filter,
-                seed,
-            ) else {
-                return TxQueueResult::QueueFull;
-            };
-            let lane_config = DexLimitingLaneConfig::new(generic_limit, dex_limit);
-            for (evicted, evicted_due_to_lane_limit) in evictions {
-                if !pending_evictions.insert(evicted.hash) {
-                    continue;
-                }
-                pending_eviction_list.push(evicted.clone());
-                let frame = henyey_tx::TransactionFrame::with_network(
-                    evicted.envelope.clone(),
-                    self.config.network_id,
-                );
-                let lane = lane_config.get_lane(&frame);
-                let mut lane_fees = self.classic_lane_evicted_inclusion_fee.write();
-                if lane_fees.len() != lane_config.lane_limits().len() {
-                    lane_fees.resize(lane_config.lane_limits().len(), (0, 0));
-                }
-                if evicted_due_to_lane_limit {
-                    lane_fees[lane] = (evicted.total_fee, evicted.op_count);
-                } else {
-                    lane_fees[GENERIC_LANE] = (evicted.total_fee, evicted.op_count);
-                }
-            }
-        }
-
-        if queued_is_soroban {
-            if let Some(limit) = &self.config.max_queue_soroban_resources {
-                let lane_config = SorobanGenericLaneConfig::new(limit.clone());
-                let filter = |tx: &QueuedTransaction| {
-                    let frame = henyey_tx::TransactionFrame::with_network(
-                        tx.envelope.clone(),
-                        self.config.network_id,
-                    );
-                    frame.is_soroban()
-                };
-                let Some(evictions) = self.collect_evictions_for_lane_config(
-                    &by_hash,
-                    &queued,
-                    Box::new(lane_config),
-                    ledger_version,
-                    &pending_evictions,
-                    filter,
-                    seed,
-                ) else {
-                    return TxQueueResult::QueueFull;
-                };
-                let lane_config = SorobanGenericLaneConfig::new(limit.clone());
-                for (evicted, evicted_due_to_lane_limit) in evictions {
-                    if !pending_evictions.insert(evicted.hash) {
-                        continue;
-                    }
-                    pending_eviction_list.push(evicted.clone());
-                    let frame = henyey_tx::TransactionFrame::with_network(
-                        evicted.envelope.clone(),
-                        self.config.network_id,
-                    );
-                    let lane = lane_config.get_lane(&frame);
-                    let mut lane_fees = self.soroban_lane_evicted_inclusion_fee.write();
-                    if lane_fees.len() != lane_config.lane_limits().len() {
-                        lane_fees.resize(lane_config.lane_limits().len(), (0, 0));
-                    }
-                    if evicted_due_to_lane_limit {
-                        lane_fees[lane] = (evicted.total_fee, evicted.op_count);
-                    } else {
-                        lane_fees[GENERIC_LANE] = (evicted.total_fee, evicted.op_count);
-                    }
-                }
-            }
-        }
-
-        if let Some(limit) = self.config.max_queue_ops {
-            let lane_config = OpsOnlyLaneConfig::new(Resource::new(vec![limit as i64]));
-            let filter = |_tx: &QueuedTransaction| true;
-            let Some(evictions) = self.collect_evictions_for_lane_config(
-                &by_hash,
-                &queued,
-                Box::new(lane_config),
-                ledger_version,
-                &pending_evictions,
-                filter,
-                seed,
-            ) else {
-                return TxQueueResult::QueueFull;
-            };
-            for (evicted, _evicted_due_to_lane_limit) in evictions {
-                if !pending_evictions.insert(evicted.hash) {
-                    continue;
-                }
-                pending_eviction_list.push(evicted.clone());
-                let mut global_fee = self.global_evicted_inclusion_fee.write();
-                *global_fee = (evicted.total_fee, evicted.op_count);
-            }
-        }
+        let pending_eviction_list = match self.check_and_collect_evictions(
+            &by_hash,
+            &queued,
+            queued_is_soroban,
+            &queued_frame,
+            ledger_version,
+            seed,
+        ) {
+            Ok(evictions) => evictions,
+            Err(result) => return result,
+        };
 
         for evicted in pending_eviction_list {
             by_hash.remove(&evicted.hash);
