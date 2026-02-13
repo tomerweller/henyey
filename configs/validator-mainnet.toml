@@ -1,6 +1,10 @@
+# henyey Mainnet Validator Configuration
+
 [node]
-name = "henyey-mainnet"
-is_validator = false
+name = "henyey-mainnet-validator"
+is_validator = true
+node_seed = "SD5LY6J7V4PMGED7T236IEFZJCZKT2HM2GJCOC6QNFHWZCDZMMHG3SC7"
+max_tx_set_size = 1000
 
 # Mainnet tier 1 validators organized by organization
 # 7 orgs, require 5-of-7 (72%) agreement at top level
@@ -151,6 +155,9 @@ known_peers = [
     "lyra.publicnode.org:11625",
 ]
 preferred_peers = []
+
+[http]
+port = 11627
 
 [logging]
 level = "info"

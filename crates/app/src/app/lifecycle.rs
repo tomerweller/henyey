@@ -600,11 +600,12 @@ impl App {
         self.store_config_peers();
 
         // Create local node info
-        let local_node = if self.config.network.passphrase.contains("Test") {
+        let mut local_node = if self.config.network.passphrase.contains("Test") {
             LocalNode::new_testnet(self.keypair.clone())
         } else {
             LocalNode::new_mainnet(self.keypair.clone())
         };
+        local_node.listening_port = self.config.overlay.peer_port;
 
         // Start with testnet or mainnet defaults
         let mut overlay_config = if self.config.network.passphrase.contains("Test") {

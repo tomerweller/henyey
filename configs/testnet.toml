@@ -34,7 +34,7 @@ validators = [
 passphrase = "Test SDF Network ; September 2015"
 
 # Peer-to-peer port
-peer_port = 11625
+peer_port = 8009
 
 # HTTP admin port (0 to disable)
 http_port = 11626

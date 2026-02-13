@@ -60,7 +60,7 @@ url = "https://history.stellar.org/prd/core-testnet/core_testnet_003"
 
 [overlay]
 # Port to listen on for peer connections
-peer_port = 11625
+peer_port = 8009
 
 # Maximum inbound/outbound peer connections
 max_inbound_peers = 64
