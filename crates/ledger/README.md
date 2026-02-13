@@ -4,78 +4,69 @@ Ledger state management and ledger close pipeline for henyey.
 
 ## Overview
 
-This crate provides the core ledger state management for the Stellar network. It coordinates between transaction execution, bucket list updates, and ledger metadata generation to process ledger closes.
+This crate provides the core ledger state management for the Stellar network,
+coordinating transaction execution, bucket list updates, state snapshots, and
+metadata generation during ledger close. It corresponds to stellar-core's
+`src/ledger/` directory and the `LedgerManager` / `LedgerTxn` subsystem.
 
-### Key Responsibilities
-
-- **Ledger Close Pipeline**: Orchestrates the complete ledger close process from receiving externalized transaction sets to committing the new state
-- **State Management**: Maintains ledger entries through the bucket list Merkle tree
-- **Transaction Execution**: Bridges to `henyey-tx` for per-transaction processing
-- **Invariant Validation**: Enforces ledger consistency rules after each close
-- **Snapshots**: Provides consistent point-in-time views for concurrent access
+The crate sits between the consensus layer (`henyey-scp`, which externalizes
+transaction sets) and the persistence layer (`henyey-bucket`, which stores
+entries). It also bridges to `henyey-tx` for per-transaction execution.
 
 ## Architecture
 
-```
-                 +-----------------+
-                 | LedgerManager   |
-                 |  (coordinator)  |
-                 +--------+--------+
-                          |
-          +---------------+---------------+
-          |               |               |
-   +------+------+ +------+------+ +------+------+
-   | BucketList  | | Snapshots   | | InvariantMgr|
-   | (Merkle tree)| | (point-in-  | | (validation)|
-   |             | | time views) | |             |
-   +-------------+ +-------------+ +-------------+
-          |
-   +------+------+
-   | LedgerClose |
-   | Context     |
-   | (per-close) |
-   +------+------+
-          |
-   +------+------+
-   | Transaction |
-   | Executor    |
-   +-------------+
+```mermaid
+graph TD
+    SCP["SCP (externalized value)"]
+    LCD["LedgerCloseData"]
+    LM["LedgerManager"]
+    SNAP["LedgerSnapshot"]
+    EXEC["TransactionExecutor"]
+    TX["henyey-tx"]
+    DELTA["LedgerDelta"]
+    BL["henyey-bucket"]
+    RESULT["LedgerCloseResult"]
+    SOROBAN["InMemorySorobanState"]
+
+    SCP --> LCD
+    LCD --> LM
+    LM --> SNAP
+    SNAP --> EXEC
+    EXEC --> TX
+    TX --> DELTA
+    DELTA --> LM
+    LM --> BL
+    LM --> RESULT
+    LM --> SOROBAN
 ```
 
 ## Key Types
 
-### Core Types
-
 | Type | Description |
 |------|-------------|
-| `LedgerManager` | Central coordinator for all ledger operations |
-| `LedgerCloseContext` | Context for processing a single ledger close |
-| `LedgerCloseData` | Input data from SCP (tx set, close time, upgrades) |
+| `LedgerManager` | Central coordinator for ledger state and close operations |
+| `LedgerManagerConfig` | Configuration for the ledger manager (invariant toggles, etc.) |
+| `LedgerCloseData` | Input data from SCP (transaction set, close time, upgrades) |
 | `LedgerCloseResult` | Output from a successful close (header, results, meta) |
-
-### State Types
-
-| Type | Description |
-|------|-------------|
-| `LedgerDelta` | Accumulator for state changes during close |
-| `EntryChange` | Single entry change (create/update/delete) |
-| `LedgerSnapshot` | Immutable point-in-time view of state |
-| `SnapshotHandle` | Thread-safe wrapper with lazy loading support |
-
-### Utility Types
-
-| Type | Description |
-|------|-------------|
-| `LedgerInfo` | Simplified view of ledger header fields |
-| `TransactionSetVariant` | Classic or generalized transaction set |
-| `LedgerCloseStats` | Statistics from ledger processing |
+| `LedgerDelta` | Accumulates state changes during a single ledger close |
+| `EntryChange` | Single entry change with coalescing semantics (create/update/delete) |
+| `LedgerSnapshot` | Immutable point-in-time view of ledger state |
+| `SnapshotHandle` | Thread-safe wrapper with optional lazy-loading lookup functions |
+| `SnapshotBuilder` | Fluent API for constructing snapshots |
+| `LedgerInfo` | Simplified flattened view of ledger header fields |
+| `TransactionSetVariant` | Classic or generalized (v1) transaction set |
+| `LedgerCloseStats` | Statistics from ledger close processing |
+| `ConfigUpgradeSetFrame` | Loads, validates, and applies Soroban config upgrades |
+| `InMemorySorobanState` | In-memory cache for contract data/code with co-located TTLs |
+| `SharedSorobanState` | Thread-safe `RwLock` wrapper around `InMemorySorobanState` |
+| `SorobanNetworkInfo` | Network-level Soroban configuration (passphrase, limits) |
 
 ## Usage
 
 ### Basic Ledger Close
 
-```rust
-use henyey_ledger::{LedgerManager, LedgerManagerConfig, LedgerCloseData, TransactionSetVariant};
+```rust,ignore
+use henyey_ledger::{LedgerManager, LedgerManagerConfig, LedgerCloseData};
 
 // Create and initialize the ledger manager
 let manager = LedgerManager::new(network_passphrase, LedgerManagerConfig::default());
@@ -83,125 +74,113 @@ manager.initialize(bucket_list, hot_archive_bucket_list, header, header_hash)?;
 
 // Close a ledger with externalized data
 let close_data = LedgerCloseData::new(
-    ledger_seq,
-    tx_set,
-    close_time,
-    prev_ledger_hash,
+    ledger_seq, tx_set, close_time, prev_ledger_hash,
 );
 let result = manager.close_ledger(close_data)?;
-println!("Closed ledger {} with hash {}",
-    result.header.ledger_seq,
-    result.header_hash.to_hex());
+println!("Closed ledger {}", result.header.ledger_seq);
 ```
 
 ### Fee and Reserve Calculations
 
-```rust
-use henyey_ledger::{fees, reserves};
+```rust,ignore
+use henyey_ledger::{fees, reserves, trustlines};
 
-// Calculate transaction fee
+// Transaction fees
 let fee = fees::calculate_fee(&tx, base_fee);
+assert!(fees::can_afford_fee(&account, fee));
 
-// Check if account can pay fee
-if fees::can_afford_fee(&account, fee) {
-    // Process transaction
-}
-
-// Calculate minimum balance
+// Account reserves
 let min_balance = reserves::minimum_balance(&account, base_reserve);
-
-// Check available balance for sending
 let available = reserves::available_to_send(&account, base_reserve);
+
+// Trustline liabilities
+let can_send = trustlines::available_to_send(&trustline);
+let can_receive = trustlines::available_to_receive(&trustline);
 ```
 
 ### Working with Snapshots
 
-```rust
+```rust,ignore
 use henyey_ledger::{SnapshotBuilder, SnapshotHandle};
 
-// Build a snapshot with specific entries
 let snapshot = SnapshotBuilder::new(ledger_seq)
     .with_header(header, header_hash)
     .add_entry(key, entry)?
     .build()?;
 
-// Create a handle with lazy loading
-let handle = SnapshotHandle::with_lookup(snapshot, bucket_list_lookup);
-
-// Query entries (falls back to bucket list if not cached)
+// Wrap with lazy bucket-list fallback
+let handle = SnapshotHandle::with_lookup(snapshot, lookup_fn);
 let entry = handle.get_entry(&key)?;
 ```
 
-## Module Organization
+## Module Layout
 
 | Module | Description |
 |--------|-------------|
-| `lib.rs` | Public API and convenience types |
-| `manager.rs` | `LedgerManager` and `LedgerCloseContext` |
-| `close.rs` | Close data structures and transaction set handling |
-| `execution.rs` | Transaction execution integration |
-| `delta.rs` | Change tracking and coalescing |
-| `header.rs` | Header utilities (hash, skip list, chain verification) |
-| `snapshot.rs` | Point-in-time state snapshots |
-| `error.rs` | Error types for ledger operations |
-
-## Protocol Support
-
-This crate supports all Stellar protocol versions with special handling for:
-
-- **Protocol 18**: Liquidity pools (AMM) with constant product invariant checking
-- **Protocol 20**: Soroban smart contracts with resource metering and rent
-- **Protocol 23**: Hot archive bucket list for state archival
+| `lib.rs` | Public API, `LedgerInfo`, `LedgerChange`, `fees`, `reserves`, `trustlines` modules |
+| `manager.rs` | `LedgerManager` coordinator -- initialization, close pipeline, bucket list integration |
+| `close.rs` | `LedgerCloseData`, `LedgerCloseResult`, transaction set sorting, upgrade handling |
+| `execution.rs` | Transaction execution bridge to `henyey-tx`, Soroban config loading, fee charging |
+| `delta.rs` | `LedgerDelta` change tracking with coalescing, fee/coin deltas, entry categorization |
+| `header.rs` | Header hash, skip list computation, chain verification, `create_next_header` |
+| `snapshot.rs` | `LedgerSnapshot`, `SnapshotHandle`, `SnapshotBuilder` for point-in-time state |
+| `soroban_state.rs` | `InMemorySorobanState` cache with TTL co-location for contract data/code |
+| `config_upgrade.rs` | `ConfigUpgradeSetFrame` for Soroban network configuration upgrades |
+| `offer.rs` | `OfferDescriptor`, `AssetPair`, offer sorting and comparison for DEX |
+| `error.rs` | `LedgerError` enum with variants for all ledger failure modes |
 
 ## Design Notes
 
-### Per-Operation Savepoints
-
-The operation execution loop wraps each operation with a per-operation savepoint to
-match stellar-core's nested `LedgerTxn` behavior. Before executing each operation,
-`create_savepoint()` is called on the state manager. If the operation fails
-(`!is_operation_success`), `rollback_to_savepoint()` undoes all state mutations from
-that operation so subsequent operations see clean state. Successful operations keep
-their mutations in place. This ensures that a failed operation (e.g., a
-`CreateClaimableBalance` that hits `LowReserve`) does not leave partial state changes
-visible to later operations in the same transaction.
-
 ### Change Coalescing
 
-When multiple operations affect the same entry within a ledger, changes are coalesced:
+When multiple operations modify the same entry within a single ledger close,
+`LedgerDelta` coalesces the changes to produce one net effect per entry:
 
-- Create + Update = Create (with final value)
-- Create + Delete = No change
-- Update + Update = Update (original previous, final current)
-- Update + Delete = Delete
+| First | Second | Result |
+|-------|--------|--------|
+| Create | Update | Create (with final value) |
+| Create | Delete | No change (annihilation) |
+| Update | Update | Update (original previous, final current) |
+| Update | Delete | Delete |
 
-### Thread Safety
+This matches stellar-core's `LedgerTxn` merging semantics and ensures the
+bucket list receives exactly one change per entry.
 
-All public APIs are thread-safe:
+### Per-Operation Savepoints
 
-- `LedgerManager` uses internal RwLocks for state protection
-- `SnapshotHandle` wraps snapshots in Arc for efficient sharing
+The execution loop wraps each operation with `create_savepoint()` /
+`rollback_to_savepoint()` to match stellar-core's nested `LedgerTxn` behavior.
+A failed operation has all its state mutations reverted so subsequent operations
+in the same transaction see clean state.
 
 ### Determinism
 
-All operations are deterministic to ensure consensus:
+All operations are deterministic for consensus. Entry changes are tracked in
+insertion order, transaction ordering follows the XOR-based sort from the
+protocol, and hash computations use canonical XDR encoding.
 
-- Entry changes are tracked in insertion order
-- Transaction ordering follows protocol rules
-- Hash computations use canonical XDR encoding
+### Thread Safety
+
+`LedgerManager` uses internal `RwLock`s for state protection. `SnapshotHandle`
+wraps snapshots in `Arc` for efficient cross-thread sharing. `SharedSorobanState`
+provides an `RwLock`-guarded wrapper for concurrent access to the Soroban cache.
 
 ## stellar-core Mapping
 
-This crate corresponds to the following stellar-core components:
-
 | Rust | stellar-core |
-|------|-----|
-| `LedgerManager` | `src/ledger/LedgerManager*` |
-| `LedgerCloseContext` | `src/ledger/LedgerTxn*` |
-| `LedgerDelta` | `src/ledger/LedgerDelta.*` |
-| Header utilities | `src/ledger/LedgerHeaderUtils.*` |
-| Close metadata | `src/ledger/LedgerCloseMeta*` |
+|------|--------------|
+| `manager.rs` | `src/ledger/LedgerManagerImpl.h/.cpp` |
+| `close.rs` | `src/ledger/LedgerCloseMetaFrame.h/.cpp` |
+| `execution.rs` | `src/ledger/LedgerManagerImpl.cpp` (transaction apply loop) |
+| `delta.rs` | `src/ledger/LedgerTxn.h/.cpp` (change tracking subset) |
+| `header.rs` | `src/ledger/LedgerHeaderUtils.h/.cpp` |
+| `snapshot.rs` | `src/ledger/LedgerStateSnapshot.h/.cpp` |
+| `soroban_state.rs` | `src/ledger/InMemoryLedgerTxn.h/.cpp` |
+| `config_upgrade.rs` | `src/ledger/NetworkConfig.h/.cpp` (upgrade validation) |
+| `offer.rs` | `src/ledger/LedgerTxn.h` (offer ordering utilities) |
+| `error.rs` | Various error returns across stellar-core ledger files |
+| `lib.rs` (fees/reserves) | Inline calculations in `LedgerTxnImpl.cpp` |
 
-## stellar-core Parity Status
+## Parity Status
 
 See [PARITY_STATUS.md](PARITY_STATUS.md) for detailed stellar-core parity analysis.

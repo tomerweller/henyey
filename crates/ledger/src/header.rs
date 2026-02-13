@@ -106,24 +106,6 @@ pub fn calculate_skip_values(header: &mut LedgerHeader) {
     }
 }
 
-/// Compute the skip list for a new ledger header (legacy interface).
-///
-/// **DEPRECATED**: This function is kept for backward compatibility but uses
-/// incorrect logic. Use `calculate_skip_values` instead, which modifies the
-/// header in place after setting the bucket_list_hash.
-///
-/// The skip list actually stores bucket_list_hash values, not previous_ledger_hash.
-/// This function returns a skip list that simply copies from the previous header's
-/// skip list, which is correct for ledgers where seq % 50 != 0.
-pub fn compute_skip_list(
-    _ledger_seq: u32,
-    _prev_hash: Hash256,
-    prev_skip_list: &[Hash; SKIP_LIST_SIZE],
-) -> [Hash; SKIP_LIST_SIZE] {
-    // For non-update ledgers, just copy the previous skip list
-    prev_skip_list.clone()
-}
-
 /// Calculate the target ledger sequence for a skip list entry.
 ///
 /// Given a ledger sequence and skip list index, computes which historical
@@ -149,29 +131,17 @@ pub fn skip_list_target_seq(current_seq: u32, skip_index: usize) -> Option<u32> 
         1 => {
             // Points back by at most 4
             let rem = current_seq % 4;
-            if rem == 0 {
-                4
-            } else {
-                rem
-            }
+            if rem == 0 { 4 } else { rem }
         }
         2 => {
             // Points back by at most 16
             let rem = current_seq % 16;
-            if rem == 0 {
-                16
-            } else {
-                rem
-            }
+            if rem == 0 { 16 } else { rem }
         }
         3 => {
             // Points back by at most 64
             let rem = current_seq % 64;
-            if rem == 0 {
-                64
-            } else {
-                rem
-            }
+            if rem == 0 { 64 } else { rem }
         }
         _ => return None,
     };
@@ -202,7 +172,6 @@ pub fn verify_header_chain(
     prev_header_hash: &Hash256,
     current_header: &LedgerHeader,
 ) -> Result<()> {
-    // Check sequence numbers
     let expected_seq = prev_header.ledger_seq + 1;
     if current_header.ledger_seq != expected_seq {
         return Err(LedgerError::InvalidSequence {
@@ -211,7 +180,6 @@ pub fn verify_header_chain(
         });
     }
 
-    // Check that previous hash matches
     let current_prev_hash = Hash256::from(current_header.previous_ledger_hash.0);
     if &current_prev_hash != prev_header_hash {
         return Err(LedgerError::HashMismatch {
@@ -245,7 +213,6 @@ pub fn verify_skip_list(
     for (i, skip_hash) in header.skip_list.iter().enumerate() {
         let skip_hash256 = Hash256::from(skip_hash.0);
 
-        // Skip verification for zero hashes (genesis or very early ledgers)
         if skip_hash256.is_zero() {
             continue;
         }
@@ -309,7 +276,6 @@ pub fn create_next_header(
 ) -> LedgerHeader {
     let new_seq = prev_header.ledger_seq + 1;
 
-    // Start with the previous header's skip_list, then update it
     let mut header = LedgerHeader {
         ledger_version: prev_header.ledger_version,
         previous_ledger_hash: prev_header_hash.into(),
@@ -333,7 +299,6 @@ pub fn create_next_header(
         ext: stellar_xdr::curr::LedgerHeaderExt::V0,
     };
 
-    // Update skip_list based on the new bucket_list_hash (only at seq % 50 == 0)
     calculate_skip_values(&mut header);
 
     header
@@ -404,11 +369,9 @@ mod tests {
         let hash = compute_header_hash(&header).unwrap();
         assert!(!hash.is_zero());
 
-        // Same header should produce same hash
         let hash2 = compute_header_hash(&header).unwrap();
         assert_eq!(hash, hash2);
 
-        // Different header should produce different hash
         let header2 = create_test_header(2);
         let hash3 = compute_header_hash(&header2).unwrap();
         assert_ne!(hash, hash3);
@@ -416,53 +379,30 @@ mod tests {
 
     #[test]
     fn test_calculate_skip_values() {
-        // Test that skip list is not updated when seq % 50 != 0
         let mut header = create_test_header(5);
         header.bucket_list_hash = Hash([1u8; 32]);
         calculate_skip_values(&mut header);
-        assert_eq!(header.skip_list[0], Hash([0u8; 32])); // Unchanged
+        assert_eq!(header.skip_list[0], Hash([0u8; 32]));
 
-        // Test that skip list[0] is updated when seq % 50 == 0
-        let mut header = create_test_header(SKIP_1); // seq = 50
+        let mut header = create_test_header(SKIP_1);
         header.bucket_list_hash = Hash([2u8; 32]);
         calculate_skip_values(&mut header);
-        assert_eq!(header.skip_list[0], Hash([2u8; 32])); // Updated to bucket_list_hash
+        assert_eq!(header.skip_list[0], Hash([2u8; 32]));
 
-        // Test that skip list[1] cascades at seq = SKIP_1 + SKIP_2
-        let mut header = create_test_header(SKIP_2 + SKIP_1); // seq = 5050
-        header.skip_list[0] = Hash([3u8; 32]); // Previous skip_list[0]
+        let mut header = create_test_header(SKIP_2 + SKIP_1);
+        header.skip_list[0] = Hash([3u8; 32]);
         header.bucket_list_hash = Hash([4u8; 32]);
         calculate_skip_values(&mut header);
-        assert_eq!(header.skip_list[0], Hash([4u8; 32])); // New bucket_list_hash
-        assert_eq!(header.skip_list[1], Hash([3u8; 32])); // Previous skip_list[0]
+        assert_eq!(header.skip_list[0], Hash([4u8; 32]));
+        assert_eq!(header.skip_list[1], Hash([3u8; 32]));
     }
 
     #[test]
     fn test_skip_list_target_seq() {
-        // Entry 0 always points to previous
         assert_eq!(skip_list_target_seq(10, 0), Some(9));
         assert_eq!(skip_list_target_seq(1, 0), Some(0));
-
-        // Entry 1 points back by at most 4
-        assert_eq!(skip_list_target_seq(8, 1), Some(4)); // 8 - 4 = 4
-        assert_eq!(skip_list_target_seq(10, 1), Some(8)); // 10 - 2 = 8
-
-        // Edge case: sequence 0
+        assert_eq!(skip_list_target_seq(8, 1), Some(4));
+        assert_eq!(skip_list_target_seq(10, 1), Some(8));
         assert_eq!(skip_list_target_seq(0, 0), None);
-    }
-
-    #[test]
-    fn test_compute_skip_list_copies_prev() {
-        // compute_skip_list now just copies the previous skip list
-        let prev_hash = Hash256::hash(b"test");
-        let prev_skip = [
-            Hash([1u8; 32]),
-            Hash([2u8; 32]),
-            Hash([3u8; 32]),
-            Hash([4u8; 32]),
-        ];
-
-        let skip_list = compute_skip_list(51, prev_hash, &prev_skip);
-        assert_eq!(skip_list, prev_skip);
     }
 }

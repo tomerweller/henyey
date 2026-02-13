@@ -21,20 +21,14 @@
 //! not in the cache. This allows efficient snapshots that don't need to copy
 //! the entire ledger state upfront.
 
-use crate::{LedgerError, Result};
+use crate::delta::key_to_bytes;
+use crate::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use henyey_common::Hash256;
 use stellar_xdr::curr::{
-    AccountEntry, AccountId, LedgerEntry, LedgerEntryData, LedgerHeader, LedgerKey, Limits,
-    WriteXdr,
+    AccountEntry, AccountId, LedgerEntry, LedgerEntryData, LedgerHeader, LedgerKey,
 };
-
-/// Serialize a ledger key to bytes for use as a map key.
-fn key_to_bytes(key: &LedgerKey) -> Result<Vec<u8>> {
-    key.to_xdr(Limits::none())
-        .map_err(|e| LedgerError::Serialization(e.to_string()))
-}
 
 /// A point-in-time snapshot of ledger state.
 ///

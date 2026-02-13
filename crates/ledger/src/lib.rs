@@ -92,7 +92,7 @@ pub use execution::{
     compute_state_size_window_entry, execute_soroban_parallel_phase, SorobanNetworkInfo,
 };
 pub use header::{
-    calculate_skip_values, close_time, compute_header_hash, compute_skip_list, create_next_header,
+    calculate_skip_values, close_time, compute_header_hash, create_next_header,
     is_before_protocol_version, protocol_version, skip_list_target_seq, verify_header_chain,
     verify_skip_list, SKIP_1, SKIP_2, SKIP_3, SKIP_4, SKIP_LIST_SIZE,
 };
