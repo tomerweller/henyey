@@ -2,13 +2,16 @@
 //!
 //! This module provides an LRU-style cache for bucket entries that are
 //! frequently accessed during transaction validation. The cache is particularly
-//! useful for account and trustline entries, which are accessed repeatedly.
+//! useful for account, trustline, claimable balance, and liquidity pool entries,
+//! which are accessed repeatedly.
 //!
 //! # Design
 //!
-//! The cache uses a simple LRU eviction strategy with random sampling to
-//! maintain bounded memory usage. Only certain entry types (accounts and
-//! trustlines) are cached, as they are the most frequently accessed.
+//! The cache uses a "least-recent-out-of-2-random-choices" eviction strategy,
+//! matching stellar-core's approach. This degrades more gracefully across
+//! pathological load patterns than strict LRU, with less bookkeeping. Only
+//! certain entry types (accounts, trustlines, claimable balances, and liquidity
+//! pools) are cached, as they are the most frequently accessed.
 //!
 //! # Thread Safety
 //!
@@ -24,12 +27,12 @@ use stellar_xdr::curr::{LedgerEntry, LedgerEntryData, LedgerKey};
 
 use crate::entry::BucketEntry;
 
-/// Default maximum cache size in bytes (100 MB).
-pub const DEFAULT_MAX_CACHE_BYTES: usize = 100 * 1024 * 1024;
+/// Default maximum cache size in bytes (1 GB).
+pub const DEFAULT_MAX_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Default maximum number of entries in the cache.
-/// Sized for both accounts and trustlines (the two cached types).
-pub const DEFAULT_MAX_CACHE_ENTRIES: usize = 200_000;
+/// Sized for accounts, trustlines, claimable balances, and liquidity pools.
+pub const DEFAULT_MAX_CACHE_ENTRIES: usize = 2_000_000;
 
 /// Minimum bucket list size (in entries) before cache is initialized.
 /// Below this threshold, the bucket list is small enough that caching
@@ -49,16 +52,19 @@ struct CacheEntry {
     size_bytes: usize,
     /// Access counter for LRU tracking.
     access_count: u64,
+    /// Index into CacheInner::keys for O(1) swap-remove.
+    vec_index: usize,
 }
 
 impl CacheEntry {
     /// Creates a new cache entry.
-    fn new(entry: BucketEntry, access_count: u64) -> Self {
+    fn new(entry: BucketEntry, access_count: u64, vec_index: usize) -> Self {
         let size_bytes = Self::estimate_size(&entry);
         Self {
             entry: Arc::new(entry),
             size_bytes,
             access_count,
+            vec_index,
         }
     }
 
@@ -108,18 +114,21 @@ impl CacheEntry {
 // Random Eviction Cache
 // ============================================================================
 
-/// An LRU cache with random eviction for bucket entries.
+/// A cache with "least-recent-out-of-2-random-choices" eviction for bucket entries.
 ///
 /// This cache stores frequently-accessed bucket entries to reduce disk I/O
-/// during transaction validation. It uses a combination of LRU tracking and
-/// random sampling for eviction decisions.
+/// during transaction validation. Eviction uses the "power of two choices"
+/// strategy (matching stellar-core): pick two random entries, evict whichever
+/// was accessed less recently. This is O(1) per eviction and approximates
+/// LRU quality with minimal bookkeeping.
 ///
 /// # Entry Type Filtering
 ///
 /// Only certain entry types are cached:
 /// - Account entries: Most frequently accessed
 /// - Trustline entries: Second most frequently accessed
-/// - Other types can be optionally cached via configuration
+/// - ClaimableBalance entries: Frequently accessed during claims
+/// - LiquidityPool entries: Frequently accessed during pool operations
 ///
 /// # Memory Management
 ///
@@ -142,8 +151,13 @@ pub struct RandomEvictionCache {
 struct CacheInner {
     /// Maps keys to cached entries.
     entries: HashMap<LedgerKey, CacheEntry>,
+    /// Keys stored redundantly for O(1) random access during eviction.
+    /// Indices are kept in sync with `CacheEntry::vec_index`.
+    keys: Vec<LedgerKey>,
     /// Global access counter for LRU tracking.
     access_counter: u64,
+    /// Simple xorshift64 RNG state for eviction sampling.
+    rng_state: u64,
     /// Cache hit count for statistics.
     hits: u64,
     /// Cache miss count for statistics.
@@ -151,9 +165,26 @@ struct CacheInner {
     /// Per-type hit counts.
     account_hits: u64,
     trustline_hits: u64,
+    claimable_balance_hits: u64,
+    liquidity_pool_hits: u64,
     /// Per-type miss counts.
     account_misses: u64,
     trustline_misses: u64,
+    claimable_balance_misses: u64,
+    liquidity_pool_misses: u64,
+}
+
+impl CacheInner {
+    /// Returns a pseudo-random index in [0, len).
+    fn rand_index(&mut self, len: usize) -> usize {
+        // xorshift64
+        let mut x = self.rng_state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng_state = x;
+        (x as usize) % len
+    }
 }
 
 impl RandomEvictionCache {
@@ -166,14 +197,20 @@ impl RandomEvictionCache {
     pub fn with_limits(max_bytes: usize, max_entries: usize) -> Self {
         Self {
             inner: Mutex::new(CacheInner {
-                entries: HashMap::new(),
+                entries: HashMap::with_capacity(max_entries.min(1024)),
+                keys: Vec::with_capacity(max_entries.min(1024)),
                 access_counter: 0,
+                rng_state: 0x5EED_CAFE_BABE_D00D, // arbitrary non-zero seed
                 hits: 0,
                 misses: 0,
                 account_hits: 0,
                 trustline_hits: 0,
+                claimable_balance_hits: 0,
+                liquidity_pool_hits: 0,
                 account_misses: 0,
                 trustline_misses: 0,
+                claimable_balance_misses: 0,
+                liquidity_pool_misses: 0,
             }),
             max_bytes,
             max_entries,
@@ -210,10 +247,17 @@ impl RandomEvictionCache {
 
     /// Checks if an entry type should be cached.
     ///
-    /// Account and Trustline entries are cached, as they are the most
-    /// frequently accessed entry types during transaction execution.
+    /// Account, Trustline, ClaimableBalance, and LiquidityPool entries are
+    /// cached, as they are the most frequently accessed entry types during
+    /// transaction execution.
     pub fn is_cached_type(key: &LedgerKey) -> bool {
-        matches!(key, LedgerKey::Account(_) | LedgerKey::Trustline(_))
+        matches!(
+            key,
+            LedgerKey::Account(_)
+                | LedgerKey::Trustline(_)
+                | LedgerKey::ClaimableBalance(_)
+                | LedgerKey::LiquidityPool(_)
+        )
     }
 
     /// Gets an entry from the cache.
@@ -235,6 +279,8 @@ impl RandomEvictionCache {
             match key {
                 LedgerKey::Account(_) => inner.account_hits += 1,
                 LedgerKey::Trustline(_) => inner.trustline_hits += 1,
+                LedgerKey::ClaimableBalance(_) => inner.claimable_balance_hits += 1,
+                LedgerKey::LiquidityPool(_) => inner.liquidity_pool_hits += 1,
                 _ => {}
             }
             Some(result)
@@ -243,6 +289,8 @@ impl RandomEvictionCache {
             match key {
                 LedgerKey::Account(_) => inner.account_misses += 1,
                 LedgerKey::Trustline(_) => inner.trustline_misses += 1,
+                LedgerKey::ClaimableBalance(_) => inner.claimable_balance_misses += 1,
+                LedgerKey::LiquidityPool(_) => inner.liquidity_pool_misses += 1,
                 _ => {}
             }
             None
@@ -251,7 +299,8 @@ impl RandomEvictionCache {
 
     /// Inserts an entry into the cache.
     ///
-    /// If the cache is at capacity, random eviction is performed to make room.
+    /// If the cache is at capacity, one entry is evicted using the
+    /// "least-recent-out-of-2-random-choices" strategy (matching stellar-core).
     /// Does nothing if the cache is not active or if the entry type should not
     /// be cached.
     pub fn insert(&self, key: LedgerKey, entry: BucketEntry) {
@@ -261,34 +310,44 @@ impl RandomEvictionCache {
 
         let mut inner = self.inner.lock();
         inner.access_counter += 1;
+        let access_count = inner.access_counter;
 
-        let cache_entry = CacheEntry::new(entry, inner.access_counter);
-        let entry_size = cache_entry.size_bytes;
-
-        // Check if we need to evict
-        let current_bytes = self.current_bytes.load(Ordering::Relaxed);
-        let should_evict =
-            inner.entries.len() >= self.max_entries || current_bytes + entry_size > self.max_bytes;
-
-        if should_evict {
-            self.evict_entries(&mut inner);
-        }
-
-        // Update size tracking
-        if let Some(old_entry) = inner.entries.insert(key, cache_entry) {
-            // Replace existing entry - adjust size
-            let size_diff = entry_size as isize - old_entry.size_bytes as isize;
+        // Check if updating an existing entry (no eviction or vec change needed)
+        if let Some(existing) = inner.entries.get_mut(&key) {
+            let old_size = existing.size_bytes;
+            let new_entry = CacheEntry::new(entry, access_count, existing.vec_index);
+            let new_size = new_entry.size_bytes;
+            *existing = new_entry;
+            let size_diff = new_size as isize - old_size as isize;
             if size_diff > 0 {
                 self.current_bytes
                     .fetch_add(size_diff as usize, Ordering::Relaxed);
-            } else {
+            } else if size_diff < 0 {
                 self.current_bytes
                     .fetch_sub((-size_diff) as usize, Ordering::Relaxed);
             }
-        } else {
-            // New entry
-            self.current_bytes.fetch_add(entry_size, Ordering::Relaxed);
+            return;
         }
+
+        // New entry — evict if at capacity
+        let new_entry = CacheEntry::new(entry, access_count, 0); // vec_index set below
+        let entry_size = new_entry.size_bytes;
+
+        if inner.keys.len() >= self.max_entries
+            || self.current_bytes.load(Ordering::Relaxed) + entry_size > self.max_bytes
+        {
+            self.evict_one(&mut inner);
+        }
+
+        // Insert into keys vec and hashmap
+        let vec_index = inner.keys.len();
+        inner.keys.push(key.clone());
+        let cache_entry = CacheEntry {
+            vec_index,
+            ..new_entry
+        };
+        inner.entries.insert(key, cache_entry);
+        self.current_bytes.fetch_add(entry_size, Ordering::Relaxed);
     }
 
     /// Removes an entry from the cache.
@@ -301,6 +360,7 @@ impl RandomEvictionCache {
         if let Some(entry) = inner.entries.remove(key) {
             self.current_bytes
                 .fetch_sub(entry.size_bytes, Ordering::Relaxed);
+            Self::swap_remove_key(&mut inner, entry.vec_index);
         }
     }
 
@@ -308,65 +368,59 @@ impl RandomEvictionCache {
     pub fn clear(&self) {
         let mut inner = self.inner.lock();
         inner.entries.clear();
+        inner.keys.clear();
         inner.hits = 0;
         inner.misses = 0;
         inner.account_hits = 0;
         inner.trustline_hits = 0;
+        inner.claimable_balance_hits = 0;
+        inner.liquidity_pool_hits = 0;
         inner.account_misses = 0;
         inner.trustline_misses = 0;
+        inner.claimable_balance_misses = 0;
+        inner.liquidity_pool_misses = 0;
         self.current_bytes.store(0, Ordering::Relaxed);
     }
 
-    /// Evicts entries to make room for new insertions.
+    /// Evicts one entry using the "least-recent-out-of-2-random-choices"
+    /// strategy, matching stellar-core's `RandomEvictionCache::evictOne()`.
     ///
-    /// Uses random sampling to find entries to evict, preferring entries
-    /// with lower access counts (LRU behavior).
-    fn evict_entries(&self, inner: &mut CacheInner) {
-        // Target: evict ~10% of entries or enough to free space
-        let target_count = std::cmp::max(inner.entries.len() / 10, 1);
-        let target_bytes = self.max_bytes / 10;
-
-        let mut to_evict = Vec::with_capacity(target_count);
-        let mut bytes_to_free = 0usize;
-
-        // Sample entries and find candidates with low access counts
-        // We use a simple strategy: find entries below median access count
-        let median_access = if inner.access_counter > 0 {
-            inner.access_counter / 2
-        } else {
-            0
-        };
-
-        for (key, entry) in inner.entries.iter() {
-            if entry.access_count < median_access {
-                to_evict.push(key.clone());
-                bytes_to_free += entry.size_bytes;
-
-                if to_evict.len() >= target_count || bytes_to_free >= target_bytes {
-                    break;
-                }
-            }
+    /// Picks two random entries and evicts whichever was accessed less recently.
+    /// This is O(1) and approximates LRU quality with minimal bookkeeping.
+    fn evict_one(&self, inner: &mut CacheInner) {
+        let sz = inner.keys.len();
+        if sz == 0 {
+            return;
         }
 
-        // If we didn't find enough old entries, take any entries
-        if to_evict.len() < target_count {
-            for key in inner.entries.keys() {
-                if !to_evict.contains(key) {
-                    to_evict.push(key.clone());
-                    if to_evict.len() >= target_count {
-                        break;
-                    }
-                }
-            }
-        }
+        // Pick two random candidates and evict the less-recently-used one
+        let idx1 = inner.rand_index(sz);
+        let idx2 = inner.rand_index(sz);
+        let access1 = inner.entries[&inner.keys[idx1]].access_count;
+        let access2 = inner.entries[&inner.keys[idx2]].access_count;
+        let victim_idx = if access1 <= access2 { idx1 } else { idx2 };
 
-        // Remove evicted entries
-        for key in to_evict {
-            if let Some(entry) = inner.entries.remove(&key) {
-                self.current_bytes
-                    .fetch_sub(entry.size_bytes, Ordering::Relaxed);
-            }
+        // Remove from hashmap
+        let victim_key = inner.keys[victim_idx].clone();
+        let entry = inner.entries.remove(&victim_key).unwrap();
+        self.current_bytes
+            .fetch_sub(entry.size_bytes, Ordering::Relaxed);
+
+        // Swap-remove from keys vec
+        Self::swap_remove_key(inner, victim_idx);
+    }
+
+    /// Swap-removes a key from the keys vec at `idx`, updating the swapped
+    /// entry's `vec_index` in the hashmap.
+    fn swap_remove_key(inner: &mut CacheInner, idx: usize) {
+        let last_idx = inner.keys.len() - 1;
+        if idx != last_idx {
+            inner.keys.swap(idx, last_idx);
+            // Clone the key so we can mutably borrow entries
+            let swapped_key = inner.keys[idx].clone();
+            inner.entries.get_mut(&swapped_key).unwrap().vec_index = idx;
         }
+        inner.keys.pop();
     }
 
     /// Returns cache statistics.
@@ -389,6 +443,10 @@ impl RandomEvictionCache {
             account_misses: inner.account_misses,
             trustline_hits: inner.trustline_hits,
             trustline_misses: inner.trustline_misses,
+            claimable_balance_hits: inner.claimable_balance_hits,
+            claimable_balance_misses: inner.claimable_balance_misses,
+            liquidity_pool_hits: inner.liquidity_pool_hits,
+            liquidity_pool_misses: inner.liquidity_pool_misses,
         }
     }
 
@@ -417,8 +475,12 @@ impl RandomEvictionCache {
         inner.misses = 0;
         inner.account_hits = 0;
         inner.trustline_hits = 0;
+        inner.claimable_balance_hits = 0;
+        inner.liquidity_pool_hits = 0;
         inner.account_misses = 0;
         inner.trustline_misses = 0;
+        inner.claimable_balance_misses = 0;
+        inner.liquidity_pool_misses = 0;
     }
 }
 
@@ -472,6 +534,14 @@ pub struct CacheStats {
     pub trustline_hits: u64,
     /// Trustline-specific miss count.
     pub trustline_misses: u64,
+    /// ClaimableBalance-specific hit count.
+    pub claimable_balance_hits: u64,
+    /// ClaimableBalance-specific miss count.
+    pub claimable_balance_misses: u64,
+    /// LiquidityPool-specific hit count.
+    pub liquidity_pool_hits: u64,
+    /// LiquidityPool-specific miss count.
+    pub liquidity_pool_misses: u64,
 }
 
 #[cfg(test)]
@@ -582,6 +652,18 @@ mod tests {
         let trustline_key = make_trustline_key(1, b"USD\0");
         assert!(RandomEvictionCache::is_cached_type(&trustline_key));
 
+        // ClaimableBalance key should be cached
+        let cb_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+            balance_id: ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([0; 32])),
+        });
+        assert!(RandomEvictionCache::is_cached_type(&cb_key));
+
+        // LiquidityPool key should be cached
+        let lp_key = LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
+            liquidity_pool_id: PoolId(Hash([0; 32])),
+        });
+        assert!(RandomEvictionCache::is_cached_type(&lp_key));
+
         // Offer key should NOT be cached
         let offer_key = LedgerKey::Offer(LedgerKeyOffer {
             seller_id: make_account_id(1),
@@ -599,19 +681,92 @@ mod tests {
 
     #[test]
     fn test_cache_eviction() {
-        // Create cache with small limits
-        let cache = RandomEvictionCache::with_limits(10_000, 5);
+        // Create cache with small entry limit — power-of-2 evicts one per insert
+        // when at capacity, so after 10 inserts with max=5 we should have exactly 5.
+        let cache = RandomEvictionCache::with_limits(1_000_000, 5);
         cache.activate();
 
-        // Insert more entries than max
         for i in 0..10u8 {
-            let key = make_account_key(i);
-            let entry = make_account_entry(i);
-            cache.insert(key, entry);
+            cache.insert(make_account_key(i), make_account_entry(i));
         }
 
-        // Cache should have evicted some entries
-        assert!(cache.len() <= 5);
+        assert_eq!(cache.len(), 5);
+    }
+
+    #[test]
+    fn test_eviction_favors_recently_accessed() {
+        // Power-of-2-choices should preferentially evict less-recently-used entries.
+        // Use a large enough cache that self-eviction (both random picks landing on
+        // the same index) is negligible.
+        let cache = RandomEvictionCache::with_limits(1_000_000, 100);
+        cache.activate();
+
+        let hot_key = make_account_key(0);
+        cache.insert(hot_key.clone(), make_account_entry(0));
+
+        for i in 1..150u8 {
+            // Touch the hot entry to keep its access_count high
+            cache.get(&hot_key);
+            cache.insert(make_account_key(i), make_account_entry(i));
+        }
+
+        // The frequently-accessed entry should still be in the cache
+        assert!(cache.get(&hot_key).is_some());
+        assert_eq!(cache.len(), 100);
+    }
+
+    #[test]
+    fn test_eviction_by_byte_limit() {
+        // Each account entry is ~200+ bytes. A 500-byte cache should only hold 1-2.
+        let cache = RandomEvictionCache::with_limits(500, 1_000_000);
+        cache.activate();
+
+        for i in 0..10u8 {
+            cache.insert(make_account_key(i), make_account_entry(i));
+        }
+
+        // Should have evicted down to fit within byte budget
+        assert!(cache.size_bytes() <= 500);
+        assert!(cache.len() <= 2);
+    }
+
+    #[test]
+    fn test_keys_vec_consistency_after_removes() {
+        // Verify the keys vec stays consistent after interleaved inserts and removes.
+        let cache = RandomEvictionCache::with_limits(1_000_000, 100);
+        cache.activate();
+
+        // Insert 20 entries
+        for i in 0..20u8 {
+            cache.insert(make_account_key(i), make_account_entry(i));
+        }
+        assert_eq!(cache.len(), 20);
+
+        // Remove odd-numbered entries
+        for i in (1..20u8).step_by(2) {
+            cache.remove(&make_account_key(i));
+        }
+        assert_eq!(cache.len(), 10);
+
+        // All even entries should still be retrievable
+        for i in (0..20u8).step_by(2) {
+            assert!(
+                cache.get(&make_account_key(i)).is_some(),
+                "entry {} should still be present",
+                i
+            );
+        }
+
+        // Insert more entries — should work without panic from inconsistent indices
+        for i in 20..30u8 {
+            cache.insert(make_account_key(i), make_account_entry(i));
+        }
+        assert_eq!(cache.len(), 20);
+
+        // Verify all new entries are retrievable
+        for i in 20..30u8 {
+            assert!(cache.get(&make_account_key(i)).is_some());
+        }
     }
 
     #[test]

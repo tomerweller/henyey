@@ -643,6 +643,77 @@ pub struct LedgerCloseResult {
     /// Contains transaction processing details, SCP history, and other
     /// data needed for complete history archive reconstruction.
     pub meta: Option<LedgerCloseMeta>,
+
+    /// Performance metrics for the ledger close.
+    pub perf: Option<LedgerClosePerf>,
+}
+
+/// Per-transaction timing data.
+#[derive(Debug, Clone)]
+pub struct TxPerf {
+    /// Transaction index in the set.
+    pub index: usize,
+    /// Transaction hash (first 8 bytes hex for display).
+    pub hash_hex: String,
+    /// Whether the transaction succeeded.
+    pub success: bool,
+    /// Number of operations.
+    pub op_count: usize,
+    /// Execution time in microseconds.
+    pub exec_us: u64,
+    /// Whether this is a Soroban transaction.
+    pub is_soroban: bool,
+}
+
+/// Cache hit/miss statistics snapshot.
+#[derive(Debug, Clone, Default)]
+pub struct CachePerfStats {
+    pub entry_count: usize,
+    pub size_bytes: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub hit_rate: f64,
+    pub account_hits: u64,
+    pub account_misses: u64,
+    pub trustline_hits: u64,
+    pub trustline_misses: u64,
+    pub claimable_balance_hits: u64,
+    pub claimable_balance_misses: u64,
+    pub liquidity_pool_hits: u64,
+    pub liquidity_pool_misses: u64,
+}
+
+/// Performance metrics collected during ledger close.
+#[derive(Debug, Clone)]
+pub struct LedgerClosePerf {
+    /// Phase timings in microseconds.
+    pub begin_close_us: u64,
+    pub tx_exec_us: u64,
+    pub classic_exec_us: u64,
+    pub soroban_exec_us: u64,
+    pub commit_setup_us: u64,
+    pub bucket_lock_wait_us: u64,
+    pub eviction_us: u64,
+    pub soroban_state_us: u64,
+    pub add_batch_us: u64,
+    pub hot_archive_us: u64,
+    pub header_us: u64,
+    pub commit_close_us: u64,
+    pub meta_us: u64,
+    pub total_us: u64,
+
+    /// Per-transaction timing (sorted by exec_us descending).
+    pub tx_timings: Vec<TxPerf>,
+
+    /// Transaction count.
+    pub tx_count: usize,
+
+    /// Cache stats for this ledger.
+    pub cache: CachePerfStats,
+
+    /// RSS in bytes at start and end of ledger close.
+    pub rss_before_bytes: u64,
+    pub rss_after_bytes: u64,
 }
 
 impl LedgerCloseResult {
@@ -653,6 +724,7 @@ impl LedgerCloseResult {
             header_hash,
             tx_results: Vec::new(),
             meta: None,
+            perf: None,
         }
     }
 
@@ -665,6 +737,12 @@ impl LedgerCloseResult {
     /// Add ledger close metadata.
     pub fn with_meta(mut self, meta: LedgerCloseMeta) -> Self {
         self.meta = Some(meta);
+        self
+    }
+
+    /// Add performance metrics.
+    pub fn with_perf(mut self, perf: LedgerClosePerf) -> Self {
+        self.perf = Some(perf);
         self
     }
 

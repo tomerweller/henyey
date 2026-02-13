@@ -60,6 +60,28 @@ use stellar_xdr::curr::{
 };
 use tracing::{debug, info};
 
+/// Read current RSS (Resident Set Size) in bytes from /proc/self/statm.
+/// Returns 0 on non-Linux or on error.
+fn get_rss_bytes() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
+            // Format: size resident shared text lib data dt (all in pages)
+            let page_size = 4096u64; // standard Linux page size
+            if let Some(rss_pages) = statm.split_whitespace().nth(1) {
+                if let Ok(pages) = rss_pages.parse::<u64>() {
+                    return pages * page_size;
+                }
+            }
+        }
+        0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
 /// Secondary index type: (account_bytes, asset) → set of offer_ids.
 type OfferAccountAssetIndex = HashMap<([u8; 32], AssetKey), HashSet<i64>>;
 
@@ -1098,6 +1120,7 @@ impl LedgerManager {
         close_data: LedgerCloseData,
         runtime_handle: Option<tokio::runtime::Handle>,
     ) -> Result<LedgerCloseResult> {
+        let rss_before = get_rss_bytes();
         let begin_start = std::time::Instant::now();
         let mut ctx = self.begin_close(close_data)?;
         ctx.runtime_handle = runtime_handle;
@@ -1107,7 +1130,7 @@ impl LedgerManager {
         ctx.apply_transactions()?;
         ctx.timing_tx_exec_us = tx_start.elapsed().as_micros() as u64;
 
-        ctx.commit()
+        ctx.commit(rss_before)
     }
 
     /// Begin closing a new ledger (internal).
@@ -1315,6 +1338,7 @@ impl LedgerManager {
             timing_tx_exec_us: 0,
             timing_classic_exec_us: 0,
             timing_soroban_exec_us: 0,
+            tx_perf: Vec::new(),
         })
     }
 
@@ -1621,6 +1645,8 @@ struct LedgerCloseContext<'a> {
     timing_tx_exec_us: u64,
     timing_classic_exec_us: u64,
     timing_soroban_exec_us: u64,
+    /// Per-transaction execution timing and metadata for perf reporting.
+    tx_perf: Vec<crate::close::TxPerf>,
 }
 
 impl<'a> LedgerCloseContext<'a> {
@@ -2113,6 +2139,27 @@ impl<'a> LedgerCloseContext<'a> {
             .record_transactions(tx_count, success_count, op_count);
         self.stats.record_fees(fees_collected);
 
+        // Collect per-transaction perf data
+        let all_txs = self.close_data.tx_set.transactions_with_base_fee();
+        for (i, result) in results.iter().enumerate() {
+            let hash_hex = if i < self.tx_results.len() {
+                Hash256::from(self.tx_results[i].transaction_hash.clone()).to_hex()[..16].to_string()
+            } else {
+                String::new()
+            };
+            let is_soroban = all_txs.get(i).map_or(false, |(env, _)| {
+                TransactionFrame::with_network(env.clone(), self.manager.network_id).is_soroban()
+            });
+            self.tx_perf.push(crate::close::TxPerf {
+                index: i,
+                hash_hex,
+                success: result.success,
+                op_count: result.operation_results.len(),
+                exec_us: result.exec_time_us,
+                is_soroban,
+            });
+        }
+
         Ok(results)
     }
 
@@ -2394,7 +2441,7 @@ impl<'a> LedgerCloseContext<'a> {
     }
 
     /// Commit the ledger close and produce the new header.
-    fn commit(mut self) -> Result<LedgerCloseResult> {
+    fn commit(mut self, rss_before: u64) -> Result<LedgerCloseResult> {
         tracing::debug!(
             ledger_seq = self.close_data.ledger_seq,
             "LedgerCloseContext::commit starting"
@@ -3002,8 +3049,8 @@ impl<'a> LedgerCloseContext<'a> {
             "Ledger closed details"
         );
 
-        // Log entry cache stats (per-ledger) and reset counters
-        {
+        // Snapshot cache stats (per-ledger) and reset counters
+        let cache_perf = {
             let bl = self.manager.bucket_list.read();
             let cache = bl.cache();
             if cache.is_active() {
@@ -3019,11 +3066,32 @@ impl<'a> LedgerCloseContext<'a> {
                     account_misses = stats.account_misses,
                     trustline_hits = stats.trustline_hits,
                     trustline_misses = stats.trustline_misses,
+                    claimable_balance_hits = stats.claimable_balance_hits,
+                    claimable_balance_misses = stats.claimable_balance_misses,
+                    liquidity_pool_hits = stats.liquidity_pool_hits,
+                    liquidity_pool_misses = stats.liquidity_pool_misses,
                     "Entry cache stats"
                 );
                 cache.reset_counters();
+                crate::close::CachePerfStats {
+                    entry_count: stats.entry_count,
+                    size_bytes: stats.size_bytes,
+                    hits: stats.hits,
+                    misses: stats.misses,
+                    hit_rate: stats.hit_rate,
+                    account_hits: stats.account_hits,
+                    account_misses: stats.account_misses,
+                    trustline_hits: stats.trustline_hits,
+                    trustline_misses: stats.trustline_misses,
+                    claimable_balance_hits: stats.claimable_balance_hits,
+                    claimable_balance_misses: stats.claimable_balance_misses,
+                    liquidity_pool_hits: stats.liquidity_pool_hits,
+                    liquidity_pool_misses: stats.liquidity_pool_misses,
+                }
+            } else {
+                crate::close::CachePerfStats::default()
             }
-        }
+        };
 
         let meta_start = std::time::Instant::now();
         let meta = build_ledger_close_meta(
@@ -3056,9 +3124,38 @@ impl<'a> LedgerCloseContext<'a> {
             "Ledger close timing"
         );
 
+        let rss_after = get_rss_bytes();
+
+        // Sort tx_perf by exec_us descending (worst offenders first)
+        let mut tx_timings = self.tx_perf;
+        tx_timings.sort_by(|a, b| b.exec_us.cmp(&a.exec_us));
+
+        let perf = crate::close::LedgerClosePerf {
+            begin_close_us: self.timing_begin_close_us,
+            tx_exec_us: self.timing_tx_exec_us,
+            classic_exec_us: self.timing_classic_exec_us,
+            soroban_exec_us: self.timing_soroban_exec_us,
+            commit_setup_us,
+            bucket_lock_wait_us,
+            eviction_us,
+            soroban_state_us,
+            add_batch_us,
+            hot_archive_us,
+            header_us,
+            commit_close_us,
+            meta_us,
+            total_us,
+            tx_timings,
+            tx_count: self.stats.tx_count,
+            cache: cache_perf,
+            rss_before_bytes: rss_before,
+            rss_after_bytes: rss_after,
+        };
+
         Ok(LedgerCloseResult::new(new_header, header_hash)
             .with_tx_results(self.tx_results)
-            .with_meta(meta))
+            .with_meta(meta)
+            .with_perf(perf))
     }
 }
 
