@@ -38,6 +38,51 @@ pub mod offer_index;
 mod sponsorship;
 mod ttl;
 
+/// Restore entries from snapshots created after the savepoint.
+///
+/// For each key present in `current_snapshots` but not in `savepoint_snapshots`,
+/// the snapshot value is applied to `live_map` (inserted if Some, removed if None).
+fn rollback_new_snapshots<K, V>(
+    live_map: &mut HashMap<K, V>,
+    current_snapshots: &HashMap<K, Option<V>>,
+    savepoint_snapshots: &HashMap<K, Option<V>>,
+) where
+    K: Eq + std::hash::Hash + Clone,
+    V: Clone,
+{
+    for (key, snapshot) in current_snapshots {
+        if !savepoint_snapshots.contains_key(key) {
+            match snapshot {
+                Some(entry) => {
+                    live_map.insert(key.clone(), entry.clone());
+                }
+                None => {
+                    live_map.remove(key);
+                }
+            }
+        }
+    }
+}
+
+/// Restore pre-savepoint values for entries modified before the savepoint.
+fn apply_pre_values<K, V>(
+    live_map: &mut HashMap<K, V>,
+    pre_values: Vec<(K, Option<V>)>,
+) where
+    K: Eq + std::hash::Hash,
+{
+    for (key, value) in pre_values {
+        match value {
+            Some(entry) => {
+                live_map.insert(key, entry);
+            }
+            None => {
+                live_map.remove(&key);
+            }
+        }
+    }
+}
+
 pub use offer_index::{AssetPair, OfferDescriptor, OfferIndex, OfferKey};
 
 pub struct SorobanState {
@@ -1160,306 +1205,28 @@ impl LedgerStateManager {
         // These entries have snapshots added after the savepoint, so their
         // snapshot values ARE their pre-savepoint (= pre-TX) values.
 
-        // Offers: collect new snapshot keys first to avoid borrow conflict
-        let new_offer_keys: Vec<_> = self
-            .offer_snapshots
-            .keys()
-            .filter(|k| !sp.offer_snapshots.contains_key(k))
-            .cloned()
-            .collect();
-        let new_offer_snapshots: Vec<_> = new_offer_keys
-            .into_iter()
-            .filter_map(|key| {
-                self.offer_snapshots
-                    .get(&key)
-                    .map(|snap| (key, snap.clone()))
-            })
-            .collect();
-        for (key, snapshot) in new_offer_snapshots {
-            let offer_key = OfferKey::new(key.0, key.1);
-            if let Some(current) = self.offers.get(&key).cloned() {
-                self.aa_index_remove(&current);
-            }
-            match snapshot {
-                Some(entry) => {
-                    self.aa_index_insert(&entry);
-                    self.offer_index.update_offer(&entry);
-                    self.offers.insert(key, entry);
-                }
-                None => {
-                    self.offer_index.remove_by_key(&offer_key);
-                    self.offers.remove(&key);
-                }
-            }
-        }
-
-        // Accounts: restore newly snapshot'd entries
-        let new_account_keys: Vec<_> = self
-            .account_snapshots
-            .keys()
-            .filter(|k| !sp.account_snapshots.contains_key(*k))
-            .cloned()
-            .collect();
-        for key in new_account_keys {
-            if let Some(snapshot) = self.account_snapshots.get(&key) {
-                match snapshot {
-                    Some(entry) => {
-                        self.accounts.insert(key, entry.clone());
-                    }
-                    None => {
-                        self.accounts.remove(&key);
-                    }
-                }
-            }
-        }
-
-        // Trustlines: restore newly snapshot'd entries
-        let new_trustline_keys: Vec<_> = self
-            .trustline_snapshots
-            .keys()
-            .filter(|k| !sp.trustline_snapshots.contains_key(k))
-            .cloned()
-            .collect();
-        for key in new_trustline_keys {
-            if let Some(snapshot) = self.trustline_snapshots.get(&key) {
-                match snapshot {
-                    Some(entry) => {
-                        self.trustlines.insert(key.clone(), entry.clone());
-                    }
-                    None => {
-                        self.trustlines.remove(&key);
-                    }
-                }
-            }
-        }
-
-        // Data entries: restore newly snapshot'd entries
-        let new_data_keys: Vec<_> = self
-            .data_snapshots
-            .keys()
-            .filter(|k| !sp.data_snapshots.contains_key(k))
-            .cloned()
-            .collect();
-        for key in new_data_keys {
-            if let Some(snapshot) = self.data_snapshots.get(&key) {
-                match snapshot {
-                    Some(entry) => {
-                        self.data_entries.insert(key, entry.clone());
-                    }
-                    None => {
-                        self.data_entries.remove(&key);
-                    }
-                }
-            }
-        }
-
-        // Contract data: restore newly snapshot'd entries
-        let new_cd_keys: Vec<_> = self
-            .contract_data_snapshots
-            .keys()
-            .filter(|k| !sp.contract_data_snapshots.contains_key(k))
-            .cloned()
-            .collect();
-        for key in new_cd_keys {
-            if let Some(snapshot) = self.contract_data_snapshots.get(&key) {
-                match snapshot {
-                    Some(entry) => {
-                        self.contract_data.insert(key, entry.clone());
-                    }
-                    None => {
-                        self.contract_data.remove(&key);
-                    }
-                }
-            }
-        }
-
-        // Contract code: restore newly snapshot'd entries
-        let new_cc_keys: Vec<_> = self
-            .contract_code_snapshots
-            .keys()
-            .filter(|k| !sp.contract_code_snapshots.contains_key(*k))
-            .copied()
-            .collect();
-        for key in new_cc_keys {
-            if let Some(snapshot) = self.contract_code_snapshots.get(&key) {
-                match snapshot {
-                    Some(entry) => {
-                        self.contract_code.insert(key, entry.clone());
-                    }
-                    None => {
-                        self.contract_code.remove(&key);
-                    }
-                }
-            }
-        }
-
-        // TTL entries: restore newly snapshot'd entries
-        let new_ttl_keys: Vec<_> = self
-            .ttl_snapshots
-            .keys()
-            .filter(|k| !sp.ttl_snapshots.contains_key(*k))
-            .copied()
-            .collect();
-        for key in new_ttl_keys {
-            if let Some(snapshot) = self.ttl_snapshots.get(&key) {
-                match snapshot {
-                    Some(entry) => {
-                        self.ttl_entries.insert(key, entry.clone());
-                    }
-                    None => {
-                        self.ttl_entries.remove(&key);
-                    }
-                }
-            }
-        }
-
-        // Claimable balances: restore newly snapshot'd entries
-        let new_cb_keys: Vec<_> = self
-            .claimable_balance_snapshots
-            .keys()
-            .filter(|k| !sp.claimable_balance_snapshots.contains_key(*k))
-            .copied()
-            .collect();
-        for key in new_cb_keys {
-            if let Some(snapshot) = self.claimable_balance_snapshots.get(&key) {
-                match snapshot {
-                    Some(entry) => {
-                        self.claimable_balances.insert(key, entry.clone());
-                    }
-                    None => {
-                        self.claimable_balances.remove(&key);
-                    }
-                }
-            }
-        }
-
-        // Liquidity pools: restore newly snapshot'd entries
-        let new_lp_keys: Vec<_> = self
-            .liquidity_pool_snapshots
-            .keys()
-            .filter(|k| !sp.liquidity_pool_snapshots.contains_key(*k))
-            .copied()
-            .collect();
-        for key in new_lp_keys {
-            if let Some(snapshot) = self.liquidity_pool_snapshots.get(&key) {
-                match snapshot {
-                    Some(entry) => {
-                        self.liquidity_pools.insert(key, entry.clone());
-                    }
-                    None => {
-                        self.liquidity_pools.remove(&key);
-                    }
-                }
-            }
-        }
+        // Offers require special handling for aa_index and offer_index
+        self.rollback_offer_snapshots(&sp);
+        rollback_new_snapshots(&mut self.accounts, &self.account_snapshots, &sp.account_snapshots);
+        rollback_new_snapshots(&mut self.trustlines, &self.trustline_snapshots, &sp.trustline_snapshots);
+        rollback_new_snapshots(&mut self.data_entries, &self.data_snapshots, &sp.data_snapshots);
+        rollback_new_snapshots(&mut self.contract_data, &self.contract_data_snapshots, &sp.contract_data_snapshots);
+        rollback_new_snapshots(&mut self.contract_code, &self.contract_code_snapshots, &sp.contract_code_snapshots);
+        rollback_new_snapshots(&mut self.ttl_entries, &self.ttl_snapshots, &sp.ttl_snapshots);
+        rollback_new_snapshots(&mut self.claimable_balances, &self.claimable_balance_snapshots, &sp.claimable_balance_snapshots);
+        rollback_new_snapshots(&mut self.liquidity_pools, &self.liquidity_pool_snapshots, &sp.liquidity_pool_snapshots);
 
         // Phase 2: Restore pre-savepoint values for entries already in snapshot maps.
         // These were modified before the savepoint AND potentially re-modified since.
-        for (key, value) in sp.offer_pre_values {
-            let offer_key = OfferKey::new(key.0, key.1);
-            if let Some(current) = self.offers.get(&key).cloned() {
-                self.aa_index_remove(&current);
-            }
-            match value {
-                Some(entry) => {
-                    self.aa_index_insert(&entry);
-                    self.offer_index.update_offer(&entry);
-                    self.offers.insert(key, entry);
-                }
-                None => {
-                    self.offer_index.remove_by_key(&offer_key);
-                    self.offers.remove(&key);
-                }
-            }
-        }
-
-        for (key, value) in sp.account_pre_values {
-            match value {
-                Some(entry) => {
-                    self.accounts.insert(key, entry);
-                }
-                None => {
-                    self.accounts.remove(&key);
-                }
-            }
-        }
-
-        for (key, value) in sp.trustline_pre_values {
-            match value {
-                Some(entry) => {
-                    self.trustlines.insert(key, entry);
-                }
-                None => {
-                    self.trustlines.remove(&key);
-                }
-            }
-        }
-
-        for (key, value) in sp.data_pre_values {
-            match value {
-                Some(entry) => {
-                    self.data_entries.insert(key, entry);
-                }
-                None => {
-                    self.data_entries.remove(&key);
-                }
-            }
-        }
-
-        for (key, value) in sp.contract_data_pre_values {
-            match value {
-                Some(entry) => {
-                    self.contract_data.insert(key, entry);
-                }
-                None => {
-                    self.contract_data.remove(&key);
-                }
-            }
-        }
-
-        for (key, value) in sp.contract_code_pre_values {
-            match value {
-                Some(entry) => {
-                    self.contract_code.insert(key, entry);
-                }
-                None => {
-                    self.contract_code.remove(&key);
-                }
-            }
-        }
-
-        for (key, value) in sp.ttl_pre_values {
-            match value {
-                Some(entry) => {
-                    self.ttl_entries.insert(key, entry);
-                }
-                None => {
-                    self.ttl_entries.remove(&key);
-                }
-            }
-        }
-
-        for (key, value) in sp.claimable_balance_pre_values {
-            match value {
-                Some(entry) => {
-                    self.claimable_balances.insert(key, entry);
-                }
-                None => {
-                    self.claimable_balances.remove(&key);
-                }
-            }
-        }
-
-        for (key, value) in sp.liquidity_pool_pre_values {
-            match value {
-                Some(entry) => {
-                    self.liquidity_pools.insert(key, entry);
-                }
-                None => {
-                    self.liquidity_pools.remove(&key);
-                }
-            }
-        }
+        self.apply_offer_pre_values(sp.offer_pre_values);
+        apply_pre_values(&mut self.accounts, sp.account_pre_values);
+        apply_pre_values(&mut self.trustlines, sp.trustline_pre_values);
+        apply_pre_values(&mut self.data_entries, sp.data_pre_values);
+        apply_pre_values(&mut self.contract_data, sp.contract_data_pre_values);
+        apply_pre_values(&mut self.contract_code, sp.contract_code_pre_values);
+        apply_pre_values(&mut self.ttl_entries, sp.ttl_pre_values);
+        apply_pre_values(&mut self.claimable_balances, sp.claimable_balance_pre_values);
+        apply_pre_values(&mut self.liquidity_pools, sp.liquidity_pool_pre_values);
 
         // Phase 3: Restore snapshot maps and created sets
         self.offer_snapshots = sp.offer_snapshots;
@@ -1502,70 +1269,15 @@ impl LedgerStateManager {
             .truncate(sp.modified_liquidity_pools_len);
 
         // Phase 6: Restore entry metadata
-
-        // entry_last_modified: restore new entries from snapshots
-        let new_lm_keys: Vec<_> = self
-            .entry_last_modified_snapshots
-            .keys()
-            .filter(|k| !sp.entry_last_modified_snapshots.contains_key(k))
-            .cloned()
-            .collect();
-        for key in new_lm_keys {
-            if let Some(snapshot) = self.entry_last_modified_snapshots.get(&key) {
-                match snapshot {
-                    Some(seq) => {
-                        self.entry_last_modified.insert(key, *seq);
-                    }
-                    None => {
-                        self.entry_last_modified.remove(&key);
-                    }
-                }
-            }
-        }
-        for (key, value) in sp.entry_last_modified_pre_values {
-            match value {
-                Some(seq) => {
-                    self.entry_last_modified.insert(key, seq);
-                }
-                None => {
-                    self.entry_last_modified.remove(&key);
-                }
-            }
-        }
+        rollback_new_snapshots(&mut self.entry_last_modified, &self.entry_last_modified_snapshots, &sp.entry_last_modified_snapshots);
+        apply_pre_values(&mut self.entry_last_modified, sp.entry_last_modified_pre_values);
         self.entry_last_modified_snapshots = sp.entry_last_modified_snapshots;
 
-        // entry_sponsorships: restore new entries from snapshots
-        let new_sp_keys: Vec<_> = self
-            .entry_sponsorship_snapshots
-            .keys()
-            .filter(|k| !sp.entry_sponsorship_snapshots.contains_key(k))
-            .cloned()
-            .collect();
-        for key in new_sp_keys {
-            if let Some(snapshot) = self.entry_sponsorship_snapshots.get(&key) {
-                match snapshot {
-                    Some(sponsor) => {
-                        self.entry_sponsorships.insert(key, sponsor.clone());
-                    }
-                    None => {
-                        self.entry_sponsorships.remove(&key);
-                    }
-                }
-            }
-        }
-        for (key, value) in sp.entry_sponsorship_pre_values {
-            match value {
-                Some(sponsor) => {
-                    self.entry_sponsorships.insert(key, sponsor);
-                }
-                None => {
-                    self.entry_sponsorships.remove(&key);
-                }
-            }
-        }
+        rollback_new_snapshots(&mut self.entry_sponsorships, &self.entry_sponsorship_snapshots, &sp.entry_sponsorship_snapshots);
+        apply_pre_values(&mut self.entry_sponsorships, sp.entry_sponsorship_pre_values);
         self.entry_sponsorship_snapshots = sp.entry_sponsorship_snapshots;
 
-        // entry_sponsorship_ext: restore
+        // entry_sponsorship_ext uses HashSet + bool (not Option<V>), handle inline
         let new_ext_keys: Vec<_> = self
             .entry_sponsorship_ext_snapshots
             .keys()
@@ -1594,6 +1306,63 @@ impl LedgerStateManager {
         self.op_entry_snapshots
             .retain(|k, _| sp.op_entry_snapshot_keys.contains(k));
         self.id_pool = sp.id_pool;
+    }
+
+    /// Rollback offer snapshots created since the savepoint.
+    /// Offers need special handling for the aa_index and offer_index.
+    fn rollback_offer_snapshots(&mut self, sp: &Savepoint) {
+        let new_offer_keys: Vec<_> = self
+            .offer_snapshots
+            .keys()
+            .filter(|k| !sp.offer_snapshots.contains_key(k))
+            .cloned()
+            .collect();
+        let new_offer_snapshots: Vec<_> = new_offer_keys
+            .into_iter()
+            .filter_map(|key| {
+                self.offer_snapshots
+                    .get(&key)
+                    .map(|snap| (key, snap.clone()))
+            })
+            .collect();
+        for (key, snapshot) in new_offer_snapshots {
+            let offer_key = OfferKey::new(key.0, key.1);
+            if let Some(current) = self.offers.get(&key).cloned() {
+                self.aa_index_remove(&current);
+            }
+            match snapshot {
+                Some(entry) => {
+                    self.aa_index_insert(&entry);
+                    self.offer_index.update_offer(&entry);
+                    self.offers.insert(key, entry);
+                }
+                None => {
+                    self.offer_index.remove_by_key(&offer_key);
+                    self.offers.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Apply offer pre-savepoint values, maintaining aa_index and offer_index.
+    fn apply_offer_pre_values(&mut self, pre_values: Vec<(([u8; 32], i64), Option<OfferEntry>)>) {
+        for (key, value) in pre_values {
+            let offer_key = OfferKey::new(key.0, key.1);
+            if let Some(current) = self.offers.get(&key).cloned() {
+                self.aa_index_remove(&current);
+            }
+            match value {
+                Some(entry) => {
+                    self.aa_index_insert(&entry);
+                    self.offer_index.update_offer(&entry);
+                    self.offers.insert(key, entry);
+                }
+                None => {
+                    self.offer_index.remove_by_key(&offer_key);
+                    self.offers.remove(&key);
+                }
+            }
+        }
     }
 
     // ==================== Rollback Support ====================
