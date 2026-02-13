@@ -56,7 +56,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use henyey_crypto;
 use henyey_history::CatchupMode;
 
 /// Main application configuration.

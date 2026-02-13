@@ -1,61 +1,49 @@
 # henyey-app
 
-Application orchestration layer for henyey.
+Application orchestration layer for henyey (rs-stellar-core).
 
 ## Overview
 
-This crate provides the top-level application layer that wires together all subsystems of a Stellar Core node. It is the main entry point for running a node and handles:
-
-- **Configuration management**: Loading and validating TOML configuration files with environment variable overrides
-- **Application lifecycle**: Initializing, running, and gracefully shutting down all node components
-- **Command execution**: Implementing CLI commands like `run` and `catchup`
-- **HTTP API**: Serving status, metrics, and control endpoints
-- **Logging**: Structured logging with progress tracking for long-running operations
+This crate provides the top-level application layer that wires together all subsystems of a Stellar Core node. It is the main entry point for running a node and handles configuration management, lifecycle control, HTTP API serving, logging, database maintenance, metadata streaming, and network surveys. It corresponds to the `src/main/` directory in upstream stellar-core, primarily `ApplicationImpl.cpp`, `Config.cpp`, `CommandHandler.cpp`, and `Maintainer.cpp`.
 
 ## Architecture
 
-The `App` struct is the central coordinator that directly owns handles to all subsystems:
-
+```mermaid
+graph TD
+    App["App (coordinator)"]
+    App --> DB["Database (SQLite)"]
+    App --> BM["BucketManager"]
+    App --> LM["LedgerManager"]
+    App --> OV["OverlayManager (P2P)"]
+    App --> HD["Herder (SCP)"]
+    App --> WS["WorkScheduler"]
+    App --> SD["SurveyDataManager"]
+    App --> SR["SyncRecoveryManager"]
+    App --> MS["MetaStream"]
+    App --> MT["Maintainer"]
+    App --> SS["StatusServer (HTTP)"]
 ```
-                         +------------------+
-                         |       App        |
-                         |  (Coordinator)   |
-                         +--------+---------+
-                                  |
-          +-----------+-----------+-----------+-----------+
-          |           |           |           |           |
-          v           v           v           v           v
-    +-----------+ +---------+ +---------+ +---------+ +---------+
-    | Database  | | Bucket  | | Ledger  | | Overlay | | Herder  |
-    | (SQLite)  | | Manager | | Manager | | (P2P)   | | (SCP)   |
-    +-----------+ +---------+ +---------+ +---------+ +---------+
-
-    Supporting components (also owned by App):
-
-    +----------------+  +------------------+  +------------------+
-    | WorkScheduler  |  | SurveyDataMgr    |  | SyncRecoveryMgr  |
-    | (history work) |  | (topology data)  |  | (stuck recovery) |
-    +----------------+  +------------------+  +------------------+
-```
-
-All subsystems are direct children of `App`, coordinated through `Arc`-based shared
-ownership and async channels. The Tokio runtime handles all task scheduling.
 
 ## Key Types
 
 | Type | Description |
 |------|-------------|
-| `App` | Main application struct coordinating all subsystems |
+| `App` | Central application struct coordinating all subsystems |
 | `AppConfig` | Configuration loaded from TOML with defaults for testnet/mainnet |
-| `AppState` | Application lifecycle state (Initializing, CatchingUp, Synced, etc.) |
-| `RunMode` | Node running mode (Full, Validator, Watcher) |
-| `RunOptions` | Configuration for the run command (mode, force catchup, sync behavior) |
-| `CatchupMode` | History download mode (Minimal, Complete, Recent) |
-| `CatchupOptions` | Configuration for the catchup command (target, mode, parallelism) |
-| `CatchupResult` | Result of a catchup operation (final ledger, buckets applied, etc.) |
-| `Maintainer` | Background database maintenance scheduler |
+| `AppState` | Lifecycle state enum: Initializing, CatchingUp, Synced, Validating, ShuttingDown |
+| `RunMode` | Node running mode: Full, Validator, Watcher |
+| `RunOptions` | Options for the run command (mode, force catchup, sync behavior) |
+| `CatchupMode` | History download mode: Minimal, Complete, Recent |
+| `CatchupOptions` | Options for the catchup command (target ledger, mode, parallelism) |
+| `CatchupResult` | Result of a catchup operation (final ledger, buckets applied) |
+| `SurveyReport` | Collected network topology survey data |
+| `NodeStatsSnapshot` | Baseline node statistics captured at survey collection start |
+| `Maintainer` | Background scheduler for database cleanup |
+| `MaintenanceConfig` | Configuration for maintenance intervals and batch sizes |
 | `StatusServer` | HTTP server for monitoring and control endpoints |
 | `ConfigBuilder` | Builder API for programmatic configuration construction |
+| `LogLevelHandle` | Handle for dynamic runtime log level changes |
+| `ProgressTracker` | Progress reporter for long-running operations |
 
 ## Usage
 
@@ -66,10 +54,7 @@ use henyey_app::{App, AppConfig, run_node, RunOptions};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Load configuration from file
     let config = AppConfig::from_file("config.toml")?;
-
-    // Run the node
     run_node(config, RunOptions::default()).await
 }
 ```
@@ -82,11 +67,9 @@ use henyey_app::{run_catchup, CatchupOptions, CatchupMode, AppConfig};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config = AppConfig::testnet();
-
     let options = CatchupOptions::to_ledger(1000000)
         .with_mode(CatchupMode::Recent(1000))
         .with_parallelism(16);
-
     run_catchup(config, options).await?;
     Ok(())
 }
@@ -105,141 +88,67 @@ let config = ConfigBuilder::new()
     .build();
 ```
 
-## Configuration
+## Module Layout
 
-Configuration is loaded from TOML files. See the `config` module for all options.
-
-### Example Configuration
-
-```toml
-[node]
-name = "my-validator"
-node_seed = "S..."  # Required for validators
-is_validator = true
-
-[network]
-passphrase = "Test SDF Network ; September 2015"
-
-[database]
-path = "/var/lib/stellar/stellar.db"
-
-[overlay]
-peer_port = 11625
-known_peers = [
-    "core-testnet1.stellar.org:11625",
-    "core-testnet2.stellar.org:11625"
-]
-
-[[history.archives]]
-name = "sdf1"
-url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
-
-[logging]
-level = "info"
-format = "text"
-```
-
-### Environment Overrides
-
-Configuration values can be overridden using environment variables:
-
-| Variable | Description |
-|----------|-------------|
-| `RS_STELLAR_CORE_NODE_NAME` | Node name |
-| `RS_STELLAR_CORE_NODE_SEED` | Node secret seed |
-| `RS_STELLAR_CORE_NETWORK_PASSPHRASE` | Network passphrase |
-| `RS_STELLAR_CORE_DATABASE_PATH` | Database file path |
-| `RS_STELLAR_CORE_LOG_LEVEL` | Log level |
-
-## HTTP API
-
-When enabled, the status server provides REST endpoints:
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/info` | GET | Node information and version |
-| `/status` | GET | Current node status |
-| `/metrics` | GET | Prometheus-format metrics |
-| `/peers` | GET | Connected peer list |
-| `/connect` | POST | Connect to a peer |
-| `/droppeer` | POST | Disconnect a peer |
-| `/bans` | GET | List banned peers |
-| `/unban` | POST | Unban a peer |
-| `/ledger` | GET | Current ledger state |
-| `/upgrades` | GET | Current/proposed upgrades |
-| `/quorum` | GET | Quorum set configuration |
-| `/scp` | GET | SCP consensus state |
-| `/survey` | GET | Survey report |
-| `/survey/start` | POST | Start survey collecting |
-| `/survey/stop` | POST | Stop survey collecting |
-| `/survey/topology` | POST | Request topology from peer |
-| `/survey/reporting/stop` | POST | Stop survey reporting |
-| `/self-check` | POST | Run self-check validation |
-| `/tx` | POST | Submit a transaction |
-| `/shutdown` | POST | Request graceful shutdown |
-| `/health` | GET | Health check endpoint |
-| `/ll` | GET/POST | Query or change log levels dynamically |
-| `/manualclose` | POST | Trigger manual ledger close (requires `manual_close` config) |
-| `/sorobaninfo` | GET | Soroban network configuration from ledger |
-| `/clearmetrics` | POST | Request metrics clearing |
-| `/logrotate` | POST | Request log rotation |
-| `/maintenance` | POST | Trigger manual database maintenance |
-| `/dumpproposedsettings` | GET | Dump proposed ConfigUpgradeSet from ledger |
-
-## Module Structure
-
-```
-src/
-├── lib.rs          # Crate root with re-exports
-├── app.rs          # Core App struct and lifecycle (~7600 lines)
-├── config.rs       # Configuration types and loading
-├── run_cmd.rs      # Run command, HTTP server, and status endpoints
-├── catchup_cmd.rs  # Catchup command implementation
-├── logging.rs      # Logging setup and progress tracking
-├── maintainer.rs   # Background database maintenance scheduler
-└── survey.rs       # Network topology survey support
-```
+| Module | Description |
+|--------|-------------|
+| `lib.rs` | Crate root with module declarations and public re-exports |
+| `app.rs` | Core `App` struct, subsystem initialization, ledger close pipeline, catchup orchestration, overlay message handling, survey coordination, and sync recovery |
+| `config.rs` | Configuration types (`AppConfig`, `NodeConfig`, `NetworkConfig`, etc.), TOML loading, environment variable overrides, and `ConfigBuilder` |
+| `run_cmd.rs` | `run_node` entry point, `NodeRunner` lifecycle, `StatusServer` HTTP API with axum handlers for all REST endpoints |
+| `catchup_cmd.rs` | `run_catchup` entry point, `CatchupOptions` parsing, progress callbacks |
+| `logging.rs` | Logging initialization, `ProgressTracker` for catchup/apply progress, dynamic `LogLevelHandle` |
+| `maintainer.rs` | `Maintainer` background scheduler for SCP history and ledger header cleanup |
+| `meta_stream.rs` | `MetaStreamManager` for emitting `LedgerCloseMeta` XDR frames to external consumers (main and debug streams) |
+| `survey.rs` | `SurveyDataManager` for time-sliced overlay network surveys, `SurveyMessageLimiter` for rate limiting |
 
 ## Design Notes
 
-### State Machine
+### Application State Machine
 
-The application transitions through well-defined states:
+The application transitions through well-defined lifecycle states:
 
+```mermaid
+stateDiagram-v2
+    [*] --> Initializing
+    Initializing --> CatchingUp: behind
+    Initializing --> Synced: up-to-date
+    CatchingUp --> Synced: catchup complete
+    Synced --> Validating: validator mode
+    Synced --> CatchingUp: fell behind
+    Validating --> CatchingUp: fell behind
+    Synced --> ShuttingDown: shutdown
+    Validating --> ShuttingDown: shutdown
+    CatchingUp --> ShuttingDown: shutdown
+    Initializing --> ShuttingDown: shutdown
+    ShuttingDown --> [*]
 ```
-Initializing ----> CatchingUp ----> Synced <----> Validating
-     |                  ^              |
-     |                  |              |
-     +------------------+-- (already   |
-     |                      up-to-date)|
-     +--- Synced <------+              |
-                                       v
-                 Any state -----> ShuttingDown
-```
-
-- `Initializing -> CatchingUp`: Node is behind and must download history
-- `Initializing -> Synced`: Node is already up-to-date (no catchup needed)
-- `CatchingUp -> Synced`: Catchup completed successfully
-- `Synced -> Validating`: Validator begins consensus participation
-- `Synced -> CatchingUp`: Node falls behind and needs to re-sync
-- Any state -> `ShuttingDown`: Shutdown signal received
 
 ### Consensus Stuck Recovery
 
-When consensus stalls (no ledger close for 35+ seconds with buffered ledgers), the node:
-
-1. Broadcasts its SCP state to peers
-2. Requests SCP state from peers
-3. Attempts recovery every 10 seconds
-4. Falls back to catchup if recovery fails
+When consensus stalls (no ledger close for 35+ seconds with buffered ledgers), the node broadcasts its SCP state to peers, requests SCP state from peers, retries recovery every 10 seconds, and falls back to catchup if recovery fails.
 
 ### Transaction Flooding
 
-Transactions are propagated using an advert/demand protocol:
-- Nodes advertise transaction hashes they have
-- Peers demand transactions they need
-- Rate limiting prevents bandwidth abuse
+Transactions are propagated using an advert/demand protocol. Nodes advertise transaction hashes they have, peers demand transactions they need, and rate limiting prevents bandwidth abuse.
 
-## stellar-core Parity Status
+### Determinism
+
+All ledger-close and state-transition logic must be deterministic and match stellar-core behavior exactly. The `App` coordinates the close pipeline through `persist_ledger_close` which applies transactions, computes bucket list hashes, and emits metadata in the same order as upstream.
+
+## stellar-core Mapping
+
+| Rust | stellar-core |
+|------|--------------|
+| `app.rs` | `src/main/ApplicationImpl.cpp`, `src/main/ApplicationImpl.h` |
+| `config.rs` | `src/main/Config.cpp`, `src/main/Config.h` |
+| `run_cmd.rs` | `src/main/CommandHandler.cpp`, `src/main/CommandLine.cpp` |
+| `catchup_cmd.rs` | `src/main/CommandLine.cpp` (catchup command) |
+| `logging.rs` | `src/util/Logging.cpp` |
+| `maintainer.rs` | `src/main/Maintainer.cpp`, `src/main/Maintainer.h` |
+| `meta_stream.rs` | `src/ledger/LedgerManagerImpl.cpp` (meta stream output) |
+| `survey.rs` | `src/overlay/SurveyManager.cpp`, `src/overlay/SurveyManager.h` |
+
+## Parity Status
 
 See [PARITY_STATUS.md](PARITY_STATUS.md) for detailed stellar-core parity analysis.

@@ -13,6 +13,8 @@
 //!   progress reporting for long-running operations ([`logging`] module)
 //! - **Database maintenance**: Background cleanup of old ledger headers and SCP
 //!   history to prevent unbounded database growth ([`maintainer`] module)
+//! - **Metadata streaming**: Emitting `LedgerCloseMeta` frames to external consumers
+//!   ([`meta_stream`] module)
 //! - **Network surveys**: Collecting and reporting overlay network topology data
 //!   ([`survey`] module)
 //!
@@ -47,6 +49,7 @@
 //! - [`config`]: Configuration loading and validation
 //! - [`logging`]: Logging setup and progress tracking utilities
 //! - [`maintainer`]: Background database maintenance scheduler
+//! - [`meta_stream`]: Metadata output stream for `LedgerCloseMeta` emission
 //! - [`run_cmd`]: Node run command and HTTP status server
 //! - [`survey`]: Time-sliced overlay network survey management
 

@@ -6094,16 +6094,14 @@ impl App {
         let state = self.state().await;
         let initially_out_of_sync = matches!(state, AppState::Initializing | AppState::CatchingUp);
 
+        let node_stats = crate::survey::NodeStatsSnapshot {
+            lost_sync_count: lost_sync,
+            out_of_sync: initially_out_of_sync,
+            added_peers: added,
+            dropped_peers: dropped,
+        };
         let mut survey_data = self.survey_data.write().await;
-        if survey_data.start_collecting(
-            message,
-            &inbound,
-            &outbound,
-            lost_sync,
-            added,
-            dropped,
-            initially_out_of_sync,
-        ) {
+        if survey_data.start_collecting(message, &inbound, &outbound, node_stats) {
             tracing::debug!(peer = %peer_id, "Survey collection started");
         } else {
             tracing::debug!(peer = %peer_id, "Survey collection already active");
@@ -7437,16 +7435,14 @@ impl App {
         let state = self.state().await;
         let initially_out_of_sync = matches!(state, AppState::Initializing | AppState::CatchingUp);
 
+        let node_stats = crate::survey::NodeStatsSnapshot {
+            lost_sync_count: lost_sync,
+            out_of_sync: initially_out_of_sync,
+            added_peers: added,
+            dropped_peers: dropped,
+        };
         let mut survey_data = self.survey_data.write().await;
-        let _ = survey_data.start_collecting(
-            message,
-            &inbound,
-            &outbound,
-            lost_sync,
-            added,
-            dropped,
-            initially_out_of_sync,
-        );
+        let _ = survey_data.start_collecting(message, &inbound, &outbound, node_stats);
     }
 
     async fn stop_local_survey_collecting(&self, message: &TimeSlicedSurveyStopCollectingMessage) {

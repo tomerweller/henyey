@@ -312,6 +312,22 @@ struct CollectingPeerData {
     latency_ms: LatencyHistogram,
 }
 
+/// Initial node-level statistics captured at the start of a survey collection.
+///
+/// These baseline values are subtracted from final totals to compute deltas
+/// over the survey window.
+#[derive(Debug, Clone)]
+pub struct NodeStatsSnapshot {
+    /// Cumulative lost-sync count at survey start.
+    pub lost_sync_count: u64,
+    /// Whether the node was out of sync when the survey started.
+    pub out_of_sync: bool,
+    /// Cumulative added-peer count at survey start.
+    pub added_peers: u64,
+    /// Cumulative dropped-peer count at survey start.
+    pub dropped_peers: u64,
+}
+
 /// Manager for collecting and reporting time-sliced survey data.
 ///
 /// This struct handles the complete survey lifecycle for a single node:
@@ -394,16 +410,12 @@ impl SurveyDataManager {
         self.phase != SurveyPhase::Inactive
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn start_collecting(
         &mut self,
         msg: &TimeSlicedSurveyStartCollectingMessage,
         inbound_peers: &[PeerSnapshot],
         outbound_peers: &[PeerSnapshot],
-        initial_lost_sync_count: u64,
-        initial_added_peers: u64,
-        initial_dropped_peers: u64,
-        initially_out_of_sync: bool,
+        node_stats: NodeStatsSnapshot,
     ) -> bool {
         if self.phase != SurveyPhase::Inactive {
             return false;
@@ -415,10 +427,10 @@ impl SurveyDataManager {
         self.nonce = Some(msg.nonce);
         self.surveyor_id = Some(msg.surveyor_id.clone());
         self.collecting_node = Some(CollectingNodeData {
-            initial_lost_sync_count,
-            initially_out_of_sync,
-            initial_added_peers,
-            initial_dropped_peers,
+            initial_lost_sync_count: node_stats.lost_sync_count,
+            initially_out_of_sync: node_stats.out_of_sync,
+            initial_added_peers: node_stats.added_peers,
+            initial_dropped_peers: node_stats.dropped_peers,
             scp_first_to_self_latency: LatencyHistogram::new(DEFAULT_HISTOGRAM_SAMPLES),
             scp_self_to_other_latency: LatencyHistogram::new(DEFAULT_HISTOGRAM_SAMPLES),
         });
