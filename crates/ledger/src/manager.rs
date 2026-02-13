@@ -2146,7 +2146,7 @@ impl<'a> LedgerCloseContext<'a> {
                 hash_hex,
                 success: result.success,
                 op_count: result.operation_results.len(),
-                exec_us: 0, // TODO: add exec_time_us to TransactionExecutionResult
+                exec_us: result.exec_time_us,
                 is_soroban,
             });
         }

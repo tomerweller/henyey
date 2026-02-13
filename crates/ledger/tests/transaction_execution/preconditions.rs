@@ -640,6 +640,7 @@ fn test_fee_bump_result_encoding() {
         post_fee_changes: None,
         hot_archive_restored_keys: vec![],
         op_type_timings: std::collections::HashMap::new(),
+        exec_time_us: 0,
     };
 
     let pair = build_tx_result_pair(

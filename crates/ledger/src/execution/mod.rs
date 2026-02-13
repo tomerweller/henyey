@@ -316,6 +316,8 @@ pub struct TransactionExecutionResult {
     pub hot_archive_restored_keys: Vec<LedgerKey>,
     /// Per-operation-type timing: maps op type to (total_us, count).
     pub op_type_timings: HashMap<OperationType, (u64, u32)>,
+    /// Total transaction execution time in microseconds.
+    pub exec_time_us: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,6 +353,7 @@ fn failed_result(failure: ExecutionFailure, error: &str) -> TransactionExecution
         post_fee_changes: None,
         hot_archive_restored_keys: Vec::new(),
         op_type_timings: HashMap::new(),
+        exec_time_us: 0,
     }
 }
 
@@ -2688,6 +2691,7 @@ impl TransactionExecutor {
             // Convert HashSet back to Vec for the return type
             hot_archive_restored_keys: collected_hot_archive_keys.into_iter().collect(),
             op_type_timings,
+            exec_time_us: total_us,
         })
     }
 
