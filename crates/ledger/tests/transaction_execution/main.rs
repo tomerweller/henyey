@@ -297,9 +297,7 @@ fn scval_symbol(sym: &str) -> ScVal {
 }
 
 fn account_id_to_strkey(account_id: &AccountId) -> String {
-    match &account_id.0 {
-        PublicKey::PublicKeyTypeEd25519(key) => henyey_crypto::encode_account_id(&key.0),
-    }
+    henyey_crypto::account_id_to_strkey(account_id)
 }
 
 fn asset_code_to_string(bytes: &[u8]) -> String {

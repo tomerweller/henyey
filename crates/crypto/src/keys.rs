@@ -29,7 +29,6 @@
 //! ```
 
 use crate::error::CryptoError;
-use crate::strkey;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::fmt;
 
@@ -81,7 +80,7 @@ impl PublicKey {
     /// This uses Stellar's StrKey format: base32 encoding with a version byte
     /// and CRC16 checksum.
     pub fn to_strkey(&self) -> String {
-        strkey::encode_account_id(self.as_bytes())
+        stellar_strkey::ed25519::PublicKey(*self.as_bytes()).to_string()
     }
 
     /// Parses a public key from a Stellar account ID (G...).
@@ -92,8 +91,10 @@ impl PublicKey {
     /// account ID, or [`CryptoError::InvalidPublicKey`] if the decoded bytes
     /// are not a valid Ed25519 public key.
     pub fn from_strkey(s: &str) -> Result<Self, CryptoError> {
-        let bytes = strkey::decode_account_id(s)?;
-        Self::from_bytes(&bytes)
+        let pk: stellar_strkey::ed25519::PublicKey = s
+            .parse()
+            .map_err(|e: stellar_strkey::DecodeError| CryptoError::InvalidStrKey(e.to_string()))?;
+        Self::from_bytes(&pk.0)
     }
 
     /// Converts to Curve25519 (Montgomery form) public key bytes.
@@ -216,7 +217,7 @@ impl SecretKey {
     /// The returned string contains sensitive key material. Handle with care
     /// and avoid logging or displaying it unnecessarily.
     pub fn to_strkey(&self) -> String {
-        strkey::encode_secret_seed(self.inner.as_bytes())
+        stellar_strkey::ed25519::PrivateKey(*self.inner.as_bytes()).to_string()
     }
 
     /// Parses a secret key from a Stellar seed (S...).
@@ -225,8 +226,10 @@ impl SecretKey {
     ///
     /// Returns [`CryptoError::InvalidStrKey`] if the string is not a valid seed.
     pub fn from_strkey(s: &str) -> Result<Self, CryptoError> {
-        let bytes = strkey::decode_secret_seed(s)?;
-        Ok(Self::from_seed(&bytes))
+        let pk: stellar_strkey::ed25519::PrivateKey = s
+            .parse()
+            .map_err(|e: stellar_strkey::DecodeError| CryptoError::InvalidStrKey(e.to_string()))?;
+        Ok(Self::from_seed(&pk.0))
     }
 
     /// Converts to Curve25519 scalar bytes for sealed box decryption.
@@ -257,6 +260,18 @@ impl Clone for SecretKey {
     fn clone(&self) -> Self {
         Self {
             inner: SigningKey::from_bytes(self.inner.as_bytes()),
+        }
+    }
+}
+
+/// Converts an XDR AccountId to its strkey representation (G...).
+///
+/// This is a convenience function for converting the XDR AccountId type
+/// directly to a human-readable strkey format, suitable for logging.
+pub fn account_id_to_strkey(account_id: &stellar_xdr::curr::AccountId) -> String {
+    match &account_id.0 {
+        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(bytes)) => {
+            stellar_strkey::ed25519::PublicKey(*bytes).to_string()
         }
     }
 }

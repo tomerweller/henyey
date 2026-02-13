@@ -11,7 +11,7 @@
 //! - **HMAC-SHA256**: Message authentication via [`hmac_sha256`] and [`hmac_sha256_verify`]
 //! - **HKDF**: Key derivation via [`hkdf_extract`], [`hkdf_expand`], and [`hkdf()`]
 //! - **XDR hashing**: [`xdr_sha256`] and [`xdr_blake2`] for hashing XDR-encoded values
-//! - **StrKey encoding**: Stellar's base32 key format for account IDs, secret seeds, and more
+//! - **StrKey encoding**: Via re-exported [`stellar_strkey`] crate, plus convenience helpers on key types
 //! - **Short hashing**: SipHash-2-4 for deterministic ordering in bucket lists and ledger state
 //! - **Sealed boxes**: Curve25519-based encryption for survey payloads
 //! - **Curve25519 ECDH**: Key exchange for P2P overlay authentication via [`Curve25519Secret`] and [`Curve25519Public`]
@@ -57,7 +57,6 @@ mod sealed_box;
 mod short_hash;
 mod signature;
 mod signer_key;
-mod strkey;
 
 pub use curve25519::*;
 pub use error::CryptoError;
@@ -68,7 +67,7 @@ pub use sealed_box::*;
 pub use short_hash::*;
 pub use signature::*;
 pub use signer_key::*;
-pub use strkey::*;
+pub use stellar_strkey;
 
 // Re-export Hash256 from common for convenience
 pub use henyey_common::Hash256;

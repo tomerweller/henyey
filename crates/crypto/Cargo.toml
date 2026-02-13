@@ -38,7 +38,7 @@ getrandom.workspace = true
 
 # Encoding - pure Rust
 hex.workspace = true
-base32.workspace = true
+stellar-strkey.workspace = true
 
 # Utilities
 thiserror.workspace = true
