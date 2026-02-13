@@ -1345,6 +1345,7 @@ impl LedgerStateManager {
     }
 
     /// Apply offer pre-savepoint values, maintaining aa_index and offer_index.
+    #[allow(clippy::type_complexity)]
     fn apply_offer_pre_values(&mut self, pre_values: Vec<(([u8; 32], i64), Option<OfferEntry>)>) {
         for (key, value) in pre_values {
             let offer_key = OfferKey::new(key.0, key.1);
