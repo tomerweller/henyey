@@ -2116,40 +2116,16 @@ impl<'a> LedgerCloseContext<'a> {
         Ok(results)
     }
 
-    /// Commit the ledger close and produce the new header.
-    fn commit(mut self) -> Result<LedgerCloseResult> {
-        tracing::debug!(
-            ledger_seq = self.close_data.ledger_seq,
-            "LedgerCloseContext::commit starting"
-        );
-
-        let commit_start = std::time::Instant::now();
-
-        // Compute transaction result hash
-        let result_set = stellar_xdr::curr::TransactionResultSet {
-            results: self.tx_results.clone().try_into().unwrap_or_default(),
-        };
-        let tx_result_hash = Hash256::hash_xdr(&result_set).unwrap_or(Hash256::ZERO);
-
-        // Log transaction results for debugging - helps identify tx execution differences
-        tracing::debug!(
-            ledger_seq = self.close_data.ledger_seq,
-            tx_count = self.tx_results.len(),
-            tx_result_hash = %tx_result_hash.to_hex(),
-            "TX_RESULT: Transaction result hash computed"
-        );
-
-        let mut upgraded_header = self.prev_header.clone();
-        self.upgrade_ctx.apply_to_header(&mut upgraded_header);
-        let protocol_version = upgraded_header.ledger_version;
-        let prev_version = self.prev_header.ledger_version;
-        tracing::debug!(
-            ledger_seq = self.close_data.ledger_seq,
-            prev_protocol_version = prev_version,
-            upgraded_protocol_version = protocol_version,
-            "Protocol version for commit"
-        );
-
+    /// Apply protocol version upgrades and config upgrades to the delta.
+    ///
+    /// Handles V25 cost type creation, config setting upgrades, and
+    /// Soroban state size window recomputation when memory cost params change.
+    /// Returns `(config_state_archival_changed, config_memory_cost_params_changed)`.
+    fn apply_upgrades_to_delta(
+        &mut self,
+        prev_version: u32,
+        protocol_version: u32,
+    ) -> Result<(bool, bool)> {
         // Parity: Upgrades.cpp:1229-1242 applyVersionUpgrade
         // Version upgrades may create/modify config setting entries in the
         // ledger (e.g. new cost types for V25, state size window for V23+).
@@ -2307,6 +2283,153 @@ impl<'a> LedgerCloseContext<'a> {
                 }
             }
         }
+
+        Ok((config_state_archival_changed, config_memory_cost_params_changed))
+    }
+
+    /// Create the new ledger header and compute its hash.
+    ///
+    /// Applies upgrades to header fields, encodes raw upgrade types for
+    /// correct header hash, and sets the id_pool.
+    fn build_and_hash_header(
+        &self,
+        bucket_list_hash: Hash256,
+        tx_result_hash: Hash256,
+        config_state_archival_changed: bool,
+        config_memory_cost_params_changed: bool,
+    ) -> Result<(LedgerHeader, Hash256)> {
+        // Log all inputs to create_next_header for debugging header mismatch
+        let total_coins = self.prev_header.total_coins + self.delta.total_coins_delta();
+        let fee_pool = self.prev_header.fee_pool + self.delta.fee_pool_delta();
+        tracing::debug!(
+            ledger_seq = self.close_data.ledger_seq,
+            prev_header_hash = %self.prev_header_hash.to_hex(),
+            prev_ledger_seq = self.prev_header.ledger_seq,
+            close_time = self.close_data.close_time,
+            tx_set_hash = %self.close_data.tx_set_hash().to_hex(),
+            bucket_list_hash = %bucket_list_hash.to_hex(),
+            tx_result_hash = %tx_result_hash.to_hex(),
+            prev_total_coins = self.prev_header.total_coins,
+            total_coins_delta = self.delta.total_coins_delta(),
+            total_coins = total_coins,
+            prev_fee_pool = self.prev_header.fee_pool,
+            fee_pool_delta = self.delta.fee_pool_delta(),
+            fee_pool = fee_pool,
+            inflation_seq = self.prev_header.inflation_seq,
+            prev_ledger_version = self.prev_header.ledger_version,
+            prev_base_fee = self.prev_header.base_fee,
+            prev_base_reserve = self.prev_header.base_reserve,
+            prev_max_tx_set_size = self.prev_header.max_tx_set_size,
+            "Header creation inputs"
+        );
+
+        // Create the new header
+        let mut new_header = create_next_header(
+            &self.prev_header,
+            self.prev_header_hash,
+            self.close_data.close_time,
+            self.close_data.tx_set_hash(),
+            bucket_list_hash,
+            tx_result_hash,
+            total_coins,
+            fee_pool,
+            self.prev_header.inflation_seq,
+            self.close_data.stellar_value_ext.clone(),
+        );
+
+        // Apply upgrades to header fields (e.g., ledger_version, base_fee)
+        self.upgrade_ctx.apply_to_header(&mut new_header);
+
+        // Log config upgrade effects (upgrades were already applied to the delta
+        // before bucket list add_batch, matching stellar-core ordering)
+        if config_state_archival_changed {
+            tracing::info!(
+                ledger_seq = self.close_data.ledger_seq,
+                "State archival settings changed via config upgrade"
+            );
+        }
+        if config_memory_cost_params_changed {
+            tracing::info!(
+                ledger_seq = self.close_data.ledger_seq,
+                "Memory cost params changed via config upgrade"
+            );
+        }
+
+        // Also set the raw upgrades in scp_value.upgrades for correct header hash
+        // The upgrades need to be XDR-encoded as UpgradeType (opaque bytes)
+        let raw_upgrades: Vec<stellar_xdr::curr::UpgradeType> = self
+            .close_data
+            .upgrades
+            .iter()
+            .filter_map(|upgrade| {
+                use stellar_xdr::curr::WriteXdr;
+                upgrade
+                    .to_xdr(stellar_xdr::curr::Limits::none())
+                    .ok()
+                    .and_then(|bytes| stellar_xdr::curr::UpgradeType::try_from(bytes).ok())
+            })
+            .collect();
+        if let Ok(upgrades_vec) = raw_upgrades.try_into() {
+            new_header.scp_value.upgrades = upgrades_vec;
+        }
+
+        new_header.id_pool = self.id_pool;
+
+        // Compute header hash - add detailed XDR logging for debugging
+        use stellar_xdr::curr::{Limits, WriteXdr};
+        let header_xdr_bytes = new_header.to_xdr(Limits::none())?;
+        let header_xdr_hex: String = header_xdr_bytes
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        tracing::debug!(
+            ledger_seq = new_header.ledger_seq,
+            header_xdr_len = header_xdr_bytes.len(),
+            header_xdr_hex = %header_xdr_hex,
+            "Full header XDR for hash debugging"
+        );
+        let header_hash = compute_header_hash(&new_header)?;
+
+        Ok((new_header, header_hash))
+    }
+
+    /// Commit the ledger close and produce the new header.
+    fn commit(mut self) -> Result<LedgerCloseResult> {
+        tracing::debug!(
+            ledger_seq = self.close_data.ledger_seq,
+            "LedgerCloseContext::commit starting"
+        );
+
+        let commit_start = std::time::Instant::now();
+
+        // Compute transaction result hash
+        let result_set = stellar_xdr::curr::TransactionResultSet {
+            results: self.tx_results.clone().try_into().unwrap_or_default(),
+        };
+        let tx_result_hash = Hash256::hash_xdr(&result_set).unwrap_or(Hash256::ZERO);
+
+        // Log transaction results for debugging - helps identify tx execution differences
+        tracing::debug!(
+            ledger_seq = self.close_data.ledger_seq,
+            tx_count = self.tx_results.len(),
+            tx_result_hash = %tx_result_hash.to_hex(),
+            "TX_RESULT: Transaction result hash computed"
+        );
+
+        let mut upgraded_header = self.prev_header.clone();
+        self.upgrade_ctx.apply_to_header(&mut upgraded_header);
+        let protocol_version = upgraded_header.ledger_version;
+        let prev_version = self.prev_header.ledger_version;
+        tracing::debug!(
+            ledger_seq = self.close_data.ledger_seq,
+            prev_protocol_version = prev_version,
+            upgraded_protocol_version = protocol_version,
+            "Protocol version for commit"
+        );
+
+        let (config_state_archival_changed, config_memory_cost_params_changed) =
+            self.apply_upgrades_to_delta(prev_version, protocol_version)?;
+
         tracing::debug!(
             ledger_seq = self.close_data.ledger_seq,
             delta_count_final = self.delta.num_changes(),
@@ -2818,98 +2941,13 @@ impl<'a> LedgerCloseContext<'a> {
             (final_hash, bucket_lock_wait_us, eviction_us, soroban_state_us, add_batch_us, hot_archive_us)
         };
 
-        // Log all inputs to create_next_header for debugging header mismatch
-        let total_coins = self.prev_header.total_coins + self.delta.total_coins_delta();
-        let fee_pool = self.prev_header.fee_pool + self.delta.fee_pool_delta();
-        tracing::debug!(
-            ledger_seq = self.close_data.ledger_seq,
-            prev_header_hash = %self.prev_header_hash.to_hex(),
-            prev_ledger_seq = self.prev_header.ledger_seq,
-            close_time = self.close_data.close_time,
-            tx_set_hash = %self.close_data.tx_set_hash().to_hex(),
-            bucket_list_hash = %bucket_list_hash.to_hex(),
-            tx_result_hash = %tx_result_hash.to_hex(),
-            prev_total_coins = self.prev_header.total_coins,
-            total_coins_delta = self.delta.total_coins_delta(),
-            total_coins = total_coins,
-            prev_fee_pool = self.prev_header.fee_pool,
-            fee_pool_delta = self.delta.fee_pool_delta(),
-            fee_pool = fee_pool,
-            inflation_seq = self.prev_header.inflation_seq,
-            prev_ledger_version = self.prev_header.ledger_version,
-            prev_base_fee = self.prev_header.base_fee,
-            prev_base_reserve = self.prev_header.base_reserve,
-            prev_max_tx_set_size = self.prev_header.max_tx_set_size,
-            "Header creation inputs"
-        );
-
-        // Create the new header
         let header_start = std::time::Instant::now();
-        let mut new_header = create_next_header(
-            &self.prev_header,
-            self.prev_header_hash,
-            self.close_data.close_time,
-            self.close_data.tx_set_hash(),
+        let (new_header, header_hash) = self.build_and_hash_header(
             bucket_list_hash,
             tx_result_hash,
-            total_coins,
-            fee_pool,
-            self.prev_header.inflation_seq,
-            self.close_data.stellar_value_ext.clone(),
-        );
-
-        // Apply upgrades to header fields (e.g., ledger_version, base_fee)
-        self.upgrade_ctx.apply_to_header(&mut new_header);
-
-        // Log config upgrade effects (upgrades were already applied to the delta
-        // before bucket list add_batch, matching stellar-core ordering)
-        if config_state_archival_changed {
-            tracing::info!(
-                ledger_seq = self.close_data.ledger_seq,
-                "State archival settings changed via config upgrade"
-            );
-        }
-        if config_memory_cost_params_changed {
-            tracing::info!(
-                ledger_seq = self.close_data.ledger_seq,
-                "Memory cost params changed via config upgrade"
-            );
-        }
-
-        // Also set the raw upgrades in scp_value.upgrades for correct header hash
-        // The upgrades need to be XDR-encoded as UpgradeType (opaque bytes)
-        let raw_upgrades: Vec<stellar_xdr::curr::UpgradeType> = self
-            .close_data
-            .upgrades
-            .iter()
-            .filter_map(|upgrade| {
-                use stellar_xdr::curr::WriteXdr;
-                upgrade
-                    .to_xdr(stellar_xdr::curr::Limits::none())
-                    .ok()
-                    .and_then(|bytes| stellar_xdr::curr::UpgradeType::try_from(bytes).ok())
-            })
-            .collect();
-        if let Ok(upgrades_vec) = raw_upgrades.try_into() {
-            new_header.scp_value.upgrades = upgrades_vec;
-        }
-
-        new_header.id_pool = self.id_pool;
-
-        // Compute header hash - add detailed XDR logging for debugging
-        use stellar_xdr::curr::{Limits, WriteXdr};
-        let header_xdr_bytes = new_header.to_xdr(Limits::none())?;
-        let header_xdr_hex: String = header_xdr_bytes
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect();
-        tracing::debug!(
-            ledger_seq = new_header.ledger_seq,
-            header_xdr_len = header_xdr_bytes.len(),
-            header_xdr_hex = %header_xdr_hex,
-            "Full header XDR for hash debugging"
-        );
-        let header_hash = compute_header_hash(&new_header)?;
+            config_state_archival_changed,
+            config_memory_cost_params_changed,
+        )?;
         let header_us = header_start.elapsed().as_micros() as u64;
 
         // Record stats
