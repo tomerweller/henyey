@@ -15,45 +15,33 @@ This Rust implementation aims to mirror stellar-core v25.x behavior for educatio
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              henyey                                │
-│                           (CLI + entrypoint)                                │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                     │
-                                     ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            henyey-app                                 │
-│                    (orchestration, config, commands)                        │
-└─────────────────────────────────────────────────────────────────────────────┘
-           │                         │                         │
-           ▼                         ▼                         ▼
-┌─────────────────┐     ┌─────────────────────┐     ┌─────────────────────────┐
-│    overlay      │     │       herder        │     │        history          │
-│  (P2P network)  │◄───►│ (consensus coord)   │     │  (archive catchup)      │
-└─────────────────┘     └─────────────────────┘     └─────────────────────────┘
-                                  │                            │
-                                  ▼                            │
-                        ┌─────────────────┐                    │
-                        │       scp       │                    │
-                        │   (consensus)   │                    │
-                        └─────────────────┘                    │
-                                  │                            │
-                                  ▼                            ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              ledger                                         │
-│                    (ledger close + state updates)                           │
-└─────────────────────────────────────────────────────────────────────────────┘
-           │                         │                         │
-           ▼                         ▼                         ▼
-┌─────────────────┐     ┌─────────────────────┐     ┌─────────────────────────┐
-│       tx        │     │       bucket        │     │           db            │
-│  (transaction   │     │    (BucketList      │     │       (SQLite           │
-│   execution)    │     │     state store)    │     │      persistence)       │
-└─────────────────┘     └─────────────────────┘     └─────────────────────────┘
+```mermaid
+graph TD
+    henyey["henyey<br/><i>CLI + entrypoint</i>"]
+    app["henyey-app<br/><i>orchestration, config, commands</i>"]
+    overlay["overlay<br/><i>P2P network</i>"]
+    herder["herder<br/><i>consensus coordination</i>"]
+    history["history<br/><i>archive catchup</i>"]
+    scp["scp<br/><i>consensus</i>"]
+    ledger["ledger<br/><i>ledger close + state updates</i>"]
+    tx["tx<br/><i>transaction execution</i>"]
+    bucket["bucket<br/><i>BucketList state store</i>"]
+    db["db<br/><i>SQLite persistence</i>"]
 
-Supporting crates: crypto, common, work, historywork
+    henyey --> app
+    app --> overlay
+    app --> herder
+    app --> history
+    overlay <--> herder
+    herder --> scp
+    scp --> ledger
+    history --> ledger
+    ledger --> tx
+    ledger --> bucket
+    ledger --> db
 ```
+
+Supporting crates: `crypto`, `common`, `work`, `historywork`
 
 ## Status
 
@@ -234,8 +222,6 @@ This implementation intentionally limits scope:
 |------------|-----------|
 | **Protocol 24+ only** | Focus on current protocol behavior |
 | **SQLite-only** | Simplicity over PostgreSQL support |
-| **No metrics** | Prometheus integration out of scope |
-| **No admin API** | HTTP admin interface not implemented |
 | **Deterministic** | Observable behavior must match stellar-core |
 
 ## Development
@@ -262,14 +248,14 @@ RUST_LOG=henyey_scp=debug,henyey_herder=debug ./target/release/henyey ...
 
 ### Adding a New Crate
 
-1. Create `crates/stellar-core-<name>/`
+1. Create `crates/<name>/` (with package name `henyey-<name>` in its `Cargo.toml`)
 2. Add to workspace in root `Cargo.toml`
 3. Add README.md documenting purpose and usage
 4. Update this file's crate overview
 
 ## Related Resources
 
-- [stellar-core (stellar-core)](https://github.com/stellar/stellar-core) — Upstream implementation
+- [stellar-core](https://github.com/stellar/stellar-core) — Upstream implementation
 - [Stellar Docs](https://developers.stellar.org/) — Protocol documentation
 - [SCP Whitepaper](https://stellar.org/papers/stellar-consensus-protocol) — Consensus protocol specification
 - [stellar-xdr](https://github.com/stellar/stellar-xdr-next) — XDR type definitions
