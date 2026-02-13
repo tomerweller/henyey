@@ -2,10 +2,11 @@
 
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountId, CreateAccountOp, CreateAccountResult,
-    CreateAccountResultCode, LedgerKey, LedgerKeyAccount, Liabilities, OperationResult,
+    CreateAccountResultCode, LedgerKey, LedgerKeyAccount, OperationResult,
     OperationResultTr, SequenceNumber, String32, Thresholds,
 };
 
+use super::account_liabilities;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
@@ -119,16 +120,6 @@ fn make_result(code: CreateAccountResultCode) -> OperationResult {
         CreateAccountResultCode::AlreadyExist => CreateAccountResult::AlreadyExist,
     };
     OperationResult::OpInner(OperationResultTr::CreateAccount(result))
-}
-
-fn account_liabilities(account: &AccountEntry) -> Liabilities {
-    match &account.ext {
-        AccountEntryExt::V0 => Liabilities {
-            buying: 0,
-            selling: 0,
-        },
-        AccountEntryExt::V1(v1) => v1.liabilities.clone(),
-    }
 }
 
 #[cfg(test)]

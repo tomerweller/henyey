@@ -2,11 +2,12 @@
 
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1Ext, AccountId, AccountMergeResult,
-    AccountMergeResultCode, LedgerKey, LedgerKeyAccount, Liabilities, MuxedAccount,
+    AccountMergeResultCode, LedgerKey, LedgerKeyAccount, MuxedAccount,
     OperationResult, OperationResultTr, SponsorshipDescriptor,
 };
 
 use crate::frame::muxed_to_account_id;
+use super::account_liabilities;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
@@ -109,16 +110,6 @@ fn make_result(code: AccountMergeResultCode) -> OperationResult {
         AccountMergeResultCode::IsSponsor => AccountMergeResult::IsSponsor,
     };
     OperationResult::OpInner(OperationResultTr::AccountMerge(result))
-}
-
-fn account_liabilities(account: &AccountEntry) -> Liabilities {
-    match &account.ext {
-        AccountEntryExt::V0 => Liabilities {
-            buying: 0,
-            selling: 0,
-        },
-        AccountEntryExt::V1(v1) => v1.liabilities.clone(),
-    }
 }
 
 fn num_sponsoring(account: &AccountEntry) -> i64 {

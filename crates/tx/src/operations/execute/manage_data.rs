@@ -4,10 +4,11 @@
 //! which allows accounts to attach arbitrary key-value data.
 
 use stellar_xdr::curr::{
-    AccountEntry, AccountId, DataEntry, DataEntryExt, LedgerKey, LedgerKeyData, Liabilities,
+    AccountId, DataEntry, DataEntryExt, LedgerKey, LedgerKeyData,
     ManageDataOp, ManageDataResult, ManageDataResultCode, OperationResult, OperationResultTr,
 };
 
+use super::{account_liabilities, ACCOUNT_SUBENTRY_LIMIT};
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
@@ -17,8 +18,6 @@ const MAX_DATA_NAME_LENGTH: usize = 64;
 
 /// Maximum length for data values.
 const MAX_DATA_VALUE_LENGTH: usize = 64;
-/// Maximum number of subentries per account.
-const ACCOUNT_SUBENTRY_LIMIT: u32 = 1000;
 
 /// Execute a ManageData operation.
 ///
@@ -174,16 +173,6 @@ pub fn execute_manage_data(
     }
 
     Ok(make_result(ManageDataResultCode::Success))
-}
-
-fn account_liabilities(account: &AccountEntry) -> Liabilities {
-    match &account.ext {
-        stellar_xdr::curr::AccountEntryExt::V0 => Liabilities {
-            buying: 0,
-            selling: 0,
-        },
-        stellar_xdr::curr::AccountEntryExt::V1(v1) => v1.liabilities.clone(),
-    }
 }
 
 /// Create an OperationResult from a ManageDataResultCode.

@@ -5,20 +5,17 @@
 
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext,
-    AccountEntryExtensionV2, AccountId, Liabilities, OperationResult, OperationResultTr, PublicKey,
+    AccountEntryExtensionV2, AccountId, OperationResult, OperationResultTr, PublicKey,
     SetOptionsOp, SetOptionsResult, SetOptionsResultCode, Signer, SignerKey,
     SignerKeyEd25519SignedPayload, SignerKeyType, SponsorshipDescriptor, MASK_ACCOUNT_FLAGS_V17,
 };
 
+use super::{account_liabilities, ACCOUNT_SUBENTRY_LIMIT};
 use crate::state::{ensure_account_ext_v2, LedgerStateManager};
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
 
-/// Maximum number of signers allowed on an account.
 const MAX_SIGNERS: usize = 20;
-
-/// Maximum number of sub-entries per account (trustlines, offers, data entries, signers).
-const ACCOUNT_SUBENTRY_LIMIT: u32 = 1000;
 
 /// Execute a SetOptions operation.
 ///
@@ -422,17 +419,6 @@ fn sponsorship_counts_for_account_entry(account: &AccountEntry) -> (i64, i64) {
                 ..
             }) => (*num_sponsoring as i64, *num_sponsored as i64),
         },
-    }
-}
-
-/// Create an OperationResult from a SetOptionsResultCode.
-fn account_liabilities(account: &AccountEntry) -> Liabilities {
-    match &account.ext {
-        AccountEntryExt::V0 => Liabilities {
-            buying: 0,
-            selling: 0,
-        },
-        AccountEntryExt::V1(v1) => v1.liabilities.clone(),
     }
 }
 

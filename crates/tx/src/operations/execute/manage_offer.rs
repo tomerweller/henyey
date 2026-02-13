@@ -6,25 +6,24 @@
 use std::cmp::Ordering;
 
 use stellar_xdr::curr::{
-    AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, AccountId,
+    AccountId,
     Asset, ClaimAtom, ClaimOfferAtom, CreatePassiveSellOfferOp, LedgerKey, LedgerKeyOffer,
     Liabilities, ManageBuyOfferOp, ManageOfferSuccessResult, ManageOfferSuccessResultOffer,
     ManageSellOfferOp, ManageSellOfferResult, ManageSellOfferResultCode, OfferEntry, OfferEntryExt,
-    OfferEntryFlags, OperationResult, OperationResultTr, Price, TrustLineEntry, TrustLineEntryExt,
-    TrustLineEntryV1, TrustLineEntryV1Ext, TrustLineFlags,
+    OfferEntryFlags, OperationResult, OperationResultTr, Price,
 };
 
 use super::offer_exchange::{
-    adjust_offer_amount, exchange_v10, exchange_v10_without_price_error_thresholds, ExchangeError,
-    RoundingType,
+    adjust_offer_amount, exchange_v10, exchange_v10_without_price_error_thresholds, RoundingType,
+};
+use super::{
+    account_liabilities, ensure_account_liabilities, ensure_trustline_liabilities,
+    is_authorized_to_maintain_liabilities, is_trustline_authorized, issuer_for_asset,
+    map_exchange_error, trustline_liabilities, ACCOUNT_SUBENTRY_LIMIT,
 };
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
-
-/// Maximum number of subentries per account.
-/// This limit is enforced starting from protocol version 11.
-const ACCOUNT_SUBENTRY_LIMIT: u32 = 1000;
 
 /// Execute a ManageSellOffer operation.
 ///
@@ -589,25 +588,6 @@ fn validate_offer(
 
 #[cfg(test)]
 const AUTH_REQUIRED_FLAG: u32 = 0x1;
-const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
-const AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG: u32 =
-    TrustLineFlags::AuthorizedToMaintainLiabilitiesFlag as u32;
-
-fn is_trustline_authorized(flags: u32) -> bool {
-    flags & AUTHORIZED_FLAG != 0
-}
-
-fn is_authorized_to_maintain_liabilities(flags: u32) -> bool {
-    flags & (AUTHORIZED_FLAG | AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG) != 0
-}
-
-fn issuer_for_asset(asset: &Asset) -> Option<&AccountId> {
-    match asset {
-        Asset::Native => None,
-        Asset::CreditAlphanum4(a) => Some(&a.issuer),
-        Asset::CreditAlphanum12(a) => Some(&a.issuer),
-    }
-}
 
 /// Delete an existing offer.
 fn delete_offer(
@@ -1109,10 +1089,6 @@ fn compare_price(lhs: &Price, rhs: &Price) -> Ordering {
     lhs_value.cmp(&rhs_value)
 }
 
-fn map_exchange_error(err: ExchangeError) -> TxError {
-    TxError::Internal(format!("offer exchange error: {err:?}"))
-}
-
 fn apply_liabilities_delta(
     source: &AccountId,
     selling: &Asset,
@@ -1160,64 +1136,6 @@ fn update_liabilities(liab: &mut Liabilities, buying_delta: i64, selling_delta: 
     liab.buying = buying;
     liab.selling = selling;
     Ok(())
-}
-
-fn account_liabilities(account: &AccountEntry) -> Liabilities {
-    match &account.ext {
-        AccountEntryExt::V0 => Liabilities {
-            buying: 0,
-            selling: 0,
-        },
-        AccountEntryExt::V1(v1) => v1.liabilities.clone(),
-    }
-}
-
-fn trustline_liabilities(trustline: &TrustLineEntry) -> Liabilities {
-    match &trustline.ext {
-        TrustLineEntryExt::V0 => Liabilities {
-            buying: 0,
-            selling: 0,
-        },
-        TrustLineEntryExt::V1(v1) => v1.liabilities.clone(),
-    }
-}
-
-fn ensure_account_liabilities(account: &mut AccountEntry) -> &mut Liabilities {
-    match &mut account.ext {
-        AccountEntryExt::V0 => {
-            account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
-                liabilities: Liabilities {
-                    buying: 0,
-                    selling: 0,
-                },
-                ext: AccountEntryExtensionV1Ext::V0,
-            });
-        }
-        AccountEntryExt::V1(_) => {}
-    }
-    match &mut account.ext {
-        AccountEntryExt::V1(v1) => &mut v1.liabilities,
-        AccountEntryExt::V0 => unreachable!("account liabilities not initialized"),
-    }
-}
-
-fn ensure_trustline_liabilities(trustline: &mut TrustLineEntry) -> &mut Liabilities {
-    match &mut trustline.ext {
-        TrustLineEntryExt::V0 => {
-            trustline.ext = TrustLineEntryExt::V1(TrustLineEntryV1 {
-                liabilities: Liabilities {
-                    buying: 0,
-                    selling: 0,
-                },
-                ext: TrustLineEntryV1Ext::V0,
-            });
-        }
-        TrustLineEntryExt::V1(_) => {}
-    }
-    match &mut trustline.ext {
-        TrustLineEntryExt::V1(v1) => &mut v1.liabilities,
-        TrustLineEntryExt::V0 => unreachable!("trustline liabilities not initialized"),
-    }
 }
 
 /// Create an OfferEntry for result.
@@ -1292,6 +1210,7 @@ fn make_sell_offer_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::{AUTHORIZED_FLAG, AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG};
     use stellar_xdr::curr::*;
 
     fn create_test_account_id(seed: u8) -> AccountId {

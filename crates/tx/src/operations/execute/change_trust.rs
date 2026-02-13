@@ -1,7 +1,7 @@
 //! ChangeTrust operation execution.
 
 use stellar_xdr::curr::{
-    AccountEntry, AccountId, Asset, ChangeTrustAsset, ChangeTrustOp, ChangeTrustResult,
+    AccountId, Asset, ChangeTrustAsset, ChangeTrustOp, ChangeTrustResult,
     ChangeTrustResultCode, LedgerKey, LedgerKeyTrustLine, Liabilities, LiquidityPoolEntry,
     LiquidityPoolEntryBody, LiquidityPoolEntryConstantProduct, LiquidityPoolParameters,
     OperationResult, OperationResultTr, TrustLineAsset, TrustLineEntry, TrustLineEntryExt,
@@ -9,13 +9,14 @@ use stellar_xdr::curr::{
     TrustLineEntryV1Ext, TrustLineFlags,
 };
 
+use super::{
+    account_liabilities, is_authorized_to_maintain_liabilities, trustline_liabilities,
+    ACCOUNT_SUBENTRY_LIMIT, AUTHORIZED_FLAG,
+};
 use crate::apply::account_id_to_key;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
-
-/// Maximum number of sub-entries per account (trustlines, offers, data entries, signers).
-const ACCOUNT_SUBENTRY_LIMIT: u32 = 1000;
 
 /// Execute a ChangeTrust operation.
 pub fn execute_change_trust(
@@ -270,9 +271,6 @@ fn get_asset_issuer(asset: &Asset) -> Option<AccountId> {
 
 const AUTH_REQUIRED_FLAG: u32 = 0x1;
 const AUTH_CLAWBACK_FLAG: u32 = 0x8;
-const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
-const AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG: u32 =
-    TrustLineFlags::AuthorizedToMaintainLiabilitiesFlag as u32;
 const TRUSTLINE_CLAWBACK_ENABLED_FLAG: u32 = TrustLineFlags::TrustlineClawbackEnabledFlag as u32;
 
 fn build_trustline_flags(asset: Option<&Asset>, state: &LedgerStateManager) -> u32 {
@@ -294,30 +292,6 @@ fn build_trustline_flags(asset: Option<&Asset>, state: &LedgerStateManager) -> u
         flags |= TRUSTLINE_CLAWBACK_ENABLED_FLAG;
     }
     flags
-}
-
-fn is_authorized_to_maintain_liabilities(flags: u32) -> bool {
-    flags & (AUTHORIZED_FLAG | AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG) != 0
-}
-
-fn trustline_liabilities(trustline: &TrustLineEntry) -> Liabilities {
-    match &trustline.ext {
-        TrustLineEntryExt::V0 => Liabilities {
-            buying: 0,
-            selling: 0,
-        },
-        TrustLineEntryExt::V1(v1) => v1.liabilities.clone(),
-    }
-}
-
-fn account_liabilities(account: &AccountEntry) -> Liabilities {
-    match &account.ext {
-        stellar_xdr::curr::AccountEntryExt::V0 => Liabilities {
-            buying: 0,
-            selling: 0,
-        },
-        stellar_xdr::curr::AccountEntryExt::V1(v1) => v1.liabilities.clone(),
-    }
 }
 
 fn validate_pool_share_trustlines(

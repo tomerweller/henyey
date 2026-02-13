@@ -5,27 +5,23 @@
 //! - SetTrustLineFlags
 
 use stellar_xdr::curr::{
-    AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, AccountId,
-    AllowTrustOp, AllowTrustResult, AllowTrustResultCode, Asset, LedgerKey, LedgerKeyOffer,
-    Liabilities, OfferEntry, OperationResult, OperationResultTr, SetTrustLineFlagsOp,
-    SetTrustLineFlagsResult, SetTrustLineFlagsResultCode, TrustLineEntry, TrustLineEntryExt,
-    TrustLineEntryV1, TrustLineEntryV1Ext, TrustLineFlags,
+    AccountId, AllowTrustOp, AllowTrustResult, AllowTrustResultCode, Asset, LedgerKey,
+    LedgerKeyOffer, OfferEntry, OperationResult, OperationResultTr, SetTrustLineFlagsOp,
+    SetTrustLineFlagsResult, SetTrustLineFlagsResultCode,
 };
 
 use crate::operations::execute::offer_exchange::{
     exchange_v10_without_price_error_thresholds, RoundingType,
 };
+use super::{
+    ensure_account_liabilities, ensure_trustline_liabilities, is_authorized_to_maintain_liabilities,
+    issuer_for_asset, AUTHORIZED_FLAG, AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG,
+};
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::Result;
 
-/// Trust line flag constants
-const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
-const AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG: u32 =
-    TrustLineFlags::AuthorizedToMaintainLiabilitiesFlag as u32;
 const AUTH_REVOCABLE_FLAG: u32 = 0x2;
-
-/// Trustline auth flags mask
 const TRUSTLINE_AUTH_FLAGS: u32 = AUTHORIZED_FLAG | AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG;
 
 /// Execute an AllowTrust operation (deprecated).
@@ -266,23 +262,6 @@ fn make_set_flags_result(code: SetTrustLineFlagsResultCode) -> OperationResult {
     OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(result))
 }
 
-/// Check if a trustline has any liabilities (buying or selling).
-#[allow(dead_code)]
-fn has_liabilities(trustline: &TrustLineEntry) -> bool {
-    let liab = match &trustline.ext {
-        TrustLineEntryExt::V0 => Liabilities {
-            buying: 0,
-            selling: 0,
-        },
-        TrustLineEntryExt::V1(v1) => v1.liabilities.clone(),
-    };
-    liab.buying != 0 || liab.selling != 0
-}
-
-fn is_authorized_to_maintain_liabilities(flags: u32) -> bool {
-    flags & (AUTHORIZED_FLAG | AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG) != 0
-}
-
 /// Check if the trust line auth flags are valid.
 /// Both AUTHORIZED_FLAG and AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG cannot be set at the same time.
 fn is_trust_line_flag_auth_valid(flags: u32) -> bool {
@@ -378,55 +357,6 @@ fn offer_liabilities(amount: &i64, price: &stellar_xdr::curr::Price) -> Result<(
     )
     .map_err(|_| crate::TxError::Internal("offer liability calculation failed".into()))?;
     Ok((res.num_wheat_received, res.num_sheep_send))
-}
-
-/// Get the issuer of an asset, if any.
-fn issuer_for_asset(asset: &Asset) -> Option<&AccountId> {
-    match asset {
-        Asset::Native => None,
-        Asset::CreditAlphanum4(a) => Some(&a.issuer),
-        Asset::CreditAlphanum12(a) => Some(&a.issuer),
-    }
-}
-
-/// Ensure account has a liabilities extension and return a mutable reference.
-fn ensure_account_liabilities(account: &mut AccountEntry) -> &mut Liabilities {
-    match &mut account.ext {
-        AccountEntryExt::V0 => {
-            account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
-                liabilities: Liabilities {
-                    buying: 0,
-                    selling: 0,
-                },
-                ext: AccountEntryExtensionV1Ext::V0,
-            });
-        }
-        AccountEntryExt::V1(_) => {}
-    }
-    match &mut account.ext {
-        AccountEntryExt::V1(v1) => &mut v1.liabilities,
-        AccountEntryExt::V0 => unreachable!("account liabilities not initialized"),
-    }
-}
-
-/// Ensure trustline has a liabilities extension and return a mutable reference.
-fn ensure_trustline_liabilities(trustline: &mut TrustLineEntry) -> &mut Liabilities {
-    match &mut trustline.ext {
-        TrustLineEntryExt::V0 => {
-            trustline.ext = TrustLineEntryExt::V1(TrustLineEntryV1 {
-                liabilities: Liabilities {
-                    buying: 0,
-                    selling: 0,
-                },
-                ext: TrustLineEntryV1Ext::V0,
-            });
-        }
-        TrustLineEntryExt::V1(_) => {}
-    }
-    match &mut trustline.ext {
-        TrustLineEntryExt::V1(v1) => &mut v1.liabilities,
-        TrustLineEntryExt::V0 => unreachable!("trustline liabilities not initialized"),
-    }
 }
 
 #[cfg(test)]

@@ -5,20 +5,23 @@
 
 use sha2::{Digest, Sha256};
 use stellar_xdr::curr::{
-    AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, AccountId,
+    AccountId,
     Asset, ClaimAtom, ClaimLiquidityAtom, ClaimOfferAtom, Hash, LedgerKey, LedgerKeyOffer,
     Liabilities, Limits, LiquidityPoolEntryBody, LiquidityPoolParameters, OperationResult,
     OperationResultTr, PathPaymentStrictReceiveOp, PathPaymentStrictReceiveResult,
     PathPaymentStrictReceiveResultCode, PathPaymentStrictReceiveResultSuccess,
     PathPaymentStrictSendOp, PathPaymentStrictSendResult, PathPaymentStrictSendResultCode,
-    PathPaymentStrictSendResultSuccess, PoolId, Price, SimplePaymentResult, TrustLineEntry,
-    TrustLineEntryExt, TrustLineEntryV1, TrustLineEntryV1Ext, TrustLineFlags, WriteXdr,
+    PathPaymentStrictSendResultSuccess, PoolId, Price, SimplePaymentResult, WriteXdr,
     LIQUIDITY_POOL_FEE_V18,
 };
 
 use super::offer_exchange::{
-    adjust_offer_amount, exchange_v10, exchange_v10_without_price_error_thresholds, ExchangeError,
-    RoundingType,
+    adjust_offer_amount, exchange_v10, exchange_v10_without_price_error_thresholds, RoundingType,
+};
+use super::{
+    account_liabilities, ensure_account_liabilities, ensure_trustline_liabilities,
+    is_authorized_to_maintain_liabilities, is_trustline_authorized, issuer_for_asset,
+    map_exchange_error, trustline_liabilities,
 };
 use crate::frame::muxed_to_account_id;
 use crate::state::LedgerStateManager;
@@ -470,26 +473,6 @@ fn update_dest_balance(
     })?;
     dest_trustline_mut.balance += amount;
     Ok(())
-}
-
-const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
-const AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG: u32 =
-    TrustLineFlags::AuthorizedToMaintainLiabilitiesFlag as u32;
-
-fn is_trustline_authorized(flags: u32) -> bool {
-    flags & AUTHORIZED_FLAG != 0
-}
-
-fn is_authorized_to_maintain_liabilities(flags: u32) -> bool {
-    flags & (AUTHORIZED_FLAG | AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG) != 0
-}
-
-fn issuer_for_asset(asset: &Asset) -> Option<&AccountId> {
-    match asset {
-        Asset::Native => None,
-        Asset::CreditAlphanum4(a) => Some(&a.issuer),
-        Asset::CreditAlphanum12(a) => Some(&a.issuer),
-    }
 }
 
 /// Maximum number of offers that can be crossed per path payment operation.
@@ -1051,38 +1034,6 @@ fn update_liabilities(liab: &mut Liabilities, buying_delta: i64, selling_delta: 
     Ok(())
 }
 
-fn ensure_account_liabilities(account: &mut AccountEntry) -> &mut Liabilities {
-    if matches!(account.ext, AccountEntryExt::V0) {
-        account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
-            liabilities: Liabilities {
-                buying: 0,
-                selling: 0,
-            },
-            ext: AccountEntryExtensionV1Ext::V0,
-        });
-    }
-    match &mut account.ext {
-        AccountEntryExt::V1(v1) => &mut v1.liabilities,
-        AccountEntryExt::V0 => unreachable!("account liabilities not initialized"),
-    }
-}
-
-fn ensure_trustline_liabilities(trustline: &mut TrustLineEntry) -> &mut Liabilities {
-    if matches!(trustline.ext, TrustLineEntryExt::V0) {
-        trustline.ext = TrustLineEntryExt::V1(TrustLineEntryV1 {
-            liabilities: Liabilities {
-                buying: 0,
-                selling: 0,
-            },
-            ext: TrustLineEntryV1Ext::V0,
-        });
-    }
-    match &mut trustline.ext {
-        TrustLineEntryExt::V1(v1) => &mut v1.liabilities,
-        TrustLineEntryExt::V0 => unreachable!("trustline liabilities not initialized"),
-    }
-}
-
 struct PoolExchange {
     pool_id: PoolId,
     send: i64,
@@ -1294,30 +1245,6 @@ fn exchange_with_pool(
     }
 }
 
-fn map_exchange_error(err: ExchangeError) -> TxError {
-    TxError::Internal(format!("offer exchange error: {err:?}"))
-}
-
-fn account_liabilities(account: &AccountEntry) -> Liabilities {
-    match &account.ext {
-        AccountEntryExt::V0 => Liabilities {
-            buying: 0,
-            selling: 0,
-        },
-        AccountEntryExt::V1(v1) => v1.liabilities.clone(),
-    }
-}
-
-fn trustline_liabilities(trustline: &TrustLineEntry) -> Liabilities {
-    match &trustline.ext {
-        TrustLineEntryExt::V0 => Liabilities {
-            buying: 0,
-            selling: 0,
-        },
-        TrustLineEntryExt::V1(v1) => v1.liabilities.clone(),
-    }
-}
-
 /// Convert PathPaymentStrictReceiveResultCode to PathPaymentStrictSendResultCode.
 fn convert_receive_to_send_code(
     code: PathPaymentStrictReceiveResultCode,
@@ -1456,6 +1383,7 @@ fn make_strict_send_result_with_asset(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::AUTHORIZED_FLAG;
     use stellar_xdr::curr::*;
 
     const AUTH_REQUIRED_FLAG: u32 = 0x1;

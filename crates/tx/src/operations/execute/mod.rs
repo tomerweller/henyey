@@ -8,15 +8,85 @@ use soroban_env_host_p24 as soroban_env_host24;
 use soroban_env_host_p25 as soroban_env_host25;
 use henyey_common::{protocol_version_is_before, ProtocolVersion};
 use stellar_xdr::curr::{
-    AccountId, ContractEvent, DiagnosticEvent, ExtendFootprintTtlResult, Operation, OperationBody,
-    OperationResult, OperationResultTr, RestoreFootprintResult, SorobanTransactionData, WriteXdr,
+    AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, AccountId,
+    Asset, ContractEvent, DiagnosticEvent, ExtendFootprintTtlResult, Liabilities, Operation,
+    OperationBody, OperationResult, OperationResultTr, RestoreFootprintResult,
+    SorobanTransactionData, TrustLineEntry, TrustLineEntryExt, TrustLineEntryV1,
+    TrustLineEntryV1Ext, TrustLineFlags, WriteXdr,
 };
 
 use crate::frame::muxed_to_account_id;
 use crate::soroban::{PersistentModuleCache, SorobanConfig};
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
-use crate::Result;
+use crate::{Result, TxError};
+
+// Shared helpers used by multiple operation submodules.
+
+const ACCOUNT_SUBENTRY_LIMIT: u32 = 1000;
+const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
+const AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG: u32 =
+    TrustLineFlags::AuthorizedToMaintainLiabilitiesFlag as u32;
+
+fn is_trustline_authorized(flags: u32) -> bool {
+    flags & AUTHORIZED_FLAG != 0
+}
+
+fn is_authorized_to_maintain_liabilities(flags: u32) -> bool {
+    flags & (AUTHORIZED_FLAG | AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG) != 0
+}
+
+fn issuer_for_asset(asset: &Asset) -> Option<&AccountId> {
+    match asset {
+        Asset::Native => None,
+        Asset::CreditAlphanum4(a) => Some(&a.issuer),
+        Asset::CreditAlphanum12(a) => Some(&a.issuer),
+    }
+}
+
+fn account_liabilities(account: &AccountEntry) -> Liabilities {
+    match &account.ext {
+        AccountEntryExt::V0 => Liabilities { buying: 0, selling: 0 },
+        AccountEntryExt::V1(v1) => v1.liabilities.clone(),
+    }
+}
+
+fn trustline_liabilities(trustline: &TrustLineEntry) -> Liabilities {
+    match &trustline.ext {
+        TrustLineEntryExt::V0 => Liabilities { buying: 0, selling: 0 },
+        TrustLineEntryExt::V1(v1) => v1.liabilities.clone(),
+    }
+}
+
+fn ensure_account_liabilities(account: &mut AccountEntry) -> &mut Liabilities {
+    if matches!(account.ext, AccountEntryExt::V0) {
+        account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+            liabilities: Liabilities { buying: 0, selling: 0 },
+            ext: AccountEntryExtensionV1Ext::V0,
+        });
+    }
+    match &mut account.ext {
+        AccountEntryExt::V1(v1) => &mut v1.liabilities,
+        _ => unreachable!(),
+    }
+}
+
+fn ensure_trustline_liabilities(trustline: &mut TrustLineEntry) -> &mut Liabilities {
+    if matches!(trustline.ext, TrustLineEntryExt::V0) {
+        trustline.ext = TrustLineEntryExt::V1(TrustLineEntryV1 {
+            liabilities: Liabilities { buying: 0, selling: 0 },
+            ext: TrustLineEntryV1Ext::V0,
+        });
+    }
+    match &mut trustline.ext {
+        TrustLineEntryExt::V1(v1) => &mut v1.liabilities,
+        _ => unreachable!(),
+    }
+}
+
+fn map_exchange_error(err: offer_exchange::ExchangeError) -> TxError {
+    TxError::Internal(format!("offer exchange error: {err:?}"))
+}
 
 mod account_merge;
 mod bump_sequence;

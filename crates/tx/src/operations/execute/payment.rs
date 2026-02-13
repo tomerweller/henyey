@@ -4,11 +4,11 @@
 //! which transfers assets between accounts.
 
 use stellar_xdr::curr::{
-    AccountEntry, AccountEntryExt, AccountId, Asset, Liabilities, OperationResult,
-    OperationResultTr, PaymentOp, PaymentResult, PaymentResultCode, TrustLineEntry,
-    TrustLineEntryExt, TrustLineFlags,
+    AccountId, Asset, OperationResult, OperationResultTr, PaymentOp, PaymentResult,
+    PaymentResultCode,
 };
 
+use super::{account_liabilities, is_trustline_authorized, trustline_liabilities};
 use crate::frame::muxed_to_account_id;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
@@ -200,32 +200,6 @@ fn execute_credit_payment(
     }
 
     Ok(make_result(PaymentResultCode::Success))
-}
-
-const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
-
-fn is_trustline_authorized(flags: u32) -> bool {
-    flags & AUTHORIZED_FLAG != 0
-}
-
-fn account_liabilities(account: &AccountEntry) -> Liabilities {
-    match &account.ext {
-        AccountEntryExt::V0 => Liabilities {
-            buying: 0,
-            selling: 0,
-        },
-        AccountEntryExt::V1(v1) => v1.liabilities.clone(),
-    }
-}
-
-fn trustline_liabilities(trustline: &TrustLineEntry) -> Liabilities {
-    match &trustline.ext {
-        TrustLineEntryExt::V0 => Liabilities {
-            buying: 0,
-            selling: 0,
-        },
-        TrustLineEntryExt::V1(v1) => v1.liabilities.clone(),
-    }
 }
 
 /// Create an OperationResult from a PaymentResultCode.

@@ -8,9 +8,9 @@ use stellar_xdr::curr::{
     AccountId, Asset, LiquidityPoolDepositOp, LiquidityPoolDepositResult,
     LiquidityPoolDepositResultCode, LiquidityPoolWithdrawOp, LiquidityPoolWithdrawResult,
     LiquidityPoolWithdrawResultCode, OperationResult, OperationResultTr, Price, TrustLineAsset,
-    TrustLineFlags,
 };
 
+use super::{is_authorized_to_maintain_liabilities, is_trustline_authorized};
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::Result;
@@ -408,17 +408,6 @@ pub fn execute_liquidity_pool_withdraw(
 }
 
 const AUTH_REQUIRED_FLAG: u32 = 0x1;
-const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
-const AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG: u32 =
-    TrustLineFlags::AuthorizedToMaintainLiabilitiesFlag as u32;
-
-fn is_trustline_authorized(flags: u32) -> bool {
-    flags & AUTHORIZED_FLAG != 0
-}
-
-fn is_trustline_authorized_to_maintain_liabilities(flags: u32) -> bool {
-    flags & (AUTHORIZED_FLAG | AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG) != 0
-}
 
 fn is_auth_required(asset: &Asset, state: &LedgerStateManager) -> bool {
     let issuer = match asset {
@@ -569,7 +558,7 @@ fn can_credit_asset(
     let Some(tl) = state.get_trustline(source, asset) else {
         return WithdrawAssetCheck::NoTrust;
     };
-    if !is_trustline_authorized_to_maintain_liabilities(tl.flags) {
+    if !is_authorized_to_maintain_liabilities(tl.flags) {
         return WithdrawAssetCheck::LineFull;
     }
     if tl.limit - tl.balance < amount {

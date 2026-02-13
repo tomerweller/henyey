@@ -5518,25 +5518,6 @@ fn pool_id_to_bytes(pool_id: &PoolId) -> [u8; 32] {
     pool_id.0 .0
 }
 
-// These functions are kept for potential debugging use but are superseded by OfferIndex
-#[allow(dead_code)]
-fn compare_offer(lhs: &OfferEntry, rhs: &OfferEntry) -> std::cmp::Ordering {
-    compare_price(&lhs.price, &rhs.price).then_with(|| lhs.offer_id.cmp(&rhs.offer_id))
-}
-
-#[allow(dead_code)]
-fn compare_price(lhs: &Price, rhs: &Price) -> std::cmp::Ordering {
-    // Use floating-point comparison to match stellar-core behavior.
-    // The stellar-core code stores `price = double(price.n) / double(price.d)` in the database
-    // and uses `ORDER BY price` for offer ordering. The isBetterOffer function also
-    // uses double comparison to match this SQL ordering.
-    let lhs_price = lhs.n as f64 / lhs.d as f64;
-    let rhs_price = rhs.n as f64 / rhs.d as f64;
-    lhs_price
-        .partial_cmp(&rhs_price)
-        .unwrap_or(std::cmp::Ordering::Equal)
-}
-
 fn sponsorship_counts(account: &AccountEntry) -> (i64, i64) {
     match &account.ext {
         AccountEntryExt::V0 => (0, 0),

@@ -6,14 +6,15 @@
 //! - RevokeSponsorship
 
 use stellar_xdr::curr::{
-    AccountEntry, AccountId, BeginSponsoringFutureReservesOp,
+    AccountId, BeginSponsoringFutureReservesOp,
     BeginSponsoringFutureReservesResult, BeginSponsoringFutureReservesResultCode,
     EndSponsoringFutureReservesResult, EndSponsoringFutureReservesResultCode, LedgerEntryData,
     LedgerKey, LedgerKeyAccount, LedgerKeyClaimableBalance, LedgerKeyData, LedgerKeyOffer,
-    LedgerKeyTrustLine, Liabilities, OperationResult, OperationResultTr, RevokeSponsorshipOp,
+    LedgerKeyTrustLine, OperationResult, OperationResultTr, RevokeSponsorshipOp,
     RevokeSponsorshipResult, RevokeSponsorshipResultCode, SponsorshipDescriptor, TrustLineAsset,
 };
 
+use super::account_liabilities;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
@@ -365,17 +366,6 @@ pub fn execute_revoke_sponsorship(
 
             Ok(make_revoke_result(RevokeSponsorshipResultCode::Success))
         }
-    }
-}
-
-/// Create a BeginSponsoringFutureReserves result.
-fn account_liabilities(account: &AccountEntry) -> Liabilities {
-    match &account.ext {
-        stellar_xdr::curr::AccountEntryExt::V0 => Liabilities {
-            buying: 0,
-            selling: 0,
-        },
-        stellar_xdr::curr::AccountEntryExt::V1(v1) => v1.liabilities.clone(),
     }
 }
 

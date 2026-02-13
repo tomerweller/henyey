@@ -6,15 +6,16 @@
 use std::collections::HashSet;
 
 use stellar_xdr::curr::{
-    AccountEntry, AccountFlags, AccountId, Asset, ClaimClaimableBalanceOp,
+    AccountFlags, AccountId, Asset, ClaimClaimableBalanceOp,
     ClaimClaimableBalanceResult, ClaimClaimableBalanceResultCode, ClaimPredicate,
     ClaimableBalanceEntry, ClaimableBalanceEntryExt, ClaimableBalanceEntryExtensionV1,
     ClaimableBalanceEntryExtensionV1Ext, ClaimableBalanceFlags, ClaimableBalanceId, Claimant,
     CreateClaimableBalanceOp, CreateClaimableBalanceResult, CreateClaimableBalanceResultCode, Hash,
-    HashIdPreimage, HashIdPreimageOperationId, LedgerKey, LedgerKeyClaimableBalance, Liabilities,
+    HashIdPreimage, HashIdPreimageOperationId, LedgerKey, LedgerKeyClaimableBalance,
     OperationResult, OperationResultTr, SequenceNumber,
 };
 
+use super::{account_liabilities, is_trustline_authorized};
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
@@ -382,13 +383,8 @@ fn generate_claimable_balance_id(
     Ok(ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash(hash.0)))
 }
 
-const AUTHORIZED_FLAG: u32 = stellar_xdr::curr::TrustLineFlags::AuthorizedFlag as u32;
 const TRUSTLINE_CLAWBACK_ENABLED_FLAG: u32 =
     stellar_xdr::curr::TrustLineFlags::TrustlineClawbackEnabledFlag as u32;
-
-fn is_trustline_authorized(flags: u32) -> bool {
-    flags & AUTHORIZED_FLAG != 0
-}
 
 fn asset_issuer(asset: &Asset) -> Option<AccountId> {
     match asset {
@@ -484,17 +480,6 @@ fn update_predicate_for_apply(predicate: &mut ClaimPredicate, close_time: u64) {
     }
 }
 
-/// Create a CreateClaimableBalance result.
-fn account_liabilities(account: &AccountEntry) -> Liabilities {
-    match &account.ext {
-        stellar_xdr::curr::AccountEntryExt::V0 => Liabilities {
-            buying: 0,
-            selling: 0,
-        },
-        stellar_xdr::curr::AccountEntryExt::V1(v1) => v1.liabilities.clone(),
-    }
-}
-
 fn make_create_result(
     code: CreateClaimableBalanceResultCode,
     balance_id: Option<ClaimableBalanceId>,
@@ -534,6 +519,7 @@ fn make_claim_result(code: ClaimClaimableBalanceResultCode) -> OperationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::AUTHORIZED_FLAG;
     use stellar_xdr::curr::*;
 
     fn create_test_account_id(seed: u8) -> AccountId {

@@ -532,16 +532,6 @@ pub struct LedgerSnapshotAdapterP25<'a> {
 }
 
 impl<'a> LedgerSnapshotAdapterP25<'a> {
-    /// Create a new snapshot adapter without hot archive lookup.
-    #[allow(dead_code)]
-    pub fn new(state: &'a LedgerStateManager, current_ledger: u32) -> Self {
-        Self {
-            state,
-            current_ledger,
-            hot_archive: None,
-        }
-    }
-
     /// Create a new snapshot adapter with hot archive lookup capability.
     pub fn with_hot_archive(
         state: &'a LedgerStateManager,
