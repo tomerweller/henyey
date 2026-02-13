@@ -158,7 +158,7 @@ impl LedgerStateManager {
                 // Add to offer index for efficient best-offer lookups
                 self.offer_index.add_offer(&offer);
                 self.aa_index_insert(&offer);
-                self.offers.insert((seller_key, offer.offer_id), offer);
+                self.offers.insert(OfferKey::new(seller_key, offer.offer_id), offer);
                 self.entry_last_modified
                     .insert(ledger_key.clone(), last_modified);
                 if has_sponsorship_ext {
@@ -506,7 +506,7 @@ impl LedgerStateManager {
                 self.trustlines.insert(key, tl.clone());
             }
             LedgerEntryData::Offer(offer) => {
-                let key = (account_id_to_bytes(&offer.seller_id), offer.offer_id);
+                let key = OfferKey::new(account_id_to_bytes(&offer.seller_id), offer.offer_id);
                 self.offers.insert(key, offer.clone());
             }
             LedgerEntryData::Data(data) => {
@@ -563,7 +563,7 @@ impl LedgerStateManager {
                 self.trustlines.remove(&(account_key, asset_key));
             }
             LedgerKey::Offer(k) => {
-                let offer_key = (account_id_to_bytes(&k.seller_id), k.offer_id);
+                let offer_key = OfferKey::new(account_id_to_bytes(&k.seller_id), k.offer_id);
                 self.offers.remove(&offer_key);
             }
             LedgerKey::Data(k) => {
@@ -887,13 +887,13 @@ impl LedgerStateManager {
     /// Get an offer by seller and offer ID (read-only).
     pub fn get_offer(&self, seller_id: &AccountId, offer_id: i64) -> Option<&OfferEntry> {
         let seller_key = account_id_to_bytes(seller_id);
-        self.offers.get(&(seller_key, offer_id))
+        self.offers.get(&OfferKey::new(seller_key, offer_id))
     }
 
     /// Check if an offer was already loaded during this transaction.
     pub fn is_offer_tracked(&self, seller_id: &AccountId, offer_id: i64) -> bool {
         let seller_key = account_id_to_bytes(seller_id);
-        self.offer_snapshots.contains_key(&(seller_key, offer_id))
+        self.offer_snapshots.contains_key(&OfferKey::new(seller_key, offer_id))
     }
 
     /// Get all offers for an account that buy or sell a specific asset.
@@ -912,7 +912,7 @@ impl LedgerStateManager {
             .get(&(account_key, asset_key))
             .map(|ids| {
                 ids.iter()
-                    .filter_map(|&id| self.offers.get(&(account_key, id)).cloned())
+                    .filter_map(|&id| self.offers.get(&OfferKey::new(account_key, id)).cloned())
                     .collect()
             })
             .unwrap_or_default()
@@ -925,7 +925,7 @@ impl LedgerStateManager {
         offer_id: i64,
     ) -> Option<&mut OfferEntry> {
         let seller_key = account_id_to_bytes(seller_id);
-        let key = (seller_key, offer_id);
+        let key = OfferKey::new(seller_key, offer_id);
 
         if self.offers.contains_key(&key) {
             // Save snapshot if not already saved or if it's None (for newly created entries).
@@ -955,7 +955,7 @@ impl LedgerStateManager {
     /// Create a new offer entry.
     pub fn create_offer(&mut self, entry: OfferEntry) {
         let seller_key = account_id_to_bytes(&entry.seller_id);
-        let key = (seller_key, entry.offer_id);
+        let key = OfferKey::new(seller_key, entry.offer_id);
         let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
             seller_id: entry.seller_id.clone(),
             offer_id: entry.offer_id,
@@ -989,7 +989,7 @@ impl LedgerStateManager {
     /// Update an existing offer entry.
     pub fn update_offer(&mut self, entry: OfferEntry) {
         let seller_key = account_id_to_bytes(&entry.seller_id);
-        let key = (seller_key, entry.offer_id);
+        let key = OfferKey::new(seller_key, entry.offer_id);
         let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
             seller_id: entry.seller_id.clone(),
             offer_id: entry.offer_id,
@@ -1037,7 +1037,7 @@ impl LedgerStateManager {
     /// Delete an offer entry.
     pub fn delete_offer(&mut self, seller_id: &AccountId, offer_id: i64) {
         let seller_key = account_id_to_bytes(seller_id);
-        let key = (seller_key, offer_id);
+        let key = OfferKey::new(seller_key, offer_id);
         let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
             seller_id: seller_id.clone(),
             offer_id,
@@ -1088,7 +1088,7 @@ impl LedgerStateManager {
     pub fn best_offer(&self, buying: &Asset, selling: &Asset) -> Option<OfferEntry> {
         // Use the offer index for efficient lookup
         if let Some(key) = self.offer_index.best_offer_key(buying, selling) {
-            return self.offers.get(&(key.seller, key.offer_id)).cloned();
+            return self.offers.get(&key).cloned();
         }
         None
     }
@@ -1107,7 +1107,7 @@ impl LedgerStateManager {
     {
         // Use the offer index to iterate in price order
         for offer_key in self.offer_index.offers_for_pair(buying, selling) {
-            if let Some(offer) = self.offers.get(&(offer_key.seller, offer_key.offer_id)) {
+            if let Some(offer) = self.offers.get(&offer_key) {
                 if keep(offer) {
                     return Some(offer.clone());
                 }
@@ -1127,7 +1127,7 @@ impl LedgerStateManager {
     pub fn offers_for_asset_pair(&self, buying: &Asset, selling: &Asset) -> Vec<OfferEntry> {
         self.offer_index
             .offers_for_pair(buying, selling)
-            .filter_map(|key| self.offers.get(&(key.seller, key.offer_id)).cloned())
+            .filter_map(|key| self.offers.get(&key).cloned())
             .collect()
     }
 
@@ -1171,7 +1171,7 @@ impl LedgerStateManager {
                     for entry in entries {
                         if let LedgerEntryData::Offer(ref offer) = entry.data {
                             let seller_key = account_id_to_bytes(&offer.seller_id);
-                            let key = (seller_key, offer.offer_id);
+                            let key = OfferKey::new(seller_key, offer.offer_id);
                             // Only load offers not already tracked in state.
                             if !self.offers.contains_key(&key) {
                                 tracing::info!(
@@ -1214,7 +1214,7 @@ impl LedgerStateManager {
             .iter()
             .filter_map(|&offer_id| {
                 self.offers
-                    .get(&(account_key, offer_id))
+                    .get(&OfferKey::new(account_key, offer_id))
                     .cloned()
                     .filter(|offer| offer.buying == *asset || offer.selling == *asset)
             })

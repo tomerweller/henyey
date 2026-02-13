@@ -50,12 +50,12 @@ use sha2::{Digest, Sha256};
 use henyey_bucket::{EvictionIterator, StateArchivalSettings};
 use henyey_common::{Hash256, NetworkId};
 use henyey_ledger::{
-    execution::{execute_transaction_set, load_soroban_config},
+    execution::{execute_transaction_set, load_soroban_config, SorobanContext},
     prepend_fee_event, EntryChange, LedgerDelta, LedgerError, LedgerSnapshot, SnapshotHandle,
     TransactionSetVariant,
 };
 use henyey_tx::soroban::PersistentModuleCache;
-use henyey_tx::{muxed_to_account_id, TransactionFrame};
+use henyey_tx::{muxed_to_account_id, LedgerContext, TransactionFrame};
 use stellar_xdr::curr::{
     BucketListType, ConfigSettingEntry, ConfigSettingId, EvictionIterator as XdrEvictionIterator,
     LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerHeader, LedgerKey, LedgerKeyConfigSetting,
@@ -583,22 +583,27 @@ pub fn replay_ledger_with_execution(
         emit_classic_events: config.emit_classic_events,
         backfill_stellar_asset_events: config.backfill_stellar_asset_events,
     };
-    let (results, tx_results, mut tx_result_metas, _total_fees, hot_archive_restored_keys) =
-        execute_transaction_set(
+    let ledger_context = LedgerContext::new(
+        header.ledger_seq,
+        header.scp_value.close_time.0,
+        header.base_fee,
+        header.base_reserve,
+        header.ledger_version,
+        *network_id,
+    );
+    let mut tx_set_result = execute_transaction_set(
             &snapshot,
             &transactions,
-            header.ledger_seq,
-            header.scp_value.close_time.0,
-            header.base_fee,
-            header.base_reserve,
-            header.ledger_version,
-            *network_id,
+            &ledger_context,
             &mut delta,
-            soroban_config,
-            soroban_base_prng_seed.0,
-            classic_events,
-            module_cache,
-            Some(hot_archive_ref.clone()),
+            SorobanContext {
+                config: soroban_config,
+                base_prng_seed: soroban_base_prng_seed.0,
+                classic_events,
+                module_cache,
+                hot_archive: Some(hot_archive_ref.clone()),
+                runtime_handle: None,
+            },
         )
         .map_err(|e| HistoryError::CatchupFailed(format!("replay execution failed: {}", e)))?;
 
@@ -606,10 +611,10 @@ pub fn replay_ledger_with_execution(
     if classic_events.events_enabled(header.ledger_version) {
         for (idx, ((envelope, _), meta)) in transactions
             .iter()
-            .zip(tx_result_metas.iter_mut())
+            .zip(tx_set_result.tx_result_metas.iter_mut())
             .enumerate()
         {
-            let fee_charged = tx_results[idx].result.fee_charged;
+            let fee_charged = tx_set_result.tx_results[idx].result.fee_charged;
             let frame = TransactionFrame::with_network(envelope.clone(), *network_id);
             let fee_source = muxed_to_account_id(&frame.fee_source_account());
             prepend_fee_event(
@@ -625,7 +630,7 @@ pub fn replay_ledger_with_execution(
 
     if config.verify_results {
         let result_set = TransactionResultSet {
-            results: tx_results
+            results: tx_set_result.tx_results
                 .clone()
                 .try_into()
                 .map_err(|_| HistoryError::CatchupFailed("tx result set too large".to_string()))?,
@@ -637,7 +642,7 @@ pub fn replay_ledger_with_execution(
             })?;
         if let Err(err) = verify::verify_tx_result_set(header, &xdr) {
             if let Some(expected) = expected_tx_results {
-                log_tx_result_mismatch(header, expected, &tx_results, &transactions);
+                log_tx_result_mismatch(header, expected, &tx_set_result.tx_results, &transactions);
             }
             return Err(err);
         }
@@ -732,7 +737,7 @@ pub fn replay_ledger_with_execution(
         .iter()
         .filter_map(|e| henyey_ledger::entry_to_key(e).ok())
         .collect();
-    for key in &hot_archive_restored_keys {
+    for key in &tx_set_result.hot_archive_restored_keys {
         // Skip if already in init_entries (added from delta's created entries)
         if init_entry_keys.contains(key) {
             continue;
@@ -751,8 +756,8 @@ pub fn replay_ledger_with_execution(
     // Remove restored entries from dead_entries - they shouldn't be deleted.
     // When an entry is restored from hot archive, it might have been marked as deleted
     // in the live bucket list when it was evicted. We need to ensure it's not re-deleted.
-    if !hot_archive_restored_keys.is_empty() {
-        let restored_set: std::collections::HashSet<_> = hot_archive_restored_keys.iter().collect();
+    if !tx_set_result.hot_archive_restored_keys.is_empty() {
+        let restored_set: std::collections::HashSet<_> = tx_set_result.hot_archive_restored_keys.iter().collect();
         dead_entries.retain(|k| !restored_set.contains(k));
     }
 
@@ -889,7 +894,7 @@ pub fn replay_ledger_with_execution(
                 header.ledger_seq,
                 header.ledger_version,
                 archived_entries,
-                hot_archive_restored_keys.clone(),
+                tx_set_result.hot_archive_restored_keys.clone(),
             )
             .map_err(HistoryError::Bucket)?;
         let post_hash = hot_archive_bucket_list.hash();
@@ -1033,8 +1038,8 @@ pub fn replay_ledger_with_execution(
         }
     }
 
-    let tx_count = results.len() as u32;
-    let op_count: u32 = results
+    let tx_count = tx_set_result.results.len() as u32;
+    let op_count: u32 = tx_set_result.results
         .iter()
         .map(|r| r.operation_results.len() as u32)
         .sum();

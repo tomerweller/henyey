@@ -100,12 +100,16 @@ fn test_soroban_refund_event_after_all_txs() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
-    let mut executor = TransactionExecutor::new(
+    let context = henyey_tx::LedgerContext::new(
         1,
         1_000,
+        100,
         5_000_000,
         25,
         network_id,
+    );
+    let mut executor = TransactionExecutor::new(
+        &context,
         0,
         SorobanConfig::default(),
         classic_events,
@@ -150,12 +154,16 @@ fn test_apply_ledger_entry_changes_updates_module_cache() {
     let module_cache = PersistentModuleCache::new_for_protocol(25).expect("create cache");
 
     // Create executor with module cache
-    let mut executor = TransactionExecutor::new(
+    let context = henyey_tx::LedgerContext::new(
         1,
         1_000,
+        100,
         5_000_000,
         25,
         network_id,
+    );
+    let mut executor = TransactionExecutor::new(
+        &context,
         0,
         SorobanConfig::default(),
         ClassicEventConfig::default(),
@@ -383,12 +391,16 @@ fn test_set_options_loads_signer_sponsor_accounts() {
         env.signatures = vec![decorated].try_into().unwrap();
     }
 
-    let mut executor = TransactionExecutor::new(
+    let context = henyey_tx::LedgerContext::new(
         1,
         1_000,
+        100,
         5_000_000,
         25,
         network_id,
+    );
+    let mut executor = TransactionExecutor::new(
+        &context,
         0,
         SorobanConfig::default(),
         ClassicEventConfig::default(),
@@ -455,7 +467,7 @@ fn test_execute_transaction_set_accepts_hot_archive_parameter() {
     use std::sync::Arc;
     use henyey_bucket::HotArchiveBucketList;
     use henyey_ledger::execution::execute_transaction_set;
-    use henyey_ledger::LedgerDelta;
+    use henyey_ledger::{LedgerDelta, SorobanContext};
 
     let secret = SecretKey::from_seed(&[99u8; 32]);
     let account_id: AccountId = (&secret.public_key()).into();
@@ -507,30 +519,36 @@ fn test_execute_transaction_set_accepts_hot_archive_parameter() {
 
     // This should NOT panic or error - the hot_archive parameter should be accepted
     // and forwarded to the executor. Prior to the fix, this parameter didn't exist.
-    let result = execute_transaction_set(
-        &snapshot,
-        &transactions,
+    let context = henyey_tx::LedgerContext::new(
         1,         // ledger_seq
         1000,      // close_time
         100,       // base_fee
         5_000_000, // base_reserve
         25,        // protocol_version (Protocol 25)
         network_id,
+    );
+    let result = execute_transaction_set(
+        &snapshot,
+        &transactions,
+        &context,
         &mut delta,
-        SorobanConfig::default(),
-        [0u8; 32], // soroban_base_prng_seed
-        ClassicEventConfig::default(),
-        None,                  // module_cache
-        Some(hot_archive_arc), // hot_archive - the key parameter being tested
+        SorobanContext {
+            config: SorobanConfig::default(),
+            base_prng_seed: [0u8; 32],
+            classic_events: ClassicEventConfig::default(),
+            module_cache: None,
+            hot_archive: Some(hot_archive_arc), // the key parameter being tested
+            runtime_handle: None,
+        },
     );
 
     // The transaction should execute (the API should accept the hot_archive parameter)
     // Note: The transaction result itself may vary - the key verification is that
     // execute_transaction_set properly accepts and forwards the hot_archive parameter
     // to TransactionExecutor without panicking or erroring.
-    let (results, _, _, _, _) =
+    let tx_set_result =
         result.expect("execute_transaction_set should succeed with hot_archive parameter");
-    assert_eq!(results.len(), 1, "Should have one transaction result");
+    assert_eq!(tx_set_result.results.len(), 1, "Should have one transaction result");
     // We don't assert success here because that depends on many factors -
     // the key test is that the API correctly accepts and processes the hot_archive parameter.
 }
@@ -646,13 +664,17 @@ fn test_deleted_offer_not_reloaded_from_snapshot() {
     let network_id = NetworkId::testnet();
 
     // Create executor
-    let mut executor = TransactionExecutor::new(
+    let context = henyey_tx::LedgerContext::new(
         1,         // ledger_seq
         1_000,     // close_time
+        100,       // base_fee
         5_000_000, // base_reserve
         25,        // protocol_version
         network_id,
-        0, // base_fee (not used directly)
+    );
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
         SorobanConfig::default(),
         ClassicEventConfig::default(),
     );
@@ -894,8 +916,8 @@ fn build_extend_ttl_tx(
 #[tokio::test(flavor = "multi_thread")]
 async fn test_parallel_soroban_multi_cluster_execution() {
     use henyey_ledger::{
-        execute_soroban_parallel_phase, LedgerDelta, SorobanPhaseStructure, SnapshotBuilder,
-        SnapshotHandle,
+        execute_soroban_parallel_phase, LedgerDelta, SorobanContext, SorobanPhaseStructure,
+        SnapshotBuilder, SnapshotHandle,
     };
 
     let network_id = NetworkId::testnet();
@@ -923,39 +945,43 @@ async fn test_parallel_soroban_multi_cluster_execution() {
     };
 
     let mut delta = LedgerDelta::new(1);
-    let (results, tx_results, tx_result_metas, _id_pool, _restored) =
-        execute_soroban_parallel_phase(
+    let context = henyey_tx::LedgerContext::new(
+        1,          // ledger_seq
+        1_000,      // close_time
+        100,        // base_fee
+        5_000_000,  // base_reserve
+        25,         // protocol_version
+        network_id,
+    );
+    let result = execute_soroban_parallel_phase(
             &snapshot,
             &phase,
             0,          // classic_tx_count
-            1,          // ledger_seq
-            1_000,      // close_time
-            100,        // base_fee
-            5_000_000,  // base_reserve
-            25,         // protocol_version
-            network_id,
+            &context,
             &mut delta,
-            SorobanConfig::default(),
-            [0u8; 32],
-            ClassicEventConfig::default(),
-            None,
-            None,
-            None,
+            SorobanContext {
+                config: SorobanConfig::default(),
+                base_prng_seed: [0u8; 32],
+                classic_events: ClassicEventConfig::default(),
+                module_cache: None,
+                hot_archive: None,
+                runtime_handle: None,
+            },
         )
         .expect("execute parallel phase");
 
     // Both TXs should have executed.
-    assert_eq!(results.len(), 2, "expected 2 execution results");
-    assert_eq!(tx_results.len(), 2, "expected 2 TX result pairs");
-    assert_eq!(tx_result_metas.len(), 2, "expected 2 TX result metas");
+    assert_eq!(result.results.len(), 2, "expected 2 execution results");
+    assert_eq!(result.tx_results.len(), 2, "expected 2 TX result pairs");
+    assert_eq!(result.tx_result_metas.len(), 2, "expected 2 TX result metas");
 
     // Both should succeed.
-    assert!(results[0].success, "TX1 should succeed");
-    assert!(results[1].success, "TX2 should succeed");
+    assert!(result.results[0].success, "TX1 should succeed");
+    assert!(result.results[1].success, "TX2 should succeed");
 
     // Fees should be collected (each TX has fee=1000, base_fee=100 → charged 100 each).
-    assert_eq!(results[0].fee_charged, 100, "TX1 fee charged");
-    assert_eq!(results[1].fee_charged, 100, "TX2 fee charged");
+    assert_eq!(result.results[0].fee_charged, 100, "TX1 fee charged");
+    assert_eq!(result.results[1].fee_charged, 100, "TX2 fee charged");
 
     // Delta should have changes from both clusters.
     // Each cluster modifies: account (fee deduction) + TTL entry (extend).
@@ -968,8 +994,8 @@ async fn test_parallel_soroban_multi_cluster_execution() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_parallel_soroban_matches_sequential() {
     use henyey_ledger::{
-        execute_soroban_parallel_phase, LedgerDelta, SorobanPhaseStructure, SnapshotBuilder,
-        SnapshotHandle,
+        execute_soroban_parallel_phase, LedgerDelta, SorobanContext, SorobanPhaseStructure,
+        SnapshotBuilder, SnapshotHandle,
     };
 
     let network_id = NetworkId::testnet();
@@ -986,21 +1012,14 @@ async fn test_parallel_soroban_matches_sequential() {
     }
     let snapshot = SnapshotHandle::new(builder.build_with_default_header());
 
-    let common_args = |phase: &SorobanPhaseStructure| {
-        (
-            phase.clone(),
-            0usize,     // classic_tx_count
-            1u32,       // ledger_seq
-            1_000u64,   // close_time
-            100u32,     // base_fee
-            5_000_000u32,
-            25u32,
-            network_id,
-            SorobanConfig::default(),
-            [0u8; 32],
-            ClassicEventConfig::default(),
-        )
-    };
+    let context = henyey_tx::LedgerContext::new(
+        1,          // ledger_seq
+        1_000,      // close_time
+        100,        // base_fee
+        5_000_000,  // base_reserve
+        25,         // protocol_version
+        network_id,
+    );
 
     // Run with 2 clusters in 1 stage (parallel path).
     let parallel_phase = SorobanPhaseStructure {
@@ -1010,17 +1029,21 @@ async fn test_parallel_soroban_matches_sequential() {
             vec![(tx2.clone(), None)],
         ]],
     };
-    let args = common_args(&parallel_phase);
     let mut parallel_delta = LedgerDelta::new(1);
-    let (par_results, par_tx_results, par_tx_result_metas, par_id_pool, par_restored) =
-        execute_soroban_parallel_phase(
+    let par = execute_soroban_parallel_phase(
             &snapshot,
-            &args.0,
-            args.1, args.2, args.3, args.4, args.5, args.6, args.7,
+            &parallel_phase,
+            0,
+            &context,
             &mut parallel_delta,
-            args.8, args.9, args.10,
-            None, None,
-            None,
+            SorobanContext {
+                config: SorobanConfig::default(),
+                base_prng_seed: [0u8; 32],
+                classic_events: ClassicEventConfig::default(),
+                module_cache: None,
+                hot_archive: None,
+                runtime_handle: None,
+            },
         )
         .expect("parallel");
 
@@ -1032,31 +1055,35 @@ async fn test_parallel_soroban_matches_sequential() {
             vec![vec![(tx2.clone(), None)]],
         ],
     };
-    let args = common_args(&sequential_phase);
     let mut sequential_delta = LedgerDelta::new(1);
-    let (seq_results, seq_tx_results, seq_tx_result_metas, seq_id_pool, seq_restored) =
-        execute_soroban_parallel_phase(
+    let seq = execute_soroban_parallel_phase(
             &snapshot,
-            &args.0,
-            args.1, args.2, args.3, args.4, args.5, args.6, args.7,
+            &sequential_phase,
+            0,
+            &context,
             &mut sequential_delta,
-            args.8, args.9, args.10,
-            None, None,
-            None,
+            SorobanContext {
+                config: SorobanConfig::default(),
+                base_prng_seed: [0u8; 32],
+                classic_events: ClassicEventConfig::default(),
+                module_cache: None,
+                hot_archive: None,
+                runtime_handle: None,
+            },
         )
         .expect("sequential");
 
     // Results should match.
-    assert_eq!(par_results.len(), seq_results.len(), "result count");
-    for i in 0..par_results.len() {
-        assert_eq!(par_results[i].success, seq_results[i].success, "success[{i}]");
-        assert_eq!(par_results[i].fee_charged, seq_results[i].fee_charged, "fee_charged[{i}]");
-        assert_eq!(par_results[i].fee_refund, seq_results[i].fee_refund, "fee_refund[{i}]");
+    assert_eq!(par.results.len(), seq.results.len(), "result count");
+    for i in 0..par.results.len() {
+        assert_eq!(par.results[i].success, seq.results[i].success, "success[{i}]");
+        assert_eq!(par.results[i].fee_charged, seq.results[i].fee_charged, "fee_charged[{i}]");
+        assert_eq!(par.results[i].fee_refund, seq.results[i].fee_refund, "fee_refund[{i}]");
     }
-    assert_eq!(par_tx_results.len(), seq_tx_results.len(), "tx_results count");
-    assert_eq!(par_tx_result_metas.len(), seq_tx_result_metas.len(), "metas count");
-    assert_eq!(par_id_pool, seq_id_pool, "id_pool");
-    assert_eq!(par_restored.len(), seq_restored.len(), "restored keys");
+    assert_eq!(par.tx_results.len(), seq.tx_results.len(), "tx_results count");
+    assert_eq!(par.tx_result_metas.len(), seq.tx_result_metas.len(), "metas count");
+    assert_eq!(par.id_pool, seq.id_pool, "id_pool");
+    assert_eq!(par.hot_archive_restored_keys.len(), seq.hot_archive_restored_keys.len(), "restored keys");
 
     // Fee pool deltas should match.
     assert_eq!(
@@ -1077,8 +1104,8 @@ async fn test_parallel_soroban_matches_sequential() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_parallel_soroban_deterministic() {
     use henyey_ledger::{
-        execute_soroban_parallel_phase, LedgerDelta, SorobanPhaseStructure, SnapshotBuilder,
-        SnapshotHandle,
+        execute_soroban_parallel_phase, LedgerDelta, SorobanContext, SorobanPhaseStructure,
+        SnapshotBuilder, SnapshotHandle,
     };
 
     let network_id = NetworkId::testnet();
@@ -1106,24 +1133,30 @@ async fn test_parallel_soroban_deterministic() {
     let mut prev_fee_delta = None;
     let mut prev_num_changes = None;
     let mut prev_results: Option<Vec<(bool, i64, i64)>> = None;
+    let context = henyey_tx::LedgerContext::new(
+        1, 1_000, 100, 5_000_000, 25, network_id,
+    );
 
     for run in 0..5 {
         let mut delta = LedgerDelta::new(1);
-        let (results, _tx_results, _metas, _id_pool, _restored) =
-            execute_soroban_parallel_phase(
+        let result = execute_soroban_parallel_phase(
                 &snapshot,
                 &phase,
-                0, 1, 1_000, 100, 5_000_000, 25, network_id,
+                0,
+                &context,
                 &mut delta,
-                SorobanConfig::default(),
-                [0u8; 32],
-                ClassicEventConfig::default(),
-                None, None,
-                None,
+                SorobanContext {
+                    config: SorobanConfig::default(),
+                    base_prng_seed: [0u8; 32],
+                    classic_events: ClassicEventConfig::default(),
+                    module_cache: None,
+                    hot_archive: None,
+                    runtime_handle: None,
+                },
             )
             .expect("execute");
 
-        let result_tuples: Vec<(bool, i64, i64)> = results
+        let result_tuples: Vec<(bool, i64, i64)> = result.results
             .iter()
             .map(|r| (r.success, r.fee_charged, r.fee_refund))
             .collect();
@@ -1150,8 +1183,8 @@ async fn test_parallel_soroban_deterministic() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_parallel_soroban_from_spawn_blocking() {
     use henyey_ledger::{
-        execute_soroban_parallel_phase, LedgerDelta, SorobanPhaseStructure, SnapshotBuilder,
-        SnapshotHandle,
+        execute_soroban_parallel_phase, LedgerDelta, SorobanContext, SorobanPhaseStructure,
+        SnapshotBuilder, SnapshotHandle,
     };
 
     let network_id = NetworkId::testnet();
@@ -1178,40 +1211,44 @@ async fn test_parallel_soroban_from_spawn_blocking() {
 
     // Execute on a spawn_blocking thread with Some(handle).
     // This exercises the Handle::block_on path (not block_in_place).
-    let result = tokio::task::spawn_blocking(move || {
+    let outer_result = tokio::task::spawn_blocking(move || {
         let mut delta = LedgerDelta::new(1);
-        let (results, tx_results, tx_result_metas, _id_pool, _restored) =
-            execute_soroban_parallel_phase(
+        let context = henyey_tx::LedgerContext::new(
+            1,
+            1_000,
+            100,
+            5_000_000,
+            25,
+            network_id,
+        );
+        let result = execute_soroban_parallel_phase(
                 &snapshot,
                 &phase,
                 0,
-                1,
-                1_000,
-                100,
-                5_000_000,
-                25,
-                network_id,
+                &context,
                 &mut delta,
-                SorobanConfig::default(),
-                [0u8; 32],
-                ClassicEventConfig::default(),
-                None,
-                None,
-                Some(handle),
+                SorobanContext {
+                    config: SorobanConfig::default(),
+                    base_prng_seed: [0u8; 32],
+                    classic_events: ClassicEventConfig::default(),
+                    module_cache: None,
+                    hot_archive: None,
+                    runtime_handle: Some(handle),
+                },
             )
             .expect("execute parallel phase from spawn_blocking");
 
-        (results, tx_results, tx_result_metas, delta)
+        (result, delta)
     })
     .await
     .expect("spawn_blocking task");
 
-    let (results, tx_results, tx_result_metas, delta) = result;
-    assert_eq!(results.len(), 2, "expected 2 execution results");
-    assert_eq!(tx_results.len(), 2, "expected 2 TX result pairs");
-    assert_eq!(tx_result_metas.len(), 2, "expected 2 TX result metas");
-    assert!(results[0].success, "TX1 should succeed");
-    assert!(results[1].success, "TX2 should succeed");
+    let (result, delta) = outer_result;
+    assert_eq!(result.results.len(), 2, "expected 2 execution results");
+    assert_eq!(result.tx_results.len(), 2, "expected 2 TX result pairs");
+    assert_eq!(result.tx_result_metas.len(), 2, "expected 2 TX result metas");
+    assert!(result.results[0].success, "TX1 should succeed");
+    assert!(result.results[1].success, "TX2 should succeed");
     assert!(delta.num_changes() > 0, "delta should have changes");
     assert!(delta.fee_pool_delta() > 0, "fees should be collected");
 }
@@ -1220,8 +1257,8 @@ async fn test_parallel_soroban_from_spawn_blocking() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_parallel_soroban_spawn_blocking_matches_worker() {
     use henyey_ledger::{
-        execute_soroban_parallel_phase, LedgerDelta, SorobanPhaseStructure, SnapshotBuilder,
-        SnapshotHandle,
+        execute_soroban_parallel_phase, LedgerDelta, SorobanContext, SorobanPhaseStructure,
+        SnapshotBuilder, SnapshotHandle,
     };
 
     let network_id = NetworkId::testnet();
@@ -1245,23 +1282,28 @@ async fn test_parallel_soroban_spawn_blocking_matches_worker() {
 
     // Run with None (block_in_place path, on worker thread).
     let mut delta_worker = LedgerDelta::new(1);
-    let (results_worker, tx_results_worker, _, _, _) = execute_soroban_parallel_phase(
-        &snapshot,
-        &phase,
-        0,
+    let context = henyey_tx::LedgerContext::new(
         1,
         1_000,
         100,
         5_000_000,
         25,
         network_id,
+    );
+    let worker_result = execute_soroban_parallel_phase(
+        &snapshot,
+        &phase,
+        0,
+        &context,
         &mut delta_worker,
-        SorobanConfig::default(),
-        [0u8; 32],
-        ClassicEventConfig::default(),
-        None,
-        None,
-        None,
+        SorobanContext {
+            config: SorobanConfig::default(),
+            base_prng_seed: [0u8; 32],
+            classic_events: ClassicEventConfig::default(),
+            module_cache: None,
+            hot_archive: None,
+            runtime_handle: None,
+        },
     )
     .expect("worker path");
 
@@ -1278,40 +1320,45 @@ async fn test_parallel_soroban_spawn_blocking_matches_worker() {
     });
     let phase2 = phase.clone();
 
-    let (results_blocking, tx_results_blocking, delta_blocking) =
+    let (blocking_result, delta_blocking) =
         tokio::task::spawn_blocking(move || {
             let mut delta = LedgerDelta::new(1);
-            let (results, tx_results, _, _, _) = execute_soroban_parallel_phase(
-                &snapshot2,
-                &phase2,
-                0,
+            let context = henyey_tx::LedgerContext::new(
                 1,
                 1_000,
                 100,
                 5_000_000,
                 25,
                 network_id,
+            );
+            let result = execute_soroban_parallel_phase(
+                &snapshot2,
+                &phase2,
+                0,
+                &context,
                 &mut delta,
-                SorobanConfig::default(),
-                [0u8; 32],
-                ClassicEventConfig::default(),
-                None,
-                None,
-                Some(handle),
+                SorobanContext {
+                    config: SorobanConfig::default(),
+                    base_prng_seed: [0u8; 32],
+                    classic_events: ClassicEventConfig::default(),
+                    module_cache: None,
+                    hot_archive: None,
+                    runtime_handle: Some(handle),
+                },
             )
             .expect("spawn_blocking path");
-            (results, tx_results, delta)
+            (result, delta)
         })
         .await
         .expect("spawn_blocking task");
 
     // Both paths should produce identical results.
-    assert_eq!(results_worker.len(), results_blocking.len());
-    for (w, b) in results_worker.iter().zip(results_blocking.iter()) {
+    assert_eq!(worker_result.results.len(), blocking_result.results.len());
+    for (w, b) in worker_result.results.iter().zip(blocking_result.results.iter()) {
         assert_eq!(w.success, b.success);
         assert_eq!(w.fee_charged, b.fee_charged);
     }
-    assert_eq!(tx_results_worker.len(), tx_results_blocking.len());
+    assert_eq!(worker_result.tx_results.len(), blocking_result.tx_results.len());
     assert_eq!(delta_worker.fee_pool_delta(), delta_blocking.fee_pool_delta());
     assert_eq!(delta_worker.num_changes(), delta_blocking.num_changes());
 }
@@ -1383,12 +1430,16 @@ fn test_cross_tx_deleted_trustline_not_reloaded() {
     let snapshot = SnapshotHandle::new(snapshot);
 
     let network_id = NetworkId::testnet();
-    let mut executor = TransactionExecutor::new(
+    let context = henyey_tx::LedgerContext::new(
         1,
         1_000,
+        100,
         5_000_000,
         25,
         network_id,
+    );
+    let mut executor = TransactionExecutor::new(
+        &context,
         0,
         SorobanConfig::default(),
         ClassicEventConfig::default(),
@@ -1663,12 +1714,16 @@ fn test_advance_to_ledger_preserving_offers() {
     let network_id = NetworkId::testnet();
 
     // Create executor for ledger 1
-    let mut executor = TransactionExecutor::new(
+    let context = henyey_tx::LedgerContext::new(
         1,         // ledger_seq
         1_000,     // close_time
+        100,       // base_fee
         5_000_000, // base_reserve
         25,        // protocol_version
         network_id,
+    );
+    let mut executor = TransactionExecutor::new(
+        &context,
         0,
         SorobanConfig::default(),
         ClassicEventConfig::default(),
@@ -1914,12 +1969,16 @@ fn test_internal_error_maps_to_tx_internal_error() {
 
     let network_id = NetworkId::testnet();
 
-    let mut executor = TransactionExecutor::new(
+    let context = henyey_tx::LedgerContext::new(
         1,
         1_000,
+        100,
         5_000_000,
         25,
         network_id,
+    );
+    let mut executor = TransactionExecutor::new(
+        &context,
         0,
         SorobanConfig::default(),
         ClassicEventConfig::default(),

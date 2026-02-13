@@ -19,12 +19,16 @@ fn test_execute_transaction_missing_operation() {
 
     let snapshot = LedgerSnapshot::empty(1);
     let snapshot = SnapshotHandle::new(snapshot);
-    let mut executor = TransactionExecutor::new(
+    let context = henyey_tx::LedgerContext::new(
         1,
         1000,
+        100,
         5_000_000,
         25,
         NetworkId::testnet(),
+    );
+    let mut executor = TransactionExecutor::new(
+        &context,
         0,
         SorobanConfig::default(),
         ClassicEventConfig::default(),
@@ -85,12 +89,16 @@ fn test_execute_transaction_time_bounds_too_early() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
-    let mut executor = TransactionExecutor::new(
+    let context = henyey_tx::LedgerContext::new(
         1,
         1_000,
+        100,
         5_000_000,
         25,
         network_id,
+    );
+    let mut executor = TransactionExecutor::new(
+        &context,
         0,
         SorobanConfig::default(),
         classic_events,
@@ -157,12 +165,16 @@ fn test_execute_transaction_min_seq_num_precondition() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
-    let mut executor = TransactionExecutor::new(
+    let context = henyey_tx::LedgerContext::new(
         1,
         1_000,
+        100,
         5_000_000,
         25,
         network_id,
+    );
+    let mut executor = TransactionExecutor::new(
+        &context,
         0,
         SorobanConfig::default(),
         classic_events,
@@ -233,12 +245,16 @@ fn test_execute_transaction_min_seq_num_relaxed_sequence() {
         env.signatures = vec![decorated].try_into().unwrap();
     }
 
-    let mut executor = TransactionExecutor::new(
+    let context = henyey_tx::LedgerContext::new(
         1,
         1_000,
+        100,
         5_000_000,
         25,
         network_id,
+    );
+    let mut executor = TransactionExecutor::new(
+        &context,
         0,
         SorobanConfig::default(),
         ClassicEventConfig::default(),
@@ -311,12 +327,16 @@ fn test_execute_transaction_strict_sequence_without_min_seq_num() {
         env.signatures = vec![decorated].try_into().unwrap();
     }
 
-    let mut executor = TransactionExecutor::new(
+    let context = henyey_tx::LedgerContext::new(
         1,
         1_000,
+        100,
         5_000_000,
         25,
         network_id,
+    );
+    let mut executor = TransactionExecutor::new(
+        &context,
         0,
         SorobanConfig::default(),
         ClassicEventConfig::default(),
@@ -390,12 +410,16 @@ fn test_execute_transaction_min_seq_age_precondition() {
         env.signatures = vec![decorated].try_into().unwrap();
     }
 
-    let mut executor = TransactionExecutor::new(
+    let context = henyey_tx::LedgerContext::new(
         10,
         1_000, // close_time
+        100,
         5_000_000,
         25,
         network_id,
+    );
+    let mut executor = TransactionExecutor::new(
+        &context,
         0,
         SorobanConfig::default(),
         ClassicEventConfig::default(),
@@ -464,12 +488,16 @@ fn test_execute_transaction_min_seq_ledger_gap_precondition() {
         env.signatures = vec![decorated].try_into().unwrap();
     }
 
-    let mut executor = TransactionExecutor::new(
+    let context = henyey_tx::LedgerContext::new(
         10,
         1_000,
+        100,
         5_000_000,
         25,
         network_id,
+    );
+    let mut executor = TransactionExecutor::new(
+        &context,
         0,
         SorobanConfig::default(),
         ClassicEventConfig::default(),
@@ -537,12 +565,16 @@ fn test_execute_transaction_extra_signers_missing() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
-    let mut executor = TransactionExecutor::new(
+    let context = henyey_tx::LedgerContext::new(
         1,
         1_000,
+        100,
         5_000_000,
         25,
         network_id,
+    );
+    let mut executor = TransactionExecutor::new(
+        &context,
         0,
         SorobanConfig::default(),
         classic_events,
@@ -680,12 +712,16 @@ fn test_operation_failure_rolls_back_changes() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
-    let mut executor = TransactionExecutor::new(
+    let context = henyey_tx::LedgerContext::new(
         1,
         1_000,
+        100,
         5_000_000,
         25,
         network_id,
+    );
+    let mut executor = TransactionExecutor::new(
+        &context,
         0,
         SorobanConfig::default(),
         classic_events,

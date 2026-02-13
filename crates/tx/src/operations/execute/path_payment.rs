@@ -16,7 +16,8 @@ use stellar_xdr::curr::{
 };
 
 use super::offer_exchange::{
-    adjust_offer_amount, exchange_v10, exchange_v10_without_price_error_thresholds, RoundingType,
+    adjust_offer_amount, exchange_v10, exchange_v10_without_price_error_thresholds,
+    ConversionParams, RoundingType,
 };
 use super::{
     account_liabilities, add_account_balance, add_trustline_balance,
@@ -109,17 +110,19 @@ pub fn execute_path_payment_strict_receive(
         let mut offer_trail = Vec::new();
         let max_offers_to_cross = MAX_OFFERS_TO_CROSS - offers_claimed.len() as i64;
         let convert_res = convert_with_offers_and_pools(
-            source,
-            &send_asset,
-            i64::MAX,
+            &mut ConversionParams {
+                source,
+                selling: &send_asset,
+                buying: &recv_asset,
+                max_send: i64::MAX,
+                max_receive: max_amount_recv,
+                round: RoundingType::PathPaymentStrictReceive,
+                offer_trail: &mut offer_trail,
+                state,
+                context,
+            },
             &mut amount_send,
-            &recv_asset,
-            max_amount_recv,
             &mut amount_recv,
-            RoundingType::PathPaymentStrictReceive,
-            &mut offer_trail,
-            state,
-            context,
             max_offers_to_cross,
         )?;
 
@@ -241,17 +244,19 @@ pub fn execute_path_payment_strict_send(
         let mut offer_trail = Vec::new();
         let max_offers_to_cross = MAX_OFFERS_TO_CROSS - offers_claimed.len() as i64;
         let convert_res = convert_with_offers_and_pools(
-            source,
-            &send_asset,
-            max_amount_send,
+            &mut ConversionParams {
+                source,
+                selling: &send_asset,
+                buying: &recv_asset,
+                max_send: max_amount_send,
+                max_receive: i64::MAX,
+                round: RoundingType::PathPaymentStrictSend,
+                offer_trail: &mut offer_trail,
+                state,
+                context,
+            },
             &mut amount_send,
-            &recv_asset,
-            i64::MAX,
             &mut amount_recv,
-            RoundingType::PathPaymentStrictSend,
-            &mut offer_trail,
-            state,
-            context,
             max_offers_to_cross,
         )?;
 
@@ -477,56 +482,27 @@ enum ConvertResult {
     CrossedTooMany,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn convert_with_offers_and_pools(
-    source: &AccountId,
-    send_asset: &Asset,
-    max_send: i64,
+    params: &mut ConversionParams<'_>,
     amount_send: &mut i64,
-    recv_asset: &Asset,
-    max_recv: i64,
     amount_recv: &mut i64,
-    round: RoundingType,
-    offer_trail: &mut Vec<ClaimAtom>,
-    state: &mut LedgerStateManager,
-    context: &LedgerContext,
     max_offers_to_cross: i64,
 ) -> Result<ConvertResult> {
-    if round == RoundingType::Normal {
-        return convert_with_offers(
-            source,
-            send_asset,
-            max_send,
-            amount_send,
-            recv_asset,
-            max_recv,
-            amount_recv,
-            round,
-            offer_trail,
-            state,
-            context,
-            max_offers_to_cross,
-        );
+    if params.round == RoundingType::Normal {
+        return convert_with_offers(params, amount_send, amount_recv, max_offers_to_cross);
     }
 
-    let pool_exchange =
-        compute_pool_exchange(send_asset, max_send, recv_asset, max_recv, round, state)?;
+    let pool_exchange = compute_pool_exchange(
+        params.selling,
+        params.max_send,
+        params.buying,
+        params.max_receive,
+        params.round,
+        params.state,
+    )?;
 
     if pool_exchange.is_none() {
-        return convert_with_offers(
-            source,
-            send_asset,
-            max_send,
-            amount_send,
-            recv_asset,
-            max_recv,
-            amount_recv,
-            round,
-            offer_trail,
-            state,
-            context,
-            max_offers_to_cross,
-        );
+        return convert_with_offers(params, amount_send, amount_recv, max_offers_to_cross);
     }
 
     // stellar-core fast-fails if maxOffersToCross == 0 and pool exchange would add to trail
@@ -541,20 +517,22 @@ fn convert_with_offers_and_pools(
     // Use savepoint instead of cloning entire state (avoids O(n) clone of 911K+ offers).
     // Run the orderbook path speculatively on the real state, and rollback if pool wins.
     let t_sp = std::time::Instant::now();
-    let savepoint = state.create_savepoint();
+    let savepoint = params.state.create_savepoint();
     let savepoint_us = t_sp.elapsed().as_micros() as u64;
     let book_res = convert_with_offers(
-        source,
-        send_asset,
-        max_send,
+        &mut ConversionParams {
+            source: params.source,
+            selling: params.selling,
+            buying: params.buying,
+            max_send: params.max_send,
+            max_receive: params.max_receive,
+            round: params.round,
+            offer_trail: &mut book_offer_trail,
+            state: params.state,
+            context: params.context,
+        },
         &mut book_amount_send,
-        recv_asset,
-        max_recv,
         &mut book_amount_recv,
-        round,
-        &mut book_offer_trail,
-        state,
-        context,
         max_offers_to_cross,
     )?;
 
@@ -579,76 +557,56 @@ fn convert_with_offers_and_pools(
         }
         *amount_send = book_amount_send;
         *amount_recv = book_amount_recv;
-        offer_trail.clear();
-        offer_trail.extend(book_offer_trail);
+        params.offer_trail.clear();
+        params.offer_trail.extend(book_offer_trail);
         return Ok(book_res);
     }
 
     // Pool wins — undo speculative book changes
     let t_rb = std::time::Instant::now();
-    state.rollback_to_savepoint(savepoint);
+    params.state.rollback_to_savepoint(savepoint);
     let rollback_us = t_rb.elapsed().as_micros() as u64;
     if savepoint_us > 100 || rollback_us > 100 {
         tracing::debug!(savepoint_us, rollback_us, "savepoint profiling (pool wins)");
     }
 
-    offer_trail.clear();
+    params.offer_trail.clear();
     if apply_pool_exchange(
-        send_asset,
-        recv_asset,
+        params.selling,
+        params.buying,
         pool_exchange.send,
         pool_exchange.recv,
-        state,
+        params.state,
     )? {
         *amount_send = pool_exchange.send;
         *amount_recv = pool_exchange.recv;
-        offer_trail.push(ClaimAtom::LiquidityPool(ClaimLiquidityAtom {
-            liquidity_pool_id: pool_exchange.pool_id,
-            asset_sold: recv_asset.clone(),
-            amount_sold: pool_exchange.recv,
-            asset_bought: send_asset.clone(),
-            amount_bought: pool_exchange.send,
-        }));
+        params
+            .offer_trail
+            .push(ClaimAtom::LiquidityPool(ClaimLiquidityAtom {
+                liquidity_pool_id: pool_exchange.pool_id,
+                asset_sold: params.buying.clone(),
+                amount_sold: pool_exchange.recv,
+                asset_bought: params.selling.clone(),
+                amount_bought: pool_exchange.send,
+            }));
         return Ok(ConvertResult::Ok);
     }
 
-    convert_with_offers(
-        source,
-        send_asset,
-        max_send,
-        amount_send,
-        recv_asset,
-        max_recv,
-        amount_recv,
-        round,
-        offer_trail,
-        state,
-        context,
-        max_offers_to_cross,
-    )
+    convert_with_offers(params, amount_send, amount_recv, max_offers_to_cross)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn convert_with_offers(
-    source: &AccountId,
-    send_asset: &Asset,
-    max_send: i64,
+    params: &mut ConversionParams<'_>,
     amount_send: &mut i64,
-    recv_asset: &Asset,
-    max_recv: i64,
     amount_recv: &mut i64,
-    round: RoundingType,
-    offer_trail: &mut Vec<ClaimAtom>,
-    state: &mut LedgerStateManager,
-    context: &LedgerContext,
     max_offers_to_cross: i64,
 ) -> Result<ConvertResult> {
-    offer_trail.clear();
+    params.offer_trail.clear();
     *amount_send = 0;
     *amount_recv = 0;
 
-    let mut max_send = max_send;
-    let mut max_recv = max_recv;
+    let mut max_send = params.max_send;
+    let mut max_recv = params.max_receive;
     let mut need_more = max_send > 0 && max_recv > 0;
 
     // Fast-fail if already at the limit (protocol 18+, but we only support 23+)
@@ -664,18 +622,18 @@ fn convert_with_offers(
 
     while need_more {
         let t0 = std::time::Instant::now();
-        let offer = state.best_offer(send_asset, recv_asset);
+        let offer = params.state.best_offer(params.selling, params.buying);
         best_offer_us += t0.elapsed().as_micros() as u64;
         let Some(offer) = offer else {
             break;
         };
 
-        if offer.seller_id == *source {
+        if offer.seller_id == *params.source {
             return Ok(ConvertResult::FilterStopCrossSelf);
         }
 
         // Enforce max offers to cross limit (matches stellar-core)
-        if offer_trail.len() as i64 >= max_offers_to_cross {
+        if params.offer_trail.len() as i64 >= max_offers_to_cross {
             return Ok(ConvertResult::CrossedTooMany);
         }
 
@@ -684,10 +642,10 @@ fn convert_with_offers(
             &offer,
             max_recv,
             max_send,
-            round,
-            offer_trail,
-            state,
-            context,
+            params.round,
+            params.offer_trail,
+            params.state,
+            params.context,
         )?;
         cross_offer_us += t1.elapsed().as_micros() as u64;
         offers_crossed += 1;

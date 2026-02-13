@@ -27,6 +27,7 @@ use super::{
     EncodedContractEvent, InvokeHostFunctionOutput, LedgerEntryChange, LiveBucketListRestore,
     TtlChange,
 };
+use crate::soroban::host::EntryWithTtl;
 use crate::soroban::SorobanConfig;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
@@ -57,11 +58,10 @@ impl<'a> LedgerSnapshotAdapter<'a> {
     /// to match stellar-core behavior. In stellar-core, entries with expired TTL are not passed to
     /// the host during invoke_host_function - expired temporary entries are skipped entirely,
     /// and expired persistent entries are treated as archived (requiring restoration).
-    #[allow(clippy::type_complexity)]
     fn get_local(
         &self,
         key: &LedgerKey,
-    ) -> Result<Option<(Rc<LedgerEntry>, Option<u32>)>, HostError> {
+    ) -> Result<Option<EntryWithTtl>, HostError> {
         let live_until = get_entry_ttl(self.state, key, self.current_ledger);
 
         let entry = match key {

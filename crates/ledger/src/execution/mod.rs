@@ -393,25 +393,21 @@ pub struct TransactionExecutor {
 
 impl TransactionExecutor {
     /// Create a new transaction executor.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        ledger_seq: u32,
-        close_time: u64,
-        base_reserve: u32,
-        protocol_version: u32,
-        network_id: NetworkId,
+        context: &LedgerContext,
         id_pool: u64,
         soroban_config: SorobanConfig,
         classic_events: ClassicEventConfig,
     ) -> Self {
-        let mut state = LedgerStateManager::new(base_reserve as i64, ledger_seq);
+        let mut state =
+            LedgerStateManager::new(context.base_reserve as i64, context.sequence);
         state.set_id_pool(id_pool);
         Self {
-            ledger_seq,
-            close_time,
-            base_reserve,
-            protocol_version,
-            network_id,
+            ledger_seq: context.sequence,
+            close_time: context.close_time,
+            base_reserve: context.base_reserve,
+            protocol_version: context.protocol_version,
+            network_id: context.network_id,
             state,
             loaded_accounts: HashMap::new(),
             soroban_config,
@@ -2471,16 +2467,19 @@ impl TransactionExecutor {
                             (RestoredEntries::default(), None)
                         };
 
+                        let ledger_changes = LedgerChanges {
+                            created: &delta_changes.created,
+                            updated: &delta_changes.updated,
+                            update_states: &delta_changes.update_states,
+                            deleted: &delta_changes.deleted,
+                            delete_states: &delta_changes.delete_states,
+                            change_order: &delta_changes.change_order,
+                            state_overrides: &op_snapshots,
+                            restored: &restored_entries,
+                        };
                         let op_changes_local = build_entry_changes_with_hot_archive(
                             &self.state,
-                            &delta_changes.created,
-                            &delta_changes.updated,
-                            &delta_changes.update_states,
-                            &delta_changes.deleted,
-                            &delta_changes.delete_states,
-                            &delta_changes.change_order,
-                            &op_snapshots,
-                            &restored_entries,
+                            &ledger_changes,
                             footprint,
                             self.ledger_seq,
                         );
@@ -3405,13 +3404,34 @@ impl<'a> SignatureTracker<'a> {
 /// Transaction envelope paired with an optional per-TX base fee override.
 type TxWithFee = (TransactionEnvelope, Option<u32>);
 
-/// Result of executing one cluster of Soroban transactions.
-pub struct ClusterResult {
-    results: Vec<TransactionExecutionResult>,
-    tx_results: Vec<TransactionResultPair>,
-    tx_result_metas: Vec<TransactionResultMetaV1>,
-    id_pool: u64,
-    hot_archive_restored_keys: Vec<LedgerKey>,
+/// Result of executing a transaction set (or a single cluster within one).
+pub struct TxSetResult {
+    pub results: Vec<TransactionExecutionResult>,
+    pub tx_results: Vec<TransactionResultPair>,
+    pub tx_result_metas: Vec<TransactionResultMetaV1>,
+    pub id_pool: u64,
+    pub hot_archive_restored_keys: Vec<LedgerKey>,
+}
+
+/// Soroban-related execution context bundled for passing through tx_set functions.
+///
+/// Groups the Soroban configuration, PRNG seed, classic event config,
+/// optional module cache, hot archive, and runtime handle that travel
+/// together through the parallel-phase pipeline.
+pub struct SorobanContext<'a> {
+    pub config: SorobanConfig,
+    pub base_prng_seed: [u8; 32],
+    pub classic_events: ClassicEventConfig,
+    pub module_cache: Option<&'a PersistentModuleCache>,
+    pub hot_archive: Option<std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
+    pub runtime_handle: Option<tokio::runtime::Handle>,
+}
+
+/// Parameters specific to a single cluster or stage within the parallel phase.
+pub struct ClusterParams<'a> {
+    pub id_pool: u64,
+    pub prior_stage_entries: &'a [LedgerEntry],
+    pub pre_charged_fees: &'a [PreChargedFee],
 }
 
 /// Extract the fee-paying source AccountId from a raw TransactionEnvelope.
@@ -3507,7 +3527,7 @@ fn pre_deduct_soroban_fees(
 const _: () = {
     fn _assert_send<T: Send>() {}
     fn _checks() {
-        _assert_send::<ClusterResult>();
+        _assert_send::<TxSetResult>();
         _assert_send::<LedgerDelta>();
     }
 };
@@ -3518,12 +3538,9 @@ mod tests {
 
     #[test]
     fn test_transaction_executor_creation() {
+        let context = LedgerContext::new(100, 1234567890, 100, 5_000_000, 21, NetworkId::testnet());
         let executor = TransactionExecutor::new(
-            100,
-            1234567890,
-            5_000_000,
-            21,
-            NetworkId::testnet(),
+            &context,
             0,
             SorobanConfig::default(),
             ClassicEventConfig::default(),

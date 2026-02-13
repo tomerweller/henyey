@@ -27,6 +27,11 @@ type BatchEntryLoaderFn = dyn Fn(&[LedgerKey]) -> Result<Vec<LedgerEntry>> + Sen
 type OffersByAccountAssetLoaderFn =
     dyn Fn(&AccountId, &Asset) -> Result<Vec<LedgerEntry>> + Send + Sync;
 
+/// Key for trustline entries: (account_id bytes, asset key).
+pub type TrustlineKey = ([u8; 32], AssetKey);
+/// Key for data entries: (account_id bytes, data name).
+pub type DataKey = ([u8; 32], String);
+
 /// Soroban state extracted from LedgerStateManager for cheap cloning.
 ///
 /// Path payment operations need to clone the entire state for speculative
@@ -106,13 +111,12 @@ pub struct SorobanState {
 /// - Entry metadata snapshot state
 /// - Created entry sets
 /// - ID pool value
-#[allow(clippy::type_complexity)]
 pub struct Savepoint {
     // Snapshot maps clones (small: only entries modified earlier in TX)
-    offer_snapshots: HashMap<([u8; 32], i64), Option<OfferEntry>>,
+    offer_snapshots: HashMap<OfferKey, Option<OfferEntry>>,
     account_snapshots: HashMap<[u8; 32], Option<AccountEntry>>,
-    trustline_snapshots: HashMap<([u8; 32], AssetKey), Option<TrustLineEntry>>,
-    data_snapshots: HashMap<([u8; 32], String), Option<DataEntry>>,
+    trustline_snapshots: HashMap<TrustlineKey, Option<TrustLineEntry>>,
+    data_snapshots: HashMap<DataKey, Option<DataEntry>>,
     contract_data_snapshots: HashMap<ContractDataKey, Option<ContractDataEntry>>,
     contract_code_snapshots: HashMap<[u8; 32], Option<ContractCodeEntry>>,
     ttl_snapshots: HashMap<[u8; 32], Option<TtlEntry>>,
@@ -120,10 +124,10 @@ pub struct Savepoint {
     liquidity_pool_snapshots: HashMap<[u8; 32], Option<LiquidityPoolEntry>>,
 
     // Pre-savepoint values of entries in snapshot maps.
-    offer_pre_values: Vec<(([u8; 32], i64), Option<OfferEntry>)>,
+    offer_pre_values: Vec<(OfferKey, Option<OfferEntry>)>,
     account_pre_values: Vec<([u8; 32], Option<AccountEntry>)>,
-    trustline_pre_values: Vec<(([u8; 32], AssetKey), Option<TrustLineEntry>)>,
-    data_pre_values: Vec<(([u8; 32], String), Option<DataEntry>)>,
+    trustline_pre_values: Vec<(TrustlineKey, Option<TrustLineEntry>)>,
+    data_pre_values: Vec<(DataKey, Option<DataEntry>)>,
     contract_data_pre_values: Vec<(ContractDataKey, Option<ContractDataEntry>)>,
     contract_code_pre_values: Vec<([u8; 32], Option<ContractCodeEntry>)>,
     ttl_pre_values: Vec<([u8; 32], Option<TtlEntry>)>,
@@ -131,10 +135,10 @@ pub struct Savepoint {
     liquidity_pool_pre_values: Vec<([u8; 32], Option<LiquidityPoolEntry>)>,
 
     // Created entry sets
-    created_offers: HashSet<([u8; 32], i64)>,
+    created_offers: HashSet<OfferKey>,
     created_accounts: HashSet<[u8; 32]>,
-    created_trustlines: HashSet<([u8; 32], AssetKey)>,
-    created_data: HashSet<([u8; 32], String)>,
+    created_trustlines: HashSet<TrustlineKey>,
+    created_data: HashSet<DataKey>,
     created_contract_data: HashSet<ContractDataKey>,
     created_contract_code: HashSet<[u8; 32]>,
     created_ttl: HashSet<[u8; 32]>,
@@ -267,11 +271,11 @@ pub struct LedgerStateManager {
     /// Account entries by account ID (32-byte public key).
     accounts: HashMap<[u8; 32], AccountEntry>,
     /// Trustline entries by (account, asset).
-    trustlines: HashMap<([u8; 32], AssetKey), TrustLineEntry>,
+    trustlines: HashMap<TrustlineKey, TrustLineEntry>,
     /// Offer entries by (seller, offer_id).
-    offers: HashMap<([u8; 32], i64), OfferEntry>,
+    offers: HashMap<OfferKey, OfferEntry>,
     /// Data entries by (account, name).
-    data_entries: HashMap<([u8; 32], String), DataEntry>,
+    data_entries: HashMap<DataKey, DataEntry>,
     /// Contract data entries by (contract, key, durability).
     contract_data: HashMap<ContractDataKey, ContractDataEntry>,
     /// Contract code entries by hash.
@@ -308,11 +312,11 @@ pub struct LedgerStateManager {
     /// Track which entries have been modified for rollback.
     modified_accounts: Vec<[u8; 32]>,
     /// Track which trustlines have been modified.
-    modified_trustlines: Vec<([u8; 32], AssetKey)>,
+    modified_trustlines: Vec<TrustlineKey>,
     /// Track which offers have been modified.
-    modified_offers: Vec<([u8; 32], i64)>,
+    modified_offers: Vec<OfferKey>,
     /// Track which data entries have been modified.
-    modified_data: Vec<([u8; 32], String)>,
+    modified_data: Vec<DataKey>,
     /// Track which contract data entries have been modified.
     modified_contract_data: Vec<ContractDataKey>,
     /// Track which contract code entries have been modified.
@@ -332,11 +336,11 @@ pub struct LedgerStateManager {
     /// Snapshot of accounts for rollback.
     account_snapshots: HashMap<[u8; 32], Option<AccountEntry>>,
     /// Snapshot of trustlines for rollback.
-    trustline_snapshots: HashMap<([u8; 32], AssetKey), Option<TrustLineEntry>>,
+    trustline_snapshots: HashMap<TrustlineKey, Option<TrustLineEntry>>,
     /// Snapshot of offers for rollback.
-    offer_snapshots: HashMap<([u8; 32], i64), Option<OfferEntry>>,
+    offer_snapshots: HashMap<OfferKey, Option<OfferEntry>>,
     /// Snapshot of data entries for rollback.
-    data_snapshots: HashMap<([u8; 32], String), Option<DataEntry>>,
+    data_snapshots: HashMap<DataKey, Option<DataEntry>>,
     /// Snapshot of contract data entries for rollback.
     contract_data_snapshots: HashMap<ContractDataKey, Option<ContractDataEntry>>,
     /// Snapshot of contract code entries for rollback.
@@ -356,11 +360,11 @@ pub struct LedgerStateManager {
     /// Track accounts created in this transaction (for rollback).
     created_accounts: HashSet<[u8; 32]>,
     /// Track trustlines created in this transaction (for rollback).
-    created_trustlines: HashSet<([u8; 32], AssetKey)>,
+    created_trustlines: HashSet<TrustlineKey>,
     /// Track offers created in this transaction (for rollback).
-    created_offers: HashSet<([u8; 32], i64)>,
+    created_offers: HashSet<OfferKey>,
     /// Track data entries created in this transaction (for rollback).
-    created_data: HashSet<([u8; 32], String)>,
+    created_data: HashSet<DataKey>,
     /// Track contract data entries created in this transaction (for rollback).
     created_contract_data: HashSet<ContractDataKey>,
     /// Track contract code entries created in this transaction (for rollback).
@@ -392,7 +396,7 @@ pub struct LedgerStateManager {
     /// Secondary index: (account_bytes, asset) → set of offer_ids.
     /// Each offer is indexed under both (seller, selling_asset) and (seller, buying_asset).
     /// Used for O(k) lookups in `remove_offers_by_account_and_asset`.
-    account_asset_offers: HashMap<([u8; 32], AssetKey), HashSet<i64>>,
+    account_asset_offers: HashMap<TrustlineKey, HashSet<i64>>,
     /// Optional callback to lazily load ledger entries from the bucket list.
     /// Used during offer crossing to load seller accounts and trustlines
     /// on demand instead of preloading all offer dependencies upfront.
@@ -959,7 +963,7 @@ impl LedgerStateManager {
             LedgerKey::Offer(k) => {
                 let seller_key = account_id_to_bytes(&k.seller_id);
                 self.offer_snapshots
-                    .get(&(seller_key, k.offer_id))
+                    .get(&OfferKey::new(seller_key, k.offer_id))
                     .and_then(|entry| entry.clone())
                     .map(|entry| LedgerEntry {
                         last_modified_ledger_seq: last_modified,
@@ -1326,7 +1330,6 @@ impl LedgerStateManager {
             })
             .collect();
         for (key, snapshot) in new_offer_snapshots {
-            let offer_key = OfferKey::new(key.0, key.1);
             if let Some(current) = self.offers.get(&key).cloned() {
                 self.aa_index_remove(&current);
             }
@@ -1337,7 +1340,7 @@ impl LedgerStateManager {
                     self.offers.insert(key, entry);
                 }
                 None => {
-                    self.offer_index.remove_by_key(&offer_key);
+                    self.offer_index.remove_by_key(&key);
                     self.offers.remove(&key);
                 }
             }
@@ -1345,10 +1348,8 @@ impl LedgerStateManager {
     }
 
     /// Apply offer pre-savepoint values, maintaining aa_index and offer_index.
-    #[allow(clippy::type_complexity)]
-    fn apply_offer_pre_values(&mut self, pre_values: Vec<(([u8; 32], i64), Option<OfferEntry>)>) {
+    fn apply_offer_pre_values(&mut self, pre_values: Vec<(OfferKey, Option<OfferEntry>)>) {
         for (key, value) in pre_values {
-            let offer_key = OfferKey::new(key.0, key.1);
             if let Some(current) = self.offers.get(&key).cloned() {
                 self.aa_index_remove(&current);
             }
@@ -1359,7 +1360,7 @@ impl LedgerStateManager {
                     self.offers.insert(key, entry);
                 }
                 None => {
-                    self.offer_index.remove_by_key(&offer_key);
+                    self.offer_index.remove_by_key(&key);
                     self.offers.remove(&key);
                 }
             }
@@ -1406,13 +1407,12 @@ impl LedgerStateManager {
         // we only undo index changes for offers touched by this transaction.
         let offer_snapshots: Vec<_> = self.offer_snapshots.drain().collect();
         for (key, snapshot) in offer_snapshots {
-            let offer_key = OfferKey::new(key.0, key.1);
             if self.created_offers.contains(&key) {
                 // Offer was created in this transaction — remove from index and map.
                 if let Some(current) = self.offers.get(&key).cloned() {
                     self.aa_index_remove(&current);
                 }
-                self.offer_index.remove_by_key(&offer_key);
+                self.offer_index.remove_by_key(&key);
                 self.offers.remove(&key);
             } else if let Some(entry) = snapshot {
                 // Offer existed before — restore it and update index.

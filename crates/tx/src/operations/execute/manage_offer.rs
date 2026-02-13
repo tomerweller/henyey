@@ -14,7 +14,8 @@ use stellar_xdr::curr::{
 };
 
 use super::offer_exchange::{
-    adjust_offer_amount, exchange_v10, exchange_v10_without_price_error_thresholds, RoundingType,
+    adjust_offer_amount, exchange_v10, exchange_v10_without_price_error_thresholds,
+    ConversionParams, RoundingType,
 };
 use super::{
     account_liabilities, apply_balance_delta, ensure_account_liabilities,
@@ -312,20 +313,22 @@ fn execute_manage_offer(
     };
 
     let convert_res = convert_with_offers(
-        source,
-        selling,
-        max_sheep_send,
+        &mut ConversionParams {
+            source,
+            selling,
+            buying,
+            max_send: max_sheep_send,
+            max_receive: max_wheat_receive,
+            round: RoundingType::Normal,
+            offer_trail: &mut offer_trail,
+            state,
+            context,
+        },
         &mut sheep_sent,
-        buying,
-        max_wheat_receive,
         &mut wheat_received,
-        RoundingType::Normal,
         offer_id,
         passive,
         &max_wheat_price,
-        &mut offer_trail,
-        state,
-        context,
     )?;
 
     let sheep_stays = match convert_res {
@@ -833,41 +836,32 @@ enum OfferFilterResult {
     StopCrossSelf,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn convert_with_offers(
-    source: &AccountId,
-    selling: &Asset,
-    max_sheep_send: i64,
+    params: &mut ConversionParams<'_>,
     sheep_sent: &mut i64,
-    buying: &Asset,
-    max_wheat_receive: i64,
     wheat_received: &mut i64,
-    round: RoundingType,
     updating_offer_id: i64,
     passive: bool,
     max_wheat_price: &Price,
-    offer_trail: &mut Vec<ClaimAtom>,
-    state: &mut LedgerStateManager,
-    context: &LedgerContext,
 ) -> Result<ConvertResult> {
-    offer_trail.clear();
+    params.offer_trail.clear();
     *sheep_sent = 0;
     *wheat_received = 0;
 
-    let mut max_sheep_send = max_sheep_send;
-    let mut max_wheat_receive = max_wheat_receive;
+    let mut max_sheep_send = params.max_send;
+    let mut max_wheat_receive = params.max_receive;
     let mut need_more = max_sheep_send > 0 && max_wheat_receive > 0;
 
     while need_more {
-        let offer = state.best_offer_filtered(selling, buying, |offer| {
-            offer.seller_id != *source || offer.offer_id != updating_offer_id
+        let offer = params.state.best_offer_filtered(params.selling, params.buying, |offer| {
+            offer.seller_id != *params.source || offer.offer_id != updating_offer_id
         });
 
         let Some(offer) = offer else {
             break;
         };
 
-        match offer_filter(source, &offer, passive, max_wheat_price) {
+        match offer_filter(params.source, &offer, passive, max_wheat_price) {
             OfferFilterResult::Keep => {}
             OfferFilterResult::StopBadPrice => return Ok(ConvertResult::FilterStopBadPrice),
             OfferFilterResult::StopCrossSelf => return Ok(ConvertResult::FilterStopCrossSelf),
@@ -877,10 +871,10 @@ fn convert_with_offers(
             &offer,
             max_wheat_receive,
             max_sheep_send,
-            round,
-            offer_trail,
-            state,
-            context,
+            params.round,
+            params.offer_trail,
+            params.state,
+            params.context,
         )?;
         *sheep_sent += num_sheep_send;
         *wheat_received += num_wheat_received;

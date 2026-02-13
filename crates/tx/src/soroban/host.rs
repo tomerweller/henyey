@@ -64,6 +64,9 @@ type ArchivedWithRestoreInfoP25 = Option<(
     Option<super::protocol::LiveBucketListRestore>,
 )>;
 
+/// A ledger entry paired with its optional TTL (live_until ledger sequence).
+pub type EntryWithTtl = (Rc<LedgerEntry>, Option<u32>);
+
 /// Result of Soroban host function execution.
 pub struct SorobanExecutionResult {
     /// The return value of the function.
@@ -548,11 +551,10 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
     /// Get an entry using our workspace XDR types (for internal use).
     /// This is separate from the `SnapshotSource::get()` trait impl which uses
     /// soroban-env-host's XDR types.
-    #[allow(clippy::type_complexity)]
     pub fn get_local(
         &self,
         key: &LedgerKey,
-    ) -> Result<Option<(Rc<LedgerEntry>, Option<u32>)>, HostErrorP25> {
+    ) -> Result<Option<EntryWithTtl>, HostErrorP25> {
         // For ContractData and ContractCode, check TTL from bucket list snapshot.
         // This matches stellar-core behavior for parallel Soroban execution:
         // - Entries with valid TTL (live_until >= current_ledger): pass to host
@@ -637,11 +639,10 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
     /// then falls back to the hot archive bucket list (for truly evicted entries).
     ///
     /// Returns entries in our workspace XDR types (not soroban-env-host's types).
-    #[allow(clippy::type_complexity)]
     pub fn get_archived(
         &self,
         key: &Rc<LedgerKey>,
-    ) -> Result<Option<(Rc<LedgerEntry>, Option<u32>)>, HostErrorP25> {
+    ) -> Result<Option<EntryWithTtl>, HostErrorP25> {
         // Get TTL but don't check if it's expired - this is for archived entries
         let live_until = get_entry_ttl(self.state, key.as_ref(), self.current_ledger);
 

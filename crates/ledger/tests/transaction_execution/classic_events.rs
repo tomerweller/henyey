@@ -50,12 +50,9 @@ fn test_classic_events_emitted_for_payment() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
     let mut executor = TransactionExecutor::new(
-        1,
-        1_000,
-        5_000_000,
-        25,
-        network_id,
+        &context,
         0,
         SorobanConfig::default(),
         classic_events,
@@ -160,12 +157,9 @@ fn test_classic_events_payment_with_muxed_destination() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
     let mut executor = TransactionExecutor::new(
-        1,
-        1_000,
-        5_000_000,
-        25,
-        network_id,
+        &context,
         0,
         SorobanConfig::default(),
         classic_events,
@@ -258,12 +252,9 @@ fn test_classic_events_payment_with_memo_data() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
     let mut executor = TransactionExecutor::new(
-        1,
-        1_000,
-        5_000_000,
-        25,
-        network_id,
+        &context,
         0,
         SorobanConfig::default(),
         classic_events,
@@ -361,12 +352,9 @@ fn test_classic_events_payment_memo_precedence() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
     let mut executor = TransactionExecutor::new(
-        1,
-        1_000,
-        5_000_000,
-        25,
-        network_id,
+        &context,
         0,
         SorobanConfig::default(),
         classic_events,
@@ -450,12 +438,9 @@ fn test_classic_events_emitted_for_account_merge() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
     let mut executor = TransactionExecutor::new(
-        1,
-        1_000,
-        5_000_000,
-        25,
-        network_id,
+        &context,
         0,
         SorobanConfig::default(),
         classic_events,
@@ -547,12 +532,9 @@ fn test_classic_events_emitted_for_create_account() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
     let mut executor = TransactionExecutor::new(
-        1,
-        1_000,
-        5_000_000,
-        25,
-        network_id,
+        &context,
         0,
         SorobanConfig::default(),
         classic_events,
@@ -646,12 +628,9 @@ fn test_classic_events_emitted_for_create_claimable_balance() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
     let mut executor = TransactionExecutor::new(
-        1,
-        1_000,
-        5_000_000,
-        25,
-        network_id,
+        &context,
         0,
         SorobanConfig::default(),
         classic_events,
@@ -769,12 +748,9 @@ fn test_classic_events_emitted_for_claim_claimable_balance() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
     let mut executor = TransactionExecutor::new(
-        1,
-        1_000,
-        5_000_000,
-        25,
-        network_id,
+        &context,
         0,
         SorobanConfig::default(),
         classic_events,
@@ -883,12 +859,9 @@ fn test_classic_events_emitted_for_allow_trust() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
     let mut executor = TransactionExecutor::new(
-        1,
-        1_000,
-        5_000_000,
-        25,
-        network_id,
+        &context,
         0,
         SorobanConfig::default(),
         classic_events,
@@ -990,12 +963,9 @@ fn test_classic_events_emitted_for_set_trustline_flags() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
     let mut executor = TransactionExecutor::new(
-        1,
-        1_000,
-        5_000_000,
-        25,
-        network_id,
+        &context,
         0,
         SorobanConfig::default(),
         classic_events,
@@ -1103,12 +1073,9 @@ fn test_classic_events_emitted_for_clawback() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
     let mut executor = TransactionExecutor::new(
-        1,
-        1_000,
-        5_000_000,
-        25,
-        network_id,
+        &context,
         0,
         SorobanConfig::default(),
         classic_events,
@@ -1217,12 +1184,9 @@ fn test_classic_events_emitted_for_clawback_claimable_balance() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
     let mut executor = TransactionExecutor::new(
-        1,
-        1_000,
-        5_000_000,
-        25,
-        network_id,
+        &context,
         0,
         SorobanConfig::default(),
         classic_events,
@@ -1347,12 +1311,9 @@ fn test_classic_events_emitted_for_liquidity_pool_deposit() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
     let mut executor = TransactionExecutor::new(
-        1,
-        1_000,
-        5_000_000,
-        25,
-        network_id,
+        &context,
         0,
         SorobanConfig::default(),
         classic_events,
@@ -1493,12 +1454,9 @@ fn test_classic_events_emitted_for_liquidity_pool_withdraw() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
     let mut executor = TransactionExecutor::new(
-        1,
-        1_000,
-        5_000_000,
-        25,
-        network_id,
+        &context,
         0,
         SorobanConfig::default(),
         classic_events,
@@ -1692,12 +1650,9 @@ fn test_classic_events_emitted_for_manage_sell_offer() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
     let mut executor = TransactionExecutor::new(
-        1,
-        1_000,
-        5_000_000,
-        25,
-        network_id,
+        &context,
         0,
         SorobanConfig::default(),
         classic_events,
@@ -1846,12 +1801,9 @@ fn test_classic_events_emitted_for_path_payment_strict_send() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
     let mut executor = TransactionExecutor::new(
-        1,
-        1_000,
-        5_000_000,
-        25,
-        network_id,
+        &context,
         0,
         SorobanConfig::default(),
         classic_events,

@@ -1,6 +1,26 @@
 //! Offer exchange math helpers (v10+).
 
-use stellar_xdr::curr::Price;
+use stellar_xdr::curr::{AccountId, Asset, ClaimAtom, Price};
+
+use crate::state::LedgerStateManager;
+use crate::validation::LedgerContext;
+
+/// Common parameters for DEX conversion functions (offer crossing / path payment).
+///
+/// Groups the shared source, asset pair, limits, rounding mode, and mutable
+/// state references that travel together through `convert_with_offers` in both
+/// `manage_offer.rs` and `path_payment.rs`.
+pub struct ConversionParams<'a> {
+    pub source: &'a AccountId,
+    pub selling: &'a Asset,
+    pub buying: &'a Asset,
+    pub max_send: i64,
+    pub max_receive: i64,
+    pub round: RoundingType,
+    pub offer_trail: &'a mut Vec<ClaimAtom>,
+    pub state: &'a mut LedgerStateManager,
+    pub context: &'a LedgerContext,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoundingType {

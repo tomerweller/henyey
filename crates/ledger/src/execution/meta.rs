@@ -467,19 +467,34 @@ pub fn build_entry_changes_with_state_overrides(
     // Empty change_order triggers the fallback type-grouped ordering
     // Empty update_states/delete_states - we'll use snapshot lookup for these cases
     let empty_restored = RestoredEntries::default();
-    build_entry_changes_with_hot_archive(
-        state,
+    let ledger_changes = LedgerChanges {
         created,
         updated,
-        &[], // update_states - empty, will use snapshot fallback
+        update_states: &[], // empty, will use snapshot fallback
         deleted,
-        &[], // delete_states - empty, will use snapshot fallback
-        &[],
+        delete_states: &[], // empty, will use snapshot fallback
+        change_order: &[],
         state_overrides,
-        &empty_restored,
+        restored: &empty_restored,
+    };
+    build_entry_changes_with_hot_archive(
+        state,
+        &ledger_changes,
         None,
         0, // ledger_seq not used for non-operation changes
     )
+}
+
+/// Ledger state changes for building entry change metadata.
+pub struct LedgerChanges<'a> {
+    pub created: &'a [LedgerEntry],
+    pub updated: &'a [LedgerEntry],
+    pub update_states: &'a [LedgerEntry],
+    pub deleted: &'a [LedgerKey],
+    pub delete_states: &'a [LedgerEntry],
+    pub change_order: &'a [henyey_tx::ChangeRef],
+    pub state_overrides: &'a HashMap<LedgerKey, LedgerEntry>,
+    pub restored: &'a RestoredEntries,
 }
 
 /// Build entry changes with support for hot archive and live BL restoration tracking.
@@ -497,20 +512,22 @@ pub fn build_entry_changes_with_state_overrides(
 /// For classic operations, entries are ordered according to the execution order tracked
 /// in `change_order` to match stellar-core behavior, emitting STATE/UPDATED pairs
 /// for EACH modification (not deduplicated).
-#[allow(clippy::too_many_arguments)]
 pub fn build_entry_changes_with_hot_archive(
     state: &LedgerStateManager,
-    created: &[LedgerEntry],
-    updated: &[LedgerEntry],
-    update_states: &[LedgerEntry],
-    deleted: &[LedgerKey],
-    delete_states: &[LedgerEntry],
-    change_order: &[henyey_tx::ChangeRef],
-    state_overrides: &HashMap<LedgerKey, LedgerEntry>,
-    restored: &RestoredEntries,
+    changes: &LedgerChanges<'_>,
     footprint: Option<&stellar_xdr::curr::LedgerFootprint>,
     current_ledger_seq: u32,
 ) -> LedgerEntryChanges {
+    let &LedgerChanges {
+        created,
+        updated,
+        update_states,
+        deleted,
+        delete_states,
+        change_order,
+        state_overrides,
+        restored,
+    } = changes;
     // Debug: log all vectors sizes and entry types
     fn entry_type_name(entry: &LedgerEntry) -> &'static str {
         match &entry.data {

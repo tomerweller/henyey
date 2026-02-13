@@ -4,47 +4,21 @@ use super::*;
 ///
 /// # Arguments
 ///
-/// * `soroban_base_prng_seed` - The transaction set hash used as base seed for Soroban PRNG.
-///   Each transaction gets its own seed computed as subSha256(baseSeed, txIndex).
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+/// * `soroban` - Soroban execution context (config, PRNG seed, module cache, etc.)
 pub fn execute_transaction_set(
     snapshot: &SnapshotHandle,
     transactions: &[(TransactionEnvelope, Option<u32>)],
-    ledger_seq: u32,
-    close_time: u64,
-    base_fee: u32,
-    base_reserve: u32,
-    protocol_version: u32,
-    network_id: NetworkId,
+    context: &LedgerContext,
     delta: &mut LedgerDelta,
-    soroban_config: SorobanConfig,
-    soroban_base_prng_seed: [u8; 32],
-    classic_events: ClassicEventConfig,
-    module_cache: Option<&PersistentModuleCache>,
-    hot_archive: Option<std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
-) -> Result<(
-    Vec<TransactionExecutionResult>,
-    Vec<TransactionResultPair>,
-    Vec<TransactionResultMetaV1>,
-    u64,
-    Vec<LedgerKey>, // Hot archive restored keys for HotArchiveBucketList::add_batch
-)> {
+    soroban: SorobanContext<'_>,
+) -> Result<TxSetResult> {
     execute_transaction_set_with_fee_mode(
         snapshot,
         transactions,
-        ledger_seq,
-        close_time,
-        base_fee,
-        base_reserve,
-        protocol_version,
-        network_id,
+        context,
         delta,
-        soroban_config,
-        soroban_base_prng_seed,
-        classic_events,
+        soroban,
         true,
-        module_cache,
-        hot_archive,
     )
 }
 
@@ -52,59 +26,29 @@ pub fn execute_transaction_set(
 ///
 /// # Arguments
 ///
-/// * `module_cache` - Optional persistent module cache for reusing compiled WASM.
-///   When provided, Soroban contract execution reuses pre-compiled modules,
-///   significantly improving performance for workloads with many contract calls.
-///
-/// # Returns
-///
-/// A tuple containing:
-/// - Transaction execution results
-/// - Transaction result pairs (XDR)
-/// - Transaction result metadata
-/// - Updated ID pool
-/// - Hot archive restored keys (for passing to HotArchiveBucketList::add_batch)
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+/// * `soroban` - Soroban execution context (config, PRNG seed, module cache, etc.)
+/// * `deduct_fee` - Whether to deduct fees from source accounts.
 pub fn execute_transaction_set_with_fee_mode(
     snapshot: &SnapshotHandle,
     transactions: &[(TransactionEnvelope, Option<u32>)],
-    ledger_seq: u32,
-    close_time: u64,
-    base_fee: u32,
-    base_reserve: u32,
-    protocol_version: u32,
-    network_id: NetworkId,
+    context: &LedgerContext,
     delta: &mut LedgerDelta,
-    soroban_config: SorobanConfig,
-    soroban_base_prng_seed: [u8; 32],
-    classic_events: ClassicEventConfig,
+    soroban: SorobanContext<'_>,
     deduct_fee: bool,
-    module_cache: Option<&PersistentModuleCache>,
-    hot_archive: Option<std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
-) -> Result<(
-    Vec<TransactionExecutionResult>,
-    Vec<TransactionResultPair>,
-    Vec<TransactionResultMetaV1>,
-    u64,
-    Vec<LedgerKey>, // Hot archive restored keys for HotArchiveBucketList::add_batch
-)> {
+) -> Result<TxSetResult> {
     let id_pool = snapshot.header().id_pool;
     let mut executor = TransactionExecutor::new(
-        ledger_seq,
-        close_time,
-        base_reserve,
-        protocol_version,
-        network_id,
+        context,
         id_pool,
-        soroban_config,
-        classic_events,
+        soroban.config,
+        soroban.classic_events,
     );
     // Set the module cache if provided for better Soroban performance
-    if let Some(cache) = module_cache {
+    if let Some(cache) = soroban.module_cache {
         executor.set_module_cache(cache.clone());
     }
     // Set the hot archive for Protocol 23+ entry restoration
-    if let Some(ha) = hot_archive {
+    if let Some(ha) = soroban.hot_archive {
         executor.set_hot_archive(ha);
     }
 
@@ -115,8 +59,8 @@ pub fn execute_transaction_set_with_fee_mode(
         &mut executor,
         snapshot,
         transactions,
-        base_fee,
-        soroban_base_prng_seed,
+        context.base_fee,
+        soroban.base_prng_seed,
         deduct_fee,
         delta,
     )
@@ -129,7 +73,6 @@ pub fn execute_transaction_set_with_fee_mode(
 /// `execute_transaction_set_with_fee_mode` (which creates a fresh executor)
 /// and by `LedgerCloseContext::apply_transactions` (which reuses a persistent
 /// executor across ledger closes to avoid reloading ~911K offers).
-#[allow(clippy::type_complexity)]
 pub fn run_transactions_on_executor(
     executor: &mut TransactionExecutor,
     snapshot: &SnapshotHandle,
@@ -138,13 +81,7 @@ pub fn run_transactions_on_executor(
     soroban_base_prng_seed: [u8; 32],
     deduct_fee: bool,
     delta: &mut LedgerDelta,
-) -> Result<(
-    Vec<TransactionExecutionResult>,
-    Vec<TransactionResultPair>,
-    Vec<TransactionResultMetaV1>,
-    u64,
-    Vec<LedgerKey>,
-)> {
+) -> Result<TxSetResult> {
     let ledger_seq = executor.ledger_seq;
     let protocol_version = executor.protocol_version;
 
@@ -269,13 +206,13 @@ pub fn run_transactions_on_executor(
         all_hot_archive_restored_keys.extend(result.hot_archive_restored_keys.iter().cloned());
     }
 
-    Ok((
+    Ok(TxSetResult {
         results,
         tx_results,
         tx_result_metas,
-        executor.id_pool(),
-        all_hot_archive_restored_keys,
-    ))
+        id_pool: executor.id_pool(),
+        hot_archive_restored_keys: all_hot_archive_restored_keys,
+    })
 }
 
 /// Execute a full Soroban parallel phase (all stages sequentially,
@@ -287,31 +224,14 @@ pub fn run_transactions_on_executor(
 ///
 /// Same tuple as `execute_transaction_set`: (results, tx_result_pairs,
 /// tx_result_metas, id_pool, hot_archive_restored_keys).
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn execute_soroban_parallel_phase(
     snapshot: &SnapshotHandle,
     phase: &crate::close::SorobanPhaseStructure,
     classic_tx_count: usize,
-    ledger_seq: u32,
-    close_time: u64,
-    base_fee: u32,
-    base_reserve: u32,
-    protocol_version: u32,
-    network_id: NetworkId,
+    context: &LedgerContext,
     delta: &mut LedgerDelta,
-    soroban_config: SorobanConfig,
-    soroban_base_prng_seed: [u8; 32],
-    classic_events: ClassicEventConfig,
-    module_cache: Option<&PersistentModuleCache>,
-    hot_archive: Option<std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
-    runtime_handle: Option<tokio::runtime::Handle>,
-) -> Result<(
-    Vec<TransactionExecutionResult>,
-    Vec<TransactionResultPair>,
-    Vec<TransactionResultMetaV1>,
-    u64,
-    Vec<LedgerKey>,
-)> {
+    soroban: SorobanContext<'_>,
+) -> Result<TxSetResult> {
     let mut all_results: Vec<TransactionExecutionResult> = Vec::new();
     let mut all_tx_results: Vec<TransactionResultPair> = Vec::new();
     let mut all_tx_result_metas: Vec<TransactionResultMetaV1> = Vec::new();
@@ -325,7 +245,8 @@ pub fn execute_soroban_parallel_phase(
     // Pre-deduct all Soroban TX fees from the main delta BEFORE any cluster execution.
     // This matches stellar-core processFeesSeqNums which deducts ALL fees upfront.
     let (pre_charged_fees, total_pre_deducted) =
-        pre_deduct_soroban_fees(snapshot, phase, base_fee, network_id, ledger_seq, delta)?;
+        pre_deduct_soroban_fees(snapshot, phase, context.base_fee, context.network_id, context.sequence, delta)?;
+    let soroban_base_prng_seed = soroban.base_prng_seed;
     if total_pre_deducted != 0 {
         delta.record_fee_pool_delta(total_pre_deducted);
     }
@@ -358,22 +279,21 @@ pub fn execute_soroban_parallel_phase(
             snapshot,
             stage,
             global_tx_offset,
-            ledger_seq,
-            close_time,
-            base_fee,
-            base_reserve,
-            protocol_version,
-            network_id,
-            &soroban_config,
-            soroban_base_prng_seed,
-            classic_events,
-            module_cache,
-            hot_archive.clone(),
-            id_pool,
+            context,
+            &SorobanContext {
+                config: soroban.config.clone(),
+                base_prng_seed: soroban_base_prng_seed,
+                classic_events: soroban.classic_events,
+                module_cache: soroban.module_cache,
+                hot_archive: soroban.hot_archive.clone(),
+                runtime_handle: soroban.runtime_handle.clone(),
+            },
             delta,
-            runtime_handle.clone(),
-            &prior_stage_entries,
-            stage_pre_charged,
+            &ClusterParams {
+                id_pool,
+                prior_stage_entries: &prior_stage_entries,
+                pre_charged_fees: stage_pre_charged,
+            },
         )?;
 
         // Merge cluster results. Use max id_pool across clusters.
@@ -393,7 +313,7 @@ pub fn execute_soroban_parallel_phase(
         pre_charge_offset += stage_tx_count;
 
         tracing::debug!(
-            ledger_seq = ledger_seq,
+            ledger_seq = context.sequence,
             stage_idx = stage_idx,
             clusters = stage.len(),
             stage_tx_count = stage_tx_count,
@@ -428,13 +348,13 @@ pub fn execute_soroban_parallel_phase(
         delta.record_fee_pool_delta(-total_refunds);
     }
 
-    Ok((
-        all_results,
-        all_tx_results,
-        all_tx_result_metas,
+    Ok(TxSetResult {
+        results: all_results,
+        tx_results: all_tx_results,
+        tx_result_metas: all_tx_result_metas,
         id_pool,
-        all_hot_archive_restored_keys,
-    ))
+        hot_archive_restored_keys: all_hot_archive_restored_keys,
+    })
 }
 
 /// Execute a single cluster of transactions independently.
@@ -442,48 +362,32 @@ pub fn execute_soroban_parallel_phase(
 /// Creates its own `TransactionExecutor` and `LedgerDelta`.
 /// Fees are NOT deducted by the executor (deduct_fee=false) because they
 /// were pre-deducted from the main delta by `pre_deduct_soroban_fees`.
-/// Returns `(ClusterResult, per_cluster_delta, total_fees)`.
-#[allow(clippy::too_many_arguments)]
+/// Returns `(TxSetResult, per_cluster_delta, total_fees)`.
 pub fn execute_single_cluster(
     snapshot: &SnapshotHandle,
     cluster: &[(TransactionEnvelope, Option<u32>)],
     cluster_offset: usize,
-    ledger_seq: u32,
-    close_time: u64,
-    base_fee: u32,
-    base_reserve: u32,
-    protocol_version: u32,
-    network_id: NetworkId,
-    soroban_config: &SorobanConfig,
-    soroban_base_prng_seed: [u8; 32],
-    classic_events: ClassicEventConfig,
-    module_cache: Option<&PersistentModuleCache>,
-    hot_archive: Option<&std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
-    id_pool: u64,
-    prior_stage_entries: &[LedgerEntry],
-    pre_charged_fees: &[PreChargedFee],
-) -> Result<(ClusterResult, LedgerDelta, i64)> {
+    context: &LedgerContext,
+    soroban: &SorobanContext<'_>,
+    params: &ClusterParams<'_>,
+) -> Result<(TxSetResult, LedgerDelta, i64)> {
     let mut executor = TransactionExecutor::new(
-        ledger_seq,
-        close_time,
-        base_reserve,
-        protocol_version,
-        network_id,
-        id_pool,
-        soroban_config.clone(),
-        classic_events,
+        context,
+        params.id_pool,
+        soroban.config.clone(),
+        soroban.classic_events,
     );
-    if let Some(cache) = module_cache {
+    if let Some(cache) = soroban.module_cache {
         executor.set_module_cache(cache.clone());
     }
-    if let Some(ha) = hot_archive {
+    if let Some(ref ha) = soroban.hot_archive {
         executor.set_hot_archive(ha.clone());
     }
 
     // Pre-load entries from prior stages so this cluster's executor sees
     // restorations and modifications made by earlier stages.  This matches
     // stellar-core `collectClusterFootprintEntriesFromGlobal`.
-    for entry in prior_stage_entries {
+    for entry in params.prior_stage_entries {
         executor.state.load_entry(entry.clone());
     }
 
@@ -494,9 +398,9 @@ pub fn execute_single_cluster(
     for (local_idx, (tx, tx_base_fee)) in cluster.iter().enumerate() {
         executor.state.snapshot_delta();
 
-        let tx_fee = tx_base_fee.unwrap_or(base_fee);
+        let tx_fee = tx_base_fee.unwrap_or(context.base_fee);
         let global_idx = cluster_offset + local_idx;
-        let tx_prng_seed = sub_sha256(&soroban_base_prng_seed, global_idx as u32);
+        let tx_prng_seed = sub_sha256(&soroban.base_prng_seed, global_idx as u32);
 
         // Execute with deduct_fee=false — fees were already pre-deducted from
         // the main delta by pre_deduct_soroban_fees().
@@ -511,7 +415,7 @@ pub fn execute_single_cluster(
         // Override fee_charged and fee_changes from pre-deduction.
         // The executor computed fee_refund correctly (based on resource consumption),
         // but fee_charged=0 because deduct_fee=false. We use the pre-charged values.
-        let pre = &pre_charged_fees[local_idx];
+        let pre = &params.pre_charged_fees[local_idx];
         result.fee_charged = pre.charged_fee.saturating_sub(result.fee_refund);
         result.fee_changes = Some(pre.fee_changes.clone());
 
@@ -528,7 +432,7 @@ pub fn execute_single_cluster(
             &executor.network_id,
             &result,
             tx_fee as i64,
-            protocol_version,
+            context.protocol_version,
         )?;
         let tx_meta = result
             .tx_meta
@@ -568,11 +472,11 @@ pub fn execute_single_cluster(
     let final_id_pool = executor.id_pool();
 
     // Apply this cluster's state changes to a local delta.
-    let mut cluster_delta = LedgerDelta::new(ledger_seq);
+    let mut cluster_delta = LedgerDelta::new(context.sequence);
     executor.apply_to_delta(snapshot, &mut cluster_delta)?;
 
     Ok((
-        ClusterResult {
+        TxSetResult {
             results,
             tx_results,
             tx_result_metas,
@@ -593,28 +497,15 @@ pub fn execute_single_cluster(
 /// When a stage has multiple clusters, they are executed in parallel using
 /// `tokio::task::spawn_blocking` (one blocking task per cluster). Results are
 /// merged into `delta` in deterministic cluster order.
-#[allow(clippy::too_many_arguments)]
 pub fn execute_stage_clusters(
     snapshot: &SnapshotHandle,
     clusters: &[Vec<(TransactionEnvelope, Option<u32>)>],
     global_tx_offset: usize,
-    ledger_seq: u32,
-    close_time: u64,
-    base_fee: u32,
-    base_reserve: u32,
-    protocol_version: u32,
-    network_id: NetworkId,
-    soroban_config: &SorobanConfig,
-    soroban_base_prng_seed: [u8; 32],
-    classic_events: ClassicEventConfig,
-    module_cache: Option<&PersistentModuleCache>,
-    hot_archive: Option<std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
-    id_pool: u64,
+    context: &LedgerContext,
+    soroban: &SorobanContext<'_>,
     delta: &mut LedgerDelta,
-    runtime_handle: Option<tokio::runtime::Handle>,
-    prior_stage_entries: &[LedgerEntry],
-    pre_charged_fees: &[PreChargedFee],
-) -> Result<Vec<ClusterResult>> {
+    params: &ClusterParams<'_>,
+) -> Result<Vec<TxSetResult>> {
     // Compute per-cluster global offsets and pre_charged_fees slicing.
     let mut offsets = Vec::with_capacity(clusters.len());
     let mut pre_charge_offsets = Vec::with_capacity(clusters.len());
@@ -628,9 +519,9 @@ pub fn execute_stage_clusters(
     }
 
     tracing::debug!(
-        ledger_seq = ledger_seq,
+        ledger_seq = context.sequence,
         num_clusters = clusters.len(),
-        prior_entries = prior_stage_entries.len(),
+        prior_entries = params.prior_stage_entries.len(),
         "execute_stage_clusters: starting"
     );
 
@@ -638,25 +529,18 @@ pub fn execute_stage_clusters(
     if clusters.len() <= 1 {
         let mut cluster_results = Vec::with_capacity(clusters.len());
         for (cluster_idx, cluster) in clusters.iter().enumerate() {
-            let cluster_pc = &pre_charged_fees[pre_charge_offsets[cluster_idx]..pre_charge_offsets[cluster_idx] + cluster.len()];
+            let cluster_pc = &params.pre_charged_fees[pre_charge_offsets[cluster_idx]..pre_charge_offsets[cluster_idx] + cluster.len()];
             let (cr, cluster_delta, total_fees) = execute_single_cluster(
                 snapshot,
                 cluster,
                 offsets[cluster_idx],
-                ledger_seq,
-                close_time,
-                base_fee,
-                base_reserve,
-                protocol_version,
-                network_id,
-                soroban_config,
-                soroban_base_prng_seed,
-                classic_events,
-                module_cache,
-                hot_archive.as_ref(),
-                id_pool,
-                prior_stage_entries,
-                cluster_pc,
+                context,
+                soroban,
+                &ClusterParams {
+                    id_pool: params.id_pool,
+                    prior_stage_entries: params.prior_stage_entries,
+                    pre_charged_fees: cluster_pc,
+                },
             )?;
             delta.merge(cluster_delta)?;
             if total_fees != 0 {
@@ -670,12 +554,18 @@ pub fn execute_stage_clusters(
     // Multi-cluster: spawn one blocking task per cluster on Tokio's thread pool.
     // Clone shared data for 'static closures (all clones are cheap / Arc-based).
     let snapshot = snapshot.clone();
-    let soroban_config = soroban_config.clone();
-    let module_cache = module_cache.cloned();
+    let context = context.clone();
+    let soroban_config = soroban.config.clone();
+    let soroban_base_prng_seed = soroban.base_prng_seed;
+    let classic_events = soroban.classic_events;
+    let module_cache = soroban.module_cache.cloned();
+    let hot_archive = soroban.hot_archive.clone();
+    let runtime_handle = soroban.runtime_handle.clone();
+    let id_pool = params.id_pool;
     let clusters: std::sync::Arc<Vec<Vec<TxWithFee>>> =
         std::sync::Arc::new(clusters.to_vec());
     let prior_entries: std::sync::Arc<Vec<LedgerEntry>> =
-        std::sync::Arc::new(prior_stage_entries.to_vec());
+        std::sync::Arc::new(params.prior_stage_entries.to_vec());
     // For multi-cluster parallel execution, we need to split pre_charged_fees per cluster.
     // Each cluster gets its own Vec since the spawn_blocking closure needs 'static data.
     let per_cluster_fees: Vec<std::sync::Arc<Vec<PreChargedFee>>> = {
@@ -683,7 +573,7 @@ pub fn execute_stage_clusters(
         for (idx, cluster) in clusters.iter().enumerate() {
             let start = pre_charge_offsets[idx];
             let end = start + cluster.len();
-            let fees: Vec<PreChargedFee> = pre_charged_fees[start..end]
+            let fees: Vec<PreChargedFee> = params.pre_charged_fees[start..end]
                 .iter()
                 .map(|f| PreChargedFee {
                     charged_fee: f.charged_fee,
@@ -701,6 +591,7 @@ pub fn execute_stage_clusters(
         let mut tasks = Vec::with_capacity(clusters.len());
         for idx in 0..clusters.len() {
             let snapshot = snapshot.clone();
+            let context = context.clone();
             let config = soroban_config.clone();
             let cache = module_cache.clone();
             let ha = hot_archive.clone();
@@ -710,24 +601,25 @@ pub fn execute_stage_clusters(
             let cluster_fees = per_cluster_fees[idx].clone();
 
             tasks.push(tokio::task::spawn_blocking(move || {
+                let soroban = SorobanContext {
+                    config: config,
+                    base_prng_seed: soroban_base_prng_seed,
+                    classic_events,
+                    module_cache: cache.as_ref(),
+                    hot_archive: ha,
+                    runtime_handle: None,
+                };
                 execute_single_cluster(
                     &snapshot,
                     &clusters[idx],
                     cluster_offset,
-                    ledger_seq,
-                    close_time,
-                    base_fee,
-                    base_reserve,
-                    protocol_version,
-                    network_id,
-                    &config,
-                    soroban_base_prng_seed,
-                    classic_events,
-                    cache.as_ref(),
-                    ha.as_ref(),
-                    id_pool,
-                    &prior_entries,
-                    &cluster_fees,
+                    &context,
+                    &soroban,
+                    &ClusterParams {
+                        id_pool,
+                        prior_stage_entries: &prior_entries,
+                        pre_charged_fees: &cluster_fees,
+                    },
                 )
             }));
         }
@@ -744,7 +636,7 @@ pub fn execute_stage_clusters(
     // use Handle::block_on directly. When called from a tokio worker thread
     // (runtime_handle is None), use block_in_place to safely enter a blocking
     // context before calling block_on.
-    let thread_results: Vec<Result<(ClusterResult, LedgerDelta, i64)>> =
+    let thread_results: Vec<Result<(TxSetResult, LedgerDelta, i64)>> =
         if let Some(handle) = runtime_handle {
             handle.block_on(spawn_and_collect)
         } else {
