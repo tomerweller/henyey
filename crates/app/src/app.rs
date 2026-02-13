@@ -2975,6 +2975,7 @@ impl App {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let mut consensus_interval = tokio::time::interval(Duration::from_secs(5));
         let mut stats_interval = tokio::time::interval(Duration::from_secs(30));
+        stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut tx_advert_interval = tokio::time::interval(self.flood_advert_period());
         let mut tx_demand_interval = tokio::time::interval(self.flood_demand_period());
         let mut survey_interval = tokio::time::interval(Duration::from_secs(1));
@@ -2983,8 +2984,11 @@ impl App {
         let mut scp_timeout_interval = tokio::time::interval(Duration::from_millis(500));
         let mut ping_interval = tokio::time::interval(Duration::from_secs(5));
         let mut peer_maintenance_interval = tokio::time::interval(Duration::from_secs(10));
+        peer_maintenance_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut peer_refresh_interval = tokio::time::interval(Duration::from_secs(60));
+        peer_refresh_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut herder_cleanup_interval = tokio::time::interval(Duration::from_secs(30));
+        herder_cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         // Get mutable access to SCP envelope receiver
         let mut scp_rx = self.scp_envelope_rx.lock().await;
@@ -3041,6 +3045,7 @@ impl App {
 
         // Add a short heartbeat interval for debugging
         let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(10));
+        heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         // In-progress background ledger close. Polled in the select loop.
         let mut pending_close: Option<PendingLedgerClose> = None;
@@ -3133,7 +3138,10 @@ impl App {
                     self.handle_overlay_message(fetch_msg).await;
                 }
 
-                // Process overlay messages
+                // Process non-critical overlay messages (TX floods, etc.).
+                // SCP and fetch-response messages no longer arrive here — they are
+                // routed exclusively to dedicated channels at the overlay layer.
+                // The skip guards below are kept as defensive fallbacks.
                 msg = message_rx.recv() => {
                     match msg {
                         Ok(overlay_msg) => {
@@ -3175,7 +3183,9 @@ impl App {
                             self.handle_overlay_message(overlay_msg).await;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(skipped = n, "Overlay receiver lagged, messages dropped");
+                            // Only non-critical messages (TX floods) flow through the
+                            // broadcast channel now, so lag is expected under load.
+                            tracing::debug!(skipped = n, "Overlay broadcast receiver lagged (non-critical messages only)");
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             tracing::info!("Overlay broadcast channel closed");
@@ -3252,7 +3262,7 @@ impl App {
                                 self.handle_overlay_message(overlay_msg).await;
                             }
                             Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
-                                tracing::warn!(skipped = n, "Overlay receiver lagged during drain");
+                                tracing::debug!(skipped = n, "Overlay broadcast receiver lagged during drain (non-critical messages only)");
                             }
                             Err(_) => break, // Empty or Closed
                         }

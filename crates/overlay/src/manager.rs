@@ -206,11 +206,11 @@ pub struct OverlayManager {
 impl OverlayManager {
     /// Create a new overlay manager with the given configuration.
     pub fn new(config: OverlayConfig, local_node: LocalNode) -> Result<Self> {
-        // Reduced from 65536 to 1024 to limit memory usage.
-        // The broadcast channel holds messages until all receivers consume them.
-        // With 65536 messages and potentially large tx_sets (~50KB each), this could
-        // use several GB of memory. Receivers that lag will get Lagged errors.
-        let (message_tx, _) = broadcast::channel(1024);
+        // Broadcast channel for non-critical overlay messages (TX floods, etc.).
+        // SCP and fetch-response messages bypass this channel via dedicated mpsc
+        // channels, so the broadcast channel only carries remaining message types.
+        // 4096 provides headroom for mainnet traffic bursts from multiple peers.
+        let (message_tx, _) = broadcast::channel(4096);
         let (shutdown_tx, _) = broadcast::channel(1);
         let (scp_message_tx, scp_message_rx) = mpsc::unbounded_channel();
         let (fetch_response_tx, fetch_response_rx) = mpsc::unbounded_channel();
@@ -803,16 +803,24 @@ impl OverlayManager {
                 received_at: std::time::Instant::now(),
             };
 
-            // Send SCP messages to the dedicated never-drop channel as well.
-            // This ensures SCP EXTERNALIZE messages are never lost even if the
-            // broadcast channel overflows during high-traffic periods.
+            // Route messages to the appropriate channel(s).
+            // SCP and fetch-response messages go ONLY to their dedicated mpsc
+            // channels (never dropped). All other messages go to the broadcast
+            // channel (may lag under load, but only carries non-critical traffic
+            // like TX floods).
+            let is_dedicated = matches!(
+                overlay_msg.message,
+                StellarMessage::ScpMessage(_)
+                    | StellarMessage::GeneralizedTxSet(_)
+                    | StellarMessage::TxSet(_)
+                    | StellarMessage::DontHave(_)
+                    | StellarMessage::ScpQuorumset(_)
+            );
+
             if matches!(overlay_msg.message, StellarMessage::ScpMessage(_)) {
                 let _ = scp_message_tx.send(overlay_msg.clone());
             }
 
-            // Send fetch response messages to the dedicated never-drop channel.
-            // This ensures GeneralizedTxSet, TxSet, DontHave, and ScpQuorumset
-            // responses are never lost when the broadcast channel overflows.
             if matches!(
                 overlay_msg.message,
                 StellarMessage::GeneralizedTxSet(_)
@@ -842,7 +850,13 @@ impl OverlayManager {
                 }
             }
 
-            let _ = message_tx.send(overlay_msg);
+            // Only send non-dedicated messages to the broadcast channel.
+            // SCP and fetch-response messages are already handled above via
+            // dedicated channels and would be immediately skipped by the
+            // broadcast receiver anyway — sending them wastes buffer capacity.
+            if !is_dedicated {
+                let _ = message_tx.send(overlay_msg);
+            }
 
             // Flow control: send SendMoreExtended after receiving a batch of messages
             messages_since_send_more += 1;
