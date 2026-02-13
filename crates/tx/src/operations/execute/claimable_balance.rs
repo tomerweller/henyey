@@ -15,7 +15,7 @@ use stellar_xdr::curr::{
     OperationResult, OperationResultTr, SequenceNumber,
 };
 
-use super::{account_liabilities, is_trustline_authorized, trustline_liabilities};
+use super::{account_liabilities, add_account_balance, add_trustline_balance, is_trustline_authorized};
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
@@ -312,17 +312,9 @@ pub fn execute_claim_claimable_balance(
     match &entry.asset {
         Asset::Native => {
             if let Some(account) = state.get_account_mut(source) {
-                // Overflow-safe: equivalent to balance + amount > INT64_MAX
-                if i64::MAX - account.balance < entry.amount {
+                if !add_account_balance(account, entry.amount) {
                     return Ok(make_claim_result(ClaimClaimableBalanceResultCode::LineFull));
                 }
-                let new_balance = account.balance + entry.amount;
-                // Check buying liabilities: newBalance > INT64_MAX - buyingLiabilities
-                let buying_liabilities = account_liabilities(account).buying;
-                if new_balance > i64::MAX - buying_liabilities {
-                    return Ok(make_claim_result(ClaimClaimableBalanceResultCode::LineFull));
-                }
-                account.balance = new_balance;
             }
         }
         _ => {
@@ -347,24 +339,11 @@ pub fn execute_claim_claimable_balance(
                                 ClaimClaimableBalanceResultCode::NotAuthorized,
                             ));
                         }
-                        // Overflow-safe trustline limit check:
-                        // equivalent to balance + amount > limit, but avoids i64 overflow.
-                        // Safe because limit >= balance >= 0.
-                        if tl.limit - tl.balance < entry.amount {
+                        if !add_trustline_balance(tl, entry.amount) {
                             return Ok(make_claim_result(
                                 ClaimClaimableBalanceResultCode::LineFull,
                             ));
                         }
-                        // At this point balance + amount <= limit, so no overflow.
-                        let new_balance = tl.balance + entry.amount;
-                        // Check buying liabilities: newBalance > limit - buyingLiabilities
-                        let buying_liabilities = trustline_liabilities(tl).buying;
-                        if new_balance > tl.limit - buying_liabilities {
-                            return Ok(make_claim_result(
-                                ClaimClaimableBalanceResultCode::LineFull,
-                            ));
-                        }
-                        tl.balance = new_balance;
                     }
                     None => {
                         return Ok(make_claim_result(ClaimClaimableBalanceResultCode::NoTrust));

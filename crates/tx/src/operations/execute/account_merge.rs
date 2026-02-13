@@ -7,7 +7,7 @@ use stellar_xdr::curr::{
 };
 
 use crate::frame::muxed_to_account_id;
-use super::account_liabilities;
+use super::add_account_balance;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
@@ -57,17 +57,12 @@ pub fn execute_account_merge(
 
     let source_balance = source_account.balance;
 
-    let dest_account = state
-        .get_account(&dest_account_id)
-        .ok_or_else(|| TxError::Internal("destination account disappeared".into()))?;
-    let max_receive = i64::MAX - dest_account.balance - account_liabilities(dest_account).buying;
-    if max_receive < source_balance {
-        return Ok(make_result(AccountMergeResultCode::DestFull));
-    }
-
     // Transfer balance to destination
-    if let Some(dest_acc) = state.get_account_mut(&dest_account_id) {
-        dest_acc.balance += source_balance;
+    let dest_acc = state
+        .get_account_mut(&dest_account_id)
+        .ok_or_else(|| TxError::Internal("destination account disappeared".into()))?;
+    if !add_account_balance(dest_acc, source_balance) {
+        return Ok(make_result(AccountMergeResultCode::DestFull));
     }
 
     if let Some(sponsored_signers) = signer_sponsoring_ids(&source_account) {

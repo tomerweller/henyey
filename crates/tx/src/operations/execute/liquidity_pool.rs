@@ -10,7 +10,10 @@ use stellar_xdr::curr::{
     LiquidityPoolWithdrawResultCode, OperationResult, OperationResultTr, Price, TrustLineAsset,
 };
 
-use super::{is_authorized_to_maintain_liabilities, is_trustline_authorized};
+use super::{
+    account_liabilities, add_account_balance, add_trustline_balance,
+    is_authorized_to_maintain_liabilities, is_trustline_authorized, trustline_liabilities,
+};
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::Result;
@@ -543,7 +546,13 @@ fn can_credit_asset(
         let Some(account) = state.get_account(source) else {
             return WithdrawAssetCheck::NoTrust;
         };
+        // Overflow-safe: i64::MAX - balance < amount
         if i64::MAX - account.balance < amount {
+            return WithdrawAssetCheck::LineFull;
+        }
+        let new_balance = account.balance + amount;
+        // Buying liabilities: new_balance > i64::MAX - buying
+        if new_balance > i64::MAX - account_liabilities(account).buying {
             return WithdrawAssetCheck::LineFull;
         }
         return WithdrawAssetCheck::Ok;
@@ -561,7 +570,13 @@ fn can_credit_asset(
     if !is_authorized_to_maintain_liabilities(tl.flags) {
         return WithdrawAssetCheck::LineFull;
     }
+    // Overflow-safe: limit - balance < amount
     if tl.limit - tl.balance < amount {
+        return WithdrawAssetCheck::LineFull;
+    }
+    let new_balance = tl.balance + amount;
+    // Buying liabilities: new_balance > limit - buying
+    if new_balance > tl.limit - trustline_liabilities(tl).buying {
         return WithdrawAssetCheck::LineFull;
     }
     WithdrawAssetCheck::Ok
@@ -570,7 +585,7 @@ fn can_credit_asset(
 fn credit_asset(state: &mut LedgerStateManager, source: &AccountId, asset: &Asset, amount: i64) {
     if matches!(asset, Asset::Native) {
         if let Some(account) = state.get_account_mut(source) {
-            account.balance += amount;
+            add_account_balance(account, amount);
         }
         return;
     }
@@ -581,7 +596,7 @@ fn credit_asset(state: &mut LedgerStateManager, source: &AccountId, asset: &Asse
     }
 
     if let Some(tl) = state.get_trustline_mut(source, asset) {
-        tl.balance += amount;
+        add_trustline_balance(tl, amount);
     }
 }
 

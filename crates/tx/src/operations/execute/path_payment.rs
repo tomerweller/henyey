@@ -19,7 +19,8 @@ use super::offer_exchange::{
     adjust_offer_amount, exchange_v10, exchange_v10_without_price_error_thresholds, RoundingType,
 };
 use super::{
-    account_liabilities, ensure_account_liabilities, ensure_trustline_liabilities,
+    account_liabilities, add_account_balance, add_trustline_balance,
+    apply_balance_delta, ensure_account_liabilities, ensure_trustline_liabilities,
     is_authorized_to_maintain_liabilities, is_trustline_authorized, issuer_for_asset,
     map_exchange_error, trustline_liabilities,
 };
@@ -419,23 +420,16 @@ fn update_dest_balance(
     context: &LedgerContext,
 ) -> std::result::Result<(), TransferError> {
     if matches!(asset, Asset::Native) {
-        let dest_account = state.get_account(dest).ok_or(TransferError {
+        let dest_account_mut = state.get_account_mut(dest).ok_or(TransferError {
             code: PathPaymentStrictReceiveResultCode::NoDestination,
             no_issuer_asset: None,
         })?;
-        let max_receive =
-            i64::MAX - dest_account.balance - account_liabilities(dest_account).buying;
-        if max_receive < amount {
+        if !add_account_balance(dest_account_mut, amount) {
             return Err(TransferError {
                 code: PathPaymentStrictReceiveResultCode::LineFull,
                 no_issuer_asset: None,
             });
         }
-        let dest_account_mut = state.get_account_mut(dest).ok_or(TransferError {
-            code: PathPaymentStrictReceiveResultCode::NoDestination,
-            no_issuer_asset: None,
-        })?;
-        dest_account_mut.balance += amount;
         return Ok(());
     }
 
@@ -458,20 +452,16 @@ fn update_dest_balance(
             no_issuer_asset: None,
         });
     }
-    let available = dest_trustline.limit
-        - dest_trustline.balance
-        - trustline_liabilities(dest_trustline).buying;
-    if available < amount {
+    let dest_trustline_mut = state.get_trustline_mut(dest, asset).ok_or(TransferError {
+        code: PathPaymentStrictReceiveResultCode::NoTrust,
+        no_issuer_asset: None,
+    })?;
+    if !add_trustline_balance(dest_trustline_mut, amount) {
         return Err(TransferError {
             code: PathPaymentStrictReceiveResultCode::LineFull,
             no_issuer_asset: None,
         });
     }
-    let dest_trustline_mut = state.get_trustline_mut(dest, asset).ok_or(TransferError {
-        code: PathPaymentStrictReceiveResultCode::NoTrust,
-        no_issuer_asset: None,
-    })?;
-    dest_trustline_mut.balance += amount;
     Ok(())
 }
 
@@ -916,49 +906,6 @@ fn can_buy_at_most(source: &AccountId, asset: &Asset, state: &LedgerStateManager
     }
     let available = trustline.limit - trustline.balance - trustline_liabilities(trustline).buying;
     available.max(0)
-}
-
-fn apply_balance_delta(
-    account_id: &AccountId,
-    asset: &Asset,
-    amount: i64,
-    state: &mut LedgerStateManager,
-) -> Result<()> {
-    if matches!(asset, Asset::Native) {
-        let Some(account) = state.get_account_mut(account_id) else {
-            return Err(TxError::Internal(
-                "missing account for balance update".into(),
-            ));
-        };
-        let new_balance = account
-            .balance
-            .checked_add(amount)
-            .ok_or_else(|| TxError::Internal("balance overflow".into()))?;
-        if new_balance < 0 {
-            return Err(TxError::Internal("balance underflow".into()));
-        }
-        account.balance = new_balance;
-        return Ok(());
-    }
-
-    if issuer_for_asset(asset) == Some(account_id) {
-        return Ok(());
-    }
-
-    let Some(tl) = state.get_trustline_mut(account_id, asset) else {
-        return Err(TxError::Internal(
-            "missing trustline for balance update".into(),
-        ));
-    };
-    let new_balance = tl
-        .balance
-        .checked_add(amount)
-        .ok_or_else(|| TxError::Internal("trustline balance overflow".into()))?;
-    if new_balance < 0 || new_balance > tl.limit {
-        return Err(TxError::Internal("trustline balance out of bounds".into()));
-    }
-    tl.balance = new_balance;
-    Ok(())
 }
 
 fn offer_liabilities_sell(amount: i64, price: &Price) -> Result<(i64, i64)> {

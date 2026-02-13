@@ -8,7 +8,7 @@ use stellar_xdr::curr::{
     PaymentResultCode,
 };
 
-use super::{account_liabilities, is_trustline_authorized, trustline_liabilities};
+use super::{account_liabilities, add_account_balance, add_trustline_balance, is_trustline_authorized, trustline_liabilities};
 use crate::frame::muxed_to_account_id;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
@@ -93,17 +93,12 @@ fn execute_native_payment(
     source_account_mut.balance -= amount;
 
     // Credit to destination
-    let dest_account = state
-        .get_account(dest)
-        .ok_or_else(|| TxError::Internal("destination account disappeared".into()))?;
-    let max_receive = i64::MAX - dest_account.balance - account_liabilities(dest_account).buying;
-    if max_receive < amount {
-        return Ok(make_result(PaymentResultCode::LineFull));
-    }
     let dest_account_mut = state
         .get_account_mut(dest)
         .ok_or_else(|| TxError::Internal("destination account disappeared".into()))?;
-    dest_account_mut.balance += amount;
+    if !add_account_balance(dest_account_mut, amount) {
+        return Ok(make_result(PaymentResultCode::LineFull));
+    }
 
     Ok(make_result(PaymentResultCode::Success))
 }
@@ -154,20 +149,14 @@ fn execute_credit_payment(
             return Ok(make_result(PaymentResultCode::NotAuthorized));
         }
 
-        // Check destination trustline has room (limit check)
-        let dest_available = dest_trustline.limit
-            - dest_trustline.balance
-            - trustline_liabilities(dest_trustline).buying;
-        if dest_available < amount {
-            return Ok(make_result(PaymentResultCode::LineFull));
-        }
-
         // Credit destination NOW (before checking source)
         // This is critical for self-payments where source == dest
         let dest_trustline_mut = state
             .get_trustline_mut(dest, asset)
             .ok_or_else(|| TxError::Internal("destination trustline disappeared".into()))?;
-        dest_trustline_mut.balance += amount;
+        if !add_trustline_balance(dest_trustline_mut, amount) {
+            return Ok(make_result(PaymentResultCode::LineFull));
+        }
     }
 
     // Step 2: Check and debit source (updateSourceBalance in stellar-core)

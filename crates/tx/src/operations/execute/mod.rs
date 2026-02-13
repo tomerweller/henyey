@@ -84,6 +84,84 @@ fn ensure_trustline_liabilities(trustline: &mut TrustLineEntry) -> &mut Liabilit
     }
 }
 
+/// Credit `delta` to an account's native balance. Returns false if overflow
+/// or buying liability constraint is violated.
+fn add_account_balance(account: &mut AccountEntry, delta: i64) -> bool {
+    // Overflow-safe: i64::MAX - balance < delta
+    if i64::MAX - account.balance < delta {
+        return false;
+    }
+    let new_balance = account.balance + delta;
+    // Buying liabilities: new_balance > i64::MAX - buying
+    if new_balance > i64::MAX - account_liabilities(account).buying {
+        return false;
+    }
+    account.balance = new_balance;
+    true
+}
+
+/// Credit `delta` to a trustline balance. Returns false if it exceeds the
+/// limit or buying liability constraint.
+fn add_trustline_balance(tl: &mut TrustLineEntry, delta: i64) -> bool {
+    // Overflow-safe: limit - balance < delta
+    if tl.limit - tl.balance < delta {
+        return false;
+    }
+    let new_balance = tl.balance + delta;
+    // Buying liabilities: new_balance > limit - buying
+    if new_balance > tl.limit - trustline_liabilities(tl).buying {
+        return false;
+    }
+    tl.balance = new_balance;
+    true
+}
+
+/// Apply a balance delta (positive or negative) to an account or trustline.
+/// Used by offer settlement — no liability checks (those are handled separately
+/// by the offer machinery).
+fn apply_balance_delta(
+    account_id: &AccountId,
+    asset: &Asset,
+    amount: i64,
+    state: &mut LedgerStateManager,
+) -> Result<()> {
+    if matches!(asset, Asset::Native) {
+        let Some(account) = state.get_account_mut(account_id) else {
+            return Err(TxError::Internal(
+                "missing account for balance update".into(),
+            ));
+        };
+        let new_balance = account
+            .balance
+            .checked_add(amount)
+            .ok_or_else(|| TxError::Internal("balance overflow".into()))?;
+        if new_balance < 0 {
+            return Err(TxError::Internal("balance underflow".into()));
+        }
+        account.balance = new_balance;
+        return Ok(());
+    }
+
+    if issuer_for_asset(asset) == Some(account_id) {
+        return Ok(());
+    }
+
+    let Some(tl) = state.get_trustline_mut(account_id, asset) else {
+        return Err(TxError::Internal(
+            "missing trustline for balance update".into(),
+        ));
+    };
+    let new_balance = tl
+        .balance
+        .checked_add(amount)
+        .ok_or_else(|| TxError::Internal("trustline balance overflow".into()))?;
+    if new_balance < 0 || new_balance > tl.limit {
+        return Err(TxError::Internal("trustline balance out of bounds".into()));
+    }
+    tl.balance = new_balance;
+    Ok(())
+}
+
 fn map_exchange_error(err: offer_exchange::ExchangeError) -> TxError {
     TxError::Internal(format!("offer exchange error: {err:?}"))
 }
