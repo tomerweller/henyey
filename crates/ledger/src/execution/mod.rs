@@ -337,6 +337,31 @@ pub enum ExecutionFailure {
     OperationFailed,
 }
 
+/// Create a failed `TransactionExecutionResult` with no fee charged or meta.
+fn failed_result(failure: ExecutionFailure, error: &str) -> TransactionExecutionResult {
+    TransactionExecutionResult {
+        success: false,
+        fee_charged: 0,
+        fee_refund: 0,
+        operation_results: vec![],
+        error: Some(error.into()),
+        failure: Some(failure),
+        tx_meta: None,
+        fee_changes: None,
+        post_fee_changes: None,
+        hot_archive_restored_keys: Vec::new(),
+        op_type_timings: HashMap::new(),
+    }
+}
+
+/// Data returned by successful pre-fee validation of a transaction.
+struct ValidatedTransaction {
+    frame: TransactionFrame,
+    fee_source_id: AccountId,
+    inner_source_id: AccountId,
+    outer_hash: Hash256,
+}
+
 /// Context for executing transactions during ledger close.
 pub struct TransactionExecutor {
     /// Ledger sequence being processed.
@@ -1478,122 +1503,47 @@ impl TransactionExecutor {
         )
     }
 
-    /// Execute a transaction with configurable fee deduction and optional pre-fee state.
-    ///
-    /// When `deduct_fee` is false, fee validation still occurs but no fee
-    /// processing changes are applied to the state or delta.
-    ///
-    /// For fee bump transactions in two-phase mode, `fee_source_pre_state` should be provided
-    /// with the fee source account state BEFORE fee processing. This is used for the STATE entry
-    /// in tx_changes_before to match stellar-core behavior.
-    pub fn execute_transaction_with_fee_mode_and_pre_state(
+    /// Validate a transaction's structure, accounts, fees, preconditions, sequence,
+    /// and signatures before any state changes. Returns the validated data needed
+    /// for execution, or a failed `TransactionExecutionResult` on validation failure.
+    fn validate_preconditions(
         &mut self,
         snapshot: &SnapshotHandle,
         tx_envelope: &TransactionEnvelope,
         base_fee: u32,
-        soroban_prng_seed: Option<[u8; 32]>,
-        deduct_fee: bool,
-        fee_source_pre_state: Option<LedgerEntry>,
-    ) -> Result<TransactionExecutionResult> {
-        let tx_timing_start = std::time::Instant::now();
+    ) -> Result<std::result::Result<ValidatedTransaction, TransactionExecutionResult>> {
         let frame = TransactionFrame::with_network(tx_envelope.clone(), self.network_id);
         let fee_source_id = henyey_tx::muxed_to_account_id(&frame.fee_source_account());
         let inner_source_id = henyey_tx::muxed_to_account_id(&frame.inner_source_account());
 
+        // Phase 1: Structure validation
         if !frame.is_valid_structure() {
             let failure = if frame.operations().is_empty() {
                 ExecutionFailure::MissingOperation
             } else {
                 ExecutionFailure::Malformed
             };
-            return Ok(TransactionExecutionResult {
-                success: false,
-                fee_charged: 0,
-                fee_refund: 0,
-                operation_results: vec![],
-                error: Some("Invalid transaction structure".into()),
-                failure: Some(failure),
-                tx_meta: None,
-                fee_changes: None,
-                post_fee_changes: None,
-                hot_archive_restored_keys: Vec::new(),
-                op_type_timings: HashMap::new(),
-            });
+            return Ok(Err(failed_result(failure, "Invalid transaction structure")));
         }
 
-        // Load source account
+        // Phase 2: Account loading
         if !self.load_account(snapshot, &fee_source_id)? {
-            return Ok(TransactionExecutionResult {
-                success: false,
-                fee_charged: 0,
-                fee_refund: 0,
-                operation_results: vec![],
-                error: Some("Source account not found".into()),
-                failure: Some(ExecutionFailure::NoAccount),
-                tx_meta: None,
-                fee_changes: None,
-                post_fee_changes: None,
-                hot_archive_restored_keys: Vec::new(),
-                op_type_timings: HashMap::new(),
-            });
+            return Ok(Err(failed_result(ExecutionFailure::NoAccount, "Source account not found")));
         }
-
         if !self.load_account(snapshot, &inner_source_id)? {
-            return Ok(TransactionExecutionResult {
-                success: false,
-                fee_charged: 0,
-                fee_refund: 0,
-                operation_results: vec![],
-                error: Some("Source account not found".into()),
-                failure: Some(ExecutionFailure::NoAccount),
-                tx_meta: None,
-                fee_changes: None,
-                post_fee_changes: None,
-                hot_archive_restored_keys: Vec::new(),
-                op_type_timings: HashMap::new(),
-            });
+            return Ok(Err(failed_result(ExecutionFailure::NoAccount, "Source account not found")));
         }
 
-        // Get accounts for validation
         let fee_source_account = match self.state.get_account(&fee_source_id) {
             Some(acc) => acc.clone(),
-            None => {
-                return Ok(TransactionExecutionResult {
-                    success: false,
-                    fee_charged: 0,
-                    fee_refund: 0,
-                    operation_results: vec![],
-                    error: Some("Source account not found".into()),
-                    failure: Some(ExecutionFailure::NoAccount),
-                    tx_meta: None,
-                    fee_changes: None,
-                    post_fee_changes: None,
-                    hot_archive_restored_keys: Vec::new(),
-                    op_type_timings: HashMap::new(),
-                });
-            }
+            None => return Ok(Err(failed_result(ExecutionFailure::NoAccount, "Source account not found"))),
         };
-
         let source_account = match self.state.get_account(&inner_source_id) {
             Some(acc) => acc.clone(),
-            None => {
-                return Ok(TransactionExecutionResult {
-                    success: false,
-                    fee_charged: 0,
-                    fee_refund: 0,
-                    operation_results: vec![],
-                    error: Some("Source account not found".into()),
-                    failure: Some(ExecutionFailure::NoAccount),
-                    tx_meta: None,
-                    fee_changes: None,
-                    post_fee_changes: None,
-                    hot_archive_restored_keys: Vec::new(),
-                    op_type_timings: HashMap::new(),
-                });
-            }
+            None => return Ok(Err(failed_result(ExecutionFailure::NoAccount, "Source account not found"))),
         };
 
-        // Validate fee
+        // Phase 3: Fee validation
         if frame.is_fee_bump() {
             let op_count = frame.operation_count() as i64;
             let outer_op_count = std::cmp::max(1_i64, op_count + 1);
@@ -1601,19 +1551,7 @@ impl TransactionExecutor {
             let outer_inclusion_fee = frame.inclusion_fee();
 
             if outer_inclusion_fee < outer_min_inclusion_fee {
-                return Ok(TransactionExecutionResult {
-                    success: false,
-                    fee_charged: 0,
-                    fee_refund: 0,
-                    operation_results: vec![],
-                    error: Some("Insufficient fee".into()),
-                    failure: Some(ExecutionFailure::InsufficientFee),
-                    tx_meta: None,
-                    fee_changes: None,
-                    post_fee_changes: None,
-                    hot_archive_restored_keys: Vec::new(),
-                    op_type_timings: HashMap::new(),
-                });
+                return Ok(Err(failed_result(ExecutionFailure::InsufficientFee, "Insufficient fee")));
             }
 
             let (inner_inclusion_fee, inner_is_soroban) = match frame.envelope() {
@@ -1632,59 +1570,23 @@ impl TransactionExecutor {
                 let inner_min_inclusion_fee = base_fee as i64 * std::cmp::max(1_i64, op_count);
                 let v1 = outer_inclusion_fee as i128 * inner_min_inclusion_fee as i128;
                 let v2 = inner_inclusion_fee as i128 * outer_min_inclusion_fee as i128;
-
                 if v1 < v2 {
-                    return Ok(TransactionExecutionResult {
-                        success: false,
-                        fee_charged: 0,
-                        fee_refund: 0,
-                        operation_results: vec![],
-                        error: Some("Insufficient fee".into()),
-                        failure: Some(ExecutionFailure::InsufficientFee),
-                        tx_meta: None,
-                        fee_changes: None,
-                        post_fee_changes: None,
-                        hot_archive_restored_keys: Vec::new(),
-                        op_type_timings: HashMap::new(),
-                    });
+                    return Ok(Err(failed_result(ExecutionFailure::InsufficientFee, "Insufficient fee")));
                 }
             } else {
                 let allow_negative_inner = inner_is_soroban;
                 if !allow_negative_inner {
-                    return Ok(TransactionExecutionResult {
-                        success: false,
-                        fee_charged: 0,
-                        fee_refund: 0,
-                        operation_results: vec![],
-                        error: Some("Fee bump inner transaction invalid".into()),
-                        failure: Some(ExecutionFailure::OperationFailed),
-                        tx_meta: None,
-                        fee_changes: None,
-                        post_fee_changes: None,
-                        hot_archive_restored_keys: Vec::new(),
-                        op_type_timings: HashMap::new(),
-                    });
+                    return Ok(Err(failed_result(ExecutionFailure::OperationFailed, "Fee bump inner transaction invalid")));
                 }
             }
         } else {
             let required_fee = frame.operation_count() as u32 * base_fee;
             if frame.fee() < required_fee {
-                return Ok(TransactionExecutionResult {
-                    success: false,
-                    fee_charged: 0,
-                    fee_refund: 0,
-                    operation_results: vec![],
-                    error: Some("Insufficient fee".into()),
-                    failure: Some(ExecutionFailure::InsufficientFee),
-                    tx_meta: None,
-                    fee_changes: None,
-                    post_fee_changes: None,
-                    hot_archive_restored_keys: Vec::new(),
-                    op_type_timings: HashMap::new(),
-                });
+                return Ok(Err(failed_result(ExecutionFailure::InsufficientFee, "Insufficient fee")));
             }
         }
 
+        // Phase 4: Time/ledger bounds and precondition validation
         let validation_ctx = ValidationContext::new(
             self.ledger_seq,
             self.close_time,
@@ -1695,33 +1597,19 @@ impl TransactionExecutor {
         );
 
         if let Err(e) = validation::validate_time_bounds(&frame, &validation_ctx) {
-            return Ok(TransactionExecutionResult {
-                success: false,
-                fee_charged: 0,
-                fee_refund: 0,
-                operation_results: vec![],
-                error: Some("Time bounds invalid".into()),
-                failure: Some(match e {
+            return Ok(Err(failed_result(
+                match e {
                     validation::ValidationError::TooEarly { .. } => ExecutionFailure::TooEarly,
                     validation::ValidationError::TooLate { .. } => ExecutionFailure::TooLate,
                     _ => ExecutionFailure::OperationFailed,
-                }),
-                tx_meta: None,
-                fee_changes: None,
-                post_fee_changes: None,
-                hot_archive_restored_keys: Vec::new(),
-                op_type_timings: HashMap::new(),
-            });
+                },
+                "Time bounds invalid",
+            )));
         }
 
         if let Err(e) = validation::validate_ledger_bounds(&frame, &validation_ctx) {
-            return Ok(TransactionExecutionResult {
-                success: false,
-                fee_charged: 0,
-                fee_refund: 0,
-                operation_results: vec![],
-                error: Some("Ledger bounds invalid".into()),
-                failure: Some(match e {
+            return Ok(Err(failed_result(
+                match e {
                     validation::ValidationError::BadLedgerBounds { min, max, current } => {
                         if max > 0 && current > max {
                             ExecutionFailure::TooLate
@@ -1732,108 +1620,45 @@ impl TransactionExecutor {
                         }
                     }
                     _ => ExecutionFailure::OperationFailed,
-                }),
-                tx_meta: None,
-                fee_changes: None,
-                post_fee_changes: None,
-                hot_archive_restored_keys: Vec::new(),
-                op_type_timings: HashMap::new(),
-            });
+                },
+                "Ledger bounds invalid",
+            )));
         }
 
         if let Preconditions::V2(cond) = frame.preconditions() {
             if let Some(min_seq) = cond.min_seq_num {
                 if source_account.seq_num.0 < min_seq.0 {
-                    return Ok(TransactionExecutionResult {
-                        success: false,
-                        fee_charged: 0,
-                        fee_refund: 0,
-                        operation_results: vec![],
-                        error: Some("Minimum sequence number not met".into()),
-                        failure: Some(ExecutionFailure::BadMinSeqAgeOrGap),
-                        tx_meta: None,
-                        fee_changes: None,
-                        post_fee_changes: None,
-                        hot_archive_restored_keys: Vec::new(),
-                        op_type_timings: HashMap::new(),
-                    });
+                    return Ok(Err(failed_result(ExecutionFailure::BadMinSeqAgeOrGap, "Minimum sequence number not met")));
                 }
             }
 
             if cond.min_seq_age.0 > 0 {
-                // stellar-core logic: minSeqAge > closeTime || closeTime - minSeqAge < accSeqTime
                 let acc_seq_time = get_account_seq_time(&source_account);
                 let min_seq_age = cond.min_seq_age.0;
-
                 if min_seq_age > self.close_time || self.close_time - min_seq_age < acc_seq_time {
-                    return Ok(TransactionExecutionResult {
-                        success: false,
-                        fee_charged: 0,
-                        fee_refund: 0,
-                        operation_results: vec![],
-                        error: Some("Minimum sequence age not met".into()),
-                        failure: Some(ExecutionFailure::BadMinSeqAgeOrGap),
-                        tx_meta: None,
-                        fee_changes: None,
-                        post_fee_changes: None,
-                        hot_archive_restored_keys: Vec::new(),
-                        op_type_timings: HashMap::new(),
-                    });
+                    return Ok(Err(failed_result(ExecutionFailure::BadMinSeqAgeOrGap, "Minimum sequence age not met")));
                 }
             }
 
             if cond.min_seq_ledger_gap > 0 {
-                // stellar-core logic: minSeqLedgerGap > ledgerSeq || ledgerSeq - minSeqLedgerGap < accSeqLedger
                 let acc_seq_ledger = get_account_seq_ledger(&source_account);
                 let min_seq_ledger_gap = cond.min_seq_ledger_gap;
-
                 if min_seq_ledger_gap > self.ledger_seq
                     || self.ledger_seq - min_seq_ledger_gap < acc_seq_ledger
                 {
-                    return Ok(TransactionExecutionResult {
-                        success: false,
-                        fee_charged: 0,
-                        fee_refund: 0,
-                        operation_results: vec![],
-                        error: Some("Minimum sequence ledger gap not met".into()),
-                        failure: Some(ExecutionFailure::BadMinSeqAgeOrGap),
-                        tx_meta: None,
-                        fee_changes: None,
-                        post_fee_changes: None,
-                        hot_archive_restored_keys: Vec::new(),
-                        op_type_timings: HashMap::new(),
-                    });
+                    return Ok(Err(failed_result(ExecutionFailure::BadMinSeqAgeOrGap, "Minimum sequence ledger gap not met")));
                 }
             }
         }
 
-        // Validate sequence number
-        // stellar-core logic from TransactionFrame::isBadSeq:
-        // 1. Always reject if tx.seqNum == starting sequence for this ledger
-        // 2. If minSeqNum is set (protocol >= 19), use relaxed check:
-        //    bad if account.seqNum < minSeqNum OR account.seqNum >= tx.seqNum
-        // 3. Otherwise, use strict check:
-        //    bad if account.seqNum + 1 != tx.seqNum
+        // Phase 5: Sequence number validation
         if self.ledger_seq <= i32::MAX as u32 {
             let starting_seq = (self.ledger_seq as i64) << 32;
             if frame.sequence_number() == starting_seq {
-                return Ok(TransactionExecutionResult {
-                    success: false,
-                    fee_charged: 0,
-                    fee_refund: 0,
-                    operation_results: vec![],
-                    error: Some("Bad sequence: equals starting sequence".into()),
-                    failure: Some(ExecutionFailure::BadSequence),
-                    tx_meta: None,
-                    fee_changes: None,
-                    post_fee_changes: None,
-                    hot_archive_restored_keys: Vec::new(),
-                    op_type_timings: HashMap::new(),
-                });
+                return Ok(Err(failed_result(ExecutionFailure::BadSequence, "Bad sequence: equals starting sequence")));
             }
         }
 
-        // Check for relaxed sequence validation (minSeqNum precondition)
         let min_seq_num = match frame.preconditions() {
             Preconditions::V2(cond) => cond.min_seq_num.map(|s| s.0),
             _ => None,
@@ -1851,10 +1676,8 @@ impl TransactionExecutor {
         );
 
         let is_bad_seq = if let Some(min_seq) = min_seq_num {
-            // Relaxed check: account.seqNum must be >= minSeqNum AND < tx.seqNum
             account_seq < min_seq || account_seq >= tx_seq
         } else {
-            // Strict check: account.seqNum + 1 must equal tx.seqNum
             account_seq == i64::MAX || account_seq + 1 != tx_seq
         };
 
@@ -1871,36 +1694,12 @@ impl TransactionExecutor {
                     tx_seq
                 )
             };
-            return Ok(TransactionExecutionResult {
-                success: false,
-                fee_charged: 0,
-                fee_refund: 0,
-                operation_results: vec![],
-                error: Some(error_msg),
-                failure: Some(ExecutionFailure::BadSequence),
-                tx_meta: None,
-                fee_changes: None,
-                post_fee_changes: None,
-                hot_archive_restored_keys: Vec::new(),
-                op_type_timings: HashMap::new(),
-            });
+            return Ok(Err(failed_result(ExecutionFailure::BadSequence, &error_msg)));
         }
 
-        // Basic signature validation (master key only).
+        // Phase 6: Signature validation
         if validation::validate_signatures(&frame, &validation_ctx).is_err() {
-            return Ok(TransactionExecutionResult {
-                success: false,
-                fee_charged: 0,
-                fee_refund: 0,
-                operation_results: vec![],
-                error: Some("Invalid signature".into()),
-                failure: Some(ExecutionFailure::InvalidSignature),
-                tx_meta: None,
-                fee_changes: None,
-                post_fee_changes: None,
-                hot_archive_restored_keys: Vec::new(),
-                op_type_timings: HashMap::new(),
-            });
+            return Ok(Err(failed_result(ExecutionFailure::InvalidSignature, "Invalid signature")));
         }
 
         let outer_hash = frame
@@ -1914,19 +1713,7 @@ impl TransactionExecutor {
             outer_threshold,
         ) {
             tracing::debug!("Signature check failed: fee_source outer check");
-            return Ok(TransactionExecutionResult {
-                success: false,
-                fee_charged: 0,
-                fee_refund: 0,
-                operation_results: vec![],
-                error: Some("Invalid signature".into()),
-                failure: Some(ExecutionFailure::InvalidSignature),
-                tx_meta: None,
-                fee_changes: None,
-                post_fee_changes: None,
-                hot_archive_restored_keys: Vec::new(),
-                op_type_timings: HashMap::new(),
-            });
+            return Ok(Err(failed_result(ExecutionFailure::InvalidSignature, "Invalid signature")));
         }
 
         if frame.is_fee_bump() {
@@ -1939,25 +1726,10 @@ impl TransactionExecutor {
                 inner_threshold,
             ) {
                 tracing::debug!("Signature check failed: fee_bump inner check");
-                return Ok(TransactionExecutionResult {
-                    success: false,
-                    fee_charged: 0,
-                    fee_refund: 0,
-                    operation_results: vec![],
-                    error: Some("Invalid inner signature".into()),
-                    failure: Some(ExecutionFailure::InvalidSignature),
-                    tx_meta: None,
-                    fee_changes: None,
-                    post_fee_changes: None,
-                    hot_archive_restored_keys: Vec::new(),
-                    op_type_timings: HashMap::new(),
-                });
+                return Ok(Err(failed_result(ExecutionFailure::InvalidSignature, "Invalid inner signature")));
             }
         }
 
-        // Transaction envelope uses LOW threshold for signature check.
-        // Each operation will additionally check its own threshold (low/medium/high).
-        // This matches stellar-core's checkAllTransactionSignatures behavior.
         let required_weight = threshold_low(&source_account);
         if !frame.is_fee_bump()
             && !has_sufficient_signer_weight(
@@ -1975,19 +1747,7 @@ impl TransactionExecutor {
                 thresholds = ?source_account.thresholds.0,
                 "Signature check failed: source outer check"
             );
-            return Ok(TransactionExecutionResult {
-                success: false,
-                fee_charged: 0,
-                fee_refund: 0,
-                operation_results: vec![],
-                error: Some("Invalid signature".into()),
-                failure: Some(ExecutionFailure::InvalidSignature),
-                tx_meta: None,
-                fee_changes: None,
-                post_fee_changes: None,
-                hot_archive_restored_keys: Vec::new(),
-                op_type_timings: HashMap::new(),
-            });
+            return Ok(Err(failed_result(ExecutionFailure::InvalidSignature, "Invalid signature")));
         }
 
         if let Preconditions::V2(cond) = frame.preconditions() {
@@ -2003,22 +1763,49 @@ impl TransactionExecutor {
                     frame.signatures()
                 };
                 if !has_required_extra_signers(&extra_hash, extra_signatures, &cond.extra_signers) {
-                    return Ok(TransactionExecutionResult {
-                        success: false,
-                        fee_charged: 0,
-                        fee_refund: 0,
-                        operation_results: vec![],
-                        error: Some("Missing extra signer".into()),
-                        failure: Some(ExecutionFailure::BadAuthExtra),
-                        tx_meta: None,
-                        fee_changes: None,
-                        post_fee_changes: None,
-                        hot_archive_restored_keys: Vec::new(),
-                        op_type_timings: HashMap::new(),
-                    });
+                    return Ok(Err(failed_result(ExecutionFailure::BadAuthExtra, "Missing extra signer")));
                 }
             }
         }
+
+        Ok(Ok(ValidatedTransaction {
+            frame,
+            fee_source_id,
+            inner_source_id,
+            outer_hash,
+        }))
+    }
+
+    /// Execute a transaction with configurable fee deduction and optional pre-fee state.
+    ///
+    /// When `deduct_fee` is false, fee validation still occurs but no fee
+    /// processing changes are applied to the state or delta.
+    ///
+    /// For fee bump transactions in two-phase mode, `fee_source_pre_state` should be provided
+    /// with the fee source account state BEFORE fee processing. This is used for the STATE entry
+    /// in tx_changes_before to match stellar-core behavior.
+    pub fn execute_transaction_with_fee_mode_and_pre_state(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        tx_envelope: &TransactionEnvelope,
+        base_fee: u32,
+        soroban_prng_seed: Option<[u8; 32]>,
+        deduct_fee: bool,
+        fee_source_pre_state: Option<LedgerEntry>,
+    ) -> Result<TransactionExecutionResult> {
+        let tx_timing_start = std::time::Instant::now();
+
+        // Phase 1-6: Validate structure, accounts, fees, preconditions, sequence, signatures
+        let validated = match self.validate_preconditions(snapshot, tx_envelope, base_fee)? {
+            Ok(v) => v,
+            Err(failure_result) => return Ok(failure_result),
+        };
+        let ValidatedTransaction {
+            frame,
+            fee_source_id,
+            inner_source_id,
+            outer_hash,
+        } = validated;
 
         let validation_us = tx_timing_start.elapsed().as_micros() as u64;
 
