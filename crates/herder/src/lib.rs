@@ -126,6 +126,7 @@ pub mod tx_broadcast;
 pub mod parallel_tx_set_builder;
 mod tx_queue;
 mod tx_queue_limiter;
+pub mod tx_set_utils;
 pub mod upgrades;
 
 // Re-export main types
@@ -156,6 +157,11 @@ pub use herder_utils::{
 
 // LedgerCloseData
 pub use ledger_close_data::{stellar_value_to_string, LedgerCloseData, LedgerCloseDataError};
+
+// TxSetUtils
+pub use tx_set_utils::{
+    get_invalid_tx_list, trim_invalid, CloseTimeBounds, TxSetValidationContext,
+};
 
 // TxQueueLimiter and surge pricing
 pub use surge_pricing::VisitTxResult;

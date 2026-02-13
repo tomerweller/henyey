@@ -265,18 +265,33 @@ pub trait SCPDriver: Send + Sync {
 
     /// Get the weight of a node in quorum calculations.
     ///
-    /// This is used for weighted voting in quorum sets. The default
-    /// implementation returns equal weight (1.0) for all nodes.
+    /// Returns the weight of `node_id` within `quorum_set`, normalized between
+    /// 0 and `u64::MAX`. If `node_id` is the local node, `is_local_node` should
+    /// be `true`.
+    ///
+    /// The default implementation mirrors upstream `SCPDriver::getNodeWeight`:
+    /// - Local node returns `u64::MAX`
+    /// - Validators found at top level: `computeWeight(UINT64_MAX, d, n)`
+    /// - Validators found in inner sets: `computeWeight(leafW, d, n)`
+    /// - Not found: 0
+    ///
+    /// The herder can override this for application-specific weight functions
+    /// (e.g., quality-based weights in P22+).
     ///
     /// # Arguments
     /// * `node_id` - The node to get weight for
     /// * `quorum_set` - The quorum set context
+    /// * `is_local_node` - Whether `node_id` is the local node
     ///
     /// # Returns
-    /// Weight as a fraction between 0.0 and 1.0.
-    fn get_node_weight(&self, _node_id: &NodeId, _quorum_set: &ScpQuorumSet) -> f64 {
-        // Default: all nodes have equal weight
-        1.0
+    /// Weight as a u64 between 0 and `u64::MAX`.
+    fn get_node_weight(
+        &self,
+        node_id: &NodeId,
+        quorum_set: &ScpQuorumSet,
+        is_local_node: bool,
+    ) -> u64 {
+        base_get_node_weight(node_id, quorum_set, is_local_node)
     }
 
     /// Get a debug string representation of a value.
@@ -391,5 +406,227 @@ pub trait SCPDriver: Send + Sync {
     /// Returns `u32::MAX` (effectively never strip).
     fn get_upgrade_nomination_timeout_limit(&self) -> u32 {
         u32::MAX
+    }
+}
+
+/// Compute weight as `ceil(m * threshold / total)`.
+///
+/// Matches upstream `computeWeight` in `SCPDriver.cpp`:
+/// `bigDivideUnsigned(res, m, threshold, total, ROUND_UP)`.
+///
+/// Uses `u128` to avoid overflow since `m` can be `u64::MAX`.
+pub fn compute_weight(m: u64, total: u64, threshold: u64) -> u64 {
+    if threshold == 0 || total == 0 {
+        return 0;
+    }
+    debug_assert!(threshold <= total);
+    let numerator = (m as u128) * (threshold as u128);
+    let denominator = total as u128;
+    numerator.div_ceil(denominator) as u64
+}
+
+/// Base implementation of `get_node_weight`, matching upstream `SCPDriver::getNodeWeight`.
+///
+/// - If `is_local_node` is true, returns `u64::MAX`.
+/// - Searches validators at each level; if found, applies `compute_weight`.
+/// - Recursively searches inner sets; if found in an inner set, the inner set's
+///   weight is further scaled by the outer level's `compute_weight`.
+/// - Returns 0 if the node is not found.
+pub fn base_get_node_weight(
+    node_id: &NodeId,
+    quorum_set: &ScpQuorumSet,
+    is_local_node: bool,
+) -> u64 {
+    if is_local_node {
+        return u64::MAX;
+    }
+
+    let total = (quorum_set.validators.len() + quorum_set.inner_sets.len()) as u64;
+    let threshold = quorum_set.threshold as u64;
+    if threshold == 0 || total == 0 {
+        return 0;
+    }
+
+    // Check top-level validators
+    for validator in quorum_set.validators.iter() {
+        if validator == node_id {
+            return compute_weight(u64::MAX, total, threshold);
+        }
+    }
+
+    // Recursively check inner sets
+    for inner in quorum_set.inner_sets.iter() {
+        let leaf_w = base_get_node_weight(node_id, inner, is_local_node);
+        if leaf_w > 0 {
+            return compute_weight(leaf_w, total, threshold);
+        }
+    }
+
+    0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::curr::{PublicKey as XdrPublicKey, Uint256};
+
+    fn make_node_id(id: u8) -> NodeId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = id;
+        NodeId(XdrPublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
+    }
+
+    fn make_quorum_set(validators: Vec<NodeId>, threshold: u32) -> ScpQuorumSet {
+        ScpQuorumSet {
+            threshold,
+            validators: validators.try_into().unwrap(),
+            inner_sets: Vec::new().try_into().unwrap(),
+        }
+    }
+
+    fn is_near_weight(weight: u64, target: f64) -> bool {
+        let ratio = weight as f64 / u64::MAX as f64;
+        (ratio - target).abs() < 0.01
+    }
+
+    #[test]
+    fn test_compute_weight_basic() {
+        // threshold=3, total=4: ceil(UINT64_MAX * 3 / 4) approx 0.75 * UINT64_MAX
+        let w = compute_weight(u64::MAX, 4, 3);
+        assert!(is_near_weight(w, 0.75));
+    }
+
+    #[test]
+    fn test_compute_weight_full() {
+        // threshold=total: ceil(m * 1) = m
+        let w = compute_weight(u64::MAX, 3, 3);
+        assert_eq!(w, u64::MAX);
+    }
+
+    #[test]
+    fn test_compute_weight_zero_total() {
+        assert_eq!(compute_weight(u64::MAX, 0, 0), 0);
+    }
+
+    #[test]
+    fn test_compute_weight_zero_threshold() {
+        assert_eq!(compute_weight(u64::MAX, 4, 0), 0);
+    }
+
+    #[test]
+    fn test_compute_weight_rounds_up() {
+        // 10 * 3 / 4 = 7.5 -> should round up to 8
+        let w = compute_weight(10, 4, 3);
+        assert_eq!(w, 8);
+    }
+
+    #[test]
+    fn test_base_get_node_weight_local_node() {
+        let node0 = make_node_id(0);
+        let qset = make_quorum_set(vec![node0.clone()], 1);
+        assert_eq!(base_get_node_weight(&node0, &qset, true), u64::MAX);
+    }
+
+    #[test]
+    fn test_base_get_node_weight_flat_qset() {
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+        let node3 = make_node_id(3);
+
+        // 4 validators, threshold 3 -> weight = 3/4 = 0.75
+        let qset = make_quorum_set(
+            vec![node0.clone(), node1.clone(), node2.clone(), node3.clone()],
+            3,
+        );
+
+        let weight = base_get_node_weight(&node2, &qset, false);
+        assert!(is_near_weight(weight, 0.75));
+    }
+
+    #[test]
+    fn test_base_get_node_weight_not_in_qset() {
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+        let node3 = make_node_id(3);
+        let node4 = make_node_id(4);
+
+        let qset = make_quorum_set(
+            vec![node0.clone(), node1.clone(), node2.clone(), node3.clone()],
+            3,
+        );
+
+        assert_eq!(base_get_node_weight(&node4, &qset, false), 0);
+    }
+
+    #[test]
+    fn test_base_get_node_weight_inner_set() {
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+        let node3 = make_node_id(3);
+        let node4 = make_node_id(4);
+        let node5 = make_node_id(5);
+
+        let inner = make_quorum_set(vec![node4.clone(), node5.clone()], 1);
+
+        // 4 validators + 1 inner set = 5 entries, threshold 3
+        let qset = ScpQuorumSet {
+            threshold: 3,
+            validators: vec![node0.clone(), node1.clone(), node2.clone(), node3.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![inner].try_into().unwrap(),
+        };
+
+        // node4 in inner set: inner weight = UINT64_MAX * 1/2 = 0.5
+        // outer weight = innerWeight * 3/5 = 0.5 * 0.6 = 0.3
+        let weight = base_get_node_weight(&node4, &qset, false);
+        assert!(is_near_weight(weight, 0.6 * 0.5));
+    }
+
+    #[test]
+    fn test_base_get_node_weight_empty_qset() {
+        let node0 = make_node_id(0);
+        let qset = ScpQuorumSet {
+            threshold: 0,
+            validators: Vec::new().try_into().unwrap(),
+            inner_sets: Vec::new().try_into().unwrap(),
+        };
+        assert_eq!(base_get_node_weight(&node0, &qset, false), 0);
+    }
+
+    #[test]
+    fn test_base_get_node_weight_matches_upstream_test_vectors() {
+        // Upstream test from SCPUnitTests.cpp:
+        // 4 validators (v0..v3), threshold 3
+        // v2 weight approx 0.75
+        // v4 not found -> 0
+        // Add inner set [v4, v5] threshold 1 -> v4 approx 0.6 * 0.5
+
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+        let node3 = make_node_id(3);
+        let node4 = make_node_id(4);
+        let node5 = make_node_id(5);
+
+        let mut qset = make_quorum_set(
+            vec![node0.clone(), node1.clone(), node2.clone(), node3.clone()],
+            3,
+        );
+
+        let result = base_get_node_weight(&node2, &qset, false);
+        assert!(is_near_weight(result, 0.75));
+
+        let result = base_get_node_weight(&node4, &qset, false);
+        assert_eq!(result, 0);
+
+        let inner = make_quorum_set(vec![node4.clone(), node5.clone()], 1);
+        qset.inner_sets = vec![inner].try_into().unwrap();
+
+        let result = base_get_node_weight(&node4, &qset, false);
+        assert!(is_near_weight(result, 0.6 * 0.5));
     }
 }

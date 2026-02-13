@@ -73,7 +73,7 @@ Corresponds to: `Floodgate.h`
 | stellar-core | Rust | Status |
 |--------------|------|--------|
 | `Floodgate()` | `FloodGate::new()` / `with_ttl()` | Full |
-| `clearBelow()` | `cleanup()` | Full |
+| `clearBelow()` | `clear_below()` | Full |
 | `addRecord()` | `record_seen()` | Full |
 | `broadcast()` | `get_forward_peers()` + external send | Full |
 | `getPeersKnows()` | `get_forward_peers()` | Full |
@@ -304,7 +304,7 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `start()` | `start()` | Full |
 | `shutdown()` | `shutdown()` | Full |
 | `isShuttingDown()` | `is_running()` (inverted) | Full |
-| `clearLedgersBelow()` | N/A | None |
+| `clearLedgersBelow()` | `clear_ledgers_below()` | Full |
 | `broadcastMessage()` | (via broadcast channel + flood gate) | Full |
 | `recvFloodedMsgID()` | `FloodGate::record_seen()` | Full |
 | `recvTransaction()` | (via broadcast channel) | Partial |
@@ -501,7 +501,6 @@ Features not yet implemented. These ARE counted against parity %.
 | `OverlayManagerImpl::storeConfigPeers()` | Low | Persist config peers to DB |
 | `OverlayManagerImpl::purgeDeadPeers()` | Low | `remove_peers_with_many_failures()` exists; needs wiring at startup |
 | `OverlayManagerImpl::triggerPeerResolution()` / `resolvePeers()` | Low | Async DNS with retry |
-| `OverlayManagerImpl::clearLedgersBelow()` | Medium | Ledger-based cleanup coordination |
 | `OverlayManagerImpl::getRandomInboundAuthenticatedPeers()` | Low | Separate inbound peer list |
 | `OverlayManagerImpl::getRandomOutboundAuthenticatedPeers()` | Low | Separate outbound peer list |
 | `OverlayManagerImpl::getInboundPendingPeers()` | Low | Pending peer tracking |
@@ -598,7 +597,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 250 |
-| Gaps (None + Partial) | 52 |
+| Implemented (Full) | 251 |
+| Gaps (None + Partial) | 51 |
 | Intentional Omissions | 10 |
-| **Parity** | **250 / (250 + 52) = 83%** |
+| **Parity** | **251 / (251 + 51) = 83%** |

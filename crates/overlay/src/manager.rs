@@ -1362,6 +1362,23 @@ impl OverlayManager {
         self.flood_gate.stats()
     }
 
+    /// Clear per-ledger state for ledgers below the given sequence.
+    ///
+    /// Mirrors upstream `OverlayManagerImpl::clearLedgersBelow()` which is
+    /// called by the herder's `eraseBelow()` after every ledger close. It
+    /// cleans up:
+    ///
+    /// - **Flood gate** entries from old ledgers (via [`FloodGate::clear_below`])
+    ///
+    /// The `_lcl_seq` parameter is accepted for parity with the upstream
+    /// signature `(uint32_t ledgerSeq, uint32_t lclSeq)` but is unused here
+    /// because survey cleanup and per-peer TxAdverts cleanup are handled
+    /// separately by the app layer in Rust.
+    pub fn clear_ledgers_below(&self, ledger_seq: u32, _lcl_seq: u32) {
+        self.flood_gate.clear_below(ledger_seq);
+        trace!(ledger_seq, "Cleared overlay state below ledger");
+    }
+
     /// Check if the overlay is running.
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
@@ -1710,6 +1727,40 @@ mod tests {
         // Second call should return None (already taken)
         let rx2 = manager.subscribe_scp().await;
         assert!(rx2.is_none(), "second subscribe_scp() should return None");
+    }
+
+    #[test]
+    fn test_clear_ledgers_below() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let manager = OverlayManager::new(config, local_node).unwrap();
+
+        // Record some flood messages
+        let hash1 = henyey_common::Hash256([1u8; 32]);
+        let hash2 = henyey_common::Hash256([2u8; 32]);
+        manager.flood_gate.record_seen(hash1, None);
+        manager.flood_gate.record_seen(hash2, None);
+        assert_eq!(manager.flood_stats().seen_count, 2);
+
+        // clear_ledgers_below should not remove entries that haven't expired
+        manager.clear_ledgers_below(100, 100);
+        assert_eq!(manager.flood_stats().seen_count, 2);
+    }
+
+    #[test]
+    fn test_clear_ledgers_below_no_panic_when_empty() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let manager = OverlayManager::new(config, local_node).unwrap();
+
+        // Should not panic with empty flood gate
+        manager.clear_ledgers_below(0, 0);
+        manager.clear_ledgers_below(100, 50);
+        manager.clear_ledgers_below(u32::MAX, u32::MAX);
     }
 
     #[test]

@@ -4715,6 +4715,22 @@ impl App {
         self.herder
             .ledger_closed(pending.ledger_seq as u64, &applied_hashes);
 
+        // Clear per-ledger overlay state (flood gate, etc.) for old ledgers.
+        // Mirrors upstream HerderImpl::eraseBelow() -> clearLedgersBelow().
+        {
+            let overlay = self.overlay.lock().await;
+            if let Some(overlay) = overlay.as_ref() {
+                overlay.clear_ledgers_below(pending.ledger_seq, pending.ledger_seq);
+            }
+        }
+
+        // Clean up old survey rate limiter entries.
+        // Mirrors upstream SurveyManager::clearOldLedgers() called from clearLedgersBelow().
+        {
+            let mut limiter = self.survey_limiter.write().await;
+            limiter.clear_old_ledgers(pending.ledger_seq);
+        }
+
         if !failed_hashes.is_empty() {
             tracing::debug!(
                 failed_count = failed_hashes.len(),

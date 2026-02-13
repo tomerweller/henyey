@@ -272,7 +272,8 @@ Corresponds to: `SCPDriver.h`
 | `setupTimer()` | `setup_timer()` | Full |
 | `stopTimer()` | `stop_timer()` | Full |
 | `computeTimeout()` | `compute_timeout()` | Full |
-| `getNodeWeight()` | `get_node_weight()` | Full |
+| `getNodeWeight()` | `get_node_weight()`, `base_get_node_weight()` | Full |
+| `computeWeight()` (helper) | `compute_weight()` | Full |
 | `valueExternalized()` | `value_externalized()` | Full |
 | `nominatingValue()` | `nominating_value()` | Full |
 | `updatedCandidateValue()` | `updated_candidate_value()` | Full |
@@ -396,7 +397,7 @@ No significant test gaps. The Rust test suite exceeds the upstream test count an
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 163 |
+| Implemented (Full) | 164 |
 | Gaps (None + Partial) | 0 |
 | Intentional Omissions | 12 |
-| **Parity** | **163 / (163 + 0) = 100%** |
+| **Parity** | **164 / (164 + 0) = 100%** |

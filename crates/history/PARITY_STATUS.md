@@ -2,7 +2,7 @@
 
 **Crate**: `henyey-history`
 **Upstream**: `.upstream-v25/src/history/`
-**Overall Parity**: 74%
+**Overall Parity**: 76%
 **Last Updated**: 2026-02-13
 
 ## Summary
@@ -78,7 +78,7 @@ Corresponds to: `HistoryArchive.h` (HistoryArchiveState)
 | `wellKnownRemoteName()` | `root_has_path()` | Full |
 | `remoteDir()` | `checkpoint_path("history", ...)` | Full |
 | `remoteName()` | `has_path()` | Full |
-| `getBucketListHash()` | -- | None |
+| `getBucketListHash()` | `get_bucket_list_hash()` | Full |
 | `differingBuckets()` | -- | None |
 | `allBuckets()` | `all_bucket_hashes()` | Full |
 | `serialize()` / `deserialize()` | `from_json()` / `to_json()` via serde | Full |
@@ -217,7 +217,6 @@ Features not yet implemented. These ARE counted against parity %.
 | `getPublishSuccessCount()` | Low | Metrics tracking |
 | `getPublishFailureCount()` | Low | Metrics tracking |
 | `waitForCheckpointPublish()` | Low | Blocking publish wait |
-| `getBucketListHash()` | High | Cumulative bucket list hash from HAS |
 | `differingBuckets()` | Medium | Differential bucket download optimization |
 | `futuresAllClear()` | Medium | FutureBucket state checking |
 | `futuresAllResolved()` | Medium | FutureBucket state checking |
@@ -292,7 +291,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 67 |
-| Gaps (None + Partial) | 23 |
+| Implemented (Full) | 68 |
+| Gaps (None + Partial) | 22 |
 | Intentional Omissions | 7 |
-| **Parity** | **67 / (67 + 23) = 74%** |
+| **Parity** | **68 / (68 + 22) = 76%** |

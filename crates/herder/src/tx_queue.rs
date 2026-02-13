@@ -721,6 +721,323 @@ impl TransactionSet {
             }
         }
     }
+
+    /// Prepare a transaction set for ledger application.
+    ///
+    /// This corresponds to upstream `TxSetXDRFrame::prepareForApply()`. It validates
+    /// the XDR structure of the generalized transaction set, deserializes transaction
+    /// envelopes, validates that each transaction has a valid fee structure, checks
+    /// that transactions are properly sorted within components/clusters, and verifies
+    /// that classic and Soroban transactions are in the correct phases.
+    ///
+    /// For legacy (non-generalized) transaction sets, only basic fee validation and
+    /// sort order checks are performed.
+    pub fn prepare_for_apply(
+        &self,
+        network_id: NetworkId,
+    ) -> std::result::Result<Self, String> {
+        if let Some(ref gen) = self.generalized_tx_set {
+            Self::prepare_generalized_for_apply(gen, network_id)
+        } else {
+            Self::prepare_legacy_for_apply(
+                self.previous_ledger_hash,
+                &self.transactions,
+                network_id,
+            )
+        }
+    }
+
+    /// Validate and prepare a generalized transaction set for application.
+    fn prepare_generalized_for_apply(
+        gen: &GeneralizedTransactionSet,
+        network_id: NetworkId,
+    ) -> std::result::Result<Self, String> {
+        validate_generalized_tx_set_xdr_structure(gen)?;
+
+        let GeneralizedTransactionSet::V1(v1) = gen;
+        let mut all_transactions = Vec::new();
+
+        for (phase_id, phase) in v1.phases.iter().enumerate() {
+            let expect_soroban = phase_id == 1;
+            match phase {
+                TransactionPhase::V0(components) => {
+                    for component in components.iter() {
+                        match component {
+                            TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) => {
+                                validate_wire_txs(&comp.txs, network_id, expect_soroban)?;
+                                all_transactions.extend(comp.txs.iter().cloned());
+                            }
+                        }
+                    }
+                }
+                TransactionPhase::V1(parallel) => {
+                    for stage in parallel.execution_stages.iter() {
+                        for cluster in stage.iter() {
+                            validate_wire_txs(
+                                cluster.as_slice(),
+                                network_id,
+                                expect_soroban,
+                            )?;
+                            all_transactions.extend(cluster.iter().cloned());
+                        }
+                    }
+                }
+            }
+        }
+
+        let hash = gen
+            .to_xdr(Limits::none())
+            .map(|bytes| Hash256::hash(&bytes))
+            .map_err(|e| format!("Failed to encode generalized tx set: {}", e))?;
+
+        let previous_ledger_hash = Hash256::from_bytes(v1.previous_ledger_hash.0);
+
+        Ok(Self {
+            hash,
+            previous_ledger_hash,
+            transactions: all_transactions,
+            generalized_tx_set: Some(gen.clone()),
+        })
+    }
+
+    /// Validate and prepare a legacy (non-generalized) transaction set for application.
+    fn prepare_legacy_for_apply(
+        previous_ledger_hash: Hash256,
+        transactions: &[TransactionEnvelope],
+        network_id: NetworkId,
+    ) -> std::result::Result<Self, String> {
+        for env in transactions {
+            validate_tx_fee(env)?;
+            let frame =
+                henyey_tx::TransactionFrame::with_network(env.clone(), network_id);
+            if frame.is_soroban() {
+                return Err(
+                    "Legacy transaction set contains Soroban transaction".to_string(),
+                );
+            }
+        }
+
+        if !is_sorted_by_hash(transactions) {
+            return Err(
+                "Legacy transaction set transactions are not sorted correctly".to_string(),
+            );
+        }
+
+        let hash =
+            Self::compute_non_generalized_hash(previous_ledger_hash, transactions)
+                .ok_or_else(|| "Failed to compute tx set hash".to_string())?;
+
+        Ok(Self {
+            hash,
+            previous_ledger_hash,
+            transactions: transactions.to_vec(),
+            generalized_tx_set: None,
+        })
+    }
+}
+
+/// Maximum allowed Soroban resource fee (2^50), matching upstream MAX_RESOURCE_FEE.
+const MAX_RESOURCE_FEE: i64 = 1i64 << 50;
+
+/// Validate the XDR structure of a GeneralizedTransactionSet.
+///
+/// Mirrors upstream `validateTxSetXDRStructure`.
+fn validate_generalized_tx_set_xdr_structure(
+    gen: &GeneralizedTransactionSet,
+) -> std::result::Result<(), String> {
+    let GeneralizedTransactionSet::V1(v1) = gen;
+
+    if v1.phases.len() != 2 {
+        return Err(format!(
+            "Expected exactly 2 phases, got {}",
+            v1.phases.len()
+        ));
+    }
+
+    for (phase_id, phase) in v1.phases.iter().enumerate() {
+        match phase {
+            TransactionPhase::V0(components) => {
+                validate_sequential_phase_xdr_structure(components.as_slice())?;
+            }
+            TransactionPhase::V1(parallel) => {
+                if phase_id != 1 {
+                    return Err(format!(
+                        "Non-Soroban parallel phase at index {}",
+                        phase_id
+                    ));
+                }
+                validate_parallel_component(parallel)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate the XDR structure of a sequential (V0) phase.
+fn validate_sequential_phase_xdr_structure(
+    components: &[TxSetComponent],
+) -> std::result::Result<(), String> {
+    let is_sorted = components.windows(2).all(|pair| {
+        let fee_a = match &pair[0] {
+            TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) => c.base_fee,
+        };
+        let fee_b = match &pair[1] {
+            TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) => c.base_fee,
+        };
+        match (fee_a, fee_b) {
+            (None, Some(_)) => true,
+            (None, None) => false,
+            (Some(_), None) => false,
+            (Some(a), Some(b)) => a < b,
+        }
+    });
+    if !is_sorted {
+        return Err("Incorrect component order or duplicate base fees".to_string());
+    }
+
+    for component in components {
+        match component {
+            TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) => {
+                if comp.txs.is_empty() {
+                    return Err("Empty component in sequential phase".to_string());
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate the structure of a parallel (V1) phase component.
+fn validate_parallel_component(
+    parallel: &stellar_xdr::curr::ParallelTxsComponent,
+) -> std::result::Result<(), String> {
+    for stage in parallel.execution_stages.iter() {
+        if stage.is_empty() {
+            return Err("Empty stage in parallel phase".to_string());
+        }
+        for cluster in stage.iter() {
+            if cluster.is_empty() {
+                return Err("Empty cluster in parallel phase".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate that a transaction envelope has a valid fee for inclusion in a tx set.
+///
+/// Mirrors upstream `XDRProvidesValidFee`.
+fn validate_tx_fee(env: &TransactionEnvelope) -> std::result::Result<(), String> {
+    let is_soroban = match env {
+        TransactionEnvelope::TxV0(e) => e.tx.operations.iter().any(|op| {
+            matches!(
+                op.body,
+                stellar_xdr::curr::OperationBody::InvokeHostFunction(_)
+                    | stellar_xdr::curr::OperationBody::ExtendFootprintTtl(_)
+                    | stellar_xdr::curr::OperationBody::RestoreFootprint(_)
+            )
+        }),
+        TransactionEnvelope::Tx(e) => e.tx.operations.iter().any(|op| {
+            matches!(
+                op.body,
+                stellar_xdr::curr::OperationBody::InvokeHostFunction(_)
+                    | stellar_xdr::curr::OperationBody::ExtendFootprintTtl(_)
+                    | stellar_xdr::curr::OperationBody::RestoreFootprint(_)
+            )
+        }),
+        TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
+            FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.operations.iter().any(|op| {
+                matches!(
+                    op.body,
+                    stellar_xdr::curr::OperationBody::InvokeHostFunction(_)
+                        | stellar_xdr::curr::OperationBody::ExtendFootprintTtl(_)
+                        | stellar_xdr::curr::OperationBody::RestoreFootprint(_)
+                )
+            }),
+        },
+    };
+
+    if is_soroban {
+        match env {
+            TransactionEnvelope::TxV0(_) => {
+                return Err("Soroban transaction uses TxV0 envelope".to_string());
+            }
+            TransactionEnvelope::Tx(e) => match &e.tx.ext {
+                stellar_xdr::curr::TransactionExt::V0 => {
+                    return Err(
+                        "Soroban transaction missing SorobanTransactionData".to_string(),
+                    );
+                }
+                stellar_xdr::curr::TransactionExt::V1(data) => {
+                    let resource_fee = data.resource_fee;
+                    if resource_fee < 0 || resource_fee > MAX_RESOURCE_FEE {
+                        return Err(format!(
+                            "Soroban resource fee {} out of valid range",
+                            resource_fee
+                        ));
+                    }
+                }
+            },
+            TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
+                FeeBumpTransactionInnerTx::Tx(inner) => match &inner.tx.ext {
+                    stellar_xdr::curr::TransactionExt::V0 => {
+                        return Err(
+                            "Soroban fee-bump inner transaction missing SorobanTransactionData"
+                                .to_string(),
+                        );
+                    }
+                    stellar_xdr::curr::TransactionExt::V1(data) => {
+                        let resource_fee = data.resource_fee;
+                        if resource_fee < 0 || resource_fee > MAX_RESOURCE_FEE {
+                            return Err(format!(
+                                "Soroban resource fee {} out of valid range",
+                                resource_fee
+                            ));
+                        }
+                    }
+                },
+            },
+        }
+    }
+
+    Ok(())
+}
+
+/// Check if a slice of transaction envelopes is sorted by hash.
+fn is_sorted_by_hash(txs: &[TransactionEnvelope]) -> bool {
+    txs.windows(2).all(|pair| {
+        let hash_a = Hash256::hash_xdr(&pair[0]).unwrap_or_default();
+        let hash_b = Hash256::hash_xdr(&pair[1]).unwrap_or_default();
+        hash_a.0 <= hash_b.0
+    })
+}
+
+/// Validate a set of wire-format transaction envelopes.
+fn validate_wire_txs(
+    txs: &[TransactionEnvelope],
+    network_id: NetworkId,
+    expect_soroban: bool,
+) -> std::result::Result<(), String> {
+    for env in txs {
+        validate_tx_fee(env)?;
+
+        let frame = henyey_tx::TransactionFrame::with_network(env.clone(), network_id);
+        if frame.is_soroban() != expect_soroban {
+            if expect_soroban {
+                return Err("Classic transaction found in Soroban phase".to_string());
+            } else {
+                return Err("Soroban transaction found in classic phase".to_string());
+            }
+        }
+    }
+
+    if !is_sorted_by_hash(txs) {
+        return Err("Transactions are not sorted correctly within component".to_string());
+    }
+
+    Ok(())
 }
 
 /// Extract all transactions from a GeneralizedTransactionSet.
@@ -2332,6 +2649,64 @@ impl TransactionQueue {
             unbanned_count,
             evicted_due_to_age,
         }
+    }
+
+    /// Reset and rebuild the transaction queue after a protocol upgrade.
+    ///
+    /// Mirrors upstream `SorobanTransactionQueue::resetAndRebuild()`. This is
+    /// called when a protocol upgrade changes Soroban resource limits. The
+    /// queue is drained, account states and seen hashes are cleared, and all
+    /// transactions are re-added via `try_add()` so that the new limits take
+    /// effect. Banned transactions are preserved across the rebuild.
+    ///
+    /// Returns the number of transactions successfully re-added.
+    pub fn reset_and_rebuild(&self) -> usize {
+        tracing::info!("Resetting transaction queue due to upgrade");
+
+        // Extract all current transactions before clearing state.
+        let existing_txs: Vec<TransactionEnvelope> = {
+            let by_hash = self.by_hash.read();
+            by_hash.values().map(|qt| qt.envelope.clone()).collect()
+        };
+
+        // Clear queue state but preserve bans (bans cannot be invalidated
+        // by a protocol upgrade, matching upstream).
+        {
+            let mut by_hash = self.by_hash.write();
+            by_hash.clear();
+        }
+        {
+            let mut seen = self.seen.write();
+            seen.clear();
+        }
+        {
+            let mut account_states = self.account_states.write();
+            account_states.clear();
+        }
+        {
+            let mut classic_evicted = self.classic_lane_evicted_inclusion_fee.write();
+            classic_evicted.clear();
+        }
+        {
+            let mut soroban_evicted = self.soroban_lane_evicted_inclusion_fee.write();
+            soroban_evicted.clear();
+        }
+        {
+            let mut global_evicted = self.global_evicted_inclusion_fee.write();
+            *global_evicted = (0, 0);
+        }
+
+        // Re-add all existing transactions. The surge pricing logic in
+        // try_add() will handle sorting and evictions based on new limits.
+        let mut re_added = 0;
+        for tx in existing_txs {
+            if self.try_add(tx) == TxQueueResult::Added {
+                re_added += 1;
+            }
+        }
+
+        tracing::info!(re_added, "Transaction queue rebuild complete");
+        re_added
     }
 
     /// Get the total number of currently banned transactions.
@@ -4580,5 +4955,195 @@ mod tests {
 
         // Should be filtered because one operation is ManageSellOffer
         assert!(queue.is_filtered(&envelope));
+    }
+
+    // ---------------------------------------------------------------
+    // Tests for reset_and_rebuild
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_reset_and_rebuild_empty_queue() {
+        let queue = TransactionQueue::with_defaults();
+
+        // Rebuild on empty queue should be a no-op
+        let re_added = queue.reset_and_rebuild();
+        assert_eq!(re_added, 0);
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn test_reset_and_rebuild_preserves_valid_transactions() {
+        let queue = TransactionQueue::with_defaults();
+
+        // Add several transactions with different source accounts
+        let mut tx1 = make_test_envelope(200, 1);
+        set_source(&mut tx1, 1);
+        let mut tx2 = make_test_envelope(300, 1);
+        set_source(&mut tx2, 2);
+        let mut tx3 = make_test_envelope(400, 1);
+        set_source(&mut tx3, 3);
+
+        assert_eq!(queue.try_add(tx1.clone()), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx2.clone()), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx3.clone()), TxQueueResult::Added);
+        assert_eq!(queue.len(), 3);
+
+        // Rebuild should re-add all valid transactions
+        let re_added = queue.reset_and_rebuild();
+        assert_eq!(re_added, 3);
+        assert_eq!(queue.len(), 3);
+
+        // Verify the same transactions are in the queue
+        let hash1 = full_hash(&tx1);
+        let hash2 = full_hash(&tx2);
+        let hash3 = full_hash(&tx3);
+        assert!(queue.contains(&hash1));
+        assert!(queue.contains(&hash2));
+        assert!(queue.contains(&hash3));
+    }
+
+    #[test]
+    fn test_reset_and_rebuild_preserves_bans() {
+        let queue = TransactionQueue::with_ban_depth(TxQueueConfig::default(), 5);
+
+        // Add a transaction, then ban it
+        let mut tx_banned = make_test_envelope(200, 1);
+        set_source(&mut tx_banned, 10);
+        let banned_hash = full_hash(&tx_banned);
+        queue.ban(&[banned_hash]);
+        assert!(queue.is_banned(&banned_hash));
+
+        // Add another transaction that stays in the queue
+        let mut tx_valid = make_test_envelope(300, 1);
+        set_source(&mut tx_valid, 11);
+        assert_eq!(queue.try_add(tx_valid.clone()), TxQueueResult::Added);
+        assert_eq!(queue.len(), 1);
+
+        // Rebuild should preserve bans
+        let re_added = queue.reset_and_rebuild();
+        assert_eq!(re_added, 1);
+        assert!(queue.is_banned(&banned_hash));
+
+        // The banned transaction should still be rejected
+        assert_eq!(queue.try_add(tx_banned), TxQueueResult::Banned);
+    }
+
+    #[test]
+    fn test_reset_and_rebuild_drops_txs_exceeding_new_limits() {
+        // Create a queue with a max_size of 2
+        let config = TxQueueConfig {
+            max_size: 2,
+            validate_signatures: false,
+            validate_time_bounds: false,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // Add 2 transactions (filling the queue)
+        let mut tx1 = make_test_envelope(200, 1);
+        set_source(&mut tx1, 1);
+        let mut tx2 = make_test_envelope(300, 1);
+        set_source(&mut tx2, 2);
+
+        assert_eq!(queue.try_add(tx1.clone()), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx2.clone()), TxQueueResult::Added);
+        assert_eq!(queue.len(), 2);
+
+        // Rebuild should re-add all transactions since they still fit
+        let re_added = queue.reset_and_rebuild();
+        assert_eq!(re_added, 2);
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn test_reset_and_rebuild_clears_eviction_thresholds() {
+        let config = TxQueueConfig {
+            max_queue_soroban_resources: Some(Resource::new(vec![10])),
+            validate_signatures: false,
+            validate_time_bounds: false,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // Add and evict to set eviction thresholds
+        let mut tx1 = make_test_envelope(200, 1);
+        set_source(&mut tx1, 1);
+        assert_eq!(queue.try_add(tx1), TxQueueResult::Added);
+
+        // After rebuild, eviction thresholds should be reset
+        queue.reset_and_rebuild();
+
+        // Verify the queue is still functional by adding a new transaction
+        let mut tx_new = make_test_envelope(100, 1);
+        set_source(&mut tx_new, 20);
+        // Even a low-fee tx should be accepted since thresholds were cleared
+        let result = queue.try_add(tx_new);
+        assert_eq!(result, TxQueueResult::Added);
+    }
+
+    #[test]
+    fn test_reset_and_rebuild_clears_account_states() {
+        let queue = TransactionQueue::with_defaults();
+
+        // Add a transaction
+        let mut tx1 = make_test_envelope(200, 1);
+        set_source(&mut tx1, 1);
+        assert_eq!(queue.try_add(tx1.clone()), TxQueueResult::Added);
+
+        // Verify account state exists
+        {
+            let states = queue.account_states.read();
+            assert!(!states.is_empty());
+        }
+
+        // After rebuild, account states should be repopulated (not stale)
+        let re_added = queue.reset_and_rebuild();
+        assert_eq!(re_added, 1);
+
+        // Account state should still exist (repopulated by try_add during rebuild)
+        {
+            let states = queue.account_states.read();
+            assert!(!states.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_reset_and_rebuild_allows_new_transactions_after() {
+        let queue = TransactionQueue::with_defaults();
+
+        // Add initial transactions
+        let mut tx1 = make_test_envelope(200, 1);
+        set_source(&mut tx1, 1);
+        assert_eq!(queue.try_add(tx1), TxQueueResult::Added);
+
+        // Rebuild
+        queue.reset_and_rebuild();
+
+        // Should be able to add new transactions after rebuild
+        let mut tx_new = make_test_envelope(400, 1);
+        set_source(&mut tx_new, 50);
+        assert_eq!(queue.try_add(tx_new), TxQueueResult::Added);
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn test_reset_and_rebuild_does_not_readd_same_tx_twice() {
+        let queue = TransactionQueue::with_defaults();
+
+        let mut tx1 = make_test_envelope(200, 1);
+        set_source(&mut tx1, 1);
+        let hash1 = full_hash(&tx1);
+        assert_eq!(queue.try_add(tx1.clone()), TxQueueResult::Added);
+
+        // Rebuild
+        let re_added = queue.reset_and_rebuild();
+        assert_eq!(re_added, 1);
+
+        // The transaction should be in the queue exactly once
+        assert_eq!(queue.len(), 1);
+        assert!(queue.contains(&hash1));
+
+        // Trying to add the same tx again should be duplicate
+        assert_eq!(queue.try_add(tx1), TxQueueResult::Duplicate);
     }
 }

@@ -265,6 +265,18 @@ impl FloodGate {
         }
     }
 
+    /// Removes flood records older than the given ledger sequence.
+    ///
+    /// In upstream stellar-core, each flood record tracks the ledger it was
+    /// created in and `clearBelow(maxLedger)` removes records from ledgers
+    /// before `maxLedger`. Our Rust FloodGate uses time-based TTL instead of
+    /// ledger sequences, so this method triggers the same cleanup that would
+    /// naturally expire old entries. This is called by
+    /// [`OverlayManager::clear_ledgers_below`] on every ledger close.
+    pub fn clear_below(&self, _ledger_seq: u32) {
+        self.cleanup();
+    }
+
     /// Clears all entries from the flood gate.
     ///
     /// Use with caution - this will allow previously-seen messages to be
@@ -434,5 +446,44 @@ mod tests {
 
         assert!(!record.hash.is_zero());
         assert!(record.from_peer.is_none());
+    }
+
+    #[test]
+    fn test_clear_below_removes_expired() {
+        // Use a very short TTL so entries expire quickly
+        let gate = FloodGate::with_ttl(Duration::from_millis(10));
+
+        let hash1 = make_hash(1);
+        let hash2 = make_hash(2);
+        gate.record_seen(hash1, None);
+        gate.record_seen(hash2, None);
+
+        assert_eq!(gate.stats().seen_count, 2);
+
+        // Wait for entries to expire
+        std::thread::sleep(Duration::from_millis(20));
+
+        // clear_below triggers cleanup of expired entries
+        gate.clear_below(100);
+
+        assert_eq!(gate.stats().seen_count, 0);
+    }
+
+    #[test]
+    fn test_clear_below_preserves_recent() {
+        // Use a long TTL so entries don't expire
+        let gate = FloodGate::with_ttl(Duration::from_secs(300));
+
+        let hash1 = make_hash(1);
+        let hash2 = make_hash(2);
+        gate.record_seen(hash1, None);
+        gate.record_seen(hash2, None);
+
+        // clear_below should not remove recent entries
+        gate.clear_below(100);
+
+        assert_eq!(gate.stats().seen_count, 2);
+        assert!(gate.has_seen(&hash1));
+        assert!(gate.has_seen(&hash2));
     }
 }

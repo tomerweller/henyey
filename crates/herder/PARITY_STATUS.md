@@ -2,7 +2,7 @@
 
 **Crate**: `henyey-herder`
 **Upstream**: `.upstream-v25/src/herder/`
-**Overall Parity**: 71%
+**Overall Parity**: 74%
 **Last Updated**: 2026-02-13
 
 ## Summary
@@ -282,7 +282,7 @@ Corresponds to: `TransactionQueue.h`
 | `isFiltered()` | `is_filtered()` | Full |
 | `broadcastTx()` | `TxBroadcastManager` | Full |
 | `broadcastSome()` | `TxBroadcastManager` | Full |
-| `SorobanTransactionQueue::resetAndRebuild()` | _(not implemented)_ | None |
+| `SorobanTransactionQueue::resetAndRebuild()` | `reset_and_rebuild()` in `tx_queue.rs` | Full |
 | `SorobanTransactionQueue::getMaxQueueSizeOps()` | via config | Full |
 | `ClassicTransactionQueue::getMaxQueueSizeOps()` | via config | Full |
 | `ClassicTransactionQueue::allowTxBroadcast()` | _(not implemented)_ | None |
@@ -343,7 +343,7 @@ Corresponds to: `TxSetFrame.h`
 | `TxSetXDRFrame::sizeOpTotalForLogging()` | _(not implemented)_ | None |
 | `TxSetXDRFrame::encodedSize()` | _(not implemented)_ | None |
 | `TxSetXDRFrame::createTransactionFrames()` | _(not implemented)_ | None |
-| `TxSetXDRFrame::prepareForApply()` | _(not implemented)_ | None |
+| `TxSetXDRFrame::prepareForApply()` | `TransactionSet::prepare_for_apply()` | Full |
 | `ApplicableTxSetFrame::getTxBaseFee()` | _(not implemented)_ | None |
 | `ApplicableTxSetFrame::getPhase()` | _(not implemented)_ | None |
 | `ApplicableTxSetFrame::getPhases()` | _(not implemented)_ | None |
@@ -366,8 +366,9 @@ Corresponds to: `TxSetUtils.h`
 | `sortTxsInHashOrder()` | handled in set building | Full |
 | `sortParallelTxsInHashOrder()` | _(not implemented)_ | None |
 | `buildAccountTxQueues()` | _(not implemented)_ | None |
-| `getInvalidTxList()` | _(not implemented)_ | None |
-| `trimInvalid()` | _(not implemented)_ | None |
+| `getInvalidTxList()` | `get_invalid_tx_list()` in `tx_set_utils.rs` | Full |
+| `trimInvalid()` | `trim_invalid()` in `tx_set_utils.rs` | Full |
+| `validateTxSetXDRStructure()` | `validate_generalized_tx_set_xdr_structure()` in `tx_queue.rs` | Full |
 
 ### Upgrades (`upgrades.rs`)
 
@@ -434,11 +435,8 @@ Features not yet implemented. These ARE counted against parity %.
 | `sourceAccountPending()` | Medium | Account-level pending check |
 | `findAllAssetPairsInvolvedInPaymentLoops()` | Low | Arbitrage flood damping; flooding optimization only, does not affect consensus correctness |
 | `allowTxBroadcast()` arb damping | Low | Classic queue arbitrage filtering; flooding optimization only |
-| `resetAndRebuild()` (Soroban queue) | Medium | Config upgrade queue rebuild |
 | `ApplicableTxSetFrame` abstraction | Low | Validation done inline in `tx_set.rs`; functionally equivalent |
 | `TxSetPhaseFrame` | Medium | Phase-level abstraction for parallel support |
-| `prepareForApply()` | Medium | Wire-to-applicable tx set conversion |
-| `TxSetUtils::getInvalidTxList()` / `trimInvalid()` | Medium | Validation during tx set construction |
 | `TxSetUtils::buildAccountTxQueues()` | Low | Account-based tx ordering |
 | `recordSCPExecutionMetrics()` | Low | SCP performance metrics |
 | `recordSCPEvent()` / `recordSCPExternalizeEvent()` | Low | SCP event tracking |
@@ -538,7 +536,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 121 |
-| Gaps (None + Partial) | 49 |
+| Implemented (Full) | 126 |
+| Gaps (None + Partial) | 44 |
 | Intentional Omissions | 12 |
-| **Parity** | **121 / (121 + 49) = 71%** |
+| **Parity** | **126 / (126 + 44) = 74%** |

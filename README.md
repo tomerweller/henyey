@@ -202,7 +202,7 @@ henyey/
 | Crate | Purpose | Parity |
 |-------|---------|--------|
 | [`henyey-scp`](crates/henyey-scp/README.md) | Stellar Consensus Protocol: nomination, balloting, quorum logic | [100%](crates/henyey-scp/PARITY_STATUS.md) |
-| [`henyey-herder`](crates/henyey-herder/README.md) | Consensus coordination, transaction queue, ledger close triggers | [71%](crates/henyey-herder/PARITY_STATUS.md) |
+| [`henyey-herder`](crates/henyey-herder/README.md) | Consensus coordination, transaction queue, ledger close triggers | [74%](crates/henyey-herder/PARITY_STATUS.md) |
 | [`henyey-overlay`](crates/henyey-overlay/README.md) | P2P overlay network, peer management, message flooding | [83%](crates/henyey-overlay/PARITY_STATUS.md) |
 
 ### Execution Layer
@@ -217,7 +217,7 @@ henyey/
 
 | Crate | Purpose | Parity |
 |-------|---------|--------|
-| [`henyey-history`](crates/henyey-history/README.md) | History archive I/O, catchup, replay, verification | [74%](crates/henyey-history/PARITY_STATUS.md) |
+| [`henyey-history`](crates/henyey-history/README.md) | History archive I/O, catchup, replay, verification | [76%](crates/henyey-history/PARITY_STATUS.md) |
 | [`henyey-historywork`](crates/henyey-historywork/README.md) | History work scheduling, publish/catchup task management | [56%](crates/henyey-historywork/PARITY_STATUS.md) |
 
 ### Utilities
