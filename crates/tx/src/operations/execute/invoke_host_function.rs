@@ -4,11 +4,10 @@
 //! which executes Soroban smart contract functions.
 
 use stellar_xdr::curr::{
-    AccountId, ContractEvent, DiagnosticEvent, Hash,
-    InvokeHostFunctionOp, InvokeHostFunctionResult, InvokeHostFunctionResultCode,
-    InvokeHostFunctionSuccessPreImage, LedgerEntry, LedgerKey, Limits,
-    OperationResult, OperationResultTr, ScVal, SorobanTransactionData, SorobanTransactionDataExt,
-    TtlEntry, WriteXdr,
+    AccountId, ContractEvent, DiagnosticEvent, Hash, InvokeHostFunctionOp,
+    InvokeHostFunctionResult, InvokeHostFunctionResultCode, InvokeHostFunctionSuccessPreImage,
+    LedgerEntry, LedgerKey, Limits, OperationResult, OperationResultTr, ScVal,
+    SorobanTransactionData, SorobanTransactionDataExt, TtlEntry, WriteXdr,
 };
 
 use henyey_common::protocol::{protocol_version_is_before, ProtocolVersion};
@@ -1353,6 +1352,9 @@ mod tests {
             resource_fee: 0,
         };
 
+        let module_cache = PersistentModuleCache::new_for_protocol(context.protocol_version)
+            .expect("create module cache");
+
         let result = execute_invoke_host_function(
             &op,
             &source,
@@ -1360,7 +1362,7 @@ mod tests {
             &context,
             Some(&soroban_data),
             &config,
-            None,
+            Some(&module_cache),
             None,
         )
         .expect("invoke host function");
