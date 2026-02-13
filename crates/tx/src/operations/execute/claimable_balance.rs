@@ -6,16 +6,16 @@
 use std::collections::HashSet;
 
 use stellar_xdr::curr::{
-    AccountFlags, AccountId, Asset, ClaimClaimableBalanceOp,
-    ClaimClaimableBalanceResult, ClaimClaimableBalanceResultCode, ClaimPredicate,
-    ClaimableBalanceEntry, ClaimableBalanceEntryExt, ClaimableBalanceEntryExtensionV1,
+    AccountFlags, AccountId, Asset, ClaimClaimableBalanceOp, ClaimClaimableBalanceResult,
+    ClaimClaimableBalanceResultCode, ClaimPredicate, ClaimableBalanceEntry,
+    ClaimableBalanceEntryExt, ClaimableBalanceEntryExtensionV1,
     ClaimableBalanceEntryExtensionV1Ext, ClaimableBalanceFlags, ClaimableBalanceId, Claimant,
     CreateClaimableBalanceOp, CreateClaimableBalanceResult, CreateClaimableBalanceResultCode, Hash,
     HashIdPreimage, HashIdPreimageOperationId, LedgerKey, LedgerKeyClaimableBalance,
     OperationResult, OperationResultTr, SequenceNumber,
 };
 
-use super::{account_liabilities, is_trustline_authorized};
+use super::{account_liabilities, is_trustline_authorized, trustline_liabilities};
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
@@ -304,15 +304,25 @@ pub fn execute_claim_claimable_balance(
         ));
     }
 
-    // Transfer the balance
+    // Transfer the balance.
+    // All balance checks use the overflow-safe pattern from stellar-core's
+    // addBalance (types.cpp): instead of `balance + delta > maxBalance` (which
+    // can overflow i64), check `maxBalance - balance < delta` (safe because
+    // maxBalance >= balance >= 0).
     match &entry.asset {
         Asset::Native => {
             if let Some(account) = state.get_account_mut(source) {
-                let max_receive = i64::MAX - account.balance;
-                if entry.amount > max_receive {
+                // Overflow-safe: equivalent to balance + amount > INT64_MAX
+                if i64::MAX - account.balance < entry.amount {
                     return Ok(make_claim_result(ClaimClaimableBalanceResultCode::LineFull));
                 }
-                account.balance += entry.amount;
+                let new_balance = account.balance + entry.amount;
+                // Check buying liabilities: newBalance > INT64_MAX - buyingLiabilities
+                let buying_liabilities = account_liabilities(account).buying;
+                if new_balance > i64::MAX - buying_liabilities {
+                    return Ok(make_claim_result(ClaimClaimableBalanceResultCode::LineFull));
+                }
+                account.balance = new_balance;
             }
         }
         _ => {
@@ -337,13 +347,24 @@ pub fn execute_claim_claimable_balance(
                                 ClaimClaimableBalanceResultCode::NotAuthorized,
                             ));
                         }
-                        // Check trustline limit
-                        if tl.balance + entry.amount > tl.limit {
+                        // Overflow-safe trustline limit check:
+                        // equivalent to balance + amount > limit, but avoids i64 overflow.
+                        // Safe because limit >= balance >= 0.
+                        if tl.limit - tl.balance < entry.amount {
                             return Ok(make_claim_result(
                                 ClaimClaimableBalanceResultCode::LineFull,
                             ));
                         }
-                        tl.balance += entry.amount;
+                        // At this point balance + amount <= limit, so no overflow.
+                        let new_balance = tl.balance + entry.amount;
+                        // Check buying liabilities: newBalance > limit - buyingLiabilities
+                        let buying_liabilities = trustline_liabilities(tl).buying;
+                        if new_balance > tl.limit - buying_liabilities {
+                            return Ok(make_claim_result(
+                                ClaimClaimableBalanceResultCode::LineFull,
+                            ));
+                        }
+                        tl.balance = new_balance;
                     }
                     None => {
                         return Ok(make_claim_result(ClaimClaimableBalanceResultCode::NoTrust));
@@ -518,8 +539,8 @@ fn make_claim_result(code: ClaimClaimableBalanceResultCode) -> OperationResult {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::AUTHORIZED_FLAG;
+    use super::*;
     use stellar_xdr::curr::*;
 
     fn create_test_account_id(seed: u8) -> AccountId {
@@ -1687,6 +1708,212 @@ mod tests {
         // Verify claimant trustline balance increased
         let claimant_trustline = state.get_trustline(&claimant_id, &asset).unwrap();
         assert_eq!(claimant_trustline.balance, 50_000);
+    }
+
+    /// Regression test for mainnet ledger 61212818: ClaimClaimableBalance
+    /// incorrectly returns Success when it should return LineFull because the
+    /// trustline's buying liabilities reduce the available room below the claim
+    /// amount. The basic `balance + amount <= limit` check passes, but
+    /// `balance + amount > limit - buyingLiabilities` should fail.
+    ///
+    /// TX hash: a56598544e7e5af878d2b88012bfa6c418a9a780fbd6aa1b271a6cb7653f6dd8
+    #[test]
+    fn test_claim_claimable_balance_line_full_with_buying_liabilities() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(80);
+        let claimant_id = create_test_account_id(81);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+        state.create_account(create_test_account(claimant_id.clone(), 100_000_000));
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+            issuer: issuer_id.clone(),
+        });
+
+        // Trustline with balance=500, limit=1000, buyingLiabilities=400.
+        // Basic check: 500 + 200 = 700 <= 1000 -> PASS (incorrect without liabilities)
+        // With liabilities: 500 + 200 = 700 > 1000 - 400 = 600 -> FAIL (LineFull)
+        let trustline = TrustLineEntry {
+            account_id: claimant_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            balance: 500,
+            limit: 1_000,
+            flags: AUTHORIZED_FLAG,
+            ext: TrustLineEntryExt::V1(TrustLineEntryV1 {
+                liabilities: Liabilities {
+                    buying: 400,
+                    selling: 0,
+                },
+                ext: TrustLineEntryV1Ext::V0,
+            }),
+        };
+        state.create_trustline(trustline);
+        state.get_account_mut(&claimant_id).unwrap().num_sub_entries += 1;
+
+        let claimants = vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+            destination: claimant_id.clone(),
+            predicate: ClaimPredicate::Unconditional,
+        })];
+        let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([81u8; 32]));
+        let entry = ClaimableBalanceEntry {
+            balance_id: balance_id.clone(),
+            claimants: claimants.try_into().unwrap(),
+            asset,
+            amount: 200,
+            ext: ClaimableBalanceEntryExt::V0,
+        };
+        state.create_claimable_balance(entry);
+
+        let op = ClaimClaimableBalanceOp { balance_id };
+        let result =
+            execute_claim_claimable_balance(&op, &claimant_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ClaimClaimableBalance(r)) => {
+                assert!(
+                    matches!(r, ClaimClaimableBalanceResult::LineFull),
+                    "Expected LineFull due to buying liabilities, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    /// Test that ClaimClaimableBalance returns LineFull for native assets when
+    /// buying liabilities reduce available room. Mirrors stellar-core's
+    /// addBalance check: newBalance > INT64_MAX - buyingLiabilities.
+    #[test]
+    fn test_claim_claimable_balance_native_line_full_with_buying_liabilities() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let claimant_id = create_test_account_id(82);
+        let mut account = create_test_account(claimant_id.clone(), i64::MAX - 1000);
+        // Set buying liabilities so that balance + amount > MAX - buyingLiabilities
+        account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+            liabilities: Liabilities {
+                buying: 500,
+                selling: 0,
+            },
+            ext: AccountEntryExtensionV1Ext::V0,
+        });
+        state.create_account(account);
+
+        let claimants = vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+            destination: claimant_id.clone(),
+            predicate: ClaimPredicate::Unconditional,
+        })];
+        let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([82u8; 32]));
+        let entry = ClaimableBalanceEntry {
+            balance_id: balance_id.clone(),
+            claimants: claimants.try_into().unwrap(),
+            asset: Asset::Native,
+            amount: 600, // balance + 600 = MAX - 400; MAX - 400 > MAX - 500 -> LineFull
+            ext: ClaimableBalanceEntryExt::V0,
+        };
+        state.create_claimable_balance(entry);
+
+        let op = ClaimClaimableBalanceOp { balance_id };
+        let result =
+            execute_claim_claimable_balance(&op, &claimant_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ClaimClaimableBalance(r)) => {
+                assert!(
+                    matches!(r, ClaimClaimableBalanceResult::LineFull),
+                    "Expected LineFull due to native buying liabilities, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    /// Regression test for mainnet ledger 61212818: ClaimClaimableBalance must
+    /// return LineFull when trustline balance + claim amount overflows i64.
+    /// Previously, the check `tl.balance + entry.amount > tl.limit` silently
+    /// wrapped around in release mode, producing a negative result that passed
+    /// the limit check, corrupting the trustline balance.
+    ///
+    /// The overflow-safe pattern (from stellar-core's addBalance in types.cpp)
+    /// is: `tl.limit - tl.balance < entry.amount`.
+    #[test]
+    fn test_claim_claimable_balance_line_full_i64_overflow() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(90);
+        let claimant_id = create_test_account_id(91);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+        state.create_account(create_test_account(claimant_id.clone(), 100_000_000));
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+            issuer: issuer_id.clone(),
+        });
+
+        // Trustline with large existing balance (9e18) and high limit (MAX).
+        // Claim amount is 9.1138e18 — sum overflows i64::MAX (9.22e18).
+        let trustline = TrustLineEntry {
+            account_id: claimant_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            balance: 9_000_000_000_002_000_000, // ~9e18
+            limit: i64::MAX,                    // 9,223,372,036,854,775,807
+            flags: AUTHORIZED_FLAG,
+            ext: TrustLineEntryExt::V0,
+        };
+        state.create_trustline(trustline);
+        state.get_account_mut(&claimant_id).unwrap().num_sub_entries += 1;
+
+        let claimants = vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+            destination: claimant_id.clone(),
+            predicate: ClaimPredicate::Unconditional,
+        })];
+        let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([91u8; 32]));
+        let entry = ClaimableBalanceEntry {
+            balance_id: balance_id.clone(),
+            claimants: claimants.try_into().unwrap(),
+            asset,
+            amount: 9_113_800_000_000_000_000, // ~9.1138e18 — sum overflows i64
+            ext: ClaimableBalanceEntryExt::V0,
+        };
+        state.create_claimable_balance(entry);
+
+        let op = ClaimClaimableBalanceOp { balance_id };
+        let result =
+            execute_claim_claimable_balance(&op, &claimant_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ClaimClaimableBalance(r)) => {
+                assert!(
+                    matches!(r, ClaimClaimableBalanceResult::LineFull),
+                    "Expected LineFull due to i64 overflow, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+
+        // Verify trustline balance was NOT corrupted
+        let tl = state
+            .get_trustline(
+                &claimant_id,
+                &Asset::CreditAlphanum4(AlphaNum4 {
+                    asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                    issuer: issuer_id.clone(),
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            tl.balance, 9_000_000_000_002_000_000,
+            "trustline balance should be unchanged"
+        );
     }
 
     /// Regression test for mainnet ledger 59501891: two ClaimClaimableBalance
