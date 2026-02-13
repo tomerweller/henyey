@@ -5784,7 +5784,7 @@ impl App {
             .herder
             .cleanup_old_pending_tx_sets(current_ledger as u64 + 1);
         if stale_cleared > 0 {
-            tracing::info!(
+            tracing::debug!(
                 stale_cleared,
                 current_ledger,
                 "Cleared stale pending tx_set requests for already-closed slots"
@@ -8227,7 +8227,7 @@ impl App {
                         dont_have.entry(*hash).or_insert_with(HashSet::new);
                     let already_exhausted = dont_have_set.len() >= peers.len();
                     if !already_exhausted {
-                        tracing::warn!(
+                        tracing::debug!(
                             hash = %hash,
                             elapsed_secs = request_age.as_secs(),
                             peers_responded = dont_have_set.len(),
@@ -8292,7 +8292,7 @@ impl App {
             let mut exhausted_warned = self.tx_set_exhausted_warned.write().await;
             for (hash, peers_asked, total_peers) in &newly_exhausted {
                 if exhausted_warned.insert(*hash) {
-                    tracing::warn!(
+                    tracing::info!(
                         hash = %hash,
                         peers_asked,
                         total_peers,

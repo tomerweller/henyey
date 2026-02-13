@@ -408,7 +408,7 @@ impl ScpDriver {
         let count = self.pending_tx_sets.len();
         self.pending_tx_sets.clear();
         if count > 0 {
-            info!(cleared = count, "Cleared stale pending tx_set requests");
+            debug!(cleared = count, "Cleared stale pending tx_set requests");
         }
     }
 
