@@ -194,7 +194,7 @@ Corresponds to: `Peer.h`, `TCPPeer.h`
 | `getPeerID()` | `id()` | Full |
 | `toString()` | `Display` impl | Full |
 | `getJsonInfo()` | N/A | None |
-| `handleMaxTxSizeIncrease()` | N/A | None |
+| `handleMaxTxSizeIncrease()` | `OverlayManager::handle_max_tx_size_increase()` | Full |
 | `pingPeer()` | N/A | None |
 | `maybeProcessPingResponse()` | N/A | None |
 | `startRecurrentTimer()` | 5s check in `run_peer_loop()` | Full |
@@ -493,7 +493,6 @@ Features not yet implemented. These ARE counted against parity %.
 |------------------------|----------|-------|
 | `Peer::pingPeer()` / `maybeProcessPingResponse()` | Medium | Ping/pong for connection liveness |
 | `Peer::getJsonInfo()` | Low | JSON info for admin API |
-| `Peer::handleMaxTxSizeIncrease()` | Medium | Protocol upgrade handling |
 | `Peer::process()` (query throttle) | Low | Rate limiting GetTxSet/GetQuorumSet |
 | `CapacityTrackedMessage` (RAII tracker) | Medium | Automatic capacity release on drop |
 | `OverlayManagerImpl::tick()` | Low | Idle/straggler timeout now in `run_peer_loop()`; connect in connector task; remaining: cleanupPeers, random peer drop |
@@ -597,7 +596,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 251 |
-| Gaps (None + Partial) | 51 |
+| Implemented (Full) | 252 |
+| Gaps (None + Partial) | 50 |
 | Intentional Omissions | 10 |
-| **Parity** | **251 / (251 + 51) = 83%** |
+| **Parity** | **252 / (252 + 50) = 83%** |

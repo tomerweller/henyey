@@ -2,7 +2,7 @@
 
 **Crate**: `henyey-common`
 **Upstream**: `.upstream-v25/src/util/`
-**Overall Parity**: 93%
+**Overall Parity**: 95%
 **Last Updated**: 2026-02-13
 
 ## Summary
@@ -12,7 +12,7 @@
 | Protocol Version | Full | All constants and comparisons match |
 | Types / Hash | Full | Hash256, asset validation, balance ops |
 | Numeric (64-bit) | Full | bigDivide, saturating ops, sqrt |
-| Numeric (128-bit) | Partial | hugeDivide not implemented |
+| Numeric (128-bit) | Full | hugeDivide inlined in henyey-tx |
 | Resource Accounting | Full | All Resource methods and friends |
 | Metadata Normalization | Full | Sorting matches stellar-core exactly |
 | XDR Output Stream | Full | writeOne with size-prefix framing |
@@ -129,7 +129,7 @@ Corresponds to: `numeric.h`, `numeric128.h`
 | `bigDivideOrThrow128()` | `big_divide_128()` (returns Result) | Full |
 | `bigMultiplyUnsigned()` | `big_multiply_unsigned()` | Full |
 | `bigMultiply()` | `big_multiply()` | Full |
-| `hugeDivide()` | -- | None |
+| `hugeDivide()` | Inlined in `exchange_with_pool()` (`henyey-tx`) | Full |
 
 ### resource (`resource.rs`)
 
@@ -242,7 +242,6 @@ Features not yet implemented. These ARE counted against parity %.
 
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
-| `hugeDivide()` (numeric128.h) | Medium | 128-bit divide with int32 numerator; used in offer processing |
 | `XDRInputFileStream::readOne()` | Medium | Needed for history archive replay and bucket reading |
 | `XDRInputFileStream::readPage()` | Low | Page-based reading with key search; optimization |
 | `XDRInputFileStream::getXDRSize()` | Low | Static helper for reading XDR size headers |
@@ -304,13 +303,13 @@ Features not yet implemented. These ARE counted against parity %.
 
 - **Metadata normalization**: No dedicated unit tests in `meta.rs`; upstream has no dedicated test file either, but parity is verified through integration testing.
 - **XDR input streaming**: Not tested because not implemented.
-- **hugeDivide**: Not tested because not implemented.
+- **hugeDivide**: Algorithm inlined in `henyey-tx` `exchange_with_pool()`; tested via offer exchange tests.
 
 ## Parity Calculation
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 72 |
-| Gaps (None + Partial) | 5 |
+| Implemented (Full) | 73 |
+| Gaps (None + Partial) | 4 |
 | Intentional Omissions | 35 |
-| **Parity** | **72 / (72 + 5) = 93%** |
+| **Parity** | **73 / (73 + 4) = 95%** |

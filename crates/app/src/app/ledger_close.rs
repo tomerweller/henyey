@@ -1093,6 +1093,24 @@ impl App {
             }
         }
 
+        // Notify peers if max tx size increased due to a protocol upgrade.
+        // Mirrors upstream HerderImpl::maybeHandleUpgrade().
+        {
+            let soroban_tx_max = self
+                .soroban_network_info()
+                .map(|info| info.tx_max_size_bytes);
+            let new_max = compute_max_tx_size(result.header.ledger_version, soroban_tx_max);
+            let old_max = self.max_tx_size_bytes.load(Ordering::Relaxed);
+            let diff = new_max.saturating_sub(old_max);
+            self.max_tx_size_bytes.store(new_max, Ordering::Relaxed);
+            if diff > 0 {
+                let overlay = self.overlay.lock().await;
+                if let Some(overlay) = overlay.as_ref() {
+                    overlay.handle_max_tx_size_increase(diff).await;
+                }
+            }
+        }
+
         // Clean up old survey rate limiter entries.
         // Mirrors upstream SurveyManager::clearOldLedgers() called from clearLedgersBelow().
         {

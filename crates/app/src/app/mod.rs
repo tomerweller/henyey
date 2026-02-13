@@ -43,7 +43,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -63,6 +63,7 @@ use henyey_db::queries::StateQueries;
 use henyey_db::schema::state_keys;
 use henyey_herder::{
     drift_tracker::CloseTimeDriftTracker,
+    flow_control::compute_max_tx_size,
     sync_recovery::{SyncRecoveryCallback, SyncRecoveryHandle, SyncRecoveryManager},
     EnvelopeState, Herder, HerderCallback, HerderConfig, HerderStats, TxQueueConfig,
 };
@@ -434,6 +435,9 @@ pub struct App {
 
     /// Total number of times the node lost sync.
     lost_sync_count: AtomicU64,
+    /// Current max tx size in bytes for flow control (tracks upgrades).
+    /// Mirrors upstream `mMaxTxSize` in HerderImpl.
+    max_tx_size_bytes: AtomicU32,
     /// Monotonic counter used for ping IDs.
     ping_counter: AtomicU64,
     /// In-flight ping requests keyed by hash.
@@ -940,6 +944,7 @@ impl App {
             is_applying_ledger: AtomicBool::new(false),
             sync_recovery_pending: AtomicBool::new(false),
             lost_sync_count: AtomicU64::new(0),
+            max_tx_size_bytes: AtomicU32::new(henyey_herder::flow_control::MAX_CLASSIC_TX_SIZE_BYTES),
             ping_counter: AtomicU64::new(0),
             ping_inflight: RwLock::new(HashMap::new()),
             peer_ping_inflight: RwLock::new(HashMap::new()),

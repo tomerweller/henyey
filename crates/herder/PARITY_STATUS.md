@@ -2,7 +2,7 @@
 
 **Crate**: `henyey-herder`
 **Upstream**: `.upstream-v25/src/herder/`
-**Overall Parity**: 74%
+**Overall Parity**: 77%
 **Last Updated**: 2026-02-13
 
 ## Summary
@@ -82,11 +82,11 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `isNewerNominationOrBallotSt()` | _(not implemented)_ | None |
 | `getMostRecentCheckpointSeq()` | `get_most_recent_checkpoint_seq()` | Full |
 | `triggerNextLedger()` | `trigger_next_ledger()` | Full |
-| `setInSyncAndTriggerNextLedger()` | _(not implemented)_ | None |
+| `setInSyncAndTriggerNextLedger()` | `trigger_next_ledger()` | Full |
 | `resolveNodeID()` | _(not implemented)_ | None |
 | `setUpgrades()` | _(not implemented)_ | None |
 | `getUpgradesJson()` | _(not implemented)_ | None |
-| `forceSCPStateIntoSyncWithLastClosedLedger()` | _(not implemented)_ | None |
+| `forceSCPStateIntoSyncWithLastClosedLedger()` | `force_externalize()` | Full |
 | `makeStellarValue()` | `scp_driver.make_stellar_value()` | Full |
 | `getJsonInfo()` | `json_api.rs` structures | Partial |
 | `getJsonQuorumInfo()` | `json_api.rs` structures | Partial |
@@ -94,13 +94,13 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `getCurrentlyTrackedQuorum()` | `quorum_tracker.quorum_map()` | Full |
 | `getMaxQueueSizeOps()` | `max_queue_size_ops()` | Full |
 | `getMaxQueueSizeSorobanOps()` | _(not implemented)_ | None |
-| `maybeHandleUpgrade()` | _(not implemented)_ | None |
+| `maybeHandleUpgrade()` | Post-close upgrade check in `henyey-app` | Full |
 | `isBannedTx()` | `tx_queue.is_banned()` | Full |
 | `getTx()` | `tx_queue.get_tx()` | Full |
 | `processExternalized()` | handled in `receive_scp_envelope()` | Full |
 | `valueExternalized()` | handled in `receive_scp_envelope()` | Full |
 | `emitEnvelope()` | handled by `ScpDriver` | Full |
-| `lostSync()` | _(not implemented)_ | None |
+| `lostSync()` | `SyncRecoveryManager::record_lost_sync()` | Full |
 | `checkCloseTime()` | `check_envelope_close_time()` | Full |
 | `ctValidityOffset()` | _(not implemented)_ | None |
 | `setupTriggerNextLedger()` | _(not implemented)_ | None |
@@ -109,7 +109,7 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `broadcast()` | `TxBroadcastManager` | Full |
 | `processSCPQueue()` | pending envelope release | Full |
 | `updateTransactionQueue()` | handled in `ledger_closed()` | Full |
-| `maybeSetupSorobanQueue()` | _(not implemented)_ | None |
+| `maybeSetupSorobanQueue()` | Integrated via lane-based `TransactionQueue` | Full |
 | `herderOutOfSync()` | `SyncRecoveryManager` | Full |
 | `getMoreSCPState()` | _(not implemented)_ | None |
 | `persistSCPState()` | `ScpPersistenceManager.persist()` | Full |
@@ -450,16 +450,12 @@ Features not yet implemented. These ARE counted against parity %.
 | `isNewerNominationOrBallotSt()` | Medium | Envelope dedup optimization |
 | `resolveNodeID()` | Low | Config-based node name lookup |
 | `setUpgrades()` / `getUpgradesJson()` | Medium | Admin API for upgrade scheduling |
-| `forceSCPStateIntoSyncWithLastClosedLedger()` | Medium | Force sync after catchup |
 | `getMinLedgerSeqToRemember()` | Low | Memory management hint |
-| `setInSyncAndTriggerNextLedger()` | Medium | Combined sync+trigger |
 | `checkAndMaybeReanalyzeQuorumMap()` | Low | Background quorum analysis |
 | `persistUpgrades()` / `restoreUpgrades()` | Low | Upgrade parameters persisted via Serde; functionally equivalent |
 | `getMoreSCPState()` | Low | Peer SCP state request |
 | `recomputeKeysToFilter()` | Low | Soroban footprint filtering |
-| `maybeHandleUpgrade()` | Medium | Post-close upgrade handling |
 | `getMaxQueueSizeSorobanOps()` | Low | Soroban queue sizing |
-| `lostSync()` | Medium | Sync loss handling |
 | `ctValidityOffset()` | Low | Close time offset computation |
 | PendingEnvelopes cost tracking (4 methods) | Low | Per-validator cost analysis |
 | `HerderPersistence::getNodeQuorumSet()` | Low | Node-level quorum set lookup |
@@ -472,7 +468,6 @@ Features not yet implemented. These ARE counted against parity %.
 | `visitTopTxs()` with custom limits | Low | TxQueueLimiter custom limits |
 | `getTotalResourcesToFlood()` | Low | Flood resource tracking |
 | `stateChanged()` | Low | SCP state change callback |
-| `maybeSetupSorobanQueue()` | Medium | Soroban queue initialization |
 | `startTxSetGCTimer()` | Low | Tx set garbage collection |
 
 ## Architectural Differences
@@ -536,7 +531,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 126 |
-| Gaps (None + Partial) | 44 |
+| Implemented (Full) | 131 |
+| Gaps (None + Partial) | 39 |
 | Intentional Omissions | 12 |
-| **Parity** | **126 / (126 + 44) = 74%** |
+| **Parity** | **131 / (131 + 39) = 77%** |

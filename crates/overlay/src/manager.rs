@@ -1379,6 +1379,46 @@ impl OverlayManager {
         trace!(ledger_seq, "Cleared overlay state below ledger");
     }
 
+    /// Notify all connected peers that the maximum transaction size has
+    /// increased due to a protocol upgrade.
+    ///
+    /// Mirrors upstream `Peer::handleMaxTxSizeIncrease()` which updates
+    /// flow control byte capacity and sends `SEND_MORE_EXTENDED` with the
+    /// additional bytes so the remote peer can unblock.
+    pub async fn handle_max_tx_size_increase(&self, increase: u32) {
+        if increase == 0 {
+            return;
+        }
+
+        // Collect peers first to avoid holding DashMap iterator across await.
+        let peers: Vec<(PeerId, Arc<TokioMutex<Peer>>)> = self
+            .peers
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+
+        for (peer_id, peer) in peers {
+            let mut peer_lock = peer.lock().await;
+            if peer_lock.is_connected() {
+                // Send SEND_MORE_EXTENDED with 0 additional messages but
+                // `increase` additional bytes, matching upstream behavior.
+                if let Err(e) = peer_lock.send_more_extended(0, increase).await {
+                    debug!(
+                        %peer_id,
+                        increase,
+                        "Failed to send max tx size increase: {}", e
+                    );
+                }
+            }
+        }
+
+        debug!(
+            increase,
+            peers = self.peer_count(),
+            "Notified peers of max tx size increase"
+        );
+    }
+
     /// Check if the overlay is running.
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
