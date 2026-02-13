@@ -1,185 +1,224 @@
-## stellar-core Parity Status
+# stellar-core Parity Status
 
-**Overall Parity: ~88%**
+**Crate**: `henyey`
+**Upstream**: `.upstream-v25/src/main/` (CLI subset only)
+**Overall Parity**: 61%
+**Last Updated**: 2026-02-13
 
-This section documents the feature parity between this Rust implementation and the stellar-core (v25).
+## Summary
 
-### Implemented
-
-#### CLI Commands
-
-| Command | Status | Notes |
-|---------|--------|-------|
-| `run` | Implemented | Supports watcher/validator/full modes, force-catchup, --wait-for-consensus equivalent |
-| `catchup` | Implemented | Supports minimal/complete/recent modes, parallelism, --no-verify |
-| `new-db` | Implemented | Database creation with --force overwrite |
-| `upgrade-db` | Implemented | Database schema upgrades |
-| `new-keypair` / `gen-seed` | Implemented | Keypair generation |
-| `info` | Implemented | Includes offline fallback output if app init fails (no separate `offline-info`) |
-| `verify-history` | Implemented | History archive verification (HAS, headers, tx sets, results, SCP) |
-| `publish` / `publish-history` | Implemented | History publishing (local paths and remote via put commands) |
-| `check-quorum-intersection` | Implemented | Quorum intersection checking from JSON (v1 algorithm) |
-| `sample-config` | Implemented | Configuration template generation |
-| `convert-id` / `convert-key` | Implemented | Key format conversion (strkey/hex) |
-| `decode-xdr` | Implemented | Base64 input only; partial `print-xdr` parity for LedgerHeader, TransactionEnvelope, TransactionResult |
-| `encode-xdr` | Implemented | Encodes AccountId, MuxedAccount, Asset, Hash, Uint256, LedgerHeader, TransactionEnvelope, TransactionResult (covers `encode-asset`) |
-| `sign-transaction` | Implemented | Add signature to transaction envelope |
-| `sec-to-pub` | Implemented | Print public key from secret key (stdin) |
-| `http-command` | Implemented | Send HTTP command to running node |
-| `bucket-info` | Implemented | Basic bucket info (not full per-account aggregation) |
-| `dump-ledger` | Implemented | Dump ledger entries to JSON with type/limit filtering |
-| `self-check` | Implemented | Header chain, bucket hash verification, crypto benchmarking |
-| `verify-checkpoints` | Implemented | Write verified checkpoint ledger hashes to file |
-
-#### Offline Tools (Unique to Rust)
-
-| Tool | Status | Notes |
+| Area | Status | Notes |
 |------|--------|-------|
-| `replay-bucket-list` | Implemented | Validates bucket list against CDP metadata |
-| `verify-execution` | Implemented | Compares transaction execution against CDP |
-| `debug-bucket-entry` | Implemented | Inspects specific entries in bucket list |
-| `header_compare` (binary) | Implemented | Compares ledger headers between DB and archive |
+| CLI Entrypoint / Dispatch | Full | `main()` + `handleCommandLine()` via clap |
+| Node Operation (`run`) | Full | Watcher/validator/full modes |
+| Catchup (`catchup`) | Full | Minimal/complete/recent modes, parallelism |
+| Database Commands | Full | `new-db`, `upgrade-db` |
+| History Publish (`publish`) | Full | Local and remote (put command) archives |
+| History Verification | Full | `verify-checkpoints`, `verify-history` |
+| Key/Crypto Utilities | Full | `gen-seed`, `convert-id`, `sec-to-pub`, `sign-transaction` |
+| HTTP Command | Full | `http-command` to local node |
+| Self-Check | Full | Header chain, bucket hash, crypto benchmark |
+| Quorum Intersection | Partial | V1 brute-force only; V2 SAT-solver not implemented |
+| XDR Tools | Partial | `decode-xdr`/`encode-xdr` cover limited types; `dump-xdr` not implemented |
+| Diagnostic CLI Commands | None | `diag-bucket-stats`, `merge-bucketlist`, `dump-archival-stats` etc. |
+| Settings Upgrade Transactions | None | `get-settings-upgrade-txs` not implemented |
 
-These CDP-based verification tools are unique to the Rust implementation and provide valuable parity testing capabilities against stellar-core production data.
+## File Mapping
 
-#### HTTP API Endpoints
+| stellar-core File | Rust Module | Notes |
+|--------------------|-------------|-------|
+| `CommandLine.h` / `CommandLine.cpp` | `main.rs` | CLI commands and argument parsing |
+| `main.cpp` | `main.rs` | Process entrypoint, initialization |
+| `StellarCoreVersion.h` | `main.rs` (via `clap` version) | Version string |
+| `dumpxdr.h` / `dumpxdr.cpp` | `main.rs` (`decode_xdr`, `encode_xdr`, `sign_transaction`, `sec_to_pub`) | Partial coverage |
 
-| Endpoint | Status | Notes |
-|----------|--------|-------|
-| `/` | Implemented | API overview |
-| `/info` | Implemented | Node information |
-| `/status` | Implemented | Node status summary |
-| `/metrics` | Implemented | Prometheus metrics |
-| `/peers` | Implemented | Connected peers list |
-| `/connect` | Implemented | Connect to peer |
-| `/droppeer` | Implemented | Disconnect peer (with ban option) |
-| `/bans` | Implemented | List banned peers |
-| `/unban` | Implemented | Remove peer from ban list |
-| `/ledger` | Implemented | Current ledger info |
-| `/upgrades` | Implemented | Upgrade settings |
-| `/self-check` | Implemented | Ledger self-check (online mode only) |
-| `/quorum` | Implemented | Quorum set summary |
-| `/scp` | Implemented | SCP slot summary |
-| `/tx` | Implemented | Transaction submission |
-| `/shutdown` | Implemented | Graceful shutdown |
-| `/health` | Implemented | Health check |
-| `/survey/start` | Implemented | Start survey collecting |
-| `/survey/stop` | Implemented | Stop survey collecting |
-| `/survey/topology` | Implemented | Survey topology request |
-| `/survey` | Implemented | Survey report data |
-| `/survey/reporting/stop` | Implemented | Stop survey reporting |
-| `/ll` | Implemented | Dynamic log level changes via tracing-subscriber reload layer |
-| `/sorobaninfo` | Implemented | Soroban network configuration (basic format) |
-| `/manualclose` | Implemented | Manual ledger close (requires is_validator and manual_close config) |
-| `/clearmetrics` | Implemented | Logs request; Prometheus metrics don't support clearing |
-| `/logrotate` | Implemented | Logs request; actual rotation depends on logging backend |
-| `/maintenance` | Implemented | Manual database maintenance (cleans old SCP/ledger history) |
-| `/dumpproposedsettings` | Implemented | Returns ConfigUpgradeSet from ledger |
+## Component Mapping
 
-#### Core Subsystems
+### CLI Entrypoint (`main.rs`)
 
-| Subsystem | Rust Crate | Status | Notes |
-|-----------|------------|--------|-------|
-| Bucket List | `henyey-bucket` | Implemented | Live bucket list, merges, hashes |
-| Cryptography | `henyey-crypto` | Implemented | Ed25519, SHA256, BLAKE2, key utils |
-| Database | `henyey-db` | Implemented | SQLite with ledger/tx/SCP storage |
-| Herder | `henyey-herder` | Implemented | SCP coordination, tx queue |
-| History | `henyey-history` | Implemented | Archive access, checkpoint handling |
-| Historywork | `henyey-historywork` | Implemented | Parallel downloads, work scheduling |
-| Ledger | `henyey-ledger` | Implemented | Transaction execution, state management |
-| Overlay | `henyey-overlay` | Implemented | Peer connections, message routing |
-| SCP | `henyey-scp` | Implemented | Consensus protocol |
-| Transactions | `henyey-tx` | Implemented | All classic operations, Soroban support |
-| Invariants | `stellar-core-invariant` | Implemented | Ledger invariant checking |
-| Work | `henyey-work` | Implemented | Async work scheduling |
-| Application | `henyey-app` | Implemented | App orchestration, config |
+Corresponds to: `CommandLine.h`, `main.cpp`
 
-### Not Yet Implemented (Gaps)
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `main()` | `main()` | Full |
+| `handleCommandLine()` | `main()` + clap dispatch | Full |
+| `runVersion()` | clap `--version` | Full |
+| `writeWithTextFlow()` | clap help formatting | Full |
+| `checkXDRFileIdentity()` | — | Omitted |
+| `checkStellarCoreMajorVersionProtocolIdentity()` | — | Omitted |
 
-#### CLI Commands
+### CLI Commands (`main.rs`)
 
-| Command | stellar-core Description | Priority |
-|---------|-----------------|----------|
-| `replay-debug-meta` | Apply ledgers from local debug metadata files | Low |
-| `dump-xdr` | Dump XDR file (with streaming support) | Low |
-| `dump-wasm` | Dump WASM blobs from ledger | Low |
-| `force-scp` | Force SCP flag (deprecated in stellar-core) | Low |
-| `diag-bucket-stats` | Diagnostic bucket statistics | Low |
-| `merge-bucketlist` | Write diagnostic merged bucket list | Low |
-| `dump-archival-stats` | Print state archival statistics | Low |
-| `new-hist` | Initialize history archives (create structure) | Low |
-| `report-last-history-checkpoint` | Report last checkpoint info | Low |
-| `get-settings-upgrade-txs` | Get settings upgrade transactions | Low |
-| `print-publish-queue` | Print scheduled checkpoints | Low |
+Corresponds to: `CommandLine.cpp`
 
-#### Test-Only Commands (BUILD_TESTS)
+#### Node Operation
 
-| Command | Description | Notes |
-|---------|-------------|-------|
-| `load-xdr` | Load XDR bucket file for testing | Test infrastructure |
-| `rebuild-ledger-from-buckets` | Rebuild DB from bucket list | Test infrastructure |
-| `fuzz` | Run fuzzer input | Testing |
-| `gen-fuzz` | Generate fuzzer input | Testing |
-| `test` | Execute test suite | Uses Rust test framework instead |
-| `apply-load` | Run apply time load test | Benchmarking |
-| `pregenerate-loadgen-txs` | Generate load test transactions | Benchmarking |
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `run()` | `cmd_run()` | Full |
+| `runCatchup()` | `cmd_catchup()` | Full |
+| `runNewDB()` | `cmd_new_db()` | Full |
+| `runUpgradeDB()` | `cmd_upgrade_db()` | Full |
+| `runPublish()` | `cmd_publish_history()` | Full |
+| `runOfflineInfo()` | `cmd_info()` | Full |
+| `runSelfCheck()` | `cmd_self_check()` | Full |
+| `runHttpCommand()` | `cmd_http_command()` | Full |
 
-#### HTTP API Endpoints
+#### History and Verification
 
-| Endpoint | stellar-core Description | Priority |
-|----------|-----------------|----------|
-| `/stopsurvey` | Stop survey (deprecated) | Low |
-| `/generateload` | Generate synthetic load (test) | Low |
-| `/testacc` | Test account operations (test) | Low |
-| `/testtx` | Test transaction (test) | Low |
-| `/toggleoverlayonlymode` | Toggle overlay-only mode (test) | Low |
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `runWriteVerifiedCheckpointHashes()` | `cmd_verify_checkpoints()` | Full |
+| `runCheckQuorumIntersection()` | `cmd_check_quorum_intersection()` | Partial |
+| `runReportLastHistoryCheckpoint()` | — | None |
+| `runPrintPublishQueue()` | — | None |
+| `runNewHist()` | — | None |
 
-#### Core Features
+#### Key and Crypto Utilities
 
-| Feature | stellar-core Location | Notes |
-|---------|--------------|-------|
-| Hot Archive Bucket List Updates | `bucket/HotArchiveBucket*` | Eviction-to-hot-archive requires entry lookup before deletion |
-| Catchup with trusted hash file | `--trusted-checkpoint-hashes` | Uses JSON hash file for verified catchup |
-| Complete catchup validation | `--extra-verification` | Full archive verification during catchup |
-| Metadata output stream | `--metadata-output-stream` | Stream ledger metadata to file/fd |
-| Database maintenance | `AUTOMATIC_MAINTENANCE_*` | Periodic DB cleanup for history data |
-| Tracy profiling | `USE_TRACY` | Performance profiling integration |
-| Process management | `process/` | Child process spawning for external commands |
-| Check-quorum-intersection v2 | SAT-based algorithm | V1 (brute-force) implemented, V2 (SAT-solver) not yet |
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `runGenSeed()` | `cmd_new_keypair()` | Full |
+| `runConvertId()` | `convert_key()` | Full |
+| `runSecToPub()` | `sec_to_pub()` | Full |
+| `runSignTransaction()` | `sign_transaction()` | Full |
 
-### Implementation Notes
+#### XDR and Diagnostic Tools
 
-#### Architectural Differences
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `runPrintXdr()` | `decode_xdr()` | Partial |
+| `runEncodeAsset()` | `encode_xdr()` | Full |
+| `runDumpLedger()` | `cmd_dump_ledger()` | Full |
+| `runDumpXDR()` | — | None |
+| `runDumpWasm()` | — | None |
+| `diagBucketStats()` | — | None |
+| `runMergeBucketList()` | — | None |
+| `runDumpStateArchivalStatistics()` | — | None |
 
-1. **Async Runtime**: Rust uses `tokio` for async I/O, while stellar-core uses `asio` via a virtual clock. The Rust implementation is natively async throughout.
+#### Other Commands
 
-2. **Error Handling**: Rust uses `Result<T, E>` types and the `?` operator, providing compile-time error handling guarantees that stellar-core achieves through exceptions.
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `runReplayDebugMeta()` | — | None |
+| `getSettingsUpgradeTransactions()` | — | None |
+| `runForceSCP()` | — | Omitted |
+| `runVersion()` | clap `--version` + `info` | Full |
 
-3. **Memory Safety**: Rust's ownership system eliminates the need for manual memory management patterns used in stellar-core (shared_ptr, unique_ptr).
+### Quorum Intersection (`quorum_intersection.rs`)
 
-4. **Configuration**: Both support TOML configuration files with environment variable overrides. The Rust version adds built-in testnet/mainnet defaults via `--testnet` and `--mainnet` flags.
+Corresponds to: `CommandLine.cpp` (`runCheckQuorumIntersection`)
 
-5. **Logging**: Rust uses `tracing` with structured logging, supporting both text and JSON output formats via `--log-format`.
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| V1 brute-force intersection check | `check_quorum_intersection_from_json()` | Full |
+| V2 SAT-based intersection check | — | None |
+| `--analyze-critical-groups` | — | None |
+| `--time-limit-ms` / `--memory-limit-bytes` | — | None |
+| `--result-json` output | — | None |
 
-6. **Testing**: While stellar-core uses Catch2 for testing, Rust uses the built-in test framework with `cargo test`.
+### XDR Utilities (`main.rs`)
 
-7. **CDP Integration**: The Rust implementation has extensive CDP (Crypto Data Platform) integration for offline verification against stellar-core production data, which is unique to this implementation.
+Corresponds to: `dumpxdr.h` / `dumpxdr.cpp`
 
-#### Known Limitations
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `dumpXdrStream()` | — | None |
+| `printXdr()` | `decode_xdr()` | Partial |
+| `signtxns()` | — | None |
+| `signtxn()` | `sign_transaction()` | Full |
+| `priv2pub()` | `sec_to_pub()` | Full |
+| `readFile()` | — | None |
 
-1. **Hot Archive Updates**: Hot archive bucket list updates require looking up the full entry data before deletion (for evicted entries). The eviction data in transaction meta only provides keys, not full entries. This is partially implemented.
+## Intentional Omissions
 
-2. **Full XDR Support**: The `decode-xdr` command supports a subset of XDR types (LedgerHeader, TransactionEnvelope, TransactionResult); stellar-core supports more types including TransactionMeta and bucket file streaming.
+Features excluded by design. These are NOT counted against parity %.
 
-3. **Network Simulation**: Simulation framework is out of scope for this implementation.
+| stellar-core Component | Reason |
+|------------------------|--------|
+| `checkXDRFileIdentity()` | Pure Rust implementation has no C++/Rust XDR bridge to validate |
+| `checkStellarCoreMajorVersionProtocolIdentity()` | Different versioning scheme; Rust uses Cargo.toml version |
+| `runForceSCP()` | Deprecated in stellar-core; `--wait-for-consensus` flag on `run` used instead |
+| `runLoadXDR()` (BUILD_TESTS) | Test-only; Rust test framework used instead |
+| `runRebuildLedgerFromBuckets()` (BUILD_TESTS) | Test-only infrastructure |
+| `runFuzz()` / `runGenFuzz()` (BUILD_TESTS) | Would use `cargo-fuzz` if needed |
+| `runTest()` (BUILD_TESTS) | Uses `cargo test` instead |
+| `runApplyLoad()` (BUILD_TESTS) | Benchmarking infrastructure; out of scope |
+| `runGenerateSyntheticLoad()` (BUILD_TESTS) | Test load generation; out of scope |
+| Tracy memory tracking | C++-specific profiling; Rust uses different tooling |
 
-4. **Fuzzing**: Rust would use `cargo-fuzz` or similar tools rather than stellar-core fuzzing infrastructure.
+## Gaps
 
-5. **Self-Check Offline Mode**: The full database-vs-bucketlist consistency check (offline mode) is not implemented; only the online quick check is available.
+Features not yet implemented. These ARE counted against parity %.
 
-#### Verification Status
+| stellar-core Component | Priority | Notes |
+|------------------------|----------|-------|
+| `runReplayDebugMeta()` | Low | Apply ledgers from local debug metadata files |
+| `runDumpXDR()` | Low | Stream and dump XDR files |
+| `runDumpWasm()` | Low | Dump WASM blobs from ledger state |
+| `diagBucketStats()` | Low | Per-account bucket statistics |
+| `runMergeBucketList()` | Low | Write diagnostic merged bucket list |
+| `runDumpStateArchivalStatistics()` | Low | Print state archival statistics |
+| `runNewHist()` | Low | Initialize history archive directory structure |
+| `runReportLastHistoryCheckpoint()` | Low | Report info about last archive checkpoint |
+| `getSettingsUpgradeTransactions()` | Low | Generate settings upgrade transaction set |
+| `runPrintPublishQueue()` | Low | Print scheduled publish checkpoints |
+| V2 SAT-based quorum intersection | Medium | `check-quorum-intersection --v2` with SAT solver |
+| Full `printXdr()` type support | Low | Only 3 XDR types supported; upstream handles many more |
 
-##### Testnet Execution Verification (January 2026)
+## Architectural Differences
+
+1. **CLI Framework**
+   - **stellar-core**: Uses `clara` (lightweight C++ argument parser) with manual command registration and help formatting.
+   - **Rust**: Uses `clap` with derive macros for declarative command definitions and automatic help generation.
+   - **Rationale**: `clap` is the standard Rust CLI framework and provides better ergonomics, auto-completion, and type safety.
+
+2. **Command Organization**
+   - **stellar-core**: All commands are flat at the top level (`stellar-core <command>`).
+   - **Rust**: Main commands are top-level, but diagnostic/offline tools are nested under `offline` subcommand (`rs-stellar-core offline <command>`).
+   - **Rationale**: Nested subcommands reduce top-level clutter and group related functionality.
+
+3. **Configuration Loading**
+   - **stellar-core**: Uses `ConfigOption` struct with per-command config parsing; config file defaults to `stellar-core.cfg`.
+   - **Rust**: Global `--config`, `--testnet`, `--mainnet` flags parsed before command dispatch; supports TOML with built-in network defaults.
+   - **Rationale**: Global config flags are simpler and avoid repetition across commands.
+
+4. **Process Initialization**
+   - **stellar-core**: `main.cpp` performs XDR identity checks, sodium init, backtrace setup, and version/protocol identity verification before dispatching commands.
+   - **Rust**: `main()` initializes logging and loads config; no XDR identity checks needed (pure Rust, single XDR crate). Signal handlers and panic hooks are set up by the Rust runtime.
+   - **Rationale**: Pure Rust eliminates the need for C++/Rust XDR bridge validation. Rust's panic infrastructure replaces explicit backtrace management.
+
+5. **Async Runtime**
+   - **stellar-core**: Synchronous command execution (blocking I/O via `asio`/virtual clock).
+   - **Rust**: `#[tokio::main]` with async command handlers for network operations.
+   - **Rationale**: Rust's async ecosystem is idiomatic and provides native non-blocking I/O.
+
+6. **CDP Integration (Rust-only)**
+   - **stellar-core**: No equivalent offline verification tools.
+   - **Rust**: `verify-execution` and `debug-bucket-entry` commands compare transaction execution against CDP (Crypto Data Platform) metadata from stellar-core production data.
+   - **Rationale**: These tools provide parity testing against production stellar-core output without requiring a live network connection.
+
+## Test Coverage
+
+| Area | stellar-core Tests | Rust Tests | Notes |
+|------|-------------------|------------|-------|
+| CLI Parsing | 0 TEST_CASE | 5 #[test] | Rust has explicit CLI parsing tests |
+| Config | 8 TEST_CASE / 18 SECTION | 0 #[test] | Config tests are in `henyey-app` crate |
+| Command Handler | 3 TEST_CASE / 25 SECTION | 0 #[test] | HTTP handler tests in `henyey-app` |
+| Application Utils | 4 TEST_CASE / 5 SECTION | 0 #[test] | Catchup/run logic tested via integration |
+| Self-Check | 1 TEST_CASE | 0 #[test] | Self-check tested manually |
+| Query Server | 1 TEST_CASE / 9 SECTION | 0 #[test] | No query server in Rust |
+| Quorum Intersection | 0 TEST_CASE | 5 #[test] | Rust has dedicated quorum intersection tests |
+
+### Test Gaps
+
+- **Config tests**: stellar-core has 8 TEST_CASE with 18 SECTIONs for configuration parsing and validation. Config testing in Rust is handled in the `henyey-app` crate, not in this CLI crate.
+- **Command handler tests**: stellar-core has 3 TEST_CASE with 25 SECTIONs for HTTP command handler behavior. These tests exist in `henyey-app` for the Rust implementation.
+- **Application utils tests**: stellar-core tests catchup configuration parsing, version extraction, and related utilities. Not covered in the CLI crate.
+
+## Verification Results
+
+### Testnet Execution Verification (January 2026)
 
 The `verify-execution` tool compares transaction execution against CDP (Crypto Data Platform) metadata from stellar-core.
 
@@ -212,22 +251,7 @@ The `verify-execution` tool compares transaction execution against CDP (Crypto D
 | Header verifications passed | 3,000 | 100% |
 | Header mismatches | 0 | 0% |
 
-**Phase 1 (Fee Calculation)**: 100% parity after implementing per-transaction base fee extraction from `GeneralizedTransactionSet` to handle surge pricing.
-
-**Phase 2 (Execution)**: ~91-99% parity. Remaining mismatches are primarily Soroban contract execution differences:
-- CPU metering differences causing `ResourceLimitExceeded` vs success
-- Storage limit handling differences
-- These affect ~0.7-8.5% of transactions depending on ledger range
-
-**Header Verification**: 100% parity after fixing eviction scan cycle completion check. Previous header mismatches in ledgers 32787+ were caused by incorrect eviction iterator advancement when wrapping from level 10 back to the starting level.
-
-##### Known Phase 2 Mismatch Patterns
-
-1. **Soroban CPU Metering Differences**: Small differences in CPU instruction counting between Rust and stellar-core Soroban implementations can cause transactions that are close to their budget limit to succeed in one implementation but fail in the other.
-
-2. **Soroban Error Code Mapping**: When contracts fail due to resource limits, Rust returns `InvokeHostFunction(ResourceLimitExceeded)` while stellar-core may return `InvokeHostFunction(Trapped)`. This is a Soroban VM error propagation difference.
-
-##### Verified Components
+### Verified Components
 
 - Transaction execution verified against CDP for testnet ledgers
 - Bucket list hash computation verified against history archives
@@ -237,3 +261,12 @@ The `verify-execution` tool compares transaction execution against CDP (Crypto D
 - Phase 1 fee calculation: 100% parity (surge pricing support)
 - Classic transaction execution: >99% parity
 - Soroban transaction execution: ~98% parity (error code mapping differences)
+
+## Parity Calculation
+
+| Category | Count |
+|----------|-------|
+| Implemented (Full) | 19 |
+| Gaps (None + Partial) | 12 |
+| Intentional Omissions | 10 |
+| **Parity** | **19 / (19 + 12) = 61%** |

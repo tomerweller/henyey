@@ -1,178 +1,278 @@
-# Parity Status: henyey-historywork
+# stellar-core Parity Status
 
-**Overall Parity: ~82%**
-
-This document tracks the parity between this Rust crate and the stellar-core
-stellar-core `src/historywork/` directory (v25.x).
+**Crate**: `henyey-historywork`
+**Upstream**: `.upstream-v25/src/historywork/`
+**Overall Parity**: 56%
+**Last Updated**: 2026-02-13
 
 ## Summary
 
-| Category | Status |
-|----------|--------|
-| Core Download Workflow | Implemented (simplified) |
-| Core Publish Workflow | Implemented (simplified) |
-| Verification | Implemented inline (no background threads) |
-| Self-Verification | Implemented (`CheckSingleLedgerHeaderWork`) |
-| Batch Operations | Complete |
-| Hot Archive Buckets | Implemented |
-| Metrics | Not implemented |
+| Area | Status | Notes |
+|------|--------|-------|
+| HAS Fetch | Full | `GetHistoryArchiveStateWork` |
+| Bucket Download + Verification | Full | Parallel download with hash verification |
+| Batch File Download | Full | `BatchDownloadWork` for checkpoint ranges |
+| Header/Tx/Result/SCP Download | Full | Dedicated work items per file type |
+| Single Header Verification | Full | `CheckSingleLedgerHeaderWork` |
+| Bucket Verification | Full | Inline in download (no index building) |
+| Tx Results Verification | Full | Inline in download |
+| HAS Publishing | Full | Checkpoint path + well-known path |
+| Data Publishing (mirror) | Full | Publish downloaded data to archive |
+| Snapshot Publish Pipeline | None | WriteSnapshot, Resolve, PutFiles, etc. |
+| Offline Verified Hash Chain | None | `WriteVerifiedCheckpointHashesWork` |
+| Bootstrap QSet Fetch | None | `FetchRecentQsetsWork` |
+| Progress Reporting | Full | Stage enum + message |
 
-## Implemented Work Items
+## File Mapping
 
-### Download Work Items
+| stellar-core File | Rust Module | Notes |
+|--------------------|-------------|-------|
+| `GetHistoryArchiveStateWork.h` / `.cpp` | `lib.rs` (`GetHistoryArchiveStateWork`) | Full parity |
+| `DownloadBucketsWork.h` / `.cpp` | `lib.rs` (`DownloadBucketsWork`) | Simplified; no bucket indexing |
+| `BatchDownloadWork.h` / `.cpp` | `lib.rs` (`BatchDownloadWork`) | Full parity |
+| `CheckSingleLedgerHeaderWork.h` / `.cpp` | `lib.rs` (`CheckSingleLedgerHeaderWork`) | Full parity |
+| `VerifyBucketWork.h` / `.cpp` | `lib.rs` (inline in `DownloadBucketsWork`) | Hash verification only, no index |
+| `VerifyTxResultsWork.h` / `.cpp` | `lib.rs` (inline in `DownloadTxResultsWork`) | Inline verification |
+| `DownloadVerifyTxResultsWork.h` / `.cpp` | `lib.rs` (`DownloadTxResultsWork`) | Combined download + verify |
+| `PutHistoryArchiveStateWork.h` / `.cpp` | `lib.rs` (`PublishHistoryArchiveStateWork`) | Full parity |
+| `Progress.h` / `.cpp` | `lib.rs` (`HistoryWorkProgress`, `BatchDownloadProgress`) | Simplified |
+| `WriteSnapshotWork.h` / `.cpp` | -- | Not implemented |
+| `ResolveSnapshotWork.h` / `.cpp` | -- | Not implemented |
+| `PutFilesWork.h` / `.cpp` | -- | Not implemented |
+| `PutSnapshotFilesWork.h` / `.cpp` | -- | Not implemented |
+| `PublishWork.h` / `.cpp` | -- | Not implemented |
+| `WriteVerifiedCheckpointHashesWork.h` / `.cpp` | -- | Not implemented |
+| `FetchRecentQsetsWork.h` / `.cpp` | -- | Not implemented |
 
-| stellar-core Class | Rust Equivalent | Parity Notes |
-|-----------|-----------------|--------------|
-| `GetHistoryArchiveStateWork` | `GetHistoryArchiveStateWork` | Full parity. Fetches HAS JSON from archive. |
-| `DownloadBucketsWork` | `DownloadBucketsWork` | Simplified. Downloads to disk with hash verification. No bucket indexing. Uses parallel async downloads (16 concurrent) matching stellar-core `MAX_CONCURRENT_SUBPROCESSES`. |
-| (via BatchDownloadWork) | `DownloadLedgerHeadersWork` | Rust-specific. Downloads and verifies header chain in one step. |
-| (via BatchDownloadWork) | `DownloadTransactionsWork` | Rust-specific. Downloads and verifies tx sets against headers. |
-| (via BatchDownloadWork) | `DownloadTxResultsWork` | Rust-specific. Downloads and verifies tx results. |
-| (via BatchDownloadWork) | `DownloadScpHistoryWork` | Rust-specific. Downloads SCP consensus messages. |
+## Component Mapping
 
-In stellar-core, ledger headers, transactions, results, and SCP are downloaded via the generic
-`BatchDownloadWork` + `GetAndUnzipRemoteFileWork` pipeline. In Rust, each category has
-a dedicated work item that uses async HTTP via `henyey-history`.
+### GetHistoryArchiveStateWork (`lib.rs`)
 
-### Publish Work Items
+Corresponds to: `GetHistoryArchiveStateWork.h`
 
-| stellar-core Class | Rust Equivalent | Parity Notes |
-|-----------|-----------------|--------------|
-| `PutHistoryArchiveStateWork` | `PublishHistoryArchiveStateWork` | Full parity. Publishes to both checkpoint path and `.well-known/stellar-history.json` (RFC 5785). |
-| (part of PutSnapshotFilesWork) | `PublishBucketsWork` | Dedicated work item. Gzips and writes each bucket. |
-| (part of PutSnapshotFilesWork) | `PublishLedgerHeadersWork` | Dedicated work item. Serializes headers to XDR, gzips, writes. |
-| (part of PutSnapshotFilesWork) | `PublishTransactionsWork` | Dedicated work item. Serializes tx entries, gzips, writes. |
-| (part of PutSnapshotFilesWork) | `PublishResultsWork` | Dedicated work item. Serializes result entries, gzips, writes. |
-| (part of PutSnapshotFilesWork) | `PublishScpHistoryWork` | Dedicated work item. Serializes SCP entries, gzips, writes. |
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `GetHistoryArchiveStateWork()` constructor | `GetHistoryArchiveStateWork::new()` | Full |
+| `getHistoryArchiveState()` | Via `SharedHistoryState.has` | Full |
+| `getArchive()` | Field on struct | Full |
+| `getStatus()` | `HistoryWorkProgress` stage reporting | Full |
+| `doWork()` | `Work::run()` impl | Full |
+| `doReset()` | Not needed (no child work) | Full |
+| `onSuccess()` (metrics) | Not implemented | None |
 
-### Builder and State
+### DownloadBucketsWork (`lib.rs`)
 
-| stellar-core Concept | Rust Equivalent | Notes |
-|-------------|-----------------|-------|
-| Implicit work dependencies | `HistoryWorkBuilder` | Explicit builder pattern with `register()` and `register_publish()` |
-| Per-work state | `SharedHistoryState` | Single shared state container (`Arc<Mutex<...>>`) |
-| Progress formatting | `HistoryWorkProgress` | Simpler stage enum + message instead of `fmtProgress()` |
+Corresponds to: `DownloadBucketsWork.h`
 
-### Verification
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `DownloadBucketsWork()` constructor | `DownloadBucketsWork::new()` | Full |
+| `getStatus()` | Progress reporting via `HistoryWorkStage` | Full |
+| `hasNext()` | Implicit in `stream::iter` | Full |
+| `yieldMoreWork()` | Implicit in `stream::iter` + `buffer_unordered` | Full |
+| `resetIter()` | Not needed (single-pass async) | Full |
+| `onSuccessCb()` (bucket adoption) | Not implemented (no BucketManager) | None |
+| `prepareWorkForBucketType()` | Inline hash verification | Partial |
+| Live bucket handling | `content_bucket_hashes()` | Full |
+| Hot archive bucket handling | `content_bucket_hashes()` via HAS | Full |
+| Bucket index building | Not implemented | None |
 
-| stellar-core Class | Rust Approach | Notes |
-|-----------|---------------|-------|
-| `VerifyBucketWork` | Inline in `DownloadBucketsWork` | stellar-core verifies and indexes in background thread. Rust verifies hash inline after download. |
-| `VerifyTxResultsWork` | Inline in `DownloadTxResultsWork` | stellar-core runs in background thread. Rust verifies against headers inline. |
-| Header chain verification | Inline in `DownloadLedgerHeadersWork` | Uses `henyey_history::verify::verify_header_chain()` |
-| `CheckSingleLedgerHeaderWork` | `CheckSingleLedgerHeaderWork` | Full parity. Downloads checkpoint and verifies expected header matches archive. Used for self-verification during catchup. |
+### BatchDownloadWork (`lib.rs`)
 
-### Batch and Range Operations
+Corresponds to: `BatchDownloadWork.h`
 
-| stellar-core Class | Rust Equivalent | Parity Notes |
-|-----------|-----------------|--------------|
-| `BatchDownloadWork` | `BatchDownloadWork` | Full parity. Downloads files for a `CheckpointRange` with 16 concurrent downloads. |
-| `CheckpointRange` | `CheckpointRange` | Full parity. Supports iteration, count, and ledger range calculation. |
-| `FileType` | `HistoryFileType` | Full parity. Ledger, Transactions, Results, Scp variants. |
-| `BatchDownloadWorkBuilder` | `BatchDownloadWorkBuilder` | Rust-specific. Creates all four batch download work items with proper dependencies. |
-| `BatchDownloadState` | `BatchDownloadState` | Rust-specific. Shared state for multi-checkpoint downloads keyed by checkpoint sequence. |
-| `DownloadVerifyTxResultsWork` | Inline in `DownloadTxResultsWork` | Verification integrated into download work. |
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `BatchDownloadWork()` constructor | `BatchDownloadWork::new()` | Full |
+| `getStatus()` | `BatchDownloadWork::get_status()` | Full |
+| `hasNext()` | Implicit in checkpoint iterator | Full |
+| `yieldMoreWork()` | `download_checkpoint_file()` | Full |
+| `resetIter()` | Not needed (single-pass async) | Full |
 
-The Rust implementation supports full multi-checkpoint range operations for catchup.
-Downloads are parallelized with up to 16 concurrent requests per batch.
+### CheckSingleLedgerHeaderWork (`lib.rs`)
 
-## Not Implemented
+Corresponds to: `CheckSingleLedgerHeaderWork.h`
 
-### Low-Level File/Shell Operations
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `CheckSingleLedgerHeaderWork()` constructor | `CheckSingleLedgerHeaderWork::new()` | Full |
+| `doWork()` | `Work::run()` impl | Full |
+| `doReset()` | Not needed (no child work) | Full |
+| `onFailureRaise()` (metrics) | Not implemented | None |
+| `onSuccess()` (metrics) | Not implemented | None |
 
-These are not needed as Rust uses native libraries instead of shell commands.
+### VerifyBucketWork (inline in `DownloadBucketsWork`)
 
-| stellar-core Class | Purpose | Rust Alternative |
-|-----------|---------|------------------|
-| `RunCommandWork` | Base class for shell commands | Not needed |
-| `GetRemoteFileWork` | HTTP downloads via curl/wget | `reqwest` in `henyey-history` |
-| `GetAndUnzipRemoteFileWork` | Download + gunzip via shell | Async HTTP + `flate2` |
-| `GunzipFileWork` | Decompress via shell | `flate2` crate |
-| `GzipFileWork` | Compress via shell | `flate2` crate |
-| `PutRemoteFileWork` | Upload via shell commands | `ArchiveWriter` trait |
-| `MakeRemoteDirWork` | Create remote dirs via shell | `ArchiveWriter` handles this |
+Corresponds to: `VerifyBucketWork.h`
 
-### Advanced Verification and Tools
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `VerifyBucketWork()` constructor | Inline in download loop | Full |
+| `onRun()` / `spawnVerifier()` | `verify::verify_bucket_hash()` | Full |
+| `onFailureRaise()` | `WorkOutcome::Failed` | Full |
+| Bucket index creation | Not implemented | None |
 
-| stellar-core Class | Purpose | Priority |
-|-----------|---------|----------|
-| `WriteVerifiedCheckpointHashesWork` | Offline verification: downloads full chain and writes verified hashes to JSON | Low |
-| ~~`CheckSingleLedgerHeaderWork`~~ | ~~Self-check: verifies local LCL against archive~~ | **Implemented** |
+### VerifyTxResultsWork (inline in `DownloadTxResultsWork`)
 
-### Snapshot and Publishing Pipeline
+Corresponds to: `VerifyTxResultsWork.h`
 
-| stellar-core Class | Purpose | Priority |
-|-----------|---------|----------|
-| `WriteSnapshotWork` | Write current state snapshot to disk | Medium |
-| `ResolveSnapshotWork` | Resolve bucket references in snapshot | Medium |
-| `PutFilesWork` | Upload multiple files to archive | Medium - `ArchiveWriter` is simpler |
-| `PutSnapshotFilesWork` | Full snapshot publish (gzip + upload) | Medium |
-| `PublishWork` | Top-level orchestration of publish | Medium |
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `VerifyTxResultsWork()` constructor | Inline in `DownloadTxResultsWork::run()` | Full |
+| `onRun()` / `verifyTxResultsOfCheckpoint()` | `verify::verify_tx_result_set()` | Full |
+| `getCurrentTxResultSet()` | Inline iteration over entries | Full |
+| `onReset()` | Not needed | Full |
 
-The Rust publish workflow is simpler: individual work items handle gzip and write.
-stellar-core has a more complex pipeline with differential uploads (only new files).
+### DownloadVerifyTxResultsWork (combined in `DownloadTxResultsWork`)
 
-### Bootstrap and QSet Operations
+Corresponds to: `DownloadVerifyTxResultsWork.h`
 
-| stellar-core Class | Purpose | Priority |
-|-----------|---------|----------|
-| `FetchRecentQsetsWork` | Download recent SCP history to extract quorum sets for bootstrap | Low |
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `DownloadVerifyTxResultsWork()` constructor | `DownloadTxResultsWork::new()` | Full |
+| `getStatus()` | Progress reporting | Full |
+| `hasNext()` | Not needed (single checkpoint) | Full |
+| `yieldMoreWork()` | Combined in `run()` | Full |
+| `resetIter()` | Not needed | Full |
 
-### Hot Archive Buckets (Protocol 25)
+### PutHistoryArchiveStateWork (`lib.rs`)
 
-| stellar-core Feature | Rust Status | Notes |
-|-------------|------------|-------|
-| `HotArchiveBucket` download | Implemented | `unique_bucket_hashes()` includes hot archive hashes |
-| `HotArchiveBucketList` reconstruction | Implemented | Catchup code builds hot archive bucket list from HAS |
+Corresponds to: `PutHistoryArchiveStateWork.h`
 
-The Rust `DownloadBucketsWork` downloads all bucket hashes from the HAS, including hot archive buckets. The `unique_bucket_hashes()` method collects hashes from both `current_buckets` and `hot_archive_buckets` fields. During catchup, the hot archive bucket list is reconstructed from the downloaded buckets.
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `PutHistoryArchiveStateWork()` constructor | `PublishHistoryArchiveStateWork::new()` | Full |
+| `doWork()` / `spawnPublishWork()` | `Work::run()` impl | Full |
+| `doReset()` | Not needed | Full |
+| Well-known path publish | Publishes to `.well-known/stellar-history.json` | Full |
 
-## Architecture Differences
+### Progress (`lib.rs`)
 
-| Aspect | stellar-core Implementation | Rust Implementation |
-|--------|-------------------|---------------------|
-| **File Downloads** | Shell commands (`curl`, `wget`) via `RunCommandWork` | Native async HTTP via `reqwest` |
-| **Compression** | Shell commands (`gzip`, `gunzip`) | In-memory via `flate2` |
-| **Bucket Storage** | Files on disk with indexing (`BucketManager.adoptFileAsBucket()`) | Files on disk (`<hash>.bucket.xdr` in configurable bucket directory) |
-| **Work Orchestration** | `BasicWork`/`Work`/`BatchWork` hierarchy with state machine | `Work` trait with `WorkScheduler` DAG |
-| **Background Work** | `postOnBackgroundThread` for CPU-intensive tasks | All async, no dedicated background threads |
-| **Progress Reporting** | `fmtProgress()` with checkpoint-range math | `HistoryWorkStage` enum + message |
-| **Error Handling** | Exception-based with `onFailureRaise` callbacks | `Result`-based with `WorkOutcome::Failed` |
-| **Archive Selection** | Random archive selection on retry | Single archive per work builder |
-| **Retry Logic** | Built into `BasicWork` base class | Configured per-work via `WorkScheduler` |
+Corresponds to: `Progress.h`
 
-## Metrics Not Implemented
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `fmtProgress()` | `HistoryWorkProgress` + `BatchDownloadProgress::message()` | Full |
 
-The stellar-core implementation includes extensive metrics via `medida`:
+### Publish Work Items (`lib.rs`)
 
-- `history.download.success` / `history.download.failure`
-- `history.verify.success` / `history.verify.failure`
-- `history.publish.success` / `history.publish.failure`
-- `history.check.success` / `history.check.failure`
-- `history.ledger-check.success` / `history.ledger-check.failure`
-- Bytes/second meters for downloads
-- Per-archive failure tracking
+These are Rust-specific work items with no direct 1:1 upstream equivalent. They publish downloaded data to an archive via the `ArchiveWriter` trait.
 
-## Testing Status
+| Rust Work Item | Upstream Equivalent | Status |
+|--------------|------|--------|
+| `PublishBucketsWork` | Part of `PutSnapshotFilesWork` | Partial (mirror only) |
+| `PublishLedgerHeadersWork` | Part of `PutSnapshotFilesWork` | Partial (mirror only) |
+| `PublishTransactionsWork` | Part of `PutSnapshotFilesWork` | Partial (mirror only) |
+| `PublishResultsWork` | Part of `PutSnapshotFilesWork` | Partial (mirror only) |
+| `PublishScpHistoryWork` | Part of `PutSnapshotFilesWork` | Partial (mirror only) |
 
-| Test Category | stellar-core | Rust | Notes |
-|---------------|-----|------|-------|
-| Integration tests | `HistoryWorkTests.cpp` | `tests/history_work.rs` | Rust has end-to-end test with mock HTTP server |
-| Unit tests | Various in `test/` | `tests/checkpoint_data.rs` | Basic state tests |
-| Acceptance tests | `[acceptance]` tagged | None | stellar-core has tagged slow tests |
-| Catchup simulation | `CatchupSimulation` | None | stellar-core has elaborate simulation framework |
+### Helper Functions and Types (`lib.rs`)
 
-## Known Behavioral Differences
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `CheckpointRange` (in `ledger/`) | `CheckpointRange` | Full |
+| `FileType` (in `history/`) | `HistoryFileType` | Full |
+| -- | `HistoryWorkBuilder` | Rust-specific builder |
+| -- | `BatchDownloadWorkBuilder` | Rust-specific builder |
+| -- | `HistoryWorkState` / `SharedHistoryState` | Rust-specific shared state |
+| -- | `BatchDownloadState` / `SharedBatchDownloadState` | Rust-specific shared state |
+| -- | `ArchiveWriter` trait / `LocalArchiveWriter` | Rust-specific abstraction |
+| -- | `build_checkpoint_data()` | Rust-specific assembly |
 
-1. **Bucket Indexing**: stellar-core builds a bucket index during verification for fast
-   lookups. Rust stores raw bucket data on disk without indexing.
+## Intentional Omissions
 
-2. **Archive Failover**: stellar-core randomly selects archives and fails over on error.
-   Rust uses a single archive per builder with retry at the work level.
+Features excluded by design. These are NOT counted against parity %.
 
-3. **Empty Result Handling**: Rust publish work items fail if data is empty.
-   stellar-core may handle this differently depending on the work type.
+| stellar-core Component | Reason |
+|------------------------|--------|
+| `RunCommandWork` | Shell command execution base class; Rust uses native async libraries instead of spawning shell processes |
+| `GetRemoteFileWork` | HTTP download via curl/wget shell commands; replaced by `reqwest` in `henyey-history` crate |
+| `GetAndUnzipRemoteFileWork` | Download + gunzip via shell commands; replaced by async HTTP + `flate2` in-memory decompression |
+| `GunzipFileWork` | Decompression via shell `gunzip`; replaced by `flate2` crate |
+| `GzipFileWork` | Compression via shell `gzip`; replaced by `flate2` crate (`gzip_bytes()`) |
+| `PutRemoteFileWork` | File upload via shell commands; replaced by `ArchiveWriter` trait abstraction |
+| `MakeRemoteDirWork` | Remote directory creation via shell commands; handled by `ArchiveWriter` implementations |
 
-## Recommendations for Future Work
+## Gaps
 
-1. **Low Priority**: Add metrics collection for monitoring and debugging.
+Features not yet implemented. These ARE counted against parity %.
+
+| stellar-core Component | Priority | Notes |
+|------------------------|----------|-------|
+| `WriteSnapshotWork` | Medium | Writes current node state snapshot to disk for archival publishing; needed for archiving nodes |
+| `ResolveSnapshotWork` | Medium | Resolves bucket references in a state snapshot; needed for archival publishing |
+| `PutFilesWork` | Medium | Differential file upload (only uploads files not already in remote archive); needed for efficient archival publishing |
+| `PutSnapshotFilesWork` | Medium | Orchestrates full snapshot publish pipeline (get remote state, gzip, upload); needed for archiving nodes |
+| `PublishWork` | Medium | Top-level publish orchestration with success/failure callbacks to HistoryManager; needed for archiving nodes |
+| `WriteVerifiedCheckpointHashesWork` | Low | Offline verification tool that downloads full ledger chain and writes verified hashes to JSON file |
+| `FetchRecentQsetsWork` | Low | Downloads recent SCP history to extract quorum sets for network bootstrap |
+
+## Architectural Differences
+
+1. **File Downloads**
+   - **stellar-core**: Shell commands (`curl`, `wget`) via `RunCommandWork` subprocess execution
+   - **Rust**: Native async HTTP via `reqwest` in `henyey-history` crate
+   - **Rationale**: Eliminates subprocess overhead and provides native async integration with tokio runtime
+
+2. **Compression**
+   - **stellar-core**: Shell commands (`gzip`, `gunzip`) via separate work items (`GzipFileWork`, `GunzipFileWork`)
+   - **Rust**: In-memory compression/decompression via `flate2` crate
+   - **Rationale**: Avoids file I/O round-trips and subprocess overhead; `gzip_bytes()` operates on byte slices directly
+
+3. **Bucket Storage**
+   - **stellar-core**: Files on disk with bucket indexing via `BucketManager.adoptFileAsBucket()`; `VerifyBucketWork` spawns background thread to verify and build index
+   - **Rust**: Raw bucket files on disk (`<hash>.bucket.xdr` in configurable directory); hash verification inline during download, no index building
+   - **Rationale**: Index building will be needed for full BucketManager parity but is not required for basic catchup
+
+4. **Work Orchestration**
+   - **stellar-core**: `BasicWork`/`Work`/`BatchWork` class hierarchy with state machine (`WORK_RUNNING`, `WORK_SUCCESS`, etc.) and child work management
+   - **Rust**: `Work` trait with `WorkScheduler` DAG; dependencies expressed as work IDs; builders (`HistoryWorkBuilder`, `BatchDownloadWorkBuilder`) register work with proper ordering
+   - **Rationale**: DAG-based scheduling is more explicit about dependencies and avoids state machine complexity
+
+5. **Background Work**
+   - **stellar-core**: `postOnBackgroundThread` for CPU-intensive tasks (bucket verification, snapshot writing)
+   - **Rust**: All operations are async; no dedicated background threads
+   - **Rationale**: tokio's task system provides equivalent concurrency without explicit thread management
+
+6. **Publish Pipeline**
+   - **stellar-core**: Multi-step snapshot pipeline: `WriteSnapshotWork` -> `ResolveSnapshotWork` -> `PutSnapshotFilesWork` (which does differential upload via `PutFilesWork`)
+   - **Rust**: Individual publish work items (`PublishBucketsWork`, `PublishLedgerHeadersWork`, etc.) that publish from downloaded state via `ArchiveWriter` trait
+   - **Rationale**: Current Rust implementation supports archive mirroring; full archiving-node publish from live state is not yet implemented
+
+7. **Archive Selection**
+   - **stellar-core**: Random archive selection on retry; `GetRemoteFileWork` picks a different archive each attempt
+   - **Rust**: Single archive per work builder; retry uses same archive
+   - **Rationale**: Simpler implementation; archive failover can be added at the `HistoryArchive` level
+
+## Test Coverage
+
+| Area | stellar-core Tests | Rust Tests | Notes |
+|------|-------------------|------------|-------|
+| Verified checkpoint hashes | 1 TEST_CASE / 2 SECTION | 0 #[test] | `WriteVerifiedCheckpointHashesWork` not implemented |
+| Single ledger header check | 1 TEST_CASE / 0 SECTION | 0 #[test] | Upstream tests; no direct Rust equivalent but functionality is tested via integration |
+| Checkpoint range | -- | 3 #[test] | `test_checkpoint_range_count`, `_iter`, `_ledger_range` |
+| File type / progress | -- | 2 #[test] | `test_history_file_type_display`, `test_batch_download_progress_message` |
+| Well-known path | -- | 1 #[test] | `test_well_known_stellar_history_path` |
+| Integration (download) | Part of `CatchupSimulation` | 1 #[tokio::test] in `history_work.rs` | Rust has end-to-end test |
+| State assembly | -- | 2 #[tokio::test] in `checkpoint_data.rs` | Basic state tests |
+
+### Test Gaps
+
+- **WriteVerifiedCheckpointHashesWork tests**: Upstream has 1 TEST_CASE with 2 SECTIONs for offline verification; functionality not implemented in Rust.
+- **CheckSingleLedgerHeaderWork tests**: Upstream has 1 TEST_CASE; Rust has no direct unit test but the work item is exercised in integration tests.
+- **CatchupSimulation-level tests**: stellar-core has elaborate simulation framework tests that exercise the full catchup pipeline including history work items; Rust has a simpler integration test.
+
+## Parity Calculation
+
+| Category | Count |
+|----------|-------|
+| Implemented (Full) | 9 |
+| Gaps (None + Partial) | 7 |
+| Intentional Omissions | 7 |
+| **Parity** | **9 / (9 + 7) = 56%** |
+
+Implemented components: GetHistoryArchiveStateWork, DownloadBucketsWork, BatchDownloadWork, CheckSingleLedgerHeaderWork, VerifyBucketWork, VerifyTxResultsWork, DownloadVerifyTxResultsWork, PutHistoryArchiveStateWork, Progress.
+
+Gap components: WriteSnapshotWork, ResolveSnapshotWork, PutFilesWork, PutSnapshotFilesWork, PublishWork, WriteVerifiedCheckpointHashesWork, FetchRecentQsetsWork.
+
+Omitted components: RunCommandWork, GetRemoteFileWork, GetAndUnzipRemoteFileWork, GunzipFileWork, GzipFileWork, PutRemoteFileWork, MakeRemoteDirWork.

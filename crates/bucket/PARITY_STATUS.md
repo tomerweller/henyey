@@ -1,513 +1,510 @@
-## stellar-core Parity Status
-
-**Overall Parity: ~98%**
-
-This section documents the implementation status relative to the stellar-core bucket implementation (v25).
-
-### Summary
-
-| Category | Status | Notes |
-|----------|--------|-------|
-| Core Data Structures | Complete | BucketList, Bucket, BucketEntry |
-| Merge Semantics (CAP-0020) | Complete | INIT/DEAD annihilation, all merge rules |
-| Spill Mechanics | Complete | Matches stellar-core `levelShouldSpill` |
-| FutureBucket (Async Merging) | Complete | Tokio-based async merges |
-| Hot Archive Bucket List | Complete | Protocol 23+ Soroban state archival |
-| Eviction Scanning | Complete | Incremental scanning with iterator |
-| Disk-Backed Storage | Complete | Index with integrated bloom filter |
-| BucketSnapshot/SnapshotManager | Complete | Thread-safe read snapshots with historical ledger support |
-| Advanced Indexing | Complete | InMemoryIndex, DiskIndex, LiveBucketIndex with page ranges, asset-to-pool mapping |
-| Specialized Queries | Complete | Inflation winners, type scanning, pool share trustline queries |
-| RandomEvictionCache | Complete | LRU cache for account entries |
-| BucketMergeMap | Complete | Merge deduplication and reattachment |
-| BucketApplicator | Complete | Chunked entry application for catchup |
-| Metrics/Counters | Complete | MergeCounters, EvictionCounters, BucketListMetrics |
-| Streaming Iterators | Complete | BucketInputIterator, BucketOutputIterator |
-| Live Entries Iterator | Complete | Memory-efficient streaming with HashSet deduplication |
-| Index Persistence | Complete | DiskIndex serialization to `.index` files for fast startup |
-| BucketManager State | Complete | loadCompleteLedgerState, mergeAllBuckets, ensureBucketsExist |
-| In-Memory Level 0 | Complete | merge_in_memory, level_zero_entries optimization |
-
-### Implemented
-
-#### Core Data Structures
-- **BucketList** (`BucketListBase` in stellar-core) - Complete 11-level hierarchical bucket list structure with curr/snap buckets per level
-- **BucketLevel** - Individual level with curr, snap, and next (staged merge) buckets
-- **Bucket** - Immutable container for sorted ledger entries with content-addressable hash
-- **BucketEntry** - All four entry types: Live, Dead, Init, Metadata (matching `BucketEntry` XDR union)
-
-#### Bucket Operations
-- **Bucket merging** - Full CAP-0020 INITENTRY/METAENTRY semantics:
-  - INIT + DEAD annihilation
-  - DEAD + INIT recreation (becomes LIVE)
-  - INIT + LIVE preserves INIT status
-  - Proper tombstone handling per level
-- **merge_buckets** / **merge_buckets_with_options** - Two-way merge with shadowing
-- **merge_multiple** - Multi-bucket merging
-- **MergeIterator** - Streaming/lazy merge iteration
-
-#### Spill Mechanics
-- **level_size** / **level_half** - Spill boundary calculations matching stellar-core `levelSize`/`levelHalf`
-- **level_should_spill** - Spill condition detection
-- **keep_tombstone_entries** - Level-dependent tombstone retention
-- **bucket_update_period** - Ledger frequency for level updates
-
-#### Storage
-- **BucketManager** - Bucket file lifecycle, caching, and garbage collection
-- **DiskBucket** - Memory-efficient disk-backed storage with 8-byte key hash index
-- In-memory buckets with `BTreeMap` key index for O(1) lookups
-- Gzip compression for bucket files
-- XDR record marking (RFC 5531) for bucket serialization
-
-#### Eviction (Soroban State Archival)
-- **EvictionIterator** - Incremental scan position tracking
-- **EvictionResult** - Scan results with archived entries and evicted keys
-- **StateArchivalSettings** - Configurable scan parameters
-- **scan_for_eviction** / **scan_for_eviction_incremental** - Full and incremental eviction scanning
-- **update_starting_eviction_iterator** - Iterator reset on bucket spills
-- TTL lookup and expiration checking for Soroban entries
-
-#### Entry Utilities
-- **compare_entries** / **compare_keys** - Proper bucket entry ordering (matches stellar-core `LedgerCmp.h`)
-- **ledger_entry_to_key** - Key extraction from ledger entries
-- **is_soroban_entry** / **is_temporary_entry** / **is_persistent_entry** - Entry classification
-- **get_ttl_key** / **is_ttl_expired** - TTL entry helpers
-
-#### Async Merging
-- **FutureBucket** (`future_bucket.rs`) - Async bucket merging support:
-  - State machine for merge lifecycle (Clear, HashOutput, HashInputs, LiveOutput, LiveInputs)
-  - Background merge execution via tokio async tasks
-  - Serialization/deserialization via `FutureBucketSnapshot`
-  - `MergeKey` for merge operation deduplication
-  - `resolve()` async and `resolve_blocking()` sync resolution
-  - `make_live()` for restarting deserialized merges
-  - `to_snapshot()` / `from_snapshot()` for HistoryArchiveState persistence
-
-#### Hot Archive Bucket List
-- **HotArchiveBucket** (`hot_archive.rs`) - Bucket for archived persistent Soroban entries:
-  - Stores `HotArchiveBucketEntry` (Metaentry, Archived, Live variants)
-  - `fresh()` for creating from archived entries and restored keys
-  - Key-based lookup and iteration
-- **HotArchiveBucketList** (`hot_archive.rs`) - Dedicated 11-level bucket list for hot archive:
-  - Same spill mechanics as live bucket list
-  - `add_batch()` for archiving entries and marking restorations
-  - `get()` / `contains()` for looking up archived entries
-- **Hot archive merge semantics**:
-  - Archived + Live in snap = Keep Archived
-  - Live + Archived in snap = Annihilate (entry was restored)
-  - Tombstones (Live markers) dropped at level 10
-
-#### Bucket Snapshots (`snapshot.rs`)
-- **BucketSnapshot** / **HotArchiveBucketSnapshot** - Read-only bucket snapshots using Arc for thread-safe sharing:
-  - `get()` - Key lookup
-  - `load_keys()` - Batched key lookups
-  - `is_empty()` / `len()` / `hash()` - Bucket metadata
-- **BucketListSnapshot** / **HotArchiveBucketListSnapshot** - Complete bucket list snapshots at a ledger:
-  - Captures all 11 levels with associated ledger header
-  - `get()` - Searches all levels from newest to oldest
-  - `load_keys()` - Batched key lookups across all levels
-  - `ledger_seq()` / `ledger_header()` - Ledger metadata
-- **BucketSnapshotManager** - Thread-safe snapshot management with:
-  - RwLock for concurrent read access
-  - Historical snapshots for querying past ledger states (configurable count)
-  - `update_current_snapshot()` - Main thread updates
-  - `copy_searchable_live_snapshot()` / `copy_searchable_hot_archive_snapshot()` - Background thread access
-  - `copy_live_and_hot_archive_snapshots()` - Atomic copy of both for consistent state
-  - `maybe_update_live_snapshot()` - Refresh-if-newer semantics
-- **SearchableBucketListSnapshot** / **SearchableHotArchiveBucketListSnapshot** - Searchable wrappers with:
-  - `load()` - Single key lookup
-  - `load_keys()` - Batched key lookups
-  - `load_keys_from_ledger()` - Historical ledger queries
-  - `available_ledger_range()` - Query range of available historical snapshots
-  - `load_pool_share_trustlines_by_account_and_asset()` - Pool share trustline queries
-  - `load_trustlines_for_account()` - Load all trustlines for an account
-  - `scan_for_entries_of_type()` - Type-bounded entry scanning
-
-#### Advanced Indexing (`index.rs`)
-- **LiveBucketIndex** - Facade that automatically selects index type based on bucket size:
-  - `InMemoryIndex` for small buckets (< 1024 entries by default)
-  - `DiskIndex` for large buckets with page-based range index
-  - `lookup()` returning offset ranges for key search
-  - `get_range_for_type()` for type-bounded queries
-- **InMemoryIndex** - Full in-memory index storing all entries:
-  - `BTreeMap` key-to-offset mapping
-  - Entry counters by type and durability
-  - Asset-to-pool ID mapping
-- **DiskIndex** - Page-based range index for large buckets:
-  - Configurable page size (default 256 entries)
-  - Range entries storing lower/upper bounds per page
-  - Type ranges for type-bounded queries
-  - Bloom filter integration
-- **AssetPoolIdMap** - Maps assets to liquidity pool IDs:
-  - `add_pool()` to register pool for both assets
-  - `get_pool_ids()` to query pools containing an asset
-- **BucketEntryCounters** - Entry statistics by type and durability:
-  - Count and size tracking per `LedgerEntryTypeAndDurability`
-  - Merge support for combining counters
-
-#### Random Eviction Cache (`cache.rs`)
-- **RandomEvictionCache** - LRU-style cache for frequently-accessed account entries:
-  - Memory-limited with configurable max bytes and entries
-  - Only caches Account entries (matching stellar-core behavior)
-  - Thread-safe via `parking_lot::Mutex`
-  - Random eviction policy (evicts random entry when full)
-  - `get()` / `insert()` / `remove()` operations
-  - `maybe_initialize()` based on bucket list account size
-  - `CacheStats` for hit/miss tracking
-
-#### Merge Deduplication (`merge_map.rs`)
-- **BucketMergeMap** - Tracks merge input-output relationships:
-  - `record_merge()` to register completed merges
-  - `get_output()` / `has_output()` to find merge results
-  - `get_outputs_for_input()` to find all outputs using an input
-  - `forget_all_merges_producing()` to remove merges by output hash
-  - `retain_outputs()` for garbage collection
-- **LiveMergeFutures** - Tracks in-progress merges for reattachment:
-  - `get()` / `get_or_insert()` for merge deduplication
-  - `remove()` when merge completes
-  - `cleanup_completed()` for batch cleanup
-  - `MergeFuturesStats` for tracking merge/reattach counts
-
-#### Bucket Applicator (`applicator.rs`)
-- **BucketApplicator** - Chunked application of bucket entries for catchup:
-  - Configurable chunk size (default 1024 entries)
-  - Deduplication via seen-key tracking
-  - Optional dead entry application
-  - `advance()` to process next chunk
-  - `has_more()` / `progress()` for iteration
-  - `reset()` to restart from beginning
-- **ApplicatorCounters** - Statistics for applied entries:
-  - Counts by entry type (upserted/deleted)
-  - `merge()` for combining counters
-- **EntryToApply** - Enum for upsert vs delete operations
-
-#### Metrics and Counters (`metrics.rs`)
-- **MergeCounters** - Merge operation statistics:
-  - Pre/post INITENTRY protocol merge counts
-  - Running merge reattachment count
-  - New meta/init/live/dead entry counts
-  - Atomic operations for thread safety
-- **EvictionCounters** - Eviction operation statistics:
-  - Entries evicted count
-  - Bytes scanned count
-  - Incomplete bucket scan count
-- **BucketListMetrics** - Aggregate bucket list metrics:
-  - Entry counts by type and durability
-  - Total size tracking
-  - Snapshot support for point-in-time capture
-
-#### Streaming Iterators (`iterator.rs`)
-- **BucketInputIterator** - File-based streaming iteration:
-  - Sequential reading with gzip decompression
-  - Automatic metadata entry handling
-  - Running hash computation
-  - Position tracking (entries read, bytes read)
-  - `open()` / `next()` / `peek()` / `collect_all()` operations
-- **BucketOutputIterator** - Streaming bucket writing:
-  - Gzip compressed output
-  - Automatic metadata entry generation (protocol 11+)
-  - Single-entry buffering for deduplication
-  - Tombstone elision when `keep_tombstones=false`
-  - Optional in-memory entry collection (for level 0 optimization)
-- **MergeInput** trait - Abstraction for merge operations:
-  - `MemoryMergeInput` - In-memory merge of two sorted vectors
-  - `FileMergeInput` - File-based merge of two bucket iterators
-
-#### Live Entries Streaming Iterator (`live_iterator.rs`)
-- **LiveEntriesIterator** - Memory-efficient streaming iterator over all live entries in a bucket list:
-  - Iterates levels 0-10, curr then snap at each level
-  - `HashSet<LedgerKey>` deduplication matching stellar-core `BucketApplicator` pattern
-  - Dead entries tracked in seen set to shadow older live entries
-  - O(unique keys) memory instead of O(total entries) for full materialization
-  - `next()` yields `Result<LedgerEntry>` one at a time
-- **LiveEntriesStats** - Statistics from a completed iteration:
-  - `entries_yielded`, `entries_skipped`, `unique_keys`
-
-#### Index Persistence (`index_persistence.rs`)
-- **save_disk_index** / **load_disk_index** - Serialize/deserialize `DiskIndex` to `.index` files:
-  - Bincode format with version header for forward compatibility
-  - Stores page ranges, bloom filter data, entry counters, type ranges, asset-to-pool mapping
-  - `BUCKET_INDEX_VERSION` (currently 2) for version checking; stale files are rebuilt
-- **index_path_for_bucket** - Derives `.index` path from bucket file path
-- **cleanup_orphaned_indexes** - Removes `.index` files without matching bucket files
-- **delete_index** - Removes a specific index file
-
-#### BucketManager State Operations
-- **load_complete_ledger_state** - Load full state from bucket list:
-  - Iterates buckets from oldest to newest
-  - Builds complete state map with dead entries shadowing live
-  - Returns all live ledger entries
-- **merge_all_buckets** - Merge entire bucket list into single bucket:
-  - Creates consolidated "super bucket" from all entries
-  - Useful for offline archives or testing
-- **verify_buckets_exist** / **verify_bucket_hashes** - Bucket verification:
-  - Check bucket files exist on disk
-  - Verify bucket content hashes match expected values
-- **ensure_buckets_exist** - Bucket fetching support:
-  - Checks if buckets exist locally
-  - Calls provided fetch function for missing buckets
-  - Supports `assumeState` flow for HistoryArchiveState restoration
-
-#### In-Memory Level 0 Optimization (`bucket.rs`, `merge.rs`, `bucket_list.rs`)
-- **level_zero_entries** field in Bucket - Optional in-memory entry storage:
-  - Enables fast in-memory merges at level 0
-  - Avoids disk I/O for frequently-updated buckets
-  - `has_in_memory_entries()` / `get_in_memory_entries()` / `set_in_memory_entries()` accessors
-- **fresh_in_memory_only** - Create shell bucket for immediate merging:
-  - No hash computation or index creation
-  - Directly populates in-memory entries
-- **merge_in_memory** - Fast level 0 merge using in-memory entries:
-  - Uses entries directly from memory (no disk reads)
-  - Preserves INIT entries (no normalization at level 0)
-  - Keeps tombstones for shadowing deeper levels
-  - Result bucket has in-memory entries for next merge
-- **prepare_first_level** - BucketLevel method for level 0:
-  - Uses in-memory merge when both buckets have entries in memory
-  - Falls back to regular merge when entries not available
-
-### Not Yet Implemented (Gaps)
-
-#### Shadow Buckets (FutureBucket.h)
-- **Shadow bucket support** - Buckets from lower levels that can inhibit entries during merge (protocol < 12)
-- Not needed for protocol 23+ but present in stellar-core for backward compatibility
-
-#### Medida Metrics Integration
-- Full Medida metrics framework integration (counters, timers, meters):
-  - `mBucketAddLiveBatch` / `mBucketAddArchiveBatch` timers
-  - `mBucketSnapMerge` timer
-  - `mCacheHitMeter` / `mCacheMissMeter`
-  - Bloom filter metrics (`getBloomMissMeter`, `getBloomLookupMeter`)
-- Note: Basic counters implemented in `metrics.rs` (MergeCounters, EvictionCounters, BucketListMetrics)
-
-### Implementation Notes
-
-#### Architectural Differences
-
-1. **Synchronous vs Asynchronous Merging**: The Rust `BucketList::add_batch` performs merges synchronously, while the `FutureBucket` implementation provides async capability. stellar-core uses `FutureBucket` throughout with background thread pool execution.
-
-2. **Single Bucket Type**: Rust uses a unified `Bucket` type with storage modes (InMemory/DiskBacked), while stellar-core has separate `LiveBucket` and `HotArchiveBucket` classes with distinct index types (`LiveBucketIndex` vs `HotArchiveBucketIndex`).
-
-3. **Index Design**: Both implementations now support similar index structures:
-   - `LiveBucketIndex` facade selecting `InMemoryIndex` or `DiskIndex` based on bucket size
-   - Bloom filters for fast negative lookups
-   - `RandomEvictionCache` for account entries
-   - `AssetPoolIdMap` for liquidity pool queries
-   - `BucketEntryCounters` for entry statistics
-
-4. **Snapshot Architecture**: Both use similar snapshot systems with `BucketSnapshotManager` for concurrent read access with historical snapshots.
-
-5. **Error Handling**: Rust uses `Result<T, BucketError>` consistently, while stellar-core uses exceptions.
-
-6. **Shadow Buckets**: stellar-core supports shadow buckets for protocol < 12 compatibility; Rust omits this as protocol 23+ is required.
-
-#### Protocol Compatibility
-
-The Rust implementation correctly handles:
-- Protocol 11+: INITENTRY and METAENTRY support
-- Protocol 12+: Shadow bucket removal (implicitly, by not implementing them)
-- Protocol 23+: Persistent eviction with `BucketMetadataExt::V1`, Hot Archive Bucket List
-
-#### Performance Considerations
-
-- Bloom filter integration reduces disk I/O for negative lookups (fast rejection of missing keys)
-- Disk-backed buckets reduce memory usage during catchup but load entries on-demand
-- `RandomEvictionCache` provides LRU caching for frequently-accessed account entries
-- In-memory level 0 optimization reduces disk I/O for frequent merges
-
-#### Known Performance Gaps
-
-**Merge Deduplication Not Integrated**
-
-The `BucketMergeMap` and `LiveMergeFutures` data structures are implemented and tested (matching stellar-core behavior), but they are **not integrated** into the `BucketList` merge workflow.
-
-In stellar-core:
-- `BucketManager::getMergeFuture()` checks `mLiveBucketFutures` for in-progress merges
-- If not found, checks `mFinishedMerges` (`BucketMergeMap`) for cached completed merges
-- `BucketManager::putMergeFuture()` registers new merges
-- `adoptFileAsBucket()` calls `recordMerge()` to cache input→output mappings
-
-This allows stellar-core to skip re-running merges when the same inputs are requested again (e.g., during catchup retries or restart merges).
-
-In our Rust implementation:
-- We guard against duplicate concurrent merges via `if self.next.is_some() { continue; }`
-- But we don't cache completed merge results for reuse
-- Each `restart_merges()` call re-runs merges even if the same inputs were merged before
-
-**Impact**: Potential performance regression during catchup/restart scenarios where the same merge is requested multiple times. During normal operation, this has minimal impact since each ledger produces unique bucket contents.
-
-**To integrate** (if needed):
-1. Add `BucketMergeMap` and `LiveMergeFutures` to `BucketManager`
-2. Before `AsyncMergeHandle::start_merge()`, check for existing/completed merge
-3. After merge completes, call `record_merge()`
-4. Wire up GC to call `forget_all_merges_producing()` when buckets are dropped
-
-#### File Format Compatibility
-
-- Bucket file format is fully compatible (gzip-compressed XDR with RFC 5531 record marking)
-- Hash computation matches stellar-core (SHA-256 over uncompressed XDR including record marks)
-- Bucket filenames use `<hash>.bucket.xdr` (canonical) with legacy `<hash>.bucket.gz` support and transparent migration
-
-### Future Work Priority
-
-1. **Lower Priority**: Full Medida metrics integration (observability)
-2. **Not Needed**: Shadow buckets (protocol < 12 feature, not required for protocol 23+)
-
-### stellar-core to Rust File Mapping
-
-| stellar-core File | Rust Equivalent | Status |
-|----------|-----------------|--------|
-| BucketListBase.h | bucket_list.rs | Complete |
-| LiveBucketList.h | bucket_list.rs | Complete |
-| HotArchiveBucketList.h | hot_archive.rs | Complete |
-| BucketBase.h | bucket.rs | Complete |
-| LiveBucket.h | bucket.rs, merge.rs | Complete |
-| HotArchiveBucket.h | hot_archive.rs | Complete |
-| FutureBucket.h | future_bucket.rs | Complete (no shadow buckets) |
-| BucketManager.h | manager.rs | Complete (state operations) |
-| BucketInputIterator.h | iterator.rs | Complete |
-| BucketOutputIterator.h | iterator.rs | Complete |
-| LiveBucketIndex.h | index.rs | Complete |
-| HotArchiveBucketIndex.h | hot_archive.rs | Simplified |
-| DiskIndex.h | index.rs (DiskIndex) | Complete |
-| InMemoryIndex.h | index.rs (InMemoryIndex) | Complete |
-| BucketSnapshot.h | snapshot.rs | Complete |
-| BucketSnapshotManager.h | snapshot.rs | Complete |
-| SearchableBucketList.h | snapshot.rs | Complete |
-| BucketListSnapshotBase.h | snapshot.rs | Complete |
-| BucketApplicator.h | applicator.rs | Complete |
-| BucketMergeMap.h | merge_map.rs | Complete |
-| BucketMergeAdapter.h | - | Not needed (Rust generics) |
-| BucketIndexUtils.h | index.rs | Complete |
-| LedgerCmp.h | entry.rs (compare_keys) | Complete |
-| MergeKey.h | future_bucket.rs (MergeKey) | Complete |
-| BucketUtils.h | entry.rs, eviction.rs | Complete |
-| BinaryFuseFilter.h | bloom_filter.rs, disk_bucket.rs | Complete |
-| RandomEvictionCache.h | cache.rs | Complete |
-| (BucketApplicator iteration) | live_iterator.rs | Complete |
-| (BucketIndex persistence) | index_persistence.rs | Complete |
-
----
-
-## Test Parity
-
-**Overall Test Parity: ~98%**
-
-The Rust test suite has **210+ tests** (185+ unit tests + 19 integration tests + 6 merge dedup tests + 6 pool query tests) compared to **49 tests** in 6 stellar-core test files (~7,000 LOC). Rust tests are more granular and unit-focused, while stellar-core tests are broader integration tests. The `bucket_list_integration.rs` file provides comprehensive parity with stellar-core integration test scenarios.
-
-### Test Coverage by Functionality
-
-| Functionality | stellar-core Tests | Rust Tests | Parity | Notes |
-|--------------|-----------|------------|--------|-------|
-| Bucket creation | 1 | 15 | 100% | Rust has more edge cases |
-| Merge semantics | 3 | 19 | 95% | Rust more granular |
-| INIT/DEAD handling | 2 | 9 | 100% | Full CAP-0020 coverage + integration test |
-| Hot archive | 2 | 15 | 100% | +3 integration tests added |
-| Manager lifecycle | 3 | 21 | 98% | +4 persistence tests added |
-| Spilling | 2 | 14 | 90% | Both cover essentials |
-| Indexing | 5 | 6 | 85% | Rust emphasizes pool queries |
-| Eviction | 1 (7 sub-cases) | 22 | 95% | +3 full eviction scan tests |
-| Snapshots | 2 | 8 | 100% | +searchable snapshot test |
-| Merge deduplication | 1 | 6 | 100% | Rust exceeds with concurrency |
-| BucketList operations | 6 | 20 | 100% | +6 integration tests |
-
-### Eviction Testing
-
-**stellar-core (`BucketListTests.cpp`)**: One comprehensive integration test `eviction scan` with 7 sub-sections:
-1. Basic eviction - verify all entries evicted at once
-2. Shadowed entries not evicted - TTL updates prevent eviction
-3. `maxEntriesToArchive` - limit entries per ledger
-4. Entry modified on eviction ledger - edge case
-5. `evictionScanSize` - byte-level scan configuration
-6. Scans across multiple buckets - curr→snap transitions
-7. Iterator resets when bucket changes - spill boundary handling
-
-**Rust (`eviction.rs`)**: 17 unit tests focused on iterator mechanics:
-- ✅ `test_level_size()` / `test_level_half()` - level math
-- ✅ `test_level_should_spill()` - spill boundary detection
-- ✅ `test_bucket_update_period()` - update frequencies
-- ✅ `test_iterator_advance()` - bucket advancement (6c→6s→7c...)
-- ✅ `test_iterator_wrap_detection()` - wrap-around detection
-- ✅ `test_iterator_different_starting_levels()` - level 0 vs 10
-- ✅ `test_iterator_offset_tracking()` - offset reset on advance
-- ✅ `test_update_starting_eviction_iterator_*` - 5 tests for spill boundary resets
-
-**Gaps** (mostly addressed in bucket_list_integration.rs):
-- ✅ `test_eviction_scan_basic` - Full BucketList + TTL expiration integration test
-- ✅ `test_eviction_scan_shadowed_entries_not_evicted` - TTL updates prevent eviction
-- ✅ `test_eviction_scan_incremental` - Byte-level scan with StateArchivalSettings
-- ❌ No test for `maxEntriesToArchive` limiting (not exposed in current API)
-
-### Hot Archive and Auto-Restore Testing
-
-**stellar-core (`BucketListTests.cpp`)**: 2 dedicated tests:
-1. `hot archive bucket tombstones expire at bottom level` - validates archived entries survive to bottom, tombstones (Live markers) expire
-2. `hot archive accepts multiple archives and restores for same key` - full cycle: archive V0 → restore → re-archive V1 → verify V1 wins
-
-**Rust (`hot_archive.rs`)**: 12 unit tests:
-- ✅ `test_hot_archive_bucket_empty()` / `test_hot_archive_bucket_fresh()` - basic bucket properties
-- ✅ `test_hot_archive_bucket_fresh_metaentry_only()` - metaentry-only bucket (critical for hash parity)
-- ✅ `test_hot_archive_metaentry_only_hash_matches_stellar_core()` - exact hash verification against testnet
-- ✅ `test_hot_archive_bucket_list_add_batch()` - adding entries to archive
-- ✅ `test_hot_archive_bucket_list_restoration()` - archive → restore → verify shadowed
-- ✅ `test_merge_newer_always_wins_archived_then_live()` - Archived + Live merge
-- ✅ `test_merge_newer_always_wins_live_then_archived()` - Live + Archived merge
-- ✅ `test_merge_metaentry_only_buckets()` - empty merge produces metaentry-only
-- ✅ `test_tombstones_dropped_at_bottom()` - tombstones removed at bottom level
-
-**Gaps** (addressed in bucket_list_integration.rs):
-- ✅ `test_hot_archive_multiple_archives_and_restores` - Full archive → restore → re-archive cycle
-- ✅ `test_single_entry_bubbling_up` - Entry bubbles through levels (tests multi-level merging)
-- ✅ `test_hot_archive_concurrent_archive_and_restore` - Archive + restore in same batch
-
-### New Integration Tests Added (bucket_list_integration.rs)
-
-The following 19 integration tests were added to achieve parity with stellar-core BucketListTests.cpp:
-
-**Hot Archive Tests:**
-- `test_hot_archive_tombstones_expire_at_bottom_level` - Verifies archived entries survive to bottom level while Live tombstones expire
-- `test_hot_archive_multiple_archives_and_restores` - Tests full cycle: archive V0 → restore → re-archive V1 → verify V1 wins
-- `test_hot_archive_concurrent_archive_and_restore` - Tests archive + restore in same batch
-
-**BucketList Operation Tests:**
-- `test_bucket_list_basic_operations` - Basic add_batch operations with level size verification (stellar-core "bucket list")
-- `test_bucket_list_snap_steady_state` - Verifies snap buckets reach consistent sizes (stellar-core "BucketList snap reaches steady state")
-- `test_bucket_list_deepest_curr_accumulates` - Verifies entries propagate to deeper levels (stellar-core "BucketList deepest curr accumulates")
-- `test_single_entry_bubbling_up` - Verifies single entry bubbles through all levels (stellar-core "single entry bubbling up")
-- `test_init_dead_annihilation` - Verifies CAP-0020 INIT + DEAD annihilation (stellar-core "bucket tombstones mutually-annihilate init entries")
-- `test_tombstones_expire_at_bottom_level` - Verifies tombstones dropped at bottom (stellar-core "live bucket tombstones expire at bottom level")
-- `test_searchable_bucket_list_snapshots` - Verifies snapshot searchability (stellar-core "Searchable BucketListDB snapshots")
-
-**Eviction Iterator Tests:**
-- `test_eviction_iterator_preserved_when_no_spill` - Verifies iterator position preserved when no spill occurs
-- `test_eviction_iterator_resets_on_spill` - Verifies iterator resets when bucket receives new data
-
-**Eviction Scan Tests:**
-- `test_eviction_scan_basic` - Full eviction test with BucketList, Soroban entries, and TTL expiration (stellar-core "eviction scan" -> "basic eviction test")
-- `test_eviction_scan_shadowed_entries_not_evicted` - TTL updates prevent eviction (stellar-core "eviction scan" -> "shadowed entries not evicted")
-- `test_eviction_scan_incremental` - Incremental eviction scan with StateArchivalSettings (stellar-core "eviction scan" -> "evictionScanSize")
-
-**BucketManager Persistence Tests:**
-- `test_bucket_manager_persistence` - Create bucket, close manager, reopen, verify persistence (stellar-core BucketManager restart tests)
-- `test_bucket_manager_load_by_hash` - Load multiple buckets by hash
-- `test_bucket_manager_empty_bucket` - Empty bucket handling
-- `test_bucket_manager_verify_buckets` - Bucket hash verification
-
-### Remaining Test Gaps (Priority Order)
-
-#### Tier 1 (Low Priority - Minor Gaps)
-1. **maxEntriesToArchive limiting** - Verify eviction respects per-ledger limits (not exposed in current Rust API)
-
-#### Tier 2 (Optional)
-2. **Concurrent snapshot access during merges** - Thread safety verification
-3. **Large bucket handling** - 100k+ entry performance testing
-
-### stellar-core Test File to Rust Mapping
-
-| stellar-core Test File | Rust Equivalent | Coverage |
-|---------------|-----------------|----------|
-| BucketTests.cpp (8 tests) | bucket.rs, merge.rs, hot_archive.rs | 95% |
-| BucketManagerTests.cpp (10 tests) | manager.rs, bucket_list_integration.rs | 98% |
-| BucketListTests.cpp (17 tests) | bucket_list.rs, eviction.rs, hot_archive.rs, bucket_list_integration.rs | 98% |
-| BucketIndexTests.cpp (13 tests) | index.rs, disk_bucket.rs | 85% |
-| BucketMergeMapTests.cpp (1 test) | merge_map.rs, test_merge_deduplication.rs | 100% |
-| BucketTestUtils.cpp | (test helpers in each module) | N/A |
+# stellar-core Parity Status
+
+**Crate**: `henyey-bucket`
+**Upstream**: `.upstream-v25/src/bucket/`
+**Overall Parity**: 92%
+**Last Updated**: 2026-02-13
+
+## Summary
+
+| Area | Status | Notes |
+|------|--------|-------|
+| BucketListBase (spill mechanics, level math) | Full | All static functions implemented |
+| LiveBucketList (addBatch, eviction) | Full | Includes eviction iterator management |
+| HotArchiveBucketList (addBatch) | Full | Archive and restore support |
+| BucketBase (merge, hash, index) | Full | Unified Bucket type covers both Live/HotArchive |
+| LiveBucket (fresh, merge, in-memory) | Full | Includes mergeInMemory and freshInMemoryOnly |
+| HotArchiveBucket (fresh, merge) | Full | Full merge semantics |
+| BucketManager (lifecycle, GC, state) | Partial | Missing some medida metrics, visitLedgerEntries |
+| FutureBucket (async merging) | Full | Tokio-based equivalent |
+| BucketSnapshot (thread-safe reads) | Full | Full snapshot hierarchy |
+| BucketSnapshotManager (snapshot lifecycle) | Full | Historical snapshots supported |
+| SearchableBucketListSnapshot (queries) | Full | Pool queries, inflation winners, type scanning |
+| BucketInputIterator / OutputIterator | Full | Streaming with metadata handling |
+| LiveBucketIndex / DiskIndex / InMemoryIndex | Full | Page-based + bloom filter + cache |
+| BucketApplicator (catchup) | Full | Chunked application with counters |
+| BucketMergeMap (dedup) | Partial | Implemented but not integrated into merge workflow |
+| LedgerCmp / BucketEntryIdCmp | Full | Full entry ordering |
+
+## File Mapping
+
+| stellar-core File | Rust Module | Notes |
+|--------------------|-------------|-------|
+| `BucketBase.h` / `BucketBase.cpp` | `bucket.rs` | Unified `Bucket` type (no CRTP template) |
+| `LiveBucket.h` / `LiveBucket.cpp` | `bucket.rs`, `merge.rs` | In-memory entries, merge logic |
+| `HotArchiveBucket.h` / `HotArchiveBucket.cpp` | `hot_archive.rs` | Separate type for hot archive |
+| `BucketListBase.h` / `BucketListBase.cpp` | `bucket_list.rs`, `eviction.rs` | Level math, spill logic |
+| `LiveBucketList.h` / `LiveBucketList.cpp` | `bucket_list.rs` | addBatch, eviction iterator |
+| `HotArchiveBucketList.h` / `HotArchiveBucketList.cpp` | `hot_archive.rs` | Hot archive addBatch |
+| `BucketManager.h` / `BucketManager.cpp` | `manager.rs`, `bucket_list.rs` | Bucket lifecycle, state loading |
+| `FutureBucket.h` / `FutureBucket.cpp` | `future_bucket.rs`, `bucket_list.rs` | Async merge + PendingMerge |
+| `BucketInputIterator.h` / `BucketInputIterator.cpp` | `iterator.rs` | Streaming input iteration |
+| `BucketOutputIterator.h` / `BucketOutputIterator.cpp` | `iterator.rs` | Streaming output with dedup |
+| `BucketSnapshot.h` / `BucketSnapshot.cpp` | `snapshot.rs` | Thread-safe bucket snapshots |
+| `BucketSnapshotManager.h` / `BucketSnapshotManager.cpp` | `snapshot.rs` | Snapshot lifecycle |
+| `BucketListSnapshotBase.h` / `BucketListSnapshotBase.cpp` | `snapshot.rs` | Searchable snapshot base |
+| `SearchableBucketList.h` / `SearchableBucketList.cpp` | `snapshot.rs` | Query interface |
+| `LiveBucketIndex.h` / `LiveBucketIndex.cpp` | `index.rs` | Hybrid index facade |
+| `DiskIndex.h` / `DiskIndex.cpp` | `index.rs` | Page-based range index |
+| `InMemoryIndex.h` / `InMemoryIndex.cpp` | `index.rs` | Full in-memory index |
+| `HotArchiveBucketIndex.h` / `HotArchiveBucketIndex.cpp` | `hot_archive.rs` | Simplified (disk-only) |
+| `BucketIndexUtils.h` / `BucketIndexUtils.cpp` | `index.rs`, `bloom_filter.rs` | Index utilities and filter |
+| `BucketApplicator.h` / `BucketApplicator.cpp` | `applicator.rs` | Catchup entry application |
+| `BucketMergeMap.h` / `BucketMergeMap.cpp` | `merge_map.rs` | Merge dedup tracking |
+| `BucketMergeAdapter.h` | *(intentional omission)* | Rust generics replace C++ template adapters |
+| `MergeKey.h` / `MergeKey.cpp` | `future_bucket.rs` | Merge key type |
+| `LedgerCmp.h` | `entry.rs` | Entry comparison/ordering |
+| `BucketUtils.h` / `BucketUtils.cpp` | `entry.rs`, `eviction.rs`, `metrics.rs` | Utility types and counters |
+
+## Component Mapping
+
+### `bucket.rs`
+
+Corresponds to: `BucketBase.h`, `LiveBucket.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `BucketBase()` (empty) | `Bucket::empty()` | Full |
+| `BucketBase(filename, hash, index)` | `Bucket::from_xdr_file_disk_backed()` | Full |
+| `getHash()` | `Bucket::hash()` | Full |
+| `getFilename()` | `Bucket::backing_file_path()` | Full |
+| `getSize()` | `Bucket::len()` | Full |
+| `isEmpty()` | `Bucket::is_empty()` | Full |
+| `freeIndex()` | *(drop semantics)* | Full |
+| `isIndexed()` | `Bucket::is_disk_backed()` | Full |
+| `setIndex()` | `Bucket::from_xdr_file_disk_backed_prebuilt()` | Full |
+| `merge()` | `merge_buckets()` / `merge_buckets_with_options()` | Full |
+| `mergeInternal()` | Internal merge logic in `merge.rs` | Full |
+| `randomBucketName()` | `canonical_bucket_filename()` | Full |
+| `LiveBucket()` (empty) | `Bucket::empty()` | Full |
+| `LiveBucket(filename, hash, index)` | Various `Bucket::from_*` constructors | Full |
+| `containsBucketIdentity()` | `Bucket::get()` | Full |
+| `getIndexCacheSize()` | *(via LiveBucketIndex)* | Full |
+| `checkProtocolLegality()` | Inline protocol checks in merge | Full |
+| `convertToBucketEntry()` | Inline in `BucketList::add_batch()` | Full |
+| `mergeCasesWithEqualKeys()` | `merge_entries()` in `merge.rs` | Full |
+| `fresh()` | `Bucket::from_entries()` / `from_sorted_entries()` | Full |
+| `freshInMemoryOnly()` | `Bucket::fresh_in_memory_only()` | Full |
+| `isTombstoneEntry()` | `BucketEntry::is_dead()` | Full |
+| `bucketEntryToLoadResult()` | `Bucket::get_entry()` | Full |
+| `maybePut()` | Shadow handling in `merge.rs` | Full |
+| `mergeInMemory()` | `merge_in_memory()` | Full |
+| `countOldEntryType()` / `countNewEntryType()` | `MergeCounters` recording | Full |
+| `updateMergeCountersForProtocolVersion()` | Inline protocol version checks | Full |
+| `getBucketVersion()` | `Bucket::protocol_version()` | Full |
+| `hasInMemoryEntries()` | `Bucket::has_in_memory_entries()` | Full |
+| `setInMemoryEntries()` | `Bucket::set_in_memory_entries()` | Full |
+| `getInMemoryEntries()` | `Bucket::get_in_memory_entries()` | Full |
+| `maybeInitializeCache()` | *(via cache.rs)* | Full |
+| `getBucketEntryCounters()` | *(via index.rs BucketEntryCounters)* | Full |
+| `getRangeForType()` | *(via index.rs TypeRange)* | Full |
+
+### `bucket_list.rs`
+
+Corresponds to: `BucketListBase.h`, `LiveBucketList.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `BucketListBase()` | `BucketList::new()` | Full |
+| `kNumLevels` | `BUCKET_LIST_LEVELS` (11) | Full |
+| `shouldMergeWithEmptyCurr()` | Inline in spill logic | Full |
+| `levelSize()` | `level_size()` | Full |
+| `levelHalf()` | `level_half()` | Full |
+| `sizeOfCurr()` | `size_of_curr()` | Full |
+| `sizeOfSnap()` | `size_of_snap()` | Full |
+| `oldestLedgerInCurr()` | `oldest_ledger_in_curr()` | Full |
+| `oldestLedgerInSnap()` | `oldest_ledger_in_snap()` | Full |
+| `levelShouldSpill()` | `level_should_spill()` | Full |
+| `keepTombstoneEntries()` | Inline level check | Full |
+| `bucketUpdatePeriod()` | `bucket_update_period()` | Full |
+| `getLevel()` | `BucketList::level()` | Full |
+| `getHash()` | `BucketList::hash()` | Full |
+| `restartMerges()` | `BucketList::restart_merges_from_has()` | Full |
+| `resolveAnyReadyFutures()` | `BucketList::resolve_ready_futures()` | Full |
+| `futuresAllResolved()` | `BucketList::futures_all_resolved()` | Full |
+| `getMaxMergeLevel()` | Inline calculation | Full |
+| `getSize()` | `BucketList::size()` | Full |
+| `addBatchInternal()` | `BucketList::add_batch()` | Full |
+| `BucketLevel(i)` | `BucketLevel::new()` | Full |
+| `BucketLevel::getHash()` | `BucketLevel::hash()` | Full |
+| `BucketLevel::getNext()` | `BucketLevel::next()` | Full |
+| `BucketLevel::getCurr()` | `BucketLevel::curr()` | Full |
+| `BucketLevel::getSnap()` | `BucketLevel::snap()` | Full |
+| `BucketLevel::setNext()` | `BucketLevel::set_next()` | Full |
+| `BucketLevel::setCurr()` | `BucketLevel::set_curr()` | Full |
+| `BucketLevel::setSnap()` | `BucketLevel::set_snap()` | Full |
+| `BucketLevel::commit()` | `BucketLevel::commit()` | Full |
+| `BucketLevel::prepare()` | `BucketLevel::prepare()` | Full |
+| `BucketLevel::prepareFirstLevel()` | `BucketLevel::prepare_first_level()` | Full |
+| `BucketLevel::snap()` | `BucketLevel::snap_curr()` | Full |
+| `LiveBucketList::addBatch()` | `BucketList::add_batch()` | Full |
+| `LiveBucketList::updateStartingEvictionIterator()` | `update_starting_eviction_iterator()` | Full |
+| `LiveBucketList::updateEvictionIterAndRecordStats()` | Inline in eviction scan | Full |
+| `LiveBucketList::checkIfEvictionScanIsStuck()` | Inline in eviction scan | Full |
+| `LiveBucketList::sumBucketEntryCounters()` | *(via BucketEntryCounters)* | Full |
+| `LiveBucketList::maybeInitializeCaches()` | *(via cache initialization)* | Full |
+
+### `merge.rs`
+
+Corresponds to: `BucketBase.h` (merge), `LiveBucket.h` (mergeCasesWithEqualKeys)
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `BucketBase::merge()` | `merge_buckets()` | Full |
+| `BucketBase::mergeInternal()` | Internal merge loop | Full |
+| `LiveBucket::mergeCasesWithEqualKeys()` | `merge_entries()` | Full |
+| `LiveBucket::maybePut()` | Shadow + tombstone logic | Full |
+| `LiveBucket::mergeInMemory()` | `merge_in_memory()` | Full |
+
+### `hot_archive.rs`
+
+Corresponds to: `HotArchiveBucket.h`, `HotArchiveBucketList.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `HotArchiveBucket()` | `HotArchiveBucket::empty()` | Full |
+| `HotArchiveBucket(filename, hash, index)` | `HotArchiveBucket::from_xdr_*()` | Full |
+| `getBucketVersion()` | `HotArchiveBucket::protocol_version()` | Full |
+| `fresh()` | `HotArchiveBucket::fresh()` | Full |
+| `isTombstoneEntry()` | `is_hot_archive_tombstone()` | Full |
+| `maybePut()` | Inline in merge | Full |
+| `mergeCasesWithEqualKeys()` | `merge_hot_archive_buckets()` | Full |
+| `bucketEntryToLoadResult()` | `HotArchiveBucket::get()` | Full |
+| `convertToBucketEntry()` | Inline in `add_batch()` | Full |
+| `HotArchiveBucketList::addBatch()` | `HotArchiveBucketList::add_batch()` | Full |
+
+### `manager.rs`
+
+Corresponds to: `BucketManager.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `BucketManager::create()` | `BucketManager::new()` | Full |
+| `initialize()` | Constructor logic | Full |
+| `dropAll()` | `BucketManager::clear_cache()` + file cleanup | Full |
+| `bucketIndexFilename()` | `index_path_for_bucket()` | Full |
+| `getTmpDir()` | `BucketManager::bucket_dir()` | Full |
+| `getBucketDir()` | `BucketManager::bucket_dir()` | Full |
+| `getLiveBucketList()` | External (in app crate) | Full |
+| `getHotArchiveBucketList()` | External (in app crate) | Full |
+| `getBucketSnapshotManager()` | External (in app crate) | Full |
+| `renameBucketDirFile()` | *(std::fs::rename)* | Full |
+| `getMergeTimer()` | `MergeCounters` | Partial |
+| `getBloomMissMeter()` / `getBloomLookupMeter()` | Not integrated | None |
+| `getCacheHitMeter()` / `getCacheMissMeter()` | `CacheStats` | Partial |
+| `readMergeCounters()` / `incrMergeCounters()` | `MergeCounters` (atomic) | Full |
+| `adoptFileAsBucket()` | `BucketManager::load_bucket()` + cache | Full |
+| `noteEmptyMergeOutput()` | Inline empty bucket handling | Full |
+| `getBucketIfExists()` | `BucketManager::bucket_exists()` | Full |
+| `getBucketByHash()` | `BucketManager::load_bucket()` | Full |
+| `getMergeFuture()` | Not integrated (MergeMap exists but unused) | None |
+| `putMergeFuture()` | Not integrated | None |
+| `forgetUnreferencedBuckets()` | `BucketManager::retain_buckets()` | Full |
+| `addLiveBatch()` | `BucketList::add_batch()` | Full |
+| `addHotArchiveBatch()` | `HotArchiveBucketList::add_batch()` | Full |
+| `snapshotLedger()` | `BucketList::snapshot_ledger()` | Full |
+| `maybeSetIndex()` | Index set during loading | Full |
+| `startBackgroundEvictionScan()` | `BucketList::scan_for_eviction_incremental()` | Full |
+| `resolveBackgroundEvictionScan()` | `ResolvedEviction` | Full |
+| `forgetUnreferencedBuckets()` | `BucketManager::retain_buckets()` | Full |
+| `checkForMissingBucketsFiles()` | `BucketManager::verify_buckets_exist()` | Full |
+| `assumeState()` | `BucketList::assume_state()` | Full |
+| `shutdown()` / `isShutdown()` | *(drop semantics)* | Full |
+| `loadCompleteLedgerState()` | `BucketManager::load_complete_ledger_state()` | Full |
+| `loadCompleteHotArchiveState()` | *(partial, via hot archive iteration)* | Partial |
+| `mergeBuckets()` | `BucketManager::merge_all_buckets()` | Full |
+| `visitLedgerEntries()` | Not implemented | None |
+| `scheduleVerifyReferencedBucketsWork()` | `BucketManager::verify_bucket_hashes()` | Partial |
+| `getConfig()` | Configuration via constructor params | Full |
+| `reportBucketEntryCountMetrics()` | `BucketEntryCounters` | Partial |
+| `calculateSkipValues()` | `BucketList::calculate_skip_values()` | Full |
+
+### `future_bucket.rs`
+
+Corresponds to: `FutureBucket.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `FutureBucket()` | `FutureBucket::clear()` | Full |
+| `FutureBucket(app, curr, snap, shadows, ...)` | `FutureBucket::start_merge()` | Full |
+| `clear()` | `FutureBucket::clear()` | Full |
+| `isLive()` | `FutureBucket::is_live()` | Full |
+| `isMerging()` | `FutureBucket::is_merging()` | Full |
+| `isClear()` | `FutureBucket::is_clear()` | Full |
+| `hasHashes()` | `FutureBucket::has_hashes()` | Full |
+| `hasOutputHash()` | `FutureBucket::has_output_hash()` | Full |
+| `getOutputHash()` | `FutureBucket::output_hash()` | Full |
+| `mergeComplete()` | `MergeHandle::is_complete()` | Full |
+| `resolve()` | `FutureBucket::resolve()` / `MergeHandle::resolve()` | Full |
+| `makeLive()` | `FutureBucket::make_live()` | Full |
+| `getHashes()` | `FutureBucket::get_hashes()` | Full |
+| `load()` / `save()` (Cereal) | `FutureBucketSnapshot` serde | Full |
+
+### `iterator.rs`
+
+Corresponds to: `BucketInputIterator.h`, `BucketOutputIterator.h`, `BucketMergeAdapter.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `BucketInputIterator(bucket)` | `BucketInputIterator::open()` | Full |
+| `operator bool()` | `BucketInputIterator::has_next()` | Full |
+| `seenMetadata()` | `BucketInputIterator::seen_metadata()` | Full |
+| `getMetadata()` | `BucketInputIterator::metadata()` | Full |
+| `operator*()` | `BucketInputIterator::peek()` | Full |
+| `operator++()` | `BucketInputIterator::next_entry()` | Full |
+| `pos()` / `size()` / `seek()` | `bytes_read()` / partial | Partial |
+| `BucketOutputIterator(...)` | `BucketOutputIterator::new()` | Full |
+| `put()` | `BucketOutputIterator::put()` | Full |
+| `getBucket()` | `BucketOutputIterator::finish()` | Full |
+| `MergeInput` (virtual base) | `MergeInput` trait | Full |
+| `FileMergeInput` | `FileMergeInput` | Full |
+| `MemoryMergeInput` | `MemoryMergeInput` | Full |
+
+### `snapshot.rs`
+
+Corresponds to: `BucketSnapshot.h`, `BucketSnapshotManager.h`, `BucketListSnapshotBase.h`, `SearchableBucketList.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `BucketSnapshotBase(bucket)` | `BucketSnapshot::new()` | Full |
+| `isEmpty()` | `BucketSnapshot::is_empty()` | Full |
+| `getRawBucket()` | `BucketSnapshot::bucket()` | Full |
+| `getBucketEntry()` | `BucketSnapshot::get()` | Full |
+| `loadKeys()` | `BucketSnapshot::load_keys()` | Full |
+| `getEntryAtOffset()` | Inline in disk lookup | Full |
+| `LiveBucketSnapshot::getPoolIDsByAsset()` | `SearchableBucketListSnapshot::load_pool_share_trustlines_*()` | Full |
+| `LiveBucketSnapshot::scanForEviction()` | Eviction scan integration | Full |
+| `LiveBucketSnapshot::scanForEntriesOfType()` | `scan_for_entries_of_type()` | Full |
+| `BucketListSnapshot(bl, header)` | `BucketListSnapshot::new()` | Full |
+| `getLevels()` | `BucketListSnapshot::levels()` | Full |
+| `getLedgerSeq()` | `BucketListSnapshot::ledger_seq()` | Full |
+| `getLedgerHeader()` | `BucketListSnapshot::ledger_header()` | Full |
+| `SearchableBucketListSnapshotBase::loopAllBuckets()` | Internal iteration | Full |
+| `SearchableBucketListSnapshotBase::load()` | `SearchableBucketListSnapshot::load()` | Full |
+| `SearchableBucketListSnapshotBase::loadKeysFromLedger()` | `load_keys_from_ledger()` | Full |
+| `SearchableLiveBucketListSnapshot::loadPoolShareTrustLinesByAccountAndAsset()` | `load_pool_share_trustlines_by_account_and_asset()` | Full |
+| `SearchableLiveBucketListSnapshot::loadInflationWinners()` | `load_inflation_winners()` | Full |
+| `SearchableLiveBucketListSnapshot::loadKeys()` | `load_keys()` | Full |
+| `SearchableLiveBucketListSnapshot::scanForEviction()` | Eviction scan integration | Full |
+| `SearchableLiveBucketListSnapshot::scanForEntriesOfType()` | `scan_for_entries_of_type()` | Full |
+| `SearchableHotArchiveBucketListSnapshot::loadKeys()` | `load_keys()` | Full |
+| `BucketSnapshotManager::updateCurrentSnapshot()` | `update_current_snapshot()` | Full |
+| `BucketSnapshotManager::copySearchableLiveBucketListSnapshot()` | `copy_searchable_live_snapshot()` | Full |
+| `BucketSnapshotManager::copySearchableHotArchiveBucketListSnapshot()` | `copy_searchable_hot_archive_snapshot()` | Full |
+| `BucketSnapshotManager::maybeCopySearchableBucketListSnapshot()` | `maybe_update_live_snapshot()` | Full |
+| `BucketSnapshotManager::maybeCopyLiveAndHotArchiveSnapshots()` | `copy_live_and_hot_archive_snapshots()` | Full |
+
+### `index.rs`
+
+Corresponds to: `LiveBucketIndex.h`, `DiskIndex.h`, `InMemoryIndex.h`, `BucketIndexUtils.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `LiveBucketIndex(bm, filename, hash, ctx, hasher)` | `LiveBucketIndex::new()` | Full |
+| `LiveBucketIndex::lookup()` | `LiveBucketIndex::lookup()` | Full |
+| `LiveBucketIndex::scan()` | `LiveBucketIndex::scan()` | Full |
+| `LiveBucketIndex::getPoolIDsByAsset()` | `LiveBucketIndex::pool_ids_by_asset()` | Full |
+| `LiveBucketIndex::maybeAddToCache()` | *(via cache.rs)* | Full |
+| `LiveBucketIndex::getRangeForType()` | `LiveBucketIndex::range_for_type()` | Full |
+| `LiveBucketIndex::getBucketEntryCounters()` | `LiveBucketIndex::counters()` | Full |
+| `LiveBucketIndex::getPageSize()` | `LiveBucketIndex::page_size()` | Full |
+| `LiveBucketIndex::maybeInitializeCache()` | `LiveBucketIndex::maybe_initialize_cache()` | Full |
+| `DiskIndex(bm, filename, pageSize, hash, ctx, hasher)` | `DiskIndex::new()` | Full |
+| `DiskIndex::scan()` | `DiskIndex::scan()` | Full |
+| `DiskIndex::getOffsetBounds()` | `DiskIndex::offset_bounds()` | Full |
+| `DiskIndex::getRangeForType()` | `DiskIndex::range_for_type()` | Full |
+| `DiskIndex::getPageSize()` | `DiskIndex::page_size()` | Full |
+| `DiskIndex::getBucketEntryCounters()` | `DiskIndex::counters()` | Full |
+| `DiskIndex::saveToDisk()` | `save_disk_index()` | Full |
+| `DiskIndex::markBloomMiss()` | Bloom filter integration | Full |
+| `InMemoryIndex(bm, filename, hasher)` | `InMemoryIndex::new()` | Full |
+| `InMemoryBucketState::insert()` | `InMemoryIndex::insert()` | Full |
+| `InMemoryBucketState::scan()` | `InMemoryIndex::scan()` | Full |
+| `createIndex()` | Auto-selected in `LiveBucketIndex::new()` | Full |
+| `loadIndex()` | `load_disk_index()` | Full |
+| `getPageSizeFromConfig()` | `DEFAULT_PAGE_SIZE` constant | Full |
+| `IndexReturnT` | Return types in scan/lookup | Full |
+
+### `applicator.rs`
+
+Corresponds to: `BucketApplicator.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `BucketApplicator(app, maxProtocol, ...)` | `BucketApplicator::new()` | Full |
+| `operator bool()` | `BucketApplicator::has_more()` | Full |
+| `advance()` | `BucketApplicator::advance()` | Full |
+| `pos()` / `size()` | `BucketApplicator::progress()` | Full |
+| `Counters(now)` | `ApplicatorCounters::new()` | Full |
+| `Counters::mark()` | `ApplicatorCounters::record_upsert()` / `record_delete()` | Full |
+| `Counters::logInfo()` / `logDebug()` | Tracing-based logging | Full |
+
+### `merge_map.rs`
+
+Corresponds to: `BucketMergeMap.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `recordMerge()` | `BucketMergeMap::record_merge()` | Full |
+| `forgetAllMergesProducing()` | `BucketMergeMap::forget_all_merges_producing()` | Full |
+| `findMergeFor()` | `BucketMergeMap::get_output()` | Full |
+| `getOutputsUsingInput()` | `BucketMergeMap::get_outputs_for_input()` | Full |
+
+### `entry.rs`
+
+Corresponds to: `LedgerCmp.h`, `BucketUtils.h` (entry utilities)
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `LedgerEntryIdCmp::operator()` | `compare_keys()` | Full |
+| `BucketEntryIdCmp::compareLive()` | `compare_entries()` | Full |
+| `BucketEntryIdCmp::compareHotArchive()` | Hot archive comparison in `hot_archive.rs` | Full |
+| `isBucketMetaEntry()` | `BucketEntry::is_metadata()` | Full |
+| `bucketEntryToLedgerEntryAndDurabilityType()` | `BucketEntryCounters::record_entry()` | Full |
+| `updateTypeBoundaries()` | Index type boundary tracking | Full |
+| `buildTypeRangesMap()` | `TypeRange` construction | Full |
+
+### `metrics.rs`
+
+Corresponds to: `BucketUtils.h` (MergeCounters, EvictionCounters)
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `MergeCounters` (all fields) | `MergeCounters` | Full |
+| `MergeCounters::operator+=` | Atomic operations | Full |
+| `EvictionResultEntry` | `EvictionCandidate` | Full |
+| `EvictionResultCandidates` | `EvictionResult` | Full |
+| `EvictionResultCandidates::isValid()` | `EvictionResult` validity check | Full |
+| `EvictedStateVectors` | `ResolvedEviction` | Full |
+| `EvictionCounters` | `EvictionCounters` | Full |
+| `EvictionStatistics` | `EvictionCounters` (simplified) | Partial |
+| `BucketEntryCounters` | `BucketEntryCounters` | Full |
+| `LedgerEntryTypeAndDurability` | `BucketEntryCounters` (tracking by type+durability) | Full |
+
+### `eviction.rs`
+
+Corresponds to: `BucketListBase.h` (eviction statics), `BucketUtils.h` (eviction types)
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `EvictionIterator` | `EvictionIterator` | Full |
+| `StateArchivalSettings` | `StateArchivalSettings` | Full |
+| `updateStartingEvictionIterator()` | `update_starting_eviction_iterator()` | Full |
+| `updateEvictionIterAndRecordStats()` | Inline in scan logic | Full |
+| `checkIfEvictionScanIsStuck()` | Inline in scan logic | Full |
+| `level_size()` / `level_half()` | `level_size()` / `level_half()` | Full |
+| `level_should_spill()` | `level_should_spill()` | Full |
+| `bucket_update_period()` | `bucket_update_period()` | Full |
+
+### `bloom_filter.rs`
+
+Corresponds to: `BucketIndexUtils.h` (BinaryFuseFilter usage)
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `BinaryFuseFilter16` | `BucketBloomFilter` (wraps `xorf::BinaryFuse16`) | Full |
+| SipHash-2-4 key hashing | `BucketBloomFilter::hash_key()` | Full |
+
+### `cache.rs`
+
+Corresponds to: `RandomEvictionCache.h` (in `util/`)
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `RandomEvictionCache` | `RandomEvictionCache` | Full |
+| `get()` / `put()` / `erase()` | `get()` / `insert()` / `remove()` | Full |
+| Memory-limited eviction | Configurable max bytes/entries | Full |
+| Account-only caching | `is_cached_type()` check | Full |
+
+### `index_persistence.rs`
+
+Corresponds to: `DiskIndex.h` (saveToDisk/loadIndex), `BucketIndexUtils.h` (createIndex/loadIndex)
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `DiskIndex::saveToDisk()` | `save_disk_index()` | Full |
+| `loadIndex()` | `load_disk_index()` | Full |
+| `createIndex()` | `LiveBucketIndex::new()` | Full |
+| Version checking on load | `BUCKET_INDEX_VERSION` check | Full |
+
+## Intentional Omissions
+
+Features excluded by design. These are NOT counted against parity %.
+
+| stellar-core Component | Reason |
+|------------------------|--------|
+| `BucketMergeAdapter.h` | Rust generics eliminate need for C++ template adapter pattern |
+| Shadow bucket support in merges | Protocol 23+ only; shadows removed in protocol 12 |
+| `TmpDirManager` / lock file | Rust uses `tempfile` crate and OS-level locking |
+| Medida metrics library integration | Rust uses custom atomic counters and tracing |
+| `NonMovableOrCopyable` base class | Rust ownership system enforces this at compile time |
+| `AppConnector` parameter threading | Rust uses direct dependency injection |
+| `BUILD_TESTS` conditional compilation | Rust uses `#[cfg(test)]` natively |
+
+## Gaps
+
+Features not yet implemented. These ARE counted against parity %.
+
+| stellar-core Component | Priority | Notes |
+|------------------------|----------|-------|
+| `BucketManager::getMergeFuture()` / `putMergeFuture()` | Medium | MergeMap exists but not wired into merge workflow |
+| `BucketManager::visitLedgerEntries()` | Medium | Visitor-based iteration with filter/accept callbacks |
+| `BucketManager::getBloomMissMeter()` / `getBloomLookupMeter()` | Low | Medida-style meter not integrated |
+| `BucketManager::loadCompleteHotArchiveState()` (full) | Low | Partial via hot archive iteration |
+| `BucketManager::scheduleVerifyReferencedBucketsWork()` (as Work) | Low | Verification exists but not as Work class |
+| `BucketInputIterator::seek()` | Low | Position seeking not exposed |
+| `EvictionStatistics::submitMetricsAndRestartCycle()` | Low | Simplified eviction stats |
+
+## Architectural Differences
+
+1. **Unified Bucket Type**
+   - **stellar-core**: Separate `LiveBucket` and `HotArchiveBucket` classes inheriting from `BucketBase<BucketT, IndexT>` via CRTP, each with distinct index types.
+   - **Rust**: Single `Bucket` type with storage modes (InMemory/DiskBacked) for live buckets, separate `HotArchiveBucket` type for hot archive.
+   - **Rationale**: Rust does not use CRTP; the unified type with storage modes provides equivalent functionality with simpler code. Hot archive is kept separate because it stores `HotArchiveBucketEntry` instead of `BucketEntry`.
+
+2. **Async Merge Architecture**
+   - **stellar-core**: `FutureBucket` wraps `std::shared_future` with background thread pool via `asio::io_context`.
+   - **Rust**: `PendingMerge` uses `tokio::task::spawn_blocking` with `oneshot::Receiver` for async merge results, plus a standalone `FutureBucket` type for HAS serialization.
+   - **Rationale**: Tokio's blocking thread pool provides equivalent parallelism with better integration into the async runtime.
+
+3. **Merge Deduplication Integration**
+   - **stellar-core**: `BucketManager` holds `mLiveBucketFutures` and `mFinishedMerges` (`BucketMergeMap`), automatically deduplicating and reattaching merges.
+   - **Rust**: `BucketMergeMap` and `LiveMergeFutures` are implemented and tested but not wired into the `BucketList` merge workflow.
+   - **Rationale**: Current approach guards against concurrent duplicates but does not cache completed merge results. Impact is limited to catchup/restart scenarios.
+
+4. **Index Persistence Format**
+   - **stellar-core**: Uses Cereal (binary) serialization for `DiskIndex` persistence.
+   - **Rust**: Uses bincode serialization with a version header for `.index` files.
+   - **Rationale**: Bincode is the Rust equivalent of Cereal for efficient binary serialization.
+
+5. **Snapshot Concurrency Model**
+   - **stellar-core**: Uses `std::shared_mutex` with explicit lock annotations (`GUARDED_BY`, `REQUIRES_SHARED`).
+   - **Rust**: Uses `parking_lot::RwLock` which provides equivalent semantics with Rust's ownership model enforcing safety.
+   - **Rationale**: Rust's type system enforces lock ordering at compile time, eliminating the need for annotation macros.
+
+## Test Coverage
+
+| Area | stellar-core Tests | Rust Tests | Notes |
+|------|-------------------|------------|-------|
+| BucketTests.cpp | 8 TEST_CASE / 13 SECTION | ~39 #[test] | Merge semantics, hot archive merge |
+| BucketListTests.cpp | 17 TEST_CASE / 23 SECTION | ~44 #[test] | Spill, eviction, snapshots |
+| BucketManagerTests.cpp | 10 TEST_CASE / 0 SECTION | ~27 #[test] | Lifecycle, persistence, reattachment |
+| BucketIndexTests.cpp | 13 TEST_CASE / 10 SECTION | ~21 #[test] | Index types, serialization, cache |
+| BucketMergeMapTests.cpp | 1 TEST_CASE / 0 SECTION | ~6 #[test] | Merge deduplication |
+| **Total** | **49 TEST_CASE / 46 SECTION** | **~252 #[test]** | Rust tests more granular |
+
+### Test Gaps
+
+- **Concurrent snapshot access during merges**: No explicit thread safety stress test matching stellar-core's `bucketmanager reattach to running merge` test pattern.
+- **Large bucket index tests**: stellar-core has dedicated tests for serializing/deserializing large bucket indexes (`serialize bucket indexes`); Rust has persistence tests but fewer edge cases for very large buckets.
+- **`maxEntriesToArchive` limiting**: No test verifying eviction respects per-ledger archive limits.
+- **BucketManager restart with in-progress merges**: stellar-core tests persistence of `FutureBucket` state across app restart; Rust tests basic persistence but not in-progress merge recovery.
+
+## Parity Calculation
+
+| Category | Count |
+|----------|-------|
+| Implemented (Full) | 137 |
+| Gaps (None + Partial) | 12 |
+| Intentional Omissions | 7 |
+| **Parity** | **137 / (137 + 12) = 92%** |

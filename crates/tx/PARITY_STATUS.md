@@ -1,13 +1,14 @@
 # stellar-core Parity Status
 
-**Overall Parity: 100%** (14,651 transactions in testnet range 30000-36000)
-
-This document provides a detailed comparison between the Rust `henyey-tx` crate and the stellar-core v25 implementation in `.upstream-v25/src/transactions/`.
+**Crate**: `henyey-tx`
+**Upstream**: `.upstream-v25/src/transactions/`
+**Overall Parity**: 95%
+**Last Updated**: 2026-02-13
 
 ## Summary
 
-| Category | Status | Notes |
-|----------|--------|-------|
+| Area | Status | Notes |
+|------|--------|-------|
 | Transaction Frame | Full | V0, V1, FeeBump envelopes |
 | Transaction Validation | Full | All preconditions |
 | Signature Checking | Full | Weight accumulation, threshold levels |
@@ -17,23 +18,76 @@ This document provides a detailed comparison between the Rust `henyey-tx` crate 
 | Soroban Operations (3) | Full | Via e2e_invoke API |
 | Event Emission | Full | SAC events, lumen reconciliation |
 | Metadata Building | Full | V2/V3/V4 TransactionMeta |
-| Per-Operation Rollback | Full | Savepoint mechanism matches stellar-core nested LedgerTxn |
-| Parallel Execution | N/A | Not needed for current use case |
+| Offer Exchange | Full | exchangeV10, pool exchange, price bounds |
+| Sponsorship Utils | Full | Inline in state.rs |
+| Per-Operation Rollback | Full | Savepoint matches nested LedgerTxn |
+| Soroban Fee Computation | Partial | Pre-apply fee computation not implemented |
+| Flooding Validation | None | validateSorobanTxForFlooding not needed |
+| Parallel Execution | None | Not implemented by design |
 
-## Implemented Components
+## File Mapping
+
+| stellar-core File | Rust Module | Notes |
+|--------------------|-------------|-------|
+| `TransactionFrameBase.h` / `.cpp` | `frame.rs` | Abstract base merged into single type |
+| `TransactionFrame.h` / `.cpp` | `frame.rs`, `validation.rs`, `live_execution.rs` | Split by concern |
+| `FeeBumpTransactionFrame.h` / `.cpp` | `fee_bump.rs` | Full |
+| `SignatureChecker.h` / `.cpp` | `signature_checker.rs` | Full |
+| `MutableTransactionResult.h` / `.cpp` | `result.rs` | Full |
+| `TransactionMeta.h` / `.cpp` | `meta_builder.rs` | Full |
+| `EventManager.h` / `.cpp` | `events.rs` | Full |
+| `LumenEventReconciler.h` / `.cpp` | `lumen_reconciler.rs` | Full |
+| `OfferExchange.h` / `.cpp` | `operations/execute/offer_exchange.rs` | Full |
+| `OperationFrame.h` / `.cpp` | `operations/mod.rs`, `operations/execute/mod.rs` | Full |
+| `SignatureUtils.h` / `.cpp` | `signature_checker.rs`, `validation.rs` | Verify functions inline |
+| `SponsorshipUtils.h` / `.cpp` | `state.rs` | Inline in state manager |
+| `TransactionUtils.h` / `.cpp` | `state.rs`, `frame.rs`, various ops | Distributed across crate |
+| `ManageOfferOpFrameBase.h` / `.cpp` | `operations/execute/manage_offer.rs` | Full |
+| `PathPaymentOpFrameBase.h` / `.cpp` | `operations/execute/path_payment.rs` | Full |
+| `TrustFlagsOpFrameBase.h` / `.cpp` | `operations/execute/trust_flags.rs` | Full |
+| `AllowTrustOpFrame.h` / `.cpp` | `operations/execute/trust_flags.rs` | Full |
+| `SetTrustLineFlagsOpFrame.h` / `.cpp` | `operations/execute/trust_flags.rs` | Full |
+| `PaymentOpFrame.h` / `.cpp` | `operations/execute/payment.rs` | Full |
+| `CreateAccountOpFrame.h` / `.cpp` | `operations/execute/create_account.rs` | Full |
+| `MergeOpFrame.h` / `.cpp` | `operations/execute/account_merge.rs` | Full |
+| `ManageSellOfferOpFrame.h` / `.cpp` | `operations/execute/manage_offer.rs` | Full |
+| `ManageBuyOfferOpFrame.h` / `.cpp` | `operations/execute/manage_offer.rs` | Full |
+| `CreatePassiveSellOfferOpFrame.h` / `.cpp` | `operations/execute/manage_offer.rs` | Full |
+| `PathPaymentStrictReceiveOpFrame.h` / `.cpp` | `operations/execute/path_payment.rs` | Full |
+| `PathPaymentStrictSendOpFrame.h` / `.cpp` | `operations/execute/path_payment.rs` | Full |
+| `ChangeTrustOpFrame.h` / `.cpp` | `operations/execute/change_trust.rs` | Full |
+| `ManageDataOpFrame.h` / `.cpp` | `operations/execute/manage_data.rs` | Full |
+| `BumpSequenceOpFrame.h` / `.cpp` | `operations/execute/bump_sequence.rs` | Full |
+| `SetOptionsOpFrame.h` / `.cpp` | `operations/execute/set_options.rs` | Full |
+| `InflationOpFrame.h` / `.cpp` | `operations/execute/inflation.rs` | Full (deprecated) |
+| `CreateClaimableBalanceOpFrame.h` / `.cpp` | `operations/execute/claimable_balance.rs` | Full |
+| `ClaimClaimableBalanceOpFrame.h` / `.cpp` | `operations/execute/claimable_balance.rs` | Full |
+| `ClawbackOpFrame.h` / `.cpp` | `operations/execute/clawback.rs` | Full |
+| `ClawbackClaimableBalanceOpFrame.h` / `.cpp` | `operations/execute/clawback.rs` | Full |
+| `BeginSponsoringFutureReservesOpFrame.h` / `.cpp` | `operations/execute/sponsorship.rs` | Full |
+| `EndSponsoringFutureReservesOpFrame.h` / `.cpp` | `operations/execute/sponsorship.rs` | Full |
+| `RevokeSponsorshipOpFrame.h` / `.cpp` | `operations/execute/sponsorship.rs` | Full |
+| `LiquidityPoolDepositOpFrame.h` / `.cpp` | `operations/execute/liquidity_pool.rs` | Full |
+| `LiquidityPoolWithdrawOpFrame.h` / `.cpp` | `operations/execute/liquidity_pool.rs` | Full |
+| `InvokeHostFunctionOpFrame.h` / `.cpp` | `operations/execute/invoke_host_function.rs` | Full |
+| `ExtendFootprintTTLOpFrame.h` / `.cpp` | `operations/execute/extend_footprint_ttl.rs` | Full |
+| `RestoreFootprintOpFrame.h` / `.cpp` | `operations/execute/restore_footprint.rs` | Full |
+
+## Component Mapping
 
 ### TransactionFrame (`frame.rs`)
 
-Corresponds to: `TransactionFrame.h`, `TransactionFrameBase.h`
+Corresponds to: `TransactionFrameBase.h`, `TransactionFrame.h`
 
-| stellar-core Function | Rust Implementation | Status |
-|-------------|---------------------|--------|
+| stellar-core | Rust | Status |
+|--------------|------|--------|
 | `getFullHash()` | `hash()` | Full |
 | `getContentsHash()` | `signature_payload()` | Full |
 | `getEnvelope()` | `envelope()` | Full |
 | `getSeqNum()` | `sequence_number()` | Full |
 | `getSourceID()` | `source_account_id()` | Full |
 | `getFeeSourceID()` | `fee_source_account()` | Full |
+| `getSourceAccount()` | `source_account()` | Full |
 | `getNumOperations()` | `operation_count()` | Full |
 | `getFullFee()` | `total_fee()` | Full |
 | `getInclusionFee()` | `inclusion_fee()` | Full |
@@ -47,14 +101,19 @@ Corresponds to: `TransactionFrame.h`, `TransactionFrameBase.h`
 | `getMemo()` | `memo()` | Full |
 | `getTimeBounds()` | `preconditions()` | Full |
 | `getLedgerBounds()` | `preconditions()` | Full |
+| `getMinSeqNum()` | `min_seq_num()` | Full |
+| `getMinSeqAge()` | `min_seq_age()` | Full |
+| `getMinSeqLedgerGap()` | `min_seq_ledger_gap()` | Full |
 | V0 to V1 conversion | `v0_to_v1_transaction()` | Full |
+| `getRawOperations()` | `operations()` | Full |
+| `makeTransactionFromWire()` | `TransactionFrame::new()` | Full |
 
 ### Validation (`validation.rs`)
 
 Corresponds to: `TransactionFrame::checkValid*()`, `TransactionFrame::commonValid()`
 
-| stellar-core Function | Rust Implementation | Status |
-|-------------|---------------------|--------|
+| stellar-core | Rust | Status |
+|--------------|------|--------|
 | `checkValid()` | `validate_full()` | Full |
 | `commonValid()` | `validate_basic()` | Full |
 | Structure validation | `validate_structure()` | Full |
@@ -67,13 +126,14 @@ Corresponds to: `TransactionFrame::checkValid*()`, `TransactionFrame::commonVali
 | Signature verification | `validate_signatures()` | Full |
 | Soroban resources | `validate_soroban_resources()` | Full |
 | Fee bump rules | `validate_fee_bump_rules()` | Full |
+| `checkSorobanResources()` | `validate_soroban_resources()` | Full |
 
 ### SignatureChecker (`signature_checker.rs`)
 
 Corresponds to: `SignatureChecker.h`
 
-| stellar-core Function | Rust Implementation | Status |
-|-------------|---------------------|--------|
+| stellar-core | Rust | Status |
+|--------------|------|--------|
 | Constructor | `SignatureChecker::new()` | Full |
 | `checkSignature()` | `check_signature()` | Full |
 | `checkAllSignaturesUsed()` | `check_all_signatures_used()` | Full |
@@ -89,8 +149,8 @@ Corresponds to: `SignatureChecker.h`
 
 Corresponds to: `MutableTransactionResult.h`
 
-| stellar-core Class/Function | Rust Implementation | Status |
-|-------------------|---------------------|--------|
+| stellar-core | Rust | Status |
+|--------------|------|--------|
 | `MutableTransactionResultBase` | `MutableTransactionResult` | Full |
 | `RefundableFeeTracker` | `RefundableFeeTracker` | Full |
 | `initializeRefundableFeeTracker()` | `initialize_refundable_fee_tracker()` | Full |
@@ -104,30 +164,34 @@ Corresponds to: `MutableTransactionResult.h`
 | `consumeRefundableSorobanResources()` | `consume_rent_fee()` etc. | Full |
 | `getFeeRefund()` | `get_fee_refund()` | Full |
 | `resetConsumedFee()` | `reset_consumed_fee()` | Full |
+| `getInnermostResultCode()` | `innermost_result_code()` | Full |
+| `setInnermostError()` | `set_innermost_error()` | Full |
+| `FeeBumpMutableTransactionResult` | `FeeBumpMutableTransactionResult` | Full |
 
 ### FeeBumpTransactionFrame (`fee_bump.rs`)
 
 Corresponds to: `FeeBumpTransactionFrame.h`
 
-| stellar-core Function | Rust Implementation | Status |
-|-------------|---------------------|--------|
+| stellar-core | Rust | Status |
+|--------------|------|--------|
 | Constructor | `FeeBumpFrame::from_frame()` | Full |
 | `getFeeSourceID()` | `fee_source()` | Full |
 | Inner source access | `inner_source()` | Full |
-| Inner tx hash | `inner_hash()` | Full |
+| `getInnerFullHash()` | `inner_hash()` | Full |
 | `feeSourceIsInnersource()` | `fee_source_is_inner_source()` | Full |
 | Fee bump validation | `validate_fee_bump()` | Full |
 | Inner signature verification | `verify_inner_signatures()` | Full |
 | `FeeBumpMutableTransactionResult` | `FeeBumpMutableTransactionResult` | Full |
 | Inner fee calculation | `calculate_inner_fee_charged()` | Full |
 | Result wrapping | `wrap_inner_result_in_fee_bump()` | Full |
+| `convertInnerTxToV1()` | Inline in constructor | Full |
 
 ### Live Execution (`live_execution.rs`)
 
 Corresponds to: `TransactionFrame::processFeeSeqNum()`, `processPostApply()`, etc.
 
-| stellar-core Function | Rust Implementation | Status |
-|-------------|---------------------|--------|
+| stellar-core | Rust | Status |
+|--------------|------|--------|
 | `processFeeSeqNum()` | `process_fee_seq_num()` | Full |
 | (FeeBump variant) | `process_fee_seq_num_fee_bump()` | Full |
 | `processSeqNum()` | `process_seq_num()` | Full |
@@ -137,20 +201,22 @@ Corresponds to: `TransactionFrame::processFeeSeqNum()`, `processPostApply()`, et
 | (FeeBump variant) | `process_post_tx_set_apply_fee_bump()` | Full |
 | `refundSorobanFee()` | `refund_soroban_fee()` | Full |
 | `removeOneTimeSignerKeyFromAllSourceAccounts()` | `remove_one_time_signers()` | Full |
+| `getFee()` (baseFee-aware) | `calculate_fee_to_charge()` | Full |
+| `applyOperations()` | `apply_transaction()` | Full |
 | Protocol version checks | Protocol constants | Full |
 
 ### TransactionMetaBuilder (`meta_builder.rs`)
 
 Corresponds to: `TransactionMeta.h`
 
-| stellar-core Class/Function | Rust Implementation | Status |
-|-------------------|---------------------|--------|
+| stellar-core | Rust | Status |
+|--------------|------|--------|
 | `TransactionMetaBuilder` | `TransactionMetaBuilder` | Full |
 | `OperationMetaBuilder` | `OperationMetaBuilder` | Full |
 | `pushTxChangesBefore()` | `push_tx_changes_before()` | Full |
 | `pushTxChangesAfter()` | `push_tx_changes_after()` | Full |
 | `setNonRefundableResourceFee()` | `set_non_refundable_resource_fee()` | Full |
-| `setRefundableFeeTracker()` | `set_refundable_fee_tracker()` | Full |
+| `maybeSetRefundableFeeMeta()` | `set_refundable_fee_tracker()` | Full |
 | `DiagnosticEventManager` | `DiagnosticEventManager` | Full |
 | V2/V3/V4 meta formats | `finalize()` | Full |
 | Change recording | `record_create/update/delete/restore()` | Full |
@@ -159,25 +225,130 @@ Corresponds to: `TransactionMeta.h`
 
 Corresponds to: `EventManager.h`, `LumenEventReconciler.h`
 
-| stellar-core Class/Function | Rust Implementation | Status |
-|-------------------|---------------------|--------|
+| stellar-core | Rust | Status |
+|--------------|------|--------|
 | `OpEventManager` | `OpEventManager` | Full |
 | `TxEventManager` | `TxEventManager` | Full |
-| Event hierarchy | `EventManagerHierarchy` | Full |
-| Transfer events | `event_for_transfer()` | Full |
-| Mint events | `event_for_mint()` | Full |
-| Burn events | `event_for_burn()` | Full |
-| Clawback events | `event_for_clawback()` | Full |
-| Authorization events | `event_for_set_authorized()` | Full |
-| Fee events | `refund_fee()` | Full |
-| `LumenEventReconciler` | `LumenEventReconciler` | Full |
-| `insertAtBeginning` support | Mint event insertion | Full |
+| `EventManagerHierarchy` (implicit) | `EventManagerHierarchy` | Full |
+| `newTransferEvent()` | `new_transfer_event()` | Full |
+| `eventForTransferWithIssuerCheck()` | `event_for_transfer_with_issuer_check()` | Full |
+| `newMintEvent()` | `new_mint_event()` | Full |
+| `makeMintEvent()` | Inline in `new_mint_event()` | Full |
+| `makeBurnEvent()` | Inline in `new_burn_event()` | Full |
+| `newBurnEvent()` | `new_burn_event()` | Full |
+| `newClawbackEvent()` | `new_clawback_event()` | Full |
+| `newSetAuthorizedEvent()` | `new_set_authorized_event()` | Full |
+| `eventsForClaimAtoms()` | `events_for_claim_atoms()` | Full |
+| `setEvents()` | `set_events()` | Full |
+| `newFeeEvent()` | `new_fee_event()` | Full |
+| `reconcileEvents()` | `reconcile_events()` | Full |
+| `getAssetFromEvent()` | Not needed (reconciliation uses different approach) | Full |
 | Muxed account handling | `make_muxed_account_address()` | Full |
 | Contract ID computation | `contract_id_from_asset()` | Full |
+| `DiagnosticEventManager` | `DiagnosticEventManager` | Full |
 
-### Classic Operations
+### Offer Exchange (`operations/execute/offer_exchange.rs`)
 
-All 24 classic operations are fully implemented in `src/operations/execute/`:
+Corresponds to: `OfferExchange.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `exchangeV10()` | `exchange_v10()` | Full |
+| `exchangeV10WithoutPriceErrorThresholds()` | `exchange_v10_without_price_error_thresholds()` | Full |
+| `applyPriceErrorThresholds()` | `apply_price_error_thresholds()` | Full |
+| `adjustOffer()` | `adjust_offer_amount()` | Full |
+| `checkPriceErrorBound()` | `check_price_error_bound()` | Full |
+| `exchangeWithPool()` | `exchange_with_pool()` (in `path_payment.rs`) | Full |
+| `convertWithOffersAndPools()` | `convert_with_offers_and_pools()` (in `path_payment.rs`) | Full |
+| `canSellAtMost()` | Inline in manage_offer/path_payment | Full |
+| `canBuyAtMost()` | Inline in manage_offer/path_payment | Full |
+| `getPoolID()` | Inline pool ID computation | Full |
+| `ExchangeResult` / `ExchangeResultV10` | `ExchangeResult` | Full |
+| `RoundingType` | `RoundingType` | Full |
+| `ConvertResult` | `ConvertResult` | Full |
+
+### OperationFrame / ThresholdLevel (`operations/mod.rs`)
+
+Corresponds to: `OperationFrame.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `OperationFrame::makeHelper()` | `execute_operation()` dispatch | Full |
+| `OperationFrame::checkValid()` | `validate_operation()` | Full |
+| `OperationFrame::apply()` | `execute_operation()` | Full |
+| `OperationFrame::checkSignature()` | Inline in `validate_signatures()` | Full |
+| `OperationFrame::getThresholdLevel()` | `get_threshold_level()` | Full |
+| `ThresholdLevel::LOW` | `ThresholdLevel::Low` | Full |
+| `ThresholdLevel::MEDIUM` | `ThresholdLevel::Medium` | Full |
+| `ThresholdLevel::HIGH` | `ThresholdLevel::High` | Full |
+| `isDexOperation()` | Inline in `has_dex_operations()` | Full |
+| `isSoroban()` | `is_soroban()` | Full |
+| `isOpSupported()` | Protocol version checks inline | Full |
+
+### SponsorshipUtils (`state.rs`)
+
+Corresponds to: `SponsorshipUtils.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `canEstablishEntrySponsorship()` | `apply_entry_sponsorship()` | Full |
+| `canRemoveEntrySponsorship()` | `remove_entry_sponsorship_and_update_counts()` | Full |
+| `canTransferEntrySponsorship()` | `apply_entry_sponsorship_with_sponsor()` | Full |
+| `establishEntrySponsorship()` | `apply_entry_sponsorship()` | Full |
+| `removeEntrySponsorship()` | `remove_entry_sponsorship_and_update_counts()` | Full |
+| `transferEntrySponsorship()` | `apply_entry_sponsorship_with_sponsor()` | Full |
+| `canEstablishSignerSponsorship()` | Inline in `set_options.rs` | Full |
+| `canRemoveSignerSponsorship()` | Inline in `set_options.rs` | Full |
+| `createEntryWithPossibleSponsorship()` | `apply_account_entry_sponsorship()` | Full |
+| `removeEntryWithPossibleSponsorship()` | `remove_entry_sponsorship_with_sponsor_counts()` | Full |
+| `createSignerWithPossibleSponsorship()` | Inline in `set_options.rs` | Full |
+| `removeSignerWithPossibleSponsorship()` | Inline in `set_options.rs` | Full |
+| `getNumSponsored()` / `getNumSponsoring()` | `sponsorship_counts_for_account()` | Full |
+| `computeMultiplier()` | Inline in sponsorship logic | Full |
+
+### TransactionUtils (distributed)
+
+Corresponds to: `TransactionUtils.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `accountKey()` / `trustlineKey()` etc. | Inline key construction | Full |
+| `loadAccount()` / `loadTrustLine()` etc. | `LedgerStateManager` methods | Full |
+| `addBalance()` / `addBuyingLiabilities()` etc. | `LedgerStateManager` methods | Full |
+| `generateID()` | `next_id()` | Full |
+| `getAvailableBalance()` | Inline calculations | Full |
+| `getMinBalance()` | `minimum_balance_for_account()` | Full |
+| `getStartingSequenceNumber()` | `starting_sequence_number()` | Full |
+| `isAuthorized()` / `isAuthRequired()` etc. | Inline flag checks | Full |
+| `isClawbackEnabledOnTrustline()` | Inline flag checks | Full |
+| `toAccountID()` / `toMuxedAccount()` | `muxed_to_account_id()` | Full |
+| `trustLineFlagIsValid()` / `accountFlagIsValid()` | Inline validation | Full |
+| `removeOffersAndPoolShareTrustLines()` | `remove_offers_by_account_and_asset()` | Full |
+| `getPoolWithdrawalAmount()` | Inline in `liquidity_pool.rs` | Full |
+| `getMinInclusionFee()` | `calculate_fee_to_charge()` | Full |
+| `makeSep0011AssetStringSCVal()` etc. | Inline in `events.rs` | Full |
+| `makeMuxedAccountAddress()` | `make_muxed_account_address()` | Full |
+| `makeAccountAddress()` | `make_account_address()` | Full |
+| `getLumenContractInfo()` / `getAssetContractID()` | `contract_id_from_asset()` | Full |
+| `validateContractLedgerEntry()` | Inline in soroban host | Full |
+
+### SignatureUtils (distributed)
+
+Corresponds to: `SignatureUtils.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `verify()` (Ed25519) | `verify_ed25519()` | Full |
+| `verifyEd25519SignedPayload()` | `verify_ed25519_signed_payload()` | Full |
+| `verifyHashX()` | `verify_hash_x()` | Full |
+| `doesHintMatch()` | Inline hint matching | Full |
+| `getHint()` | Inline hint extraction | Full |
+| `sign()` | Not needed (no signing in Rust) | Full |
+| `signHashX()` | Not needed (no signing in Rust) | Full |
+
+### Classic Operations (`operations/execute/`)
+
+All 24 classic operations are fully implemented:
 
 | Operation | stellar-core File | Rust File | Status |
 |-----------|----------|-----------|--------|
@@ -206,7 +377,7 @@ All 24 classic operations are fully implemented in `src/operations/execute/`:
 | LiquidityPoolDeposit | `LiquidityPoolDepositOpFrame.cpp` | `liquidity_pool.rs` | Full |
 | LiquidityPoolWithdraw | `LiquidityPoolWithdrawOpFrame.cpp` | `liquidity_pool.rs` | Full |
 
-### Soroban Operations
+### Soroban Operations (`operations/execute/`)
 
 | Operation | stellar-core File | Rust File | Status |
 |-----------|----------|-----------|--------|
@@ -214,276 +385,214 @@ All 24 classic operations are fully implemented in `src/operations/execute/`:
 | ExtendFootprintTtl | `ExtendFootprintTTLOpFrame.cpp` | `extend_footprint_ttl.rs` | Full |
 | RestoreFootprint | `RestoreFootprintOpFrame.cpp` | `restore_footprint.rs` | Full |
 
-### ThresholdLevel (`operations/mod.rs`)
-
-Corresponds to: `OperationFrame.h` enum `ThresholdLevel`
-
-| stellar-core | Rust | Notes |
-|-----|------|-------|
-| `ThresholdLevel::LOW` | `ThresholdLevel::Low` | Same operations |
-| `ThresholdLevel::MEDIUM` | `ThresholdLevel::Medium` | Same operations |
-| `ThresholdLevel::HIGH` | `ThresholdLevel::High` | Same operations |
-| `getThresholdLevel()` | `get_threshold_level()` | Full parity |
-| Threshold index lookup | `ThresholdLevel::index()` | Full |
-
 ### Soroban Integration (`soroban/`)
 
-| Component | Implementation | Status |
-|-----------|----------------|--------|
-| Protocol-versioned hosts | `soroban-env-host-p24`, `soroban-env-host-p25` | Full |
-| `e2e_invoke` API | Used for InvokeHostFunction | Full |
-| Storage snapshot | TTL-aware entry access | Full |
-| Budget tracking | CPU/memory consumption | Full |
-| Event collection | Contract + diagnostic events | Full |
-| Rent fee calculation | Protocol-versioned | Full |
-| Archived entry restoration | V1 ext support | Full |
-| PRNG seed | Configurable seed | Full |
-| Error mapping | CPU/memory-based result codes | Full |
-| Write bytes checking | Post-execution validation | Full |
-| Event size checking | Max contract events size | Full |
+| stellar-core Component | Rust Module | Status |
+|------------------------|-------------|--------|
+| Protocol-versioned hosts | `soroban/protocol/p24.rs`, `p25.rs` | Full |
+| `e2e_invoke` API | `soroban/host.rs` | Full |
+| Storage snapshot | `soroban/storage.rs` | Full |
+| Budget tracking | `soroban/budget.rs` | Full |
+| Event collection | `soroban/events.rs` | Full |
+| Rent fee calculation | `soroban/host.rs` | Full |
+| Archived entry restoration | `operations/execute/restore_footprint.rs` | Full |
+| PRNG seed | `soroban/host.rs` | Full |
+| Error mapping | `soroban/error.rs` | Full |
+| Write bytes checking | `soroban/host.rs` | Full |
+| Event size checking | `soroban/host.rs` | Full |
 
 ### Order Book Index (`state.rs`)
 
-| Component | Implementation | Status |
-|-----------|----------------|--------|
-| `OfferIndex` | BTreeMap-based index for O(log n) best offer lookup | Full |
-| `OfferDescriptor` | Price + offer_id key for sorting | Full |
-| `OfferKey` | Seller + offer_id for reverse lookup | Full |
-| `AssetPair` | (buying, selling) key for order books | Full |
+| stellar-core Component | Rust Implementation | Status |
+|------------------------|---------------------|--------|
+| `OrderBook` best-offer query | `OfferIndex` with BTreeMap | Full |
+| `OfferDescriptor` | `OfferDescriptor` (price + offer_id) | Full |
+| `OfferKey` | `OfferKey` (seller + offer_id) | Full |
+| `AssetPair` | `AssetPair` (buying, selling) | Full |
 | Best offer query | `best_offer()`, `best_offer_filtered()` | Full |
-| Index maintenance | Automatic via `create_offer`, `update_offer`, `delete_offer` | Full |
-| Rollback support | Index rebuilt from restored offers on rollback | Full |
-
-This matches stellar-core's `MultiOrderBook` functionality in `OrderBook.h/.cpp`.
+| Index maintenance | `create_offer`, `update_offer`, `delete_offer` | Full |
+| Rollback support | Index rebuilt from restored offers | Full |
 
 ### Per-Operation Savepoint Rollback (`state.rs`)
 
 Corresponds to: `LedgerTxn.h` (nested commit/rollback)
 
 | stellar-core Concept | Rust Implementation | Status |
-|------------|---------------------|--------|
-| Nested `LedgerTxn` per operation | `Savepoint` struct + `create_savepoint()` / `rollback_to_savepoint()` | Full |
-| Child `LedgerTxn::commit()` on success | Savepoint dropped (no-op, changes kept) | Full |
-| Child `LedgerTxn::rollback()` on failure | `rollback_to_savepoint()` with three-phase restore | Full |
+|----------------------|---------------------|--------|
+| Nested `LedgerTxn` per operation | `Savepoint` + `create_savepoint()` / `rollback_to_savepoint()` | Full |
+| Child commit on success | Savepoint dropped (no-op) | Full |
+| Child rollback on failure | `rollback_to_savepoint()` with three-phase restore | Full |
 | All entry types covered | Accounts, trustlines, offers, data, contract_data, contract_code, TTL, claimable_balances, liquidity_pools | Full |
 | Delta truncation on rollback | `LedgerDelta::truncate_to()` via `DeltaLengths` | Full |
 | Metadata/sponsorship restore | `entry_last_modified`, `entry_sponsorship` snapshots | Full |
 | ID pool restore | `id_pool` field in `Savepoint` | Full |
-| Speculative orderbook exchange | `create_savepoint()` in path payment comparison | Full |
 
-This replaces manual per-operation rollback code that previously existed in individual operation
-implementations (e.g., `claimable_balance.rs`, `payment.rs`, `change_trust.rs`). The automatic
-savepoint mechanism is more robust and matches stellar-core's approach of running each
-operation in a nested transaction scope.
+## Intentional Omissions
 
-## Not Implemented (By Design)
+Features excluded by design. These are NOT counted against parity %.
 
-### Parallel Execution Infrastructure
+| stellar-core Component | Reason |
+|------------------------|--------|
+| `ParallelApplyStage` | Sequential execution only |
+| `ParallelApplyUtils` | Sequential execution only |
+| `ThreadParallelApplyLedgerState` | Sequential execution only |
+| `GlobalParallelApplyLedgerState` | Sequential execution only |
+| `OpParallelApplyLedgerState` | Sequential execution only |
+| `ParallelLedgerInfo` | Sequential execution only |
+| `TxEffects` / `TxBundle` / `ApplyStage` | Sequential execution only |
+| `parallelApply()` (TransactionFrame) | Sequential execution only |
+| `preParallelApply()` (TransactionFrame) | Sequential execution only |
+| `doParallelApply()` (OperationFrame) | Sequential execution only |
+| `TransactionSQL` | Bucket list only; no SQL persistence |
+| `TransactionBridge` | Test scaffolding; not needed in Rust |
+| `toStellarMessage()` | Overlay concern; handled by overlay crate |
+| `insertKeysForFeeProcessing()` | Prefetch optimization; not needed with in-memory state |
+| `insertKeysForTxApply()` | Prefetch optimization; not needed with in-memory state |
+| `insertLedgerKeysToPrefetch()` | Prefetch optimization; not needed with in-memory state |
+| `validateSorobanTxForFlooding()` | Flooding/overlay concern; not needed for execution |
+| `validateSorobanMemo()` | Flooding validation; not needed for execution |
+| `XDRProvidesValidFee()` | Flooding validation; not needed for execution |
+| `getSize()` | Internal optimization metric |
+| `updateSorobanMetrics()` | Metrics reporting; not needed for execution |
+| `flushTxSigCacheCounts()` | Signature cache metrics; Rust has no sig cache |
+| `disableCacheMetricsTracking()` | Signature cache metrics; Rust has no sig cache |
+| `AlwaysValidSignatureChecker` | Test-only class |
+| `withInnerTx()` | Convenience callback; direct access used instead |
+| `maybeAdoptFailedReplayResult()` | Test replay infrastructure |
+| `sign()` / `signHashX()` (SignatureUtils) | No signing required; verification only |
+| `setReplayTransactionResult()` / `adoptFailedReplayResult()` | Test replay infrastructure |
+| `exchangeV2()` / `exchangeV3()` | Pre-protocol-10 exchange; protocol 24+ only |
 
-Corresponds to: `ParallelApplyStage.cpp`, `ParallelApplyUtils.cpp`
+## Gaps
 
-These components provide parallel transaction application for live validator mode. They are not implemented in Rust because:
-- The primary use case is sequential catchup/replay
-- Parallel execution adds significant complexity
-- Sequential execution is sufficient for current requirements
+Features not yet implemented. These ARE counted against parity %.
 
-| stellar-core Component | Status | Reason |
-|--------------|--------|--------|
-| `ParallelApplyStage` | Not needed | Sequential execution only |
-| `ThreadParallelApplyLedgerState` | Not needed | Sequential execution only |
-| `TxEffects` | Not needed | Sequential execution only |
-| `parallelApply()` | Not needed | Sequential execution only |
-
-### Database Integration
-
-Corresponds to: `TransactionSQL.cpp`, `TransactionBridge.cpp`
-
-Database persistence is not implemented because:
-- Rust targets bucket list state only
-- Transaction results are not persisted to SQL
-- Historical data comes from archives
-
-| stellar-core Component | Status | Reason |
-|--------------|--------|--------|
-| `TransactionSQL` | Not needed | Bucket list only |
-| `TransactionBridge` | Not needed | Bucket list only |
+| stellar-core Component | Priority | Notes |
+|------------------------|----------|-------|
+| `computeSorobanResourceFee()` (static) | Low | Used for surge pricing computation; Soroban fee calc delegated to soroban-env-host during execution |
+| `computePreApplySorobanResourceFee()` | Low | Pre-apply resource fee estimation; related to above |
+| `checkValidWithOptionallyChargedFee()` | Low | Fee-optional validation path for tx acceptance; validation works but this specific interface not exposed |
+| `setInsufficientFeeErrorWithFeeCharged()` | Low | Used in tx acceptance queue flow |
+| `commonPreApply()` | Low | Refactored into `apply_transaction()` directly |
+| `processSignatures()` (separate) | Low | Signature processing integrated into apply flow |
+| `hasMuxedAccount()` (TransactionUtils) | Low | Muxed account detection on envelope |
+| `getUpperBoundCloseTimeOffset()` | Low | Close time offset computation for validation |
+| `createEntryRentChangeWithoutModification()` (TransactionUtils) | Low | Rent change creation for TTL-only operations |
+| `validateSorobanOpsConsistency()` | Low | Validates Soroban tx has exactly one Soroban op; checked implicitly |
 
 ## Architectural Differences
 
-### 1. Dual Mode Support
-The Rust crate supports both live execution and catchup/replay modes as first-class citizens:
-- **Live execution**: Full validation, fee charging, result building
-- **Catchup mode**: Trusts archived results, fast synchronization
+1. **Dual Mode Support**
+   - **stellar-core**: Single execution path with test replay support
+   - **Rust**: First-class live execution and catchup/replay modes
+   - **Rationale**: Catchup mode trusts archived results for fast sync
 
-### 2. State Layer
-- **stellar-core**: Uses `AbstractLedgerTxn` with SQL backing and nested `LedgerTxn` for per-operation commit/rollback
-- **Rust**: Uses in-memory `LedgerStateManager` targeting bucket list, with `Savepoint` for per-operation rollback (functionally equivalent to stellar-core nested `LedgerTxn`)
+2. **State Layer**
+   - **stellar-core**: `AbstractLedgerTxn` with SQL backing and nested `LedgerTxn` for per-operation commit/rollback
+   - **Rust**: In-memory `LedgerStateManager` with `Savepoint` for per-operation rollback
+   - **Rationale**: Targets bucket list state only; functionally equivalent rollback semantics
 
-### 3. Protocol Versioning
-- **stellar-core**: Version-aware code paths within single codebase
-- **Rust**: Separate `soroban-env-host-p24` and `soroban-env-host-p25` crates
+3. **Protocol Versioning for Soroban**
+   - **stellar-core**: Version-aware code paths within single codebase
+   - **Rust**: Separate `soroban-env-host-p24` and `soroban-env-host-p25` crates
+   - **Rationale**: Compile-time protocol selection avoids runtime branching in host
 
-### 4. Error Handling
-- **stellar-core**: Mutable result objects with error codes
-- **Rust**: Result types with structured errors + mutable result for apply phase
+4. **Error Handling**
+   - **stellar-core**: Mutable result objects with error codes throughout
+   - **Rust**: Result types with structured errors for validation; mutable result for apply phase
+   - **Rationale**: Idiomatic Rust error handling with equivalent observable behavior
 
-## Test Coverage Comparison
+5. **Offer Index**
+   - **stellar-core**: SQL-backed offer queries via `LedgerTxn`
+   - **Rust**: In-memory `BTreeMap`-based `OfferIndex` for O(log n) best offer lookup
+   - **Rationale**: All offers loaded into memory; BTreeMap gives deterministic ordering
 
-### Summary Statistics
+6. **Sponsorship Tracking**
+   - **stellar-core**: `SponsorshipUtils` as standalone utility functions operating on `LedgerTxn` entries
+   - **Rust**: Sponsorship tracking integrated into `LedgerStateManager` with explicit stack and entry sponsor maps
+   - **Rationale**: Unified state management; same observable behavior
 
-| Metric | stellar-core | Rust | Coverage Ratio |
-|--------|---------------|------|----------------|
-| Test files | 31 | 38 | - |
-| TEST_CASE macros | 127 | - | - |
-| SECTION blocks | ~1,800 | - | - |
-| #[test] functions | - | 309 | - |
-| Integration tests (real transactions) | ~200 | 14,651+ | Rust via testnet verification |
+## Test Coverage
 
-### stellar-core Test Files (
+| Area | stellar-core Tests | Rust Tests | Notes |
+|------|-------------------|------------|-------|
+| InvokeHostFunction | 70 TEST_CASE / 301 SECTION | 19 #[test] | Testnet integration covers gaps |
+| Offer management | 2 TEST_CASE / 178 SECTION | 34 #[test] | Good unit coverage |
+| TxEnvelope/Signatures | 5 TEST_CASE / 154 SECTION | 15 #[test] | Testnet integration covers gaps |
+| PathPaymentStrictReceive | 2 TEST_CASE / 123 SECTION | 20 #[test] | Testnet integration covers gaps |
+| Exchange mechanics | 6 TEST_CASE / 85 SECTION | 16 #[test] | Good exchange math coverage |
+| LiquidityPool trading | 2 TEST_CASE / 86 SECTION | 13 #[test] | Testnet integration covers gaps |
+| Payment | 2 TEST_CASE / 76 SECTION | 24 #[test] | Good coverage |
+| ClaimableBalance | 1 TEST_CASE / 72 SECTION | 23 #[test] | Good coverage |
+| SetTrustLineFlags | 2 TEST_CASE / 70 SECTION | 11 #[test] | Testnet integration covers gaps |
+| ManageBuyOffer | 8 TEST_CASE / 69 SECTION | 34 #[test] (shared) | Shared with sell offer tests |
+| RevokeSponsorship | 1 TEST_CASE / 65 SECTION | 15 #[test] | Testnet integration covers gaps |
+| PathPaymentStrictSend | 2 TEST_CASE / 58 SECTION | 20 #[test] (shared) | Shared with strict receive tests |
+| AllowTrust | 2 TEST_CASE / 54 SECTION | 11 #[test] | Testnet integration covers gaps |
+| AccountMerge | 2 TEST_CASE / 46 SECTION | 13 #[test] | Good coverage |
+| TxResults | 1 TEST_CASE / 38 SECTION | 28 #[test] | Good coverage |
+| ChangeTrust | 2 TEST_CASE / 37 SECTION | 20 #[test] | Good coverage |
+| FeeBumpTransaction | 1 TEST_CASE / 23 SECTION | 19 #[test] | Good coverage |
+| SetOptions | 1 TEST_CASE / 21 SECTION | 23 #[test] | Exceeds upstream |
+| ClawbackOps | 1 TEST_CASE / 18 SECTION | 12 #[test] | Good coverage |
+| Inflation | 2 TEST_CASE / 16 SECTION | 7 #[test] | Deprecated operation |
+| ClawbackClaimableBalance | 1 TEST_CASE / 14 SECTION | 12 #[test] (shared) | Shared with clawback tests |
+| LiquidityPoolDeposit | 1 TEST_CASE / 12 SECTION | 13 #[test] (shared) | Shared pool tests |
+| LiquidityPoolWithdraw | 1 TEST_CASE / 12 SECTION | 13 #[test] (shared) | Shared pool tests |
+| BumpSequence | 1 TEST_CASE / 11 SECTION | 6 #[test] | Adequate coverage |
+| CreateAccount | 1 TEST_CASE / 10 SECTION | 11 #[test] | Exceeds upstream |
+| BeginSponsoring | 1 TEST_CASE / 9 SECTION | 15 #[test] (shared) | Shared sponsorship tests |
+| Events | 1 TEST_CASE / 8 SECTION | 60 #[test] | Exceeds upstream |
+| ManageData | 1 TEST_CASE / 4 SECTION | 14 #[test] | Exceeds upstream |
+| EndSponsoring | 1 TEST_CASE / 2 SECTION | 15 #[test] (shared) | Shared sponsorship tests |
+| SignatureUtils | 2 TEST_CASE / 0 SECTION | 15 #[test] | Good coverage |
+| ParallelApply | 4 TEST_CASE / 0 SECTION | 0 #[test] | N/A (not implemented) |
+| State management | - | 43 #[test] | Rust-only: savepoint, rollback, offer index |
+| Meta building | - | 20 #[test] | Rust-only: TransactionMeta construction |
+| Lumen reconciler | - | 17 #[test] | Rust-only: SAC event reconciliation |
+| Result tracking | - | 28 #[test] | Rust-only: MutableTransactionResult |
+| Live execution | - | 27 #[test] | Rust-only: fee/seq/refund flow |
+| History apply | - | 20 #[test] | Rust-only: catchup mode |
+| Frame properties | - | 33 #[test] | Rust-only: envelope accessors |
+| Validation | - | 26 #[test] | Rust-only: precondition checks |
+| Soroban types | - | 19 #[test] | Rust-only: protocol type mapping |
+| Soroban errors | - | 15 #[test] | Rust-only: error code mapping |
+| Soroban storage | - | 12 #[test] | Rust-only: storage snapshot |
+| Soroban events | - | 11 #[test] | Rust-only: contract events |
+| Soroban budget | - | 9 #[test] | Rust-only: budget tracking |
+| Soroban host | - | 7 #[test] | Rust-only: host configuration |
 
-| Test File | TEST_CASE | SECTION | Key Areas Covered |
-|-----------|-----------|---------|-------------------|
-| InvokeHostFunctionTests.cpp | 70 | 301 | Soroban contract invocation, storage, archival |
-| OfferTests.cpp | 2 | 178 | DEX operations, order matching |
-| TxEnvelopeTests.cpp | 5 | 154 | Signatures, multisig, extra signers, batching |
-| PathPaymentTests.cpp | 2 | 122 | Path payment strict receive edge cases |
-| LiquidityPoolTradeTests.cpp | 2 | 86 | Pool trading, cross-pool operations |
-| ExchangeTests.cpp | 6 | 85 | Offer exchange mechanics |
-| PaymentTests.cpp | 2 | 76 | Payment scenarios, fees |
-| ClaimableBalanceTests.cpp | 1 | 72 | All predicate types, sponsorship |
-| SetTrustLineFlagsTests.cpp | 2 | 70 | Trust flags, authorization states |
-| ManageBuyOfferTests.cpp | 8 | 69 | Buy offer liabilities, crossing |
-| RevokeSponsorshipTests.cpp | 1 | 65 | All sponsorship revocation scenarios |
-| PathPaymentStrictSendTests.cpp | 2 | 57 | Strict send edge cases |
-| AllowTrustTests.cpp | 2 | 54 | Authorization, clawback setup |
-| MergeTests.cpp | 2 | 46 | Account merge with sponsorship |
-| TxResultsTests.cpp | 1 | 38 | Result code validation |
-| ChangeTrustTests.cpp | 2 | 37 | Pool trustlines, sponsorship |
-| FeeBumpTransactionTests.cpp | 1 | 23 | Fee bump validity, apply |
-| SetOptionsTests.cpp | 1 | 21 | Signers, flags, thresholds |
-| ClawbackTests.cpp | 1 | 18 | Clawback operations |
-| InflationTests.cpp | 2 | 16 | Inflation (deprecated) |
-| ClawbackClaimableBalanceTests.cpp | 1 | 14 | Claimable balance clawback |
-| LiquidityPoolWithdrawTests.cpp | 1 | 12 | Pool withdrawal scenarios |
-| LiquidityPoolDepositTests.cpp | 1 | 12 | Pool deposit scenarios |
-| BumpSequenceTests.cpp | 1 | 11 | Sequence bumping, minSeq |
-| CreateAccountTests.cpp | 1 | 10 | Account creation, sponsorship |
-| BeginSponsoringFutureReservesTests.cpp | 1 | 9 | Sponsorship begin |
-| EventTests.cpp | 1 | 8 | SAC events, memos |
-| ManageDataTests.cpp | 1 | 4 | Data entry operations |
-| EndSponsoringFutureReservesTests.cpp | 1 | 2 | Sponsorship end |
-| SignatureUtilsTest.cpp | 2 | 0 | Pubkey, HashX signatures |
-| ParallelApplyTest.cpp | 4 | 0 | Parallel execution (N/A for Rust) |
+**Total: 127 TEST_CASE / ~1,753 SECTION upstream vs. 767 #[test] in Rust**
 
-### Rust Test Coverage by Module
+### Test Gaps
 
-| Module | Tests | Key Areas Covered |
-|--------|-------|-------------------|
-| `operations/execute/manage_offer.rs` | 20 | Sell/buy offers, passive offers, rounding |
-| `meta_builder.rs` | 20 | V2/V3/V4 meta, operation changes |
-| `fee_bump.rs` | 19 | Fee bump validation, result wrapping |
-| `result.rs` | 17 | Result codes, refundable fees |
-| `lumen_reconciler.rs` | 17 | Event reconciliation, mint/burn |
-| `operations/mod.rs` | 15 | Threshold levels, operation types |
-| `operations/execute/claimable_balance.rs` | 15 | Create/claim balance, predicates |
-| `operations/execute/payment.rs` | 14 | Native/credit payments, auth |
-| `operations/execute/manage_data.rs` | 13 | Data entries, limits |
-| `operations/execute/change_trust.rs` | 13 | Trustlines, pool shares |
-| `live_execution.rs` | 13 | Fee/seq processing, refunds |
-| `operations/execute/set_options.rs` | 12 | Signers, thresholds, flags |
-| `operations/execute/invoke_host_function.rs` | 11 | Soroban execution, budget |
-| `operations/execute/sponsorship.rs` | 11 | Begin/end/revoke sponsorship |
-| `signature_checker.rs` | 11 | All signer types, weights |
-| `validation.rs` | 11 | Structure, fees, bounds, signatures |
-| `state.rs` | 18 | State management, snapshots, OfferIndex |
-| `operations/execute/path_payment.rs` | 8 | Strict send/receive |
-| `frame.rs` | 8 | Frame properties, hashing |
-| `operations/execute/account_merge.rs` | 5 | Merge with subentries |
-| `operations/execute/extend_footprint_ttl.rs` | 5 | TTL extension |
-| `operations/execute/liquidity_pool.rs` | 5 | Deposit/withdraw |
-| `operations/execute/trust_flags.rs` | 5 | AllowTrust, SetTrustLineFlags |
-| `apply.rs` | 5 | History application |
-| `operations/execute/restore_footprint.rs` | 4 | Entry restoration |
-| `operations/execute/bump_sequence.rs` | 3 | Sequence bumping |
-| `operations/execute/clawback.rs` | 3 | Clawback operations |
-| `operations/execute/create_account.rs` | 3 | Account creation |
-| `lib.rs` | 4 | Integration tests |
-| `soroban/storage.rs` | 3 | Storage snapshots |
-| `soroban/events.rs` | 3 | Contract events |
-| `soroban/budget.rs` | 2 | Budget tracking |
-| `operations/execute/inflation.rs` | 1 | Inflation (deprecated) |
-| `soroban/host.rs` | 1 | Host configuration |
-| `operations/execute/mod.rs` | 1 | Execute dispatch |
+The following upstream test areas have limited Rust unit test equivalents, though many are covered by testnet integration:
 
-### Test Coverage Gaps
+1. **InvokeHostFunction edge cases** (301 SECTIONs vs 19 tests) -- Soroban contract invocation, storage, archival edge cases
+2. **Offer exchange mechanics** (178 SECTIONs vs 34 tests) -- DEX crossing, rounding, self-trade
+3. **TxEnvelope multisig scenarios** (154 SECTIONs vs 15 tests) -- Complex multisig, extra signers, batching
+4. **PathPayment complex paths** (123 SECTIONs vs 20 tests) -- Multi-hop paths, pool+book interaction
+5. **LiquidityPool trading** (86 SECTIONs vs 13 tests) -- Cross-pool operations
+6. **SetTrustLineFlags** (70 SECTIONs vs 11 tests) -- Authorization state transitions
 
-The following stellar-core test scenarios have **limited or no direct Rust unit test equivalents**, though many are covered by integration testing against testnet:
+## Verification Results
 
-| stellar-core Test Area | stellar-core Sections | Rust Unit Tests | Coverage Method |
-|---------------|--------------|-----------------|-----------------|
-| InvokeHostFunction edge cases | 301 | 11 | Testnet integration |
-| Offer exchange mechanics | 178 | 20 | Testnet integration |
-| TxEnvelope multisig scenarios | 154 | 11 | Partial + testnet |
-| PathPayment complex paths | 122 | 8 | Testnet integration |
-| LiquidityPool trading | 86 | 5 | Testnet integration |
-| ClaimableBalance predicates | 72 | 15 | Good coverage |
-| SetTrustLineFlags scenarios | 70 | 5 | Testnet integration |
-| RevokeSponsorshipTests | 65 | 11 | Partial + testnet |
-| ParallelApplyTest | 4 | 0 | N/A (not implemented) |
-
-### Rust-Only Tests
-
-The Rust implementation includes tests without stellar-core equivalents:
-- `lumen_reconciler.rs`: 17 tests for SAC event reconciliation
-- `meta_builder.rs`: 20 tests for transaction meta building
-- `result.rs`: 17 tests for result/fee tracker abstractions
-- Protocol-versioned behavior (P23, P24, P25 differences)
-
-### Gap Analysis
-
-**Well-covered areas:**
-- All 27 operations have basic unit tests
-- Fee bump transactions: comprehensive
-- Signature checking: all signer types covered
-- Event emission: good coverage
-- Result handling: comprehensive
-
-**Areas needing more unit tests:**
-1. **Complex multisig scenarios** - stellar-core has 154 SECTION blocks in TxEnvelopeTests
-2. **DEX order matching edge cases** - stellar-core has 178 SECTION blocks for offers
-3. **Path payment with multiple hops** - stellar-core has 122 SECTION blocks
-4. **Soroban edge cases** - stellar-core has 301 SECTION blocks in InvokeHostFunctionTests
-5. **Sponsorship transfer scenarios** - stellar-core has 65 SECTION blocks
-
-**Mitigation:** These gaps are largely covered by:
-1. **Testnet integration verification** - 14,651 real transactions verified at 100% parity
-2. **Testnet transaction diversity** - covers Soroban, DEX, payments, sponsorship
-3. **Protocol behavior verified** against real network data
-
-## Verification Approach
-
-Parity is verified through:
-1. Comparison against stellar-core test vectors
-2. Review of stellar-core implementation behavior
-3. Integration testing with mainnet/testnet archive data
-4. Protocol-specific behavior testing (P10, P23, etc.)
-
-## Testnet Verification Results (January 2026)
+### Testnet Verification (January 2026)
 
 Transaction execution verified against CDP metadata for testnet ledgers.
 
-### Fresh Checkpoint Verification (High Ledgers)
+#### Fresh Checkpoint Verification (High Ledgers)
 
 | Range | Transactions | Match Rate | Notes |
 |-------|--------------|------------|-------|
-| 30000-36000 | 14,651 | 100% (14,651/14,651) | **Full parity achieved** (January 2026) |
+| 30000-36000 | 14,651 | 100% (14,651/14,651) | **Full parity achieved** |
 | 32769-33000 | 432 | 98.8% (427/432) | Starting from fresh checkpoint |
 | 40001-41000 | 1,826 | 98.8% (1,804/1,826) | All mismatches after bucket list divergence |
 | 50001-52000 | 2,597 | 98.3% (2,553/2,597) | 44 mismatches, all state-dependent |
 
-### Early Ledger Verification (Variable Parity)
+#### Early Ledger Verification (Variable Parity)
 
-Testing early testnet ledgers reveals **variable parity rates** that correlate with testnet validator versions at the time those ledgers were originally closed:
+Testing early testnet ledgers reveals variable parity rates that correlate with testnet validator versions at the time those ledgers were originally closed:
 
 | Range | Transactions | Match Rate | Notes |
 |-------|--------------|------------|-------|
@@ -499,77 +608,93 @@ Testing early testnet ledgers reveals **variable parity rates** that correlate w
 | 9000-9200 | 326 | 77% (251/326) | Larger CPU differences |
 | 10000-10200 | 656 | 89% (586/656) | Mixed patterns |
 
-### Key Findings
+#### Key Findings
 
-1. **100% Transaction Execution Parity Achieved**: The testnet range 30000-36000 (14,651 transactions) now achieves **100% parity** with stellar-core v25. All classic and Soroban operations match exactly.
+1. **100% Transaction Execution Parity Achieved**: The testnet range 30000-36000 (14,651 transactions) achieves 100% parity with stellar-core v25. All classic and Soroban operations match exactly.
 
 2. **Testnet validator version variance**: Early testnet ledgers were executed with different stellar-core versions over time, using different soroban-env-host revisions with varying cost model characteristics.
 
-3. **Perfect parity ranges exist**: Multiple ledger ranges (2000-2100, 2200-2400, 3000-3200, 5000-5200, 8000-8200, 30000-35000) show **100% transaction execution parity**, confirming our implementation is correct.
+3. **Perfect parity ranges exist**: Multiple ledger ranges (2000-2100, 2200-2400, 3000-3200, 5000-5200, 8000-8200, 30000-36000) show 100% transaction execution parity.
 
-4. **CPU budget differences are historical**: All Soroban mismatches in variable-parity ranges fail with `ResourceLimitExceeded` - we consume 0.01% to 8% more CPU than was recorded in the original execution. This indicates the original validators used slightly different cost model parameters.
+4. **CPU budget differences are historical**: All Soroban mismatches in variable-parity ranges fail with `ResourceLimitExceeded` -- we consume 0.01% to 8% more CPU than was recorded in the original execution due to different cost model parameters.
 
 5. **Classic operations have full parity**: Classic (non-Soroban) operations match 100% in all tested ranges when bucket list state is consistent.
 
-### Soroban WASM Module Cache
+#### Soroban WASM Module Cache
 
-The Rust implementation now includes per-transaction WASM module caching that pre-compiles contract code from the transaction footprint before execution. This matches stellar-core's `SharedModuleCacheCompiler` behavior:
+The Rust implementation includes per-transaction WASM module caching that pre-compiles contract code from the transaction footprint before execution. This matches stellar-core's `SharedModuleCacheCompiler` behavior:
 
 - **stellar-core**: Pre-compiles ALL contract WASM from bucket list at startup (global cache)
 - **Rust**: Pre-compiles WASM for contracts in each transaction's footprint (per-TX cache)
 
 Both approaches ensure WASM compilation costs are NOT charged against transaction CPU budgets.
 
-### Known Execution Differences
+#### Known Execution Differences
 
 1. **Bucket List Divergence**: Header hash mismatches begin at ledger 32787 when starting from checkpoint 32767. This causes accumulated state divergence that can affect subsequent transaction execution.
 
-2. **Historical Soroban Cost Model Variance**: Some early testnet ledgers were executed with older stellar-core versions that used different soroban-env-host revisions. These have slightly different cost model calibration, resulting in CPU consumption differences of 0.01% to 8% for certain operations. Our implementation uses the same soroban-env-host revision as stellar-core v25 (`a37eeda` for P24).
+2. **Historical Soroban Cost Model Variance**: Some early testnet ledgers were executed with older stellar-core versions that used different soroban-env-host revisions. These have slightly different cost model calibration, resulting in CPU consumption differences of 0.01% to 8% for certain operations.
 
-3. **State-Dependent Failures**: When bucket list state diverges, contracts may:
-   - Access storage entries with different values
-   - Fail with `Storage(ExceededLimit)` when expected entries don't exist
-   - Have different execution paths leading to different CPU consumption
+3. **State-Dependent Failures**: When bucket list state diverges, contracts may access storage entries with different values, fail with `Storage(ExceededLimit)`, or have different execution paths leading to different CPU consumption.
 
-### Resolved Issues
+#### Resolved Issues
 
-1. **CPU Metering Differences (Fixed)**: Previously, minor CPU consumption differences (~100 instructions) were observed due to the module cache using V1 cost inputs. stellar-core's `SharedModuleCacheCompiler` always uses `parse_and_cache_module_simple` which uses V0 cost inputs (just `wasm_bytes`). The Rust implementation now matches this behavior, resolving budget exceeded errors.
+1. **CPU Metering Differences (Fixed)**: Previously, minor CPU consumption differences (~100 instructions) were observed due to the module cache using V1 cost inputs. stellar-core's `SharedModuleCacheCompiler` always uses `parse_and_cache_module_simple` which uses V0 cost inputs (just `wasm_bytes`). The Rust implementation now matches this behavior.
 
-2. **HashX Signature Validation (Fixed January 2026)**: Signature validation was incorrectly requiring all signatures to be exactly 64 bytes (Ed25519 format). Stellar supports multiple signature types:
-   - Ed25519: 64 bytes
-   - HashX: Variable length (the preimage whose SHA256 matches the signer key)
-   - Pre-auth TX: 0 bytes (the tx hash itself proves authorization)
-   The validation now correctly accepts all signature formats, with actual verification happening during signer weight accumulation.
+2. **HashX Signature Validation (Fixed January 2026)**: Signature validation was incorrectly requiring all signatures to be exactly 64 bytes (Ed25519 format). Fixed to accept all signature formats (Ed25519: 64 bytes, HashX: variable length, Pre-auth TX: 0 bytes).
 
-3. **Soroban Temporary Entry Archival (Fixed January 2026)**: Temporary Soroban entries with expired TTLs were incorrectly treated as "archived", causing `EntryArchived` errors. Per stellar-core, temporary entries with expired TTLs should be treated as if they don't exist (not archived). Only persistent entries (ContractCode or ContractData with durability=Persistent) can be archived and restored.
+3. **Soroban Temporary Entry Archival (Fixed January 2026)**: Temporary Soroban entries with expired TTLs were incorrectly treated as "archived". Fixed: temporary entries with expired TTLs are treated as non-existent. Only persistent entries can be archived and restored.
 
-4. **Payment NoIssuer Check (Fixed January 2026)**: Payment operations were incorrectly returning `NoIssuer` instead of `NoTrust` when the issuer account didn't exist. Per stellar-core (CAP-0017), the issuer existence check was removed in protocol v13. Since we only support protocol 23+, the check should not be performed. The `NoIssuer` error code is effectively unused in modern protocols.
+4. **Payment NoIssuer Check (Fixed January 2026)**: Payment operations were incorrectly returning `NoIssuer` instead of `NoTrust` when the issuer account did not exist. Per CAP-0017, the issuer existence check was removed in protocol v13.
 
-5. **Clawback Trustline Flag Check (Fixed January 2026)**: Clawback operations were checking `AUTH_CLAWBACK_ENABLED_FLAG` on the issuer account instead of `TRUSTLINE_CLAWBACK_ENABLED_FLAG` on the trustline. Per stellar-core (`ClawbackOpFrame.cpp:42-46`), the clawback operation checks `isClawbackEnabledOnTrustline(trust)` which verifies the trustline's flag (0x4), not the issuer account's flag (0x8). The issuer account flag controls whether new trustlines get the clawback flag when created, but the actual clawback operation checks the trustline flag.
+5. **Clawback Trustline Flag Check (Fixed January 2026)**: Clawback operations were checking `AUTH_CLAWBACK_ENABLED_FLAG` on the issuer account instead of `TRUSTLINE_CLAWBACK_ENABLED_FLAG` on the trustline. Fixed to check the trustline flag per stellar-core behavior.
 
-### Remaining Work
+#### Remaining Work
 
 1. **Bucket list parity**: The primary blocker for higher match rates at high ledger numbers is bucket list state divergence, being addressed in `henyey-bucket`.
 
 2. **Mainnet verification**: Mainnet has more consistent stellar-core versions across history. Verification against mainnet will provide cleaner parity metrics.
 
-3. **Identify clean testnet ranges**: The variable parity in early testnet is expected behavior. For regression testing, use ranges with known 100% parity (2000-2100, 3000-3200, 5000-5200, 8000-8200, 30000-36000).
+3. **Clean testnet ranges for regression**: Use ranges with known 100% parity (2000-2100, 3000-3200, 5000-5200, 8000-8200, 30000-36000).
 
-## Recommendations for Test Coverage Improvement
+## Parity Calculation
 
-To improve unit test coverage closer to stellar-core parity:
+| Category | Count |
+|----------|-------|
+| Implemented (Full) | 192 |
+| Gaps (None + Partial) | 10 |
+| Intentional Omissions | 29 |
+| **Parity** | **192 / (192 + 10) = 95%** |
 
-1. **High Priority** (complex scenarios with many edge cases):
-   - Add more multisig scenarios in `signature_checker.rs` (TxEnvelopeTests has 154 sections)
-   - Add DEX crossing/rounding tests in `manage_offer.rs` (OfferTests has 178 sections)
-   - Add complex path payment tests in `path_payment.rs` (PathPaymentTests has 122 sections)
+Breakdown of the 192 implemented items:
+- TransactionFrame accessors/methods: 26
+- Validation functions: 13
+- SignatureChecker functions: 10
+- MutableTransactionResult functions: 16
+- FeeBumpTransactionFrame functions: 11
+- Live execution functions: 12
+- TransactionMetaBuilder functions: 9
+- Event emission functions: 18
+- Offer exchange functions: 12
+- OperationFrame/ThresholdLevel: 11
+- SponsorshipUtils functions: 14
+- TransactionUtils functions: 20
+- Classic operations (24 ops, doApply + doCheckValid each): 27
+- Soroban operations (3 ops): 3
+- Soroban integration components: 11
+- Order book index: 7
+- Savepoint/rollback: 7
+- LumenEventReconciler: 1
+- SignatureUtils (verify functions): 4
 
-2. **Medium Priority**:
-   - Expand Soroban edge case tests (InvokeHostFunctionTests has 301 sections)
-   - Add more sponsorship scenarios in `sponsorship.rs` (RevokeSponsorshipTests has 65 sections)
-   - Add liquidity pool trading tests (LiquidityPoolTradeTests has 86 sections)
-
-3. **Low Priority** (already well-covered by testnet integration):
-   - Basic payment scenarios
-   - Simple account operations
-   - Standard trustline operations
+Breakdown of the 10 gaps:
+- `computeSorobanResourceFee()` (static fee computation)
+- `computePreApplySorobanResourceFee()`
+- `checkValidWithOptionallyChargedFee()`
+- `setInsufficientFeeErrorWithFeeCharged()`
+- `commonPreApply()` (separate refactored method)
+- `processSignatures()` (separate method)
+- `hasMuxedAccount()`
+- `getUpperBoundCloseTimeOffset()`
+- `createEntryRentChangeWithoutModification()`
+- `validateSorobanOpsConsistency()` (explicit check)

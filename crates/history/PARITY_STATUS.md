@@ -1,256 +1,298 @@
-# Parity Status: henyey-history
+# stellar-core Parity Status
 
-**Overall Parity: ~85%**
+**Crate**: `henyey-history`
+**Upstream**: `.upstream-v25/src/history/`
+**Overall Parity**: 74%
+**Last Updated**: 2026-02-13
 
-This document tracks the parity between this Rust crate (`henyey-history`) and stellar-core `stellar-core/src/history/` module. The reference is `.upstream-v25/src/history/`.
+## Summary
 
-## Overview
+| Area | Status | Notes |
+|------|--------|-------|
+| Checkpoint arithmetic | Full | All static methods implemented |
+| History Archive State (HAS) | Partial | Missing FutureBucket resolution |
+| HistoryArchive (shell commands) | Full | get/put/mkdir commands |
+| HistoryArchiveManager | Partial | Missing report/check work |
+| Publish queue | Full | SQLite-backed, crash-safe |
+| CheckpointBuilder | Full | ACID dirty-file pattern |
+| FileTransferInfo / paths | Full | All path generation covered |
+| StateSnapshot / publish | Partial | Missing SCP messages, diffing |
+| Publish metrics / callbacks | None | No Medida equivalent |
+| Verification | Full | Header chain, bucket, tx set |
+| Catchup orchestration | Full | 7-step process (Rust-native) |
+| Ledger replay | Full | Re-execution and meta-based |
 
-The `henyey-history` crate provides history archive access, catchup, replay, and publish support for henyey. It corresponds to stellar-core `src/history/` module and related components in `src/catchup/` and `src/historywork/`.
+## File Mapping
 
----
+| stellar-core File | Rust Module | Notes |
+|--------------------|-------------|-------|
+| `HistoryManager.h` / `HistoryManagerImpl.h` | `lib.rs`, `checkpoint.rs`, `publish_queue.rs` | Split across multiple modules |
+| `HistoryArchive.h` (HistoryArchiveState) | `archive_state.rs` | JSON-based serde vs cereal |
+| `HistoryArchive.h` (HistoryArchive class) | `remote_archive.rs` | Shell command archive ops |
+| `HistoryArchiveManager.h` | `lib.rs` (HistoryArchiveManager) | Archive management |
+| `FileTransferInfo.h` | `paths.rs` | Path generation functions |
+| `CheckpointBuilder.h` | `checkpoint_builder.rs` | Crash-safe checkpoint building |
+| `StateSnapshot.h` | `publish.rs` | Publishing workflow |
+| `HistoryUtils.h` | Inline in `replay.rs` / `catchup.rs` | Entry iteration |
 
-## Implemented Features
+## Component Mapping
 
-- [x] HistoryArchive - HTTP client for fetching archive data
-- [x] HistoryManager - Multi-archive access with failover
-- [x] HistoryArchiveManager - Archive management with writable detection
-- [x] HistoryArchiveState - Full JSON parsing/serialization (v1 and v2)
-- [x] Checkpoint utilities - Path generation, frequency, boundary detection
-- [x] CheckpointBuilder - Crash-safe checkpoint construction with dirty files
-- [x] PublishQueue - Persistent SQLite-backed publish queue
-- [x] CatchupManager - Full catchup orchestration (7-step process)
-- [x] Bucket download/verification - Parallel downloads with hash verification
-- [x] Ledger replay - Transaction re-execution and TransactionMeta-based replay
-- [x] Header chain verification - Cryptographic hash chain validation
-- [x] Transaction set/result verification
-- [x] RemoteArchive - Shell command-based upload (put_cmd, mkdir_cmd)
-- [x] CDP Integration - SEP-0054 data lake client (Rust-only extension)
+### checkpoint.rs / paths.rs (`checkpoint.rs`, `paths.rs`)
 
-## Not Implemented (Gaps)
+Corresponds to: `HistoryManager.h` (static checkpoint methods), `FileTransferInfo.h`
 
-- [ ] Work-based catchup orchestration (stellar-core uses explicit work graph)
-- [ ] FutureBucket in-progress merge resolution
-- [ ] Publish success/failure metrics (Medida instrumentation)
-- [ ] Publication callback mechanism
-- [ ] Get command templating for shell-based fetch
-- [ ] History archive report work
-- [ ] SCP message writing in published snapshots
-- [ ] Accelerated checkpoint frequency for testing
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `getCheckpointFrequency()` | `CHECKPOINT_FREQUENCY` | Full |
+| `checkpointContainingLedger()` | `checkpoint_ledger()` | Full |
+| `publishCheckpointOnLedgerClose()` | `is_checkpoint_ledger()` | Full |
+| `isFirstLedgerInCheckpoint()` | Compare with `first_ledger_in_checkpoint_containing()` | Full |
+| `isLastLedgerInCheckpoint()` | `is_checkpoint_ledger()` | Full |
+| `sizeOfCheckpointContaining()` | `size_of_checkpoint_containing()` | Full |
+| `firstLedgerInCheckpointContaining()` | `first_ledger_in_checkpoint_containing()` | Full |
+| `firstLedgerAfterCheckpointContaining()` | `next_checkpoint()` | Full |
+| `lastLedgerBeforeCheckpointContaining()` | `last_ledger_before_checkpoint_containing()` | Full |
+| `ledgerToTriggerCatchup()` | -- | None |
+| `FileType` enum | Category strings in `paths.rs` | Full |
+| `typeString()` | Inline category strings | Full |
+| `createPath()` | `fs::create_dir_all` | Full |
+| `createPublishDir()` | `PublishManager` directory creation | Full |
+| `getPublishHistoryDir()` | `PublishManager` path handling | Full |
+| `FileTransferInfo` constructors | `checkpoint_path()`, `bucket_path()` | Full |
+| `localPath_nogz()` / `localPath_nogz_dirty()` | `checkpoint_path()` / `checkpoint_path_dirty()` | Full |
+| `localPath_gz()` / `localPath_gz_tmp()` | `checkpoint_path()` with `.gz` extension | Full |
+| `baseName_nogz()` / `baseName_gz()` | `checkpoint_path()` basename extraction | Full |
+| `remoteDir()` / `remoteName()` | `checkpoint_path()` URL generation | Full |
+| `checkpoint_path()` dirty helpers | `checkpoint_path_dirty()`, `is_dirty_path()`, `dirty_to_final_path()`, `final_to_dirty_path()` | Full |
 
----
+### archive_state.rs (`archive_state.rs`)
 
-## Test Coverage Comparison
+Corresponds to: `HistoryArchive.h` (HistoryArchiveState)
 
-### stellar-core Tests (`.upstream-v25/src/history/test/`)
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `HistoryArchiveState()` (default) | `HistoryArchiveState` struct with serde defaults | Full |
+| `HistoryArchiveState(ledgerSeq, buckets, passphrase)` | `build_history_archive_state()` | Full |
+| `baseName()` | `root_has_path()` | Full |
+| `wellKnownRemoteDir()` | `.well-known/` in paths | Full |
+| `wellKnownRemoteName()` | `root_has_path()` | Full |
+| `remoteDir()` | `checkpoint_path("history", ...)` | Full |
+| `remoteName()` | `has_path()` | Full |
+| `getBucketListHash()` | -- | None |
+| `differingBuckets()` | -- | None |
+| `allBuckets()` | `all_bucket_hashes()` | Full |
+| `serialize()` / `deserialize()` | `from_json()` / `to_json()` via serde | Full |
+| `futuresAllClear()` | -- | None |
+| `futuresAllResolved()` | -- | None |
+| `resolveAllFutures()` | -- | None |
+| `resolveAnyReadyFutures()` | -- | None |
+| `save()` / `load()` | `to_json()` / `from_json()` + file I/O | Full |
+| `toString()` / `fromString()` | `to_json()` / `from_json()` | Full |
+| `prepareForPublish()` | `build_history_archive_state()` | Full |
+| `containsValidBuckets()` | -- | None |
+| `hasHotArchiveBuckets()` | `has_hot_archive_buckets()` | Full |
 
-| Test File | Test Name | Rust Equivalent | Status |
-|-----------|-----------|-----------------|--------|
-| **HistoryTests.cpp** | | | |
-| | `checkpoint containing ledger` | `checkpoint.rs::test_checkpoint_containing_matches_stellar_core` | ✅ Covered |
-| | `HistoryManager compress` | `download_utils.rs::test_decompress_gzip_roundtrip` | ✅ Covered |
-| | `HistoryArchiveState get_put` | `lib.rs::archive_manager_tests` | 🔶 Partial |
-| | `History bucket verification` | `catchup_integration.rs::test_catchup_against_local_archive_checkpoint` | ✅ Covered |
-| | `History bucket verification (live)` | `catchup_integration.rs` | ✅ Covered |
-| | `History bucket verification (hot archive)` | `catchup_integration.rs` | 🔶 Partial (hot archive not tested separately) |
-| | `History bucket verification (file not found)` | — | ❌ Missing |
-| | `History bucket verification (corrupted zip)` | — | ❌ Missing |
-| | `History bucket verification (hash mismatch)` | — | ❌ Missing |
-| | `Ledger chain verification` | `verify.rs::test_verify_header_chain_*` | ✅ Covered |
-| | `Ledger chain verification (bad hash)` | `verify.rs::test_verify_header_chain_broken` | ✅ Covered |
-| | `Ledger chain verification (bad ledger version)` | — | ❌ Missing |
-| | `Ledger chain verification (overshot)` | — | ❌ Missing |
-| | `Ledger chain verification (undershot)` | — | ❌ Missing |
-| | `Ledger chain verification (missing entries)` | — | ❌ Missing |
-| | `Tx results verification` | `replay_integration.rs::test_catchup_replay_bucket_hash_verification` | 🔶 Partial |
-| | `Tx results verification (header file missing)` | — | ❌ Missing |
-| | `Tx results verification (hash mismatch)` | — | ❌ Missing |
-| | `History publish` | — | ❌ Missing |
-| | `History publish with restart` | — | ❌ Missing |
-| | `History publish to multiple archives` | — | ❌ Missing |
-| | `History catchup with extra validation` | — | ❌ Missing |
-| | `Publish works correctly post shadow removal` | — | ❌ Missing |
-| | `History catchup` | `catchup_integration.rs` | 🔶 Partial |
-| | `Publish throttles catchup` | — | ❌ Missing |
-| | `History catchup with different modes` | — | ❌ Missing |
-| | `Retriggering catchups after trimming mSyncingLedgers` | — | ❌ Missing |
-| | `History prefix catchup` | — | ❌ Missing |
-| | `Catchup with protocol upgrade` | — | ❌ Missing |
-| | `Catchup fatal failure` | — | ❌ Missing |
-| | `Catchup non-initentry buckets to initentry-supporting works` | — | ❌ Missing |
-| | `Publish catchup alternation with stall` | — | ❌ Missing |
-| | `Publish catchup via s3` | — | ❌ Missing (hidden test) |
-| | `HAS in publishqueue remains in pristine state until publish` | — | ❌ Missing |
-| | `persist publish queue` | — | ❌ Missing |
-| | `catchup with a gap` | — | ❌ Missing |
-| | `Catchup recent` | — | ❌ Missing |
-| | `Catchup manual` | — | ❌ Missing |
-| | `initialize existing history store fails` | `lib.rs::archive_manager_tests` | 🔶 Partial |
-| | `Catchup failure recovery with buffered checkpoint` | — | ❌ Missing |
-| | `Change ordering of buffered ledgers` | — | ❌ Missing |
-| | `Introduce and fix gap without starting catchup` | — | ❌ Missing |
-| | `Receive trigger and checkpoint ledger out of order` | — | ❌ Missing |
-| | `Externalize gap while catchup work is running` | — | ❌ Missing |
-| | `CheckpointBuilder` | — | ❌ Missing |
-| **SerializeTests.cpp** | | | |
-| | `Serialization round trip` | `serialize_roundtrip.rs::test_history_archive_state_roundtrip` | ✅ Covered |
+### remote_archive.rs (`remote_archive.rs`)
 
-### Legend
+Corresponds to: `HistoryArchive.h` (HistoryArchive class)
 
-- ✅ **Covered**: Rust test exists with equivalent functionality
-- 🔶 **Partial**: Some aspects tested but not complete coverage
-- ❌ **Missing**: No Rust equivalent test
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `HistoryArchive(config)` | `RemoteArchive::new(config)` | Full |
+| `hasGetCmd()` | `can_read()` | Full |
+| `hasPutCmd()` | `can_write()` | Full |
+| `hasMkdirCmd()` | `config.mkdir_cmd.is_some()` | Full |
+| `getName()` | `name()` | Full |
+| `getFileCmd()` | `get_file()` | Full |
+| `putFileCmd()` | `put_file()` | Full |
+| `mkdirCmd()` | `mkdir()` | Full |
 
-### Rust-only Tests
+### lib.rs - HistoryArchiveManager (`lib.rs`)
 
-These tests exist in Rust but have no direct stellar-core equivalent:
+Corresponds to: `HistoryArchiveManager.h`
 
-| Test File | Test Name | Description |
-|-----------|-----------|-------------|
-| `serialize_roundtrip.rs` | `test_history_archive_state_roundtrip` | Tests HAS JSON round-trip with real testnet/mainnet fixtures |
-| `download_utils.rs` | `test_decompress_gzip_roundtrip` | Gzip compression/decompression |
-| `download_utils.rs` | `test_parse_xdr_stream_raw` | Raw XDR stream parsing |
-| `download_utils.rs` | `test_parse_xdr_stream_record_marked` | Record-marked XDR parsing (RFC 5531) |
-| `catchup_integration.rs` | `test_catchup_against_local_archive_checkpoint` | Full catchup against mock HTTP server |
-| `replay_integration.rs` | `test_catchup_replay_bucket_hash_verification` | Replay with bucket list hash verification |
-| `checkpoint.rs` | `test_latest_checkpoint_before_or_at` | Checkpoint boundary utility |
-| `checkpoint.rs` | `test_next_checkpoint` | Next checkpoint calculation |
-| `checkpoint.rs` | `test_checkpoint_start` | First ledger in checkpoint |
-| `checkpoint.rs` | `test_checkpoint_range` | Checkpoint ledger range |
-| `verify.rs` | `test_verify_header_chain_valid` | Valid header chain verification |
-| `verify.rs` | `test_verify_header_chain_broken` | Broken hash chain detection |
-| `verify.rs` | `test_verify_header_chain_non_consecutive` | Sequence gap detection |
-| `verify.rs` | `test_verify_bucket_hash` | Bucket content hash verification |
-| `verify.rs` | `test_verify_header_chain_empty` | Empty chain edge case |
-| `verify.rs` | `test_verify_header_chain_single` | Single header edge case |
-| `lib.rs` | `test_archive_entry_read_only` | Read-only archive configuration |
-| `lib.rs` | `test_archive_entry_write_only` | Write-only archive configuration |
-| `lib.rs` | `test_archive_entry_fully_configured` | Full read/write archive |
-| `lib.rs` | `test_manager_publish_enabled_*` | Publish capability detection |
-| `lib.rs` | `test_manager_get_archive` | Archive lookup by name |
-| `lib.rs` | `test_manager_check_sensible_config_*` | Archive config validation |
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `HistoryArchiveManager(app)` | `HistoryArchiveManager::new(passphrase)` | Full |
+| `checkSensibleConfig()` | `check_sensible_config()` | Full |
+| `selectRandomReadableHistoryArchive()` | `get_readable_archives()` | Partial |
+| `getHistoryArchiveReportWork()` | -- | None |
+| `getCheckLedgerHeaderWork()` | -- | None |
+| `initializeHistoryArchive()` | `initialize_history_archive()` | Full |
+| `publishEnabled()` | `publish_enabled()` | Full |
+| `getHistoryArchive()` | `get_archive()` | Full |
+| `getWritableHistoryArchives()` | `get_writable_archives()` | Full |
 
----
+### checkpoint_builder.rs (`checkpoint_builder.rs`)
 
-## Known Gaps
+Corresponds to: `CheckpointBuilder.h`
 
-### Critical Test Coverage Gaps
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `CheckpointBuilder(app)` | `CheckpointBuilder::new(publish_dir)` | Full |
+| `appendTransactionSet()` (TxSetXDRFrame) | `append_transaction_set()` | Full |
+| `appendTransactionSet()` (TransactionHistoryEntry) | `append_transaction_set()` | Full |
+| `appendLedgerHeader()` | `append_ledger_header()` | Full |
+| `cleanup(lcl)` | `cleanup(lcl)` | Full |
+| `checkpointComplete(checkpoint)` | `checkpoint_complete(checkpoint)` | Full |
+| `ensureOpen(ledgerSeq)` | `ensure_open(checkpoint)` | Full |
 
-1. **Bucket verification failure modes**: The stellar-core tests extensively test bucket download failures (file not found, corrupted zip, hash mismatch). Rust lacks these negative test cases.
+### publish_queue.rs / lib.rs - HistoryManager (`publish_queue.rs`, `lib.rs`)
 
-2. **Ledger chain verification edge cases**: stellar-core tests `VERIFY_STATUS_ERR_BAD_LEDGER_VERSION`, `VERIFY_STATUS_ERR_OVERSHOT`, `VERIFY_STATUS_ERR_UNDERSHOT`, `VERIFY_STATUS_ERR_MISSING_ENTRIES`. Rust only tests basic chain validation.
+Corresponds to: `HistoryManager.h` (publish queue methods), `HistoryManagerImpl.h`
 
-3. **Online catchup scenarios**: stellar-core has extensive tests for online catchup with buffered ledgers, gaps, out-of-order delivery, and recovery. Rust tests are primarily offline catchup.
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `checkSensibleConfig()` | `HistoryArchiveManager::check_sensible_config()` | Full |
+| `create()` | `HistoryManager::new()` / `HistoryArchiveManager::new()` | Full |
+| `dropAll()` | PublishQueue DB schema in henyey-db | Full |
+| `publishQueuePath()` | DB-based (in-database) | Full |
+| `publishQueueLength()` | `PublishQueue::len()` | Full |
+| `logAndUpdatePublishStatus()` | `PublishQueue::log_status()` | Partial |
+| `maybeQueueHistoryCheckpoint()` | Handled in app crate | Partial |
+| `queueCurrentHistory()` | `PublishQueue::enqueue()` | Full |
+| `getMinLedgerQueuedToPublish()` | `PublishQueue::min_ledger()` | Full |
+| `getMaxLedgerQueuedToPublish()` | `PublishQueue::max_ledger()` | Full |
+| `publishQueuedHistory()` | -- | Partial |
+| `maybeCheckpointComplete()` | `CheckpointBuilder::checkpoint_complete()` | Full |
+| `getMissingBucketsReferencedByPublishQueue()` | -- | None |
+| `getBucketsReferencedByPublishQueue()` | `PublishQueue::get_referenced_bucket_hashes()` | Full |
+| `getPublishQueueStates()` | `PublishQueue::get_all()` | Full |
+| `historyPublished()` | -- | None |
+| `appendTransactionSet()` | `CheckpointBuilder::append_transaction_set()` | Full |
+| `appendLedgerHeader()` | `CheckpointBuilder::append_ledger_header()` | Full |
+| `restoreCheckpoint()` | `CheckpointBuilder::cleanup()` | Full |
+| `deletePublishedFiles()` | -- | None |
+| `getPublishQueueCount()` | `PublishQueue::len()` | Full |
+| `getPublishSuccessCount()` | -- | None |
+| `getPublishFailureCount()` | -- | None |
+| `waitForCheckpointPublish()` | -- | None |
 
-4. **Publish workflow**: stellar-core tests publish with restart, multiple archives, crash recovery with dirty files. Rust lacks publish integration tests.
+### publish.rs (`publish.rs`)
 
-5. **Protocol upgrade during catchup**: stellar-core tests catching up across protocol upgrades (e.g., generalized tx sets, hot archive buckets). Rust lacks these.
+Corresponds to: `StateSnapshot.h`, `HistoryManagerImpl.h` (publish methods)
 
-6. **CheckpointBuilder crash scenarios**: stellar-core tests `mThrowOnAppend` for simulating crashes during checkpoint building. Rust lacks crash simulation tests.
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `StateSnapshot(app, state)` | `PublishManager` construction | Full |
+| `writeSCPMessages()` | -- | None |
+| `differingHASFiles()` | -- | None |
+| `takeSnapshotAndPublish()` | `PublishManager::publish_checkpoint()` | Full |
 
-### Functionality Gaps
+### catchup.rs / replay.rs (`catchup.rs`, `replay.rs`)
 
-1. **FutureBucket resolution**: stellar-core resolves in-progress bucket merges from HAS `next` field. Rust parses but ignores merge state.
+Corresponds to: Catchup workflow (spans multiple upstream Work classes)
 
-2. **Metrics**: stellar-core tracks publish success/failure counts via Medida. Rust uses only logging.
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `getHistoryEntryForLedger()` | Inline iteration logic | Partial |
 
-3. **Online catchup buffering**: stellar-core has sophisticated `mSyncingLedgers` buffer management with trimming. Rust's catchup is simpler.
+## Intentional Omissions
 
-4. **Archive report work**: stellar-core can check what's published on remote archives. Rust lacks this.
+Features excluded by design. These are NOT counted against parity %.
 
----
+| stellar-core Component | Reason |
+|------------------------|--------|
+| `createPublishQueueDir()` | Publish queue is SQLite-backed, no filesystem directory needed |
+| `dropSQLBasedPublish()` | Never had SQL-based publish format to migrate from |
+| `getTmpDir()` | Handled by Rust temp directory abstractions (`tempfile` crate) |
+| `localFilename()` | Handled by Rust path manipulation directly |
+| `setPublicationEnabled()` | Test-only method (`#ifdef BUILD_TESTS`) |
+| `getConfig()` | Config passed at construction, no getter needed |
+| `localName()` (HAS) | Handled differently via temp file abstractions |
 
-## Module Mapping
+## Gaps
 
-| Rust Module | stellar-core File(s) | Status |
-|-------------|-------------|--------|
-| `lib.rs` | `HistoryManager.h`, `HistoryArchiveManager.h` | Complete |
-| `archive.rs` | `HistoryArchive.h` | Complete |
-| `remote_archive.rs` | `HistoryArchive.h` (putFileCmd, mkdirCmd) | Complete |
-| `archive_state.rs` | `HistoryArchive.h` (HistoryArchiveState) | Complete |
-| `catchup.rs` | `historywork/*.cpp` (CatchupWork, etc.) | Partial |
-| `checkpoint.rs` | `HistoryManager.h` (static methods) | Complete |
-| `checkpoint_builder.rs` | `CheckpointBuilder.h` | Complete |
-| `download.rs` | `historywork/GetRemoteFileWork.cpp` | Complete |
-| `paths.rs` | `HistoryArchive.h` (path helpers) | Complete |
-| `publish.rs` | `historywork/PublishWork.cpp`, `StateSnapshot.cpp` | Partial |
-| `publish_queue.rs` | `HistoryManagerImpl.cpp` (publish queue) | Partial |
-| `replay.rs` | `ledger/LedgerManagerImpl.cpp` (closeLedger) | Complete |
-| `verify.rs` | Various verification in catchup works | Complete |
-| `cdp.rs` | N/A (Rust-only, SEP-0054) | N/A |
-| `error.rs` | stellar-core exceptions | Complete |
+Features not yet implemented. These ARE counted against parity %.
 
----
+| stellar-core Component | Priority | Notes |
+|------------------------|----------|-------|
+| `ledgerToTriggerCatchup()` | Medium | Catchup trigger point calculation |
+| `logAndUpdatePublishStatus()` | Low | Missing StatusManager integration (logs only) |
+| `maybeQueueHistoryCheckpoint()` | Low | Orchestration in app crate, not history crate |
+| `publishQueuedHistory()` | Medium | No work-based publish orchestration |
+| `getMissingBucketsReferencedByPublishQueue()` | Medium | Missing bucket availability check |
+| `historyPublished()` | Medium | No publish completion callback |
+| `deletePublishedFiles()` | Low | Published file cleanup |
+| `getPublishSuccessCount()` | Low | Metrics tracking |
+| `getPublishFailureCount()` | Low | Metrics tracking |
+| `waitForCheckpointPublish()` | Low | Blocking publish wait |
+| `getBucketListHash()` | High | Cumulative bucket list hash from HAS |
+| `differingBuckets()` | Medium | Differential bucket download optimization |
+| `futuresAllClear()` | Medium | FutureBucket state checking |
+| `futuresAllResolved()` | Medium | FutureBucket state checking |
+| `resolveAllFutures()` | Medium | FutureBucket merge resolution |
+| `resolveAnyReadyFutures()` | Low | Incremental FutureBucket resolution |
+| `containsValidBuckets()` | Medium | Bucket validation against BucketManager |
+| `writeSCPMessages()` | Low | SCP envelope publishing |
+| `differingHASFiles()` | Low | Differential file upload optimization |
+| `selectRandomReadableHistoryArchive()` | Low | Random selection (sequential used instead) |
+| `getHistoryArchiveReportWork()` | Low | Archive reporting diagnostics |
+| `getCheckLedgerHeaderWork()` | Low | Ledger header verification work |
+| `getHistoryEntryForLedger()` | Low | Handled inline, not as separate utility |
 
 ## Architectural Differences
 
-### Async Model
+1. **Async model**
+   - **stellar-core**: Work-based state machine (`WorkScheduler`, `BasicWork` subclasses). Catchup is orchestrated as a graph of dependent Work objects.
+   - **Rust**: `async/await` with Tokio. Catchup is a single `CatchupManager` with sequential async steps.
+   - **Rationale**: Rust's native async is more idiomatic and avoids the complexity of manual state machines.
 
-Rust uses `async/await` with Tokio. stellar-core uses a Work-based state machine pattern (`WorkScheduler`, `BasicWork` subclasses). The Rust approach is more idiomatic but doesn't map 1:1 to stellar-core Work classes.
+2. **Publish queue storage**
+   - **stellar-core**: Originally filesystem-based, migrated to SQL with `dropSQLBasedPublish()`. Uses file-based checkpoint builder plus DB queue.
+   - **Rust**: SQLite-backed from the start via `henyey-db`. No filesystem queue migration needed.
+   - **Rationale**: Database-backed queue is simpler and already crash-safe without extra filesystem coordination.
 
-### Database Integration
+3. **FutureBucket handling**
+   - **stellar-core**: Full FutureBucket resolution with in-progress merge tracking. HAS contains merge state that can be resolved on load.
+   - **Rust**: Parses FutureBucket state from HAS JSON via `live_next_states()` and `hot_archive_next_states()`, but does not resolve pending merges.
+   - **Rationale**: Merge resolution is tightly coupled to BucketManager. Rust reads the state but defers resolution to the bucket crate.
 
-stellar-core integrates deeply with its SQL database for persistent state. Rust uses `henyey-db` more standalone.
+4. **HTTP archive access**
+   - **stellar-core**: Shell command-based (`get` command templates) for all archive access. No built-in HTTP client.
+   - **Rust**: Native HTTP client (`reqwest`) for reading archives, plus shell commands (`RemoteArchive`) for writing. Both approaches coexist.
+   - **Rationale**: Native HTTP provides better error handling, retry logic, and connection pooling for the common read path.
 
-### Crash Safety
+5. **CDP data lake integration**
+   - **stellar-core**: No CDP support; relies solely on traditional history archives.
+   - **Rust**: First-class `CdpDataLake` and `CachedCdpDataLake` for accessing LedgerCloseMeta from SEP-0054 cloud storage.
+   - **Rationale**: Enables direct access to transaction metadata for exact replay without full archive downloads.
 
-stellar-core `CheckpointBuilder` implements ACID-like semantics with `.dirty` files and atomic renames. Rust's `CheckpointBuilder` mirrors this approach, but `PublishManager` writes files directly.
+6. **Metrics**
+   - **stellar-core**: Medida-based metrics for publish success/failure counts, queue depth, publish latency.
+   - **Rust**: Structured logging via `tracing` only. No numeric metric counters.
+   - **Rationale**: Metrics infrastructure not yet built; `tracing` provides observability for now.
 
-### Metrics
+## Test Coverage
 
-stellar-core uses Medida for publish success/failure metrics. Rust uses `tracing` for structured logging but lacks equivalent metrics.
+| Area | stellar-core Tests | Rust Tests | Notes |
+|------|-------------------|------------|-------|
+| Checkpoint arithmetic | 2 TEST_CASE / 3 SECTION | 21 `#[test]` | More thorough in Rust |
+| HAS serialization | 1 TEST_CASE / 1 SECTION | 8 `#[test]` | Rust includes roundtrip, hot archive |
+| Bucket verification | 5 TEST_CASE / 8 SECTION | 7 `#[test]` | Rust missing failure mode tests |
+| Ledger chain verification | 3 TEST_CASE / 5 SECTION | 6 `#[test]` | Rust missing overshot/undershot/version |
+| Publish workflow | 6 TEST_CASE / 12 SECTION | 11 `#[test]` | Rust missing multi-archive, restart |
+| Catchup modes | 8 TEST_CASE / 15 SECTION | 13 `#[test]` | Rust missing online catchup, gap handling |
+| Checkpoint builder | 2 TEST_CASE / 5 SECTION | 5 `#[test]` | Rust missing crash simulation |
+| Remote archive | -- | 12 `#[test]` | Rust-only (shell command testing) |
+| CDP / download | -- | 7 `#[test]` | Rust-only extensions |
+| Archive manager | -- | 10 `#[test]` | Rust-only unit tests |
+| **Total** | **34 TEST_CASE / 60 SECTION** | **122 `#[test]`** | |
 
----
+### Test Gaps
 
-## Design Decisions (Rust Extensions)
+- **Bucket verification failure modes**: stellar-core tests file-not-found, corrupted zip, and hash mismatch scenarios. Rust lacks these negative test cases.
+- **Ledger chain verification edge cases**: stellar-core tests `VERIFY_STATUS_ERR_BAD_LEDGER_VERSION`, `VERIFY_STATUS_ERR_OVERSHOT`, `VERIFY_STATUS_ERR_UNDERSHOT`, `VERIFY_STATUS_ERR_MISSING_ENTRIES`. Rust only tests basic chain validation and broken hashes.
+- **Online catchup with buffering**: stellar-core has extensive tests for online catchup with buffered ledgers, gaps, out-of-order delivery, trimming `mSyncingLedgers`, and recovery. Rust tests are primarily offline catchup.
+- **Publish integration**: stellar-core tests publish with restart, multiple archives, post-shadow-removal, and throttled catchup. Rust lacks these integration tests.
+- **Protocol upgrade during catchup**: stellar-core tests catching up across protocol boundaries. Rust lacks these.
+- **CheckpointBuilder crash simulation**: stellar-core uses `mThrowOnAppend` to simulate crashes during checkpoint building. Rust lacks equivalent crash injection tests.
 
-### CDP Integration (SEP-0054)
+## Parity Calculation
 
-The Rust crate includes first-class CDP support not present in stellar-core:
-- `CdpDataLake` for accessing LedgerCloseMeta from cloud storage
-- Full `TransactionMeta` extraction for exact replay
-
-### Disk-Backed Buckets
-
-During catchup, Rust saves buckets to disk and uses file-backed storage with compact key-to-offset indexes.
-
-### Re-execution Focus
-
-Rust emphasizes transaction re-execution during replay rather than TransactionMeta application. Works with traditional archives lacking TransactionMeta.
-
-### Invariant Integration
-
-The Rust crate integrates with `stellar-core-invariant` for runtime verification during replay.
-
----
-
-## Notes
-
-- The stellar-core test infrastructure (`CatchupSimulation`, `HistoryConfigurator`, etc.) is significantly more sophisticated than the Rust test setup. Many stellar-core tests require this simulation framework.
-- Several stellar-core tests use `REAL_TIME` virtual clock mode for timeout testing; Rust tests are primarily unit/integration tests.
-- The `[acceptance]` tagged tests in stellar-core are longer-running integration tests; Rust could benefit from similar acceptance-level tests.
-- Hot archive bucket testing should be expanded as protocol 23+ features mature.
-
----
-
-## Recommendations for Improving Parity
-
-### High Priority
-
-1. Add bucket verification failure tests (file not found, corrupted, hash mismatch)
-2. Add ledger chain verification edge case tests (overshot, undershot, missing entries)
-3. Add publish integration tests with checkpoint completion
-4. Add online catchup tests with buffered ledgers
-
-### Medium Priority
-
-5. Add protocol upgrade catchup tests
-6. Add CheckpointBuilder crash recovery tests
-7. Add multi-archive publish tests
-8. Add FutureBucket resolution (or document why it's not needed)
-
-### Low Priority
-
-9. Add metrics tracking
-10. Add archive report work
-11. Add S3-style remote archive tests
+| Category | Count |
+|----------|-------|
+| Implemented (Full) | 67 |
+| Gaps (None + Partial) | 23 |
+| Intentional Omissions | 7 |
+| **Parity** | **67 / (67 + 23) = 74%** |

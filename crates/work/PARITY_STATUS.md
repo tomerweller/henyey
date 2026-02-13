@@ -1,234 +1,255 @@
 # stellar-core Parity Status
 
-**Overall Parity: ~90%**
+**Crate**: `henyey-work`
+**Upstream**: `.upstream-v25/src/work/`
+**Overall Parity**: 46%
+**Last Updated**: 2026-02-13
 
-This document tracks parity between `henyey-work` and the stellar-core work system in `stellar-core/src/work/`.
+## Summary
 
-## stellar-core Source Files
+| Area | Status | Notes |
+|------|--------|-------|
+| Work trait / BasicWork abstraction | Full | Async trait replaces class hierarchy |
+| State machine (WorkState / State enum) | Full | Simplified from 8 to 6 states |
+| Retry mechanism | Full | Outcome-based rather than internal counter |
+| Cancellation / abort | Full | CancellationToken replaces shutdown/abort |
+| Work scheduler core loop | Full | DAG-based async execution |
+| Concurrency control | Full | max_concurrency config parameter |
+| Dependency ordering | Full | Explicit DAG deps replace hierarchical model |
+| Work sequence helper | Full | Different design, same sequential semantics |
+| WorkWithCallback wrapper | Full | Wraps work + callback vs callback-as-work |
+| Event monitoring | Full | Channel-based WorkEvent system |
+| Metrics / introspection | Full | metrics() and snapshot() APIs |
+| Hierarchical work (Work class) | None | Flat DAG replaces parent-child tree |
+| BatchWork parallel batching | None | Not implemented |
+| ConditionalWork gated execution | None | Not implemented |
 
-| stellar-core File | Description | Rust Equivalent |
-|----------|-------------|-----------------|
-| `BasicWork.h/.cpp` | Base work class with state machine, retries, abort handling | `Work` trait, `WorkOutcome`, `WorkState` |
-| `Work.h/.cpp` | Hierarchical work with parent-child relationships | Not implemented (flat DAG model instead) |
-| `WorkScheduler.h/.cpp` | Top-level scheduler with IO service integration | `WorkScheduler` struct |
-| `WorkSequence.h/.cpp` | Sequential work execution helper | `WorkSequence` struct |
-| `WorkWithCallback.h/.cpp` | Single-shot callback as work item | `WorkWithCallback` (different design) |
-| `BatchWork.h/.cpp` | Parallel batch execution with bandwidth control | Not implemented |
-| `ConditionalWork.h/.cpp` | Condition-gated work execution | Not implemented |
+## File Mapping
 
-## Parity Summary
+| stellar-core File | Rust Module | Notes |
+|--------------------|-------------|-------|
+| `BasicWork.h` / `BasicWork.cpp` | `lib.rs` | `Work` trait, `WorkOutcome`, `WorkState`, `WorkContext` |
+| `Work.h` / `Work.cpp` | (not mapped) | Hierarchical work model not implemented |
+| `WorkScheduler.h` / `WorkScheduler.cpp` | `lib.rs` | `WorkScheduler`, `WorkSchedulerConfig` |
+| `WorkSequence.h` / `WorkSequence.cpp` | `lib.rs` | `WorkSequence` helper struct |
+| `WorkWithCallback.h` / `WorkWithCallback.cpp` | `lib.rs` | `WorkWithCallback` wrapper struct |
+| `BatchWork.h` / `BatchWork.cpp` | (not mapped) | Not implemented |
+| `ConditionalWork.h` / `ConditionalWork.cpp` | (not mapped) | Not implemented |
 
-| Feature | stellar-core | Rust | Notes |
-|---------|-----|------|-------|
-| Work trait/class | Yes | Yes | Different design (trait vs class hierarchy) |
-| State machine | 8 states | 6 states | Rust simplifies by eliminating WAITING, ABORTING |
-| Retry mechanism | Yes | Yes | stellar-core has exponential backoff built-in |
-| Cancellation | Yes | Yes | Both support cooperative cancellation |
-| Dependency ordering | Hierarchical | DAG | Rust uses flat graph with explicit deps |
-| Concurrency control | Yes | Yes | `max_concurrency` / `MAX_CONCURRENT_SUBPROCESSES` |
-| Work sequences | Yes | Yes | Different implementation approach |
-| Batch work | Yes | No | stellar-core has iterator-based batch generation |
-| Conditional work | Yes | No | stellar-core has monotonic condition gating |
-| Event monitoring | Via status strings | Via channels | Rust uses `WorkEvent` channel |
-| Metrics/snapshots | Via getStatus() | Via metrics()/snapshot() | Different introspection approach |
+## Component Mapping
 
-## Implemented
+### Work trait and state types (`lib.rs`)
 
-### Core Work Abstractions
+Corresponds to: `BasicWork.h`
 
-- **`Work` trait**: Equivalent to stellar-core `BasicWork::onRun()`. Async work execution with outcome-based state transitions.
-  - `name()` method matches stellar-core `getName()`
-  - `run()` method matches stellar-core `onRun()` pure virtual
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `BasicWork::State` enum (5 values) | `WorkOutcome` enum (4 variants) | Full |
+| `BasicWork::InternalState` enum (8 values) | `WorkState` enum (6 variants) | Full |
+| `BasicWork()` constructor | `Work` trait + `WorkEntry` construction | Full |
+| `getName()` | `Work::name()` | Full |
+| `getState()` | `WorkScheduler::state()` | Full |
+| `isDone()` | `WorkState::is_terminal()` | Full |
+| `onRun()` pure virtual | `Work::run()` async method | Full |
+| `startWork()` | Handled by scheduler when spawning | Full |
+| `crankWork()` | Handled by Tokio async execution | Full |
+| `RETRY_NEVER` / `RETRY_ONCE` / `RETRY_A_FEW` / `RETRY_A_LOT` | Caller passes `retries: u32` | Partial |
+| `getStatus()` formatted string | `WorkSnapshot` / `WorkEvent` | Partial |
+| `onAbort()` pure virtual | `WorkContext::is_cancelled()` cooperative | Full |
+| `shutdown()` | `WorkScheduler::cancel()` / `cancel_all()` | Full |
+| `isAborting()` | `CancellationToken::is_cancelled()` | Full |
+| `onReset()` | Not needed (work items are stateful across retries) | None |
+| `onSuccess()` callback | Not implemented (use `WorkWithCallback`) | None |
+| `onFailureRetry()` callback | Not implemented | None |
+| `onFailureRaise()` callback | Not implemented | None |
+| `wakeUp()` | Not needed (async handles waiting) | None |
+| `wakeSelfUpCallback()` | Not needed (async handles waiting) | None |
+| `setupWaitingCallback()` | Not needed (async handles waiting) | None |
+| `getRetryDelay()` exponential backoff | Work items control delay via `WorkOutcome::Retry { delay }` | Partial |
+| `getRetryETA()` | Not implemented | None |
+| `ALLOWED_TRANSITIONS` validation | Not implemented (simpler state model) | None |
+| `assertValidTransition()` | Not implemented | None |
 
-- **`WorkOutcome` enum**: Maps to stellar-core `BasicWork::State` return values:
-  | Rust | stellar-core |
-  |------|-----|
-  | `Success` | `WORK_SUCCESS` |
-  | `Retry { delay }` | `WORK_FAILURE` (with retries left) |
-  | `Failed(String)` | `WORK_FAILURE` (no retries left) |
-  | `Cancelled` | `WORK_ABORTED` |
+### Work class - hierarchical work (`lib.rs`)
 
-- **`WorkState` enum**: Simplified state machine compared to stellar-core `InternalState`:
-  | Rust | stellar-core InternalState |
-  |------|-------------------|
-  | `Pending` | `PENDING` |
-  | `Running` | `RUNNING` |
-  | `Success` | `SUCCESS` |
-  | `Failed` | `FAILURE` |
-  | `Blocked` | (no direct equivalent - Rust-specific for dep failures) |
-  | `Cancelled` | `ABORTED` |
-  | (handled via async) | `WAITING` |
-  | (handled via async) | `RETRYING` |
-  | (merged into Cancelled) | `ABORTING` |
+Corresponds to: `Work.h`
 
-- **`WorkContext`**: Execution context provided to work items:
-  - `id: WorkId` - unique work identifier
-  - `attempt: u32` - current attempt number (1-indexed)
-  - `is_cancelled()` - check cancellation status
-  - `cancel_token()` - access underlying `CancellationToken`
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `Work()` constructor | (not implemented) | None |
+| `getStatus()` with child counts | (not implemented) | None |
+| `allChildrenSuccessful()` | (not implemented) | None |
+| `allChildrenDone()` | (not implemented) | None |
+| `anyChildRaiseFailure()` | (not implemented) | None |
+| `anyChildRunning()` | (not implemented) | None |
+| `hasChildren()` | (not implemented) | None |
+| `shutdown()` with child shutdown | (not implemented) | None |
+| `addWork<T>()` template | (not implemented) | None |
+| `addWorkWithCallback<T>()` template | (not implemented) | None |
+| `addWork(cb, child)` | (not implemented) | None |
+| `onRun()` with round-robin dispatch | (not implemented) | None |
+| `onAbort()` with child abort | (not implemented) | None |
+| `onReset()` with child cleanup | (not implemented) | None |
+| `doWork()` pure virtual | (not implemented) | None |
+| `doReset()` virtual | (not implemented) | None |
+| `checkChildrenStatus()` | (not implemented) | None |
+| `yieldNextRunningChild()` | (not implemented) | None |
+| `WorkUtils::getWorkStatus()` | (not implemented) | None |
+| `WorkUtils::allSuccessful()` | (not implemented) | None |
+| `WorkUtils::anyFailed()` | (not implemented) | None |
+| `WorkUtils::anyRunning()` | (not implemented) | None |
 
-### Scheduler Features
+### WorkScheduler (`lib.rs`)
 
-- **`WorkScheduler`**: Core scheduler matching stellar-core `WorkScheduler` functionality:
-  - `add_work()` - register work with dependencies and retry count
-  - `run_until_done()` - execute all work to completion
-  - `run_until_done_with_cancel()` - execute with external cancellation token
-  - `cancel()` / `cancel_all()` - cancellation APIs
-  - `state()` - query work state
-  - `metrics()` - aggregate statistics
-  - `snapshot()` - detailed work item snapshots
+Corresponds to: `WorkScheduler.h`
 
-- **`WorkSchedulerConfig`**:
-  - `max_concurrency` - equivalent to stellar-core `MAX_CONCURRENT_SUBPROCESSES`
-  - `retry_delay` - default delay between retries
-  - `event_tx` - optional channel for monitoring
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `WorkScheduler()` constructor | `WorkScheduler::new()` | Full |
+| `create()` factory | `WorkScheduler::new()` | Full |
+| `executeWork<T>()` blocking run | `run_until_done()` | Full |
+| `scheduleWork<T>()` non-blocking | `add_work()` + `run_until_done()` | Full |
+| `shutdown()` | `cancel_all()` | Full |
+| `doWork()` scheduler loop | `run_until_done_with_cancel()` | Full |
+| `scheduleOne()` IO posting | Tokio task spawning | Full |
+| `TRIGGER_PERIOD` constant | Not needed (async event-driven) | None |
 
-- **Dependency handling**:
-  - Work items declare dependencies via `deps: Vec<WorkId>` parameter
-  - Scheduler uses DAG model for topological execution order
-  - Failed/cancelled work blocks all dependents (`WorkState::Blocked`)
+### WorkSequence (`lib.rs`)
 
-### Helper Types
+Corresponds to: `WorkSequence.h`
 
-- **`WorkSequence`**: Linear chain builder (different from stellar-core design):
-  - stellar-core `WorkSequence` is a `BasicWork` subclass managing internal work vector
-  - Rust `WorkSequence` is a helper adding work with auto-chained deps to external scheduler
-  - Both achieve sequential execution semantics
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `WorkSequence()` constructor | `WorkSequence::new()` | Full |
+| `onRun()` sequential dispatch | `push()` creates dependency chain | Full |
+| `onAbort()` abort current | Handled by scheduler cancellation | Full |
+| `onReset()` | Not needed (scheduler handles retries) | Full |
+| `getStatus()` | Not implemented (scheduler has snapshot) | Partial |
+| `shutdown()` | Handled by scheduler cancel | Full |
+| `stopAtFirstFailure` flag | Scheduler blocks dependents on failure | Full |
 
-- **`WorkWithCallback`**: Post-completion callback wrapper (different from stellar-core design):
-  - stellar-core version wraps a callback function as the work itself
-  - Rust version wraps another work item and calls callback after completion
-  - Rust design better for instrumentation/logging; stellar-core design for inline logic
+### BatchWork (not implemented)
 
-### Monitoring and Introspection
+Corresponds to: `BatchWork.h`
 
-- **`WorkEvent`**: State change notifications via channel:
-  - `id`, `name`, `state`, `attempt` fields
-  - Sent via `try_send` to avoid blocking scheduler
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `BatchWork()` constructor | (not implemented) | None |
+| `getNumWorksInBatch()` | (not implemented) | None |
+| `doReset()` | (not implemented) | None |
+| `doWork()` batch management | (not implemented) | None |
+| `hasNext()` pure virtual | (not implemented) | None |
+| `yieldMoreWork()` pure virtual | (not implemented) | None |
+| `resetIter()` pure virtual | (not implemented) | None |
+| `addMoreWorkIfNeeded()` | (not implemented) | None |
 
-- **`WorkSchedulerMetrics`**: Aggregate counts:
-  - `total`, `pending`, `running`, `success`, `failed`, `blocked`, `cancelled`
-  - `attempts` (total execution attempts across all work)
-  - `retries_left` (remaining retry budget)
+### ConditionalWork (not implemented)
 
-- **`WorkSnapshot`**: Point-in-time work item state:
-  - `id`, `name`, `state`, `deps`, `dependents`
-  - `attempts`, `retries_left`, `last_error`
-  - `last_duration`, `total_duration`
+Corresponds to: `ConditionalWork.h`
 
-## Not Implemented (Gaps)
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `ConditionalWork()` constructor | (not implemented) | None |
+| `shutdown()` | (not implemented) | None |
+| `getStatus()` | (not implemented) | None |
+| `onRun()` condition polling | (not implemented) | None |
+| `onAbort()` | (not implemented) | None |
+| `onReset()` | (not implemented) | None |
 
-### stellar-core Class Hierarchy Features
+### WorkWithCallback (`lib.rs`)
 
-**BasicWork features not in Rust**:
-- `RETRY_NEVER` (0), `RETRY_ONCE` (1), `RETRY_A_FEW` (5), `RETRY_A_LOT` (32) constants
-- `getStatus()` formatted status string with state and retry ETA
-- `onReset()`, `onSuccess()`, `onFailureRetry()`, `onFailureRaise()` lifecycle hooks
-- `wakeUp()` / `wakeSelfUpCallback()` for WAITING state transitions
-- `setupWaitingCallback()` for timer-based waiting
-- `ALLOWED_TRANSITIONS` state transition validation
-- `isAborting()` state check
-- `getRetryDelay()` with exponential backoff via `exponentialBackoff()`
-- `getRetryETA()` for time until next retry
+Corresponds to: `WorkWithCallback.h`
 
-**Work class (hierarchical) not in Rust**:
-- `addWork<T>()` / `addWorkWithCallback<T>()` for child work
-- Round-robin child scheduling via `yieldNextRunningChild()`
-- `doWork()` pure virtual for local work
-- `doReset()` for custom reset logic
-- `allChildrenSuccessful()`, `allChildrenDone()`, `anyChildRaiseFailure()`, `anyChildRunning()`, `hasChildren()`
-- `checkChildrenStatus()`, `shutdownChildren()`
-- `mAbortChildrenButNotSelf` flag
-- `WorkUtils` namespace helpers
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `WorkWithCallback()` constructor | `WorkWithCallback::new()` | Full |
+| `onRun()` callback execution | `Work::run()` delegates + callback | Full |
+| `onAbort()` | Handled by cancellation token | Full |
 
-### Missing stellar-core Classes
+## Intentional Omissions
 
-**BatchWork** (parallel batch execution):
-- Configurable bandwidth via `MAX_CONCURRENT_SUBPROCESSES`
-- Iterator-based work generation: `hasNext()`, `yieldMoreWork()`, `resetIter()`
-- Automatic cleanup of completed children
-- Failure propagation (any child failure causes batch failure)
+Features excluded by design. These are NOT counted against parity %.
 
-**ConditionalWork** (condition-gated execution):
-- Monotonic condition function (`ConditionFn`) gating work
-- Polling with configurable `sleepDelay` (default 100ms)
-- Delegation to conditioned work after condition satisfied
+| stellar-core Component | Reason |
+|------------------------|--------|
+| `VirtualClock` / `VirtualTimer` integration | Rust uses Tokio async timers instead |
+| `postOnMainThread` scheduling | Rust uses Tokio task spawning |
+| `shouldYield()` cooperative yielding | Rust async yields naturally at `.await` points |
+| `mApp` application context in work | Rust work receives minimal `WorkContext`; app state passed via closures |
+| Tracy profiling markers (`ZoneScoped`) | Not needed; can be added via `tracing` if required |
+| `CLOG_*` logging macros | Rust uses `tracing` crate equivalently |
+| `NonMovableOrCopyable` base | Rust ownership system enforces this naturally |
+| `enable_shared_from_this` | Not needed; Rust ownership model avoids shared_ptr patterns |
+| `ALLOWED_TRANSITIONS` / `assertValidTransition()` | Simpler state model makes exhaustive validation unnecessary |
 
-### Application Integration (Not Applicable)
+## Gaps
 
-These stellar-core features rely on stellar-core's Application context and are handled differently in Rust:
-- `VirtualClock` / `VirtualTimer` integration (Rust uses Tokio timers)
-- `postOnMainThread` scheduling (Rust uses async tasks)
-- `shouldYield()` cooperative yielding (Rust async yields naturally)
-- `mApp` application context access (Rust work has no app access)
-- Tracy profiling markers (can be added if needed)
-- `CLOG_*` logging macros (Rust uses `tracing` crate)
+Features not yet implemented. These ARE counted against parity %.
+
+| stellar-core Component | Priority | Notes |
+|------------------------|----------|-------|
+| `Work` class (hierarchical parent-child) | Medium | Flat DAG covers current use cases; may be needed for complex work trees |
+| `BatchWork` class | Medium | Iterator-based parallel batch generation not yet needed |
+| `ConditionalWork` class | Medium | Condition-gated work execution not yet needed |
+| `onReset()` lifecycle hook | Low | Work items manage own state across retries |
+| `onSuccess()` lifecycle hook | Low | Can use `WorkWithCallback` instead |
+| `onFailureRetry()` lifecycle hook | Low | Work items handle retry logic in `run()` |
+| `onFailureRaise()` lifecycle hook | Low | Error info captured in `WorkOutcome::Failed` |
+| `getRetryETA()` | Low | No UI/status display currently needs this |
+| `getStatus()` formatted strings | Low | `WorkSnapshot` provides equivalent data |
+| `RETRY_NEVER` / `RETRY_ONCE` / `RETRY_A_FEW` / `RETRY_A_LOT` constants | Low | Callers pass numeric retry counts directly |
 
 ## Architectural Differences
 
-### 1. Async Model
+1. **Execution Model**
+   - **stellar-core**: Cooperative single-threaded execution via `crankWork()` called from the main IO loop. Work items yield by returning `WORK_WAITING` and resume via timer-based `wakeUp()`.
+   - **Rust**: True async execution via Tokio tasks. Work items are spawned as independent tasks up to `max_concurrency`. Waiting is implicit via `.await`.
+   - **Rationale**: Rust's async/await model eliminates the need for explicit WAITING/RETRYING states and timer-based wake-up, resulting in a simpler state machine.
 
-| Aspect | stellar-core | Rust |
-|--------|-----|------|
-| Execution model | Cooperative via `crankWork()` on main thread | True async via Tokio tasks |
-| Waiting | Explicit `WORK_WAITING` state | Implicit via `async`/`.await` |
-| Concurrency | Round-robin child scheduling | Parallel task execution up to limit |
-| Timer integration | `VirtualTimer` with `async_wait` | `tokio::time::sleep` |
+2. **Work Hierarchy vs. Flat DAG**
+   - **stellar-core**: Tree-structured work with `Work` as a parent managing `mChildren` list. Round-robin dispatch of children via `yieldNextRunningChild()`. `WorkSequence` and `BatchWork` are `BasicWork` subclasses.
+   - **Rust**: Flat DAG with explicit dependency edges. All work items registered at the scheduler level. `WorkSequence` is a helper that adds dependency edges rather than a work item itself.
+   - **Rationale**: A flat DAG is simpler to reason about and sufficient for the current catchup/history use cases. The hierarchical model provides no additional benefit in an async context where concurrency is managed by the runtime.
 
-### 2. Ownership Model
+3. **Ownership During Execution**
+   - **stellar-core**: Uses `shared_ptr` and `weak_ptr` for work items. Parent holds `shared_ptr` to children; callbacks capture `weak_ptr` to self.
+   - **Rust**: Work items are moved into the scheduler. During execution, the real work is temporarily swapped out and replaced by an `EmptyWork` placeholder. Work is moved back after completion.
+   - **Rationale**: Satisfies Rust's ownership rules without `Arc<Mutex<>>` overhead. Allows stateful work items to be retried without cloning.
 
-| Aspect | stellar-core | Rust |
-|--------|-----|------|
-| Work ownership | `shared_ptr` with reference counting | Moved into scheduler |
-| During execution | Shared via weak pointers | Replaced with `EmptyWork` placeholder |
-| Parent-child | Hierarchical references | Flat with dependency IDs |
-
-### 3. State Machine Simplification
-
-stellar-core has 8 internal states with explicit transition validation:
-```
-PENDING -> RUNNING -> WAITING -> SUCCESS/FAILURE/RETRYING -> ABORTING -> ABORTED
-```
-
-Rust has 6 states with simpler transitions:
-```
-Pending -> Running -> Success/Failed/Cancelled/Blocked
-```
-
-Key simplifications:
-- WAITING eliminated (async naturally handles waiting)
-- RETRYING merged into retry loop logic
-- ABORTING merged into Cancelled
-- Blocked added for dependency failure propagation
-
-### 4. Design Decisions
-
-| Decision | Rationale |
-|----------|-----------|
-| No WAITING state | Rust async naturally handles waiting via `.await` |
-| No hierarchical work | Flat DAG model sufficient for catchup/history workflows |
-| No Application context | Work receives minimal `WorkContext`, not full app |
-| No exponential backoff | Work items control their own backoff in `run()` |
-| Event channels vs strings | Channel-based monitoring more suitable for async |
+4. **Retry Strategy**
+   - **stellar-core**: Built-in exponential backoff via `getRetryDelay()` using `exponentialBackoff()`. Retry count managed by `BasicWork` with max retries.
+   - **Rust**: Work items specify retry delay in `WorkOutcome::Retry { delay }`. Scheduler uses `config.retry_delay` as default. Work items control their own backoff.
+   - **Rationale**: Gives work items more control over retry timing. Exponential backoff can be implemented per-work-item if needed.
 
 ## Test Coverage
 
-The Rust implementation includes integration tests for:
-- Dependency ordering (`test_dependency_ordering`)
-- Retry behavior (`test_retry_then_success`)
-- Work sequences (`test_work_sequence_ordering`)
-- Callback wrappers (`test_work_callback`)
-- Cancellation (`test_cancel_work`)
-- Metrics and snapshots (`test_metrics_snapshot`)
+| Area | stellar-core Tests | Rust Tests | Notes |
+|------|-------------------|------------|-------|
+| BasicWork | 1 TEST_CASE / 8 SECTION | 0 #[test] | Covered indirectly via scheduler tests |
+| Work with children | 1 TEST_CASE / 4 SECTION | 0 #[test] | Hierarchical work not implemented |
+| Work scheduling | 2 TEST_CASE / 4 SECTION | 2 #[tokio::test] | Dependency and retry tests |
+| RunCommandWork | 1 TEST_CASE / 4 SECTION | 0 #[test] | RunCommandWork is in a different crate |
+| WorkSequence | 1 TEST_CASE / 5 SECTION | 1 #[tokio::test] | Basic ordering test |
+| BatchWork | 1 TEST_CASE / 2 SECTION | 0 #[test] | BatchWork not implemented |
+| ConditionalWork | 1 TEST_CASE / 5 SECTION | 0 #[test] | ConditionalWork not implemented |
+| WorkWithCallback | (tested inline) | 1 #[tokio::test] | Callback invocation test |
+| Cancellation | (tested via shutdown) | 1 #[tokio::test] | External cancellation token |
+| Metrics/Snapshots | (no direct tests) | 1 #[tokio::test] | Scheduler introspection |
 
-Test file: `crates/henyey-work/tests/scheduler.rs`
+### Test Gaps
 
-## Future Considerations
+- **BasicWork state machine tests**: stellar-core has 8 SECTIONs covering individual state transitions, waiting, shutdown, and mid-flight work addition. Rust tests do not directly test state transitions.
+- **Hierarchical work tests**: 4 SECTIONs covering parent-child success, child failure, abort propagation. Not applicable since hierarchical model is not implemented.
+- **BatchWork tests**: 2 SECTIONs covering success and shutdown of batch work. Not applicable.
+- **ConditionalWork tests**: 5 SECTIONs covering condition satisfaction, failure, shutdown, and reset. Not applicable.
+- **Multi-level tree scheduling**: 4 SECTIONs testing scheduling fairness across tree structures. Rust has no equivalent complex scheduling tests.
+- **Failure propagation tests**: stellar-core tests child failure causing parent abort. Rust tests dependency blocking but not complex failure cascading.
 
-If additional stellar-core parity is needed:
+## Parity Calculation
 
-1. **BatchWork equivalent**: Could be implemented as a work generator pattern with the existing scheduler
-2. **ConditionalWork equivalent**: Could use async condition variables or channels
-3. **Lifecycle hooks**: Could add optional trait methods for `on_success`, `on_failure`, etc.
-4. **Retry constants**: Could add `RetryPolicy` enum with predefined strategies
-5. **Exponential backoff**: Could add configurable backoff strategy to `WorkSchedulerConfig`
+| Category | Count |
+|----------|-------|
+| Implemented (Full) | 30 |
+| Gaps (None + Partial) | 35 |
+| Intentional Omissions | 9 |
+| **Parity** | **30 / (30 + 35) = 46%** |

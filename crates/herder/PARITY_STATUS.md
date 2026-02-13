@@ -1,333 +1,546 @@
-## stellar-core Parity Status
+# stellar-core Parity Status
 
-This section documents the parity between this Rust crate and the stellar-core herder implementation (v25).
+**Crate**: `henyey-herder`
+**Upstream**: `.upstream-v25/src/herder/`
+**Overall Parity**: 69%
+**Last Updated**: 2026-02-13
 
-### Implemented
+## Summary
 
-#### Core Herder (`herder.rs` -> `Herder.h`, `HerderImpl.h`)
-- [x] State machine (Booting, Syncing, Tracking) - matches `HERDER_BOOTING_STATE`, `HERDER_SYNCING_STATE`, `HERDER_TRACKING_NETWORK_STATE`
-- [x] `receive_scp_envelope()` - SCP envelope processing with signature verification
-- [x] `receive_transaction()` - Transaction queue integration
-- [x] `bootstrap()` - Transition to tracking state after catchup
-- [x] `trigger_next_ledger()` - Validator consensus triggering
-- [x] EXTERNALIZE fast-forward with security checks (quorum membership, slot distance)
-- [x] Tracking slot management (`trackingConsensusLedgerIndex()`)
-- [x] `check_ledger_close()` - Ledger close readiness check
-- [x] `ledger_closed()` - Post-close cleanup
-- [x] Observer mode (non-validator) support
-- [x] Validator mode with secret key signing
-- [x] `get_scp_state()` - SCP state for peer requests (`sendSCPStateToPeer()`)
-- [x] Quorum set storage and lookup (`getQSet()`)
-- [x] Pending tx set request tracking (`getTxSet()`)
-- [x] `get_min_ledger_seq_to_ask_peers()` - Minimum ledger for peer requests
-- [x] `heard_from_quorum()` / `is_v_blocking()` checks
-- [x] `handle_nomination_timeout()` / `handle_ballot_timeout()` - Timeout handling
-- [x] `getMaxClassicTxSize()` / `getMaxTxSize()` - Transaction size limits
-- [x] `getFlowControlExtraBuffer()` - Flow control buffer sizing
-- [x] `getMaxQueueSizeOps()` - Queue size for demand calculation
+| Area | Status | Notes |
+|------|--------|-------|
+| Core Herder (state machine, envelope recv) | Partial | Missing metrics, quorum map reanalysis |
+| HerderSCPDriver (value validation, signing) | Partial | Missing SCP metrics, node weight, TxSet validity cache |
+| HerderPersistence (SCP state DB) | Partial | Missing `copySCPHistoryToStream`, `getNodeQuorumSet` |
+| HerderUtils (value extraction) | Full | All functions implemented |
+| LedgerCloseData | Full | All accessors and XDR round-trip |
+| PendingEnvelopes (fetching, caching) | Partial | Missing cost tracking, value size cache |
+| QuorumTracker | Full | expand, rebuild, closest validators |
+| TransactionQueue | Partial | Missing account state, shift/aging, arb damping |
+| TxQueueLimiter | Partial | Missing visitTopTxs with custom limits |
+| TxSetFrame / ApplicableTxSetFrame | Partial | No ApplicableTxSetFrame abstraction |
+| SurgePricingUtils | Full | All lane configs and priority queue |
+| Upgrades / ConfigUpgradeSetFrame | Partial | Missing ConfigUpgradeSetFrame entirely |
+| QuorumIntersectionChecker | None | Not implemented |
+| ParallelTxSetBuilder | Full | Implemented in parallel_tx_set_builder.rs |
+| FilteredEntries | None | Not implemented (trivial) |
 
-#### SCP State Persistence (`persistence.rs` -> `HerderPersistence.h`)
-- [x] `PersistedSlotState` - Serializable SCP state for a slot
-- [x] `ScpStatePersistence` trait - Storage backend abstraction
-- [x] `InMemoryScpPersistence` - In-memory storage for testing
-- [x] `SqliteScpPersistence` - SQLite storage for production (crash recovery)
-- [x] `ScpPersistenceManager` - Persistence coordinator
-- [x] `persist_scp_state()` - Save SCP state with envelopes, tx sets, quorum sets
-- [x] `restore_scp_state()` - Load persisted state for recovery
-- [x] `cleanup()` - Remove old persisted state
-- [x] `get_tx_set_hashes()` - Extract tx set hashes from envelopes
-- [x] `get_quorum_set_hash()` - Extract quorum set hash from statements
-- [x] JSON/base64 serialization for state encoding
+## File Mapping
 
-#### SCP Driver (`scp_driver.rs` -> `HerderSCPDriver.h`)
-- [x] `SCPDriver` trait implementation (`HerderScpCallback`)
-- [x] `validate_value()` - StellarValue validation (close time, tx set hash, upgrades)
-- [x] `combine_candidates()` - Value combination for consensus
-- [x] `extract_valid_value()` - Value extraction
-- [x] `emit_envelope()` - Envelope broadcasting
-- [x] `sign_envelope()` / `verify_envelope()` - Cryptographic operations
-- [x] `compute_timeout()` - Protocol 23+ timeout calculation with network config
-- [x] `compute_hash_node()` / `compute_value_hash()` - Priority hash computation
-- [x] Transaction set caching by hash
-- [x] Pending tx set request management
-- [x] Externalized slot tracking
-- [x] Quorum set by node ID lookup
-- [x] Quorum set by hash lookup
-- [x] Value upgrade order validation
-- [x] `toShortString()` - Short node ID formatting
+| stellar-core File | Rust Module | Notes |
+|--------------------|-------------|-------|
+| `Herder.h` / `Herder.cpp` | `herder.rs`, `state.rs` | Interface + state enum |
+| `HerderImpl.h` / `HerderImpl.cpp` | `herder.rs` | Main implementation |
+| `HerderSCPDriver.h` / `HerderSCPDriver.cpp` | `scp_driver.rs` | SCP callbacks |
+| `HerderPersistence.h` / `HerderPersistenceImpl.h` / `HerderPersistenceImpl.cpp` | `persistence.rs` | SCP state persistence |
+| `HerderUtils.h` / `HerderUtils.cpp` | `herder_utils.rs` | Utility functions |
+| `LedgerCloseData.h` / `LedgerCloseData.cpp` | `ledger_close_data.rs` | Ledger close wrapper |
+| `PendingEnvelopes.h` / `PendingEnvelopes.cpp` | `pending.rs`, `fetching_envelopes.rs` | Split into two modules |
+| `QuorumTracker.h` / `QuorumTracker.cpp` | `quorum_tracker.rs` | Transitive quorum tracking |
+| `TransactionQueue.h` / `TransactionQueue.cpp` | `tx_queue.rs`, `tx_broadcast.rs` | Queue + broadcast split |
+| `TxQueueLimiter.h` / `TxQueueLimiter.cpp` | `tx_queue_limiter.rs` | Resource-aware limiting |
+| `TxSetFrame.h` / `TxSetFrame.cpp` | `tx_queue.rs` (TransactionSet) | Simplified; no ApplicableTxSetFrame |
+| `TxSetUtils.h` / `TxSetUtils.cpp` | `tx_queue.rs` | Inlined into tx_queue |
+| `SurgePricingUtils.h` / `SurgePricingUtils.cpp` | `surge_pricing.rs` | Lane configs + priority queue |
+| `Upgrades.h` / `Upgrades.cpp` | `upgrades.rs` | Upgrade scheduling |
+| `ParallelTxSetBuilder.h` / `ParallelTxSetBuilder.cpp` | `parallel_tx_set_builder.rs` | Parallel Soroban phase |
+| `FilteredEntries.h` | _(not implemented)_ | Trivial constant array |
 
-#### Transaction Queue (`tx_queue.rs` -> `TransactionQueue.h`, `TxSetFrame.h`)
-- [x] `TransactionQueue` with fee-based ordering
-- [x] `try_add()` - Transaction validation and addition
-- [x] Signature validation
-- [x] Time bounds validation
-- [x] Ledger bounds validation
-- [x] Extra signers validation (PreconditionsV2)
-- [x] Sequence number extraction
-- [x] Fee rate comparison (`fee_rate_cmp`)
-- [x] Transaction eviction by lower fee
-- [x] `TransactionSet` with hash computation
-- [x] `GeneralizedTransactionSet` building (protocol 20+)
-- [x] Two-phase transaction set (classic + Soroban)
-- [x] Transaction set summary logging
-- [x] `remove_applied()` - Post-ledger cleanup
-- [x] `evict_expired()` - Age-based eviction
-- [x] Eviction threshold tracking per lane
-- [x] Starting sequence number map for tx set building
-- [x] `ban()` / `is_banned()` - Transaction banning mechanism
-- [x] `isFiltered()` / `mFilteredTypes` - Operation type filtering
+## Component Mapping
 
-#### Surge Pricing (`surge_pricing.rs` -> `SurgePricingUtils.h`)
-- [x] `SurgePricingLaneConfig` trait
-- [x] `DexLimitingLaneConfig` - DEX lane separation
-- [x] `SorobanGenericLaneConfig` - Soroban resource limits
-- [x] `OpsOnlyLaneConfig` - Simple op-count limits
-- [x] `SurgePricingPriorityQueue` - Fee-ordered selection
-- [x] Multi-lane resource tracking
-- [x] Lane limit enforcement
-- [x] `pop_top_txs()` - Greedy selection with lane limits
-- [x] `get_most_top_txs_within_limits()` - Max subset selection
-- [x] `can_fit_with_eviction()` - Eviction planning
-- [x] Tie-breaking with seeded hash
+### Herder (`herder.rs`, `state.rs`)
 
-#### Pending Envelopes (`pending.rs` -> `PendingEnvelopes.h`)
-- [x] `PendingEnvelopes` with slot-based buffering
-- [x] Deduplication via envelope hash
-- [x] Slot distance limits
-- [x] Per-slot envelope limits
-- [x] `release()` / `release_up_to()` - Slot activation
-- [x] `evict_expired()` - Age-based cleanup
-- [x] Statistics tracking
+Corresponds to: `Herder.h`, `HerderImpl.h`
 
-#### Fetching Envelopes (`fetching_envelopes.rs` -> `PendingEnvelopes.h` fetching logic)
-- [x] `FetchingEnvelopes` - SCP envelope dependency fetching manager
-- [x] `ItemFetcher` integration for TxSet and QuorumSet fetching from peers
-- [x] Per-slot envelope state tracking (fetching, ready, processed, discarded)
-- [x] TxSet cache with slot-based eviction
-- [x] QuorumSet cache with size-based eviction
-- [x] `recv_envelope()` - Receive and check dependencies, start fetching if needed
-- [x] `recv_tx_set()` / `recv_quorum_set()` - Handle received dependencies
-- [x] `pop()` - Pop ready envelopes for processing
-- [x] `erase_below()` / `trim_stale()` - Memory management for old slots
-- [x] `peer_doesnt_have()` - Handle DONT_HAVE responses
-- [x] `process_pending()` - Process pending fetch requests
-- [x] `FetchingStats` - Statistics tracking
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `Herder::State` enum | `HerderState` enum | Full |
+| `Herder::EnvelopeStatus` enum | `EnvelopeState` enum | Full |
+| `getState()` | `state()` | Full |
+| `getStateHuman()` | `HerderState::Display` | Full |
+| `syncMetrics()` | _(not implemented)_ | None |
+| `bootstrap()` | `bootstrap()` | Full |
+| `shutdown()` | _(not implemented)_ | None |
+| `start()` | _(not implemented)_ | None |
+| `lastClosedLedgerIncreased()` | `ledger_closed()` | Full |
+| `setTrackingSCPState()` | `advance_tracking_slot()` | Full |
+| `recvSCPQuorumSet()` | `store_quorum_set()` | Full |
+| `recvTxSet()` | `receive_tx_set()` | Full |
+| `recvTransaction()` | `receive_transaction()` | Full |
+| `peerDoesntHave()` | `fetching_envelopes.peer_doesnt_have()` | Full |
+| `getTxSet()` | `scp_driver.get_tx_set()` | Full |
+| `getQSet()` | `get_quorum_set_by_hash()` | Full |
+| `recvSCPEnvelope()` | `receive_scp_envelope()` | Full |
+| `isTracking()` | `is_tracking()` | Full |
+| `sendSCPStateToPeer()` | `get_scp_state()` | Full |
+| `trackingConsensusLedgerIndex()` | `tracking_slot()` | Full |
+| `getMaxClassicTxSize()` | via `flow_control` module | Full |
+| `getMaxTxSize()` | via `flow_control` module | Full |
+| `getFlowControlExtraBuffer()` | `FLOW_CONTROL_BYTES_EXTRA_BUFFER` | Full |
+| `getMinLedgerSeqToAskPeers()` | `get_min_ledger_seq_to_ask_peers()` | Full |
+| `getMinLedgerSeqToRemember()` | _(not implemented)_ | None |
+| `isNewerNominationOrBallotSt()` | _(not implemented)_ | None |
+| `getMostRecentCheckpointSeq()` | `get_most_recent_checkpoint_seq()` | Full |
+| `triggerNextLedger()` | `trigger_next_ledger()` | Full |
+| `setInSyncAndTriggerNextLedger()` | _(not implemented)_ | None |
+| `resolveNodeID()` | _(not implemented)_ | None |
+| `setUpgrades()` | _(not implemented)_ | None |
+| `getUpgradesJson()` | _(not implemented)_ | None |
+| `forceSCPStateIntoSyncWithLastClosedLedger()` | _(not implemented)_ | None |
+| `makeStellarValue()` | `scp_driver.make_stellar_value()` | Full |
+| `getJsonInfo()` | `json_api.rs` structures | Partial |
+| `getJsonQuorumInfo()` | `json_api.rs` structures | Partial |
+| `getJsonTransitiveQuorumInfo()` | `json_api.rs` structures | Partial |
+| `getCurrentlyTrackedQuorum()` | `quorum_tracker.quorum_map()` | Full |
+| `getMaxQueueSizeOps()` | `max_queue_size_ops()` | Full |
+| `getMaxQueueSizeSorobanOps()` | _(not implemented)_ | None |
+| `maybeHandleUpgrade()` | _(not implemented)_ | None |
+| `isBannedTx()` | `tx_queue.is_banned()` | Full |
+| `getTx()` | `tx_queue.get_tx()` | Full |
+| `processExternalized()` | handled in `receive_scp_envelope()` | Full |
+| `valueExternalized()` | handled in `receive_scp_envelope()` | Full |
+| `emitEnvelope()` | handled by `ScpDriver` | Full |
+| `lostSync()` | _(not implemented)_ | None |
+| `checkCloseTime()` | `check_envelope_close_time()` | Full |
+| `ctValidityOffset()` | _(not implemented)_ | None |
+| `setupTriggerNextLedger()` | _(not implemented)_ | None |
+| `startOutOfSyncTimer()` | `SyncRecoveryManager` | Full |
+| `outOfSyncRecovery()` | `out_of_sync_recovery()` | Full |
+| `broadcast()` | `TxBroadcastManager` | Full |
+| `processSCPQueue()` | pending envelope release | Full |
+| `updateTransactionQueue()` | handled in `ledger_closed()` | Full |
+| `maybeSetupSorobanQueue()` | _(not implemented)_ | None |
+| `herderOutOfSync()` | `SyncRecoveryManager` | Full |
+| `getMoreSCPState()` | _(not implemented)_ | None |
+| `persistSCPState()` | `ScpPersistenceManager.persist()` | Full |
+| `restoreSCPState()` | `ScpPersistenceManager.restore()` | Full |
+| `persistUpgrades()` | _(not implemented)_ | None |
+| `restoreUpgrades()` | _(not implemented)_ | None |
+| `trackingHeartBeat()` | `SyncRecoveryManager` | Full |
+| `startCheckForDeadNodesInterval()` | `DeadNodeTracker` | Full |
+| `checkAndMaybeReanalyzeQuorumMap()` | _(not implemented)_ | None |
+| `checkAndMaybeReanalyzeQuorumMapV2()` | _(not implemented)_ | None |
+| `eraseBelow()` | `fetching_envelopes.erase_below()` | Full |
+| `verifyEnvelope()` | `scp_driver.verify_envelope()` | Full |
+| `signEnvelope()` | `scp_driver.sign_envelope()` | Full |
+| `verifyStellarValueSignature()` | `scp_driver.verify_stellar_value_signature()` | Full |
+| `startTxSetGCTimer()` | _(handled differently)_ | None |
+| `recomputeKeysToFilter()` | _(not implemented)_ | None |
 
-#### Quorum Tracker (`quorum_tracker.rs` -> `QuorumTracker.h`)
-- [x] `SlotQuorumTracker` - Per-slot quorum monitoring
-- [x] `has_quorum()` / `is_v_blocking()` checks
-- [x] `QuorumTracker` - Transitive quorum tracking
-- [x] `is_node_definitely_in_quorum()` - Security validation
-- [x] `expand()` - Incremental quorum expansion
-- [x] `rebuild()` - Full quorum reconstruction
-- [x] Distance and closest validators tracking
+### SCP Driver (`scp_driver.rs`)
 
-#### Upgrades (`upgrades.rs` -> `Upgrades.h`)
-- [x] `Upgrades` class - Upgrade scheduling and validation
-- [x] `UpgradeParameters` - Version, base fee, max tx size, base reserve, flags, Soroban config
-- [x] `create_upgrades_for()` - Create upgrade proposals based on scheduled time
-- [x] `is_valid_for_apply()` - XDR validation and safety checks
-- [x] `remove_upgrades()` - Remove applied/expired upgrades
-- [x] `time_for_upgrade()` - Time-based upgrade triggering
-- [x] `UpgradeValidity` enum - `VALID`, `XDR_INVALID`, `INVALID`
-- [x] JSON serialization for upgrade parameters
+Corresponds to: `HerderSCPDriver.h`
 
-#### HerderUtils (`herder_utils.rs` -> `HerderUtils.h`)
-- [x] `getStellarValues()` - Extract StellarValue from SCP statements
-- [x] `getTxSetHashes()` - Extract tx set hashes from SCP envelopes
-- [x] `toShortString()` - Short node ID rendering (hex and strkey formats)
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `bootstrap()` | handled in Herder | Full |
+| `stateChanged()` | _(not implemented)_ | None |
+| `getSCP()` | via `Herder.scp` field | Full |
+| `recordSCPExecutionMetrics()` | _(not implemented)_ | None |
+| `recordSCPEvent()` | _(not implemented)_ | None |
+| `recordSCPExternalizeEvent()` | _(not implemented)_ | None |
+| `wrapEnvelope()` | _(handled differently)_ | None |
+| `signEnvelope()` | `sign_envelope()` | Full |
+| `emitEnvelope()` | `emit_envelope()` | Full |
+| `validateValue()` | `validate_value()` | Full |
+| `extractValidValue()` | `extract_valid_value()` | Full |
+| `toShortString()` | `to_short_string()` | Full |
+| `getValueString()` | `get_value_string()` | Full |
+| `setupTimer()` | `TimerManager` | Full |
+| `stopTimer()` | `TimerManager` | Full |
+| `computeTimeout()` | `compute_timeout()` | Full |
+| `getHashOf()` | `compute_hash_node()` | Full |
+| `combineCandidates()` | `combine_candidates()` | Full |
+| `valueExternalized()` | `record_externalized()` | Full |
+| `nominate()` | handled in Herder | Full |
+| `getQSet()` | `get_quorum_set_by_hash()` | Full |
+| `ballotDidHearFromQuorum()` | _(not implemented)_ | None |
+| `nominatingValue()` | _(not implemented)_ | None |
+| `updatedCandidateValue()` | _(not implemented)_ | None |
+| `startedBallotProtocol()` | _(not implemented)_ | None |
+| `acceptedBallotPrepared()` | _(not implemented)_ | None |
+| `confirmedBallotPrepared()` | _(not implemented)_ | None |
+| `acceptedCommit()` | _(not implemented)_ | None |
+| `getPrepareStart()` | _(not implemented)_ | None |
+| `toStellarValue()` | `parse_stellar_value()` | Full |
+| `checkCloseTime()` | `check_close_time()` | Full |
+| `wrapStellarValue()` | _(not implemented)_ | None |
+| `wrapValue()` | _(not implemented)_ | None |
+| `purgeSlots()` | `purge_slots_below()` | Full |
+| `getExternalizeLag()` | _(not implemented)_ | None |
+| `getQsetLagInfo()` | _(not implemented)_ | None |
+| `getMaybeDeadNodes()` | `DeadNodeTracker` | Full |
+| `startCheckForDeadNodesInterval()` | `DeadNodeTracker` | Full |
+| `getNodeWeight()` | _(not implemented)_ | None |
+| `cacheValidTxSet()` | _(not implemented)_ | None |
+| `checkAndCacheTxSetValid()` | _(not implemented)_ | None |
 
-#### LedgerCloseData (`ledger_close_data.rs` -> `LedgerCloseData.h`)
-- [x] `LedgerCloseData` class - Complete ledger close information wrapper
-- [x] Expected hash tracking (`mExpectedLedgerHash`)
-- [x] XDR serialization (`to_xdr()`, `from_xdr()`)
-- [x] `stellarValueToString()` - Human-readable StellarValue formatting
+### Persistence (`persistence.rs`)
 
-#### TxQueueLimiter (`tx_queue_limiter.rs` -> `TxQueueLimiter.h`)
-- [x] `TxQueueLimiter` class - Resource-aware queue limiting
-- [x] Multi-resource tracking (operations, bytes, Soroban resources)
-- [x] Eviction candidate selection (finding lowest-fee eviction targets)
-- [x] Evicted fee tracking per lane
-- [x] Flood priority queue for broadcasting
+Corresponds to: `HerderPersistence.h`, `HerderPersistenceImpl.h`
 
-#### Timer & Sync Management
-- [x] `TimerManager` (`timer_manager.rs`) - SCP timer scheduling with tokio
-- [x] `SyncRecoveryManager` (`sync_recovery.rs`) - Consensus stuck detection and recovery
-- [x] `CloseTimeDriftTracker` (`drift_tracker.rs`) - Network time drift monitoring
-- [x] `DeadNodeTracker` (`dead_node_tracker.rs`) - Missing/dead validator tracking
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `saveSCPHistory()` | `ScpPersistenceManager.persist()` | Full |
+| `copySCPHistoryToStream()` | _(not implemented)_ | None |
+| `getNodeQuorumSet()` | _(not implemented)_ | None |
+| `getQuorumSet()` | _(not implemented)_ | None |
+| `dropAll()` | _(not implemented)_ | None |
+| `deleteOldEntries()` | `delete_scp_state_below()` | Full |
 
-#### Flow Control (`flow_control.rs`)
-- [x] `getFlowControlExtraBuffer()` - Extra buffer calculation
-- [x] `getMaxTxSize()` - Maximum transaction size
-- [x] `getMaxClassicTxSize()` - Maximum classic transaction size
+### HerderUtils (`herder_utils.rs`)
 
-#### Transaction Broadcast (`tx_broadcast.rs`)
-- [x] `TxBroadcastManager` - Periodic flooding of transactions
-- [x] `broadcastSome()` - Batch broadcasting with resource limits
-- [x] Flood period configuration
+Corresponds to: `HerderUtils.h`
 
-#### JSON API (`json_api.rs`)
-- [x] `getJsonInfo()` - Herder state information
-- [x] `getJsonQuorumInfo()` - Quorum state information
-- [x] `getJsonTransitiveQuorumInfo()` - Transitive quorum information
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `getTxSetHashes()` | `get_tx_set_hashes_from_envelope()` | Full |
+| `getStellarValues()` | `get_stellar_values()` | Full |
+| `toShortString()` | `to_short_string()`, `to_short_strkey()` | Full |
+| `toQuorumIntersectionMap()` | _(not implemented)_ | None |
+| `parseQuorumMapFromJson()` | _(not implemented)_ | None |
 
-### Not Yet Implemented (Gaps)
+### LedgerCloseData (`ledger_close_data.rs`)
 
-#### Core Herder (`HerderImpl`)
-- [ ] **Persistence**: `persistUpgrades()` / `restoreUpgrades()` - Upgrade parameters persistence to database
-- [ ] **Metrics**: Full medida-style metrics (counters, timers, histograms)
-- [ ] **Node ID resolution**: `resolveNodeID()` - Config-based node lookup from name
-- [ ] **Upgrade scheduling API**: `setUpgrades()`, `getUpgradesJson()` - Admin endpoint for upgrade scheduling
-- [ ] **SCP state synchronization**: `forceSCPStateIntoSyncWithLastClosedLedger()` - Force sync after catchup
-- [ ] **Last checkpoint sending**: `SEND_LATEST_CHECKPOINT_DELAY` timing for peer sync
-- [ ] **Quorum map reanalysis**: `checkAndMaybeReanalyzeQuorumMap()`, `checkAndMaybeReanalyzeQuorumMapV2()`
-- [ ] **Keys to filter recomputation**: `recomputeKeysToFilter()` for Soroban footprint filtering
+Corresponds to: `LedgerCloseData.h`
 
-#### SCP Driver (`HerderSCPDriver`)
-- [ ] **SCP execution metrics**: `recordSCPExecutionMetrics()`, `recordSCPEvent()`, `recordSCPExternalizeEvent()`
-- [ ] **Externalize lag tracking**: `getExternalizeLag()`, `mQSetLag` per-node timers
-- [ ] **Node weight function**: `getNodeWeight()` - Application-specific leader election (protocol 22+)
-- [ ] **TxSet validity caching**: `TxSetValidityKey`, `mTxSetValidCache` with `RandomEvictionCache`
-- [ ] **Value wrapper**: `wrapStellarValue()`, `wrapValue()` with `ValueWrapperPtr`
-- [ ] **Ballot phase callbacks**: `ballotDidHearFromQuorum()`, `nominatingValue()`, `updatedCandidateValue()`
-- [ ] **Prepare timing**: `getPrepareStart()`, `mSCPExecutionTimes` tracking
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `LedgerCloseData()` constructor | `LedgerCloseData::new()` | Full |
+| `getLedgerSeq()` | `ledger_seq()` | Full |
+| `getTxSet()` | `tx_set()` | Full |
+| `getValue()` | `value()` | Full |
+| `getExpectedHash()` | `expected_hash()` | Full |
+| `toXDR()` | `to_xdr()` | Full |
+| `toLedgerCloseData()` | `from_xdr()` | Full |
+| `stellarValueToString()` | `stellar_value_to_string()` | Full |
 
-#### Transaction Queue (`TransactionQueue`)
-- [ ] **Account state tracking**: Full `AccountState` with `mTotalFees`, `mAge`, per-account transaction lists
-- [ ] **Transaction aging**: `shift()` - Age increment per ledger, auto-ban on max age
-- [ ] **Arbitrage damping**: `mArbitrageFloodDamping`, `allowTxBroadcast()` for path payment loops
-- [ ] **Separate queues**: `ClassicTransactionQueue`, `SorobanTransactionQueue` as distinct types (Rust uses unified queue)
-- [ ] **Queue rebuild**: `resetAndRebuild()` for config upgrades
-- [ ] **Footprint key filtering**: `mKeysToFilter`, `mTxsFilteredDueToFootprintKeys`
-- [ ] **Pending depth configuration**: `mPendingDepth` for per-account limits
-- [ ] **Pool ledger multiplier**: Queue sizing based on ledger multiplier
+### PendingEnvelopes (`pending.rs`, `fetching_envelopes.rs`)
 
-#### TxSetFrame (`TxSetFrame.h`)
-- [ ] **ApplicableTxSetFrame**: Validated tx set ready for application with phase separation
-- [ ] **TxSetPhaseFrame**: Phase-level abstraction with parallel stage support
-- [ ] **Parallel execution stages**: `TxStageFrameList`, `ParallelSorobanOrder` for Soroban
-- [ ] **TxSetXDRFrame**: Wire-format wrapper with `prepareForApply()`
-- [ ] **Legacy format support**: `TransactionSet` (non-generalized) for old protocols
-- [ ] **Tx set validation**: `checkValid()` with close time offset bounds
-- [ ] **Per-phase iteration**: `getTransactionsForPhase()`, `PerPhaseTransactionList`
-- [ ] **Encoded size calculation**: `encodedSize()` for flow control
-- [ ] **Inclusion fee map**: Per-transaction base fee tracking
+Corresponds to: `PendingEnvelopes.h`
 
-#### Pending Envelopes (`PendingEnvelopes`) / Fetching Envelopes (`fetching_envelopes.rs`)
-- [x] **ItemFetcher integration**: `mTxSetFetcher`, `mQuorumSetFetcher` for async network fetching (via `FetchingEnvelopes`)
-- [x] **Fetching state tracking**: `mFetchingEnvelopes` with timestamps (via `SlotEnvelopes.fetching`)
-- [x] **Ready envelope queuing**: `mReadyEnvelopes` with wrappers (via `SlotEnvelopes.ready`)
-- [x] **Discarded envelope tracking**: `mDiscardedEnvelopes`, `discardSCPEnvelope()` (via `SlotEnvelopes.discarded`)
-- [x] **Envelope processing callbacks**: `envelopeProcessed()`, `envelopeReady()` (via `pop()` and `check_and_move_to_ready()`)
-- [ ] **Cost tracking**: `mReceivedCost` per validator, `reportCostOutliersForSlot()`
-- [ ] **Quorum tracker integration**: `rebuildQuorumTrackerState()`, `forceRebuildQuorum()`
-- [ ] **Value size caching**: `mValueSizeCache` for txset/qset sizes
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `recvSCPEnvelope()` | `FetchingEnvelopes::recv_envelope()` | Full |
+| `addSCPQuorumSet()` | `FetchingEnvelopes::recv_quorum_set()` | Full |
+| `recvSCPQuorumSet()` | `FetchingEnvelopes::recv_quorum_set()` | Full |
+| `addTxSet()` | `FetchingEnvelopes::recv_tx_set()` | Full |
+| `putTxSet()` | `FetchingEnvelopes::cache_tx_set()` | Full |
+| `recvTxSet()` | `FetchingEnvelopes::recv_tx_set()` | Full |
+| `peerDoesntHave()` | `FetchingEnvelopes::peer_doesnt_have()` | Full |
+| `pop()` | `FetchingEnvelopes::pop()` | Full |
+| `eraseBelow()` | `FetchingEnvelopes::erase_below()` | Full |
+| `forceRebuildQuorum()` | _(not implemented)_ | None |
+| `readySlots()` | `FetchingEnvelopes::ready_slots()` | Full |
+| `getJsonInfo()` | _(not implemented)_ | None |
+| `getTxSet()` | `FetchingEnvelopes::get_tx_set()` | Full |
+| `getQSet()` | `FetchingEnvelopes::get_quorum_set()` | Full |
+| `isNodeDefinitelyInQuorum()` | `QuorumTracker::is_node_definitely_in_quorum()` | Full |
+| `rebuildQuorumTrackerState()` | _(not implemented)_ | None |
+| `getCurrentlyTrackedQuorum()` | `QuorumTracker::quorum_map()` | Full |
+| `envelopeProcessed()` | handled in pop/processing | Full |
+| `reportCostOutliersForSlot()` | _(not implemented)_ | None |
+| `getJsonValidatorCost()` | _(not implemented)_ | None |
+| `recordReceivedCost()` | _(not implemented)_ | None |
+| `getCostPerValidator()` | _(not implemented)_ | None |
 
-#### ConfigUpgradeSetFrame (`Upgrades.h`)
-- [ ] **ConfigUpgradeSetFrame**: Soroban config upgrade handling
-- [ ] **makeFromKey()**: Retrieve config from ledger state
-- [ ] **getLedgerKey()**: Convert upgrade key to contract data key
-- [ ] **upgradeNeeded()**: Check if upgrade differs from current config
-- [ ] **applyTo()**: Apply config upgrade to ledger state
-- [ ] **isConsistentWith()**: Validate against scheduled upgrade
+### QuorumTracker (`quorum_tracker.rs`)
 
-#### Quorum Intersection Checker (`QuorumIntersectionChecker.h`)
-- [ ] **QuorumIntersectionChecker**: Network safety analysis
-- [ ] **networkEnjoysQuorumIntersection()**: Check for quorum intersection
-- [ ] **getIntersectionCriticalGroups()**: Find critical node groups
-- [ ] **getPotentialSplit()**: Detect potential network splits
-- [ ] **Background analysis**: Async recalculation with interrupt support
-- [ ] **QuorumMapIntersectionState**: Result caching and status tracking
+Corresponds to: `QuorumTracker.h`
 
-#### Parallel TxSet Builder (`ParallelTxSetBuilder.h`)
-- [ ] **buildSurgePricedParallelSorobanPhase()**: Parallel execution planning
-- [ ] **Stage construction**: Grouping transactions into parallel stages
-- [ ] **Cluster building**: Identifying dependent transaction clusters
-- [ ] **Resource conflict detection**: Ledger key overlap analysis
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `QuorumTracker()` constructor | `QuorumTracker::new()` | Full |
+| `isNodeDefinitelyInQuorum()` | `is_node_definitely_in_quorum()` | Full |
+| `expand()` | `expand()` | Full |
+| `rebuild()` | `rebuild()` | Full |
+| `getQuorum()` | `quorum_map()` | Full |
+| `findClosestValidators()` | `find_closest_validators()` | Full |
 
-#### FilteredEntries (`FilteredEntries.h`)
-- [ ] **Filtered entry tracking**: For footprint-based transaction filtering
+### TransactionQueue (`tx_queue.rs`)
 
-### Implementation Notes
+Corresponds to: `TransactionQueue.h`
 
-#### Architectural Differences
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `tryAdd()` | `try_add()` | Full |
+| `removeApplied()` | `remove_applied()` | Full |
+| `ban()` | `ban()` | Full |
+| `shift()` | _(not implemented)_ | None |
+| `rebroadcast()` | `TxBroadcastManager` | Full |
+| `shutdown()` | _(not implemented)_ | None |
+| `isBanned()` | `is_banned()` | Full |
+| `getTx()` | `get_tx()` | Full |
+| `getTransactions()` | `get_transactions()` | Full |
+| `sourceAccountPending()` | _(not implemented)_ | None |
+| `getMaxQueueSizeOps()` | via config | Full |
+| `findAllAssetPairsInvolvedInPaymentLoops()` | _(not implemented)_ | None |
+| `canAdd()` | logic in `try_add()` | Full |
+| `releaseFeeMaybeEraseAccountState()` | _(not implemented)_ | None |
+| `prepareDropTransaction()` | _(not implemented)_ | None |
+| `dropTransaction()` | handled in eviction | Partial |
+| `isFiltered()` | `is_filtered()` | Full |
+| `broadcastTx()` | `TxBroadcastManager` | Full |
+| `broadcastSome()` | `TxBroadcastManager` | Full |
+| `SorobanTransactionQueue::resetAndRebuild()` | _(not implemented)_ | None |
+| `SorobanTransactionQueue::getMaxQueueSizeOps()` | via config | Full |
+| `ClassicTransactionQueue::getMaxQueueSizeOps()` | via config | Full |
+| `ClassicTransactionQueue::allowTxBroadcast()` | _(not implemented)_ | None |
+
+### TxQueueLimiter (`tx_queue_limiter.rs`)
+
+Corresponds to: `TxQueueLimiter.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `TxQueueLimiter()` constructor | `TxQueueLimiter::new()` | Full |
+| `addTransaction()` | `add_transaction()` | Full |
+| `removeTransaction()` | `remove_transaction()` | Full |
+| `maxScaledLedgerResources()` | `max_scaled_ledger_resources()` | Full |
+| `evictTransactions()` | `evict_transactions()` | Full |
+| `canAddTx()` | `can_add_tx()` | Full |
+| `resetEvictionState()` | `reset_eviction_state()` | Full |
+| `reset()` | `reset()` | Full |
+| `visitTopTxs()` | `visit_top_txs()` | Partial |
+| `getTotalResourcesToFlood()` | _(not implemented)_ | None |
+| `resetBestFeeTxs()` | `reset_best_fee_txs()` | Full |
+| `markTxForFlood()` | `mark_tx_for_flood()` | Full |
+
+### SurgePricingUtils (`surge_pricing.rs`)
+
+Corresponds to: `SurgePricingUtils.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `feeRate3WayCompare()` | `fee_rate_cmp()` | Full |
+| `computeBetterFee()` | `compute_better_fee()` | Full |
+| `SurgePricingLaneConfig` (interface) | `SurgePricingLaneConfig` trait | Full |
+| `DexLimitingLaneConfig` | `DexLimitingLaneConfig` | Full |
+| `SorobanGenericLaneConfig` | `SorobanGenericLaneConfig` | Full |
+| `SurgePricingPriorityQueue` | `SurgePricingPriorityQueue` | Full |
+| `getMostTopTxsWithinLimits()` | `get_most_top_txs_within_limits()` | Full |
+| `totalResources()` | `total_resources()` | Full |
+| `laneResources()` | `lane_resources()` | Full |
+| `visitTopTxs()` | `visit_top_txs()` | Full |
+| `add()` / `erase()` | `add()` / `erase()` | Full |
+| `canFitWithEviction()` | `can_fit_with_eviction()` | Full |
+| `popTopTxs()` | `pop_top_txs()` | Full |
+
+### TxSetFrame (`tx_queue.rs` TransactionSet)
+
+Corresponds to: `TxSetFrame.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `TxSetXDRFrame::makeEmpty()` | `TransactionSet::new()` | Full |
+| `TxSetXDRFrame::makeFromWire()` | `TransactionSet::from_xdr_stored_set()` | Partial |
+| `TxSetXDRFrame::makeFromStoredTxSet()` | `TransactionSet::from_xdr_stored_set()` | Full |
+| `TxSetXDRFrame::makeFromHistoryTransactions()` | _(not implemented)_ | None |
+| `TxSetXDRFrame::toXDR()` | `TransactionSet::to_xdr_stored_set()` | Full |
+| `TxSetXDRFrame::getContentsHash()` | `TransactionSet::hash` | Full |
+| `TxSetXDRFrame::previousLedgerHash()` | `TransactionSet::previous_ledger_hash` | Full |
+| `TxSetXDRFrame::sizeTxTotal()` | `TransactionSet::len()` | Full |
+| `TxSetXDRFrame::sizeOpTotalForLogging()` | _(not implemented)_ | None |
+| `TxSetXDRFrame::encodedSize()` | _(not implemented)_ | None |
+| `TxSetXDRFrame::createTransactionFrames()` | _(not implemented)_ | None |
+| `TxSetXDRFrame::prepareForApply()` | _(not implemented)_ | None |
+| `ApplicableTxSetFrame::getTxBaseFee()` | _(not implemented)_ | None |
+| `ApplicableTxSetFrame::getPhase()` | _(not implemented)_ | None |
+| `ApplicableTxSetFrame::getPhases()` | _(not implemented)_ | None |
+| `ApplicableTxSetFrame::getPhasesInApplyOrder()` | _(not implemented)_ | None |
+| `ApplicableTxSetFrame::checkValid()` | _(not implemented)_ | None |
+| `ApplicableTxSetFrame::size()` | _(not implemented)_ | None |
+| `ApplicableTxSetFrame::getTotalFees()` | _(not implemented)_ | None |
+| `ApplicableTxSetFrame::getTotalInclusionFees()` | _(not implemented)_ | None |
+| `ApplicableTxSetFrame::summary()` | `TransactionSet` summary logging | Partial |
+| `TxSetPhaseFrame` (all methods) | _(not implemented)_ | None |
+| `makeTxSetFromTransactions()` | `build_generalized_tx_set()` | Partial |
+
+### TxSetUtils (inlined in `tx_queue.rs`)
+
+Corresponds to: `TxSetUtils.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `hashTxSorter()` | tx hash sorting in set building | Full |
+| `sortTxsInHashOrder()` | handled in set building | Full |
+| `sortParallelTxsInHashOrder()` | _(not implemented)_ | None |
+| `buildAccountTxQueues()` | _(not implemented)_ | None |
+| `getInvalidTxList()` | _(not implemented)_ | None |
+| `trimInvalid()` | _(not implemented)_ | None |
+
+### Upgrades (`upgrades.rs`)
+
+Corresponds to: `Upgrades.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `Upgrades()` constructor | `Upgrades::new()` | Full |
+| `setParameters()` | `set_parameters()` | Full |
+| `getParameters()` | `parameters()` | Full |
+| `createUpgradesFor()` | `create_upgrades_for()` | Full |
+| `applyTo()` | _(not implemented)_ | None |
+| `toString(LedgerUpgrade)` | `upgrade_to_string()` | Full |
+| `isValidForApply()` | `is_valid_for_apply()` | Full |
+| `isValid()` | `is_valid()` | Full |
+| `toString()` | `Display` impl | Full |
+| `removeUpgrades()` | `remove_upgrades()` | Full |
+| `dropAll()` | _(not implemented)_ | None |
+| `dropSupportUpgradeHistory()` | _(not implemented)_ | None |
+| `ConfigUpgradeSetFrame::makeFromKey()` | _(not implemented)_ | None |
+| `ConfigUpgradeSetFrame::getLedgerKey()` | _(not implemented)_ | None |
+| `ConfigUpgradeSetFrame::toXDR()` | _(not implemented)_ | None |
+| `ConfigUpgradeSetFrame::getKey()` | _(not implemented)_ | None |
+| `ConfigUpgradeSetFrame::upgradeNeeded()` | _(not implemented)_ | None |
+| `ConfigUpgradeSetFrame::applyTo()` | _(not implemented)_ | None |
+| `ConfigUpgradeSetFrame::isConsistentWith()` | _(not implemented)_ | None |
+| `ConfigUpgradeSetFrame::isValidForApply()` | _(not implemented)_ | None |
+| `ConfigUpgradeSetFrame::encodeAsString()` | _(not implemented)_ | None |
+| `ConfigUpgradeSetFrame::toJson()` | _(not implemented)_ | None |
+
+### ParallelTxSetBuilder (`parallel_tx_set_builder.rs`)
+
+Corresponds to: `ParallelTxSetBuilder.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `buildSurgePricedParallelSorobanPhase()` | `build_surge_priced_parallel_soroban_phase()` | Full |
+
+## Intentional Omissions
+
+Features excluded by design. These are NOT counted against parity %.
+
+| stellar-core Component | Reason |
+|------------------------|--------|
+| `QuorumIntersectionChecker` / `QuorumIntersectionCheckerImpl` | Complex graph-theoretic analysis; planned for separate crate or external tool |
+| `RustQuorumCheckerAdaptor` | C++/Rust FFI bridge for quorum checker; not applicable in pure Rust |
+| `FilteredEntries.h` (`KEYS_TO_FILTER_P24`) | Empty array constant in upstream; P24 filtering not needed for P24+ |
+| `Upgrades::applyTo()` (static) | Ledger upgrade application handled by `henyey-ledger` crate |
+| `Upgrades::dropAll()` / `dropSupportUpgradeHistory()` | Database schema management handled by `henyey-db` crate |
+| `HerderPersistence::dropAll()` | Database schema management handled by `henyey-db` crate |
+| `HerderPersistence::copySCPHistoryToStream()` | History archiving handled by `henyey-history` crate |
+| `ConfigUpgradeSetFrame` (entire class) | Soroban config upgrade retrieval from ledger state handled by `henyey-ledger` crate |
+| `#ifdef BUILD_TESTS` methods | Test-only overrides not needed in Rust architecture |
+| `Herder::create()` (factory) | Rust uses direct construction |
+| `Herder::shutdown()` | Rust uses RAII; drop handles cleanup |
+| medida metrics (`SCPMetrics`, `QueueMetrics`) | Metrics infrastructure uses different Rust libraries |
+
+## Gaps
+
+Features not yet implemented. These ARE counted against parity %.
+
+| stellar-core Component | Priority | Notes |
+|------------------------|----------|-------|
+| `shift()` (TransactionQueue aging) | High | Needed for correct transaction lifecycle |
+| `sourceAccountPending()` | Medium | Account-level pending check |
+| `AccountState` tracking (fees, age) | High | Full per-account state needed for aging |
+| `findAllAssetPairsInvolvedInPaymentLoops()` | Medium | Arbitrage flood damping |
+| `allowTxBroadcast()` arb damping | Medium | Classic queue arbitrage filtering |
+| `resetAndRebuild()` (Soroban queue) | Medium | Config upgrade queue rebuild |
+| `ApplicableTxSetFrame` abstraction | Medium | Validated tx set with phases and apply order |
+| `TxSetPhaseFrame` | Medium | Phase-level abstraction for parallel support |
+| `prepareForApply()` | Medium | Wire-to-applicable tx set conversion |
+| `TxSetUtils::getInvalidTxList()` / `trimInvalid()` | Medium | Validation during tx set construction |
+| `TxSetUtils::buildAccountTxQueues()` | Low | Account-based tx ordering |
+| `recordSCPExecutionMetrics()` | Low | SCP performance metrics |
+| `recordSCPEvent()` / `recordSCPExternalizeEvent()` | Low | SCP event tracking |
+| `getExternalizeLag()` / `getQsetLagInfo()` | Low | Externalize timing metrics |
+| `getNodeWeight()` | Medium | Application-specific leader election (P22+) |
+| `cacheValidTxSet()` / `checkAndCacheTxSetValid()` | Low | TxSet validity caching |
+| `wrapEnvelope()` / `wrapStellarValue()` / `wrapValue()` | Low | Value wrapper pattern |
+| Ballot phase callbacks (7 methods) | Low | Logging/metrics callbacks |
+| `getPrepareStart()` / SCPTiming | Low | Consensus timing tracking |
+| `syncMetrics()` | Low | Metrics synchronization |
+| `isNewerNominationOrBallotSt()` | Medium | Envelope dedup optimization |
+| `resolveNodeID()` | Low | Config-based node name lookup |
+| `setUpgrades()` / `getUpgradesJson()` | Medium | Admin API for upgrade scheduling |
+| `forceSCPStateIntoSyncWithLastClosedLedger()` | Medium | Force sync after catchup |
+| `getMinLedgerSeqToRemember()` | Low | Memory management hint |
+| `setInSyncAndTriggerNextLedger()` | Medium | Combined sync+trigger |
+| `checkAndMaybeReanalyzeQuorumMap()` | Low | Background quorum analysis |
+| `persistUpgrades()` / `restoreUpgrades()` | Medium | Upgrade persistence |
+| `getMoreSCPState()` | Low | Peer SCP state request |
+| `recomputeKeysToFilter()` | Low | Soroban footprint filtering |
+| `maybeHandleUpgrade()` | Medium | Post-close upgrade handling |
+| `getMaxQueueSizeSorobanOps()` | Low | Soroban queue sizing |
+| `lostSync()` | Medium | Sync loss handling |
+| `ctValidityOffset()` | Low | Close time offset computation |
+| PendingEnvelopes cost tracking (4 methods) | Low | Per-validator cost analysis |
+| `HerderPersistence::getNodeQuorumSet()` | Low | Node-level quorum set lookup |
+| `HerderPersistence::getQuorumSet()` | Low | Hash-based quorum set lookup |
+| `HerderUtils::toQuorumIntersectionMap()` | Low | Quorum map conversion |
+| `HerderUtils::parseQuorumMapFromJson()` | Low | JSON quorum map parsing |
+| `TxSetXDRFrame::makeFromHistoryTransactions()` | Low | History tx set construction |
+| `TxSetXDRFrame::encodedSize()` | Low | Wire size calculation |
+| `TxSetUtils::sortParallelTxsInHashOrder()` | Low | Parallel stage sorting |
+| `visitTopTxs()` with custom limits | Low | TxQueueLimiter custom limits |
+| `getTotalResourcesToFlood()` | Low | Flood resource tracking |
+| `stateChanged()` | Low | SCP state change callback |
+| `maybeSetupSorobanQueue()` | Medium | Soroban queue initialization |
+| `startTxSetGCTimer()` | Low | Tx set garbage collection |
+
+## Architectural Differences
 
 1. **Concurrency Model**
-   - **stellar-core**: Single-threaded with VirtualClock timers, callback-driven
-   - **Rust**: Thread-safe with `RwLock`, `DashMap`; async-ready with tokio integration
+   - **stellar-core**: Single-threaded with `VirtualClock` timers and callback-driven processing
+   - **Rust**: Thread-safe with `RwLock` and `DashMap`; async-ready with tokio integration via `TimerManager` and `SyncRecoveryManager`
+   - **Rationale**: Rust's ownership model and async runtime provide thread safety without a global event loop
 
-2. **Timer Management**
-   - **stellar-core**: VirtualTimer with Application's VirtualClock
-   - **Rust**: `TimerManager` with tokio channels; `SyncRecoveryManager` for tracking timeouts
+2. **Pending Envelopes Split**
+   - **stellar-core**: Single `PendingEnvelopes` class handles both slot-based buffering and dependency fetching
+   - **Rust**: Split into `PendingEnvelopes` (slot-based buffering) and `FetchingEnvelopes` (dependency fetching with `ItemFetcher`)
+   - **Rationale**: Separation of concerns; each module has a single responsibility
 
-3. **Metrics**
-   - **stellar-core**: medida library with counters, meters, timers, histograms
-   - **Rust**: Not implemented; would use `metrics` or `prometheus` crate
+3. **Transaction Queue Architecture**
+   - **stellar-core**: Separate `ClassicTransactionQueue` and `SorobanTransactionQueue` classes using C++ inheritance
+   - **Rust**: Unified `TransactionQueue` with lane-based separation via `SurgePricingLaneConfig` trait
+   - **Rationale**: Rust trait-based composition avoids inheritance hierarchy while maintaining lane separation
 
-4. **Database Persistence**
-   - **stellar-core**: Direct SQL database access for SCP state and upgrades
-   - **Rust**: `ScpStatePersistence` trait with `InMemoryScpPersistence` and `SqliteScpPersistence`
+4. **Transaction Set Abstraction**
+   - **stellar-core**: `TxSetXDRFrame` (wire) -> `ApplicableTxSetFrame` (validated, apply-ready) with `TxSetPhaseFrame` per phase
+   - **Rust**: Single `TransactionSet` struct with direct `GeneralizedTransactionSet` building
+   - **Rationale**: Simplified for current needs; full abstraction layers can be added when needed
 
-5. **Transaction Queue Architecture**
-   - **stellar-core**: Separate `ClassicTransactionQueue` and `SorobanTransactionQueue` classes with inheritance
-   - **Rust**: Unified `TransactionQueue` with lane-based separation
+5. **Timer Management**
+   - **stellar-core**: `VirtualTimer` instances per slot/timer ID, managed by `Application::VirtualClock`
+   - **Rust**: `TimerManager` actor with tokio channels; timers are commands sent via `mpsc`
+   - **Rationale**: Actor model is natural for async Rust; avoids shared mutable timer state
 
-6. **Envelope Fetching**
-   - **stellar-core**: `ItemFetcher` for async network requests with callbacks
-   - **Rust**: `FetchingEnvelopes` with `ItemFetcher` from `henyey-overlay`; per-slot tracking of fetching/ready/processed/discarded envelopes
+6. **Metrics**
+   - **stellar-core**: medida library with counters, meters, timers, histograms integrated throughout
+   - **Rust**: No metrics infrastructure; statistics tracked via simple structs
+   - **Rationale**: Metrics will use Rust ecosystem libraries (prometheus, metrics crate) when added
 
 7. **Error Handling**
-   - **stellar-core**: Exceptions and result codes
-   - **Rust**: `Result<T, HerderError>` with thiserror
+   - **stellar-core**: C++ exceptions and integer result codes
+   - **Rust**: `Result<T, HerderError>` with `thiserror` derive macros
+   - **Rationale**: Idiomatic Rust error handling with no exceptions
 
-8. **Transaction Set Building**
-   - **stellar-core**: `TxSetXDRFrame` -> `ApplicableTxSetFrame` with `prepareForApply()`
-   - **Rust**: Direct `TransactionSet` / `GeneralizedTransactionSet` building
+## Test Coverage
 
-#### Key Design Decisions
+| Area | stellar-core Tests | Rust Tests | Notes |
+|------|-------------------|------------|-------|
+| HerderTests | 34 TEST_CASE / 222 SECTION | 18 unit + 3 lib tests | Major gap in integration-level tests |
+| PendingEnvelopesTests | 1 TEST_CASE / 18 SECTION | 5 unit + 6 fetching tests | Moderate coverage |
+| QuorumIntersectionTests | 28 TEST_CASE / 14 SECTION | 0 tests | Not implemented |
+| QuorumTrackerTests | 2 TEST_CASE / 10 SECTION | 10 unit tests | Good coverage |
+| TransactionQueueTests | 18 TEST_CASE / 155 SECTION | 63 unit + 11 integration tests | Good unit coverage; missing integration scenarios |
+| TxSetTests | 10 TEST_CASE / 55 SECTION | 16 parallel_tx_set_builder tests | Partial; missing ApplicableTxSetFrame tests |
+| UpgradesTests | 31 TEST_CASE / 107 SECTION | 16 unit tests | Major gap; missing ledger-integrated tests |
 
-1. **Security**: EXTERNALIZE validation matches stellar-core with quorum membership and slot distance checks (`MAX_EXTERNALIZE_SLOT_DISTANCE = 1000`)
-2. **Surge Pricing**: Lane configuration is trait-based for flexibility
-3. **Quorum Tracking**: Both slot-level and transitive tracking implemented
-4. **Value Validation**: Close time, tx set hash, and upgrade ordering all validated
-5. **Transaction Set Building**: Supports both legacy and GeneralizedTransactionSet formats (protocol 20+)
-6. **Constants Match**: `CONSENSUS_STUCK_TIMEOUT_SECONDS`, `LEDGER_VALIDITY_BRACKET`, `MAX_TIME_SLIP_SECONDS`
+### Test Gaps
 
-#### Missing Integration Points
+- **HerderTests**: Missing integration tests for full envelope processing flow, ledger close lifecycle, out-of-sync recovery, quorum map reanalysis, and upgrade scheduling
+- **TransactionQueue**: Missing tests for `shift()` aging, arbitrage damping, queue rebuild, and separate classic/soroban queue behavior
+- **TxSet**: Missing `ApplicableTxSetFrame` validation tests, phase ordering tests, and `prepareForApply()` round-trip tests
+- **Upgrades**: Missing ledger-integrated upgrade application tests, config upgrade set tests, and multi-validator upgrade coordination tests
+- **QuorumIntersection**: Entirely missing (not implemented)
 
-- Metrics collection and reporting infrastructure
-- Quorum intersection analysis for network health
-- Parallel Soroban execution planning
-- Config upgrade application to ledger state
-- Per-validator cost tracking for outlier detection
+## Parity Calculation
 
-#### App Integration Status
-
-The following herder features are integrated with the main application:
-
-- **Periodic cleanup**: 30s interval cleanup of expired pending envelopes, transactions, and old tx sets
-- **Quorum loss detection**: `heard_from_quorum()` and `is_v_blocking()` checks in heartbeat
-- **Close time drift tracking**: `CloseTimeDriftTracker` records local/network times and warns on drift
-- **Transaction banning**: Failed transactions banned; ban queue shifts on ledger close
-- **Pending envelope statistics**: `PendingStats` exposed via `HerderStats`
-- **Transaction queue introspection**: `TxQueueStats` provides queue state visibility
-- **Sync recovery manager**: Background task monitors for consensus stuck (35s timeout) and triggers recovery
-- **Timer management**: SCP nomination/ballot timers with configurable timeouts
-- **Transaction broadcast**: Periodic flooding with resource-aware batching
-
-#### Parity Estimate
-
-| Component | Parity |
-|-----------|--------|
-| Core Herder | ~85% |
-| SCP Driver | ~80% |
-| Transaction Queue | ~75% |
-| Surge Pricing | ~95% |
-| Pending Envelopes | ~85% |
-| Quorum Tracker | ~90% |
-| Upgrades | ~80% |
-| TxSetFrame | ~60% |
-| Persistence | ~85% |
-| Quorum Intersection | 0% |
-| Parallel TxSet Builder | 0% |
-| **Overall** | **~83%** |
+| Category | Count |
+|----------|-------|
+| Implemented (Full) | 118 |
+| Gaps (None + Partial) | 53 |
+| Intentional Omissions | 12 |
+| **Parity** | **118 / (118 + 53) = 69%** |

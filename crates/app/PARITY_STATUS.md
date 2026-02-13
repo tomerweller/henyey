@@ -1,316 +1,436 @@
 # stellar-core Parity Status
 
-**Overall Parity: ~75%**
+**Crate**: `henyey-app`
+**Upstream**: `.upstream-v25/src/main/`
+**Overall Parity**: 62%
+**Last Updated**: 2026-02-13
 
-This document details the parity between this Rust implementation (`henyey-app`) and the stellar-core `src/main/` directory (v25.x).
+## Summary
 
-## stellar-core Mapping
+| Area | Status | Notes |
+|------|--------|-------|
+| Application lifecycle | Full | Init, run, shutdown, state machine |
+| Application subsystem accessors | Partial | Core subsystems wired; some accessors missing |
+| Configuration loading and validation | Partial | TOML-based; many testing/advanced fields omitted |
+| HTTP command handler | Full | All production endpoints implemented |
+| CLI commands | Partial | Core commands present; several utility commands missing |
+| Maintainer | Full | Automatic DB cleanup with configurable period |
+| PersistentState | Partial | Covered by `henyey-db`; some operations missing |
+| Survey system | Full | Time-sliced collecting, reporting, rate limiting |
+| Metadata stream | Full | XDR output stream with debug rotation |
+| Logging and diagnostics | Full | Dynamic levels, partition mapping |
+| ApplicationUtils | Partial | Core utils present; several utility functions missing |
+| QueryServer | None | Not implemented |
+| AppConnector | None | Thread-isolation helper not needed (Tokio model) |
+| SettingsUpgradeUtils | None | Soroban upgrade transaction builders |
+| dumpxdr utilities | Partial | Basic XDR decode; full dump/sign suite incomplete |
 
-This crate corresponds to the following stellar-core components:
+## File Mapping
 
-| stellar-core File | Rust Module | Status |
-|----------|-------------|--------|
-| `Application.h` / `ApplicationImpl.cpp` | `app.rs` | Partial |
-| `Config.h` / `Config.cpp` | `config.rs` | Partial |
-| `CommandHandler.h` / `CommandHandler.cpp` | `run_cmd.rs` (StatusServer) | Partial |
-| `CommandLine.cpp` | `run_cmd.rs`, `catchup_cmd.rs` | Partial |
-| `PersistentState.h` / `PersistentState.cpp` | `henyey-db` crate | Partial |
-| `Maintainer.h` / `Maintainer.cpp` | `maintainer.rs` | Implemented |
-| `ApplicationUtils.h` / `ApplicationUtils.cpp` | Distributed across modules | Partial |
-| `QueryServer.h` / `QueryServer.cpp` | Not implemented | Missing |
+| stellar-core File | Rust Module | Notes |
+|--------------------|-------------|-------|
+| `Application.h` / `Application.cpp` | `app.rs` | App struct with lifecycle management |
+| `ApplicationImpl.h` / `ApplicationImpl.cpp` | `app.rs` | Merged into App struct |
+| `ApplicationUtils.h` / `ApplicationUtils.cpp` | `app.rs`, `catchup_cmd.rs`, `run_cmd.rs` | Distributed across modules |
+| `Config.h` / `Config.cpp` | `config.rs` | TOML-based with serde |
+| `CommandHandler.h` / `CommandHandler.cpp` | `run_cmd.rs` (StatusServer) | Axum-based HTTP server |
+| `CommandLine.h` / `CommandLine.cpp` | `run_cmd.rs`, `catchup_cmd.rs`, `henyey` crate | CLI in separate binary crate |
+| `Maintainer.h` / `Maintainer.cpp` | `maintainer.rs` | Async background task |
+| `PersistentState.h` / `PersistentState.cpp` | `henyey-db` crate | Handled by database crate |
+| `Diagnostics.h` / `Diagnostics.cpp` | — | Not implemented |
+| `ErrorMessages.h` | — | Inline error strings |
+| `QueryServer.h` / `QueryServer.cpp` | — | Not implemented |
+| `AppConnector.h` / `AppConnector.cpp` | — | Not needed (Tokio model) |
+| `SettingsUpgradeUtils.h` / `SettingsUpgradeUtils.cpp` | — | Not implemented |
+| `dumpxdr.h` / `dumpxdr.cpp` | `henyey` crate (partial) | Partial decode-xdr support |
+| `StellarCoreVersion.h` | `Cargo.toml` version | Via CARGO_PKG_VERSION |
 
-## Implemented Features
+## Component Mapping
 
-### Core Application (Application.h/ApplicationImpl.cpp)
+### Application (`app.rs`)
 
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Application lifecycle management | Implemented | `App::new()`, `App::run()`, `App::shutdown()` |
-| Application state machine | Implemented | `AppState` enum: Initializing, CatchingUp, Synced, Validating, ShuttingDown |
-| Configuration loading | Implemented | TOML-based via `AppConfig` |
-| Database initialization | Implemented | SQLite via `henyey-db` |
-| Bucket manager integration | Implemented | Via `henyey-bucket` |
-| Ledger manager integration | Implemented | Via `henyey-ledger` |
-| Overlay manager integration | Implemented | Via `henyey-overlay` |
-| Herder integration | Implemented | Via `henyey-herder` |
-| Network ID computation | Implemented | Hash of network passphrase |
-| Graceful shutdown | Implemented | Signal handling, shutdown broadcast |
-| Metrics registry | Partial | Prometheus-style metrics via HTTP |
-| Worker thread pools | Different | Uses Tokio async runtime instead of ASIO threads |
-| VirtualClock | Different | Uses `tokio::time` instead of custom VirtualClock |
+Corresponds to: `Application.h`, `ApplicationImpl.h`
 
-### CLI Commands (CommandLine.cpp)
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `Application::create()` | `App::new()` | Full |
+| `initialize()` | `App::new()` (inline) | Full |
+| `resetLedgerState()` | — | None |
+| `timeNow()` | System time via `std::time` | Full |
+| `getConfig()` | `App::config()` | Full |
+| `getState()` | `App::state()` | Full |
+| `getStateHuman()` | `AppState::Display` impl | Full |
+| `isStopping()` | `AppState::ShuttingDown` check | Full |
+| `getClock()` | — | None |
+| `getMetrics()` | — (Prometheus via HTTP) | Partial |
+| `syncOwnMetrics()` | — | None |
+| `syncAllMetrics()` | — | None |
+| `clearMetrics()` | `App::clear_metrics()` | Partial |
+| `getTmpDirManager()` | — | None |
+| `getLedgerManager()` | `App::ledger_manager` field | Full |
+| `getBucketManager()` | `App::bucket_manager` field | Full |
+| `getLedgerApplyManager()` | — (merged into LedgerManager) | Full |
+| `getHistoryArchiveManager()` | — (in catchup flow) | Partial |
+| `getHistoryManager()` | — (in history crate) | Partial |
+| `getMaintainer()` | `Maintainer` struct | Full |
+| `getProcessManager()` | — | None |
+| `getHerder()` | `App::herder` field | Full |
+| `getHerderPersistence()` | — (in db crate) | Partial |
+| `getInvariantManager()` | — (partial in ledger) | Partial |
+| `getOverlayManager()` | `App::overlay` field | Full |
+| `getDatabase()` | `App::database()` | Full |
+| `getPersistentState()` | — (in db crate) | Partial |
+| `getCommandHandler()` | `StatusServer` | Full |
+| `getWorkScheduler()` | — (in work crate) | Partial |
+| `getBanManager()` | — (in overlay crate) | Full |
+| `getStatusManager()` | — (HTTP endpoints) | Partial |
+| `getProtocol23CorruptionDataVerifier()` | — | None |
+| `getProtocol23CorruptionEventReconciler()` | — | None |
+| `getWorkerIOContext()` | — (Tokio runtime) | Full |
+| `getEvictionIOContext()` | — | None |
+| `getOverlayIOContext()` | — (Tokio runtime) | Full |
+| `getLedgerCloseIOContext()` | — (Tokio runtime) | Full |
+| `postOnMainThread()` | Tokio task spawning | Full |
+| `postOnBackgroundThread()` | `tokio::spawn_blocking` | Full |
+| `postOnEvictionBackgroundThread()` | — | None |
+| `postOnOverlayThread()` | Tokio task spawning | Full |
+| `postOnLedgerCloseThread()` | Tokio task spawning | Full |
+| `start()` | `App::run()` | Full |
+| `gracefulStop()` | `App::shutdown()` | Full |
+| `joinAllThreads()` | — (Tokio handles) | Full |
+| `manualClose()` | `App::manual_close_ledger()` | Full |
+| `applyCfgCommands()` | — | None |
+| `reportCfgMetrics()` | — | None |
+| `getJsonInfo()` | `App::info()` | Full |
+| `reportInfo()` | `print_startup_info()` | Full |
+| `scheduleSelfCheck()` | `App::self_check()` | Full |
+| `getNetworkID()` | `App::network_id()` | Full |
+| `getLedgerTxnRoot()` | — (different architecture) | None |
+| `validateAndLogConfig()` | `AppConfig::validate()` | Full |
+| `threadIsType()` | — (not needed with Tokio) | None |
+| `getAppConnector()` | — (not needed with Tokio) | None |
+| `validateNetworkPassphrase()` | `AppConfig::validate()` | Full |
 
-CLI commands are implemented in the `henyey` binary crate. This crate provides the
-run/catchup handlers and HTTP server wiring used by those commands.
+### Configuration (`config.rs`)
 
-| stellar-core Command | Rust Status | Notes |
-|-------------|-------------|-------|
-| `run` | Implemented | `run_node()` in `run_cmd.rs` |
-| `catchup` | Implemented | `run_catchup()` in `catchup_cmd.rs` |
-| `version` | Implemented | Via `--version` flag |
-| `help` | Implemented | Via `--help` flag |
-| `verify-checkpoints` | Implemented | Via `offline verify-checkpoints` in henyey |
-| `convert-id` | Implemented | `offline convert-key` in henyey |
-| `diag-bucket-stats` | Not Implemented | |
-| `dump-ledger` | Implemented | `offline dump-ledger` in henyey |
-| `dump-xdr` | Not Implemented | |
-| `dump-wasm` | Not Implemented | |
-| `encode-asset` | Implemented | `offline encode-xdr --type Asset` in henyey |
-| `force-scp` | Not Implemented | Deprecated in stellar-core |
-| `gen-seed` | Implemented | `new-keypair` command in henyey |
-| `http-command` | Implemented | `http-command` in henyey |
-| `self-check` (CLI) | Implemented | Via `offline self-check` in henyey |
-| `merge-bucketlist` | Not Implemented | |
-| `dump-archival-stats` | Not Implemented | |
-| `new-db` | Implemented | `new-db` in henyey |
-| `new-hist` | Not Implemented | |
-| `offline-info` | Partial | `info` shows basic offline info if app init fails |
-| `print-xdr` | Partial | `offline decode-xdr` in henyey (base64 input only) |
-| `publish` | Implemented | `publish-history` in henyey |
-| `report-last-history-checkpoint` | Not Implemented | |
-| `sec-to-pub` | Implemented | Via `offline sec-to-pub` in henyey |
-| `sign-transaction` | Implemented | Via `offline sign-transaction` in henyey |
-| `upgrade-db` | Implemented | `upgrade-db` in henyey |
-| `get-settings-upgrade-txs` | Not Implemented | |
-| `check-quorum-intersection` | Implemented | `check-quorum-intersection` in henyey |
-| `print-publish-queue` | Not Implemented | |
-| `replay-debug-meta` | Not Implemented | |
+Corresponds to: `Config.h`
 
-### Test-Only CLI Commands (BUILD_TESTS)
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `Config()` constructor | `AppConfig::default()` | Full |
+| `load(filename)` | `AppConfig::from_file()` | Full |
+| `load(istream)` | — | None |
+| `adjust()` | — | None |
+| `toShortString()` | — | None |
+| `toStrKey()` | — | None |
+| `resolveNodeID()` | — | None |
+| `modeDoesCatchupWithBucketList()` | — | None |
+| `allBucketsInMemory()` | — | None |
+| `logBasicInfo()` | `print_startup_info()` | Full |
+| `parallelLedgerClose()` | — | None |
+| `setNoListen()` | — | None |
+| `setNoPublish()` | — | None |
+| `getSorobanByteAllowance()` | `surge_pricing.soroban_byte_allowance` | Full |
+| `getClassicByteAllowance()` | `surge_pricing.classic_byte_allowance` | Full |
+| `toString(qset)` | — | None |
+| Core config fields (FORCE_SCP, RUN_STANDALONE, etc.) | — | Partial |
+| Network/overlay/peer config fields | `OverlayConfig`, `NetworkConfig` | Full |
+| `METADATA_OUTPUT_STREAM` | `MetadataConfig::output_stream` | Full |
+| `METADATA_DEBUG_LEDGERS` | `MetadataConfig::debug_ledgers` | Full |
+| `CATCHUP_COMPLETE` / `CATCHUP_RECENT` | `CatchupConfig` | Full |
+| `AUTOMATIC_MAINTENANCE_PERIOD` / `COUNT` | `MaintenanceConfig` | Full |
+| `MANUAL_CLOSE` | `NodeConfig::manual_close` | Full |
+| `ARTIFICIALLY_*_FOR_TESTING` fields | — | None |
+| `LOADGEN_*` fields | — | None |
+| `APPLY_LOAD_*` fields | — | None |
+| `BUCKETLIST_DB_*` fields | — | None |
+| `EXPERIMENTAL_*` fields | — | None |
+| `processOpApplySleepTimeForTestingConfigs()` | — | None |
+| `getExpectedLedgerCloseTimeTestingOverride()` | — | None |
 
-| stellar-core Command | Rust Status | Notes |
-|-------------|-------------|-------|
-| `load-xdr` | Not Implemented | |
-| `rebuild-ledger-from-buckets` | Not Implemented | |
-| `fuzz` | Not Implemented | |
-| `gen-fuzz` | Not Implemented | |
-| `test` | Not Applicable | Uses Rust test framework |
-| `apply-load` | Not Implemented | |
-| `pregenerate-loadgen-txs` | Not Implemented | |
+### HTTP Command Handler (`run_cmd.rs`)
 
-### HTTP Command Handler (CommandHandler.cpp)
+Corresponds to: `CommandHandler.h`
 
-| stellar-core Endpoint | Rust Status | Notes |
-|--------------|-------------|-------|
-| `/info` | Implemented | Node info and version |
-| `/peers` | Implemented | Connected peer list |
-| `/connect` | Implemented | Connect to peer |
-| `/droppeer` | Implemented | Disconnect peer |
-| `/bans` | Implemented | List banned peers |
-| `/unban` | Implemented | Remove peer from ban list |
-| `/quorum` | Implemented | Quorum set configuration |
-| `/scp` | Implemented | SCP slot status summary |
-| `/metrics` | Implemented | Prometheus-format metrics |
-| `/tx` | Implemented | Submit transaction |
-| `/ll` | Implemented | Dynamic log level changes via tracing-subscriber reload layer |
-| `/selfCheck` | Implemented | Via `/self-check` |
-| `/upgrades` | Implemented | Current and proposed upgrades |
-| `/startSurveyCollecting` | Implemented | Via `/survey/start` |
-| `/stopSurveyCollecting` | Implemented | Via `/survey/stop` |
-| `/surveyTopologyTimeSliced` | Implemented | Via `/survey/topology` |
-| `/survey` | Implemented | Survey data report |
-| `/shutdown` | Implemented | Graceful shutdown |
-| `/health` | Implemented | Health check endpoint |
-| `/ledger` | Implemented | Current ledger info (Rust-specific) |
-| `/status` | Implemented | Current node status (Rust-specific) |
-| `/manualclose` | Implemented | Triggers manual ledger close (requires is_validator and manual_close config) |
-| `/sorobaninfo` | Implemented | Basic format, reads actual config from ledger |
-| `/logrotate` | Implemented | Logs request; actual rotation depends on logging backend |
-| `/maintenance` | Implemented | Manual database maintenance (cleans old SCP/ledger history) |
-| `/clearmetrics` | Implemented | Logs request; Prometheus metrics don't support clearing |
-| `/dumpproposedsettings` | Implemented | Returns ConfigUpgradeSet from ledger |
-| `/surveyTopology` (legacy) | Not Implemented | Non-time-sliced survey |
-| `/getSurveyResult` (legacy) | Not Implemented | Legacy survey result |
-| `/survey/reporting/stop` | Implemented | Stop survey reporting |
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `CommandHandler()` | `StatusServer::new()` | Full |
+| `manualCmd()` | — | None |
+| `bans()` | `bans_handler` | Full |
+| `connect()` | `connect_handler` | Full |
+| `dropPeer()` | `droppeer_handler` | Full |
+| `info()` | `info_handler` | Full |
+| `ll()` | `ll_handler` | Full |
+| `logRotate()` | `logrotate_handler` | Full |
+| `maintenance()` | `maintenance_handler` | Full |
+| `manualClose()` | `manualclose_handler` | Full |
+| `metrics()` | `metrics_handler` | Full |
+| `clearMetrics()` | `clearmetrics_handler` | Full |
+| `peers()` | `peers_handler` | Full |
+| `selfCheck()` | `self_check_handler` | Full |
+| `quorum()` | `quorum_handler` | Full |
+| `scpInfo()` | `scp_handler` | Full |
+| `tx()` | `submit_tx_handler` | Full |
+| `unban()` | `unban_handler` | Full |
+| `upgrades()` | `upgrades_handler` | Full |
+| `dumpProposedSettings()` | `dumpproposedsettings_handler` | Full |
+| `surveyTopology()` (legacy) | — | None |
+| `stopSurvey()` (legacy) | — | None |
+| `getSurveyResult()` (legacy) | — | None |
+| `sorobanInfo()` | `sorobaninfo_handler` | Full |
+| `startSurveyCollecting()` | `start_survey_collecting_handler` | Full |
+| `stopSurveyCollecting()` | `stop_survey_collecting_handler` | Full |
+| `surveyTopologyTimeSliced()` | `survey_topology_handler` | Full |
+| `checkBooted()` | `survey_booted()` | Full |
 
-### Test-Only HTTP Endpoints (BUILD_TESTS)
+### Maintainer (`maintainer.rs`)
 
-| stellar-core Endpoint | Rust Status | Notes |
-|--------------|-------------|-------|
-| `/generateLoad` | Not Implemented | |
-| `/testAcc` | Not Implemented | |
-| `/testTx` | Not Implemented | |
-| `/toggleOverlayOnlyMode` | Not Implemented | |
+Corresponds to: `Maintainer.h`
 
-### Configuration (Config.h/Config.cpp)
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `Maintainer()` | `Maintainer::new()` | Full |
+| `start()` | `Maintainer::start()` | Full |
+| `performMaintenance()` | `Maintainer::perform_maintenance()` | Full |
 
-| Config Category | Status | Notes |
-|-----------------|--------|-------|
-| Node identity | Implemented | `node.name`, `node.node_seed`, `node.is_validator` |
-| Quorum set | Implemented | `node.quorum_set` with threshold and validators |
-| Network settings | Implemented | `network.passphrase`, `network.base_fee`, `network.base_reserve` |
-| Database | Implemented | `database.path`, `database.pool_size` |
-| Bucket storage | Implemented | `buckets.directory`, `buckets.cache_size` |
-| History archives | Implemented | `history.archives[]` with get/put commands |
-| Overlay | Implemented | Peer ports, limits, flooding rates, surveyor keys |
-| HTTP server | Implemented | `http.port`, `http.address`, `http.enabled` |
-| Logging | Implemented | `logging.level`, `logging.format`, `logging.colors` |
-| Protocol upgrades | Implemented | `upgrades.protocol_version`, etc. |
-| Surge pricing | Implemented | `surge_pricing.classic_byte_allowance`, etc. |
-| Events | Implemented | `events.emit_classic_events`, `events.backfill_stellar_asset_events` |
-| `ARTIFICIALLY_*_FOR_TESTING` | Not Implemented | Testing-only options |
-| `LOADGEN_*` | Not Implemented | Load generation options |
-| `APPLY_LOAD_*` | Not Implemented | Apply-load benchmarking |
-| `MANUAL_CLOSE` | Implemented | `node.manual_close` enables manual close mode |
-| `RUN_STANDALONE` | Not Implemented | Standalone mode |
-| Parallel ledger application | Not Implemented | `EXPERIMENTAL_PARALLEL_LEDGER_APPLY` |
-| Background overlay processing | Different | Always uses async via Tokio |
+### ApplicationUtils (`app.rs`, `catchup_cmd.rs`, `run_cmd.rs`)
 
-### Survey System
+Corresponds to: `ApplicationUtils.h`
 
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Time-sliced survey protocol | Implemented | Full collecting and reporting phases |
-| SurveyDataManager | Implemented | Collects peer statistics, latency histograms |
-| SurveyMessageLimiter | Implemented | Rate limiting and deduplication |
-| Collecting phase (30 min max) | Implemented | |
-| Reporting phase (3 hr max) | Implemented | |
-| Latency histograms | Implemented | SCP latency tracking |
-| Legacy (non-time-sliced) survey | Not Implemented | |
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `setupApp()` | `App::new()` | Full |
+| `runApp()` | `run_node()` | Full |
+| `setForceSCPFlag()` | — | None |
+| `initializeDatabase()` | DB init in `App::new()` | Full |
+| `httpCommand()` | — | None |
+| `selfCheck()` | `App::self_check()` | Full |
+| `mergeBucketList()` | — | None |
+| `dumpStateArchivalStatistics()` | — | None |
+| `dumpLedger()` | `dump-ledger` in henyey binary | Full |
+| `dumpWasmBlob()` | — | None |
+| `showOfflineInfo()` | `info` command in henyey binary | Partial |
+| `reportLastHistoryCheckpoint()` | — | None |
+| `checkQuorumIntersectionFromJson()` | `check-quorum-intersection` in henyey | Full |
+| `loadXdr()` | — | None |
+| `rebuildLedgerFromBuckets()` | — | None |
+| `genSeed()` | `new-keypair` in henyey binary | Full |
+| `initializeHistories()` | — | None |
+| `writeCatchupInfo()` | — | None |
+| `catchup()` | `App::catchup()` | Full |
+| `applyBucketsForLCL()` | In catchup flow | Full |
+| `publish()` | `publish-history` in henyey binary | Full |
+| `minimalDBForInMemoryMode()` | — | None |
+| `canRebuildInMemoryLedgerFromBuckets()` | — | None |
+| `setAuthenticatedLedgerHashPair()` | — | None |
+| `getStellarCoreMajorReleaseVersion()` | — | None |
 
-### PersistentState (PersistentState.h/PersistentState.cpp)
+### PersistentState (in `henyey-db` crate)
 
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Last closed ledger | Implemented | Via `henyey-db` |
-| History archive state | Implemented | Via `henyey-db` |
-| Database schema version | Implemented | Via `henyey-db` |
-| Network passphrase storage | Implemented | Via `henyey-db` |
-| Ledger upgrades | Partial | Via herder |
-| SCP state persistence | Partial | Slot state stored, migration not implemented |
-| TxSet storage | Partial | Basic storage via `henyey-db` |
-| Rebuild ledger flag | Not Implemented | |
+Corresponds to: `PersistentState.h`
 
-### Application Subsystems
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `PersistentState()` | DB init in henyey-db | Full |
+| `dropAll()` | Schema migration | Full |
+| `getState()` | `StateQueries::get_state()` | Full |
+| `setState()` | `StateQueries::set_state()` | Full |
+| `getSCPStateAllSlots()` | `ScpQueries::get_scp_state_all_slots()` | Full |
+| `getTxSetsForAllSlots()` | `ScpQueries::get_tx_sets_for_all_slots()` | Partial |
+| `getTxSetHashesForAllSlots()` | — | None |
+| `setSCPStateV1ForSlot()` | `ScpQueries::set_scp_state_for_slot()` | Partial |
+| `shouldRebuildForOfferTable()` | — | None |
+| `clearRebuildForOfferTable()` | — | None |
+| `setRebuildForOfferTable()` | — | None |
+| `hasTxSet()` | — | None |
+| `deleteTxSets()` | — | None |
+| `migrateToSlotStateTable()` | — | None |
 
-| Subsystem | Status | Notes |
-|-----------|--------|-------|
-| TmpDirManager | Not Implemented | |
-| ProcessManager | Not Implemented | External process spawning |
-| WorkScheduler | Partial | Uses `henyey-work` with Tokio |
-| Maintainer | Implemented | Automatic table cleanup via `maintainer.rs` |
-| InvariantManager | Partial | Via `henyey-ledger` |
-| BanManager | Implemented | Via `henyey-overlay` |
-| StatusManager | Partial | Via HTTP endpoints |
-| Protocol23CorruptionDataVerifier | Not Implemented | |
-| Protocol23CorruptionEventReconciler | Not Implemented | |
+### Logging (`logging.rs`)
 
-### Consensus Recovery
+Corresponds to: Logging subsystem in stellar-core (no single header)
 
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Consensus stuck detection | Implemented | 35-second timeout |
-| SCP state broadcast | Implemented | Request and broadcast SCP state |
-| Out-of-sync recovery | Implemented | Via `SyncRecoveryManager` |
-| Automatic catchup on stuck | Implemented | Falls back to catchup |
-| Buffered ledger tx_set updates | Implemented | Entry pattern for late-arriving tx_sets |
-| Broadcast tx_set requests during catchup | Implemented | Request from all peers, not just sender |
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| Log initialization | `init_with_handle()` | Full |
+| Per-partition log levels | `LogLevelHandle::set_partition_level()` | Full |
+| Dynamic level changes | `LogLevelHandle::set_level()` | Full |
+| Log partitions | `LOG_PARTITIONS` constant | Full |
+| Progress tracking | `ProgressTracker`, `CatchupProgress` | Full |
 
-## Bug Fixes and Improvements
+### Metadata Stream (`meta_stream.rs`)
 
-### Catchup Gap Recovery (January 2026)
+Corresponds to: `METADATA_OUTPUT_STREAM` in `ApplicationImpl.cpp`
 
-Two related issues were fixed to improve recovery after catchup completes:
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| Main XDR output stream | `MetaStreamManager::emit_meta()` | Full |
+| Debug meta stream with rotation | `MetaStreamManager::maybe_rotate_debug_stream()` | Full |
+| fd: syntax support | `MetaStreamManager::open_stream()` | Full |
+| Gzip compression of segments | `MetaStreamManager::gzip_file()` | Full |
 
-1. **Buffered tx_set update fix** (`80bd38d`): When a slot is buffered without its tx_set
-   (because the tx_set hasn't arrived yet), and the tx_set arrives later, the buffered
-   entry was not being updated. This was caused by using `or_insert()` which doesn't
-   update existing entries. Fixed by using the `Entry::Occupied/Vacant` pattern to
-   properly update existing entries when tx_sets arrive.
+### Survey System (`survey.rs`)
 
-2. **Broadcast tx_set requests to all peers** (`759757b`): During catchup, when
-   EXTERNALIZE messages arrive for future slots, the validator now broadcasts GetTxSet
-   requests to ALL connected peers instead of just the message sender. This increases
-   the probability of receiving tx_sets before they are evicted from peer caches,
-   helping bridge the gap between catchup checkpoint and live consensus.
+Corresponds to: Survey logic in `CommandHandler.cpp` and overlay
 
-**Root cause**: After catchup completes at a checkpoint boundary (e.g., ledger 690303),
-the network may be 20-30 slots ahead. The validator needs tx_sets for these "gap" slots
-to close ledgers. Previously, tx_set requests went only to the peer that sent the
-EXTERNALIZE message, but that peer might have already evicted the tx_set from cache.
-By requesting from all peers and properly updating buffered entries, the validator
-can now successfully bridge this gap.
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `SurveyDataManager` | `SurveyDataManager` | Full |
+| `SurveyMessageLimiter` | `SurveyMessageLimiter` | Full |
+| Time-sliced collecting phase | `start_collecting()` / `stop_collecting()` | Full |
+| Time-sliced reporting phase | `fill_survey_data()` | Full |
+| Latency histograms | `LatencyHistogram` | Full |
+| Phase timeout enforcement | `update_phase()` | Full |
+
+### Catchup Command (`catchup_cmd.rs`)
+
+Corresponds to: `catchup()` in `ApplicationUtils.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| Catchup orchestration | `run_catchup()` | Full |
+| Target parsing (ledger/count) | `parse_target_with_mode()` | Full |
+| Catchup modes (minimal/complete/recent) | `CatchupMode` enum | Full |
+| Progress callbacks | `CatchupProgressCallback` trait | Full |
+| Verification | `verify_catchup()` | Partial |
+
+### Run Command (`run_cmd.rs`)
+
+Corresponds to: `runApp()` in `ApplicationUtils.h`, `CommandHandler.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| Main run loop | `run_main_loop()` | Full |
+| Signal handling (SIGTERM, Ctrl+C) | `wait_for_shutdown_signal()` | Full |
+| HTTP status server | `StatusServer` | Full |
+| State restoration from disk | `load_last_known_ledger()` | Full |
+| Sync detection | `check_needs_catchup()` | Full |
+| NodeRunner wrapper | `NodeRunner` struct | Full |
+
+## Intentional Omissions
+
+Features excluded by design. These are NOT counted against parity %.
+
+| stellar-core Component | Reason |
+|------------------------|--------|
+| `VirtualClock` | Replaced by Tokio async runtime; not needed for real-time operation |
+| `AppConnector` | Thread-isolation helper; unnecessary with Tokio's shared-nothing async model |
+| `ThreadType` / `threadIsType()` | Tokio manages task scheduling; explicit thread typing not needed |
+| Worker/Eviction/Overlay IO contexts | Replaced by Tokio runtime with task-based concurrency |
+| `TmpDirManager` | Uses standard `tempfile` crate |
+| `ProcessManager` | External process spawning handled by `tokio::process` where needed |
+| `ARTIFICIALLY_*_FOR_TESTING` configs | Testing-only knobs; Rust tests use different patterns |
+| `LOADGEN_*` / `APPLY_LOAD_*` configs | Load generation not implemented (different testing approach) |
+| `BUILD_TESTS`-only endpoints | Rust test framework provides equivalent capabilities |
+| `LoadGenerator` | Not needed; test workloads use different approach |
+| Legacy (non-time-sliced) survey | Deprecated in stellar-core v25 |
+| `Protocol23CorruptionDataVerifier` | Protocol 23 bug workaround; not needed for p24+ only |
+| `Protocol23CorruptionEventReconciler` | Protocol 23 bug workaround; not needed for p24+ only |
+| `BEST_OFFER_DEBUGGING` | Debug-only feature; not applicable |
+| `MODE_USES_IN_MEMORY_LEDGER` | Test-only mode; Rust uses different testing approach |
+| `BUCKETLIST_DB_*` configs | BucketListDB tuning handled internally |
+| `EXPERIMENTAL_PARALLEL_LEDGER_APPLY` | Future feature; not in stable upstream |
+| `EXPERIMENTAL_BACKGROUND_TX_SIG_VERIFICATION` | Experimental; not in stable upstream |
+
+## Gaps
+
+Features not yet implemented. These ARE counted against parity %.
+
+| stellar-core Component | Priority | Notes |
+|------------------------|----------|-------|
+| `QueryServer` (getLedgerEntry, getLedgerEntryRaw) | Medium | RPC query endpoint for BucketListDB lookups |
+| `SettingsUpgradeUtils` (getWasmRestoreTx, getUploadTx, etc.) | Medium | Soroban config upgrade transaction builders |
+| `Diagnostics::bucketStats()` | Low | Bucket statistics diagnostic tool |
+| `dumpXdrStream()` / `printXdr()` full support | Low | Full XDR dump and print utilities |
+| `signtxns()` / `signtxn()` full support | Low | Multi-transaction signing |
+| `setForceSCPFlag()` | Low | Force SCP on startup |
+| `httpCommand()` CLI utility | Low | Send HTTP commands from CLI |
+| `mergeBucketList()` | Low | Offline bucket list merge tool |
+| `dumpStateArchivalStatistics()` | Low | Archival statistics reporting |
+| `reportLastHistoryCheckpoint()` | Low | Report last checkpoint to file |
+| `initializeHistories()` | Low | Initialize new history archives |
+| `showOfflineInfo()` full support | Low | Complete offline info display |
+| `Config::adjust()` | Low | Connection setting adjustment |
+| `Config::resolveNodeID()` | Low | Node ID resolution from names |
+| `Config::toShortString()` / `toStrKey()` | Low | Node ID display helpers |
+| PersistentState: `migrateToSlotStateTable()` | Low | SCP state table migration |
+| PersistentState: rebuild-for-offer-table flags | Low | Offer table rebuild tracking |
+| `resetLedgerState()` | Low | Pre-bucket-application state reset |
+| `applyCfgCommands()` | Low | Execute config-embedded commands at startup |
+| `reportCfgMetrics()` | Low | Report configured metrics to logs |
+| `syncOwnMetrics()` / `syncAllMetrics()` | Low | Medida metrics sync (Prometheus model differs) |
+| `getStellarCoreMajorReleaseVersion()` | Low | Version string parsing utility |
+| `writeCatchupInfo()` | Low | Write catchup JSON info to file |
 
 ## Architectural Differences
 
-### Async Runtime
+1. **Async Runtime**
+   - **stellar-core**: ASIO io_context with explicit worker thread pools (main, worker, eviction, overlay, ledger-close)
+   - **Rust**: Tokio async runtime with task-based concurrency
+   - **Rationale**: Tokio provides equivalent concurrency with simpler code and no manual thread management
 
-| Aspect | stellar-core | Rust |
-|--------|-----|------|
-| Event loop | ASIO io_context | Tokio async runtime |
-| Timer management | VirtualTimer | `tokio::time` |
-| Thread pools | Explicit worker threads | Tokio task spawning |
-| Signal handling | ASIO signals | `tokio::signal` |
-| Clock abstraction | VirtualClock | System time (no virtual clock) |
+2. **Configuration Format**
+   - **stellar-core**: Custom cpptoml parser with SCREAMING_SNAKE_CASE field names
+   - **Rust**: Standard `toml` crate with serde deserialization, snake_case fields, environment variable overrides
+   - **Rationale**: Leverages Rust ecosystem for type-safe config parsing with less custom code
 
-### Configuration Format
+3. **HTTP Server**
+   - **stellar-core**: Custom `lib/http/server.hpp` with query string routing
+   - **Rust**: Axum framework with typed extractors and tower middleware
+   - **Rationale**: Production-grade async HTTP framework with built-in graceful shutdown
 
-| Aspect | stellar-core | Rust |
-|--------|-----|------|
-| Parser | cpptoml (custom TOML-like) | `toml` crate with serde |
-| Field naming | SCREAMING_SNAKE_CASE | snake_case in TOML |
-| Environment overrides | Not standard | `RS_STELLAR_CORE_*` prefix |
+4. **Metrics System**
+   - **stellar-core**: libmedida MetricsRegistry with JSON export via `/metrics`
+   - **Rust**: Prometheus text format with direct gauge/counter computation in handlers
+   - **Rationale**: Prometheus is the industry standard for metrics; eliminates medida dependency
 
-### HTTP Server
+5. **Logging**
+   - **stellar-core**: Custom logging system with per-partition levels
+   - **Rust**: `tracing` ecosystem with `tracing-subscriber` reload layers for dynamic levels
+   - **Rationale**: `tracing` provides structured logging, span context, and dynamic filtering
 
-| Aspect | stellar-core | Rust |
-|--------|-----|------|
-| Framework | Custom `lib/http/server.hpp` | Axum with tower middleware |
-| Response format | JSON | JSON (similar but not byte-identical) |
-| URL structure | Query string parameters | Query string parameters |
+6. **Application Structure**
+   - **stellar-core**: Abstract `Application` interface with `ApplicationImpl` concrete class; subsystems accessed via virtual getters
+   - **Rust**: Single `App` struct with direct field ownership; subsystems accessed via typed fields behind `Arc`/`RwLock`
+   - **Rationale**: Rust ownership model makes virtual interface pattern unnecessary; direct field access is idiomatic
 
-### Logging
+7. **Thread Isolation (AppConnector)**
+   - **stellar-core**: `AppConnector` wraps `Application&` to provide thread-safe subset of methods
+   - **Rust**: Not needed; Tokio's `Send + Sync` bounds and `Arc<RwLock<T>>` provide compile-time thread safety
+   - **Rationale**: Rust's type system enforces thread safety at compile time
 
-| Aspect | stellar-core | Rust |
-|--------|-----|------|
-| Framework | Custom logging system | `tracing` ecosystem |
-| Log levels | Per partition | Per partition via filter directives |
-| Format | Custom | Text or JSON via `tracing-subscriber` |
-| Dynamic changes | Fully supported | Fully supported via `/ll` endpoint |
-| Partition mapping | Direct stellar-core modules | Maps stellar-core partitions to Rust crate targets |
+## Test Coverage
 
-### Metrics
+| Area | stellar-core Tests | Rust Tests | Notes |
+|------|-------------------|------------|-------|
+| Config | 8 TEST_CASE / 18 SECTION | 16 `#[test]` | Good coverage of config loading and validation |
+| CommandHandler | 3 TEST_CASE / 25 SECTION | 6 `#[test]` | Rust tests cover run_cmd options; less endpoint testing |
+| ApplicationUtils | 4 TEST_CASE / 5 SECTION | 13 `#[test]` (catchup_cmd) | Catchup target parsing well tested |
+| SelfCheck | 1 TEST_CASE / 0 SECTION | 0 `#[test]` | No dedicated self-check tests |
+| QueryServer | 1 TEST_CASE / 9 SECTION | 0 `#[test]` | Not implemented |
+| App core | — | 47 `#[test]` | Extensive app-level tests |
+| Maintainer | — | 7 `#[test]` | Good coverage |
+| Logging | — | 5 `#[test]` | Basic coverage |
+| Meta stream | — | 5 `#[test]` | Covers emit, rotation, error handling |
 
-| Aspect | stellar-core | Rust |
-|--------|-----|------|
-| Framework | libmedida | Prometheus-style counters |
-| Registry | MetricsRegistry | Direct collection in handlers |
-| Export format | JSON via /metrics | Prometheus text format |
+### Test Gaps
 
-## Design Decisions
+- **HTTP endpoint integration tests**: stellar-core has 25 SECTION entries testing various command handler scenarios (manual close with different parameters, overlay-only mode toggle, transaction envelope bridge). The Rust crate lacks HTTP endpoint integration tests.
+- **QueryServer tests**: 1 TEST_CASE with 9 SECTION entries in stellar-core for getLedgerEntry; no equivalent in Rust (feature not implemented).
+- **Self-check scheduling tests**: stellar-core tests online self-check scheduling; Rust only has the self-check function, not its scheduling.
+- **Config edge cases**: stellar-core has extensive tests for validator config validation (bad validators, nesting levels, operation filters, domain quality). Rust tests are simpler.
 
-1. **No cpptoml dependency**: Configuration uses native Rust TOML parsing with serde.
+## Verification Results
 
-2. **No libmedida**: Metrics use Prometheus-compatible format directly instead of the medida library.
+- **Testnet verification**: Node successfully syncs and tracks consensus on testnet, closing ledgers in parity with stellar-core validators.
+- **Catchup gap recovery**: Successfully bridges 20-30 slot gaps between catchup checkpoint and live consensus (verified January 2026).
+- **Survey protocol**: Time-sliced surveys successfully collect and report topology data from testnet peers.
 
-3. **Simplified thread model**: Tokio handles all async work distribution; no separate worker thread pools.
+## Parity Calculation
 
-4. **Survey implementation**: Full time-sliced survey support; legacy survey protocol not implemented.
-
-5. **Command parity**: Focus on essential operational commands (`run`, `catchup`) first; utility commands are lower priority.
-
-6. **Database locking**: Uses file-based locking (`.lock` file) to prevent multiple instances.
-
-7. **Virtual clock**: Not implemented; uses real system time only. This affects testability but simplifies the implementation.
-
-## Known Behavioral Differences
-
-1. **Log output format**: Log messages have different formatting and structure.
-
-2. **HTTP response formatting**: JSON responses are functionally equivalent but not byte-identical.
-
-3. **Metrics naming**: Metric names follow Prometheus conventions rather than medida conventions.
-
-4. **Error messages**: Error message text differs but conveys equivalent information.
-
-5. **Startup sequence**: Initialization order and startup messages differ slightly.
-
-6. **Thread naming**: No explicit thread naming as Tokio manages task scheduling.
-
-## Testing Notes
-
-- Unit tests use Rust's built-in test framework (`#[test]`)
-- No `BUILD_TESTS` equivalent; test code is always available
-- No fuzzing infrastructure implemented
-- No load generation (`generateLoad`) implemented
+| Category | Count |
+|----------|-------|
+| Implemented (Full) | 82 |
+| Gaps (None + Partial) | 50 |
+| Intentional Omissions | 18 |
+| **Parity** | **82 / (82 + 50) = 62%** |
