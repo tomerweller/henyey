@@ -18,6 +18,9 @@ use henyey_scp::SlotIndex;
 use stellar_xdr::curr::{Hash, Limits, ReadXdr, ScpEnvelope, ScpQuorumSet};
 use tracing::{debug, trace};
 
+/// Callback type for requesting items from peers.
+type AskPeerFn = Box<dyn Fn(&PeerId, &Hash, ItemType) + Send + Sync>;
+
 /// Result of receiving an SCP envelope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecvResult {
@@ -133,17 +136,12 @@ impl FetchingEnvelopes {
     }
 
     /// Set the callback for requesting TxSets from peers.
-    #[allow(clippy::type_complexity)]
-    pub fn set_tx_set_ask_peer(&mut self, f: Box<dyn Fn(&PeerId, &Hash, ItemType) + Send + Sync>) {
+    pub fn set_tx_set_ask_peer(&mut self, f: AskPeerFn) {
         self.tx_set_fetcher.set_ask_peer(f);
     }
 
     /// Set the callback for requesting QuorumSets from peers.
-    #[allow(clippy::type_complexity)]
-    pub fn set_quorum_set_ask_peer(
-        &mut self,
-        f: Box<dyn Fn(&PeerId, &Hash, ItemType) + Send + Sync>,
-    ) {
+    pub fn set_quorum_set_ask_peer(&mut self, f: AskPeerFn) {
         self.quorum_set_fetcher.set_ask_peer(f);
     }
 
@@ -603,14 +601,8 @@ impl FetchingEnvelopes {
             false
         };
 
-        // TODO: Re-enable quorum set fetching when we have proper peer fetching wired up
-        // For now, assume quorum sets are available (SCP validates them separately)
+        // Quorum set fetching is not yet wired up; SCP validates them separately.
         let need_quorum_set = false;
-        // let need_quorum_set = if let Some(hash) = Self::extract_quorum_set_hash(envelope) {
-        //     !self.quorum_set_cache.contains_key(&hash)
-        // } else {
-        //     false
-        // };
 
         (need_tx_set, need_quorum_set)
     }

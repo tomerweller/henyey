@@ -261,78 +261,18 @@ pub struct Herder {
 }
 
 impl Herder {
-    /// Create a new Herder.
+    /// Create a new Herder (observer mode, no secret key).
     pub fn new(config: HerderConfig) -> Self {
-        let mut pending_config = config.pending_config.clone();
-        let max_slots = config.max_externalized_slots.max(1);
-        pending_config.max_slots = pending_config.max_slots.min(max_slots);
-        pending_config.max_slot_distance = pending_config.max_slot_distance.min(max_slots as u64);
-
-        let scp_driver_config = ScpDriverConfig {
-            node_id: config.node_public_key,
-            max_tx_set_cache: 100,
-            max_time_drift: MAX_TIME_SLIP_SECONDS,
-            local_quorum_set: config.local_quorum_set.clone(),
-        };
-
-        let scp_driver = Arc::new(ScpDriver::new(scp_driver_config, config.network_id));
-        let tx_queue = TransactionQueue::new(config.tx_queue_config.clone());
-        let pending_envelopes = PendingEnvelopes::new(pending_config);
-        let fetching_envelopes = FetchingEnvelopes::with_defaults();
-
-        // Pre-cache the local quorum set in fetching_envelopes so envelopes
-        // referencing it don't wait for fetching.
-        if let Some(ref quorum_set) = config.local_quorum_set {
-            let qs_hash = Hash256::hash_xdr(quorum_set).unwrap_or(Hash256::ZERO);
-            fetching_envelopes.cache_quorum_set(qs_hash, quorum_set.clone());
-        }
-
-        let slot_quorum_tracker =
-            SlotQuorumTracker::new(config.local_quorum_set.clone(), max_slots);
-        let local_node_id = node_id_from_public_key(&config.node_public_key);
-        let mut quorum_tracker = QuorumTracker::new(local_node_id.clone());
-        if let Some(ref quorum_set) = config.local_quorum_set {
-            info!(
-                validators = quorum_set.validators.len(),
-                threshold = quorum_set.threshold,
-                "Initializing quorum tracker with local quorum set"
-            );
-            for v in quorum_set.validators.iter() {
-                let key_hex = match &v.0 {
-                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                        stellar_xdr::curr::Uint256(bytes),
-                    ) => hex::encode(bytes),
-                };
-                info!(validator = %key_hex, "Quorum set validator");
-            }
-            let _ = quorum_tracker.expand(&local_node_id, quorum_set.clone());
-            info!(
-                tracked_nodes = quorum_tracker.tracked_node_count(),
-                "Quorum tracker initialized"
-            );
-        }
-
-        Self {
-            config,
-            state: RwLock::new(HerderState::Booting),
-            tx_queue,
-            pending_envelopes,
-            fetching_envelopes,
-            scp_driver,
-            scp: None,
-            tracking_slot: RwLock::new(0),
-            tracking_consensus_close_time: RwLock::new(0),
-            tracking_started_at: RwLock::new(None),
-            secret_key: None,
-            ledger_manager: RwLock::new(None),
-            prev_value: RwLock::new(Value::default()),
-            slot_quorum_tracker: RwLock::new(slot_quorum_tracker),
-            quorum_tracker: RwLock::new(quorum_tracker),
-        }
+        Self::build(config, None)
     }
 
     /// Create a new Herder with a secret key for validation.
     pub fn with_secret_key(config: HerderConfig, secret_key: SecretKey) -> Self {
+        Self::build(config, Some(secret_key))
+    }
+
+    /// Shared constructor logic for both observer and validator modes.
+    fn build(config: HerderConfig, secret_key: Option<SecretKey>) -> Self {
         let mut pending_config = config.pending_config.clone();
         let max_slots = config.max_externalized_slots.max(1);
         pending_config.max_slots = pending_config.max_slots.min(max_slots);
@@ -345,11 +285,11 @@ impl Herder {
             local_quorum_set: config.local_quorum_set.clone(),
         };
 
-        let scp_driver = Arc::new(ScpDriver::with_secret_key(
-            scp_driver_config,
-            config.network_id,
-            secret_key.clone(),
-        ));
+        let scp_driver = Arc::new(if let Some(ref sk) = secret_key {
+            ScpDriver::with_secret_key(scp_driver_config, config.network_id, sk.clone())
+        } else {
+            ScpDriver::new(scp_driver_config, config.network_id)
+        });
 
         let tx_queue = TransactionQueue::new(config.tx_queue_config.clone());
         let pending_envelopes = PendingEnvelopes::new(pending_config);
@@ -362,9 +302,9 @@ impl Herder {
             fetching_envelopes.cache_quorum_set(qs_hash, quorum_set.clone());
         }
 
-        // Create SCP instance for validators
+        // Create SCP instance for validators with a secret key.
         let node_id = node_id_from_public_key(&config.node_public_key);
-        let scp = if config.is_validator {
+        let scp = if secret_key.is_some() && config.is_validator {
             if let Some(ref quorum_set) = config.local_quorum_set {
                 let callback = HerderScpCallback::new(Arc::clone(&scp_driver));
                 Some(SCP::new(
@@ -385,10 +325,16 @@ impl Herder {
             SlotQuorumTracker::new(config.local_quorum_set.clone(), max_slots);
         let mut quorum_tracker = QuorumTracker::new(node_id.clone());
         if let Some(ref quorum_set) = config.local_quorum_set {
+            let mode = if secret_key.is_some() {
+                "validator"
+            } else {
+                "observer"
+            };
             info!(
                 validators = quorum_set.validators.len(),
                 threshold = quorum_set.threshold,
-                "Initializing quorum tracker with local quorum set (validator)"
+                mode,
+                "Initializing quorum tracker with local quorum set"
             );
             for v in quorum_set.validators.iter() {
                 let key_hex = match &v.0 {
@@ -416,7 +362,7 @@ impl Herder {
             tracking_slot: RwLock::new(0),
             tracking_consensus_close_time: RwLock::new(0),
             tracking_started_at: RwLock::new(None),
-            secret_key: Some(secret_key),
+            secret_key,
             ledger_manager: RwLock::new(None),
             prev_value: RwLock::new(Value::default()),
             slot_quorum_tracker: RwLock::new(slot_quorum_tracker),

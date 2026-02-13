@@ -154,6 +154,9 @@ pub struct ScpDriverCacheSizes {
     pub quorum_sets_by_hash: usize,
 }
 
+/// Callback type for broadcasting SCP envelopes to peers.
+type EnvelopeSender = Box<dyn Fn(ScpEnvelope) + Send + Sync>;
+
 /// SCP driver that integrates consensus with the Herder.
 ///
 /// This manages:
@@ -178,8 +181,7 @@ pub struct ScpDriver {
     /// Latest externalized slot.
     latest_externalized: RwLock<Option<SlotIndex>>,
     /// Envelope broadcast callback.
-    #[allow(clippy::type_complexity)]
-    envelope_sender: RwLock<Option<Box<dyn Fn(ScpEnvelope) + Send + Sync>>>,
+    envelope_sender: RwLock<Option<EnvelopeSender>>,
     /// Network ID for signing.
     network_id: Hash256,
     /// Quorum sets by node ID (key is 32-byte public key).

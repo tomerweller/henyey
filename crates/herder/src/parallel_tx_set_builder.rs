@@ -82,11 +82,6 @@ impl BitSet {
         }
     }
 
-    #[allow(dead_code)]
-    fn is_empty(&self) -> bool {
-        self.words.iter().all(|&w| w == 0)
-    }
-
     fn iter_ones(&self) -> impl Iterator<Item = usize> + '_ {
         self.words.iter().enumerate().flat_map(|(word_idx, &word)| {
             let base = word_idx * 64;
@@ -141,8 +136,6 @@ impl Cluster {
 // ---------------------------------------------------------------------------
 
 struct ParallelPartitionConfig {
-    #[allow(dead_code)]
-    stage_count: u32,
     clusters_per_stage: u32,
     instructions_per_cluster: u64,
 }
@@ -159,7 +152,6 @@ impl ParallelPartitionConfig {
             ledger_max_instructions as u64
         };
         Self {
-            stage_count,
             clusters_per_stage: ledger_max_dependent_tx_clusters,
             instructions_per_cluster,
         }
