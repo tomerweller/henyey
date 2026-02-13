@@ -22,7 +22,7 @@
 //! the entire ledger state upfront.
 
 use crate::delta::key_to_bytes;
-use crate::Result;
+use crate::{LedgerError, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 use henyey_common::Hash256;

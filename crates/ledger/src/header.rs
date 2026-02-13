@@ -27,7 +27,7 @@
 
 use crate::{LedgerError, Result};
 use henyey_common::Hash256;
-use stellar_xdr::curr::{Hash, LedgerHeader, Limits, WriteXdr};
+use stellar_xdr::curr::{LedgerHeader, Limits, WriteXdr};
 
 /// Number of entries in the skip list (fixed at 4 by protocol).
 pub const SKIP_LIST_SIZE: usize = 4;
@@ -337,6 +337,7 @@ pub fn is_before_protocol_version(header: &LedgerHeader, version: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stellar_xdr::curr::Hash;
 
     fn create_test_header(seq: u32) -> LedgerHeader {
         LedgerHeader {
