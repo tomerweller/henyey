@@ -59,6 +59,7 @@
   - GitHub Copilot (CLI or IDE): `Co-authored-by: GitHub Copilot <copilot@github.com>`
   - Codex: `Co-authored-by: Codex <codex@openai.com>`
   - Other agents: Use the agent/tool name, not the model name
+- **Documentation updates**: Before committing new code, ensure the affected crate's README documentation and `PARITY_STATUS.md` are updated to reflect the changes.
 - **Bug fixes**: As soon as a bug is fixed and its regression test passes, commit and push immediately. Do not wait to be told.
 - **Other changes**: Commit and push when explicitly directed by the user.
 - PRs should include: a clear description, the tests run, and documentation updates when behavior changes.
