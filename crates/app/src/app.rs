@@ -813,6 +813,7 @@ impl App {
             max_tx_set_size: 1000,
             pending_config: Default::default(),
             tx_queue_config: TxQueueConfig {
+                network_id: henyey_common::NetworkId(config.network_id()),
                 max_dex_ops: config.surge_pricing.max_dex_tx_operations,
                 max_classic_bytes: Some(config.surge_pricing.classic_byte_allowance),
                 max_soroban_bytes: Some(config.surge_pricing.soroban_byte_allowance),
