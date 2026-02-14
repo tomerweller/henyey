@@ -1083,6 +1083,11 @@ impl BucketList {
         self.bucket_list_db_config = Some(config);
     }
 
+    /// Returns the current BucketListDB config, if set.
+    pub fn bucket_list_db_config(&self) -> Option<&BucketListDbConfig> {
+        self.bucket_list_db_config.as_ref()
+    }
+
     /// Sums entry counters across all buckets in the bucket list.
     ///
     /// Matches stellar-core's `LiveBucketList::sumBucketEntryCounters`.

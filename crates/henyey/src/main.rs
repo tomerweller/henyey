@@ -1875,6 +1875,7 @@ async fn cmd_verify_execution(
         config.network.passphrase.clone(),
         LedgerManagerConfig {
             validate_bucket_hash: true,
+            bucket_list_db: config.buckets.bucket_list_db.clone(),
             ..Default::default()
         },
     );

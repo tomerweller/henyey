@@ -832,6 +832,7 @@ impl App {
                 validate_bucket_hash: true,
                 emit_classic_events: config.events.emit_classic_events,
                 backfill_stellar_asset_events: config.events.backfill_stellar_asset_events,
+                bucket_list_db: config.buckets.bucket_list_db.clone(),
             },
         ));
         tracing::info!("Ledger manager initialized");

@@ -54,6 +54,7 @@
 //! - `RS_STELLAR_CORE_DATABASE_PATH` - Database file path
 //! - `RS_STELLAR_CORE_LOG_LEVEL` - Log level (trace, debug, info, warn, error)
 
+use henyey_common::BucketListDbConfig;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use henyey_history::CatchupMode;
@@ -506,6 +507,13 @@ pub struct BucketConfig {
     /// Maximum number of buckets to keep in memory cache.
     #[serde(default = "default_bucket_cache_size")]
     pub cache_size: usize,
+
+    /// BucketListDB indexing and caching configuration.
+    ///
+    /// Controls per-bucket entry caching and index page sizes.
+    /// Set `memory_for_caching_mb` to a non-zero value to enable caching.
+    #[serde(default)]
+    pub bucket_list_db: BucketListDbConfig,
 }
 
 impl Default for BucketConfig {
@@ -513,6 +521,7 @@ impl Default for BucketConfig {
         Self {
             directory: default_bucket_dir(),
             cache_size: default_bucket_cache_size(),
+            bucket_list_db: BucketListDbConfig::default(),
         }
     }
 }
@@ -1419,5 +1428,57 @@ complete = true
         let config: AppConfig = toml::from_str(toml_str).unwrap();
         assert!(config.catchup.complete);
         assert!(matches!(config.catchup.to_mode(), CatchupMode::Complete));
+    }
+
+    #[test]
+    fn test_bucket_list_db_config_default() {
+        let config = AppConfig::default();
+        assert_eq!(config.buckets.bucket_list_db.memory_for_caching_mb, 0);
+        assert_eq!(config.buckets.bucket_list_db.index_page_size_exponent, 14);
+        assert!(config.buckets.bucket_list_db.persist_index);
+    }
+
+    #[test]
+    fn test_bucket_list_db_config_from_toml() {
+        let toml_str = r#"
+[network]
+passphrase = "Test SDF Network ; September 2015"
+
+[[history.archives]]
+name = "sdf1"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
+
+[buckets.bucket_list_db]
+memory_for_caching_mb = 512
+index_page_size_exponent = 16
+index_cutoff_mb = 40
+persist_index = false
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.buckets.bucket_list_db.memory_for_caching_mb, 512);
+        assert_eq!(config.buckets.bucket_list_db.index_page_size_exponent, 16);
+        assert_eq!(config.buckets.bucket_list_db.index_cutoff_mb, 40);
+        assert!(!config.buckets.bucket_list_db.persist_index);
+    }
+
+    #[test]
+    fn test_bucket_list_db_config_partial_toml() {
+        // Only setting memory_for_caching_mb, other fields should get defaults
+        let toml_str = r#"
+[network]
+passphrase = "Test SDF Network ; September 2015"
+
+[[history.archives]]
+name = "sdf1"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
+
+[buckets.bucket_list_db]
+memory_for_caching_mb = 256
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.buckets.bucket_list_db.memory_for_caching_mb, 256);
+        // Defaults for unspecified fields
+        assert_eq!(config.buckets.bucket_list_db.index_page_size_exponent, 14);
+        assert!(config.buckets.bucket_list_db.persist_index);
     }
 }

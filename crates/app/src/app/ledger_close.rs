@@ -359,7 +359,6 @@ impl App {
             .unwrap_or(&self.config.database.path)
             .join("buckets");
         bucket_list.set_bucket_dir(bucket_dir.clone());
-        bucket_list.set_bucket_list_db_config(henyey_common::BucketListDbConfig::default());
         bucket_list.set_ledger_seq(lcl_seq);
 
         // Restart pending merges from HAS state.

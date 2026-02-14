@@ -46,7 +46,7 @@ use henyey_bucket::{
     BucketEntry, BucketList, BucketListSnapshot, EvictionIterator, EvictionResult,
     HotArchiveBucketList, StateArchivalSettings,
 };
-use henyey_common::{Hash256, NetworkId};
+use henyey_common::{BucketListDbConfig, Hash256, NetworkId};
 use henyey_tx::soroban::PersistentModuleCache;
 use henyey_tx::state::AssetKey;
 use henyey_tx::{ClassicEventConfig, LedgerContext, TransactionFrame, TxEventManager};
@@ -628,6 +628,12 @@ pub struct LedgerManagerConfig {
     /// When enabled during catchup, classic events are generated for
     /// historical ledgers that predate native event support.
     pub backfill_stellar_asset_events: bool,
+
+    /// BucketListDB configuration for indexing and caching.
+    ///
+    /// Controls per-bucket caching and index page sizes. Applied to the
+    /// bucket list during initialization.
+    pub bucket_list_db: BucketListDbConfig,
 }
 
 impl Default for LedgerManagerConfig {
@@ -636,6 +642,7 @@ impl Default for LedgerManagerConfig {
             validate_bucket_hash: true,
             emit_classic_events: false,
             backfill_stellar_asset_events: false,
+            bucket_list_db: BucketListDbConfig::default(),
         }
     }
 }
@@ -983,8 +990,12 @@ impl LedgerManager {
         *self.bucket_list.write() = bucket_list;
         *self.hot_archive_bucket_list.write() = Some(hot_archive_bucket_list);
 
-        // Set the ledger sequence on bucket lists after restoring from history archive.
-        self.bucket_list.write().set_ledger_seq(header.ledger_seq);
+        // Set the ledger sequence and BucketListDB config on bucket lists.
+        {
+            let mut bl = self.bucket_list.write();
+            bl.set_ledger_seq(header.ledger_seq);
+            bl.set_bucket_list_db_config(self.config.bucket_list_db.clone());
+        }
         if let Some(ref mut habl) = *self.hot_archive_bucket_list.write() {
             habl.set_ledger_seq(header.ledger_seq);
         }
@@ -3873,6 +3884,96 @@ mod tests {
     fn test_ledger_manager_config_default() {
         let config = LedgerManagerConfig::default();
         assert!(config.validate_bucket_hash);
+        assert_eq!(config.bucket_list_db.memory_for_caching_mb, 0);
+    }
+
+    #[test]
+    fn test_bucket_list_db_config_applied_on_initialize() {
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            bucket_list_db: BucketListDbConfig {
+                memory_for_caching_mb: 256,
+                index_page_size_exponent: 16,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let manager = LedgerManager::new(
+            "Test SDF Network ; September 2015".to_string(),
+            config,
+        );
+
+        // Before initialize, bucket list has no config
+        assert!(manager.bucket_list.read().bucket_list_db_config().is_none());
+
+        // Initialize with empty bucket lists
+        let header = create_genesis_header();
+        let header_hash = Hash256::ZERO;
+        manager
+            .initialize(
+                BucketList::new(),
+                HotArchiveBucketList::new(),
+                header,
+                header_hash,
+            )
+            .unwrap();
+
+        // After initialize, config should be applied
+        let bl = manager.bucket_list.read();
+        let applied = bl.bucket_list_db_config().expect("config should be set");
+        assert_eq!(applied.memory_for_caching_mb, 256);
+        assert_eq!(applied.index_page_size_exponent, 16);
+    }
+
+    #[test]
+    fn test_bucket_list_db_config_survives_reset_and_reinitialize() {
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            bucket_list_db: BucketListDbConfig {
+                memory_for_caching_mb: 128,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let manager = LedgerManager::new(
+            "Test SDF Network ; September 2015".to_string(),
+            config,
+        );
+
+        // Initialize
+        manager
+            .initialize(
+                BucketList::new(),
+                HotArchiveBucketList::new(),
+                create_genesis_header(),
+                Hash256::ZERO,
+            )
+            .unwrap();
+
+        // Verify config is set
+        assert_eq!(
+            manager.bucket_list.read().bucket_list_db_config().unwrap().memory_for_caching_mb,
+            128
+        );
+
+        // Reset clears everything
+        manager.reset();
+        assert!(manager.bucket_list.read().bucket_list_db_config().is_none());
+
+        // Re-initialize should re-apply config
+        manager
+            .initialize(
+                BucketList::new(),
+                HotArchiveBucketList::new(),
+                create_genesis_header(),
+                Hash256::ZERO,
+            )
+            .unwrap();
+
+        assert_eq!(
+            manager.bucket_list.read().bucket_list_db_config().unwrap().memory_for_caching_mb,
+            128
+        );
     }
 
     #[test]
