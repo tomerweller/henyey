@@ -366,7 +366,7 @@ impl Default for BucketListDbConfig {
         Self {
             index_page_size_exponent: default_index_page_size_exponent(),
             index_cutoff_mb: default_index_cutoff_mb(),
-            memory_for_caching_mb: 0,
+            memory_for_caching_mb: 1024,
             persist_index: default_persist_index(),
         }
     }
