@@ -21,37 +21,16 @@ pub fn execute_create_account(
     let sponsor = state.active_sponsor_for(&op.destination);
     let account_multiplier = 2i64;
 
-    // Check starting balance meets minimum
-    let min_balance = if sponsor.is_some() {
-        state.minimum_balance_with_counts(context.protocol_version, 0, 0, account_multiplier)?
-    } else {
-        state.minimum_balance_with_counts(context.protocol_version, 0, 0, 0)?
-    };
-    if op.starting_balance < min_balance {
-        return Ok(make_result(CreateAccountResultCode::LowReserve));
-    }
-
-    // Check destination doesn't already exist
+    // Check destination doesn't already exist (matches upstream doApply)
     if state.get_account(&op.destination).is_some() {
         return Ok(make_result(CreateAccountResultCode::AlreadyExist));
     }
 
-    // Get source account and check balance
-    let source_account = match state.get_account(source) {
-        Some(account) => account,
-        None => return Err(TxError::SourceAccountNotFound),
-    };
-
-    // Check source has sufficient available balance
-    let source_min_balance =
-        state.minimum_balance_for_account(source_account, context.protocol_version, 0)?;
-    let available = (source_account.balance - source_min_balance)
-        .saturating_sub(account_liabilities(source_account).selling);
-    if available < op.starting_balance {
-        return Ok(make_result(CreateAccountResultCode::Underfunded));
-    }
-
+    // Check sponsorship / reserve constraints first (matches upstream
+    // createEntryWithPossibleSponsorship which runs before the source
+    // available-balance check).
     if let Some(sponsor) = &sponsor {
+        // Sponsored path: verify sponsor can afford the new account's reserve.
         let sponsor_account = state
             .get_account(sponsor)
             .ok_or(TxError::SourceAccountNotFound)?;
@@ -70,6 +49,28 @@ pub fn execute_create_account(
         if available < sponsor_min_balance {
             return Ok(make_result(CreateAccountResultCode::LowReserve));
         }
+    } else {
+        // Non-sponsored path: starting balance must meet minimum reserve.
+        let min_balance =
+            state.minimum_balance_with_counts(context.protocol_version, 0, 0, 0)?;
+        if op.starting_balance < min_balance {
+            return Ok(make_result(CreateAccountResultCode::LowReserve));
+        }
+    }
+
+    // Get source account and check balance
+    let source_account = match state.get_account(source) {
+        Some(account) => account,
+        None => return Err(TxError::SourceAccountNotFound),
+    };
+
+    // Check source has sufficient available balance
+    let source_min_balance =
+        state.minimum_balance_for_account(source_account, context.protocol_version, 0)?;
+    let available = (source_account.balance - source_min_balance)
+        .saturating_sub(account_liabilities(source_account).selling);
+    if available < op.starting_balance {
+        return Ok(make_result(CreateAccountResultCode::Underfunded));
     }
 
     // Deduct from source. Use in-place mutation to avoid duplicate updates when
@@ -417,6 +418,48 @@ mod tests {
                 assert!(
                     matches!(r, CreateAccountResult::LowReserve),
                     "Should fail with LowReserve, got {:?}",
+                    r
+                );
+            }
+            other => panic!("Unexpected result: {:?}", other),
+        }
+    }
+
+    /// Regression test: when both sponsor is underfunded AND source is
+    /// underfunded, we must return LowReserve (sponsor check first), not
+    /// Underfunded (source check). Matches upstream stellar-core which runs
+    /// createEntryWithPossibleSponsorship before the source balance check.
+    ///
+    /// Reproduces mainnet mismatch at ledger 61232072.
+    #[test]
+    fn test_create_account_sponsor_low_reserve_before_underfunded() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+        let sponsor_id = create_test_account_id(2);
+
+        // Source has minimum balance only — also can't afford starting_balance
+        state.create_account(create_test_account(source_id.clone(), 10_000_000));
+        // Sponsor has minimum balance only — can't afford to sponsor
+        state.create_account(create_test_account(sponsor_id.clone(), 10_000_000));
+
+        state.push_sponsorship(sponsor_id.clone(), dest_id.clone());
+
+        let op = CreateAccountOp {
+            destination: dest_id.clone(),
+            starting_balance: 20_000_000, // source can't afford this either
+        };
+
+        let result = execute_create_account(&op, &source_id, &mut state, &context);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::CreateAccount(r)) => {
+                assert!(
+                    matches!(r, CreateAccountResult::LowReserve),
+                    "Must return LowReserve (sponsor checked first), not Underfunded; got {:?}",
                     r
                 );
             }
