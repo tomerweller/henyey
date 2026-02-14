@@ -547,7 +547,25 @@ impl App {
             {
                 let current_ledger = *self.current_ledger.read().await;
                 let mut buffer = self.syncing_ledgers.write().await;
-                for slot in (last_processed + 1)..=latest_externalized {
+
+                // Only iterate slots that peers are likely to still have
+                // tx_sets for.  When the gap between last_processed and
+                // latest_externalized is large (e.g., after catchup resets
+                // last_processed_slot to current_ledger), iterating old
+                // slots creates syncing_ledgers entries with tx_set: None
+                // that trigger futile fetch requests.  Limit to the most
+                // recent TX_SET_REQUEST_WINDOW slots; the gap check below
+                // (line 618) will trigger catchup for larger gaps.
+                let iter_start = if latest_externalized.saturating_sub(last_processed) > TX_SET_REQUEST_WINDOW {
+                    let skip_to = latest_externalized.saturating_sub(TX_SET_REQUEST_WINDOW);
+                    // Advance last_processed past the skipped range
+                    advance_to = skip_to;
+                    skip_to + 1
+                } else {
+                    last_processed + 1
+                };
+
+                for slot in iter_start..=latest_externalized {
                     // Skip slots that have already been closed. Stale
                     // EXTERNALIZE messages (e.g., from SCP state responses)
                     // can set latest_externalized to old slots whose tx_sets
@@ -1087,8 +1105,7 @@ impl App {
         // Clear per-ledger overlay state (flood gate, etc.) for old ledgers.
         // Mirrors upstream HerderImpl::eraseBelow() -> clearLedgersBelow().
         {
-            let overlay = self.overlay.lock().await;
-            if let Some(overlay) = overlay.as_ref() {
+            if let Some(overlay) = self.overlay().await {
                 overlay.clear_ledgers_below(pending.ledger_seq, pending.ledger_seq);
             }
         }
@@ -1104,8 +1121,7 @@ impl App {
             let diff = new_max.saturating_sub(old_max);
             self.max_tx_size_bytes.store(new_max, Ordering::Relaxed);
             if diff > 0 {
-                let overlay = self.overlay.lock().await;
-                if let Some(overlay) = overlay.as_ref() {
+                if let Some(overlay) = self.overlay().await {
                     overlay.handle_max_tx_size_increase(diff).await;
                 }
             }

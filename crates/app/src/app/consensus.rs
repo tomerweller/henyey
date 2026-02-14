@@ -263,16 +263,12 @@ impl App {
             "Got SCP state for recovery"
         );
 
-        tracing::debug!("Acquiring overlay lock for recovery");
-        let overlay = self.overlay.lock().await;
-        tracing::debug!("Acquired overlay lock for recovery");
-        let overlay = match overlay.as_ref() {
-            Some(o) => o,
-            None => {
-                tracing::debug!("No overlay available for out-of-sync recovery");
-                return;
-            }
+        tracing::debug!("Acquiring overlay for recovery");
+        let Some(overlay) = self.overlay().await else {
+            tracing::debug!("No overlay available for out-of-sync recovery");
+            return;
         };
+        tracing::debug!("Acquired overlay for recovery");
 
         let peer_count = overlay.peer_count();
         if peer_count == 0 {
@@ -280,46 +276,58 @@ impl App {
             return;
         }
 
-        // Broadcast recent SCP envelopes to all peers
-        // This helps peers that might have missed our messages
-        let mut broadcast_count = 0;
-        for envelope in &envelopes {
-            let msg = StellarMessage::ScpMessage(envelope.clone());
-            if let Err(e) = overlay.broadcast(msg).await {
-                tracing::debug!(error = %e, "Failed to broadcast SCP envelope during recovery");
-            } else {
-                broadcast_count += 1;
-            }
-        }
+        // Broadcast recent SCP envelopes + request SCP state from peers.
+        // Spawn as a background task so the main event loop is not blocked.
+        // The overlay and envelopes are cheaply clonable (Arc / Vec).
+        let overlay_clone = Arc::clone(&overlay);
+        let envelope_count = envelopes.len();
+        tokio::spawn(async move {
+            // Broadcast all envelopes concurrently
+            let broadcast_futures: Vec<_> = envelopes
+                .into_iter()
+                .map(|envelope| {
+                    let overlay = Arc::clone(&overlay_clone);
+                    async move {
+                        let msg = StellarMessage::ScpMessage(envelope);
+                        overlay.broadcast(msg).await.is_ok()
+                    }
+                })
+                .collect();
 
-        if broadcast_count > 0 {
-            tracing::info!(
-                broadcast_count,
-                "Broadcast SCP envelopes during out-of-sync recovery"
-            );
-        }
+            let results = futures::future::join_all(broadcast_futures).await;
+            let broadcast_count = results.into_iter().filter(|ok| *ok).count();
 
-        // Request SCP state from peers, starting from current_ledger to get gap slots
-        // Use current_ledger instead of get_min_ledger_seq_to_ask_peers() to ensure
-        // we request envelopes for slots close to where we're stuck.
-        let ledger_seq = current_ledger;
-        match overlay.request_scp_state(ledger_seq).await {
-            Ok(count) => {
+            if broadcast_count > 0 {
                 tracing::info!(
-                    ledger_seq,
-                    peers_requested = count,
-                    attempts,
-                    "Requested SCP state during out-of-sync recovery"
+                    broadcast_count,
+                    "Broadcast SCP envelopes during out-of-sync recovery"
                 );
             }
-            Err(e) => {
-                tracing::warn!(
-                    ledger_seq,
-                    error = %e,
-                    "Failed to request SCP state during out-of-sync recovery"
-                );
+
+            // Request SCP state from peers
+            let ledger_seq = current_ledger;
+            match overlay_clone.request_scp_state(ledger_seq).await {
+                Ok(count) => {
+                    tracing::info!(
+                        ledger_seq,
+                        peers_requested = count,
+                        "Requested SCP state during out-of-sync recovery"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        ledger_seq,
+                        error = %e,
+                        "Failed to request SCP state during out-of-sync recovery"
+                    );
+                }
             }
-        }
+        });
+
+        tracing::debug!(
+            envelope_count,
+            "Spawned background task for recovery broadcast"
+        );
     }
 
     /// Send SCP state to a peer in response to GetScpState.
@@ -327,10 +335,8 @@ impl App {
         let from_slot = from_ledger as u64;
         let (envelopes, quorum_set) = self.herder.get_scp_state(from_slot);
 
-        let overlay = self.overlay.lock().await;
-        let overlay = match overlay.as_ref() {
-            Some(o) => o,
-            None => return,
+        let Some(overlay) = self.overlay().await else {
+            return;
         };
 
         // Send our quorum set first if we have one configured
@@ -359,10 +365,8 @@ impl App {
         peer_id: &henyey_overlay::PeerId,
         requested_hash: stellar_xdr::curr::Uint256,
     ) {
-        let overlay = self.overlay.lock().await;
-        let overlay = match overlay.as_ref() {
-            Some(o) => o,
-            None => return,
+        let Some(overlay) = self.overlay().await else {
+            return;
         };
 
         let req = requested_hash.0;

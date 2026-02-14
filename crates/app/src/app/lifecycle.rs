@@ -10,7 +10,7 @@ impl App {
         // Start overlay network if not already started.
         // (run_cmd may have already started it before catchup)
         {
-            let overlay = self.overlay.lock().await;
+            let overlay = self.overlay.read().await;
             if overlay.is_none() {
                 drop(overlay); // release lock before starting
                 self.start_overlay().await?;
@@ -53,8 +53,10 @@ impl App {
 
         // Get message receiver from overlay
         let message_rx = {
-            let overlay = self.overlay.lock().await;
-            overlay.as_ref().map(|o| o.subscribe())
+            match self.overlay().await {
+                Some(o) => Some(o.subscribe()),
+                None => None,
+            }
         };
 
         let mut message_rx = match message_rx {
@@ -70,8 +72,7 @@ impl App {
 
         // Get dedicated SCP message receiver (never drops messages)
         let scp_message_rx = {
-            let overlay = self.overlay.lock().await;
-            match overlay.as_ref() {
+            match self.overlay().await {
                 Some(o) => o.subscribe_scp().await,
                 None => None,
             }
@@ -88,8 +89,7 @@ impl App {
 
         // Get dedicated fetch response receiver (never drops messages)
         let fetch_response_rx = {
-            let overlay = self.overlay.lock().await;
-            match overlay.as_ref() {
+            match self.overlay().await {
                 Some(o) => o.subscribe_fetch_responses().await,
                 None => None,
             }
@@ -183,7 +183,12 @@ impl App {
         // In-progress background ledger close. Polled in the select loop.
         let mut pending_close: Option<PendingLedgerClose> = None;
 
+        let mut select_iteration: u64 = 0;
         loop {
+            select_iteration += 1;
+            if select_iteration <= 5 || select_iteration % 1000 == 0 {
+                tracing::debug!(select_iteration, "Main loop: entering select!");
+            }
             tokio::select! {
                 // NOTE: Removed biased; to ensure timers get fair polling
 
@@ -194,6 +199,7 @@ impl App {
                         None => std::future::pending().await,
                     }
                 } => {
+                    tracing::debug!(select_iteration, "BRANCH: pending_close completed");
                     let pending = pending_close.take().unwrap();
                     let success = self.handle_close_complete(pending, join_result).await;
                     // Chain next close if successful.
@@ -253,22 +259,26 @@ impl App {
                 // Process SCP messages from dedicated never-drop channel.
                 // These are guaranteed to arrive even if the broadcast channel overflows.
                 Some(scp_msg) = scp_message_rx.recv() => {
+                    tracing::trace!(select_iteration, "BRANCH: scp_message_rx");
                     tracing::debug!(
                         latency_ms = scp_msg.received_at.elapsed().as_millis(),
                         "Received SCP message via dedicated channel"
                     );
                     self.handle_overlay_message(scp_msg).await;
+                    tracing::trace!(select_iteration, "BRANCH: scp_message_rx done");
                 }
 
                 // Process fetch response messages from dedicated never-drop channel.
                 // GeneralizedTxSet, TxSet, DontHave, and ScpQuorumset are routed here
                 // to ensure they are never lost when the broadcast channel overflows.
                 Some(fetch_msg) = fetch_response_rx.recv() => {
+                    tracing::trace!(select_iteration, "BRANCH: fetch_response_rx");
                     tracing::debug!(
                         latency_ms = fetch_msg.received_at.elapsed().as_millis(),
                         "Received fetch response via dedicated channel"
                     );
                     self.handle_overlay_message(fetch_msg).await;
+                    tracing::trace!(select_iteration, "BRANCH: fetch_response_rx done");
                 }
 
                 // Process non-critical overlay messages (TX floods, etc.).
@@ -340,8 +350,7 @@ impl App {
                             survey_data.record_scp_first_to_self_latency(ms);
                         }
                         let msg = StellarMessage::ScpMessage(envelope);
-                        let overlay = self.overlay.lock().await;
-                        if let Some(ref overlay) = *overlay {
+                        if let Some(overlay) = self.overlay().await {
                             match overlay.broadcast(msg).await {
                                 Ok(count) => {
                                     tracing::debug!(slot, peers = count, "Broadcast SCP envelope");
@@ -483,8 +492,8 @@ impl App {
 
                 // Refresh known peers from config + SQLite cache
                 _ = peer_refresh_interval.tick() => {
-                    if let Some(overlay) = self.overlay.lock().await.as_ref() {
-                        let _ = self.refresh_known_peers(overlay);
+                    if let Some(overlay) = self.overlay().await {
+                        let _ = self.refresh_known_peers(&overlay);
                     }
                 }
 
@@ -504,9 +513,7 @@ impl App {
                     let tracking_slot = self.herder.tracking_slot();
                     let ledger = *self.current_ledger.read().await;
                     let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
-                    let overlay = self.overlay.lock().await;
-                    let peers = overlay.as_ref().map(|o| o.peer_count()).unwrap_or(0);
-                    drop(overlay);
+                    let peers = self.overlay().await.map(|o| o.peer_count()).unwrap_or(0);
 
                     // Check quorum status - use latest_ext if available since we have
                     // actual SCP messages for that slot, otherwise fall back to tracking_slot
@@ -696,7 +703,7 @@ impl App {
         let peer_count = overlay.peer_count();
         tracing::info!(peer_count, "Overlay network started");
 
-        *self.overlay.lock().await = Some(overlay);
+        *self.overlay.write().await = Some(Arc::new(overlay));
         Ok(())
     }
 
@@ -755,8 +762,7 @@ impl App {
                     if self.herder.request_quorum_set(hash256, sender_node_id) {
                         // New pending request - need to fetch from network
                         let peer = msg.from_peer.clone();
-                        let overlay = self.overlay.lock().await;
-                        if let Some(ref overlay) = *overlay {
+                        if let Some(overlay) = self.overlay().await {
                             let request =
                                 StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256(hash.0));
                             if let Err(e) = overlay.send_to(&peer, request).await {
@@ -779,8 +785,7 @@ impl App {
                                 self.herder.scp_driver().request_tx_set(tx_set_hash, slot);
                                 if self.herder.needs_tx_set(&tx_set_hash) {
                                     let peer = msg.from_peer.clone();
-                                    let overlay = self.overlay.lock().await;
-                                    if let Some(ref overlay) = *overlay {
+                                    if let Some(overlay) = self.overlay().await {
                                         let request = StellarMessage::GetTxSet(
                                             stellar_xdr::curr::Uint256(tx_set_hash.0),
                                         );
@@ -825,8 +830,7 @@ impl App {
                         );
                         if let Some(tx_set_hash) = tx_set_hash {
                             let peer = msg.from_peer.clone();
-                            let overlay = self.overlay.lock().await;
-                            if let Some(ref overlay) = *overlay {
+                            if let Some(overlay) = self.overlay().await {
                                 let request = StellarMessage::GetTxSet(
                                     stellar_xdr::curr::Uint256(tx_set_hash.0),
                                 );
@@ -1042,8 +1046,7 @@ impl App {
 
         // Get overlay stats if available
         let (peer_count, flood_stats) = {
-            let overlay = self.overlay.lock().await;
-            match overlay.as_ref() {
+            match self.overlay().await {
                 Some(o) => (o.peer_count(), Some(o.flood_stats())),
                 None => (0, None),
             }
@@ -1080,8 +1083,7 @@ impl App {
 
     /// Get the number of connected peers.
     async fn get_peer_count(&self) -> usize {
-        let overlay = self.overlay.lock().await;
-        overlay.as_ref().map(|o| o.peer_count()).unwrap_or(0)
+        self.overlay().await.map(|o| o.peer_count()).unwrap_or(0)
     }
 
     /// Signal the application to shut down.
@@ -1102,10 +1104,20 @@ impl App {
         self.set_state(AppState::ShuttingDown).await;
         self.stop_survey_reporting().await;
 
-        let mut overlay = self.overlay.lock().await;
-        if let Some(mut overlay) = overlay.take() {
-            if let Err(err) = overlay.shutdown().await {
-                tracing::warn!(error = %err, "Overlay shutdown reported error");
+        let mut overlay = self.overlay.write().await;
+        if let Some(overlay_arc) = overlay.take() {
+            match Arc::try_unwrap(overlay_arc) {
+                Ok(mut overlay_owned) => {
+                    if let Err(err) = overlay_owned.shutdown().await {
+                        tracing::warn!(error = %err, "Overlay shutdown reported error");
+                    }
+                }
+                Err(arc) => {
+                    // Other references still exist; just drop and let the
+                    // OverlayManager's Drop impl clean up.
+                    tracing::warn!("Overlay still has outstanding references at shutdown, dropping");
+                    drop(arc);
+                }
             }
         }
 

@@ -367,10 +367,8 @@ impl App {
     }
 
     async fn broadcast_survey_message(&self, message: StellarMessage) -> bool {
-        let overlay = self.overlay.lock().await;
-        let overlay = match overlay.as_ref() {
-            Some(overlay) => overlay,
-            None => return false,
+        let Some(overlay) = self.overlay().await else {
+            return false;
         };
 
         match overlay.broadcast(message).await {
@@ -426,18 +424,14 @@ impl App {
             return;
         }
 
-        let (snapshots, added, dropped) = {
-            let overlay = self.overlay.lock().await;
-            let overlay = match overlay.as_ref() {
-                Some(o) => o,
-                None => return,
-            };
-            (
-                overlay.peer_snapshots(),
-                overlay.added_authenticated_peers(),
-                overlay.dropped_authenticated_peers(),
-            )
+        let Some(overlay) = self.overlay().await else {
+            return;
         };
+        let snapshots = overlay.peer_snapshots();
+        let added = overlay.added_authenticated_peers();
+        let dropped = overlay.dropped_authenticated_peers();
+        drop(overlay);
+
         let (inbound, outbound) = Self::partition_peer_snapshots(snapshots);
         let lost_sync = self.lost_sync_count.load(Ordering::Relaxed);
         let state = self.state().await;
@@ -483,18 +477,14 @@ impl App {
             return;
         }
 
-        let (snapshots, added, dropped) = {
-            let overlay = self.overlay.lock().await;
-            let overlay = match overlay.as_ref() {
-                Some(o) => o,
-                None => return,
-            };
-            (
-                overlay.peer_snapshots(),
-                overlay.added_authenticated_peers(),
-                overlay.dropped_authenticated_peers(),
-            )
+        let Some(overlay) = self.overlay().await else {
+            return;
         };
+        let snapshots = overlay.peer_snapshots();
+        let added = overlay.added_authenticated_peers();
+        let dropped = overlay.dropped_authenticated_peers();
+        drop(overlay);
+
         let (inbound, outbound) = Self::partition_peer_snapshots(snapshots);
         let lost_sync = self.lost_sync_count.load(Ordering::Relaxed);
 
@@ -623,8 +613,7 @@ impl App {
             response: response_message,
         };
 
-        let overlay = self.overlay.lock().await;
-        if let Some(ref overlay) = *overlay {
+        if let Some(overlay) = self.overlay().await {
             if let Err(e) = overlay
                 .send_to(
                     peer_id,
@@ -926,16 +915,13 @@ impl App {
                     }
                 }
 
-                let overlay = self.overlay.lock().await;
-                let overlay = match overlay.as_ref() {
-                    Some(overlay) => overlay,
-                    None => {
-                        scheduler.next_action = now + SURVEY_INTERVAL;
-                        return;
-                    }
+                let Some(overlay) = self.overlay().await else {
+                    scheduler.next_action = now + SURVEY_INTERVAL;
+                    return;
                 };
 
                 let peers = Self::select_survey_peers(overlay.peer_snapshots(), SURVEY_MAX_PEERS);
+                drop(overlay);
 
                 if peers.is_empty() {
                     scheduler.next_action = now + SURVEY_INTERVAL;
@@ -991,18 +977,14 @@ impl App {
     }
 
     pub(super) async fn update_survey_phase(&self) {
-        let (snapshots, added, dropped) = {
-            let overlay = self.overlay.lock().await;
-            let overlay = match overlay.as_ref() {
-                Some(o) => o,
-                None => return,
-            };
-            (
-                overlay.peer_snapshots(),
-                overlay.added_authenticated_peers(),
-                overlay.dropped_authenticated_peers(),
-            )
+        let Some(overlay) = self.overlay().await else {
+            return;
         };
+        let snapshots = overlay.peer_snapshots();
+        let added = overlay.added_authenticated_peers();
+        let dropped = overlay.dropped_authenticated_peers();
+        drop(overlay);
+
         let (inbound, outbound) = Self::partition_peer_snapshots(snapshots);
         let lost_sync = self.lost_sync_count.load(Ordering::Relaxed);
 
@@ -1155,10 +1137,8 @@ impl App {
         peers: &[henyey_overlay::PeerId],
         message: StellarMessage,
     ) -> bool {
-        let overlay = self.overlay.lock().await;
-        let overlay = match overlay.as_ref() {
-            Some(overlay) => overlay,
-            None => return false,
+        let Some(overlay) = self.overlay().await else {
+            return false;
         };
 
         let mut ok = true;
@@ -1175,18 +1155,14 @@ impl App {
         &self,
         message: &TimeSlicedSurveyStartCollectingMessage,
     ) {
-        let (snapshots, added, dropped) = {
-            let overlay = self.overlay.lock().await;
-            let overlay = match overlay.as_ref() {
-                Some(o) => o,
-                None => return,
-            };
-            (
-                overlay.peer_snapshots(),
-                overlay.added_authenticated_peers(),
-                overlay.dropped_authenticated_peers(),
-            )
+        let Some(overlay) = self.overlay().await else {
+            return;
         };
+        let snapshots = overlay.peer_snapshots();
+        let added = overlay.added_authenticated_peers();
+        let dropped = overlay.dropped_authenticated_peers();
+        drop(overlay);
+
         let (inbound, outbound) = Self::partition_peer_snapshots(snapshots);
         let lost_sync = self.lost_sync_count.load(Ordering::Relaxed);
         let state = self.state().await;
@@ -1203,18 +1179,14 @@ impl App {
     }
 
     async fn stop_local_survey_collecting(&self, message: &TimeSlicedSurveyStopCollectingMessage) {
-        let (snapshots, added, dropped) = {
-            let overlay = self.overlay.lock().await;
-            let overlay = match overlay.as_ref() {
-                Some(o) => o,
-                None => return,
-            };
-            (
-                overlay.peer_snapshots(),
-                overlay.added_authenticated_peers(),
-                overlay.dropped_authenticated_peers(),
-            )
+        let Some(overlay) = self.overlay().await else {
+            return;
         };
+        let snapshots = overlay.peer_snapshots();
+        let added = overlay.added_authenticated_peers();
+        let dropped = overlay.dropped_authenticated_peers();
+        drop(overlay);
+
         let (inbound, outbound) = Self::partition_peer_snapshots(snapshots);
         let lost_sync = self.lost_sync_count.load(Ordering::Relaxed);
 

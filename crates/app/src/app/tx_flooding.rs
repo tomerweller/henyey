@@ -38,10 +38,8 @@ impl App {
 
         self.tx_advert_set.write().await.clear();
 
-        let overlay = self.overlay.lock().await;
-        let overlay = match overlay.as_ref() {
-            Some(overlay) => overlay,
-            None => return,
+        let Some(overlay) = self.overlay().await else {
+            return;
         };
 
         let max_advert_size = self.max_advert_size();
@@ -271,10 +269,8 @@ impl App {
     }
 
     pub(super) async fn run_tx_demands(&self) {
-        let overlay = self.overlay.lock().await;
-        let overlay = match overlay.as_ref() {
-            Some(overlay) => overlay,
-            None => return,
+        let Some(overlay) = self.overlay().await else {
+            return;
         };
 
         let mut peers = overlay.peer_snapshots();
@@ -410,10 +406,8 @@ impl App {
         peer_id: &henyey_overlay::PeerId,
         demand: FloodDemand,
     ) {
-        let overlay = self.overlay.lock().await;
-        let overlay = match overlay.as_ref() {
-            Some(overlay) => overlay,
-            None => return,
+        let Some(overlay) = self.overlay().await else {
+            return;
         };
 
         for hash in demand.tx_hashes.0.iter() {
@@ -688,8 +682,7 @@ impl App {
             Some(ts) => ts,
             None => {
                 tracing::debug!(hash = hex::encode(hash), peer = %peer_id, "TxSet not found in cache");
-                let overlay = self.overlay.lock().await;
-                if let Some(ref overlay) = *overlay {
+                if let Some(overlay) = self.overlay().await {
                     let ledger_version = self.ledger_manager.current_header().ledger_version;
                     let message_type = if ledger_version >= 20 {
                         stellar_xdr::curr::MessageType::GeneralizedTxSet
@@ -724,8 +717,7 @@ impl App {
                 };
                 if gen_hash == hash256 {
                     let message = StellarMessage::GeneralizedTxSet(gen_tx_set);
-                    let overlay = self.overlay.lock().await;
-                    if let Some(ref overlay) = *overlay {
+                    if let Some(overlay) = self.overlay().await {
                         if let Err(e) = overlay.send_to(peer_id, message).await {
                             tracing::warn!(hash = %hash256, peer = %peer_id, error = %e, "Failed to send GeneralizedTxSet");
                         } else {
@@ -747,8 +739,7 @@ impl App {
 
         let message = StellarMessage::TxSet(xdr_tx_set);
 
-        let overlay = self.overlay.lock().await;
-        if let Some(ref overlay) = *overlay {
+        if let Some(overlay) = self.overlay().await {
             if let Err(e) = overlay.send_to(peer_id, message).await {
                 tracing::warn!(hash = hex::encode(hash), peer = %peer_id, error = %e, "Failed to send TxSet");
             } else {
@@ -797,13 +788,9 @@ impl App {
             "Will request tx_sets"
         );
 
-        let overlay = self.overlay.lock().await;
-        let overlay = match overlay.as_ref() {
-            Some(o) => o,
-            None => {
-                tracing::warn!("No overlay available to request tx sets");
-                return;
-            }
+        let Some(overlay) = self.overlay().await else {
+            tracing::warn!("No overlay available to request tx sets");
+            return;
         };
 
         let peer_infos = overlay.peer_infos();

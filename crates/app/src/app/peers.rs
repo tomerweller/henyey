@@ -2,24 +2,22 @@ use super::*;
 
 impl App {
     pub async fn peer_snapshots(&self) -> Vec<PeerSnapshot> {
-        let overlay = self.overlay.lock().await;
-        overlay
-            .as_ref()
-            .map(|overlay| overlay.peer_snapshots())
-            .unwrap_or_default()
+        match self.overlay().await {
+            Some(overlay) => overlay.peer_snapshots(),
+            None => Vec::new(),
+        }
     }
 
     pub async fn connect_peer(&self, addr: PeerAddress) -> anyhow::Result<PeerId> {
-        let overlay = self.overlay.lock().await;
-        let overlay = overlay
-            .as_ref()
+        let overlay = self
+            .overlay()
+            .await
             .ok_or_else(|| anyhow::anyhow!("Overlay manager not available"))?;
         overlay.connect(&addr).await.map_err(|e| anyhow::anyhow!(e))
     }
 
     pub async fn disconnect_peer(&self, peer_id: &PeerId) -> bool {
-        let overlay = self.overlay.lock().await;
-        let Some(overlay) = overlay.as_ref() else {
+        let Some(overlay) = self.overlay().await else {
             return false;
         };
         overlay.disconnect(peer_id).await
@@ -30,9 +28,9 @@ impl App {
             anyhow::bail!("Invalid peer id");
         };
         self.db.ban_node(&strkey)?;
-        let overlay = self.overlay.lock().await;
-        let overlay = overlay
-            .as_ref()
+        let overlay = self
+            .overlay()
+            .await
             .ok_or_else(|| anyhow::anyhow!("Overlay manager not available"))?;
         overlay.ban_peer(peer_id).await;
         Ok(())
@@ -43,9 +41,9 @@ impl App {
             anyhow::bail!("Invalid peer id");
         };
         self.db.unban_node(&strkey)?;
-        let overlay = self.overlay.lock().await;
-        let overlay = overlay
-            .as_ref()
+        let overlay = self
+            .overlay()
+            .await
             .ok_or_else(|| anyhow::anyhow!("Overlay manager not available"))?;
         Ok(overlay.unban_peer(peer_id))
     }
@@ -64,70 +62,95 @@ impl App {
     }
 
     /// Maintain peer connections - reconnect if peer count drops too low.
+    ///
+    /// IMPORTANT: This function must NOT hold the overlay lock during connection
+    /// attempts, because each connect can take 30-90 seconds. Holding the lock
+    /// would block the entire main event loop.
     pub(super) async fn maintain_peers(&self) {
         let _ = self
             .db
             .remove_peers_with_failures(self.config.overlay.peer_max_failures);
-        let overlay_guard = self.overlay.lock().await;
-        let overlay = match overlay_guard.as_ref() {
-            Some(o) => o,
-            None => return,
-        };
 
-        let peer_count = overlay.peer_count();
-        let min_peers = 3; // Minimum peers we want
+        // Phase 1: Acquire lock briefly to check peer count and collect candidates.
+        let (_peer_count, _target_outbound, candidates) = {
+            let Some(overlay) = self.overlay().await else {
+                return;
+            };
 
-        if peer_count < min_peers {
+            let peer_count = overlay.peer_count();
+            let min_peers = 3;
+
+            if peer_count >= min_peers {
+                return;
+            }
+
             tracing::info!(
                 peer_count,
                 min_peers,
                 "Peer count below threshold, reconnecting to known peers"
             );
 
-            // Try to reconnect to known peers (dynamic list first, then config).
-            let mut candidates = overlay.known_peers();
-            for addr_str in &self.config.overlay.known_peers {
-                // Parse "host:port" or just "host" (default port 11625)
-                let parts: Vec<&str> = addr_str.split(':').collect();
-                let peer_addr = match parts.len() {
-                    1 => Some(PeerAddress::new(parts[0], 11625)),
-                    2 => parts[1]
-                        .parse()
-                        .ok()
-                        .map(|port| PeerAddress::new(parts[0], port)),
-                    _ => None,
-                };
-                if let Some(addr) = peer_addr {
-                    if !candidates.contains(&addr) {
-                        candidates.push(addr);
+            let candidates = self.refresh_known_peers(&overlay);
+            let target = self.config.overlay.target_outbound_peers;
+            (peer_count, target, candidates)
+        };
+
+        // Phase 2: Connect to candidates concurrently WITHOUT holding the overlay lock.
+        // Each connect acquires the lock briefly and independently.
+        // Use an overall timeout to keep the main loop responsive.
+        let overlay_for_connects = {
+            let Some(overlay) = self.overlay().await else {
+                return;
+            };
+            Arc::clone(&overlay)
+        };
+
+        let connect_futures: Vec<_> = candidates
+            .into_iter()
+            .map(|addr| {
+                let overlay = Arc::clone(&overlay_for_connects);
+                async move {
+                    match tokio::time::timeout(
+                        Duration::from_secs(15),
+                        overlay.connect(&addr),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {
+                            tracing::debug!(addr = %addr, "Reconnected to peer");
+                            true
+                        }
+                        Ok(Err(e)) => {
+                            tracing::debug!(addr = %addr, error = %e, "Failed to reconnect to peer");
+                            false
+                        }
+                        Err(_) => {
+                            tracing::debug!(addr = %addr, "Peer connection timed out (15s)");
+                            false
+                        }
                     }
                 }
+            })
+            .collect();
+
+        // Overall timeout: 20s for all connects combined
+        let reconnected = match tokio::time::timeout(
+            Duration::from_secs(20),
+            futures::future::join_all(connect_futures),
+        )
+        .await
+        {
+            Ok(results) => results.into_iter().any(|ok| ok),
+            Err(_) => {
+                tracing::debug!("Overall maintain_peers connect timeout (20s)");
+                false
             }
+        };
 
-            let mut reconnected = false;
-            let candidates = self.refresh_known_peers(overlay);
-            for addr in candidates {
-                if overlay.peer_count() >= self.config.overlay.target_outbound_peers {
-                    break;
-                }
-
-                if let Err(e) = overlay.connect(&addr).await {
-                    tracing::debug!(addr = %addr, error = %e, "Failed to reconnect to peer");
-                } else {
-                    reconnected = true;
-                }
-            }
-
-            // Drop the lock explicitly before requesting SCP state
-            // (which needs to acquire the lock again)
-            let _ = overlay;
-            drop(overlay_guard);
-
-            if reconnected {
-                // Give peers time to complete handshake
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                self.request_scp_state_from_peers().await;
-            }
+        if reconnected {
+            // Give peers time to complete handshake
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            self.request_scp_state_from_peers().await;
         }
     }
 
@@ -139,17 +162,19 @@ impl App {
     pub(super) async fn send_peer_pings(&self) {
         const PING_TIMEOUT: Duration = Duration::from_secs(60);
 
-        let overlay = self.overlay.lock().await;
-        let overlay = match overlay.as_ref() {
-            Some(o) => o,
-            None => return,
+        // Phase 1: Collect snapshots (no long-lived lock needed).
+        let snapshots = {
+            let Some(overlay) = self.overlay().await else {
+                return;
+            };
+            overlay.peer_snapshots()
         };
 
-        let snapshots = overlay.peer_snapshots();
         if snapshots.is_empty() {
             return;
         }
 
+        // Phase 2: Build the to_ping list (no overlay lock needed).
         let now = Instant::now();
         let mut inflight = self.ping_inflight.write().await;
         let mut peer_inflight = self.peer_ping_inflight.write().await;
@@ -184,10 +209,27 @@ impl App {
         drop(inflight);
         drop(peer_inflight);
 
-        for (peer, hash) in to_ping {
-            let msg = StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256(hash.0));
-            if let Err(e) = overlay.send_to(&peer, msg).await {
-                tracing::debug!(peer = %peer, error = %e, "Failed to send ping");
+        // Phase 3: Send pings concurrently.
+        let Some(overlay) = self.overlay().await else {
+            return;
+        };
+
+        let ping_futures: Vec<_> = to_ping
+            .into_iter()
+            .map(|(peer, hash)| {
+                let overlay = Arc::clone(&overlay);
+                async move {
+                    let msg = StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256(hash.0));
+                    let result = overlay.send_to(&peer, msg).await;
+                    (peer, hash, result.map_err(|_| ()))
+                }
+            })
+            .collect();
+
+        let results = futures::future::join_all(ping_futures).await;
+        for (peer, hash, result) in results {
+            if result.is_err() {
+                tracing::debug!(peer = %peer, "Failed to send ping");
                 let mut inflight = self.ping_inflight.write().await;
                 inflight.remove(&hash);
                 let mut peer_inflight = self.peer_ping_inflight.write().await;
@@ -234,10 +276,8 @@ impl App {
         &self,
         peer_list: stellar_xdr::curr::VecM<stellar_xdr::curr::PeerAddress, 100>,
     ) {
-        let overlay = self.overlay.lock().await;
-        let overlay = match overlay.as_ref() {
-            Some(o) => o,
-            None => return,
+        let Some(overlay) = self.overlay().await else {
+            return;
         };
 
         // Convert XDR peer addresses to our PeerAddress format
@@ -275,7 +315,7 @@ impl App {
             }
         }
 
-        let _ = self.refresh_known_peers(overlay);
+        let _ = self.refresh_known_peers(&overlay);
     }
 
     pub(super) fn parse_peer_address(value: &str) -> Option<PeerAddress> {

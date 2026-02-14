@@ -338,7 +338,10 @@ pub struct App {
     ledger_manager: Arc<LedgerManager>,
 
     /// Overlay network manager.
-    overlay: TokioMutex<Option<OverlayManager>>,
+    /// Wrapped in Arc so callers can clone the reference and use it without
+    /// holding the RwLock, preventing the overlay lock from blocking the main
+    /// event loop during slow network operations.
+    overlay: RwLock<Option<Arc<OverlayManager>>>,
 
     /// Herder for consensus coordination.
     herder: Arc<Herder>,
@@ -917,7 +920,7 @@ impl App {
             keypair,
             bucket_manager,
             ledger_manager,
-            overlay: TokioMutex::new(None),
+            overlay: RwLock::new(None),
             herder,
             current_ledger: RwLock::new(0),
             shutdown_tx,
@@ -1372,12 +1375,21 @@ impl App {
         snapshots
     }
 
+    /// Get a cloned Arc reference to the overlay manager.
+    ///
+    /// This acquires the RwLock briefly (read lock), clones the Arc, and
+    /// drops the lock. Callers can then use the overlay freely without
+    /// blocking other tasks from accessing it.
+    ///
+    /// Returns `None` if the overlay hasn't been started yet.
+    pub(super) async fn overlay(&self) -> Option<Arc<OverlayManager>> {
+        self.overlay.read().await.clone()
+    }
+
     /// Request SCP state from all connected peers.
     pub async fn request_scp_state_from_peers(&self) {
-        let overlay = self.overlay.lock().await;
-        let overlay = match overlay.as_ref() {
-            Some(o) => o,
-            None => return,
+        let Some(overlay) = self.overlay().await else {
+            return;
         };
 
         let peer_count = overlay.peer_count();

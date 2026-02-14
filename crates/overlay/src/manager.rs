@@ -939,6 +939,10 @@ impl OverlayManager {
     }
 
     /// Broadcast a message to all connected peers.
+    ///
+    /// Sends to all peers concurrently using `join_all` to avoid blocking the
+    /// caller for O(N) sequential lock acquisitions + TCP writes. Each per-peer
+    /// send is capped at 10 seconds (the connection-level send timeout).
     pub async fn broadcast(&self, message: StellarMessage) -> Result<usize> {
         if !self.running.load(Ordering::Relaxed) {
             return Err(OverlayError::NotStarted);
@@ -960,17 +964,30 @@ impl OverlayManager {
             .map(|e| (e.key().clone(), Arc::clone(e.value())))
             .collect();
 
-        let mut sent = 0;
-        for (peer_id, peer) in peers {
-            let mut peer_lock = peer.lock().await;
-            if peer_lock.is_ready() {
-                if let Err(e) = peer_lock.send(message.clone()).await {
-                    debug!("Failed to send to {}: {}", peer_id, e);
-                } else {
-                    sent += 1;
+        // Send to all peers concurrently
+        let futures: Vec<_> = peers
+            .into_iter()
+            .map(|(peer_id, peer)| {
+                let msg = message.clone();
+                async move {
+                    let mut peer_lock = peer.lock().await;
+                    if peer_lock.is_ready() {
+                        match peer_lock.send(msg).await {
+                            Ok(()) => true,
+                            Err(e) => {
+                                debug!("Failed to send to {}: {}", peer_id, e);
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    }
                 }
-            }
-        }
+            })
+            .collect();
+
+        let results = futures::future::join_all(futures).await;
+        let sent = results.into_iter().filter(|ok| *ok).count();
 
         debug!("Broadcast {} to {} peers", msg_type, sent);
         Ok(sent)

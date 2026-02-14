@@ -626,9 +626,8 @@ impl App {
     pub async fn start_catchup_message_caching(
         self: &Arc<Self>,
     ) -> Option<tokio::task::JoinHandle<()>> {
-        let overlay = self.overlay.lock().await;
-        if let Some(ref o) = *overlay {
-            let message_rx = o.subscribe_catchup();
+        if let Some(overlay) = self.overlay().await {
+            let message_rx = overlay.subscribe_catchup();
             let app = Arc::clone(self);
             Some(tokio::spawn(async move {
                 app.cache_messages_during_catchup_impl(message_rx).await;
@@ -769,8 +768,8 @@ impl App {
                                 // catchup completes, older tx_sets may be evicted from the sender's
                                 // cache. By requesting from all peers, we maximize our chances of
                                 // getting the tx_set before any single peer evicts it.
-                                let overlay = self.overlay.lock().await;
-                                if let Some(ref overlay) = *overlay {
+                                let overlay = self.overlay().await;
+                                if let Some(overlay) = overlay {
                                     match overlay.request_tx_set(&tx_set_hash.0).await {
                                         Ok(peer_count) => {
                                             requested_tx_sets += 1;
@@ -1414,23 +1413,29 @@ impl App {
                         }
                     }
 
-                    // Set last_processed_slot to the latest externalized slot
-                    // so process_externalized_slots() does NOT re-iterate
-                    // stale slots between current_ledger and the network head.
-                    // Those stale slots have tx_sets that peers have already
-                    // evicted (~60s cache), so creating syncing_ledgers entries
-                    // for them causes an unrecoverable timeout→exhausted→catchup
-                    // loop.  Only future EXTERNALIZE messages (for slots the
-                    // network hasn't closed yet) will be processed.
+                    // Reset last_processed_slot to current_ledger so the main
+                    // loop's process_externalized_slots() re-evaluates the gap
+                    // from current_ledger+1.  Previously this was set to
+                    // latest_ext which skipped all intermediate slots, creating
+                    // an unbridgeable gap between current_ledger and
+                    // last_processed_slot — no ledger closes could happen and
+                    // the node fell into infinite sync recovery loops.
+                    //
+                    // With last_processed_slot = current_ledger, the main loop
+                    // will iterate slots current_ledger+1..=latest_ext:
+                    //  - If gap > TX_SET_REQUEST_WINDOW: triggers another
+                    //    externalized catchup (line 618 in ledger_close.rs)
+                    //  - If gap <= TX_SET_REQUEST_WINDOW: fetches tx_sets from
+                    //    peers (recent enough to still be cached)
                     {
                         let current_ledger = *self.current_ledger.read().await;
                         let latest_ext = self.herder.latest_externalized_slot()
                             .unwrap_or(current_ledger as u64);
-                        *self.last_processed_slot.write().await = latest_ext;
+                        *self.last_processed_slot.write().await = current_ledger as u64;
                         tracing::info!(
                             latest_ext,
                             current_ledger,
-                            "Set last_processed_slot to latest_externalized after catchup"
+                            "Reset last_processed_slot to current_ledger after catchup"
                         );
                     }
 
@@ -1492,6 +1497,27 @@ impl App {
         }
         let gap = latest_externalized.saturating_sub(current_ledger as u64);
         if gap <= TX_SET_REQUEST_WINDOW {
+            return;
+        }
+
+        // Cooldown: don't retry immediately after a catchup attempt.
+        // Failed catchups (e.g., archive checkpoint not yet published)
+        // would otherwise trigger rapid-fire retries because
+        // process_externalized_slots() re-evaluates the gap on every
+        // tick.  10 seconds gives the archive time to publish and
+        // avoids wasting resources on repeated download failures.
+        const CATCHUP_RETRY_COOLDOWN_SECS: u64 = 10;
+        let cooldown_elapsed = self
+            .last_catchup_completed_at
+            .read()
+            .await
+            .map(|t| t.elapsed().as_secs());
+        if cooldown_elapsed.is_some_and(|s| s < CATCHUP_RETRY_COOLDOWN_SECS) {
+            tracing::debug!(
+                cooldown_elapsed = ?cooldown_elapsed,
+                gap,
+                "Externalized catchup skipped due to cooldown"
+            );
             return;
         }
 
