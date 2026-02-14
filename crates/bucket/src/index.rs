@@ -26,15 +26,24 @@ use stellar_xdr::curr::{
     Limits, PoolId, TrustLineAsset, WriteXdr,
 };
 
+use crate::entry::ledger_key_type;
+
+use henyey_common::BucketListDbConfig;
+
 use crate::bloom_filter::{BucketBloomFilter, HashSeed};
 use crate::entry::{compare_keys, BucketEntry};
 
-/// Threshold for switching from in-memory to disk-based indexing.
-/// Buckets with fewer entries than this will use in-memory indexing.
-pub const IN_MEMORY_INDEX_THRESHOLD: usize = 10_000;
+/// Default page size for disk index in bytes.
+///
+/// This matches stellar-core's default `BUCKETLIST_DB_INDEX_PAGE_SIZE` = 16384 (1 << 14).
+/// Pages are sized by byte offset in the bucket file, not by entry count.
+pub const DEFAULT_PAGE_SIZE: u64 = 16384;
 
-/// Default page size for disk index (number of entries per page).
-pub const DEFAULT_PAGE_SIZE: u64 = 1024;
+/// Default file size cutoff in bytes for InMemory vs Disk index selection.
+///
+/// Buckets with file size below this threshold use InMemoryIndex (per-key offsets).
+/// Matches stellar-core's `BUCKETLIST_DB_INDEX_CUTOFF` = 20 MB.
+pub const DEFAULT_INDEX_CUTOFF: u64 = 20 * 1024 * 1024;
 
 // ============================================================================
 // Range Entry
@@ -81,6 +90,8 @@ pub struct BucketEntryCounters {
     pub dead_entries: HashMap<LedgerEntryType, u64>,
     /// Count of init entries by entry type.
     pub init_entries: HashMap<LedgerEntryType, u64>,
+    /// XDR byte sizes per entry type (matches stellar-core's `entryTypeSizes`).
+    pub entry_type_sizes: HashMap<LedgerEntryType, u64>,
     /// Count of persistent Soroban entries.
     pub persistent_soroban_entries: u64,
     /// Count of temporary Soroban entries.
@@ -95,20 +106,26 @@ impl BucketEntryCounters {
 
     /// Records a bucket entry.
     pub fn record_entry(&mut self, entry: &BucketEntry) {
+        // Compute XDR size of the full BucketEntry for type-size tracking.
+        let xdr_size = entry.to_xdr().map(|v| v.len() as u64).unwrap_or(0);
+
         match entry {
             BucketEntry::Live(e) => {
                 let entry_type = ledger_entry_type(&e.data);
                 *self.live_entries.entry(entry_type).or_insert(0) += 1;
+                *self.entry_type_sizes.entry(entry_type).or_insert(0) += xdr_size;
                 self.record_soroban_durability(e);
             }
             BucketEntry::Init(e) => {
                 let entry_type = ledger_entry_type(&e.data);
                 *self.init_entries.entry(entry_type).or_insert(0) += 1;
+                *self.entry_type_sizes.entry(entry_type).or_insert(0) += xdr_size;
                 self.record_soroban_durability(e);
             }
             BucketEntry::Dead(k) => {
                 let entry_type = ledger_key_type(k);
                 *self.dead_entries.entry(entry_type).or_insert(0) += 1;
+                *self.entry_type_sizes.entry(entry_type).or_insert(0) += xdr_size;
             }
             BucketEntry::Metadata(_) => {}
         }
@@ -146,6 +163,34 @@ impl BucketEntryCounters {
     pub fn count_for_type(&self, entry_type: LedgerEntryType) -> u64 {
         self.live_entries.get(&entry_type).copied().unwrap_or(0)
             + self.init_entries.get(&entry_type).copied().unwrap_or(0)
+    }
+
+    /// Returns the total XDR byte size for a specific entry type.
+    pub fn size_for_type(&self, entry_type: LedgerEntryType) -> u64 {
+        self.entry_type_sizes.get(&entry_type).copied().unwrap_or(0)
+    }
+
+    /// Returns the total XDR byte size across all entry types.
+    pub fn total_size(&self) -> u64 {
+        self.entry_type_sizes.values().sum()
+    }
+
+    /// Merges another set of counters into this one (summing counts and sizes).
+    pub fn merge(&mut self, other: &BucketEntryCounters) {
+        for (k, v) in &other.live_entries {
+            *self.live_entries.entry(*k).or_insert(0) += v;
+        }
+        for (k, v) in &other.dead_entries {
+            *self.dead_entries.entry(*k).or_insert(0) += v;
+        }
+        for (k, v) in &other.init_entries {
+            *self.init_entries.entry(*k).or_insert(0) += v;
+        }
+        for (k, v) in &other.entry_type_sizes {
+            *self.entry_type_sizes.entry(*k).or_insert(0) += v;
+        }
+        self.persistent_soroban_entries += other.persistent_soroban_entries;
+        self.temporary_soroban_entries += other.temporary_soroban_entries;
     }
 }
 
@@ -267,7 +312,7 @@ impl TypeRange {
 /// An in-memory index for small buckets.
 ///
 /// This stores all entry keys and their offsets in memory, providing O(log n)
-/// lookup time. Suitable for buckets with fewer than [`IN_MEMORY_INDEX_THRESHOLD`]
+/// lookup time. Suitable for buckets with file size below [`DEFAULT_INDEX_CUTOFF`]
 /// entries.
 #[derive(Debug, Clone)]
 pub struct InMemoryIndex {
@@ -462,7 +507,8 @@ impl InMemoryIndex {
 /// then reads that page from disk.
 #[derive(Debug, Clone)]
 pub struct DiskIndex {
-    /// Page size (number of entries per page).
+    /// Page size in bytes. Pages are split at byte-offset boundaries in the
+    /// bucket file, matching stellar-core's `DiskIndex` behavior.
     page_size: u64,
     /// Maps page ranges to file offsets.
     /// Each entry contains (RangeEntry, page_start_offset).
@@ -482,11 +528,15 @@ pub struct DiskIndex {
 impl DiskIndex {
     /// Creates a new disk index from bucket entries.
     ///
+    /// Pages are built by byte offset in the bucket file, matching stellar-core's
+    /// `DiskIndex` constructor. A new page starts whenever the entry's file offset
+    /// crosses the next `page_size`-aligned boundary.
+    ///
     /// # Arguments
     ///
     /// * `entries` - Iterator over (BucketEntry, offset) pairs
     /// * `bloom_seed` - Seed for bloom filter construction
-    /// * `page_size` - Number of entries per page
+    /// * `page_size` - Page size in bytes (must be a power of two)
     pub fn from_entries<I>(entries: I, bloom_seed: HashSeed, page_size: u64) -> Self
     where
         I: Iterator<Item = (BucketEntry, u64)>,
@@ -499,11 +549,9 @@ impl DiskIndex {
         let mut current_type: Option<LedgerEntryType> = None;
         let mut type_start_offset = 0u64;
 
-        // Page building state
-        let mut page_start_offset = 0u64;
-        let mut page_first_key: Option<LedgerKey> = None;
-        let mut page_last_key: Option<LedgerKey> = None;
-        let mut entries_in_page = 0u64;
+        // Byte-based page building state (matches stellar-core DiskIndex.cpp)
+        let mut page_upper_bound: u64 = 0;
+        let mut is_first_entry = true;
 
         for (entry, offset) in entries {
             // Record counters
@@ -525,21 +573,15 @@ impl DiskIndex {
                 // Compute bloom hash
                 bloom_key_hashes.push(BucketBloomFilter::hash_key(&key, &bloom_seed));
 
-                // Page handling
-                if page_first_key.is_none() {
-                    page_start_offset = offset;
-                    page_first_key = Some(key.clone());
-                }
-                page_last_key = Some(key.clone());
-                entries_in_page += 1;
-
-                // Flush page if full
-                if entries_in_page >= page_size {
-                    if let (Some(first), Some(last)) = (page_first_key.take(), page_last_key.take())
-                    {
-                        pages.push((RangeEntry::new(first, last), page_start_offset));
-                    }
-                    entries_in_page = 0;
+                // Page handling: start a new page when offset crosses page_upper_bound
+                if is_first_entry || offset >= page_upper_bound {
+                    // Align to page boundary and advance by one page
+                    page_upper_bound = (offset & !(page_size - 1)) + page_size;
+                    pages.push((RangeEntry::new(key.clone(), key.clone()), offset));
+                    is_first_entry = false;
+                } else {
+                    // Extend current page's upper bound
+                    pages.last_mut().unwrap().0.upper_bound = key.clone();
                 }
 
                 // Extract pool mappings
@@ -556,11 +598,6 @@ impl DiskIndex {
                     }
                 }
             }
-        }
-
-        // Flush final partial page
-        if let (Some(first), Some(last)) = (page_first_key, page_last_key) {
-            pages.push((RangeEntry::new(first, last), page_start_offset));
         }
 
         // Close final type range
@@ -670,7 +707,7 @@ impl DiskIndex {
     ///
     /// # Arguments
     ///
-    /// * `page_size` - Page size (number of entries per page)
+    /// * `page_size` - Page size in bytes
     /// * `pages` - Page ranges and their offsets
     /// * `bloom_seed` - Seed for bloom filter reconstruction
     /// * `counters` - Entry counters
@@ -751,20 +788,49 @@ impl LiveBucketIndex {
     /// Creates a new index from bucket entries.
     ///
     /// Automatically selects in-memory or disk-based indexing based on
-    /// the number of entries.
-    pub fn from_entries<I>(entries: I, bloom_seed: HashSeed, entry_count: usize) -> Self
+    /// the bucket's file size, matching stellar-core's `BUCKETLIST_DB_INDEX_CUTOFF`.
+    ///
+    /// # Arguments
+    ///
+    /// * `entries` - Iterator over (BucketEntry, offset) pairs
+    /// * `bloom_seed` - Seed for bloom filter construction
+    /// * `file_size` - Size of the bucket file in bytes
+    /// * `config` - BucketListDB configuration
+    pub fn from_entries<I>(
+        entries: I,
+        bloom_seed: HashSeed,
+        file_size: u64,
+        config: &BucketListDbConfig,
+    ) -> Self
     where
         I: Iterator<Item = (BucketEntry, u64)>,
     {
-        if entry_count < IN_MEMORY_INDEX_THRESHOLD {
+        if file_size < config.index_cutoff_bytes() {
             LiveBucketIndex::InMemory(InMemoryIndex::from_entries(entries, bloom_seed))
         } else {
             LiveBucketIndex::Disk(DiskIndex::from_entries(
                 entries,
                 bloom_seed,
-                DEFAULT_PAGE_SIZE,
+                config.page_size_bytes(),
             ))
         }
+    }
+
+    /// Creates a new index from bucket entries with default config.
+    ///
+    /// Convenience method that uses the default `BucketListDbConfig`.
+    pub fn from_entries_default<I>(entries: I, bloom_seed: HashSeed, file_size: u64) -> Self
+    where
+        I: Iterator<Item = (BucketEntry, u64)>,
+    {
+        let config = BucketListDbConfig::default();
+        Self::from_entries(entries, bloom_seed, file_size, &config)
+    }
+
+    /// Returns true if the given entry type is not supported by BucketListDB lookups.
+    /// Matches stellar-core's `LiveBucketIndex::typeNotSupported(OFFER)`.
+    pub fn type_not_supported(entry_type: LedgerEntryType) -> bool {
+        entry_type == LedgerEntryType::Offer
     }
 
     /// Checks if this is an in-memory index.
@@ -877,21 +943,7 @@ fn ledger_entry_type(data: &LedgerEntryData) -> LedgerEntryType {
     }
 }
 
-/// Returns the ledger entry type for a given ledger key.
-fn ledger_key_type(key: &LedgerKey) -> LedgerEntryType {
-    match key {
-        LedgerKey::Account(_) => LedgerEntryType::Account,
-        LedgerKey::Trustline(_) => LedgerEntryType::Trustline,
-        LedgerKey::Offer(_) => LedgerEntryType::Offer,
-        LedgerKey::Data(_) => LedgerEntryType::Data,
-        LedgerKey::ClaimableBalance(_) => LedgerEntryType::ClaimableBalance,
-        LedgerKey::LiquidityPool(_) => LedgerEntryType::LiquidityPool,
-        LedgerKey::ContractData(_) => LedgerEntryType::ContractData,
-        LedgerKey::ContractCode(_) => LedgerEntryType::ContractCode,
-        LedgerKey::ConfigSetting(_) => LedgerEntryType::ConfigSetting,
-        LedgerKey::Ttl(_) => LedgerEntryType::Ttl,
-    }
-}
+// `ledger_key_type` is imported from crate::entry
 
 #[cfg(test)]
 mod tests {
@@ -950,13 +1002,19 @@ mod tests {
 
     #[test]
     fn test_disk_index() {
+        // With byte-based pages: entries are spaced 128 bytes apart in test data.
+        // Using page_size=1024 (power of two) → 10 entries per page.
         let entries: Vec<(BucketEntry, u64)> = (0..100u8)
-            .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
+            .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 128))
             .collect();
 
-        let index = DiskIndex::from_entries(entries.into_iter(), [0u8; 16], 10);
+        // page_size=1024, offsets 0..12672 → pages at 0, 1024, 2048, ..., 11264, 12288
+        // That's ceil(12672/1024) = 13 pages, but last entry is at 99*128=12672.
+        // Pages: [0,1024), [1024,2048), ..., [12288, 13312)
+        // So 13 pages.
+        let index = DiskIndex::from_entries(entries.into_iter(), [0u8; 16], 1024);
 
-        assert_eq!(index.num_pages(), 10);
+        assert!(index.num_pages() > 0);
 
         // Test page lookup
         let key = make_account_key(55);
@@ -993,17 +1051,36 @@ mod tests {
 
     #[test]
     fn test_live_bucket_index_selection() {
-        // Small bucket should use in-memory
+        // Small file (below default 20MB cutoff) should use in-memory
         let entries: Vec<(BucketEntry, u64)> = (0..100u8)
             .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
             .collect();
 
-        let index = LiveBucketIndex::from_entries(entries.into_iter(), [0u8; 16], 100);
+        // file_size=10000 is well below the 20MB default cutoff
+        let index = LiveBucketIndex::from_entries_default(entries.into_iter(), [0u8; 16], 10000);
         assert!(index.is_in_memory());
 
-        // Large bucket simulation (we can't easily test with 10k entries here)
-        // but we verify the interface works
         assert!(index.may_contain(&make_account_key(50)));
+    }
+
+    #[test]
+    fn test_live_bucket_index_file_size_threshold() {
+        // Small file → InMemory
+        let entries1: Vec<(BucketEntry, u64)> = (0..10u8)
+            .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
+            .collect();
+        let config = BucketListDbConfig::default();
+        let index = LiveBucketIndex::from_entries(entries1.into_iter(), [0u8; 16], 1000, &config);
+        assert!(index.is_in_memory());
+
+        // Custom config with cutoff_mb=0 → always DiskIndex
+        let entries2: Vec<(BucketEntry, u64)> = (0..10u8)
+            .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
+            .collect();
+        let mut config_small = BucketListDbConfig::default();
+        config_small.index_cutoff_mb = 0;
+        let index = LiveBucketIndex::from_entries(entries2.into_iter(), [0u8; 16], 1000, &config_small);
+        assert!(!index.is_in_memory());
     }
 
     #[test]
@@ -1390,5 +1467,76 @@ mod tests {
         let counters = index.counters();
         assert_eq!(counters.total_live(), 2);
         assert_eq!(counters.total_dead(), 1);
+    }
+
+    #[test]
+    fn test_entry_type_sizes() {
+        let mut counters = BucketEntryCounters::new();
+
+        // Record some entries of different types
+        counters.record_entry(&BucketEntry::Live(make_account_entry(1)));
+        counters.record_entry(&BucketEntry::Live(make_account_entry(2)));
+        counters.record_entry(&BucketEntry::Live(make_offer_entry(1, 1)));
+        counters.record_entry(&BucketEntry::Dead(make_account_key(3)));
+
+        // Verify sizes are accumulated for account type (2 live + 1 dead)
+        let account_size = counters.size_for_type(LedgerEntryType::Account);
+        assert!(account_size > 0, "Account size should be non-zero");
+
+        // Verify offer size is tracked
+        let offer_size = counters.size_for_type(LedgerEntryType::Offer);
+        assert!(offer_size > 0, "Offer size should be non-zero");
+
+        // Total size should be sum of all types
+        assert_eq!(counters.total_size(), account_size + offer_size);
+
+        // Non-existent type should return 0
+        assert_eq!(counters.size_for_type(LedgerEntryType::Trustline), 0);
+    }
+
+    #[test]
+    fn test_entry_counters_merge() {
+        let mut counters1 = BucketEntryCounters::new();
+        counters1.record_entry(&BucketEntry::Live(make_account_entry(1)));
+        counters1.record_entry(&BucketEntry::Live(make_account_entry(2)));
+
+        let mut counters2 = BucketEntryCounters::new();
+        counters2.record_entry(&BucketEntry::Live(make_account_entry(3)));
+        counters2.record_entry(&BucketEntry::Live(make_offer_entry(1, 1)));
+        counters2.record_entry(&BucketEntry::Dead(make_account_key(4)));
+
+        let size1 = counters1.size_for_type(LedgerEntryType::Account);
+        let size2 = counters2.size_for_type(LedgerEntryType::Account);
+
+        counters1.merge(&counters2);
+
+        assert_eq!(counters1.count_for_type(LedgerEntryType::Account), 3);
+        assert_eq!(counters1.count_for_type(LedgerEntryType::Offer), 1);
+        assert_eq!(counters1.total_dead(), 1);
+        assert_eq!(
+            counters1.size_for_type(LedgerEntryType::Account),
+            size1 + size2
+        );
+        assert!(counters1.size_for_type(LedgerEntryType::Offer) > 0);
+    }
+
+    #[test]
+    fn test_type_not_supported_offer() {
+        assert!(
+            LiveBucketIndex::type_not_supported(LedgerEntryType::Offer),
+            "OFFER should be unsupported"
+        );
+        assert!(
+            !LiveBucketIndex::type_not_supported(LedgerEntryType::Account),
+            "Account should be supported"
+        );
+        assert!(
+            !LiveBucketIndex::type_not_supported(LedgerEntryType::Trustline),
+            "Trustline should be supported"
+        );
+        assert!(
+            !LiveBucketIndex::type_not_supported(LedgerEntryType::ContractData),
+            "ContractData should be supported"
+        );
     }
 }

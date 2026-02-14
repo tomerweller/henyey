@@ -139,7 +139,7 @@ pub use bloom_filter::{BucketBloomFilter, HashSeed, HASH_KEY_BYTES};
 
 pub use entry::{
     compare_entries, compare_keys, get_ttl_key, is_persistent_entry, ledger_entry_to_key,
-    BucketEntry,
+    ledger_key_type, BucketEntry,
 };
 
 // ============================================================================
@@ -206,7 +206,7 @@ pub use snapshot::{
 
 pub use index::{
     AssetPoolIdMap, BucketEntryCounters, DiskIndex, InMemoryIndex, LiveBucketIndex, RangeEntry,
-    TypeRange, DEFAULT_PAGE_SIZE, IN_MEMORY_INDEX_THRESHOLD,
+    TypeRange, DEFAULT_INDEX_CUTOFF, DEFAULT_PAGE_SIZE,
 };
 
 // ============================================================================

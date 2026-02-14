@@ -256,7 +256,8 @@ pub fn compare_keys(a: &LedgerKey, b: &LedgerKey) -> Ordering {
     }
 }
 
-fn ledger_key_type(key: &LedgerKey) -> stellar_xdr::curr::LedgerEntryType {
+/// Returns the ledger entry type for a given ledger key.
+pub fn ledger_key_type(key: &LedgerKey) -> stellar_xdr::curr::LedgerEntryType {
     match key {
         LedgerKey::Account(_) => stellar_xdr::curr::LedgerEntryType::Account,
         LedgerKey::Trustline(_) => stellar_xdr::curr::LedgerEntryType::Trustline,

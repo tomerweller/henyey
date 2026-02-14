@@ -42,6 +42,8 @@
 
 use crate::{
     cache::RandomEvictionCache,
+    entry::ledger_key_type,
+    index::LiveBucketIndex,
     Bucket, BucketEntry, BucketLevel, BucketList, HotArchiveBucket, HotArchiveBucketLevel,
     HotArchiveBucketList,
 };
@@ -304,7 +306,14 @@ impl BucketListSnapshot {
     /// If a shared cache is present, checks it first and populates it on miss.
     /// Searches from level 0 (most recent) to level 10 (oldest), returning
     /// the first live entry found or `None` if the key is dead or not present.
+    ///
+    /// Returns `None` immediately for OFFER keys (matching stellar-core's
+    /// `LiveBucketIndex::typeNotSupported`).
     pub fn get(&self, key: &LedgerKey) -> Option<LedgerEntry> {
+        if LiveBucketIndex::type_not_supported(ledger_key_type(key)) {
+            return None;
+        }
+
         // Check cache first for eligible key types.
         if let Some(ref cache) = self.cache {
             if cache.is_active() && RandomEvictionCache::is_cached_type(key) {
@@ -349,7 +358,13 @@ impl BucketListSnapshot {
     /// If a shared cache is present, checks it first and populates it on miss.
     /// Serializes the key once and reuses the bytes across all bucket lookups
     /// to avoid redundant XDR serialization.
+    ///
+    /// Returns `Ok(None)` immediately for OFFER keys.
     pub fn get_result(&self, key: &LedgerKey) -> crate::Result<Option<LedgerEntry>> {
+        if LiveBucketIndex::type_not_supported(ledger_key_type(key)) {
+            return Ok(None);
+        }
+
         // Check cache first for eligible key types.
         if let Some(ref cache) = self.cache {
             if cache.is_active() && RandomEvictionCache::is_cached_type(key) {
@@ -399,16 +414,24 @@ impl BucketListSnapshot {
     ///
     /// This is significantly faster than individual lookups when loading related entries
     /// (e.g., an account and its trustlines) because it avoids re-traversing upper levels.
+    ///
+    /// OFFER keys are skipped (matching stellar-core's `typeNotSupported`).
     pub fn load_keys_result(&self, keys: &[LedgerKey]) -> crate::Result<Vec<LedgerEntry>> {
         use stellar_xdr::curr::{Limits, WriteXdr};
 
         let mut result = Vec::with_capacity(keys.len());
 
+        // Filter out unsupported types (OFFER).
+        let keys: Vec<&LedgerKey> = keys
+            .iter()
+            .filter(|k| !LiveBucketIndex::type_not_supported(ledger_key_type(k)))
+            .collect();
+
         // Check cache first for eligible keys, collecting remaining keys for level scan.
         let mut uncached_keys: Vec<&LedgerKey> = Vec::with_capacity(keys.len());
         if let Some(ref cache) = self.cache {
             if cache.is_active() {
-                for key in keys {
+                for key in &keys {
                     if RandomEvictionCache::is_cached_type(key) {
                         if let Some(cached) = cache.get(key) {
                             match cached.as_ref() {
@@ -424,10 +447,10 @@ impl BucketListSnapshot {
                     uncached_keys.push(key);
                 }
             } else {
-                uncached_keys.extend(keys.iter());
+                uncached_keys.extend(keys.iter().copied());
             }
         } else {
-            uncached_keys.extend(keys.iter());
+            uncached_keys.extend(keys.iter().copied());
         }
 
         if uncached_keys.is_empty() {
@@ -933,21 +956,7 @@ fn ledger_entry_type(data: &LedgerEntryData) -> LedgerEntryType {
     }
 }
 
-/// Returns the ledger entry type for a given ledger key.
-fn ledger_key_type(key: &LedgerKey) -> LedgerEntryType {
-    match key {
-        LedgerKey::Account(_) => LedgerEntryType::Account,
-        LedgerKey::Trustline(_) => LedgerEntryType::Trustline,
-        LedgerKey::Offer(_) => LedgerEntryType::Offer,
-        LedgerKey::Data(_) => LedgerEntryType::Data,
-        LedgerKey::ClaimableBalance(_) => LedgerEntryType::ClaimableBalance,
-        LedgerKey::LiquidityPool(_) => LedgerEntryType::LiquidityPool,
-        LedgerKey::ContractData(_) => LedgerEntryType::ContractData,
-        LedgerKey::ContractCode(_) => LedgerEntryType::ContractCode,
-        LedgerKey::ConfigSetting(_) => LedgerEntryType::ConfigSetting,
-        LedgerKey::Ttl(_) => LedgerEntryType::Ttl,
-    }
-}
+// ledger_key_type is imported from crate::entry
 
 /// A searchable wrapper around a hot archive bucket list snapshot.
 pub struct SearchableHotArchiveBucketListSnapshot {

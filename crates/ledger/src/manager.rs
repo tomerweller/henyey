@@ -3055,12 +3055,6 @@ impl<'a> LedgerCloseContext<'a> {
                     hit_rate = format!("{:.1}%", stats.hit_rate * 100.0),
                     account_hits = stats.account_hits,
                     account_misses = stats.account_misses,
-                    trustline_hits = stats.trustline_hits,
-                    trustline_misses = stats.trustline_misses,
-                    claimable_balance_hits = stats.claimable_balance_hits,
-                    claimable_balance_misses = stats.claimable_balance_misses,
-                    liquidity_pool_hits = stats.liquidity_pool_hits,
-                    liquidity_pool_misses = stats.liquidity_pool_misses,
                     "Entry cache stats"
                 );
                 cache.reset_counters();
@@ -3072,12 +3066,6 @@ impl<'a> LedgerCloseContext<'a> {
                     hit_rate: stats.hit_rate,
                     account_hits: stats.account_hits,
                     account_misses: stats.account_misses,
-                    trustline_hits: stats.trustline_hits,
-                    trustline_misses: stats.trustline_misses,
-                    claimable_balance_hits: stats.claimable_balance_hits,
-                    claimable_balance_misses: stats.claimable_balance_misses,
-                    liquidity_pool_hits: stats.liquidity_pool_hits,
-                    liquidity_pool_misses: stats.liquidity_pool_misses,
                 }
             } else {
                 crate::close::CachePerfStats::default()

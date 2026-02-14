@@ -1,17 +1,15 @@
-//! Random eviction cache for frequently-accessed bucket entries.
+//! Random eviction cache for frequently-accessed account entries.
 //!
 //! This module provides an LRU-style cache for bucket entries that are
-//! frequently accessed during transaction validation. The cache is particularly
-//! useful for account, trustline, claimable balance, and liquidity pool entries,
-//! which are accessed repeatedly.
+//! frequently accessed during transaction validation. The cache only stores
+//! ACCOUNT entries, matching stellar-core's behavior.
 //!
 //! # Design
 //!
 //! The cache uses a "least-recent-out-of-2-random-choices" eviction strategy,
 //! matching stellar-core's approach. This degrades more gracefully across
 //! pathological load patterns than strict LRU, with less bookkeeping. Only
-//! certain entry types (accounts, trustlines, claimable balances, and liquidity
-//! pools) are cached, as they are the most frequently accessed.
+//! ACCOUNT entries are cached, as they are the most frequently accessed.
 //!
 //! # Thread Safety
 //!
@@ -124,11 +122,7 @@ impl CacheEntry {
 ///
 /// # Entry Type Filtering
 ///
-/// Only certain entry types are cached:
-/// - Account entries: Most frequently accessed
-/// - Trustline entries: Second most frequently accessed
-/// - ClaimableBalance entries: Frequently accessed during claims
-/// - LiquidityPool entries: Frequently accessed during pool operations
+/// Only ACCOUNT entries are cached, matching stellar-core's behavior.
 ///
 /// # Memory Management
 ///
@@ -158,20 +152,14 @@ struct CacheInner {
     access_counter: u64,
     /// Simple xorshift64 RNG state for eviction sampling.
     rng_state: u64,
-    /// Cache hit count for statistics.
+    /// Cache hit count for statistics (account only).
     hits: u64,
-    /// Cache miss count for statistics.
+    /// Cache miss count for statistics (account only).
     misses: u64,
-    /// Per-type hit counts.
+    /// Account-specific hit count (same as hits since only accounts are cached).
     account_hits: u64,
-    trustline_hits: u64,
-    claimable_balance_hits: u64,
-    liquidity_pool_hits: u64,
-    /// Per-type miss counts.
+    /// Account-specific miss count (same as misses since only accounts are cached).
     account_misses: u64,
-    trustline_misses: u64,
-    claimable_balance_misses: u64,
-    liquidity_pool_misses: u64,
 }
 
 impl CacheInner {
@@ -204,13 +192,7 @@ impl RandomEvictionCache {
                 hits: 0,
                 misses: 0,
                 account_hits: 0,
-                trustline_hits: 0,
-                claimable_balance_hits: 0,
-                liquidity_pool_hits: 0,
                 account_misses: 0,
-                trustline_misses: 0,
-                claimable_balance_misses: 0,
-                liquidity_pool_misses: 0,
             }),
             max_bytes,
             max_entries,
@@ -247,17 +229,9 @@ impl RandomEvictionCache {
 
     /// Checks if an entry type should be cached.
     ///
-    /// Account, Trustline, ClaimableBalance, and LiquidityPool entries are
-    /// cached, as they are the most frequently accessed entry types during
-    /// transaction execution.
+    /// Only ACCOUNT entries are cached, matching stellar-core's behavior.
     pub fn is_cached_type(key: &LedgerKey) -> bool {
-        matches!(
-            key,
-            LedgerKey::Account(_)
-                | LedgerKey::Trustline(_)
-                | LedgerKey::ClaimableBalance(_)
-                | LedgerKey::LiquidityPool(_)
-        )
+        matches!(key, LedgerKey::Account(_))
     }
 
     /// Gets an entry from the cache.
@@ -276,23 +250,11 @@ impl RandomEvictionCache {
             entry.access_count = current_counter;
             let result = Arc::clone(&entry.entry);
             inner.hits += 1;
-            match key {
-                LedgerKey::Account(_) => inner.account_hits += 1,
-                LedgerKey::Trustline(_) => inner.trustline_hits += 1,
-                LedgerKey::ClaimableBalance(_) => inner.claimable_balance_hits += 1,
-                LedgerKey::LiquidityPool(_) => inner.liquidity_pool_hits += 1,
-                _ => {}
-            }
+            inner.account_hits += 1;
             Some(result)
         } else {
             inner.misses += 1;
-            match key {
-                LedgerKey::Account(_) => inner.account_misses += 1,
-                LedgerKey::Trustline(_) => inner.trustline_misses += 1,
-                LedgerKey::ClaimableBalance(_) => inner.claimable_balance_misses += 1,
-                LedgerKey::LiquidityPool(_) => inner.liquidity_pool_misses += 1,
-                _ => {}
-            }
+            inner.account_misses += 1;
             None
         }
     }
@@ -372,13 +334,7 @@ impl RandomEvictionCache {
         inner.hits = 0;
         inner.misses = 0;
         inner.account_hits = 0;
-        inner.trustline_hits = 0;
-        inner.claimable_balance_hits = 0;
-        inner.liquidity_pool_hits = 0;
         inner.account_misses = 0;
-        inner.trustline_misses = 0;
-        inner.claimable_balance_misses = 0;
-        inner.liquidity_pool_misses = 0;
         self.current_bytes.store(0, Ordering::Relaxed);
     }
 
@@ -441,12 +397,6 @@ impl RandomEvictionCache {
             active: self.is_active(),
             account_hits: inner.account_hits,
             account_misses: inner.account_misses,
-            trustline_hits: inner.trustline_hits,
-            trustline_misses: inner.trustline_misses,
-            claimable_balance_hits: inner.claimable_balance_hits,
-            claimable_balance_misses: inner.claimable_balance_misses,
-            liquidity_pool_hits: inner.liquidity_pool_hits,
-            liquidity_pool_misses: inner.liquidity_pool_misses,
         }
     }
 
@@ -474,13 +424,7 @@ impl RandomEvictionCache {
         inner.hits = 0;
         inner.misses = 0;
         inner.account_hits = 0;
-        inner.trustline_hits = 0;
-        inner.claimable_balance_hits = 0;
-        inner.liquidity_pool_hits = 0;
         inner.account_misses = 0;
-        inner.trustline_misses = 0;
-        inner.claimable_balance_misses = 0;
-        inner.liquidity_pool_misses = 0;
     }
 }
 
@@ -530,18 +474,6 @@ pub struct CacheStats {
     pub account_hits: u64,
     /// Account-specific miss count.
     pub account_misses: u64,
-    /// Trustline-specific hit count.
-    pub trustline_hits: u64,
-    /// Trustline-specific miss count.
-    pub trustline_misses: u64,
-    /// ClaimableBalance-specific hit count.
-    pub claimable_balance_hits: u64,
-    /// ClaimableBalance-specific miss count.
-    pub claimable_balance_misses: u64,
-    /// LiquidityPool-specific hit count.
-    pub liquidity_pool_hits: u64,
-    /// LiquidityPool-specific miss count.
-    pub liquidity_pool_misses: u64,
 }
 
 #[cfg(test)]
@@ -641,28 +573,25 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_accounts_and_trustlines() {
-        let cache = RandomEvictionCache::new();
-        cache.activate();
-
+    fn test_is_cached_type_account_only() {
         // Account key should be cached
         assert!(RandomEvictionCache::is_cached_type(&make_account_key(1)));
 
-        // Trustline key should be cached
+        // Trustline key should NOT be cached (matching stellar-core)
         let trustline_key = make_trustline_key(1, b"USD\0");
-        assert!(RandomEvictionCache::is_cached_type(&trustline_key));
+        assert!(!RandomEvictionCache::is_cached_type(&trustline_key));
 
-        // ClaimableBalance key should be cached
+        // ClaimableBalance key should NOT be cached
         let cb_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
             balance_id: ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([0; 32])),
         });
-        assert!(RandomEvictionCache::is_cached_type(&cb_key));
+        assert!(!RandomEvictionCache::is_cached_type(&cb_key));
 
-        // LiquidityPool key should be cached
+        // LiquidityPool key should NOT be cached
         let lp_key = LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
             liquidity_pool_id: PoolId(Hash([0; 32])),
         });
-        assert!(RandomEvictionCache::is_cached_type(&lp_key));
+        assert!(!RandomEvictionCache::is_cached_type(&lp_key));
 
         // Offer key should NOT be cached
         let offer_key = LedgerKey::Offer(LedgerKeyOffer {
@@ -844,71 +773,22 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_trustline_basic_operations() {
+    fn test_cache_rejects_non_account_types() {
         let cache = RandomEvictionCache::new();
         cache.activate();
 
-        let key = make_trustline_key(1, b"USD\0");
-        let entry = make_trustline_entry(1, b"USD\0");
-
-        // Initially empty
-        assert!(cache.get(&key).is_none());
-
-        // Insert and retrieve
-        cache.insert(key.clone(), entry);
-        assert!(cache.get(&key).is_some());
-
-        // Remove
-        cache.remove(&key);
-        assert!(cache.get(&key).is_none());
-    }
-
-    #[test]
-    fn test_cache_mixed_accounts_and_trustlines() {
-        let cache = RandomEvictionCache::new();
-        cache.activate();
-
-        let acct_key = make_account_key(1);
-        let acct_entry = make_account_entry(1);
+        // Trustline should not be cached
         let tl_key = make_trustline_key(1, b"USD\0");
         let tl_entry = make_trustline_entry(1, b"USD\0");
-
-        cache.insert(acct_key.clone(), acct_entry);
         cache.insert(tl_key.clone(), tl_entry);
+        assert!(cache.is_empty(), "Trustline should not be cached");
+        assert!(cache.get(&tl_key).is_none());
 
-        assert_eq!(cache.len(), 2);
+        // Account should be cached
+        let acct_key = make_account_key(1);
+        let acct_entry = make_account_entry(1);
+        cache.insert(acct_key.clone(), acct_entry);
+        assert_eq!(cache.len(), 1, "Only account should be cached");
         assert!(cache.get(&acct_key).is_some());
-        assert!(cache.get(&tl_key).is_some());
-
-        // Remove account, trustline should remain
-        cache.remove(&acct_key);
-        assert!(cache.get(&acct_key).is_none());
-        assert!(cache.get(&tl_key).is_some());
-
-        let stats = cache.stats();
-        // 2 misses (initial gets), 2 gets after insert = hits, 1 miss after remove, 1 hit after remove
-        assert!(stats.hits >= 2);
-    }
-
-    #[test]
-    fn test_cache_trustline_stats() {
-        let cache = RandomEvictionCache::new();
-        cache.activate();
-
-        let key = make_trustline_key(1, b"EUR\0");
-        let entry = make_trustline_entry(1, b"EUR\0");
-
-        // Miss
-        cache.get(&key);
-
-        // Insert
-        cache.insert(key.clone(), entry);
-
-        // Hit
-        cache.get(&key);
-
-        let stats = cache.stats();
-        assert_eq!(stats.hits, 1);
-        assert_eq!(stats.misses, 1);
     }
 }

@@ -43,7 +43,9 @@ use crate::BucketError;
 ///
 /// Increment this when making breaking changes to the serialization format.
 /// Version 2: Added bloom filter and asset-to-pool-id map persistence.
-pub const BUCKET_INDEX_VERSION: u32 = 2;
+/// Version 3: Page size changed from entry-count to byte-offset semantics.
+/// Version 4: Added entry_type_sizes to counters.
+pub const BUCKET_INDEX_VERSION: u32 = 4;
 
 // ============================================================================
 // Serializable Types
@@ -145,6 +147,9 @@ struct SerializableCounters {
     dead_entries: HashMap<u32, u64>,
     /// Count of init entries by entry type.
     init_entries: HashMap<u32, u64>,
+    /// XDR byte sizes per entry type.
+    #[serde(default)]
+    entry_type_sizes: HashMap<u32, u64>,
     /// Count of persistent Soroban entries.
     persistent_soroban_entries: u64,
     /// Count of temporary Soroban entries.
@@ -169,6 +174,11 @@ impl SerializableCounters {
                 .iter()
                 .map(|(k, v)| (entry_type_to_u32(*k), *v))
                 .collect(),
+            entry_type_sizes: counters
+                .entry_type_sizes
+                .iter()
+                .map(|(k, v)| (entry_type_to_u32(*k), *v))
+                .collect(),
             persistent_soroban_entries: counters.persistent_soroban_entries,
             temporary_soroban_entries: counters.temporary_soroban_entries,
         }
@@ -188,6 +198,11 @@ impl SerializableCounters {
                 .collect(),
             init_entries: self
                 .init_entries
+                .iter()
+                .filter_map(|(k, v)| u32_to_entry_type(*k).map(|t| (t, *v)))
+                .collect(),
+            entry_type_sizes: self
+                .entry_type_sizes
                 .iter()
                 .filter_map(|(k, v)| u32_to_entry_type(*k).map(|t| (t, *v)))
                 .collect(),
