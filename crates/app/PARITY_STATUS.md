@@ -3,7 +3,7 @@
 **Crate**: `henyey-app`
 **Upstream**: `.upstream-v25/src/main/`
 **Overall Parity**: 62%
-**Last Updated**: 2026-02-13
+**Last Updated**: 2026-02-14
 
 ## Summary
 
@@ -143,7 +143,7 @@ Corresponds to: `Config.h`
 | `ARTIFICIALLY_*_FOR_TESTING` fields | — | None |
 | `LOADGEN_*` fields | — | None |
 | `APPLY_LOAD_*` fields | — | None |
-| `BUCKETLIST_DB_*` fields | — | None |
+| `BUCKETLIST_DB_*` fields | `BucketConfig::bucket_list_db` | Full |
 | `EXPERIMENTAL_*` fields | — | None |
 | `processOpApplySleepTimeForTestingConfigs()` | — | None |
 | `getExpectedLedgerCloseTimeTestingOverride()` | — | None |
@@ -328,7 +328,6 @@ Features excluded by design. These are NOT counted against parity %.
 | `Protocol23CorruptionEventReconciler` | Protocol 23 bug workaround; not needed for p24+ only |
 | `BEST_OFFER_DEBUGGING` | Debug-only feature; not applicable |
 | `MODE_USES_IN_MEMORY_LEDGER` | Test-only mode; Rust uses different testing approach |
-| `BUCKETLIST_DB_*` configs | BucketListDB tuning handled internally |
 | `EXPERIMENTAL_PARALLEL_LEDGER_APPLY` | Future feature; not in stable upstream |
 | `EXPERIMENTAL_BACKGROUND_TX_SIG_VERIFICATION` | Experimental; not in stable upstream |
 
@@ -403,7 +402,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
-| Config | 8 TEST_CASE / 18 SECTION | 16 `#[test]` | Good coverage of config loading and validation |
+| Config | 8 TEST_CASE / 18 SECTION | 19 `#[test]` | Good coverage of config loading, validation, and BucketListDB wiring |
 | CommandHandler | 3 TEST_CASE / 25 SECTION | 6 `#[test]` | Rust tests cover run_cmd options; less endpoint testing |
 | ApplicationUtils | 4 TEST_CASE / 5 SECTION | 13 `#[test]` (catchup_cmd) | Catchup target parsing well tested |
 | SelfCheck | 1 TEST_CASE / 0 SECTION | 0 `#[test]` | No dedicated self-check tests |
@@ -430,7 +429,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 82 |
+| Implemented (Full) | 83 |
 | Gaps (None + Partial) | 50 |
-| Intentional Omissions | 18 |
-| **Parity** | **82 / (82 + 50) = 62%** |
+| Intentional Omissions | 17 |
+| **Parity** | **83 / (83 + 50) = 62%** |

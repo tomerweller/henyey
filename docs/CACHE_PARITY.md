@@ -8,8 +8,8 @@
 | **Cached types** | ACCOUNT only | ACCOUNT only |
 | **Eviction** | Least-recent-of-2-random-choices | Least-recent-of-2-random-choices |
 | **Sizing** | Proportional to account fraction in each bucket | Proportional to account bytes in each bucket |
-| **Default limit** | Config-driven (per-bucket proportional) | 1 GB / 2M entries, with per-bucket proportional split |
-| **Activation** | Always active for disk-backed buckets | Only if bucket list has >= 1M entries |
+| **Default limit** | Config-driven (`BUCKETLIST_DB_MEMORY_FOR_CACHING`, default 0 = disabled) | Config-driven (`memory_for_caching_mb` in `[buckets.bucket_list_db]`, default 0 = disabled) |
+| **Activation** | When `BUCKETLIST_DB_MEMORY_FOR_CACHING > 0` for DiskIndex buckets | When `memory_for_caching_mb > 0` for DiskIndex buckets |
 | **Parity** | Equivalent design and policy |
 
 ## 2. LedgerTxnRoot Entry Cache (cross-transaction)
@@ -102,9 +102,11 @@ Henyey has a `batch_lookup_fn` on `SnapshotHandle`, but it's only used for Sorob
 
 | | stellar-core | henyey |
 |---|---|---|
-| **Type** | `mEvictionFuture` — async scan on background thread, cached result | Inline during `close_ledger` |
+| **Type** | `mEvictionFuture` — async scan on background thread, cached result | `PendingEvictionScan` — background thread via `BucketListSnapshot` |
 | **Iterator** | Resumes from persisted `EvictionIterator` position | Same — persisted iterator position |
-| **Parity** | Henyey does eviction inline rather than async, but the iterator caching is equivalent |
+| **Lifecycle** | After closing ledger N, starts scan for N+1; resolved at next close | Same — spawned after `add_batch`, resolved at next `close_ledger` |
+| **Fallback** | Falls back to inline scan on settings mismatch or error | Same — falls back to inline on mismatch, error, or first close |
+| **Parity** | Equivalent |
 
 ## Summary of Gaps
 
@@ -113,6 +115,5 @@ Henyey has a `batch_lookup_fn` on `SnapshotHandle`, but it's only used for Sorob
 | **No `LedgerTxnRoot` entry cache** | High | stellar-core: 100K entry RandomEvictionCache across all txs in a ledger. Repeated classic entry lookups within same ledger hit bucket list every time in henyey. |
 | **No prefetch passes** | High | stellar-core does 2 batch `loadKeys()` passes, warming entry cache. Source accounts and tx keys not bulk-loaded before apply in henyey. |
 | **No best-offer account/trustline prefetch** | Medium | stellar-core preloads seller + buying/selling trustlines into entry cache. During path payment in henyey, seller accounts loaded individually. |
-| **No background eviction scan** | Low | Eviction is fast relative to total close time. Could help with tail latency. |
 
 The two most impactful missing caches are the **LedgerTxnRoot entry cache** and the **prefetch mechanism**. Together they mean that in stellar-core, by the time a transaction actually executes, most of the entries it needs are already in a fast in-memory cache. In henyey, every classic entry lookup during execution goes through the per-bucket cache (which only covers ACCOUNTs) or all the way to disk.
