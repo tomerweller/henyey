@@ -777,7 +777,7 @@ impl Herder {
 
         // Check if we can receive SCP messages
         if !state.can_receive_scp() {
-            debug!("Ignoring SCP envelope in {:?} state", state);
+            debug!("Rejecting SCP envelope: herder in {:?} state (cannot receive)", state);
             return EnvelopeState::Invalid;
         }
 
@@ -789,7 +789,7 @@ impl Herder {
         if !self.check_envelope_close_time(&envelope, false) {
             debug!(
                 slot,
-                "Discarding envelope: incompatible close time with current state"
+                "Rejecting SCP envelope: close-time pre-filter failed (check_envelope_close_time(false))"
             );
             return EnvelopeState::Invalid;
         }
@@ -811,7 +811,10 @@ impl Herder {
             {
                 debug!(
                     slot,
-                    "Discarding envelope: invalid close time (MAXIMUM_LEDGER_CLOSETIME_DRIFT)"
+                    tracking_consensus_index,
+                    enforce_recent,
+                    checkpoint,
+                    "Rejecting SCP envelope: close-time filter (non-tracking, enforce_recent={})", enforce_recent
                 );
                 return EnvelopeState::Invalid;
             }

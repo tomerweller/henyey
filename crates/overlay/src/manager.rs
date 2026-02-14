@@ -758,7 +758,11 @@ impl OverlayManager {
             }
 
             if !flood_gate.allow_message() {
-                debug!("Dropping message due to rate limit");
+                if matches!(message, StellarMessage::ScpMessage(_)) {
+                    warn!("Rate-limiting dropped SCP message from {}", peer_id);
+                } else {
+                    debug!("Dropping message due to rate limit");
+                }
                 continue;
             }
 

@@ -260,9 +260,15 @@ impl App {
                 // These are guaranteed to arrive even if the broadcast channel overflows.
                 Some(scp_msg) = scp_message_rx.recv() => {
                     tracing::trace!(select_iteration, "BRANCH: scp_message_rx");
+                    let scp_slot = match &scp_msg.message {
+                        StellarMessage::ScpMessage(env) => env.statement.slot_index,
+                        _ => 0,
+                    };
                     tracing::debug!(
+                        scp_slot,
+                        peer = %scp_msg.from_peer,
                         latency_ms = scp_msg.received_at.elapsed().as_millis(),
-                        "Received SCP message via dedicated channel"
+                        "SCP message arrived via dedicated channel"
                     );
                     self.handle_overlay_message(scp_msg).await;
                     tracing::trace!(select_iteration, "BRANCH: scp_message_rx done");
@@ -774,7 +780,7 @@ impl App {
 
                 match self.herder.receive_scp_envelope(envelope) {
                     EnvelopeState::Valid => {
-                        tracing::debug!(slot, tracking, "Processed SCP envelope (valid)");
+                        tracing::debug!(slot, tracking, "SCP envelope accepted (Valid)");
                         // Signal heartbeat to sync recovery - consensus is making progress
                         self.sync_recovery_heartbeat();
 
@@ -812,10 +818,10 @@ impl App {
                         // Expected, ignore silently
                     }
                     EnvelopeState::TooOld => {
-                        tracing::debug!(slot, tracking, "SCP envelope too old");
+                        tracing::debug!(slot, tracking, "SCP envelope rejected (TooOld)");
                     }
                     EnvelopeState::Invalid => {
-                        tracing::debug!(slot, peer = %msg.from_peer, "Invalid SCP envelope");
+                        tracing::debug!(slot, peer = %msg.from_peer, "SCP envelope rejected (Invalid)");
                     }
                     EnvelopeState::InvalidSignature => {
                         tracing::warn!(slot, peer = %msg.from_peer, "SCP envelope with invalid signature");

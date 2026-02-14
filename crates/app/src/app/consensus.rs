@@ -306,6 +306,7 @@ impl App {
 
             // Request SCP state from peers
             let ledger_seq = current_ledger;
+            tracing::info!(ledger_seq, "Requesting SCP state from peers (recovery task)");
             match overlay_clone.request_scp_state(ledger_seq).await {
                 Ok(count) => {
                     tracing::info!(
