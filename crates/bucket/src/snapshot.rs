@@ -41,17 +41,26 @@
 //! ```
 
 use crate::{
-    entry::ledger_key_type,
+    bucket_list::BUCKET_LIST_LEVELS,
+    entry::{
+        get_ttl_key, is_soroban_entry, is_temporary_entry, is_ttl_expired, ledger_entry_to_key,
+        ledger_key_type,
+    },
+    eviction::{
+        update_starting_eviction_iterator, EvictionCandidate, EvictionIterator, EvictionResult,
+        StateArchivalSettings,
+    },
     index::LiveBucketIndex,
     Bucket, BucketEntry, BucketLevel, BucketList, HotArchiveBucket, HotArchiveBucketLevel,
     HotArchiveBucketList,
 };
+use henyey_common::protocol::MIN_SOROBAN_PROTOCOL_VERSION;
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use stellar_xdr::curr::{
     AccountId, Asset, LedgerEntry, LedgerEntryData, LedgerEntryType, LedgerHeader, LedgerKey,
-    LedgerKeyTrustLine, PoolId, TrustLineAsset,
+    LedgerKeyTrustLine, Limits, PoolId, TrustLineAsset, WriteXdr,
 };
 
 /// A read-only snapshot of a single bucket.
@@ -434,6 +443,250 @@ impl BucketListSnapshot {
         }
 
         result
+    }
+
+    /// Run an incremental eviction scan on this snapshot.
+    ///
+    /// This is the snapshot-based equivalent of [`BucketList::scan_for_eviction_incremental`].
+    /// It performs the scan phase of eviction, collecting candidates within the byte budget.
+    /// The result must be resolved via [`EvictionResult::resolve`] to apply TTL filtering
+    /// and max_entries limits.
+    ///
+    /// Used by the background eviction scan: a snapshot is taken after committing ledger N,
+    /// and the scan runs on a background thread targeting ledger N+1. When N+1 arrives,
+    /// the result is resolved with that ledger's modified TTL keys.
+    pub fn scan_for_eviction_incremental(
+        &self,
+        mut iter: EvictionIterator,
+        current_ledger: u32,
+        settings: &StateArchivalSettings,
+    ) -> crate::Result<EvictionResult> {
+        let mut result = EvictionResult {
+            candidates: Vec::new(),
+            end_iterator: iter,
+            bytes_scanned: 0,
+            scan_complete: false,
+        };
+
+        // Update iterator based on spills (reset offset if bucket received new data)
+        update_starting_eviction_iterator(
+            &mut iter,
+            settings.starting_eviction_scan_level,
+            current_ledger,
+        );
+
+        let start_iter = iter;
+        let mut bytes_remaining = settings.eviction_scan_size;
+
+        // Track keys we've seen to avoid duplicates (from shadowed entries)
+        let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
+
+        loop {
+            let level = iter.bucket_list_level as usize;
+            if level >= BUCKET_LIST_LEVELS {
+                result.scan_complete = true;
+                break;
+            }
+
+            let bucket = if iter.is_curr_bucket {
+                self.levels[level].curr.raw_bucket()
+            } else {
+                self.levels[level].snap.raw_bucket()
+            };
+
+            let (_entries_scanned, bytes_used, finished_bucket) = self.scan_bucket_region(
+                bucket,
+                &mut iter,
+                bytes_remaining,
+                current_ledger,
+                &mut result.candidates,
+                &mut seen_keys,
+            )?;
+
+            result.bytes_scanned += bytes_used;
+
+            if bytes_remaining > bytes_used {
+                bytes_remaining -= bytes_used;
+            } else {
+                bytes_remaining = 0;
+            }
+
+            if bytes_remaining == 0 {
+                result.scan_complete = true;
+                break;
+            }
+
+            if finished_bucket {
+                iter.advance_to_next_bucket(settings.starting_eviction_scan_level);
+
+                if iter.bucket_list_level == start_iter.bucket_list_level
+                    && iter.is_curr_bucket == start_iter.is_curr_bucket
+                {
+                    result.scan_complete = true;
+                    break;
+                }
+            }
+        }
+
+        result.end_iterator = iter;
+
+        Ok(result)
+    }
+
+    /// Scan a region of a bucket for evictable entries (scan phase only).
+    ///
+    /// Returns (entries_scanned, bytes_used, finished_bucket).
+    ///
+    /// This is the snapshot-based equivalent of [`BucketList::scan_bucket_region`].
+    /// Uses `self.get_result()` for TTL and entry lookups instead of `BucketList::get()`.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_bucket_region(
+        &self,
+        bucket: &Bucket,
+        iter: &mut EvictionIterator,
+        max_bytes: u64,
+        current_ledger: u32,
+        candidates: &mut Vec<EvictionCandidate>,
+        seen_keys: &mut HashSet<Vec<u8>>,
+    ) -> crate::Result<(usize, u64, bool)> {
+        let mut entries_scanned = 0;
+        let mut bytes_used = 0u64;
+
+        let bucket_protocol = bucket.protocol_version().unwrap_or(0);
+        if bucket_protocol < MIN_SOROBAN_PROTOCOL_VERSION {
+            iter.bucket_file_offset = 0;
+            return Ok((entries_scanned, bytes_used, true));
+        }
+
+        let start_offset = iter.bucket_file_offset;
+
+        for (entry, entry_size) in bucket.iter_from_offset_with_sizes(start_offset) {
+            bytes_used += entry_size;
+            entries_scanned += 1;
+
+            let live_entry = match &entry {
+                BucketEntry::Live(e) | BucketEntry::Init(e) => e,
+                BucketEntry::Dead(key) => {
+                    if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
+                        seen_keys.insert(key_bytes);
+                    }
+                    if bytes_used >= max_bytes {
+                        iter.bucket_file_offset = start_offset + bytes_used;
+                        return Ok((entries_scanned, bytes_used, false));
+                    }
+                    continue;
+                }
+                BucketEntry::Metadata(_) => {
+                    if bytes_used >= max_bytes {
+                        iter.bucket_file_offset = start_offset + bytes_used;
+                        return Ok((entries_scanned, bytes_used, false));
+                    }
+                    continue;
+                }
+            };
+
+            if !is_soroban_entry(live_entry) {
+                if bytes_used >= max_bytes {
+                    iter.bucket_file_offset = start_offset + bytes_used;
+                    return Ok((entries_scanned, bytes_used, false));
+                }
+                continue;
+            }
+
+            let Some(key) = ledger_entry_to_key(live_entry) else {
+                if bytes_used >= max_bytes {
+                    iter.bucket_file_offset = start_offset + bytes_used;
+                    return Ok((entries_scanned, bytes_used, false));
+                }
+                continue;
+            };
+
+            let key_bytes = match key.to_xdr(Limits::none()) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    if bytes_used >= max_bytes {
+                        iter.bucket_file_offset = start_offset + bytes_used;
+                        return Ok((entries_scanned, bytes_used, false));
+                    }
+                    continue;
+                }
+            };
+
+            if !seen_keys.insert(key_bytes) {
+                if bytes_used >= max_bytes {
+                    iter.bucket_file_offset = start_offset + bytes_used;
+                    return Ok((entries_scanned, bytes_used, false));
+                }
+                continue;
+            }
+
+            let Some(ttl_key) = get_ttl_key(&key) else {
+                if bytes_used >= max_bytes {
+                    iter.bucket_file_offset = start_offset + bytes_used;
+                    return Ok((entries_scanned, bytes_used, false));
+                }
+                continue;
+            };
+
+            // Look up TTL entry from the snapshot (instead of BucketList::get)
+            let Some(ttl_entry) = self.get_result(&ttl_key)? else {
+                if bytes_used >= max_bytes {
+                    iter.bucket_file_offset = start_offset + bytes_used;
+                    return Ok((entries_scanned, bytes_used, false));
+                }
+                continue;
+            };
+
+            let Some(is_expired) = is_ttl_expired(&ttl_entry, current_ledger) else {
+                if bytes_used >= max_bytes {
+                    iter.bucket_file_offset = start_offset + bytes_used;
+                    return Ok((entries_scanned, bytes_used, false));
+                }
+                continue;
+            };
+
+            if !is_expired {
+                if bytes_used >= max_bytes {
+                    iter.bucket_file_offset = start_offset + bytes_used;
+                    return Ok((entries_scanned, bytes_used, false));
+                }
+                continue;
+            }
+
+            // Entry is expired — collect as eviction candidate.
+            // For persistent entries, archive the NEWEST version from the snapshot.
+            let is_temp = is_temporary_entry(live_entry);
+            let entry_for_candidate = if !is_temp {
+                if let Some(newest_entry) = self.get_result(&key)? {
+                    newest_entry
+                } else {
+                    live_entry.clone()
+                }
+            } else {
+                live_entry.clone()
+            };
+
+            candidates.push(EvictionCandidate {
+                entry: entry_for_candidate,
+                data_key: key,
+                ttl_key,
+                is_temporary: is_temp,
+                position: EvictionIterator {
+                    bucket_list_level: iter.bucket_list_level,
+                    is_curr_bucket: iter.is_curr_bucket,
+                    bucket_file_offset: start_offset + bytes_used,
+                },
+            });
+
+            if bytes_used >= max_bytes {
+                iter.bucket_file_offset = start_offset + bytes_used;
+                return Ok((entries_scanned, bytes_used, false));
+            }
+        }
+
+        // Finished the bucket
+        iter.bucket_file_offset = start_offset + bytes_used;
+        Ok((entries_scanned, bytes_used, true))
     }
 }
 

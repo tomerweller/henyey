@@ -311,7 +311,7 @@ impl EvictionResult {
 ///
 /// These settings control the eviction scan behavior and are typically
 /// sourced from network configuration (ConfigSetting entries).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StateArchivalSettings {
     /// Maximum bytes to scan per ledger (default: 100 KB).
     ///

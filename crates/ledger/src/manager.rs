@@ -43,7 +43,8 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use henyey_bucket::{
-    BucketEntry, BucketList, EvictionIterator, HotArchiveBucketList, StateArchivalSettings,
+    BucketEntry, BucketList, BucketListSnapshot, EvictionIterator, EvictionResult,
+    HotArchiveBucketList, StateArchivalSettings,
 };
 use henyey_common::{Hash256, NetworkId};
 use henyey_tx::soroban::PersistentModuleCache;
@@ -166,6 +167,17 @@ pub fn prepend_fee_event(
 
 /// Protocol version that introduced persistent eviction/state archival.
 const FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION: u32 = 23;
+
+/// A background eviction scan that was started after committing a ledger.
+///
+/// After committing ledger N, a background thread scans for entries to evict
+/// at ledger N+1. When N+1 arrives, the result is resolved (TTL filtering +
+/// max_entries limit) instead of running the scan inline.
+struct PendingEvictionScan {
+    handle: std::thread::JoinHandle<henyey_bucket::Result<EvictionResult>>,
+    target_ledger_seq: u32,
+    settings: StateArchivalSettings,
+}
 
 /// Pre-computed cache data from a bucket list scan.
 ///
@@ -741,6 +753,13 @@ pub struct LedgerManager {
     /// Set to `None` before initialization and after `reset()`. Populated on
     /// the first `close_ledger` call and reused on subsequent calls.
     executor: Mutex<Option<TransactionExecutor>>,
+
+    /// Background eviction scan started after the previous ledger's commit.
+    ///
+    /// After committing ledger N, a background thread scans for entries to evict
+    /// at ledger N+1 using a snapshot of the bucket list. When N+1 arrives, the
+    /// result is resolved instead of running an inline scan, reducing close latency.
+    pending_eviction_scan: Mutex<Option<PendingEvictionScan>>,
 }
 
 // Compile-time assertion: LedgerManager must be Send + Sync for spawn_blocking.
@@ -776,6 +795,7 @@ impl LedgerManager {
             offer_account_asset_index: Arc::new(RwLock::new(HashMap::new())),
             soroban_state: Arc::new(crate::soroban_state::SharedSorobanState::new()),
             executor: Mutex::new(None),
+            pending_eviction_scan: Mutex::new(None),
         }
     }
 
@@ -997,6 +1017,9 @@ impl LedgerManager {
 
         // Clear the persistent executor so offers are reloaded after re-initialization
         *self.executor.lock() = None;
+
+        // Discard any pending background eviction scan
+        *self.pending_eviction_scan.lock() = None;
 
         // Reset state
         let mut state = self.state.write();
@@ -2511,7 +2534,7 @@ impl<'a> LedgerCloseContext<'a> {
             ledger_seq = self.close_data.ledger_seq,
             "Acquiring bucket list write lock"
         );
-        let (bucket_list_hash, bucket_lock_wait_us, eviction_us, soroban_state_us, add_batch_us, hot_archive_us) = {
+        let (bucket_list_hash, bucket_lock_wait_us, eviction_us, soroban_state_us, add_batch_us, hot_archive_us, bg_eviction_data) = {
             let lock_wait_start = std::time::Instant::now();
             let mut bucket_list = self.manager.bucket_list.write();
             let bucket_lock_wait_us = lock_wait_start.elapsed().as_micros() as u64;
@@ -2585,59 +2608,97 @@ impl<'a> LedgerCloseContext<'a> {
             tracing::debug!(ledger_seq = self.close_data.ledger_seq, "Got delta entries");
 
             // Run incremental eviction scan for Protocol 23+
-            // This must happen BEFORE applying transaction changes to match stellar-core
+            // This must happen BEFORE applying transaction changes to match stellar-core.
+            //
+            // Background eviction optimization: after committing ledger N, a background
+            // thread scans for entries to evict at N+1 using a bucket list snapshot.
+            // When N+1 arrives here, we try to use that pre-computed result instead of
+            // scanning inline. Falls back to inline scan for the first ledger, on
+            // settings mismatch (config upgrade), or if the background scan failed.
             let mut archived_entries: Vec<LedgerEntry> = Vec::new();
             let mut eviction_us: u64 = 0;
 
             if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
-                tracing::debug!(
-                    ledger_seq = self.close_data.ledger_seq,
-                    "Acquiring hot archive read lock"
-                );
                 let hot_archive_guard = self.manager.hot_archive_bucket_list.read();
-                tracing::debug!(
-                    ledger_seq = self.close_data.ledger_seq,
-                    "Acquired hot archive read lock"
-                );
-                tracing::debug!(
-                    ledger_seq = self.close_data.ledger_seq,
-                    hot_archive_present = hot_archive_guard.is_some(),
-                    "Checking hot archive presence"
-                );
                 if hot_archive_guard.is_some() {
-                    tracing::debug!(
-                        ledger_seq = self.close_data.ledger_seq,
-                        "Dropping hot archive read lock"
-                    );
                     drop(hot_archive_guard); // Release read lock before write operations
-                    tracing::debug!(
-                        ledger_seq = self.close_data.ledger_seq,
-                        "Dropped hot archive read lock"
-                    );
 
                     // Use pre-loaded eviction settings (loaded before bucket list lock)
                     let eviction_settings = eviction_settings.unwrap_or_default();
 
-                    let eviction_iterator = load_eviction_iterator_from_bucket_list(&bucket_list);
-
-                    let iter = eviction_iterator.unwrap_or_else(|| {
-                        tracing::debug!(
-                            ledger_seq = self.close_data.ledger_seq,
-                            starting_level = eviction_settings.starting_eviction_scan_level,
-                            "Creating new EvictionIterator (no entry found)"
-                        );
-                        EvictionIterator::new(eviction_settings.starting_eviction_scan_level)
-                    });
-
-                    // Run eviction scan (scan phase only — collects candidates)
+                    // Try to use background eviction scan from previous ledger
                     let eviction_start = std::time::Instant::now();
-                    let eviction_result = bucket_list
-                        .scan_for_eviction_incremental(
-                            iter,
-                            self.close_data.ledger_seq,
-                            &eviction_settings,
-                        )
-                        .map_err(LedgerError::Bucket)?;
+                    let eviction_result = {
+                        let pending = self.manager.pending_eviction_scan.lock().take();
+                        let background_result = pending.and_then(|scan| {
+                            if scan.target_ledger_seq != self.close_data.ledger_seq {
+                                tracing::debug!(
+                                    ledger_seq = self.close_data.ledger_seq,
+                                    target = scan.target_ledger_seq,
+                                    "Discarding background eviction scan: ledger mismatch"
+                                );
+                                return None;
+                            }
+                            if scan.settings != eviction_settings {
+                                tracing::debug!(
+                                    ledger_seq = self.close_data.ledger_seq,
+                                    "Discarding background eviction scan: settings changed"
+                                );
+                                return None;
+                            }
+                            match scan.handle.join() {
+                                Ok(Ok(result)) => {
+                                    tracing::debug!(
+                                        ledger_seq = self.close_data.ledger_seq,
+                                        candidates = result.candidates.len(),
+                                        bytes_scanned = result.bytes_scanned,
+                                        "Using background eviction scan result"
+                                    );
+                                    Some(result)
+                                }
+                                Ok(Err(e)) => {
+                                    tracing::warn!(
+                                        ledger_seq = self.close_data.ledger_seq,
+                                        error = %e,
+                                        "Background eviction scan failed, falling back to inline"
+                                    );
+                                    None
+                                }
+                                Err(_) => {
+                                    tracing::warn!(
+                                        ledger_seq = self.close_data.ledger_seq,
+                                        "Background eviction scan panicked, falling back to inline"
+                                    );
+                                    None
+                                }
+                            }
+                        });
+
+                        match background_result {
+                            Some(result) => result,
+                            None => {
+                                // Inline fallback: load iterator and scan synchronously
+                                let iter = load_eviction_iterator_from_bucket_list(&bucket_list)
+                                    .unwrap_or_else(|| {
+                                        tracing::debug!(
+                                            ledger_seq = self.close_data.ledger_seq,
+                                            starting_level = eviction_settings.starting_eviction_scan_level,
+                                            "Creating new EvictionIterator (no entry found)"
+                                        );
+                                        EvictionIterator::new(
+                                            eviction_settings.starting_eviction_scan_level,
+                                        )
+                                    });
+                                bucket_list
+                                    .scan_for_eviction_incremental(
+                                        iter,
+                                        self.close_data.ledger_seq,
+                                        &eviction_settings,
+                                    )
+                                    .map_err(LedgerError::Bucket)?
+                            }
+                        }
+                    };
                     let eviction_duration = eviction_start.elapsed();
                     eviction_us = eviction_duration.as_micros() as u64;
 
@@ -2646,7 +2707,7 @@ impl<'a> LedgerCloseContext<'a> {
                         bytes_scanned = eviction_result.bytes_scanned,
                         candidates = eviction_result.candidates.len(),
                         duration_ms = eviction_duration.as_millis(),
-                        "Eviction scan completed"
+                        "Eviction completed"
                     );
 
                     // Resolution phase: apply TTL filtering + max_entries limit.
@@ -2980,8 +3041,41 @@ impl<'a> LedgerCloseContext<'a> {
                 live_hash
             };
             let hot_archive_us = hot_archive_start.elapsed().as_micros() as u64;
-            (final_hash, bucket_lock_wait_us, eviction_us, soroban_state_us, add_batch_us, hot_archive_us)
+
+            // Prepare data for background eviction scan (snapshot while we hold the lock)
+            let bg_eviction_data = if protocol_version
+                >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION
+            {
+                eviction_settings.map(|settings| {
+                    let snapshot =
+                        BucketListSnapshot::new(&bucket_list, self.prev_header.clone());
+                    let iter = load_eviction_iterator_from_bucket_list(&bucket_list)
+                        .unwrap_or_else(|| {
+                            EvictionIterator::new(settings.starting_eviction_scan_level)
+                        });
+                    (snapshot, iter, settings)
+                })
+            } else {
+                None
+            };
+
+            (final_hash, bucket_lock_wait_us, eviction_us, soroban_state_us, add_batch_us, hot_archive_us, bg_eviction_data)
         };
+
+        // Start background eviction scan for the next ledger.
+        // The scan runs on a snapshot of the bucket list (taken above while the write
+        // lock was held), so it doesn't interfere with subsequent operations.
+        if let Some((snapshot, iter, settings)) = bg_eviction_data {
+            let target_ledger_seq = self.close_data.ledger_seq + 1;
+            let handle = std::thread::spawn(move || {
+                snapshot.scan_for_eviction_incremental(iter, target_ledger_seq, &settings)
+            });
+            *self.manager.pending_eviction_scan.lock() = Some(PendingEvictionScan {
+                handle,
+                target_ledger_seq,
+                settings,
+            });
+        }
 
         let header_start = std::time::Instant::now();
         let (new_header, header_hash) = self.build_and_hash_header(
@@ -3215,7 +3309,7 @@ mod tests {
     use stellar_xdr::curr::{
         Asset, ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint,
         LedgerScpMessages, OfferEntry, OfferEntryExt, Price, ScAddress, ScpHistoryEntry,
-        ScpHistoryEntryV0, ScVal, TransactionSet, TtlEntry,
+        ScpHistoryEntryV0, ScVal, TransactionSet, TtlEntry, WriteXdr,
     };
 
     // Note: These tests require proper mocking of BucketManager and Database
@@ -3809,5 +3903,123 @@ mod tests {
             LedgerCloseMeta::V2(v2) => v2.scp_info.len(),
         };
         assert_eq!(scp_info_len, 1);
+    }
+
+    #[test]
+    fn test_pending_eviction_scan_initialized_as_none() {
+        let manager = LedgerManager::new(
+            "Test SDF Network ; September 2015".to_string(),
+            LedgerManagerConfig::default(),
+        );
+        assert!(
+            manager.pending_eviction_scan.lock().is_none(),
+            "pending_eviction_scan should be None on creation"
+        );
+    }
+
+    #[test]
+    fn test_pending_eviction_scan_cleared_on_reset() {
+        let manager = LedgerManager::new(
+            "Test SDF Network ; September 2015".to_string(),
+            LedgerManagerConfig::default(),
+        );
+
+        // Simulate storing a pending scan
+        let snapshot = BucketListSnapshot::new(
+            &BucketList::default(),
+            create_genesis_header(),
+        );
+        let settings = StateArchivalSettings::default();
+        let iter = EvictionIterator::new(settings.starting_eviction_scan_level);
+        let handle = std::thread::spawn(move || {
+            snapshot.scan_for_eviction_incremental(iter, 2, &settings)
+        });
+        *manager.pending_eviction_scan.lock() = Some(PendingEvictionScan {
+            handle,
+            target_ledger_seq: 2,
+            settings,
+        });
+
+        assert!(manager.pending_eviction_scan.lock().is_some());
+
+        // Reset should clear the pending scan
+        manager.reset();
+
+        assert!(
+            manager.pending_eviction_scan.lock().is_none(),
+            "pending_eviction_scan should be None after reset"
+        );
+    }
+
+    #[test]
+    fn test_pending_eviction_scan_thread_completes() {
+        // Verify that a background eviction scan thread can complete and
+        // its result can be joined successfully.
+        let mut bl = BucketList::new();
+
+        // Add some Soroban entries with TTLs
+        let mut entries = Vec::new();
+        for i in 0..3u8 {
+            let mut hash_bytes = [0u8; 32];
+            hash_bytes[0] = i;
+            let code_entry = LedgerEntry {
+                last_modified_ledger_seq: 1,
+                data: LedgerEntryData::ContractCode(
+                    stellar_xdr::curr::ContractCodeEntry {
+                        ext: stellar_xdr::curr::ContractCodeEntryExt::V0,
+                        hash: Hash(hash_bytes),
+                        code: vec![0u8; 50].try_into().unwrap(),
+                    },
+                ),
+                ext: LedgerEntryExt::V0,
+            };
+            let code_key = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+                hash: Hash(hash_bytes),
+            });
+
+            // Create TTL entry with SHA256 hash of the key
+            use sha2::{Digest, Sha256};
+            let key_bytes = code_key.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
+            let mut hasher = Sha256::new();
+            hasher.update(&key_bytes);
+            let hash_result = hasher.finalize();
+            let mut key_hash = [0u8; 32];
+            key_hash.copy_from_slice(&hash_result);
+
+            let ttl_entry = LedgerEntry {
+                last_modified_ledger_seq: 1,
+                data: LedgerEntryData::Ttl(TtlEntry {
+                    key_hash: Hash(key_hash),
+                    live_until_ledger_seq: 3, // Expires at ledger 3
+                }),
+                ext: LedgerEntryExt::V0,
+            };
+
+            entries.push(code_entry);
+            entries.push(ttl_entry);
+        }
+
+        bl.add_batch(1, TEST_PROTOCOL, BucketListType::Live, entries, vec![], vec![])
+            .unwrap();
+
+        let snapshot = BucketListSnapshot::new(&bl, create_genesis_header());
+        let settings = StateArchivalSettings {
+            starting_eviction_scan_level: 0,
+            eviction_scan_size: 100_000,
+            max_entries_to_archive: 1000,
+        };
+        let iter = EvictionIterator {
+            bucket_list_level: 0,
+            is_curr_bucket: true,
+            bucket_file_offset: 0,
+        };
+
+        let handle = std::thread::spawn(move || {
+            snapshot.scan_for_eviction_incremental(iter, 5, &settings)
+        });
+
+        let result = handle.join().expect("thread should not panic").unwrap();
+        assert_eq!(result.candidates.len(), 3, "Should find 3 expired entries");
+        assert!(result.bytes_scanned > 0);
     }
 }

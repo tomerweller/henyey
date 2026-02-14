@@ -953,6 +953,421 @@ async fn test_eviction_scan_incremental() {
     // scan_complete means we wrapped around all levels, which is fine
 }
 
+/// Test that BucketListSnapshot eviction scan produces the same results as
+/// BucketList eviction scan. This is the core correctness guarantee for the
+/// background eviction optimization: the snapshot-based scan must be identical.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_snapshot_eviction_scan_matches_bucket_list() {
+    use henyey_bucket::{BucketListSnapshot, EvictionIterator, StateArchivalSettings};
+
+    let mut bl = BucketList::new();
+
+    let current_ledger = 1u32;
+    let ttl_expiration = current_ledger + 2;
+
+    // Create 10 contract code entries with TTLs that expire at ledger 3
+    let mut entries = Vec::new();
+    for i in 0..10 {
+        let code_entry = make_contract_code_entry(i, current_ledger);
+        let code_key = make_contract_code_key(i);
+        let ttl_entry = make_ttl_entry(&code_key, ttl_expiration, current_ledger);
+        entries.push(code_entry);
+        entries.push(ttl_entry);
+    }
+
+    bl.add_batch(
+        current_ledger,
+        TEST_PROTOCOL,
+        BucketListType::Live,
+        entries,
+        vec![],
+        vec![],
+    )
+    .unwrap();
+
+    let settings = StateArchivalSettings {
+        starting_eviction_scan_level: 0,
+        eviction_scan_size: 100_000,
+        max_entries_to_archive: 1000,
+    };
+
+    let iter = EvictionIterator {
+        bucket_list_level: 0,
+        is_curr_bucket: true,
+        bucket_file_offset: 0,
+    };
+
+    let scan_ledger = 5; // After TTL expiration
+
+    // Run scan on the bucket list directly
+    let bl_result = bl
+        .scan_for_eviction_incremental(iter, scan_ledger, &settings)
+        .unwrap();
+
+    // Take a snapshot and run the same scan on it
+    let header = LedgerHeader {
+        ledger_version: TEST_PROTOCOL,
+        previous_ledger_hash: Hash([0; 32]),
+        scp_value: StellarValue {
+            tx_set_hash: Hash([0; 32]),
+            close_time: TimePoint(0),
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        },
+        tx_set_result_hash: Hash([0; 32]),
+        bucket_list_hash: Hash([0; 32]),
+        ledger_seq: current_ledger,
+        total_coins: 0,
+        fee_pool: 0,
+        inflation_seq: 0,
+        id_pool: 0,
+        base_fee: 100,
+        base_reserve: 5000000,
+        max_tx_set_size: 100,
+        skip_list: [Hash([0; 32]), Hash([0; 32]), Hash([0; 32]), Hash([0; 32])],
+        ext: LedgerHeaderExt::V0,
+    };
+    let snapshot = BucketListSnapshot::new(&bl, header);
+    let snap_result = snapshot
+        .scan_for_eviction_incremental(iter, scan_ledger, &settings)
+        .unwrap();
+
+    // Results must be identical
+    assert_eq!(
+        bl_result.candidates.len(),
+        snap_result.candidates.len(),
+        "Snapshot and BucketList should find the same number of candidates"
+    );
+    assert_eq!(
+        bl_result.bytes_scanned, snap_result.bytes_scanned,
+        "Snapshot and BucketList should scan the same number of bytes"
+    );
+    assert_eq!(
+        bl_result.scan_complete, snap_result.scan_complete,
+        "Snapshot and BucketList should agree on scan completion"
+    );
+    assert_eq!(
+        bl_result.end_iterator, snap_result.end_iterator,
+        "Snapshot and BucketList should end at the same iterator position"
+    );
+
+    // Verify candidates match entry-by-entry
+    for (i, (bl_c, snap_c)) in bl_result
+        .candidates
+        .iter()
+        .zip(snap_result.candidates.iter())
+        .enumerate()
+    {
+        assert_eq!(
+            bl_c.data_key, snap_c.data_key,
+            "Candidate {} data_key mismatch",
+            i
+        );
+        assert_eq!(
+            bl_c.ttl_key, snap_c.ttl_key,
+            "Candidate {} ttl_key mismatch",
+            i
+        );
+        assert_eq!(
+            bl_c.is_temporary, snap_c.is_temporary,
+            "Candidate {} is_temporary mismatch",
+            i
+        );
+        assert_eq!(
+            bl_c.position, snap_c.position,
+            "Candidate {} position mismatch",
+            i
+        );
+    }
+}
+
+/// Test that the snapshot eviction scan works correctly on a background thread.
+/// This simulates the actual background eviction scan pattern: take a snapshot,
+/// send it to another thread, run the scan there, and collect the result.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_snapshot_eviction_scan_on_background_thread() {
+    use henyey_bucket::{BucketListSnapshot, EvictionIterator, StateArchivalSettings};
+
+    let mut bl = BucketList::new();
+
+    let current_ledger = 1u32;
+    let ttl_expiration = current_ledger + 2;
+
+    let mut entries = Vec::new();
+    for i in 0..5 {
+        let code_entry = make_contract_code_entry(i, current_ledger);
+        let code_key = make_contract_code_key(i);
+        let ttl_entry = make_ttl_entry(&code_key, ttl_expiration, current_ledger);
+        entries.push(code_entry);
+        entries.push(ttl_entry);
+    }
+
+    bl.add_batch(
+        current_ledger,
+        TEST_PROTOCOL,
+        BucketListType::Live,
+        entries,
+        vec![],
+        vec![],
+    )
+    .unwrap();
+
+    let settings = StateArchivalSettings {
+        starting_eviction_scan_level: 0,
+        eviction_scan_size: 100_000,
+        max_entries_to_archive: 1000,
+    };
+
+    let iter = EvictionIterator {
+        bucket_list_level: 0,
+        is_curr_bucket: true,
+        bucket_file_offset: 0,
+    };
+
+    let target_ledger = 5u32;
+
+    // Take snapshot and run scan on background thread (the actual pattern)
+    let header = LedgerHeader {
+        ledger_version: TEST_PROTOCOL,
+        previous_ledger_hash: Hash([0; 32]),
+        scp_value: StellarValue {
+            tx_set_hash: Hash([0; 32]),
+            close_time: TimePoint(0),
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        },
+        tx_set_result_hash: Hash([0; 32]),
+        bucket_list_hash: Hash([0; 32]),
+        ledger_seq: current_ledger,
+        total_coins: 0,
+        fee_pool: 0,
+        inflation_seq: 0,
+        id_pool: 0,
+        base_fee: 100,
+        base_reserve: 5000000,
+        max_tx_set_size: 100,
+        skip_list: [Hash([0; 32]), Hash([0; 32]), Hash([0; 32]), Hash([0; 32])],
+        ext: LedgerHeaderExt::V0,
+    };
+    let snapshot = BucketListSnapshot::new(&bl, header);
+
+    let handle = std::thread::spawn(move || {
+        snapshot.scan_for_eviction_incremental(iter, target_ledger, &settings)
+    });
+
+    let result = handle.join().expect("thread should not panic").unwrap();
+
+    // Should have found all 5 expired entries
+    assert_eq!(
+        result.candidates.len(),
+        5,
+        "Should find 5 expired entries on background thread"
+    );
+    assert!(result.bytes_scanned > 0);
+
+    // Verify all candidates are persistent contract code entries
+    for candidate in &result.candidates {
+        assert!(
+            !candidate.is_temporary,
+            "Contract code entries are persistent"
+        );
+    }
+}
+
+/// Test that the snapshot eviction scan correctly handles shadowed TTL entries.
+/// When a TTL is updated (extended), the snapshot must see the latest version.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_snapshot_eviction_scan_respects_extended_ttl() {
+    use henyey_bucket::{BucketListSnapshot, EvictionIterator, StateArchivalSettings};
+
+    let mut bl = BucketList::new();
+
+    let current_ledger = 1u32;
+    let initial_ttl = current_ledger + 3; // Expires at ledger 4
+
+    // Create entry with short TTL
+    let code_entry = make_contract_code_entry(1, current_ledger);
+    let code_key = make_contract_code_key(1);
+    let ttl_entry = make_ttl_entry(&code_key, initial_ttl, current_ledger);
+
+    bl.add_batch(
+        current_ledger,
+        TEST_PROTOCOL,
+        BucketListType::Live,
+        vec![code_entry, ttl_entry],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+
+    // Advance and extend the TTL
+    bl.add_batch(2, TEST_PROTOCOL, BucketListType::Live, vec![], vec![], vec![])
+        .unwrap();
+
+    let extended_ttl = 20; // Now expires at ledger 20
+    let updated_ttl = make_ttl_entry(&code_key, extended_ttl, 3);
+
+    bl.add_batch(
+        3,
+        TEST_PROTOCOL,
+        BucketListType::Live,
+        vec![],
+        vec![updated_ttl],
+        vec![],
+    )
+    .unwrap();
+
+    // Take snapshot AFTER the TTL extension
+    let header = LedgerHeader {
+        ledger_version: TEST_PROTOCOL,
+        previous_ledger_hash: Hash([0; 32]),
+        scp_value: StellarValue {
+            tx_set_hash: Hash([0; 32]),
+            close_time: TimePoint(0),
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        },
+        tx_set_result_hash: Hash([0; 32]),
+        bucket_list_hash: Hash([0; 32]),
+        ledger_seq: 3,
+        total_coins: 0,
+        fee_pool: 0,
+        inflation_seq: 0,
+        id_pool: 0,
+        base_fee: 100,
+        base_reserve: 5000000,
+        max_tx_set_size: 100,
+        skip_list: [Hash([0; 32]), Hash([0; 32]), Hash([0; 32]), Hash([0; 32])],
+        ext: LedgerHeaderExt::V0,
+    };
+    let snapshot = BucketListSnapshot::new(&bl, header);
+
+    let settings = StateArchivalSettings {
+        starting_eviction_scan_level: 0,
+        eviction_scan_size: 100_000,
+        max_entries_to_archive: 1000,
+    };
+    let iter = EvictionIterator {
+        bucket_list_level: 0,
+        is_curr_bucket: true,
+        bucket_file_offset: 0,
+    };
+
+    // Scan at ledger 10: after original TTL (4) but before extended TTL (20)
+    let result = snapshot
+        .scan_for_eviction_incremental(iter, 10, &settings)
+        .unwrap();
+
+    // Entry should NOT be evicted because the snapshot sees the extended TTL
+    assert_eq!(
+        result.candidates.len(),
+        0,
+        "Entry should not be a candidate - TTL was extended before snapshot"
+    );
+
+    // Now scan at ledger 25: after the extended TTL
+    let result2 = snapshot
+        .scan_for_eviction_incremental(iter, 25, &settings)
+        .unwrap();
+
+    // Entry SHOULD be evicted now
+    assert_eq!(
+        result2.candidates.len(),
+        1,
+        "Entry should be a candidate after extended TTL expires"
+    );
+}
+
+/// Test that snapshot eviction scan handles temporary entries correctly
+/// (they should be marked as temporary, not persistent).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_snapshot_eviction_scan_temporary_entries() {
+    use henyey_bucket::{BucketListSnapshot, EvictionIterator, StateArchivalSettings};
+
+    let mut bl = BucketList::new();
+
+    let current_ledger = 1u32;
+    let ttl_expiration = current_ledger + 2;
+
+    // Create temporary contract data entries
+    let mut entries = Vec::new();
+    for i in 0..3 {
+        let data_entry =
+            make_contract_data_entry(i, ContractDataDurability::Temporary, current_ledger);
+        let data_key = make_contract_data_key(i, ContractDataDurability::Temporary);
+        let ttl_entry = make_ttl_entry(&data_key, ttl_expiration, current_ledger);
+        entries.push(data_entry);
+        entries.push(ttl_entry);
+    }
+
+    // Also add 2 persistent entries
+    for i in 10..12 {
+        let code_entry = make_contract_code_entry(i, current_ledger);
+        let code_key = make_contract_code_key(i);
+        let ttl_entry = make_ttl_entry(&code_key, ttl_expiration, current_ledger);
+        entries.push(code_entry);
+        entries.push(ttl_entry);
+    }
+
+    bl.add_batch(
+        current_ledger,
+        TEST_PROTOCOL,
+        BucketListType::Live,
+        entries,
+        vec![],
+        vec![],
+    )
+    .unwrap();
+
+    let header = LedgerHeader {
+        ledger_version: TEST_PROTOCOL,
+        previous_ledger_hash: Hash([0; 32]),
+        scp_value: StellarValue {
+            tx_set_hash: Hash([0; 32]),
+            close_time: TimePoint(0),
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        },
+        tx_set_result_hash: Hash([0; 32]),
+        bucket_list_hash: Hash([0; 32]),
+        ledger_seq: current_ledger,
+        total_coins: 0,
+        fee_pool: 0,
+        inflation_seq: 0,
+        id_pool: 0,
+        base_fee: 100,
+        base_reserve: 5000000,
+        max_tx_set_size: 100,
+        skip_list: [Hash([0; 32]), Hash([0; 32]), Hash([0; 32]), Hash([0; 32])],
+        ext: LedgerHeaderExt::V0,
+    };
+    let snapshot = BucketListSnapshot::new(&bl, header);
+
+    let settings = StateArchivalSettings {
+        starting_eviction_scan_level: 0,
+        eviction_scan_size: 100_000,
+        max_entries_to_archive: 1000,
+    };
+    let iter = EvictionIterator {
+        bucket_list_level: 0,
+        is_curr_bucket: true,
+        bucket_file_offset: 0,
+    };
+
+    let result = snapshot
+        .scan_for_eviction_incremental(iter, 5, &settings)
+        .unwrap();
+
+    // Should find all 5 expired entries (3 temporary + 2 persistent)
+    assert_eq!(result.candidates.len(), 5, "Should find all 5 expired entries");
+
+    let temp_count = result.candidates.iter().filter(|c| c.is_temporary).count();
+    let persistent_count = result.candidates.iter().filter(|c| !c.is_temporary).count();
+
+    assert_eq!(temp_count, 3, "Should have 3 temporary candidates");
+    assert_eq!(persistent_count, 2, "Should have 2 persistent candidates");
+}
+
 // =============================================================================
 // BucketManager Persistence Tests
 // =============================================================================
