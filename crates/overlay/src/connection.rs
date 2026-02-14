@@ -262,9 +262,25 @@ pub struct ConnectionSender {
 
 impl ConnectionSender {
     /// Sends a message to the peer.
+    ///
+    /// Includes a timeout to prevent blocking indefinitely on TCP backpressure,
+    /// matching the timeout behavior of [`Connection::send`].
     pub async fn send(&mut self, message: AuthenticatedMessage) -> Result<()> {
         trace!("Sending message to {}", self.remote_addr);
-        self.sink.send(message).await
+        const SEND_TIMEOUT_SECS: u64 = 10;
+        match timeout(
+            Duration::from_secs(SEND_TIMEOUT_SECS),
+            self.sink.send(message),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(OverlayError::ConnectionTimeout(format!(
+                "send timeout after {}s to {}",
+                SEND_TIMEOUT_SECS, self.remote_addr
+            ))),
+        }
     }
 
     /// Returns the remote peer's socket address.

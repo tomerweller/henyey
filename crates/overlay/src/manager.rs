@@ -616,8 +616,14 @@ impl OverlayManager {
         const PEER_TIMEOUT: Duration = Duration::from_secs(30);
         const PEER_STRAGGLER_TIMEOUT: Duration = Duration::from_secs(120);
 
+        // Track message counts for periodic diagnostics
+        let mut total_messages: u64 = 0;
+        let mut scp_messages: u64 = 0;
+        let mut last_stats_log = Instant::now();
+
         loop {
             if !running.load(Ordering::Relaxed) {
+                info!("Peer {} read loop exiting: overlay shutting down (total_msgs={}, scp_msgs={})", peer_id, total_messages, scp_messages);
                 break;
             }
 
@@ -649,11 +655,11 @@ impl OverlayManager {
                 if now.duration_since(last_read) >= PEER_TIMEOUT
                     && now.duration_since(last_write) >= PEER_TIMEOUT
                 {
-                    warn!("Dropping peer {} due to idle timeout (no activity for {:?})", peer_id, PEER_TIMEOUT);
+                    warn!("Dropping peer {} due to idle timeout (no activity for {:?}, total_msgs={}, scp_msgs={})", peer_id, PEER_TIMEOUT, total_messages, scp_messages);
                     break;
                 }
                 if now.duration_since(last_write) >= PEER_STRAGGLER_TIMEOUT {
-                    warn!("Dropping peer {} due to straggler timeout (write stalled for {:?})", peer_id, PEER_STRAGGLER_TIMEOUT);
+                    warn!("Dropping peer {} due to straggler timeout (write stalled for {:?}, total_msgs={}, scp_msgs={})", peer_id, PEER_STRAGGLER_TIMEOUT, total_messages, scp_messages);
                     break;
                 }
 
@@ -685,6 +691,7 @@ impl OverlayManager {
             let message = {
                 let mut peer_lock = peer.lock().await;
                 if !peer_lock.is_connected() {
+                    info!("Peer {} read loop exiting: peer not connected (total_msgs={}, scp_msgs={})", peer_id, total_messages, scp_messages);
                     break;
                 }
 
@@ -692,11 +699,11 @@ impl OverlayManager {
                 match tokio::time::timeout(Duration::from_secs(2), peer_lock.recv()).await {
                     Ok(Ok(Some(msg))) => msg,
                     Ok(Ok(None)) => {
-                        debug!("Peer {} connection closed cleanly by remote", peer_id);
+                        info!("Peer {} read loop exiting: connection closed cleanly by remote (total_msgs={}, scp_msgs={})", peer_id, total_messages, scp_messages);
                         break;
                     }
                     Ok(Err(e)) => {
-                        debug!("Peer {} recv error: {}", peer_id, e);
+                        info!("Peer {} read loop exiting: recv error: {} (total_msgs={}, scp_msgs={})", peer_id, e, total_messages, scp_messages);
                         break;
                     }
                     Err(_) => {
@@ -708,6 +715,18 @@ impl OverlayManager {
 
             // Update last_read timestamp on every received message
             last_read = Instant::now();
+            total_messages += 1;
+
+            // Periodic per-peer stats (every 60s)
+            if last_stats_log.elapsed() >= Duration::from_secs(60) {
+                info!(
+                    "Peer {} stats: total_msgs={}, scp_msgs={}",
+                    peer_id,
+                    total_messages,
+                    scp_messages,
+                );
+                last_stats_log = Instant::now();
+            }
 
             // Process message
             let msg_type = helpers::message_type_name(&message);
@@ -757,12 +776,11 @@ impl OverlayManager {
                 continue;
             }
 
-            if !flood_gate.allow_message() {
-                if matches!(message, StellarMessage::ScpMessage(_)) {
-                    warn!("Rate-limiting dropped SCP message from {}", peer_id);
-                } else {
-                    debug!("Dropping message due to rate limit");
-                }
+            // SCP messages are consensus-critical and must never be rate-limited.
+            // Only apply the rate limiter to non-SCP flood traffic (transactions,
+            // flood adverts, etc.).
+            if !matches!(message, StellarMessage::ScpMessage(_)) && !flood_gate.allow_message() {
+                debug!("Dropping message due to rate limit");
                 continue;
             }
 
@@ -851,7 +869,10 @@ impl OverlayManager {
             );
 
             if matches!(overlay_msg.message, StellarMessage::ScpMessage(_)) {
-                let _ = scp_message_tx.send(overlay_msg.clone());
+                scp_messages += 1;
+                if let Err(e) = scp_message_tx.send(overlay_msg.clone()) {
+                    error!("SCP channel send FAILED for peer {} (receiver dropped?): {}", peer_id, e);
+                }
             }
 
             if matches!(
@@ -861,7 +882,9 @@ impl OverlayManager {
                     | StellarMessage::DontHave(_)
                     | StellarMessage::ScpQuorumset(_)
             ) {
-                let _ = fetch_response_tx.send(overlay_msg.clone());
+                if let Err(e) = fetch_response_tx.send(overlay_msg.clone()) {
+                    error!("Fetch response channel send FAILED for peer {} (receiver dropped?): {}", peer_id, e);
+                }
             }
 
             // Send catchup-critical messages (SCP + TxSet) to any extra subscribers.
@@ -915,7 +938,7 @@ impl OverlayManager {
         // Close peer
         let mut peer_lock = peer.lock().await;
         peer_lock.close().await;
-        debug!("Peer {} disconnected", peer_id);
+        info!("Peer {} read loop exited and disconnected", peer_id);
     }
 
     /// Connect to a specific peer.

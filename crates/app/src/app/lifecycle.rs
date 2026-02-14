@@ -180,6 +180,11 @@ impl App {
         let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(10));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // SCP message flow rate tracking
+        let mut scp_messages_received: u64 = 0;
+        let mut scp_messages_last_heartbeat: u64 = 0;
+        let mut last_scp_message_at = Instant::now();
+
         // In-progress background ledger close. Polled in the select loop.
         let mut pending_close: Option<PendingLedgerClose> = None;
 
@@ -260,6 +265,8 @@ impl App {
                 // These are guaranteed to arrive even if the broadcast channel overflows.
                 Some(scp_msg) = scp_message_rx.recv() => {
                     tracing::trace!(select_iteration, "BRANCH: scp_message_rx");
+                    scp_messages_received += 1;
+                    last_scp_message_at = Instant::now();
                     let scp_slot = match &scp_msg.message {
                         StellarMessage::ScpMessage(env) => env.statement.slot_index,
                         _ => 0,
@@ -534,8 +541,12 @@ impl App {
                         peers,
                         heard_from_quorum,
                         is_v_blocking,
+                        scp_total = scp_messages_received,
+                        scp_since_last = scp_messages_received - scp_messages_last_heartbeat,
+                        scp_silent_secs = last_scp_message_at.elapsed().as_secs(),
                         "Heartbeat"
                     );
+                    scp_messages_last_heartbeat = scp_messages_received;
 
                     // Warn if we haven't heard from quorum for a while
                     if self.is_validator && !heard_from_quorum && peers > 0 {

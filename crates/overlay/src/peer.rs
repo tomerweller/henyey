@@ -634,12 +634,24 @@ impl PeerSender {
 
     /// Sends a message to the peer.
     ///
-    /// Returns an error if the receiving end has been dropped.
+    /// Returns an error if the receiving end has been dropped or if the
+    /// channel is full for longer than the timeout (indicating the peer's
+    /// write loop is stalled, e.g. due to TCP backpressure).
     pub async fn send(&self, message: StellarMessage) -> Result<()> {
-        self.tx
-            .send(message)
-            .await
-            .map_err(|_| OverlayError::ChannelSend)
+        const SEND_TIMEOUT_SECS: u64 = 10;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
+            self.tx.send(message),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(OverlayError::ChannelSend),
+            Err(_) => Err(OverlayError::ConnectionTimeout(format!(
+                "PeerSender channel full for {}s for {}",
+                SEND_TIMEOUT_SECS, self.peer_id
+            ))),
+        }
     }
 
     /// Returns the peer ID this sender is associated with.
