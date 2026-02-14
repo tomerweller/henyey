@@ -90,7 +90,6 @@ pub const DEFAULT_BLOOM_SEED: HashSeed = [0u8; 16];
 /// from disk. The `OnceLock` wrapper provides thread-safe initialization
 /// and supports the `from_prebuilt` path where a persisted index is
 /// loaded directly.
-#[derive(Clone)]
 pub struct DiskBucket {
     /// The SHA-256 hash of this bucket's contents (for verification).
     hash: Hash256,
@@ -108,6 +107,25 @@ pub struct DiskBucket {
     /// Initialized lazily via `maybe_initialize_cache()`.
     /// Only caches ACCOUNT entries (matching stellar-core).
     cache: OnceLock<Arc<RandomEvictionCache>>,
+    /// Pre-collected scan-relevant entries from the index-building pass.
+    /// Consumed once by `take_scan_entries()` to avoid a redundant disk read.
+    scan_entries: std::sync::Mutex<Option<Vec<BucketEntry>>>,
+}
+
+impl Clone for DiskBucket {
+    fn clone(&self) -> Self {
+        Self {
+            hash: self.hash,
+            file_path: self.file_path.clone(),
+            entry_count: self.entry_count,
+            bloom_seed: self.bloom_seed,
+            index: self.index.clone(),
+            mmap: self.mmap.clone(),
+            cache: self.cache.clone(),
+            // Cloned buckets don't carry scan entries — they are one-time-use
+            scan_entries: std::sync::Mutex::new(None),
+        }
+    }
 }
 
 /// Iterator that reads `(BucketEntry, offset)` pairs one at a time from an
@@ -210,7 +228,7 @@ impl DiskBucket {
                 .len();
             let iter = StreamingXdrEntryIterator::new(&self.file_path, file_len)
                 .expect("failed to open bucket file for index build");
-            let live_index = LiveBucketIndex::from_entries_default(iter, self.bloom_seed, file_len);
+            let live_index = LiveBucketIndex::from_entries_default(iter, self.bloom_seed, file_len, None);
 
             tracing::debug!(
                 hash = %self.hash.to_hex(),
@@ -258,11 +276,18 @@ impl DiskBucket {
         // Pass 2: build index by streaming entries one at a time (O(index_size) memory)
         // The iterator reads and parses one entry at a time from disk.
         let iter = StreamingXdrEntryIterator::new(path, file_len)?;
-        let live_index = LiveBucketIndex::from_entries_default(iter, bloom_seed, file_len);
+        let mut scan_entries_vec = Vec::new();
+        let live_index = LiveBucketIndex::from_entries_default(
+            iter,
+            bloom_seed,
+            file_len,
+            Some(&mut scan_entries_vec),
+        );
 
         tracing::debug!(
             entry_count,
             file_size = file_len,
+            scan_entries = scan_entries_vec.len(),
             index_type = if live_index.is_in_memory() {
                 "InMemory"
             } else {
@@ -279,6 +304,12 @@ impl DiskBucket {
         mmap.set(Self::create_mmap(path)?)
             .unwrap_or_else(|_| unreachable!());
 
+        let scan_entries = std::sync::Mutex::new(if scan_entries_vec.is_empty() {
+            None
+        } else {
+            Some(scan_entries_vec)
+        });
+
         Ok(Self {
             hash,
             file_path: path.to_path_buf(),
@@ -287,6 +318,7 @@ impl DiskBucket {
             index,
             mmap,
             cache: OnceLock::new(),
+            scan_entries,
         })
     }
 
@@ -361,6 +393,7 @@ impl DiskBucket {
             index,
             mmap,
             cache: OnceLock::new(),
+            scan_entries: std::sync::Mutex::new(None),
         })
     }
 
@@ -425,6 +458,15 @@ impl DiskBucket {
     /// Returns the size of the bloom filter in bytes, or 0 if no filter exists.
     pub fn bloom_filter_size_bytes(&self) -> usize {
         self.ensure_index().bloom_filter_size_bytes()
+    }
+
+    /// Takes the pre-collected scan-relevant entries, if available.
+    ///
+    /// Returns `Some(entries)` exactly once after a fresh index build. Subsequent
+    /// calls return `None`. This avoids a redundant full-file read during cache
+    /// initialization.
+    pub fn take_scan_entries(&self) -> Option<Vec<BucketEntry>> {
+        self.scan_entries.lock().unwrap().take()
     }
 
     /// Returns the hash seed used for the bloom filter.

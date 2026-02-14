@@ -756,6 +756,19 @@ impl Bucket {
         }
     }
 
+    /// Takes pre-collected scan-relevant entries from the index-building pass.
+    ///
+    /// Returns `Some(entries)` exactly once for disk-backed buckets that were
+    /// freshly built (not loaded from a persisted index). Returns `None` for
+    /// in-memory buckets (where `iter()` is already zero-cost) and for buckets
+    /// whose entries have already been taken.
+    pub fn take_scan_entries(&self) -> Option<Vec<BucketEntry>> {
+        match &self.storage {
+            BucketStorage::DiskBacked { disk_bucket } => disk_bucket.take_scan_entries(),
+            BucketStorage::InMemory { .. } => None,
+        }
+    }
+
     /// Resets cache hit/miss counters for this bucket's per-bucket cache.
     pub fn reset_cache_counters(&self) {
         if let BucketStorage::DiskBacked { disk_bucket } = &self.storage {

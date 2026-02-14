@@ -219,6 +219,65 @@ struct LevelScanResult {
 /// Within a level, curr shadows snap: if the same key appears in both, only the
 /// curr version is kept. Dead entries are tracked in the seen set but not added
 /// to results (they shadow entries in higher-numbered levels during merge).
+/// Process a single scan-relevant entry, updating the level's result maps.
+///
+/// This is the core logic shared by both the fast path (pre-collected entries)
+/// and the fallback path (full bucket iteration).
+#[allow(clippy::too_many_arguments)]
+fn process_scan_entry(
+    entry: &BucketEntry,
+    key: LedgerKey,
+    seen_keys: &mut HashSet<LedgerKey>,
+    entries: &mut HashMap<LedgerKey, LedgerEntry>,
+    ttl_entries: &mut HashMap<[u8; 32], (stellar_xdr::curr::LedgerKeyTtl, crate::soroban_state::TtlData)>,
+    dead_keys: &mut HashSet<LedgerKey>,
+    dead_ttl_keys: &mut HashSet<[u8; 32]>,
+    soroban_enabled: bool,
+    module_cache: &Option<Arc<PersistentModuleCache>>,
+    protocol_version: u32,
+) {
+    if seen_keys.contains(&key) {
+        return;
+    }
+
+    // Skip soroban types if not enabled
+    if !soroban_enabled && !matches!(&key, LedgerKey::Offer(_)) {
+        return;
+    }
+
+    seen_keys.insert(key.clone());
+
+    if let BucketEntry::Live(ref le) | BucketEntry::Init(ref le) = entry {
+        // Compile contracts in parallel across levels via the shared module cache
+        if let LedgerEntryData::ContractCode(ref contract_code) = le.data {
+            if let Some(ref cache) = module_cache {
+                cache.add_contract(contract_code.code.as_slice(), protocol_version);
+            }
+        }
+
+        // TTL entries go into a separate map keyed by hash
+        if let LedgerEntryData::Ttl(ref ttl) = le.data {
+            let ttl_key = stellar_xdr::curr::LedgerKeyTtl {
+                key_hash: ttl.key_hash.clone(),
+            };
+            let ttl_data = crate::soroban_state::TtlData::new(
+                ttl.live_until_ledger_seq,
+                le.last_modified_ledger_seq,
+            );
+            ttl_entries.insert(ttl.key_hash.0, (ttl_key, ttl_data));
+        } else {
+            entries.insert(key, le.clone());
+        }
+    } else if let BucketEntry::Dead(_) = entry {
+        // Track dead keys so they shadow live entries at higher (older) levels.
+        // For TTL entries, also track in the TTL-specific dead set.
+        if let LedgerKey::Ttl(ref ttl_key) = key {
+            dead_ttl_keys.insert(ttl_key.key_hash.0);
+        }
+        dead_keys.insert(key);
+    }
+}
+
 fn scan_single_level(
     curr: &henyey_bucket::Bucket,
     snap: &henyey_bucket::Bucket,
@@ -234,63 +293,59 @@ fn scan_single_level(
 
     // Scan curr first, then snap (curr shadows snap within a level)
     for bucket in [curr, snap] {
-        for entry in bucket.iter() {
-            let key = match entry.key() {
-                Some(k) => k,
-                None => continue, // metadata
-            };
-
-            if seen_keys.contains(&key) {
-                continue;
+        if let Some(pre_collected) = bucket.take_scan_entries() {
+            // Fast path: use entries pre-collected during index building (no disk I/O)
+            for entry in &pre_collected {
+                let key = match entry.key() {
+                    Some(k) => k,
+                    None => continue,
+                };
+                process_scan_entry(
+                    entry,
+                    key,
+                    &mut seen_keys,
+                    &mut entries,
+                    &mut ttl_entries,
+                    &mut dead_keys,
+                    &mut dead_ttl_keys,
+                    soroban_enabled,
+                    module_cache,
+                    protocol_version,
+                );
             }
+        } else {
+            // Fallback: full iteration (in-memory buckets, prebuilt index path)
+            for entry in bucket.iter() {
+                let key = match entry.key() {
+                    Some(k) => k,
+                    None => continue, // metadata
+                };
 
-            // Check if this entry type is one we care about
-            let dominated = matches!(
-                &key,
-                LedgerKey::Offer(_)
-                    | LedgerKey::ContractCode(_)
-                    | LedgerKey::ContractData(_)
-                    | LedgerKey::Ttl(_)
-                    | LedgerKey::ConfigSetting(_)
-            );
-            if !dominated {
-                continue;
-            }
-            // Skip soroban types if not enabled
-            if !soroban_enabled && !matches!(&key, LedgerKey::Offer(_)) {
-                continue;
-            }
-
-            seen_keys.insert(key.clone());
-
-            if let BucketEntry::Live(ref le) | BucketEntry::Init(ref le) = entry {
-                // Compile contracts in parallel across levels via the shared module cache
-                if let LedgerEntryData::ContractCode(ref contract_code) = le.data {
-                    if let Some(ref cache) = module_cache {
-                        cache.add_contract(contract_code.code.as_slice(), protocol_version);
-                    }
+                // Filter to scan-relevant types only
+                let dominated = matches!(
+                    &key,
+                    LedgerKey::Offer(_)
+                        | LedgerKey::ContractCode(_)
+                        | LedgerKey::ContractData(_)
+                        | LedgerKey::Ttl(_)
+                        | LedgerKey::ConfigSetting(_)
+                );
+                if !dominated {
+                    continue;
                 }
 
-                // TTL entries go into a separate map keyed by hash
-                if let LedgerEntryData::Ttl(ref ttl) = le.data {
-                    let ttl_key = stellar_xdr::curr::LedgerKeyTtl {
-                        key_hash: ttl.key_hash.clone(),
-                    };
-                    let ttl_data = crate::soroban_state::TtlData::new(
-                        ttl.live_until_ledger_seq,
-                        le.last_modified_ledger_seq,
-                    );
-                    ttl_entries.insert(ttl.key_hash.0, (ttl_key, ttl_data));
-                } else {
-                    entries.insert(key, le.clone());
-                }
-            } else if let BucketEntry::Dead(_) = entry {
-                // Track dead keys so they shadow live entries at higher (older) levels.
-                // For TTL entries, also track in the TTL-specific dead set.
-                if let LedgerKey::Ttl(ref ttl_key) = key {
-                    dead_ttl_keys.insert(ttl_key.key_hash.0);
-                }
-                dead_keys.insert(key);
+                process_scan_entry(
+                    &entry,
+                    key,
+                    &mut seen_keys,
+                    &mut entries,
+                    &mut ttl_entries,
+                    &mut dead_keys,
+                    &mut dead_ttl_keys,
+                    soroban_enabled,
+                    module_cache,
+                    protocol_version,
+                );
             }
         }
     }

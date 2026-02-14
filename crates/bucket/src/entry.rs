@@ -498,6 +498,21 @@ pub fn is_soroban_entry(entry: &LedgerEntry) -> bool {
     )
 }
 
+/// Check if a ledger key is relevant for the BucketListDB cache scan.
+///
+/// These are the entry types that need to be loaded into in-memory caches
+/// during initialization: offers, contract code/data, TTLs, and config settings.
+pub fn is_scan_relevant_key(key: &LedgerKey) -> bool {
+    matches!(
+        key,
+        LedgerKey::Offer(_)
+            | LedgerKey::ContractCode(_)
+            | LedgerKey::ContractData(_)
+            | LedgerKey::Ttl(_)
+            | LedgerKey::ConfigSetting(_)
+    )
+}
+
 /// Check if a ledger key is for a Soroban entry.
 pub fn is_soroban_key(key: &LedgerKey) -> bool {
     matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_))

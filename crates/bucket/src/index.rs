@@ -31,7 +31,7 @@ use crate::entry::ledger_key_type;
 use henyey_common::BucketListDbConfig;
 
 use crate::bloom_filter::{BucketBloomFilter, HashSeed};
-use crate::entry::{compare_keys, BucketEntry};
+use crate::entry::{compare_keys, is_scan_relevant_key, BucketEntry};
 
 /// Default page size for disk index in bytes.
 ///
@@ -337,7 +337,11 @@ impl InMemoryIndex {
     ///
     /// * `entries` - Iterator over (BucketEntry, offset) pairs
     /// * `bloom_seed` - Seed for bloom filter construction
-    pub fn from_entries<I>(entries: I, bloom_seed: HashSeed) -> Self
+    pub fn from_entries<I>(
+        entries: I,
+        bloom_seed: HashSeed,
+        mut cache_collector: Option<&mut Vec<BucketEntry>>,
+    ) -> Self
     where
         I: Iterator<Item = (BucketEntry, u64)>,
     {
@@ -385,6 +389,13 @@ impl InMemoryIndex {
                             &cp.params.asset_a,
                             &cp.params.asset_b,
                         );
+                    }
+                }
+
+                // Collect scan-relevant entries for cache initialization
+                if let Some(ref mut collector) = cache_collector {
+                    if is_scan_relevant_key(&key) {
+                        collector.push(entry);
                     }
                 }
             }
@@ -537,7 +548,12 @@ impl DiskIndex {
     /// * `entries` - Iterator over (BucketEntry, offset) pairs
     /// * `bloom_seed` - Seed for bloom filter construction
     /// * `page_size` - Page size in bytes (must be a power of two)
-    pub fn from_entries<I>(entries: I, bloom_seed: HashSeed, page_size: u64) -> Self
+    pub fn from_entries<I>(
+        entries: I,
+        bloom_seed: HashSeed,
+        page_size: u64,
+        mut cache_collector: Option<&mut Vec<BucketEntry>>,
+    ) -> Self
     where
         I: Iterator<Item = (BucketEntry, u64)>,
     {
@@ -595,6 +611,13 @@ impl DiskIndex {
                             &cp.params.asset_a,
                             &cp.params.asset_b,
                         );
+                    }
+                }
+
+                // Collect scan-relevant entries for cache initialization
+                if let Some(ref mut collector) = cache_collector {
+                    if is_scan_relevant_key(&key) {
+                        collector.push(entry);
                     }
                 }
             }
@@ -801,17 +824,23 @@ impl LiveBucketIndex {
         bloom_seed: HashSeed,
         file_size: u64,
         config: &BucketListDbConfig,
+        cache_collector: Option<&mut Vec<BucketEntry>>,
     ) -> Self
     where
         I: Iterator<Item = (BucketEntry, u64)>,
     {
         if file_size < config.index_cutoff_bytes() {
-            LiveBucketIndex::InMemory(InMemoryIndex::from_entries(entries, bloom_seed))
+            LiveBucketIndex::InMemory(InMemoryIndex::from_entries(
+                entries,
+                bloom_seed,
+                cache_collector,
+            ))
         } else {
             LiveBucketIndex::Disk(DiskIndex::from_entries(
                 entries,
                 bloom_seed,
                 config.page_size_bytes(),
+                cache_collector,
             ))
         }
     }
@@ -819,12 +848,17 @@ impl LiveBucketIndex {
     /// Creates a new index from bucket entries with default config.
     ///
     /// Convenience method that uses the default `BucketListDbConfig`.
-    pub fn from_entries_default<I>(entries: I, bloom_seed: HashSeed, file_size: u64) -> Self
+    pub fn from_entries_default<I>(
+        entries: I,
+        bloom_seed: HashSeed,
+        file_size: u64,
+        cache_collector: Option<&mut Vec<BucketEntry>>,
+    ) -> Self
     where
         I: Iterator<Item = (BucketEntry, u64)>,
     {
         let config = BucketListDbConfig::default();
-        Self::from_entries(entries, bloom_seed, file_size, &config)
+        Self::from_entries(entries, bloom_seed, file_size, &config, cache_collector)
     }
 
     /// Returns true if the given entry type is not supported by BucketListDB lookups.
@@ -986,7 +1020,7 @@ mod tests {
             .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
             .collect();
 
-        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16]);
+        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16], None);
 
         assert_eq!(index.len(), 10);
 
@@ -1012,7 +1046,7 @@ mod tests {
         // That's ceil(12672/1024) = 13 pages, but last entry is at 99*128=12672.
         // Pages: [0,1024), [1024,2048), ..., [12288, 13312)
         // So 13 pages.
-        let index = DiskIndex::from_entries(entries.into_iter(), [0u8; 16], 1024);
+        let index = DiskIndex::from_entries(entries.into_iter(), [0u8; 16], 1024, None);
 
         assert!(index.num_pages() > 0);
 
@@ -1057,7 +1091,7 @@ mod tests {
             .collect();
 
         // file_size=10000 is well below the 20MB default cutoff
-        let index = LiveBucketIndex::from_entries_default(entries.into_iter(), [0u8; 16], 10000);
+        let index = LiveBucketIndex::from_entries_default(entries.into_iter(), [0u8; 16], 10000, None);
         assert!(index.is_in_memory());
 
         assert!(index.may_contain(&make_account_key(50)));
@@ -1070,7 +1104,7 @@ mod tests {
             .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
             .collect();
         let config = BucketListDbConfig::default();
-        let index = LiveBucketIndex::from_entries(entries1.into_iter(), [0u8; 16], 1000, &config);
+        let index = LiveBucketIndex::from_entries(entries1.into_iter(), [0u8; 16], 1000, &config, None);
         assert!(index.is_in_memory());
 
         // Custom config with cutoff_mb=0 → always DiskIndex
@@ -1079,7 +1113,7 @@ mod tests {
             .collect();
         let mut config_small = BucketListDbConfig::default();
         config_small.index_cutoff_mb = 0;
-        let index = LiveBucketIndex::from_entries(entries2.into_iter(), [0u8; 16], 1000, &config_small);
+        let index = LiveBucketIndex::from_entries(entries2.into_iter(), [0u8; 16], 1000, &config_small, None);
         assert!(!index.is_in_memory());
     }
 
@@ -1137,7 +1171,7 @@ mod tests {
             .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
             .collect();
 
-        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16]);
+        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16], None);
 
         assert_eq!(index.len(), 20);
         // No offer type range should exist
@@ -1162,7 +1196,7 @@ mod tests {
             ));
         }
 
-        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16]);
+        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16], None);
 
         assert_eq!(index.len(), 15);
         assert!(index.type_range(LedgerEntryType::Account).is_some());
@@ -1193,7 +1227,7 @@ mod tests {
             ));
         }
 
-        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16]);
+        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16], None);
 
         assert_eq!(index.len(), 10);
 
@@ -1267,7 +1301,7 @@ mod tests {
             ),
         ];
 
-        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16]);
+        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16], None);
         assert_eq!(index.len(), 2);
 
         // Both should be independently findable
@@ -1300,7 +1334,7 @@ mod tests {
             ),
         ];
 
-        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16]);
+        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16], None);
         assert_eq!(index.len(), 2);
 
         let key_persistent = make_contract_data_key(1, 42, ContractDataDurability::Persistent);
@@ -1324,7 +1358,7 @@ mod tests {
             .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
             .collect();
 
-        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16]);
+        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16], None);
 
         // Look up specific accounts
         for i in [0u8, 10, 25, 49] {
@@ -1351,7 +1385,7 @@ mod tests {
             .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
             .collect();
 
-        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16]);
+        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16], None);
 
         // may_contain should return true for existing keys
         for i in [0u8, 50, 99] {
@@ -1426,7 +1460,7 @@ mod tests {
             ));
         }
 
-        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16]);
+        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16], None);
 
         let counters = index.counters();
         assert_eq!(
@@ -1462,7 +1496,7 @@ mod tests {
             ),
         ];
 
-        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16]);
+        let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16], None);
 
         let counters = index.counters();
         assert_eq!(counters.total_live(), 2);

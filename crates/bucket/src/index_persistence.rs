@@ -645,7 +645,7 @@ mod tests {
 
         let bloom_seed = [42u8; 16];
         let page_size = 10u64;
-        let original = DiskIndex::from_entries(entries.into_iter(), bloom_seed, page_size);
+        let original = DiskIndex::from_entries(entries.into_iter(), bloom_seed, page_size, None);
 
         // Save the index
         save_disk_index(&original, &bucket_path).unwrap();
@@ -750,7 +750,7 @@ mod tests {
             .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
             .collect();
 
-        let index = DiskIndex::from_entries(entries.into_iter(), [0u8; 16], 10);
+        let index = DiskIndex::from_entries(entries.into_iter(), [0u8; 16], 10, None);
         save_disk_index(&index, &bucket_path).unwrap();
 
         // Try to load with different page_size = 20
@@ -839,7 +839,7 @@ mod tests {
             .map(|i| (BucketEntry::Live(make_account_entry_for(i)), i as u64 * 100))
             .collect();
 
-        DiskIndex::from_entries(entries.into_iter(), bloom_seed, page_size)
+        DiskIndex::from_entries(entries.into_iter(), bloom_seed, page_size, None)
     }
 
     #[test]
@@ -944,7 +944,7 @@ mod tests {
 
         let bloom_seed = [0u8; 16];
         let page_size = 10u64;
-        let original = DiskIndex::from_entries(entries.into_iter(), bloom_seed, page_size);
+        let original = DiskIndex::from_entries(entries.into_iter(), bloom_seed, page_size, None);
 
         // Verify original has pool data
         let pools_native = original.asset_to_pool_id().get_pools_for_asset(&asset_a);
