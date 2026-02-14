@@ -113,6 +113,33 @@ pub fn merge_buckets_with_options(
     max_protocol_version: u32,
     normalize_init_entries: bool,
 ) -> Result<Bucket> {
+    merge_with_shadows_impl(
+        old_bucket,
+        new_bucket,
+        keep_dead_entries,
+        max_protocol_version,
+        normalize_init_entries,
+        &[],
+        false,
+    )
+}
+
+/// Core merge implementation with integrated shadow checking.
+///
+/// Performs a single-pass two-pointer merge with inline shadow filtering.
+/// When `shadow_buckets` is empty, shadow checking is a no-op. This matches
+/// stellar-core's `BucketOutputIterator::maybePut()` pattern where shadow
+/// checking is integrated into the output path rather than as a post-processing
+/// filter.
+fn merge_with_shadows_impl(
+    old_bucket: &Bucket,
+    new_bucket: &Bucket,
+    keep_dead_entries: bool,
+    max_protocol_version: u32,
+    normalize_init_entries: bool,
+    shadow_buckets: &[Bucket],
+    keep_shadowed_lifecycle_entries: bool,
+) -> Result<Bucket> {
     // Note: We intentionally do NOT use fast paths for empty buckets here.
     // stellar-core always goes through the full merge process even when
     // one input is empty. This is important because:
@@ -150,6 +177,12 @@ pub fn merge_buckets_with_options(
 
     let mut merged = Vec::new();
 
+    // Create shadow cursors for inline shadow checking.
+    // For protocol >= 12 (FIRST_PROTOCOL_SHADOWS_REMOVED), shadow_buckets is always
+    // empty, so no cursors are created.
+    let mut shadow_cursors: Vec<ShadowCursor<'_>> =
+        shadow_buckets.iter().map(ShadowCursor::new).collect();
+
     if let Some(ref meta) = output_meta {
         merged.push(meta.clone());
     }
@@ -168,17 +201,27 @@ pub fn merge_buckets_with_options(
                     Ordering::Less => {
                         // Old entry comes first, no shadow.
                         if should_keep_entry(old_entry, keep_dead_entries) {
-                            merged.push(old_entry.clone());
+                            maybe_put(
+                                old_entry.clone(),
+                                &mut shadow_cursors,
+                                keep_shadowed_lifecycle_entries,
+                                &mut merged,
+                            );
                         }
                         old_current = next_non_meta(&mut old_iter);
                     }
                     Ordering::Greater => {
                         // New entry comes first
                         if should_keep_entry(new_entry, keep_dead_entries) {
-                            merged.push(maybe_normalize_entry(
-                                new_entry.clone(),
-                                normalize_init_entries,
-                            ));
+                            maybe_put(
+                                maybe_normalize_entry(
+                                    new_entry.clone(),
+                                    normalize_init_entries,
+                                ),
+                                &mut shadow_cursors,
+                                keep_shadowed_lifecycle_entries,
+                                &mut merged,
+                            );
                         }
                         new_current = next_non_meta(&mut new_iter);
                     }
@@ -190,7 +233,12 @@ pub fn merge_buckets_with_options(
                             keep_dead_entries,
                             normalize_init_entries,
                         ) {
-                            merged.push(merged_entry);
+                            maybe_put(
+                                merged_entry,
+                                &mut shadow_cursors,
+                                keep_shadowed_lifecycle_entries,
+                                &mut merged,
+                            );
                         }
                         old_current = next_non_meta(&mut old_iter);
                         new_current = next_non_meta(&mut new_iter);
@@ -213,7 +261,12 @@ pub fn merge_buckets_with_options(
     // Drain remaining old entries
     while let Some(entry) = old_current {
         if !entry.is_metadata() && should_keep_entry(&entry, keep_dead_entries) {
-            merged.push(entry);
+            maybe_put(
+                entry,
+                &mut shadow_cursors,
+                keep_shadowed_lifecycle_entries,
+                &mut merged,
+            );
         }
         old_current = old_iter.next();
     }
@@ -221,7 +274,12 @@ pub fn merge_buckets_with_options(
     // Drain remaining new entries
     while let Some(entry) = new_current {
         if !entry.is_metadata() && should_keep_entry(&entry, keep_dead_entries) {
-            merged.push(maybe_normalize_entry(entry, normalize_init_entries));
+            maybe_put(
+                maybe_normalize_entry(entry, normalize_init_entries),
+                &mut shadow_cursors,
+                keep_shadowed_lifecycle_entries,
+                &mut merged,
+            );
         }
         new_current = new_iter.next();
     }
@@ -748,21 +806,31 @@ pub fn merge_buckets_with_options_and_shadows(
     normalize_init_entries: bool,
     shadow_buckets: &[Bucket],
 ) -> Result<Bucket> {
-    let merged = merge_buckets_with_options(
+    // For protocol >= 12 (FIRST_PROTOCOL_SHADOWS_REMOVED), shadows are always
+    // empty in practice. Pass empty slice to skip shadow cursor creation.
+    if shadow_buckets.is_empty() || max_protocol_version >= FIRST_PROTOCOL_SHADOWS_REMOVED {
+        return merge_with_shadows_impl(
+            old_bucket,
+            new_bucket,
+            keep_dead_entries,
+            max_protocol_version,
+            normalize_init_entries,
+            &[],
+            false,
+        );
+    }
+
+    let keep_shadowed_lifecycle_entries =
+        max_protocol_version >= FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY;
+    merge_with_shadows_impl(
         old_bucket,
         new_bucket,
         keep_dead_entries,
         max_protocol_version,
         normalize_init_entries,
-    )?;
-
-    if shadow_buckets.is_empty() || max_protocol_version >= FIRST_PROTOCOL_SHADOWS_REMOVED {
-        return Ok(merged);
-    }
-
-    let keep_shadowed_lifecycle_entries =
-        max_protocol_version >= FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY;
-    filter_shadowed_entries(&merged, shadow_buckets, keep_shadowed_lifecycle_entries)
+        shadow_buckets,
+        keep_shadowed_lifecycle_entries,
+    )
 }
 
 struct ShadowCursor<'a> {
@@ -816,31 +884,28 @@ fn is_shadowed(entry: &BucketEntry, cursors: &mut [ShadowCursor<'_>]) -> bool {
     false
 }
 
-fn filter_shadowed_entries(
-    merged: &Bucket,
-    shadow_buckets: &[Bucket],
+/// Emit an entry to the output, checking shadows inline.
+///
+/// This matches stellar-core's `BucketOutputIterator::maybePut()` pattern.
+/// If the entry is shadowed by a higher-level bucket, it's silently dropped
+/// unless it's a lifecycle entry (INIT/DEAD) and `keep_shadowed_lifecycle_entries`
+/// is true (protocol 11+).
+///
+/// When `shadow_cursors` is empty, this is equivalent to `output.push(entry)`.
+fn maybe_put(
+    entry: BucketEntry,
+    shadow_cursors: &mut [ShadowCursor<'_>],
     keep_shadowed_lifecycle_entries: bool,
-) -> Result<Bucket> {
-    let mut cursors: Vec<ShadowCursor<'_>> = shadow_buckets.iter().map(ShadowCursor::new).collect();
-
-    let mut filtered = Vec::with_capacity(merged.len());
-    for entry in merged.iter() {
-        if entry.is_metadata() {
-            filtered.push(entry);
-            continue;
-        }
-
+    output: &mut Vec<BucketEntry>,
+) {
+    if !shadow_cursors.is_empty() {
         if keep_shadowed_lifecycle_entries && (entry.is_init() || entry.is_dead()) {
-            filtered.push(entry);
-            continue;
-        }
-
-        if !is_shadowed(&entry, &mut cursors) {
-            filtered.push(entry);
+            // Lifecycle entries (INIT/DEAD) are preserved even when shadowed
+        } else if is_shadowed(&entry, shadow_cursors) {
+            return;
         }
     }
-
-    Bucket::from_sorted_entries(filtered)
+    output.push(entry);
 }
 
 /// Check if an entry should be kept in the merged output.

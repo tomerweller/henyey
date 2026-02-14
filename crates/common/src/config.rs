@@ -146,6 +146,10 @@ pub struct Config {
     /// Logging configuration (level and format).
     #[serde(default)]
     pub logging: LoggingConfig,
+
+    /// BucketListDB configuration (indexing and caching).
+    #[serde(default)]
+    pub bucket_list_db: BucketListDbConfig,
 }
 
 /// Network-related configuration.
@@ -318,6 +322,80 @@ pub struct HistoryArchiveConfig {
     pub mkdir: Option<String>,
 }
 
+/// BucketListDB configuration.
+///
+/// Controls the indexing and caching behavior of the disk-backed BucketListDB.
+/// These settings match stellar-core's `BUCKETLIST_DB_*` config options.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BucketListDbConfig {
+    /// Exponent for the index page size in bytes: page_size = 1 << exponent.
+    ///
+    /// Default: 14 (16384 bytes = 16 KB per page), matching stellar-core.
+    /// Must be a power-of-two page size. Larger pages mean fewer index entries
+    /// but longer per-page scans.
+    #[serde(default = "default_index_page_size_exponent")]
+    pub index_page_size_exponent: u32,
+
+    /// File size threshold (in MB) below which buckets use InMemoryIndex.
+    ///
+    /// Buckets with file size below this threshold use a full in-memory index
+    /// (per-key offset map), while larger buckets use a page-based DiskIndex
+    /// with bloom filter. Default: 20 MB, matching stellar-core's
+    /// `BUCKETLIST_DB_INDEX_CUTOFF`.
+    #[serde(default = "default_index_cutoff_mb")]
+    pub index_cutoff_mb: usize,
+
+    /// Memory budget (in MB) for per-bucket entry caching. 0 = disabled.
+    ///
+    /// When non-zero, each DiskIndex bucket gets a proportional share of this
+    /// budget for caching Account entries, reducing disk I/O during lookups.
+    /// Default: 0 (disabled).
+    #[serde(default)]
+    pub memory_for_caching_mb: usize,
+
+    /// Whether to persist disk indexes alongside bucket files.
+    ///
+    /// When true, indexes are saved as `.index` files and loaded on startup
+    /// instead of being rebuilt from bucket files. Default: true.
+    #[serde(default = "default_persist_index")]
+    pub persist_index: bool,
+}
+
+impl Default for BucketListDbConfig {
+    fn default() -> Self {
+        Self {
+            index_page_size_exponent: default_index_page_size_exponent(),
+            index_cutoff_mb: default_index_cutoff_mb(),
+            memory_for_caching_mb: 0,
+            persist_index: default_persist_index(),
+        }
+    }
+}
+
+impl BucketListDbConfig {
+    /// Returns the page size in bytes: `1 << index_page_size_exponent`.
+    pub fn page_size_bytes(&self) -> u64 {
+        1u64 << self.index_page_size_exponent
+    }
+
+    /// Returns the index cutoff in bytes: `index_cutoff_mb * 1024 * 1024`.
+    pub fn index_cutoff_bytes(&self) -> u64 {
+        self.index_cutoff_mb as u64 * 1024 * 1024
+    }
+}
+
+fn default_index_page_size_exponent() -> u32 {
+    14 // 16384 bytes
+}
+
+fn default_index_cutoff_mb() -> usize {
+    20
+}
+
+fn default_persist_index() -> bool {
+    true
+}
+
 /// Logging configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LoggingConfig {
@@ -417,6 +495,7 @@ impl Config {
                 put_commands: vec![],
             },
             logging: LoggingConfig::default(),
+            bucket_list_db: BucketListDbConfig::default(),
         }
     }
 }

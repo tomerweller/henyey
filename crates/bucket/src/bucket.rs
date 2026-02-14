@@ -39,8 +39,12 @@ use stellar_xdr::curr::{LedgerEntry, LedgerKey, Limits, ReadXdr, WriteXdr};
 
 use henyey_common::Hash256;
 
+use henyey_common::BucketListDbConfig;
+
+use crate::cache::CacheStats;
 use crate::disk_bucket::DiskBucket;
 use crate::entry::{compare_entries, BucketEntry};
+use crate::index::BucketEntryCounters;
 use crate::{BucketError, Result};
 
 /// Internal storage mode for bucket entries.
@@ -712,6 +716,52 @@ impl Bucket {
         match &self.storage {
             BucketStorage::DiskBacked { disk_bucket } => Some(disk_bucket.file_path()),
             BucketStorage::InMemory { .. } => None,
+        }
+    }
+
+    /// Returns the entry counters from the bucket's index, if available.
+    ///
+    /// Only disk-backed buckets have counters (via their index).
+    /// In-memory buckets return `None`.
+    pub fn entry_counters(&self) -> Option<&BucketEntryCounters> {
+        match &self.storage {
+            BucketStorage::DiskBacked { disk_bucket } => {
+                Some(disk_bucket.live_index().counters())
+            }
+            BucketStorage::InMemory { .. } => None,
+        }
+    }
+
+    /// Initializes the per-bucket entry cache with proportional sizing.
+    ///
+    /// Delegates to `DiskBucket::maybe_initialize_cache()`. Only disk-backed
+    /// buckets get caches; in-memory buckets are no-ops.
+    pub fn maybe_initialize_cache(
+        &self,
+        total_account_bytes: u64,
+        config: &BucketListDbConfig,
+    ) {
+        if let BucketStorage::DiskBacked { disk_bucket } = &self.storage {
+            disk_bucket.maybe_initialize_cache(total_account_bytes, config);
+        }
+    }
+
+    /// Returns cache statistics for this bucket's per-bucket cache, if present.
+    pub fn cache_stats(&self) -> Option<CacheStats> {
+        match &self.storage {
+            BucketStorage::DiskBacked { disk_bucket } => {
+                disk_bucket.cache().map(|c| c.stats())
+            }
+            BucketStorage::InMemory { .. } => None,
+        }
+    }
+
+    /// Resets cache hit/miss counters for this bucket's per-bucket cache.
+    pub fn reset_cache_counters(&self) {
+        if let BucketStorage::DiskBacked { disk_bucket } = &self.storage {
+            if let Some(cache) = disk_bucket.cache() {
+                cache.reset_counters();
+            }
         }
     }
 

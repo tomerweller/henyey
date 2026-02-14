@@ -183,10 +183,6 @@ struct CacheInitResult {
     module_cache: Option<PersistentModuleCache>,
     /// In-memory Soroban state (contract data, code, TTLs, config).
     soroban_state: crate::soroban_state::InMemorySorobanState,
-    /// Total unique entries found during the scan (offers + code + data + config).
-    /// This is a lower bound on the total bucket list size since accounts and
-    /// trustlines are not scanned. Used to activate the entry cache.
-    scanned_entry_count: u64,
 }
 
 /// Result of scanning a single bucket level's curr+snap buckets.
@@ -401,14 +397,11 @@ fn merge_level_results(
         }
     }
 
-    let scanned_entry_count = offer_count + code_count + data_count + ttl_count + config_count;
-
     CacheInitResult {
         offers: mem_offers,
         offer_index,
         module_cache,
         soroban_state,
-        scanned_entry_count,
     }
 }
 
@@ -1085,10 +1078,9 @@ impl LedgerManager {
         let bucket_list = self.bucket_list.read();
         let cache_data = scan_bucket_list_for_caches(&bucket_list, protocol_version);
 
-        // Activate the RandomEvictionCache for account/trustline lookups.
-        // The scanned_entry_count is a lower bound (only offers, code, data,
-        // TTL, config) — the real total includes accounts and trustlines too.
-        bucket_list.maybe_activate_cache(cache_data.scanned_entry_count);
+        // Initialize per-bucket caches for all DiskIndex buckets.
+        // Uses proportional sizing based on the BucketListDB config.
+        bucket_list.maybe_initialize_caches();
         drop(bucket_list);
 
         *self.offer_store.write() = cache_data.offers;
@@ -3040,12 +3032,11 @@ impl<'a> LedgerCloseContext<'a> {
             "Ledger closed details"
         );
 
-        // Snapshot cache stats (per-ledger) and reset counters
+        // Snapshot per-bucket cache stats (aggregated across all buckets) and reset counters
         let cache_perf = {
             let bl = self.manager.bucket_list.read();
-            let cache = bl.cache();
-            if cache.is_active() {
-                let stats = cache.stats();
+            let stats = bl.aggregate_cache_stats();
+            if stats.active {
                 tracing::debug!(
                     ledger_seq = new_header.ledger_seq,
                     cache_entries = stats.entry_count,
@@ -3055,20 +3046,17 @@ impl<'a> LedgerCloseContext<'a> {
                     hit_rate = format!("{:.1}%", stats.hit_rate * 100.0),
                     account_hits = stats.account_hits,
                     account_misses = stats.account_misses,
-                    "Entry cache stats"
+                    "Per-bucket cache stats"
                 );
-                cache.reset_counters();
-                crate::close::CachePerfStats {
-                    entry_count: stats.entry_count,
-                    size_bytes: stats.size_bytes,
-                    hits: stats.hits,
-                    misses: stats.misses,
-                    hit_rate: stats.hit_rate,
-                    account_hits: stats.account_hits,
-                    account_misses: stats.account_misses,
-                }
-            } else {
-                crate::close::CachePerfStats::default()
+            }
+            crate::close::CachePerfStats {
+                entry_count: stats.entry_count,
+                size_bytes: stats.size_bytes,
+                hits: stats.hits,
+                misses: stats.misses,
+                hit_rate: stats.hit_rate,
+                account_hits: stats.account_hits,
+                account_misses: stats.account_misses,
             }
         };
 

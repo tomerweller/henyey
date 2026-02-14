@@ -51,14 +51,15 @@ use stellar_xdr::curr::{
 };
 use tokio::sync::oneshot;
 
-use henyey_common::Hash256;
+use henyey_common::{BucketListDbConfig, Hash256};
 
 use crate::bucket::Bucket;
 use crate::entry::{
     get_ttl_key, is_persistent_entry, is_soroban_entry, is_temporary_entry, is_ttl_expired,
     ledger_entry_to_key, BucketEntry,
 };
-use crate::cache::RandomEvictionCache;
+use crate::cache::CacheStats;
+use crate::index::BucketEntryCounters;
 use crate::eviction::{
     update_starting_eviction_iterator, EvictionCandidate, EvictionIterator, EvictionResult,
     StateArchivalSettings,
@@ -858,11 +859,9 @@ pub struct BucketList {
     /// When set, merges at level 1+ write to disk instead of collecting in memory,
     /// reducing peak memory from O(data_size) to O(index_size).
     bucket_dir: Option<std::path::PathBuf>,
-    /// Optional entry cache for frequently-accessed keys (Account and Trustline entries).
-    /// When active, `get()` checks the cache before scanning levels, and populates
-    /// it on miss. Cache entries are invalidated when new data is added via `add_batch()`.
-    /// Shared via `Arc` so clones of BucketList (and BucketListSnapshot) share the same cache.
-    cache: Arc<RandomEvictionCache>,
+    /// Optional BucketListDB config for per-bucket cache initialization.
+    /// When set, `add_batch()` calls `maybe_initialize_caches()` after updating levels.
+    bucket_list_db_config: Option<BucketListDbConfig>,
 }
 
 /// Get the LedgerEntryType from LedgerEntryData.
@@ -994,7 +993,7 @@ impl BucketList {
             levels,
             ledger_seq: 0,
             bucket_dir: None,
-            cache: Arc::new(RandomEvictionCache::new()),
+            bucket_list_db_config: None,
         }
     }
 
@@ -1075,19 +1074,97 @@ impl BucketList {
         })
     }
 
-    /// Get a reference to the entry cache.
-    pub fn cache(&self) -> &Arc<RandomEvictionCache> {
-        &self.cache
+    /// Set the BucketListDB config for per-bucket cache initialization.
+    ///
+    /// When set, `add_batch()` calls `maybe_initialize_caches()` after updating
+    /// levels, and per-bucket caches are proportionally sized based on
+    /// `memory_for_caching_mb`.
+    pub fn set_bucket_list_db_config(&mut self, config: BucketListDbConfig) {
+        self.bucket_list_db_config = Some(config);
     }
 
-    /// Activate the cache if the bucket list is large enough.
+    /// Sums entry counters across all buckets in the bucket list.
     ///
-    /// This should be called after restoring a bucket list from a history archive,
-    /// passing the total number of live entries. The cache self-activates when
-    /// the entry count exceeds `MIN_BUCKET_LIST_SIZE_FOR_CACHE` (1M entries).
-    pub fn maybe_activate_cache(&self, bucket_list_entry_count: u64) {
-        self.cache
-            .maybe_initialize(bucket_list_entry_count as usize);
+    /// Matches stellar-core's `LiveBucketList::sumBucketEntryCounters`.
+    pub fn sum_bucket_entry_counters(&self) -> BucketEntryCounters {
+        let mut counters = BucketEntryCounters::new();
+        for level in &self.levels {
+            for bucket in [&level.curr, &level.snap] {
+                if !bucket.is_empty() {
+                    if let Some(idx_counters) = bucket.entry_counters() {
+                        counters.merge(idx_counters);
+                    }
+                }
+            }
+        }
+        counters
+    }
+
+    /// Initializes per-bucket caches for all DiskIndex buckets.
+    ///
+    /// Matches stellar-core's `LiveBucketList::maybeInitializeCaches`.
+    /// Each DiskIndex bucket gets a proportional share of the configured
+    /// `memory_for_caching_mb` budget based on its account byte fraction.
+    pub fn maybe_initialize_caches(&self) {
+        let Some(config) = &self.bucket_list_db_config else {
+            return;
+        };
+        if config.memory_for_caching_mb == 0 {
+            return;
+        }
+        let counters = self.sum_bucket_entry_counters();
+        let total_account_bytes =
+            counters.size_for_type(stellar_xdr::curr::LedgerEntryType::Account);
+        for level in &self.levels {
+            for bucket in [&level.curr, &level.snap] {
+                if !bucket.is_empty() {
+                    bucket.maybe_initialize_cache(total_account_bytes, config);
+                }
+            }
+        }
+    }
+
+    /// Returns aggregated cache statistics across all per-bucket caches.
+    ///
+    /// Sums hits/misses from all DiskIndex bucket caches and resets their counters.
+    pub fn aggregate_cache_stats(&self) -> CacheStats {
+        let mut total = CacheStats {
+            entry_count: 0,
+            size_bytes: 0,
+            max_bytes: 0,
+            max_entries: 0,
+            hits: 0,
+            misses: 0,
+            hit_rate: 0.0,
+            active: false,
+            account_hits: 0,
+            account_misses: 0,
+        };
+        for level in &self.levels {
+            for bucket in [&level.curr, &level.snap] {
+                if !bucket.is_empty() {
+                    if let Some(stats) = bucket.cache_stats() {
+                        total.entry_count += stats.entry_count;
+                        total.size_bytes += stats.size_bytes;
+                        total.max_bytes += stats.max_bytes;
+                        total.max_entries += stats.max_entries;
+                        total.hits += stats.hits;
+                        total.misses += stats.misses;
+                        total.account_hits += stats.account_hits;
+                        total.account_misses += stats.account_misses;
+                        if stats.active {
+                            total.active = true;
+                        }
+                        bucket.reset_cache_counters();
+                    }
+                }
+            }
+        }
+        let total_requests = total.hits + total.misses;
+        if total_requests > 0 {
+            total.hit_rate = total.hits as f64 / total_requests as f64;
+        }
+        total
     }
 
     /// Look up an entry by its key.
@@ -1099,28 +1176,10 @@ impl BucketList {
     }
 
     /// Look up an entry by its key with optional debug tracing.
+    ///
+    /// Per-bucket caches (inside each DiskBucket) handle caching transparently;
+    /// no global cache logic is needed here.
     pub fn get_with_debug(&self, key: &LedgerKey, debug: bool) -> Result<Option<LedgerEntry>> {
-        // Check cache first for eligible key types (currently Account only).
-        // The cache is only consulted when active (entry count >= threshold).
-        if self.cache.is_active() && RandomEvictionCache::is_cached_type(key) {
-            if let Some(cached) = self.cache.get(key) {
-                if debug {
-                    tracing::info!("Cache hit for entry");
-                }
-                return match cached.as_ref() {
-                    BucketEntry::Live(e) | BucketEntry::Init(e) => Ok(Some(e.clone())),
-                    BucketEntry::Dead(_) => Ok(None),
-                    BucketEntry::Metadata(_) => {
-                        // Metadata should never be cached; fall through to level scan
-                        Ok(None)
-                    }
-                };
-            }
-            if debug {
-                tracing::info!("Cache miss for entry, scanning levels");
-            }
-        }
-
         // Search from newest to oldest (curr then snap). Pending merges (next)
         // are not part of the bucket list state yet.
         for (level_idx, level) in self.levels.iter().enumerate() {
@@ -1133,10 +1192,6 @@ impl BucketList {
                         entry_type = ?std::mem::discriminant(&entry),
                         "Found entry in bucket list"
                     );
-                }
-                // Populate cache on miss for eligible types
-                if self.cache.is_active() && RandomEvictionCache::is_cached_type(key) {
-                    self.cache.insert(key.clone(), entry.clone());
                 }
                 return match entry {
                     BucketEntry::Live(e) | BucketEntry::Init(e) => Ok(Some(e.clone())),
@@ -1154,10 +1209,6 @@ impl BucketList {
                         entry_type = ?std::mem::discriminant(&entry),
                         "Found entry in bucket list"
                     );
-                }
-                // Populate cache on miss for eligible types
-                if self.cache.is_active() && RandomEvictionCache::is_cached_type(key) {
-                    self.cache.insert(key.clone(), entry.clone());
                 }
                 return match entry {
                     BucketEntry::Live(e) | BucketEntry::Init(e) => Ok(Some(e.clone())),
@@ -1458,36 +1509,16 @@ impl BucketList {
             .collect();
         entries.extend(dedup_dead.into_iter().map(BucketEntry::Dead));
 
-        // Update the cache for any entries being added to the bucket list.
-        // This ensures the cache stays consistent with the newest state.
-        // We insert Live/Init/Dead entries so that subsequent get() calls
-        // return the correct result without scanning levels.
-        if self.cache.is_active() {
-            for entry in &entries {
-                if let Some(key) = entry.key() {
-                    if RandomEvictionCache::is_cached_type(&key) {
-                        match entry {
-                            BucketEntry::Live(_) | BucketEntry::Init(_) => {
-                                self.cache.insert(key, entry.clone());
-                            }
-                            BucketEntry::Dead(_) => {
-                                // Remove dead entries from cache so the next get()
-                                // returns None without a stale Live hit.
-                                self.cache.remove(&key);
-                            }
-                            BucketEntry::Metadata(_) => {}
-                        }
-                    }
-                }
-            }
-        }
-
         // Create the new bucket with in-memory entries for level 0 optimization.
         // We use fresh_in_memory_only() which skips hash computation because:
         // 1. This bucket will be immediately merged with level 0 curr
         // 2. Only the merged result's hash matters for the bucket list
         // 3. Skipping hash computation saves ~50% of the bucket update time
         // This matches stellar-core's freshInMemoryOnly optimization.
+        //
+        // No global cache write-through is needed: new entries go to level 0
+        // (always InMemory), and lookups check level 0 first, so stale
+        // deeper-level per-bucket caches don't cause incorrect results.
         let new_bucket = Bucket::fresh_in_memory_only({
             let mut e = entries;
             e.sort_by(crate::entry::compare_entries);
@@ -1496,6 +1527,10 @@ impl BucketList {
 
         self.add_batch_internal(ledger_seq, protocol_version, new_bucket)?;
         self.ledger_seq = ledger_seq;
+
+        // Initialize per-bucket caches for any new DiskIndex buckets
+        self.maybe_initialize_caches();
+
         Ok(())
     }
 
@@ -1976,7 +2011,7 @@ impl BucketList {
             levels,
             ledger_seq: 0,
             bucket_dir: None,
-            cache: Arc::new(RandomEvictionCache::new()),
+            bucket_list_db_config: None,
         })
     }
 

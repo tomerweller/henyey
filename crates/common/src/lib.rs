@@ -56,7 +56,7 @@ pub mod types;
 pub mod xdr_stream;
 
 // Re-export key types at crate root for convenience
-pub use config::Config;
+pub use config::{BucketListDbConfig, Config};
 pub use error::{Error, Result};
 pub use meta::*;
 pub use network::NetworkId;

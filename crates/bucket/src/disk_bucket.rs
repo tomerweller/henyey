@@ -40,11 +40,12 @@ use std::sync::{Arc, OnceLock};
 use memmap2::Mmap;
 
 use sha2::{Digest, Sha256};
-use stellar_xdr::curr::{LedgerKey, Limits, ReadXdr};
+use stellar_xdr::curr::{LedgerEntryType, LedgerKey, Limits, ReadXdr};
 
-use henyey_common::Hash256;
+use henyey_common::{BucketListDbConfig, Hash256};
 
 use crate::bloom_filter::HashSeed;
+use crate::cache::RandomEvictionCache;
 use crate::entry::BucketEntry;
 use crate::index::LiveBucketIndex;
 use crate::{BucketError, Result};
@@ -103,6 +104,10 @@ pub struct DiskBucket {
     index: OnceLock<Box<LiveBucketIndex>>,
     /// Memory-mapped file for lock-free reads.
     mmap: OnceLock<Arc<Mmap>>,
+    /// Per-bucket entry cache for DiskIndex buckets.
+    /// Initialized lazily via `maybe_initialize_cache()`.
+    /// Only caches ACCOUNT entries (matching stellar-core).
+    cache: OnceLock<Arc<RandomEvictionCache>>,
 }
 
 /// Iterator that reads `(BucketEntry, offset)` pairs one at a time from an
@@ -205,7 +210,7 @@ impl DiskBucket {
                 .len();
             let iter = StreamingXdrEntryIterator::new(&self.file_path, file_len)
                 .expect("failed to open bucket file for index build");
-            let live_index = LiveBucketIndex::from_entries(iter, self.bloom_seed, self.entry_count);
+            let live_index = LiveBucketIndex::from_entries_default(iter, self.bloom_seed, file_len);
 
             tracing::debug!(
                 hash = %self.hash.to_hex(),
@@ -253,7 +258,7 @@ impl DiskBucket {
         // Pass 2: build index by streaming entries one at a time (O(index_size) memory)
         // The iterator reads and parses one entry at a time from disk.
         let iter = StreamingXdrEntryIterator::new(path, file_len)?;
-        let live_index = LiveBucketIndex::from_entries(iter, bloom_seed, entry_count);
+        let live_index = LiveBucketIndex::from_entries_default(iter, bloom_seed, file_len);
 
         tracing::debug!(
             entry_count,
@@ -281,6 +286,7 @@ impl DiskBucket {
             bloom_seed,
             index,
             mmap,
+            cache: OnceLock::new(),
         })
     }
 
@@ -354,6 +360,7 @@ impl DiskBucket {
             bloom_seed: DEFAULT_BLOOM_SEED,
             index,
             mmap,
+            cache: OnceLock::new(),
         })
     }
 
@@ -425,6 +432,63 @@ impl DiskBucket {
         self.bloom_seed
     }
 
+    /// Returns the per-bucket cache, if initialized.
+    pub fn cache(&self) -> Option<&Arc<RandomEvictionCache>> {
+        self.cache.get()
+    }
+
+    /// Initializes the per-bucket entry cache with proportional sizing.
+    ///
+    /// Matches stellar-core's `LiveBucketIndex::maybeInitializeCache`:
+    /// - Only DiskIndex buckets get caches (InMemory already has everything in memory)
+    /// - Cache size is proportional to this bucket's share of total account bytes
+    /// - When total account bytes fit in the budget, the full bucket is cached
+    pub fn maybe_initialize_cache(
+        &self,
+        total_bucket_list_account_size_bytes: u64,
+        config: &BucketListDbConfig,
+    ) {
+        if self.cache.get().is_some() {
+            return;
+        }
+
+        let index = self.ensure_index();
+
+        // Only DiskIndex buckets get caches (InMemory already has everything)
+        let LiveBucketIndex::Disk(disk_idx) = index else {
+            return;
+        };
+
+        let counters = disk_idx.counters();
+        let accounts_in_bucket = counters.count_for_type(LedgerEntryType::Account);
+        let max_cache_bytes = config.memory_for_caching_mb as u64 * 1024 * 1024;
+
+        if accounts_in_bucket == 0 || max_cache_bytes == 0 {
+            return;
+        }
+
+        let account_bytes = counters.size_for_type(LedgerEntryType::Account);
+        let cache_entries = if total_bucket_list_account_size_bytes <= max_cache_bytes {
+            // Can cache the entire bucket
+            accounts_in_bucket as usize
+        } else {
+            // Proportional allocation (stellar-core formula)
+            let fraction =
+                account_bytes as f64 / total_bucket_list_account_size_bytes as f64;
+            let bytes_for_bucket = max_cache_bytes as f64 * fraction;
+            let avg_size = account_bytes as f64 / accounts_in_bucket as f64;
+            (bytes_for_bucket / avg_size) as usize
+        };
+
+        if cache_entries == 0 {
+            return;
+        }
+
+        let cache = RandomEvictionCache::with_limits(usize::MAX, cache_entries);
+        cache.activate();
+        let _ = self.cache.set(Arc::new(cache));
+    }
+
     /// Look up an entry by key.
     ///
     /// This reads from disk using the index. The bloom filter is checked first
@@ -432,6 +496,13 @@ impl DiskBucket {
     ///
     /// On first call, this lazily initializes the index (Pass 2) and mmap.
     pub fn get(&self, key: &LedgerKey) -> Result<Option<BucketEntry>> {
+        // Check per-bucket cache first
+        if let Some(cache) = self.cache.get() {
+            if let Some(cached) = cache.get(key) {
+                return Ok(Some((*cached).clone()));
+            }
+        }
+
         let index = self.ensure_index();
 
         // Check bloom filter (built into the index)
@@ -439,28 +510,42 @@ impl DiskBucket {
             return Ok(None);
         }
 
-        match index {
+        let result = match index {
             LiveBucketIndex::InMemory(idx) => {
                 // Exact offset lookup
                 if let Some(offset) = idx.get_offset(key) {
                     let entry = self.read_entry_at(offset)?;
                     if let Some(entry_key) = entry.key() {
                         if &entry_key == key {
-                            return Ok(Some(entry));
+                            Some(entry)
+                        } else {
+                            None
                         }
+                    } else {
+                        None
                     }
+                } else {
+                    None
                 }
-                Ok(None)
             }
             LiveBucketIndex::Disk(disk_idx) => {
                 // Page-based lookup: find candidate page, scan within it
                 if let Some(page_offset) = disk_idx.find_page_for_key(key) {
-                    self.scan_page_for_key(page_offset, key, disk_idx.page_size())
+                    self.scan_page_for_key(page_offset, key, disk_idx.page_size())?
                 } else {
-                    Ok(None)
+                    None
                 }
             }
+        };
+
+        // Populate cache on miss
+        if let Some(ref entry) = result {
+            if let Some(cache) = self.cache.get() {
+                cache.insert(key.clone(), entry.clone());
+            }
         }
+
+        Ok(result)
     }
 
     /// Look up an entry using pre-serialized key bytes to avoid redundant serialization.
@@ -472,34 +557,55 @@ impl DiskBucket {
         key: &LedgerKey,
         key_bytes: &[u8],
     ) -> Result<Option<BucketEntry>> {
+        // Check per-bucket cache first
+        if let Some(cache) = self.cache.get() {
+            if let Some(cached) = cache.get(key) {
+                return Ok(Some((*cached).clone()));
+            }
+        }
+
         let index = self.ensure_index();
 
         if !index.may_contain_bytes(key_bytes) {
             return Ok(None);
         }
 
-        match index {
+        let result = match index {
             LiveBucketIndex::InMemory(idx) => {
                 if let Some(offset) = idx.get_offset_by_key_bytes(key_bytes) {
                     let entry = self.read_entry_at(offset)?;
                     if let Some(entry_key) = entry.key() {
                         if &entry_key == key {
-                            return Ok(Some(entry));
+                            Some(entry)
+                        } else {
+                            None
                         }
+                    } else {
+                        None
                     }
+                } else {
+                    None
                 }
-                Ok(None)
             }
             LiveBucketIndex::Disk(disk_idx) => {
                 // Disk-based index uses key comparison for page search,
                 // fall back to regular method
                 if let Some(page_offset) = disk_idx.find_page_for_key(key) {
-                    self.scan_page_for_key(page_offset, key, disk_idx.page_size())
+                    self.scan_page_for_key(page_offset, key, disk_idx.page_size())?
                 } else {
-                    Ok(None)
+                    None
                 }
             }
+        };
+
+        // Populate cache on miss
+        if let Some(ref entry) = result {
+            if let Some(cache) = self.cache.get() {
+                cache.insert(key.clone(), entry.clone());
+            }
         }
+
+        Ok(result)
     }
 
     /// Read a single entry from the mmap at the given offset.
@@ -550,7 +656,11 @@ impl DiskBucket {
         BucketEntry::from_xdr_entry(xdr_entry)
     }
 
-    /// Scan a page starting at `page_offset` for a key, reading up to `page_size` entries.
+    /// Scan a page starting at `page_offset` for a key, reading up to `page_size` bytes.
+    ///
+    /// The scan terminates when the position exceeds `page_offset + page_size` or
+    /// when an entry with a key greater than the target is found (entries are sorted).
+    /// Entries straddling the page boundary are still read completely (mmap allows this).
     fn scan_page_for_key(
         &self,
         page_offset: u64,
@@ -559,9 +669,9 @@ impl DiskBucket {
     ) -> Result<Option<BucketEntry>> {
         let data = &**self.ensure_mmap();
         let mut position = page_offset as usize;
-        let mut entries_scanned = 0u64;
+        let page_end = (page_offset + page_size) as usize;
 
-        while (position + 4) <= data.len() && entries_scanned < page_size {
+        while (position + 4) <= data.len() && position < page_end {
             // Read 4-byte record mark
             let mark_buf: [u8; 4] = data[position..position + 4].try_into().unwrap();
             position += 4;
@@ -591,8 +701,6 @@ impl DiskBucket {
                     }
                 }
             }
-
-            entries_scanned += 1;
         }
 
         Ok(None)
