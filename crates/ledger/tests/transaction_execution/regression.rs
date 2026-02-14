@@ -2032,3 +2032,125 @@ fn test_internal_error_maps_to_tx_internal_error() {
     );
 }
 
+/// Regression test for CreateAccount check order with sponsorship (mainnet ledger 61232072).
+///
+/// When a sponsored CreateAccount fails because both the sponsor lacks reserve AND
+/// the source lacks available balance, the result must be LowReserve (sponsor checked
+/// first via createEntryWithPossibleSponsorship), not Underfunded (source checked first).
+///
+/// This exercises the full TransactionExecutor pipeline, not just the op-level function.
+#[test]
+fn test_create_account_sponsor_low_reserve_before_underfunded() {
+    let source_secret = SecretKey::from_seed(&[230u8; 32]);
+    let source_id: AccountId = (&source_secret.public_key()).into();
+
+    let sponsor_secret = SecretKey::from_seed(&[231u8; 32]);
+    let sponsor_id: AccountId = (&sponsor_secret.public_key()).into();
+    let dest_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([232u8; 32])));
+
+    // Source: just above minimum balance — enough to pay fees but NOT enough
+    // available balance for the starting_balance of 20M.
+    // min_balance = 2 * base_reserve = 10M, available = 11M - 10M = 1M (< 20M)
+    let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 11_000_000);
+
+    // Sponsor: minimum balance only, can't afford to sponsor (needs 2x base_reserve extra)
+    let (sponsor_key, sponsor_entry) =
+        create_sponsor_account_entry(sponsor_id.clone(), 1, 10_000_000, 0);
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .expect("add source")
+        .add_entry(sponsor_key, sponsor_entry)
+        .expect("add sponsor")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let network_id = NetworkId::testnet();
+
+    // Build a CreateAccount op inside a BeginSponsoringFutureReserves sandwich
+    let ops: Vec<Operation> = vec![
+        // Op 0: sponsor begins sponsoring
+        Operation {
+            source_account: Some(MuxedAccount::Ed25519(
+                match &sponsor_id.0 {
+                    PublicKey::PublicKeyTypeEd25519(k) => k.clone(),
+                },
+            )),
+            body: OperationBody::BeginSponsoringFutureReserves(
+                stellar_xdr::curr::BeginSponsoringFutureReservesOp {
+                    sponsored_id: dest_id.clone(),
+                },
+            ),
+        },
+        // Op 1: CreateAccount (should fail with LowReserve, not Underfunded)
+        Operation {
+            source_account: None,
+            body: OperationBody::CreateAccount(CreateAccountOp {
+                destination: dest_id.clone(),
+                starting_balance: 20_000_000, // source can't afford this either
+            }),
+        },
+    ];
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*source_secret.public_key().as_bytes())),
+        fee: 200,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: ops.try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    // Sign with both source and sponsor
+    let source_sig = sign_envelope(&envelope, &source_secret, &network_id);
+    let sponsor_sig = sign_envelope(&envelope, &sponsor_secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![source_sig, sponsor_sig].try_into().unwrap();
+    }
+
+    let context = henyey_tx::LedgerContext::new(
+        1,
+        1_000,
+        100,
+        5_000_000,
+        25,
+        network_id,
+    );
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    // TX should fail (CreateAccount op fails)
+    assert!(
+        !result.success,
+        "TX should fail because sponsor can't afford reserve. failure={:?} ops={:?}",
+        result.failure, result.operation_results
+    );
+
+    // Op 1 (CreateAccount) must be LowReserve, NOT Underfunded
+    let op_result = &result.operation_results[1];
+    match op_result {
+        OperationResult::OpInner(OperationResultTr::CreateAccount(r)) => {
+            assert!(
+                matches!(r, CreateAccountResult::LowReserve),
+                "Must return LowReserve (sponsor checked first), not Underfunded; got {:?}",
+                r
+            );
+        }
+        other => panic!("Expected CreateAccount result, got {:?}", other),
+    }
+}
+
