@@ -222,10 +222,7 @@ pub use index_persistence::{
 // Caching
 // ============================================================================
 
-pub use cache::{
-    CacheStats, RandomEvictionCache, DEFAULT_MAX_CACHE_BYTES, DEFAULT_MAX_CACHE_ENTRIES,
-    MIN_BUCKET_LIST_SIZE_FOR_CACHE,
-};
+pub use cache::{CacheStats, RandomEvictionCache};
 
 // ============================================================================
 // Merge deduplication

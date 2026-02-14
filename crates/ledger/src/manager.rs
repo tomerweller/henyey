@@ -3056,8 +3056,6 @@ impl<'a> LedgerCloseContext<'a> {
                     hits = stats.hits,
                     misses = stats.misses,
                     hit_rate = format!("{:.1}%", stats.hit_rate * 100.0),
-                    account_hits = stats.account_hits,
-                    account_misses = stats.account_misses,
                     "Per-bucket cache stats"
                 );
             }
@@ -3067,8 +3065,6 @@ impl<'a> LedgerCloseContext<'a> {
                 hits: stats.hits,
                 misses: stats.misses,
                 hit_rate: stats.hit_rate,
-                account_hits: stats.account_hits,
-                account_misses: stats.account_misses,
             }
         };
 

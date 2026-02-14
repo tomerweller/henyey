@@ -673,8 +673,6 @@ pub struct CachePerfStats {
     pub hits: u64,
     pub misses: u64,
     pub hit_rate: f64,
-    pub account_hits: u64,
-    pub account_misses: u64,
 }
 
 /// Performance metrics collected during ledger close.

@@ -1137,8 +1137,6 @@ impl BucketList {
             misses: 0,
             hit_rate: 0.0,
             active: false,
-            account_hits: 0,
-            account_misses: 0,
         };
         for level in &self.levels {
             for bucket in [&level.curr, &level.snap] {
@@ -1150,8 +1148,6 @@ impl BucketList {
                         total.max_entries += stats.max_entries;
                         total.hits += stats.hits;
                         total.misses += stats.misses;
-                        total.account_hits += stats.account_hits;
-                        total.account_misses += stats.account_misses;
                         if stats.active {
                             total.active = true;
                         }

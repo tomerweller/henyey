@@ -142,7 +142,7 @@ iter = result.end_iterator;
 | `iterator.rs` | `BucketInputIterator`, `BucketOutputIterator` for streaming file I/O |
 | `live_iterator.rs` | `LiveEntriesIterator`: memory-efficient streaming over live entries |
 | `eviction.rs` | Eviction scan logic, `EvictionIterator`, level math utilities |
-| `cache.rs` | `RandomEvictionCache` for account and trustline entries |
+| `cache.rs` | `RandomEvictionCache` for frequently-accessed account entries |
 | `applicator.rs` | `BucketApplicator` for chunked catchup entry application |
 | `merge_map.rs` | `BucketMergeMap` for merge deduplication and reattachment |
 | `metrics.rs` | `MergeCounters`, `EvictionCounters`, `BucketListMetrics` |

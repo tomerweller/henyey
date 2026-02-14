@@ -25,17 +25,6 @@ use stellar_xdr::curr::{LedgerEntry, LedgerEntryData, LedgerKey};
 
 use crate::entry::BucketEntry;
 
-/// Default maximum cache size in bytes (1 GB).
-pub const DEFAULT_MAX_CACHE_BYTES: usize = 1024 * 1024 * 1024;
-
-/// Default maximum number of entries in the cache.
-/// Sized for accounts, trustlines, claimable balances, and liquidity pools.
-pub const DEFAULT_MAX_CACHE_ENTRIES: usize = 2_000_000;
-
-/// Minimum bucket list size (in entries) before cache is initialized.
-/// Below this threshold, the bucket list is small enough that caching
-/// provides minimal benefit.
-pub const MIN_BUCKET_LIST_SIZE_FOR_CACHE: usize = 1_000_000;
 
 // ============================================================================
 // Cache Entry
@@ -152,14 +141,10 @@ struct CacheInner {
     access_counter: u64,
     /// Simple xorshift64 RNG state for eviction sampling.
     rng_state: u64,
-    /// Cache hit count for statistics (account only).
+    /// Cache hit count (only ACCOUNT entries are cached).
     hits: u64,
-    /// Cache miss count for statistics (account only).
+    /// Cache miss count (only ACCOUNT entries are cached).
     misses: u64,
-    /// Account-specific hit count (same as hits since only accounts are cached).
-    account_hits: u64,
-    /// Account-specific miss count (same as misses since only accounts are cached).
-    account_misses: u64,
 }
 
 impl CacheInner {
@@ -176,12 +161,7 @@ impl CacheInner {
 }
 
 impl RandomEvictionCache {
-    /// Creates a new cache with default settings.
-    pub fn new() -> Self {
-        Self::with_limits(DEFAULT_MAX_CACHE_BYTES, DEFAULT_MAX_CACHE_ENTRIES)
-    }
-
-    /// Creates a new cache with custom limits.
+    /// Creates a new cache with the given limits.
     pub fn with_limits(max_bytes: usize, max_entries: usize) -> Self {
         Self {
             inner: Mutex::new(CacheInner {
@@ -191,23 +171,11 @@ impl RandomEvictionCache {
                 rng_state: 0x5EED_CAFE_BABE_D00D, // arbitrary non-zero seed
                 hits: 0,
                 misses: 0,
-                account_hits: 0,
-                account_misses: 0,
             }),
             max_bytes,
             max_entries,
             current_bytes: AtomicUsize::new(0),
             active: AtomicUsize::new(0), // Not active initially
-        }
-    }
-
-    /// Initializes the cache based on bucket list size.
-    ///
-    /// The cache is only activated if the bucket list is large enough
-    /// to benefit from caching.
-    pub fn maybe_initialize(&self, bucket_list_entry_count: usize) {
-        if bucket_list_entry_count >= MIN_BUCKET_LIST_SIZE_FOR_CACHE {
-            self.active.store(1, Ordering::Release);
         }
     }
 
@@ -250,11 +218,9 @@ impl RandomEvictionCache {
             entry.access_count = current_counter;
             let result = Arc::clone(&entry.entry);
             inner.hits += 1;
-            inner.account_hits += 1;
             Some(result)
         } else {
             inner.misses += 1;
-            inner.account_misses += 1;
             None
         }
     }
@@ -333,8 +299,6 @@ impl RandomEvictionCache {
         inner.keys.clear();
         inner.hits = 0;
         inner.misses = 0;
-        inner.account_hits = 0;
-        inner.account_misses = 0;
         self.current_bytes.store(0, Ordering::Relaxed);
     }
 
@@ -395,8 +359,6 @@ impl RandomEvictionCache {
                 0.0
             },
             active: self.is_active(),
-            account_hits: inner.account_hits,
-            account_misses: inner.account_misses,
         }
     }
 
@@ -423,16 +385,9 @@ impl RandomEvictionCache {
         let mut inner = self.inner.lock();
         inner.hits = 0;
         inner.misses = 0;
-        inner.account_hits = 0;
-        inner.account_misses = 0;
     }
 }
 
-impl Default for RandomEvictionCache {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 impl std::fmt::Debug for RandomEvictionCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -470,10 +425,6 @@ pub struct CacheStats {
     pub hit_rate: f64,
     /// Whether the cache is active.
     pub active: bool,
-    /// Account-specific hit count.
-    pub account_hits: u64,
-    /// Account-specific miss count.
-    pub account_misses: u64,
 }
 
 #[cfg(test)]
@@ -541,7 +492,7 @@ mod tests {
 
     #[test]
     fn test_cache_basic_operations() {
-        let cache = RandomEvictionCache::new();
+        let cache = RandomEvictionCache::with_limits(1_000_000, 1_000);
         cache.activate();
 
         let key = make_account_key(1);
@@ -561,7 +512,7 @@ mod tests {
 
     #[test]
     fn test_cache_not_active() {
-        let cache = RandomEvictionCache::new();
+        let cache = RandomEvictionCache::with_limits(1_000_000, 1_000);
         // Don't activate the cache
 
         let key = make_account_key(1);
@@ -700,7 +651,7 @@ mod tests {
 
     #[test]
     fn test_cache_stats() {
-        let cache = RandomEvictionCache::new();
+        let cache = RandomEvictionCache::with_limits(1_000_000, 1_000);
         cache.activate();
 
         let key = make_account_key(1);
@@ -724,7 +675,7 @@ mod tests {
 
     #[test]
     fn test_cache_clear() {
-        let cache = RandomEvictionCache::new();
+        let cache = RandomEvictionCache::with_limits(1_000_000, 1_000);
         cache.activate();
 
         for i in 0..5u8 {
@@ -739,22 +690,8 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_maybe_initialize() {
-        let cache = RandomEvictionCache::new();
-        assert!(!cache.is_active());
-
-        // Below threshold
-        cache.maybe_initialize(100);
-        assert!(!cache.is_active());
-
-        // Above threshold
-        cache.maybe_initialize(MIN_BUCKET_LIST_SIZE_FOR_CACHE);
-        assert!(cache.is_active());
-    }
-
-    #[test]
     fn test_cache_update_existing() {
-        let cache = RandomEvictionCache::new();
+        let cache = RandomEvictionCache::with_limits(1_000_000, 1_000);
         cache.activate();
 
         let key = make_account_key(1);
@@ -774,7 +711,7 @@ mod tests {
 
     #[test]
     fn test_cache_rejects_non_account_types() {
-        let cache = RandomEvictionCache::new();
+        let cache = RandomEvictionCache::with_limits(1_000_000, 1_000);
         cache.activate();
 
         // Trustline should not be cached
