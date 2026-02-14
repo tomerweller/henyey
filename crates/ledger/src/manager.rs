@@ -866,6 +866,18 @@ impl LedgerManager {
         self.hot_archive_bucket_list.read()
     }
 
+    /// Get all bucket hashes referenced by the live and hot archive bucket lists.
+    ///
+    /// Used for garbage collection to determine which bucket files on disk
+    /// are still needed.
+    pub fn all_referenced_bucket_hashes(&self) -> Vec<Hash256> {
+        let mut hashes = self.bucket_list.read().all_bucket_hashes();
+        if let Some(ref hot_archive) = *self.hot_archive_bucket_list.read() {
+            hashes.extend(hot_archive.all_bucket_hashes());
+        }
+        hashes
+    }
+
     /// Initialize the ledger from bucket list state.
     ///
     /// This is used during catchup from history archives.

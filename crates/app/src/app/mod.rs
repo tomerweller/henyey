@@ -1316,6 +1316,23 @@ impl App {
         }
     }
 
+    /// Delete bucket files on disk that are no longer referenced by the live
+    /// or hot archive bucket lists. Prevents unbounded disk growth.
+    /// Matches stellar-core's cleanupStaleFiles() + forgetUnreferencedBuckets().
+    pub(crate) fn cleanup_stale_bucket_files(&self) {
+        let hashes = self.ledger_manager.all_referenced_bucket_hashes();
+        match self.bucket_manager.retain_buckets(&hashes) {
+            Ok(deleted) => {
+                if deleted > 0 {
+                    tracing::info!(deleted, "Cleaned up stale bucket files");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to cleanup stale bucket files");
+            }
+        }
+    }
+
     /// Get a ConfigUpgradeSet from the ledger by its key.
     ///
     /// Looks up the temporary ledger entry containing the ConfigUpgradeSet

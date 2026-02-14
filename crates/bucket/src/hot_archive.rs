@@ -925,6 +925,19 @@ impl HotArchiveBucketList {
         paths
     }
 
+    /// Get all bucket hashes in the hot archive bucket list.
+    ///
+    /// Returns hashes for curr and snap buckets at every level.
+    /// Used for garbage collection to identify which bucket files are still referenced.
+    pub fn all_bucket_hashes(&self) -> Vec<Hash256> {
+        let mut hashes = Vec::with_capacity(self.levels.len() * 2);
+        for level in &self.levels {
+            hashes.push(level.curr.hash());
+            hashes.push(level.snap.hash());
+        }
+        hashes
+    }
+
     /// Get a reference to a level.
     pub fn level(&self, idx: usize) -> Option<&HotArchiveBucketLevel> {
         self.levels.get(idx)

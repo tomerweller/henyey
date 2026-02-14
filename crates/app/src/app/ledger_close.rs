@@ -1190,6 +1190,11 @@ impl App {
         // Signal heartbeat to sync recovery.
         self.sync_recovery_heartbeat();
 
+        // Periodically garbage collect stale bucket files.
+        if pending.ledger_seq % 100 == 0 {
+            self.cleanup_stale_bucket_files();
+        }
+
         self.tx_set_all_peers_exhausted
             .store(false, Ordering::SeqCst);
 

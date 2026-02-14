@@ -220,6 +220,18 @@ impl App {
             "Cleared bucket manager cache after catchup"
         );
 
+        // Garbage collect bucket files no longer referenced after catchup.
+        // Matches stellar-core's cleanupStaleFiles() in assumeState().
+        self.cleanup_stale_bucket_files();
+
+        // Clean up merge temp files left by previous process runs.
+        let empty_refs = std::collections::HashSet::new();
+        if let Ok(deleted) = self.bucket_manager.cleanup_unreferenced_files(&empty_refs) {
+            if deleted > 0 {
+                tracing::info!(deleted, "Cleaned up merge temp files from previous runs");
+            }
+        }
+
         // Trim herder/scp_driver caches to release memory after catchup, but
         // PRESERVE data for slots > new_lcl that will be needed for buffered ledgers.
         // This is critical: during catchup, we receive EXTERNALIZE envelopes and
