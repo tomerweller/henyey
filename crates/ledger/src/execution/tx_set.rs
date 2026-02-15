@@ -108,37 +108,6 @@ pub fn run_transactions_on_executor(
         );
     }
 
-    // Phase 2: Prefetch seller entries for likely offer crossings.
-    // For each DEX asset pair in the tx set, pre-load the top offers' seller
-    // accounts and trustlines into the prefetch cache. This avoids per-offer
-    // bucket list lookups during the offer crossing loop.
-    {
-        const MAX_OFFERS_TO_PREFETCH: usize = 100;
-        let mut offer_seller_keys = std::collections::HashSet::new();
-        for (tx, _) in transactions {
-            let frame = TransactionFrame::new(tx.clone());
-            for op in frame.operations() {
-                for (selling, buying) in henyey_tx::extract_dex_asset_pairs(&op.body) {
-                    executor.state.collect_best_offer_seller_keys(
-                        &selling,
-                        &buying,
-                        &mut offer_seller_keys,
-                        MAX_OFFERS_TO_PREFETCH,
-                    );
-                }
-            }
-        }
-        if !offer_seller_keys.is_empty() {
-            let stats = snapshot
-                .prefetch(&offer_seller_keys.into_iter().collect::<Vec<_>>())?;
-            tracing::info!(
-                requested = stats.requested,
-                loaded = stats.loaded,
-                "Prefetched offer seller entries"
-            );
-        }
-    }
-
     let mut results = Vec::with_capacity(transactions.len());
     let mut tx_results = Vec::with_capacity(transactions.len());
     let mut tx_result_metas = Vec::with_capacity(transactions.len());

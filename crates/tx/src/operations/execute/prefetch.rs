@@ -66,26 +66,10 @@ fn asset_to_trustline_asset(asset: &Asset) -> Option<TrustLineAsset> {
     }
 }
 
-/// Get the issuer AccountId from an asset, if it's not native.
-fn asset_issuer_id(asset: &Asset) -> Option<AccountId> {
-    match asset {
-        Asset::Native => None,
-        Asset::CreditAlphanum4(a) => Some(a.issuer.clone()),
-        Asset::CreditAlphanum12(a) => Some(a.issuer.clone()),
-    }
-}
-
 /// Insert trustline key for a non-native asset.
 fn insert_asset_trustline(keys: &mut HashSet<LedgerKey>, id: &AccountId, asset: &Asset) {
     if let Some(tl_asset) = asset_to_trustline_asset(asset) {
         keys.insert(trustline_key(id, &tl_asset));
-    }
-}
-
-/// Insert issuer account key for a non-native asset.
-fn insert_asset_issuer(keys: &mut HashSet<LedgerKey>, asset: &Asset) {
-    if let Some(issuer) = asset_issuer_id(asset) {
-        keys.insert(account_key(&issuer));
     }
 }
 
@@ -110,7 +94,7 @@ pub fn prefetch_keys_payment(
     keys.insert(account_key(&dest));
     insert_asset_trustline(keys, source, &op.asset);
     insert_asset_trustline(keys, &dest, &op.asset);
-    insert_asset_issuer(keys, &op.asset);
+
 }
 
 pub fn prefetch_keys_path_payment_strict_receive(
@@ -122,8 +106,7 @@ pub fn prefetch_keys_path_payment_strict_receive(
     keys.insert(account_key(&dest));
     insert_asset_trustline(keys, source, &op.send_asset);
     insert_asset_trustline(keys, &dest, &op.dest_asset);
-    insert_asset_issuer(keys, &op.send_asset);
-    insert_asset_issuer(keys, &op.dest_asset);
+
 }
 
 pub fn prefetch_keys_path_payment_strict_send(
@@ -135,8 +118,7 @@ pub fn prefetch_keys_path_payment_strict_send(
     keys.insert(account_key(&dest));
     insert_asset_trustline(keys, source, &op.send_asset);
     insert_asset_trustline(keys, &dest, &op.dest_asset);
-    insert_asset_issuer(keys, &op.send_asset);
-    insert_asset_issuer(keys, &op.dest_asset);
+
 }
 
 pub fn prefetch_keys_manage_sell_offer(
@@ -149,8 +131,7 @@ pub fn prefetch_keys_manage_sell_offer(
     }
     insert_asset_trustline(keys, source, &op.selling);
     insert_asset_trustline(keys, source, &op.buying);
-    insert_asset_issuer(keys, &op.selling);
-    insert_asset_issuer(keys, &op.buying);
+
 }
 
 pub fn prefetch_keys_manage_buy_offer(
@@ -163,8 +144,7 @@ pub fn prefetch_keys_manage_buy_offer(
     }
     insert_asset_trustline(keys, source, &op.selling);
     insert_asset_trustline(keys, source, &op.buying);
-    insert_asset_issuer(keys, &op.selling);
-    insert_asset_issuer(keys, &op.buying);
+
 }
 
 pub fn prefetch_keys_create_passive_sell_offer(
@@ -174,8 +154,7 @@ pub fn prefetch_keys_create_passive_sell_offer(
 ) {
     insert_asset_trustline(keys, source, &op.selling);
     insert_asset_trustline(keys, source, &op.buying);
-    insert_asset_issuer(keys, &op.selling);
-    insert_asset_issuer(keys, &op.buying);
+
 }
 
 pub fn prefetch_keys_change_trust(
@@ -413,46 +392,6 @@ pub fn collect_prefetch_keys(
     }
 }
 
-/// Extract (selling, buying) asset pairs from DEX operations.
-///
-/// For path payments, this includes all hops in the path.
-/// Used by the best-offer seller prefetch to pre-load entries for likely
-/// offer crossings.
-pub fn extract_dex_asset_pairs(op: &OperationBody) -> Vec<(Asset, Asset)> {
-    match op {
-        OperationBody::ManageSellOffer(data) => {
-            vec![(data.selling.clone(), data.buying.clone())]
-        }
-        OperationBody::CreatePassiveSellOffer(data) => {
-            vec![(data.selling.clone(), data.buying.clone())]
-        }
-        OperationBody::ManageBuyOffer(data) => {
-            vec![(data.selling.clone(), data.buying.clone())]
-        }
-        OperationBody::PathPaymentStrictReceive(data) => {
-            let mut pairs = Vec::new();
-            let mut assets = vec![data.send_asset.clone()];
-            assets.extend(data.path.iter().cloned());
-            assets.push(data.dest_asset.clone());
-            for w in assets.windows(2) {
-                pairs.push((w[0].clone(), w[1].clone()));
-            }
-            pairs
-        }
-        OperationBody::PathPaymentStrictSend(data) => {
-            let mut pairs = Vec::new();
-            let mut assets = vec![data.send_asset.clone()];
-            assets.extend(data.path.iter().cloned());
-            assets.push(data.dest_asset.clone());
-            for w in assets.windows(2) {
-                pairs.push((w[0].clone(), w[1].clone()));
-            }
-            pairs
-        }
-        _ => vec![],
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,8 +447,8 @@ mod tests {
             amount: 1000,
         };
         prefetch_keys_payment(&op, &source, &mut keys);
-        // dest account + source trustline + dest trustline + issuer account = 4
-        assert_eq!(keys.len(), 4);
+        // dest account + source trustline + dest trustline = 3
+        assert_eq!(keys.len(), 3);
     }
 
     #[test]
@@ -526,8 +465,8 @@ mod tests {
             offer_id: 42,
         };
         prefetch_keys_manage_sell_offer(&op, &source, &mut keys);
-        // offer key + 2 trustlines + 2 issuers = 5
-        assert_eq!(keys.len(), 5);
+        // offer key + 2 trustlines = 3
+        assert_eq!(keys.len(), 3);
         assert!(keys.contains(&offer_key(&source, 42)));
     }
 
@@ -543,8 +482,8 @@ mod tests {
             offer_id: 0,
         };
         prefetch_keys_manage_sell_offer(&op, &source, &mut keys);
-        // no offer key + buying trustline + buying issuer = 2
-        assert_eq!(keys.len(), 2);
+        // no offer key + buying trustline = 1
+        assert_eq!(keys.len(), 1);
     }
 
     #[test]
@@ -610,49 +549,4 @@ mod tests {
         assert!(keys.is_empty());
     }
 
-    #[test]
-    fn test_extract_dex_asset_pairs_manage_sell() {
-        let selling = Asset::Native;
-        let buying = test_credit_asset(b"USD\0", 3);
-        let body = OperationBody::ManageSellOffer(ManageSellOfferOp {
-            selling: selling.clone(),
-            buying: buying.clone(),
-            amount: 100,
-            price: Price { n: 1, d: 1 },
-            offer_id: 0,
-        });
-        let pairs = extract_dex_asset_pairs(&body);
-        assert_eq!(pairs.len(), 1);
-        assert_eq!(pairs[0].0, selling);
-        assert_eq!(pairs[0].1, buying);
-    }
-
-    #[test]
-    fn test_extract_dex_asset_pairs_path_payment() {
-        let send = Asset::Native;
-        let mid = test_credit_asset(b"EUR\0", 4);
-        let dest = test_credit_asset(b"USD\0", 3);
-        let body = OperationBody::PathPaymentStrictReceive(PathPaymentStrictReceiveOp {
-            send_asset: send.clone(),
-            send_max: 1000,
-            destination: MuxedAccount::Ed25519(Uint256([2; 32])),
-            dest_asset: dest.clone(),
-            dest_amount: 500,
-            path: vec![mid.clone()].try_into().unwrap(),
-        });
-        let pairs = extract_dex_asset_pairs(&body);
-        assert_eq!(pairs.len(), 2);
-        assert_eq!(pairs[0], (send, mid.clone()));
-        assert_eq!(pairs[1], (mid, dest));
-    }
-
-    #[test]
-    fn test_extract_dex_asset_pairs_payment_empty() {
-        let body = OperationBody::Payment(PaymentOp {
-            destination: MuxedAccount::Ed25519(Uint256([2; 32])),
-            asset: Asset::Native,
-            amount: 100,
-        });
-        assert!(extract_dex_asset_pairs(&body).is_empty());
-    }
 }

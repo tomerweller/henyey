@@ -1141,44 +1141,6 @@ impl LedgerStateManager {
         self.offer_index.num_asset_pairs()
     }
 
-    /// Collect account + trustline keys for the top offers in a given asset pair.
-    ///
-    /// Used by prefetch to pre-load seller entries before the offer crossing loop.
-    /// This matches stellar-core's `populateEntryCacheFromBestOffers` which
-    /// pre-loads seller accounts and trustlines for upcoming offer crossings.
-    pub fn collect_best_offer_seller_keys(
-        &self,
-        selling: &Asset,
-        buying: &Asset,
-        keys: &mut HashSet<LedgerKey>,
-        max_offers: usize,
-    ) {
-        for (i, offer_key) in self.offer_index.offers_for_pair(buying, selling).enumerate() {
-            if i >= max_offers {
-                break;
-            }
-            if let Some(offer) = self.offers.get(offer_key) {
-                keys.insert(LedgerKey::Account(LedgerKeyAccount {
-                    account_id: offer.seller_id.clone(),
-                }));
-                if !matches!(offer.selling, Asset::Native) {
-                    let tl_asset = asset_to_trustline_asset(&offer.selling);
-                    keys.insert(LedgerKey::Trustline(LedgerKeyTrustLine {
-                        account_id: offer.seller_id.clone(),
-                        asset: tl_asset,
-                    }));
-                }
-                if !matches!(offer.buying, Asset::Native) {
-                    let tl_asset = asset_to_trustline_asset(&offer.buying);
-                    keys.insert(LedgerKey::Trustline(LedgerKeyTrustLine {
-                        account_id: offer.seller_id.clone(),
-                        asset: tl_asset,
-                    }));
-                }
-            }
-        }
-    }
-
     /// Remove all offers owned by an account that are buying or selling a specific asset.
     /// This is used when revoking authorization on a trustline.
     /// Returns the list of OfferEntry that were removed (before deletion) so callers can

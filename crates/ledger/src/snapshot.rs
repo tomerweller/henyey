@@ -364,13 +364,15 @@ impl SnapshotHandle {
         for key in keys {
             if let Some(entry) = self.inner.get_entry(key)? {
                 result.push(entry.clone());
-            } else {
+            } else if !is_soroban_key(key) {
                 let key_bytes = key_to_bytes(key)?;
                 if let Some(entry) = prefetch.get(&key_bytes) {
                     result.push(entry.clone());
                 } else {
                     remaining.push(key.clone());
                 }
+            } else {
+                remaining.push(key.clone());
             }
         }
         drop(prefetch);
@@ -427,10 +429,12 @@ impl SnapshotHandle {
             return Ok(Some(entry.clone()));
         }
 
-        // 2. Check prefetch cache
-        let key_bytes = key_to_bytes(key)?;
-        if let Some(entry) = self.prefetch_cache.read().get(&key_bytes) {
-            return Ok(Some(entry.clone()));
+        // 2. Check prefetch cache (skip for Soroban keys — they're never cached)
+        if !is_soroban_key(key) {
+            let key_bytes = key_to_bytes(key)?;
+            if let Some(entry) = self.prefetch_cache.read().get(&key_bytes) {
+                return Ok(Some(entry.clone()));
+            }
         }
 
         // 3. Fall back to lookup function if available

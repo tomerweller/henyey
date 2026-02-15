@@ -166,7 +166,7 @@ pub use validation::{
 
 // Re-export operation types
 pub use operations::{
-    collect_prefetch_keys, extract_dex_asset_pairs, get_needed_threshold, get_operation_source,
+    collect_prefetch_keys, get_needed_threshold, get_operation_source,
     get_threshold_level, validate_operation, OperationType, OperationValidationError,
     ThresholdLevel,
 };

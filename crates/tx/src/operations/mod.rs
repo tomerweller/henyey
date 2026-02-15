@@ -4,7 +4,7 @@
 //! basic validation for each operation, as well as execution logic.
 
 pub mod execute;
-pub use execute::prefetch::{collect_prefetch_keys, extract_dex_asset_pairs};
+pub use execute::prefetch::collect_prefetch_keys;
 
 use std::collections::HashSet;
 
