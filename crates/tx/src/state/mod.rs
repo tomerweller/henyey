@@ -1568,6 +1568,7 @@ impl LedgerStateManager {
         self.claimable_balance_snapshots.clear();
         self.liquidity_pool_snapshots.clear();
         self.entry_sponsorship_snapshots.clear();
+        self.entry_sponsorship_ext_snapshots.clear();
         self.entry_last_modified_snapshots.clear();
 
         // Clear modification tracking
@@ -1637,7 +1638,9 @@ impl LedgerStateManager {
                         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
                         let post_state = self.account_to_ledger_entry(&entry);
                         self.delta.record_update(pre_state, post_state);
-                        self.account_snapshots.insert(key, Some(entry));
+                        // Do NOT update account_snapshots here. The original pre-tx
+                        // snapshot must be preserved for transaction-level rollback().
+                        // Per-op STATE values are tracked via op_entry_snapshots.
                     }
                 }
             }
@@ -1676,7 +1679,7 @@ impl LedgerStateManager {
                         self.set_last_modified_key(ledger_key, self.ledger_seq);
                         let post_state = self.account_to_ledger_entry(&entry);
                         self.delta.record_update(pre_state, post_state);
-                        self.account_snapshots.insert(key, Some(entry));
+                        // Do NOT update account_snapshots — preserve for rollback().
                         return true;
                     }
                 }
@@ -3561,6 +3564,66 @@ mod tests {
             removed_ids,
             HashSet::from([100, 200]),
             "Both the pre-loaded offer and the loader-discovered offer should be removed"
+        );
+    }
+
+    /// Regression test: rollback must restore accounts to pre-tx state even after
+    /// flush_all_accounts() was called between operations. Before the fix,
+    /// flush_all_accounts_except() updated account_snapshots to the post-flush
+    /// value, so rollback() would "restore" to the mid-transaction value instead
+    /// of the original pre-tx value.
+    ///
+    /// This bug caused a bucket_list_hash mismatch at mainnet L59504399 where a
+    /// multi-op transaction (3 ChangeTrust + AccountMerge) failed but the sponsor
+    /// account's num_sponsoring was not correctly rolled back.
+    #[test]
+    fn test_rollback_after_flush_all_accounts_restores_original() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        // Create an account that will be modified across multiple "operations"
+        let account = create_test_account_entry(1);
+        let account_id = account.account_id.clone();
+        manager.create_account(account.clone());
+        manager.commit(); // commit the creation so it's permanent
+
+        let original_balance = manager.get_account(&account_id).unwrap().balance;
+        assert_eq!(original_balance, 1_000_000_000);
+
+        // Simulate start of a new transaction: snapshot delta
+        manager.snapshot_delta();
+
+        // Operation 1: modify account and flush
+        {
+            let acc = manager.get_account_mut(&account_id).unwrap();
+            acc.balance -= 100;
+        }
+        manager.flush_all_accounts();
+
+        // Operation 2: modify account again and flush
+        {
+            let acc = manager.get_account_mut(&account_id).unwrap();
+            acc.balance -= 200;
+        }
+        manager.flush_all_accounts();
+
+        // Operation 3: modify account again and flush
+        {
+            let acc = manager.get_account_mut(&account_id).unwrap();
+            acc.balance -= 300;
+        }
+        manager.flush_all_accounts();
+
+        // Current state should reflect all modifications
+        let current_balance = manager.get_account(&account_id).unwrap().balance;
+        assert_eq!(current_balance, 1_000_000_000 - 100 - 200 - 300);
+
+        // Transaction fails — rollback should restore to original pre-tx state
+        manager.rollback();
+
+        let restored_balance = manager.get_account(&account_id).unwrap().balance;
+        assert_eq!(
+            restored_balance, original_balance,
+            "rollback() must restore to original pre-tx balance, not mid-tx flushed value"
         );
     }
 }
