@@ -2502,8 +2502,35 @@ async fn cmd_verify_execution(
                                                     println!("      Ours offer: seller={:?} amount={} price={}/{}", hex::encode(&{let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) = our_o.seller_id.0; pk.0}[..8]), our_o.amount, our_o.price.n, our_o.price.d);
                                                 }
                                                 if let (stellar_xdr::curr::LedgerEntryData::Account(cdp_a), stellar_xdr::curr::LedgerEntryData::Account(our_a)) = (&cdp_entry.data, &our_entry.data) {
-                                                    println!("      CDP  account: balance={} seq={}", cdp_a.balance, cdp_a.seq_num.0);
-                                                    println!("      Ours account: balance={} seq={}", our_a.balance, our_a.seq_num.0);
+                                                    let cdp_pk = {let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) = cdp_a.account_id.0; hex::encode(&pk.0[..16])};
+                                                    // Extract sponsorship counts from extensions
+                                                    let get_ext = |a: &stellar_xdr::curr::AccountEntry| -> (u32, u32, u32) {
+                                                        match &a.ext {
+                                                            stellar_xdr::curr::AccountEntryExt::V0 => (0, 0, 0),
+                                                            stellar_xdr::curr::AccountEntryExt::V1(v1) => match &v1.ext {
+                                                                stellar_xdr::curr::AccountEntryExtensionV1Ext::V0 => (0, 0, 0),
+                                                                stellar_xdr::curr::AccountEntryExtensionV1Ext::V2(v2) => (v2.num_sponsoring, v2.num_sponsored, v2.signer_sponsoring_i_ds.len() as u32),
+                                                            },
+                                                        }
+                                                    };
+                                                    let (cdp_ing, cdp_ed, cdp_sigs) = get_ext(cdp_a);
+                                                    let (our_ing, our_ed, our_sigs) = get_ext(our_a);
+                                                    println!("      CDP  account: id={} balance={} seq={} sub_entries={} flags={} num_sponsoring={} num_sponsored={} signer_sponsors={}",
+                                                        cdp_pk, cdp_a.balance, cdp_a.seq_num.0, cdp_a.num_sub_entries, cdp_a.flags, cdp_ing, cdp_ed, cdp_sigs);
+                                                    println!("      Ours account: id={} balance={} seq={} sub_entries={} flags={} num_sponsoring={} num_sponsored={} signer_sponsors={}",
+                                                        cdp_pk, our_a.balance, our_a.seq_num.0, our_a.num_sub_entries, our_a.flags, our_ing, our_ed, our_sigs);
+                                                    if cdp_a.balance != our_a.balance {
+                                                        println!("      BALANCE DIFF: {} (ours - cdp)", our_a.balance - cdp_a.balance);
+                                                    }
+                                                    if cdp_a.num_sub_entries != our_a.num_sub_entries {
+                                                        println!("      SUB_ENTRIES DIFF: {} (ours - cdp)", our_a.num_sub_entries as i64 - cdp_a.num_sub_entries as i64);
+                                                    }
+                                                    if cdp_ing != our_ing {
+                                                        println!("      NUM_SPONSORING DIFF: {} (ours - cdp)", our_ing as i64 - cdp_ing as i64);
+                                                    }
+                                                    if cdp_ed != our_ed {
+                                                        println!("      NUM_SPONSORED DIFF: {} (ours - cdp)", our_ed as i64 - cdp_ed as i64);
+                                                    }
                                                 }
                                                 if let (stellar_xdr::curr::LedgerEntryData::Trustline(cdp_t), stellar_xdr::curr::LedgerEntryData::Trustline(our_t)) = (&cdp_entry.data, &our_entry.data) {
                                                     println!("      CDP  trustline: balance={} asset={:?}", cdp_t.balance, cdp_t.asset);
@@ -2519,8 +2546,38 @@ async fn cmd_verify_execution(
                                             }
                                         }
                                         None => {
-                                            missing += 1;
-                                            if missing <= 10 {
+                                            // For offers, try the offer_store instead of bucket list snapshot
+                                            // (offers are not indexed in bucket list snapshot)
+                                            if let stellar_xdr::curr::LedgerEntryData::Offer(ref cdp_offer) = cdp_entry.data {
+                                                let offer_store = ledger_manager.offer_store_read();
+                                                if let Some(our_entry) = offer_store.get(&cdp_offer.offer_id) {
+                                                    let our_xdr = our_entry.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
+                                                    let our_hash = {
+                                                        let mut h = Sha256::new();
+                                                        h.update(&our_xdr);
+                                                        format!("{:x}", h.finalize())
+                                                    };
+                                                    if our_hash != cdp_hash {
+                                                        diffs += 1;
+                                                        if let stellar_xdr::curr::LedgerEntryData::Offer(ref our_offer) = our_entry.data {
+                                                            let cdp_seller = {let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) = cdp_offer.seller_id.0; hex::encode(&pk.0[..8])};
+                                                            println!("    OFFER DIFF #{}: id={} seller={}", diffs, cdp_offer.offer_id, cdp_seller);
+                                                            println!("      CDP:  amount={} price={}/{} lm={}", cdp_offer.amount, cdp_offer.price.n, cdp_offer.price.d, cdp_entry.last_modified_ledger_seq);
+                                                            println!("      Ours: amount={} price={}/{} lm={}", our_offer.amount, our_offer.price.n, our_offer.price.d, our_entry.last_modified_ledger_seq);
+                                                        }
+                                                    }
+                                                    // else: offer matches, not a real diff
+                                                } else {
+                                                    // Offer is truly missing from our state
+                                                    missing += 1;
+                                                    let cdp_seller = {let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) = cdp_offer.seller_id.0; hex::encode(&pk.0)};
+                                                    println!("    TRULY MISSING offer: id={} seller={} amount={} price={}/{} cdp_lm={}",
+                                                        cdp_offer.offer_id, cdp_seller, cdp_offer.amount,
+                                                        cdp_offer.price.n, cdp_offer.price.d, cdp_entry.last_modified_ledger_seq);
+                                                }
+                                            } else {
+                                                // Non-offer entry truly missing
+                                                missing += 1;
                                                 let key_str = match &cdp_entry.data {
                                                     stellar_xdr::curr::LedgerEntryData::Account(a) => {
                                                         let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) = a.account_id.0;
@@ -2529,9 +2586,6 @@ async fn cmd_verify_execution(
                                                     stellar_xdr::curr::LedgerEntryData::Trustline(t) => {
                                                         let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) = t.account_id.0;
                                                         format!("Trustline(acct={}, asset={:?}, balance={})", hex::encode(&pk.0[..8]), t.asset, t.balance)
-                                                    }
-                                                    stellar_xdr::curr::LedgerEntryData::Offer(o) => {
-                                                        format!("Offer(id={}, amount={})", o.offer_id, o.amount)
                                                     }
                                                     stellar_xdr::curr::LedgerEntryData::LiquidityPool(p) => {
                                                         let stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(ref cp) = p.body;
@@ -2546,7 +2600,7 @@ async fn cmd_verify_execution(
                                     }
                                 }
                             }
-                            println!("    Entry comparison: {} diffs, {} missing (out of {} CDP entries)", diffs, missing, final_entries.len());
+                            println!("    Entry comparison: {} diffs, {} truly missing (out of {} CDP entries)", diffs, missing, final_entries.len());
                         }
                     }
 

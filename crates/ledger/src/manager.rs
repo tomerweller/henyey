@@ -915,6 +915,11 @@ impl LedgerManager {
         self.offer_store.read().values().cloned().collect()
     }
 
+    /// Get a read lock on the offer store for direct access.
+    pub fn offer_store_read(&self) -> parking_lot::RwLockReadGuard<'_, HashMap<i64, LedgerEntry>> {
+        self.offer_store.read()
+    }
+
     /// Get a read lock on the hot archive bucket list.
     ///
     /// This is used during HAS serialization to capture the hot archive state
