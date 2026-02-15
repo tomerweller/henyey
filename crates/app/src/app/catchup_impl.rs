@@ -670,6 +670,7 @@ impl App {
         let mut cached_tx_sets = 0u32;
         let mut requested_tx_sets = 0u32;
         let mut recorded_externalized = 0u32;
+        let mut rejected_externalized = 0u32;
         // Track tx_sets we've already broadcast requests for to avoid spamming all peers
         let mut requested_hashes: HashSet<Hash256> = HashSet::new();
 
@@ -750,55 +751,106 @@ impl App {
                         let slot = envelope.statement.slot_index;
                         let value = ext.commit.value.clone();
 
-                        // Record this externalized slot so we can apply it after catchup
-                        self.herder.scp_driver().record_externalized(slot, value);
+                        // Parse the StellarValue to validate before recording
+                        let sv = match StellarValue::from_xdr(&ext.commit.value.0, Limits::none()) {
+                            Ok(sv) => sv,
+                            Err(e) => {
+                                tracing::debug!(
+                                    slot,
+                                    error = %e,
+                                    "Rejecting EXTERNALIZE during catchup: failed to parse StellarValue"
+                                );
+                                rejected_externalized += 1;
+                                continue;
+                            }
+                        };
+
+                        // Validate close-time: reject messages with stale or future close times.
+                        // This prevents accepting EXTERNALIZE from pre-reset eras or other networks.
+                        let lcl_close_time = self.ledger_manager.current_header().scp_value.close_time.0;
+                        let scp_driver = self.herder.scp_driver();
+                        if !scp_driver.check_close_time(slot, lcl_close_time, sv.close_time.0) {
+                            tracing::debug!(
+                                slot,
+                                close_time = sv.close_time.0,
+                                lcl_close_time,
+                                "Rejecting EXTERNALIZE during catchup: close-time validation failed"
+                            );
+                            rejected_externalized += 1;
+                            continue;
+                        }
+
+                        // Validate slot range: reject slots impossibly far from LCL.
+                        // Use the same LEDGER_VALIDITY_BRACKET (100) as the herder.
+                        let lcl_seq = self.ledger_manager.current_ledger_seq() as u64;
+                        const LEDGER_VALIDITY_BRACKET: u64 = 100;
+                        if slot > lcl_seq + LEDGER_VALIDITY_BRACKET {
+                            tracing::debug!(
+                                slot,
+                                lcl_seq,
+                                max = lcl_seq + LEDGER_VALIDITY_BRACKET,
+                                "Rejecting EXTERNALIZE during catchup: slot outside validity bracket"
+                            );
+                            rejected_externalized += 1;
+                            continue;
+                        }
+
+                        // Verify envelope signature to prevent accepting forged messages
+                        if let Err(e) = scp_driver.verify_envelope(&envelope) {
+                            tracing::debug!(
+                                slot,
+                                error = %e,
+                                "Rejecting EXTERNALIZE during catchup: invalid signature"
+                            );
+                            rejected_externalized += 1;
+                            continue;
+                        }
+
+                        // All validations passed - record this externalized slot
+                        scp_driver.record_externalized(slot, value);
                         recorded_externalized += 1;
                         tracing::debug!(
                             slot,
                             "Recorded externalized slot during catchup"
                         );
 
-                        if let Ok(sv) =
-                            StellarValue::from_xdr(&ext.commit.value.0, Limits::none())
+                        let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
+
+                        // Check if we already have this tx_set or already broadcast a request
+                        if !self.herder.has_tx_set(&tx_set_hash)
+                            && !requested_hashes.contains(&tx_set_hash)
                         {
-                            let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
+                            // Register as pending and send GetTxSet request
+                            self.herder
+                                .scp_driver()
+                                .request_tx_set(tx_set_hash, slot);
 
-                            // Check if we already have this tx_set or already broadcast a request
-                            if !self.herder.has_tx_set(&tx_set_hash)
-                                && !requested_hashes.contains(&tx_set_hash)
-                            {
-                                // Register as pending and send GetTxSet request
-                                self.herder
-                                    .scp_driver()
-                                    .request_tx_set(tx_set_hash, slot);
+                            // Track that we've requested this hash to avoid duplicate broadcasts
+                            requested_hashes.insert(tx_set_hash);
 
-                                // Track that we've requested this hash to avoid duplicate broadcasts
-                                requested_hashes.insert(tx_set_hash);
-
-                                // Broadcast GetTxSet request to ALL peers, not just the sender.
-                                // This is critical for bridging the gap after catchup: by the time
-                                // catchup completes, older tx_sets may be evicted from the sender's
-                                // cache. By requesting from all peers, we maximize our chances of
-                                // getting the tx_set before any single peer evicts it.
-                                let overlay = self.overlay().await;
-                                if let Some(overlay) = overlay {
-                                    match overlay.request_tx_set(&tx_set_hash.0).await {
-                                        Ok(peer_count) => {
-                                            requested_tx_sets += 1;
-                                            tracing::debug!(
-                                                slot,
-                                                hash = %tx_set_hash,
-                                                peer_count,
-                                                "Broadcast tx_set request to all peers during catchup"
-                                            );
-                                        }
-                                        Err(e) => {
-                                            tracing::debug!(
-                                                slot,
-                                                error = %e,
-                                                "Failed to broadcast tx_set request during catchup"
-                                            );
-                                        }
+                            // Broadcast GetTxSet request to ALL peers, not just the sender.
+                            // This is critical for bridging the gap after catchup: by the time
+                            // catchup completes, older tx_sets may be evicted from the sender's
+                            // cache. By requesting from all peers, we maximize our chances of
+                            // getting the tx_set before any single peer evicts it.
+                            let overlay = self.overlay().await;
+                            if let Some(overlay) = overlay {
+                                match overlay.request_tx_set(&tx_set_hash.0).await {
+                                    Ok(peer_count) => {
+                                        requested_tx_sets += 1;
+                                        tracing::debug!(
+                                            slot,
+                                            hash = %tx_set_hash,
+                                            peer_count,
+                                            "Broadcast tx_set request to all peers during catchup"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            slot,
+                                            error = %e,
+                                            "Failed to broadcast tx_set request during catchup"
+                                        );
                                     }
                                 }
                             }
@@ -816,6 +868,7 @@ impl App {
             cached_tx_sets,
             requested_tx_sets,
             recorded_externalized,
+            rejected_externalized,
             "Finished caching messages during catchup"
         );
     }
