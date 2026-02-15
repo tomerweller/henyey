@@ -867,23 +867,23 @@ impl UpgradeContext {
     /// Loads and validates each config upgrade, then applies the configuration
     /// changes to the ledger delta.
     ///
-    /// Returns a tuple of:
-    /// - `state_archival_changed`: Whether any StateArchival settings were modified
-    /// - `memory_limit_changed`: Whether any memory limit settings were modified
-    ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - A config upgrade cannot be loaded from the ledger
     /// - A config upgrade fails validation
     /// - The delta update fails
+    #[allow(clippy::type_complexity)]
     pub fn apply_config_upgrades(
         &self,
         snapshot: &SnapshotHandle,
         delta: &mut LedgerDelta,
-    ) -> Result<(bool, bool), LedgerError> {
+    ) -> Result<(bool, bool, HashMap<Vec<u8>, stellar_xdr::curr::LedgerEntryChanges>), LedgerError> {
+        use stellar_xdr::curr::{Limits, WriteXdr};
+
         let mut state_archival_changed = false;
         let mut memory_cost_params_changed = false;
+        let mut per_upgrade_changes = HashMap::new();
 
         for key in self.config_upgrade_keys() {
             // Load the upgrade set from the ledger
@@ -918,9 +918,13 @@ impl UpgradeContext {
             }
 
             // Apply the upgrade (includes window resize if sample size changed)
-            let (archival, memory_cost) = frame.apply_to(snapshot, delta)?;
+            let (archival, memory_cost, entry_changes) = frame.apply_to(snapshot, delta)?;
             state_archival_changed |= archival;
             memory_cost_params_changed |= memory_cost;
+
+            // Store changes keyed by serialized ConfigUpgradeSetKey for later matching
+            let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
+            per_upgrade_changes.insert(key_bytes, entry_changes);
 
             tracing::info!(
                 contract_id = ?key.contract_id,
@@ -928,7 +932,7 @@ impl UpgradeContext {
             );
         }
 
-        Ok((state_archival_changed, memory_cost_params_changed))
+        Ok((state_archival_changed, memory_cost_params_changed, per_upgrade_changes))
     }
 
     /// Apply upgrades to a header, returning the modified values.

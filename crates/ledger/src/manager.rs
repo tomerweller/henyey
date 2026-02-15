@@ -2246,20 +2246,51 @@ impl<'a> LedgerCloseContext<'a> {
         &mut self,
         prev_version: u32,
         protocol_version: u32,
-    ) -> Result<(bool, bool)> {
+    ) -> Result<(bool, bool, Vec<UpgradeEntryMeta>)> {
+        use stellar_xdr::curr::{LedgerEntryChange, LedgerEntryChanges, LedgerUpgrade, Limits, WriteXdr};
+
         // Parity: Upgrades.cpp:1229-1242 applyVersionUpgrade
         // Version upgrades may create/modify config setting entries in the
         // ledger (e.g. new cost types for V25, state size window for V23+).
         // These must be applied to the delta before bucket list extraction.
         let mut version_upgrade_memory_cost_changed = false;
-        if prev_version != protocol_version {
+
+        // Capture changes from version upgrade side effects (cost types for V25).
+        // We record the delta state before and after to extract changes.
+        let version_changes = if prev_version != protocol_version {
+            let delta_before = self.delta.num_changes();
             // Parity: Upgrades.cpp:1229-1233
             // needUpgradeToVersion(V_25, prev, new) → createCostTypesForV25
             if prev_version < 25 && protocol_version >= 25 {
                 self.create_cost_types_for_v25()?;
                 version_upgrade_memory_cost_changed = true;
             }
-        }
+            // Extract changes made during version upgrade side effects
+            let mut changes: Vec<LedgerEntryChange> = Vec::new();
+            let delta_after = self.delta.num_changes();
+            if delta_after > delta_before {
+                for change in self.delta.changes().skip(delta_before) {
+                    match change {
+                        crate::delta::EntryChange::Created(entry) => {
+                            changes.push(LedgerEntryChange::Created(entry.clone()));
+                        }
+                        crate::delta::EntryChange::Updated { previous, current } => {
+                            changes.push(LedgerEntryChange::State(previous.clone()));
+                            changes.push(LedgerEntryChange::Updated(current.as_ref().clone()));
+                        }
+                        crate::delta::EntryChange::Deleted { previous } => {
+                            if let Ok(key) = crate::delta::entry_to_key(previous) {
+                                changes.push(LedgerEntryChange::State(previous.clone()));
+                                changes.push(LedgerEntryChange::Removed(key));
+                            }
+                        }
+                    }
+                }
+            }
+            LedgerEntryChanges(changes.try_into().unwrap_or_default())
+        } else {
+            LedgerEntryChanges(VecM::default())
+        };
 
         // Apply config upgrades to the delta BEFORE extracting entries for the bucket list.
         // In stellar-core, config upgrades are applied to the LedgerTxn before
@@ -2267,13 +2298,15 @@ impl<'a> LedgerCloseContext<'a> {
         // in the bucket list update. We must do the same here.
         let mut config_state_archival_changed = false;
         let mut config_memory_cost_params_changed = false;
+        let mut per_config_changes: HashMap<Vec<u8>, LedgerEntryChanges> = HashMap::new();
         let delta_count_before_upgrades = self.delta.num_changes();
         if self.upgrade_ctx.has_config_upgrades() {
-            let (archival, memory_cost) = self
+            let (archival, memory_cost, config_changes) = self
                 .upgrade_ctx
                 .apply_config_upgrades(&self.snapshot, &mut self.delta)?;
             config_state_archival_changed = archival;
             config_memory_cost_params_changed = memory_cost;
+            per_config_changes = config_changes;
             tracing::info!(
                 ledger_seq = self.close_data.ledger_seq,
                 delta_before = delta_count_before_upgrades,
@@ -2282,6 +2315,26 @@ impl<'a> LedgerCloseContext<'a> {
                 memory_cost_changed = config_memory_cost_params_changed,
                 "Delta entry count after config upgrades"
             );
+        }
+
+        // Build UpgradeEntryMeta for each upgrade.
+        // Parity: LedgerManagerImpl.cpp:1660-1673
+        let mut upgrades_meta = Vec::new();
+        for upgrade in &self.close_data.upgrades {
+            let changes = match upgrade {
+                LedgerUpgrade::Version(_) => version_changes.clone(),
+                LedgerUpgrade::Config(key) => {
+                    let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
+                    per_config_changes.remove(&key_bytes).unwrap_or_else(|| {
+                        LedgerEntryChanges(VecM::default())
+                    })
+                }
+                _ => LedgerEntryChanges(VecM::default()),
+            };
+            upgrades_meta.push(UpgradeEntryMeta {
+                upgrade: upgrade.clone(),
+                changes,
+            });
         }
 
         // Parity: Upgrades.cpp:1238-1242 and 1449-1453
@@ -2405,7 +2458,7 @@ impl<'a> LedgerCloseContext<'a> {
             }
         }
 
-        Ok((config_state_archival_changed, config_memory_cost_params_changed))
+        Ok((config_state_archival_changed, config_memory_cost_params_changed, upgrades_meta))
     }
 
     /// Create the new ledger header and compute its hash.
@@ -2548,7 +2601,7 @@ impl<'a> LedgerCloseContext<'a> {
             "Protocol version for commit"
         );
 
-        let (config_state_archival_changed, config_memory_cost_params_changed) =
+        let (config_state_archival_changed, config_memory_cost_params_changed, upgrades_meta) =
             self.apply_upgrades_to_delta(prev_version, protocol_version)?;
 
         tracing::debug!(
@@ -2590,7 +2643,7 @@ impl<'a> LedgerCloseContext<'a> {
             ledger_seq = self.close_data.ledger_seq,
             "Acquiring bucket list write lock"
         );
-        let (bucket_list_hash, bucket_lock_wait_us, eviction_us, soroban_state_us, add_batch_us, hot_archive_us, bg_eviction_data) = {
+        let (bucket_list_hash, bucket_lock_wait_us, eviction_us, soroban_state_us, add_batch_us, hot_archive_us, bg_eviction_data, evicted_meta_keys) = {
             let lock_wait_start = std::time::Instant::now();
             let mut bucket_list = self.manager.bucket_list.write();
             let bucket_lock_wait_us = lock_wait_start.elapsed().as_micros() as u64;
@@ -2673,6 +2726,7 @@ impl<'a> LedgerCloseContext<'a> {
             // settings mismatch (config upgrade), or if the background scan failed.
             let mut archived_entries: Vec<LedgerEntry> = Vec::new();
             let mut eviction_us: u64 = 0;
+            let mut evicted_meta_keys: Vec<LedgerKey> = Vec::new();
 
             if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
                 let hot_archive_guard = self.manager.hot_archive_bucket_list.read();
@@ -2788,6 +2842,13 @@ impl<'a> LedgerCloseContext<'a> {
                     let bytes_scanned = eviction_result.bytes_scanned;
                     let resolved = eviction_result
                         .resolve(eviction_settings.max_entries_to_archive, &modified_ttl_keys);
+
+                    // Capture evicted keys for LedgerCloseMeta before consuming them.
+                    // Parity: LedgerCloseMetaFrame.cpp:170-187 populateEvictedEntries()
+                    // adds deletedKeys (temp data + all TTL keys) and LedgerEntryKey(entry)
+                    // for archived persistent entries. Our resolved.evicted_keys already
+                    // contains all of these.
+                    evicted_meta_keys = resolved.evicted_keys.clone();
 
                     dead_entries.extend(resolved.evicted_keys);
                     archived_entries = resolved.archived_entries;
@@ -3115,7 +3176,7 @@ impl<'a> LedgerCloseContext<'a> {
                 None
             };
 
-            (final_hash, bucket_lock_wait_us, eviction_us, soroban_state_us, add_batch_us, hot_archive_us, bg_eviction_data)
+            (final_hash, bucket_lock_wait_us, eviction_us, soroban_state_us, add_batch_us, hot_archive_us, bg_eviction_data, evicted_meta_keys)
         };
 
         // Start background eviction scan for the next ledger.
@@ -3218,12 +3279,44 @@ impl<'a> LedgerCloseContext<'a> {
             }
         };
 
+        // Compute average Soroban state size from the LiveSorobanStateSizeWindow.
+        // Parity: NetworkConfig.cpp:1812 — average of all window entries.
+        let avg_soroban_state_size = if protocol_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION {
+            let bl = self.manager.bucket_list.read();
+            let window_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+                config_setting_id: ConfigSettingId::LiveSorobanStateSizeWindow,
+            });
+            bl.get(&window_key)
+                .ok()
+                .flatten()
+                .and_then(|entry| {
+                    if let LedgerEntryData::ConfigSetting(
+                        ConfigSettingEntry::LiveSorobanStateSizeWindow(window),
+                    ) = &entry.data
+                    {
+                        if window.is_empty() {
+                            return Some(0u64);
+                        }
+                        let sum: u64 = window.iter().copied().sum();
+                        Some(sum / window.len() as u64)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
         let meta_start = std::time::Instant::now();
         let meta = build_ledger_close_meta(
             &self.close_data,
             &new_header,
             header_hash,
             &self.tx_result_metas,
+            evicted_meta_keys,
+            avg_soroban_state_size,
+            upgrades_meta,
         );
         let meta_us = meta_start.elapsed().as_micros() as u64;
 
@@ -3308,6 +3401,9 @@ fn build_ledger_close_meta(
     header: &LedgerHeader,
     header_hash: Hash256,
     tx_result_metas: &[TransactionResultMetaV1],
+    evicted_keys: Vec<LedgerKey>,
+    total_byte_size_of_live_soroban_state: u64,
+    upgrades_processing: Vec<UpgradeEntryMeta>,
 ) -> LedgerCloseMeta {
     let ledger_header = LedgerHeaderHistoryEntry {
         hash: Hash::from(header_hash),
@@ -3322,14 +3418,14 @@ fn build_ledger_close_meta(
         ledger_header,
         tx_set,
         tx_processing: tx_result_metas.to_vec().try_into().unwrap_or_default(),
-        upgrades_processing: VecM::<UpgradeEntryMeta>::default(),
+        upgrades_processing: upgrades_processing.try_into().unwrap_or_default(),
         scp_info: close_data
             .scp_history
             .clone()
             .try_into()
             .unwrap_or_default(),
-        total_byte_size_of_live_soroban_state: 0,
-        evicted_keys: VecM::default(),
+        total_byte_size_of_live_soroban_state,
+        evicted_keys: evicted_keys.try_into().unwrap_or_default(),
     })
 }
 
@@ -4042,7 +4138,7 @@ mod tests {
         .with_scp_history(vec![scp_entry.clone()]);
 
         let header = create_genesis_header();
-        let meta = build_ledger_close_meta(&close_data, &header, Hash256::ZERO, &[]);
+        let meta = build_ledger_close_meta(&close_data, &header, Hash256::ZERO, &[], Vec::new(), 0, Vec::new());
         let scp_info_len = match meta {
             LedgerCloseMeta::V0(_) => 0,
             LedgerCloseMeta::V1(v1) => v1.scp_info.len(),

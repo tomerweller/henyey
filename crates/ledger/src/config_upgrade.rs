@@ -356,10 +356,13 @@ impl ConfigUpgradeSetFrame {
         &self,
         snapshot: &SnapshotHandle,
         delta: &mut LedgerDelta,
-    ) -> Result<(bool, bool), LedgerError> {
+    ) -> Result<(bool, bool, stellar_xdr::curr::LedgerEntryChanges), LedgerError> {
+        use stellar_xdr::curr::LedgerEntryChange;
+
         let mut state_archival_changed = false;
         let mut memory_cost_params_changed = false;
         let mut window_sample_size_changed = false;
+        let mut changes: Vec<LedgerEntryChange> = Vec::new();
 
         for new_entry in self.config_upgrade_set.updated_entry.iter() {
             let setting_id = new_entry.discriminant();
@@ -422,6 +425,10 @@ impl ConfigUpgradeSetFrame {
                 ext: LedgerEntryExt::V0,
             };
 
+            // Capture before/after for upgrade meta
+            changes.push(LedgerEntryChange::State(previous.clone()));
+            changes.push(LedgerEntryChange::Updated(new_ledger_entry.clone()));
+
             // Record the update
             delta.record_update(previous.clone(), new_ledger_entry)?;
 
@@ -439,7 +446,11 @@ impl ConfigUpgradeSetFrame {
             self.maybe_update_state_size_window(snapshot, delta)?;
         }
 
-        Ok((state_archival_changed, memory_cost_params_changed))
+        let entry_changes = stellar_xdr::curr::LedgerEntryChanges(
+            changes.try_into().unwrap_or_default(),
+        );
+
+        Ok((state_archival_changed, memory_cost_params_changed, entry_changes))
     }
 
     /// Resize the LiveSorobanStateSizeWindow when liveSorobanStateSizeWindowSampleSize
