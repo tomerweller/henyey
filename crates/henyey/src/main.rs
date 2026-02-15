@@ -1569,26 +1569,6 @@ async fn download_buckets_parallel(
     Ok((cached_count, download_count))
 }
 
-/// Read the current process RSS (Resident Set Size) in bytes from `/proc/self/status`.
-/// Returns 0 on non-Linux platforms or if the file can't be read.
-fn rss_bytes() -> u64 {
-    let status = match std::fs::read_to_string("/proc/self/status") {
-        Ok(s) => s,
-        Err(_) => return 0,
-    };
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("VmRSS:") {
-            // Format is "VmRSS:    123456 kB"
-            if let Some(kb) = rest.trim().split_whitespace().next() {
-                if let Ok(kb_val) = kb.parse::<u64>() {
-                    return kb_val * 1024;
-                }
-            }
-        }
-    }
-    0
-}
-
 /// Options for the verify-execution command.
 struct VerifyExecutionOptions {
     from: Option<u32>,
@@ -1833,15 +1813,9 @@ async fn cmd_verify_execution(
     let all_hashes: Vec<&Hash256> = all_hashes.iter().filter(|h| !h.is_zero()).collect();
 
     // Download buckets
-    let rss_before_download = rss_bytes();
-    println!("[MEM] Before bucket download:    RSS={}MB", rss_before_download / (1024 * 1024));
     let (cached, downloaded) =
         download_buckets_parallel(&archive, bucket_manager.clone(), all_hashes).await?;
-    let rss_after_download = rss_bytes();
     println!("[INIT] Bucket download: {} cached, {} downloaded", cached, downloaded);
-    println!("[MEM] After bucket download:     RSS={}MB  (+{}MB)",
-        rss_after_download / (1024 * 1024),
-        (rss_after_download.saturating_sub(rss_before_download)) / (1024 * 1024));
 
     // Restore bucket lists
     let mut bucket_list = BucketList::restore_from_has(
@@ -1859,10 +1833,6 @@ async fn cmd_verify_execution(
         )?,
         _ => HotArchiveBucketList::new(),
     };
-    let rss_after_restore = rss_bytes();
-    println!("[MEM] After bucket list restore: RSS={}MB  (+{}MB)",
-        rss_after_restore / (1024 * 1024),
-        (rss_after_restore.saturating_sub(rss_after_download)) / (1024 * 1024));
 
     // Get init header and restart merges
     let init_headers = archive.get_ledger_headers(init_checkpoint).await?;
@@ -1899,10 +1869,6 @@ async fn cmd_verify_execution(
             true, // restart_structure_based = true to match stellar-core online mode
         )?;
     }
-    let rss_after_merges = rss_bytes();
-    println!("[MEM] After merge restart:       RSS={}MB  (+{}MB)",
-        rss_after_merges / (1024 * 1024),
-        (rss_after_merges.saturating_sub(rss_after_restore)) / (1024 * 1024));
 
     // Create and initialize LedgerManager
     let ledger_manager = LedgerManager::new(
@@ -1923,37 +1889,6 @@ async fn cmd_verify_execution(
         init_header_entry.header.clone(),
         init_header_hash,
     )?;
-    let rss_after_init = rss_bytes();
-    println!("[MEM] After initialize():        RSS={}MB  (+{}MB)",
-        rss_after_init / (1024 * 1024),
-        (rss_after_init.saturating_sub(rss_after_merges)) / (1024 * 1024));
-
-    // Print component breakdown
-    let mem = ledger_manager.memory_report();
-    let offer_est_mb = (mem.offer_count as u64 * 300) / (1024 * 1024); // ~300 bytes/offer estimate
-    let soroban_data_est_mb = (mem.soroban_data_xdr_bytes as f64 * 2.5) as u64 / (1024 * 1024);
-    let soroban_code_est_mb = (mem.soroban_code_xdr_bytes as f64 * 2.5) as u64 / (1024 * 1024);
-    let bucket_idx_mb = mem.bucket_index_bytes / (1024 * 1024);
-    let bucket_bloom_mb = mem.bucket_bloom_bytes / (1024 * 1024);
-    let bucket_cache_mb = mem.bucket_cache_bytes / (1024 * 1024);
-    let estimated_total_mb = offer_est_mb + soroban_data_est_mb + soroban_code_est_mb
-        + bucket_idx_mb + bucket_bloom_mb + bucket_cache_mb;
-    let rss_mb = mem.rss_bytes / (1024 * 1024);
-    println!("[MEM] Component Breakdown (post-init):");
-    println!("  RSS total:             {} MB", rss_mb);
-    println!("  Offers:                {} entries  (~{} MB est)", mem.offer_count, offer_est_mb);
-    println!("  Offer index:           {} keys", mem.offer_index_keys);
-    println!("  Soroban contract data: {} entries  (XDR size={} MB)",
-        mem.soroban_data_count, mem.soroban_data_xdr_bytes / (1024 * 1024));
-    println!("  Soroban contract code: {} entries  (XDR size={} MB)",
-        mem.soroban_code_count, mem.soroban_code_xdr_bytes / (1024 * 1024));
-    println!("  Soroban config:        {} entries", mem.soroban_config_count);
-    println!("  Bucket indexes:        {} MB", bucket_idx_mb);
-    println!("  Bucket bloom filters:  {} MB", bucket_bloom_mb);
-    println!("  Bucket entry cache:    {} MB  ({} entries)", bucket_cache_mb, mem.bucket_cache_entries);
-    println!("  --------------------------------");
-    println!("  Estimated accounted:   {} MB", estimated_total_mb);
-    println!("  Unaccounted:           {} MB", rss_mb.saturating_sub(estimated_total_mb));
 
     println!("[INIT] TOTAL initialization: {:.2}s", init_start.elapsed().as_secs_f64());
 
@@ -2685,16 +2620,7 @@ async fn cmd_verify_execution(
                     }
                 }
 
-                // Periodic memory report every 10 ledgers
-                if ledgers_verified % 10 == 0 {
-                    let mem = ledger_manager.memory_report();
-                    println!("[MEM] L{}: RSS={}MB  offers={}  soroban={}  cache={}MB",
-                        seq,
-                        mem.rss_bytes / (1024 * 1024),
-                        mem.offer_count,
-                        mem.soroban_data_count,
-                        mem.bucket_cache_bytes / (1024 * 1024));
-                }
+
             }
 
             // Update prev hash for next ledger

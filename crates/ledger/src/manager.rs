@@ -679,37 +679,6 @@ impl Default for LedgerManagerConfig {
     }
 }
 
-/// Memory usage report for instrumentation.
-///
-/// Contains RSS and per-component heap estimates to help identify
-/// which data structures dominate memory during verify-execution.
-pub struct MemoryReport {
-    /// Current RSS in bytes.
-    pub rss_bytes: u64,
-    /// Number of offers in the in-memory offer store.
-    pub offer_count: usize,
-    /// Number of keys in the offer secondary index.
-    pub offer_index_keys: usize,
-    /// Number of Soroban contract data entries.
-    pub soroban_data_count: usize,
-    /// Number of Soroban contract code entries.
-    pub soroban_code_count: usize,
-    /// Number of Soroban config setting entries.
-    pub soroban_config_count: usize,
-    /// Total XDR bytes for contract data.
-    pub soroban_data_xdr_bytes: u64,
-    /// Total XDR bytes for contract code.
-    pub soroban_code_xdr_bytes: u64,
-    /// Total estimated heap bytes for bucket indexes.
-    pub bucket_index_bytes: u64,
-    /// Total bloom filter bytes across all buckets.
-    pub bucket_bloom_bytes: u64,
-    /// Total cache bytes across all buckets.
-    pub bucket_cache_bytes: u64,
-    /// Total cache entries across all buckets.
-    pub bucket_cache_entries: usize,
-}
-
 /// Internal state of the ledger manager.
 ///
 /// This struct holds the mutable state that changes with each ledger close.
@@ -996,54 +965,6 @@ impl LedgerManager {
         );
 
         Ok(())
-    }
-
-    /// Generate a memory report with RSS and component breakdown.
-    pub fn memory_report(&self) -> MemoryReport {
-        let rss = get_rss_bytes();
-
-        let offers = self.offer_store.read();
-        let offer_count = offers.len();
-        drop(offers);
-
-        let offer_index = self.offer_account_asset_index.read();
-        let offer_index_keys = offer_index.len();
-        drop(offer_index);
-
-        let soroban = self.soroban_state.read();
-        let soroban_stats = soroban.stats();
-        drop(soroban);
-
-        let bucket_list = self.bucket_list.read();
-        let mut bucket_index_bytes: u64 = 0;
-        let mut bucket_bloom_bytes: u64 = 0;
-        let mut bucket_cache_bytes: u64 = 0;
-        let mut bucket_cache_entries: usize = 0;
-
-        for level in bucket_list.levels() {
-            for bucket in [&level.curr, &level.snap] {
-                bucket_index_bytes += bucket.index_heap_bytes() as u64;
-                bucket_bloom_bytes += bucket.bloom_filter_size_bytes() as u64;
-                bucket_cache_bytes += bucket.cache_size_bytes() as u64;
-                bucket_cache_entries += bucket.cache_entry_count();
-            }
-        }
-        drop(bucket_list);
-
-        MemoryReport {
-            rss_bytes: rss,
-            offer_count,
-            offer_index_keys,
-            soroban_data_count: soroban_stats.contract_data_count,
-            soroban_code_count: soroban_stats.contract_code_count,
-            soroban_config_count: soroban_stats.config_settings_count,
-            soroban_data_xdr_bytes: soroban_stats.contract_data_size as u64,
-            soroban_code_xdr_bytes: soroban_stats.contract_code_size as u64,
-            bucket_index_bytes,
-            bucket_bloom_bytes,
-            bucket_cache_bytes,
-            bucket_cache_entries,
-        }
     }
 
     /// Verify bucket list hash against the header and install bucket lists + state.

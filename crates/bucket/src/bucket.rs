@@ -756,45 +756,6 @@ impl Bucket {
         }
     }
 
-    /// Returns the estimated heap bytes used by this bucket's index.
-    /// Returns 0 for in-memory buckets (entries are the main cost, not the index).
-    pub fn index_heap_bytes(&self) -> usize {
-        match &self.storage {
-            BucketStorage::DiskBacked { disk_bucket } => disk_bucket.index_heap_bytes(),
-            BucketStorage::InMemory { .. } => 0,
-        }
-    }
-
-    /// Returns the bloom filter size in bytes for this bucket.
-    pub fn bloom_filter_size_bytes(&self) -> usize {
-        match &self.storage {
-            BucketStorage::DiskBacked { disk_bucket } => {
-                disk_bucket.live_index().bloom_filter_size_bytes()
-            }
-            BucketStorage::InMemory { .. } => 0,
-        }
-    }
-
-    /// Returns the cache size in bytes for this bucket, or 0 if no cache.
-    pub fn cache_size_bytes(&self) -> usize {
-        match &self.storage {
-            BucketStorage::DiskBacked { disk_bucket } => {
-                disk_bucket.cache().map_or(0, |c| c.size_bytes())
-            }
-            BucketStorage::InMemory { .. } => 0,
-        }
-    }
-
-    /// Returns the number of entries in this bucket's cache, or 0 if no cache.
-    pub fn cache_entry_count(&self) -> usize {
-        match &self.storage {
-            BucketStorage::DiskBacked { disk_bucket } => {
-                disk_bucket.cache().map_or(0, |c| c.len())
-            }
-            BucketStorage::InMemory { .. } => 0,
-        }
-    }
-
     /// Resets cache hit/miss counters for this bucket's per-bucket cache.
     pub fn reset_cache_counters(&self) {
         if let BucketStorage::DiskBacked { disk_bucket } = &self.storage {
