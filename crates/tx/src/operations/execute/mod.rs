@@ -181,6 +181,7 @@ mod manage_offer;
 mod offer_exchange;
 mod path_payment;
 mod payment;
+pub mod prefetch;
 mod restore_footprint;
 mod set_options;
 mod sponsorship;

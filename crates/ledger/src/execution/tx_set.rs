@@ -85,6 +85,60 @@ pub fn run_transactions_on_executor(
     let ledger_seq = executor.ledger_seq;
     let protocol_version = executor.protocol_version;
 
+    // Prefetch all statically-known keys for the entire tx set in a single
+    // bucket list pass. This populates the snapshot's prefetch cache so
+    // subsequent per-operation loads hit the cache instead of the bucket list.
+    {
+        let prefetch_start = std::time::Instant::now();
+        let mut all_keys = std::collections::HashSet::new();
+        for (tx, _) in transactions {
+            let frame = TransactionFrame::new(tx.clone());
+            for key in frame.keys_for_fee_processing() {
+                all_keys.insert(key);
+            }
+            all_keys.extend(frame.keys_for_apply());
+        }
+        let keys_vec: Vec<LedgerKey> = all_keys.into_iter().collect();
+        let stats = snapshot.prefetch(&keys_vec)?;
+        tracing::info!(
+            requested = stats.requested,
+            loaded = stats.loaded,
+            elapsed_ms = prefetch_start.elapsed().as_millis() as u64,
+            "Prefetched ledger keys for classic phase"
+        );
+    }
+
+    // Phase 2: Prefetch seller entries for likely offer crossings.
+    // For each DEX asset pair in the tx set, pre-load the top offers' seller
+    // accounts and trustlines into the prefetch cache. This avoids per-offer
+    // bucket list lookups during the offer crossing loop.
+    {
+        const MAX_OFFERS_TO_PREFETCH: usize = 100;
+        let mut offer_seller_keys = std::collections::HashSet::new();
+        for (tx, _) in transactions {
+            let frame = TransactionFrame::new(tx.clone());
+            for op in frame.operations() {
+                for (selling, buying) in henyey_tx::extract_dex_asset_pairs(&op.body) {
+                    executor.state.collect_best_offer_seller_keys(
+                        &selling,
+                        &buying,
+                        &mut offer_seller_keys,
+                        MAX_OFFERS_TO_PREFETCH,
+                    );
+                }
+            }
+        }
+        if !offer_seller_keys.is_empty() {
+            let stats = snapshot
+                .prefetch(&offer_seller_keys.into_iter().collect::<Vec<_>>())?;
+            tracing::info!(
+                requested = stats.requested,
+                loaded = stats.loaded,
+                "Prefetched offer seller entries"
+            );
+        }
+    }
+
     let mut results = Vec::with_capacity(transactions.len());
     let mut tx_results = Vec::with_capacity(transactions.len());
     let mut tx_result_metas = Vec::with_capacity(transactions.len());
@@ -249,6 +303,34 @@ pub fn execute_soroban_parallel_phase(
     let soroban_base_prng_seed = soroban.base_prng_seed;
     if total_pre_deducted != 0 {
         delta.record_fee_pool_delta(total_pre_deducted);
+    }
+
+    // Prefetch fee source accounts for all Soroban TXs.
+    // Soroban operations themselves return empty from collect_prefetch_keys (their
+    // state is in-memory via InMemorySorobanState), but fee source account loading
+    // in each cluster benefits from the prefetch cache.
+    {
+        let prefetch_start = std::time::Instant::now();
+        let mut all_keys = std::collections::HashSet::new();
+        for stage in &phase.stages {
+            for cluster in stage {
+                for (tx, _) in cluster {
+                    let frame = TransactionFrame::new(tx.clone());
+                    for key in frame.keys_for_fee_processing() {
+                        all_keys.insert(key);
+                    }
+                    all_keys.extend(frame.keys_for_apply());
+                }
+            }
+        }
+        let keys_vec: Vec<LedgerKey> = all_keys.into_iter().collect();
+        let stats = snapshot.prefetch(&keys_vec)?;
+        tracing::info!(
+            requested = stats.requested,
+            loaded = stats.loaded,
+            elapsed_ms = prefetch_start.elapsed().as_millis() as u64,
+            "Prefetched ledger keys for Soroban parallel phase"
+        );
     }
 
     // Track position in the flattened pre_charged_fees vector.

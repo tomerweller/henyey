@@ -2714,7 +2714,21 @@ impl TransactionExecutor {
             self.load_account(snapshot, &op_source)?;
         }
 
-        // Load destination accounts based on operation type
+        // Phase 1: Batch-load statically-known keys (shared with per-ledger prefetch).
+        // When the prefetch cache is populated, these lookups are cache hits.
+        // When called without prefetch (e.g., in tests), this provides the
+        // same batch-loading benefit as the per-ledger prefetch.
+        {
+            let mut static_keys = std::collections::HashSet::new();
+            henyey_tx::collect_prefetch_keys(&op.body, &op_source, &mut static_keys);
+            if !static_keys.is_empty() {
+                let keys_vec: Vec<LedgerKey> = static_keys.into_iter().collect();
+                self.batch_load_keys(snapshot, &keys_vec)?;
+            }
+        }
+
+        // Phase 2: Conditional/secondary loading that depends on loaded state
+        // or requires special semantics (e.g., load_account_without_record).
         match &op.body {
             OperationBody::CreateAccount(op_data) => {
                 self.load_account(snapshot, &op_data.destination)?;

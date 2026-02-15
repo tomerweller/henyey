@@ -330,6 +330,50 @@ impl TransactionFrame {
         self.operations().len()
     }
 
+    /// Collect all keys needed for fee processing (source accounts).
+    pub fn keys_for_fee_processing(&self) -> Vec<LedgerKey> {
+        use stellar_xdr::curr::LedgerKeyAccount;
+
+        let mut keys = vec![LedgerKey::Account(LedgerKeyAccount {
+            account_id: self.source_account_id(),
+        })];
+        if self.is_fee_bump() {
+            let inner = self.inner_source_account_id();
+            if inner != self.source_account_id() {
+                keys.push(LedgerKey::Account(LedgerKeyAccount {
+                    account_id: inner,
+                }));
+            }
+        }
+        keys
+    }
+
+    /// Collect all statically-known keys needed for transaction apply.
+    ///
+    /// This calls `collect_prefetch_keys` for each operation, collecting
+    /// keys that can be determined from the operation data alone.
+    pub fn keys_for_apply(&self) -> std::collections::HashSet<LedgerKey> {
+        use crate::operations::execute::prefetch::collect_prefetch_keys;
+        use stellar_xdr::curr::LedgerKeyAccount;
+
+        let mut keys = std::collections::HashSet::new();
+        let source = self.inner_source_account_id();
+        for op in self.operations() {
+            let op_source = op
+                .source_account
+                .as_ref()
+                .map(muxed_to_account_id)
+                .unwrap_or_else(|| source.clone());
+            if op_source != source {
+                keys.insert(LedgerKey::Account(LedgerKeyAccount {
+                    account_id: op_source.clone(),
+                }));
+            }
+            collect_prefetch_keys(&op.body, &op_source, &mut keys);
+        }
+        keys
+    }
+
     /// Get the memo.
     pub fn memo(&self) -> &Memo {
         match &self.envelope {
@@ -575,6 +619,48 @@ impl TransactionFrame {
         // If Soroban, must have exactly one operation
         if self.is_soroban() && self.operations().len() != 1 {
             return false;
+        }
+
+        // DoS guard: reject envelopes that exceed the maximum transaction size.
+        // This serves as a proxy for stellar-core's XDR depth check (500 levels),
+        // since excessively large envelopes are the practical attack vector.
+        // The limit matches MAX_CLASSIC_TX_SIZE_BYTES (100 KB) from flow control.
+        const MAX_TX_ENVELOPE_SIZE: u32 = 100 * 1024;
+        if self.tx_size_bytes() > MAX_TX_ENVELOPE_SIZE {
+            return false;
+        }
+
+        true
+    }
+
+    /// Validate Soroban memo and muxed account constraints.
+    ///
+    /// Soroban transactions must have MEMO_NONE and must not use muxed
+    /// source accounts (neither at the transaction level nor at the operation level).
+    ///
+    /// Parity: TransactionFrame.cpp:314-342
+    pub fn validate_soroban_memo(&self) -> bool {
+        if !self.is_soroban() {
+            return true;
+        }
+
+        // Reject if memo is not MEMO_NONE
+        if !matches!(self.memo(), Memo::None) {
+            return false;
+        }
+
+        // Reject if source account is muxed
+        if matches!(self.source_account(), MuxedAccount::MuxedEd25519(_)) {
+            return false;
+        }
+
+        // Reject if any operation source is muxed
+        for op in self.operations() {
+            if let Some(src) = &op.source_account {
+                if matches!(src, MuxedAccount::MuxedEd25519(_)) {
+                    return false;
+                }
+            }
         }
 
         true
@@ -1084,5 +1170,152 @@ mod tests {
         let frame = TransactionFrame::new(envelope);
         let precond = frame.preconditions();
         assert!(matches!(precond, Preconditions::None));
+    }
+
+    // --- P0-4: XDR size limit in is_valid_structure() ---
+
+    #[test]
+    fn test_is_valid_structure_rejects_oversized_envelope() {
+        // Create a Soroban transaction with a large args vector to exceed 100KB.
+        // ScVal::Bytes can hold up to 256KB, so we use a single large blob.
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let large_bytes = vec![0xABu8; 110_000]; // 110KB payload
+        let host_function = HostFunction::InvokeContract(InvokeContractArgs {
+            contract_address: ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(
+                Uint256([3u8; 32]),
+            ))),
+            function_name: ScSymbol(StringM::<32>::try_from("test".to_string()).unwrap()),
+            args: vec![ScVal::Bytes(ScBytes(large_bytes.try_into().unwrap()))]
+                .try_into()
+                .unwrap(),
+        });
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function,
+                auth: VecM::default(),
+            }),
+        };
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+
+        let frame = TransactionFrame::new(envelope);
+        assert!(
+            frame.tx_size_bytes() > 100 * 1024,
+            "test envelope should exceed 100KB, actual: {} bytes",
+            frame.tx_size_bytes()
+        );
+        assert!(
+            !frame.is_valid_structure(),
+            "oversized envelope should fail structure check"
+        );
+    }
+
+    #[test]
+    fn test_is_valid_structure_accepts_normal_sized_envelope() {
+        let envelope = create_test_transaction();
+        let frame = TransactionFrame::new(envelope);
+        assert!(frame.tx_size_bytes() < 100 * 1024);
+        assert!(frame.is_valid_structure());
+    }
+
+    // --- P1-3: validate_soroban_memo() ---
+
+    #[test]
+    fn test_validate_soroban_memo_classic_always_passes() {
+        // Classic transactions pass regardless of memo
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let dest = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::Text(StringM::try_from("hello").unwrap()),
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::Payment(PaymentOp {
+                    destination: dest,
+                    asset: Asset::Native,
+                    amount: 1000,
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+        let frame = TransactionFrame::new(envelope);
+        assert!(!frame.is_soroban());
+        assert!(frame.validate_soroban_memo());
+    }
+
+    #[test]
+    fn test_validate_soroban_memo_none_passes() {
+        let envelope = create_soroban_transaction();
+        let frame = TransactionFrame::new(envelope);
+        assert!(frame.is_soroban());
+        assert!(frame.validate_soroban_memo());
+    }
+
+    #[test]
+    fn test_validate_soroban_memo_text_rejected() {
+        // Soroban tx with a text memo should be rejected
+        let mut envelope = create_soroban_transaction();
+        if let TransactionEnvelope::Tx(ref mut env) = envelope {
+            env.tx.memo = Memo::Text(StringM::try_from("bad").unwrap());
+        }
+        let frame = TransactionFrame::new(envelope);
+        assert!(frame.is_soroban());
+        assert!(!frame.validate_soroban_memo());
+    }
+
+    #[test]
+    fn test_validate_soroban_memo_muxed_source_rejected() {
+        // Soroban tx with a muxed source account should be rejected
+        let mut envelope = create_soroban_transaction();
+        if let TransactionEnvelope::Tx(ref mut env) = envelope {
+            env.tx.source_account = MuxedAccount::MuxedEd25519(MuxedAccountMed25519 {
+                id: 42,
+                ed25519: Uint256([2u8; 32]),
+            });
+        }
+        let frame = TransactionFrame::new(envelope);
+        assert!(!frame.validate_soroban_memo());
+    }
+
+    #[test]
+    fn test_validate_soroban_memo_muxed_op_source_rejected() {
+        // Soroban tx with a muxed operation source should be rejected
+        let mut envelope = create_soroban_transaction();
+        if let TransactionEnvelope::Tx(ref mut env) = envelope {
+            let mut ops: Vec<Operation> = env.tx.operations.to_vec();
+            ops[0].source_account =
+                Some(MuxedAccount::MuxedEd25519(MuxedAccountMed25519 {
+                    id: 99,
+                    ed25519: Uint256([5u8; 32]),
+                }));
+            env.tx.operations = ops.try_into().unwrap();
+        }
+        let frame = TransactionFrame::new(envelope);
+        assert!(!frame.validate_soroban_memo());
     }
 }

@@ -30,6 +30,15 @@ use stellar_xdr::curr::{
     AccountEntry, AccountId, LedgerEntry, LedgerEntryData, LedgerHeader, LedgerKey,
 };
 
+/// Statistics from a prefetch operation.
+#[derive(Debug, Default)]
+pub struct PrefetchStats {
+    /// Number of keys that needed loading (not already cached).
+    pub requested: usize,
+    /// Number of entries actually loaded from the bucket list.
+    pub loaded: usize,
+}
+
 /// A point-in-time snapshot of ledger state.
 ///
 /// `LedgerSnapshot` provides a consistent, read-only view of the ledger
@@ -249,6 +258,9 @@ pub struct SnapshotHandle {
     batch_lookup_fn: Option<BatchEntryLookupFn>,
     /// Optional index-based lookup for offers by (account, asset).
     offers_by_account_asset_fn: Option<OffersByAccountAssetFn>,
+    /// Cache populated by prefetch, checked before falling through to lookup_fn.
+    /// Uses Arc<RwLock> so clones of SnapshotHandle share the same cache.
+    prefetch_cache: Arc<parking_lot::RwLock<HashMap<Vec<u8>, LedgerEntry>>>,
 }
 
 impl SnapshotHandle {
@@ -260,6 +272,7 @@ impl SnapshotHandle {
             entries_fn: None,
             batch_lookup_fn: None,
             offers_by_account_asset_fn: None,
+            prefetch_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
 
@@ -271,6 +284,7 @@ impl SnapshotHandle {
             entries_fn: None,
             batch_lookup_fn: None,
             offers_by_account_asset_fn: None,
+            prefetch_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
 
@@ -286,6 +300,7 @@ impl SnapshotHandle {
             entries_fn: Some(entries_fn),
             batch_lookup_fn: None,
             offers_by_account_asset_fn: None,
+            prefetch_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
 
@@ -338,19 +353,27 @@ impl SnapshotHandle {
 
     /// Load multiple entries by their keys.
     ///
-    /// Checks the snapshot cache first, then uses the batch lookup function
-    /// (if available) for remaining keys. Falls back to individual lookups.
+    /// Checks the snapshot cache first, then the prefetch cache, then uses
+    /// the batch lookup function (if available) for remaining keys.
+    /// Falls back to individual lookups.
     pub fn load_entries(&self, keys: &[LedgerKey]) -> Result<Vec<LedgerEntry>> {
-        // Check cache first, collect remaining keys
+        // Check snapshot cache first, then prefetch cache, collect remaining keys
         let mut result = Vec::new();
         let mut remaining = Vec::new();
+        let prefetch = self.prefetch_cache.read();
         for key in keys {
             if let Some(entry) = self.inner.get_entry(key)? {
                 result.push(entry.clone());
             } else {
-                remaining.push(key.clone());
+                let key_bytes = key_to_bytes(key)?;
+                if let Some(entry) = prefetch.get(&key_bytes) {
+                    result.push(entry.clone());
+                } else {
+                    remaining.push(key.clone());
+                }
             }
         }
+        drop(prefetch);
 
         if remaining.is_empty() {
             return Ok(result);
@@ -395,15 +418,22 @@ impl SnapshotHandle {
 
     /// Look up an entry.
     ///
-    /// First checks the snapshot cache, then falls back to the lookup function
-    /// if one is configured (e.g., for bucket list lookups).
+    /// First checks the snapshot cache, then the prefetch cache, then falls
+    /// back to the lookup function if one is configured (e.g., for bucket
+    /// list lookups).
     pub fn get_entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
-        // First try the cached entries
+        // 1. Check snapshot's built-in cache
         if let Some(entry) = self.inner.get_entry(key)? {
             return Ok(Some(entry.clone()));
         }
 
-        // Fall back to lookup function if available
+        // 2. Check prefetch cache
+        let key_bytes = key_to_bytes(key)?;
+        if let Some(entry) = self.prefetch_cache.read().get(&key_bytes) {
+            return Ok(Some(entry.clone()));
+        }
+
+        // 3. Fall back to lookup function if available
         if let Some(ref lookup_fn) = self.lookup_fn {
             return lookup_fn(key);
         }
@@ -424,6 +454,74 @@ impl SnapshotHandle {
         }
         Ok(None)
     }
+
+    /// Bulk-load keys into the prefetch cache.
+    ///
+    /// Uses batch_lookup_fn for a single bucket list traversal.
+    /// Keys already in the snapshot cache or prefetch cache are skipped.
+    /// Soroban entry types are skipped (they're in-memory via InMemorySorobanState).
+    pub fn prefetch(&self, keys: &[LedgerKey]) -> Result<PrefetchStats> {
+        let mut needed = Vec::new();
+        let cache = self.prefetch_cache.read();
+
+        for key in keys {
+            // Skip soroban types (in-memory via InMemorySorobanState)
+            if is_soroban_key(key) {
+                continue;
+            }
+            let key_bytes = key_to_bytes(key)?;
+            if self.inner.get_entry(key)?.is_some() || cache.contains_key(&key_bytes) {
+                continue;
+            }
+            needed.push(key.clone());
+        }
+        drop(cache); // Release read lock before write
+
+        if needed.is_empty() {
+            return Ok(PrefetchStats::default());
+        }
+
+        // Batch load from bucket list
+        let entries = if let Some(ref batch_fn) = self.batch_lookup_fn {
+            batch_fn(&needed)?
+        } else if let Some(ref lookup_fn) = self.lookup_fn {
+            let mut loaded = Vec::new();
+            for k in &needed {
+                if let Some(entry) = lookup_fn(k)? {
+                    loaded.push(entry);
+                }
+            }
+            loaded
+        } else {
+            return Ok(PrefetchStats {
+                requested: needed.len(),
+                loaded: 0,
+            });
+        };
+
+        let loaded = entries.len();
+        let mut cache = self.prefetch_cache.write();
+        for entry in entries {
+            if let Ok(key) = crate::delta::entry_to_key(&entry) {
+                if let Ok(key_bytes) = key_to_bytes(&key) {
+                    cache.insert(key_bytes, entry);
+                }
+            }
+        }
+
+        Ok(PrefetchStats {
+            requested: needed.len(),
+            loaded,
+        })
+    }
+}
+
+/// Check if a LedgerKey is a Soroban type (ContractData, ContractCode, Ttl).
+fn is_soroban_key(key: &LedgerKey) -> bool {
+    matches!(
+        key,
+        LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) | LedgerKey::Ttl(_)
+    )
 }
 
 /// Fluent builder for constructing [`LedgerSnapshot`] instances.
