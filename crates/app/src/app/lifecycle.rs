@@ -176,7 +176,6 @@ impl App {
 
         tracing::info!("Entering main event loop");
 
-        // Add a short heartbeat interval for debugging
         let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(10));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -378,53 +377,31 @@ impl App {
 
                 // Consensus timer - trigger ledger close for validators and process externalized
                 _ = consensus_interval.tick() => {
-                    // IMPORTANT: Drain pending overlay messages FIRST before any catchup evaluation.
-                    // This ensures tx_sets that arrived via broadcast are processed before we
-                    // decide whether to trigger catchup due to missing tx_sets.
-                    let mut drained = 0;
+                    // Drain pending overlay messages FIRST before any catchup
+                    // evaluation.  This ensures tx_sets and SCP envelopes that
+                    // arrived since the last tick are processed before we decide
+                    // whether to trigger catchup or consensus.
 
                     // Drain dedicated SCP channel first (highest priority)
                     while let Ok(scp_msg) = scp_message_rx.try_recv() {
-                        drained += 1;
                         self.handle_overlay_message(scp_msg).await;
                     }
 
                     // Drain dedicated fetch response channel (tx_sets, dont_have, etc.)
                     while let Ok(fetch_msg) = fetch_response_rx.try_recv() {
-                        drained += 1;
                         self.handle_overlay_message(fetch_msg).await;
                     }
 
-                    // Drain broadcast channel (remaining message types only)
-                    loop {
-                        match message_rx.try_recv() {
-                            Ok(overlay_msg) => {
-                                // Skip SCP messages — already handled via dedicated channel
-                                if matches!(overlay_msg.message, StellarMessage::ScpMessage(_)) {
-                                    continue;
-                                }
-                                // Skip fetch response messages — already handled via dedicated channel
-                                if matches!(
-                                    overlay_msg.message,
-                                    StellarMessage::GeneralizedTxSet(_)
-                                        | StellarMessage::TxSet(_)
-                                        | StellarMessage::DontHave(_)
-                                        | StellarMessage::ScpQuorumset(_)
-                                ) {
-                                    continue;
-                                }
-                                drained += 1;
-                                self.handle_overlay_message(overlay_msg).await;
-                            }
-                            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
-                                tracing::debug!(skipped = n, "Overlay broadcast receiver lagged during drain (non-critical messages only)");
-                            }
-                            Err(_) => break, // Empty or Closed
-                        }
-                    }
-                    if drained > 0 {
-                        tracing::debug!(drained, "Drained pending overlay messages before consensus tick");
-                    }
+                    // NOTE: The broadcast channel is NOT drained here.
+                    // It carries only non-critical messages (TX floods, peer
+                    // requests like GetScpState/GetScpQuorumset) which are
+                    // already handled one-at-a-time by the select! branch for
+                    // message_rx.recv().  Draining the broadcast channel in a
+                    // tight loop caused the event loop to freeze: slow handlers
+                    // (GetScpState takes ~1s per peer via overlay.send_to) let
+                    // new messages accumulate → Lagged → loop continues →
+                    // starvation.  Critical messages (SCP envelopes, tx_sets)
+                    // are routed to dedicated mpsc channels drained above.
 
                     // Check if SyncRecoveryManager requested recovery
                     if self.sync_recovery_pending.swap(false, Ordering::SeqCst) {
