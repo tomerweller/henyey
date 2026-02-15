@@ -82,8 +82,8 @@ pub enum TxQueueResult {
     QueueFull,
     /// Transaction fee is too low.
     FeeTooLow,
-    /// Transaction is invalid.
-    Invalid,
+    /// Transaction is invalid. Contains the specific error code when available.
+    Invalid(Option<henyey_tx::TxResultCode>),
     /// Transaction is banned.
     Banned,
     /// Transaction contains a filtered operation type.
@@ -673,10 +673,10 @@ impl TransactionQueue {
     fn validate_transaction(
         &self,
         envelope: &TransactionEnvelope,
-    ) -> std::result::Result<(), &'static str> {
+    ) -> std::result::Result<(), henyey_tx::TxResultCode> {
         use henyey_tx::{
             validate_ledger_bounds, validate_signatures, validate_time_bounds, LedgerContext,
-            TransactionFrame,
+            TxResultCode, TransactionFrame,
         };
 
         let frame = TransactionFrame::with_network(envelope.clone(), self.config.network_id);
@@ -685,7 +685,19 @@ impl TransactionQueue {
 
         // Validate basic structure
         if !frame.is_valid_structure() {
-            return Err("invalid transaction structure");
+            return Err(TxResultCode::TxMalformed);
+        }
+
+        // Validate operation parameters
+        for op in frame.operations() {
+            if henyey_tx::operations::validate_operation(op).is_err() {
+                return Err(TxResultCode::TxMalformed);
+            }
+        }
+
+        // Validate Soroban memo/muxed constraints
+        if !frame.validate_soroban_memo() {
+            return Err(TxResultCode::TxSorobanInvalid);
         }
 
         // Validate time bounds if enabled
@@ -700,11 +712,11 @@ impl TransactionQueue {
             );
 
             if validate_time_bounds(&frame, &ledger_ctx).is_err() {
-                return Err("time bounds validation failed");
+                return Err(TxResultCode::TxTooEarly);
             }
 
             if validate_ledger_bounds(&frame, &ledger_ctx).is_err() {
-                return Err("ledger bounds validation failed");
+                return Err(TxResultCode::TxTooEarly);
             }
         }
 
@@ -720,16 +732,18 @@ impl TransactionQueue {
             );
 
             if validate_signatures(&frame, &ledger_ctx).is_err() {
-                return Err("signature validation failed");
+                return Err(TxResultCode::TxBadAuth);
             }
         }
 
         // Validate preconditions (extra signers / min seq age+gap)
         if let Preconditions::V2(cond) = frame.preconditions() {
-            if !cond.extra_signers.is_empty()
-                && !extra_signers_satisfied(envelope, &self.config.network_id, &cond.extra_signers)?
-            {
-                return Err("extra signer validation failed");
+            if !cond.extra_signers.is_empty() {
+                match extra_signers_satisfied(envelope, &self.config.network_id, &cond.extra_signers)
+                {
+                    Ok(true) => {}
+                    _ => return Err(TxResultCode::TxBadAuth),
+                }
             }
         }
 
@@ -786,7 +800,7 @@ impl TransactionQueue {
 
                 let current_seq = envelope_seq_num(&current_tx.envelope);
                 if new_seq < current_seq {
-                    return Err(TxQueueResult::Invalid);
+                    return Err(TxQueueResult::Invalid(None));
                 }
 
                 if !is_fee_bump {
@@ -1033,14 +1047,14 @@ impl TransactionQueue {
     /// Try to add a transaction to the queue.
     pub fn try_add(&self, envelope: TransactionEnvelope) -> TxQueueResult {
         // Validate transaction before queueing
-        if self.validate_transaction(&envelope).is_err() {
-            return TxQueueResult::Invalid;
+        if let Err(code) = self.validate_transaction(&envelope) {
+            return TxQueueResult::Invalid(Some(code));
         }
 
         // Create queued transaction
         let queued = match QueuedTransaction::new(envelope) {
             Ok(q) => q,
-            Err(_) => return TxQueueResult::Invalid,
+            Err(_) => return TxQueueResult::Invalid(None),
         };
 
         // Check if already seen
@@ -1179,11 +1193,11 @@ impl TransactionQueue {
             if let Some(available) = provider.get_available_balance(&fee_source_id) {
                 // available - net_new_fee < current_total_fees means insufficient
                 if available.saturating_sub(net_new_fee) < current_total_fees {
-                    return TxQueueResult::Invalid; // txINSUFFICIENT_BALANCE
+                    return TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxInsufficientBalance));
                 }
             } else {
                 // Account doesn't exist
-                return TxQueueResult::Invalid;
+                return TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxNoAccount));
             }
         }
 
@@ -1831,11 +1845,11 @@ mod tests {
     use stellar_xdr::curr::{
         AccountId, AlphaNum4, Asset, AssetCode4, CreateAccountOp, DecoratedSignature, Duration,
         HostFunction, InvokeContractArgs, InvokeHostFunctionOp, LedgerFootprint, ManageSellOfferOp,
-        Memo, MuxedAccount, Operation, OperationBody, Preconditions, PreconditionsV2, Price,
-        PublicKey, ScAddress, ScSymbol, ScVal, SequenceNumber, Signature as XdrSignature,
-        SignatureHint, SignerKey, SorobanResources, SorobanTransactionData,
-        SorobanTransactionDataExt, StringM, Transaction, TransactionEnvelope, TransactionExt,
-        TransactionV1Envelope, Uint256, VecM,
+        Memo, MuxedAccount, MuxedAccountMed25519, Operation, OperationBody, PaymentOp,
+        Preconditions, PreconditionsV2, Price, PublicKey, ScAddress, ScSymbol, ScVal,
+        SequenceNumber, Signature as XdrSignature, SignatureHint, SignerKey, SorobanResources,
+        SorobanTransactionData, SorobanTransactionDataExt, StringM, Transaction,
+        TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, VecM,
     };
 
     fn make_test_envelope(fee: u32, ops: usize) -> TransactionEnvelope {
@@ -3617,7 +3631,7 @@ mod tests {
             env.signatures = vec![sig].try_into().unwrap();
         }
 
-        assert_eq!(queue.try_add(envelope), TxQueueResult::Invalid);
+        assert!(matches!(queue.try_add(envelope), TxQueueResult::Invalid(_)));
     }
 
     #[test]
@@ -4064,5 +4078,220 @@ mod tests {
 
         // Trying to add the same tx again should be duplicate
         assert_eq!(queue.try_add(tx1), TxQueueResult::Duplicate);
+    }
+
+    // --- P1-2: Specific error codes from TxQueueResult::Invalid ---
+
+    #[test]
+    fn test_invalid_structure_returns_tx_malformed() {
+        let queue = TransactionQueue::with_defaults();
+
+        // Zero-fee transaction should fail is_valid_structure()
+        let mut envelope = make_test_envelope(0, 1);
+        set_source(&mut envelope, 100);
+
+        match queue.try_add(envelope) {
+            TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxMalformed)) => {}
+            other => panic!("expected Invalid(TxMalformed), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_zero_operations_returns_tx_malformed() {
+        let queue = TransactionQueue::with_defaults();
+
+        // Create a transaction with zero operations (violates structure check)
+        let source = MuxedAccount::Ed25519(Uint256([101u8; 32]));
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        });
+
+        match queue.try_add(envelope) {
+            TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxMalformed)) => {}
+            other => panic!("expected Invalid(TxMalformed), got {:?}", other),
+        }
+    }
+
+    // --- P1-1: Operation-level validation at queue time ---
+
+    #[test]
+    fn test_invalid_operation_rejected_at_queue_time() {
+        let queue = TransactionQueue::with_defaults();
+
+        // Create a transaction with an invalid payment (amount <= 0)
+        let source = MuxedAccount::Ed25519(Uint256([102u8; 32]));
+        let dest = MuxedAccount::Ed25519(Uint256([103u8; 32]));
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 200,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::Payment(PaymentOp {
+                    destination: dest,
+                    asset: Asset::Native,
+                    amount: 0, // Invalid: amount must be > 0
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        });
+
+        match queue.try_add(envelope) {
+            TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxMalformed)) => {}
+            other => panic!("expected Invalid(TxMalformed), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_valid_operation_accepted_at_queue_time() {
+        let queue = TransactionQueue::with_defaults();
+
+        // Normal valid transaction should pass operation validation
+        let mut envelope = make_test_envelope(200, 1);
+        set_source(&mut envelope, 104);
+
+        assert_eq!(queue.try_add(envelope), TxQueueResult::Added);
+    }
+
+    #[test]
+    fn test_negative_payment_amount_rejected() {
+        let queue = TransactionQueue::with_defaults();
+
+        let source = MuxedAccount::Ed25519(Uint256([105u8; 32]));
+        let dest = MuxedAccount::Ed25519(Uint256([106u8; 32]));
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 200,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::Payment(PaymentOp {
+                    destination: dest,
+                    asset: Asset::Native,
+                    amount: -100, // Invalid: negative amount
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        });
+
+        match queue.try_add(envelope) {
+            TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxMalformed)) => {}
+            other => panic!("expected Invalid(TxMalformed), got {:?}", other),
+        }
+    }
+
+    // --- P1-3: Soroban memo validation at queue time ---
+
+    #[test]
+    fn test_soroban_with_memo_rejected() {
+        let queue = TransactionQueue::with_defaults();
+
+        let mut envelope = make_soroban_envelope(500);
+        if let TransactionEnvelope::Tx(ref mut env) = envelope {
+            env.tx.memo = Memo::Text(StringM::try_from("bad").unwrap());
+        }
+        set_source(&mut envelope, 107);
+
+        match queue.try_add(envelope) {
+            TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxSorobanInvalid)) => {}
+            other => panic!("expected Invalid(TxSorobanInvalid), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_soroban_with_muxed_source_rejected() {
+        let queue = TransactionQueue::with_defaults();
+
+        let mut envelope = make_soroban_envelope(500);
+        if let TransactionEnvelope::Tx(ref mut env) = envelope {
+            env.tx.source_account = MuxedAccount::MuxedEd25519(MuxedAccountMed25519 {
+                id: 42,
+                ed25519: Uint256([108u8; 32]),
+            });
+        }
+
+        match queue.try_add(envelope) {
+            TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxSorobanInvalid)) => {}
+            other => panic!("expected Invalid(TxSorobanInvalid), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_soroban_with_muxed_op_source_rejected() {
+        let queue = TransactionQueue::with_defaults();
+
+        let mut envelope = make_soroban_envelope(500);
+        if let TransactionEnvelope::Tx(ref mut env) = envelope {
+            let mut ops: Vec<Operation> = env.tx.operations.to_vec();
+            ops[0].source_account =
+                Some(MuxedAccount::MuxedEd25519(MuxedAccountMed25519 {
+                    id: 99,
+                    ed25519: Uint256([109u8; 32]),
+                }));
+            env.tx.operations = ops.try_into().unwrap();
+        }
+        set_source(&mut envelope, 110);
+
+        match queue.try_add(envelope) {
+            TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxSorobanInvalid)) => {}
+            other => panic!("expected Invalid(TxSorobanInvalid), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_soroban_without_memo_accepted() {
+        let queue = TransactionQueue::with_defaults();
+
+        // Normal soroban tx with MEMO_NONE should pass memo validation
+        let mut envelope = make_soroban_envelope(500);
+        set_source(&mut envelope, 111);
+
+        assert_eq!(queue.try_add(envelope), TxQueueResult::Added);
     }
 }

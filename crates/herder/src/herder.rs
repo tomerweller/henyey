@@ -1322,7 +1322,7 @@ impl Herder {
 
         if !state.can_receive_transactions() {
             debug!("Ignoring transaction in {:?} state", state);
-            return TxQueueResult::Invalid;
+            return TxQueueResult::Invalid(None);
         }
 
         // Add to transaction queue
@@ -1341,8 +1341,8 @@ impl Herder {
             TxQueueResult::FeeTooLow => {
                 debug!("Transaction fee too low");
             }
-            TxQueueResult::Invalid => {
-                debug!("Invalid transaction rejected");
+            TxQueueResult::Invalid(code) => {
+                debug!(?code, "Invalid transaction rejected");
             }
             TxQueueResult::Banned => {
                 debug!("Banned transaction rejected");

@@ -1655,8 +1655,12 @@ async fn submit_tx_handler(
         henyey_herder::TxQueueResult::FeeTooLow => {
             (false, Some("Transaction fee too low".to_string()))
         }
-        henyey_herder::TxQueueResult::Invalid => {
-            (false, Some("Transaction invalid".to_string()))
+        henyey_herder::TxQueueResult::Invalid(code) => {
+            let msg = match code {
+                Some(c) => format!("Transaction invalid: {}", c),
+                None => "Transaction invalid".to_string(),
+            };
+            (false, Some(msg))
         }
         henyey_herder::TxQueueResult::Banned => {
             (false, Some("Transaction from banned source".to_string()))

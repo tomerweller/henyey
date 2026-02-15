@@ -888,8 +888,8 @@ impl App {
                     henyey_herder::TxQueueResult::FeeTooLow => {
                         tracing::debug!("Transaction fee too low, rejected");
                     }
-                    henyey_herder::TxQueueResult::Invalid => {
-                        tracing::debug!("Invalid transaction rejected");
+                    henyey_herder::TxQueueResult::Invalid(code) => {
+                        tracing::debug!(?code, "Invalid transaction rejected");
                     }
                     henyey_herder::TxQueueResult::Banned => {
                         tracing::debug!("Transaction from banned source rejected");
