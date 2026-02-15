@@ -107,9 +107,6 @@ pub struct DiskBucket {
     /// Initialized lazily via `maybe_initialize_cache()`.
     /// Only caches ACCOUNT entries (matching stellar-core).
     cache: OnceLock<Arc<RandomEvictionCache>>,
-    /// Pre-collected scan-relevant entries from the index-building pass.
-    /// Consumed once by `take_scan_entries()` to avoid a redundant disk read.
-    scan_entries: std::sync::Mutex<Option<Vec<BucketEntry>>>,
 }
 
 impl Clone for DiskBucket {
@@ -122,29 +119,58 @@ impl Clone for DiskBucket {
             index: self.index.clone(),
             mmap: self.mmap.clone(),
             cache: self.cache.clone(),
-            // Cloned buckets don't carry scan entries — they are one-time-use
-            scan_entries: std::sync::Mutex::new(None),
         }
     }
 }
 
 /// Iterator that reads `(BucketEntry, offset)` pairs one at a time from an
 /// uncompressed XDR bucket file. Each call to `next()` reads and parses a
-/// single record, keeping only O(1) memory (one entry + read buffer).
+/// single record, keeping only O(1) memory (one entry + reusable buffer).
+///
+/// Optionally computes SHA-256 hash incrementally as records are read,
+/// merging what was previously a separate `count_and_hash` pass into the
+/// index-building pass (single-pass over the file).
 struct StreamingXdrEntryIterator {
     reader: BufReader<File>,
     file_len: u64,
     position: u64,
+    /// Reusable buffer for record data (avoids per-record allocation).
+    buf: Vec<u8>,
+    /// Optional hasher for computing bucket hash during iteration.
+    hasher: Option<Sha256>,
+    /// Number of records read (including those that failed to parse).
+    record_count: usize,
 }
 
 impl StreamingXdrEntryIterator {
     fn new(path: &Path, file_len: u64) -> Result<Self> {
+        Self::with_hasher(path, file_len, false)
+    }
+
+    fn with_hasher(path: &Path, file_len: u64, compute_hash: bool) -> Result<Self> {
         let file = File::open(path)?;
         Ok(Self {
             reader: BufReader::new(file),
             file_len,
             position: 0,
+            buf: Vec::with_capacity(4096),
+            hasher: if compute_hash {
+                Some(Sha256::new())
+            } else {
+                None
+            },
+            record_count: 0,
         })
+    }
+
+    /// Finalize the iterator, returning (record_count, hash).
+    /// Hash is only available if the iterator was created with `compute_hash=true`.
+    fn finalize(self) -> (usize, Option<Hash256>) {
+        let hash = self.hasher.map(|h| {
+            let hash_bytes: [u8; 32] = h.finalize().into();
+            Hash256::from_bytes(hash_bytes)
+        });
+        (self.record_count, hash)
     }
 }
 
@@ -173,16 +199,23 @@ impl Iterator for StreamingXdrEntryIterator {
                 return None;
             }
 
-            // Read record data
-            let mut record_data = vec![0u8; record_len];
-            if self.reader.read_exact(&mut record_data).is_err() {
+            // Read record data into reusable buffer
+            self.buf.resize(record_len, 0);
+            if self.reader.read_exact(&mut self.buf[..record_len]).is_err() {
                 return None;
             }
             self.position += record_len as u64;
 
+            // Feed raw bytes to hasher before parsing
+            if let Some(ref mut hasher) = self.hasher {
+                hasher.update(mark_buf);
+                hasher.update(&self.buf[..record_len]);
+            }
+            self.record_count += 1;
+
             // Parse entry — skip records that fail to parse
             if let Ok(xdr_entry) =
-                stellar_xdr::curr::BucketEntry::from_xdr(&record_data, Limits::none())
+                stellar_xdr::curr::BucketEntry::from_xdr(&self.buf[..record_len], Limits::none())
             {
                 if let Ok(bucket_entry) = BucketEntry::from_xdr_entry(xdr_entry) {
                     if bucket_entry.key().is_some() {
@@ -228,7 +261,7 @@ impl DiskBucket {
                 .len();
             let iter = StreamingXdrEntryIterator::new(&self.file_path, file_len)
                 .expect("failed to open bucket file for index build");
-            let live_index = LiveBucketIndex::from_entries_default(iter, self.bloom_seed, file_len, None);
+            let live_index = LiveBucketIndex::from_entries_default(iter, self.bloom_seed, file_len);
 
             tracing::debug!(
                 hash = %self.hash.to_hex(),
@@ -270,30 +303,27 @@ impl DiskBucket {
         let path = path.as_ref();
         let file_len = std::fs::metadata(path)?.len();
 
-        // Pass 1: count entries and compute hash (O(1) memory, no entry storage)
-        let (entry_count, hash) = Self::count_and_hash(path, file_len)?;
-
-        // Pass 2: build index by streaming entries one at a time (O(index_size) memory)
-        // The iterator reads and parses one entry at a time from disk.
-        let iter = StreamingXdrEntryIterator::new(path, file_len)?;
-        let mut scan_entries_vec = Vec::new();
-        let live_index = LiveBucketIndex::from_entries_default(
+        // Single pass: build index and compute hash simultaneously.
+        // The iterator feeds raw record bytes to a SHA-256 hasher while also
+        // parsing entries for the index, eliminating the previous two-pass approach.
+        let iter = StreamingXdrEntryIterator::with_hasher(path, file_len, true)?;
+        let (live_index, iter) = LiveBucketIndex::from_entries_default_with_iter(
             iter,
             bloom_seed,
             file_len,
-            Some(&mut scan_entries_vec),
         );
+        let (entry_count, hash) = iter.finalize();
+        let hash = hash.expect("hasher was enabled");
 
         tracing::debug!(
             entry_count,
             file_size = file_len,
-            scan_entries = scan_entries_vec.len(),
             index_type = if live_index.is_in_memory() {
                 "InMemory"
             } else {
                 "DiskIndex"
             },
-            "Built disk bucket index via streaming"
+            "Built disk bucket index via single-pass streaming"
         );
 
         let index = OnceLock::new();
@@ -304,12 +334,6 @@ impl DiskBucket {
         mmap.set(Self::create_mmap(path)?)
             .unwrap_or_else(|_| unreachable!());
 
-        let scan_entries = std::sync::Mutex::new(if scan_entries_vec.is_empty() {
-            None
-        } else {
-            Some(scan_entries_vec)
-        });
-
         Ok(Self {
             hash,
             file_path: path.to_path_buf(),
@@ -318,43 +342,7 @@ impl DiskBucket {
             index,
             mmap,
             cache: OnceLock::new(),
-            scan_entries,
         })
-    }
-
-    /// Pass 1: count entries and compute SHA-256 hash by streaming through the file.
-    /// Uses O(1) memory — only a small read buffer and hasher state.
-    fn count_and_hash(path: &Path, file_len: u64) -> Result<(usize, Hash256)> {
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
-        let mut hasher = Sha256::new();
-        let mut position = 0u64;
-        let mut count = 0usize;
-
-        while position + 4 <= file_len {
-            let mut mark_buf = [0u8; 4];
-            reader.read_exact(&mut mark_buf)?;
-            position += 4;
-
-            let record_mark = u32::from_be_bytes(mark_buf);
-            let record_len = (record_mark & 0x7FFFFFFF) as usize;
-
-            if position + record_len as u64 > file_len {
-                break;
-            }
-
-            let mut record_data = vec![0u8; record_len];
-            reader.read_exact(&mut record_data)?;
-            position += record_len as u64;
-
-            hasher.update(mark_buf);
-            hasher.update(&record_data);
-
-            count += 1;
-        }
-
-        let hash_bytes: [u8; 32] = hasher.finalize().into();
-        Ok((count, Hash256::from_bytes(hash_bytes)))
     }
 
     /// Create a disk bucket from a pre-built index, skipping file scanning.
@@ -393,7 +381,6 @@ impl DiskBucket {
             index,
             mmap,
             cache: OnceLock::new(),
-            scan_entries: std::sync::Mutex::new(None),
         })
     }
 
@@ -460,15 +447,6 @@ impl DiskBucket {
         self.ensure_index().bloom_filter_size_bytes()
     }
 
-    /// Takes the pre-collected scan-relevant entries, if available.
-    ///
-    /// Returns `Some(entries)` exactly once after a fresh index build. Subsequent
-    /// calls return `None`. This avoids a redundant full-file read during cache
-    /// initialization.
-    pub fn take_scan_entries(&self) -> Option<Vec<BucketEntry>> {
-        self.scan_entries.lock().unwrap().take()
-    }
-
     /// Returns the hash seed used for the bloom filter.
     pub fn bloom_seed(&self) -> HashSeed {
         self.bloom_seed
@@ -477,6 +455,11 @@ impl DiskBucket {
     /// Returns the per-bucket cache, if initialized.
     pub fn cache(&self) -> Option<&Arc<RandomEvictionCache>> {
         self.cache.get()
+    }
+
+    /// Returns the estimated heap bytes used by this bucket's index.
+    pub fn index_heap_bytes(&self) -> usize {
+        self.ensure_index().estimated_heap_bytes()
     }
 
     /// Initializes the per-bucket entry cache with proportional sizing.

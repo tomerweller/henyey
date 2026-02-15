@@ -1543,7 +1543,7 @@ mod tests {
             .collect();
         let bloom_seed = [0u8; 16];
         let index =
-            DiskIndex::from_entries(indexed_entries.into_iter(), bloom_seed, DEFAULT_PAGE_SIZE, None);
+            DiskIndex::from_entries(indexed_entries.into_iter(), bloom_seed, DEFAULT_PAGE_SIZE);
         manager.save_index_for_bucket(&hash, &index).unwrap();
 
         // Verify index file exists
@@ -1574,7 +1574,7 @@ mod tests {
         // save/load should be no-ops when persist_index is false
         let hash = Hash256::hash(b"dummy");
         let entries: Vec<(crate::entry::BucketEntry, u64)> = vec![];
-        let index = crate::index::DiskIndex::from_entries(entries.into_iter(), [0u8; 16], 10, None);
+        let index = crate::index::DiskIndex::from_entries(entries.into_iter(), [0u8; 16], 10);
 
         manager.save_index_for_bucket(&hash, &index).unwrap();
         let loaded = manager.try_load_index_for_bucket(&hash, 10).unwrap();

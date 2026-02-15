@@ -1473,7 +1473,7 @@ async fn download_buckets_parallel(
     use std::sync::atomic::{AtomicU32, Ordering};
 
     const MAX_CONCURRENT_DOWNLOADS: usize = 16;
-    const MAX_CONCURRENT_LOADS: usize = 8;
+    const MAX_CONCURRENT_LOADS: usize = 4;
 
     let total_count = hashes.len();
 
@@ -1567,6 +1567,26 @@ async fn download_buckets_parallel(
     );
 
     Ok((cached_count, download_count))
+}
+
+/// Read the current process RSS (Resident Set Size) in bytes from `/proc/self/status`.
+/// Returns 0 on non-Linux platforms or if the file can't be read.
+fn rss_bytes() -> u64 {
+    let status = match std::fs::read_to_string("/proc/self/status") {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            // Format is "VmRSS:    123456 kB"
+            if let Some(kb) = rest.trim().split_whitespace().next() {
+                if let Ok(kb_val) = kb.parse::<u64>() {
+                    return kb_val * 1024;
+                }
+            }
+        }
+    }
+    0
 }
 
 /// Options for the verify-execution command.
@@ -1728,7 +1748,7 @@ async fn cmd_verify_execution(
         let path = temp.path().to_path_buf();
         (Some(temp), path)
     };
-    let bucket_manager = Arc::new(BucketManager::new(bucket_path.clone())?);
+    let bucket_manager = Arc::new(BucketManager::with_persist_index(bucket_path.clone(), true)?);
 
     // Download initial state
     if !quiet {
@@ -1813,9 +1833,15 @@ async fn cmd_verify_execution(
     let all_hashes: Vec<&Hash256> = all_hashes.iter().filter(|h| !h.is_zero()).collect();
 
     // Download buckets
+    let rss_before_download = rss_bytes();
+    println!("[MEM] Before bucket download:    RSS={}MB", rss_before_download / (1024 * 1024));
     let (cached, downloaded) =
         download_buckets_parallel(&archive, bucket_manager.clone(), all_hashes).await?;
+    let rss_after_download = rss_bytes();
     println!("[INIT] Bucket download: {} cached, {} downloaded", cached, downloaded);
+    println!("[MEM] After bucket download:     RSS={}MB  (+{}MB)",
+        rss_after_download / (1024 * 1024),
+        (rss_after_download.saturating_sub(rss_before_download)) / (1024 * 1024));
 
     // Restore bucket lists
     let mut bucket_list = BucketList::restore_from_has(
@@ -1833,6 +1859,10 @@ async fn cmd_verify_execution(
         )?,
         _ => HotArchiveBucketList::new(),
     };
+    let rss_after_restore = rss_bytes();
+    println!("[MEM] After bucket list restore: RSS={}MB  (+{}MB)",
+        rss_after_restore / (1024 * 1024),
+        (rss_after_restore.saturating_sub(rss_after_download)) / (1024 * 1024));
 
     // Get init header and restart merges
     let init_headers = archive.get_ledger_headers(init_checkpoint).await?;
@@ -1869,6 +1899,10 @@ async fn cmd_verify_execution(
             true, // restart_structure_based = true to match stellar-core online mode
         )?;
     }
+    let rss_after_merges = rss_bytes();
+    println!("[MEM] After merge restart:       RSS={}MB  (+{}MB)",
+        rss_after_merges / (1024 * 1024),
+        (rss_after_merges.saturating_sub(rss_after_restore)) / (1024 * 1024));
 
     // Create and initialize LedgerManager
     let ledger_manager = LedgerManager::new(
@@ -1889,6 +1923,37 @@ async fn cmd_verify_execution(
         init_header_entry.header.clone(),
         init_header_hash,
     )?;
+    let rss_after_init = rss_bytes();
+    println!("[MEM] After initialize():        RSS={}MB  (+{}MB)",
+        rss_after_init / (1024 * 1024),
+        (rss_after_init.saturating_sub(rss_after_merges)) / (1024 * 1024));
+
+    // Print component breakdown
+    let mem = ledger_manager.memory_report();
+    let offer_est_mb = (mem.offer_count as u64 * 300) / (1024 * 1024); // ~300 bytes/offer estimate
+    let soroban_data_est_mb = (mem.soroban_data_xdr_bytes as f64 * 2.5) as u64 / (1024 * 1024);
+    let soroban_code_est_mb = (mem.soroban_code_xdr_bytes as f64 * 2.5) as u64 / (1024 * 1024);
+    let bucket_idx_mb = mem.bucket_index_bytes / (1024 * 1024);
+    let bucket_bloom_mb = mem.bucket_bloom_bytes / (1024 * 1024);
+    let bucket_cache_mb = mem.bucket_cache_bytes / (1024 * 1024);
+    let estimated_total_mb = offer_est_mb + soroban_data_est_mb + soroban_code_est_mb
+        + bucket_idx_mb + bucket_bloom_mb + bucket_cache_mb;
+    let rss_mb = mem.rss_bytes / (1024 * 1024);
+    println!("[MEM] Component Breakdown (post-init):");
+    println!("  RSS total:             {} MB", rss_mb);
+    println!("  Offers:                {} entries  (~{} MB est)", mem.offer_count, offer_est_mb);
+    println!("  Offer index:           {} keys", mem.offer_index_keys);
+    println!("  Soroban contract data: {} entries  (XDR size={} MB)",
+        mem.soroban_data_count, mem.soroban_data_xdr_bytes / (1024 * 1024));
+    println!("  Soroban contract code: {} entries  (XDR size={} MB)",
+        mem.soroban_code_count, mem.soroban_code_xdr_bytes / (1024 * 1024));
+    println!("  Soroban config:        {} entries", mem.soroban_config_count);
+    println!("  Bucket indexes:        {} MB", bucket_idx_mb);
+    println!("  Bucket bloom filters:  {} MB", bucket_bloom_mb);
+    println!("  Bucket entry cache:    {} MB  ({} entries)", bucket_cache_mb, mem.bucket_cache_entries);
+    println!("  --------------------------------");
+    println!("  Estimated accounted:   {} MB", estimated_total_mb);
+    println!("  Unaccounted:           {} MB", rss_mb.saturating_sub(estimated_total_mb));
 
     println!("[INIT] TOTAL initialization: {:.2}s", init_start.elapsed().as_secs_f64());
 
@@ -1902,6 +1967,20 @@ async fn cmd_verify_execution(
 
     // Track previous ledger hash for close_ledger
     let mut prev_ledger_hash = init_header_hash;
+
+    // Performance tracking accumulators
+    let mut total_close_us: u64 = 0;
+    let mut total_tx_exec_us: u64 = 0;
+    let mut total_commit_us: u64 = 0;
+    let mut total_add_batch_us: u64 = 0;
+    let mut total_eviction_us: u64 = 0;
+    let mut total_tx_count: usize = 0;
+    let mut total_cache_hits: u64 = 0;
+    let mut total_cache_misses: u64 = 0;
+    let mut slowest_ledger_us: u64 = 0;
+    let mut slowest_ledger_seq: u32 = 0;
+    let mut slowest_txs: Vec<(u32, String, u64)> = Vec::new(); // (ledger, hash, us)
+    let mut peak_rss_bytes: u64 = 0;
 
     // Main verification loop
     let verification_start = std::time::Instant::now();
@@ -2540,6 +2619,82 @@ async fn cmd_verify_execution(
                         anyhow::bail!("Mismatch at ledger {}", seq);
                     }
                 }
+
+                // Collect and display performance metrics
+                if let Some(ref perf) = result.perf {
+                    total_close_us += perf.total_us;
+                    total_tx_exec_us += perf.tx_exec_us;
+                    total_commit_us += perf.commit_setup_us + perf.add_batch_us
+                        + perf.hot_archive_us + perf.header_us + perf.commit_close_us;
+                    total_add_batch_us += perf.add_batch_us;
+                    total_eviction_us += perf.eviction_us;
+                    total_tx_count += perf.tx_count;
+                    total_cache_hits += perf.cache.hits;
+                    total_cache_misses += perf.cache.misses;
+                    if perf.rss_after_bytes > peak_rss_bytes {
+                        peak_rss_bytes = perf.rss_after_bytes;
+                    }
+                    if perf.total_us > slowest_ledger_us {
+                        slowest_ledger_us = perf.total_us;
+                        slowest_ledger_seq = seq;
+                    }
+                    // Track top slowest transactions across all ledgers
+                    for tx in &perf.tx_timings {
+                        slowest_txs.push((seq, tx.hash_hex.clone(), tx.exec_us));
+                    }
+
+                    // Print per-ledger summary every 64 ledgers or if slow
+                    if !quiet && (ledgers_verified % 64 == 0 || perf.total_us > 500_000) {
+                        let cache_rate = if perf.cache.hits + perf.cache.misses > 0 {
+                            perf.cache.hits as f64
+                                / (perf.cache.hits + perf.cache.misses) as f64
+                                * 100.0
+                        } else {
+                            0.0
+                        };
+                        println!(
+                            "\n  [PERF L{}] total={:.1}ms tx_exec={:.1}ms commit={:.1}ms \
+                             add_batch={:.1}ms eviction={:.1}ms txs={} cache={:.0}% \
+                             rss={:.0}MB",
+                            seq,
+                            perf.total_us as f64 / 1000.0,
+                            perf.tx_exec_us as f64 / 1000.0,
+                            (perf.commit_setup_us + perf.add_batch_us + perf.hot_archive_us
+                                + perf.header_us + perf.commit_close_us) as f64
+                                / 1000.0,
+                            perf.add_batch_us as f64 / 1000.0,
+                            perf.eviction_us as f64 / 1000.0,
+                            perf.tx_count,
+                            cache_rate,
+                            perf.rss_after_bytes as f64 / (1024.0 * 1024.0),
+                        );
+                        // Show top 3 slowest txs for this ledger
+                        for tx in perf.tx_timings.iter().take(3) {
+                            if tx.exec_us > 1000 {
+                                println!(
+                                    "    tx[{}] {}..  {:.1}ms  ops={}  {}  {}",
+                                    tx.index,
+                                    &tx.hash_hex[..tx.hash_hex.len().min(12)],
+                                    tx.exec_us as f64 / 1000.0,
+                                    tx.op_count,
+                                    if tx.is_soroban { "soroban" } else { "classic" },
+                                    if tx.success { "ok" } else { "FAILED" },
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Periodic memory report every 10 ledgers
+                if ledgers_verified % 10 == 0 {
+                    let mem = ledger_manager.memory_report();
+                    println!("[MEM] L{}: RSS={}MB  offers={}  soroban={}  cache={}MB",
+                        seq,
+                        mem.rss_bytes / (1024 * 1024),
+                        mem.offer_count,
+                        mem.soroban_data_count,
+                        mem.bucket_cache_bytes / (1024 * 1024));
+                }
             }
 
             // Update prev hash for next ledger
@@ -2569,6 +2724,50 @@ async fn cmd_verify_execution(
     if ledgers_verified > 0 {
         println!("  Average per ledger: {:.2}ms",
             verification_time.as_millis() as f64 / ledgers_verified as f64);
+    }
+
+    // Performance summary
+    println!();
+    println!("Performance Summary");
+    println!("====================");
+    if ledgers_verified > 0 {
+        let avg_close_ms = total_close_us as f64 / ledgers_verified as f64 / 1000.0;
+        let avg_tx_exec_ms = total_tx_exec_us as f64 / ledgers_verified as f64 / 1000.0;
+        let avg_commit_ms = total_commit_us as f64 / ledgers_verified as f64 / 1000.0;
+        println!("  Timing (averages per ledger):");
+        println!("    close_ledger:  {:.2}ms", avg_close_ms);
+        println!("    tx_exec:       {:.2}ms", avg_tx_exec_ms);
+        println!("    commit:        {:.2}ms", avg_commit_ms);
+        println!("    add_batch:     {:.2}ms", total_add_batch_us as f64 / ledgers_verified as f64 / 1000.0);
+        println!("    eviction:      {:.2}ms", total_eviction_us as f64 / ledgers_verified as f64 / 1000.0);
+        println!();
+        println!("  Transactions:");
+        println!("    total:         {}", total_tx_count);
+        println!("    avg/ledger:    {:.1}", total_tx_count as f64 / ledgers_verified as f64);
+        println!();
+        println!("  Cache:");
+        let overall_cache_rate = if total_cache_hits + total_cache_misses > 0 {
+            total_cache_hits as f64 / (total_cache_hits + total_cache_misses) as f64 * 100.0
+        } else {
+            0.0
+        };
+        println!("    hit rate:      {:.1}%", overall_cache_rate);
+        println!("    total hits:    {}", total_cache_hits);
+        println!("    total misses:  {}", total_cache_misses);
+        println!();
+        println!("  Memory:");
+        println!("    peak RSS:      {:.1}MB", peak_rss_bytes as f64 / (1024.0 * 1024.0));
+        println!();
+        println!("  Slowest ledger:  {} ({:.1}ms)", slowest_ledger_seq, slowest_ledger_us as f64 / 1000.0);
+
+        // Top 10 slowest transactions overall
+        slowest_txs.sort_by(|a, b| b.2.cmp(&a.2));
+        println!();
+        println!("  Top 10 slowest transactions:");
+        for (i, (ledger, hash, us)) in slowest_txs.iter().take(10).enumerate() {
+            println!("    {}. L{} {}..  {:.1}ms",
+                i + 1, ledger, &hash[..hash.len().min(16)], *us as f64 / 1000.0);
+        }
     }
 
     if ledgers_mismatched > 0 {

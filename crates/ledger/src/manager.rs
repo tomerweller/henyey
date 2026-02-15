@@ -293,60 +293,37 @@ fn scan_single_level(
 
     // Scan curr first, then snap (curr shadows snap within a level)
     for bucket in [curr, snap] {
-        if let Some(pre_collected) = bucket.take_scan_entries() {
-            // Fast path: use entries pre-collected during index building (no disk I/O)
-            for entry in &pre_collected {
-                let key = match entry.key() {
-                    Some(k) => k,
-                    None => continue,
-                };
-                process_scan_entry(
-                    entry,
-                    key,
-                    &mut seen_keys,
-                    &mut entries,
-                    &mut ttl_entries,
-                    &mut dead_keys,
-                    &mut dead_ttl_keys,
-                    soroban_enabled,
-                    module_cache,
-                    protocol_version,
-                );
-            }
-        } else {
-            // Fallback: full iteration (in-memory buckets, prebuilt index path)
-            for entry in bucket.iter() {
-                let key = match entry.key() {
-                    Some(k) => k,
-                    None => continue, // metadata
-                };
+        for entry in bucket.iter() {
+            let key = match entry.key() {
+                Some(k) => k,
+                None => continue, // metadata
+            };
 
-                // Filter to scan-relevant types only
-                let dominated = matches!(
-                    &key,
-                    LedgerKey::Offer(_)
-                        | LedgerKey::ContractCode(_)
-                        | LedgerKey::ContractData(_)
-                        | LedgerKey::Ttl(_)
-                        | LedgerKey::ConfigSetting(_)
-                );
-                if !dominated {
-                    continue;
-                }
-
-                process_scan_entry(
-                    &entry,
-                    key,
-                    &mut seen_keys,
-                    &mut entries,
-                    &mut ttl_entries,
-                    &mut dead_keys,
-                    &mut dead_ttl_keys,
-                    soroban_enabled,
-                    module_cache,
-                    protocol_version,
-                );
+            // Filter to scan-relevant types only
+            let is_scan_relevant = matches!(
+                &key,
+                LedgerKey::Offer(_)
+                    | LedgerKey::ContractCode(_)
+                    | LedgerKey::ContractData(_)
+                    | LedgerKey::Ttl(_)
+                    | LedgerKey::ConfigSetting(_)
+            );
+            if !is_scan_relevant {
+                continue;
             }
+
+            process_scan_entry(
+                &entry,
+                key,
+                &mut seen_keys,
+                &mut entries,
+                &mut ttl_entries,
+                &mut dead_keys,
+                &mut dead_ttl_keys,
+                soroban_enabled,
+                module_cache,
+                protocol_version,
+            );
         }
     }
 
@@ -702,6 +679,37 @@ impl Default for LedgerManagerConfig {
     }
 }
 
+/// Memory usage report for instrumentation.
+///
+/// Contains RSS and per-component heap estimates to help identify
+/// which data structures dominate memory during verify-execution.
+pub struct MemoryReport {
+    /// Current RSS in bytes.
+    pub rss_bytes: u64,
+    /// Number of offers in the in-memory offer store.
+    pub offer_count: usize,
+    /// Number of keys in the offer secondary index.
+    pub offer_index_keys: usize,
+    /// Number of Soroban contract data entries.
+    pub soroban_data_count: usize,
+    /// Number of Soroban contract code entries.
+    pub soroban_code_count: usize,
+    /// Number of Soroban config setting entries.
+    pub soroban_config_count: usize,
+    /// Total XDR bytes for contract data.
+    pub soroban_data_xdr_bytes: u64,
+    /// Total XDR bytes for contract code.
+    pub soroban_code_xdr_bytes: u64,
+    /// Total estimated heap bytes for bucket indexes.
+    pub bucket_index_bytes: u64,
+    /// Total bloom filter bytes across all buckets.
+    pub bucket_bloom_bytes: u64,
+    /// Total cache bytes across all buckets.
+    pub bucket_cache_bytes: u64,
+    /// Total cache entries across all buckets.
+    pub bucket_cache_entries: usize,
+}
+
 /// Internal state of the ledger manager.
 ///
 /// This struct holds the mutable state that changes with each ledger close.
@@ -990,6 +998,54 @@ impl LedgerManager {
         Ok(())
     }
 
+    /// Generate a memory report with RSS and component breakdown.
+    pub fn memory_report(&self) -> MemoryReport {
+        let rss = get_rss_bytes();
+
+        let offers = self.offer_store.read();
+        let offer_count = offers.len();
+        drop(offers);
+
+        let offer_index = self.offer_account_asset_index.read();
+        let offer_index_keys = offer_index.len();
+        drop(offer_index);
+
+        let soroban = self.soroban_state.read();
+        let soroban_stats = soroban.stats();
+        drop(soroban);
+
+        let bucket_list = self.bucket_list.read();
+        let mut bucket_index_bytes: u64 = 0;
+        let mut bucket_bloom_bytes: u64 = 0;
+        let mut bucket_cache_bytes: u64 = 0;
+        let mut bucket_cache_entries: usize = 0;
+
+        for level in bucket_list.levels() {
+            for bucket in [&level.curr, &level.snap] {
+                bucket_index_bytes += bucket.index_heap_bytes() as u64;
+                bucket_bloom_bytes += bucket.bloom_filter_size_bytes() as u64;
+                bucket_cache_bytes += bucket.cache_size_bytes() as u64;
+                bucket_cache_entries += bucket.cache_entry_count();
+            }
+        }
+        drop(bucket_list);
+
+        MemoryReport {
+            rss_bytes: rss,
+            offer_count,
+            offer_index_keys,
+            soroban_data_count: soroban_stats.contract_data_count,
+            soroban_code_count: soroban_stats.contract_code_count,
+            soroban_config_count: soroban_stats.config_settings_count,
+            soroban_data_xdr_bytes: soroban_stats.contract_data_size as u64,
+            soroban_code_xdr_bytes: soroban_stats.contract_code_size as u64,
+            bucket_index_bytes,
+            bucket_bloom_bytes,
+            bucket_cache_bytes,
+            bucket_cache_entries,
+        }
+    }
+
     /// Verify bucket list hash against the header and install bucket lists + state.
     fn verify_and_install_bucket_lists(
         &self,
@@ -1176,12 +1232,16 @@ impl LedgerManager {
     /// - TTL -> soroban state
     /// - ConfigSetting -> soroban state
     fn initialize_all_caches(&self, protocol_version: u32, _ledger_seq: u32) -> Result<()> {
+        let rss_before = get_rss_bytes();
+
         let bucket_list = self.bucket_list.read();
         let cache_data = scan_bucket_list_for_caches(&bucket_list, protocol_version);
+        let rss_after_scan = get_rss_bytes();
 
         // Initialize per-bucket caches for all DiskIndex buckets.
         // Uses proportional sizing based on the BucketListDB config.
         bucket_list.maybe_initialize_caches();
+        let rss_after_bucket_cache = get_rss_bytes();
         drop(bucket_list);
 
         *self.offer_store.write() = cache_data.offers;
@@ -1189,6 +1249,15 @@ impl LedgerManager {
         *self.module_cache.write() = cache_data.module_cache;
         *self.soroban_state.write() = cache_data.soroban_state;
         *self.offers_initialized.write() = true;
+        let rss_after_install = get_rss_bytes();
+
+        info!(
+            before_mb = rss_before / (1024 * 1024),
+            after_scan_mb = rss_after_scan / (1024 * 1024),
+            after_bucket_cache_mb = rss_after_bucket_cache / (1024 * 1024),
+            after_install_mb = rss_after_install / (1024 * 1024),
+            "initialize_all_caches memory"
+        );
 
         Ok(())
     }
