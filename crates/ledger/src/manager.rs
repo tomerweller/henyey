@@ -930,9 +930,9 @@ impl LedgerManager {
     /// Used for garbage collection to determine which bucket files on disk
     /// are still needed.
     pub fn all_referenced_bucket_hashes(&self) -> Vec<Hash256> {
-        let mut hashes = self.bucket_list.read().all_bucket_hashes();
+        let mut hashes = self.bucket_list.read().all_referenced_hashes();
         if let Some(ref hot_archive) = *self.hot_archive_bucket_list.read() {
-            hashes.extend(hot_archive.all_bucket_hashes());
+            hashes.extend(hot_archive.all_referenced_hashes());
         }
         hashes
     }

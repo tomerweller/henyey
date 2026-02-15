@@ -938,6 +938,20 @@ impl HotArchiveBucketList {
         hashes
     }
 
+    /// Get all bucket hashes referenced by the hot archive bucket list, including
+    /// pending merge outputs. Used for garbage collection.
+    pub fn all_referenced_hashes(&self) -> Vec<Hash256> {
+        let mut hashes = Vec::with_capacity(self.levels.len() * 3);
+        for level in &self.levels {
+            hashes.push(level.curr.hash());
+            hashes.push(level.snap.hash());
+            if let Some(ref next) = level.next {
+                hashes.push(next.hash());
+            }
+        }
+        hashes
+    }
+
     /// Get a reference to a level.
     pub fn level(&self, idx: usize) -> Option<&HotArchiveBucketLevel> {
         self.levels.get(idx)

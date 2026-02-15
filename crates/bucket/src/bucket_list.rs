@@ -1845,6 +1845,37 @@ impl BucketList {
         hashes
     }
 
+    /// Get all bucket hashes referenced by the bucket list, including pending merge
+    /// inputs and outputs. This is used for garbage collection — any bucket files not
+    /// in this set can be safely deleted.
+    ///
+    /// Matches stellar-core's `getBucketListReferencedBuckets()` which includes
+    /// `level.getNext().getHashes()` (both merge inputs and outputs from FutureBucket).
+    pub fn all_referenced_hashes(&self) -> Vec<Hash256> {
+        let mut hashes = Vec::with_capacity(BUCKET_LIST_LEVELS * 4);
+        for level in &self.levels {
+            hashes.push(level.curr.hash());
+            hashes.push(level.snap.hash());
+            // Include pending merge hashes (inputs + output) to prevent
+            // cleanup from deleting files still being read by in-flight merges.
+            if let Some(ref pending) = level.next {
+                match pending {
+                    PendingMerge::InMemory(bucket) => {
+                        hashes.push(bucket.hash());
+                    }
+                    PendingMerge::Async(handle) => {
+                        hashes.push(handle.input_curr_hash);
+                        hashes.push(handle.input_snap_hash);
+                        if let Some(ref result) = handle.result {
+                            hashes.push(result.hash());
+                        }
+                    }
+                }
+            }
+        }
+        hashes
+    }
+
     /// Get all file paths referenced by disk-backed buckets in this bucket list.
     ///
     /// This includes:

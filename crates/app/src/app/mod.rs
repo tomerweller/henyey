@@ -1320,7 +1320,17 @@ impl App {
     /// Delete bucket files on disk that are no longer referenced by the live
     /// or hot archive bucket lists. Prevents unbounded disk growth.
     /// Matches stellar-core's cleanupStaleFiles() + forgetUnreferencedBuckets().
+    ///
+    /// Must resolve all pending async merges first: background merge threads may
+    /// have already written output files to disk, but the result hasn't been
+    /// polled yet (handle.result == None). Without resolution, the output hash
+    /// won't appear in the referenced set and the file would be deleted while
+    /// the DiskBacked bucket still points to it. This is analogous to
+    /// stellar-core tracking all merge outputs in mSharedLiveBuckets.
     pub(crate) fn cleanup_stale_bucket_files(&self) {
+        // Resolve async merges so their output hashes appear in the referenced set.
+        self.ledger_manager.resolve_pending_bucket_merges();
+
         let hashes = self.ledger_manager.all_referenced_bucket_hashes();
         match self.bucket_manager.retain_buckets(&hashes) {
             Ok(deleted) => {
