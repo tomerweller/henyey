@@ -220,6 +220,12 @@ impl App {
                     let success = self.handle_close_complete(pending, join_result).await;
                     // Chain next close if successful.
                     if success {
+                        // Trigger consensus immediately after a successful close, matching
+                        // stellar-core's triggerNextLedger() call inside closeLedger().
+                        if self.is_validator {
+                            self.try_trigger_consensus().await;
+                        }
+
                         // Before trying the next close, drain SCP + fetch response channels.
                         // During rapid buffered closes the select! loop may not poll these
                         // channels frequently enough, so EXTERNALIZEs and TxSet responses

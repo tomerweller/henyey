@@ -853,6 +853,11 @@ impl App {
         // this burst.  This mirrors the reset done in the pending_close
         // handler at the end of the select-loop chain.
         if success {
+            // Trigger consensus immediately after close, matching stellar-core.
+            if self.is_validator {
+                self.try_trigger_consensus().await;
+            }
+
             *self.last_externalized_at.write().await = Instant::now();
             self.tx_set_all_peers_exhausted
                 .store(false, Ordering::SeqCst);

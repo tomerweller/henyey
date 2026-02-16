@@ -14,9 +14,11 @@ impl App {
         if self.herder.is_tracking() {
             let current_ledger = *self.current_ledger.read().await;
 
-            // Don't propose if our LCL is behind the tracking slot.
-            // This matches stellar-core's `!mLedgerManager.isSynced()` guard.
-            if (current_ledger as u64) < tracking_slot {
+            // Don't propose if our LCL is not synced with the tracking slot.
+            // stellar-core's isSynced() checks: lastClosedLedger + 1 == trackingConsensusLedgerIndex.
+            // We are synced when our LCL is exactly one behind the tracking slot (the next slot
+            // to reach consensus on). If we're more than one behind, skip.
+            if (current_ledger as u64) + 1 < tracking_slot {
                 tracing::debug!(
                     current_ledger,
                     tracking_slot,
