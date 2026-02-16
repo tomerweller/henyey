@@ -298,7 +298,12 @@ impl App {
         }
 
         // Step 6: Reconstruct bucket lists from HAS using shared helper
+        let reconstruct_start = std::time::Instant::now();
         let (bucket_list, hot_archive) = self.reconstruct_bucket_lists(&has, &header, lcl_seq).await?;
+        tracing::info!(
+            elapsed_ms = reconstruct_start.elapsed().as_millis() as u64,
+            "Bucket lists reconstructed from disk"
+        );
 
         // Step 7: Initialize LedgerManager
         if self.ledger_manager.is_initialized() {

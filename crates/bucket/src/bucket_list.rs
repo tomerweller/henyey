@@ -1994,6 +1994,7 @@ impl BucketList {
         let mut levels = Vec::with_capacity(BUCKET_LIST_LEVELS);
 
         for (i, (curr_hash, snap_hash)) in hashes.iter().enumerate() {
+            let level_start = std::time::Instant::now();
             let curr = if curr_hash.is_zero() {
                 Bucket::empty()
             } else {
@@ -2005,6 +2006,14 @@ impl BucketList {
             } else {
                 load_bucket(snap_hash)?
             };
+
+            tracing::info!(
+                level = i,
+                curr_entries = curr.len(),
+                snap_entries = snap.len(),
+                elapsed_ms = level_start.elapsed().as_millis() as u64,
+                "restore_from_has: loaded level"
+            );
 
             // Check if there's a completed merge (state == HAS_NEXT_STATE_OUTPUT) for this level
             let next: Option<PendingMerge> = if let Some(state) = next_states.get(i) {

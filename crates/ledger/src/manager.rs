@@ -468,8 +468,15 @@ fn scan_parallel(
             .map(|(level_idx, level)| {
                 let mc = &module_cache;
                 s.spawn(move || {
+                    let level_start = std::time::Instant::now();
                     let result = scan_single_level(&level.curr, &level.snap, soroban_enabled, mc, protocol_version);
-                    debug!(level = level_idx, entries = result.entries.len(), ttls = result.ttl_entries.len(), "level scan complete");
+                    info!(
+                        level = level_idx,
+                        entries = result.entries.len(),
+                        ttls = result.ttl_entries.len(),
+                        elapsed_ms = level_start.elapsed().as_millis() as u64,
+                        "scan_bucket_list_for_caches: level scan complete"
+                    );
                     result
                 })
             })
