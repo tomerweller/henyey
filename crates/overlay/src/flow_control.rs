@@ -135,21 +135,17 @@ struct ReadingCapacity {
 struct FlowControlMessageCapacity {
     /// Current local reading capacity.
     capacity: ReadingCapacity,
-    /// Capacity limits (stored for debugging/future use).
-    _capacity_limits: ReadingCapacity,
     /// Outbound capacity (what the peer allows us to send).
     outbound_capacity: u64,
 }
 
 impl FlowControlMessageCapacity {
     fn new(config: &FlowControlConfig) -> Self {
-        let capacity_limits = ReadingCapacity {
-            flood_capacity: config.peer_flood_reading_capacity,
-            total_capacity: Some(config.peer_reading_capacity),
-        };
         Self {
-            capacity: capacity_limits,
-            _capacity_limits: capacity_limits,
+            capacity: ReadingCapacity {
+                flood_capacity: config.peer_flood_reading_capacity,
+                total_capacity: Some(config.peer_reading_capacity),
+            },
             outbound_capacity: 0,
         }
     }
@@ -495,15 +491,12 @@ impl FlowControl {
                 let queue = &mut state.outbound_queues[queue_idx];
                 if queue.len() > limit {
                     while queue.len() > limit / 2 {
-                        if let Some(front) = queue.front() {
-                            if !front.being_sent {
+                        match queue.front() {
+                            Some(front) if !front.being_sent => {
                                 queue.pop_front();
                                 dropped += 1;
-                            } else {
-                                break;
                             }
-                        } else {
-                            break;
+                            _ => break,
                         }
                     }
                     self.dropped_scp

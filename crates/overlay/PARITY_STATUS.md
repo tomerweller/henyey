@@ -3,7 +3,7 @@
 **Crate**: `henyey-overlay`
 **Upstream**: `.upstream-v25/src/overlay/`
 **Overall Parity**: 83%
-**Last Updated**: 2026-02-13
+**Last Updated**: 2026-02-15
 
 ## Summary
 
@@ -29,7 +29,7 @@
 | stellar-core File | Rust Module | Notes |
 |--------------------|-------------|-------|
 | `BanManager.h` / `BanManagerImpl.h` / `BanManagerImpl.cpp` | `ban_manager.rs` | Full match |
-| `Floodgate.h` / `Floodgate.cpp` | `flood.rs` | SHA-256 instead of BLAKE2 |
+| `Floodgate.h` / `Floodgate.cpp` | `flood.rs` | Full match (BLAKE2b-256) |
 | `FlowControl.h` / `FlowControl.cpp` | `flow_control.rs` | Includes capacity classes |
 | `FlowControlCapacity.h` / `FlowControlCapacity.cpp` | `flow_control.rs` | Merged into one module |
 | `Hmac.h` / `Hmac.cpp` | `auth.rs` | Integrated into AuthContext |
@@ -225,6 +225,9 @@ Corresponds to: `Peer.h`, `TCPPeer.h`
 | `TCPPeer::readHeaderHandler()` | (in MessageCodec decoder) | Full |
 | `TCPPeer::readBodyHandler()` | (in MessageCodec decoder) | Full |
 | `TCPPeer::shutdown()` | `close()` | Full |
+| `cancelTimers()` | N/A (Tokio handles timer lifecycle) | Full |
+| `msgSummary()` | `helpers::message_type_name()` | Full |
+| `doIfAuthenticated()` | N/A (different concurrency model) | Full |
 
 ### PeerAuth / AuthContext (`auth.rs`)
 
@@ -356,6 +359,8 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `isFloodMessage()` | `helpers::is_flood_message()` | Full |
 | `createTxBatch()` | N/A | None |
 | `getFlowControlBytesBatch()` | N/A | None |
+| `availableOutboundAuthenticatedSlots()` | N/A | None |
+| `getPeersToConnectTo()` | (in connector flow) | Partial |
 
 ### OverlayMetrics (`metrics.rs`)
 
@@ -431,6 +436,7 @@ Corresponds to: `SurveyManager.h`, `SurveyDataManager.h`, `SurveyMessageLimiter.
 | `populateSurveyRequestMessage()` | N/A | None |
 | `dropPeerIfSigInvalid()` | N/A | None |
 | `surveyorPermitted()` | `surveyor_permitted()` | Full |
+| `getMsgSummary()` | N/A | None |
 | `SurveyDataManager::startSurveyCollecting()` | `start_collecting()` | Full |
 | `SurveyDataManager::stopSurveyCollecting()` | `stop_collecting()` | Full |
 | `SurveyDataManager::modifyNodeData()` | `modify_node_data()` | Full |
@@ -512,6 +518,8 @@ Features not yet implemented. These ARE counted against parity %.
 | `OverlayManagerImpl::getFlowControlBytesBatch()` | Low | Config-based batch size |
 | `OverlayManagerImpl::nonPreferredAuthenticatedCount()` | Low | Count for peer eviction |
 | `OverlayManagerImpl::updateSizeCounters()` | Low | Metrics for pending/auth sizes |
+| `OverlayManagerImpl::availableOutboundAuthenticatedSlots()` | Low | Slot availability check |
+| `SurveyManager::getMsgSummary()` | Low | Survey message logging |
 | `SurveyManager::relayOrProcessResponse()` | Medium | Full survey request/response relay |
 | `SurveyManager::relayOrProcessRequest()` | Medium | Full survey request/response relay |
 | `SurveyManager::broadcastStartSurveyCollecting()` | Medium | Survey initiation broadcasting |
@@ -551,12 +559,7 @@ Features not yet implemented. These ARE counted against parity %.
    - **Rust**: Custom atomics-based Counter and Timer types in metrics.rs
    - **Rationale**: Avoids external metrics library dependency; atomics provide thread-safe counting with lower overhead
 
-5. **Flood Message Hashing**
-   - **stellar-core**: BLAKE2 via `xdrBlake2()` for message deduplication
-   - **Rust**: SHA-256 via `henyey_common::Hash256::hash()`
-   - **Rationale**: Both are cryptographic hashes suitable for deduplication; SHA-256 is used elsewhere in the codebase
-
-6. **Survey Encryption**
+5. **Survey Encryption**
    - **stellar-core**: Survey response encryption handled inline in SurveyManager
    - **Rust**: Encryption/decryption handled at application layer (henyey-app) using henyey_crypto
    - **Rationale**: Separation of concerns; crypto operations belong at a higher level
@@ -596,7 +599,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 252 |
-| Gaps (None + Partial) | 50 |
+| Implemented (Full) | 255 |
+| Gaps (None + Partial) | 53 |
 | Intentional Omissions | 10 |
-| **Parity** | **252 / (252 + 50) = 83%** |
+| **Parity** | **255 / (255 + 53) = 83%** |

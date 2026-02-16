@@ -109,7 +109,7 @@ struct PeerHandle {
 enum OutboundMessage {
     /// Direct send (non-flood, e.g. GetTxSet, ScpQuorumset response).
     Send(StellarMessage),
-    /// Flood message (goes through FlowControl outbound queue in Phase 3).
+    /// Flood message (goes through FlowControl outbound queue).
     Flood(StellarMessage),
     /// Close the connection.
     Shutdown,
@@ -292,6 +292,29 @@ impl OverlayManager {
         }
     }
 
+    /// Create a PeerHandle (outbound channel + FlowControl) and register
+    /// the peer in the shared maps. Returns the receiver and FlowControl
+    /// needed by `run_peer_loop`.
+    fn register_peer(
+        peer: &Peer,
+        peer_id: &PeerId,
+        peer_info: PeerInfo,
+        shared: &SharedPeerState,
+    ) -> (mpsc::Receiver<OutboundMessage>, Arc<FlowControl>) {
+        let (outbound_tx, outbound_rx) = mpsc::channel(256);
+        let stats = peer.stats();
+        let flow_control = Arc::new(FlowControl::new(FlowControlConfig::default()));
+        flow_control.set_peer_id(peer_id.clone());
+        let peer_handle = PeerHandle {
+            outbound_tx,
+            stats,
+            flow_control: Arc::clone(&flow_control),
+        };
+        shared.peers.insert(peer_id.clone(), peer_handle);
+        shared.peer_info_cache.insert(peer_id.clone(), peer_info);
+        (outbound_rx, flow_control)
+    }
+
     /// Start the overlay network (listening and connecting to peers).
     pub async fn start(&mut self) -> Result<()> {
         if self.running.load(Ordering::Relaxed) {
@@ -400,18 +423,8 @@ impl OverlayManager {
                                                 }
                                             }
 
-                                            // Create outbound channel, FlowControl, and PeerHandle
-                                            let (outbound_tx, outbound_rx) = mpsc::channel(256);
-                                            let stats = peer.stats();
-                                            let flow_control = Arc::new(FlowControl::new(FlowControlConfig::default()));
-                                            flow_control.set_peer_id(peer_id.clone());
-                                            let peer_handle = PeerHandle {
-                                                outbound_tx,
-                                                stats,
-                                                flow_control: Arc::clone(&flow_control),
-                                            };
-                                            shared.peers.insert(peer_id.clone(), peer_handle);
-                                            shared.peer_info_cache.insert(peer_id.clone(), peer_info);
+                                            let (outbound_rx, flow_control) =
+                                                Self::register_peer(&peer, &peer_id, peer_info, &shared);
                                             shared.added_authenticated_peers.fetch_add(1, Ordering::Relaxed);
 
                                             // Run peer loop (peer is moved, not locked)
@@ -783,13 +796,12 @@ impl OverlayManager {
                                 _ => {}
                             }
 
-                            // Route message — use a block to avoid `continue` before
-                            // end_message_processing. The block evaluates to false if
-                            // the message should not be routed.
-                            let routed = 'route: {
+                            // Route message — use a labeled block to avoid `continue`
+                            // before end_message_processing runs below.
+                            'route: {
                                 if helpers::is_handshake_message(&message) {
                                     debug!("Ignoring handshake message from authenticated peer {}", peer_id);
-                                    break 'route false;
+                                    break 'route;
                                 }
 
                                 // Flow control messages are handled above, not routed
@@ -797,19 +809,19 @@ impl OverlayManager {
                                     StellarMessage::SendMore(_)
                                     | StellarMessage::SendMoreExtended(_)
                                 ) {
-                                    break 'route false;
+                                    break 'route;
                                 }
 
                                 // Watcher filter: drop non-essential flood messages for non-validator nodes.
                                 if !is_validator && helpers::is_watcher_droppable(&message) {
                                     trace!("Watcher: dropping {} from {}", msg_type, peer_id);
-                                    break 'route false;
+                                    break 'route;
                                 }
 
                                 // SCP messages are consensus-critical and must never be rate-limited.
                                 if !matches!(message, StellarMessage::ScpMessage(_)) && !flood_gate.allow_message() {
                                     debug!("Dropping message due to rate limit");
-                                    break 'route false;
+                                    break 'route;
                                 }
 
                                 let message_size = msg_body_size(&message);
@@ -818,7 +830,7 @@ impl OverlayManager {
                                     let unique = flood_gate.record_seen(hash, Some(peer_id.clone()));
                                     peer.record_flood_stats(unique, message_size);
                                     if !unique {
-                                        break 'route false;
+                                        break 'route;
                                     }
                                 } else if is_fetch_message(&message) {
                                     peer.record_fetch_stats(true, message_size);
@@ -908,10 +920,7 @@ impl OverlayManager {
                                 if !is_dedicated {
                                     let _ = message_tx.send(overlay_msg);
                                 }
-
-                                true
-                            };
-                            let _ = routed; // suppress unused warning
+                            }
 
                             // Flow control: end tracking and maybe send SendMoreExtended
                             let send_more_cap = flow_control.end_message_processing(&message);
@@ -1284,17 +1293,8 @@ impl OverlayManager {
         info!("Connected to peer: {} at {}", peer_id, addr);
 
         let peer_info = peer.info().clone();
-        let stats = peer.stats();
-        let (outbound_tx, outbound_rx) = mpsc::channel(256);
-        let flow_control = Arc::new(FlowControl::new(FlowControlConfig::default()));
-        flow_control.set_peer_id(peer_id.clone());
-        let peer_handle = PeerHandle {
-            outbound_tx,
-            stats,
-            flow_control: Arc::clone(&flow_control),
-        };
-        shared.peers.insert(peer_id.clone(), peer_handle);
-        shared.peer_info_cache.insert(peer_id.clone(), peer_info);
+        let (outbound_rx, flow_control) =
+            Self::register_peer(&peer, &peer_id, peer_info, &shared);
         shared.added_authenticated_peers.fetch_add(1, Ordering::Relaxed);
         if let Some(tx) = shared.peer_event_tx.clone() {
             let _ = tx
@@ -1732,17 +1732,8 @@ impl OverlayManager {
                     }
 
                     let peer_info = peer.info().clone();
-                    let stats = peer.stats();
-                    let (outbound_tx, outbound_rx) = mpsc::channel(256);
-                    let flow_control = Arc::new(FlowControl::new(FlowControlConfig::default()));
-                    flow_control.set_peer_id(peer_id.clone());
-                    let peer_handle = PeerHandle {
-                        outbound_tx,
-                        stats,
-                        flow_control: Arc::clone(&flow_control),
-                    };
-                    shared.peers.insert(peer_id.clone(), peer_handle);
-                    shared.peer_info_cache.insert(peer_id.clone(), peer_info);
+                    let (outbound_rx, flow_control) =
+                        Self::register_peer(&peer, &peer_id, peer_info, &shared);
 
                     // NOTE: Do NOT send PEERS to outbound peers — see Peer.cpp:1225-1230.
 

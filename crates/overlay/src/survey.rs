@@ -240,8 +240,6 @@ impl Default for SurveyConfig {
 struct SurveyState {
     /// Survey nonce (unique identifier).
     nonce: u32,
-    /// Surveyor node ID (stored for future use).
-    _surveyor: PeerId,
     /// Current phase.
     phase: SurveyPhase,
     /// When collecting started.
@@ -419,7 +417,6 @@ impl SurveyManager {
     pub fn start_collecting(
         &self,
         nonce: u32,
-        surveyor: PeerId,
         initial_lost_sync_count: u64,
         inbound_peers: &[PeerId],
         outbound_peers: &[PeerId],
@@ -446,7 +443,6 @@ impl SurveyManager {
 
         *state = Some(SurveyState {
             nonce,
-            _surveyor: surveyor,
             phase: SurveyPhase::Collecting,
             collect_start_time: Instant::now(),
             collect_end_time: None,
@@ -841,11 +837,9 @@ mod tests {
     #[test]
     fn test_start_collecting() {
         let manager = SurveyManager::new();
-        let surveyor = make_peer_id(1);
 
         let result = manager.start_collecting(
             12345,
-            surveyor.clone(),
             0,
             &[make_peer_id(2), make_peer_id(3)],
             &[make_peer_id(4)],
@@ -857,18 +851,17 @@ mod tests {
         assert_eq!(manager.nonce(), Some(12345));
 
         // Can't start another survey while one is active
-        let result = manager.start_collecting(99999, surveyor, 0, &[], &[]);
+        let result = manager.start_collecting(99999, 0, &[], &[]);
         assert!(!result);
     }
 
     #[test]
     fn test_stop_collecting() {
         let manager = SurveyManager::new();
-        let surveyor = make_peer_id(1);
         let peer2 = make_peer_id(2);
         let peer3 = make_peer_id(3);
 
-        manager.start_collecting(12345, surveyor, 0, &[peer2.clone()], &[peer3.clone()]);
+        manager.start_collecting(12345, 0, &[peer2.clone()], &[peer3.clone()]);
 
         // Wrong nonce should fail
         assert!(!manager.stop_collecting(99999, 0, &[], &[]));
@@ -898,9 +891,8 @@ mod tests {
     #[test]
     fn test_reset() {
         let manager = SurveyManager::new();
-        let surveyor = make_peer_id(1);
 
-        manager.start_collecting(12345, surveyor, 0, &[], &[]);
+        manager.start_collecting(12345, 0, &[], &[]);
         assert!(manager.is_active());
 
         manager.reset();
@@ -911,9 +903,8 @@ mod tests {
     #[test]
     fn test_modify_node_data() {
         let manager = SurveyManager::new();
-        let surveyor = make_peer_id(1);
 
-        manager.start_collecting(12345, surveyor, 10, &[], &[]);
+        manager.start_collecting(12345, 10, &[], &[]);
 
         manager.modify_node_data(|data| {
             data.record_peer_added();
@@ -1056,7 +1047,6 @@ mod tests {
     #[test]
     fn test_stats() {
         let manager = SurveyManager::new();
-        let surveyor = make_peer_id(1);
 
         let stats = manager.stats();
         assert_eq!(stats.phase, SurveyPhase::Inactive);
@@ -1064,7 +1054,6 @@ mod tests {
 
         manager.start_collecting(
             12345,
-            surveyor,
             0,
             &[make_peer_id(2)],
             &[make_peer_id(3), make_peer_id(4)],

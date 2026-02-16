@@ -118,7 +118,7 @@ config.listen_enabled = false; // Don't accept inbound connections
 | `auth.rs` | `AuthContext` -- X25519 key exchange, HKDF key derivation, HMAC-SHA256 MACs |
 | `codec.rs` | `MessageCodec` -- 4-byte length-prefixed XDR framing with auth bit |
 | `connection.rs` | `Connection`, `Listener`, `ConnectionPool` -- TCP connection management |
-| `flood.rs` | `FloodGate` -- SHA-256 message hash tracking with TTL expiry |
+| `flood.rs` | `FloodGate` -- BLAKE2b-256 message hash tracking with TTL expiry |
 | `flow_control.rs` | `FlowControl` -- SendMore/SendMoreExtended capacity and priority queuing |
 | `item_fetcher.rs` | `ItemFetcher`, `Tracker` -- fetch missing tx sets/quorum sets with retry |
 | `message_handlers.rs` | `MessageDispatcher` -- routes GetTxSet, ScpQuorumset, DontHave; caches results |
@@ -132,10 +132,11 @@ config.listen_enabled = false; // Don't accept inbound connections
 
 ## Design Notes
 
-- **Channel separation**: SCP and fetch-response messages are routed through
-  dedicated unbounded `mpsc` channels rather than the main `broadcast` channel.
-  This prevents consensus-critical messages from being lost when the broadcast
-  channel overflows during high transaction traffic.
+- **Channel separation**: SCP messages are routed through a dedicated unbounded
+  `mpsc` channel, and fetch responses (TxSet, ScpQuorumset, DontHave) through a
+  bounded `mpsc` channel, rather than the main `broadcast` channel. This prevents
+  consensus-critical messages from being lost when the broadcast channel overflows
+  during high transaction traffic.
 
 - **Watcher filtering**: When `is_validator` is false, flood messages
   (Transaction, FloodAdvert, FloodDemand, Survey) are dropped at the peer loop
