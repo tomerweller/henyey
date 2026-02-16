@@ -2154,3 +2154,136 @@ fn test_create_account_sponsor_low_reserve_before_underfunded() {
     }
 }
 
+/// Regression test: All classic transaction fees must be deducted upfront
+/// before any TX body executes (matching stellar-core processFeesSeqNums).
+///
+/// This test reproduces the bug found at mainnet ledger 59534195 where an account
+/// submitted 25 transactions in one ledger. Without upfront fee deduction, early
+/// TXs saw inflated balances (only their own fee deducted, not all 25). This caused
+/// path payments to succeed that should have failed with UNDERFUNDED because the
+/// correct post-all-fees balance was insufficient.
+///
+/// Scenario:
+///   - Source account: balance = min_balance + 500 (available = 500)
+///   - 3 TXs with fee=100 each (total fees = 300)
+///   - Each TX sends 200 native to a destination
+///
+/// With correct upfront fee deduction:
+///   - After all fees: available = 200
+///   - TX 1: payment 200 succeeds (uses all remaining available)
+///   - TX 2: payment 200 fails (UNDERFUNDED, available = 0)
+///
+/// With the old bug (per-TX fee deduction):
+///   - TX 1: fee 100 → available 400, payment 200 → succeeds
+///   - TX 2: fee 100 → available 100, payment 200 → fails
+///   (TX 1 incorrectly succeeds with higher available balance)
+#[test]
+fn test_classic_fees_deducted_upfront_before_tx_execution() {
+    use henyey_ledger::execution::{execute_transaction_set_with_fee_mode, SorobanContext};
+    use henyey_ledger::LedgerDelta;
+
+    let secret = SecretKey::from_seed(&[77u8; 32]);
+    let source_id: AccountId = (&secret.public_key()).into();
+    let dest_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([88u8; 32])));
+
+    let base_reserve: i64 = 5_000_000;
+    let min_balance = 2 * base_reserve; // 10_000_000 for 0 sub entries
+    let source_balance = min_balance + 500; // available = 500
+    let base_fee: u32 = 100;
+
+    let (source_key, source_entry) = create_account_entry(source_id.clone(), 100, source_balance);
+    let (dest_key, dest_entry) = create_account_entry(dest_id.clone(), 1, 10_000_000);
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .expect("add source")
+        .add_entry(dest_key, dest_entry)
+        .expect("add dest")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    // Create 3 payment TXs from the same source, each paying 200 native.
+    let network_id = NetworkId::testnet();
+    let mut tx_set: Vec<(TransactionEnvelope, Option<u32>)> = Vec::new();
+    for i in 0..3u32 {
+        let operation = Operation {
+            source_account: None,
+            body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+                destination: MuxedAccount::Ed25519(Uint256([88u8; 32])),
+                asset: stellar_xdr::curr::Asset::Native,
+                amount: 200,
+            }),
+        };
+
+        let tx = Transaction {
+            source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+            fee: base_fee * 1, // 1 op
+            seq_num: SequenceNumber(101 + i as i64),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![operation].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        });
+
+        let decorated = sign_envelope(&envelope, &secret, &network_id);
+        if let TransactionEnvelope::Tx(ref mut env) = envelope {
+            env.signatures = vec![decorated].try_into().unwrap();
+        }
+
+        tx_set.push((envelope, None));
+    }
+
+    let context = henyey_tx::LedgerContext::new(
+        2,
+        1_000,
+        base_fee,
+        base_reserve as u32,
+        25,
+        network_id,
+    );
+    let mut delta = LedgerDelta::new(2);
+    let soroban = SorobanContext {
+        config: SorobanConfig::default(),
+        base_prng_seed: [0u8; 32],
+        classic_events: ClassicEventConfig::default(),
+        module_cache: None,
+        hot_archive: None,
+        runtime_handle: None,
+    };
+
+    let result = execute_transaction_set_with_fee_mode(
+        &snapshot,
+        &tx_set,
+        &context,
+        &mut delta,
+        soroban,
+        true,
+    )
+    .expect("execute tx set");
+
+    // TX 0: With upfront fee deduction (3 × 100 = 300), available = 500 - 300 = 200.
+    // Payment of 200 should succeed (exactly enough).
+    assert!(
+        result.results[0].success,
+        "TX 0 should succeed: available (200) >= payment (200); got {:?}",
+        result.results[0].failure
+    );
+
+    // TX 1: After TX 0's payment of 200, available = 0.
+    // Payment of 200 should fail with UNDERFUNDED.
+    assert!(
+        !result.results[1].success,
+        "TX 1 should fail: available (0) < payment (200)"
+    );
+
+    // TX 2: Same - should fail with UNDERFUNDED.
+    assert!(
+        !result.results[2].success,
+        "TX 2 should fail: available (0) < payment (200)"
+    );
+}
+

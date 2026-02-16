@@ -108,6 +108,27 @@ pub fn run_transactions_on_executor(
         );
     }
 
+    // Pre-deduct ALL classic fees before executing any TX body.
+    // This matches stellar-core's processFeesSeqNums() which deducts fees for ALL
+    // transactions in a single pass before any transaction bodies execute.
+    // Without this, TXs from the same account see an inflated balance because only
+    // prior TXs' fees have been deducted, not all of them.
+    let pre_fee_results: Vec<PreChargedFee> = if deduct_fee {
+        let mut results = Vec::with_capacity(transactions.len());
+        for (tx, tx_base_fee) in transactions.iter() {
+            let tx_fee = tx_base_fee.unwrap_or(base_fee);
+            let (fee_changes, charged_fee) = executor.process_fee_only(snapshot, tx, tx_fee)?;
+            results.push(PreChargedFee {
+                charged_fee,
+                should_apply: true,
+                fee_changes,
+            });
+        }
+        results
+    } else {
+        Vec::new()
+    };
+
     let mut results = Vec::with_capacity(transactions.len());
     let mut tx_results = Vec::with_capacity(transactions.len());
     let mut tx_result_metas = Vec::with_capacity(transactions.len());
@@ -121,12 +142,14 @@ pub fn run_transactions_on_executor(
         let tx_fee = tx_base_fee.unwrap_or(base_fee);
         // Compute per-transaction PRNG seed: subSha256(basePrngSeed, txIndex)
         let tx_prng_seed = sub_sha256(&soroban_base_prng_seed, tx_index as u32);
+        // Execute with deduct_fee=false — fees were already pre-deducted above
+        // (when deduct_fee=true) or not needed (when deduct_fee=false from caller).
         let result = executor.execute_transaction_with_fee_mode(
             snapshot,
             tx,
             tx_fee,
             Some(tx_prng_seed),
-            deduct_fee,
+            false,
         )?;
         let frame = TransactionFrame::with_network(tx.clone(), executor.network_id);
 
@@ -141,10 +164,16 @@ pub fn run_transactions_on_executor(
             .tx_meta
             .clone()
             .unwrap_or_else(empty_transaction_meta);
-        let fee_changes = result
-            .fee_changes
-            .clone()
-            .unwrap_or_else(empty_entry_changes);
+        // Use pre-captured fee_changes from the upfront fee deduction pass,
+        // or the per-TX result if fees were not pre-deducted.
+        let fee_changes = if deduct_fee {
+            pre_fee_results[tx_index].fee_changes.clone()
+        } else {
+            result
+                .fee_changes
+                .clone()
+                .unwrap_or_else(empty_entry_changes)
+        };
         let post_fee_changes = result
             .post_fee_changes
             .clone()
