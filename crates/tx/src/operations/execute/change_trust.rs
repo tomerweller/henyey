@@ -137,15 +137,7 @@ pub fn execute_change_trust(
     } else {
         // Creating new trustline
 
-        // Check subentries limit before creating trustline
-        // Pool share trustlines count as 2 subentries (multiplier)
-        let source_account = state
-            .get_account(source)
-            .ok_or(TxError::SourceAccountNotFound)?;
-        if source_account.num_sub_entries + multiplier as u32 > ACCOUNT_SUBENTRY_LIMIT {
-            return Ok(OperationResult::OpTooManySubentries);
-        }
-
+        // Check issuer exists before subentry limit (matches stellar-core ordering)
         if is_pool_share {
             let params = pool_params.expect("pool params must exist");
             if let Err(code) = validate_pool_share_trustlines(source, params, state) {
@@ -160,6 +152,15 @@ pub fn execute_change_trust(
                     return Ok(make_result(ChangeTrustResultCode::NoIssuer));
                 }
             }
+        }
+
+        // Check subentries limit before creating trustline
+        // Pool share trustlines count as 2 subentries (multiplier)
+        let source_account = state
+            .get_account(source)
+            .ok_or(TxError::SourceAccountNotFound)?;
+        if source_account.num_sub_entries + multiplier as u32 > ACCOUNT_SUBENTRY_LIMIT {
+            return Ok(OperationResult::OpTooManySubentries);
         }
 
         // Check source can afford new sub-entry
@@ -1729,6 +1730,46 @@ mod tests {
                 // Expected: without liabilities, same balance is sufficient
             }
             other => panic!("Expected Success without selling liabilities, got {:?}", other),
+        }
+    }
+
+    /// Regression test: When both NoIssuer and TooManySubentries conditions apply,
+    /// stellar-core returns NoIssuer because it checks issuer existence before the
+    /// subentry limit (via createEntryWithPossibleSponsorship).
+    #[test]
+    fn test_change_trust_no_issuer_before_too_many_subentries() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+
+        // Source account at max subentries AND issuer doesn't exist
+        let mut source_account = create_test_account(source_id.clone(), 100_000_000);
+        source_account.num_sub_entries = 1000;
+        state.create_account(source_account);
+        // Do NOT create issuer account
+
+        let asset = AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id,
+        };
+
+        let op = ChangeTrustOp {
+            line: ChangeTrustAsset::CreditAlphanum4(asset),
+            limit: 1_000_000,
+        };
+
+        let result = execute_change_trust(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ChangeTrust(r)) => {
+                assert!(
+                    matches!(r, ChangeTrustResult::NoIssuer),
+                    "Expected NoIssuer (checked before TooManySubentries), got {:?}",
+                    r
+                );
+            }
+            other => panic!("Expected ChangeTrust(NoIssuer), got {:?}", other),
         }
     }
 }
