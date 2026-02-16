@@ -2154,6 +2154,137 @@ fn test_create_account_sponsor_low_reserve_before_underfunded() {
     }
 }
 
+/// Regression test: ClawbackClaimableBalance must return NotIssuer (not NotClawbackEnabled)
+/// when the source account is not the issuer of the claimable balance's asset.
+///
+/// This test reproduces a bug found at mainnet ledger 59536635 where a
+/// ClawbackClaimableBalance operation failed because the source was not the issuer,
+/// but our code returned `NotClawbackEnabled` instead of `NotIssuer`.
+///
+/// stellar-core's ClawbackClaimableBalanceOpFrame::doApply checks in this order:
+///   1. CB entry exists? → DOES_NOT_EXIST
+///   2. Asset is native? → NOT_ISSUER
+///   3. Source == issuer? → NOT_ISSUER
+///   4. isClawbackEnabledOnClaimableBalance? → NOT_CLAWBACK_ENABLED
+///   5. Success
+///
+/// Our code was returning NotClawbackEnabled for checks 2, 3, and was also
+/// checking the issuer account's AUTH_CLAWBACK_ENABLED flag instead of the
+/// claimable balance entry's own CLAIMABLE_BALANCE_CLAWBACK_ENABLED_FLAG.
+#[test]
+fn test_clawback_claimable_balance_not_issuer_error_code() {
+    use stellar_xdr::curr::{
+        ClaimableBalanceEntryExtensionV1, ClaimableBalanceEntryExtensionV1Ext,
+        ClaimableBalanceFlags, ClawbackClaimableBalanceResult,
+    };
+
+    let source_secret = SecretKey::from_seed(&[240u8; 32]);
+    let source_id: AccountId = (&source_secret.public_key()).into();
+
+    // The actual issuer of the asset in the claimable balance
+    let issuer_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([241u8; 32])));
+
+    let asset = Asset::CreditAlphanum4(AlphaNum4 {
+        asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+        issuer: issuer_id.clone(),
+    });
+
+    // Create source account (NOT the issuer) with AUTH_CLAWBACK_ENABLED
+    let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 100_000_000);
+
+    // Create a claimable balance with clawback enabled on the CB entry itself
+    let cb_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([42u8; 32]));
+    let cb_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+        balance_id: cb_id.clone(),
+    });
+    let cb_entry = LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::ClaimableBalance(ClaimableBalanceEntry {
+            balance_id: cb_id.clone(),
+            claimants: vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+                destination: source_id.clone(),
+                predicate: ClaimPredicate::Unconditional,
+            })]
+            .try_into()
+            .unwrap(),
+            asset: asset.clone(),
+            amount: 1_000_000,
+            ext: ClaimableBalanceEntryExt::V1(ClaimableBalanceEntryExtensionV1 {
+                ext: ClaimableBalanceEntryExtensionV1Ext::V0,
+                flags: ClaimableBalanceFlags::ClaimableBalanceClawbackEnabledFlag as u32,
+            }),
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .expect("add source")
+        .add_entry(cb_key, cb_entry)
+        .expect("add cb")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let network_id = NetworkId::testnet();
+
+    // ClawbackClaimableBalance from source (who is NOT the issuer)
+    let op = Operation {
+        source_account: None,
+        body: OperationBody::ClawbackClaimableBalance(ClawbackClaimableBalanceOp {
+            balance_id: cb_id,
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*source_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    let decorated = sign_envelope(&envelope, &source_secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    // The TX should fail (op fails)
+    assert!(!result.success, "TX should fail because source is not issuer");
+
+    // The op result MUST be NotIssuer (not NotClawbackEnabled)
+    match &result.operation_results[0] {
+        OperationResult::OpInner(OperationResultTr::ClawbackClaimableBalance(r)) => {
+            assert!(
+                matches!(r, ClawbackClaimableBalanceResult::NotIssuer),
+                "Expected NotIssuer when source is not the asset issuer, got {:?}",
+                r
+            );
+        }
+        other => panic!(
+            "Expected ClawbackClaimableBalance result, got {:?}",
+            other
+        ),
+    }
+}
+
 /// Regression test: All classic transaction fees must be deducted upfront
 /// before any TX body executes (matching stellar-core processFeesSeqNums).
 ///

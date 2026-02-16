@@ -5,9 +5,10 @@
 //! - ClawbackClaimableBalance (clawback from a claimable balance)
 
 use stellar_xdr::curr::{
-    AccountId, Asset, ClawbackClaimableBalanceOp, ClawbackClaimableBalanceResult,
-    ClawbackClaimableBalanceResultCode, ClawbackOp, ClawbackResult, ClawbackResultCode, LedgerKey,
-    LedgerKeyClaimableBalance, OperationResult, OperationResultTr, TrustLineFlags,
+    AccountId, Asset, ClaimableBalanceFlags, ClawbackClaimableBalanceOp,
+    ClawbackClaimableBalanceResult, ClawbackClaimableBalanceResultCode, ClawbackOp, ClawbackResult,
+    ClawbackResultCode, LedgerKey, LedgerKeyClaimableBalance, OperationResult, OperationResultTr,
+    TrustLineFlags,
 };
 
 use crate::frame::muxed_to_account_id;
@@ -15,7 +16,8 @@ use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::Result;
 
-/// Account flag for clawback enabled
+/// Account flag for clawback enabled (used in tests)
+#[cfg(test)]
 const AUTH_CLAWBACK_ENABLED_FLAG: u32 = 0x8;
 
 /// Trustline flag for clawback enabled
@@ -106,45 +108,44 @@ pub fn execute_clawback_claimable_balance(
         }
     };
 
-    // Cannot clawback native asset
+    // Cannot clawback native asset — stellar-core returns NOT_ISSUER for this
     if matches!(&entry.asset, Asset::Native) {
         return Ok(make_clawback_cb_result(
-            ClawbackClaimableBalanceResultCode::NotClawbackEnabled,
+            ClawbackClaimableBalanceResultCode::NotIssuer,
         ));
     }
 
-    // Check source account exists and is the issuer.
-    // Use a mutable load to mirror stellar-core loadSourceAccount access patterns.
-    let issuer_flags = match state.get_account_mut(source) {
-        Some(a) => a.flags,
-        None => {
-            return Ok(make_clawback_cb_result(
-                ClawbackClaimableBalanceResultCode::NotClawbackEnabled,
-            ));
-        }
-    };
-
-    // Verify source is the issuer of the asset
+    // Verify source is the issuer of the asset — NOT_ISSUER if not
     let asset_issuer = match &entry.asset {
-        Asset::Native => {
-            return Ok(make_clawback_cb_result(
-                ClawbackClaimableBalanceResultCode::NotClawbackEnabled,
-            ));
-        }
+        Asset::Native => unreachable!(), // handled above
         Asset::CreditAlphanum4(a) => &a.issuer,
         Asset::CreditAlphanum12(a) => &a.issuer,
     };
 
     if asset_issuer != source {
         return Ok(make_clawback_cb_result(
+            ClawbackClaimableBalanceResultCode::NotIssuer,
+        ));
+    }
+
+    // Check the claimable balance entry itself has CLAWBACK_ENABLED flag
+    // (stellar-core checks isClawbackEnabledOnClaimableBalance, NOT the issuer account)
+    let cb_clawback_enabled = match &entry.ext {
+        stellar_xdr::curr::ClaimableBalanceEntryExt::V1(v1) => {
+            v1.flags & ClaimableBalanceFlags::ClaimableBalanceClawbackEnabledFlag as u32 != 0
+        }
+        _ => false,
+    };
+    if !cb_clawback_enabled {
+        return Ok(make_clawback_cb_result(
             ClawbackClaimableBalanceResultCode::NotClawbackEnabled,
         ));
     }
 
-    // Check issuer has AUTH_CLAWBACK_ENABLED flag
-    if issuer_flags & AUTH_CLAWBACK_ENABLED_FLAG == 0 {
+    // Load source account after all validation (matches stellar-core ordering)
+    if state.get_account_mut(source).is_none() {
         return Ok(make_clawback_cb_result(
-            ClawbackClaimableBalanceResultCode::NotClawbackEnabled,
+            ClawbackClaimableBalanceResultCode::NotIssuer,
         ));
     }
 
