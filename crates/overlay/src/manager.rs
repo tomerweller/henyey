@@ -351,6 +351,12 @@ impl OverlayManager {
                                                 pool.release();
                                                 return;
                                             }
+                                            if shared.peers.contains_key(&peer_id) {
+                                                debug!("Rejected duplicate inbound peer {}", peer_id);
+                                                peer.close().await;
+                                                pool.release();
+                                                return;
+                                            }
                                             info!("Accepted peer: {}", peer_id);
 
                                             let peer_info = peer.info().clone();
@@ -733,7 +739,7 @@ impl OverlayManager {
 
                             // Periodic per-peer stats (every 60s)
                             if last_stats_log.elapsed() >= Duration::from_secs(60) {
-                                info!(
+                                debug!(
                                     "Peer {} stats: total_msgs={}, scp_msgs={}",
                                     peer_id, total_messages, scp_messages,
                                 );
@@ -972,7 +978,7 @@ impl OverlayManager {
 
                         // Periodic stats (every 60s, checked on ping interval)
                         if last_stats_log.elapsed() >= Duration::from_secs(60) {
-                            info!("Peer {} stats: total_msgs={}, scp_msgs={}", peer_id, total_messages, scp_messages);
+                            debug!("Peer {} stats: total_msgs={}, scp_msgs={}", peer_id, total_messages, scp_messages);
                             last_stats_log = Instant::now();
                         }
                     }
@@ -982,7 +988,7 @@ impl OverlayManager {
 
         // Close peer (owned, no mutex needed)
         peer.close().await;
-        info!("Peer {} loop exited and disconnected", peer_id);
+        debug!("Peer {} loop exited and disconnected", peer_id);
     }
 
     /// Send queued outbound messages that have flow control capacity.
