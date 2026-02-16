@@ -1,4 +1,4 @@
-//! P2P networking for rs-stellar-core.
+//! P2P networking for henyey.
 //!
 //! This crate implements the Stellar overlay network protocol, enabling nodes to
 //! communicate with each other for consensus, transaction propagation, and state
@@ -258,7 +258,7 @@ impl Default for OverlayConfig {
             flood_ttl_secs: 300,
             listen_enabled: true,
             is_validator: true,
-            version_string: "rs-stellar-core/0.1.0".to_string(),
+            version_string: VERSION_STRING.to_string(),
             peer_event_tx: None,
         }
     }
@@ -550,6 +550,12 @@ pub struct LocalNode {
     pub listening_port: u16,
 }
 
+const VERSION_STRING: &str = "henyey 0.0.1";
+const LEDGER_VERSION: u32 = 25;
+const OVERLAY_VERSION: u32 = 38;
+const OVERLAY_MIN_VERSION: u32 = 35;
+const DEFAULT_LISTENING_PORT: u16 = 11625;
+
 impl LocalNode {
     /// Creates a new local node configured for the Stellar testnet.
     ///
@@ -558,11 +564,11 @@ impl LocalNode {
         Self {
             secret_key,
             network_id: henyey_common::NetworkId::testnet(),
-            version_string: "stellar-core v25.0.1".to_string(),
-            ledger_version: 24,
-            overlay_version: 38,
-            overlay_min_version: 35,
-            listening_port: 11625,
+            version_string: VERSION_STRING.to_string(),
+            ledger_version: LEDGER_VERSION,
+            overlay_version: OVERLAY_VERSION,
+            overlay_min_version: OVERLAY_MIN_VERSION,
+            listening_port: DEFAULT_LISTENING_PORT,
         }
     }
 
@@ -573,11 +579,11 @@ impl LocalNode {
         Self {
             secret_key,
             network_id: henyey_common::NetworkId::mainnet(),
-            version_string: "stellar-core v25.0.1".to_string(),
-            ledger_version: 24,
-            overlay_version: 38,
-            overlay_min_version: 35,
-            listening_port: 11625,
+            version_string: VERSION_STRING.to_string(),
+            ledger_version: LEDGER_VERSION,
+            overlay_version: OVERLAY_VERSION,
+            overlay_min_version: OVERLAY_MIN_VERSION,
+            listening_port: DEFAULT_LISTENING_PORT,
         }
     }
 
@@ -588,11 +594,11 @@ impl LocalNode {
         Self {
             secret_key,
             network_id: henyey_common::NetworkId::from_passphrase(network_passphrase),
-            version_string: "stellar-core v25.0.1".to_string(),
-            ledger_version: 24,
-            overlay_version: 38,
-            overlay_min_version: 35,
-            listening_port: 11625,
+            version_string: VERSION_STRING.to_string(),
+            ledger_version: LEDGER_VERSION,
+            overlay_version: OVERLAY_VERSION,
+            overlay_min_version: OVERLAY_MIN_VERSION,
+            listening_port: DEFAULT_LISTENING_PORT,
         }
     }
 

@@ -773,7 +773,7 @@ impl App {
         tracing::info!(
             node_name = %config.node.name,
             network = %config.network.passphrase,
-            "Initializing rs-stellar-core"
+            "Initializing henyey"
         );
 
         // Validate configuration
@@ -1618,7 +1618,7 @@ pub struct SelfCheckResult {
 
 impl std::fmt::Display for AppInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "rs-stellar-core {}", self.version)?;
+        writeln!(f, "henyey {}", self.version)?;
         writeln!(f)?;
         writeln!(f, "Node Information:")?;
         writeln!(f, "  Name:       {}", self.node_name)?;

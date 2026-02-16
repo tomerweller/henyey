@@ -160,7 +160,7 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
         mode = %options.mode,
         node_name = %config.node.name,
         network = %config.network.passphrase,
-        "Starting rs-stellar-core node"
+        "Starting henyey node"
     );
 
     // Validate mode-specific requirements
@@ -237,7 +237,7 @@ fn validate_run_options(config: &AppConfig, options: &RunOptions) -> anyhow::Res
 /// Print information about the node at startup.
 fn print_startup_info(app: &App, options: &RunOptions) {
     let info = app.info();
-    println!("rs-stellar-core {}", info.version);
+    println!("henyey {}", info.version);
     println!();
     println!("Node: {}", info.node_name);
     println!("Mode: {}", options.mode);
@@ -980,7 +980,7 @@ struct DumpProposedSettingsParams {
 
 async fn root_handler() -> Json<RootResponse> {
     Json(RootResponse {
-        name: "rs-stellar-core".to_string(),
+        name: "henyey".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         endpoints: vec![
             "/info".to_string(),

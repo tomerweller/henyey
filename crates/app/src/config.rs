@@ -725,7 +725,7 @@ fn default_http_address() -> String {
 // Default value functions
 
 fn default_node_name() -> String {
-    "rs-stellar-core".to_string()
+    "henyey".to_string()
 }
 
 fn default_threshold() -> u32 {
