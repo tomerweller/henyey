@@ -419,48 +419,34 @@ impl App {
                 bucket_manager.load_hot_archive_bucket(hash)
             };
 
-            match HotArchiveBucketList::restore_from_has(
+            let mut hot_bl = HotArchiveBucketList::restore_from_has(
                 &hot_hash_pairs,
                 &hot_next_states,
                 load_hot,
-            ) {
-                Ok(mut hot_bl) => {
-                    let protocol_version = header.ledger_version;
-                    let bucket_manager = self.bucket_manager.clone();
-                    let load_hot_for_merge = move |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::HotArchiveBucket> {
-                        bucket_manager.load_hot_archive_bucket(hash)
-                    };
-                    match hot_bl.restart_merges_from_has(
+            ).map_err(|e| anyhow::anyhow!("Failed to restore hot archive: {}", e))?;
+
+            {
+                let protocol_version = header.ledger_version;
+                let bucket_manager = self.bucket_manager.clone();
+                let load_hot_for_merge = move |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::HotArchiveBucket> {
+                    bucket_manager.load_hot_archive_bucket(hash)
+                };
+                hot_bl
+                    .restart_merges_from_has(
                         lcl_seq,
                         protocol_version,
                         &hot_next_states,
                         load_hot_for_merge,
                         true,
-                    ) {
-                        Ok(()) => {
-                            tracing::info!(
-                                hot_archive_hash = %hot_bl.hash().to_hex(),
-                                "Restarted hot archive pending merges from HAS"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "Failed to restart hot archive merges, using empty hot archive"
-                            );
-                            hot_bl = HotArchiveBucketList::default();
-                        }
-                    }
-                    hot_bl
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "Failed to restore hot archive from disk, using empty hot archive"
-                    );
-                    HotArchiveBucketList::default()
-                }
+                    )
+                    .map_err(|e| anyhow::anyhow!("Failed to restart hot archive merges: {}", e))?;
+                tracing::info!(
+                    hot_archive_hash = %hot_bl.hash().to_hex(),
+                    "Restarted hot archive pending merges from HAS"
+                );
             }
+
+            hot_bl
         } else {
             HotArchiveBucketList::default()
         };
