@@ -222,14 +222,39 @@ impl App {
 
         // Garbage collect bucket files no longer referenced after catchup.
         // Matches stellar-core's cleanupStaleFiles() in assumeState().
-        self.cleanup_stale_bucket_files();
+        // Run on the blocking thread pool: resolve_pending_bucket_merges() inside
+        // cleanup_stale_bucket_files() uses block_in_place() to wait for in-flight
+        // async merges, which would freeze the tokio event loop if run inline.
+        {
+            let lm = self.ledger_manager.clone();
+            let bm = self.bucket_manager.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                lm.resolve_pending_bucket_merges();
 
-        // Clean up merge temp files left by previous process runs.
-        let empty_refs = std::collections::HashSet::new();
-        if let Ok(deleted) = self.bucket_manager.cleanup_unreferenced_files(&empty_refs) {
-            if deleted > 0 {
-                tracing::info!(deleted, "Cleaned up merge temp files from previous runs");
-            }
+                let hashes = lm.all_referenced_bucket_hashes();
+                match bm.retain_buckets(&hashes) {
+                    Ok(deleted) => {
+                        if deleted > 0 {
+                            tracing::info!(deleted, "Cleaned up stale bucket files");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to cleanup stale bucket files");
+                    }
+                }
+
+                // Clean up merge temp files left by previous process runs.
+                let empty_refs = std::collections::HashSet::new();
+                if let Ok(deleted) = bm.cleanup_unreferenced_files(&empty_refs) {
+                    if deleted > 0 {
+                        tracing::info!(
+                            deleted,
+                            "Cleaned up merge temp files from previous runs"
+                        );
+                    }
+                }
+            })
+            .await;
         }
 
         // Trim herder/scp_driver caches to release memory after catchup, but
