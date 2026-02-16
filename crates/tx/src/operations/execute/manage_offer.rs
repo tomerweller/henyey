@@ -272,6 +272,16 @@ fn execute_manage_offer(
     }
 
     let (selling_liab, buying_liab) = offer_kind.offer_liabilities(price)?;
+    // Check LineFull before Underfunded to match stellar-core ordering
+    // (ManageOfferOpFrameBase.cpp:173 checks availableLimit before line 198 checks availableBalance).
+    // When both conditions fail, the first check determines the result code.
+    if !has_buying_capacity(source, buying, buying_liab, 0, state) {
+        return Ok(make_sell_offer_result(
+            ManageSellOfferResultCode::LineFull,
+            None,
+        ));
+    }
+
     if !has_selling_capacity(
         source,
         selling,
@@ -283,13 +293,6 @@ fn execute_manage_offer(
     )? {
         return Ok(make_sell_offer_result(
             ManageSellOfferResultCode::Underfunded,
-            None,
-        ));
-    }
-
-    if !has_buying_capacity(source, buying, buying_liab, 0, state) {
-        return Ok(make_sell_offer_result(
-            ManageSellOfferResultCode::LineFull,
             None,
         ));
     }
@@ -3243,5 +3246,65 @@ mod tests {
             op_snapshots.contains_key(&source_account_key),
             "Source account must be recorded in op snapshot"
         );
+    }
+
+    /// Regression test: when both LineFull and Underfunded conditions are true,
+    /// the result must be LineFull (not Underfunded) to match stellar-core's
+    /// check ordering in ManageOfferOpFrameBase.cpp.
+    ///
+    /// Bug: L59549719 TX 36 returned ManageBuyOffer(Underfunded) instead of
+    /// ManageBuyOffer(LineFull) because we checked Underfunded before LineFull.
+    #[test]
+    fn test_manage_offer_line_full_before_underfunded() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        // Give account very low balance: (2 + 2 sub_entries) * base_reserve = 4 * 5_000_000 = 20_000_000
+        // This leaves 0 available balance for selling, triggering Underfunded.
+        state.create_account(create_test_account(source_id.clone(), 20_000_000));
+
+        let issuer_id = create_test_account_id(99);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let buying_asset = create_asset(&issuer_id);
+
+        // Create buying trustline with balance == limit (LineFull condition)
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            1000, // balance
+            1000, // limit == balance, so no room for buying
+            AUTHORIZED_FLAG,
+        ));
+
+        // Sell native (Underfunded because balance is at minimum reserve)
+        // Buy the asset (LineFull because trustline is at limit)
+        // Both conditions fail, but LineFull should be returned first.
+        let op = ManageSellOfferOp {
+            selling: Asset::Native,
+            buying: buying_asset,
+            amount: 10_000_000,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        };
+
+        let result = execute_manage_sell_offer(&op, &source_id, &mut state, &context);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
+                assert!(
+                    matches!(r, ManageSellOfferResult::LineFull),
+                    "Must return LineFull (not Underfunded) when both conditions fail, \
+                     matching stellar-core check ordering. Got: {:?}",
+                    r
+                );
+            }
+            other => panic!("Unexpected result type: {:?}", other),
+        }
     }
 }
