@@ -742,3 +742,122 @@ fn test_operation_failure_rolls_back_changes() {
     assert_eq!(source.balance, 10_000_000 - 200);
 }
 
+/// Regression test: fee-bump inner TX source account signature must be checked
+/// against THRESHOLD_LOW (matching stellar-core's checkAllTransactionSignatures),
+/// not THRESHOLD_MEDIUM. If we used medium, this TX would fail with
+/// InvalidSignature because the master key weight (1) < medium threshold (2).
+#[test]
+fn test_fee_bump_inner_signature_uses_low_threshold() {
+    let inner_secret = SecretKey::from_seed(&[20u8; 32]);
+    let inner_account_id: AccountId = (&inner_secret.public_key()).into();
+
+    let fee_secret = SecretKey::from_seed(&[21u8; 32]);
+    let fee_account_id: AccountId = (&fee_secret.public_key()).into();
+
+    // Inner source: master_weight=1, low=1, medium=2, high=3
+    // Master key has weight 1 which passes low (1) but fails medium (2)
+    let inner_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        account_id: inner_account_id.clone(),
+    });
+    let inner_entry = LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::Account(AccountEntry {
+            account_id: inner_account_id,
+            balance: 10_000_000,
+            seq_num: SequenceNumber(1),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 1, 2, 3]),
+            signers: VecM::default(),
+            ext: AccountEntryExt::V0,
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+
+    let (fee_key, fee_entry) = create_account_entry(fee_account_id.clone(), 1, 10_000_000);
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(inner_key, inner_entry)
+        .expect("add inner")
+        .add_entry(fee_key, fee_entry)
+        .expect("add fee")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let destination = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([22u8; 32])));
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::CreateAccount(CreateAccountOp {
+            destination,
+            starting_balance: 1_000_000,
+        }),
+    };
+
+    let inner_tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(
+            *inner_secret.public_key().as_bytes(),
+        )),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    // Sign the inner TX with the inner source's key
+    let inner_env = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: inner_tx.clone(),
+        signatures: VecM::default(),
+    });
+    let network_id = NetworkId::testnet();
+    let inner_sig = sign_envelope(&inner_env, &inner_secret, &network_id);
+
+    let inner_v1 = TransactionV1Envelope {
+        tx: inner_tx,
+        signatures: vec![inner_sig].try_into().unwrap(),
+    };
+
+    let fee_bump = FeeBumpTransaction {
+        fee_source: MuxedAccount::Ed25519(Uint256(
+            *fee_secret.public_key().as_bytes(),
+        )),
+        fee: 200,
+        inner_tx: FeeBumpTransactionInnerTx::Tx(inner_v1),
+        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+        tx: fee_bump,
+        signatures: VecM::default(),
+    });
+
+    // Sign the outer envelope with the fee source's key
+    let outer_sig = sign_envelope(&envelope, &fee_secret, &network_id);
+    if let TransactionEnvelope::TxFeeBump(ref mut env) = envelope {
+        env.signatures = vec![outer_sig].try_into().unwrap();
+    }
+
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    // Must NOT fail with InvalidSignature — if it does, the inner TX
+    // signature was checked against medium threshold instead of low
+    assert_ne!(
+        result.failure,
+        Some(ExecutionFailure::InvalidSignature),
+        "fee-bump inner TX signature should use THRESHOLD_LOW, not THRESHOLD_MEDIUM"
+    );
+}
+

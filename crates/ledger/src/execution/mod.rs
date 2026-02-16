@@ -1717,7 +1717,9 @@ impl TransactionExecutor {
 
         if frame.is_fee_bump() {
             let inner_hash = fee_bump_inner_hash(&frame, &self.network_id)?;
-            let inner_threshold = threshold_medium(&source_account);
+            // stellar-core's checkAllTransactionSignatures uses THRESHOLD_LOW
+            // for all TX source account signatures, including fee-bump inner TXs
+            let inner_threshold = threshold_low(&source_account);
             if !has_sufficient_signer_weight(
                 &inner_hash,
                 frame.inner_signatures(),
