@@ -894,7 +894,7 @@ fn apply_soroban_storage_change(
                     ?key_hash,
                     live_until,
                     existing = existing_ttl.is_some(),
-                    "TTL RO bump: recording in delta for meta, deferring state update"
+                    "RO TTL bump: recording in delta for meta, deferring state update"
                 );
                 // Record in delta for transaction meta, but defer state update
                 // so subsequent TXs in this ledger don't see the bumped value

@@ -134,6 +134,14 @@ pub fn run_transactions_on_executor(
     let mut tx_result_metas = Vec::with_capacity(transactions.len());
 
     for (tx_index, (tx, tx_base_fee)) in transactions.iter().enumerate() {
+        // Flush pending RO TTL bumps for keys in this TX's write footprint
+        // (matches stellar-core's flushRoTTLBumpsInTxWriteFootprint).
+        if let Some(write_keys) = soroban_write_footprint(tx) {
+            executor
+                .state_mut()
+                .flush_ro_ttl_bumps_for_write_footprint(&write_keys);
+        }
+
         // Snapshot the delta before starting each transaction.
         // This preserves committed changes from previous transactions so they're
         // not lost if this transaction fails and rolls back.
@@ -437,6 +445,24 @@ pub fn execute_soroban_parallel_phase(
     })
 }
 
+/// Extract the read-write footprint keys from a Soroban transaction envelope.
+fn soroban_write_footprint(tx: &TransactionEnvelope) -> Option<Vec<LedgerKey>> {
+    let data = match tx {
+        TransactionEnvelope::Tx(env) => match &env.tx.ext {
+            stellar_xdr::curr::TransactionExt::V1(data) => Some(data),
+            _ => None,
+        },
+        TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => match &inner.tx.ext {
+                stellar_xdr::curr::TransactionExt::V1(data) => Some(data),
+                _ => None,
+            },
+        },
+        _ => None,
+    };
+    data.map(|d| d.resources.footprint.read_write.to_vec())
+}
+
 /// Execute a single cluster of transactions independently.
 ///
 /// Creates its own `TransactionExecutor` and `LedgerDelta`.
@@ -475,7 +501,25 @@ pub fn execute_single_cluster(
     let mut tx_results = Vec::with_capacity(cluster.len());
     let mut tx_result_metas = Vec::with_capacity(cluster.len());
 
+    tracing::debug!(
+        ledger_seq = context.sequence,
+        cluster_offset,
+        cluster_len = cluster.len(),
+        "Starting cluster execution"
+    );
+
     for (local_idx, (tx, tx_base_fee)) in cluster.iter().enumerate() {
+        // Flush pending RO TTL bumps for keys in this TX's write footprint.
+        // This matches stellar-core's flushRoTTLBumpsInTxWriteFootprint:
+        // bumped TTL values from earlier TXs' read-only bumps must be visible
+        // to write TXs for correct rent fee calculation. Must happen BEFORE
+        // snapshot_delta so flushed values are not rolled back on TX failure.
+        if let Some(write_keys) = soroban_write_footprint(tx) {
+            executor
+                .state_mut()
+                .flush_ro_ttl_bumps_for_write_footprint(&write_keys);
+        }
+
         executor.state.snapshot_delta();
 
         let tx_fee = tx_base_fee.unwrap_or(context.base_fee);

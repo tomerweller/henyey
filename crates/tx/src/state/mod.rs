@@ -329,6 +329,8 @@ pub struct LedgerStateManager {
     /// - They should be flushed to the delta at end of ledger (for bucket list)
     ///   Key is TTL key hash, value is the new live_until_ledger_seq.
     deferred_ro_ttl_bumps: HashMap<[u8; 32], u32>,
+    /// Snapshot of deferred RO TTL bumps at TX start (for rollback).
+    deferred_ro_ttl_bumps_snapshot: Option<HashMap<[u8; 32], u32>>,
     /// Track which claimable balance entries have been modified.
     modified_claimable_balances: Vec<[u8; 32]>,
     /// Track which liquidity pool entries have been modified.
@@ -458,6 +460,7 @@ impl LedgerStateManager {
             modified_contract_code: Vec::new(),
             modified_ttl: Vec::new(),
             deferred_ro_ttl_bumps: HashMap::new(),
+            deferred_ro_ttl_bumps_snapshot: None,
             modified_claimable_balances: Vec::new(),
             modified_liquidity_pools: Vec::new(),
             account_snapshots: HashMap::new(),
@@ -807,6 +810,7 @@ impl LedgerStateManager {
     /// transaction before any modifications.
     pub fn snapshot_delta(&mut self) {
         self.delta_snapshot = Some(self.delta.clone());
+        self.deferred_ro_ttl_bumps_snapshot = Some(self.deferred_ro_ttl_bumps.clone());
     }
 
     /// Clear all cached ledger entries.
@@ -1465,6 +1469,16 @@ impl LedgerStateManager {
             }
         }
         self.created_ttl.clear();
+
+        // Restore deferred RO TTL bumps to pre-transaction state.
+        // In stellar-core, commitChangesFromSuccessfulOp is only called for
+        // successful TXs. Failed TXs do not commit RO TTL bumps to
+        // mRoTTLBumps. We restore the snapshot to match this behavior.
+        if let Some(snapshot) = self.deferred_ro_ttl_bumps_snapshot.take() {
+            self.deferred_ro_ttl_bumps = snapshot;
+        } else {
+            self.deferred_ro_ttl_bumps.clear();
+        }
 
         // Restore claimable balance snapshots
         for (key, snapshot) in self.claimable_balance_snapshots.drain() {
@@ -3716,6 +3730,319 @@ mod tests {
         assert_eq!(
             delete_count, 1,
             "offer1 must be deleted exactly once in the delta, not twice"
+        );
+    }
+
+    /// Regression test for L59548531: TTL rollback must restore original value.
+    ///
+    /// When a Soroban TX extends a TTL entry and then fails (e.g.
+    /// InsufficientRefundableFee), the TTL must be rolled back to its
+    /// pre-transaction value so that subsequent TXs in the same cluster
+    /// see the original TTL.  A bug in `update_ttl` overwrote the snapshot
+    /// with the post-modification value, making rollback a no-op and
+    /// leaking extended TTLs into the next transaction's state.
+    #[test]
+    fn test_ttl_rollback_restores_original_value() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let key_hash = Hash([7; 32]);
+        let original_ttl = TtlEntry {
+            key_hash: key_hash.clone(),
+            live_until_ledger_seq: 100_000,
+        };
+
+        // Load entry (simulating load_soroban_footprint)
+        manager.ttl_entries.insert(key_hash.0, original_ttl.clone());
+
+        // Commit (simulating the commit before operations)
+        manager.commit();
+
+        // Snapshot delta (simulating TX start)
+        manager.snapshot_delta();
+
+        // update_ttl extends TTL to 500_000 (simulating Soroban host extending TTL)
+        let extended_ttl = TtlEntry {
+            key_hash: key_hash.clone(),
+            live_until_ledger_seq: 500_000,
+        };
+        manager.update_ttl(extended_ttl);
+        assert_eq!(
+            manager.get_ttl(&key_hash).unwrap().live_until_ledger_seq,
+            500_000
+        );
+
+        // TX fails — rollback must restore original TTL
+        manager.rollback();
+        assert_eq!(
+            manager.get_ttl(&key_hash).unwrap().live_until_ledger_seq,
+            100_000,
+            "TTL must be restored to original value after rollback"
+        );
+    }
+
+    /// Regression test for L59548531: extend_ttl rollback via savepoint.
+    ///
+    /// Same scenario as above but using extend_ttl and savepoint rollback
+    /// (simulating per-operation rollback within a transaction).
+    #[test]
+    fn test_extend_ttl_savepoint_rollback_restores_original_value() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let key_hash = Hash([8; 32]);
+        let original_ttl = TtlEntry {
+            key_hash: key_hash.clone(),
+            live_until_ledger_seq: 200_000,
+        };
+
+        // Load and commit entry
+        manager.ttl_entries.insert(key_hash.0, original_ttl.clone());
+        manager.commit();
+
+        // Create savepoint (simulating per-operation savepoint)
+        let sp = manager.create_savepoint();
+
+        // extend_ttl to 700_000
+        manager.extend_ttl(&key_hash, 700_000);
+        assert_eq!(
+            manager.get_ttl(&key_hash).unwrap().live_until_ledger_seq,
+            700_000
+        );
+
+        // Rollback to savepoint (simulating failed operation)
+        manager.rollback_to_savepoint(sp);
+        assert_eq!(
+            manager.get_ttl(&key_hash).unwrap().live_until_ledger_seq,
+            200_000,
+            "TTL must be restored to original value after savepoint rollback"
+        );
+    }
+
+    /// Regression test for L59548531: cross-TX TTL isolation in a cluster.
+    ///
+    /// Verifies that when TX 1 extends a TTL (RW) and fails, TX 2 in the same
+    /// cluster sees the original TTL value (not the extended one from TX 1).
+    #[test]
+    fn test_ttl_cross_tx_isolation_after_failed_tx() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let key_hash = Hash([9; 32]);
+        let original_ttl = TtlEntry {
+            key_hash: key_hash.clone(),
+            live_until_ledger_seq: 100_000,
+        };
+
+        // Load entry and commit
+        manager.ttl_entries.insert(key_hash.0, original_ttl.clone());
+        manager.commit();
+
+        // === TX 1 ===
+        manager.snapshot_delta();
+
+        // TX 1 extends TTL (RW path — uses update_ttl which modifies ttl_entries directly)
+        let extended_ttl = TtlEntry {
+            key_hash: key_hash.clone(),
+            live_until_ledger_seq: 500_000,
+        };
+        manager.update_ttl(extended_ttl);
+
+        // TX 1 fails
+        manager.rollback();
+
+        // === TX 2 ===
+        // TX 2 should see the ORIGINAL TTL, not the extended one from TX 1
+        let ttl = manager.get_ttl(&key_hash).unwrap();
+        assert_eq!(
+            ttl.live_until_ledger_seq, 100_000,
+            "TX 2 must see original TTL (100_000), not leaked extended TTL (500_000) from failed TX 1"
+        );
+    }
+
+    /// Regression test: RO TTL bumps are rolled back when a TX fails.
+    ///
+    /// In stellar-core, `commitChangesFromSuccessfulOp` is only called for
+    /// successful TXs. Failed TXs do not commit their RO TTL bumps to
+    /// `mRoTTLBumps`. Our code matches this by snapshotting/restoring
+    /// `deferred_ro_ttl_bumps` on rollback.
+    #[test]
+    fn test_ro_ttl_bumps_rolled_back_on_tx_failure() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let key_hash = Hash([10; 32]);
+        let original_ttl = TtlEntry {
+            key_hash: key_hash.clone(),
+            live_until_ledger_seq: 100_000,
+        };
+
+        // Load entry and commit
+        manager.ttl_entries.insert(key_hash.0, original_ttl.clone());
+        manager.commit();
+
+        // === TX 1 (will fail) ===
+        manager.snapshot_delta();
+
+        // TX 1 records an RO TTL bump (deferred — does NOT update ttl_entries)
+        manager.record_ro_ttl_bump_for_meta(&key_hash, 500_000);
+
+        // Verify the bump is stored in deferred_ro_ttl_bumps
+        assert_eq!(
+            manager.deferred_ro_ttl_bumps.get(&key_hash.0),
+            Some(&500_000),
+            "RO TTL bump must be stored in deferred_ro_ttl_bumps"
+        );
+
+        // TX 1 fails — rollback
+        manager.rollback();
+
+        // RO TTL bumps are rolled back (matches stellar-core behavior)
+        assert_eq!(
+            manager.deferred_ro_ttl_bumps.get(&key_hash.0),
+            None,
+            "RO TTL bump must be rolled back on TX failure"
+        );
+
+        // === TX 2 (succeeds) ===
+        manager.snapshot_delta();
+
+        // TX 2 records an RO TTL bump for the same key
+        manager.record_ro_ttl_bump_for_meta(&key_hash, 600_000);
+
+        // TX 2 commits (no rollback)
+        manager.commit();
+
+        // Only TX 2's bump should be present
+        assert_eq!(
+            manager.deferred_ro_ttl_bumps.get(&key_hash.0),
+            Some(&600_000),
+            "Only successful TX's RO TTL bump should be present"
+        );
+    }
+
+    /// Regression test: RO TTL bumps are flushed to ttl_entries for keys in
+    /// a subsequent TX's write footprint before that TX executes.
+    ///
+    /// This matches stellar-core's `flushRoTTLBumpsInTxWriteFootprint`:
+    /// when TX A (read-only) bumps a TTL, and TX B has that key in its
+    /// write footprint, TX B must see the bumped TTL value for correct
+    /// rent fee calculation. Without this flush, TX B would see the old
+    /// (lower) TTL and compute higher rent fees.
+    #[test]
+    fn test_flush_ro_ttl_bumps_for_write_footprint() {
+        use stellar_xdr::curr::{
+            ContractDataDurability, LedgerKey, LedgerKeyContractData, ScAddress, ScVal,
+        };
+
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let key_hash = Hash([20; 32]);
+        let original_ttl = TtlEntry {
+            key_hash: key_hash.clone(),
+            live_until_ledger_seq: 100_000,
+        };
+
+        // Load TTL entry
+        manager.ttl_entries.insert(key_hash.0, original_ttl.clone());
+        manager.commit();
+
+        // === TX 1 (succeeds): records an RO TTL bump ===
+        manager.snapshot_delta();
+        manager.record_ro_ttl_bump_for_meta(&key_hash, 500_000);
+        manager.commit();
+
+        // Bump is deferred — ttl_entries still has old value
+        assert_eq!(
+            manager.ttl_entries.get(&key_hash.0).unwrap().live_until_ledger_seq,
+            100_000,
+            "TTL entry must not be updated yet (deferred)"
+        );
+        assert_eq!(
+            manager.deferred_ro_ttl_bumps.get(&key_hash.0),
+            Some(&500_000),
+            "Deferred bump must be stored"
+        );
+
+        // === TX 2 is about to execute with this key in its write footprint ===
+        // Build a ContractData key that hashes to key_hash.
+        // We can't easily control the hash, so we use the flush method directly
+        // with a key whose hash matches. Instead, let's test by inserting the
+        // bump manually and verifying flush behavior with known hash.
+
+        // For this test, call flush_ro_ttl_bumps_for_write_footprint with
+        // a ContractData key. The function hashes the key to find the TTL entry.
+        // Since we can't make a key hash to exactly [20; 32], let's test the
+        // mechanism: create a real ContractData key, compute its actual hash,
+        // and set up state accordingly.
+        let contract_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(stellar_xdr::curr::ContractId(Hash([99; 32]))),
+            key: ScVal::Bool(true),
+            durability: ContractDataDurability::Persistent,
+        });
+
+        // Compute the actual hash this key produces
+        let actual_hash = {
+            use sha2::{Digest, Sha256};
+            use stellar_xdr::curr::WriteXdr;
+            let mut hasher = Sha256::new();
+            let bytes = contract_key.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
+            hasher.update(&bytes);
+            let result: [u8; 32] = hasher.finalize().into();
+            result
+        };
+
+        // Set up the TTL entry and deferred bump using the ACTUAL hash
+        let real_key_hash = Hash(actual_hash);
+        let real_ttl = TtlEntry {
+            key_hash: real_key_hash.clone(),
+            live_until_ledger_seq: 200_000,
+        };
+        manager.ttl_entries.insert(actual_hash, real_ttl);
+        manager.deferred_ro_ttl_bumps.insert(actual_hash, 800_000);
+
+        // Flush for write footprint containing this key
+        manager.flush_ro_ttl_bumps_for_write_footprint(&[contract_key]);
+
+        // After flush: TTL entry should be updated to the bumped value
+        assert_eq!(
+            manager.ttl_entries.get(&actual_hash).unwrap().live_until_ledger_seq,
+            800_000,
+            "TTL must be flushed to bumped value for write footprint key"
+        );
+
+        // Deferred bump should be removed (erased, like stellar-core)
+        assert_eq!(
+            manager.deferred_ro_ttl_bumps.get(&actual_hash),
+            None,
+            "Deferred bump must be erased after flush"
+        );
+    }
+
+    /// Test that flush_ro_ttl_bumps_for_write_footprint skips non-Soroban keys.
+    #[test]
+    fn test_flush_ro_ttl_bumps_skips_non_soroban_keys() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        // Add a deferred bump
+        let key_hash = [30; 32];
+        let ttl = TtlEntry {
+            key_hash: Hash(key_hash),
+            live_until_ledger_seq: 100_000,
+        };
+        manager.ttl_entries.insert(key_hash, ttl);
+        manager.deferred_ro_ttl_bumps.insert(key_hash, 500_000);
+
+        // Flush with a non-Soroban key (Account)
+        let account_key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::curr::Uint256([1; 32]),
+            )),
+        });
+        manager.flush_ro_ttl_bumps_for_write_footprint(&[account_key]);
+
+        // Deferred bump should NOT be erased (Account keys are skipped)
+        assert_eq!(
+            manager.deferred_ro_ttl_bumps.get(&key_hash),
+            Some(&500_000),
+            "Non-Soroban keys must not trigger flush"
+        );
+        // TTL entry should be unchanged
+        assert_eq!(
+            manager.ttl_entries.get(&key_hash).unwrap().live_until_ledger_seq,
+            100_000,
+            "TTL must remain unchanged for non-Soroban keys"
         );
     }
 }

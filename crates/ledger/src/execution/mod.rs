@@ -2291,6 +2291,16 @@ impl TransactionExecutor {
 
                         if let Some(meta) = &op_exec.soroban_meta {
                             if let Some(tracker) = refundable_fee_tracker.as_mut() {
+                                tracing::debug!(
+                                    ledger_seq = self.ledger_seq,
+                                    op_index,
+                                    rent_fee = meta.rent_fee,
+                                    event_size_bytes = meta.event_size_bytes,
+                                    max_refundable = tracker.max_refundable_fee,
+                                    consumed_rent = tracker.consumed_rent_fee,
+                                    consumed_refundable = tracker.consumed_refundable_fee,
+                                    "Refundable fee tracker pre-consume"
+                                );
                                 if !tracker.consume(
                                     &frame,
                                     self.protocol_version,
@@ -2298,6 +2308,11 @@ impl TransactionExecutor {
                                     meta.event_size_bytes,
                                     meta.rent_fee,
                                 ) {
+                                    tracing::debug!(
+                                        ledger_seq = self.ledger_seq,
+                                        op_index,
+                                        "InsufficientRefundableFee"
+                                    );
                                     op_result = insufficient_refundable_fee_result(op);
                                     all_success = false;
                                     failure = Some(ExecutionFailure::OperationFailed);

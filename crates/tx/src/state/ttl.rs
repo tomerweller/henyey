@@ -1,4 +1,5 @@
 use super::*;
+use stellar_xdr::curr::WriteXdr;
 
 impl LedgerStateManager {
     /// Get a TTL entry by key hash (read-only).
@@ -140,7 +141,7 @@ impl LedgerStateManager {
             }
         }
 
-        // Save snapshot if not already saved
+        // Save snapshot if not already saved (preserves original value for rollback)
         if !self.ttl_snapshots.contains_key(&key) {
             let snapshot = self.ttl_entries.get(&key).cloned();
             self.ttl_snapshots.insert(key, snapshot);
@@ -148,25 +149,11 @@ impl LedgerStateManager {
         self.capture_op_snapshot_for_key(&ledger_key);
         self.snapshot_last_modified_key(&ledger_key);
 
-        // Get pre-state (current value BEFORE this update)
-        let pre_state = self
-            .ttl_entries
-            .get(&key)
-            .map(|ttl| self.ttl_to_ledger_entry(ttl));
-
         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
 
-        // Record in delta with pre-state
-        let post_state = self.ttl_to_ledger_entry(&entry);
-        if let Some(pre) = pre_state {
-            self.delta.record_update(pre, post_state);
-        }
-
-        // Update state
+        // Update state — delta recording is deferred to flush_modified_entries()
+        // which compares current state against the snapshot.
         self.ttl_entries.insert(key, entry.clone());
-
-        // Update snapshot to current value so flush_modified_entries doesn't record a duplicate.
-        self.ttl_snapshots.insert(key, Some(entry));
 
         // Track modification
         if !self.modified_ttl.contains(&key) {
@@ -322,14 +309,62 @@ impl LedgerStateManager {
         );
     }
 
+    /// Flush pending RO TTL bumps for keys in a TX's write footprint.
+    ///
+    /// This matches stellar-core's `flushRoTTLBumpsInTxWriteFootprint`:
+    /// before each TX in a cluster executes, any accumulated RO TTL bumps
+    /// for Soroban entries in the TX's read-write footprint are flushed
+    /// to `ttl_entries`. This ensures write TXs see bumped TTL values
+    /// from earlier TXs' read-only bumps, producing correct rent fee
+    /// calculations.
+    pub fn flush_ro_ttl_bumps_for_write_footprint(&mut self, write_keys: &[LedgerKey]) {
+        for key in write_keys {
+            // Only flush for Soroban entry keys (ContractData, ContractCode)
+            if !matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)) {
+                continue;
+            }
+
+            // Compute the TTL key hash (SHA-256 of the XDR-encoded entry key)
+            let key_hash = {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                if let Ok(bytes) = key.to_xdr(stellar_xdr::curr::Limits::none()) {
+                    hasher.update(&bytes);
+                }
+                let result: [u8; 32] = hasher.finalize().into();
+                result
+            };
+
+            // Check if there's a pending RO TTL bump for this key
+            if let Some(bumped_live_until) = self.deferred_ro_ttl_bumps.remove(&key_hash) {
+                if let Some(existing) = self.ttl_entries.get(&key_hash) {
+                    if bumped_live_until > existing.live_until_ledger_seq {
+                        tracing::debug!(
+                            ?key_hash,
+                            old_live_until = existing.live_until_ledger_seq,
+                            new_live_until = bumped_live_until,
+                            "flush_ro_ttl_bumps_for_write_footprint: flushing bump for write key"
+                        );
+                        let ttl = TtlEntry {
+                            key_hash: Hash(key_hash),
+                            live_until_ledger_seq: bumped_live_until,
+                        };
+                        self.update_ttl_no_delta(ttl);
+                    }
+                }
+            }
+        }
+    }
+
     /// Flush deferred read-only TTL bumps to state.
     ///
-    /// This should be called at the end of ledger processing, after all transaction
-    /// meta has been built but before the bucket list is updated.
+    /// This should be called at the end of cluster processing, after all
+    /// transactions have been executed. Any remaining deferred RO TTL bumps
+    /// (not already flushed by `flush_ro_ttl_bumps_for_write_footprint`)
+    /// are applied to `ttl_entries` so the bucket list sees the final values.
     ///
-    /// Note: The delta already has the TTL changes (recorded by record_ro_ttl_bump_for_meta
-    /// during transaction execution). This flush only updates the state (ttl_entries) so
-    /// the bucket list sees the final values.
+    /// The delta already has the TTL changes (recorded by record_ro_ttl_bump_for_meta
+    /// during transaction execution). This flush only updates state.
     pub fn flush_deferred_ro_ttl_bumps(&mut self) {
         let bumps = std::mem::take(&mut self.deferred_ro_ttl_bumps);
         tracing::debug!(
@@ -394,7 +429,7 @@ impl LedgerStateManager {
                     // Update state
                     self.ttl_entries.insert(key, updated);
                 } else {
-                    // Save snapshot if not already saved
+                    // Save snapshot if not already saved (preserves original value for rollback)
                     self.ttl_snapshots
                         .entry(key)
                         .or_insert_with(|| Some(ttl_entry.clone()));
@@ -404,9 +439,6 @@ impl LedgerStateManager {
                     self.capture_op_snapshot_for_key(&ledger_key);
                     self.snapshot_last_modified_key(&ledger_key);
 
-                    // Get pre-state (current value BEFORE this update)
-                    let pre_state = self.ttl_to_ledger_entry(&ttl_entry);
-
                     self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
 
                     // Create updated entry
@@ -415,15 +447,8 @@ impl LedgerStateManager {
                         live_until_ledger_seq,
                     };
 
-                    // Record in delta with pre-state
-                    let post_state = self.ttl_to_ledger_entry(&updated);
-                    self.delta.record_update(pre_state, post_state);
-
-                    // Update state
-                    self.ttl_entries.insert(key, updated.clone());
-
-                    // Update snapshot to current value so flush_modified_entries doesn't record a duplicate.
-                    self.ttl_snapshots.insert(key, Some(updated));
+                    // Update state — delta recording is deferred to flush_modified_entries()
+                    self.ttl_entries.insert(key, updated);
 
                     // Track modification
                     if !self.modified_ttl.contains(&key) {
