@@ -1172,6 +1172,16 @@ impl LedgerStateManager {
                         if let LedgerEntryData::Offer(ref offer) = entry.data {
                             let seller_key = account_id_to_bytes(&offer.seller_id);
                             let key = OfferKey::new(seller_key, offer.offer_id);
+                            // Skip offers already deleted in this ledger (by a previous TX).
+                            // The loader returns offers from the bucket list snapshot which
+                            // doesn't reflect in-ledger deletions.
+                            let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
+                                seller_id: offer.seller_id.clone(),
+                                offer_id: offer.offer_id,
+                            });
+                            if self.delta.deleted_keys().contains(&ledger_key) {
+                                continue;
+                            }
                             // Only load offers not already tracked in state.
                             if !self.offers.contains_key(&key) {
                                 tracing::info!(

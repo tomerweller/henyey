@@ -3626,4 +3626,96 @@ mod tests {
             "rollback() must restore to original pre-tx balance, not mid-tx flushed value"
         );
     }
+
+    /// Regression test: remove_offers_by_account_and_asset must skip offers
+    /// that were already deleted in a previous transaction within the same ledger.
+    ///
+    /// The offers_by_account_asset_loader returns offers from the bucket list
+    /// snapshot, which does not reflect in-ledger deletions. Without the fix,
+    /// a deleted offer would be re-loaded from the snapshot and then deleted
+    /// again, causing double liability release and double sub_entries decrement.
+    ///
+    /// This bug caused a bucket_list_hash mismatch at mainnet L59517076 where
+    /// offer 1799030633 was deleted by TX 81 (offer crossing), then re-loaded
+    /// and re-deleted by TX 105 (AllowTrust authorization revocation), causing
+    /// selling_liabilities to go negative (-801) and sub_entries to be off by -1.
+    #[test]
+    fn test_remove_offers_skips_already_deleted_offers() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let seller = create_test_account_id(1);
+
+        // Create account with sub_entries tracking
+        let mut account = create_test_account_entry(1);
+        account.num_sub_entries = 2; // has 2 offers
+        manager.create_account(account);
+
+        // Create and load two offers for the same account
+        let offer1 = create_test_offer_with_assets(1, 100, Asset::Native, usd_asset());
+        let offer2 = create_test_offer_with_assets(1, 200, eur_asset(), usd_asset());
+        manager.create_offer(offer1.clone());
+        manager.create_offer(offer2.clone());
+        manager.commit(); // permanent state
+
+        // --- TX1: Delete offer1 via offer crossing ---
+        manager.snapshot_delta();
+        manager.delete_offer(&seller, 100);
+        manager.flush_modified_entries();
+        // TX1 succeeds
+        manager.commit();
+
+        // Verify offer1 is deleted from state
+        assert!(manager.get_offer(&seller, 100).is_none());
+        // Verify offer1 deletion is in the delta
+        let offer1_key = LedgerKey::Offer(LedgerKeyOffer {
+            seller_id: seller.clone(),
+            offer_id: 100,
+        });
+        assert!(
+            manager.delta().deleted_keys().contains(&offer1_key),
+            "offer1 deletion must be in the delta"
+        );
+
+        // --- TX2: AllowTrust revokes authorization, triggering remove_offers ---
+        manager.snapshot_delta();
+
+        // The loader returns BOTH offers from the "bucket list" snapshot,
+        // which doesn't know about the in-ledger deletion of offer1.
+        let offer1_entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::Offer(offer1),
+            ext: LedgerEntryExt::V0,
+        };
+        let offer2_entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::Offer(offer2),
+            ext: LedgerEntryExt::V0,
+        };
+        let entries = vec![offer1_entry, offer2_entry];
+        manager.set_offers_by_account_asset_loader(Arc::new(move |_account_id, _asset| {
+            Ok(entries.clone())
+        }));
+
+        let removed = manager.remove_offers_by_account_and_asset(&seller, &usd_asset());
+
+        // Only offer2 should be removed. offer1 was already deleted in TX1
+        // and must NOT be re-loaded from the loader.
+        let removed_ids: HashSet<i64> = removed.iter().map(|o| o.offer_id).collect();
+        assert_eq!(
+            removed_ids,
+            HashSet::from([200]),
+            "Only offer2 should be removed; offer1 was already deleted in TX1"
+        );
+
+        // Verify offer1's deletion appears exactly once in the delta
+        let delete_count = manager
+            .delta()
+            .deleted_keys()
+            .iter()
+            .filter(|k| *k == &offer1_key)
+            .count();
+        assert_eq!(
+            delete_count, 1,
+            "offer1 must be deleted exactly once in the delta, not twice"
+        );
+    }
 }
