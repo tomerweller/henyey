@@ -2251,6 +2251,35 @@ async fn cmd_verify_execution(
                                     }
                                 }
 
+                                // Show cross-case fee bump inner results
+                                if let (TransactionResultResult::TxFeeBumpInnerSuccess(our_inner), TransactionResultResult::TxFeeBumpInnerFailed(cdp_inner)) = (our_result, cdp_result) {
+                                    println!("        Inner fee: ours={} CDP={}", our_inner.result.fee_charged, cdp_inner.result.fee_charged);
+                                    if let stellar_xdr::curr::InnerTransactionResultResult::TxSuccess(our_ops) = &our_inner.result.result {
+                                        println!("        Ours inner ops ({}):", our_ops.len());
+                                        for (j, op) in our_ops.iter().enumerate() {
+                                            println!("          Op {}: {:?}", j, op);
+                                        }
+                                    }
+                                    if let stellar_xdr::curr::InnerTransactionResultResult::TxFailed(cdp_ops) = &cdp_inner.result.result {
+                                        println!("        CDP inner ops ({}):", cdp_ops.len());
+                                        for (j, op) in cdp_ops.iter().enumerate() {
+                                            println!("          Op {}: {:?}", j, op);
+                                        }
+                                    } else {
+                                        println!("        CDP inner result: {:?}", cdp_inner.result.result);
+                                    }
+                                }
+                                if let (TransactionResultResult::TxFeeBumpInnerFailed(our_inner), TransactionResultResult::TxFeeBumpInnerSuccess(cdp_inner)) = (our_result, cdp_result) {
+                                    println!("        Inner fee: ours={} CDP={}", our_inner.result.fee_charged, cdp_inner.result.fee_charged);
+                                    println!("        Ours inner result: {:?}", our_inner.result.result);
+                                    if let stellar_xdr::curr::InnerTransactionResultResult::TxSuccess(cdp_ops) = &cdp_inner.result.result {
+                                        println!("        CDP inner ops ({}):", cdp_ops.len());
+                                        for (j, op) in cdp_ops.iter().enumerate() {
+                                            println!("          Op {}: {:?}", j, op);
+                                        }
+                                    }
+                                }
+
                                 // Show CDP ops when ours is TxNotSupported or other non-standard result
                                 if !matches!(our_result, TransactionResultResult::TxSuccess(_) | TransactionResultResult::TxFailed(_)
                                     | TransactionResultResult::TxFeeBumpInnerSuccess(_) | TransactionResultResult::TxFeeBumpInnerFailed(_)) {

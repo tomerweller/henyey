@@ -131,12 +131,16 @@ pub fn execute_liquidity_pool_deposit(
     let available_a = match &asset_a {
         Asset::Native => available_native_balance(source, state, context)?,
         _ if is_issuer(source, &asset_a) => i64::MAX, // Issuers have unlimited capacity
-        _ => trustline_a.map(|tl| tl.balance).unwrap_or(0),
+        _ => trustline_a
+            .map(|tl| tl.balance.saturating_sub(trustline_liabilities(tl).selling))
+            .unwrap_or(0),
     };
     let available_b = match &asset_b {
         Asset::Native => available_native_balance(source, state, context)?,
         _ if is_issuer(source, &asset_b) => i64::MAX, // Issuers have unlimited capacity
-        _ => trustline_b.map(|tl| tl.balance).unwrap_or(0),
+        _ => trustline_b
+            .map(|tl| tl.balance.saturating_sub(trustline_liabilities(tl).selling))
+            .unwrap_or(0),
     };
     let available_pool_share_limit = pool_share_trustline
         .limit
@@ -433,7 +437,11 @@ fn available_native_balance(
         return Ok(0);
     };
     let min_balance = state.minimum_balance_for_account(account, context.protocol_version, 0)?;
-    Ok(account.balance.saturating_sub(min_balance))
+    let selling_liab = account_liabilities(account).selling;
+    Ok(account
+        .balance
+        .saturating_sub(min_balance)
+        .saturating_sub(selling_liab))
 }
 
 fn is_bad_price(amount_a: i64, amount_b: i64, min_price: &Price, max_price: &Price) -> bool {
@@ -1738,6 +1746,104 @@ mod tests {
                 assert!(
                     matches!(r, LiquidityPoolWithdrawResult::UnderMinimum),
                     "Expected UnderMinimum, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    /// Regression test: LiquidityPoolDeposit available balance must deduct
+    /// selling liabilities from trustline balances (matching stellar-core's
+    /// TrustLineWrapper::getAvailableBalance).
+    #[test]
+    fn test_deposit_underfunded_due_to_selling_liabilities() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(50);
+        let issuer_a = create_test_account_id(51);
+        let issuer_b = create_test_account_id(52);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000, 0));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_a,
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: issuer_b,
+        });
+        let pool_id = PoolId(Hash([50u8; 32]));
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            0,
+            0,
+            0,
+        ));
+
+        // Trustline A: balance=1000 but selling_liabilities=900, so available=100
+        let trustline_a = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_a {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 1_000,
+            limit: 100_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V1(TrustLineEntryV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: 900,
+                },
+                ext: TrustLineEntryV1Ext::V0,
+            }),
+        };
+        let trustline_b = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_b {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 10_000,
+            limit: 100_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        let pool_share_tl = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 0,
+            limit: i64::MAX,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        };
+        state.create_trustline(trustline_a);
+        state.create_trustline(trustline_b);
+        state.create_trustline(pool_share_tl);
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+
+        // Deposit 500 of each — raw balance (1000) >= 500,
+        // but available (1000 - 900 = 100) < 500
+        let op = LiquidityPoolDepositOp {
+            liquidity_pool_id: pool_id,
+            max_amount_a: 500,
+            max_amount_b: 500,
+            min_price: Price { n: 1, d: 2 },
+            max_price: Price { n: 2, d: 1 },
+        };
+
+        let result = execute_liquidity_pool_deposit(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolDeposit(r)) => {
+                assert!(
+                    matches!(r, LiquidityPoolDepositResult::Underfunded),
+                    "Expected Underfunded when selling liabilities reduce available balance, got {:?}",
                     r
                 );
             }
