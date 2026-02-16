@@ -2,12 +2,30 @@ use super::*;
 
 impl App {
     /// Try to trigger consensus for the next ledger (validators only).
+    ///
+    /// Matches stellar-core's triggerNextLedger() gate: only propose when
+    /// the node is tracking the network AND the ledger manager is synced
+    /// (LCL == tracking slot). Without this, a node that is behind would
+    /// propose stale transaction sets for slots it hasn't closed yet.
     pub(super) async fn try_trigger_consensus(&self) {
-        let current_slot = self.herder.tracking_slot();
+        let tracking_slot = self.herder.tracking_slot();
 
         // Check if we should start a new round
         if self.herder.is_tracking() {
-            let next_slot = (current_slot + 1) as u32;
+            let current_ledger = *self.current_ledger.read().await;
+
+            // Don't propose if our LCL is behind the tracking slot.
+            // This matches stellar-core's `!mLedgerManager.isSynced()` guard.
+            if (current_ledger as u64) < tracking_slot {
+                tracing::debug!(
+                    current_ledger,
+                    tracking_slot,
+                    "Skipping consensus trigger: not synced (LCL behind tracking slot)"
+                );
+                return;
+            }
+
+            let next_slot = current_ledger + 1;
             tracing::debug!(next_slot, "Checking if we should trigger consensus");
 
             // Record local close time for drift tracking before triggering consensus.
