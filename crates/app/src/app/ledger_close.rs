@@ -825,37 +825,34 @@ impl App {
         drained
     }
 
-    /// Apply buffered ledgers (yields to tokio via `spawn_blocking`).
+    /// Apply a single buffered ledger (yields to tokio via `spawn_blocking`).
     ///
     /// Used by callers outside the main select loop (catchup completion, tx set
     /// handlers). If a background close is already in progress (`is_applying_ledger`),
     /// returns immediately — the select loop completion handler will chain the next close.
+    ///
+    /// Closes at most ONE ledger to avoid blocking the event loop. Subsequent
+    /// buffered ledgers are picked up by the main select loop's `pending_close`
+    /// chaining or the next `consensus_interval` tick.
     pub(super) async fn try_apply_buffered_ledgers(&self) {
         // If a background close is already running, let the select loop handle chaining.
         if self.is_applying_ledger() {
             return;
         }
 
-        let mut closed_any = false;
-        loop {
-            let mut pending = match self.try_start_ledger_close().await {
-                Some(p) => p,
-                None => break,
-            };
-            let join_result = (&mut pending.handle).await;
-            let success = self.handle_close_complete(pending, join_result).await;
-            if !success {
-                break;
-            }
-            closed_any = true;
-        }
+        let mut pending = match self.try_start_ledger_close().await {
+            Some(p) => p,
+            None => return,
+        };
+        let join_result = (&mut pending.handle).await;
+        let success = self.handle_close_complete(pending, join_result).await;
 
-        // After closing one or more buffered ledgers, reset timestamps and
+        // After closing a buffered ledger, reset timestamps and
         // tracking state so the heartbeat stall detector doesn't fire based
         // on the (now stale) timestamp of the EXTERNALIZE that triggered
         // this burst.  This mirrors the reset done in the pending_close
-        // handler at the end of the select-loop chain (line ~3086-3111).
-        if closed_any {
+        // handler at the end of the select-loop chain.
+        if success {
             *self.last_externalized_at.write().await = Instant::now();
             self.tx_set_all_peers_exhausted
                 .store(false, Ordering::SeqCst);
