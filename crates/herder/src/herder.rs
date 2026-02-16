@@ -1404,9 +1404,9 @@ impl Herder {
         );
 
         info!(
-            "Proposing transaction set with {} transactions, hash: {}",
-            tx_set.len(),
-            tx_set.hash
+            hash = %tx_set.hash,
+            tx_count = tx_set.len(),
+            "Proposing transaction set"
         );
 
         // Cache the transaction set
