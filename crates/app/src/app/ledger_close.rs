@@ -555,8 +555,23 @@ impl App {
                 // slots creates syncing_ledgers entries with tx_set: None
                 // that trigger futile fetch requests.  Limit to the most
                 // recent TX_SET_REQUEST_WINDOW slots; the gap check below
-                // (line 618) will trigger catchup for larger gaps.
-                let iter_start = if latest_externalized.saturating_sub(last_processed) > TX_SET_REQUEST_WINDOW {
+                // will trigger catchup for larger gaps.
+                //
+                // Exception: when the first replay ledger falls in an
+                // unpublished checkpoint AND we have its EXTERNALIZE,
+                // archive-based catchup would fail (the checkpoint file
+                // doesn't exist yet).  In that case, process ALL slots so
+                // the node can close ledgers from cached SCP messages +
+                // peer-fetched tx_sets instead of waiting for the checkpoint.
+                let first_replay = current_ledger as u64 + 1;
+                let replay_checkpoint = checkpoint_containing(first_replay as u32);
+                let checkpoint_unpublished = replay_checkpoint > latest_externalized as u32;
+                let have_next_externalize = self.herder.get_externalized(first_replay).is_some();
+
+                let iter_start = if checkpoint_unpublished && have_next_externalize {
+                    // Process all slots — archive catchup would fail
+                    last_processed + 1
+                } else if latest_externalized.saturating_sub(last_processed) > TX_SET_REQUEST_WINDOW {
                     let skip_to = latest_externalized.saturating_sub(TX_SET_REQUEST_WINDOW);
                     // Advance last_processed past the skipped range
                     advance_to = skip_to;

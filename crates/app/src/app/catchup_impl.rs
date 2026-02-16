@@ -1597,6 +1597,29 @@ impl App {
             return;
         }
 
+        // When the first replay ledger is in an unpublished checkpoint,
+        // archive downloads would fail.  However, if we have the EXTERNALIZE
+        // for the next slot, we can close ledgers from cached SCP messages
+        // without archives.  Skip catchup in that case and let
+        // process_externalized_slots handle it.
+        //
+        // If we do NOT have the EXTERNALIZE (permanently missing slots),
+        // we must still attempt archive catchup — the download will fail
+        // with cooldown and eventually succeed once the checkpoint is published.
+        let first_replay = current_ledger as u64 + 1;
+        let replay_checkpoint = checkpoint_containing(first_replay as u32);
+        let have_next_externalize = self.herder.get_externalized(first_replay).is_some();
+        if replay_checkpoint > latest_externalized as u32 && have_next_externalize {
+            tracing::debug!(
+                first_replay,
+                replay_checkpoint,
+                latest_externalized,
+                "Skipping archive catchup: have EXTERNALIZE for next slot in unpublished checkpoint"
+            );
+            self.catchup_in_progress.store(false, Ordering::SeqCst);
+            return;
+        }
+
         tracing::info!(
             current_ledger,
             latest_externalized,

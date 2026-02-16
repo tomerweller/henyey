@@ -68,9 +68,9 @@ use henyey_herder::{
     EnvelopeState, Herder, HerderCallback, HerderConfig, HerderStats, TxQueueConfig,
 };
 use henyey_history::{
-    is_checkpoint_ledger, latest_checkpoint_before_or_at, CatchupManager, CatchupMode,
-    CatchupOutput, CheckpointData, ExistingBucketState, HistoryArchive, HistoryArchiveState,
-    GENESIS_LEDGER_SEQ, CHECKPOINT_FREQUENCY,
+    checkpoint_containing, is_checkpoint_ledger, latest_checkpoint_before_or_at,
+    CatchupManager, CatchupMode, CatchupOutput, CheckpointData, ExistingBucketState,
+    HistoryArchive, HistoryArchiveState, GENESIS_LEDGER_SEQ, CHECKPOINT_FREQUENCY,
     build_history_archive_state,
 };
 use henyey_historywork::{
