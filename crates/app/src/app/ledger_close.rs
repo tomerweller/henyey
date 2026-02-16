@@ -874,6 +874,12 @@ impl App {
         if self.is_applying_ledger() {
             return None;
         }
+        // Don't start ledger closes while catchup is running.
+        // Catchup modifies the LedgerManager state; concurrent ledger
+        // closes could corrupt it.
+        if self.catchup_in_progress.load(Ordering::SeqCst) {
+            return None;
+        }
 
         let current_ledger = self.get_current_ledger().await.ok()?;
         let next_seq = current_ledger.saturating_add(1);
