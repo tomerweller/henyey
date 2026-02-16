@@ -1206,7 +1206,7 @@ impl App {
 
         // Periodically garbage collect stale bucket files.
         if pending.ledger_seq % 100 == 0 {
-            self.cleanup_stale_bucket_files();
+            self.cleanup_stale_bucket_files_background();
         }
 
         self.tx_set_all_peers_exhausted

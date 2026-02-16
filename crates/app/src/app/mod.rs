@@ -1327,8 +1327,8 @@ impl App {
     /// won't appear in the referenced set and the file would be deleted while
     /// the DiskBacked bucket still points to it. This is analogous to
     /// stellar-core tracking all merge outputs in mSharedLiveBuckets.
+    /// Synchronous version for use during catchup (before the main event loop).
     pub(crate) fn cleanup_stale_bucket_files(&self) {
-        // Resolve async merges so their output hashes appear in the referenced set.
         self.ledger_manager.resolve_pending_bucket_merges();
 
         let hashes = self.ledger_manager.all_referenced_bucket_hashes();
@@ -1342,6 +1342,31 @@ impl App {
                 tracing::warn!(error = %e, "Failed to cleanup stale bucket files");
             }
         }
+    }
+
+    /// Non-blocking version for use in the main event loop.
+    ///
+    /// Spawns the cleanup on tokio's blocking thread pool so that
+    /// `resolve_pending_bucket_merges()` (which may block waiting for
+    /// in-flight async merges) does not stall the async event loop.
+    pub(crate) fn cleanup_stale_bucket_files_background(&self) {
+        let lm = self.ledger_manager.clone();
+        let bm = self.bucket_manager.clone();
+        tokio::task::spawn_blocking(move || {
+            lm.resolve_pending_bucket_merges();
+
+            let hashes = lm.all_referenced_bucket_hashes();
+            match bm.retain_buckets(&hashes) {
+                Ok(deleted) => {
+                    if deleted > 0 {
+                        tracing::info!(deleted, "Cleaned up stale bucket files");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to cleanup stale bucket files");
+                }
+            }
+        });
     }
 
     /// Get a ConfigUpgradeSet from the ledger by its key.

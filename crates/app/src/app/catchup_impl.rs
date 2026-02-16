@@ -1527,11 +1527,27 @@ impl App {
                         "{} catchup skipped (already at target); preserving tx_set tracking",
                         label
                     );
+                    // Restore operational state even when catchup was a no-op,
+                    // since catchup() unconditionally sets CatchingUp on entry.
+                    if self.is_validator {
+                        self.set_state(AppState::Validating).await;
+                    } else {
+                        self.set_state(AppState::Synced).await;
+                    }
                 }
                 *self.last_catchup_completed_at.write().await = Some(Instant::now());
             }
             Err(err) => {
                 tracing::error!(error = %err, "{} catchup failed", label);
+                // Restore operational state so the node can continue
+                // participating in consensus. Without this, the node stays
+                // permanently stuck in CatchingUp after a failed catchup
+                // (e.g., archive checkpoint not yet published).
+                if self.is_validator {
+                    self.set_state(AppState::Validating).await;
+                } else {
+                    self.set_state(AppState::Synced).await;
+                }
                 // Apply cooldown after failed catchup to prevent rapid-fire retries.
                 // Without this, a failed catchup (e.g., archive checkpoint not yet
                 // published) would re-trigger immediately on the next tick because
