@@ -469,6 +469,20 @@ pub struct App {
     /// Weak reference to self for spawning background tasks from &self methods.
     /// Set via `set_self_arc` after wrapping in Arc.
     self_arc: RwLock<std::sync::Weak<Self>>,
+
+    /// Monotonic timestamp (ms since epoch) of the last event loop iteration.
+    /// Updated at the top of each select! iteration. Read by the std::thread
+    /// watchdog to detect event loop freezes.
+    last_event_loop_tick_ms: Arc<AtomicU64>,
+
+    /// Numeric code indicating what the event loop is currently doing.
+    /// Read by the watchdog to identify where a freeze occurs.
+    /// Codes: 0=idle/select, 1=scp_message, 2=fetch_response, 3=broadcast_msg,
+    ///        4=scp_broadcast, 5=consensus_tick, 6=pending_close,
+    ///        10=process_externalized, 11=maybe_externalized_catchup,
+    ///        12=try_apply_buffered, 13=maybe_buffered_catchup,
+    ///        14=catchup_running, 15=heartbeat
+    event_loop_phase: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -973,6 +987,8 @@ impl App {
             ping_inflight: RwLock::new(HashMap::new()),
             peer_ping_inflight: RwLock::new(HashMap::new()),
             self_arc: RwLock::new(std::sync::Weak::new()),
+            last_event_loop_tick_ms: Arc::new(AtomicU64::new(0)),
+            event_loop_phase: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -1918,6 +1934,103 @@ impl App {
         if let Some(handle) = self.sync_recovery_handle.read().as_ref() {
             let _ = handle.try_set_applying_ledger(applying);
         }
+    }
+
+    /// Update the event loop phase code (for watchdog diagnostics).
+    #[inline]
+    fn set_phase(&self, phase: u64) {
+        self.event_loop_phase.store(phase, Ordering::Relaxed);
+    }
+
+    /// Record a new event loop tick (for watchdog freshness tracking).
+    #[inline]
+    fn tick_event_loop(&self) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.last_event_loop_tick_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    /// Start a std::thread watchdog that monitors event loop liveness.
+    ///
+    /// The watchdog runs independently of the tokio runtime. Every 10 seconds
+    /// it checks the last event loop tick timestamp. If the event loop hasn't
+    /// ticked in 30+ seconds, it logs an error with the current phase code
+    /// and thread backtraces to help diagnose deadlocks.
+    pub fn start_event_loop_watchdog(&self) {
+        let tick_ms = Arc::clone(&self.last_event_loop_tick_ms);
+        let phase = Arc::clone(&self.event_loop_phase);
+        let pid = std::process::id();
+
+        std::thread::Builder::new()
+            .name("watchdog".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_secs(10));
+
+                    let last_tick = tick_ms.load(Ordering::Relaxed);
+                    if last_tick == 0 {
+                        // Event loop hasn't started yet
+                        continue;
+                    }
+
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let stale_secs = now_ms.saturating_sub(last_tick) / 1000;
+                    let current_phase = phase.load(Ordering::Relaxed);
+
+                    if stale_secs >= 30 {
+                        tracing::error!(
+                            stale_secs,
+                            phase = current_phase,
+                            pid,
+                            "WATCHDOG: Event loop appears frozen! \
+                             Phase codes: 0=select, 1=scp_msg, 2=fetch_resp, \
+                             3=broadcast, 4=scp_broadcast, 5=consensus_tick, \
+                             6=pending_close, 10=process_externalized, \
+                             11=externalized_catchup, 12=try_apply_buffered, \
+                             13=buffered_catchup, 14=catchup_running, 15=heartbeat"
+                        );
+
+                        // Log thread states from /proc for debugging
+                        if let Ok(entries) = std::fs::read_dir(format!("/proc/{}/task", pid)) {
+                            let mut states: std::collections::HashMap<String, u32> =
+                                std::collections::HashMap::new();
+                            for entry in entries.flatten() {
+                                let status_path =
+                                    format!("{}/status", entry.path().display());
+                                if let Ok(status) = std::fs::read_to_string(&status_path) {
+                                    let state = status
+                                        .lines()
+                                        .find(|l| l.starts_with("State:"))
+                                        .map(|l| l.to_string())
+                                        .unwrap_or_else(|| "Unknown".into());
+                                    *states.entry(state).or_insert(0) += 1;
+                                }
+                            }
+                            for (state, count) in &states {
+                                tracing::error!(
+                                    count,
+                                    state = state.as_str(),
+                                    "WATCHDOG: Thread state summary"
+                                );
+                            }
+                        }
+                    } else if stale_secs >= 15 {
+                        tracing::warn!(
+                            stale_secs,
+                            phase = current_phase,
+                            "WATCHDOG: Event loop slow (>15s since last tick)"
+                        );
+                    }
+                }
+            })
+            .expect("Failed to spawn watchdog thread");
+
+        tracing::info!("Event loop watchdog started");
     }
 }
 

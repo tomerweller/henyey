@@ -147,7 +147,9 @@ impl App {
                 let catchup_message_handle =
                     self.start_catchup_message_caching_from_self().await;
 
+                self.set_phase(14); // 14 = catchup_running
                 let catchup_result = self.catchup(CatchupTarget::Current).await;
+                self.set_phase(5); // 5 = back in consensus_tick
 
                 if let Some(handle) = catchup_message_handle {
                     handle.abort();

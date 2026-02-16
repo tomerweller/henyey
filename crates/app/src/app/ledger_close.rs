@@ -654,6 +654,7 @@ impl App {
                 let current_ledger = *self.current_ledger.read().await;
                 let gap = latest_externalized.saturating_sub(current_ledger as u64);
                 if buffered_count == 0 || gap > TX_SET_REQUEST_WINDOW {
+                    self.set_phase(11); // 11 = externalized_catchup
                     self.maybe_start_externalized_catchup(latest_externalized)
                         .await;
                 }
@@ -664,7 +665,9 @@ impl App {
 
         // Always try to apply buffered ledgers and check for catchup,
         // even when no new slots - we may need to trigger stuck recovery.
+        self.set_phase(12); // 12 = try_apply_buffered
         self.try_apply_buffered_ledgers().await;
+        self.set_phase(13); // 13 = maybe_buffered_catchup
         self.maybe_start_buffered_catchup().await;
     }
 

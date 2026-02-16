@@ -176,6 +176,9 @@ impl App {
 
         tracing::info!("Entering main event loop");
 
+        // Start the std::thread watchdog (independent of tokio runtime).
+        self.start_event_loop_watchdog();
+
         let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(10));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -196,6 +199,8 @@ impl App {
         let mut select_iteration: u64 = 0;
         loop {
             select_iteration += 1;
+            self.tick_event_loop();
+            self.set_phase(0); // 0 = waiting in select
             if select_iteration <= 5 || select_iteration % 1000 == 0 {
                 tracing::debug!(select_iteration, "Main loop: entering select!");
             }
@@ -209,6 +214,7 @@ impl App {
                         None => std::future::pending().await,
                     }
                 } => {
+                    self.set_phase(6); // 6 = pending_close
                     tracing::debug!(select_iteration, "BRANCH: pending_close completed");
                     let pending = pending_close.take().unwrap();
                     let success = self.handle_close_complete(pending, join_result).await;
@@ -276,6 +282,7 @@ impl App {
                 // Process SCP messages from dedicated never-drop channel.
                 // These are guaranteed to arrive even if the broadcast channel overflows.
                 Some(scp_msg) = scp_message_rx.recv() => {
+                    self.set_phase(1); // 1 = scp_message
                     tracing::trace!(select_iteration, "BRANCH: scp_message_rx");
                     scp_messages_received += 1;
                     last_scp_message_at = Instant::now();
@@ -297,6 +304,7 @@ impl App {
                 // GeneralizedTxSet, TxSet, DontHave, and ScpQuorumset are routed here
                 // to ensure they are never lost when the broadcast channel overflows.
                 Some(fetch_msg) = fetch_response_rx.recv() => {
+                    self.set_phase(2); // 2 = fetch_response
                     tracing::trace!(select_iteration, "BRANCH: fetch_response_rx");
                     tracing::debug!(
                         latency_ms = fetch_msg.received_at.elapsed().as_millis(),
@@ -390,6 +398,8 @@ impl App {
 
                 // Consensus timer - trigger ledger close for validators and process externalized
                 _ = consensus_interval.tick() => {
+                    self.set_phase(5); // 5 = consensus_tick
+
                     // Drain pending overlay messages FIRST before any catchup
                     // evaluation.  This ensures tx_sets and SCP envelopes that
                     // arrived since the last tick are processed before we decide
@@ -425,6 +435,7 @@ impl App {
                     }
 
                     // Check for externalized slots to process
+                    self.set_phase(10); // 10 = process_externalized
                     self.process_externalized_slots().await;
 
                     // Start a background ledger close if one isn't already running.
@@ -508,6 +519,7 @@ impl App {
 
                 // Heartbeat for debugging
                 _ = heartbeat_interval.tick() => {
+                    self.set_phase(15); // 15 = heartbeat
                     let tracking_slot = self.herder.tracking_slot();
                     let ledger = *self.current_ledger.read().await;
                     let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);

@@ -1646,7 +1646,9 @@ impl App {
         // Start caching messages during catchup to capture tx_sets for gap ledgers
         let catchup_message_handle = self.start_catchup_message_caching_from_self().await;
 
+        self.set_phase(14); // 14 = catchup_running
         let catchup_result = self.catchup(CatchupTarget::Ledger(target)).await;
+        self.set_phase(11); // 11 = back in externalized_catchup
 
         // Stop the catchup message caching task
         if let Some(handle) = catchup_message_handle {
