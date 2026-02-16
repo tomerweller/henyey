@@ -651,10 +651,8 @@ pub struct ItemFetcherStats {
 
 /// Compute hash of an SCP envelope for tracking.
 ///
-/// Uses the same approach as stellar-core: BLAKE2 of the StellarMessage wrapping the envelope.
+/// Uses the same approach as stellar-core: BLAKE2b-256 of the StellarMessage wrapping the envelope.
 fn compute_envelope_hash(env: &ScpEnvelope) -> Hash {
-    use blake2::Digest;
-
     // Create a StellarMessage::ScpMessage wrapping the envelope
     let msg = stellar_xdr::curr::StellarMessage::ScpMessage(env.clone());
 
@@ -663,12 +661,9 @@ fn compute_envelope_hash(env: &ScpEnvelope) -> Hash {
         .to_xdr(stellar_xdr::curr::Limits::none())
         .unwrap_or_default();
 
-    // Compute BLAKE2 hash (we use 256-bit output to match Hash size)
-    let mut hasher = blake2::Blake2s256::new();
-    hasher.update(&xdr_bytes);
-    let result = hasher.finalize();
-
-    Hash(result.into())
+    // Compute BLAKE2b-256 hash (matching stellar-core's xdrBlake2)
+    let hash256 = henyey_crypto::blake2(&xdr_bytes);
+    Hash(*hash256.as_bytes())
 }
 
 #[cfg(test)]

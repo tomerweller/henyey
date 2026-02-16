@@ -33,7 +33,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use stellar_xdr::curr::{Auth, Hello, StellarMessage};
-use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
 /// Current state of a peer connection.
@@ -613,50 +612,6 @@ impl Peer {
             self.state = PeerState::Disconnected;
             debug!("Closed connection to {}", self.info.peer_id);
         }
-    }
-}
-
-/// A clonable handle for sending messages to a peer.
-///
-/// This is used internally when the peer connection is split for concurrent
-/// send/receive operations.
-#[derive(Clone)]
-pub struct PeerSender {
-    peer_id: PeerId,
-    tx: mpsc::Sender<StellarMessage>,
-}
-
-impl PeerSender {
-    /// Creates a new peer sender with the given channel.
-    pub fn new(peer_id: PeerId, tx: mpsc::Sender<StellarMessage>) -> Self {
-        Self { peer_id, tx }
-    }
-
-    /// Sends a message to the peer.
-    ///
-    /// Returns an error if the receiving end has been dropped or if the
-    /// channel is full for longer than the timeout (indicating the peer's
-    /// write loop is stalled, e.g. due to TCP backpressure).
-    pub async fn send(&self, message: StellarMessage) -> Result<()> {
-        const SEND_TIMEOUT_SECS: u64 = 10;
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
-            self.tx.send(message),
-        )
-        .await
-        {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => Err(OverlayError::ChannelSend),
-            Err(_) => Err(OverlayError::ConnectionTimeout(format!(
-                "PeerSender channel full for {}s for {}",
-                SEND_TIMEOUT_SECS, self.peer_id
-            ))),
-        }
-    }
-
-    /// Returns the peer ID this sender is associated with.
-    pub fn peer_id(&self) -> &PeerId {
-        &self.peer_id
     }
 }
 

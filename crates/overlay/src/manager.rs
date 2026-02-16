@@ -36,8 +36,8 @@ use crate::{
     codec::helpers,
     connection::{ConnectionDirection, ConnectionPool, Listener},
     flood::{compute_message_hash, FloodGate, FloodGateStats},
-    flow_control::msg_body_size,
-    peer::{Peer, PeerInfo, PeerStatsSnapshot},
+    flow_control::{msg_body_size, FlowControl, FlowControlConfig},
+    peer::{Peer, PeerInfo, PeerStats, PeerStatsSnapshot},
     LocalNode, OverlayConfig, OverlayError, PeerAddress, PeerEvent, PeerId, PeerType, Result,
 };
 use dashmap::DashMap;
@@ -92,6 +92,29 @@ pub struct PeerSnapshot {
     pub stats: PeerStatsSnapshot,
 }
 
+/// Lightweight handle stored in DashMap, replaces Arc<TokioMutex<Peer>>.
+///
+/// The actual `Peer` is owned by the spawned peer task. This handle
+/// provides non-blocking access to send messages and read stats.
+struct PeerHandle {
+    /// Channel to send outbound messages to the peer task.
+    outbound_tx: mpsc::Sender<OutboundMessage>,
+    /// Shared stats (atomically updated by the peer task).
+    stats: Arc<PeerStats>,
+    /// Per-peer flow control (shared with the peer task).
+    flow_control: Arc<FlowControl>,
+}
+
+/// Messages sent to a peer task via the outbound channel.
+enum OutboundMessage {
+    /// Direct send (non-flood, e.g. GetTxSet, ScpQuorumset response).
+    Send(StellarMessage),
+    /// Flood message (goes through FlowControl outbound queue in Phase 3).
+    Flood(StellarMessage),
+    /// Close the connection.
+    Shutdown,
+}
+
 /// Shared state passed to spawned peer tasks.
 ///
 /// Bundles all `Arc`-wrapped state that background tasks need, avoiding
@@ -99,12 +122,12 @@ pub struct PeerSnapshot {
 /// `run_peer_loop`.
 #[derive(Clone)]
 struct SharedPeerState {
-    peers: Arc<DashMap<PeerId, Arc<TokioMutex<Peer>>>>,
+    peers: Arc<DashMap<PeerId, PeerHandle>>,
     flood_gate: Arc<FloodGate>,
     running: Arc<AtomicBool>,
     message_tx: broadcast::Sender<OverlayMessage>,
-    scp_message_tx: mpsc::UnboundedSender<OverlayMessage>,
-    fetch_response_tx: mpsc::UnboundedSender<OverlayMessage>,
+    scp_message_tx: mpsc::Sender<OverlayMessage>,
+    fetch_response_tx: mpsc::Sender<OverlayMessage>,
     peer_handles: Arc<RwLock<Vec<JoinHandle<()>>>>,
     advertised_outbound_peers: Arc<RwLock<Vec<PeerAddress>>>,
     advertised_inbound_peers: Arc<RwLock<Vec<PeerAddress>>>,
@@ -148,8 +171,9 @@ pub struct OverlayManager {
     config: OverlayConfig,
     /// Local node info.
     local_node: LocalNode,
-    /// Connected peers (using TokioMutex so guards can be held across await).
-    peers: Arc<DashMap<PeerId, Arc<TokioMutex<Peer>>>>,
+    /// Connected peers. Each entry is a lightweight handle with a channel
+    /// to the peer's dedicated task (which owns the actual `Peer`).
+    peers: Arc<DashMap<PeerId, PeerHandle>>,
     /// Flood gate.
     flood_gate: Arc<FloodGate>,
     /// Connection pool for inbound connections.
@@ -184,19 +208,18 @@ pub struct OverlayManager {
     shutdown_tx: Option<broadcast::Sender<()>>,
     /// Cache of peer info for connected peers (lock-free access).
     peer_info_cache: Arc<DashMap<PeerId, PeerInfo>>,
-    /// Dedicated channel for SCP messages (never drops).
-    /// Uses mpsc::unbounded so SCP EXTERNALIZE messages are never lost
-    /// even when the broadcast channel overflows during high traffic.
-    scp_message_tx: mpsc::UnboundedSender<OverlayMessage>,
+    /// Dedicated bounded channel for SCP messages.
+    /// Large buffer (8192) ensures SCP EXTERNALIZE messages are not lost
+    /// during realistic traffic bursts while preventing unbounded growth.
+    scp_message_tx: mpsc::Sender<OverlayMessage>,
     /// Receiver end of the SCP channel. Taken once via `subscribe_scp()`.
-    scp_message_rx: Arc<TokioMutex<Option<mpsc::UnboundedReceiver<OverlayMessage>>>>,
-    /// Dedicated channel for fetch response messages (never drops).
+    scp_message_rx: Arc<TokioMutex<Option<mpsc::Receiver<OverlayMessage>>>>,
+    /// Dedicated bounded channel for fetch response messages.
     /// Routes GeneralizedTxSet, TxSet, DontHave, and ScpQuorumset through
-    /// a dedicated mpsc channel so they are never lost when the broadcast
-    /// channel overflows during high traffic.
-    fetch_response_tx: mpsc::UnboundedSender<OverlayMessage>,
+    /// a dedicated channel. Buffer (4096) is generous for fetch responses.
+    fetch_response_tx: mpsc::Sender<OverlayMessage>,
     /// Receiver end of the fetch response channel. Taken once via `subscribe_fetch_responses()`.
-    fetch_response_rx: Arc<TokioMutex<Option<mpsc::UnboundedReceiver<OverlayMessage>>>>,
+    fetch_response_rx: Arc<TokioMutex<Option<mpsc::Receiver<OverlayMessage>>>>,
     /// Dynamic extra subscribers for catchup-critical messages (SCP + TxSet).
     /// Created on demand via `subscribe_catchup()` and cleaned up when dropped.
     /// Uses parking_lot::RwLock for minimal contention in the hot path (read-heavy).
@@ -212,8 +235,8 @@ impl OverlayManager {
         // 4096 provides headroom for mainnet traffic bursts from multiple peers.
         let (message_tx, _) = broadcast::channel(4096);
         let (shutdown_tx, _) = broadcast::channel(1);
-        let (scp_message_tx, scp_message_rx) = mpsc::unbounded_channel();
-        let (fetch_response_tx, fetch_response_rx) = mpsc::unbounded_channel();
+        let (scp_message_tx, scp_message_rx) = mpsc::channel(8192);
+        let (fetch_response_tx, fetch_response_rx) = mpsc::channel(4096);
 
         Ok(Self {
             config: config.clone(),
@@ -344,11 +367,7 @@ impl OverlayManager {
                                                     .await;
                                             }
 
-                                            let peer = Arc::new(TokioMutex::new(peer));
-                                            shared.peers.insert(peer_id.clone(), Arc::clone(&peer));
-                                            shared.peer_info_cache.insert(peer_id.clone(), peer_info.clone());
-                                            shared.added_authenticated_peers.fetch_add(1, Ordering::Relaxed);
-
+                                            // Send Peers message directly (we still own the peer)
                                             let outbound_snapshot =
                                                 shared.advertised_outbound_peers.read().clone();
                                             let inbound_snapshot =
@@ -364,9 +383,8 @@ impl OverlayManager {
                                                     Some(&exclude),
                                                 )
                                             {
-                                                let mut peer_lock = peer.lock().await;
-                                                if peer_lock.is_ready() {
-                                                    if let Err(e) = peer_lock.send(message).await {
+                                                if peer.is_ready() {
+                                                    if let Err(e) = peer.send(message).await {
                                                         debug!(
                                                             "Failed to send peers to {}: {}",
                                                             peer_id, e
@@ -375,10 +393,26 @@ impl OverlayManager {
                                                 }
                                             }
 
-                                            // Run peer loop
+                                            // Create outbound channel, FlowControl, and PeerHandle
+                                            let (outbound_tx, outbound_rx) = mpsc::channel(256);
+                                            let stats = peer.stats();
+                                            let flow_control = Arc::new(FlowControl::new(FlowControlConfig::default()));
+                                            flow_control.set_peer_id(peer_id.clone());
+                                            let peer_handle = PeerHandle {
+                                                outbound_tx,
+                                                stats,
+                                                flow_control: Arc::clone(&flow_control),
+                                            };
+                                            shared.peers.insert(peer_id.clone(), peer_handle);
+                                            shared.peer_info_cache.insert(peer_id.clone(), peer_info);
+                                            shared.added_authenticated_peers.fetch_add(1, Ordering::Relaxed);
+
+                                            // Run peer loop (peer is moved, not locked)
                                             Self::run_peer_loop(
                                                 peer_id.clone(),
                                                 peer,
+                                                outbound_rx,
+                                                flow_control,
                                                 shared.clone(),
                                             ).await;
 
@@ -462,7 +496,7 @@ impl OverlayManager {
                 }
 
                 let now = Instant::now();
-                let outbound_count = Self::count_outbound_peers(&shared.peers);
+                let outbound_count = Self::count_outbound_peers(&shared.peer_info_cache);
                 let available = max_outbound.saturating_sub(outbound_count);
                 if available == 0 {
                     continue;
@@ -487,9 +521,23 @@ impl OverlayManager {
                     }
 
                     if !pool.try_reserve() {
-                        debug!("Outbound peer limit reached");
-                        remaining = 0;
-                        break;
+                        // Preferred peer eviction: evict youngest non-preferred
+                        // outbound peer to make room (matches stellar-core behavior).
+                        let evicted = Self::maybe_evict_for_preferred(
+                            &shared.peers,
+                            &shared.peer_info_cache,
+                            &preferred_peers,
+                        );
+                        if evicted {
+                            // Give the evicted peer task time to clean up and
+                            // release its pool slot.
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        if !pool.try_reserve() {
+                            debug!("Outbound peer limit reached (even after eviction attempt)");
+                            remaining = 0;
+                            break;
+                        }
                     }
 
                     let timeout = connect_timeout.max(auth_timeout);
@@ -513,7 +561,7 @@ impl OverlayManager {
                     }
                 }
 
-                let outbound_count = Self::count_outbound_peers(&shared.peers);
+                let outbound_count = Self::count_outbound_peers(&shared.peer_info_cache);
                 if remaining == 0 || outbound_count >= target_outbound {
                     continue;
                 }
@@ -527,7 +575,7 @@ impl OverlayManager {
                         break;
                     }
 
-                    let outbound_now = Self::count_outbound_peers(&shared.peers);
+                    let outbound_now = Self::count_outbound_peers(&shared.peer_info_cache);
                     if outbound_now >= target_outbound {
                         break;
                     }
@@ -574,9 +622,15 @@ impl OverlayManager {
     }
 
     /// Run the peer message loop.
+    ///
+    /// The peer is owned by this task (no mutex). Outbound messages arrive
+    /// via `outbound_rx`. The `tokio::select!` multiplexes between network
+    /// recv, outbound channel, and periodic timers without blocking.
     async fn run_peer_loop(
         peer_id: PeerId,
-        peer: Arc<TokioMutex<Peer>>,
+        mut peer: Peer,
+        mut outbound_rx: mpsc::Receiver<OutboundMessage>,
+        flow_control: Arc<FlowControl>,
         state: SharedPeerState,
     ) {
         let SharedPeerState {
@@ -589,28 +643,26 @@ impl OverlayManager {
             extra_subscribers,
             ..
         } = state;
-        // Flow control: track messages received and send SendMoreExtended frequently
-        // stellar-core sends FLOW_CONTROL_SEND_MORE_BATCH_SIZE=40 msgs / 100000 bytes after processing
-        // a batch, NOT the full initial capacity. Match this behavior.
-        const SEND_MORE_BATCH_SIZE: u32 = 40;
-        const SEND_MORE_BYTE_BATCH: u32 = 100_000;
-        let mut messages_since_send_more = 0u32;
-        let mut last_send_more = std::time::Instant::now();
-        const SEND_MORE_INTERVAL: Duration = Duration::from_secs(1); // Send every second
 
-        // Ping/keepalive: send GetScpQuorumSet every 5 seconds to keep the connection alive.
-        // stellar-core has a 5-second recurrent timer that calls pingPeer(), which sends
-        // GetScpQuorumSet with a synthetic hash. Without this, the remote peer's idle timeout
-        // (30s for authenticated peers) will eventually fire since we stop writing after the
-        // initial handshake burst.
-        let mut last_ping = std::time::Instant::now();
-        const PING_INTERVAL: Duration = Duration::from_secs(5);
+        // Send initial SendMoreExtended to grant the peer our full reading capacity.
+        // Matches stellar-core's Peer::recvAuth() → sendSendMore().
+        {
+            let config = FlowControlConfig::default();
+            let initial_flood_msgs = config.peer_flood_reading_capacity as u32;
+            let initial_flood_bytes =
+                (config.peer_flood_reading_capacity * config.flow_control_bytes_batch_size) as u32;
+            if let Err(e) = peer
+                .send_more_extended(initial_flood_msgs, initial_flood_bytes)
+                .await
+            {
+                warn!(
+                    "Failed to send initial SendMoreExtended to {}: {}",
+                    peer_id, e
+                );
+            }
+        }
 
         // Idle/straggler timeout tracking (matches stellar-core Peer::recurrentTimerExpired).
-        // - PEER_TIMEOUT (30s): if no read AND no write for this long, disconnect.
-        // - PEER_STRAGGLER_TIMEOUT (120s): if the oldest enqueued write has been
-        //   waiting longer than this, the peer can't keep up — disconnect.
-        // These timestamps are updated on every received/sent message.
         let mut last_read = Instant::now();
         let mut last_write = Instant::now();
         const PEER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -621,324 +673,350 @@ impl OverlayManager {
         let mut scp_messages: u64 = 0;
         let mut last_stats_log = Instant::now();
 
+        // Single periodic timer for ping, SendMore, and timeout checks.
+        // Fires every second (covers 1s SendMore interval and 5s ping interval).
+        let mut periodic_interval = tokio::time::interval(Duration::from_secs(1));
+        let mut ticks_since_ping: u32 = 0;
+
         loop {
             if !running.load(Ordering::Relaxed) {
-                info!("Peer {} read loop exiting: overlay shutting down (total_msgs={}, scp_msgs={})", peer_id, total_messages, scp_messages);
+                info!("Peer {} loop exiting: overlay shutting down (total_msgs={}, scp_msgs={})", peer_id, total_messages, scp_messages);
                 break;
             }
 
-            // Check if we should send a flow control message proactively
-            if last_send_more.elapsed() >= SEND_MORE_INTERVAL {
-                let mut peer_lock = peer.lock().await;
-                if peer_lock.is_connected() {
-                    // Send batch flow control matching stellar-core FLOW_CONTROL_SEND_MORE_BATCH_SIZE
-                    if let Err(e) = peer_lock.send_more_extended(SEND_MORE_BATCH_SIZE, SEND_MORE_BYTE_BATCH).await {
-                        debug!("Failed to send periodic flow control to {}: {}", peer_id, e);
-                    } else {
-                        trace!(
-                            "Sent periodic SendMoreExtended to {}",
-                            peer_id
-                        );
-                        last_write = Instant::now();
+            tokio::select! {
+                // Outbound messages from broadcast/send_to/disconnect
+                msg = outbound_rx.recv() => {
+                    match msg {
+                        Some(OutboundMessage::Send(m)) => {
+                            if let Err(e) = peer.send(m).await {
+                                debug!("Failed to send to {}: {}", peer_id, e);
+                                break;
+                            }
+                            last_write = Instant::now();
+                        }
+                        Some(OutboundMessage::Flood(m)) => {
+                            // Enqueue in FlowControl with priority-based trimming
+                            flow_control.add_msg_and_maybe_trim_queue(m);
+                            // Send whatever has capacity
+                            match Self::send_flow_controlled_batch(&mut peer, &flow_control).await {
+                                Ok(sent) => {
+                                    if sent {
+                                        last_write = Instant::now();
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!("Failed to send batch to {}: {}", peer_id, e);
+                                    break;
+                                }
+                            }
+                        }
+                        Some(OutboundMessage::Shutdown) => {
+                            info!("Peer {} loop exiting: shutdown requested", peer_id);
+                            break;
+                        }
+                        None => {
+                            // Channel closed (PeerHandle dropped)
+                            info!("Peer {} loop exiting: outbound channel closed", peer_id);
+                            break;
+                        }
                     }
                 }
-                last_send_more = std::time::Instant::now();
-            }
 
-            // Ping/keepalive: send GetScpQuorumSet every 5 seconds (matches stellar-core RECURRENT_TIMER_PERIOD)
-            // stellar-core sends GetScpQuorumSet with a hash derived from current time as a ping.
-            // This resets the remote peer's mLastRead timer, preventing idle timeout disconnects.
-            if last_ping.elapsed() >= PING_INTERVAL {
-                // Idle/straggler timeout check (runs alongside ping, every 5s).
-                // Matches stellar-core Peer::recurrentTimerExpired() logic.
-                let now = Instant::now();
-                if now.duration_since(last_read) >= PEER_TIMEOUT
-                    && now.duration_since(last_write) >= PEER_TIMEOUT
-                {
-                    warn!("Dropping peer {} due to idle timeout (no activity for {:?}, total_msgs={}, scp_msgs={})", peer_id, PEER_TIMEOUT, total_messages, scp_messages);
-                    break;
-                }
-                if now.duration_since(last_write) >= PEER_STRAGGLER_TIMEOUT {
-                    warn!("Dropping peer {} due to straggler timeout (write stalled for {:?}, total_msgs={}, scp_msgs={})", peer_id, PEER_STRAGGLER_TIMEOUT, total_messages, scp_messages);
-                    break;
-                }
+                // Receive from network (no mutex — peer is owned)
+                result = peer.recv() => {
+                    match result {
+                        Ok(Some(message)) => {
+                            last_read = Instant::now();
+                            total_messages += 1;
 
-                let mut peer_lock = peer.lock().await;
-                if peer_lock.is_connected() {
-                    // Generate a synthetic hash from the current time (same approach as stellar-core pingIDfromTimePoint)
-                    let now_nanos = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos();
-                    let ping_hash = {
-                        let mut hasher = sha2::Sha256::new();
-                        hasher.update(now_nanos.to_le_bytes());
-                        let result = hasher.finalize();
-                        stellar_xdr::curr::Uint256(result.into())
-                    };
-                    let ping_msg = stellar_xdr::curr::StellarMessage::GetScpQuorumset(ping_hash);
-                    if let Err(e) = peer_lock.send(ping_msg).await {
-                        debug!("Failed to send ping to {}: {}", peer_id, e);
-                    } else {
-                        trace!("Sent ping (GetScpQuorumSet) to {}", peer_id);
-                        last_write = Instant::now();
+                            // Periodic per-peer stats (every 60s)
+                            if last_stats_log.elapsed() >= Duration::from_secs(60) {
+                                info!(
+                                    "Peer {} stats: total_msgs={}, scp_msgs={}",
+                                    peer_id, total_messages, scp_messages,
+                                );
+                                last_stats_log = Instant::now();
+                            }
+
+                            let msg_type = helpers::message_type_name(&message);
+                            trace!("Processing {} from {}", msg_type, peer_id);
+
+                            // Log ERROR messages
+                            if let StellarMessage::ErrorMsg(ref err) = message {
+                                warn!(
+                                    "Peer {} sent ERROR: code={:?}, msg={}",
+                                    peer_id, err.code, err.msg.to_string()
+                                );
+                            }
+
+                            // Flow control: begin tracking capacity for this message
+                            flow_control.begin_message_processing(&message);
+
+                            // Handle flow control messages: release outbound capacity
+                            // and drain queued messages that now have capacity.
+                            match &message {
+                                StellarMessage::SendMore(sm) => {
+                                    debug!("Peer {} sent SEND_MORE: num_messages={}", peer_id, sm.num_messages);
+                                }
+                                StellarMessage::SendMoreExtended(sme) => {
+                                    debug!("Peer {} sent SEND_MORE_EXTENDED: num_messages={}, num_bytes={}", peer_id, sme.num_messages, sme.num_bytes);
+                                    flow_control.maybe_release_capacity(&message);
+                                    // Drain queued messages now that we have more outbound capacity
+                                    match Self::send_flow_controlled_batch(&mut peer, &flow_control).await {
+                                        Ok(sent) => {
+                                            if sent { last_write = Instant::now(); }
+                                        }
+                                        Err(e) => {
+                                            debug!("Failed to drain queue to {}: {}", peer_id, e);
+                                            break;
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+
+                            // Route message — use a block to avoid `continue` before
+                            // end_message_processing. The block evaluates to false if
+                            // the message should not be routed.
+                            let routed = 'route: {
+                                if helpers::is_handshake_message(&message) {
+                                    debug!("Ignoring handshake message from authenticated peer {}", peer_id);
+                                    break 'route false;
+                                }
+
+                                // Flow control messages are handled above, not routed
+                                if matches!(message,
+                                    StellarMessage::SendMore(_)
+                                    | StellarMessage::SendMoreExtended(_)
+                                ) {
+                                    break 'route false;
+                                }
+
+                                // Watcher filter: drop non-essential flood messages for non-validator nodes.
+                                if !is_validator && helpers::is_watcher_droppable(&message) {
+                                    trace!("Watcher: dropping {} from {}", msg_type, peer_id);
+                                    break 'route false;
+                                }
+
+                                // SCP messages are consensus-critical and must never be rate-limited.
+                                if !matches!(message, StellarMessage::ScpMessage(_)) && !flood_gate.allow_message() {
+                                    debug!("Dropping message due to rate limit");
+                                    break 'route false;
+                                }
+
+                                let message_size = msg_body_size(&message);
+                                if helpers::is_flood_message(&message) {
+                                    let hash = compute_message_hash(&message);
+                                    let unique = flood_gate.record_seen(hash, Some(peer_id.clone()));
+                                    peer.record_flood_stats(unique, message_size);
+                                    if !unique {
+                                        break 'route false;
+                                    }
+                                } else if is_fetch_message(&message) {
+                                    peer.record_fetch_stats(true, message_size);
+                                    match &message {
+                                        StellarMessage::TxSet(ts) => {
+                                            debug!(
+                                                "OVERLAY: Received TxSet from {} hash={} prev_ledger={}",
+                                                peer_id,
+                                                hex::encode(sha2::Sha256::digest(
+                                                    stellar_xdr::curr::WriteXdr::to_xdr(ts, stellar_xdr::curr::Limits::none()).unwrap_or_default()
+                                                )),
+                                                hex::encode(ts.previous_ledger_hash.0)
+                                            );
+                                        }
+                                        StellarMessage::GeneralizedTxSet(ts) => {
+                                            let hash = henyey_common::Hash256::hash_xdr(ts)
+                                                .unwrap_or(henyey_common::Hash256::ZERO);
+                                            debug!("OVERLAY: Received GeneralizedTxSet from {} hash={}", peer_id, hash);
+                                        }
+                                        StellarMessage::ScpQuorumset(qs) => {
+                                            let hash = henyey_common::Hash256::hash_xdr(qs)
+                                                .unwrap_or(henyey_common::Hash256::ZERO);
+                                            debug!("OVERLAY: Received ScpQuorumset from {} hash={}", peer_id, hash);
+                                        }
+                                        StellarMessage::DontHave(dh) => {
+                                            debug!("OVERLAY: Received DontHave from {} type={:?} hash={}", peer_id, dh.type_, hex::encode(dh.req_hash.0));
+                                        }
+                                        StellarMessage::GetTxSet(hash) => {
+                                            debug!("OVERLAY: Received GetTxSet from {} hash={}", peer_id, hex::encode(hash.0));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+
+                                // Forward to subscribers
+                                let overlay_msg = OverlayMessage {
+                                    from_peer: peer_id.clone(),
+                                    message: message.clone(),
+                                    received_at: Instant::now(),
+                                };
+
+                                // Route to dedicated channels
+                                let is_dedicated = matches!(
+                                    overlay_msg.message,
+                                    StellarMessage::ScpMessage(_)
+                                        | StellarMessage::GeneralizedTxSet(_)
+                                        | StellarMessage::TxSet(_)
+                                        | StellarMessage::DontHave(_)
+                                        | StellarMessage::ScpQuorumset(_)
+                                );
+
+                                if matches!(overlay_msg.message, StellarMessage::ScpMessage(_)) {
+                                    scp_messages += 1;
+                                    if let Err(e) = scp_message_tx.try_send(overlay_msg.clone()) {
+                                        error!("SCP channel send FAILED for peer {}: {}", peer_id, e);
+                                    }
+                                }
+
+                                if matches!(
+                                    overlay_msg.message,
+                                    StellarMessage::GeneralizedTxSet(_)
+                                        | StellarMessage::TxSet(_)
+                                        | StellarMessage::DontHave(_)
+                                        | StellarMessage::ScpQuorumset(_)
+                                ) {
+                                    if let Err(e) = fetch_response_tx.try_send(overlay_msg.clone()) {
+                                        error!("Fetch response channel send FAILED for peer {}: {}", peer_id, e);
+                                    }
+                                }
+
+                                // Send catchup-critical messages to extra subscribers
+                                if matches!(
+                                    overlay_msg.message,
+                                    StellarMessage::ScpMessage(_)
+                                        | StellarMessage::GeneralizedTxSet(_)
+                                        | StellarMessage::TxSet(_)
+                                        | StellarMessage::ScpQuorumset(_)
+                                ) {
+                                    let subs = extra_subscribers.read();
+                                    if !subs.is_empty() {
+                                        for sub in subs.iter() {
+                                            let _ = sub.send(overlay_msg.clone());
+                                        }
+                                    }
+                                }
+
+                                if !is_dedicated {
+                                    let _ = message_tx.send(overlay_msg);
+                                }
+
+                                true
+                            };
+                            let _ = routed; // suppress unused warning
+
+                            // Flow control: end tracking and maybe send SendMoreExtended
+                            let send_more_cap = flow_control.end_message_processing(&message);
+                            if send_more_cap.should_send() && peer.is_connected() {
+                                if let Err(e) = peer.send_more_extended(
+                                    send_more_cap.num_flood_messages as u32,
+                                    send_more_cap.num_flood_bytes as u32,
+                                ).await {
+                                    debug!("Failed to send SendMoreExtended to {}: {}", peer_id, e);
+                                } else {
+                                    last_write = Instant::now();
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            info!("Peer {} loop exiting: connection closed by remote (total_msgs={}, scp_msgs={})", peer_id, total_messages, scp_messages);
+                            break;
+                        }
+                        Err(e) => {
+                            info!("Peer {} loop exiting: recv error: {} (total_msgs={}, scp_msgs={})", peer_id, e, total_messages, scp_messages);
+                            break;
+                        }
                     }
                 }
-                last_ping = std::time::Instant::now();
-            }
 
-            // Receive message with timeout to allow periodic flow control
-            let message = {
-                let mut peer_lock = peer.lock().await;
-                if !peer_lock.is_connected() {
-                    info!("Peer {} read loop exiting: peer not connected (total_msgs={}, scp_msgs={})", peer_id, total_messages, scp_messages);
-                    break;
-                }
+                // Periodic tasks: ping, timeout checks
+                _ = periodic_interval.tick() => {
+                    let now = Instant::now();
 
-                // Use a short timeout so we can send periodic flow control messages
-                match tokio::time::timeout(Duration::from_secs(2), peer_lock.recv()).await {
-                    Ok(Ok(Some(msg))) => msg,
-                    Ok(Ok(None)) => {
-                        info!("Peer {} read loop exiting: connection closed cleanly by remote (total_msgs={}, scp_msgs={})", peer_id, total_messages, scp_messages);
+                    // Idle/straggler timeout check
+                    if now.duration_since(last_read) >= PEER_TIMEOUT
+                        && now.duration_since(last_write) >= PEER_TIMEOUT
+                    {
+                        warn!("Dropping peer {} due to idle timeout (total_msgs={}, scp_msgs={})", peer_id, total_messages, scp_messages);
                         break;
                     }
-                    Ok(Err(e)) => {
-                        info!("Peer {} read loop exiting: recv error: {} (total_msgs={}, scp_msgs={})", peer_id, e, total_messages, scp_messages);
+                    if now.duration_since(last_write) >= PEER_STRAGGLER_TIMEOUT {
+                        warn!("Dropping peer {} due to straggler timeout (total_msgs={}, scp_msgs={})", peer_id, total_messages, scp_messages);
                         break;
                     }
-                    Err(_) => {
-                        // Timeout - continue to check flow control
-                        continue;
+
+                    // Ping every 5 seconds (every 5 ticks)
+                    ticks_since_ping += 1;
+                    if ticks_since_ping >= 5 {
+                        ticks_since_ping = 0;
+                        if peer.is_connected() {
+                            let now_nanos = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_nanos();
+                            let ping_hash = {
+                                let mut hasher = sha2::Sha256::new();
+                                hasher.update(now_nanos.to_le_bytes());
+                                let result = hasher.finalize();
+                                stellar_xdr::curr::Uint256(result.into())
+                            };
+                            let ping_msg = StellarMessage::GetScpQuorumset(ping_hash);
+                            if let Err(e) = peer.send(ping_msg).await {
+                                debug!("Failed to send ping to {}: {}", peer_id, e);
+                            } else {
+                                last_write = Instant::now();
+                            }
+                        }
+
+                        // Periodic stats (every 60s, checked on ping interval)
+                        if last_stats_log.elapsed() >= Duration::from_secs(60) {
+                            info!("Peer {} stats: total_msgs={}, scp_msgs={}", peer_id, total_messages, scp_messages);
+                            last_stats_log = Instant::now();
+                        }
                     }
                 }
-            };
-
-            // Update last_read timestamp on every received message
-            last_read = Instant::now();
-            total_messages += 1;
-
-            // Periodic per-peer stats (every 60s)
-            if last_stats_log.elapsed() >= Duration::from_secs(60) {
-                info!(
-                    "Peer {} stats: total_msgs={}, scp_msgs={}",
-                    peer_id,
-                    total_messages,
-                    scp_messages,
-                );
-                last_stats_log = Instant::now();
-            }
-
-            // Process message
-            let msg_type = helpers::message_type_name(&message);
-            trace!("Processing {} from {}", msg_type, peer_id);
-
-            // Log ERROR messages
-            if let stellar_xdr::curr::StellarMessage::ErrorMsg(ref err) = message {
-                warn!(
-                    "Peer {} sent ERROR: code={:?}, msg={}",
-                    peer_id,
-                    err.code,
-                    err.msg.to_string()
-                );
-            }
-
-            // Log and handle flow control messages
-            match &message {
-                stellar_xdr::curr::StellarMessage::SendMore(sm) => {
-                    debug!(
-                        "Peer {} sent SEND_MORE: num_messages={}",
-                        peer_id, sm.num_messages
-                    );
-                }
-                stellar_xdr::curr::StellarMessage::SendMoreExtended(sme) => {
-                    debug!(
-                        "Peer {} sent SEND_MORE_EXTENDED: num_messages={}, num_bytes={}",
-                        peer_id, sme.num_messages, sme.num_bytes
-                    );
-                }
-                _ => {}
-            }
-
-            if helpers::is_handshake_message(&message) {
-                debug!(
-                    "Ignoring handshake message from authenticated peer {}",
-                    peer_id
-                );
-                continue;
-            }
-
-            // Watcher filter: drop non-essential flood messages for non-validator nodes.
-            // This eliminates ~90% of mainnet traffic (TX, FloodAdvert, FloodDemand, Survey)
-            // before it enters the broadcast channel, preventing SCP message loss due to
-            // channel overflow.
-            if !is_validator && helpers::is_watcher_droppable(&message) {
-                trace!("Watcher: dropping {} from {}", msg_type, peer_id);
-                continue;
-            }
-
-            // SCP messages are consensus-critical and must never be rate-limited.
-            // Only apply the rate limiter to non-SCP flood traffic (transactions,
-            // flood adverts, etc.).
-            if !matches!(message, StellarMessage::ScpMessage(_)) && !flood_gate.allow_message() {
-                debug!("Dropping message due to rate limit");
-                continue;
-            }
-
-            let message_size = msg_body_size(&message);
-            if helpers::is_flood_message(&message) {
-                let hash = compute_message_hash(&message);
-                let unique = flood_gate.record_seen(hash, Some(peer_id.clone()));
-                if let Ok(peer_lock) = peer.try_lock() {
-                    peer_lock.record_flood_stats(unique, message_size);
-                }
-                if !unique {
-                    continue;
-                }
-            } else if is_fetch_message(&message) {
-                if let Ok(peer_lock) = peer.try_lock() {
-                    peer_lock.record_fetch_stats(true, message_size);
-                }
-                // Log fetch messages for debugging tx_set issues
-                match &message {
-                    StellarMessage::TxSet(ts) => {
-                        debug!(
-                            "OVERLAY: Received TxSet from {} hash={} prev_ledger={}",
-                            peer_id,
-                            hex::encode(sha2::Sha256::digest(
-                                stellar_xdr::curr::WriteXdr::to_xdr(ts, stellar_xdr::curr::Limits::none()).unwrap_or_default()
-                            )),
-                            hex::encode(ts.previous_ledger_hash.0)
-                        );
-                    }
-                    StellarMessage::GeneralizedTxSet(ts) => {
-                        let hash = henyey_common::Hash256::hash_xdr(ts)
-                            .unwrap_or(henyey_common::Hash256::ZERO);
-                        debug!(
-                            "OVERLAY: Received GeneralizedTxSet from {} hash={}",
-                            peer_id,
-                            hash
-                        );
-                    }
-                    StellarMessage::ScpQuorumset(qs) => {
-                        let hash = henyey_common::Hash256::hash_xdr(qs)
-                            .unwrap_or(henyey_common::Hash256::ZERO);
-                        debug!(
-                            "OVERLAY: Received ScpQuorumset from {} hash={}",
-                            peer_id,
-                            hash
-                        );
-                    }
-                    StellarMessage::DontHave(dh) => {
-                        debug!(
-                            "OVERLAY: Received DontHave from {} type={:?} hash={}",
-                            peer_id,
-                            dh.type_,
-                            hex::encode(dh.req_hash.0)
-                        );
-                    }
-                    StellarMessage::GetTxSet(hash) => {
-                        debug!(
-                            "OVERLAY: Received GetTxSet from {} hash={}",
-                            peer_id,
-                            hex::encode(hash.0)
-                        );
-                    }
-                    _ => {}
-                }
-            }
-
-            // Forward to subscribers
-            let overlay_msg = OverlayMessage {
-                from_peer: peer_id.clone(),
-                message,
-                received_at: std::time::Instant::now(),
-            };
-
-            // Route messages to the appropriate channel(s).
-            // SCP and fetch-response messages go ONLY to their dedicated mpsc
-            // channels (never dropped). All other messages go to the broadcast
-            // channel (may lag under load, but only carries non-critical traffic
-            // like TX floods).
-            let is_dedicated = matches!(
-                overlay_msg.message,
-                StellarMessage::ScpMessage(_)
-                    | StellarMessage::GeneralizedTxSet(_)
-                    | StellarMessage::TxSet(_)
-                    | StellarMessage::DontHave(_)
-                    | StellarMessage::ScpQuorumset(_)
-            );
-
-            if matches!(overlay_msg.message, StellarMessage::ScpMessage(_)) {
-                scp_messages += 1;
-                if let Err(e) = scp_message_tx.send(overlay_msg.clone()) {
-                    error!("SCP channel send FAILED for peer {} (receiver dropped?): {}", peer_id, e);
-                }
-            }
-
-            if matches!(
-                overlay_msg.message,
-                StellarMessage::GeneralizedTxSet(_)
-                    | StellarMessage::TxSet(_)
-                    | StellarMessage::DontHave(_)
-                    | StellarMessage::ScpQuorumset(_)
-            ) {
-                if let Err(e) = fetch_response_tx.send(overlay_msg.clone()) {
-                    error!("Fetch response channel send FAILED for peer {} (receiver dropped?): {}", peer_id, e);
-                }
-            }
-
-            // Send catchup-critical messages (SCP + TxSet) to any extra subscribers.
-            // These are used by the catchup message cacher to bridge the gap between
-            // catchup checkpoint and live consensus. Using mpsc channels ensures
-            // these messages are never lost, unlike the broadcast channel.
-            if matches!(
-                overlay_msg.message,
-                StellarMessage::ScpMessage(_)
-                    | StellarMessage::GeneralizedTxSet(_)
-                    | StellarMessage::TxSet(_)
-                    | StellarMessage::ScpQuorumset(_)
-            ) {
-                let subs = extra_subscribers.read();
-                if !subs.is_empty() {
-                    for sub in subs.iter() {
-                        let _ = sub.send(overlay_msg.clone());
-                    }
-                }
-            }
-
-            // Only send non-dedicated messages to the broadcast channel.
-            // SCP and fetch-response messages are already handled above via
-            // dedicated channels and would be immediately skipped by the
-            // broadcast receiver anyway — sending them wastes buffer capacity.
-            if !is_dedicated {
-                let _ = message_tx.send(overlay_msg);
-            }
-
-            // Flow control: send SendMoreExtended after receiving a batch of messages
-            messages_since_send_more += 1;
-            if messages_since_send_more >= SEND_MORE_BATCH_SIZE {
-                let mut peer_lock = peer.lock().await;
-                if peer_lock.is_connected() {
-                    // Send batch capacity matching stellar-core FLOW_CONTROL_SEND_MORE_BATCH_SIZE
-                    if let Err(e) = peer_lock.send_more_extended(SEND_MORE_BATCH_SIZE, SEND_MORE_BYTE_BATCH).await {
-                        debug!("Failed to send flow control to {}: {}", peer_id, e);
-                    } else {
-                        trace!(
-                            "Sent batch SendMoreExtended to {}",
-                            peer_id
-                        );
-                        last_write = Instant::now();
-                    }
-                }
-                messages_since_send_more = 0;
-                last_send_more = std::time::Instant::now();
             }
         }
 
-        // Close peer
-        let mut peer_lock = peer.lock().await;
-        peer_lock.close().await;
-        info!("Peer {} read loop exited and disconnected", peer_id);
+        // Close peer (owned, no mutex needed)
+        peer.close().await;
+        info!("Peer {} loop exited and disconnected", peer_id);
+    }
+
+    /// Send queued outbound messages that have flow control capacity.
+    ///
+    /// Retrieves the next batch from FlowControl's priority queues,
+    /// sends each message, then cleans up sent entries. Returns true
+    /// if any messages were sent.
+    async fn send_flow_controlled_batch(
+        peer: &mut Peer,
+        flow_control: &FlowControl,
+    ) -> Result<bool> {
+        use crate::flow_control::MessagePriority;
+
+        let batch = flow_control.get_next_batch_to_send();
+        if batch.is_empty() {
+            return Ok(false);
+        }
+
+        // Group sent messages by priority for process_sent_messages
+        let mut sent_by_priority: Vec<Vec<StellarMessage>> =
+            vec![Vec::new(); MessagePriority::COUNT];
+
+        for queued in &batch {
+            if let Err(e) = peer.send(queued.message.clone()).await {
+                // Send failed — process what we've sent so far, then propagate error
+                flow_control.process_sent_messages(&sent_by_priority);
+                return Err(e);
+            }
+            if let Some(priority) = MessagePriority::from_message(&queued.message) {
+                sent_by_priority[priority as usize].push(queued.message.clone());
+            }
+        }
+
+        flow_control.process_sent_messages(&sent_by_priority);
+        Ok(true)
     }
 
     /// Connect to a specific peer.
@@ -967,54 +1045,55 @@ impl OverlayManager {
 
     /// Broadcast a message to all connected peers.
     ///
-    /// Sends to all peers concurrently using `join_all` to avoid blocking the
-    /// caller for O(N) sequential lock acquisitions + TCP writes. Each per-peer
-    /// send is capped at 10 seconds (the connection-level send timeout).
+    /// Non-blocking: sends via each peer's outbound channel. The peer tasks
+    /// handle the actual TCP writes asynchronously.
     pub async fn broadcast(&self, message: StellarMessage) -> Result<usize> {
         if !self.running.load(Ordering::Relaxed) {
             return Err(OverlayError::NotStarted);
         }
 
         let msg_type = helpers::message_type_name(&message);
-        debug!("Broadcasting {} to {} peers", msg_type, self.peers.len());
+        let is_flood = helpers::is_flood_message(&message);
 
-        // Record in flood gate if this is a flood message
-        if helpers::is_flood_message(&message) {
+        // Record in flood gate and get filtered peer list
+        let forward_peers: Option<Vec<PeerId>> = if is_flood {
             let hash = compute_message_hash(&message);
             self.flood_gate.record_seen(hash, None);
-        }
+            // Only forward to peers that haven't already sent us this message
+            let all_peers: Vec<PeerId> = self.peers.iter().map(|e| e.key().clone()).collect();
+            Some(self.flood_gate.get_forward_peers(&hash, &all_peers))
+        } else {
+            None // non-flood: send to all
+        };
 
-        // Collect peers to send to
-        let peers: Vec<_> = self
-            .peers
-            .iter()
-            .map(|e| (e.key().clone(), Arc::clone(e.value())))
-            .collect();
+        debug!("Broadcasting {} to {} peers", msg_type, self.peers.len());
 
-        // Send to all peers concurrently
-        let futures: Vec<_> = peers
-            .into_iter()
-            .map(|(peer_id, peer)| {
-                let msg = message.clone();
-                async move {
-                    let mut peer_lock = peer.lock().await;
-                    if peer_lock.is_ready() {
-                        match peer_lock.send(msg).await {
-                            Ok(()) => true,
-                            Err(e) => {
-                                debug!("Failed to send to {}: {}", peer_id, e);
-                                false
-                            }
-                        }
-                    } else {
-                        false
-                    }
+        let mut sent = 0usize;
+        for entry in self.peers.iter() {
+            let peer_id = entry.key();
+            // For flood messages, skip peers excluded by FloodGate
+            if let Some(ref forward) = forward_peers {
+                if !forward.contains(peer_id) {
+                    trace!("Skipping flood to {} (already has message)", peer_id);
+                    continue;
                 }
-            })
-            .collect();
+            }
 
-        let results = futures::future::join_all(futures).await;
-        let sent = results.into_iter().filter(|ok| *ok).count();
+            let outbound_msg = if is_flood {
+                OutboundMessage::Flood(message.clone())
+            } else {
+                OutboundMessage::Send(message.clone())
+            };
+            match entry.value().outbound_tx.try_send(outbound_msg) {
+                Ok(()) => sent += 1,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    debug!("Outbound channel full for {}, dropping broadcast", peer_id);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    debug!("Outbound channel closed for {}", peer_id);
+                }
+            }
+        }
 
         debug!("Broadcast {} to {} peers", msg_type, sent);
         Ok(sent)
@@ -1025,23 +1104,16 @@ impl OverlayManager {
         let Some(entry) = self.peers.get(peer_id) else {
             return false;
         };
-        let peer = Arc::clone(entry.value());
-        drop(entry);
-        let mut peer_lock = peer.lock().await;
-        peer_lock.close().await;
+        let _ = entry.value().outbound_tx.send(OutboundMessage::Shutdown).await;
         true
     }
 
     /// Ban a peer by node ID and disconnect if connected.
     pub async fn ban_peer(&self, peer_id: PeerId) {
         self.banned_peers.write().insert(peer_id.clone());
-        let Some(entry) = self.peers.get(&peer_id) else {
-            return;
-        };
-        let peer = Arc::clone(entry.value());
-        drop(entry);
-        let mut peer_lock = peer.lock().await;
-        peer_lock.close().await;
+        if let Some(entry) = self.peers.get(&peer_id) {
+            let _ = entry.value().outbound_tx.send(OutboundMessage::Shutdown).await;
+        }
     }
 
     /// Remove a peer from the ban list.
@@ -1056,13 +1128,13 @@ impl OverlayManager {
 
     /// Send a message to a specific peer.
     pub async fn send_to(&self, peer_id: &PeerId, message: StellarMessage) -> Result<()> {
-        let peer = self
+        let entry = self
             .peers
             .get(peer_id)
             .ok_or_else(|| OverlayError::PeerNotFound(peer_id.to_string()))?;
 
-        let mut peer_lock = peer.value().lock().await;
-        peer_lock.send(message).await
+        entry.value().outbound_tx.send(OutboundMessage::Send(message)).await
+            .map_err(|_| OverlayError::ChannelSend)
     }
 
     /// Get the number of connected peers.
@@ -1080,16 +1152,10 @@ impl OverlayManager {
             .collect()
     }
 
-    fn count_outbound_peers(peers: &DashMap<PeerId, Arc<TokioMutex<Peer>>>) -> usize {
-        peers
+    fn count_outbound_peers(peer_info_cache: &DashMap<PeerId, PeerInfo>) -> usize {
+        peer_info_cache
             .iter()
-            .filter(|entry| {
-                entry
-                    .value()
-                    .try_lock()
-                    .map(|p| p.is_connected() && p.direction().we_called_remote())
-                    .unwrap_or(true)
-            })
+            .filter(|entry| entry.value().direction.we_called_remote())
             .count()
     }
 
@@ -1119,6 +1185,62 @@ impl OverlayManager {
                 None => false,
             }
         })
+    }
+
+    /// Evict the youngest non-preferred outbound peer to make room for a
+    /// preferred peer connection. Returns true if a peer was evicted.
+    ///
+    /// Matches stellar-core's `OverlayManagerImpl::maybeAddInboundConnection`
+    /// eviction logic for preferred peers.
+    fn maybe_evict_for_preferred(
+        peers: &DashMap<PeerId, PeerHandle>,
+        peer_info_cache: &DashMap<PeerId, PeerInfo>,
+        preferred_addrs: &[PeerAddress],
+    ) -> bool {
+        // Find the youngest (most recently connected) non-preferred outbound peer.
+        let mut youngest: Option<(PeerId, Instant)> = None;
+        for entry in peer_info_cache.iter() {
+            let info = entry.value();
+            if !info.direction.we_called_remote() {
+                continue;
+            }
+            // Check if this peer is preferred (by original address or resolved IP)
+            let is_preferred = preferred_addrs.iter().any(|pref| {
+                if let Some(ref orig) = info.original_address {
+                    if orig.host == pref.host && orig.port == pref.port {
+                        return true;
+                    }
+                }
+                if info.address.port() != pref.port {
+                    return false;
+                }
+                pref.host
+                    .parse::<IpAddr>()
+                    .map(|ip| info.address.ip() == ip)
+                    .unwrap_or(false)
+            });
+            if is_preferred {
+                continue;
+            }
+            // Track the youngest (most recent connected_at)
+            match youngest {
+                None => youngest = Some((entry.key().clone(), info.connected_at)),
+                Some((_, ref youngest_time)) if info.connected_at > *youngest_time => {
+                    youngest = Some((entry.key().clone(), info.connected_at));
+                }
+                _ => {}
+            }
+        }
+
+        if let Some((peer_id, _)) = youngest {
+            info!("Evicting non-preferred peer {} to make room for preferred peer", peer_id);
+            if let Some(entry) = peers.get(&peer_id) {
+                let _ = entry.value().outbound_tx.try_send(OutboundMessage::Shutdown);
+            }
+            true
+        } else {
+            false
+        }
     }
 
     async fn connect_outbound_inner(
@@ -1155,8 +1277,16 @@ impl OverlayManager {
         info!("Connected to peer: {} at {}", peer_id, addr);
 
         let peer_info = peer.info().clone();
-        let peer = Arc::new(TokioMutex::new(peer));
-        shared.peers.insert(peer_id.clone(), Arc::clone(&peer));
+        let stats = peer.stats();
+        let (outbound_tx, outbound_rx) = mpsc::channel(256);
+        let flow_control = Arc::new(FlowControl::new(FlowControlConfig::default()));
+        flow_control.set_peer_id(peer_id.clone());
+        let peer_handle = PeerHandle {
+            outbound_tx,
+            stats,
+            flow_control: Arc::clone(&flow_control),
+        };
+        shared.peers.insert(peer_id.clone(), peer_handle);
         shared.peer_info_cache.insert(peer_id.clone(), peer_info);
         shared.added_authenticated_peers.fetch_add(1, Ordering::Relaxed);
         if let Some(tx) = shared.peer_event_tx.clone() {
@@ -1174,7 +1304,7 @@ impl OverlayManager {
         let shared_clone = shared.clone();
         let pool_clone = Arc::clone(&pool);
         let handle = tokio::spawn(async move {
-            Self::run_peer_loop(peer_id_clone.clone(), peer, shared_clone.clone()).await;
+            Self::run_peer_loop(peer_id_clone.clone(), peer, outbound_rx, flow_control, shared_clone.clone()).await;
             shared_clone.peers.remove(&peer_id_clone);
             shared_clone.peer_info_cache.remove(&peer_id_clone);
             shared_clone.dropped_authenticated_peers.fetch_add(1, Ordering::Relaxed);
@@ -1188,6 +1318,7 @@ impl OverlayManager {
 
     fn start_peer_advertiser(&mut self) {
         let peers = Arc::clone(&self.peers);
+        let peer_info_cache = Arc::clone(&self.peer_info_cache);
         let advertised_outbound_peers = Arc::clone(&self.advertised_outbound_peers);
         let advertised_inbound_peers = Arc::clone(&self.advertised_inbound_peers);
         let running = Arc::clone(&self.running);
@@ -1220,16 +1351,14 @@ impl OverlayManager {
                     None => continue,
                 };
 
-                for entry in peers.iter() {
-                    if let Ok(mut peer) = entry.value().try_lock() {
-                        // Only send PEERS to inbound peers (peers that connected to us).
-                        // stellar-core drops connections from initiators that send PEERS (Peer.cpp:1225-1230).
-                        if peer.is_ready()
-                            && peer.direction() == ConnectionDirection::Inbound
-                        {
-                            if let Err(e) = peer.send(message.clone()).await {
-                                debug!("Failed to send peers to {}: {}", entry.key(), e);
-                            }
+                // Only send PEERS to inbound peers (peers that connected to us).
+                // stellar-core drops connections from initiators that send PEERS (Peer.cpp:1225-1230).
+                for entry in peer_info_cache.iter() {
+                    if entry.value().direction == ConnectionDirection::Inbound {
+                        if let Some(peer_handle) = peers.get(entry.key()) {
+                            let _ = peer_handle.outbound_tx.try_send(
+                                OutboundMessage::Send(message.clone()),
+                            );
                         }
                     }
                 }
@@ -1330,25 +1459,18 @@ impl OverlayManager {
     }
 
     /// Get snapshots for all connected peers.
-    /// Uses the peer info cache for info, tries to get stats if lock is available.
-    /// Returns all peers even if stats lock is unavailable (uses default stats).
+    /// Uses the peer info cache for info and PeerHandle for lock-free stats access.
     pub fn peer_snapshots(&self) -> Vec<PeerSnapshot> {
         self.peer_info_cache
             .iter()
             .map(|entry| {
                 let peer_id = entry.key();
                 let info = entry.value().clone();
-                // Try to get stats from the locked peer, default if lock unavailable
-                let stats = if let Some(peer_entry) = self.peers.get(peer_id) {
-                    peer_entry
-                        .value()
-                        .try_lock()
-                        .ok()
-                        .map(|p| p.stats().snapshot())
-                        .unwrap_or_default()
-                } else {
-                    PeerStatsSnapshot::default()
-                };
+                let stats = self
+                    .peers
+                    .get(peer_id)
+                    .map(|h| h.stats.snapshot())
+                    .unwrap_or_default();
                 PeerSnapshot { info, stats }
             })
             .collect()
@@ -1367,20 +1489,19 @@ impl OverlayManager {
     ///
     /// Can only be called once (takes ownership of the receiver). Returns `None`
     /// if already called.
-    pub async fn subscribe_scp(&self) -> Option<mpsc::UnboundedReceiver<OverlayMessage>> {
+    pub async fn subscribe_scp(&self) -> Option<mpsc::Receiver<OverlayMessage>> {
         self.scp_message_rx.lock().await.take()
     }
 
     /// Subscribe to the dedicated fetch response message channel.
     ///
     /// Routes GeneralizedTxSet, TxSet, DontHave, and ScpQuorumset messages
-    /// through a dedicated mpsc channel that never drops messages, even when
-    /// the broadcast channel overflows during high traffic. This prevents
-    /// the node from losing tx_set responses needed to close ledgers.
+    /// through a bounded channel. Buffer is generous (4096) to handle
+    /// realistic traffic while preventing unbounded memory growth.
     ///
     /// Can only be called once (takes ownership of the receiver). Returns `None`
     /// if already called.
-    pub async fn subscribe_fetch_responses(&self) -> Option<mpsc::UnboundedReceiver<OverlayMessage>> {
+    pub async fn subscribe_fetch_responses(&self) -> Option<mpsc::Receiver<OverlayMessage>> {
         self.fetch_response_rx.lock().await.take()
     }
 
@@ -1434,26 +1555,19 @@ impl OverlayManager {
             return;
         }
 
-        // Collect peers first to avoid holding DashMap iterator across await.
-        let peers: Vec<(PeerId, Arc<TokioMutex<Peer>>)> = self
-            .peers
-            .iter()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
-            .collect();
+        // Send SEND_MORE_EXTENDED with 0 additional messages but
+        // `increase` additional bytes, matching upstream behavior.
+        let send_more = StellarMessage::SendMoreExtended(stellar_xdr::curr::SendMoreExtended {
+            num_messages: 0,
+            num_bytes: increase,
+        });
 
-        for (peer_id, peer) in peers {
-            let mut peer_lock = peer.lock().await;
-            if peer_lock.is_connected() {
-                // Send SEND_MORE_EXTENDED with 0 additional messages but
-                // `increase` additional bytes, matching upstream behavior.
-                if let Err(e) = peer_lock.send_more_extended(0, increase).await {
-                    debug!(
-                        %peer_id,
-                        increase,
-                        "Failed to send max tx size increase: {}", e
-                    );
-                }
-            }
+        for entry in self.peers.iter() {
+            // Update each peer's FlowControl byte capacity
+            entry.value().flow_control.handle_tx_size_increase(increase);
+            let _ = entry.value().outbound_tx.try_send(
+                OutboundMessage::Send(send_more.clone()),
+            );
         }
 
         debug!(
@@ -1579,14 +1693,13 @@ impl OverlayManager {
         // Check if we're already connected to this address
         // (We check by address, not by peer ID since we don't know it yet)
         let target_addr = addr.to_socket_addr();
-        for entry in self.peers.iter() {
-            if let Ok(peer) = entry.value().try_lock() {
-                if peer.remote_addr().to_string() == target_addr {
-                    self.outbound_pool.release();
-                    debug!("Already connected to {}", addr);
-                    return Ok(false);
-                }
-            }
+        let already_connected = self.peer_info_cache.iter().any(|entry| {
+            entry.value().address.to_string() == target_addr
+        });
+        if already_connected {
+            self.outbound_pool.release();
+            debug!("Already connected to {}", addr);
+            return Ok(false);
         }
 
         // Spawn connection task
@@ -1612,14 +1725,22 @@ impl OverlayManager {
                     }
 
                     let peer_info = peer.info().clone();
-                    let peer = Arc::new(TokioMutex::new(peer));
-                    shared.peers.insert(peer_id.clone(), Arc::clone(&peer));
+                    let stats = peer.stats();
+                    let (outbound_tx, outbound_rx) = mpsc::channel(256);
+                    let flow_control = Arc::new(FlowControl::new(FlowControlConfig::default()));
+                    flow_control.set_peer_id(peer_id.clone());
+                    let peer_handle = PeerHandle {
+                        outbound_tx,
+                        stats,
+                        flow_control: Arc::clone(&flow_control),
+                    };
+                    shared.peers.insert(peer_id.clone(), peer_handle);
                     shared.peer_info_cache.insert(peer_id.clone(), peer_info);
 
                     // NOTE: Do NOT send PEERS to outbound peers — see Peer.cpp:1225-1230.
 
-                    // Run peer loop
-                    Self::run_peer_loop(peer_id.clone(), peer, shared.clone())
+                    // Run peer loop (peer is moved, not locked)
+                    Self::run_peer_loop(peer_id.clone(), peer, outbound_rx, flow_control, shared.clone())
                         .await;
 
                     // Cleanup
@@ -1696,11 +1817,10 @@ impl OverlayManager {
             let _ = tx.send(());
         }
 
-        // Close all peers
-        let peers: Vec<_> = self.peers.iter().map(|e| Arc::clone(e.value())).collect();
-        for peer in peers {
-            let mut peer_lock = peer.lock().await;
-            peer_lock.close().await;
+        // Send shutdown to all peer tasks via their channels
+        let senders: Vec<_> = self.peers.iter().map(|e| e.value().outbound_tx.clone()).collect();
+        for tx in senders {
+            let _ = tx.send(OutboundMessage::Shutdown).await;
         }
         self.peers.clear();
 

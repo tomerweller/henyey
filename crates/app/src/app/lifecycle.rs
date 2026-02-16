@@ -82,12 +82,12 @@ impl App {
             Some(rx) => rx,
             None => {
                 // Create a dummy receiver that never receives
-                let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<OverlayMessage>();
+                let (_tx, rx) = tokio::sync::mpsc::channel::<OverlayMessage>(1);
                 rx
             }
         };
 
-        // Get dedicated fetch response receiver (never drops messages)
+        // Get dedicated fetch response receiver
         let fetch_response_rx = {
             match self.overlay().await {
                 Some(o) => o.subscribe_fetch_responses().await,
@@ -99,7 +99,7 @@ impl App {
             Some(rx) => rx,
             None => {
                 // Create a dummy receiver that never receives
-                let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<OverlayMessage>();
+                let (_tx, rx) = tokio::sync::mpsc::channel::<OverlayMessage>(1);
                 rx
             }
         };

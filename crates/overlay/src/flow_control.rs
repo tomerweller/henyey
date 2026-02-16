@@ -53,9 +53,9 @@ impl Default for FlowControlConfig {
         Self {
             // Match stellar-core defaults from Config.cpp
             peer_flood_reading_capacity: 200,
-            peer_reading_capacity: 400,
+            peer_reading_capacity: 201,
             flow_control_send_more_batch_size: 40,
-            outbound_tx_queue_byte_limit: 100 * 1024 * 1024, // 100 MB
+            outbound_tx_queue_byte_limit: 3 * 1024 * 1024, // 3 MB (match stellar-core)
             max_tx_set_size_ops: 10000,
             flow_control_bytes_batch_size: 300 * 1024, // 300 KB
         }
@@ -896,7 +896,7 @@ mod tests {
         let stats = fc.get_stats();
 
         assert_eq!(stats.local_flood_capacity, 200);
-        assert_eq!(stats.local_total_capacity, Some(400));
+        assert_eq!(stats.local_total_capacity, Some(201));
         assert_eq!(stats.peer_message_capacity, 0);
     }
 

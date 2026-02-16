@@ -7,8 +7,8 @@
 //!
 //! # Functionality
 //!
-//! - **Duplicate Detection**: Messages are identified by their SHA-256 hash.
-//!   If we've seen a message before, it's not flooded again.
+//! - **Duplicate Detection**: Messages are identified by their BLAKE2b-256 hash
+//!   (matching stellar-core's `xdrBlake2`). If we've seen a message before, it's not flooded again.
 //!
 //! - **Peer Tracking**: Records which peers have sent each message, so we
 //!   don't forward messages back to peers that already have them.
@@ -317,20 +317,20 @@ impl FloodGateStats {
     }
 }
 
-/// Computes the SHA-256 hash of a message for flood tracking.
+/// Computes the BLAKE2b-256 hash of a message for flood tracking.
 ///
-/// This is the canonical hash used to identify messages across the network.
+/// This matches stellar-core's `xdrBlake2()` used in `Floodgate::broadcast()`.
 pub fn compute_message_hash(message: &StellarMessage) -> Hash256 {
     use stellar_xdr::curr::{Limits, WriteXdr};
     let bytes = message.to_xdr(Limits::none()).unwrap_or_default();
-    Hash256::hash(&bytes)
+    henyey_crypto::blake2(&bytes)
 }
 
 /// A message queued for flooding, with tracking metadata.
 ///
 /// Used internally to track messages that need to be forwarded to peers.
 pub struct FloodRecord {
-    /// SHA-256 hash of the message.
+    /// BLAKE2b-256 hash of the message.
     pub hash: Hash256,
     /// The message to be flooded.
     pub message: StellarMessage,
