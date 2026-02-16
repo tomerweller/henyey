@@ -132,6 +132,9 @@ pub fn execute_path_payment_strict_receive(
                 None,
             ));
         }
+        if convert_res == ConvertResult::CrossedTooMany {
+            return Ok(OperationResult::OpExceededWorkLimit);
+        }
         if convert_res != ConvertResult::Ok || amount_recv != max_amount_recv {
             return Ok(make_strict_receive_result(
                 PathPaymentStrictReceiveResultCode::TooFewOffers,
@@ -265,6 +268,9 @@ pub fn execute_path_payment_strict_send(
                 PathPaymentStrictSendResultCode::OfferCrossSelf,
                 None,
             ));
+        }
+        if convert_res == ConvertResult::CrossedTooMany {
+            return Ok(OperationResult::OpExceededWorkLimit);
         }
         if convert_res != ConvertResult::Ok || amount_send != max_amount_send {
             return Ok(make_strict_send_result(
@@ -2202,4 +2208,37 @@ mod tests {
             result.err()
         );
     }
+
+    /// Regression test: convert_with_offers must return CrossedTooMany when
+    /// max_offers_to_cross is 0 and there is still demand (fast-fail path).
+    #[test]
+    fn test_convert_with_offers_crossed_too_many_fast_fail() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source_id = create_test_account_id(0);
+
+        let mut amount_send = 0;
+        let mut amount_recv = 0;
+        let mut offer_trail = Vec::new();
+
+        let result = convert_with_offers(
+            &mut ConversionParams {
+                source: &source_id,
+                selling: &Asset::Native,
+                buying: &Asset::Native,
+                max_send: i64::MAX,
+                max_receive: 1_000_000,
+                round: RoundingType::Normal,
+                offer_trail: &mut offer_trail,
+                state: &mut state,
+                context: &context,
+            },
+            &mut amount_send,
+            &mut amount_recv,
+            0, // max_offers_to_cross = 0 → fast-fail
+        );
+
+        assert_eq!(result.unwrap(), ConvertResult::CrossedTooMany);
+    }
+
 }
