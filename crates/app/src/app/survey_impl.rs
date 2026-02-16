@@ -615,11 +615,10 @@ impl App {
 
         if let Some(overlay) = self.overlay().await {
             if let Err(e) = overlay
-                .send_to(
+                .try_send_to(
                     peer_id,
                     StellarMessage::TimeSlicedSurveyResponse(signed_response),
                 )
-                .await
             {
                 tracing::debug!(peer = %peer_id, error = %e, "Failed to send survey response");
             }
@@ -1143,7 +1142,7 @@ impl App {
 
         let mut ok = true;
         for peer in peers {
-            if let Err(e) = overlay.send_to(peer, message.clone()).await {
+            if let Err(e) = overlay.try_send_to(peer, message.clone()) {
                 tracing::debug!(peer = %peer, error = %e, "Failed to send survey message");
                 ok = false;
             }

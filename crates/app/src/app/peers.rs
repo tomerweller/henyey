@@ -214,21 +214,9 @@ impl App {
             return;
         };
 
-        let ping_futures: Vec<_> = to_ping
-            .into_iter()
-            .map(|(peer, hash)| {
-                let overlay = Arc::clone(&overlay);
-                async move {
-                    let msg = StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256(hash.0));
-                    let result = overlay.send_to(&peer, msg).await;
-                    (peer, hash, result.map_err(|_| ()))
-                }
-            })
-            .collect();
-
-        let results = futures::future::join_all(ping_futures).await;
-        for (peer, hash, result) in results {
-            if result.is_err() {
+        for (peer, hash) in to_ping {
+            let msg = StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256(hash.0));
+            if let Err(_) = overlay.try_send_to(&peer, msg) {
                 tracing::debug!(peer = %peer, "Failed to send ping");
                 let mut inflight = self.ping_inflight.write().await;
                 inflight.remove(&hash);

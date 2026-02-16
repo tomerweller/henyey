@@ -363,7 +363,7 @@ impl App {
         // Send our quorum set first if we have one configured
         if let Some(qs) = quorum_set {
             let msg = StellarMessage::ScpQuorumset(qs);
-            if let Err(e) = overlay.send_to(peer_id, msg).await {
+            if let Err(e) = overlay.try_send_to(peer_id, msg) {
                 tracing::debug!(peer = %peer_id, error = %e, "Failed to send quorum set");
             }
         }
@@ -371,9 +371,9 @@ impl App {
         // Send SCP envelopes for recent slots
         for envelope in envelopes {
             let msg = StellarMessage::ScpMessage(envelope);
-            if let Err(e) = overlay.send_to(peer_id, msg).await {
+            if let Err(e) = overlay.try_send_to(peer_id, msg) {
                 tracing::debug!(peer = %peer_id, error = %e, "Failed to send SCP envelope");
-                break; // Stop if we can't send
+                break; // Stop if we can't send (channel full)
             }
         }
 
@@ -392,10 +392,7 @@ impl App {
 
         let req = requested_hash.0;
         if let Some(qs) = self.herder.get_quorum_set_by_hash(&req) {
-            if let Err(e) = overlay
-                .send_to(peer_id, StellarMessage::ScpQuorumset(qs))
-                .await
-            {
+            if let Err(e) = overlay.try_send_to(peer_id, StellarMessage::ScpQuorumset(qs)) {
                 tracing::debug!(peer = %peer_id, error = %e, "Failed to send quorum set");
             }
         } else {
@@ -403,7 +400,7 @@ impl App {
                 type_: stellar_xdr::curr::MessageType::ScpQuorumset,
                 req_hash: requested_hash,
             });
-            if let Err(e) = overlay.send_to(peer_id, msg).await {
+            if let Err(e) = overlay.try_send_to(peer_id, msg) {
                 tracing::debug!(peer = %peer_id, error = %e, "Failed to send DontHave for quorum set");
             }
         }

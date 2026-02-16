@@ -91,8 +91,7 @@ impl App {
                 };
                 let advert = FloodAdvert { tx_hashes };
                 if let Err(e) = overlay
-                    .send_to(&peer_id, StellarMessage::FloodAdvert(advert))
-                    .await
+                    .try_send_to(&peer_id, StellarMessage::FloodAdvert(advert))
                 {
                     tracing::debug!(peer = %peer_id, error = %e, "Failed to send tx advert batch");
                 }
@@ -379,8 +378,7 @@ impl App {
             };
             let demand = FloodDemand { tx_hashes };
             if let Err(e) = overlay
-                .send_to(&peer_id, StellarMessage::FloodDemand(demand))
-                .await
+                .try_send_to(&peer_id, StellarMessage::FloodDemand(demand))
             {
                 tracing::debug!(peer = %peer_id, error = %e, "Failed to send flood demand");
             }
@@ -706,7 +704,7 @@ impl App {
                         type_: message_type,
                         req_hash: stellar_xdr::curr::Uint256(*hash),
                     });
-                    if let Err(e) = overlay.send_to(peer_id, msg).await {
+                    if let Err(e) = overlay.try_send_to(peer_id, msg) {
                         tracing::debug!(hash = hex::encode(hash), peer = %peer_id, error = %e, "Failed to send DontHave for TxSet");
                     }
                 }
@@ -731,7 +729,7 @@ impl App {
                 if gen_hash == hash256 {
                     let message = StellarMessage::GeneralizedTxSet(gen_tx_set);
                     if let Some(overlay) = self.overlay().await {
-                        if let Err(e) = overlay.send_to(peer_id, message).await {
+                        if let Err(e) = overlay.try_send_to(peer_id, message) {
                             tracing::warn!(hash = %hash256, peer = %peer_id, error = %e, "Failed to send GeneralizedTxSet");
                         } else {
                             tracing::debug!(hash = %hash256, peer = %peer_id, "Sent GeneralizedTxSet");
@@ -753,7 +751,7 @@ impl App {
         let message = StellarMessage::TxSet(xdr_tx_set);
 
         if let Some(overlay) = self.overlay().await {
-            if let Err(e) = overlay.send_to(peer_id, message).await {
+            if let Err(e) = overlay.try_send_to(peer_id, message) {
                 tracing::warn!(hash = hex::encode(hash), peer = %peer_id, error = %e, "Failed to send TxSet");
             } else {
                 tracing::debug!(hash = hex::encode(hash), peer = %peer_id, "Sent TxSet");
@@ -959,7 +957,7 @@ impl App {
         for (hash, peer_id) in requests {
             tracing::debug!(hash = %hash, peer = %peer_id, "Requesting tx set");
             let request = StellarMessage::GetTxSet(stellar_xdr::curr::Uint256(hash.0));
-            if let Err(e) = overlay.send_to(&peer_id, request).await {
+            if let Err(e) = overlay.try_send_to(&peer_id, request) {
                 tracing::warn!(hash = %hash, peer = %peer_id, error = %e, "Failed to request TxSet");
             }
         }

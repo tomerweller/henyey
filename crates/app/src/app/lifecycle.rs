@@ -792,7 +792,7 @@ impl App {
                         if let Some(overlay) = self.overlay().await {
                             let request =
                                 StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256(hash.0));
-                            if let Err(e) = overlay.send_to(&peer, request).await {
+                            if let Err(e) = overlay.try_send_to(&peer, request) {
                                 tracing::debug!(peer = %peer, error = %e, "Failed to request quorum set");
                             }
                         }
@@ -816,7 +816,7 @@ impl App {
                                         let request = StellarMessage::GetTxSet(
                                             stellar_xdr::curr::Uint256(tx_set_hash.0),
                                         );
-                                        if let Err(e) = overlay.send_to(&peer, request).await {
+                                        if let Err(e) = overlay.try_send_to(&peer, request) {
                                             tracing::debug!(
                                                 peer = %peer,
                                                 error = %e,
@@ -861,7 +861,7 @@ impl App {
                                 let request = StellarMessage::GetTxSet(
                                     stellar_xdr::curr::Uint256(tx_set_hash.0),
                                 );
-                                if let Err(e) = overlay.send_to(&peer, request).await {
+                                if let Err(e) = overlay.try_send_to(&peer, request) {
                                     tracing::debug!(
                                         peer = %peer,
                                         error = %e,
