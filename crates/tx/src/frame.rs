@@ -621,14 +621,11 @@ impl TransactionFrame {
             return false;
         }
 
-        // DoS guard: reject envelopes that exceed the maximum transaction size.
-        // This serves as a proxy for stellar-core's XDR depth check (500 levels),
-        // since excessively large envelopes are the practical attack vector.
-        // The limit matches MAX_CLASSIC_TX_SIZE_BYTES (100 KB) from flow control.
-        const MAX_TX_ENVELOPE_SIZE: u32 = 100 * 1024;
-        if self.tx_size_bytes() > MAX_TX_ENVELOPE_SIZE {
-            return false;
-        }
+        // Note: stellar-core does NOT enforce a transaction envelope size limit
+        // during execution. The 100KB MAX_CLASSIC_TX_SIZE_BYTES limit is applied
+        // at the overlay layer (Peer::recvTransaction), not here. Soroban
+        // transactions can be much larger (limited by network config
+        // txMaxSizeBytes, checked during Soroban-specific validation).
 
         true
     }
@@ -1172,12 +1169,15 @@ mod tests {
         assert!(matches!(precond, Preconditions::None));
     }
 
-    // --- P0-4: XDR size limit in is_valid_structure() ---
+    // --- Envelope size: no execution-level limit (stellar-core parity) ---
 
     #[test]
-    fn test_is_valid_structure_rejects_oversized_envelope() {
-        // Create a Soroban transaction with a large args vector to exceed 100KB.
-        // ScVal::Bytes can hold up to 256KB, so we use a single large blob.
+    fn test_is_valid_structure_accepts_large_soroban_envelope() {
+        // Stellar-core does NOT enforce a tx envelope size limit during execution.
+        // MAX_CLASSIC_TX_SIZE_BYTES (100KB) is an overlay-layer limit only.
+        // Soroban transactions can exceed 100KB (e.g. contract deployments).
+        // Regression: a 110KB Soroban TX was incorrectly rejected as TxMalformed
+        // at mainnet ledger 61259069.
         let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
         let large_bytes = vec![0xABu8; 110_000]; // 110KB payload
         let host_function = HostFunction::InvokeContract(InvokeContractArgs {
@@ -1219,8 +1219,8 @@ mod tests {
             frame.tx_size_bytes()
         );
         assert!(
-            !frame.is_valid_structure(),
-            "oversized envelope should fail structure check"
+            frame.is_valid_structure(),
+            "large Soroban envelope should pass structure check (no execution-level size limit)"
         );
     }
 
