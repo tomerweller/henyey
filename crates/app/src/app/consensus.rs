@@ -246,23 +246,46 @@ impl App {
                 // catchup immediately to skip past the gap instead of spinning in
                 // recovery forever.
                 if missing_slots.contains(&next_slot) {
-                    tracing::warn!(
-                        current_ledger,
-                        next_slot,
-                        latest_externalized,
-                        gap,
-                        "Next slot permanently missing — triggering catchup to skip gap"
-                    );
-                    // Clear stale syncing_ledgers entries that will never be closeable
-                    {
-                        let mut buffer = self.syncing_ledgers.write().await;
-                        buffer.retain(|seq, info| {
-                            *seq > current_ledger && info.tx_set.is_some()
-                        });
+                    // Check if the target checkpoint hasn't been published yet.
+                    // maybe_start_externalized_catchup targets latest_ext - 12;
+                    // if the checkpoint containing that target hasn't been published,
+                    // archive-based catchup would block on 404s.  Fall through to
+                    // the SCP state request so peers can provide the missing data.
+                    let catchup_target = latest_externalized
+                        .saturating_sub(TX_SET_REQUEST_WINDOW) as u32;
+                    let target_checkpoint =
+                        henyey_history::checkpoint::checkpoint_containing(catchup_target);
+                    if target_checkpoint as u64 > latest_externalized {
+                        tracing::info!(
+                            current_ledger,
+                            next_slot,
+                            catchup_target,
+                            target_checkpoint,
+                            latest_externalized,
+                            "Next slot missing but target checkpoint not yet published — \
+                             requesting SCP state from peers instead of archive catchup"
+                        );
+                        // Fall through to the SCP state request below instead of
+                        // triggering archive catchup that would fail.
+                    } else {
+                        tracing::warn!(
+                            current_ledger,
+                            next_slot,
+                            latest_externalized,
+                            gap,
+                            "Next slot permanently missing — triggering catchup to skip gap"
+                        );
+                        // Clear stale syncing_ledgers entries that will never be closeable
+                        {
+                            let mut buffer = self.syncing_ledgers.write().await;
+                            buffer.retain(|seq, info| {
+                                *seq > current_ledger && info.tx_set.is_some()
+                            });
+                        }
+                        self.maybe_start_externalized_catchup(latest_externalized)
+                            .await;
+                        return;
                     }
-                    self.maybe_start_externalized_catchup(latest_externalized)
-                        .await;
-                    return;
                 }
             } else {
                 // No gaps in externalized, but we can't apply - likely missing tx_sets

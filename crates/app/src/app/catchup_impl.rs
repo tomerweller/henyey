@@ -42,6 +42,31 @@ impl App {
 
         // Check if we're already at or past the target
         let current = self.get_current_ledger().await.unwrap_or(0);
+
+        // Safety: for Ledger targets, verify the archive has the required checkpoint.
+        // Replay from current+1 to target_ledger needs all checkpoint files covering
+        // that range.  If the checkpoint containing target_ledger hasn't been published
+        // (i.e., it's beyond the latest externalized slot), the download will 404.
+        if matches!(target, CatchupTarget::Ledger(_)) && current > 0 {
+            let target_cp = checkpoint_containing(target_ledger);
+            let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
+            if target_cp as u64 > latest_ext {
+                tracing::warn!(
+                    target_ledger,
+                    target_checkpoint = target_cp,
+                    latest_externalized = latest_ext,
+                    current_ledger = current,
+                    "Catchup target requires unpublished checkpoint — aborting"
+                );
+                return Ok(CatchupResult {
+                    ledger_seq: current,
+                    ledger_hash: Hash256::default(),
+                    buckets_applied: 0,
+                    ledgers_replayed: 0,
+                });
+            }
+        }
+
         if target_ledger <= current {
             tracing::info!(
                 current_ledger = current,
@@ -1638,26 +1663,28 @@ impl App {
             return;
         }
 
-        // When the first replay ledger is in an unpublished checkpoint,
-        // archive downloads would fail.  However, if we have the EXTERNALIZE
-        // for the next slot, we can close ledgers from cached SCP messages
-        // without archives.  Skip catchup in that case and let
-        // process_externalized_slots handle it.
-        //
-        // If we do NOT have the EXTERNALIZE (permanently missing slots),
-        // we must still attempt archive catchup — the download will fail
-        // with cooldown and eventually succeed once the checkpoint is published.
-        let first_replay = current_ledger as u64 + 1;
-        let replay_checkpoint = checkpoint_containing(first_replay as u32);
-        let have_next_externalize = self.herder.get_externalized(first_replay).is_some();
-        if replay_checkpoint > latest_externalized as u32 && have_next_externalize {
-            tracing::debug!(
-                first_replay,
-                replay_checkpoint,
+        // Skip catchup when any required checkpoint data hasn't been published yet.
+        // The archive organizes data into 64-ledger checkpoints.  A replay from
+        // current_ledger+1 to target needs all checkpoints covering that range.
+        // If the checkpoint containing the TARGET hasn't been published, the
+        // download will fail with 404s, blocking the event loop.  The stuck
+        // state / escalation logic will eventually use CatchupTarget::Current
+        // which queries the archive for what's actually available.
+        let target_checkpoint = checkpoint_containing(target);
+        if target_checkpoint > latest_externalized as u32 {
+            let first_replay = current_ledger as u64 + 1;
+            let have_next_externalize = self.herder.get_externalized(first_replay).is_some();
+            tracing::info!(
+                current_ledger,
+                target,
+                target_checkpoint,
                 latest_externalized,
-                "Skipping archive catchup: have EXTERNALIZE for next slot in unpublished checkpoint"
+                have_next_externalize,
+                "Skipping archive catchup: target checkpoint not yet published"
             );
             self.catchup_in_progress.store(false, Ordering::SeqCst);
+            // Set cooldown to avoid rapid re-evaluation.
+            *self.last_catchup_completed_at.write().await = Some(Instant::now());
             return;
         }
 
