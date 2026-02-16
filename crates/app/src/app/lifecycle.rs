@@ -319,6 +319,7 @@ impl App {
                 // routed exclusively to dedicated channels at the overlay layer.
                 // The skip guards below are kept as defensive fallbacks.
                 msg = message_rx.recv() => {
+                    self.set_phase(3); // 3 = broadcast
                     match msg {
                         Ok(overlay_msg) => {
                             // Skip SCP messages from broadcast channel — they are already
@@ -372,6 +373,7 @@ impl App {
 
                 // Broadcast outbound SCP envelopes
                 envelope = scp_rx.recv() => {
+                    self.set_phase(4); // 4 = scp_broadcast
                     if let Some(envelope) = envelope {
                         let slot = envelope.statement.slot_index;
                         let sample = {
@@ -454,21 +456,25 @@ impl App {
 
                 // Stats logging
                 _ = stats_interval.tick() => {
+                    self.set_phase(20); // 20 = stats
                     self.log_stats().await;
                 }
 
                 // Batched tx advert flush
                 _ = tx_advert_interval.tick() => {
+                    self.set_phase(21); // 21 = tx_advert_flush
                     self.flush_tx_adverts().await;
                 }
 
                 // Demand missing transactions from peers
                 _ = tx_demand_interval.tick() => {
+                    self.set_phase(22); // 22 = tx_demand
                     self.run_tx_demands().await;
                 }
 
                 // Survey scheduler
                 _ = survey_interval.tick() => {
+                    self.set_phase(23); // 23 = survey
                     if self.config.overlay.auto_survey {
                         self.advance_survey_scheduler().await;
                     }
@@ -476,31 +482,37 @@ impl App {
 
                 // Survey reporting request top-off
                 _ = survey_request_interval.tick() => {
+                    self.set_phase(24); // 24 = survey_request
                     self.top_off_survey_requests().await;
                 }
 
                 // Survey phase maintenance
                 _ = survey_phase_interval.tick() => {
+                    self.set_phase(25); // 25 = survey_phase
                     self.update_survey_phase().await;
                 }
 
                 // SCP nomination/ballot timeouts
                 _ = scp_timeout_interval.tick() => {
+                    self.set_phase(26); // 26 = scp_timeout
                     self.check_scp_timeouts().await;
                 }
 
                 // Ping peers for latency measurements
                 _ = ping_interval.tick() => {
+                    self.set_phase(27); // 27 = ping
                     self.send_peer_pings().await;
                 }
 
                 // Peer maintenance - reconnect if peer count drops too low
                 _ = peer_maintenance_interval.tick() => {
+                    self.set_phase(28); // 28 = peer_maintenance
                     self.maintain_peers().await;
                 }
 
                 // Refresh known peers from config + SQLite cache
                 _ = peer_refresh_interval.tick() => {
+                    self.set_phase(29); // 29 = peer_refresh
                     if let Some(overlay) = self.overlay().await {
                         let _ = self.refresh_known_peers(&overlay);
                     }
@@ -508,6 +520,7 @@ impl App {
 
                 // Herder cleanup - evict expired data
                 _ = herder_cleanup_interval.tick() => {
+                    self.set_phase(30); // 30 = herder_cleanup
                     self.herder.cleanup();
                 }
 

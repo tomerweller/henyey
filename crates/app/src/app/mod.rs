@@ -1974,7 +1974,10 @@ impl App {
                              3=broadcast, 4=scp_broadcast, 5=consensus_tick, \
                              6=pending_close, 10=process_externalized, \
                              11=externalized_catchup, 12=try_apply_buffered, \
-                             13=buffered_catchup, 14=catchup_running, 15=heartbeat"
+                             13=buffered_catchup, 14=catchup_running, 15=heartbeat, \
+                             20=stats, 21=tx_advert, 22=tx_demand, 23=survey, \
+                             24=survey_req, 25=survey_phase, 26=scp_timeout, \
+                             27=ping, 28=peer_maint, 29=peer_refresh, 30=herder_cleanup"
                         );
 
                         // Log thread states from /proc for debugging

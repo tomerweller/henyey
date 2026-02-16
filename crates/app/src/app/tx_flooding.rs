@@ -410,27 +410,40 @@ impl App {
             return;
         };
 
+        // Use non-blocking try_send_to to avoid stalling the event loop
+        // when the peer's outbound channel is full.  The peer will re-request
+        // any transactions it still needs.
+        let mut sent = 0u32;
+        let mut dropped = 0u32;
         for hash in demand.tx_hashes.0.iter() {
             let hash256 = Hash256::from(hash.clone());
             if let Some(tx) = self.herder.tx_queue().get(&hash256) {
-                if let Err(e) = overlay
-                    .send_to(peer_id, StellarMessage::Transaction(tx.envelope))
-                    .await
-                {
-                    tracing::debug!(peer = %peer_id, error = %e, "Failed to send demanded transaction");
+                match overlay.try_send_to(peer_id, StellarMessage::Transaction(tx.envelope)) {
+                    Ok(()) => sent += 1,
+                    Err(_) => {
+                        dropped += 1;
+                        break; // Channel full — stop sending to this peer
+                    }
                 }
             } else {
                 let dont_have = DontHave {
                     type_: MessageType::Transaction,
                     req_hash: stellar_xdr::curr::Uint256(hash.0),
                 };
-                if let Err(e) = overlay
-                    .send_to(peer_id, StellarMessage::DontHave(dont_have))
-                    .await
-                {
-                    tracing::debug!(peer = %peer_id, error = %e, "Failed to send DontHave for transaction");
+                if let Err(_) = overlay.try_send_to(peer_id, StellarMessage::DontHave(dont_have)) {
+                    dropped += 1;
+                    break;
                 }
             }
+        }
+        if dropped > 0 {
+            tracing::debug!(
+                peer = %peer_id,
+                sent,
+                dropped,
+                total = demand.tx_hashes.0.len(),
+                "Flood demand partially served (peer outbound channel full)"
+            );
         }
     }
 

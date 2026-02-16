@@ -1153,6 +1153,18 @@ impl OverlayManager {
             .map_err(|_| OverlayError::ChannelSend)
     }
 
+    /// Non-blocking send: drops the message if the peer's outbound channel is full.
+    /// Use this for flood responses where back-pressure should not stall the caller.
+    pub fn try_send_to(&self, peer_id: &PeerId, message: StellarMessage) -> Result<()> {
+        let entry = self
+            .peers
+            .get(peer_id)
+            .ok_or_else(|| OverlayError::PeerNotFound(peer_id.to_string()))?;
+
+        entry.value().outbound_tx.try_send(OutboundMessage::Send(message))
+            .map_err(|_| OverlayError::ChannelSend)
+    }
+
     /// Get the number of connected peers.
     /// Uses the peer info cache for lock-free access.
     pub fn peer_count(&self) -> usize {
