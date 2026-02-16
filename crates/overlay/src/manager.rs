@@ -126,7 +126,7 @@ struct SharedPeerState {
     flood_gate: Arc<FloodGate>,
     running: Arc<AtomicBool>,
     message_tx: broadcast::Sender<OverlayMessage>,
-    scp_message_tx: mpsc::Sender<OverlayMessage>,
+    scp_message_tx: mpsc::UnboundedSender<OverlayMessage>,
     fetch_response_tx: mpsc::Sender<OverlayMessage>,
     peer_handles: Arc<RwLock<Vec<JoinHandle<()>>>>,
     advertised_outbound_peers: Arc<RwLock<Vec<PeerAddress>>>,
@@ -208,12 +208,13 @@ pub struct OverlayManager {
     shutdown_tx: Option<broadcast::Sender<()>>,
     /// Cache of peer info for connected peers (lock-free access).
     peer_info_cache: Arc<DashMap<PeerId, PeerInfo>>,
-    /// Dedicated bounded channel for SCP messages.
-    /// Large buffer (8192) ensures SCP EXTERNALIZE messages are not lost
-    /// during realistic traffic bursts while preventing unbounded growth.
-    scp_message_tx: mpsc::Sender<OverlayMessage>,
+    /// Dedicated unbounded channel for SCP messages.
+    /// SCP messages are consensus-critical and must never be dropped.
+    /// Mainnet generates ~24 validators * multiple SCP rounds per slot,
+    /// which can overwhelm bounded channels during catchup.
+    scp_message_tx: mpsc::UnboundedSender<OverlayMessage>,
     /// Receiver end of the SCP channel. Taken once via `subscribe_scp()`.
-    scp_message_rx: Arc<TokioMutex<Option<mpsc::Receiver<OverlayMessage>>>>,
+    scp_message_rx: Arc<TokioMutex<Option<mpsc::UnboundedReceiver<OverlayMessage>>>>,
     /// Dedicated bounded channel for fetch response messages.
     /// Routes GeneralizedTxSet, TxSet, DontHave, and ScpQuorumset through
     /// a dedicated channel. Buffer (4096) is generous for fetch responses.
@@ -235,7 +236,7 @@ impl OverlayManager {
         // 4096 provides headroom for mainnet traffic bursts from multiple peers.
         let (message_tx, _) = broadcast::channel(4096);
         let (shutdown_tx, _) = broadcast::channel(1);
-        let (scp_message_tx, scp_message_rx) = mpsc::channel(8192);
+        let (scp_message_tx, scp_message_rx) = mpsc::unbounded_channel();
         let (fetch_response_tx, fetch_response_rx) = mpsc::channel(4096);
 
         Ok(Self {
@@ -865,7 +866,7 @@ impl OverlayManager {
 
                                 if matches!(overlay_msg.message, StellarMessage::ScpMessage(_)) {
                                     scp_messages += 1;
-                                    if let Err(e) = scp_message_tx.try_send(overlay_msg.clone()) {
+                                    if let Err(e) = scp_message_tx.send(overlay_msg.clone()) {
                                         error!("SCP channel send FAILED for peer {}: {}", peer_id, e);
                                     }
                                 }
@@ -1489,7 +1490,7 @@ impl OverlayManager {
     ///
     /// Can only be called once (takes ownership of the receiver). Returns `None`
     /// if already called.
-    pub async fn subscribe_scp(&self) -> Option<mpsc::Receiver<OverlayMessage>> {
+    pub async fn subscribe_scp(&self) -> Option<mpsc::UnboundedReceiver<OverlayMessage>> {
         self.scp_message_rx.lock().await.take()
     }
 

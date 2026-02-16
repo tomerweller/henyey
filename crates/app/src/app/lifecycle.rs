@@ -82,7 +82,7 @@ impl App {
             Some(rx) => rx,
             None => {
                 // Create a dummy receiver that never receives
-                let (_tx, rx) = tokio::sync::mpsc::channel::<OverlayMessage>(1);
+                let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<OverlayMessage>();
                 rx
             }
         };
@@ -187,6 +187,12 @@ impl App {
         // In-progress background ledger close. Polled in the select loop.
         let mut pending_close: Option<PendingLedgerClose> = None;
 
+        // Maximum messages to drain from SCP/fetch channels per tick.
+        // On mainnet with 24+ validators, SCP messages can arrive faster
+        // than they're processed.  An unbounded drain starves everything
+        // else in the tick (sync recovery, consensus trigger, tx_set requests).
+        const MAX_DRAIN_PER_TICK: usize = 200;
+
         let mut select_iteration: u64 = 0;
         loop {
             select_iteration += 1;
@@ -213,11 +219,18 @@ impl App {
                         // channels frequently enough, so EXTERNALIZEs and TxSet responses
                         // can sit unprocessed.  Draining here ensures we have the latest
                         // network state before deciding whether another close is ready.
-                        while let Ok(scp_msg) = scp_message_rx.try_recv() {
-                            self.handle_overlay_message(scp_msg).await;
+                        // Bounded to avoid starvation on high-traffic mainnet.
+                        for _ in 0..MAX_DRAIN_PER_TICK {
+                            match scp_message_rx.try_recv() {
+                                Ok(scp_msg) => self.handle_overlay_message(scp_msg).await,
+                                Err(_) => break,
+                            }
                         }
-                        while let Ok(fetch_msg) = fetch_response_rx.try_recv() {
-                            self.handle_overlay_message(fetch_msg).await;
+                        for _ in 0..MAX_DRAIN_PER_TICK {
+                            match fetch_response_rx.try_recv() {
+                                Ok(fetch_msg) => self.handle_overlay_message(fetch_msg).await,
+                                Err(_) => break,
+                            }
                         }
                         self.process_externalized_slots().await;
 
@@ -383,25 +396,20 @@ impl App {
                     // whether to trigger catchup or consensus.
 
                     // Drain dedicated SCP channel first (highest priority)
-                    while let Ok(scp_msg) = scp_message_rx.try_recv() {
-                        self.handle_overlay_message(scp_msg).await;
+                    for _ in 0..MAX_DRAIN_PER_TICK {
+                        match scp_message_rx.try_recv() {
+                            Ok(scp_msg) => self.handle_overlay_message(scp_msg).await,
+                            Err(_) => break,
+                        }
                     }
 
                     // Drain dedicated fetch response channel (tx_sets, dont_have, etc.)
-                    while let Ok(fetch_msg) = fetch_response_rx.try_recv() {
-                        self.handle_overlay_message(fetch_msg).await;
+                    for _ in 0..MAX_DRAIN_PER_TICK {
+                        match fetch_response_rx.try_recv() {
+                            Ok(fetch_msg) => self.handle_overlay_message(fetch_msg).await,
+                            Err(_) => break,
+                        }
                     }
-
-                    // NOTE: The broadcast channel is NOT drained here.
-                    // It carries only non-critical messages (TX floods, peer
-                    // requests like GetScpState/GetScpQuorumset) which are
-                    // already handled one-at-a-time by the select! branch for
-                    // message_rx.recv().  Draining the broadcast channel in a
-                    // tight loop caused the event loop to freeze: slow handlers
-                    // (GetScpState takes ~1s per peer via overlay.send_to) let
-                    // new messages accumulate → Lagged → loop continues →
-                    // starvation.  Critical messages (SCP envelopes, tx_sets)
-                    // are routed to dedicated mpsc channels drained above.
 
                     // Check if SyncRecoveryManager requested recovery
                     if self.sync_recovery_pending.swap(false, Ordering::SeqCst) {
