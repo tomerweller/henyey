@@ -155,17 +155,10 @@ pub fn execute_set_trust_line_flags(
         ));
     }
 
-    // Get the trustline
-    let trustline = match state.get_trustline(&op.trustor, &op.asset) {
-        Some(tl) => tl.clone(),
-        None => {
-            return Ok(make_set_flags_result(
-                SetTrustLineFlagsResultCode::NoTrustLine,
-            ));
-        }
-    };
-
-    // Check AUTH_REVOCABLE_FLAG for revocation operations.
+    // Check AUTH_REVOCABLE_FLAG for revocation operations (before trustline load).
+    // stellar-core checks isAuthRevocationValid() before loading the trustline,
+    // so CantRevoke takes priority over NoTrustLine when both conditions are true.
+    //
     // If AUTH_REVOCABLE is not set on the issuer account, the following transitions
     // are not allowed:
     // 1. AUTHORIZED_FLAG -> AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG
@@ -182,6 +175,16 @@ pub fn execute_set_trust_line_flags(
             ));
         }
     }
+
+    // Get the trustline
+    let trustline = match state.get_trustline(&op.trustor, &op.asset) {
+        Some(tl) => tl.clone(),
+        None => {
+            return Ok(make_set_flags_result(
+                SetTrustLineFlagsResultCode::NoTrustLine,
+            ));
+        }
+    };
 
     // Cannot set both AUTHORIZED and AUTHORIZED_TO_MAINTAIN_LIABILITIES
     if (op.set_flags & AUTHORIZED_FLAG != 0)
@@ -932,6 +935,49 @@ mod tests {
                 assert!(
                     matches!(r, AllowTrustResult::NoTrustLine),
                     "Expected NoTrustLine, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Regression test for ledger 61257945 hash mismatch: When both AUTH_REVOCABLE
+    /// is not set AND the trustline doesn't exist, stellar-core returns CantRevoke
+    /// (checks AUTH_REVOCABLE first) while we were returning NoTrustLine (checked
+    /// trustline existence first). The check order must match stellar-core:
+    /// isAuthRevocationValid() before trustline load.
+    #[test]
+    fn test_set_trust_line_flags_cant_revoke_before_no_trustline() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(50);
+        let trustor_id = create_test_account_id(51);
+
+        // Issuer WITHOUT AUTH_REVOCABLE
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(trustor_id.clone(), 100_000_000, 0));
+
+        let asset = create_asset(&issuer_id);
+        // NO trustline created — both CantRevoke and NoTrustLine conditions are true
+
+        // Try to clear AUTHORIZED_FLAG without setting AUTHORIZED — this is a revocation
+        let op = SetTrustLineFlagsOp {
+            trustor: trustor_id.clone(),
+            asset,
+            clear_flags: AUTHORIZED_FLAG,
+            set_flags: 0,
+        };
+
+        let result = execute_set_trust_line_flags(&op, &issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
+                // stellar-core checks AUTH_REVOCABLE before trustline existence,
+                // so CantRevoke must take priority over NoTrustLine
+                assert!(
+                    matches!(r, SetTrustLineFlagsResult::CantRevoke),
+                    "Expected CantRevoke (AUTH_REVOCABLE check before trustline load), got {:?}",
                     r
                 );
             }
