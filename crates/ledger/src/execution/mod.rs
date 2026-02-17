@@ -3578,13 +3578,14 @@ fn fee_source_account_id(env: &TransactionEnvelope) -> AccountId {
 /// Computed during the pre-deduction pass (matching stellar-core `processFeesSeqNums`)
 /// and consumed during cluster execution to provide fee metadata without
 /// re-deducting fees.
+#[derive(Clone)]
 pub struct PreChargedFee {
     /// The fee actually charged (min(balance, computed_fee)).
-    charged_fee: i64,
+    pub charged_fee: i64,
     /// Whether the transaction should be applied (charged_fee >= computed_fee).
-    should_apply: bool,
+    pub should_apply: bool,
     /// Fee processing LedgerEntryChanges: [State(before), Updated(after)].
-    fee_changes: LedgerEntryChanges,
+    pub fee_changes: LedgerEntryChanges,
 }
 
 /// Pre-deduct fees for all Soroban transactions across all stages/clusters.

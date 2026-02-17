@@ -967,6 +967,7 @@ async fn test_parallel_soroban_multi_cluster_execution() {
                 hot_archive: None,
                 runtime_handle: None,
             },
+            None,
         )
         .expect("execute parallel phase");
 
@@ -1044,6 +1045,7 @@ async fn test_parallel_soroban_matches_sequential() {
                 hot_archive: None,
                 runtime_handle: None,
             },
+            None,
         )
         .expect("parallel");
 
@@ -1070,6 +1072,7 @@ async fn test_parallel_soroban_matches_sequential() {
                 hot_archive: None,
                 runtime_handle: None,
             },
+            None,
         )
         .expect("sequential");
 
@@ -1153,6 +1156,7 @@ async fn test_parallel_soroban_deterministic() {
                     hot_archive: None,
                     runtime_handle: None,
                 },
+                None,
             )
             .expect("execute");
 
@@ -1235,6 +1239,7 @@ async fn test_parallel_soroban_from_spawn_blocking() {
                     hot_archive: None,
                     runtime_handle: Some(handle),
                 },
+                None,
             )
             .expect("execute parallel phase from spawn_blocking");
 
@@ -1304,6 +1309,7 @@ async fn test_parallel_soroban_spawn_blocking_matches_worker() {
             hot_archive: None,
             runtime_handle: None,
         },
+        None,
     )
     .expect("worker path");
 
@@ -1345,6 +1351,7 @@ async fn test_parallel_soroban_spawn_blocking_matches_worker() {
                     hot_archive: None,
                     runtime_handle: Some(handle),
                 },
+                None,
             )
             .expect("spawn_blocking path");
             (result, delta)

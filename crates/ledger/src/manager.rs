@@ -32,8 +32,9 @@ use crate::{
     delta::{EntryChange, LedgerDelta},
     execution::{
         execute_soroban_parallel_phase, load_soroban_network_info,
-        run_transactions_on_executor, SorobanContext, SorobanNetworkInfo,
-        TransactionExecutionResult, TransactionExecutor, TxSetResult,
+        pre_deduct_all_fees_on_delta, run_transactions_on_executor,
+        SorobanContext, SorobanNetworkInfo, TransactionExecutionResult,
+        TransactionExecutor, TxSetResult,
     },
     header::{compute_header_hash, create_next_header},
     snapshot::{LedgerSnapshot, SnapshotHandle},
@@ -2099,9 +2100,34 @@ impl<'a> LedgerCloseContext<'a> {
                 )
             {
                 let phase = phase_structure.unwrap();
-
-                // Execute classic phase first (sequential) using the persistent executor.
                 let classic_txs = self.close_data.tx_set.classic_phase_transactions();
+
+                // Pre-deduct ALL fees (classic + Soroban) in a single pass before
+                // any transaction body executes. This matches stellar-core's
+                // processFeesSeqNums() which processes all phases' fees in order
+                // before any transaction applies.
+                let (classic_pre_charged, soroban_pre_charged, total_fee_pool) =
+                    pre_deduct_all_fees_on_delta(
+                        &classic_txs,
+                        &phase,
+                        self.prev_header.base_fee,
+                        self.manager.network_id,
+                        self.close_data.ledger_seq,
+                        &mut self.delta,
+                        &self.snapshot,
+                    )?;
+                self.delta.record_fee_pool_delta(total_fee_pool);
+
+                // Pre-load fee-deducted account entries from the delta into the
+                // classic executor so classic TXs see ALL fee deductions (including
+                // Soroban fees on shared accounts).
+                for entry in self.delta.current_entries() {
+                    if matches!(entry.data, stellar_xdr::curr::LedgerEntryData::Account(_)) {
+                        executor_ref.state_mut().load_entry(entry);
+                    }
+                }
+
+                // Execute classic phase (fees already deducted on delta).
                 let classic_start = std::time::Instant::now();
                 let mut classic_result = if classic_txs.is_empty() {
                     TxSetResult {
@@ -2118,15 +2144,14 @@ impl<'a> LedgerCloseContext<'a> {
                         &classic_txs,
                         self.prev_header.base_fee,
                         soroban_base_prng_seed.0,
-                        true,
+                        false,
                         &mut self.delta,
+                        Some(&classic_pre_charged),
                     )?
                 };
                 self.timing_classic_exec_us = classic_start.elapsed().as_micros() as u64;
 
-                // Execute Soroban parallel phase.
-                // Soroban clusters use their own per-cluster executors (they don't
-                // load offers since Soroban TXs don't use the orderbook).
+                // Execute Soroban parallel phase (fees already deducted on delta).
                 let soroban_start = std::time::Instant::now();
                 let ledger_context = LedgerContext::new(
                     self.close_data.ledger_seq,
@@ -2150,6 +2175,7 @@ impl<'a> LedgerCloseContext<'a> {
                         hot_archive,
                         runtime_handle: self.runtime_handle.clone(),
                     },
+                    Some(soroban_pre_charged),
                 )?;
                 self.timing_soroban_exec_us = soroban_start.elapsed().as_micros() as u64;
 
@@ -2179,6 +2205,7 @@ impl<'a> LedgerCloseContext<'a> {
                     soroban_base_prng_seed.0,
                     true,
                     &mut self.delta,
+                    None,
                 )?
             };
 

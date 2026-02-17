@@ -63,6 +63,7 @@ pub fn execute_transaction_set_with_fee_mode(
         soroban.base_prng_seed,
         deduct_fee,
         delta,
+        None,
     )
 }
 
@@ -73,6 +74,11 @@ pub fn execute_transaction_set_with_fee_mode(
 /// `execute_transaction_set_with_fee_mode` (which creates a fresh executor)
 /// and by `LedgerCloseContext::apply_transactions` (which reuses a persistent
 /// executor across ledger closes to avoid reloading ~911K offers).
+///
+/// When `external_pre_charged` is `Some`, fees have already been pre-deducted
+/// on the delta by `pre_deduct_all_fees_on_delta`. The internal fee loop is
+/// skipped and the provided fee changes are used for transaction meta.
+#[allow(clippy::too_many_arguments)]
 pub fn run_transactions_on_executor(
     executor: &mut TransactionExecutor,
     snapshot: &SnapshotHandle,
@@ -81,6 +87,7 @@ pub fn run_transactions_on_executor(
     soroban_base_prng_seed: [u8; 32],
     deduct_fee: bool,
     delta: &mut LedgerDelta,
+    external_pre_charged: Option<&[PreChargedFee]>,
 ) -> Result<TxSetResult> {
     let ledger_seq = executor.ledger_seq;
     let protocol_version = executor.protocol_version;
@@ -108,12 +115,13 @@ pub fn run_transactions_on_executor(
         );
     }
 
-    // Pre-deduct ALL classic fees before executing any TX body.
-    // This matches stellar-core's processFeesSeqNums() which deducts fees for ALL
-    // transactions in a single pass before any transaction bodies execute.
-    // Without this, TXs from the same account see an inflated balance because only
-    // prior TXs' fees have been deducted, not all of them.
-    let pre_fee_results: Vec<PreChargedFee> = if deduct_fee {
+    // Pre-deduct fees before executing any TX body.
+    // When external_pre_charged is provided (parallel path), fees were already
+    // deducted on the delta by pre_deduct_all_fees_on_delta. Otherwise, deduct
+    // fees using the executor's internal state (sequential path).
+    let pre_fee_results: Vec<PreChargedFee> = if let Some(ext) = external_pre_charged {
+        ext.to_vec()
+    } else if deduct_fee {
         let mut results = Vec::with_capacity(transactions.len());
         for (tx, tx_base_fee) in transactions.iter() {
             let tx_fee = tx_base_fee.unwrap_or(base_fee);
@@ -128,6 +136,7 @@ pub fn run_transactions_on_executor(
     } else {
         Vec::new()
     };
+    let has_pre_charged = !pre_fee_results.is_empty();
 
     // Protocol 19+ MAX_SEQ_NUM_TO_APPLY: when any transaction in the set
     // contains an AccountMerge operation, record the maximum sequence number
@@ -207,9 +216,10 @@ pub fn run_transactions_on_executor(
             .tx_meta
             .clone()
             .unwrap_or_else(empty_transaction_meta);
-        // Use pre-captured fee_changes from the upfront fee deduction pass,
-        // or the per-TX result if fees were not pre-deducted.
-        let fee_changes = if deduct_fee {
+        // Use pre-captured fee_changes from the upfront fee deduction pass
+        // (either internal or external), or the per-TX result if fees were
+        // not pre-deducted.
+        let fee_changes = if has_pre_charged {
             pre_fee_results[tx_index].fee_changes.clone()
         } else {
             result
@@ -246,7 +256,7 @@ pub fn run_transactions_on_executor(
 
     // Protocol 23+: Apply Soroban fee refunds after ALL transactions
     // This matches stellar-core's processPostTxSetApply() phase
-    if deduct_fee {
+    if has_pre_charged {
         let mut total_refunds = 0i64;
         for (idx, (tx, _)) in transactions.iter().enumerate() {
             let refund = results[idx].fee_refund;
@@ -289,8 +299,10 @@ pub fn run_transactions_on_executor(
     // Apply all changes to the delta
     executor.apply_to_delta(snapshot, delta)?;
 
-    // Add fees to fee pool
-    if deduct_fee {
+    // Add fees to fee pool.
+    // When external_pre_charged is provided, the caller already recorded the
+    // fee pool delta on the main delta, so we only record for internal fees.
+    if external_pre_charged.is_none() && deduct_fee {
         let total_fees = executor.total_fees();
         delta.record_fee_pool_delta(total_fees);
     }
@@ -315,10 +327,9 @@ pub fn run_transactions_on_executor(
 ///
 /// The classic phase must be executed separately before calling this function.
 ///
-/// # Returns
-///
-/// Same tuple as `execute_transaction_set`: (results, tx_result_pairs,
-/// tx_result_metas, id_pool, hot_archive_restored_keys).
+/// When `external_pre_charged` is `Some`, fees have already been pre-deducted
+/// on the delta by `pre_deduct_all_fees_on_delta`. The internal fee deduction
+/// is skipped and the provided fee changes are used.
 pub fn execute_soroban_parallel_phase(
     snapshot: &SnapshotHandle,
     phase: &crate::close::SorobanPhaseStructure,
@@ -326,6 +337,7 @@ pub fn execute_soroban_parallel_phase(
     context: &LedgerContext,
     delta: &mut LedgerDelta,
     soroban: SorobanContext<'_>,
+    external_pre_charged: Option<Vec<PreChargedFee>>,
 ) -> Result<TxSetResult> {
     let mut all_results: Vec<TransactionExecutionResult> = Vec::new();
     let mut all_tx_results: Vec<TransactionResultPair> = Vec::new();
@@ -338,14 +350,20 @@ pub fn execute_soroban_parallel_phase(
     // and Soroban TXs get indexes N..N+M-1 (see LedgerManagerImpl::applyTransactions).
     let mut global_tx_offset: usize = classic_tx_count;
 
-    // Pre-deduct all Soroban TX fees from the main delta BEFORE any cluster execution.
-    // This matches stellar-core processFeesSeqNums which deducts ALL fees upfront.
-    let (pre_charged_fees, total_pre_deducted) =
-        pre_deduct_soroban_fees(snapshot, phase, context.base_fee, context.network_id, context.sequence, delta)?;
+    // Use externally pre-charged fees if provided (from unified fee pass),
+    // otherwise pre-deduct Soroban fees from the delta internally.
+    let pre_charged_fees = if let Some(ext) = external_pre_charged {
+        // Fees already deducted on delta and fee pool already recorded by caller.
+        ext
+    } else {
+        let (fees, total_pre_deducted) =
+            pre_deduct_soroban_fees(snapshot, phase, context.base_fee, context.network_id, context.sequence, delta)?;
+        if total_pre_deducted != 0 {
+            delta.record_fee_pool_delta(total_pre_deducted);
+        }
+        fees
+    };
     let soroban_base_prng_seed = soroban.base_prng_seed;
-    if total_pre_deducted != 0 {
-        delta.record_fee_pool_delta(total_pre_deducted);
-    }
 
     // Prefetch fee source accounts for all Soroban TXs.
     // Soroban operations themselves return empty from collect_prefetch_keys (their
@@ -479,6 +497,89 @@ pub fn execute_soroban_parallel_phase(
         id_pool,
         hot_archive_restored_keys: all_hot_archive_restored_keys,
     })
+}
+
+/// Pre-deduct ALL fees (classic + Soroban) on the delta in a single pass.
+///
+/// This matches stellar-core's `processFeesSeqNums()` which processes fees for
+/// ALL transactions across both phases before any transaction body executes.
+/// The processing order is: classic phase first, then Soroban phase (matching
+/// stellar-core's phase iteration order).
+///
+/// Returns `(classic_pre_charged, soroban_pre_charged, total_fee_pool)`.
+pub fn pre_deduct_all_fees_on_delta(
+    classic_txs: &[(TransactionEnvelope, Option<u32>)],
+    soroban_phase: &crate::close::SorobanPhaseStructure,
+    base_fee: u32,
+    network_id: NetworkId,
+    ledger_seq: u32,
+    delta: &mut LedgerDelta,
+    snapshot: &SnapshotHandle,
+) -> Result<(Vec<PreChargedFee>, Vec<PreChargedFee>, i64)> {
+    let mut total_fee_pool = 0i64;
+
+    // Phase 0: Classic fees (in apply order)
+    let mut classic_pre_charged = Vec::with_capacity(classic_txs.len());
+    for (tx, tx_base_fee) in classic_txs {
+        let tx_fee = tx_base_fee.unwrap_or(base_fee);
+        let frame = TransactionFrame::with_network(tx.clone(), network_id);
+        let fee_source = fee_source_account_id(tx);
+
+        let num_ops = std::cmp::max(1, frame.operation_count() as i64);
+        let required_fee = if frame.is_fee_bump() {
+            tx_fee as i64 * (num_ops + 1)
+        } else {
+            tx_fee as i64 * num_ops
+        };
+        let inclusion_fee = frame.inclusion_fee();
+        let computed_fee = if frame.is_soroban() {
+            frame.declared_soroban_resource_fee() + std::cmp::min(inclusion_fee, required_fee)
+        } else {
+            std::cmp::min(inclusion_fee, required_fee)
+        };
+
+        let (charged_fee, fee_changes) =
+            delta.deduct_fee_from_account(&fee_source, computed_fee, snapshot, ledger_seq)?;
+        total_fee_pool += charged_fee;
+        classic_pre_charged.push(PreChargedFee {
+            charged_fee,
+            should_apply: charged_fee >= computed_fee,
+            fee_changes,
+        });
+    }
+
+    // Phase 1: Soroban fees (in stage/cluster/tx order)
+    let mut soroban_pre_charged = Vec::new();
+    for stage in &soroban_phase.stages {
+        for cluster in stage {
+            for (tx, tx_base_fee) in cluster {
+                let tx_fee = tx_base_fee.unwrap_or(base_fee);
+                let frame = TransactionFrame::with_network(tx.clone(), network_id);
+                let fee_source = fee_source_account_id(tx);
+
+                let num_ops = std::cmp::max(1, frame.operation_count() as i64);
+                let required_fee = if frame.is_fee_bump() {
+                    tx_fee as i64 * (num_ops + 1)
+                } else {
+                    tx_fee as i64 * num_ops
+                };
+                let inclusion_fee = frame.inclusion_fee();
+                let computed_fee = frame.declared_soroban_resource_fee()
+                    + std::cmp::min(inclusion_fee, required_fee);
+
+                let (charged_fee, fee_changes) =
+                    delta.deduct_fee_from_account(&fee_source, computed_fee, snapshot, ledger_seq)?;
+                total_fee_pool += charged_fee;
+                soroban_pre_charged.push(PreChargedFee {
+                    charged_fee,
+                    should_apply: charged_fee >= computed_fee,
+                    fee_changes,
+                });
+            }
+        }
+    }
+
+    Ok((classic_pre_charged, soroban_pre_charged, total_fee_pool))
 }
 
 /// Extract the read-write footprint keys from a Soroban transaction envelope.
