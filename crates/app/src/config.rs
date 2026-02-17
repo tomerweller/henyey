@@ -1089,12 +1089,43 @@ impl AppConfig {
             );
         }
 
+        // HTTP port and peer port must not conflict
+        if self.http.enabled && self.http.port == self.overlay.peer_port {
+            anyhow::bail!(
+                "HTTP port ({}) and peer port ({}) must be different",
+                self.http.port,
+                self.overlay.peer_port
+            );
+        }
+
+        // Bucket page size exponent must be in valid range (4-24)
+        let exp = self.buckets.bucket_list_db.index_page_size_exponent;
+        if exp < 4 || exp > 24 {
+            anyhow::bail!(
+                "bucket_list_db.index_page_size_exponent must be between 4 and 24, got {}",
+                exp
+            );
+        }
+
+        // Warn about writable-without-readable archive configuration
+        for archive in &self.history.archives {
+            if archive.put_enabled && !archive.get_enabled {
+                tracing::warn!(
+                    archive = %archive.name,
+                    "Archive has put_enabled but not get_enabled; cannot verify uploads"
+                );
+            }
+        }
+
         // Validate quorum set if validator
         if self.node.is_validator {
             if self.node.quorum_set.validators.is_empty()
                 && self.node.quorum_set.inner_sets.is_empty()
             {
                 anyhow::bail!("Validators must have a quorum set configured");
+            }
+            if self.node.quorum_set.threshold_percent == 0 {
+                anyhow::bail!("Quorum set threshold_percent must be > 0 for validators");
             }
             let quorum_set = self
                 .node
@@ -1428,6 +1459,55 @@ complete = true
         let config: AppConfig = toml::from_str(toml_str).unwrap();
         assert!(config.catchup.complete);
         assert!(matches!(config.catchup.to_mode(), CatchupMode::Complete));
+    }
+
+    // Item 9: Config validation tests
+    #[test]
+    fn test_validation_http_peer_port_conflict() {
+        let mut config = AppConfig::default();
+        config.http.port = 11625;
+        config.overlay.peer_port = 11625;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("port"));
+    }
+
+    #[test]
+    fn test_validation_bucket_page_size_exponent_bounds() {
+        let mut config = AppConfig::default();
+        config.buckets.bucket_list_db.index_page_size_exponent = 3; // Below min of 4
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("index_page_size_exponent"));
+
+        let mut config = AppConfig::default();
+        config.buckets.bucket_list_db.index_page_size_exponent = 25; // Above max of 24
+        let result = config.validate();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validation_quorum_threshold_zero() {
+        let mut config = AppConfig::default();
+        config.node.is_validator = true;
+        config.node.node_seed =
+            Some("SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH".to_string());
+        config.node.quorum_set.threshold_percent = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("threshold"));
+    }
+
+    #[test]
+    fn test_validation_valid_config_different_ports() {
+        // Default config should have different ports (11625 vs 11626) and pass
+        let config = AppConfig::default();
+        // Not a validator, so quorum checks are skipped
+        let result = config.validate();
+        assert!(result.is_ok());
     }
 
     #[test]

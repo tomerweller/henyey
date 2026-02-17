@@ -14,9 +14,9 @@
 //! The size header has bit 31 set (the "continuation bit"), matching the
 //! XDR record marking standard (RFC 1832 / RFC 4506).
 
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 
-use stellar_xdr::curr::WriteXdr;
+use stellar_xdr::curr::{Limits, ReadXdr, WriteXdr};
 
 /// An output stream that writes XDR values with size-prefix framing.
 ///
@@ -119,6 +119,72 @@ impl XdrOutputStream {
     }
 }
 
+/// An input stream that reads XDR values with size-prefix framing.
+///
+/// Reads the same wire format as [`XdrOutputStream`]: a 4-byte big-endian
+/// size header (with bit 31 set as the continuation bit) followed by the
+/// XDR payload bytes. This matches stellar-core's `XDRInputFileStream`.
+pub struct XdrInputStream {
+    reader: BufReader<Box<dyn Read + Send>>,
+}
+
+impl XdrInputStream {
+    /// Open an XDR input stream from a file path.
+    pub fn open(path: &str) -> io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        Ok(Self {
+            reader: BufReader::new(Box::new(file)),
+        })
+    }
+
+    /// Create an XDR input stream from any reader.
+    ///
+    /// Useful for testing with in-memory buffers.
+    pub fn from_reader(reader: Box<dyn Read + Send>) -> Self {
+        Self {
+            reader: BufReader::new(reader),
+        }
+    }
+
+    /// Read one XDR value from the stream.
+    ///
+    /// Returns `None` at end of stream, or an error if the data is malformed.
+    pub fn read_one<T: ReadXdr>(&mut self) -> io::Result<Option<T>> {
+        // Read 4-byte size header
+        let mut header = [0u8; 4];
+        match self.reader.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e),
+        }
+
+        // Extract size (strip continuation bit from high byte)
+        let sz = (((header[0] & 0x7F) as u32) << 24)
+            | ((header[1] as u32) << 16)
+            | ((header[2] as u32) << 8)
+            | (header[3] as u32);
+
+        // Read payload
+        let mut payload = vec![0u8; sz as usize];
+        self.reader.read_exact(&mut payload)?;
+
+        // Deserialize XDR
+        let value = T::from_xdr(&payload, Limits::none())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        Ok(Some(value))
+    }
+
+    /// Read all XDR values from the stream until EOF.
+    pub fn read_all<T: ReadXdr>(&mut self) -> io::Result<Vec<T>> {
+        let mut entries = Vec::new();
+        while let Some(entry) = self.read_one::<T>()? {
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +281,126 @@ mod tests {
             stellar_xdr::curr::Limits::none(),
         )
         .unwrap();
+    }
+
+    // XdrInputStream tests
+
+    #[test]
+    fn test_xdr_input_stream_roundtrip() {
+        // Write entries with XdrOutputStream, read back with XdrInputStream
+        let buf = SharedBuffer::new();
+        let mut out = XdrOutputStream::from_writer(Box::new(buf.clone()));
+
+        let meta1 = LedgerCloseMeta::V2(LedgerCloseMetaV2::default());
+        let meta2 = LedgerCloseMeta::V2(LedgerCloseMetaV2::default());
+        out.write_one(&meta1).unwrap();
+        out.write_one(&meta2).unwrap();
+
+        let data = buf.data();
+        let cursor = std::io::Cursor::new(data);
+        let mut input = XdrInputStream::from_reader(Box::new(cursor));
+
+        let entries: Vec<LedgerCloseMeta> = input.read_all().unwrap();
+        assert_eq!(entries.len(), 2);
+
+        // Verify roundtrip fidelity
+        assert_eq!(
+            entries[0].to_xdr(Limits::none()).unwrap(),
+            meta1.to_xdr(Limits::none()).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_xdr_input_stream_empty() {
+        let cursor = std::io::Cursor::new(Vec::<u8>::new());
+        let mut input = XdrInputStream::from_reader(Box::new(cursor));
+
+        let entries: Vec<LedgerCloseMeta> = input.read_all().unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_xdr_input_stream_read_one() {
+        let buf = SharedBuffer::new();
+        let mut out = XdrOutputStream::from_writer(Box::new(buf.clone()));
+
+        let meta = LedgerCloseMeta::V2(LedgerCloseMetaV2::default());
+        out.write_one(&meta).unwrap();
+
+        let data = buf.data();
+        let cursor = std::io::Cursor::new(data);
+        let mut input = XdrInputStream::from_reader(Box::new(cursor));
+
+        let entry: Option<LedgerCloseMeta> = input.read_one().unwrap();
+        assert!(entry.is_some());
+
+        // Second read should return None (EOF)
+        let entry2: Option<LedgerCloseMeta> = input.read_one().unwrap();
+        assert!(entry2.is_none());
+    }
+
+    #[test]
+    fn test_xdr_input_stream_truncated_header() {
+        // Only 2 bytes — not enough for a 4-byte header
+        let cursor = std::io::Cursor::new(vec![0x80, 0x00]);
+        let mut input = XdrInputStream::from_reader(Box::new(cursor));
+
+        let result: io::Result<Option<LedgerCloseMeta>> = input.read_one();
+        // Should return None (EOF during header read) since UnexpectedEof maps to None
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_xdr_input_stream_truncated_payload() {
+        // Valid header saying 100 bytes, but only 4 bytes of payload
+        let mut data = vec![0x80, 0x00, 0x00, 100]; // header: size=100
+        data.extend_from_slice(&[0u8; 4]); // only 4 bytes of payload, need 100
+        let cursor = std::io::Cursor::new(data);
+        let mut input = XdrInputStream::from_reader(Box::new(cursor));
+
+        let result: io::Result<Option<LedgerCloseMeta>> = input.read_one();
+        assert!(result.is_err()); // UnexpectedEof during payload read
+    }
+
+    #[test]
+    fn test_xdr_input_stream_multiple_roundtrip() {
+        let buf = SharedBuffer::new();
+        let mut out = XdrOutputStream::from_writer(Box::new(buf.clone()));
+
+        // Write 5 entries
+        for _ in 0..5 {
+            let meta = LedgerCloseMeta::V2(LedgerCloseMetaV2::default());
+            out.write_one(&meta).unwrap();
+        }
+
+        let data = buf.data();
+        let cursor = std::io::Cursor::new(data);
+        let mut input = XdrInputStream::from_reader(Box::new(cursor));
+
+        let entries: Vec<LedgerCloseMeta> = input.read_all().unwrap();
+        assert_eq!(entries.len(), 5);
+    }
+
+    #[test]
+    fn test_xdr_input_stream_file_roundtrip() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+
+        // Write
+        {
+            let mut out = XdrOutputStream::open(&path).unwrap();
+            let meta1 = LedgerCloseMeta::V2(LedgerCloseMetaV2::default());
+            let meta2 = LedgerCloseMeta::V2(LedgerCloseMetaV2::default());
+            out.write_one(&meta1).unwrap();
+            out.write_one(&meta2).unwrap();
+        }
+
+        // Read back
+        {
+            let mut input = XdrInputStream::open(&path).unwrap();
+            let entries: Vec<LedgerCloseMeta> = input.read_all().unwrap();
+            assert_eq!(entries.len(), 2);
+        }
     }
 
     #[cfg(unix)]

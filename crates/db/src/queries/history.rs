@@ -10,6 +10,7 @@
 //! and catchup operations.
 
 use rusqlite::{params, Connection, OptionalExtension};
+use henyey_common::xdr_stream::XdrOutputStream;
 use stellar_xdr::curr::{
     Limits, ReadXdr, TransactionHistoryEntry, TransactionHistoryResultEntry, WriteXdr,
 };
@@ -96,6 +97,21 @@ pub trait HistoryQueries {
         &self,
         ledger_seq: u32,
     ) -> Result<Option<TransactionHistoryResultEntry>, DbError>;
+
+    /// Copy transaction history and results to XDR output streams.
+    ///
+    /// Writes `TransactionHistoryEntry` records to `tx_stream` and
+    /// `TransactionHistoryResultEntry` records to `result_stream` for
+    /// ledger sequences `[begin, begin + count)`.
+    ///
+    /// Returns `(tx_entries_written, result_entries_written)`.
+    fn copy_tx_history_to_streams(
+        &self,
+        begin: u32,
+        count: u32,
+        tx_stream: &mut XdrOutputStream,
+        result_stream: &mut XdrOutputStream,
+    ) -> Result<(u32, u32), DbError>;
 }
 
 impl HistoryQueries for Connection {
@@ -207,6 +223,53 @@ impl HistoryQueries for Connection {
             None => Ok(None),
         }
     }
+
+    fn copy_tx_history_to_streams(
+        &self,
+        begin: u32,
+        count: u32,
+        tx_stream: &mut XdrOutputStream,
+        result_stream: &mut XdrOutputStream,
+    ) -> Result<(u32, u32), DbError> {
+        let end = begin.saturating_add(count);
+        let mut tx_written = 0u32;
+        let mut result_written = 0u32;
+
+        // Stream transaction history entries
+        {
+            let mut stmt = self.prepare(
+                "SELECT data FROM txsets WHERE ledgerseq >= ?1 AND ledgerseq < ?2 ORDER BY ledgerseq ASC",
+            )?;
+            let rows = stmt.query_map(params![begin, end], |row| row.get::<_, Vec<u8>>(0))?;
+            for row in rows {
+                let data = row?;
+                let entry = TransactionHistoryEntry::from_xdr(data.as_slice(), Limits::none())?;
+                tx_stream.write_one(&entry).map_err(|e| {
+                    DbError::Integrity(format!("Failed to write tx entry: {}", e))
+                })?;
+                tx_written += 1;
+            }
+        }
+
+        // Stream transaction result entries
+        {
+            let mut stmt = self.prepare(
+                "SELECT data FROM txresults WHERE ledgerseq >= ?1 AND ledgerseq < ?2 ORDER BY ledgerseq ASC",
+            )?;
+            let rows = stmt.query_map(params![begin, end], |row| row.get::<_, Vec<u8>>(0))?;
+            for row in rows {
+                let data = row?;
+                let entry =
+                    TransactionHistoryResultEntry::from_xdr(data.as_slice(), Limits::none())?;
+                result_stream.write_one(&entry).map_err(|e| {
+                    DbError::Integrity(format!("Failed to write result entry: {}", e))
+                })?;
+                result_written += 1;
+            }
+        }
+
+        Ok((tx_written, result_written))
+    }
 }
 
 #[cfg(test)]
@@ -304,6 +367,222 @@ mod tests {
         assert_eq!(loaded.body, b"new_body".to_vec());
         assert_eq!(loaded.result, b"new_result".to_vec());
         assert_eq!(loaded.meta, Some(b"meta".to_vec()));
+    }
+
+    // Item 14: copy_tx_history_to_streams tests
+    #[test]
+    fn test_copy_tx_history_to_streams() {
+        let conn = setup_db();
+
+        // Store tx history and result entries for ledgers 100-102
+        for seq in 100..=102 {
+            let tx_entry = TransactionHistoryEntry {
+                ledger_seq: seq,
+                tx_set: TransactionSet {
+                    previous_ledger_hash: Hash::default(),
+                    txs: VecM::default(),
+                },
+                ext: TransactionHistoryEntryExt::V0,
+            };
+            conn.store_tx_history_entry(seq, &tx_entry).unwrap();
+
+            let result_entry = TransactionHistoryResultEntry {
+                ledger_seq: seq,
+                tx_result_set: TransactionResultSet {
+                    results: VecM::default(),
+                },
+                ext: TransactionHistoryResultEntryExt::V0,
+            };
+            conn.store_tx_result_entry(seq, &result_entry).unwrap();
+        }
+
+        // Create two streams
+        struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let tx_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let result_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+
+        let mut tx_stream = XdrOutputStream::from_writer(Box::new(SharedBuf(tx_buf.clone())));
+        let mut result_stream =
+            XdrOutputStream::from_writer(Box::new(SharedBuf(result_buf.clone())));
+
+        let (tx_written, result_written) = conn
+            .copy_tx_history_to_streams(100, 3, &mut tx_stream, &mut result_stream)
+            .unwrap();
+
+        assert_eq!(tx_written, 3);
+        assert_eq!(result_written, 3);
+
+        // Verify data was written
+        assert!(!tx_buf.lock().unwrap().is_empty());
+        assert!(!result_buf.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_copy_tx_history_to_streams_readback() {
+        let conn = setup_db();
+
+        // Store entries for ledgers 100-102
+        for seq in 100..=102 {
+            let tx_entry = TransactionHistoryEntry {
+                ledger_seq: seq,
+                tx_set: TransactionSet {
+                    previous_ledger_hash: Hash::default(),
+                    txs: VecM::default(),
+                },
+                ext: TransactionHistoryEntryExt::V0,
+            };
+            conn.store_tx_history_entry(seq, &tx_entry).unwrap();
+
+            let result_entry = TransactionHistoryResultEntry {
+                ledger_seq: seq,
+                tx_result_set: TransactionResultSet {
+                    results: VecM::default(),
+                },
+                ext: TransactionHistoryResultEntryExt::V0,
+            };
+            conn.store_tx_result_entry(seq, &result_entry).unwrap();
+        }
+
+        struct SharedBufRB(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBufRB {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let tx_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let result_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+
+        let mut tx_stream =
+            XdrOutputStream::from_writer(Box::new(SharedBufRB(tx_buf.clone())));
+        let mut result_stream =
+            XdrOutputStream::from_writer(Box::new(SharedBufRB(result_buf.clone())));
+
+        let (tx_written, result_written) = conn
+            .copy_tx_history_to_streams(100, 3, &mut tx_stream, &mut result_stream)
+            .unwrap();
+
+        assert_eq!(tx_written, 3);
+        assert_eq!(result_written, 3);
+
+        // Read back tx entries
+        let tx_data = tx_buf.lock().unwrap().clone();
+        let cursor = std::io::Cursor::new(tx_data);
+        let mut input =
+            henyey_common::xdr_stream::XdrInputStream::from_reader(Box::new(cursor));
+        let tx_entries: Vec<TransactionHistoryEntry> = input.read_all().unwrap();
+        assert_eq!(tx_entries.len(), 3);
+        assert_eq!(tx_entries[0].ledger_seq, 100);
+        assert_eq!(tx_entries[1].ledger_seq, 101);
+        assert_eq!(tx_entries[2].ledger_seq, 102);
+
+        // Read back result entries
+        let result_data = result_buf.lock().unwrap().clone();
+        let cursor = std::io::Cursor::new(result_data);
+        let mut input =
+            henyey_common::xdr_stream::XdrInputStream::from_reader(Box::new(cursor));
+        let result_entries: Vec<TransactionHistoryResultEntry> = input.read_all().unwrap();
+        assert_eq!(result_entries.len(), 3);
+        assert_eq!(result_entries[0].ledger_seq, 100);
+        assert_eq!(result_entries[2].ledger_seq, 102);
+    }
+
+    #[test]
+    fn test_copy_tx_history_to_streams_partial() {
+        let conn = setup_db();
+
+        // Store entries only for ledgers 100 and 102 (gap at 101)
+        for seq in [100, 102] {
+            let tx_entry = TransactionHistoryEntry {
+                ledger_seq: seq,
+                tx_set: TransactionSet {
+                    previous_ledger_hash: Hash::default(),
+                    txs: VecM::default(),
+                },
+                ext: TransactionHistoryEntryExt::V0,
+            };
+            conn.store_tx_history_entry(seq, &tx_entry).unwrap();
+
+            let result_entry = TransactionHistoryResultEntry {
+                ledger_seq: seq,
+                tx_result_set: TransactionResultSet {
+                    results: VecM::default(),
+                },
+                ext: TransactionHistoryResultEntryExt::V0,
+            };
+            conn.store_tx_result_entry(seq, &result_entry).unwrap();
+        }
+
+        struct SharedBufP(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBufP {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let tx_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let result_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+
+        let mut tx_stream =
+            XdrOutputStream::from_writer(Box::new(SharedBufP(tx_buf.clone())));
+        let mut result_stream =
+            XdrOutputStream::from_writer(Box::new(SharedBufP(result_buf.clone())));
+
+        let (tx_written, result_written) = conn
+            .copy_tx_history_to_streams(100, 5, &mut tx_stream, &mut result_stream)
+            .unwrap();
+
+        // Only 2 entries exist even though we asked for 5
+        assert_eq!(tx_written, 2);
+        assert_eq!(result_written, 2);
+    }
+
+    #[test]
+    fn test_copy_tx_history_to_streams_empty_range() {
+        let conn = setup_db();
+
+        struct SharedBuf2(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf2 {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let tx_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let result_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+
+        let mut tx_stream = XdrOutputStream::from_writer(Box::new(SharedBuf2(tx_buf.clone())));
+        let mut result_stream =
+            XdrOutputStream::from_writer(Box::new(SharedBuf2(result_buf.clone())));
+
+        let (tx_written, result_written) = conn
+            .copy_tx_history_to_streams(100, 3, &mut tx_stream, &mut result_stream)
+            .unwrap();
+
+        assert_eq!(tx_written, 0);
+        assert_eq!(result_written, 0);
     }
 
     #[test]

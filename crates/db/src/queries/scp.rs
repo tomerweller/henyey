@@ -14,8 +14,10 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 use henyey_common::Hash256;
+use henyey_common::xdr_stream::XdrOutputStream;
 use stellar_xdr::curr::{
     Hash, Limits, NodeId, PublicKey, ReadXdr, ScpEnvelope, ScpQuorumSet, Uint256, WriteXdr,
+    ScpHistoryEntry, ScpHistoryEntryV0, LedgerScpMessages,
 };
 
 use crate::error::DbError;
@@ -52,6 +54,18 @@ pub trait ScpQueries {
     ///
     /// Returns `None` if no quorum set with the given hash is stored.
     fn load_scp_quorum_set(&self, hash: &Hash256) -> Result<Option<ScpQuorumSet>, DbError>;
+
+    /// Copy SCP history entries to an XDR output stream.
+    ///
+    /// Builds `ScpHistoryEntry::V0` records for ledger sequences
+    /// `[begin, begin + count)` by combining SCP envelopes and their
+    /// referenced quorum sets. Returns the number of entries written.
+    fn copy_scp_history_to_stream(
+        &self,
+        begin: u32,
+        count: u32,
+        stream: &mut XdrOutputStream,
+    ) -> Result<usize, DbError>;
 
     /// Deletes old SCP history entries up to and including `max_ledger`.
     ///
@@ -154,6 +168,68 @@ impl ScpQueries for Connection {
         }
     }
 
+    fn copy_scp_history_to_stream(
+        &self,
+        begin: u32,
+        count: u32,
+        stream: &mut XdrOutputStream,
+    ) -> Result<usize, DbError> {
+        let end = begin.saturating_add(count);
+        let mut written = 0usize;
+
+        // Get distinct ledger sequences in range that have SCP history
+        let mut seq_stmt = self.prepare(
+            "SELECT DISTINCT ledgerseq FROM scphistory WHERE ledgerseq >= ?1 AND ledgerseq < ?2 ORDER BY ledgerseq ASC",
+        )?;
+        let ledger_seqs: Vec<u32> = seq_stmt
+            .query_map(params![begin, end], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        for ledger_seq in ledger_seqs {
+            // Load envelopes for this ledger
+            let envelopes = self.load_scp_history(ledger_seq)?;
+            if envelopes.is_empty() {
+                continue;
+            }
+
+            // Collect referenced quorum set hashes
+            let mut qset_hashes = std::collections::HashSet::new();
+            for env in &envelopes {
+                if let Some(hash) = scp_envelope_quorum_set_hash(env) {
+                    qset_hashes.insert(hash);
+                }
+            }
+
+            // Load referenced quorum sets
+            let mut quorum_sets = Vec::new();
+            for hash in &qset_hashes {
+                if let Some(qset) = self.load_scp_quorum_set(hash)? {
+                    quorum_sets.push(qset);
+                }
+            }
+
+            // Build ScpHistoryEntry::V0
+            let entry = ScpHistoryEntry::V0(ScpHistoryEntryV0 {
+                quorum_sets: quorum_sets.try_into().map_err(|_| {
+                    DbError::Integrity("too many quorum sets for XDR vec".to_string())
+                })?,
+                ledger_messages: LedgerScpMessages {
+                    ledger_seq,
+                    messages: envelopes.try_into().map_err(|_| {
+                        DbError::Integrity("too many SCP messages for XDR vec".to_string())
+                    })?,
+                },
+            });
+
+            stream
+                .write_one(&entry)
+                .map_err(|e| DbError::Integrity(format!("Failed to write SCP entry: {}", e)))?;
+            written += 1;
+        }
+
+        Ok(written)
+    }
+
     fn delete_old_scp_entries(&self, max_ledger: u32, count: u32) -> Result<u32, DbError> {
         // Delete old SCP history entries
         // Note: scphistory may have multiple rows per ledger (one per node)
@@ -187,6 +263,17 @@ impl ScpQueries for Connection {
 
         Ok((history_deleted + quorums_deleted) as u32)
     }
+}
+
+/// Extract the quorum set hash from an SCP envelope's statement.
+fn scp_envelope_quorum_set_hash(envelope: &ScpEnvelope) -> Option<Hash256> {
+    let hash = match &envelope.statement.pledges {
+        stellar_xdr::curr::ScpStatementPledges::Nominate(nom) => &nom.quorum_set_hash,
+        stellar_xdr::curr::ScpStatementPledges::Prepare(prep) => &prep.quorum_set_hash,
+        stellar_xdr::curr::ScpStatementPledges::Confirm(conf) => &conf.quorum_set_hash,
+        stellar_xdr::curr::ScpStatementPledges::Externalize(ext) => &ext.commit_quorum_set_hash,
+    };
+    Some(Hash256::from_bytes(hash.0))
 }
 
 /// Converts a NodeId to a hex string for database storage and sorting.
@@ -479,6 +566,162 @@ mod tests {
         // Load all
         let all = conn.load_all_tx_set_data().unwrap();
         assert_eq!(all.len(), 1);
+    }
+
+    // Item 13: copy_scp_history_to_stream tests
+    #[test]
+    fn test_copy_scp_history_to_stream_basic() {
+        let conn = setup_db();
+
+        // Store SCP history for ledger 100
+        let node_id = NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
+        let qset_hash = Hash([0u8; 32]);
+        let envelope = ScpEnvelope {
+            statement: stellar_xdr::curr::ScpStatement {
+                node_id: node_id.clone(),
+                slot_index: 100,
+                pledges: stellar_xdr::curr::ScpStatementPledges::Prepare(
+                    stellar_xdr::curr::ScpStatementPrepare {
+                        quorum_set_hash: qset_hash.clone(),
+                        ballot: stellar_xdr::curr::ScpBallot {
+                            counter: 1,
+                            value: vec![].try_into().unwrap(),
+                        },
+                        prepared: None,
+                        prepared_prime: None,
+                        n_c: 0,
+                        n_h: 0,
+                    },
+                ),
+            },
+            signature: stellar_xdr::curr::Signature::default(),
+        };
+        conn.store_scp_history(100, &[envelope]).unwrap();
+
+        // Store the referenced quorum set
+        let hash = Hash256::from([0u8; 32]);
+        let qset = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        conn.store_scp_quorum_set(&hash, 100, &qset).unwrap();
+
+        // Write to stream
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let writer = SharedBuf(buf.clone());
+        let mut stream = XdrOutputStream::from_writer(Box::new(writer));
+
+        let written = conn.copy_scp_history_to_stream(100, 1, &mut stream).unwrap();
+        assert_eq!(written, 1);
+
+        // Verify data was written
+        let data = buf.lock().unwrap().clone();
+        assert!(!data.is_empty());
+    }
+
+    #[test]
+    fn test_copy_scp_history_to_stream_readback() {
+        let conn = setup_db();
+
+        // Store SCP history for ledgers 100 and 101
+        for seq in 100..=101u32 {
+            let node_id = NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([seq as u8; 32])));
+            let qset_hash = Hash([seq as u8; 32]);
+            let envelope = ScpEnvelope {
+                statement: stellar_xdr::curr::ScpStatement {
+                    node_id: node_id.clone(),
+                    slot_index: seq as u64,
+                    pledges: stellar_xdr::curr::ScpStatementPledges::Prepare(
+                        stellar_xdr::curr::ScpStatementPrepare {
+                            quorum_set_hash: qset_hash.clone(),
+                            ballot: stellar_xdr::curr::ScpBallot {
+                                counter: 1,
+                                value: vec![].try_into().unwrap(),
+                            },
+                            prepared: None,
+                            prepared_prime: None,
+                            n_c: 0,
+                            n_h: 0,
+                        },
+                    ),
+                },
+                signature: stellar_xdr::curr::Signature::default(),
+            };
+            conn.store_scp_history(seq, &[envelope]).unwrap();
+
+            let hash = Hash256::from([seq as u8; 32]);
+            let qset = ScpQuorumSet {
+                threshold: 1,
+                validators: vec![].try_into().unwrap(),
+                inner_sets: vec![].try_into().unwrap(),
+            };
+            conn.store_scp_quorum_set(&hash, seq, &qset).unwrap();
+        }
+
+        // Write to stream
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        struct SharedBufR(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBufR {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let writer = SharedBufR(buf.clone());
+        let mut stream = XdrOutputStream::from_writer(Box::new(writer));
+
+        let written = conn.copy_scp_history_to_stream(100, 2, &mut stream).unwrap();
+        assert_eq!(written, 2);
+
+        // Read back with XdrInputStream
+        let data = buf.lock().unwrap().clone();
+        let cursor = std::io::Cursor::new(data);
+        let mut input =
+            henyey_common::xdr_stream::XdrInputStream::from_reader(Box::new(cursor));
+        let entries: Vec<ScpHistoryEntry> = input.read_all().unwrap();
+        assert_eq!(entries.len(), 2);
+
+        // Verify ledger sequences
+        let ScpHistoryEntry::V0(ref v0_100) = entries[0];
+        assert_eq!(v0_100.ledger_messages.ledger_seq, 100);
+        let ScpHistoryEntry::V0(ref v0_101) = entries[1];
+        assert_eq!(v0_101.ledger_messages.ledger_seq, 101);
+    }
+
+    #[test]
+    fn test_copy_scp_history_to_stream_empty_range() {
+        let conn = setup_db();
+
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        struct SharedBuf2(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf2 {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let writer = SharedBuf2(buf.clone());
+        let mut stream = XdrOutputStream::from_writer(Box::new(writer));
+
+        let written = conn.copy_scp_history_to_stream(200, 10, &mut stream).unwrap();
+        assert_eq!(written, 0);
     }
 
     #[test]

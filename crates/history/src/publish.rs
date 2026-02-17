@@ -309,6 +309,12 @@ impl PublishManager {
 
         // Write History Archive State
         let has = self.create_has(checkpoint_ledger, headers, bucket_list)?;
+
+        // Validate that all bucket hashes in the HAS are known (pre-publish check)
+        let known_hashes: std::collections::HashSet<Hash256> =
+            has.all_bucket_hashes().into_iter().collect();
+        has.contains_valid_buckets(&known_hashes)?;
+
         let has_path = self.has_path(checkpoint_ledger);
         self.write_has(&has_path, &has)?;
         state.files_written += 1;

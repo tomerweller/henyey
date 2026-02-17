@@ -32,11 +32,14 @@
 //! state must match `header.bucket_list_hash`. This proves that we have correctly
 //! rebuilt the entire ledger state.
 
-use crate::{archive_state::HistoryArchiveState, HistoryError, Result};
+use crate::{archive_state::HistoryArchiveState, checkpoint, HistoryError, Result, GENESIS_LEDGER_SEQ};
 use henyey_common::Hash256;
 use henyey_crypto::Sha256Hasher;
 use henyey_ledger::TransactionSetVariant;
-use stellar_xdr::curr::{LedgerHeader, Limits, ScpHistoryEntry, ScpStatement, WriteXdr};
+use stellar_xdr::curr::{
+    LedgerHeader, Limits, ScpHistoryEntry, ScpStatement,
+    TransactionHistoryResultEntry, WriteXdr,
+};
 
 /// Verify that a chain of ledger headers is correctly linked.
 ///
@@ -145,12 +148,20 @@ pub fn compute_header_hash(header: &LedgerHeader) -> Result<Hash256> {
 /// Verify a transaction result set against the ledger header.
 ///
 /// The hash of the transaction result set must match what's in the header.
+/// For the genesis ledger (seq == 1), an empty result set is accepted without
+/// hash verification, matching stellar-core's `VerifyTxResultsWork`.
 ///
 /// # Arguments
 ///
 /// * `header` - The ledger header
 /// * `tx_result_set_xdr` - XDR-encoded transaction result set
 pub fn verify_tx_result_set(header: &LedgerHeader, tx_result_set_xdr: &[u8]) -> Result<()> {
+    // Genesis ledger exception: stellar-core skips verification when the result
+    // set is empty at the genesis ledger because it has no transactions.
+    if header.ledger_seq == GENESIS_LEDGER_SEQ && tx_result_set_xdr.is_empty() {
+        return Ok(());
+    }
+
     let actual_hash = Hash256::hash(tx_result_set_xdr);
     let expected_hash = Hash256::from(header.tx_set_result_hash.clone());
 
@@ -315,6 +326,52 @@ pub fn verify_scp_history_entries(entries: &[ScpHistoryEntry]) -> Result<()> {
     Ok(())
 }
 
+/// Verify that transaction result entries within a checkpoint are correctly ordered.
+///
+/// Validates that:
+/// 1. All ledger sequence numbers fall within the checkpoint range
+/// 2. Sequence numbers are strictly increasing
+///
+/// # Arguments
+///
+/// * `entries` - Transaction result entries to verify
+/// * `checkpoint` - The checkpoint ledger sequence number
+pub fn verify_tx_result_ordering(
+    entries: &[TransactionHistoryResultEntry],
+    checkpoint: u32,
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let (range_start, range_end) = checkpoint::checkpoint_range(checkpoint);
+
+    let mut prev_seq = None;
+    for entry in entries {
+        // Check within checkpoint range
+        if entry.ledger_seq < range_start || entry.ledger_seq > range_end {
+            return Err(HistoryError::VerificationFailed(format!(
+                "tx result entry ledger {} outside checkpoint range [{}, {}]",
+                entry.ledger_seq, range_start, range_end
+            )));
+        }
+
+        // Check strictly increasing
+        if let Some(prev) = prev_seq {
+            if entry.ledger_seq <= prev {
+                return Err(HistoryError::VerificationFailed(format!(
+                    "tx result entries not strictly increasing: {} followed by {}",
+                    prev, entry.ledger_seq
+                )));
+            }
+        }
+
+        prev_seq = Some(entry.ledger_seq);
+    }
+
+    Ok(())
+}
+
 fn scp_quorum_set_hash(statement: &ScpStatement) -> Option<stellar_xdr::curr::Hash> {
     match &statement.pledges {
         stellar_xdr::curr::ScpStatementPledges::Nominate(nom) => Some(nom.quorum_set_hash.clone()),
@@ -408,5 +465,188 @@ mod tests {
         let header = make_test_header(1, Hash256::ZERO);
         let headers = vec![header];
         assert!(verify_header_chain(&headers).is_ok());
+    }
+
+    // Item 1: Genesis ledger exception tests
+    #[test]
+    fn test_verify_tx_result_set_genesis_empty() {
+        let header = make_test_header(GENESIS_LEDGER_SEQ, Hash256::ZERO);
+        // Empty result set at genesis should pass without hash check
+        assert!(verify_tx_result_set(&header, &[]).is_ok());
+    }
+
+    #[test]
+    fn test_verify_tx_result_set_genesis_nonempty() {
+        let header = make_test_header(GENESIS_LEDGER_SEQ, Hash256::ZERO);
+        // Non-empty result set at genesis should still verify hash
+        let result = verify_tx_result_set(&header, &[1, 2, 3]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_tx_result_set_non_genesis_empty() {
+        let header = make_test_header(2, Hash256::ZERO);
+        // Empty result at non-genesis should still verify hash
+        let result = verify_tx_result_set(&header, &[]);
+        // This will fail unless the hash happens to match (it won't for zero header)
+        // The hash of empty bytes won't match the zero tx_set_result_hash
+        let empty_hash = Hash256::hash(&[]);
+        let expected_hash = Hash256::from(header.tx_set_result_hash.clone());
+        if empty_hash != expected_hash {
+            assert!(result.is_err());
+        }
+    }
+
+    // Item 4: Transaction result ordering tests
+    #[test]
+    fn test_verify_tx_result_ordering_valid() {
+        use stellar_xdr::curr::{
+            TransactionHistoryResultEntry, TransactionHistoryResultEntryExt,
+            TransactionResultSet, VecM,
+        };
+
+        let entries = vec![
+            TransactionHistoryResultEntry {
+                ledger_seq: 64,
+                tx_result_set: TransactionResultSet {
+                    results: VecM::default(),
+                },
+                ext: TransactionHistoryResultEntryExt::V0,
+            },
+            TransactionHistoryResultEntry {
+                ledger_seq: 65,
+                tx_result_set: TransactionResultSet {
+                    results: VecM::default(),
+                },
+                ext: TransactionHistoryResultEntryExt::V0,
+            },
+            TransactionHistoryResultEntry {
+                ledger_seq: 127,
+                tx_result_set: TransactionResultSet {
+                    results: VecM::default(),
+                },
+                ext: TransactionHistoryResultEntryExt::V0,
+            },
+        ];
+        assert!(verify_tx_result_ordering(&entries, 127).is_ok());
+    }
+
+    #[test]
+    fn test_verify_tx_result_ordering_out_of_range() {
+        use stellar_xdr::curr::{
+            TransactionHistoryResultEntry, TransactionHistoryResultEntryExt,
+            TransactionResultSet, VecM,
+        };
+
+        let entries = vec![TransactionHistoryResultEntry {
+            ledger_seq: 200, // Outside checkpoint 127 (range 64-127)
+            tx_result_set: TransactionResultSet {
+                results: VecM::default(),
+            },
+            ext: TransactionHistoryResultEntryExt::V0,
+        }];
+        assert!(verify_tx_result_ordering(&entries, 127).is_err());
+    }
+
+    #[test]
+    fn test_verify_tx_result_ordering_not_increasing() {
+        use stellar_xdr::curr::{
+            TransactionHistoryResultEntry, TransactionHistoryResultEntryExt,
+            TransactionResultSet, VecM,
+        };
+
+        let entries = vec![
+            TransactionHistoryResultEntry {
+                ledger_seq: 65,
+                tx_result_set: TransactionResultSet {
+                    results: VecM::default(),
+                },
+                ext: TransactionHistoryResultEntryExt::V0,
+            },
+            TransactionHistoryResultEntry {
+                ledger_seq: 65, // Duplicate, not strictly increasing
+                tx_result_set: TransactionResultSet {
+                    results: VecM::default(),
+                },
+                ext: TransactionHistoryResultEntryExt::V0,
+            },
+        ];
+        assert!(verify_tx_result_ordering(&entries, 127).is_err());
+    }
+
+    #[test]
+    fn test_verify_tx_result_ordering_empty() {
+        let entries: Vec<TransactionHistoryResultEntry> = vec![];
+        assert!(verify_tx_result_ordering(&entries, 127).is_ok());
+    }
+
+    #[test]
+    fn test_verify_tx_result_ordering_descending() {
+        use stellar_xdr::curr::{
+            TransactionHistoryResultEntry, TransactionHistoryResultEntryExt,
+            TransactionResultSet, VecM,
+        };
+
+        let entries = vec![
+            TransactionHistoryResultEntry {
+                ledger_seq: 100,
+                tx_result_set: TransactionResultSet {
+                    results: VecM::default(),
+                },
+                ext: TransactionHistoryResultEntryExt::V0,
+            },
+            TransactionHistoryResultEntry {
+                ledger_seq: 80, // Descending, not strictly increasing
+                tx_result_set: TransactionResultSet {
+                    results: VecM::default(),
+                },
+                ext: TransactionHistoryResultEntryExt::V0,
+            },
+        ];
+        assert!(verify_tx_result_ordering(&entries, 127).is_err());
+    }
+
+    #[test]
+    fn test_verify_tx_result_ordering_single_entry() {
+        use stellar_xdr::curr::{
+            TransactionHistoryResultEntry, TransactionHistoryResultEntryExt,
+            TransactionResultSet, VecM,
+        };
+
+        let entries = vec![TransactionHistoryResultEntry {
+            ledger_seq: 100,
+            tx_result_set: TransactionResultSet {
+                results: VecM::default(),
+            },
+            ext: TransactionHistoryResultEntryExt::V0,
+        }];
+        assert!(verify_tx_result_ordering(&entries, 127).is_ok());
+    }
+
+    #[test]
+    fn test_verify_tx_result_ordering_first_checkpoint() {
+        use stellar_xdr::curr::{
+            TransactionHistoryResultEntry, TransactionHistoryResultEntryExt,
+            TransactionResultSet, VecM,
+        };
+
+        // Checkpoint 63: range is 0-63
+        let entries = vec![
+            TransactionHistoryResultEntry {
+                ledger_seq: 1,
+                tx_result_set: TransactionResultSet {
+                    results: VecM::default(),
+                },
+                ext: TransactionHistoryResultEntryExt::V0,
+            },
+            TransactionHistoryResultEntry {
+                ledger_seq: 63,
+                tx_result_set: TransactionResultSet {
+                    results: VecM::default(),
+                },
+                ext: TransactionHistoryResultEntryExt::V0,
+            },
+        ];
+        assert!(verify_tx_result_ordering(&entries, 63).is_ok());
     }
 }

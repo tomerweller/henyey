@@ -6,7 +6,8 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 use henyey_common::Hash256;
-use stellar_xdr::curr::{LedgerHeader, Limits, ReadXdr};
+use henyey_common::xdr_stream::XdrOutputStream;
+use stellar_xdr::curr::{LedgerHeader, LedgerHeaderHistoryEntry, Limits, ReadXdr};
 
 use crate::error::DbError;
 
@@ -37,6 +38,24 @@ pub trait LedgerQueries {
     /// The hash is computed from the XDR-encoded header data.
     /// Returns `None` if the ledger is not found.
     fn get_ledger_hash(&self, seq: u32) -> Result<Option<Hash256>, DbError>;
+
+    /// Loads a ledger header by its hash (hex-encoded).
+    ///
+    /// Returns `None` if no ledger with the given hash is found.
+    fn load_ledger_header_by_hash(&self, hash: &str) -> Result<Option<LedgerHeader>, DbError>;
+
+    /// Copy ledger headers from the database to an XDR output stream.
+    ///
+    /// Writes `LedgerHeaderHistoryEntry` records for ledger sequences
+    /// `[begin, begin + count)` to the stream. Returns the number of
+    /// headers actually written (may be less than `count` if some ledgers
+    /// are missing from the database).
+    fn copy_ledger_headers_to_stream(
+        &self,
+        begin: u32,
+        count: u32,
+        stream: &mut XdrOutputStream,
+    ) -> Result<u32, DbError>;
 
     /// Deletes old ledger headers up to and including `max_ledger`.
     ///
@@ -116,6 +135,61 @@ impl LedgerQueries for Connection {
             }
             None => Ok(None),
         }
+    }
+
+    fn load_ledger_header_by_hash(&self, hash: &str) -> Result<Option<LedgerHeader>, DbError> {
+        let result: Option<Vec<u8>> = self
+            .query_row(
+                "SELECT data FROM ledgerheaders WHERE ledgerhash = ?1",
+                params![hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        match result {
+            Some(data) => {
+                let header = LedgerHeader::from_xdr(&data, Limits::none())?;
+                Ok(Some(header))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn copy_ledger_headers_to_stream(
+        &self,
+        begin: u32,
+        count: u32,
+        stream: &mut XdrOutputStream,
+    ) -> Result<u32, DbError> {
+        let end = begin.saturating_add(count);
+        let mut stmt = self.prepare(
+            "SELECT ledgerseq, ledgerhash, data FROM ledgerheaders WHERE ledgerseq >= ?1 AND ledgerseq < ?2 ORDER BY ledgerseq ASC",
+        )?;
+        let rows = stmt.query_map(params![begin, end], |row| {
+            let seq: u32 = row.get(0)?;
+            let hash_hex: String = row.get(1)?;
+            let data: Vec<u8> = row.get(2)?;
+            Ok((seq, hash_hex, data))
+        })?;
+
+        let mut written = 0u32;
+        for row in rows {
+            let (_seq, hash_hex, data) = row?;
+            let header = LedgerHeader::from_xdr(&data, Limits::none())?;
+            let hash_bytes = Hash256::from_hex(&hash_hex)
+                .map_err(|e| DbError::Integrity(format!("Invalid ledger hash: {}", e)))?;
+            let entry = LedgerHeaderHistoryEntry {
+                hash: stellar_xdr::curr::Hash(hash_bytes.0),
+                header,
+                ext: stellar_xdr::curr::LedgerHeaderHistoryEntryExt::V0,
+            };
+            stream
+                .write_one(&entry)
+                .map_err(|e| DbError::Integrity(format!("Failed to write header: {}", e)))?;
+            written += 1;
+        }
+
+        Ok(written)
     }
 
     fn delete_old_ledger_headers(&self, max_ledger: u32, count: u32) -> Result<u32, DbError> {
@@ -232,6 +306,107 @@ mod tests {
 
         // Non-existent ledger
         assert!(conn.get_ledger_hash(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_copy_ledger_headers_to_stream() {
+        let conn = setup_db();
+
+        // Store 5 ledger headers (seq 10-14)
+        for seq in 10..=14 {
+            let header = create_test_header(seq);
+            let data = header.to_xdr(Limits::none()).unwrap();
+            conn.store_ledger_header(&header, &data).unwrap();
+        }
+
+        // Write to an in-memory XDR stream
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let writer = SharedBuf(buf.clone());
+        let mut stream = XdrOutputStream::from_writer(Box::new(writer));
+
+        let written = conn.copy_ledger_headers_to_stream(10, 5, &mut stream).unwrap();
+        assert_eq!(written, 5);
+
+        // Verify we can read them back
+        let data = buf.lock().unwrap().clone();
+        assert!(!data.is_empty());
+
+        // Read back with XdrInputStream
+        let cursor = std::io::Cursor::new(data);
+        let mut input = henyey_common::xdr_stream::XdrInputStream::from_reader(Box::new(cursor));
+        let entries: Vec<LedgerHeaderHistoryEntry> = input.read_all().unwrap();
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries[0].header.ledger_seq, 10);
+        assert_eq!(entries[4].header.ledger_seq, 14);
+    }
+
+    #[test]
+    fn test_copy_ledger_headers_to_stream_partial_range() {
+        let conn = setup_db();
+
+        // Store only ledgers 10 and 12 (skip 11)
+        for seq in [10, 12] {
+            let header = create_test_header(seq);
+            let data = header.to_xdr(Limits::none()).unwrap();
+            conn.store_ledger_header(&header, &data).unwrap();
+        }
+
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        struct SharedBuf2(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf2 {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let writer = SharedBuf2(buf.clone());
+        let mut stream = XdrOutputStream::from_writer(Box::new(writer));
+
+        // Request 5 ledgers starting at 10, but only 2 exist
+        let written = conn.copy_ledger_headers_to_stream(10, 5, &mut stream).unwrap();
+        assert_eq!(written, 2);
+    }
+
+    #[test]
+    fn test_load_ledger_header_by_hash_found() {
+        let conn = setup_db();
+        let header = create_test_header(100);
+        let data = header.to_xdr(Limits::none()).unwrap();
+        let hash = Hash256::hash(&data);
+
+        conn.store_ledger_header(&header, &data).unwrap();
+
+        let loaded = conn
+            .load_ledger_header_by_hash(&hash.to_hex())
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.ledger_seq, 100);
+    }
+
+    #[test]
+    fn test_load_ledger_header_by_hash_not_found() {
+        let conn = setup_db();
+        let result = conn
+            .load_ledger_header_by_hash(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap();
+        assert!(result.is_none());
     }
 
     #[test]

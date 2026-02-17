@@ -134,7 +134,7 @@ pub use cdp::{
 pub use checkpoint::{
     checkpoint_containing, first_ledger_in_checkpoint_containing, is_checkpoint_ledger,
     last_ledger_before_checkpoint_containing, latest_checkpoint_before_or_at,
-    size_of_checkpoint_containing, CHECKPOINT_FREQUENCY,
+    ledger_to_trigger_catchup, size_of_checkpoint_containing, CHECKPOINT_FREQUENCY,
 };
 pub use download::DownloadConfig;
 pub use error::HistoryError;
@@ -146,7 +146,10 @@ pub use publish_queue::{PublishQueue, PublishQueueStats};
 pub use publish::build_history_archive_state;
 pub use remote_archive::{RemoteArchive, RemoteArchiveConfig};
 pub use replay::{ReplayConfig, ReplayedLedgerState};
-pub use verify::{compute_header_hash, verify_bucket_hash, verify_header_chain};
+pub use archive_state::MAX_HISTORY_ARCHIVE_BUCKET_SIZE;
+pub use verify::{
+    compute_header_hash, verify_bucket_hash, verify_header_chain, verify_tx_result_ordering,
+};
 
 /// Result type for history operations.
 pub type Result<T> = std::result::Result<T, HistoryError>;

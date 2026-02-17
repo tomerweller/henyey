@@ -164,6 +164,36 @@ pub fn checkpoint_range(checkpoint_ledger_seq: u32) -> (u32, u32) {
     (start, checkpoint_ledger_seq)
 }
 
+/// Get the ledger that should trigger catchup for a buffered checkpoint.
+///
+/// Given the first ledger of a buffered checkpoint range, returns the ledger
+/// that should trigger catchup processing. This is `first_ledger + 1`,
+/// matching stellar-core's `LedgerManager::ledgerToTriggerCatchup`.
+///
+/// # Panics
+///
+/// Panics if `first_ledger_of_buffered_checkpoint` is not a checkpoint start
+/// (i.e., not a multiple of `CHECKPOINT_FREQUENCY`).
+///
+/// # Examples
+///
+/// ```
+/// use henyey_history::checkpoint::ledger_to_trigger_catchup;
+///
+/// assert_eq!(ledger_to_trigger_catchup(0), 1);
+/// assert_eq!(ledger_to_trigger_catchup(64), 65);
+/// assert_eq!(ledger_to_trigger_catchup(128), 129);
+/// ```
+pub fn ledger_to_trigger_catchup(first_ledger_of_buffered_checkpoint: u32) -> u32 {
+    assert_eq!(
+        first_ledger_of_buffered_checkpoint % CHECKPOINT_FREQUENCY,
+        0,
+        "not a checkpoint start: {}",
+        first_ledger_of_buffered_checkpoint
+    );
+    first_ledger_of_buffered_checkpoint + 1
+}
+
 /// Build the HAS (History Archive State) path for a given checkpoint.
 ///
 /// Re-export of [`crate::paths::has_path`].
@@ -274,5 +304,24 @@ mod tests {
         assert_eq!(first_ledger_in_checkpoint_containing(64), 64);
         assert_eq!(first_ledger_in_checkpoint_containing(127), 64);
         assert_eq!(first_ledger_in_checkpoint_containing(128), 128);
+    }
+
+    // Item 5: ledger_to_trigger_catchup tests
+    #[test]
+    fn test_ledger_to_trigger_catchup_first_checkpoint() {
+        assert_eq!(ledger_to_trigger_catchup(0), 1);
+    }
+
+    #[test]
+    fn test_ledger_to_trigger_catchup_normal() {
+        assert_eq!(ledger_to_trigger_catchup(64), 65);
+        assert_eq!(ledger_to_trigger_catchup(128), 129);
+        assert_eq!(ledger_to_trigger_catchup(192), 193);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a checkpoint start")]
+    fn test_ledger_to_trigger_catchup_panics_on_non_start() {
+        ledger_to_trigger_catchup(63); // 63 is not a checkpoint start
     }
 }

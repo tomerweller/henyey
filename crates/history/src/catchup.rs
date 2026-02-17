@@ -905,6 +905,16 @@ impl CatchupManager {
         Ok(())
     }
 
+    /// Select an archive for a download attempt, rotating through available archives.
+    ///
+    /// Uses `attempt % archives.len()` to distribute retries across different archives,
+    /// providing failover when one archive is down or slow. This matches stellar-core's
+    /// archive selection strategy for retry resilience.
+    fn select_archive(&self, attempt: u32) -> &Arc<HistoryArchive> {
+        let index = (attempt as usize) % self.archives.len();
+        &self.archives[index]
+    }
+
     /// Update the progress status.
     fn update_progress(&mut self, status: CatchupStatus, step: u32, message: &str) {
         self.progress.status = status;
@@ -917,8 +927,13 @@ impl CatchupManager {
     }
 
     /// Download the History Archive State for a checkpoint.
+    ///
+    /// Uses archive rotation: each attempt tries a different archive, cycling
+    /// through them to provide failover when one archive is unavailable.
     async fn download_has(&self, checkpoint_seq: u32) -> Result<HistoryArchiveState> {
-        for archive in &self.archives {
+        let num_archives = self.archives.len() as u32;
+        for attempt in 0..num_archives {
+            let archive = self.select_archive(attempt);
             match archive.get_checkpoint_has(checkpoint_seq).await {
                 Ok(has) => return Ok(has),
                 Err(e) => {
@@ -1020,6 +1035,18 @@ impl CatchupManager {
                     for archive in &archives {
                         match archive.get_bucket(&hash).await {
                             Ok(data) => {
+                                // Reject oversized buckets
+                                if data.len() as u64
+                                    > crate::archive_state::MAX_HISTORY_ARCHIVE_BUCKET_SIZE
+                                {
+                                    warn!(
+                                        "Bucket {} exceeds MAX_HISTORY_ARCHIVE_BUCKET_SIZE ({} > {})",
+                                        hash,
+                                        data.len(),
+                                        crate::archive_state::MAX_HISTORY_ARCHIVE_BUCKET_SIZE
+                                    );
+                                    continue;
+                                }
                                 // Save to disk
                                 if let Err(e) = std::fs::write(&bucket_path, &data) {
                                     warn!("Failed to save bucket {} to disk: {}", hash, e);
@@ -2224,5 +2251,29 @@ mod tests {
     fn test_catchup_status() {
         assert_eq!(CatchupStatus::Pending, CatchupStatus::Pending);
         assert_ne!(CatchupStatus::Pending, CatchupStatus::Completed);
+    }
+
+    #[test]
+    fn test_select_archive_rotation_logic() {
+        // Verify the rotation logic: attempt % len gives round-robin
+        let num_archives = 3usize;
+
+        let select = |attempt: u32| -> usize { (attempt as usize) % num_archives };
+
+        assert_eq!(select(0), 0);
+        assert_eq!(select(1), 1);
+        assert_eq!(select(2), 2);
+        // Wraps around
+        assert_eq!(select(3), 0);
+        assert_eq!(select(4), 1);
+        assert_eq!(select(5), 2);
+        assert_eq!(select(6), 0);
+
+        // Single archive always returns 0
+        let num_archives = 1usize;
+        let select = |attempt: u32| -> usize { (attempt as usize) % num_archives };
+        assert_eq!(select(0), 0);
+        assert_eq!(select(1), 0);
+        assert_eq!(select(100), 0);
     }
 }

@@ -3,10 +3,17 @@
 //! The History Archive State is a JSON file that describes the current state
 //! of a Stellar history archive, including the current ledger and bucket list hashes.
 
+use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use henyey_common::Hash256;
 
 use crate::error::HistoryError;
+
+/// Maximum allowed size for a bucket file downloaded from a history archive (100 GiB).
+///
+/// This matches stellar-core's `MAX_HISTORY_ARCHIVE_BUCKET_SIZE` constant
+/// and prevents downloading unreasonably large or corrupted bucket files.
+pub const MAX_HISTORY_ARCHIVE_BUCKET_SIZE: u64 = 100 * 1024 * 1024 * 1024;
 
 /// The zero hash string used to identify empty bucket slots.
 const ZERO_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -318,6 +325,127 @@ impl HistoryArchiveState {
             .collect()
     }
 
+    /// Validate that all bucket hashes referenced in this HAS exist in the known set.
+    ///
+    /// This checks that:
+    /// 1. Level 0 `next` is clear (state == 0) — level 0 never has pending merges
+    /// 2. All non-zero curr/snap bucket hashes exist in `known_hashes`
+    /// 3. For state==2 futures, the input curr/snap hashes also exist in `known_hashes`
+    /// 4. For state==1 futures, the output hash exists in `known_hashes`
+    ///
+    /// This matches stellar-core's `containsValidBuckets` check.
+    pub fn contains_valid_buckets(&self, known_hashes: &HashSet<Hash256>) -> Result<(), HistoryError> {
+        // Level 0 next must be clear
+        if let Some(level0) = self.current_buckets.first() {
+            if level0.next.state != 0 {
+                return Err(HistoryError::VerificationFailed(
+                    "level 0 next is not clear in HAS".to_string(),
+                ));
+            }
+        }
+
+        for (i, level) in self.current_buckets.iter().enumerate() {
+            // Check curr hash
+            if let Some(h) = parse_nonzero_hash(&level.curr) {
+                if !known_hashes.contains(&h) {
+                    return Err(HistoryError::VerificationFailed(format!(
+                        "unknown curr bucket hash at level {}: {}",
+                        i,
+                        level.curr
+                    )));
+                }
+            }
+
+            // Check snap hash
+            if let Some(h) = parse_nonzero_hash(&level.snap) {
+                if !known_hashes.contains(&h) {
+                    return Err(HistoryError::VerificationFailed(format!(
+                        "unknown snap bucket hash at level {}: {}",
+                        i,
+                        level.snap
+                    )));
+                }
+            }
+
+            // Check future bucket references
+            match level.next.state {
+                1 => {
+                    // Output hash must be known
+                    if let Some(ref output) = level.next.output {
+                        if let Some(h) = parse_nonzero_hash(output) {
+                            if !known_hashes.contains(&h) {
+                                return Err(HistoryError::VerificationFailed(format!(
+                                    "unknown output bucket hash at level {}: {}",
+                                    i, output
+                                )));
+                            }
+                        }
+                    }
+                }
+                2 => {
+                    // Input curr/snap must be known
+                    if let Some(ref curr) = level.next.curr {
+                        if let Some(h) = parse_nonzero_hash(curr) {
+                            if !known_hashes.contains(&h) {
+                                return Err(HistoryError::VerificationFailed(format!(
+                                    "unknown input curr bucket hash at level {}: {}",
+                                    i, curr
+                                )));
+                            }
+                        }
+                    }
+                    if let Some(ref snap) = level.next.snap {
+                        if let Some(h) = parse_nonzero_hash(snap) {
+                            if !known_hashes.contains(&h) {
+                                return Err(HistoryError::VerificationFailed(format!(
+                                    "unknown input snap bucket hash at level {}: {}",
+                                    i, snap
+                                )));
+                            }
+                        }
+                    }
+                }
+                _ => {} // state 0 (clear) — nothing to check
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if all future bucket merges are clear (state == 0).
+    ///
+    /// This means no merges are pending or in progress.
+    pub fn futures_all_clear(&self) -> bool {
+        self.current_buckets.iter().all(|level| level.next.state == 0)
+    }
+
+    /// Check if all future bucket merges are resolved (state <= 1).
+    ///
+    /// State 0 (clear) and state 1 (output hash known) are both "resolved".
+    /// Only state 2 (inputs known, merge in progress) is "unresolved".
+    pub fn futures_all_resolved(&self) -> bool {
+        self.current_buckets.iter().all(|level| level.next.state <= 1)
+    }
+
+    /// Resolve all completed futures: convert state 1 (output) to state 0 (clear).
+    ///
+    /// For state 1 futures, the output hash becomes the new curr, and the
+    /// future is cleared. This is used after restart to settle completed merges.
+    pub fn resolve_all_futures(&mut self) {
+        for level in &mut self.current_buckets {
+            if level.next.state == 1 {
+                level.next = HASBucketNext::default();
+            }
+        }
+    }
+
+    /// Clear all futures, resetting every level's next to default (state 0).
+    pub fn clear_all_futures(&mut self) {
+        for level in &mut self.current_buckets {
+            level.next = HASBucketNext::default();
+        }
+    }
+
     /// Get the next bucket merge states for hot archive bucket levels.
     pub fn hot_archive_next_states(&self) -> Option<Vec<LiveBucketNextState>> {
         self.hot_archive_buckets.as_ref().map(|levels| {
@@ -492,5 +620,238 @@ mod tests {
     fn test_invalid_json() {
         let result = HistoryArchiveState::from_json("not valid json");
         assert!(result.is_err());
+    }
+
+    // Item 3: MAX_HISTORY_ARCHIVE_BUCKET_SIZE constant test
+    #[test]
+    fn test_max_history_archive_bucket_size() {
+        assert_eq!(MAX_HISTORY_ARCHIVE_BUCKET_SIZE, 100 * 1024 * 1024 * 1024);
+    }
+
+    // Item 2: contains_valid_buckets tests
+    #[test]
+    fn test_contains_valid_buckets_all_present() {
+        let has = HistoryArchiveState::from_json(sample_has_json()).unwrap();
+        let known: HashSet<Hash256> = has.all_bucket_hashes().into_iter().collect();
+        assert!(has.contains_valid_buckets(&known).is_ok());
+    }
+
+    #[test]
+    fn test_contains_valid_buckets_missing_hash() {
+        let has = HistoryArchiveState::from_json(sample_has_json()).unwrap();
+        // Empty set — no known hashes
+        let known: HashSet<Hash256> = HashSet::new();
+        assert!(has.contains_valid_buckets(&known).is_err());
+    }
+
+    #[test]
+    fn test_contains_valid_buckets_level0_not_clear() {
+        let json = r#"{
+            "version": 2,
+            "currentLedger": 127,
+            "currentBuckets": [
+                {
+                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "next": { "state": 1, "output": "e113f8cc5468579cb57538e3204c8d3ecce59a0cdb47f6fa7e87ab4d9d8146fd" }
+                }
+            ]
+        }"#;
+        let has = HistoryArchiveState::from_json(json).unwrap();
+        let known: HashSet<Hash256> = has.all_bucket_hashes().into_iter().collect();
+        let result = has.contains_valid_buckets(&known);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("level 0"));
+    }
+
+    #[test]
+    fn test_contains_valid_buckets_state2_missing_inputs() {
+        let json = r#"{
+            "version": 2,
+            "currentLedger": 127,
+            "currentBuckets": [
+                {
+                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "next": { "state": 0 }
+                },
+                {
+                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "next": {
+                        "state": 2,
+                        "curr": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "snap": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    }
+                }
+            ]
+        }"#;
+        let has = HistoryArchiveState::from_json(json).unwrap();
+        // Only provide main hashes, not the future input hashes
+        let known: HashSet<Hash256> = HashSet::new();
+        let result = has.contains_valid_buckets(&known);
+        assert!(result.is_err());
+    }
+
+    // Item 6: FutureBucket resolution method tests
+    #[test]
+    fn test_futures_all_clear() {
+        let has = HistoryArchiveState::from_json(sample_has_json()).unwrap();
+        assert!(has.futures_all_clear());
+    }
+
+    #[test]
+    fn test_futures_all_clear_with_pending() {
+        let json = r#"{
+            "version": 2,
+            "currentLedger": 127,
+            "currentBuckets": [
+                {
+                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "next": { "state": 1, "output": "e113f8cc5468579cb57538e3204c8d3ecce59a0cdb47f6fa7e87ab4d9d8146fd" }
+                }
+            ]
+        }"#;
+        let has = HistoryArchiveState::from_json(json).unwrap();
+        assert!(!has.futures_all_clear());
+    }
+
+    #[test]
+    fn test_futures_all_resolved() {
+        let json = r#"{
+            "version": 2,
+            "currentLedger": 127,
+            "currentBuckets": [
+                {
+                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "next": { "state": 1, "output": "e113f8cc5468579cb57538e3204c8d3ecce59a0cdb47f6fa7e87ab4d9d8146fd" }
+                }
+            ]
+        }"#;
+        let has = HistoryArchiveState::from_json(json).unwrap();
+        assert!(has.futures_all_resolved()); // state <= 1 is resolved
+    }
+
+    #[test]
+    fn test_futures_not_all_resolved_with_state2() {
+        let json = r#"{
+            "version": 2,
+            "currentLedger": 127,
+            "currentBuckets": [
+                {
+                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "next": { "state": 2, "curr": "aaaa", "snap": "bbbb" }
+                }
+            ]
+        }"#;
+        let has = HistoryArchiveState::from_json(json).unwrap();
+        assert!(!has.futures_all_resolved()); // state 2 is not resolved
+    }
+
+    #[test]
+    fn test_resolve_all_futures() {
+        let json = r#"{
+            "version": 2,
+            "currentLedger": 127,
+            "currentBuckets": [
+                {
+                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "next": { "state": 0 }
+                },
+                {
+                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "next": { "state": 1, "output": "e113f8cc5468579cb57538e3204c8d3ecce59a0cdb47f6fa7e87ab4d9d8146fd" }
+                },
+                {
+                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "next": { "state": 2, "curr": "aaaa", "snap": "bbbb" }
+                }
+            ]
+        }"#;
+        let mut has = HistoryArchiveState::from_json(json).unwrap();
+        has.resolve_all_futures();
+
+        // state 0 stays 0, state 1 becomes 0, state 2 stays 2
+        assert_eq!(has.current_buckets[0].next.state, 0);
+        assert_eq!(has.current_buckets[1].next.state, 0);
+        assert_eq!(has.current_buckets[2].next.state, 2);
+    }
+
+    #[test]
+    fn test_contains_valid_buckets_state1_unknown_output() {
+        let json = r#"{
+            "version": 2,
+            "currentLedger": 127,
+            "currentBuckets": [
+                {
+                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "next": { "state": 0 }
+                },
+                {
+                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "next": { "state": 1, "output": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }
+                }
+            ]
+        }"#;
+        let has = HistoryArchiveState::from_json(json).unwrap();
+        // Provide empty set — output hash is unknown
+        let known: HashSet<Hash256> = HashSet::new();
+        let result = has.contains_valid_buckets(&known);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("output"));
+    }
+
+    #[test]
+    fn test_contains_valid_buckets_zero_hashes_only() {
+        // HAS with only zero hashes should pass (zero hashes are skipped)
+        let json = r#"{
+            "version": 2,
+            "currentLedger": 127,
+            "currentBuckets": [
+                {
+                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "next": { "state": 0 }
+                }
+            ]
+        }"#;
+        let has = HistoryArchiveState::from_json(json).unwrap();
+        let known: HashSet<Hash256> = HashSet::new();
+        assert!(has.contains_valid_buckets(&known).is_ok());
+    }
+
+    #[test]
+    fn test_clear_all_futures() {
+        let json = r#"{
+            "version": 2,
+            "currentLedger": 127,
+            "currentBuckets": [
+                {
+                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "next": { "state": 1, "output": "e113f8cc5468579cb57538e3204c8d3ecce59a0cdb47f6fa7e87ab4d9d8146fd" }
+                },
+                {
+                    "curr": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "snap": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "next": { "state": 2, "curr": "aaaa", "snap": "bbbb" }
+                }
+            ]
+        }"#;
+        let mut has = HistoryArchiveState::from_json(json).unwrap();
+        has.clear_all_futures();
+
+        assert!(has.futures_all_clear());
+        for level in &has.current_buckets {
+            assert_eq!(level.next.state, 0);
+        }
     }
 }
