@@ -112,19 +112,14 @@ pub fn execute_set_options(
         }
     }
 
-    // Clawback requires auth revocable
-    if let Some(set_flags) = op.set_flags {
-        if set_flags & AUTH_CLAWBACK_FLAG != 0 {
-            let new_flags = current_flags | set_flags;
-            if new_flags & AUTH_REVOCABLE_FLAG == 0 {
-                return Ok(make_result(SetOptionsResultCode::AuthRevocableRequired));
-            }
-        }
-    }
-
-    // Can't clear revocable if clawback is set
-    if let Some(clear_flags) = op.clear_flags {
-        if clear_flags & AUTH_REVOCABLE_FLAG != 0 && current_flags & AUTH_CLAWBACK_FLAG != 0 {
+    // Clawback requires auth revocable — check resulting flags after applying
+    // clear then set, matching stellar-core's accountFlagClawbackIsValid check
+    // which runs AFTER both clearFlags and setFlags are applied to account.flags
+    let clear = op.clear_flags.unwrap_or(0);
+    let set = op.set_flags.unwrap_or(0);
+    if clear != 0 || set != 0 {
+        let new_flags = (current_flags & !clear) | set;
+        if new_flags & AUTH_CLAWBACK_FLAG != 0 && new_flags & AUTH_REVOCABLE_FLAG == 0 {
             return Ok(make_result(SetOptionsResultCode::AuthRevocableRequired));
         }
     }
@@ -447,6 +442,7 @@ mod tests {
 
     const AUTH_REQUIRED_FLAG: u32 = 0x1;
     const AUTH_REVOCABLE_FLAG: u32 = 0x2;
+    const AUTH_CLAWBACK_FLAG: u32 = 0x8;
 
     fn make_string32(s: &str) -> String32 {
         String32::try_from(s.as_bytes().to_vec()).unwrap()
@@ -1331,6 +1327,55 @@ mod tests {
             0,
             "AUTH_REQUIRED should remain"
         );
+    }
+
+    /// Test clearing both AUTH_REVOCABLE and AUTH_CLAWBACK simultaneously succeeds.
+    ///
+    /// Regression test for ledger 59902996 mismatch: stellar-core applies clear_flags
+    /// then set_flags before checking accountFlagClawbackIsValid on the resulting
+    /// flags. If both REVOCABLE and CLAWBACK are cleared together, the resulting
+    /// flags have neither, which is valid. Our old code checked before applying and
+    /// incorrectly blocked clearing revocable when clawback was currently set.
+    #[test]
+    fn test_set_options_clear_revocable_and_clawback_simultaneously() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(50);
+        let mut source = create_test_account(source_id.clone(), 100_000_000);
+        // Account has both AUTH_REVOCABLE and AUTH_CLAWBACK set
+        source.flags = AUTH_REQUIRED_FLAG | AUTH_REVOCABLE_FLAG | AUTH_CLAWBACK_FLAG;
+        state.create_account(source);
+
+        // Clear both revocable and clawback at once
+        let op = SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: Some(AUTH_REVOCABLE_FLAG | AUTH_CLAWBACK_FLAG),
+            set_flags: None,
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: None,
+        };
+
+        let result = execute_set_options(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::SetOptions(r)) => {
+                assert!(
+                    matches!(r, SetOptionsResult::Success),
+                    "Clearing both revocable and clawback should succeed, got {:?}",
+                    r
+                );
+            }
+            other => panic!("expected SetOptions result, got {:?}", other),
+        }
+
+        let account = state.get_account(&source_id).unwrap();
+        assert_eq!(account.flags & AUTH_REVOCABLE_FLAG, 0);
+        assert_eq!(account.flags & AUTH_CLAWBACK_FLAG, 0);
+        assert_ne!(account.flags & AUTH_REQUIRED_FLAG, 0);
     }
 
     /// Test SetOptions set master weight to 0 (disable master key).
