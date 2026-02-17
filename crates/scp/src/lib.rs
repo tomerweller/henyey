@@ -56,7 +56,7 @@ mod scp;
 mod slot;
 
 // Re-export main types
-pub use ballot::{get_working_ballot, BallotPhase, BallotProtocol};
+pub use ballot::{get_working_ballot, BallotPhase};
 pub use compare::is_newer_nomination_or_ballot_st;
 pub use driver::{SCPDriver, SCPTimerType, ValidationLevel};
 pub use error::ScpError;
@@ -66,7 +66,6 @@ pub use format::{
 pub use info::{
     BallotInfo, BallotValue, CommitBounds, NominationInfo, NodeInfo, QuorumInfo, SlotInfo,
 };
-pub use nomination::NominationProtocol;
 pub use quorum::{
     find_closest_v_blocking, get_all_nodes, hash_quorum_set, is_blocking_set, is_quorum,
     is_quorum_set_sane, is_quorum_slice, is_v_blocking, is_valid_quorum_set, normalize_quorum_set,
@@ -85,9 +84,6 @@ pub type Result<T> = std::result::Result<T, ScpError>;
 
 /// A slot index (typically the ledger sequence number).
 pub type SlotIndex = u64;
-
-/// SCP ballot number.
-pub type BallotCounter = u32;
 
 /// Shared context threaded through ballot and nomination protocol methods.
 ///
@@ -187,80 +183,6 @@ impl QuorumInfoNodeState {
     /// Check if this state represents completed consensus.
     pub fn is_externalized(&self) -> bool {
         matches!(self, QuorumInfoNodeState::Externalized)
-    }
-}
-
-/// A historical statement record for debugging and analysis.
-///
-/// This struct captures metadata about a statement when it was received,
-/// useful for post-hoc analysis of consensus behavior.
-#[derive(Debug, Clone)]
-pub struct HistoricalStatement {
-    /// The envelope containing the statement.
-    pub envelope: ScpEnvelope,
-    /// When the statement was received (monotonic counter or timestamp).
-    pub received_at: u64,
-    /// Whether this statement was valid.
-    pub valid: bool,
-}
-
-/// JSON-serializable quorum set for persistence and debugging.
-///
-/// This provides a human-readable representation of a quorum set
-/// that can be serialized to JSON, matching stellar-core `toJson()` functionality.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
-pub struct QuorumSetJson {
-    /// Threshold required for this quorum set.
-    pub threshold: u32,
-    /// Validator public keys (as strkey strings).
-    pub validators: Vec<String>,
-    /// Nested inner quorum sets.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub inner_sets: Vec<QuorumSetJson>,
-}
-
-impl QuorumSetJson {
-    /// Convert from XDR ScpQuorumSet to JSON-serializable format.
-    pub fn from_xdr(qs: &ScpQuorumSet) -> Self {
-        Self {
-            threshold: qs.threshold,
-            validators: qs
-                .validators
-                .iter()
-                .map(quorum_config::node_id_to_strkey)
-                .collect(),
-            inner_sets: qs.inner_sets.iter().map(QuorumSetJson::from_xdr).collect(),
-        }
-    }
-
-    /// Convert to XDR ScpQuorumSet from JSON format.
-    ///
-    /// Returns None if any validator key fails to parse.
-    pub fn to_xdr(&self) -> Option<ScpQuorumSet> {
-        let validators: std::result::Result<Vec<_>, _> = self
-            .validators
-            .iter()
-            .map(|s| quorum_config::parse_node_id(s))
-            .collect();
-        let validators = validators.ok()?;
-
-        let inner_sets: Option<Vec<_>> = self.inner_sets.iter().map(|i| i.to_xdr()).collect();
-        let inner_sets = inner_sets?;
-
-        Some(ScpQuorumSet {
-            threshold: self.threshold,
-            validators: validators.try_into().ok()?,
-            inner_sets: inner_sets.try_into().ok()?,
-        })
-    }
-
-    /// Create a simple quorum set with just validators.
-    pub fn simple(threshold: u32, validators: Vec<String>) -> Self {
-        Self {
-            threshold,
-            validators,
-            inner_sets: vec![],
-        }
     }
 }
 
@@ -388,148 +310,4 @@ mod tests {
         assert!(QuorumInfoNodeState::Externalized.is_externalized());
     }
 
-    #[test]
-    fn test_historical_statement() {
-        let node = make_node_id(1);
-        let value = make_value(&[1, 2, 3]);
-        let quorum_set = make_quorum_set(vec![node.clone()], 1);
-
-        let nom = ScpNomination {
-            quorum_set_hash: hash_quorum_set(&quorum_set).into(),
-            votes: vec![value.clone()].try_into().unwrap(),
-            accepted: vec![].try_into().unwrap(),
-        };
-        let statement = ScpStatement {
-            node_id: node.clone(),
-            slot_index: 1,
-            pledges: ScpStatementPledges::Nominate(nom),
-        };
-        let envelope = ScpEnvelope {
-            statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
-        };
-
-        let hist = HistoricalStatement {
-            envelope: envelope.clone(),
-            received_at: 12345,
-            valid: true,
-        };
-
-        assert_eq!(hist.received_at, 12345);
-        assert!(hist.valid);
-        assert_eq!(hist.envelope.statement.slot_index, 1);
-    }
-
-    #[test]
-    fn test_quorum_set_json_simple() {
-        let qs_json = QuorumSetJson::simple(
-            2,
-            vec![
-                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
-                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB".to_string(),
-            ],
-        );
-
-        assert_eq!(qs_json.threshold, 2);
-        assert_eq!(qs_json.validators.len(), 2);
-        assert!(qs_json.inner_sets.is_empty());
-    }
-
-    #[test]
-    fn test_quorum_set_json_serialization() {
-        let qs_json = QuorumSetJson {
-            threshold: 2,
-            validators: vec!["GABC".to_string(), "GDEF".to_string()],
-            inner_sets: vec![QuorumSetJson {
-                threshold: 1,
-                validators: vec!["GHIJ".to_string()],
-                inner_sets: vec![],
-            }],
-        };
-
-        let json = serde_json::to_string(&qs_json).unwrap();
-        assert!(json.contains("\"threshold\":2"));
-        assert!(json.contains("\"validators\":[\"GABC\",\"GDEF\"]"));
-        assert!(json.contains("\"inner_sets\":[{"));
-
-        let deserialized: QuorumSetJson = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.threshold, 2);
-        assert_eq!(deserialized.validators.len(), 2);
-        assert_eq!(deserialized.inner_sets.len(), 1);
-        assert_eq!(deserialized.inner_sets[0].threshold, 1);
-    }
-
-    #[test]
-    fn test_quorum_set_json_from_xdr_roundtrip() {
-        let node1 = make_node_id(1);
-        let node2 = make_node_id(2);
-        let qs = make_quorum_set(vec![node1.clone(), node2.clone()], 2);
-
-        // Convert to JSON format
-        let qs_json = QuorumSetJson::from_xdr(&qs);
-        assert_eq!(qs_json.threshold, 2);
-        assert_eq!(qs_json.validators.len(), 2);
-
-        // Serialize and deserialize
-        let json = serde_json::to_string(&qs_json).unwrap();
-        let deserialized: QuorumSetJson = serde_json::from_str(&json).unwrap();
-        assert_eq!(qs_json, deserialized);
-
-        // Convert back to XDR
-        let qs_back = deserialized.to_xdr().unwrap();
-        assert_eq!(qs_back.threshold, 2);
-        assert_eq!(qs_back.validators.len(), 2);
-    }
-
-    #[test]
-    fn test_quorum_set_json_with_inner_sets() {
-        let node1 = make_node_id(1);
-        let node2 = make_node_id(2);
-        let node3 = make_node_id(3);
-
-        let inner = ScpQuorumSet {
-            threshold: 1,
-            validators: vec![node3.clone()].try_into().unwrap(),
-            inner_sets: vec![].try_into().unwrap(),
-        };
-
-        let qs = ScpQuorumSet {
-            threshold: 2,
-            validators: vec![node1.clone(), node2.clone()].try_into().unwrap(),
-            inner_sets: vec![inner].try_into().unwrap(),
-        };
-
-        let qs_json = QuorumSetJson::from_xdr(&qs);
-        assert_eq!(qs_json.threshold, 2);
-        assert_eq!(qs_json.validators.len(), 2);
-        assert_eq!(qs_json.inner_sets.len(), 1);
-        assert_eq!(qs_json.inner_sets[0].threshold, 1);
-        assert_eq!(qs_json.inner_sets[0].validators.len(), 1);
-
-        // Roundtrip through JSON
-        let json = serde_json::to_string_pretty(&qs_json).unwrap();
-        let deserialized: QuorumSetJson = serde_json::from_str(&json).unwrap();
-        let qs_back = deserialized.to_xdr().unwrap();
-
-        assert_eq!(qs_back.threshold, 2);
-        assert_eq!(qs_back.validators.len(), 2);
-        assert_eq!(qs_back.inner_sets.len(), 1);
-    }
-
-    #[test]
-    fn test_quorum_set_json_empty_inner_sets_skipped() {
-        let qs_json = QuorumSetJson {
-            threshold: 1,
-            validators: vec!["GABC".to_string()],
-            inner_sets: vec![],
-        };
-
-        let json = serde_json::to_string(&qs_json).unwrap();
-        // inner_sets should be skipped when empty
-        assert!(!json.contains("inner_sets"));
-
-        // But deserialization should still work with missing field
-        let deserialized: QuorumSetJson = serde_json::from_str(&json).unwrap();
-        assert!(deserialized.inner_sets.is_empty());
-    }
 }

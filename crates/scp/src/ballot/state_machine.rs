@@ -285,10 +285,6 @@ impl BallotProtocol {
                 self.commit = Some(new_c);
                 did_work = true;
             }
-
-            if did_work {
-                ctx.driver.confirmed_ballot_prepared(ctx.slot_index, &new_h);
-            }
         }
 
         did_work = self.update_current_if_needed(&new_h) || did_work;
@@ -398,7 +394,6 @@ impl BallotProtocol {
 
         if did_work {
             self.update_current_if_needed(&h);
-            ctx.driver.accepted_commit(ctx.slot_index, &h);
             self.emit_current_state(ctx);
         }
 
@@ -750,7 +745,6 @@ impl BallotProtocol {
         }
 
         if did_work {
-            driver.accepted_ballot_prepared(slot_index, &ballot);
             driver.ballot_did_prepare(slot_index, &ballot);
         }
 
