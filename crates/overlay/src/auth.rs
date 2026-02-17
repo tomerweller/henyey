@@ -765,6 +765,6 @@ mod tests {
         let hello = ctx.create_hello();
         assert_eq!(hello.overlay_version, 38);
         assert_eq!(hello.overlay_min_version, 35);
-        assert_eq!(hello.ledger_version, 24);
+        assert_eq!(hello.ledger_version, 25);
     }
 }

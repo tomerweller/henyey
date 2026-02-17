@@ -4037,7 +4037,7 @@ mod tests {
     fn test_ledger_manager_config_default() {
         let config = LedgerManagerConfig::default();
         assert!(config.validate_bucket_hash);
-        assert_eq!(config.bucket_list_db.memory_for_caching_mb, 0);
+        assert_eq!(config.bucket_list_db.memory_for_caching_mb, 1024);
     }
 
     #[test]

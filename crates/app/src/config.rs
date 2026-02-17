@@ -1433,7 +1433,7 @@ complete = true
     #[test]
     fn test_bucket_list_db_config_default() {
         let config = AppConfig::default();
-        assert_eq!(config.buckets.bucket_list_db.memory_for_caching_mb, 0);
+        assert_eq!(config.buckets.bucket_list_db.memory_for_caching_mb, 1024);
         assert_eq!(config.buckets.bucket_list_db.index_page_size_exponent, 14);
         assert!(config.buckets.bucket_list_db.persist_index);
     }

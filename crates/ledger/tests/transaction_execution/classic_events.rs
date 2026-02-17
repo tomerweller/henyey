@@ -1136,7 +1136,10 @@ fn test_classic_events_emitted_for_clawback_claimable_balance() {
             claimants,
             asset: asset.clone(),
             amount: 20_000_000,
-            ext: ClaimableBalanceEntryExt::V0,
+            ext: ClaimableBalanceEntryExt::V1(ClaimableBalanceEntryExtensionV1 {
+                ext: ClaimableBalanceEntryExtensionV1Ext::V0,
+                flags: ClaimableBalanceFlags::ClaimableBalanceClawbackEnabledFlag as u32,
+            }),
         }),
         ext: LedgerEntryExt::V0,
     };
