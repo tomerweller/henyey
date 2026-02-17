@@ -15,7 +15,7 @@ use stellar_xdr::curr::{
     OperationResult, OperationResultTr, SequenceNumber,
 };
 
-use super::{account_liabilities, add_account_balance, add_trustline_balance, is_trustline_authorized};
+use super::{account_liabilities, add_account_balance, add_trustline_balance, is_trustline_authorized, trustline_liabilities};
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
@@ -113,11 +113,12 @@ pub fn execute_create_claimable_balance(
     // happens separately in createEntryWithPossibleSponsorship AFTER deducting balance.
     match &op.asset {
         Asset::Native => {
-            // For native assets, available = balance - minBalance(current state)
-            // Do NOT include sponsorship_multiplier here - matches stellar-core behavior
+            // For native assets, available = balance - minBalance - sellingLiabilities
+            // Matches stellar-core's getAvailableBalance(header, sourceAccount)
             let min_balance =
                 state.minimum_balance_for_account(&account, context.protocol_version, 0)?;
-            let available = account.balance - min_balance;
+            let available = (account.balance - min_balance)
+                .saturating_sub(account_liabilities(&account).selling);
             if available < op.amount {
                 return Ok(make_create_result(
                     CreateClaimableBalanceResultCode::Underfunded,
@@ -137,7 +138,10 @@ pub fn execute_create_claimable_balance(
                                 None,
                             ));
                         }
-                        if tl.balance < op.amount {
+                        // stellar-core uses trustline.addBalance(header, -amount)
+                        // which fails if newBalance < sellingLiabilities
+                        let available = tl.balance.saturating_sub(trustline_liabilities(tl).selling);
+                        if available < op.amount {
                             return Ok(make_create_result(
                                 CreateClaimableBalanceResultCode::Underfunded,
                                 None,
@@ -1961,6 +1965,131 @@ mod tests {
                 assert!(
                     matches!(r, ClaimClaimableBalanceResult::DoesNotExist),
                     "Second claim of same balance should return DoesNotExist, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    /// Regression test for mainnet ledger 59907857: CreateClaimableBalance must
+    /// deduct selling liabilities from available native balance.
+    /// Without this fix, the operation would return Success when it should
+    /// return Underfunded because selling liabilities reduce the available balance.
+    #[test]
+    fn test_create_claimable_balance_native_underfunded_selling_liabilities() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let claimant_id = create_test_account_id(1);
+
+        // Source: balance=50M, min_balance=10M, selling_liabilities=30M
+        // available = (50M - 10M) - 30M = 10M
+        let mut source_account = create_test_account(source_id.clone(), 50_000_000);
+        source_account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+            liabilities: Liabilities {
+                buying: 0,
+                selling: 30_000_000,
+            },
+            ext: AccountEntryExtensionV1Ext::V0,
+        });
+        state.create_account(source_account);
+        state.create_account(create_test_account(claimant_id.clone(), 10_000_000));
+
+        let claimant = Claimant::ClaimantTypeV0(ClaimantV0 {
+            destination: claimant_id.clone(),
+            predicate: ClaimPredicate::Unconditional,
+        });
+
+        // Request 15M > available 10M -> Underfunded
+        let op = CreateClaimableBalanceOp {
+            asset: Asset::Native,
+            amount: 15_000_000,
+            claimants: vec![claimant].try_into().unwrap(),
+        };
+
+        let result = execute_create_claimable_balance(
+            &op, &source_id, &source_id, 123, 0, &mut state, &context,
+        )
+        .unwrap();
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::CreateClaimableBalance(r)) => {
+                assert!(
+                    matches!(r, CreateClaimableBalanceResult::Underfunded),
+                    "Should be Underfunded due to native selling liabilities, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    /// Regression test for mainnet ledger 59907857: CreateClaimableBalance must
+    /// deduct selling liabilities from available non-native balance.
+    #[test]
+    fn test_create_claimable_balance_non_native_underfunded_selling_liabilities() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let claimant_id = create_test_account_id(1);
+        let issuer_id = create_test_account_id(2);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(claimant_id.clone(), 10_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 10_000_000));
+
+        // Trustline: balance=1000, selling_liabilities=800
+        // available = 1000 - 800 = 200
+        let trustline = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: issuer_id.clone(),
+            }),
+            balance: 1_000,
+            limit: 100_000,
+            flags: AUTHORIZED_FLAG,
+            ext: TrustLineEntryExt::V1(TrustLineEntryV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: 800,
+                },
+                ext: TrustLineEntryV1Ext::V0,
+            }),
+        };
+        state.create_trustline(trustline);
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 1;
+
+        let claimant = Claimant::ClaimantTypeV0(ClaimantV0 {
+            destination: claimant_id.clone(),
+            predicate: ClaimPredicate::Unconditional,
+        });
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id.clone(),
+        });
+
+        // Request 500 > available 200 -> Underfunded
+        let op = CreateClaimableBalanceOp {
+            asset,
+            amount: 500,
+            claimants: vec![claimant].try_into().unwrap(),
+        };
+
+        let result = execute_create_claimable_balance(
+            &op, &source_id, &source_id, 123, 0, &mut state, &context,
+        )
+        .unwrap();
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::CreateClaimableBalance(r)) => {
+                assert!(
+                    matches!(r, CreateClaimableBalanceResult::Underfunded),
+                    "Should be Underfunded due to non-native selling liabilities, got {:?}",
                     r
                 );
             }
