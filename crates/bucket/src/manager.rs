@@ -51,6 +51,7 @@ use henyey_common::Hash256;
 use crate::bucket::Bucket;
 use crate::entry::BucketEntry;
 use crate::merge::merge_buckets_to_file;
+use crate::merge_map::BucketMergeMap;
 use crate::{BucketError, Result};
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -117,6 +118,8 @@ pub struct BucketManager {
     max_cache_size: usize,
     /// Whether to persist/load disk indexes alongside bucket files.
     persist_index: bool,
+    /// Tracks completed merges for deduplication/reattachment.
+    finished_merges: RwLock<BucketMergeMap>,
 }
 
 impl BucketManager {
@@ -141,6 +144,7 @@ impl BucketManager {
             cache: RwLock::new(HashMap::new()),
             max_cache_size: Self::DEFAULT_MAX_CACHE_SIZE,
             persist_index: false,
+            finished_merges: RwLock::new(BucketMergeMap::new()),
         })
     }
 
@@ -153,6 +157,7 @@ impl BucketManager {
             cache: RwLock::new(HashMap::new()),
             max_cache_size,
             persist_index: false,
+            finished_merges: RwLock::new(BucketMergeMap::new()),
         })
     }
 
@@ -168,12 +173,22 @@ impl BucketManager {
             cache: RwLock::new(HashMap::new()),
             max_cache_size: Self::DEFAULT_MAX_CACHE_SIZE,
             persist_index,
+            finished_merges: RwLock::new(BucketMergeMap::new()),
         })
     }
 
     /// Returns whether index persistence is enabled.
     pub fn persist_index(&self) -> bool {
         self.persist_index
+    }
+
+    /// Returns a reference to the finished merges map.
+    ///
+    /// This can be used to record completed merges (for deduplication)
+    /// and to check if a merge was previously completed before starting
+    /// a new one.
+    pub fn finished_merges(&self) -> &RwLock<BucketMergeMap> {
+        &self.finished_merges
     }
 
     /// Get the bucket directory path.
@@ -602,6 +617,14 @@ impl BucketManager {
                 self.delete_bucket(&hash)?;
                 deleted += 1;
             }
+        }
+
+        // Clean up merge map entries whose outputs are no longer retained
+        {
+            let keep_hash_set: std::collections::HashSet<Hash256> =
+                keep.iter().copied().collect();
+            let mut merge_map = self.finished_merges.write().unwrap();
+            merge_map.retain_outputs(&keep_hash_set);
         }
 
         // Clean up any orphaned index files
@@ -1145,6 +1168,7 @@ pub struct BucketManagerStats {
 mod tests {
     use super::*;
     use crate::BucketEntry; // Re-import to shadow XDR's BucketEntry
+    use crate::future_bucket::MergeKey;
     use stellar_xdr::curr::*;
     use tempfile::TempDir;
 
@@ -1835,5 +1859,74 @@ mod tests {
         let reloaded = manager.load_bucket(&merged_hash).unwrap();
         assert_eq!(reloaded.hash(), merged_hash);
         assert_eq!(reloaded.len(), merged.len());
+    }
+
+    #[test]
+    fn test_merge_map_records_and_retrieves() {
+        let (_temp_dir, manager) = create_manager();
+
+        let old = manager
+            .create_bucket(vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))])
+            .unwrap();
+        let new = manager
+            .create_bucket(vec![BucketEntry::Live(make_account_entry([2u8; 32], 200))])
+            .unwrap();
+        let old_hash = old.hash();
+        let new_hash = new.hash();
+
+        // Merge the buckets
+        let result = manager.merge(&old, &new, 25).unwrap();
+        let result_hash = result.hash();
+
+        // Record the merge in the merge map
+        let merge_key = MergeKey::new(true, old_hash, new_hash);
+        manager
+            .finished_merges()
+            .write()
+            .unwrap()
+            .record_merge(merge_key.clone(), result_hash);
+
+        // Verify the merge map returns the output
+        let output = manager
+            .finished_merges()
+            .read()
+            .unwrap()
+            .get_output(&merge_key)
+            .copied();
+        assert_eq!(output, Some(result_hash));
+    }
+
+    #[test]
+    fn test_retain_buckets_cleans_merge_map() {
+        let (_temp_dir, manager) = create_manager();
+
+        let old = manager
+            .create_bucket(vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))])
+            .unwrap();
+        let new = manager
+            .create_bucket(vec![BucketEntry::Live(make_account_entry([2u8; 32], 200))])
+            .unwrap();
+        let result = manager.merge(&old, &new, 25).unwrap();
+
+        let merge_key = MergeKey::new(true, old.hash(), new.hash());
+        manager
+            .finished_merges()
+            .write()
+            .unwrap()
+            .record_merge(merge_key.clone(), result.hash());
+
+        // Retain only the input buckets (not the merged output)
+        manager
+            .retain_buckets(&[old.hash(), new.hash()])
+            .unwrap();
+
+        // Merge map entry should be cleaned up since the output was deleted
+        let output = manager
+            .finished_merges()
+            .read()
+            .unwrap()
+            .get_output(&merge_key)
+            .copied();
+        assert_eq!(output, None);
     }
 }

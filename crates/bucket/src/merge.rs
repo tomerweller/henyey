@@ -51,11 +51,24 @@ use stellar_xdr::curr::{BucketMetadata, BucketMetadataExt, LedgerKey, Limits, Wr
 
 use crate::bucket::{Bucket, BucketIter};
 use crate::entry::{compare_keys, BucketEntry};
+use crate::metrics::{EntryCountType, MergeCounters};
 use crate::{
     BucketError, Result, FIRST_PROTOCOL_SHADOWS_REMOVED,
     FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY,
     FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION,
 };
+
+/// Record an entry type in the merge counters.
+fn record_entry_type(counters: Option<&MergeCounters>, entry: &BucketEntry) {
+    if let Some(c) = counters {
+        match entry {
+            BucketEntry::Metadata(_) => c.record_new_entry(EntryCountType::Meta),
+            BucketEntry::Init(_) => c.record_new_entry(EntryCountType::Init),
+            BucketEntry::Live(_) => c.record_new_entry(EntryCountType::Live),
+            BucketEntry::Dead(_) => c.record_new_entry(EntryCountType::Dead),
+        }
+    }
+}
 
 /// Merge two buckets into a new bucket.
 ///
@@ -121,6 +134,7 @@ pub fn merge_buckets_with_options(
         normalize_init_entries,
         &[],
         false,
+        None,
     )
 }
 
@@ -131,6 +145,7 @@ pub fn merge_buckets_with_options(
 /// stellar-core's `BucketOutputIterator::maybePut()` pattern where shadow
 /// checking is integrated into the output path rather than as a post-processing
 /// filter.
+#[allow(clippy::too_many_arguments)]
 fn merge_with_shadows_impl(
     old_bucket: &Bucket,
     new_bucket: &Bucket,
@@ -139,6 +154,7 @@ fn merge_with_shadows_impl(
     normalize_init_entries: bool,
     shadow_buckets: &[Bucket],
     keep_shadowed_lifecycle_entries: bool,
+    counters: Option<&MergeCounters>,
 ) -> Result<Bucket> {
     // Note: We intentionally do NOT use fast paths for empty buckets here.
     // stellar-core always goes through the full merge process even when
@@ -201,11 +217,13 @@ fn merge_with_shadows_impl(
                     Ordering::Less => {
                         // Old entry comes first, no shadow.
                         if should_keep_entry(old_entry, keep_dead_entries) {
+                            record_entry_type(counters, old_entry);
                             maybe_put(
                                 old_entry.clone(),
                                 &mut shadow_cursors,
                                 keep_shadowed_lifecycle_entries,
                                 &mut merged,
+                                counters,
                             );
                         }
                         old_current = next_non_meta(&mut old_iter);
@@ -213,14 +231,17 @@ fn merge_with_shadows_impl(
                     Ordering::Greater => {
                         // New entry comes first
                         if should_keep_entry(new_entry, keep_dead_entries) {
+                            let entry = maybe_normalize_entry(
+                                new_entry.clone(),
+                                normalize_init_entries,
+                            );
+                            record_entry_type(counters, &entry);
                             maybe_put(
-                                maybe_normalize_entry(
-                                    new_entry.clone(),
-                                    normalize_init_entries,
-                                ),
+                                entry,
                                 &mut shadow_cursors,
                                 keep_shadowed_lifecycle_entries,
                                 &mut merged,
+                                counters,
                             );
                         }
                         new_current = next_non_meta(&mut new_iter);
@@ -233,12 +254,19 @@ fn merge_with_shadows_impl(
                             keep_dead_entries,
                             normalize_init_entries,
                         ) {
+                            record_entry_type(counters, &merged_entry);
                             maybe_put(
                                 merged_entry,
                                 &mut shadow_cursors,
                                 keep_shadowed_lifecycle_entries,
                                 &mut merged,
+                                counters,
                             );
+                        } else {
+                            // INIT+DEAD annihilation
+                            if let Some(c) = counters {
+                                c.record_annihilated();
+                            }
                         }
                         old_current = next_non_meta(&mut old_iter);
                         new_current = next_non_meta(&mut new_iter);
@@ -261,11 +289,13 @@ fn merge_with_shadows_impl(
     // Drain remaining old entries
     while let Some(entry) = old_current {
         if !entry.is_metadata() && should_keep_entry(&entry, keep_dead_entries) {
+            record_entry_type(counters, &entry);
             maybe_put(
                 entry,
                 &mut shadow_cursors,
                 keep_shadowed_lifecycle_entries,
                 &mut merged,
+                counters,
             );
         }
         old_current = old_iter.next();
@@ -274,11 +304,14 @@ fn merge_with_shadows_impl(
     // Drain remaining new entries
     while let Some(entry) = new_current {
         if !entry.is_metadata() && should_keep_entry(&entry, keep_dead_entries) {
+            let entry = maybe_normalize_entry(entry, normalize_init_entries);
+            record_entry_type(counters, &entry);
             maybe_put(
-                maybe_normalize_entry(entry, normalize_init_entries),
+                entry,
                 &mut shadow_cursors,
                 keep_shadowed_lifecycle_entries,
                 &mut merged,
+                counters,
             );
         }
         new_current = new_iter.next();
@@ -331,6 +364,27 @@ pub fn merge_buckets_to_file(
     max_protocol_version: u32,
     normalize_init_entries: bool,
 ) -> Result<(Hash256, usize)> {
+    merge_buckets_to_file_with_counters(
+        old_bucket,
+        new_bucket,
+        output_path,
+        keep_dead_entries,
+        max_protocol_version,
+        normalize_init_entries,
+        None,
+    )
+}
+
+/// Merge two buckets to file with optional merge counters.
+pub fn merge_buckets_to_file_with_counters(
+    old_bucket: &Bucket,
+    new_bucket: &Bucket,
+    output_path: &Path,
+    keep_dead_entries: bool,
+    max_protocol_version: u32,
+    normalize_init_entries: bool,
+    counters: Option<&MergeCounters>,
+) -> Result<(Hash256, usize)> {
     use std::io::{BufWriter, Write};
 
     if new_bucket.is_empty() && old_bucket.is_empty() {
@@ -381,6 +435,7 @@ pub fn merge_buckets_to_file(
 
     // Write metadata first
     if let Some(ref meta) = output_meta {
+        record_entry_type(counters, meta);
         write_entry(meta, &mut writer, &mut hasher, &mut entry_count)?;
     }
 
@@ -396,6 +451,7 @@ pub fn merge_buckets_to_file(
             (Some(ref ok), Some(ref nk)) => match compare_keys(ok, nk) {
                 Ordering::Less => {
                     if should_keep_entry(old_entry, keep_dead_entries) {
+                        record_entry_type(counters, old_entry);
                         write_entry(old_entry, &mut writer, &mut hasher, &mut entry_count)?;
                     }
                     old_current = next_non_meta(&mut old_iter);
@@ -404,6 +460,7 @@ pub fn merge_buckets_to_file(
                     if should_keep_entry(new_entry, keep_dead_entries) {
                         let entry =
                             maybe_normalize_entry(new_entry.clone(), normalize_init_entries);
+                        record_entry_type(counters, &entry);
                         write_entry(&entry, &mut writer, &mut hasher, &mut entry_count)?;
                     }
                     new_current = next_non_meta(&mut new_iter);
@@ -415,7 +472,13 @@ pub fn merge_buckets_to_file(
                         keep_dead_entries,
                         normalize_init_entries,
                     ) {
+                        record_entry_type(counters, &merged_entry);
                         write_entry(&merged_entry, &mut writer, &mut hasher, &mut entry_count)?;
+                    } else {
+                        // INIT+DEAD annihilation
+                        if let Some(c) = counters {
+                            c.record_annihilated();
+                        }
                     }
                     old_current = next_non_meta(&mut old_iter);
                     new_current = next_non_meta(&mut new_iter);
@@ -437,6 +500,7 @@ pub fn merge_buckets_to_file(
     // Drain remaining old entries
     while let Some(entry) = old_current {
         if !entry.is_metadata() && should_keep_entry(&entry, keep_dead_entries) {
+            record_entry_type(counters, &entry);
             write_entry(&entry, &mut writer, &mut hasher, &mut entry_count)?;
         }
         old_current = old_iter.next();
@@ -446,6 +510,7 @@ pub fn merge_buckets_to_file(
     while let Some(entry) = new_current {
         if !entry.is_metadata() && should_keep_entry(&entry, keep_dead_entries) {
             let entry = maybe_normalize_entry(entry, normalize_init_entries);
+            record_entry_type(counters, &entry);
             write_entry(&entry, &mut writer, &mut hasher, &mut entry_count)?;
         }
         new_current = new_iter.next();
@@ -806,6 +871,27 @@ pub fn merge_buckets_with_options_and_shadows(
     normalize_init_entries: bool,
     shadow_buckets: &[Bucket],
 ) -> Result<Bucket> {
+    merge_buckets_with_options_and_shadows_and_counters(
+        old_bucket,
+        new_bucket,
+        keep_dead_entries,
+        max_protocol_version,
+        normalize_init_entries,
+        shadow_buckets,
+        None,
+    )
+}
+
+/// Merge two buckets with shadow elimination and optional merge counters.
+pub fn merge_buckets_with_options_and_shadows_and_counters(
+    old_bucket: &Bucket,
+    new_bucket: &Bucket,
+    keep_dead_entries: bool,
+    max_protocol_version: u32,
+    normalize_init_entries: bool,
+    shadow_buckets: &[Bucket],
+    counters: Option<&MergeCounters>,
+) -> Result<Bucket> {
     // For protocol >= 12 (FIRST_PROTOCOL_SHADOWS_REMOVED), shadows are always
     // empty in practice. Pass empty slice to skip shadow cursor creation.
     if shadow_buckets.is_empty() || max_protocol_version >= FIRST_PROTOCOL_SHADOWS_REMOVED {
@@ -817,6 +903,7 @@ pub fn merge_buckets_with_options_and_shadows(
             normalize_init_entries,
             &[],
             false,
+            counters,
         );
     }
 
@@ -830,6 +917,7 @@ pub fn merge_buckets_with_options_and_shadows(
         normalize_init_entries,
         shadow_buckets,
         keep_shadowed_lifecycle_entries,
+        counters,
     )
 }
 
@@ -897,11 +985,15 @@ fn maybe_put(
     shadow_cursors: &mut [ShadowCursor<'_>],
     keep_shadowed_lifecycle_entries: bool,
     output: &mut Vec<BucketEntry>,
+    counters: Option<&MergeCounters>,
 ) {
     if !shadow_cursors.is_empty() {
         if keep_shadowed_lifecycle_entries && (entry.is_init() || entry.is_dead()) {
             // Lifecycle entries (INIT/DEAD) are preserved even when shadowed
         } else if is_shadowed(&entry, shadow_cursors) {
+            if let Some(c) = counters {
+                c.record_shadowed();
+            }
             return;
         }
     }
@@ -1238,6 +1330,8 @@ mod tests {
     use super::*;
     use crate::BucketEntry;
     use stellar_xdr::curr::*; // Re-import to shadow XDR's BucketEntry
+
+    const TEST_PROTOCOL: u32 = 25;
 
     fn make_account_id(bytes: [u8; 32]) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
@@ -2400,6 +2494,148 @@ mod tests {
         assert!(
             !has_metadata,
             "In-memory merge with pre-protocol-11 should NOT produce metadata"
+        );
+    }
+
+    #[test]
+    fn test_merge_counters_populated_after_merge() {
+        let counters = MergeCounters::new();
+        let old = Bucket::from_entries(vec![
+            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
+        ])
+        .unwrap();
+        let new = Bucket::from_entries(vec![
+            BucketEntry::Live(make_account_entry([1u8; 32], 200)), // shadows old
+            BucketEntry::Live(make_account_entry([2u8; 32], 300)), // new entry
+        ])
+        .unwrap();
+
+        let _result = merge_buckets_with_options_and_shadows_and_counters(
+            &old,
+            &new,
+            true,
+            TEST_PROTOCOL,
+            false,
+            &[],
+            Some(&counters),
+        )
+        .unwrap();
+
+        let snap = counters.snapshot();
+        assert!(
+            snap.new_live_entries > 0 || snap.new_meta_entries > 0,
+            "should count entries"
+        );
+    }
+
+    #[test]
+    fn test_merge_counters_annihilation() {
+        let counters = MergeCounters::new();
+        let key = make_account_key([1u8; 32]);
+        let old = Bucket::from_entries(vec![
+            BucketEntry::Init(make_account_entry([1u8; 32], 100)),
+        ])
+        .unwrap();
+        let new = Bucket::from_entries(vec![BucketEntry::Dead(key)]).unwrap();
+
+        let _result = merge_buckets_with_options_and_shadows_and_counters(
+            &old,
+            &new,
+            false,
+            TEST_PROTOCOL,
+            false,
+            &[],
+            Some(&counters),
+        )
+        .unwrap();
+
+        let snap = counters.snapshot();
+        assert_eq!(
+            snap.entries_annihilated, 1,
+            "INIT+DEAD should produce annihilation"
+        );
+    }
+
+    #[test]
+    fn test_merge_counters_shadow_elision() {
+        let counters = MergeCounters::new();
+        // Create a shadow bucket that contains the key we'll try to merge
+        let shadow_bucket = Bucket::from_entries(vec![BucketEntry::Live(
+            make_account_entry([1u8; 32], 999),
+        )])
+        .unwrap();
+        let old = Bucket::from_entries(vec![BucketEntry::Live(make_account_entry(
+            [1u8; 32], 100,
+        ))])
+        .unwrap();
+        let new = Bucket::from_entries(vec![]).unwrap();
+
+        // Use pre-protocol-12 to enable shadow filtering
+        let _result = merge_buckets_with_options_and_shadows_and_counters(
+            &old,
+            &new,
+            true,
+            FIRST_PROTOCOL_SHADOWS_REMOVED - 1,
+            false,
+            &[shadow_bucket],
+            Some(&counters),
+        )
+        .unwrap();
+
+        let snap = counters.snapshot();
+        assert_eq!(
+            snap.old_entries_shadowed, 1,
+            "entry present in shadow should be elided"
+        );
+    }
+
+    #[test]
+    fn test_merge_counters_file_based() {
+        let counters = MergeCounters::new();
+        // Include metadata so the merge produces protocol-aware output
+        let meta = BucketEntry::Metadata(BucketMetadata {
+            ledger_version: TEST_PROTOCOL,
+            ext: BucketMetadataExt::V1(BucketListType::Live),
+        });
+        let old = Bucket::from_sorted_entries(vec![
+            meta.clone(),
+            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Live(make_account_entry([3u8; 32], 300)),
+        ])
+        .unwrap();
+        let new = Bucket::from_sorted_entries(vec![
+            meta,
+            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
+        ])
+        .unwrap();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let output_path = temp_dir.path().join("merged.xdr");
+        let (hash, entry_count) = merge_buckets_to_file_with_counters(
+            &old,
+            &new,
+            &output_path,
+            true,
+            TEST_PROTOCOL,
+            false,
+            Some(&counters),
+        )
+        .unwrap();
+
+        assert!(!hash.is_zero());
+        // 1 metadata + 3 live entries = 4
+        assert_eq!(entry_count, 4);
+
+        let snap = counters.snapshot();
+        assert!(
+            snap.new_live_entries >= 3,
+            "should count at least 3 live entries, got {}",
+            snap.new_live_entries
+        );
+        assert!(
+            snap.new_meta_entries >= 1,
+            "should count metadata entry, got {}",
+            snap.new_meta_entries
         );
     }
 }

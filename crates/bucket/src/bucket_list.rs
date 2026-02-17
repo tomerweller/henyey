@@ -59,6 +59,7 @@ use crate::entry::{
     ledger_entry_to_key, BucketEntry,
 };
 use crate::cache::CacheStats;
+use crate::future_bucket::MergeKey;
 use crate::index::BucketEntryCounters;
 use crate::eviction::{
     update_starting_eviction_iterator, EvictionCandidate, EvictionIterator, EvictionResult,
@@ -66,7 +67,13 @@ use crate::eviction::{
 };
 use crate::live_iterator::LiveEntriesIterator;
 use crate::manager::{canonical_bucket_filename, temp_merge_path};
-use crate::merge::{merge_buckets_to_file, merge_buckets_with_options_and_shadows, merge_in_memory};
+use crate::merge::{
+    merge_buckets_to_file, merge_buckets_to_file_with_counters,
+    merge_buckets_with_options_and_shadows,
+    merge_buckets_with_options_and_shadows_and_counters, merge_in_memory,
+};
+use crate::merge_map::BucketMergeMap;
+use crate::metrics::MergeCounters;
 use crate::{
     BucketError, Result, FIRST_PROTOCOL_SHADOWS_REMOVED,
     FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY,
@@ -190,6 +197,8 @@ pub struct AsyncMergeHandle {
     input_curr_hash: Hash256,
     /// Hash of the "snap" input bucket for this merge.
     input_snap_hash: Hash256,
+    /// Merge key for recording completed merges in the BucketMergeMap.
+    merge_key: MergeKey,
 }
 
 impl AsyncMergeHandle {
@@ -212,6 +221,7 @@ impl AsyncMergeHandle {
         shadow_buckets: Vec<Bucket>,
         level: usize,
         bucket_dir: Option<std::path::PathBuf>,
+        counters: Option<Arc<MergeCounters>>,
     ) -> Self {
         let (sender, receiver) = oneshot::channel();
 
@@ -247,17 +257,20 @@ impl AsyncMergeHandle {
             let start = std::time::Instant::now();
             tracing::debug!(level, disk_backed = bucket_dir.is_some(), "Background merge started");
 
+            let counters_ref = counters.as_deref();
+
             let result = if let Some(ref dir) = bucket_dir {
                 // Disk-backed merge: write output to temp file, create DiskBacked bucket.
                 // This keeps memory O(index_size) instead of O(data_size).
                 let temp_path = temp_merge_path(dir);
-                match merge_buckets_to_file(
+                match merge_buckets_to_file_with_counters(
                     &curr,
                     &snap,
                     &temp_path,
                     keep_dead_entries,
                     protocol_version,
                     normalize_init,
+                    counters_ref,
                 ) {
                     Ok((hash, entry_count)) => {
                         if entry_count == 0 {
@@ -298,17 +311,24 @@ impl AsyncMergeHandle {
                 }
             } else {
                 // In-memory merge (used in tests or when no bucket_dir is set)
-                merge_buckets_with_options_and_shadows(
+                merge_buckets_with_options_and_shadows_and_counters(
                     &curr,
                     &snap,
                     keep_dead_entries,
                     protocol_version,
                     normalize_init,
                     &shadow_buckets,
+                    counters_ref,
                 )
             };
 
             let elapsed = start.elapsed();
+
+            // Record merge timing in counters
+            if let Some(ref c) = counters {
+                c.record_merge_completed(elapsed.as_micros() as u64);
+            }
+
             match &result {
                 Ok(bucket) => {
                     tracing::debug!(
@@ -334,6 +354,8 @@ impl AsyncMergeHandle {
             let _ = sender.send(result);
         });
 
+        let merge_key = MergeKey::new(keep_dead_entries, input_curr_hash, input_snap_hash);
+
         Self {
             receiver: Some(receiver),
             level,
@@ -341,6 +363,7 @@ impl AsyncMergeHandle {
             input_file_paths,
             input_curr_hash,
             input_snap_hash,
+            merge_key,
         }
     }
 
@@ -474,16 +497,23 @@ impl BucketLevel {
     ///
     /// For async merges, this will block until the merge completes.
     /// This matches stellar-core's BucketLevel::commit() behavior.
-    fn commit(&mut self) {
+    ///
+    /// Returns the merge key and output hash for async merges that completed
+    /// successfully, so the caller can record them in the BucketMergeMap.
+    fn commit(&mut self) -> Option<(MergeKey, Hash256)> {
         if let Some(pending) = self.next.take() {
             match pending {
                 PendingMerge::InMemory(bucket) => {
                     self.curr = Arc::new(bucket);
+                    None
                 }
                 PendingMerge::Async(mut handle) => {
+                    let merge_key = handle.merge_key.clone();
                     match handle.resolve() {
                         Ok(bucket) => {
+                            let output_hash = bucket.hash();
                             self.curr = bucket;
+                            Some((merge_key, output_hash))
                         }
                         Err(e) => {
                             tracing::error!(
@@ -492,10 +522,13 @@ impl BucketLevel {
                                 "Failed to resolve async merge, keeping current bucket"
                             );
                             // Keep the current bucket on error
+                            None
                         }
                     }
                 }
             }
+        } else {
+            None
         }
     }
 
@@ -621,6 +654,8 @@ impl BucketLevel {
         normalize_init: bool,
         use_empty_curr: bool,
         bucket_dir: Option<&std::path::Path>,
+        merge_map: Option<&std::sync::Arc<std::sync::RwLock<BucketMergeMap>>>,
+        merge_counters: Option<Arc<MergeCounters>>,
     ) -> Result<()> {
         if self.next.is_some() {
             return Err(BucketError::Merge(
@@ -656,6 +691,42 @@ impl BucketLevel {
             "prepare_with_normalization: about to merge"
         );
 
+        // Check merge map for a cached result before starting a new merge.
+        // If this exact merge (same inputs + keep_dead_entries) was previously
+        // completed, reuse the output instead of re-computing.
+        if let Some(merge_map) = merge_map {
+            let curr_hash = curr_for_merge.hash();
+            let snap_hash = incoming.hash();
+            let key = MergeKey::new(keep_dead_entries, curr_hash, snap_hash);
+            if let Some(output_hash) = merge_map.read().unwrap().get_output(&key).copied() {
+                if !output_hash.is_zero() {
+                    if let Some(dir) = bucket_dir {
+                        let path = dir.join(canonical_bucket_filename(&output_hash));
+                        if path.exists() {
+                            match Bucket::from_xdr_file_disk_backed(&path) {
+                                Ok(bucket) => {
+                                    tracing::debug!(
+                                        level = self.level,
+                                        output_hash = %output_hash,
+                                        "Reusing cached merge result from merge map"
+                                    );
+                                    self.next = Some(PendingMerge::InMemory(bucket));
+                                    return Ok(());
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        level = self.level,
+                                        error = %e,
+                                        "Failed to load cached merge result, falling through to new merge"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // For levels 1+, use async merging to run merges in background threads.
         // This matches stellar-core's FutureBucket design where merges for
         // higher levels (which have larger buckets) start immediately and run
@@ -673,17 +744,19 @@ impl BucketLevel {
                 shadow_buckets.to_vec(),
                 self.level,
                 bucket_dir.map(|p| p.to_path_buf()),
+                merge_counters,
             );
             self.next = Some(PendingMerge::Async(handle));
         } else {
             // Level 0 should use prepare_first_level, but if called here, do sync merge
-            let merged = merge_buckets_with_options_and_shadows(
+            let merged = merge_buckets_with_options_and_shadows_and_counters(
                 &curr_for_merge,
                 &incoming,
                 keep_dead_entries,
                 protocol_version,
                 normalize_init,
                 shadow_buckets,
+                merge_counters.as_deref(),
             )?;
 
             tracing::debug!(
@@ -862,6 +935,15 @@ pub struct BucketList {
     /// Optional BucketListDB config for per-bucket cache initialization.
     /// When set, `add_batch()` calls `maybe_initialize_caches()` after updating levels.
     bucket_list_db_config: Option<BucketListDbConfig>,
+    /// Merges completed during the last `add_batch_internal` call.
+    /// The caller should drain these and record them in the BucketManager's
+    /// merge map for deduplication.
+    completed_merges: Vec<(MergeKey, Hash256)>,
+    /// Optional reference to the merge map for checking cached merge results
+    /// before starting new merges. Shared with BucketManager.
+    merge_map: Option<std::sync::Arc<std::sync::RwLock<BucketMergeMap>>>,
+    /// Counters for merge operations (shared across all merge calls).
+    merge_counters: Arc<MergeCounters>,
 }
 
 /// Get the LedgerEntryType from LedgerEntryData.
@@ -994,6 +1076,9 @@ impl BucketList {
             ledger_seq: 0,
             bucket_dir: None,
             bucket_list_db_config: None,
+            completed_merges: Vec::new(),
+            merge_map: None,
+            merge_counters: Arc::new(MergeCounters::new()),
         }
     }
 
@@ -1005,6 +1090,29 @@ impl BucketList {
     /// at higher levels can be tens of GB.
     pub fn set_bucket_dir(&mut self, dir: std::path::PathBuf) {
         self.bucket_dir = Some(dir);
+    }
+
+    /// Set the merge map for checking cached merge results.
+    ///
+    /// When set, `prepare_with_normalization` checks the merge map before starting
+    /// a new merge. If a matching merge was previously completed, the cached result
+    /// is reused instead of re-computing the merge.
+    pub fn set_merge_map(&mut self, merge_map: std::sync::Arc<std::sync::RwLock<BucketMergeMap>>) {
+        self.merge_map = Some(merge_map);
+    }
+
+    /// Drain completed merge records from the last `add_batch` call.
+    ///
+    /// Returns merge keys and output hashes for all merges that completed
+    /// during the last `add_batch_internal`. The caller should record these
+    /// in the BucketManager's merge map for future deduplication.
+    pub fn drain_completed_merges(&mut self) -> Vec<(MergeKey, Hash256)> {
+        std::mem::take(&mut self.completed_merges)
+    }
+
+    /// Returns a reference to the merge counters.
+    pub fn merge_counters(&self) -> &MergeCounters {
+        &self.merge_counters
     }
 
     /// Resolve all pending async merges without committing them.
@@ -1547,6 +1655,9 @@ impl BucketList {
             ));
         }
 
+        // Clear completed merges from previous call
+        self.completed_merges.clear();
+
         // Step 1: Process spills from highest level down to level 1
         // This matches stellar-core's BucketListBase::addBatchInternal
         //
@@ -1594,7 +1705,10 @@ impl BucketList {
                     .map(|b| b.hash().to_hex())
                     .unwrap_or_else(|| "None".to_string());
 
-                self.levels[i].commit();
+                // Record completed merges for deduplication
+                if let Some((merge_key, output_hash)) = self.levels[i].commit() {
+                    self.completed_merges.push((merge_key, output_hash));
+                }
 
                 let post_commit_curr_hash = self.levels[i].curr.hash();
                 tracing::debug!(
@@ -1630,6 +1744,8 @@ impl BucketList {
                     normalize_init,
                     use_empty_curr,
                     self.bucket_dir.as_deref(),
+                    self.merge_map.as_ref(),
+                    Some(Arc::clone(&self.merge_counters)),
                 )?;
 
                 let post_prepare_next_hash = self.levels[i]
@@ -1654,7 +1770,8 @@ impl BucketList {
         // Use the in-memory optimization for level 0
         // This avoids disk I/O for level 0 merges which happen frequently
         self.levels[0].prepare_first_level(protocol_version, new_bucket)?;
-        self.levels[0].commit();
+        // Level 0 commit doesn't produce merge keys (in-memory merges)
+        let _ = self.levels[0].commit();
 
         // Ensure all curr/snap buckets have a permanent file on disk so that
         // restart recovery can locate them by hash.  Level 0 uses an in-memory
@@ -2053,6 +2170,9 @@ impl BucketList {
             ledger_seq: 0,
             bucket_dir: None,
             bucket_list_db_config: None,
+            completed_merges: Vec::new(),
+            merge_map: None,
+            merge_counters: Arc::new(MergeCounters::new()),
         })
     }
 
@@ -2300,6 +2420,8 @@ impl BucketList {
                 normalize_init,
                 use_empty_curr,
                 self.bucket_dir.as_deref(),
+                self.merge_map.as_ref(),
+                Some(Arc::clone(&self.merge_counters)),
             )?;
 
             tracing::info!(
@@ -2996,9 +3118,9 @@ mod tests {
         .unwrap();
 
         level
-            .prepare_with_normalization(5, TEST_PROTOCOL, Arc::new(incoming), false, &[], true, false, None)
+            .prepare_with_normalization(5, TEST_PROTOCOL, Arc::new(incoming), false, &[], true, false, None, None, None)
             .unwrap();
-        level.commit();
+        let _ = level.commit();
 
         let mut saw_live = false;
         for entry in level.curr.iter() {
@@ -3326,6 +3448,7 @@ mod tests {
             vec![],
             1,
             Some(temp_dir.path().to_path_buf()),
+            None,
         );
 
         // Set up bucket list with the pending merge
@@ -3630,5 +3753,77 @@ mod tests {
         if let LedgerEntryData::Account(b) = &bob_entry.data {
             assert_eq!(b.balance, 1000, "Bob should have latest balance");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_bucket_list_merge_records_counters() {
+        let mut bl = BucketList::new();
+        // Add enough batches to trigger spills (level 0 spills at ledger 2, 4, etc.)
+        for seq in 1..=4u32 {
+            let entry = make_account_entry([seq as u8; 32], seq as i64 * 100);
+            bl.add_batch(
+                seq,
+                TEST_PROTOCOL,
+                BucketListType::Live,
+                vec![entry],
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        }
+
+        let snap = bl.merge_counters().snapshot();
+        // After 4 ledgers, level 0 should have spilled at least once, triggering merges.
+        // The counters should reflect entries processed during those merges.
+        assert!(
+            snap.new_live_entries > 0 || snap.new_meta_entries > 0 || snap.new_init_entries > 0,
+            "merge counters should record entries after spills: {:?}",
+            snap
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_bucket_list_completed_merges_tracked() {
+        let mut bl = BucketList::new();
+        // Run enough ledgers to trigger an async merge (level >= 1)
+        // Level 1 spills every 8 ledgers, but at ledger 2 level 0 spills which
+        // triggers an in-memory merge. Async merges start at level 1+.
+        for seq in 1..=8u32 {
+            let entry = make_account_entry([seq as u8; 32], seq as i64 * 100);
+            bl.add_batch(
+                seq,
+                TEST_PROTOCOL,
+                BucketListType::Live,
+                vec![entry],
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        }
+
+        // drain_completed_merges should return merge keys and output hashes
+        let completed = bl.drain_completed_merges();
+        // After 8 ledgers, at least one async merge should have completed
+        // (level 1 gets a merge when level 0 spills into it)
+        assert!(
+            !completed.is_empty(),
+            "at least one merge should have been tracked after 8 ledgers"
+        );
+
+        // Each completed merge should have a non-zero output hash
+        for (merge_key, output_hash) in &completed {
+            assert!(
+                !output_hash.is_zero(),
+                "merge output hash should not be zero for key {:?}",
+                merge_key
+            );
+        }
+
+        // Draining again should be empty
+        let completed2 = bl.drain_completed_merges();
+        assert!(
+            completed2.is_empty(),
+            "drain should clear the completed merges"
+        );
     }
 }
