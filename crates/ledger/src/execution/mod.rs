@@ -365,6 +365,17 @@ struct ValidatedTransaction {
     outer_hash: Hash256,
 }
 
+/// Validation failure with additional context about the validation level reached.
+/// This is used to determine whether the sequence number should still be bumped
+/// even though validation failed, matching stellar-core's ValidationType enum.
+struct ValidationFailure {
+    result: TransactionExecutionResult,
+    /// Whether the validation passed the sequence check (equivalent to
+    /// stellar-core's `cv >= kInvalidUpdateSeqNum`). When true, the sequence
+    /// number should be bumped even though the TX failed validation.
+    past_seq_check: bool,
+}
+
 /// Context for executing transactions during ledger close.
 pub struct TransactionExecutor {
     /// Ledger sequence being processed.
@@ -1504,16 +1515,31 @@ impl TransactionExecutor {
 
     /// Validate a transaction's structure, accounts, fees, preconditions, sequence,
     /// and signatures before any state changes. Returns the validated data needed
-    /// for execution, or a failed `TransactionExecutionResult` on validation failure.
+    /// for execution, or a `ValidationFailure` on validation failure.
     fn validate_preconditions(
         &mut self,
         snapshot: &SnapshotHandle,
         tx_envelope: &TransactionEnvelope,
         base_fee: u32,
-    ) -> Result<std::result::Result<ValidatedTransaction, TransactionExecutionResult>> {
+    ) -> Result<std::result::Result<ValidatedTransaction, ValidationFailure>> {
         let frame = TransactionFrame::with_network(tx_envelope.clone(), self.network_id);
         let fee_source_id = henyey_tx::muxed_to_account_id(&frame.fee_source_account());
         let inner_source_id = henyey_tx::muxed_to_account_id(&frame.inner_source_account());
+
+        // Helper to create a pre-seq-check failure (no sequence bump needed).
+        let pre_seq_fail = |failure, error| {
+            ValidationFailure {
+                result: failed_result(failure, error),
+                past_seq_check: false,
+            }
+        };
+        // Helper to create a post-seq-check failure (sequence bump needed).
+        let post_seq_fail = |failure, error| {
+            ValidationFailure {
+                result: failed_result(failure, error),
+                past_seq_check: true,
+            }
+        };
 
         // Phase 1: Structure validation
         if !frame.is_valid_structure() {
@@ -1522,24 +1548,24 @@ impl TransactionExecutor {
             } else {
                 ExecutionFailure::Malformed
             };
-            return Ok(Err(failed_result(failure, "Invalid transaction structure")));
+            return Ok(Err(pre_seq_fail(failure, "Invalid transaction structure")));
         }
 
         // Phase 2: Account loading
         if !self.load_account(snapshot, &fee_source_id)? {
-            return Ok(Err(failed_result(ExecutionFailure::NoAccount, "Source account not found")));
+            return Ok(Err(pre_seq_fail(ExecutionFailure::NoAccount, "Source account not found")));
         }
         if !self.load_account(snapshot, &inner_source_id)? {
-            return Ok(Err(failed_result(ExecutionFailure::NoAccount, "Source account not found")));
+            return Ok(Err(pre_seq_fail(ExecutionFailure::NoAccount, "Source account not found")));
         }
 
         let fee_source_account = match self.state.get_account(&fee_source_id) {
             Some(acc) => acc.clone(),
-            None => return Ok(Err(failed_result(ExecutionFailure::NoAccount, "Source account not found"))),
+            None => return Ok(Err(pre_seq_fail(ExecutionFailure::NoAccount, "Source account not found"))),
         };
         let source_account = match self.state.get_account(&inner_source_id) {
             Some(acc) => acc.clone(),
-            None => return Ok(Err(failed_result(ExecutionFailure::NoAccount, "Source account not found"))),
+            None => return Ok(Err(pre_seq_fail(ExecutionFailure::NoAccount, "Source account not found"))),
         };
 
         // Phase 3: Fee validation
@@ -1550,7 +1576,7 @@ impl TransactionExecutor {
             let outer_inclusion_fee = frame.inclusion_fee();
 
             if outer_inclusion_fee < outer_min_inclusion_fee {
-                return Ok(Err(failed_result(ExecutionFailure::InsufficientFee, "Insufficient fee")));
+                return Ok(Err(pre_seq_fail(ExecutionFailure::InsufficientFee, "Insufficient fee")));
             }
 
             let (inner_inclusion_fee, inner_is_soroban) = match frame.envelope() {
@@ -1570,18 +1596,18 @@ impl TransactionExecutor {
                 let v1 = outer_inclusion_fee as i128 * inner_min_inclusion_fee as i128;
                 let v2 = inner_inclusion_fee as i128 * outer_min_inclusion_fee as i128;
                 if v1 < v2 {
-                    return Ok(Err(failed_result(ExecutionFailure::InsufficientFee, "Insufficient fee")));
+                    return Ok(Err(pre_seq_fail(ExecutionFailure::InsufficientFee, "Insufficient fee")));
                 }
             } else {
                 let allow_negative_inner = inner_is_soroban;
                 if !allow_negative_inner {
-                    return Ok(Err(failed_result(ExecutionFailure::OperationFailed, "Fee bump inner transaction invalid")));
+                    return Ok(Err(pre_seq_fail(ExecutionFailure::OperationFailed, "Fee bump inner transaction invalid")));
                 }
             }
         } else {
             let required_fee = frame.operation_count() as u32 * base_fee;
             if frame.fee() < required_fee {
-                return Ok(Err(failed_result(ExecutionFailure::InsufficientFee, "Insufficient fee")));
+                return Ok(Err(pre_seq_fail(ExecutionFailure::InsufficientFee, "Insufficient fee")));
             }
         }
 
@@ -1596,7 +1622,7 @@ impl TransactionExecutor {
         );
 
         if let Err(e) = validation::validate_time_bounds(&frame, &validation_ctx) {
-            return Ok(Err(failed_result(
+            return Ok(Err(pre_seq_fail(
                 match e {
                     validation::ValidationError::TooEarly { .. } => ExecutionFailure::TooEarly,
                     validation::ValidationError::TooLate { .. } => ExecutionFailure::TooLate,
@@ -1607,7 +1633,7 @@ impl TransactionExecutor {
         }
 
         if let Err(e) = validation::validate_ledger_bounds(&frame, &validation_ctx) {
-            return Ok(Err(failed_result(
+            return Ok(Err(pre_seq_fail(
                 match e {
                     validation::ValidationError::BadLedgerBounds { min, max, current } => {
                         if max > 0 && current > max {
@@ -1624,37 +1650,12 @@ impl TransactionExecutor {
             )));
         }
 
-        if let Preconditions::V2(cond) = frame.preconditions() {
-            if let Some(min_seq) = cond.min_seq_num {
-                if source_account.seq_num.0 < min_seq.0 {
-                    return Ok(Err(failed_result(ExecutionFailure::BadMinSeqAgeOrGap, "Minimum sequence number not met")));
-                }
-            }
-
-            if cond.min_seq_age.0 > 0 {
-                let acc_seq_time = get_account_seq_time(&source_account);
-                let min_seq_age = cond.min_seq_age.0;
-                if min_seq_age > self.close_time || self.close_time - min_seq_age < acc_seq_time {
-                    return Ok(Err(failed_result(ExecutionFailure::BadMinSeqAgeOrGap, "Minimum sequence age not met")));
-                }
-            }
-
-            if cond.min_seq_ledger_gap > 0 {
-                let acc_seq_ledger = get_account_seq_ledger(&source_account);
-                let min_seq_ledger_gap = cond.min_seq_ledger_gap;
-                if min_seq_ledger_gap > self.ledger_seq
-                    || self.ledger_seq - min_seq_ledger_gap < acc_seq_ledger
-                {
-                    return Ok(Err(failed_result(ExecutionFailure::BadMinSeqAgeOrGap, "Minimum sequence ledger gap not met")));
-                }
-            }
-        }
-
         // Phase 5: Sequence number validation
+        // This combines stellar-core's isBadSeq (including min_seq_num) check.
         if self.ledger_seq <= i32::MAX as u32 {
             let starting_seq = (self.ledger_seq as i64) << 32;
             if frame.sequence_number() == starting_seq {
-                return Ok(Err(failed_result(ExecutionFailure::BadSequence, "Bad sequence: equals starting sequence")));
+                return Ok(Err(pre_seq_fail(ExecutionFailure::BadSequence, "Bad sequence: equals starting sequence")));
             }
         }
 
@@ -1693,12 +1694,37 @@ impl TransactionExecutor {
                     tx_seq
                 )
             };
-            return Ok(Err(failed_result(ExecutionFailure::BadSequence, &error_msg)));
+            return Ok(Err(pre_seq_fail(ExecutionFailure::BadSequence, &error_msg)));
+        }
+
+        // --- Past this point, the sequence check has passed ---
+        // In stellar-core's commonValid, res = kInvalidUpdateSeqNum here.
+        // Failures after this point should still bump the sequence number.
+
+        // Phase 5b: Min seq age/gap checks (stellar-core's isTooEarlyForAccount)
+        if let Preconditions::V2(cond) = frame.preconditions() {
+            if cond.min_seq_age.0 > 0 {
+                let acc_seq_time = get_account_seq_time(&source_account);
+                let min_seq_age = cond.min_seq_age.0;
+                if min_seq_age > self.close_time || self.close_time - min_seq_age < acc_seq_time {
+                    return Ok(Err(post_seq_fail(ExecutionFailure::BadMinSeqAgeOrGap, "Minimum sequence age not met")));
+                }
+            }
+
+            if cond.min_seq_ledger_gap > 0 {
+                let acc_seq_ledger = get_account_seq_ledger(&source_account);
+                let min_seq_ledger_gap = cond.min_seq_ledger_gap;
+                if min_seq_ledger_gap > self.ledger_seq
+                    || self.ledger_seq - min_seq_ledger_gap < acc_seq_ledger
+                {
+                    return Ok(Err(post_seq_fail(ExecutionFailure::BadMinSeqAgeOrGap, "Minimum sequence ledger gap not met")));
+                }
+            }
         }
 
         // Phase 6: Signature validation
         if validation::validate_signatures(&frame, &validation_ctx).is_err() {
-            return Ok(Err(failed_result(ExecutionFailure::InvalidSignature, "Invalid signature")));
+            return Ok(Err(post_seq_fail(ExecutionFailure::InvalidSignature, "Invalid signature")));
         }
 
         let outer_hash = frame
@@ -1712,7 +1738,7 @@ impl TransactionExecutor {
             outer_threshold,
         ) {
             tracing::debug!("Signature check failed: fee_source outer check");
-            return Ok(Err(failed_result(ExecutionFailure::InvalidSignature, "Invalid signature")));
+            return Ok(Err(post_seq_fail(ExecutionFailure::InvalidSignature, "Invalid signature")));
         }
 
         if frame.is_fee_bump() {
@@ -1727,7 +1753,7 @@ impl TransactionExecutor {
                 inner_threshold,
             ) {
                 tracing::debug!("Signature check failed: fee_bump inner check");
-                return Ok(Err(failed_result(ExecutionFailure::InvalidSignature, "Invalid inner signature")));
+                return Ok(Err(post_seq_fail(ExecutionFailure::InvalidSignature, "Invalid inner signature")));
             }
         }
 
@@ -1748,7 +1774,7 @@ impl TransactionExecutor {
                 thresholds = ?source_account.thresholds.0,
                 "Signature check failed: source outer check"
             );
-            return Ok(Err(failed_result(ExecutionFailure::InvalidSignature, "Invalid signature")));
+            return Ok(Err(post_seq_fail(ExecutionFailure::InvalidSignature, "Invalid signature")));
         }
 
         if let Preconditions::V2(cond) = frame.preconditions() {
@@ -1764,7 +1790,7 @@ impl TransactionExecutor {
                     frame.signatures()
                 };
                 if !has_required_extra_signers(&extra_hash, extra_signatures, &cond.extra_signers) {
-                    return Ok(Err(failed_result(ExecutionFailure::BadAuthExtra, "Missing extra signer")));
+                    return Ok(Err(post_seq_fail(ExecutionFailure::BadAuthExtra, "Missing extra signer")));
                 }
             }
         }
@@ -1796,10 +1822,69 @@ impl TransactionExecutor {
     ) -> Result<TransactionExecutionResult> {
         let tx_timing_start = std::time::Instant::now();
 
+        // For Soroban TXs, compute the max refundable fee BEFORE validation.
+        // In stellar-core, the RefundableFeeTracker is initialized in
+        // commonPreApply() before commonValid(), so even validation failures
+        // get the refundable fee subtracted from feeCharged via
+        // finalizeFeeRefund(). We need to replicate this by setting fee_refund
+        // on the failure result when validate_preconditions fails.
+        let soroban_max_refundable = {
+            let pre_frame = TransactionFrame::new(tx_envelope.clone());
+            if pre_frame.is_soroban() {
+                let (non_refundable_fee, _) = compute_soroban_resource_fee(
+                    &pre_frame,
+                    self.protocol_version,
+                    &self.soroban_config,
+                    0,
+                )
+                .unwrap_or((0, 0));
+                pre_frame
+                    .declared_soroban_resource_fee()
+                    .saturating_sub(non_refundable_fee)
+            } else {
+                0
+            }
+        };
+
         // Phase 1-6: Validate structure, accounts, fees, preconditions, sequence, signatures
         let validated = match self.validate_preconditions(snapshot, tx_envelope, base_fee)? {
             Ok(v) => v,
-            Err(failure_result) => return Ok(failure_result),
+            Err(validation_failure) => {
+                let mut failure_result = validation_failure.result;
+
+                // For Soroban TXs, even validation failures get a fee refund.
+                // stellar-core's setError() resets consumed to 0 and
+                // finalizeFeeRefund() subtracts the full max_refundable from
+                // feeCharged.
+                failure_result.fee_refund = soroban_max_refundable;
+
+                // If the validation passed the sequence check (stellar-core's
+                // cv >= kInvalidUpdateSeqNum), bump the sequence number even
+                // though the TX failed. This matches stellar-core's
+                // commonPreApply which calls processSeqNum before returning.
+                if validation_failure.past_seq_check {
+                    let frame = TransactionFrame::with_network(
+                        tx_envelope.clone(),
+                        self.network_id,
+                    );
+                    let inner_source_id =
+                        henyey_tx::muxed_to_account_id(&frame.inner_source_account());
+                    if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
+                        acc.seq_num =
+                            stellar_xdr::curr::SequenceNumber(frame.sequence_number());
+                        henyey_tx::state::update_account_seq_info(
+                            acc,
+                            self.ledger_seq,
+                            self.close_time,
+                        );
+                    }
+                    // Flush and commit the sequence bump so it persists.
+                    self.state.flush_modified_entries();
+                    self.state.commit();
+                }
+
+                return Ok(failure_result);
+            }
         };
         let ValidatedTransaction {
             frame,
