@@ -329,7 +329,15 @@ impl Peer {
             .unwrap_message(frame.message, frame.is_authenticated)?;
 
         match message {
-            StellarMessage::Auth(_) => {
+            StellarMessage::Auth(ref auth) => {
+                // Validate AUTH_MSG_FLAG_FLOW_CONTROL_BYTES_REQUESTED (200)
+                // Peers must set this flag to enable byte-based flow control
+                if auth.flags != 200 {
+                    return Err(OverlayError::InvalidMessage(format!(
+                        "Auth message missing flow control flag, got flags={}",
+                        auth.flags
+                    )));
+                }
                 self.auth.process_auth()?;
             }
             StellarMessage::ErrorMsg(err) => {
@@ -375,7 +383,23 @@ impl Peer {
 
     /// Process a received Hello message.
     fn process_hello(&mut self, hello: Hello) -> Result<()> {
-        // Let auth context process it
+        // State guard: reject if not in Handshaking state
+        if self.state != PeerState::Handshaking {
+            return Err(OverlayError::InvalidMessage(format!(
+                "received Hello in unexpected state {:?}",
+                self.state
+            )));
+        }
+
+        // Port validation: XDR uses i32, but valid ports are u16 range (0-65535)
+        if hello.listening_port < 0 || hello.listening_port > u16::MAX as i32 {
+            return Err(OverlayError::InvalidMessage(format!(
+                "invalid listening port: {}",
+                hello.listening_port
+            )));
+        }
+
+        // Let auth context process it (network ID, version, cert checks)
         self.auth.process_hello(&hello)?;
 
         // Extract peer info
@@ -384,6 +408,14 @@ impl Peer {
             .peer_id()
             .cloned()
             .ok_or_else(|| OverlayError::AuthenticationFailed("no peer ID".to_string()))?;
+
+        // Self-connection check: reject if peer is ourselves
+        let local_peer_id = self.auth.local_peer_id();
+        if peer_id == local_peer_id {
+            return Err(OverlayError::InvalidMessage(
+                "received Hello from self".to_string(),
+            ));
+        }
 
         let version_string: String = hello.version_str.to_string();
 

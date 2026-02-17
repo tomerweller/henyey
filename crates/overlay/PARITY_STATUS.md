@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-overlay`
 **Upstream**: `.upstream-v25/src/overlay/`
-**Overall Parity**: 83%
-**Last Updated**: 2026-02-15
+**Overall Parity**: 88%
+**Last Updated**: 2026-02-16
 
 ## Summary
 
@@ -12,14 +12,14 @@
 | Authentication (PeerAuth, Hmac) | Full | HKDF key derivation, HMAC-SHA256 MAC |
 | Peer Connection (Peer, TCPPeer) | Partial | Missing ping/pong latency tracking |
 | OverlayManager | Partial | Missing DNS re-resolution, some peer list queries |
-| Floodgate | Full | Message deduplication and forwarding |
-| FlowControl | Full | Capacity tracking, throttling, priority queues |
+| Floodgate | Full | Message deduplication, ledger-based cleanup |
+| FlowControl | Full | Capacity tracking, throttling, SCP-aware trimming |
 | ItemFetcher / Tracker | Full | Fetch lifecycle, retry, envelope tracking |
 | BanManager | Full | In-memory + SQLite persistence |
 | PeerManager | Full | SQLite persistence, backoff, type tracking |
 | TxAdverts | Full | Queuing, batching, history cache |
 | TxDemandsManager | Full | Demand scheduling, pull latency |
-| SurveyManager | Partial | Missing encryption, signature validation |
+| SurveyManager | Full | Encryption/signatures in app layer (survey_impl.rs) |
 | OverlayMetrics | Full | Counters and timers for all message types |
 | PeerBareAddress | Full | Mapped to PeerAddress in lib.rs |
 | MessageCodec (framing) | Full | Length-prefix with auth bit |
@@ -43,7 +43,7 @@
 | `PeerDoor.h` / `PeerDoor.cpp` | `connection.rs` (Listener) | Full match |
 | `PeerManager.h` / `PeerManager.cpp` | `peer_manager.rs` | Full match |
 | `RandomPeerSource.h` / `RandomPeerSource.cpp` | `peer_manager.rs` | Merged into PeerManager |
-| `SurveyManager.h` / `SurveyManager.cpp` | `survey.rs` | Missing encryption/signatures |
+| `SurveyManager.h` / `SurveyManager.cpp` | `survey.rs` + `app/survey_impl.rs` | Full match (relay/crypto in app layer) |
 | `SurveyDataManager.h` / `SurveyDataManager.cpp` | `survey.rs` | Merged into SurveyManager |
 | `SurveyMessageLimiter.h` / `SurveyMessageLimiter.cpp` | `survey.rs` | Simplified implementation |
 | `TCPPeer.h` / `TCPPeer.cpp` | `peer.rs`, `connection.rs`, `codec.rs` | Split across modules |
@@ -322,7 +322,7 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `removePeer()` | (via peer drop) | Full |
 | `acceptAuthenticatedPeer()` | (in handshake completion) | Full |
 | `isPreferred()` | (via preferred_peers config) | Full |
-| `isPossiblyPreferred()` | N/A | None |
+| `isPossiblyPreferred()` | `ConnectionPool::try_reserve_with_ip()` | Full |
 | `haveSpaceForConnection()` | `ConnectionPool::can_accept()` | Full |
 | `getInboundPendingPeers()` | N/A | None |
 | `getOutboundPendingPeers()` | N/A | None |
@@ -417,24 +417,24 @@ Corresponds to: `SurveyManager.h`, `SurveyDataManager.h`, `SurveyMessageLimiter.
 | `startSurveyReporting()` | `start_collecting()` | Full |
 | `stopSurveyReporting()` | `stop_collecting()` | Full |
 | `addNodeToRunningSurveyBacklog()` | `add_peer_to_backlog()` | Full |
-| `relayOrProcessResponse()` | N/A | None |
-| `relayOrProcessRequest()` | N/A | None |
+| `relayOrProcessResponse()` | `survey_impl::handle_survey_response()` | Full |
+| `relayOrProcessRequest()` | `survey_impl::handle_survey_request()` | Full |
 | `clearOldLedgers()` | `clear_old_ledgers()` | Full |
 | `getJsonResults()` | `get_node_data()` / peer data getters | Partial |
-| `broadcastStartSurveyCollecting()` | N/A | None |
-| `relayStartSurveyCollecting()` | N/A | None |
-| `broadcastStopSurveyCollecting()` | N/A | None |
-| `relayStopSurveyCollecting()` | N/A | None |
+| `broadcastStartSurveyCollecting()` | `survey_impl::handle_survey_start_collecting()` | Full |
+| `relayStartSurveyCollecting()` | `survey_impl::handle_survey_start_collecting()` | Full |
+| `broadcastStopSurveyCollecting()` | `survey_impl::handle_survey_stop_collecting()` | Full |
+| `relayStopSurveyCollecting()` | `survey_impl::handle_survey_stop_collecting()` | Full |
 | `modifyNodeData()` | `modify_node_data()` | Full |
 | `modifyPeerData()` | `modify_peer_data()` | Full |
 | `recordDroppedPeer()` | `record_dropped_peer()` | Full |
 | `updateSurveyPhase()` | `update_phase()` | Full |
-| `sendTopologyRequest()` | N/A | None |
-| `processTimeSlicedTopologyResponse()` | N/A | None |
-| `processTimeSlicedTopologyRequest()` | N/A | None |
-| `populateSurveyResponseMessage()` | N/A | None |
-| `populateSurveyRequestMessage()` | N/A | None |
-| `dropPeerIfSigInvalid()` | N/A | None |
+| `sendTopologyRequest()` | `survey_impl::handle_survey_request()` | Full |
+| `processTimeSlicedTopologyResponse()` | `survey_impl::handle_survey_response()` | Full |
+| `processTimeSlicedTopologyRequest()` | `survey_impl::handle_survey_request()` | Full |
+| `populateSurveyResponseMessage()` | `survey_impl::handle_survey_response()` | Full |
+| `populateSurveyRequestMessage()` | `survey_impl::handle_survey_request()` | Full |
+| `dropPeerIfSigInvalid()` | `survey_impl::verify_survey_signature()` | Full |
 | `surveyorPermitted()` | `surveyor_permitted()` | Full |
 | `getMsgSummary()` | N/A | None |
 | `SurveyDataManager::startSurveyCollecting()` | `start_collecting()` | Full |
@@ -444,7 +444,7 @@ Corresponds to: `SurveyManager.h`, `SurveyDataManager.h`, `SurveyMessageLimiter.
 | `SurveyDataManager::recordDroppedPeer()` | `record_dropped_peer()` | Full |
 | `SurveyDataManager::getNonce()` | `nonce()` | Full |
 | `SurveyDataManager::nonceIsReporting()` | (via phase check) | Full |
-| `SurveyDataManager::fillSurveyData()` | N/A | None |
+| `SurveyDataManager::fillSurveyData()` | `survey_impl::handle_survey_request()` | Full |
 | `SurveyDataManager::getFinalNodeData()` | `get_node_data()` | Full |
 | `SurveyDataManager::getFinalInboundPeerData()` | `get_inbound_peer_data()` | Full |
 | `SurveyDataManager::getFinalOutboundPeerData()` | `get_outbound_peer_data()` | Full |
@@ -453,8 +453,8 @@ Corresponds to: `SurveyManager.h`, `SurveyDataManager.h`, `SurveyMessageLimiter.
 | `SurveyMessageLimiter::addAndValidateRequest()` | `add_request()` | Partial |
 | `SurveyMessageLimiter::recordAndValidateResponse()` | `record_response()` | Partial |
 | `SurveyMessageLimiter::clearOldLedgers()` | `clear_old_ledgers()` | Full |
-| `SurveyMessageLimiter::validateStartSurveyCollecting()` | N/A | None |
-| `SurveyMessageLimiter::validateStopSurveyCollecting()` | N/A | None |
+| `SurveyMessageLimiter::validateStartSurveyCollecting()` | `survey_impl::handle_survey_start_collecting()` | Full |
+| `SurveyMessageLimiter::validateStopSurveyCollecting()` | `survey_impl::handle_survey_stop_collecting()` | Full |
 
 ### MessageCodec (`codec.rs`)
 
@@ -490,6 +490,7 @@ Features excluded by design. These are NOT counted against parity %.
 | `BUILD_TESTS`-only methods | Test helpers; Rust uses different test patterns |
 | `OverlayUtils::logErrorOrThrow()` | Handled by Rust's tracing + Result types |
 | `recvTxBatch()` (BUILD_TESTS only) | Test-only message handler |
+| `PeerAuth` certificate refresh timer | Per-connection `AuthContext` generates a fresh 1-hour cert; connections time out long before expiry |
 
 ## Gaps
 
@@ -520,21 +521,6 @@ Features not yet implemented. These ARE counted against parity %.
 | `OverlayManagerImpl::updateSizeCounters()` | Low | Metrics for pending/auth sizes |
 | `OverlayManagerImpl::availableOutboundAuthenticatedSlots()` | Low | Slot availability check |
 | `SurveyManager::getMsgSummary()` | Low | Survey message logging |
-| `SurveyManager::relayOrProcessResponse()` | Medium | Full survey request/response relay |
-| `SurveyManager::relayOrProcessRequest()` | Medium | Full survey request/response relay |
-| `SurveyManager::broadcastStartSurveyCollecting()` | Medium | Survey initiation broadcasting |
-| `SurveyManager::broadcastStopSurveyCollecting()` | Medium | Survey stop broadcasting |
-| `SurveyManager::relayStartSurveyCollecting()` | Medium | Survey relay |
-| `SurveyManager::relayStopSurveyCollecting()` | Medium | Survey relay |
-| `SurveyManager::sendTopologyRequest()` | Medium | Topology survey requests |
-| `SurveyManager::processTimeSlicedTopologyResponse()` | Medium | Process survey responses |
-| `SurveyManager::processTimeSlicedTopologyRequest()` | Medium | Process survey requests |
-| `SurveyManager::populateSurveyResponseMessage()` | Medium | Response message construction |
-| `SurveyManager::populateSurveyRequestMessage()` | Medium | Request message construction |
-| `SurveyManager::dropPeerIfSigInvalid()` | Medium | Signature validation for surveys |
-| `SurveyDataManager::fillSurveyData()` | Medium | Fill survey response data |
-| `SurveyMessageLimiter::validateStartSurveyCollecting()` | Medium | Full validation |
-| `SurveyMessageLimiter::validateStopSurveyCollecting()` | Medium | Full validation |
 | `TxAdverts::getOpsFloodLedger()` | Low | Ops-based flood rate calculation |
 
 ## Architectural Differences
@@ -599,7 +585,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 255 |
-| Gaps (None + Partial) | 53 |
-| Intentional Omissions | 10 |
-| **Parity** | **255 / (255 + 53) = 83%** |
+| Implemented (Full) | 271 |
+| Gaps (None + Partial) | 37 |
+| Intentional Omissions | 11 |
+| **Parity** | **271 / (271 + 37) = 88%** |

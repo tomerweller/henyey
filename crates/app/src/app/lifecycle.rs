@@ -721,6 +721,9 @@ impl App {
         );
 
         let mut overlay = OverlayManager::new(overlay_config, local_node)?;
+        overlay.set_scp_callback(Arc::new(super::HerderScpCallback {
+            herder: Arc::clone(&self.herder),
+        }));
         if let Ok(bans) = self.db.load_bans() {
             for ban in bans {
                 if let Some(peer_id) = Self::strkey_to_peer_id(&ban) {

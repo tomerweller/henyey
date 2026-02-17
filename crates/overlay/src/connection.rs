@@ -372,9 +372,18 @@ impl Listener {
 ///
 /// Used to track inbound and outbound connection counts separately,
 /// ensuring we don't exceed configured limits.
+///
+/// For inbound pools, supports "possibly preferred" extra slots:
+/// connections from preferred IP addresses can exceed `max_connections`
+/// by up to `possibly_preferred_extra` slots, matching upstream's
+/// `Config::POSSIBLY_PREFERRED_EXTRA`.
 pub struct ConnectionPool {
     /// Maximum number of connections allowed.
     max_connections: usize,
+    /// Extra slots for connections from preferred IP addresses.
+    possibly_preferred_extra: usize,
+    /// Set of preferred IP addresses that qualify for extra slots.
+    preferred_ips: parking_lot::RwLock<std::collections::HashSet<std::net::IpAddr>>,
     /// Current number of active connections.
     current_count: std::sync::atomic::AtomicUsize,
 }
@@ -384,6 +393,22 @@ impl ConnectionPool {
     pub fn new(max_connections: usize) -> Self {
         Self {
             max_connections,
+            possibly_preferred_extra: 0,
+            preferred_ips: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            current_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Creates a new connection pool with extra slots for preferred peers.
+    pub fn with_preferred(
+        max_connections: usize,
+        possibly_preferred_extra: usize,
+        preferred_ips: std::collections::HashSet<std::net::IpAddr>,
+    ) -> Self {
+        Self {
+            max_connections,
+            possibly_preferred_extra,
+            preferred_ips: parking_lot::RwLock::new(preferred_ips),
             current_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -400,11 +425,37 @@ impl ConnectionPool {
     /// Returns true if a slot was reserved, false if the limit is reached.
     /// Uses atomic compare-and-swap for thread safety.
     pub fn try_reserve(&self) -> bool {
+        self.try_reserve_with_ip(None)
+    }
+
+    /// Attempts to reserve a connection slot, with optional preferred IP check.
+    ///
+    /// If `ip` is provided and matches a preferred IP, the connection may be
+    /// allowed even when the pool is at `max_connections`, up to
+    /// `max_connections + possibly_preferred_extra`.
+    pub fn try_reserve_with_ip(&self, ip: Option<std::net::IpAddr>) -> bool {
         let mut current = self
             .current_count
             .load(std::sync::atomic::Ordering::Relaxed);
         loop {
-            if current >= self.max_connections {
+            let effective_max = if current >= self.max_connections {
+                // Over the base limit — only allow if IP is preferred
+                // and we haven't exceeded the extra slots
+                if let Some(ref addr) = ip {
+                    let preferred = self.preferred_ips.read();
+                    if preferred.contains(addr) {
+                        self.max_connections + self.possibly_preferred_extra
+                    } else {
+                        self.max_connections
+                    }
+                } else {
+                    self.max_connections
+                }
+            } else {
+                self.max_connections
+            };
+
+            if current >= effective_max {
                 return false;
             }
             match self.current_count.compare_exchange_weak(
@@ -462,6 +513,44 @@ mod tests {
         pool.release();
         assert!(pool.can_accept());
         assert_eq!(pool.count(), 1);
+    }
+
+    #[test]
+    fn test_connection_pool_preferred_ip() {
+        let preferred: std::collections::HashSet<std::net::IpAddr> =
+            vec!["10.0.0.1".parse().unwrap()].into_iter().collect();
+        let pool = ConnectionPool::with_preferred(2, 2, preferred);
+
+        // Fill to base limit
+        assert!(pool.try_reserve()); // 1
+        assert!(pool.try_reserve()); // 2
+
+        // Non-preferred IP is rejected at base limit
+        let non_preferred: std::net::IpAddr = "10.0.0.2".parse().unwrap();
+        assert!(!pool.try_reserve_with_ip(Some(non_preferred)));
+
+        // Preferred IP is allowed in extra slots
+        let preferred_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        assert!(pool.try_reserve_with_ip(Some(preferred_ip))); // 3
+        assert!(pool.try_reserve_with_ip(Some(preferred_ip))); // 4
+
+        // Even preferred IP is rejected when extra slots are full
+        assert!(!pool.try_reserve_with_ip(Some(preferred_ip)));
+        assert_eq!(pool.count(), 4);
+
+        // Release one and preferred can get back in
+        pool.release();
+        assert!(pool.try_reserve_with_ip(Some(preferred_ip)));
+    }
+
+    #[test]
+    fn test_connection_pool_no_ip_at_limit() {
+        let pool = ConnectionPool::new(2);
+        assert!(pool.try_reserve());
+        assert!(pool.try_reserve());
+
+        // try_reserve_with_ip(None) should also fail at limit
+        assert!(!pool.try_reserve_with_ip(None));
     }
 
     #[tokio::test]

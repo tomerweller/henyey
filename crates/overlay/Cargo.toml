@@ -10,6 +10,7 @@ rust-version.workspace = true
 stellar-xdr.workspace = true
 henyey-common.workspace = true
 henyey-crypto.workspace = true
+henyey-scp.workspace = true
 
 # Async runtime
 tokio.workspace = true

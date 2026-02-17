@@ -36,7 +36,7 @@ use crate::{
     codec::helpers,
     connection::{ConnectionDirection, ConnectionPool, Listener},
     flood::{compute_message_hash, FloodGate, FloodGateStats},
-    flow_control::{msg_body_size, FlowControl, FlowControlConfig},
+    flow_control::{msg_body_size, FlowControl, FlowControlConfig, ScpQueueCallback},
     peer::{Peer, PeerInfo, PeerStats, PeerStatsSnapshot},
     LocalNode, OverlayConfig, OverlayError, PeerAddress, PeerEvent, PeerId, PeerType, Result,
 };
@@ -45,7 +45,7 @@ use parking_lot::RwLock;
 use rand::seq::SliceRandom;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use stellar_xdr::curr::{PeerAddress as XdrPeerAddress, PeerAddressIp, StellarMessage, VecM};
@@ -135,6 +135,10 @@ struct SharedPeerState {
     dropped_authenticated_peers: Arc<std::sync::atomic::AtomicU64>,
     banned_peers: Arc<RwLock<HashSet<PeerId>>>,
     peer_info_cache: Arc<DashMap<PeerId, PeerInfo>>,
+    /// Last closed ledger sequence, used for flood record cleanup.
+    last_closed_ledger: Arc<AtomicU32>,
+    /// Optional callback for intelligent SCP queue trimming.
+    scp_callback: Option<Arc<dyn ScpQueueCallback>>,
     is_validator: bool,
     peer_event_tx: Option<mpsc::Sender<PeerEvent>>,
     extra_subscribers: Arc<RwLock<Vec<mpsc::UnboundedSender<OverlayMessage>>>>,
@@ -225,6 +229,10 @@ pub struct OverlayManager {
     /// Created on demand via `subscribe_catchup()` and cleaned up when dropped.
     /// Uses parking_lot::RwLock for minimal contention in the hot path (read-heavy).
     extra_subscribers: Arc<RwLock<Vec<mpsc::UnboundedSender<OverlayMessage>>>>,
+    /// Last closed ledger sequence, used for flood record cleanup.
+    last_closed_ledger: Arc<AtomicU32>,
+    /// Optional callback for intelligent SCP queue trimming.
+    scp_callback: Option<Arc<dyn ScpQueueCallback>>,
 }
 
 impl OverlayManager {
@@ -246,7 +254,24 @@ impl OverlayManager {
             flood_gate: Arc::new(FloodGate::with_ttl(Duration::from_secs(
                 config.flood_ttl_secs,
             ))),
-            inbound_pool: Arc::new(ConnectionPool::new(config.max_inbound_peers)),
+            inbound_pool: Arc::new({
+                // Extract IPs from preferred peers for possibly-preferred inbound slots
+                let preferred_ips: std::collections::HashSet<IpAddr> = config
+                    .preferred_peers
+                    .iter()
+                    .filter_map(|addr| addr.host.parse::<IpAddr>().ok())
+                    .collect();
+                const POSSIBLY_PREFERRED_EXTRA: usize = 2;
+                if preferred_ips.is_empty() {
+                    ConnectionPool::new(config.max_inbound_peers)
+                } else {
+                    ConnectionPool::with_preferred(
+                        config.max_inbound_peers,
+                        POSSIBLY_PREFERRED_EXTRA,
+                        preferred_ips,
+                    )
+                }
+            }),
             outbound_pool: Arc::new(ConnectionPool::new(config.max_outbound_peers)),
             running: Arc::new(AtomicBool::new(false)),
             message_tx,
@@ -267,6 +292,8 @@ impl OverlayManager {
             fetch_response_tx,
             fetch_response_rx: Arc::new(TokioMutex::new(Some(fetch_response_rx))),
             extra_subscribers: Arc::new(RwLock::new(Vec::new())),
+            last_closed_ledger: Arc::new(AtomicU32::new(0)),
+            scp_callback: None,
         })
     }
 
@@ -286,6 +313,8 @@ impl OverlayManager {
             dropped_authenticated_peers: Arc::clone(&self.dropped_authenticated_peers),
             banned_peers: Arc::clone(&self.banned_peers),
             peer_info_cache: Arc::clone(&self.peer_info_cache),
+            last_closed_ledger: Arc::clone(&self.last_closed_ledger),
+            scp_callback: self.scp_callback.clone(),
             is_validator: self.config.is_validator,
             peer_event_tx: self.config.peer_event_tx.clone(),
             extra_subscribers: Arc::clone(&self.extra_subscribers),
@@ -303,7 +332,10 @@ impl OverlayManager {
     ) -> (mpsc::Receiver<OutboundMessage>, Arc<FlowControl>) {
         let (outbound_tx, outbound_rx) = mpsc::channel(256);
         let stats = peer.stats();
-        let flow_control = Arc::new(FlowControl::new(FlowControlConfig::default()));
+        let flow_control = Arc::new(FlowControl::with_scp_callback(
+            FlowControlConfig::default(),
+            shared.scp_callback.clone(),
+        ));
         flow_control.set_peer_id(peer_id.clone());
         let peer_handle = PeerHandle {
             outbound_tx,
@@ -354,8 +386,9 @@ impl OverlayManager {
                     result = listener.accept() => {
                         match result {
                             Ok(connection) => {
-                                if !pool.try_reserve() {
-                                    warn!("Inbound peer limit reached, rejecting connection");
+                                let peer_ip = connection.remote_addr().ip();
+                                if !pool.try_reserve_with_ip(Some(peer_ip)) {
+                                    warn!("Inbound peer limit reached, rejecting connection from {}", peer_ip);
                                     continue;
                                 }
 
@@ -659,6 +692,7 @@ impl OverlayManager {
             fetch_response_tx,
             flood_gate,
             running,
+            last_closed_ledger,
             is_validator,
             extra_subscribers,
             ..
@@ -827,7 +861,8 @@ impl OverlayManager {
                                 let message_size = msg_body_size(&message);
                                 if helpers::is_flood_message(&message) {
                                     let hash = compute_message_hash(&message);
-                                    let unique = flood_gate.record_seen(hash, Some(peer_id.clone()));
+                                    let lcl = last_closed_ledger.load(Ordering::Relaxed);
+                                    let unique = flood_gate.record_seen(hash, Some(peer_id.clone()), lcl);
                                     peer.record_flood_stats(unique, message_size);
                                     if !unique {
                                         break 'route;
@@ -1074,7 +1109,8 @@ impl OverlayManager {
         // Record in flood gate and get filtered peer list
         let forward_peers: Option<Vec<PeerId>> = if is_flood {
             let hash = compute_message_hash(&message);
-            self.flood_gate.record_seen(hash, None);
+            let lcl = self.last_closed_ledger.load(Ordering::Relaxed);
+            self.flood_gate.record_seen(hash, None, lcl);
             // Only forward to peers that haven't already sent us this message
             let all_peers: Vec<PeerId> = self.peers.iter().map(|e| e.key().clone()).collect();
             Some(self.flood_gate.get_forward_peers(&hash, &all_peers))
@@ -1546,6 +1582,15 @@ impl OverlayManager {
         self.flood_gate.stats()
     }
 
+    /// Set the SCP queue callback for intelligent queue trimming.
+    ///
+    /// When set, the overlay will use herder state to make smart decisions
+    /// about which SCP messages to drop from outbound queues (slot-age
+    /// eviction and nomination/ballot replacement).
+    pub fn set_scp_callback(&mut self, callback: Arc<dyn ScpQueueCallback>) {
+        self.scp_callback = Some(callback);
+    }
+
     /// Clear per-ledger state for ledgers below the given sequence.
     ///
     /// Mirrors upstream `OverlayManagerImpl::clearLedgersBelow()` which is
@@ -1559,6 +1604,7 @@ impl OverlayManager {
     /// because survey cleanup and per-peer TxAdverts cleanup are handled
     /// separately by the app layer in Rust.
     pub fn clear_ledgers_below(&self, ledger_seq: u32, _lcl_seq: u32) {
+        self.last_closed_ledger.store(ledger_seq, Ordering::Relaxed);
         self.flood_gate.clear_below(ledger_seq);
         trace!(ledger_seq, "Cleared overlay state below ledger");
     }
@@ -1951,16 +1997,20 @@ mod tests {
 
         let manager = OverlayManager::new(config, local_node).unwrap();
 
-        // Record some flood messages
+        // Record some flood messages at ledger 100
         let hash1 = henyey_common::Hash256([1u8; 32]);
         let hash2 = henyey_common::Hash256([2u8; 32]);
-        manager.flood_gate.record_seen(hash1, None);
-        manager.flood_gate.record_seen(hash2, None);
+        manager.flood_gate.record_seen(hash1, None, 100);
+        manager.flood_gate.record_seen(hash2, None, 100);
         assert_eq!(manager.flood_stats().seen_count, 2);
 
-        // clear_ledgers_below should not remove entries that haven't expired
+        // clear_ledgers_below should not remove entries at or above the threshold
         manager.clear_ledgers_below(100, 100);
         assert_eq!(manager.flood_stats().seen_count, 2);
+
+        // clear_ledgers_below with a higher seq removes them
+        manager.clear_ledgers_below(101, 101);
+        assert_eq!(manager.flood_stats().seen_count, 0);
     }
 
     #[test]

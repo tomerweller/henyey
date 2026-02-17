@@ -26,10 +26,25 @@
 use crate::{OverlayError, PeerId, Result};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use stellar_xdr::curr::{StellarMessage, WriteXdr};
+use stellar_xdr::curr::{Limits, Limited, StellarMessage, WriteXdr};
 use tracing::{debug, trace, warn};
+
+/// Callback trait for SCP queue trimming decisions.
+///
+/// The overlay layer needs information from the herder to make intelligent
+/// trimming decisions for the SCP message queue. This trait abstracts that
+/// dependency so the overlay crate doesn't depend on the herder directly.
+pub trait ScpQueueCallback: Send + Sync {
+    /// Returns the minimum slot index to keep in memory.
+    /// Messages for slots below this value (except checkpoint seq) are dropped.
+    fn min_slot_to_remember(&self) -> u64;
+
+    /// Returns the most recent checkpoint sequence number.
+    /// Messages at this slot index are preserved even if below min_slot_to_remember.
+    fn most_recent_checkpoint_seq(&self) -> u64;
+}
 
 /// Configuration for flow control.
 #[derive(Debug, Clone)]
@@ -338,6 +353,8 @@ pub struct FlowControl {
     config: FlowControlConfig,
     /// Protected state.
     state: Mutex<FlowControlState>,
+    /// Optional callback for intelligent SCP queue trimming.
+    scp_callback: Option<Arc<dyn ScpQueueCallback>>,
     /// Metrics - messages dropped from SCP queue.
     pub dropped_scp: AtomicU64,
     /// Metrics - messages dropped from TX queue.
@@ -351,6 +368,14 @@ pub struct FlowControl {
 impl FlowControl {
     /// Create a new flow control instance.
     pub fn new(config: FlowControlConfig) -> Self {
+        Self::with_scp_callback(config, None)
+    }
+
+    /// Create a new flow control instance with an SCP queue callback.
+    pub fn with_scp_callback(
+        config: FlowControlConfig,
+        scp_callback: Option<Arc<dyn ScpQueueCallback>>,
+    ) -> Self {
         let initial_bytes_capacity =
             config.peer_flood_reading_capacity * config.flow_control_bytes_batch_size;
 
@@ -370,6 +395,7 @@ impl FlowControl {
                 peer_id: None,
             }),
             config,
+            scp_callback,
             dropped_scp: AtomicU64::new(0),
             dropped_txs: AtomicU64::new(0),
             dropped_adverts: AtomicU64::new(0),
@@ -485,18 +511,82 @@ impl FlowControl {
                 }
             }
             MessagePriority::Scp => {
-                // Don't drop SCP messages completely - they're critical for consensus
-                // But we can drop old ones for slots we don't care about anymore
-                // For now, just keep a reasonable limit
                 let queue = &mut state.outbound_queues[queue_idx];
                 if queue.len() > limit {
-                    while queue.len() > limit / 2 {
-                        match queue.front() {
-                            Some(front) if !front.being_sent => {
-                                queue.pop_front();
-                                dropped += 1;
+                    if let Some(ref cb) = self.scp_callback {
+                        // Intelligent trimming: use herder state to decide what to drop
+                        let min_slot = cb.min_slot_to_remember();
+                        let checkpoint_seq = cb.most_recent_checkpoint_seq();
+                        let mut value_replaced = false;
+
+                        let mut i = 0;
+                        while i < queue.len() {
+                            if queue[i].being_sent {
+                                i += 1;
+                                continue;
                             }
-                            _ => break,
+
+                            // Extract slot index from the SCP envelope
+                            let slot_index =
+                                if let StellarMessage::ScpMessage(ref env) = queue[i].message {
+                                    env.statement.slot_index
+                                } else {
+                                    i += 1;
+                                    continue;
+                                };
+
+                            // Drop messages for slots we no longer care about
+                            // (except the checkpoint sequence)
+                            if slot_index < min_slot && slot_index != checkpoint_seq {
+                                queue.remove(i);
+                                dropped += 1;
+                                continue;
+                            }
+
+                            // Replace older nomination/ballot with newer one from the back
+                            if !value_replaced
+                                && i + 1 < queue.len()
+                                && !queue.back().map(|m| m.being_sent).unwrap_or(true)
+                            {
+                                let back_st = queue.back().and_then(|m| {
+                                    if let StellarMessage::ScpMessage(ref env) = m.message {
+                                        Some(&env.statement)
+                                    } else {
+                                        None
+                                    }
+                                });
+                                let curr_st =
+                                    if let StellarMessage::ScpMessage(ref env) = queue[i].message {
+                                        Some(&env.statement)
+                                    } else {
+                                        None
+                                    };
+                                if let (Some(old_st), Some(new_st)) = (curr_st, back_st) {
+                                    if henyey_scp::is_newer_nomination_or_ballot_st(
+                                        old_st, new_st,
+                                    ) {
+                                        value_replaced = true;
+                                        let back = queue.pop_back().unwrap();
+                                        queue[i] = back;
+                                        dropped += 1;
+                                        i += 1;
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            i += 1;
+                        }
+                    } else {
+                        // Fallback: naive FIFO trimming when no callback is set
+                        while queue.len() > limit / 2 {
+                            match queue.front() {
+                                Some(front) if !front.being_sent => {
+                                    queue.pop_front();
+                                    dropped += 1;
+                                }
+                                _ => break,
+                            }
                         }
                     }
                     self.dropped_scp
@@ -817,11 +907,24 @@ pub fn is_flood_message(msg: &StellarMessage) -> bool {
     )
 }
 
-/// Get message body size in bytes.
+/// A writer that counts bytes written without allocating.
+struct CountingWriter(u64);
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Get message body size in bytes without heap allocation.
 pub fn msg_body_size(msg: &StellarMessage) -> u64 {
-    msg.to_xdr(stellar_xdr::curr::Limits::none())
-        .map(|bytes| bytes.len() as u64)
-        .unwrap_or(0)
+    let mut w = Limited::new(CountingWriter(0), Limits::none());
+    msg.write_xdr(&mut w).map(|_| w.inner.0).unwrap_or(0)
 }
 
 /// Compare two messages for equality (by XDR serialization).
@@ -1075,5 +1178,129 @@ mod tests {
         // Queue should have been trimmed
         let stats = fc.get_stats();
         assert!(stats.tx_queue_size <= 5 || stats.tx_queue_size == 0);
+    }
+
+    fn make_scp_message_at_slot(slot: u64) -> StellarMessage {
+        StellarMessage::ScpMessage(ScpEnvelope {
+            statement: stellar_xdr::curr::ScpStatement {
+                node_id: stellar_xdr::curr::NodeId(
+                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+                        [0u8; 32],
+                    )),
+                ),
+                slot_index: slot,
+                pledges: stellar_xdr::curr::ScpStatementPledges::Nominate(
+                    stellar_xdr::curr::ScpNomination {
+                        quorum_set_hash: Hash([0u8; 32]),
+                        votes: vec![].try_into().unwrap(),
+                        accepted: vec![].try_into().unwrap(),
+                    },
+                ),
+            },
+            signature: stellar_xdr::curr::Signature::default(),
+        })
+    }
+
+    struct MockScpCallback {
+        min_slot: u64,
+        checkpoint_seq: u64,
+    }
+
+    impl ScpQueueCallback for MockScpCallback {
+        fn min_slot_to_remember(&self) -> u64 {
+            self.min_slot
+        }
+        fn most_recent_checkpoint_seq(&self) -> u64 {
+            self.checkpoint_seq
+        }
+    }
+
+    #[test]
+    fn test_scp_queue_trimming_drops_old_slots() {
+        let mut config = FlowControlConfig::default();
+        config.max_tx_set_size_ops = 3; // Trim when queue > 3
+
+        let callback = Arc::new(MockScpCallback {
+            min_slot: 100,
+            checkpoint_seq: 50,
+        });
+        let fc = FlowControl::with_scp_callback(config, Some(callback));
+
+        // Add messages at various slots
+        fc.add_msg_and_maybe_trim_queue(make_scp_message_at_slot(10)); // old, should drop
+        fc.add_msg_and_maybe_trim_queue(make_scp_message_at_slot(50)); // checkpoint, should keep
+        fc.add_msg_and_maybe_trim_queue(make_scp_message_at_slot(80)); // old, should drop
+        // Queue is at 3 — not over limit yet
+
+        // This 4th message triggers trimming (queue > limit of 3)
+        fc.add_msg_and_maybe_trim_queue(make_scp_message_at_slot(100)); // current, should keep
+
+        let stats = fc.get_stats();
+        // Slot 10 and 80 should have been dropped (below min_slot=100, not checkpoint=50)
+        // Slot 50 and 100 should remain
+        // But slot 10 is below min AND not checkpoint — dropped
+        // Slot 80 is below min AND not checkpoint — dropped
+        // Slot 50 IS the checkpoint seq — kept
+        // Slot 100 is at min — kept
+        assert_eq!(stats.scp_queue_size, 2);
+    }
+
+    #[test]
+    fn test_scp_queue_trimming_preserves_checkpoint() {
+        let mut config = FlowControlConfig::default();
+        config.max_tx_set_size_ops = 2; // Trim when queue > 2
+
+        let callback = Arc::new(MockScpCallback {
+            min_slot: 100,
+            checkpoint_seq: 50,
+        });
+        let fc = FlowControl::with_scp_callback(config, Some(callback));
+
+        // Fill past limit with old slots including the checkpoint
+        fc.add_msg_and_maybe_trim_queue(make_scp_message_at_slot(50)); // checkpoint
+        fc.add_msg_and_maybe_trim_queue(make_scp_message_at_slot(10)); // old
+        fc.add_msg_and_maybe_trim_queue(make_scp_message_at_slot(200)); // triggers trim
+
+        let stats = fc.get_stats();
+        // Slot 10 should be dropped, slot 50 (checkpoint) and 200 should remain
+        assert_eq!(stats.scp_queue_size, 2);
+    }
+
+    #[test]
+    fn test_scp_queue_fallback_fifo_without_callback() {
+        let mut config = FlowControlConfig::default();
+        config.max_tx_set_size_ops = 3; // Trim when queue > 3
+
+        // No callback — should use FIFO fallback
+        let fc = FlowControl::new(config);
+
+        fc.add_msg_and_maybe_trim_queue(make_scp_message_at_slot(1));
+        fc.add_msg_and_maybe_trim_queue(make_scp_message_at_slot(2));
+        fc.add_msg_and_maybe_trim_queue(make_scp_message_at_slot(3));
+        fc.add_msg_and_maybe_trim_queue(make_scp_message_at_slot(4)); // triggers trim
+
+        let stats = fc.get_stats();
+        // FIFO trims to limit/2 = 1, then the new msg makes it 2
+        // (the 4th message was already added before trimming happens)
+        assert!(stats.scp_queue_size <= 3);
+    }
+
+    #[test]
+    fn test_counting_writer_matches_xdr_len() {
+        let tx = make_tx_message();
+        let scp = make_scp_message();
+
+        // CountingWriter-based size
+        let tx_size = msg_body_size(&tx);
+        let scp_size = msg_body_size(&scp);
+
+        // Vec-based size (the old approach)
+        let tx_xdr = tx.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
+        let scp_xdr = scp.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
+
+        assert_eq!(tx_size, tx_xdr.len() as u64);
+        assert_eq!(scp_size, scp_xdr.len() as u64);
+        assert!(tx_size > 0);
+        assert!(scp_size > 0);
     }
 }

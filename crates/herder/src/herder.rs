@@ -412,7 +412,7 @@ impl Herder {
     /// - ledger 1..63  → checkpoint starts at 1 (first checkpoint is size 63)
     /// - ledger 64..127 → checkpoint starts at 64
     /// - ledger 128..191 → checkpoint starts at 128
-    fn get_most_recent_checkpoint_seq(&self) -> u64 {
+    pub fn get_most_recent_checkpoint_seq(&self) -> u64 {
         let tracking_consensus_index = self.tracking_slot().saturating_sub(1);
         let freq = CHECKPOINT_FREQUENCY;
         // checkpointContainingLedger: ((ledger / freq + 1) * freq) - 1
@@ -425,6 +425,19 @@ impl Herder {
         };
         // firstLedgerInCheckpointContaining
         last - (size - 1)
+    }
+
+    /// Returns the minimum ledger sequence to keep in SCP memory.
+    ///
+    /// Messages for slots below this value can be safely dropped from queues.
+    /// Matches upstream `HerderImpl::getMinLedgerSeqToRemember()`.
+    pub fn get_min_ledger_seq_to_remember(&self) -> u64 {
+        let current_slot = self.tracking_slot();
+        if current_slot > MAX_SLOTS_TO_REMEMBER {
+            current_slot - MAX_SLOTS_TO_REMEMBER + 1
+        } else {
+            1
+        }
     }
 
     /// Compute the minimum ledger sequence to ask peers for SCP state.

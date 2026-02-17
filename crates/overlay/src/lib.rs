@@ -98,7 +98,7 @@ pub use error::OverlayError;
 pub use flood::{compute_message_hash, FloodGate, FloodGateStats, FloodRecord};
 pub use flow_control::{
     is_flood_message, FlowControl, FlowControlConfig, FlowControlStats, MessagePriority,
-    QueuedOutboundMessage, SendMoreCapacity,
+    QueuedOutboundMessage, ScpQueueCallback, SendMoreCapacity,
 };
 pub use item_fetcher::{
     ItemFetcher, ItemFetcherConfig, ItemFetcherStats, ItemType, NextPeerResult, PendingRequest,

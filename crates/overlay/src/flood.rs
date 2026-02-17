@@ -53,15 +53,18 @@ const DEFAULT_RATE_LIMIT_PER_SEC: u64 = 1000;
 struct SeenEntry {
     /// When the message was first seen.
     first_seen: Instant,
+    /// Ledger sequence when the message was first seen.
+    ledger_seq: u32,
     /// Set of peers that have sent us this message.
     peers: HashSet<PeerId>,
 }
 
 impl SeenEntry {
-    /// Creates a new entry with the current timestamp.
-    fn new() -> Self {
+    /// Creates a new entry with the current timestamp and ledger sequence.
+    fn new(ledger_seq: u32) -> Self {
         Self {
             first_seen: Instant::now(),
+            ledger_seq,
             peers: HashSet::new(),
         }
     }
@@ -95,7 +98,7 @@ impl SeenEntry {
 ///
 /// // Check if we should flood a message
 /// let hash = compute_message_hash(&message);
-/// if gate.record_seen(hash, Some(peer_id)) {
+/// if gate.record_seen(hash, Some(peer_id), current_ledger_seq) {
 ///     // First time seeing this - flood to other peers
 ///     let forward_to = gate.get_forward_peers(&hash, &all_peers);
 /// }
@@ -154,7 +157,15 @@ impl FloodGate {
     ///
     /// If `from_peer` is `Some`, that peer is recorded so we don't forward
     /// the message back to them.
-    pub fn record_seen(&self, message_hash: Hash256, from_peer: Option<PeerId>) -> bool {
+    ///
+    /// The `ledger_seq` parameter records the current ledger sequence for
+    /// ledger-based cleanup via [`clear_below`](FloodGate::clear_below).
+    pub fn record_seen(
+        &self,
+        message_hash: Hash256,
+        from_peer: Option<PeerId>,
+        ledger_seq: u32,
+    ) -> bool {
         self.messages_seen.fetch_add(1, Ordering::Relaxed);
 
         // Try cleanup if needed
@@ -172,7 +183,7 @@ impl FloodGate {
         }
 
         // New message
-        let mut entry = SeenEntry::new();
+        let mut entry = SeenEntry::new(ledger_seq);
         if let Some(peer) = from_peer {
             entry.add_peer(peer);
         }
@@ -265,16 +276,26 @@ impl FloodGate {
         }
     }
 
-    /// Removes flood records older than the given ledger sequence.
+    /// Removes flood records from ledgers before `ledger_seq`.
     ///
-    /// In upstream stellar-core, each flood record tracks the ledger it was
-    /// created in and `clearBelow(maxLedger)` removes records from ledgers
-    /// before `maxLedger`. Our Rust FloodGate uses time-based TTL instead of
-    /// ledger sequences, so this method triggers the same cleanup that would
-    /// naturally expire old entries. This is called by
-    /// [`OverlayManager::clear_ledgers_below`] on every ledger close.
-    pub fn clear_below(&self, _ledger_seq: u32) {
-        self.cleanup();
+    /// Matches upstream stellar-core's `clearBelow(maxLedger)` which removes
+    /// records from ledgers before `maxLedger`. Also runs time-based TTL
+    /// cleanup as a secondary mechanism.
+    pub fn clear_below(&self, ledger_seq: u32) {
+        let ttl = self.ttl;
+        let before_count = self.seen.len();
+        self.seen
+            .retain(|_, entry| entry.ledger_seq >= ledger_seq && !entry.is_expired(ttl));
+        let removed = before_count.saturating_sub(self.seen.len());
+
+        if removed > 0 {
+            debug!(
+                "FloodGate clear_below({}): removed {} entries",
+                ledger_seq, removed
+            );
+        }
+
+        *self.last_cleanup.write() = Instant::now();
     }
 
     /// Clears all entries from the flood gate.
@@ -373,13 +394,13 @@ mod tests {
         assert!(gate.should_flood(&hash));
 
         // Record as seen
-        assert!(gate.record_seen(hash, None));
+        assert!(gate.record_seen(hash, None, 1));
 
         // Should not flood again
         assert!(!gate.should_flood(&hash));
 
         // Record again should return false
-        assert!(!gate.record_seen(hash, None));
+        assert!(!gate.record_seen(hash, None, 1));
     }
 
     #[test]
@@ -392,10 +413,10 @@ mod tests {
         let peer3 = make_peer_id(3);
 
         // First seen from peer1
-        assert!(gate.record_seen(hash, Some(peer1.clone())));
+        assert!(gate.record_seen(hash, Some(peer1.clone()), 1));
 
         // Also seen from peer2
-        assert!(!gate.record_seen(hash, Some(peer2.clone())));
+        assert!(!gate.record_seen(hash, Some(peer2.clone()), 1));
 
         // Get forward peers - should exclude peer1 and peer2
         let all_peers = vec![peer1.clone(), peer2.clone(), peer3.clone()];
@@ -412,9 +433,9 @@ mod tests {
         let hash1 = make_hash(1);
         let hash2 = make_hash(2);
 
-        gate.record_seen(hash1, None);
-        gate.record_seen(hash1, None); // duplicate
-        gate.record_seen(hash2, None);
+        gate.record_seen(hash1, None, 1);
+        gate.record_seen(hash1, None, 1); // duplicate
+        gate.record_seen(hash2, None, 1);
 
         let stats = gate.stats();
         assert_eq!(stats.seen_count, 2);
@@ -427,7 +448,7 @@ mod tests {
         let gate = FloodGate::with_ttl(Duration::from_millis(10));
 
         let hash = make_hash(1);
-        gate.record_seen(hash, None);
+        gate.record_seen(hash, None, 1);
 
         // Wait for expiry
         std::thread::sleep(Duration::from_millis(20));
@@ -449,21 +470,43 @@ mod tests {
     }
 
     #[test]
+    fn test_clear_below_removes_by_ledger() {
+        let gate = FloodGate::with_ttl(Duration::from_secs(300));
+
+        let hash1 = make_hash(1);
+        let hash2 = make_hash(2);
+        let hash3 = make_hash(3);
+        // Record at different ledger sequences
+        gate.record_seen(hash1, None, 50);
+        gate.record_seen(hash2, None, 100);
+        gate.record_seen(hash3, None, 150);
+
+        assert_eq!(gate.stats().seen_count, 3);
+
+        // clear_below(100) removes entries from ledgers < 100
+        gate.clear_below(100);
+        assert_eq!(gate.stats().seen_count, 2);
+        assert!(!gate.has_seen(&hash1));
+        assert!(gate.has_seen(&hash2));
+        assert!(gate.has_seen(&hash3));
+    }
+
+    #[test]
     fn test_clear_below_removes_expired() {
         // Use a very short TTL so entries expire quickly
         let gate = FloodGate::with_ttl(Duration::from_millis(10));
 
         let hash1 = make_hash(1);
         let hash2 = make_hash(2);
-        gate.record_seen(hash1, None);
-        gate.record_seen(hash2, None);
+        gate.record_seen(hash1, None, 100);
+        gate.record_seen(hash2, None, 100);
 
         assert_eq!(gate.stats().seen_count, 2);
 
         // Wait for entries to expire
         std::thread::sleep(Duration::from_millis(20));
 
-        // clear_below triggers cleanup of expired entries
+        // clear_below triggers cleanup of expired entries (even at same ledger)
         gate.clear_below(100);
 
         assert_eq!(gate.stats().seen_count, 0);
@@ -476,10 +519,10 @@ mod tests {
 
         let hash1 = make_hash(1);
         let hash2 = make_hash(2);
-        gate.record_seen(hash1, None);
-        gate.record_seen(hash2, None);
+        gate.record_seen(hash1, None, 100);
+        gate.record_seen(hash2, None, 100);
 
-        // clear_below should not remove recent entries
+        // clear_below should not remove entries at or above the threshold
         gate.clear_below(100);
 
         assert_eq!(gate.stats().seen_count, 2);

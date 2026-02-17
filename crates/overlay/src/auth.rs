@@ -334,6 +334,11 @@ impl AuthContext {
         self.peer_id.as_ref()
     }
 
+    /// Returns the local node's peer ID.
+    pub fn local_peer_id(&self) -> PeerId {
+        PeerId::from_xdr(self.local_node.xdr_public_key())
+    }
+
     /// Creates a Hello message to send to the peer.
     ///
     /// The Hello message contains our identity, protocol versions, and

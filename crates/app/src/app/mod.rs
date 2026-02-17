@@ -82,7 +82,7 @@ use henyey_ledger::{
 };
 use henyey_overlay::{
     ConnectionDirection, LocalNode, OverlayConfig as OverlayManagerConfig, OverlayManager,
-    OverlayMessage, PeerAddress, PeerEvent, PeerId, PeerSnapshot, PeerType,
+    OverlayMessage, PeerAddress, PeerEvent, PeerId, PeerSnapshot, PeerType, ScpQueueCallback,
 };
 use henyey_scp::hash_quorum_set;
 use henyey_tx::TransactionFrame;
@@ -778,6 +778,22 @@ impl ScpTimeoutState {
             next_nomination: None,
             next_ballot: None,
         }
+    }
+}
+
+// Adapter from the app's Herder to the overlay's ScpQueueCallback trait.
+// Bridges herder SCP state into overlay flow control for slot-age-aware trimming.
+struct HerderScpCallback {
+    herder: Arc<Herder>,
+}
+
+impl ScpQueueCallback for HerderScpCallback {
+    fn min_slot_to_remember(&self) -> u64 {
+        self.herder.get_min_ledger_seq_to_remember()
+    }
+
+    fn most_recent_checkpoint_seq(&self) -> u64 {
+        self.herder.get_most_recent_checkpoint_seq()
     }
 }
 
