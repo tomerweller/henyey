@@ -414,6 +414,12 @@ pub struct LedgerStateManager {
     /// only contain offers that happened to be loaded during prior TX execution,
     /// causing non-deterministic offer removal in `SetTrustLineFlags` / `AllowTrust`.
     offers_by_account_asset_loader: Option<Arc<OffersByAccountAssetLoaderFn>>,
+    /// Per-source-account maximum sequence number across all transactions in the
+    /// current tx set.  Populated by `run_transactions_on_executor` when any
+    /// transaction contains an AccountMerge operation.  `MergeOpFrame::isSeqnumTooFar`
+    /// in stellar-core uses this to prevent merges that could allow sequence-number
+    /// reuse after account re-creation.
+    max_seq_num_to_apply: HashMap<[u8; 32], i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -494,6 +500,7 @@ impl LedgerStateManager {
             entry_loader: None,
             batch_entry_loader: None,
             offers_by_account_asset_loader: None,
+            max_seq_num_to_apply: HashMap::new(),
         }
     }
 
@@ -523,6 +530,19 @@ impl LedgerStateManager {
             ));
         }
         Ok((self.ledger_seq as i64) << 32)
+    }
+
+    /// Set the per-account maximum sequence numbers for the current tx set.
+    /// Called by the tx-set execution loop when any transaction contains an
+    /// AccountMerge operation.
+    pub fn set_max_seq_num_to_apply(&mut self, map: HashMap<[u8; 32], i64>) {
+        self.max_seq_num_to_apply = map;
+    }
+
+    /// Look up the maximum sequence number that any transaction in the current
+    /// tx set uses for the given source account.
+    pub fn get_max_seq_num_to_apply(&self, account_id: &[u8; 32]) -> Option<&i64> {
+        self.max_seq_num_to_apply.get(account_id)
     }
 
     /// Calculate the minimum balance required for an account.

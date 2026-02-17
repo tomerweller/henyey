@@ -2,8 +2,8 @@
 
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1Ext, AccountId, AccountMergeResult,
-    AccountMergeResultCode, LedgerKey, LedgerKeyAccount, MuxedAccount,
-    OperationResult, OperationResultTr, SponsorshipDescriptor,
+    AccountMergeResultCode, LedgerKey, LedgerKeyAccount, MuxedAccount, OperationResult,
+    OperationResultTr, PublicKey, SponsorshipDescriptor,
 };
 
 use crate::frame::muxed_to_account_id;
@@ -46,7 +46,15 @@ pub fn execute_account_merge(
         return Ok(make_result(AccountMergeResultCode::HasSubEntries));
     }
 
+    let source_key = match &source.0 {
+        PublicKey::PublicKeyTypeEd25519(k) => k.0,
+    };
     let starting_seq = state.starting_sequence_number()?;
+    if let Some(&max_seq) = state.get_max_seq_num_to_apply(&source_key) {
+        if max_seq >= starting_seq {
+            return Ok(make_result(AccountMergeResultCode::SeqnumTooFar));
+        }
+    }
     if source_account.seq_num.0 >= starting_seq {
         return Ok(make_result(AccountMergeResultCode::SeqnumTooFar));
     }
@@ -777,6 +785,102 @@ mod tests {
                 // Success is expected when seqnum is below starting_seq
             }
             other => panic!("Expected Success at seqnum boundary, got {:?}", other),
+        }
+    }
+
+    /// Test that AccountMerge is blocked by MAX_SEQ_NUM_TO_APPLY even when
+    /// source.seq_num < starting_seq.
+    ///
+    /// stellar-core's MergeOpFrame::isSeqnumTooFar checks the per-account max
+    /// sequence number from the tx set against starting_seq. This prevents
+    /// merging an account when another transaction in the same set would
+    /// advance the sequence number past the boundary.
+    ///
+    /// C++ Reference: MergeOpFrame.cpp:36-56 (isSeqnumTooFar / MAX_SEQ_NUM_TO_APPLY)
+    #[test]
+    fn test_account_merge_blocked_by_max_seq_num_to_apply() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(10);
+        let dest_id = create_test_account_id(11);
+
+        // Source seq_num is well below starting_seq — would normally succeed
+        let source = create_test_account(source_id.clone(), 100_000_000);
+        assert!(source.seq_num.0 < state.starting_sequence_number().unwrap());
+        state.create_account(source);
+        state.create_account(create_test_account(dest_id.clone(), 50_000_000));
+
+        // Set max_seq_num_to_apply for this source to >= starting_seq
+        let source_key_bytes = match &source_id.0 {
+            PublicKey::PublicKeyTypeEd25519(k) => k.0,
+        };
+        let starting_seq = state.starting_sequence_number().unwrap();
+        let mut map = std::collections::HashMap::new();
+        map.insert(source_key_bytes, starting_seq);
+        state.set_max_seq_num_to_apply(map);
+
+        let result = execute_account_merge(
+            &create_test_muxed_account(11),
+            &source_id,
+            &mut state,
+            &context,
+        )
+        .unwrap();
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::AccountMerge(r)) => {
+                assert!(
+                    matches!(r, AccountMergeResult::SeqnumTooFar),
+                    "Expected SeqnumTooFar due to max_seq_num_to_apply, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    /// Test that max_seq_num_to_apply does NOT block merge when the max
+    /// sequence number is below starting_seq.
+    #[test]
+    fn test_account_merge_allowed_when_max_seq_below_starting() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(12);
+        let dest_id = create_test_account_id(13);
+
+        let source = create_test_account(source_id.clone(), 100_000_000);
+        state.create_account(source);
+        state.create_account(create_test_account(dest_id.clone(), 50_000_000));
+
+        // Set max_seq_num_to_apply below starting_seq — merge should succeed
+        let source_key_bytes = match &source_id.0 {
+            PublicKey::PublicKeyTypeEd25519(k) => k.0,
+        };
+        let starting_seq = state.starting_sequence_number().unwrap();
+        let mut map = std::collections::HashMap::new();
+        map.insert(source_key_bytes, starting_seq - 1);
+        state.set_max_seq_num_to_apply(map);
+
+        let result = execute_account_merge(
+            &create_test_muxed_account(13),
+            &source_id,
+            &mut state,
+            &context,
+        )
+        .unwrap();
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::AccountMerge(
+                AccountMergeResult::Success(amount),
+            )) => {
+                assert_eq!(amount, 100_000_000);
+            }
+            other => panic!(
+                "Expected Success when max_seq < starting_seq, got {:?}",
+                other
+            ),
         }
     }
 }

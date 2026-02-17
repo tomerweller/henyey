@@ -129,6 +129,41 @@ pub fn run_transactions_on_executor(
         Vec::new()
     };
 
+    // Protocol 19+ MAX_SEQ_NUM_TO_APPLY: when any transaction in the set
+    // contains an AccountMerge operation, record the maximum sequence number
+    // per source account so that MergeOpFrame::isSeqnumTooFar can prevent
+    // merges that would allow sequence-number reuse after account re-creation.
+    // Matches stellar-core processFeesSeqNums (LedgerManagerImpl.cpp).
+    if deduct_fee {
+        let mut merge_seen = false;
+        let mut acc_to_max_seq: HashMap<[u8; 32], i64> = HashMap::new();
+        for (tx, _) in transactions.iter() {
+            let frame = TransactionFrame::new(tx.clone());
+            let source_id = frame.source_account_id();
+            let source_bytes = match source_id.0 {
+                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(k) => k.0,
+            };
+            let seq = frame.sequence_number();
+            acc_to_max_seq
+                .entry(source_bytes)
+                .and_modify(|e| *e = (*e).max(seq))
+                .or_insert(seq);
+            if !merge_seen {
+                for op in frame.operations() {
+                    if matches!(op.body, OperationBody::AccountMerge(_)) {
+                        merge_seen = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if merge_seen {
+            executor
+                .state_mut()
+                .set_max_seq_num_to_apply(acc_to_max_seq);
+        }
+    }
+
     let mut results = Vec::with_capacity(transactions.len());
     let mut tx_results = Vec::with_capacity(transactions.len());
     let mut tx_result_metas = Vec::with_capacity(transactions.len());
