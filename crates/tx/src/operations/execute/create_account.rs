@@ -64,9 +64,22 @@ pub fn execute_create_account(
         None => return Err(TxError::SourceAccountNotFound),
     };
 
-    // Check source has sufficient available balance
-    let source_min_balance =
-        state.minimum_balance_for_account(source_account, context.protocol_version, 0)?;
+    // Check source has sufficient available balance.
+    // If source is the sponsor, its numSponsoring has already been incremented
+    // by createEntryWithPossibleSponsorship in stellar-core before this check,
+    // so we must include the sponsoring delta in the minimum balance.
+    let sponsoring_delta = if sponsor.as_ref() == Some(source) {
+        account_multiplier
+    } else {
+        0
+    };
+    let source_min_balance = state.minimum_balance_for_account_with_deltas(
+        source_account,
+        context.protocol_version,
+        0,
+        sponsoring_delta,
+        0,
+    )?;
     let available = (source_account.balance - source_min_balance)
         .saturating_sub(account_liabilities(source_account).selling);
     if available < op.starting_balance {
@@ -558,6 +571,53 @@ mod tests {
                 assert!(
                     matches!(r, CreateAccountResult::LowReserve),
                     "Zero balance without sponsorship should fail with LowReserve, got {:?}",
+                    r
+                );
+            }
+            other => panic!("Unexpected result: {:?}", other),
+        }
+    }
+
+    /// Test CreateAccount returns Underfunded when source is also the sponsor.
+    ///
+    /// Regression test for ledger 59616305 mismatch: stellar-core increments
+    /// the sponsor's numSponsoring via createEntryWithPossibleSponsorship BEFORE
+    /// checking getAvailableBalance on the source. When source == sponsor, the
+    /// increased numSponsoring raises the minimum balance, reducing available
+    /// balance. Our old code checked balance before incrementing numSponsoring.
+    #[test]
+    fn test_create_account_underfunded_when_source_is_sponsor() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(20);
+        let dest_id = create_test_account_id(21);
+
+        // Source balance: 20M
+        // Base reserve: 5M, so min_balance without sponsoring = (2 + 0 + 0 - 0) * 5M = 10M
+        // Available without sponsoring: (20M - 10M) - 0 = 10M
+        //
+        // But if source is also the sponsor, numSponsoring increases by 2 (account_multiplier):
+        // min_balance with sponsoring = (2 + 0 + 2 - 0) * 5M = 20M
+        // Available with sponsoring: (20M - 20M) - 0 = 0
+        // So starting_balance of 5M should fail (Underfunded)
+        state.create_account(create_test_account(source_id.clone(), 20_000_000));
+
+        // Set up sponsorship: source sponsors the new account (dest)
+        state.push_sponsorship(source_id.clone(), dest_id.clone());
+
+        let op = CreateAccountOp {
+            destination: dest_id.clone(),
+            starting_balance: 5_000_000,
+        };
+
+        let result = execute_create_account(&op, &source_id, &mut state, &context).unwrap();
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::CreateAccount(r)) => {
+                assert!(
+                    matches!(r, CreateAccountResult::Underfunded),
+                    "Source-as-sponsor should be Underfunded due to increased min balance, got {:?}",
                     r
                 );
             }
