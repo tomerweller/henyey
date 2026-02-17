@@ -4,15 +4,16 @@
 //! which transfers assets between accounts.
 
 use stellar_xdr::curr::{
-    AccountId, Asset, OperationResult, OperationResultTr, PaymentOp, PaymentResult,
-    PaymentResultCode,
+    AccountId, Asset, OperationResult, OperationResultTr, PathPaymentStrictReceiveOp,
+    PathPaymentStrictReceiveResult, PaymentOp, PaymentResult, PaymentResultCode,
 };
 
-use super::{account_liabilities, add_account_balance, add_trustline_balance, is_trustline_authorized, trustline_liabilities};
+use super::is_asset_valid;
+use super::path_payment::execute_path_payment_strict_receive;
 use crate::frame::muxed_to_account_id;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
-use crate::{Result, TxError};
+use crate::Result;
 
 /// Execute a Payment operation.
 ///
@@ -43,6 +44,11 @@ pub fn execute_payment(
         return Ok(make_result(PaymentResultCode::Malformed));
     }
 
+    // Asset must be valid (stellar-core doCheckValid)
+    if !is_asset_valid(&op.asset) {
+        return Ok(make_result(PaymentResultCode::Malformed));
+    }
+
     // stellar-core optimization: if sending native XLM to self, mark as instant success
     // without accessing any ledger entries. This matches behavior from protocol v3+.
     // (Before v3, this applied to all asset types, but we only support v23+)
@@ -50,145 +56,41 @@ pub fn execute_payment(
         return Ok(make_result(PaymentResultCode::Success));
     }
 
-    match &op.asset {
-        Asset::Native => execute_native_payment(source, &dest, op.amount, state, context),
-        Asset::CreditAlphanum4(_) | Asset::CreditAlphanum12(_) => {
-            execute_credit_payment(source, &dest, &op.asset, op.amount, state)
-        }
-    }
-}
-
-/// Execute a native (XLM) payment.
-fn execute_native_payment(
-    source: &AccountId,
-    dest: &AccountId,
-    amount: i64,
-    state: &mut LedgerStateManager,
-    context: &LedgerContext,
-) -> Result<OperationResult> {
-    // Check destination exists
-    if state.get_account(dest).is_none() {
-        return Ok(make_result(PaymentResultCode::NoDestination));
-    }
-
-    // Get source account and check balance
-    let source_account = match state.get_account(source) {
-        Some(account) => account,
-        None => return Err(TxError::SourceAccountNotFound),
+    // stellar-core delegates ALL payments to PathPaymentStrictReceive
+    // (PaymentOpFrame.cpp:56-126). Build the equivalent operation and translate results.
+    let pp_op = PathPaymentStrictReceiveOp {
+        send_asset: op.asset.clone(),
+        send_max: op.amount,
+        destination: op.destination.clone(),
+        dest_asset: op.asset.clone(),
+        dest_amount: op.amount,
+        path: vec![].try_into().unwrap(),
     };
 
-    // Check source has sufficient available balance
-    let source_min_balance =
-        state.minimum_balance_for_account(source_account, context.protocol_version, 0)?;
-    let available =
-        source_account.balance - source_min_balance - account_liabilities(source_account).selling;
-    if available < amount {
-        return Ok(make_result(PaymentResultCode::Underfunded));
-    }
+    let pp_result = execute_path_payment_strict_receive(&pp_op, source, state, context)?;
 
-    // Deduct from source
-    let source_account_mut = state
-        .get_account_mut(source)
-        .ok_or(TxError::SourceAccountNotFound)?;
-    source_account_mut.balance -= amount;
-
-    // Credit to destination
-    let dest_account_mut = state
-        .get_account_mut(dest)
-        .ok_or_else(|| TxError::Internal("destination account disappeared".into()))?;
-    if !add_account_balance(dest_account_mut, amount) {
-        return Ok(make_result(PaymentResultCode::LineFull));
-    }
-
-    Ok(make_result(PaymentResultCode::Success))
-}
-
-/// Execute a credit asset payment.
-///
-/// The order of operations matches stellar-core's PathPaymentStrictReceive implementation:
-/// 1. Check destination exists
-/// 2. Check destination trustline exists and is authorized (NoTrust, NotAuthorized)
-/// 3. **Credit destination** (LineFull check happens here)
-/// 4. Check source trustline exists and is authorized (SrcNoTrust, SrcNotAuthorized)
-/// 5. **Debit source** (Underfunded check happens here)
-///
-/// IMPORTANT: The credit-before-debit order is critical for self-payments (source == dest).
-/// For a self-payment, both operations affect the same trustline. By crediting first, the
-/// balance is available for the subsequent debit, so self-payments succeed even with 0 balance.
-fn execute_credit_payment(
-    source: &AccountId,
-    dest: &AccountId,
-    asset: &Asset,
-    amount: i64,
-    state: &mut LedgerStateManager,
-) -> Result<OperationResult> {
-    let issuer = match asset {
-        Asset::CreditAlphanum4(a) => &a.issuer,
-        Asset::CreditAlphanum12(a) => &a.issuer,
-        Asset::Native => return Ok(make_result(PaymentResultCode::Malformed)),
-    };
-
-    // Check destination exists (unless issuer is destination)
-    if issuer != dest && state.get_account(dest).is_none() {
-        return Ok(make_result(PaymentResultCode::NoDestination));
-    }
-
-    // Note: stellar-core only checks if issuer exists before protocol v13.
-    // Since we only support protocol 23+, we skip the issuer existence check.
-    // The NoIssuer error code is effectively unused in modern protocols.
-
-    // Step 1: Check and credit destination (updateDestBalance in stellar-core)
-    if issuer != dest {
-        let dest_trustline = match state.get_trustline(dest, asset) {
-            Some(tl) => tl,
-            None => return Ok(make_result(PaymentResultCode::NoTrust)),
-        };
-
-        // Check destination is authorized
-        if !is_trustline_authorized(dest_trustline.flags) {
-            return Ok(make_result(PaymentResultCode::NotAuthorized));
+    // Translate PathPaymentStrictReceive result codes to Payment result codes
+    match pp_result {
+        OperationResult::OpInner(OperationResultTr::PathPaymentStrictReceive(ref pp)) => {
+            let payment_code = match pp {
+                PathPaymentStrictReceiveResult::Success(_) => PaymentResultCode::Success,
+                PathPaymentStrictReceiveResult::Malformed => PaymentResultCode::Malformed,
+                PathPaymentStrictReceiveResult::Underfunded => PaymentResultCode::Underfunded,
+                PathPaymentStrictReceiveResult::SrcNotAuthorized => {
+                    PaymentResultCode::SrcNotAuthorized
+                }
+                PathPaymentStrictReceiveResult::SrcNoTrust => PaymentResultCode::SrcNoTrust,
+                PathPaymentStrictReceiveResult::NoDestination => PaymentResultCode::NoDestination,
+                PathPaymentStrictReceiveResult::NoTrust => PaymentResultCode::NoTrust,
+                PathPaymentStrictReceiveResult::NotAuthorized => PaymentResultCode::NotAuthorized,
+                PathPaymentStrictReceiveResult::LineFull => PaymentResultCode::LineFull,
+                PathPaymentStrictReceiveResult::NoIssuer(_) => PaymentResultCode::NoIssuer,
+                _ => PaymentResultCode::Malformed,
+            };
+            Ok(make_result(payment_code))
         }
-
-        // Credit destination NOW (before checking source)
-        // This is critical for self-payments where source == dest
-        let dest_trustline_mut = state
-            .get_trustline_mut(dest, asset)
-            .ok_or_else(|| TxError::Internal("destination trustline disappeared".into()))?;
-        if !add_trustline_balance(dest_trustline_mut, amount) {
-            return Ok(make_result(PaymentResultCode::LineFull));
-        }
+        _ => Ok(make_result(PaymentResultCode::Malformed)),
     }
-
-    // Step 2: Check and debit source (updateSourceBalance in stellar-core)
-    if issuer != source {
-        let source_trustline = match state.get_trustline(source, asset) {
-            Some(tl) => tl,
-            None => {
-                return Ok(make_result(PaymentResultCode::SrcNoTrust));
-            }
-        };
-
-        // Check source is authorized
-        if !is_trustline_authorized(source_trustline.flags) {
-            return Ok(make_result(PaymentResultCode::SrcNotAuthorized));
-        }
-
-        // Check source has sufficient balance (after destination credit)
-        // For self-payments, the balance now includes the credited amount
-        let selling_liabilities = trustline_liabilities(source_trustline).selling;
-        let available = source_trustline.balance - selling_liabilities;
-        if available < amount {
-            return Ok(make_result(PaymentResultCode::Underfunded));
-        }
-
-        // Debit source
-        let source_trustline_mut = state
-            .get_trustline_mut(source, asset)
-            .ok_or_else(|| TxError::Internal("source trustline disappeared".into()))?;
-        source_trustline_mut.balance -= amount;
-    }
-
-    Ok(make_result(PaymentResultCode::Success))
 }
 
 /// Create an OperationResult from a PaymentResultCode.
@@ -1385,6 +1287,119 @@ mod tests {
                 assert!(
                     matches!(r, PaymentResult::SrcNoTrust),
                     "Expected SrcNoTrust, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test payment with invalid asset code returns Malformed.
+    ///
+    /// stellar-core's doCheckValid calls isAssetValid() after checking amount > 0.
+    /// An all-zero asset code is not valid.
+    ///
+    /// C++ Reference: PaymentOpFrame.cpp:136-140
+    #[test]
+    fn test_payment_invalid_asset_code_returns_malformed() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(70);
+        let dest_id = create_test_account_id(71);
+        let issuer_id = create_test_account_id(72);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        // All-zero asset code is invalid
+        let op = PaymentOp {
+            destination: create_test_muxed_account(71),
+            asset: Asset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([0, 0, 0, 0]),
+                issuer: issuer_id.clone(),
+            }),
+            amount: 100,
+        };
+
+        let result = execute_payment(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Payment(r)) => {
+                assert!(
+                    matches!(r, PaymentResult::Malformed),
+                    "Expected Malformed for all-zero asset code, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+
+        // Non-alphanumeric character in asset code
+        let op2 = PaymentOp {
+            destination: create_test_muxed_account(71),
+            asset: Asset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'$', 0]),
+                issuer: issuer_id,
+            }),
+            amount: 100,
+        };
+
+        let result2 = execute_payment(&op2, &source_id, &mut state, &context).unwrap();
+        match result2 {
+            OperationResult::OpInner(OperationResultTr::Payment(r)) => {
+                assert!(
+                    matches!(r, PaymentResult::Malformed),
+                    "Expected Malformed for non-alphanumeric asset code, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test native payment returns LineFull before Underfunded.
+    ///
+    /// stellar-core delegates ALL payments (including native) to PathPaymentStrictReceive,
+    /// which credits dest first. When dest would overflow AND source is underfunded,
+    /// the result should be LineFull (not Underfunded).
+    ///
+    /// C++ Reference: PaymentOpFrame.cpp:56-116
+    #[test]
+    fn test_native_payment_line_full_before_underfunded() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(80);
+        let dest_id = create_test_account_id(81);
+
+        // Source has very little available balance (minimum reserve + small amount)
+        let min_balance = state
+            .minimum_balance_with_counts(context.protocol_version, 0, 0, 0)
+            .unwrap();
+        state.create_account(create_test_account(source_id.clone(), min_balance + 100));
+
+        // Dest has high balance + buying liabilities near i64::MAX so any credit overflows
+        state.create_account(create_test_account_with_liabilities(
+            dest_id.clone(),
+            i64::MAX - 10, // Very high balance
+            20,            // Buying liabilities that make dest LineFull
+            0,
+        ));
+
+        // Amount of 1000 exceeds both source available (100) and dest capacity
+        let op = PaymentOp {
+            destination: create_test_muxed_account(81),
+            asset: Asset::Native,
+            amount: 1000,
+        };
+
+        let result = execute_payment(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Payment(r)) => {
+                assert!(
+                    matches!(r, PaymentResult::LineFull),
+                    "Expected LineFull (dest credited first via PathPayment delegation), got {:?}",
                     r
                 );
             }

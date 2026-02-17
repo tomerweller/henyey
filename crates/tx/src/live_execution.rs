@@ -665,11 +665,24 @@ pub fn refund_soroban_fee(
         None => return Ok(0), // Account merged, no refund
     };
 
-    // Apply the refund
-    // Check for overflow
-    let new_balance = account.balance.saturating_add(refund);
-    let actual_refund = new_balance - account.balance;
+    // Apply the refund using addBalance semantics (stellar-core TransactionUtils.cpp:561-592).
+    // 1. Check overflow: i64::MAX - balance < refund
+    if i64::MAX - account.balance < refund {
+        // Overflow, skip refund
+        return Ok(0);
+    }
+    let new_balance = account.balance + refund;
+    // 2. Check buying liabilities: new_balance > i64::MAX - buying_liabilities
+    let buying_liabilities = match &account.ext {
+        stellar_xdr::curr::AccountEntryExt::V0 => 0,
+        stellar_xdr::curr::AccountEntryExt::V1(v1) => v1.liabilities.buying,
+    };
+    if new_balance > i64::MAX - buying_liabilities {
+        // Liabilities in the way of the refund, just skip (matches stellar-core)
+        return Ok(0);
+    }
 
+    let actual_refund = refund;
     account.balance = new_balance;
     ctx.subtract_from_fee_pool(actual_refund);
 
@@ -1081,6 +1094,68 @@ mod tests {
         if let Some(state) = ctx.state() {
             let updated_account = state.get_account(&account_id).unwrap();
             assert_eq!(updated_account.balance, 10_000_000 + 300);
+        }
+    }
+
+    #[test]
+    fn test_refund_soroban_fee_skipped_when_liabilities_block() {
+        let mut ctx = make_test_context_with_state(23);
+        let account_id = make_account_id(1);
+
+        // Create account with high buying liabilities such that:
+        // balance + refund + buying_liabilities > i64::MAX
+        // balance = i64::MAX - 100, buying_liabilities = 50, refund = 300
+        // new_balance = i64::MAX - 100 + 300 = i64::MAX + 200 (overflow check passes
+        //   since we use addBalance which checks differently)
+        // Actually: addBalance checks new_balance > i64::MAX - buying_liabilities
+        // new_balance = balance + refund, need new_balance > i64::MAX - buying
+        // i64::MAX - 100 + 300 = i64::MAX + 200 -- this overflows first
+        //
+        // Better scenario: balance=i64::MAX - 200, buying=50, refund=300
+        // overflow: i64::MAX - 200 + 300 = i64::MAX + 100 -> overflow -> skip
+        //
+        // Even simpler: balance near MAX, small refund, buying liabilities block it
+        // balance=i64::MAX - 100, buying=200, refund=50
+        // overflow check: i64::MAX - (i64::MAX-100) = 100 >= 50 -> ok
+        // liability check: (i64::MAX-100+50) > i64::MAX - 200 -> (i64::MAX-50) > (i64::MAX-200) -> true -> skip
+        let mut account =
+            make_account_entry(account_id.clone(), i64::MAX - 100, 1);
+        // Add buying liabilities via V1 extension
+        account.ext = stellar_xdr::curr::AccountEntryExt::V1(
+            stellar_xdr::curr::AccountEntryExtensionV1 {
+                liabilities: stellar_xdr::curr::Liabilities {
+                    buying: 200,
+                    selling: 0,
+                },
+                ext: stellar_xdr::curr::AccountEntryExtensionV1Ext::V0,
+            },
+        );
+
+        if let Some(state) = ctx.state_mut() {
+            state.put_account(account);
+        }
+
+        let mut tx_result = MutableTransactionResult::new(1000);
+        tx_result.initialize_refundable_fee_tracker(50);
+        // Don't consume any rent fee, so refund = 50
+
+        let refund = refund_soroban_fee(&mut ctx, &account_id, &mut tx_result, None).unwrap();
+        // stellar-core: addBalance returns false because
+        // new_balance (i64::MAX - 50) > i64::MAX - buying (i64::MAX - 200)
+        // So refund should be 0
+        assert_eq!(
+            refund, 0,
+            "Refund should be skipped when buying liabilities block it"
+        );
+
+        // Balance should be unchanged
+        if let Some(state) = ctx.state() {
+            let updated_account = state.get_account(&account_id).unwrap();
+            assert_eq!(
+                updated_account.balance,
+                i64::MAX - 100,
+                "Balance should be unchanged when refund is blocked by liabilities"
+            );
         }
     }
 

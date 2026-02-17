@@ -35,13 +35,15 @@ pub fn execute_account_merge(
         None => return Err(TxError::SourceAccountNotFound),
     };
 
+    // Check source is not immutable (checked first per stellar-core doApplyFromV16)
+    const AUTH_IMMUTABLE_FLAG: u32 = 0x4;
+    if source_account.flags & AUTH_IMMUTABLE_FLAG != 0 {
+        return Ok(make_result(AccountMergeResultCode::ImmutableSet));
+    }
+
     // Check source has no sub-entries besides signers
     if source_account.num_sub_entries != source_account.signers.len() as u32 {
         return Ok(make_result(AccountMergeResultCode::HasSubEntries));
-    }
-
-    if num_sponsoring(&source_account) > 0 {
-        return Ok(make_result(AccountMergeResultCode::IsSponsor));
     }
 
     let starting_seq = state.starting_sequence_number()?;
@@ -49,10 +51,8 @@ pub fn execute_account_merge(
         return Ok(make_result(AccountMergeResultCode::SeqnumTooFar));
     }
 
-    // Check source is not immutable
-    const AUTH_IMMUTABLE_FLAG: u32 = 0x4;
-    if source_account.flags & AUTH_IMMUTABLE_FLAG != 0 {
-        return Ok(make_result(AccountMergeResultCode::ImmutableSet));
+    if num_sponsoring(&source_account) > 0 {
+        return Ok(make_result(AccountMergeResultCode::IsSponsor));
     }
 
     let source_balance = source_account.balance;
@@ -658,6 +658,87 @@ mod tests {
 
         // Source should be deleted
         assert!(state.get_account(&source_id).is_none());
+    }
+
+    /// Test that ImmutableSet is checked before HasSubEntries.
+    ///
+    /// stellar-core checks ImmutableSet first in doApplyFromV16.
+    /// When both conditions are true, result should be ImmutableSet.
+    ///
+    /// C++ Reference: MergeOpFrame.cpp:209-223 (ImmutableSet before HasSubEntries)
+    #[test]
+    fn test_account_merge_immutable_checked_before_has_sub_entries() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(40);
+        let dest_id = create_test_account_id(41);
+
+        // Source has both AUTH_IMMUTABLE flag AND sub-entries
+        let mut source = create_test_account(source_id.clone(), 100_000_000);
+        source.flags = 0x4; // AUTH_IMMUTABLE_FLAG
+        source.num_sub_entries = 1; // Has sub-entries too
+        state.create_account(source);
+        state.create_account(create_test_account(dest_id.clone(), 50_000_000));
+
+        let result = execute_account_merge(
+            &create_test_muxed_account(41),
+            &source_id,
+            &mut state,
+            &context,
+        )
+        .unwrap();
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::AccountMerge(r)) => {
+                assert!(
+                    matches!(r, AccountMergeResult::ImmutableSet),
+                    "Expected ImmutableSet (checked before HasSubEntries), got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    /// Test that ImmutableSet is checked before SeqnumTooFar.
+    ///
+    /// When both conditions are true, result should be ImmutableSet.
+    ///
+    /// C++ Reference: MergeOpFrame.cpp:209-229 (ImmutableSet before SeqnumTooFar)
+    #[test]
+    fn test_account_merge_immutable_checked_before_seqnum_too_far() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(42);
+        let dest_id = create_test_account_id(43);
+
+        let starting_seq = state.starting_sequence_number().unwrap();
+        let mut source = create_test_account(source_id.clone(), 100_000_000);
+        source.flags = 0x4; // AUTH_IMMUTABLE_FLAG
+        source.seq_num = SequenceNumber(starting_seq); // SeqnumTooFar condition
+        state.create_account(source);
+        state.create_account(create_test_account(dest_id.clone(), 50_000_000));
+
+        let result = execute_account_merge(
+            &create_test_muxed_account(43),
+            &source_id,
+            &mut state,
+            &context,
+        )
+        .unwrap();
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::AccountMerge(r)) => {
+                assert!(
+                    matches!(r, AccountMergeResult::ImmutableSet),
+                    "Expected ImmutableSet (checked before SeqnumTooFar), got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
     }
 
     /// Test AccountMerge with sequence number just below the limit.

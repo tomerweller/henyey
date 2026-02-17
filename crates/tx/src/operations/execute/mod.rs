@@ -162,6 +162,57 @@ fn apply_balance_delta(
     Ok(())
 }
 
+/// Check if an asset code is valid per stellar-core's `isAssetValid()`.
+///
+/// - Native → always valid
+/// - CreditAlphanum4: at least 1 non-zero alphanumeric char, zeros only trailing
+/// - CreditAlphanum12: at least 5 non-zero alphanumeric chars, zeros only trailing
+///
+/// Reference: `.upstream-v25/src/util/types.cpp:146-211`
+fn is_asset_valid(asset: &Asset) -> bool {
+    match asset {
+        Asset::Native => true,
+        Asset::CreditAlphanum4(a) => {
+            let code = &a.asset_code.0;
+            let mut zeros = false;
+            let mut onechar = false;
+            for &b in code.iter() {
+                if b == 0 {
+                    zeros = true;
+                } else if zeros {
+                    // zeros can only be trailing
+                    return false;
+                } else {
+                    if b > 0x7f || !b.is_ascii_alphanumeric() {
+                        return false;
+                    }
+                    onechar = true;
+                }
+            }
+            onechar
+        }
+        Asset::CreditAlphanum12(a) => {
+            let code = &a.asset_code.0;
+            let mut zeros = false;
+            let mut charcount = 0;
+            for &b in code.iter() {
+                if b == 0 {
+                    zeros = true;
+                } else if zeros {
+                    // zeros can only be trailing
+                    return false;
+                } else {
+                    if b > 0x7f || !b.is_ascii_alphanumeric() {
+                        return false;
+                    }
+                    charcount += 1;
+                }
+            }
+            charcount > 4
+        }
+    }
+}
+
 fn map_exchange_error(err: offer_exchange::ExchangeError) -> TxError {
     TxError::Internal(format!("offer exchange error: {err:?}"))
 }

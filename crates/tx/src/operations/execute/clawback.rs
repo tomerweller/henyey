@@ -11,6 +11,7 @@ use stellar_xdr::curr::{
     TrustLineFlags,
 };
 
+use super::is_asset_valid;
 use crate::frame::muxed_to_account_id;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
@@ -34,6 +35,12 @@ pub fn execute_clawback(
     state: &mut LedgerStateManager,
     _context: &LedgerContext,
 ) -> Result<OperationResult> {
+    // Cannot clawback from self (stellar-core doCheckValid checks this first)
+    let from_account_id = muxed_to_account_id(&op.from);
+    if &from_account_id == source {
+        return Ok(make_clawback_result(ClawbackResultCode::Malformed));
+    }
+
     // Validate amount
     if op.amount <= 0 {
         return Ok(make_clawback_result(ClawbackResultCode::Malformed));
@@ -41,6 +48,11 @@ pub fn execute_clawback(
 
     // Cannot clawback native asset
     if matches!(&op.asset, Asset::Native) {
+        return Ok(make_clawback_result(ClawbackResultCode::Malformed));
+    }
+
+    // Asset must be valid (stellar-core doCheckValid)
+    if !is_asset_valid(&op.asset) {
         return Ok(make_clawback_result(ClawbackResultCode::Malformed));
     }
 
@@ -56,9 +68,6 @@ pub fn execute_clawback(
     if asset_issuer != source {
         return Ok(make_clawback_result(ClawbackResultCode::Malformed));
     }
-
-    // Convert MuxedAccount to AccountId for trustline lookup
-    let from_account_id = muxed_to_account_id(&op.from);
 
     // Get the trustline
     let trustline = match state.get_trustline(&from_account_id, &op.asset) {
@@ -761,6 +770,94 @@ mod tests {
                 assert!(
                     matches!(r, ClawbackResult::NotClawbackEnabled),
                     "Expected NotClawbackEnabled, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test Clawback from self returns Malformed.
+    ///
+    /// stellar-core's doCheckValid checks `from == source` before any other check.
+    /// Issuer trying to claw back from themselves should return Malformed.
+    ///
+    /// C++ Reference: ClawbackOpFrame.cpp:67-71
+    #[test]
+    fn test_clawback_self_clawback_returns_malformed() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(40);
+
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AUTH_CLAWBACK_ENABLED_FLAG,
+        ));
+
+        let asset = create_asset(&issuer_id);
+
+        // Issuer tries to clawback from themselves
+        let op = ClawbackOp {
+            asset,
+            from: MuxedAccount::Ed25519(match issuer_id.0.clone() {
+                PublicKey::PublicKeyTypeEd25519(k) => k,
+            }),
+            amount: 100,
+        };
+
+        let result = execute_clawback(&op, &issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Clawback(r)) => {
+                assert!(
+                    matches!(r, ClawbackResult::Malformed),
+                    "Expected Malformed for self-clawback, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test Clawback with invalid asset code returns Malformed.
+    ///
+    /// stellar-core's doCheckValid calls isAssetValid() after the native asset check.
+    ///
+    /// C++ Reference: ClawbackOpFrame.cpp:85-89
+    #[test]
+    fn test_clawback_invalid_asset_code_returns_malformed() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(41);
+        let holder_id = create_test_account_id(42);
+
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AUTH_CLAWBACK_ENABLED_FLAG,
+        ));
+        state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
+
+        // All-zero asset code
+        let op = ClawbackOp {
+            asset: Asset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([0, 0, 0, 0]),
+                issuer: issuer_id.clone(),
+            }),
+            from: MuxedAccount::Ed25519(match holder_id.0.clone() {
+                PublicKey::PublicKeyTypeEd25519(k) => k,
+            }),
+            amount: 100,
+        };
+
+        let result = execute_clawback(&op, &issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Clawback(r)) => {
+                assert!(
+                    matches!(r, ClawbackResult::Malformed),
+                    "Expected Malformed for all-zero asset code, got {:?}",
                     r
                 );
             }
