@@ -183,7 +183,9 @@ fn test_execute_transaction_min_seq_num_precondition() {
         .execute_transaction(&snapshot, &envelope, 100, None)
         .expect("execute");
 
-    assert_eq!(result.failure, Some(ExecutionFailure::BadMinSeqAgeOrGap));
+    // When minSeqNum is set, isBadSeq checks: account_seq < minSeqNum || account_seq >= tx_seq.
+    // Here account_seq (1) < minSeqNum (5) → txBAD_SEQ, matching stellar-core's isBadSeq.
+    assert_eq!(result.failure, Some(ExecutionFailure::BadSequence));
 }
 
 /// Test that with minSeqNum set, sequence validation is relaxed.
