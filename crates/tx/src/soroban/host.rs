@@ -34,7 +34,7 @@ use soroban_env_host25::{
 // while our workspace uses a git revision of stellar-xdr. We need to convert
 // between the two via XDR serialization when crossing the boundary.
 use stellar_xdr::curr::{
-    AccountId, DiagnosticEvent, Hash, HostFunction, LedgerEntry, LedgerEntryData, LedgerEntryExt,
+    AccountId, DiagnosticEvent, Hash, HostFunction, LedgerEntry,
     LedgerKey, Limits, ReadXdr, ScVal, SorobanAuthorizationEntry, SorobanTransactionData,
     SorobanTransactionDataExt, WriteXdr,
 };
@@ -279,56 +279,10 @@ impl<'a> LedgerSnapshotAdapter<'a> {
         // Get TTL but don't check if it's expired - this is for archived entries
         let live_until = get_entry_ttl(self.state, &current_key, self.current_ledger);
 
-        // Get entry without TTL check (entry might be archived with expired TTL)
-        let entry = match &current_key {
-            LedgerKey::Account(account_key) => {
-                self.state
-                    .get_account(&account_key.account_id)
-                    .map(|acc| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::Account(acc.clone()),
-                        ext: LedgerEntryExt::V0,
-                    })
-            }
-            LedgerKey::Trustline(tl_key) => self
-                .state
-                .get_trustline_by_trustline_asset(&tl_key.account_id, &tl_key.asset)
-                .map(|tl| LedgerEntry {
-                    last_modified_ledger_seq: self.current_ledger,
-                    data: LedgerEntryData::Trustline(tl.clone()),
-                    ext: LedgerEntryExt::V0,
-                }),
-            LedgerKey::ContractData(cd_key) => {
-                // No TTL check for archived entries
-                self.state
-                    .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
-                    .map(|cd| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::ContractData(cd.clone()),
-                        ext: LedgerEntryExt::V0,
-                    })
-            }
-            LedgerKey::ContractCode(cc_key) => {
-                // No TTL check for archived entries
-                self.state
-                    .get_contract_code(&cc_key.hash)
-                    .map(|code| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::ContractCode(code.clone()),
-                        ext: LedgerEntryExt::V0,
-                    })
-            }
-            LedgerKey::Ttl(ttl_key) => {
-                self.state
-                    .get_ttl(&ttl_key.key_hash)
-                    .map(|ttl| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::Ttl(ttl.clone()),
-                        ext: LedgerEntryExt::V0,
-                    })
-            }
-            _ => None,
-        };
+        // Use get_entry() to reconstruct the full LedgerEntry with correct
+        // last_modified_ledger_seq and ext (sponsorship) metadata.
+        // No TTL check - entry might be archived with expired TTL.
+        let entry = self.state.get_entry(&current_key);
 
         // If entry found in live state, return it
         if let Some(e) = entry {
@@ -379,26 +333,8 @@ impl<'a> LedgerSnapshotAdapter<'a> {
                 // Check if this is a live BL restore: entry exists AND TTL is expired
                 let live_bl_restore = if let Some(lu) = live_until {
                     if lu < self.current_ledger {
-                        // Get the entry in current format (not p24)
-                        let current_entry = match current_key {
-                            LedgerKey::ContractData(cd_key) => self
-                                .state
-                                .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
-                                .map(|cd| LedgerEntry {
-                                    last_modified_ledger_seq: self.current_ledger,
-                                    data: LedgerEntryData::ContractData(cd.clone()),
-                                    ext: LedgerEntryExt::V0,
-                                }),
-                            LedgerKey::ContractCode(cc_key) => self
-                                .state
-                                .get_contract_code(&cc_key.hash)
-                                .map(|code| LedgerEntry {
-                                    last_modified_ledger_seq: self.current_ledger,
-                                    data: LedgerEntryData::ContractCode(code.clone()),
-                                    ext: LedgerEntryExt::V0,
-                                }),
-                            _ => None,
-                        };
+                        // Get the entry with correct metadata
+                        let current_entry = self.state.get_entry(current_key);
 
                         if let Some(e) = current_entry {
                             // Get the TTL entry for the restore info
@@ -406,11 +342,7 @@ impl<'a> LedgerSnapshotAdapter<'a> {
                             let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
                                 key_hash: key_hash.clone(),
                             });
-                            let ttl_entry = self.state.get_ttl(&key_hash).map(|ttl| LedgerEntry {
-                                last_modified_ledger_seq: self.current_ledger,
-                                data: LedgerEntryData::Ttl(ttl.clone()),
-                                ext: LedgerEntryExt::V0,
-                            });
+                            let ttl_entry = self.state.get_entry(&ttl_key);
 
                             ttl_entry.map(|te| super::protocol::LiveBucketListRestore {
                                 key: current_key.clone(),
@@ -452,65 +384,22 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
         // and not accessible. This mimics stellar-core behavior.
         let live_until = get_entry_ttl(self.state, &current_key, self.current_ledger);
 
-        let entry = match &current_key {
-            LedgerKey::Account(account_key) => {
-                self.state
-                    .get_account(&account_key.account_id)
-                    .map(|acc| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::Account(acc.clone()),
-                        ext: LedgerEntryExt::V0,
-                    })
-            }
-            LedgerKey::Trustline(tl_key) => self
-                .state
-                .get_trustline_by_trustline_asset(&tl_key.account_id, &tl_key.asset)
-                .map(|tl| LedgerEntry {
-                    last_modified_ledger_seq: self.current_ledger,
-                    data: LedgerEntryData::Trustline(tl.clone()),
-                    ext: LedgerEntryExt::V0,
-                }),
-            LedgerKey::ContractData(cd_key) => {
-                // Check if entry has expired TTL - if so, it's archived and not accessible
-                if let Some(ttl) = live_until {
-                    if ttl < self.current_ledger {
-                        return Ok(None);
-                    }
+        // Check TTL expiration for contract entries before looking up the entry.
+        if matches!(
+            current_key,
+            LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)
+        ) {
+            if let Some(ttl) = live_until {
+                if ttl < self.current_ledger {
+                    return Ok(None);
                 }
-                self.state
-                    .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
-                    .map(|cd| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::ContractData(cd.clone()),
-                        ext: LedgerEntryExt::V0,
-                    })
             }
-            LedgerKey::ContractCode(cc_key) => {
-                // Check if entry has expired TTL - if so, it's archived and not accessible
-                if let Some(ttl) = live_until {
-                    if ttl < self.current_ledger {
-                        return Ok(None);
-                    }
-                }
-                self.state
-                    .get_contract_code(&cc_key.hash)
-                    .map(|code| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::ContractCode(code.clone()),
-                        ext: LedgerEntryExt::V0,
-                    })
-            }
-            LedgerKey::Ttl(ttl_key) => {
-                self.state
-                    .get_ttl(&ttl_key.key_hash)
-                    .map(|ttl| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::Ttl(ttl.clone()),
-                        ext: LedgerEntryExt::V0,
-                    })
-            }
-            _ => None,
-        };
+        }
+
+        // Use get_entry() to reconstruct the full LedgerEntry with correct
+        // last_modified_ledger_seq and ext (sponsorship) metadata.
+        // stellar-core preserves original entry metadata in its InMemorySorobanState.
+        let entry = self.state.get_entry(&current_key);
 
         match entry {
             Some(e) => {
@@ -562,69 +451,20 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
         // - Entries without TTL in bucket list snapshot: created within ledger, not visible
         let live_until = get_entry_ttl(self.state, key, self.current_ledger);
 
-        let entry = match key {
-            LedgerKey::Account(account_key) => {
-                self.state
-                    .get_account(&account_key.account_id)
-                    .map(|acc| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::Account(acc.clone()),
-                        ext: LedgerEntryExt::V0,
-                    })
+        // Check TTL expiration for contract entries before looking up the entry.
+        if matches!(
+            key,
+            LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)
+        ) {
+            match live_until {
+                Some(ttl) if ttl >= self.current_ledger => {} // live, proceed
+                _ => return Ok(None), // expired or no TTL
             }
-            LedgerKey::Trustline(tl_key) => self
-                .state
-                .get_trustline_by_trustline_asset(&tl_key.account_id, &tl_key.asset)
-                .map(|tl| LedgerEntry {
-                    last_modified_ledger_seq: self.current_ledger,
-                    data: LedgerEntryData::Trustline(tl.clone()),
-                    ext: LedgerEntryExt::V0,
-                }),
-            LedgerKey::ContractData(cd_key) => {
-                // Check TTL first - same logic as ContractCode
-                match live_until {
-                    Some(ttl) if ttl >= self.current_ledger => {
-                        // TTL exists and is live
-                        self.state
-                            .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
-                            .map(|cd| LedgerEntry {
-                                last_modified_ledger_seq: self.current_ledger,
-                                data: LedgerEntryData::ContractData(cd.clone()),
-                                ext: LedgerEntryExt::V0,
-                            })
-                    }
-                    Some(_) => None, // TTL expired - archived
-                    None => None,    // No TTL in snapshot - created within ledger or doesn't exist
-                }
-            }
-            LedgerKey::ContractCode(cc_key) => {
-                // Same logic as ContractData
-                match live_until {
-                    Some(ttl) if ttl >= self.current_ledger => {
-                        // TTL exists and is live
-                        self.state
-                            .get_contract_code(&cc_key.hash)
-                            .map(|code| LedgerEntry {
-                                last_modified_ledger_seq: self.current_ledger,
-                                data: LedgerEntryData::ContractCode(code.clone()),
-                                ext: LedgerEntryExt::V0,
-                            })
-                    }
-                    Some(_) => None, // TTL expired - archived
-                    None => None,    // No TTL in snapshot - created within ledger or doesn't exist
-                }
-            }
-            LedgerKey::Ttl(ttl_key) => {
-                self.state
-                    .get_ttl(&ttl_key.key_hash)
-                    .map(|ttl| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::Ttl(ttl.clone()),
-                        ext: LedgerEntryExt::V0,
-                    })
-            }
-            _ => None,
-        };
+        }
+
+        // Use get_entry() to reconstruct the full LedgerEntry with correct
+        // last_modified_ledger_seq and ext (sponsorship) metadata.
+        let entry = self.state.get_entry(key);
 
         match entry {
             Some(e) => Ok(Some((Rc::new(e), live_until))),
@@ -646,56 +486,9 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
         // Get TTL but don't check if it's expired - this is for archived entries
         let live_until = get_entry_ttl(self.state, key.as_ref(), self.current_ledger);
 
-        // Get entry without TTL check (entry might be archived with expired TTL)
-        let entry = match key.as_ref() {
-            LedgerKey::Account(account_key) => {
-                self.state
-                    .get_account(&account_key.account_id)
-                    .map(|acc| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::Account(acc.clone()),
-                        ext: LedgerEntryExt::V0,
-                    })
-            }
-            LedgerKey::Trustline(tl_key) => self
-                .state
-                .get_trustline_by_trustline_asset(&tl_key.account_id, &tl_key.asset)
-                .map(|tl| LedgerEntry {
-                    last_modified_ledger_seq: self.current_ledger,
-                    data: LedgerEntryData::Trustline(tl.clone()),
-                    ext: LedgerEntryExt::V0,
-                }),
-            LedgerKey::ContractData(cd_key) => {
-                // No TTL check for archived entries - first try live state
-                self.state
-                    .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
-                    .map(|cd| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::ContractData(cd.clone()),
-                        ext: LedgerEntryExt::V0,
-                    })
-            }
-            LedgerKey::ContractCode(cc_key) => {
-                // No TTL check for archived entries - first try live state
-                self.state
-                    .get_contract_code(&cc_key.hash)
-                    .map(|code| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::ContractCode(code.clone()),
-                        ext: LedgerEntryExt::V0,
-                    })
-            }
-            LedgerKey::Ttl(ttl_key) => {
-                self.state
-                    .get_ttl(&ttl_key.key_hash)
-                    .map(|ttl| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::Ttl(ttl.clone()),
-                        ext: LedgerEntryExt::V0,
-                    })
-            }
-            _ => None,
-        };
+        // Use get_entry() to reconstruct the full LedgerEntry with correct
+        // last_modified_ledger_seq and ext (sponsorship) metadata.
+        let entry = self.state.get_entry(key.as_ref());
 
         // If entry found in live state, return it
         if let Some(e) = entry {
@@ -739,11 +532,7 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
                         let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
                             key_hash: key_hash.clone(),
                         });
-                        let ttl_entry = self.state.get_ttl(&key_hash).map(|ttl| LedgerEntry {
-                            last_modified_ledger_seq: self.current_ledger,
-                            data: LedgerEntryData::Ttl(ttl.clone()),
-                            ext: LedgerEntryExt::V0,
-                        });
+                        let ttl_entry = self.state.get_entry(&ttl_key);
 
                         ttl_entry.map(|te| super::protocol::LiveBucketListRestore {
                             key: key.as_ref().clone(),
@@ -780,65 +569,20 @@ impl<'a> soroban_env_host25::storage::SnapshotSource for LedgerSnapshotAdapterP2
         // and not accessible. This mimics stellar-core behavior.
         let live_until = get_entry_ttl(self.state, &local_key, self.current_ledger);
 
-        let entry = match &local_key {
-            LedgerKey::Account(account_key) => {
-                self.state
-                    .get_account(&account_key.account_id)
-                    .map(|acc| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::Account(acc.clone()),
-                        ext: LedgerEntryExt::V0,
-                    })
+        // Check TTL expiration for contract entries before looking up the entry.
+        if matches!(
+            &local_key,
+            LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)
+        ) {
+            match live_until {
+                Some(ttl) if ttl >= self.current_ledger => {} // live, proceed
+                _ => return Ok(None), // expired or no TTL
             }
-            LedgerKey::Trustline(tl_key) => self
-                .state
-                .get_trustline_by_trustline_asset(&tl_key.account_id, &tl_key.asset)
-                .map(|tl| LedgerEntry {
-                    last_modified_ledger_seq: self.current_ledger,
-                    data: LedgerEntryData::Trustline(tl.clone()),
-                    ext: LedgerEntryExt::V0,
-                }),
-            LedgerKey::ContractData(cd_key) => {
-                // Check if entry has expired TTL - if so, it's archived and not accessible
-                if let Some(ttl) = live_until {
-                    if ttl < self.current_ledger {
-                        return Ok(None);
-                    }
-                }
-                self.state
-                    .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
-                    .map(|cd| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::ContractData(cd.clone()),
-                        ext: LedgerEntryExt::V0,
-                    })
-            }
-            LedgerKey::ContractCode(cc_key) => {
-                // Check if entry has expired TTL - if so, it's archived and not accessible
-                if let Some(ttl) = live_until {
-                    if ttl < self.current_ledger {
-                        return Ok(None);
-                    }
-                }
-                self.state
-                    .get_contract_code(&cc_key.hash)
-                    .map(|code| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::ContractCode(code.clone()),
-                        ext: LedgerEntryExt::V0,
-                    })
-            }
-            LedgerKey::Ttl(ttl_key) => {
-                self.state
-                    .get_ttl(&ttl_key.key_hash)
-                    .map(|ttl| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::Ttl(ttl.clone()),
-                        ext: LedgerEntryExt::V0,
-                    })
-            }
-            _ => None,
-        };
+        }
+
+        // Use get_entry() to reconstruct the full LedgerEntry with correct
+        // last_modified_ledger_seq and ext (sponsorship) metadata.
+        let entry = self.state.get_entry(&local_key);
 
         // Convert the entry to P25 XDR type
         match entry {
@@ -1352,8 +1096,6 @@ fn encode_footprint_entries(
         Ok(())
     };
 
-    let footprint_start = std::time::Instant::now();
-
     // Read-only footprint entries
     for key in soroban_data.resources.footprint.read_only.iter() {
         let key_p24 = convert_ledger_key_to_p24(key)
@@ -1453,15 +1195,6 @@ fn encode_footprint_entries(
             }
         }
     }
-
-    let footprint_elapsed = footprint_start.elapsed();
-    tracing::info!(
-        ledger_entries_count = encoded_ledger_entries.len(),
-        ttl_entries_count = encoded_ttl_entries.len(),
-        actual_restored_count = actual_restored_indices.len(),
-        footprint_ms = footprint_elapsed.as_millis() as u64,
-        "P24: Prepared entries for e2e_invoke"
-    );
 
     Ok(EncodedFootprint {
         ledger_entries: encoded_ledger_entries,
@@ -1612,20 +1345,10 @@ fn execute_host_function_p24(
             r
         }
         Err(e) => {
-            let invoke_elapsed = invoke_start.elapsed();
-            let cpu_insns_consumed = budget.get_cpu_insns_consumed().unwrap_or(0);
-            let mem_bytes_consumed = budget.get_mem_bytes_consumed().unwrap_or(0);
-            tracing::info!(
-                invoke_ms = invoke_elapsed.as_millis() as u64,
-                cpu_consumed = cpu_insns_consumed,
-                mem_consumed = mem_bytes_consumed,
-                diagnostic_events = diagnostic_events.len(),
-                "P24: e2e_invoke FAILED"
-            );
             return Err(SorobanExecutionError {
                 host_error: convert_host_error_p24_to_p25(e),
-                cpu_insns_consumed,
-                mem_bytes_consumed,
+                cpu_insns_consumed: budget.get_cpu_insns_consumed().unwrap_or(0),
+                mem_bytes_consumed: budget.get_mem_bytes_consumed().unwrap_or(0),
             });
         }
     };
@@ -1637,12 +1360,10 @@ fn execute_host_function_p24(
             (val, bytes.len() as u32)
         }
         Err(ref e) => {
-            let cpu_insns_consumed = budget.get_cpu_insns_consumed().unwrap_or(0);
-            let mem_bytes_consumed = budget.get_mem_bytes_consumed().unwrap_or(0);
             return Err(SorobanExecutionError {
                 host_error: convert_host_error_p24_to_p25(e.clone()),
-                cpu_insns_consumed,
-                mem_bytes_consumed,
+                cpu_insns_consumed: budget.get_cpu_insns_consumed().unwrap_or(0),
+                mem_bytes_consumed: budget.get_mem_bytes_consumed().unwrap_or(0),
             });
         }
     };
@@ -2311,6 +2032,7 @@ fn convert_diagnostic_events_p25(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stellar_xdr::curr::LedgerEntryData;
 
     #[test]
     fn test_compute_key_hash() {
