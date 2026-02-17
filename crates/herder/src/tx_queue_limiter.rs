@@ -360,6 +360,11 @@ impl TxQueueLimiter {
                 .unwrap_or_else(|| Resource::new(vec![old.op_count as i64]))
         });
 
+        // Parity: update the generic lane limit to stay in sync after upgrades
+        if let Some(ref mut txs) = self.txs {
+            txs.update_generic_lane_limit(self.max_resources.clone());
+        }
+
         // Check if transaction can fit with eviction
         let Some(ref txs) = self.txs else {
             return (false, 0);

@@ -973,6 +973,18 @@ impl Herder {
                     }
                 }
 
+                // Parity: only fast-forward if the slot is ahead of the LCL.
+                // After catchup, LCL may have jumped ahead of the tracking slot,
+                // so an EXTERNALIZE for a slot already closed should be ignored.
+                if lcl.is_some_and(|l| slot <= l) {
+                    debug!(
+                        slot,
+                        lcl = lcl.unwrap_or(0),
+                        "Ignoring EXTERNALIZE for slot already closed"
+                    );
+                    return EnvelopeState::Valid;
+                }
+
                 // Fast-forward to this slot using the externalized value
                 info!(
                     slot,

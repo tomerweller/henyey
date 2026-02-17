@@ -207,6 +207,27 @@ pub struct ValidationContext {
     pub protocol_version: u32,
     /// Current ledger base fee (stroops per op).
     pub base_fee: u32,
+    /// Soroban per-transaction resource limits (if available).
+    pub soroban_limits: Option<SorobanTxLimits>,
+}
+
+/// Per-transaction Soroban resource limits from network config.
+///
+/// Parity: stellar-core `SorobanNetworkConfig` tx-level limits.
+#[derive(Debug, Clone)]
+pub struct SorobanTxLimits {
+    /// Maximum instructions per transaction.
+    pub tx_max_instructions: u64,
+    /// Maximum disk read bytes per transaction.
+    pub tx_max_read_bytes: u64,
+    /// Maximum write bytes per transaction.
+    pub tx_max_write_bytes: u64,
+    /// Maximum read ledger entries per transaction.
+    pub tx_max_read_ledger_entries: u64,
+    /// Maximum write ledger entries per transaction.
+    pub tx_max_write_ledger_entries: u64,
+    /// Maximum transaction size in bytes.
+    pub tx_max_size_bytes: u64,
 }
 
 impl Default for ValidationContext {
@@ -219,6 +240,7 @@ impl Default for ValidationContext {
                 .as_secs(),
             protocol_version: 21,
             base_fee: 100,
+            soroban_limits: None,
         }
     }
 }
@@ -750,6 +772,76 @@ impl TransactionQueue {
         Ok(())
     }
 
+    /// Check that a Soroban transaction's declared resources don't exceed
+    /// per-transaction network config limits.
+    ///
+    /// Parity: stellar-core `TransactionFrame::checkSorobanResources()`.
+    fn check_soroban_resources(
+        &self,
+        frame: &henyey_tx::TransactionFrame,
+    ) -> std::result::Result<(), String> {
+        let ctx = self.validation_context.read();
+        let Some(ref limits) = ctx.soroban_limits else {
+            // No limits configured — skip check
+            return Ok(());
+        };
+
+        let Some(data) = frame.soroban_data() else {
+            return Err("missing soroban transaction data".to_string());
+        };
+
+        let resources = &data.resources;
+
+        if resources.instructions as u64 > limits.tx_max_instructions {
+            return Err(format!(
+                "instructions {} exceed limit {}",
+                resources.instructions, limits.tx_max_instructions
+            ));
+        }
+
+        if resources.disk_read_bytes as u64 > limits.tx_max_read_bytes {
+            return Err(format!(
+                "read bytes {} exceed limit {}",
+                resources.disk_read_bytes, limits.tx_max_read_bytes
+            ));
+        }
+
+        if resources.write_bytes as u64 > limits.tx_max_write_bytes {
+            return Err(format!(
+                "write bytes {} exceed limit {}",
+                resources.write_bytes, limits.tx_max_write_bytes
+            ));
+        }
+
+        let read_entries = resources.footprint.read_only.len() as u64;
+        let write_entries = resources.footprint.read_write.len() as u64;
+
+        if write_entries > limits.tx_max_write_ledger_entries {
+            return Err(format!(
+                "write entries {} exceed limit {}",
+                write_entries, limits.tx_max_write_ledger_entries
+            ));
+        }
+
+        if read_entries + write_entries > limits.tx_max_read_ledger_entries {
+            return Err(format!(
+                "read entries {} exceed limit {}",
+                read_entries + write_entries,
+                limits.tx_max_read_ledger_entries
+            ));
+        }
+
+        let tx_size = frame.tx_size_bytes() as u64;
+        if tx_size > limits.tx_max_size_bytes {
+            return Err(format!(
+                "tx size {} exceeds limit {}",
+                tx_size, limits.tx_max_size_bytes
+            ));
+        }
+
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn collect_evictions_for_lane_config<F>(
         &self,
@@ -1088,6 +1180,19 @@ impl TransactionQueue {
             self.config.network_id,
         );
         let queued_is_soroban = queued_frame.is_soroban();
+
+        // Parity: check Soroban resource limits against network config
+        if queued_is_soroban {
+            if let Err(reason) = self.check_soroban_resources(&queued_frame) {
+                tracing::debug!(
+                    hash = %queued.hash,
+                    reason = %reason,
+                    "Rejecting Soroban tx: resources exceed network config"
+                );
+                return TxQueueResult::Invalid(None);
+            }
+        }
+
         // Check for duplicate in queue
         if by_hash.contains_key(&queued.hash) {
             return TxQueueResult::Duplicate;
@@ -4293,5 +4398,175 @@ mod tests {
         set_source(&mut envelope, 111);
 
         assert_eq!(queue.try_add(envelope), TxQueueResult::Added);
+    }
+
+    // =========================================================================
+    // Phase 3A: check_soroban_resources tests
+    // =========================================================================
+
+    fn make_soroban_frame_with_resources(
+        instructions: u32,
+        disk_read_bytes: u32,
+        write_bytes: u32,
+        read_only_entries: usize,
+        read_write_entries: usize,
+    ) -> henyey_tx::TransactionFrame {
+        use stellar_xdr::curr::LedgerKey;
+        let source = MuxedAccount::Ed25519(Uint256([50u8; 32]));
+        let host_function = HostFunction::InvokeContract(InvokeContractArgs {
+            contract_address: ScAddress::default(),
+            function_name: ScSymbol(StringM::<32>::try_from("test".to_string()).expect("symbol")),
+            args: VecM::<ScVal>::default(),
+        });
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function,
+                auth: VecM::default(),
+            }),
+        };
+
+        // Build footprint with specified entry counts
+        let read_only: Vec<LedgerKey> = (0..read_only_entries)
+            .map(|i| {
+                LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                    account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                        [i as u8; 32],
+                    ))),
+                })
+            })
+            .collect();
+        let read_write: Vec<LedgerKey> = (0..read_write_entries)
+            .map(|i| {
+                LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                    account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                        [(i + 100) as u8; 32],
+                    ))),
+                })
+            })
+            .collect();
+
+        let resources = SorobanResources {
+            footprint: LedgerFootprint {
+                read_only: read_only.try_into().unwrap(),
+                read_write: read_write.try_into().unwrap(),
+            },
+            instructions,
+            disk_read_bytes,
+            write_bytes,
+        };
+        let tx = Transaction {
+            source_account: source,
+            fee: 10_000,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V1(SorobanTransactionData {
+                ext: SorobanTransactionDataExt::V0,
+                resources,
+                resource_fee: 5000,
+            }),
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        });
+
+        henyey_tx::TransactionFrame::with_network(envelope, NetworkId::testnet())
+    }
+
+    fn make_queue_with_soroban_limits(limits: SorobanTxLimits) -> TransactionQueue {
+        let queue = TransactionQueue::with_defaults();
+        queue.validation_context.write().soroban_limits = Some(limits);
+        queue
+    }
+
+    fn permissive_soroban_limits() -> SorobanTxLimits {
+        SorobanTxLimits {
+            tx_max_instructions: 1_000_000,
+            tx_max_read_bytes: 1_000_000,
+            tx_max_write_bytes: 1_000_000,
+            tx_max_read_ledger_entries: 100,
+            tx_max_write_ledger_entries: 50,
+            tx_max_size_bytes: 1_000_000,
+        }
+    }
+
+    #[test]
+    fn test_check_soroban_resources_passes_within_limits() {
+        let queue = make_queue_with_soroban_limits(permissive_soroban_limits());
+        let frame = make_soroban_frame_with_resources(100, 200, 300, 2, 1);
+        assert!(queue.check_soroban_resources(&frame).is_ok());
+    }
+
+    #[test]
+    fn test_check_soroban_resources_no_limits_skips_check() {
+        let queue = TransactionQueue::with_defaults();
+        // No soroban_limits configured — should pass
+        let frame = make_soroban_frame_with_resources(u32::MAX, u32::MAX, u32::MAX, 100, 100);
+        assert!(queue.check_soroban_resources(&frame).is_ok());
+    }
+
+    #[test]
+    fn test_check_soroban_resources_rejects_excess_instructions() {
+        let mut limits = permissive_soroban_limits();
+        limits.tx_max_instructions = 50;
+        let queue = make_queue_with_soroban_limits(limits);
+
+        let frame = make_soroban_frame_with_resources(100, 0, 0, 0, 0);
+        let err = queue.check_soroban_resources(&frame).unwrap_err();
+        assert!(err.contains("instructions"), "Error: {}", err);
+    }
+
+    #[test]
+    fn test_check_soroban_resources_rejects_excess_read_bytes() {
+        let mut limits = permissive_soroban_limits();
+        limits.tx_max_read_bytes = 100;
+        let queue = make_queue_with_soroban_limits(limits);
+
+        let frame = make_soroban_frame_with_resources(0, 200, 0, 0, 0);
+        let err = queue.check_soroban_resources(&frame).unwrap_err();
+        assert!(err.contains("read bytes"), "Error: {}", err);
+    }
+
+    #[test]
+    fn test_check_soroban_resources_rejects_excess_write_bytes() {
+        let mut limits = permissive_soroban_limits();
+        limits.tx_max_write_bytes = 100;
+        let queue = make_queue_with_soroban_limits(limits);
+
+        let frame = make_soroban_frame_with_resources(0, 0, 200, 0, 0);
+        let err = queue.check_soroban_resources(&frame).unwrap_err();
+        assert!(err.contains("write bytes"), "Error: {}", err);
+    }
+
+    #[test]
+    fn test_check_soroban_resources_rejects_excess_write_entries() {
+        let mut limits = permissive_soroban_limits();
+        limits.tx_max_write_ledger_entries = 2;
+        let queue = make_queue_with_soroban_limits(limits);
+
+        let frame = make_soroban_frame_with_resources(0, 0, 0, 0, 5);
+        let err = queue.check_soroban_resources(&frame).unwrap_err();
+        assert!(err.contains("write entries"), "Error: {}", err);
+    }
+
+    #[test]
+    fn test_check_soroban_resources_rejects_excess_total_read_entries() {
+        let mut limits = permissive_soroban_limits();
+        limits.tx_max_read_ledger_entries = 5;
+        let queue = make_queue_with_soroban_limits(limits);
+
+        // 4 read-only + 3 read-write = 7 total > 5 limit
+        let frame = make_soroban_frame_with_resources(0, 0, 0, 4, 3);
+        let err = queue.check_soroban_resources(&frame).unwrap_err();
+        assert!(err.contains("read entries"), "Error: {}", err);
     }
 }

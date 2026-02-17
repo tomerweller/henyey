@@ -376,8 +376,15 @@ impl Upgrades {
             }
         }
 
-        // Config upgrade requires additional validation (not included here)
-        // This would need ledger state access to validate
+        // Parity: config upgrade proposal. In upstream, this validates via
+        // ConfigUpgradeSetFrame::makeFromKey() against ledger state. Here we
+        // emit the upgrade if the key is configured, and validation happens
+        // when the upgrade is applied.
+        if let Some(ref key_json) = self.params.config_upgrade_set_key {
+            if let Ok(key) = key_json.to_xdr() {
+                result.push(LedgerUpgrade::Config(key));
+            }
+        }
 
         result
     }
@@ -853,5 +860,89 @@ mod tests {
 
         assert_eq!(key.contract_id, roundtrip.contract_id);
         assert_eq!(key.content_hash, roundtrip.content_hash);
+    }
+
+    // =========================================================================
+    // Phase 3B: Config upgrade proposal
+    // =========================================================================
+
+    #[test]
+    fn test_create_upgrades_for_config_upgrade() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
+        let contract_id = [1u8; 32];
+        let content_hash = [2u8; 32];
+
+        let mut params = UpgradeParameters::new(1000);
+        params.config_upgrade_set_key = Some(ConfigUpgradeSetKeyJson {
+            contract_id: STANDARD.encode(contract_id),
+            content_hash: STANDARD.encode(content_hash),
+        });
+
+        let upgrades = Upgrades::new(params);
+
+        // At upgrade time, should emit a Config upgrade
+        let proposals = upgrades.create_upgrades_for(1000, 24, 100, 1000, 10000000, 0, None);
+        assert_eq!(proposals.len(), 1);
+        match &proposals[0] {
+            LedgerUpgrade::Config(key) => {
+                assert_eq!(key.contract_id.0 .0, contract_id);
+                assert_eq!(key.content_hash.0, content_hash);
+            }
+            other => panic!("Expected Config upgrade, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_create_upgrades_for_config_upgrade_with_other_upgrades() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
+        let mut params = UpgradeParameters::new(1000);
+        params.protocol_version = Some(25);
+        params.base_fee = Some(200);
+        params.config_upgrade_set_key = Some(ConfigUpgradeSetKeyJson {
+            contract_id: STANDARD.encode([3u8; 32]),
+            content_hash: STANDARD.encode([4u8; 32]),
+        });
+
+        let upgrades = Upgrades::new(params);
+
+        let proposals = upgrades.create_upgrades_for(1000, 24, 100, 1000, 10000000, 0, None);
+        // Should have: Version, BaseFee, Config = 3 upgrades
+        assert_eq!(proposals.len(), 3);
+        assert!(matches!(proposals[0], LedgerUpgrade::Version(25)));
+        assert!(matches!(proposals[1], LedgerUpgrade::BaseFee(200)));
+        assert!(matches!(proposals[2], LedgerUpgrade::Config(_)));
+    }
+
+    #[test]
+    fn test_create_upgrades_for_config_upgrade_bad_key() {
+        // Invalid base64 key should be silently skipped
+        let mut params = UpgradeParameters::new(1000);
+        params.config_upgrade_set_key = Some(ConfigUpgradeSetKeyJson {
+            contract_id: "not-valid-base64!!!".to_string(),
+            content_hash: "also-bad".to_string(),
+        });
+
+        let upgrades = Upgrades::new(params);
+        let proposals = upgrades.create_upgrades_for(1000, 24, 100, 1000, 10000000, 0, None);
+        assert!(proposals.is_empty(), "Bad config key should produce no upgrade");
+    }
+
+    #[test]
+    fn test_create_upgrades_for_config_upgrade_before_time() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
+        let mut params = UpgradeParameters::new(2000);
+        params.config_upgrade_set_key = Some(ConfigUpgradeSetKeyJson {
+            contract_id: STANDARD.encode([1u8; 32]),
+            content_hash: STANDARD.encode([2u8; 32]),
+        });
+
+        let upgrades = Upgrades::new(params);
+
+        // Before upgrade time, should emit nothing
+        let proposals = upgrades.create_upgrades_for(1000, 24, 100, 1000, 10000000, 0, None);
+        assert!(proposals.is_empty());
     }
 }

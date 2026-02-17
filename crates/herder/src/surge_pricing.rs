@@ -83,6 +83,12 @@ pub(crate) trait SurgePricingLaneConfig {
 
     /// Calculate the resources consumed by a transaction.
     fn tx_resources(&self, frame: &TransactionFrame, ledger_version: u32) -> Resource;
+
+    /// Update the generic lane (lane 0) limit.
+    ///
+    /// Parity: stellar-core calls this in `canAddTx()` to keep lane limits
+    /// in sync with current max scaled ledger resources after upgrades.
+    fn update_generic_lane_limit(&mut self, limit: Resource);
 }
 
 /// Lane configuration that separates DEX transactions into their own lane.
@@ -124,6 +130,10 @@ impl SurgePricingLaneConfig for DexLimitingLaneConfig {
     fn tx_resources(&self, frame: &TransactionFrame, ledger_version: u32) -> Resource {
         frame.resources(self.use_byte_limit, ledger_version)
     }
+
+    fn update_generic_lane_limit(&mut self, limit: Resource) {
+        self.lane_limits[GENERIC_LANE] = limit;
+    }
 }
 
 /// Lane configuration for Soroban smart contract transactions.
@@ -158,6 +168,10 @@ impl SurgePricingLaneConfig for SorobanGenericLaneConfig {
     fn tx_resources(&self, frame: &TransactionFrame, ledger_version: u32) -> Resource {
         frame.resources(false, ledger_version)
     }
+
+    fn update_generic_lane_limit(&mut self, limit: Resource) {
+        self.lane_limits[GENERIC_LANE] = limit;
+    }
 }
 
 /// Simple lane configuration that only considers operation count.
@@ -188,6 +202,10 @@ impl SurgePricingLaneConfig for OpsOnlyLaneConfig {
     fn tx_resources(&self, frame: &TransactionFrame, _ledger_version: u32) -> Resource {
         let ops = i64::try_from(frame.operation_count()).unwrap_or(i64::MAX);
         Resource::new(vec![ops])
+    }
+
+    fn update_generic_lane_limit(&mut self, limit: Resource) {
+        self.lane_limits[GENERIC_LANE] = limit;
     }
 }
 
@@ -320,6 +338,15 @@ impl SurgePricingPriorityQueue {
 
     pub(crate) fn get_num_lanes(&self) -> usize {
         self.lane_limits.len()
+    }
+
+    /// Update the generic lane limit to match current max resources.
+    ///
+    /// Parity: stellar-core calls `updateGenericLaneLimit()` in `canAddTx()`
+    /// to keep limits in sync after protocol upgrades.
+    pub(crate) fn update_generic_lane_limit(&mut self, limit: Resource) {
+        self.lane_config.update_generic_lane_limit(limit.clone());
+        self.lane_limits[GENERIC_LANE] = limit;
     }
 
     pub(crate) fn lane_limits(&self, lane: usize) -> Resource {
@@ -682,5 +709,66 @@ impl SurgePricingPriorityQueue {
         }
 
         Some(evictions)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use henyey_common::Resource;
+
+    #[test]
+    fn test_update_generic_lane_limit_dex_config() {
+        let initial = Resource::new(vec![100]);
+        let dex_limit = Resource::new(vec![50]);
+        let mut config = DexLimitingLaneConfig::new(initial.clone(), Some(dex_limit.clone()));
+
+        assert_eq!(config.lane_limits()[GENERIC_LANE], initial);
+        assert_eq!(config.lane_limits()[DEX_LANE], dex_limit);
+
+        // Update generic lane
+        let new_limit = Resource::new(vec![200]);
+        config.update_generic_lane_limit(new_limit.clone());
+        assert_eq!(config.lane_limits()[GENERIC_LANE], new_limit);
+        // DEX lane should be unchanged
+        assert_eq!(config.lane_limits()[DEX_LANE], dex_limit);
+    }
+
+    #[test]
+    fn test_update_generic_lane_limit_soroban_config() {
+        // Soroban resources have 7 dimensions
+        let initial = Resource::new(vec![1000, 500, 200, 100, 50, 25, 10]);
+        let mut config = SorobanGenericLaneConfig::new(initial.clone());
+
+        assert_eq!(config.lane_limits()[GENERIC_LANE], initial);
+
+        let new_limit = Resource::new(vec![2000, 1000, 400, 200, 100, 50, 20]);
+        config.update_generic_lane_limit(new_limit.clone());
+        assert_eq!(config.lane_limits()[GENERIC_LANE], new_limit);
+    }
+
+    #[test]
+    fn test_update_generic_lane_limit_ops_only_config() {
+        let initial = Resource::new(vec![500]);
+        let mut config = OpsOnlyLaneConfig::new(initial.clone());
+
+        assert_eq!(config.lane_limits()[GENERIC_LANE], initial);
+
+        let new_limit = Resource::new(vec![1000]);
+        config.update_generic_lane_limit(new_limit.clone());
+        assert_eq!(config.lane_limits()[GENERIC_LANE], new_limit);
+    }
+
+    #[test]
+    fn test_update_generic_lane_limit_priority_queue() {
+        let initial = Resource::new(vec![100]);
+        let config = Box::new(OpsOnlyLaneConfig::new(initial.clone()));
+        let mut queue = SurgePricingPriorityQueue::new(config, 42);
+
+        assert_eq!(queue.lane_limits(GENERIC_LANE), initial);
+
+        let new_limit = Resource::new(vec![300]);
+        queue.update_generic_lane_limit(new_limit.clone());
+        assert_eq!(queue.lane_limits(GENERIC_LANE), new_limit);
     }
 }

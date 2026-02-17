@@ -779,6 +779,7 @@ impl ScpDriver {
                 return ValueValidation::MaybeValid;
             }
             if let Some(tx_set) = self.tx_set_cache.get(&tx_set_hash) {
+                // Parity: verify hash integrity
                 match tx_set.tx_set.recompute_hash() {
                     Some(computed) if computed == tx_set_hash => {}
                     Some(computed) => {
@@ -792,6 +793,24 @@ impl ScpDriver {
                         debug!("Failed to recompute tx set hash");
                         return ValueValidation::Invalid;
                     }
+                }
+
+                // Parity: check previousLedgerHash matches the LCL hash
+                if let Some(ref lm) = *self.ledger_manager.read() {
+                    let lcl_hash = lm.current_header_hash();
+                    if tx_set.tx_set.previous_ledger_hash != lcl_hash {
+                        debug!(
+                            "Tx set previousLedgerHash mismatch: expected {}, got {}",
+                            lcl_hash, tx_set.tx_set.previous_ledger_hash
+                        );
+                        return ValueValidation::Invalid;
+                    }
+                }
+
+                // Parity: validate tx set is well-formed (sorted, no duplicates)
+                if !Self::is_tx_set_well_formed(&tx_set.tx_set) {
+                    debug!("Tx set is not well-formed (unsorted or has duplicates)");
+                    return ValueValidation::Invalid;
                 }
             }
 
@@ -1040,13 +1059,31 @@ impl ScpDriver {
         }
 
         // Decode all values
-        let decoded: Vec<StellarValue> = values
+        let mut decoded: Vec<StellarValue> = values
             .iter()
             .filter_map(|v| StellarValue::from_xdr(v, stellar_xdr::curr::Limits::none()).ok())
             .collect();
 
         if decoded.is_empty() {
             return values[0].clone();
+        }
+
+        // Parity: filter out candidates whose tx set has a different previousLedgerHash
+        if let Some(ref lm) = *self.ledger_manager.read() {
+            let lcl_hash = lm.current_header_hash();
+            decoded.retain(|sv| {
+                let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
+                if let Some(tx_set) = self.tx_set_cache.get(&tx_set_hash) {
+                    tx_set.tx_set.previous_ledger_hash == lcl_hash
+                } else {
+                    // Can't verify — keep it
+                    true
+                }
+            });
+            if decoded.is_empty() {
+                // All candidates filtered out — fall back to first value
+                return values[0].clone();
+            }
         }
 
         // Step 1: Compute candidates hash (XOR of all candidate hashes) for tiebreaking
@@ -1174,6 +1211,28 @@ impl ScpDriver {
         let a_xored = Self::xor_hash(&a_hash.0, candidates_hash);
         let b_xored = Self::xor_hash(&b_hash.0, candidates_hash);
         a_xored.cmp(&b_xored)
+    }
+
+    /// Check that a transaction set is well-formed: sorted by hash and no duplicates.
+    ///
+    /// Parity: stellar-core `TxSetUtils::checkValid()` verifies structural integrity.
+    fn is_tx_set_well_formed(tx_set: &TransactionSet) -> bool {
+        let txs = &tx_set.transactions;
+        if txs.len() <= 1 {
+            return true;
+        }
+
+        let mut prev_hash = Hash256::hash_xdr(&txs[0]).unwrap_or(Hash256::ZERO);
+        for tx in &txs[1..] {
+            let hash = Hash256::hash_xdr(tx).unwrap_or(Hash256::ZERO);
+            if hash.0 <= prev_hash.0 {
+                // Not strictly ascending — either unsorted or duplicate
+                return false;
+            }
+            prev_hash = hash;
+        }
+
+        true
     }
 
     /// Count total number of operations in a transaction set.
@@ -2854,5 +2913,110 @@ mod tests {
         // slot 1 == lcl_seq(0) + 1 -> current ledger path
         let result = driver.validate_value_against_local_state(1, &sv);
         assert_eq!(result, ValueValidation::Valid);
+    }
+
+    // =========================================================================
+    // Phase 2A: is_tx_set_well_formed tests
+    // =========================================================================
+
+    fn make_simple_tx(seed: u8) -> stellar_xdr::curr::TransactionEnvelope {
+        use stellar_xdr::curr::{
+            CreateAccountOp, DecoratedSignature, Memo, MuxedAccount, Operation, OperationBody,
+            Preconditions, SequenceNumber, SignatureHint, Transaction, TransactionEnvelope,
+            TransactionExt, TransactionV1Envelope, Uint256,
+        };
+        let source = MuxedAccount::Ed25519(Uint256([seed; 32]));
+        let dest =
+            stellar_xdr::curr::AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                Uint256([seed.wrapping_add(1); 32]),
+            ));
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(seed as i64),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::CreateAccount(CreateAccountOp {
+                    destination: dest,
+                    starting_balance: 1_000_000_000,
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V0,
+        };
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: stellar_xdr::curr::Signature(
+                    vec![0u8; 64].try_into().unwrap(),
+                ),
+            }]
+            .try_into()
+            .unwrap(),
+        })
+    }
+
+    #[test]
+    fn test_is_tx_set_well_formed_empty() {
+        let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
+        assert!(ScpDriver::is_tx_set_well_formed(&tx_set));
+    }
+
+    #[test]
+    fn test_is_tx_set_well_formed_single_tx() {
+        let tx = make_simple_tx(1);
+        let tx_set = TransactionSet::new(Hash256::ZERO, vec![tx]);
+        assert!(ScpDriver::is_tx_set_well_formed(&tx_set));
+    }
+
+    #[test]
+    fn test_is_tx_set_well_formed_sorted() {
+        // Create txs and sort them by hash
+        let mut txs: Vec<stellar_xdr::curr::TransactionEnvelope> =
+            (1..=5).map(|i| make_simple_tx(i)).collect();
+        txs.sort_by(|a, b| {
+            let ha = Hash256::hash_xdr(a).unwrap_or(Hash256::ZERO);
+            let hb = Hash256::hash_xdr(b).unwrap_or(Hash256::ZERO);
+            ha.0.cmp(&hb.0)
+        });
+
+        let tx_set = TransactionSet::new(Hash256::ZERO, txs);
+        assert!(ScpDriver::is_tx_set_well_formed(&tx_set));
+    }
+
+    #[test]
+    fn test_is_tx_set_well_formed_unsorted() {
+        // Create txs sorted by hash, then swap first two to make unsorted
+        let mut txs: Vec<stellar_xdr::curr::TransactionEnvelope> =
+            (1..=5).map(|i| make_simple_tx(i)).collect();
+        txs.sort_by(|a, b| {
+            let ha = Hash256::hash_xdr(a).unwrap_or(Hash256::ZERO);
+            let hb = Hash256::hash_xdr(b).unwrap_or(Hash256::ZERO);
+            ha.0.cmp(&hb.0)
+        });
+        // Swap first two to guarantee out-of-order
+        txs.swap(0, 1);
+
+        // Use with_hash to bypass auto-sorting in TransactionSet::new
+        let tx_set = TransactionSet::with_hash(Hash256::ZERO, Hash256::ZERO, txs);
+        assert!(
+            !ScpDriver::is_tx_set_well_formed(&tx_set),
+            "Swapped tx set should not be well-formed"
+        );
+    }
+
+    #[test]
+    fn test_is_tx_set_well_formed_duplicates() {
+        let tx = make_simple_tx(1);
+        // Use with_hash to bypass auto-sorting/dedup in TransactionSet::new
+        let tx_set = TransactionSet::with_hash(Hash256::ZERO, Hash256::ZERO, vec![tx.clone(), tx]);
+        assert!(
+            !ScpDriver::is_tx_set_well_formed(&tx_set),
+            "Tx set with duplicate should not be well-formed"
+        );
     }
 }
