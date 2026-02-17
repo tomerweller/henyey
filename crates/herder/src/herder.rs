@@ -53,6 +53,7 @@ use stellar_xdr::curr::{
 
 use crate::error::HerderError;
 use crate::fetching_envelopes::{FetchingEnvelopes, FetchingStats};
+use crate::herder_utils::to_short_string;
 use crate::pending::{PendingConfig, PendingEnvelopes, PendingResult, PendingStats};
 use crate::quorum_tracker::{QuorumTracker, SlotQuorumTracker};
 use crate::scp_driver::{HerderScpCallback, ScpDriver, ScpDriverConfig};
@@ -882,34 +883,18 @@ impl Herder {
         {
             // Extract value and tx_set_hash upfront before any potential move
             let value = ext.commit.value.clone();
-            let (tx_set_hash, stellar_value_ext_desc) = if let Ok(sv) = StellarValue::from_xdr(&value.0, Limits::none()) {
-                let ext_desc = match &sv.ext {
-                    stellar_xdr::curr::StellarValueExt::Basic => "Basic".to_string(),
-                    stellar_xdr::curr::StellarValueExt::Signed(sig) => {
-                        let node_id_bytes = match &sig.node_id.0 {
-                            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => key.0,
-                        };
-                        format!(
-                            "Signed(node_id={}, sig_len={})",
-                            Hash256::from_bytes(node_id_bytes).to_hex(),
-                            sig.signature.len()
-                        )
-                    }
-                };
-                (Hash256::from_bytes(sv.tx_set_hash.0), ext_desc)
-            } else {
-                warn!(slot, "Failed to parse StellarValue from EXTERNALIZE");
-                return EnvelopeState::Invalid;
+            let sv = match StellarValue::from_xdr(&value.0, Limits::none()) {
+                Ok(sv) => sv,
+                Err(_) => {
+                    warn!(slot, "Failed to parse StellarValue from EXTERNALIZE");
+                    return EnvelopeState::Invalid;
+                }
             };
-            
-            // Log the sender and stellar_value_ext for debugging
-            let sender_bytes = match &envelope.statement.node_id.0 {
-                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => key.0,
-            };
+            let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
             debug!(
                 slot,
-                sender = %Hash256::from_bytes(sender_bytes).to_hex(),
-                stellar_value_ext = %stellar_value_ext_desc,
+                sender = %to_short_string(&envelope.statement.node_id),
+                tx_set = %tx_set_hash,
                 "Received EXTERNALIZE message"
             );
 
@@ -946,31 +931,10 @@ impl Herder {
                 // Like stellar-core, we must wait until the tx_set is available before
                 // recording externalization. Otherwise we create buffered ledgers that can
                 // never close (no tx_set to apply).
-                if !self.scp_driver.has_tx_set(&tx_set_hash) {
-                    debug!(
-                        slot,
-                        hash = %tx_set_hash,
-                        "Fast-forward EXTERNALIZE waiting for tx_set"
-                    );
-                    // Buffer this envelope until tx_set arrives
-                    use crate::fetching_envelopes::RecvResult;
-                    let result = self.fetching_envelopes.recv_envelope(envelope);
-                    match result {
-                        RecvResult::Ready => {
-                            // tx_set is in fetching cache, proceed below
-                            debug!(slot, "EXTERNALIZE ready after fetching check");
-                        }
-                        RecvResult::Fetching => {
-                            // Request already made above, wait for it
-                            return EnvelopeState::Fetching;
-                        }
-                        RecvResult::AlreadyProcessed => {
-                            return EnvelopeState::Duplicate;
-                        }
-                        RecvResult::Discarded => {
-                            return EnvelopeState::Invalid;
-                        }
-                    }
+                if let Some(state) =
+                    self.buffer_envelope_until_tx_set(slot, &tx_set_hash, envelope)
+                {
+                    return state;
                 }
 
                 // Parity: only fast-forward if the slot is ahead of the LCL.
@@ -1037,30 +1001,10 @@ impl Herder {
 
                 // CRITICAL: Don't externalize without the tx_set!
                 // Like stellar-core, we must wait until the tx_set is available.
-                if !self.scp_driver.has_tx_set(&tx_set_hash) {
-                    debug!(
-                        slot,
-                        hash = %tx_set_hash,
-                        "Gap slot EXTERNALIZE waiting for tx_set"
-                    );
-                    // Buffer this envelope until tx_set arrives
-                    use crate::fetching_envelopes::RecvResult;
-                    let result = self.fetching_envelopes.recv_envelope(envelope);
-                    match result {
-                        RecvResult::Ready => {
-                            // tx_set is in fetching cache, proceed
-                            debug!(slot, "Gap EXTERNALIZE ready after fetching check");
-                        }
-                        RecvResult::Fetching => {
-                            return EnvelopeState::Fetching;
-                        }
-                        RecvResult::AlreadyProcessed => {
-                            return EnvelopeState::Duplicate;
-                        }
-                        RecvResult::Discarded => {
-                            return EnvelopeState::Invalid;
-                        }
-                    }
+                if let Some(state) =
+                    self.buffer_envelope_until_tx_set(slot, &tx_set_hash, envelope)
+                {
+                    return state;
                 }
 
                 // Record this externalization so we can close the gap ledger
@@ -1126,6 +1070,33 @@ impl Herder {
 
         // Process the envelope - it's for current slot or a recent slot within the window
         self.process_scp_envelope(envelope)
+    }
+
+    /// Buffer an EXTERNALIZE envelope until its tx_set is available.
+    ///
+    /// Returns `Some(state)` if the envelope was buffered/rejected (caller should return),
+    /// or `None` if the tx_set is available and processing can continue.
+    fn buffer_envelope_until_tx_set(
+        &self,
+        slot: u64,
+        tx_set_hash: &Hash256,
+        envelope: ScpEnvelope,
+    ) -> Option<EnvelopeState> {
+        if self.scp_driver.has_tx_set(tx_set_hash) {
+            return None; // tx_set available, continue processing
+        }
+
+        debug!(slot, hash = %tx_set_hash, "EXTERNALIZE waiting for tx_set");
+        use crate::fetching_envelopes::RecvResult;
+        match self.fetching_envelopes.recv_envelope(envelope) {
+            RecvResult::Ready => {
+                debug!(slot, "EXTERNALIZE ready after fetching check");
+                None // tx_set was in fetching cache
+            }
+            RecvResult::Fetching => Some(EnvelopeState::Fetching),
+            RecvResult::AlreadyProcessed => Some(EnvelopeState::Duplicate),
+            RecvResult::Discarded => Some(EnvelopeState::Invalid),
+        }
     }
 
     /// Process an SCP envelope (internal).

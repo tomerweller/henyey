@@ -149,11 +149,6 @@ impl TxQueueLimiter {
         }
     }
 
-    /// Get the maximum scaled ledger resources.
-    pub fn max_scaled_ledger_resources(&self) -> &Resource {
-        &self.max_resources
-    }
-
     /// Initialize the main transaction queue if not already done.
     fn ensure_initialized(&mut self, ledger_version: u32) {
         if self.txs.is_some() {
@@ -441,11 +436,6 @@ impl TxQueueLimiter {
                 }
             }
         }
-    }
-
-    /// Get total resources in the flood queue.
-    pub fn total_resources_to_flood(&self) -> Option<Resource> {
-        self.txs_to_flood.as_ref().map(|q| q.total_resources())
     }
 
     /// Get total resources in the main queue.

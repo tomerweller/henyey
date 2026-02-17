@@ -250,6 +250,28 @@ impl fmt::Display for UpgradeParameters {
     }
 }
 
+/// Current ledger state for upgrade proposal generation.
+///
+/// Groups the ledger parameters that `create_upgrades_for` compares against
+/// scheduled upgrade targets.
+#[derive(Debug, Clone, Default)]
+pub struct CurrentLedgerState {
+    /// Current ledger close time.
+    pub close_time: u64,
+    /// Current protocol version.
+    pub protocol_version: u32,
+    /// Current base fee (in stroops).
+    pub base_fee: u32,
+    /// Current max transaction set size (number of operations).
+    pub max_tx_set_size: u32,
+    /// Current base reserve (in stroops).
+    pub base_reserve: u32,
+    /// Current ledger header flags.
+    pub flags: u32,
+    /// Current max Soroban transaction set size (if Soroban enabled).
+    pub max_soroban_tx_set_size: Option<u32>,
+}
+
 /// Ledger upgrade scheduling and validation.
 ///
 /// Manages scheduled upgrades and validates upgrade proposals during
@@ -305,31 +327,18 @@ impl Upgrades {
         current_time >= self.params.upgrade_time
     }
 
-    /// Create upgrade proposals for the given ledger header values.
+    /// Create upgrade proposals for the given ledger state.
     ///
     /// Returns a list of LedgerUpgrade XDR objects for parameters that
     /// differ from the current values and should be upgraded.
-    ///
-    /// # Arguments
-    ///
-    /// * `close_time` - Current ledger close time
-    /// * `current_version` - Current protocol version
-    /// * `current_base_fee` - Current base fee
-    /// * `current_max_tx_set_size` - Current max tx set size
-    /// * `current_base_reserve` - Current base reserve
-    /// * `current_flags` - Current ledger flags
-    /// * `current_max_soroban_tx_set_size` - Current max Soroban tx set size (if Soroban enabled)
-    #[allow(clippy::too_many_arguments)]
-    pub fn create_upgrades_for(
-        &self,
-        close_time: u64,
-        current_version: u32,
-        current_base_fee: u32,
-        current_max_tx_set_size: u32,
-        current_base_reserve: u32,
-        current_flags: u32,
-        current_max_soroban_tx_set_size: Option<u32>,
-    ) -> Vec<LedgerUpgrade> {
+    pub fn create_upgrades_for(&self, state: &CurrentLedgerState) -> Vec<LedgerUpgrade> {
+        let close_time = state.close_time;
+        let current_version = state.protocol_version;
+        let current_base_fee = state.base_fee;
+        let current_max_tx_set_size = state.max_tx_set_size;
+        let current_base_reserve = state.base_reserve;
+        let current_flags = state.flags;
+        let current_max_soroban_tx_set_size = state.max_soroban_tx_set_size;
         let mut result = Vec::new();
 
         if !self.time_for_upgrade(close_time) {
@@ -653,15 +662,27 @@ mod tests {
         let upgrades = Upgrades::new(params);
 
         // Before upgrade time
-        let proposals = upgrades.create_upgrades_for(999, 23, 100, 1000, 10000000, 0, None);
+        let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
+                close_time: 999, protocol_version: 23, base_fee: 100,
+                max_tx_set_size: 1000, base_reserve: 10000000, flags: 0,
+                max_soroban_tx_set_size: None,
+            });
         assert!(proposals.is_empty());
 
         // At upgrade time, with differences
-        let proposals = upgrades.create_upgrades_for(1000, 23, 100, 1000, 10000000, 0, None);
+        let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
+                close_time: 1000, protocol_version: 23, base_fee: 100,
+                max_tx_set_size: 1000, base_reserve: 10000000, flags: 0,
+                max_soroban_tx_set_size: None,
+            });
         assert_eq!(proposals.len(), 3);
 
         // At upgrade time, with no differences
-        let proposals = upgrades.create_upgrades_for(1000, 24, 200, 500, 10000000, 0, None);
+        let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
+                close_time: 1000, protocol_version: 24, base_fee: 200,
+                max_tx_set_size: 500, base_reserve: 10000000, flags: 0,
+                max_soroban_tx_set_size: None,
+            });
         assert!(proposals.is_empty());
     }
 
@@ -882,7 +903,11 @@ mod tests {
         let upgrades = Upgrades::new(params);
 
         // At upgrade time, should emit a Config upgrade
-        let proposals = upgrades.create_upgrades_for(1000, 24, 100, 1000, 10000000, 0, None);
+        let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
+                close_time: 1000, protocol_version: 24, base_fee: 100,
+                max_tx_set_size: 1000, base_reserve: 10000000, flags: 0,
+                max_soroban_tx_set_size: None,
+            });
         assert_eq!(proposals.len(), 1);
         match &proposals[0] {
             LedgerUpgrade::Config(key) => {
@@ -907,7 +932,11 @@ mod tests {
 
         let upgrades = Upgrades::new(params);
 
-        let proposals = upgrades.create_upgrades_for(1000, 24, 100, 1000, 10000000, 0, None);
+        let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
+                close_time: 1000, protocol_version: 24, base_fee: 100,
+                max_tx_set_size: 1000, base_reserve: 10000000, flags: 0,
+                max_soroban_tx_set_size: None,
+            });
         // Should have: Version, BaseFee, Config = 3 upgrades
         assert_eq!(proposals.len(), 3);
         assert!(matches!(proposals[0], LedgerUpgrade::Version(25)));
@@ -925,7 +954,11 @@ mod tests {
         });
 
         let upgrades = Upgrades::new(params);
-        let proposals = upgrades.create_upgrades_for(1000, 24, 100, 1000, 10000000, 0, None);
+        let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
+                close_time: 1000, protocol_version: 24, base_fee: 100,
+                max_tx_set_size: 1000, base_reserve: 10000000, flags: 0,
+                max_soroban_tx_set_size: None,
+            });
         assert!(proposals.is_empty(), "Bad config key should produce no upgrade");
     }
 
@@ -942,7 +975,11 @@ mod tests {
         let upgrades = Upgrades::new(params);
 
         // Before upgrade time, should emit nothing
-        let proposals = upgrades.create_upgrades_for(1000, 24, 100, 1000, 10000000, 0, None);
+        let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
+                close_time: 1000, protocol_version: 24, base_fee: 100,
+                max_tx_set_size: 1000, base_reserve: 10000000, flags: 0,
+                max_soroban_tx_set_size: None,
+            });
         assert!(proposals.is_empty());
     }
 }

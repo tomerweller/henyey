@@ -68,6 +68,7 @@ graph TD
 | `QuorumTracker` | Transitive quorum membership graph for security checks |
 | `SlotQuorumTracker` | Per-slot quorum heard-from and v-blocking checks |
 | `Upgrades` | Ledger upgrade scheduling and validation |
+| `CurrentLedgerState` | Current ledger parameters for upgrade proposal decisions |
 | `LedgerCloseData` | Complete data package from consensus for ledger close |
 | `ScpPersistenceManager` | SCP state persistence for crash recovery |
 | `TimerManager` | Async SCP nomination/ballot timeout scheduling |
@@ -176,6 +177,7 @@ let (tx_set, gen_tx_set) = queue.build_generalized_tx_set(
 | `persistence.rs` | `ScpPersistenceManager`, `SqliteScpPersistence`: SCP state crash recovery |
 | `upgrades.rs` | `Upgrades`, `UpgradeParameters`: ledger upgrade scheduling and validation |
 | `ledger_close_data.rs` | `LedgerCloseData`: complete consensus data for ledger close |
+| `tx_set_utils.rs` | Transaction set validation: invalid tx filtering, trimming |
 | `herder_utils.rs` | Utility functions: value extraction, node ID conversion, short strings |
 | `timer_manager.rs` | `TimerManager`: async SCP nomination/ballot timeout scheduling |
 | `sync_recovery.rs` | `SyncRecoveryManager`: out-of-sync detection and recovery |
@@ -215,6 +217,7 @@ let (tx_set, gen_tx_set) = queue.build_generalized_tx_set(
 | `persistence.rs` | `src/herder/HerderPersistence.cpp` |
 | `upgrades.rs` | `src/herder/Upgrades.cpp` |
 | `ledger_close_data.rs` | `src/herder/LedgerCloseData.cpp` |
+| `tx_set_utils.rs` | `src/herder/TxSetUtils.cpp` |
 | `herder_utils.rs` | `src/herder/HerderUtils.cpp` |
 | `flow_control.rs` | `src/herder/Herder.h` (constants), `src/overlay/Peer.h` |
 | `timer_manager.rs` | SCP timeout logic within `HerderImpl.cpp` |

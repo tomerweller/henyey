@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-herder`
 **Upstream**: `.upstream-v25/src/herder/`
-**Overall Parity**: 77%
-**Last Updated**: 2026-02-13
+**Overall Parity**: 76%
+**Last Updated**: 2026-02-17
 
 ## Summary
 
@@ -40,7 +40,7 @@
 | `TransactionQueue.h` / `TransactionQueue.cpp` | `tx_queue.rs`, `tx_broadcast.rs` | Queue + broadcast split |
 | `TxQueueLimiter.h` / `TxQueueLimiter.cpp` | `tx_queue_limiter.rs` | Resource-aware limiting |
 | `TxSetFrame.h` / `TxSetFrame.cpp` | `tx_queue.rs` (TransactionSet) | Simplified; no ApplicableTxSetFrame |
-| `TxSetUtils.h` / `TxSetUtils.cpp` | `tx_queue.rs` | Inlined into tx_queue |
+| `TxSetUtils.h` / `TxSetUtils.cpp` | `tx_set_utils.rs` | Filtering and validation utilities |
 | `SurgePricingUtils.h` / `SurgePricingUtils.cpp` | `surge_pricing.rs` | Lane configs + priority queue |
 | `Upgrades.h` / `Upgrades.cpp` | `upgrades.rs` | Upgrade scheduling |
 | `ParallelTxSetBuilder.h` / `ParallelTxSetBuilder.cpp` | `parallel_tx_set_builder.rs` | Parallel Soroban phase |
@@ -296,7 +296,7 @@ Corresponds to: `TxQueueLimiter.h`
 | `TxQueueLimiter()` constructor | `TxQueueLimiter::new()` | Full |
 | `addTransaction()` | `add_transaction()` | Full |
 | `removeTransaction()` | `remove_transaction()` | Full |
-| `maxScaledLedgerResources()` | `max_scaled_ledger_resources()` | Full |
+| `maxScaledLedgerResources()` | _(removed)_ | None |
 | `evictTransactions()` | `evict_transactions()` | Full |
 | `canAddTx()` | `can_add_tx()` | Full |
 | `resetEvictionState()` | `reset_eviction_state()` | Full |
@@ -356,7 +356,7 @@ Corresponds to: `TxSetFrame.h`
 | `TxSetPhaseFrame` (all methods) | _(not implemented)_ | None |
 | `makeTxSetFromTransactions()` | `build_generalized_tx_set()` | Partial |
 
-### TxSetUtils (inlined in `tx_queue.rs`)
+### TxSetUtils (`tx_set_utils.rs`)
 
 Corresponds to: `TxSetUtils.h`
 
@@ -466,6 +466,7 @@ Features not yet implemented. These ARE counted against parity %.
 | `TxSetXDRFrame::encodedSize()` | Low | Wire size calculation |
 | `TxSetUtils::sortParallelTxsInHashOrder()` | Low | Parallel stage sorting |
 | `visitTopTxs()` with custom limits | Low | TxQueueLimiter custom limits |
+| `maxScaledLedgerResources()` | Low | Removed during simplification; re-add if needed |
 | `getTotalResourcesToFlood()` | Low | Flood resource tracking |
 | `stateChanged()` | Low | SCP state change callback |
 | `startTxSetGCTimer()` | Low | Tx set garbage collection |
@@ -531,7 +532,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 131 |
-| Gaps (None + Partial) | 39 |
+| Implemented (Full) | 130 |
+| Gaps (None + Partial) | 40 |
 | Intentional Omissions | 12 |
-| **Parity** | **131 / (131 + 39) = 77%** |
+| **Parity** | **130 / (130 + 40) = 76%** |
