@@ -720,8 +720,13 @@ impl ScpDriver {
             return ValueValidation::Invalid;
         }
 
-        // Check upgrade ordering (regardless of local state result)
+        // Check upgrade ordering and validity (regardless of local state result)
         if !Self::check_upgrade_ordering(&stellar_value) {
+            return ValueValidation::Invalid;
+        }
+
+        // Parity: HerderSCPDriver.cpp:375-401 — validate each upgrade via isValid
+        if !self.check_upgrades_valid(&stellar_value) {
             return ValueValidation::Invalid;
         }
 
@@ -911,6 +916,13 @@ impl ScpDriver {
         }
 
         // Parity: strip invalid upgrades, keeping valid ones in order
+        // Also validates each upgrade via isValidForApply
+        let current_version = self
+            .ledger_manager
+            .read()
+            .as_ref()
+            .map(|lm| lm.current_header().ledger_version)
+            .unwrap_or(0);
         let mut valid_upgrades = Vec::new();
         let mut last_upgrade_type = None;
         for upgrade_bytes in stellar_value.upgrades.iter() {
@@ -919,13 +931,11 @@ impl ScpDriver {
                 stellar_xdr::curr::Limits::none(),
             ) {
                 let upgrade_type = Self::upgrade_type_order(&upgrade);
-                // Only keep if in strictly increasing order
+                // Only keep if in strictly increasing order and valid for apply
                 let in_order = last_upgrade_type
                     .map(|prev| upgrade_type > prev)
                     .unwrap_or(true);
-                if in_order {
-                    // TODO: In stellar-core, also checks mUpgrades.isValid(upgrade, nomination=true)
-                    // For now, keep all upgrades that parse and are in order
+                if in_order && Self::is_valid_upgrade_for_apply(&upgrade, current_version) {
                     last_upgrade_type = Some(upgrade_type);
                     valid_upgrades.push(upgrade_bytes.clone());
                 }
@@ -942,6 +952,62 @@ impl ScpDriver {
                 .map(|bytes| Value(bytes.try_into().unwrap_or_default()))
         } else {
             Some(value.clone())
+        }
+    }
+
+    /// Check that all upgrades in a StellarValue are valid for application.
+    ///
+    /// Parity: Upgrades.cpp `isValid` → `isValidForApply`
+    fn check_upgrades_valid(&self, stellar_value: &StellarValue) -> bool {
+        let current_version = if let Some(ref lm) = *self.ledger_manager.read() {
+            lm.current_header().ledger_version
+        } else {
+            return true; // No ledger manager — can't validate
+        };
+
+        for upgrade_bytes in stellar_value.upgrades.iter() {
+            let upgrade = match LedgerUpgrade::from_xdr(
+                upgrade_bytes.0.as_slice(),
+                stellar_xdr::curr::Limits::none(),
+            ) {
+                Ok(u) => u,
+                Err(_) => return false,
+            };
+            if !Self::is_valid_upgrade_for_apply(&upgrade, current_version) {
+                debug!(?upgrade, "Invalid upgrade for apply");
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Check if a single upgrade is valid for application to the ledger.
+    ///
+    /// Parity: Upgrades.cpp `isValidForApply` (lines 543-616)
+    fn is_valid_upgrade_for_apply(upgrade: &LedgerUpgrade, current_version: u32) -> bool {
+        match upgrade {
+            LedgerUpgrade::Version(new_version) => {
+                // Must be strictly monotonic and within supported range
+                *new_version > current_version
+                    && *new_version <= henyey_common::CURRENT_LEDGER_PROTOCOL_VERSION
+            }
+            LedgerUpgrade::BaseFee(fee) => *fee != 0,
+            LedgerUpgrade::MaxTxSetSize(_) => true, // Any size allowed
+            LedgerUpgrade::BaseReserve(reserve) => *reserve != 0,
+            LedgerUpgrade::Flags(flags) => {
+                // Must be protocol >= 18 and only valid flag bits
+                const MASK_LEDGER_HEADER_FLAGS: u32 = 0x7;
+                current_version >= 18 && (*flags & !MASK_LEDGER_HEADER_FLAGS) == 0
+            }
+            LedgerUpgrade::Config(_) => {
+                // Config upgrades require Soroban protocol.
+                // Full validation would load the config set from ledger,
+                // but basic version check is the critical gate.
+                current_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION
+            }
+            LedgerUpgrade::MaxSorobanTxSetSize(_) => {
+                current_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION
+            }
         }
     }
 
@@ -1017,18 +1083,18 @@ impl ScpDriver {
             }
         }
 
-        // Step 3: Select best candidate (by tx set hash tiebreak with candidates_hash)
-        // stellar-core uses compareTxSets which compares size, fees, etc.
-        // We don't have full tx set metadata here, so we use the XOR tiebreak:
-        // lessThanXored(lh, rh, candidatesHash) as the primary comparison
+        // Step 3: Select best candidate using compareTxSets logic
+        // Parity: HerderSCPDriver.cpp:614-653 compareTxSets
+        // 1. More operations wins
+        // 2. Higher total fees wins
+        // 3. XOR hash tiebreak with candidates_hash
         let best_idx = decoded
             .iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| {
-                // XOR tiebreak: XOR each hash with candidates_hash, compare
-                let a_xored = Self::xor_hash(&a.tx_set_hash.0, &candidates_hash);
-                let b_xored = Self::xor_hash(&b.tx_set_hash.0, &candidates_hash);
-                a_xored.cmp(&b_xored)
+                let a_hash = Hash256::from_bytes(a.tx_set_hash.0);
+                let b_hash = Hash256::from_bytes(b.tx_set_hash.0);
+                self.compare_tx_sets(&a_hash, &b_hash, &candidates_hash)
             })
             .map(|(i, _)| i)
             .unwrap_or(0);
@@ -1071,6 +1137,73 @@ impl ScpDriver {
             (LedgerUpgrade::MaxSorobanTxSetSize(a), LedgerUpgrade::MaxSorobanTxSetSize(b)) => a > b,
             _ => false, // Different types shouldn't happen
         }
+    }
+
+    /// Compare two transaction sets for combine_candidates.
+    ///
+    /// Parity: HerderSCPDriver.cpp:614-653 compareTxSets.
+    /// Compares: num ops > total fees > XOR hash tiebreak.
+    fn compare_tx_sets(
+        &self,
+        a_hash: &Hash256,
+        b_hash: &Hash256,
+        candidates_hash: &[u8; 32],
+    ) -> std::cmp::Ordering {
+        let a_set = self.tx_set_cache.get(a_hash);
+        let b_set = self.tx_set_cache.get(b_hash);
+
+        if let (Some(a), Some(b)) = (a_set.as_ref(), b_set.as_ref()) {
+            // Compare by number of operations (more is better)
+            let a_ops = Self::tx_set_num_ops(&a.tx_set);
+            let b_ops = Self::tx_set_num_ops(&b.tx_set);
+            let ops_cmp = a_ops.cmp(&b_ops);
+            if ops_cmp != std::cmp::Ordering::Equal {
+                return ops_cmp;
+            }
+
+            // Compare by total fees (higher is better)
+            let a_fees = Self::tx_set_total_fees(&a.tx_set);
+            let b_fees = Self::tx_set_total_fees(&b.tx_set);
+            let fees_cmp = a_fees.cmp(&b_fees);
+            if fees_cmp != std::cmp::Ordering::Equal {
+                return fees_cmp;
+            }
+        }
+
+        // XOR hash tiebreak
+        let a_xored = Self::xor_hash(&a_hash.0, candidates_hash);
+        let b_xored = Self::xor_hash(&b_hash.0, candidates_hash);
+        a_xored.cmp(&b_xored)
+    }
+
+    /// Count total number of operations in a transaction set.
+    fn tx_set_num_ops(tx_set: &TransactionSet) -> usize {
+        tx_set
+            .transactions
+            .iter()
+            .map(|env| match env {
+                stellar_xdr::curr::TransactionEnvelope::TxV0(e) => e.tx.operations.len(),
+                stellar_xdr::curr::TransactionEnvelope::Tx(e) => e.tx.operations.len(),
+                stellar_xdr::curr::TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
+                    stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+                        inner.tx.operations.len()
+                    }
+                },
+            })
+            .sum()
+    }
+
+    /// Compute total fees for a transaction set.
+    fn tx_set_total_fees(tx_set: &TransactionSet) -> i64 {
+        tx_set
+            .transactions
+            .iter()
+            .map(|env| match env {
+                stellar_xdr::curr::TransactionEnvelope::TxV0(e) => e.tx.fee as i64,
+                stellar_xdr::curr::TransactionEnvelope::Tx(e) => e.tx.fee as i64,
+                stellar_xdr::curr::TransactionEnvelope::TxFeeBump(e) => e.tx.fee,
+            })
+            .sum()
     }
 
     /// XOR a 32-byte hash with another 32-byte value for tiebreaking.

@@ -23,8 +23,9 @@ use henyey_crypto::Sha256Hasher;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use stellar_xdr::curr::{
-    ConfigUpgradeSetKey, GeneralizedTransactionSet, LedgerCloseMeta, LedgerHeader, LedgerUpgrade,
-    Limits, ScpHistoryEntry, StellarValueExt, TransactionEnvelope, TransactionResultPair,
+    ConfigUpgradeSetKey, GeneralizedTransactionSet, LedgerCloseMeta, LedgerHeader,
+    LedgerHeaderExt, LedgerHeaderExtensionV1, LedgerHeaderExtensionV1Ext, LedgerUpgrade, Limits,
+    ScpHistoryEntry, StellarValueExt, TransactionEnvelope, TransactionResultPair,
     TransactionResultSet, TransactionSet, WriteXdr,
 };
 
@@ -952,19 +953,95 @@ impl UpgradeContext {
                     header.base_reserve = *reserve;
                 }
                 LedgerUpgrade::Flags(flags) => {
-                    // Flags are typically network-wide settings
-                    // handled in header extension
-                    let _ = flags;
+                    // Set flags in the header extension v1 (matching upstream setLedgerHeaderFlag)
+                    match &mut header.ext {
+                        LedgerHeaderExt::V1(ext) => {
+                            ext.flags = *flags;
+                        }
+                        LedgerHeaderExt::V0 => {
+                            header.ext = LedgerHeaderExt::V1(LedgerHeaderExtensionV1 {
+                                flags: *flags,
+                                ext: LedgerHeaderExtensionV1Ext::V0,
+                            });
+                        }
+                    }
                 }
                 LedgerUpgrade::Config(_) => {
                     // Config upgrades are handled separately
                 }
-                LedgerUpgrade::MaxSorobanTxSetSize(size) => {
-                    // Handled in header extension for Soroban
-                    let _ = size;
+                LedgerUpgrade::MaxSorobanTxSetSize(_) => {
+                    // Applied to delta via apply_max_soroban_tx_set_size()
                 }
             }
         }
+    }
+
+    /// Check if there's a MaxSorobanTxSetSize upgrade.
+    pub fn max_soroban_tx_set_size_upgrade(&self) -> Option<u32> {
+        for upgrade in &self.upgrades {
+            if let LedgerUpgrade::MaxSorobanTxSetSize(size) = upgrade {
+                return Some(*size);
+            }
+        }
+        None
+    }
+
+    /// Apply MaxSorobanTxSetSize upgrade to the delta by modifying the
+    /// CONFIG_SETTING_CONTRACT_EXECUTION_LANES entry.
+    ///
+    /// Matches upstream `upgradeMaxSorobanTxSetSize()` in Upgrades.cpp.
+    pub fn apply_max_soroban_tx_set_size(
+        &self,
+        snapshot: &SnapshotHandle,
+        delta: &mut LedgerDelta,
+        ledger_seq: u32,
+    ) -> Result<stellar_xdr::curr::LedgerEntryChanges, LedgerError> {
+        use stellar_xdr::curr::{
+            ConfigSettingEntry, ConfigSettingId, LedgerEntryChange, LedgerEntryChanges,
+            LedgerEntryData, LedgerKey, LedgerKeyConfigSetting, VecM,
+        };
+
+        let new_size = match self.max_soroban_tx_set_size_upgrade() {
+            Some(s) => s,
+            None => return Ok(LedgerEntryChanges(VecM::default())),
+        };
+
+        let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::ContractExecutionLanes,
+        });
+
+        // Load existing entry from delta (if previously modified) or snapshot
+        let existing = delta
+            .get_change(&key)?
+            .and_then(|c| c.current_entry().cloned())
+            .or_else(|| snapshot.get_entry(&key).ok().flatten());
+
+        let previous = existing.ok_or_else(|| {
+            LedgerError::Internal(
+                "CONFIG_SETTING_CONTRACT_EXECUTION_LANES entry not found".to_string(),
+            )
+        })?;
+
+        let mut updated = previous.clone();
+        if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractExecutionLanes(
+            ref mut lanes,
+        )) = updated.data
+        {
+            lanes.ledger_max_tx_count = new_size;
+        } else {
+            return Err(LedgerError::Internal(
+                "CONFIG_SETTING_CONTRACT_EXECUTION_LANES has unexpected type".to_string(),
+            ));
+        }
+        updated.last_modified_ledger_seq = ledger_seq;
+
+        delta.record_update(previous.clone(), updated.clone())?;
+
+        let changes = vec![
+            LedgerEntryChange::State(previous),
+            LedgerEntryChange::Updated(updated),
+        ];
+        Ok(LedgerEntryChanges(changes.try_into().unwrap_or_default()))
     }
 }
 

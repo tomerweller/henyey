@@ -2329,6 +2329,18 @@ impl<'a> LedgerCloseContext<'a> {
             );
         }
 
+        // Apply MaxSorobanTxSetSize upgrade to the delta (modifies CONFIG_SETTING entry).
+        // Parity: Upgrades.cpp upgradeMaxSorobanTxSetSize()
+        let max_soroban_changes = if self.upgrade_ctx.max_soroban_tx_set_size_upgrade().is_some() {
+            self.upgrade_ctx.apply_max_soroban_tx_set_size(
+                &self.snapshot,
+                &mut self.delta,
+                self.close_data.ledger_seq,
+            )?
+        } else {
+            LedgerEntryChanges(VecM::default())
+        };
+
         // Build UpgradeEntryMeta for each upgrade.
         // Parity: LedgerManagerImpl.cpp:1660-1673
         let mut upgrades_meta = Vec::new();
@@ -2341,6 +2353,7 @@ impl<'a> LedgerCloseContext<'a> {
                         LedgerEntryChanges(VecM::default())
                     })
                 }
+                LedgerUpgrade::MaxSorobanTxSetSize(_) => max_soroban_changes.clone(),
                 _ => LedgerEntryChanges(VecM::default()),
             };
             upgrades_meta.push(UpgradeEntryMeta {

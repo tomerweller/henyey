@@ -46,8 +46,9 @@ use henyey_crypto::{PublicKey, SecretKey};
 use henyey_ledger::LedgerManager;
 use henyey_scp::{BallotPhase, SlotIndex, SCP};
 use stellar_xdr::curr::{
-    Limits, NodeId, ReadXdr, ScpEnvelope, ScpQuorumSet, StellarValue, StellarValueExt, TimePoint,
-    TransactionEnvelope, UpgradeType, Value, WriteXdr,
+    EnvelopeType, LedgerCloseValueSignature, Limits, NodeId, ReadXdr, ScpEnvelope, ScpQuorumSet,
+    Signature as XdrSignature, StellarValue, StellarValueExt, TimePoint, TransactionEnvelope,
+    Uint256, UpgradeType, Value, WriteXdr,
 };
 
 use crate::error::HerderError;
@@ -1426,10 +1427,20 @@ impl Herder {
         self.scp_driver.cache_tx_set(tx_set.clone());
 
         // Create StellarValue for nomination
-        let close_time = std::time::SystemTime::now()
+        // Parity: HerderImpl.cpp triggerNextLedger — clamp to ensure monotonic increase
+        let lcl_close_time = self
+            .ledger_manager
+            .read()
+            .as_ref()
+            .map(|lm| lm.current_header().scp_value.close_time.0)
+            .unwrap_or(0);
+        let mut close_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        if close_time <= lcl_close_time {
+            close_time = lcl_close_time + 1;
+        }
 
         let upgrades: Vec<UpgradeType> = self
             .config
@@ -1439,12 +1450,7 @@ impl Herder {
             .filter_map(|bytes| bytes.try_into().ok().map(UpgradeType))
             .collect();
 
-        let stellar_value = StellarValue {
-            tx_set_hash: stellar_xdr::curr::Hash(tx_set.hash.0),
-            close_time: TimePoint(close_time),
-            upgrades: upgrades.try_into().unwrap_or_default(),
-            ext: stellar_xdr::curr::StellarValueExt::Basic,
-        };
+        let stellar_value = self.make_stellar_value(tx_set.hash, close_time, upgrades)?;
 
         // Encode to Value
         let value_bytes = stellar_value
@@ -1656,17 +1662,59 @@ impl Herder {
             .filter_map(|bytes| bytes.try_into().ok().map(UpgradeType))
             .collect();
 
-        let stellar_value = StellarValue {
-            tx_set_hash: stellar_xdr::curr::Hash(tx_set.hash.0),
-            close_time: TimePoint(close_time),
-            upgrades: upgrades.try_into().unwrap_or_default(),
-            ext: stellar_xdr::curr::StellarValueExt::Basic,
-        };
+        let stellar_value = self.make_stellar_value(tx_set.hash, close_time, upgrades).ok()?;
 
         // Encode to Value
         let value_bytes = stellar_value.to_xdr(Limits::none()).ok()?;
         let value = Value(value_bytes.try_into().ok()?);
         Some(value)
+    }
+
+    /// Create a signed StellarValue.
+    ///
+    /// Parity: HerderImpl.cpp `makeStellarValue` — signs with STELLAR_VALUE_SIGNED.
+    fn make_stellar_value(
+        &self,
+        tx_set_hash: Hash256,
+        close_time: u64,
+        upgrades: Vec<UpgradeType>,
+    ) -> std::result::Result<StellarValue, HerderError> {
+        let xdr_tx_set_hash = stellar_xdr::curr::Hash(tx_set_hash.0);
+        let xdr_close_time = TimePoint(close_time);
+        let secret_key = self.secret_key.as_ref().ok_or_else(|| {
+            HerderError::Internal("No secret key for signing".to_string())
+        })?;
+        let network_id = self.scp_driver.network_id();
+        let mut sign_data = network_id.0.to_vec();
+        sign_data.extend_from_slice(
+            &EnvelopeType::Scpvalue.to_xdr(Limits::none()).map_err(|e| {
+                HerderError::Internal(format!("Failed to encode envelope type: {}", e))
+            })?,
+        );
+        sign_data.extend_from_slice(
+            &xdr_tx_set_hash.to_xdr(Limits::none()).map_err(|e| {
+                HerderError::Internal(format!("Failed to encode tx set hash: {}", e))
+            })?,
+        );
+        sign_data.extend_from_slice(
+            &xdr_close_time.to_xdr(Limits::none()).map_err(|e| {
+                HerderError::Internal(format!("Failed to encode close time: {}", e))
+            })?,
+        );
+        let sig = secret_key.sign(&sign_data);
+        let node_id = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            Uint256(*secret_key.public_key().as_bytes()),
+        ));
+
+        Ok(StellarValue {
+            tx_set_hash: xdr_tx_set_hash,
+            close_time: xdr_close_time,
+            upgrades: upgrades.try_into().unwrap_or_default(),
+            ext: StellarValueExt::Signed(LedgerCloseValueSignature {
+                node_id,
+                signature: XdrSignature(sig.0.to_vec().try_into().unwrap_or_default()),
+            }),
+        })
     }
 
     fn build_starting_seq_map(

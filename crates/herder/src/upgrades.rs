@@ -42,8 +42,8 @@ use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use stellar_xdr::curr::{ConfigUpgradeSetKey, LedgerUpgrade, ReadXdr, UpgradeType};
 
-/// Default expiration time for pending upgrades (15 minutes).
-pub const DEFAULT_UPGRADE_EXPIRATION_MINUTES: u64 = 15;
+/// Default expiration time for pending upgrades (12 hours, matching upstream).
+pub const DEFAULT_UPGRADE_EXPIRATION_HOURS: u64 = 12;
 
 /// Upgrade validity result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,8 +193,8 @@ impl UpgradeParameters {
     /// Get the expiration time in seconds.
     pub fn expiration_seconds(&self) -> u64 {
         self.expiration_minutes
-            .unwrap_or(DEFAULT_UPGRADE_EXPIRATION_MINUTES)
-            * 60
+            .map(|m| m * 60)
+            .unwrap_or(DEFAULT_UPGRADE_EXPIRATION_HOURS * 3600)
     }
 
     /// Check if the upgrade has expired at the given time.
@@ -586,13 +586,18 @@ mod tests {
     fn test_upgrade_parameters_expiration() {
         let mut params = UpgradeParameters::new(1000);
         assert!(!params.is_expired(1000));
-        assert!(!params.is_expired(1000 + 15 * 60 - 1)); // Just before expiration
-        assert!(params.is_expired(1000 + 15 * 60 + 1)); // After expiration
+        assert!(!params.is_expired(1000 + 12 * 3600 - 1)); // Just before 12h expiration
+        assert!(params.is_expired(1000 + 12 * 3600 + 1)); // After 12h expiration
 
-        // Custom expiration
+        // Custom expiration (in minutes) — shorter than default
         params.expiration_minutes = Some(30);
-        assert!(!params.is_expired(1000 + 15 * 60 + 1)); // Would have expired with default
+        assert!(!params.is_expired(1000 + 30 * 60 - 1)); // Just before custom expiration
         assert!(params.is_expired(1000 + 30 * 60 + 1)); // Expires with custom
+
+        // Custom expiration — longer than default
+        params.expiration_minutes = Some(60 * 24); // 24 hours in minutes
+        assert!(!params.is_expired(1000 + 12 * 3600 + 1)); // Would have expired with default
+        assert!(params.is_expired(1000 + 24 * 3600 + 1)); // Expires with custom
     }
 
     #[test]
@@ -787,8 +792,8 @@ mod tests {
 
         let upgrades = Upgrades::new(params);
 
-        // After expiration (15 minutes = 900 seconds)
-        let (new_params, updated) = upgrades.remove_upgrades(&[], 1000 + 901);
+        // After expiration (12 hours = 43200 seconds)
+        let (new_params, updated) = upgrades.remove_upgrades(&[], 1000 + 12 * 3600 + 1);
         assert!(updated);
         assert!(!new_params.has_any_upgrade());
     }
