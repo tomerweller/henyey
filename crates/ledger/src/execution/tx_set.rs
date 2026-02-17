@@ -287,6 +287,7 @@ pub fn run_transactions_on_executor(
 pub fn execute_soroban_parallel_phase(
     snapshot: &SnapshotHandle,
     phase: &crate::close::SorobanPhaseStructure,
+    classic_tx_count: usize,
     context: &LedgerContext,
     delta: &mut LedgerDelta,
     soroban: SorobanContext<'_>,
@@ -297,10 +298,10 @@ pub fn execute_soroban_parallel_phase(
     let mut all_hot_archive_restored_keys: Vec<LedgerKey> = Vec::new();
     let mut id_pool = snapshot.header().id_pool;
     // Global TX offset tracks the canonical position for PRNG seed computation.
-    // In stellar-core, phases are applied in order [Soroban (phase 0), Classic (phase 1)],
-    // with a shared index counter starting at 0. Soroban TXs get indexes 0..N-1,
-    // and classic TXs get indexes N..N+M-1 (see LedgerManagerImpl::applyParallelPhase).
-    let mut global_tx_offset: usize = 0;
+    // In stellar-core, phases are applied in order [Classic (phase 0), Soroban (phase 1)],
+    // with a shared index counter starting at 0. Classic TXs get indexes 0..N-1,
+    // and Soroban TXs get indexes N..N+M-1 (see LedgerManagerImpl::applyTransactions).
+    let mut global_tx_offset: usize = classic_tx_count;
 
     // Pre-deduct all Soroban TX fees from the main delta BEFORE any cluster execution.
     // This matches stellar-core processFeesSeqNums which deducts ALL fees upfront.
