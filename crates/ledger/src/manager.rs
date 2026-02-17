@@ -2139,7 +2139,6 @@ impl<'a> LedgerCloseContext<'a> {
                 let soroban_result = execute_soroban_parallel_phase(
                     &self.snapshot,
                     &phase,
-                    classic_txs.len(),
                     &ledger_context,
                     &mut self.delta,
                     SorobanContext {

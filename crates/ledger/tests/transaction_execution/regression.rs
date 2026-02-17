@@ -956,7 +956,6 @@ async fn test_parallel_soroban_multi_cluster_execution() {
     let result = execute_soroban_parallel_phase(
             &snapshot,
             &phase,
-            0,          // classic_tx_count
             &context,
             &mut delta,
             SorobanContext {
@@ -1033,7 +1032,6 @@ async fn test_parallel_soroban_matches_sequential() {
     let par = execute_soroban_parallel_phase(
             &snapshot,
             &parallel_phase,
-            0,
             &context,
             &mut parallel_delta,
             SorobanContext {
@@ -1059,7 +1057,6 @@ async fn test_parallel_soroban_matches_sequential() {
     let seq = execute_soroban_parallel_phase(
             &snapshot,
             &sequential_phase,
-            0,
             &context,
             &mut sequential_delta,
             SorobanContext {
@@ -1142,7 +1139,6 @@ async fn test_parallel_soroban_deterministic() {
         let result = execute_soroban_parallel_phase(
                 &snapshot,
                 &phase,
-                0,
                 &context,
                 &mut delta,
                 SorobanContext {
@@ -1224,7 +1220,6 @@ async fn test_parallel_soroban_from_spawn_blocking() {
         let result = execute_soroban_parallel_phase(
                 &snapshot,
                 &phase,
-                0,
                 &context,
                 &mut delta,
                 SorobanContext {
@@ -1293,7 +1288,6 @@ async fn test_parallel_soroban_spawn_blocking_matches_worker() {
     let worker_result = execute_soroban_parallel_phase(
         &snapshot,
         &phase,
-        0,
         &context,
         &mut delta_worker,
         SorobanContext {
@@ -1334,7 +1328,6 @@ async fn test_parallel_soroban_spawn_blocking_matches_worker() {
             let result = execute_soroban_parallel_phase(
                 &snapshot2,
                 &phase2,
-                0,
                 &context,
                 &mut delta,
                 SorobanContext {
