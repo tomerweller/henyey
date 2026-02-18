@@ -42,7 +42,6 @@ stellar.lock
 
 # Source symlinks
 source
-.upstream-v25/
 upstream/
 rust_out
 testnet.lock

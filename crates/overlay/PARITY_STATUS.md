@@ -1,7 +1,7 @@
 # stellar-core Parity Status
 
 **Crate**: `henyey-overlay`
-**Upstream**: `.upstream-v25/src/overlay/`
+**Upstream**: `stellar-core/src/overlay/`
 **Overall Parity**: 88%
 **Last Updated**: 2026-02-17
 

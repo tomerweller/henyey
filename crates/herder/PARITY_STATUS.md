@@ -1,7 +1,7 @@
 # stellar-core Parity Status
 
 **Crate**: `henyey-herder`
-**Upstream**: `.upstream-v25/src/herder/`
+**Upstream**: `stellar-core/src/herder/`
 **Overall Parity**: 77%
 **Last Updated**: 2026-02-17
 

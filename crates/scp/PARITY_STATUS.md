@@ -1,7 +1,7 @@
 # stellar-core Parity Status
 
 **Crate**: `henyey-scp`
-**Upstream**: `.upstream-v25/src/scp/`
+**Upstream**: `stellar-core/src/scp/`
 **Overall Parity**: 100%
 **Last Updated**: 2026-02-17
 

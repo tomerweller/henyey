@@ -2,7 +2,7 @@
 //!
 //! This module provides builders for constructing transaction metadata during
 //! live transaction execution. It matches the stellar-core implementation
-//! in `.upstream-v25/src/transactions/TransactionMeta.cpp`.
+//! in `stellar-core/src/transactions/TransactionMeta.cpp`.
 //!
 //! # Overview
 //!

@@ -3,10 +3,10 @@
 //! This module provides the main entry point for executing Stellar operations.
 //! Each operation type has its own submodule with the specific execution logic.
 
+use henyey_common::{protocol_version_is_before, ProtocolVersion};
 use soroban_env_host24::xdr::ReadXdr as ReadXdrP24;
 use soroban_env_host_p24 as soroban_env_host24;
 use soroban_env_host_p25 as soroban_env_host25;
-use henyey_common::{protocol_version_is_before, ProtocolVersion};
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, AccountId,
     Asset, ContractEvent, DiagnosticEvent, ExtendFootprintTtlResult, Liabilities, Operation,
@@ -46,14 +46,20 @@ fn issuer_for_asset(asset: &Asset) -> Option<&AccountId> {
 
 fn account_liabilities(account: &AccountEntry) -> Liabilities {
     match &account.ext {
-        AccountEntryExt::V0 => Liabilities { buying: 0, selling: 0 },
+        AccountEntryExt::V0 => Liabilities {
+            buying: 0,
+            selling: 0,
+        },
         AccountEntryExt::V1(v1) => v1.liabilities.clone(),
     }
 }
 
 fn trustline_liabilities(trustline: &TrustLineEntry) -> Liabilities {
     match &trustline.ext {
-        TrustLineEntryExt::V0 => Liabilities { buying: 0, selling: 0 },
+        TrustLineEntryExt::V0 => Liabilities {
+            buying: 0,
+            selling: 0,
+        },
         TrustLineEntryExt::V1(v1) => v1.liabilities.clone(),
     }
 }
@@ -61,7 +67,10 @@ fn trustline_liabilities(trustline: &TrustLineEntry) -> Liabilities {
 fn ensure_account_liabilities(account: &mut AccountEntry) -> &mut Liabilities {
     if matches!(account.ext, AccountEntryExt::V0) {
         account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
-            liabilities: Liabilities { buying: 0, selling: 0 },
+            liabilities: Liabilities {
+                buying: 0,
+                selling: 0,
+            },
             ext: AccountEntryExtensionV1Ext::V0,
         });
     }
@@ -74,7 +83,10 @@ fn ensure_account_liabilities(account: &mut AccountEntry) -> &mut Liabilities {
 fn ensure_trustline_liabilities(trustline: &mut TrustLineEntry) -> &mut Liabilities {
     if matches!(trustline.ext, TrustLineEntryExt::V0) {
         trustline.ext = TrustLineEntryExt::V1(TrustLineEntryV1 {
-            liabilities: Liabilities { buying: 0, selling: 0 },
+            liabilities: Liabilities {
+                buying: 0,
+                selling: 0,
+            },
             ext: TrustLineEntryV1Ext::V0,
         });
     }
@@ -180,7 +192,7 @@ fn rent_classification(key: &stellar_xdr::curr::LedgerKey) -> (bool, bool) {
 /// - CreditAlphanum4: at least 1 non-zero alphanumeric char, zeros only trailing
 /// - CreditAlphanum12: at least 5 non-zero alphanumeric chars, zeros only trailing
 ///
-/// Reference: `.upstream-v25/src/util/types.cpp:146-211`
+/// Reference: `stellar-core/src/util/types.cpp:146-211`
 fn is_asset_valid(asset: &Asset) -> bool {
     match asset {
         Asset::Native => true,

@@ -1,7 +1,7 @@
 # Consensus Parity Report: `crates/bucket` vs stellar-core v25
 
 **Date:** 2026-02-17
-**Scope:** Full pseudocode comparison of `crates/bucket` (Henyey) against `.upstream-v25/src/bucket/` (stellar-core v25 / protocol 25)
+**Scope:** Full pseudocode comparison of `crates/bucket` (Henyey) against `stellar-core/src/bucket/` (stellar-core v25 / protocol 25)
 **Method:** Side-by-side pseudocode comparison of all 21 Rust source files against their C++ counterparts
 
 ---
@@ -15,7 +15,7 @@
 - **7 Medium** — will cause divergence in edge cases or affect operational fidelity
 - **18 Low/Verified** — minor differences unlikely to affect consensus, or verified correct
 
-All file references use the format `file:line` relative to `crates/bucket/src/` (Rust) and `.upstream-v25/src/bucket/` (C++).
+All file references use the format `file:line` relative to `crates/bucket/src/` (Rust) and `stellar-core/src/bucket/` (C++).
 
 ---
 
@@ -238,7 +238,7 @@ Features present in C++ but entirely absent in Rust, beyond the behavioral delta
 
 ## Methodology
 
-Each Rust source file in `crates/bucket/src/` was compared against its C++ counterpart(s) in `.upstream-v25/src/bucket/` using side-by-side pseudocode generation. The comparison focused on:
+Each Rust source file in `crates/bucket/src/` was compared against its C++ counterpart(s) in `stellar-core/src/bucket/` using side-by-side pseudocode generation. The comparison focused on:
 
 - Merge entry combination rules and precedence
 - Bucket hash computation

@@ -88,7 +88,7 @@ readability, or prevent bugs. High-impact first.
 
 ## Scope
 
-Ignore test code and `.upstream-v25/`.
+Ignore test code and `stellar-core/`.
 
 ## Output Format (review mode only)
 

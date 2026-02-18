@@ -1,7 +1,7 @@
 # stellar-core Parity Status
 
 **Crate**: `henyey-work`
-**Upstream**: `.upstream-v25/src/work/`
+**Upstream**: `stellar-core/src/work/`
 **Overall Parity**: 39%
 **Last Updated**: 2026-02-17
 

@@ -27,20 +27,20 @@ Use this table to find the upstream stellar-core directory for each crate.
 
 | Crate | Upstream Directory |
 |-------|--------------------|
-| `crates/tx` | `.upstream-v25/src/transactions/` |
-| `crates/scp` | `.upstream-v25/src/scp/` |
-| `crates/db` | `.upstream-v25/src/database/` |
-| `crates/common` | `.upstream-v25/src/util/` |
-| `crates/crypto` | `.upstream-v25/src/crypto/` |
-| `crates/ledger` | `.upstream-v25/src/ledger/` |
-| `crates/bucket` | `.upstream-v25/src/bucket/` |
-| `crates/herder` | `.upstream-v25/src/herder/` |
-| `crates/overlay` | `.upstream-v25/src/overlay/` |
-| `crates/history` | `.upstream-v25/src/history/` |
-| `crates/historywork` | `.upstream-v25/src/historywork/` |
-| `crates/work` | `.upstream-v25/src/work/` |
-| `crates/app` | `.upstream-v25/src/main/` |
-| `crates/henyey` | `.upstream-v25/src/main/` (CLI subset) |
+| `crates/tx` | `stellar-core/src/transactions/` |
+| `crates/scp` | `stellar-core/src/scp/` |
+| `crates/db` | `stellar-core/src/database/` |
+| `crates/common` | `stellar-core/src/util/` |
+| `crates/crypto` | `stellar-core/src/crypto/` |
+| `crates/ledger` | `stellar-core/src/ledger/` |
+| `crates/bucket` | `stellar-core/src/bucket/` |
+| `crates/herder` | `stellar-core/src/herder/` |
+| `crates/overlay` | `stellar-core/src/overlay/` |
+| `crates/history` | `stellar-core/src/history/` |
+| `crates/historywork` | `stellar-core/src/historywork/` |
+| `crates/work` | `stellar-core/src/work/` |
+| `crates/app` | `stellar-core/src/main/` |
+| `crates/henyey` | `stellar-core/src/main/` (CLI subset) |
 
 Some crates may reference additional upstream directories (e.g., `crates/db`
 also covers SQL operations in `src/overlay/PeerManager.*`,
@@ -99,7 +99,7 @@ Identify areas where the Rust crate has significantly fewer tests than upstream.
 - Read Rust source second — match against the upstream API.
 - Read `.cpp` files only when the header is ambiguous or you need to
   understand specific behavior to classify parity accurately.
-- Do NOT read `.upstream-v25/` test files exhaustively. Scan for `TEST_CASE`
+- Do NOT read `stellar-core/` test files exhaustively. Scan for `TEST_CASE`
   and `SECTION` counts to characterize coverage.
 
 ## Standardized Format
@@ -111,7 +111,7 @@ required unless marked optional.
 # stellar-core Parity Status
 
 **Crate**: `henyey-<name>`
-**Upstream**: `.upstream-v25/src/<dir>/`
+**Upstream**: `stellar-core/src/<dir>/`
 **Overall Parity**: N%
 **Last Updated**: YYYY-MM-DD
 

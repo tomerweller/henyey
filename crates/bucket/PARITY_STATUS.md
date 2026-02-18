@@ -1,7 +1,7 @@
 # stellar-core Parity Status
 
 **Crate**: `henyey-bucket`
-**Upstream**: `.upstream-v25/src/bucket/`
+**Upstream**: `stellar-core/src/bucket/`
 **Overall Parity**: 93%
 **Last Updated**: 2026-02-17
 

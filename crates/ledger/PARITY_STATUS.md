@@ -1,7 +1,7 @@
 # stellar-core Parity Status
 
 **Crate**: `henyey-ledger`
-**Upstream**: `.upstream-v25/src/ledger/`
+**Upstream**: `stellar-core/src/ledger/`
 **Overall Parity**: 64%
 **Last Updated**: 2026-02-17
 

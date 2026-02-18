@@ -4,7 +4,7 @@ SCP coordination and ledger-close orchestration for henyey.
 
 ## Overview
 
-The Herder is the central coordinator that bridges the overlay network and the ledger manager through SCP (Stellar Consensus Protocol). It orchestrates the entire flow from receiving transactions and SCP messages, through consensus, to triggering ledger close. This crate corresponds to stellar-core's `src/herder/` directory (upstream reference: `.upstream-v25/src/herder/`) and implements `HerderImpl`, `HerderSCPDriver`, `TransactionQueue`, `PendingEnvelopes`, `Upgrades`, and related components.
+The Herder is the central coordinator that bridges the overlay network and the ledger manager through SCP (Stellar Consensus Protocol). It orchestrates the entire flow from receiving transactions and SCP messages, through consensus, to triggering ledger close. This crate corresponds to stellar-core's `src/herder/` directory (upstream reference: `stellar-core/src/herder/`) and implements `HerderImpl`, `HerderSCPDriver`, `TransactionQueue`, `PendingEnvelopes`, `Upgrades`, and related components.
 
 The Herder operates in two modes: **Observer** (tracks consensus without voting) and **Validator** (proposes values and votes via SCP). It progresses through three states: Booting, Syncing, and Tracking.
 

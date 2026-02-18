@@ -1,7 +1,7 @@
 # Consensus Parity Report: `crates/ledger` vs stellar-core v25
 
 **Date:** 2026-02-17
-**Scope:** Full pseudocode comparison of `crates/ledger` (Henyey) against `.upstream-v25/src/ledger/` (stellar-core v25 / protocol 25)
+**Scope:** Full pseudocode comparison of `crates/ledger` (Henyey) against `stellar-core/src/ledger/` (stellar-core v25 / protocol 25)
 **Method:** Side-by-side pseudocode comparison of all 16 Rust source files against their C++ counterparts
 
 ---
@@ -15,7 +15,7 @@
 - **12 Medium** — will cause divergence in edge cases or affect result XDR fidelity
 - **37 Low** — minor differences unlikely to affect consensus
 
-All file references use the format `file:line` relative to `crates/ledger/src/` (Rust) and `.upstream-v25/src/ledger/` or `.upstream-v25/src/` (C++).
+All file references use the format `file:line` relative to `crates/ledger/src/` (Rust) and `stellar-core/src/ledger/` or `stellar-core/src/` (C++).
 
 ---
 
@@ -338,7 +338,7 @@ Features present in C++ but entirely absent in Rust, beyond the behavioral delta
 
 ## Methodology
 
-Each Rust source file in `crates/ledger/src/` was compared against its C++ counterpart(s) in `.upstream-v25/src/ledger/` using side-by-side pseudocode generation. The comparison focused on:
+Each Rust source file in `crates/ledger/src/` was compared against its C++ counterpart(s) in `stellar-core/src/ledger/` using side-by-side pseudocode generation. The comparison focused on:
 
 - Guard check ordering and conditions
 - State mutations and their sequencing

@@ -1,0 +1,3 @@
+[submodule "stellar-core"]
+	path = stellar-core
+	url = https://github.com/stellar/stellar-core

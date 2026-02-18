@@ -1,7 +1,7 @@
 # stellar-core Parity Status
 
 **Crate**: `henyey`
-**Upstream**: `.upstream-v25/src/main/` (CLI subset only)
+**Upstream**: `stellar-core/src/main/` (CLI subset only)
 **Overall Parity**: 43%
 **Last Updated**: 2026-02-17
 

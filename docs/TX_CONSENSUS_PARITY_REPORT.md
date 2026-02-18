@@ -1,7 +1,7 @@
 # Consensus Parity Report: `crates/tx` vs stellar-core v25
 
 **Date:** 2026-02-17
-**Scope:** Full pseudocode comparison of `crates/tx` (Henyey) against `.upstream-v25/src/transactions/` (stellar-core v25 / protocol 25)
+**Scope:** Full pseudocode comparison of `crates/tx` (Henyey) against `stellar-core/src/transactions/` (stellar-core v25 / protocol 25)
 **Method:** Side-by-side pseudocode comparison of all 24 Rust source files against their C++ counterparts
 
 ---
@@ -15,7 +15,7 @@
 - **9 Medium** — will cause divergence in edge cases or affect result XDR fidelity
 - **5 Low** — minor result code differences unlikely to affect consensus
 
-All file references use the format `file:line` relative to `crates/tx/src/` (Rust) and `.upstream-v25/src/transactions/` (C++).
+All file references use the format `file:line` relative to `crates/tx/src/` (Rust) and `stellar-core/src/transactions/` (C++).
 
 ---
 
@@ -275,7 +275,7 @@ Features present in C++ but entirely absent in Rust, beyond the behavioral delta
 
 ## Methodology
 
-Each Rust source file in `crates/tx/src/` was compared against its C++ counterpart(s) in `.upstream-v25/src/transactions/` using side-by-side pseudocode generation. The comparison focused on:
+Each Rust source file in `crates/tx/src/` was compared against its C++ counterpart(s) in `stellar-core/src/transactions/` using side-by-side pseudocode generation. The comparison focused on:
 
 - Guard check ordering and conditions
 - State mutations and their sequencing

@@ -4,7 +4,7 @@ Rust implementation of the Stellar Consensus Protocol (SCP).
 
 ## Overview
 
-SCP is a federated Byzantine agreement protocol that enables nodes to reach consensus without requiring a closed membership or central authority. This crate provides a complete, deterministic implementation of SCP suitable for use in Stellar network nodes. It corresponds to stellar-core's `src/scp/` (upstream reference at `.upstream-v25/src/scp/`) and is the consensus engine used by `henyey-herder` to agree on transaction sets each ledger.
+SCP is a federated Byzantine agreement protocol that enables nodes to reach consensus without requiring a closed membership or central authority. This crate provides a complete, deterministic implementation of SCP suitable for use in Stellar network nodes. It corresponds to stellar-core's `src/scp/` (upstream reference at `stellar-core/src/scp/`) and is the consensus engine used by `henyey-herder` to agree on transaction sets each ledger.
 
 SCP operates in two phases per slot: **nomination** (propose and vote on candidate values) followed by the **ballot protocol** (commit to a single value through prepare, confirm, and externalize stages).
 

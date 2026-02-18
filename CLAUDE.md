@@ -26,7 +26,7 @@
 
 - Any observable behavior must be deterministic and identical to stellar-core (v25.x / p25).
 - Align behavior by comparing against stellar-core test vectors and edge cases; do not introduce new semantics.
-- For protocol or consensus behavior, consult `.upstream-v25/` to mirror upstream decisions and sequencing.
+- For protocol or consensus behavior, consult `stellar-core/` to mirror upstream decisions and sequencing.
 - Update the relevant crate's `PARITY_STATUS.md` and the parity column in the main `README.md` Crate Overview when implementing or removing functionality that affects stellar-core parity.
 
 ## Testing Guidelines
@@ -69,4 +69,4 @@
 
 - SQLite is the only supported database backend.
 - Protocol support is 24+ only; do not add legacy protocol behavior.
-- The stellar-core v25 upstream is available locally under `.upstream-v25/` for parity checks.
+- The stellar-core v25 upstream is available as a git submodule at `stellar-core/` (pinned to v25.0.1) for parity checks.

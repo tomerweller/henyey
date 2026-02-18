@@ -116,7 +116,7 @@ Only include if `$TARGET/PARITY_STATUS.md` exists.
 - Read all source files before writing. Understand the crate before
   documenting it.
 - Be precise about types and APIs — verify names against the actual code.
-- Do not document test code or `.upstream-v25/`.
+- Do not document test code or `stellar-core/`.
 - When updating an existing README, diff your changes mentally against
   what's there. Preserve accurate content, fix stale content, add missing
   sections.

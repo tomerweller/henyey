@@ -1,7 +1,7 @@
 # stellar-core Parity Status
 
 **Crate**: `henyey-crypto`
-**Upstream**: `.upstream-v25/src/crypto/`
+**Upstream**: `stellar-core/src/crypto/`
 **Overall Parity**: 79%
 **Last Updated**: 2026-02-13
 

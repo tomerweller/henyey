@@ -1,7 +1,7 @@
 # stellar-core Parity Status
 
 **Crate**: `henyey-historywork`
-**Upstream**: `.upstream-v25/src/historywork/`
+**Upstream**: `stellar-core/src/historywork/`
 **Overall Parity**: 56%
 **Last Updated**: 2026-02-13
 

@@ -1,6 +1,6 @@
 # Bucket Crate Test Parity Plan
 
-stellar-core: `.upstream-v25/src/bucket/test/` (5 files, ~42 top-level test cases, ~42 sub-sections)
+stellar-core: `stellar-core/src/bucket/test/` (5 files, ~42 top-level test cases, ~42 sub-sections)
 Rust: `crates/henyey-bucket/` (286 tests across 21 modules + 3 integration test files)
 
 ## Architecture Mapping
