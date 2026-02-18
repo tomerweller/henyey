@@ -235,4 +235,3 @@ impl OfferIndex {
         self.order_books.len()
     }
 }
-

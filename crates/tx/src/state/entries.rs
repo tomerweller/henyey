@@ -165,7 +165,8 @@ impl LedgerStateManager {
                 // Add to offer index for efficient best-offer lookups
                 self.offer_index.add_offer(&offer);
                 self.aa_index_insert(&offer);
-                self.offers.insert(OfferKey::new(seller_key, offer.offer_id), offer);
+                self.offers
+                    .insert(OfferKey::new(seller_key, offer.offer_id), offer);
                 self.record_entry_metadata(ledger_key, last_modified, has_sponsorship_ext, sponsor);
             }
             LedgerEntryData::Data(data) => {
@@ -842,7 +843,8 @@ impl LedgerStateManager {
     /// Check if an offer was already loaded during this transaction.
     pub fn is_offer_tracked(&self, seller_id: &AccountId, offer_id: i64) -> bool {
         let seller_key = account_id_to_bytes(seller_id);
-        self.offer_snapshots.contains_key(&OfferKey::new(seller_key, offer_id))
+        self.offer_snapshots
+            .contains_key(&OfferKey::new(seller_key, offer_id))
     }
 
     /// Get all offers for an account that buy or sell a specific asset.
@@ -2073,7 +2075,10 @@ impl LedgerStateManager {
         self.build_ledger_entry(&key, LedgerEntryData::Ttl(entry.clone()))
     }
 
-    pub(super) fn claimable_balance_to_ledger_entry(&self, entry: &ClaimableBalanceEntry) -> LedgerEntry {
+    pub(super) fn claimable_balance_to_ledger_entry(
+        &self,
+        entry: &ClaimableBalanceEntry,
+    ) -> LedgerEntry {
         let key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
             balance_id: entry.balance_id.clone(),
         });

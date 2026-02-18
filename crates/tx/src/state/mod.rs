@@ -70,10 +70,8 @@ fn rollback_new_snapshots<K, V>(
 }
 
 /// Restore pre-savepoint values for entries modified before the savepoint.
-fn apply_pre_values<K, V>(
-    live_map: &mut HashMap<K, V>,
-    pre_values: Vec<(K, Option<V>)>,
-) where
+fn apply_pre_values<K, V>(live_map: &mut HashMap<K, V>, pre_values: Vec<(K, Option<V>)>)
+where
     K: Eq + std::hash::Hash,
 {
     for (key, value) in pre_values {
@@ -987,7 +985,8 @@ impl LedgerStateManager {
                 let account_key = account_id_to_bytes(&k.account_id);
                 self.account_snapshots
                     .get(&account_key)
-                    .cloned().flatten()
+                    .cloned()
+                    .flatten()
                     .map(|entry| LedgerEntry {
                         last_modified_ledger_seq: last_modified,
                         data: LedgerEntryData::Account(entry),
@@ -999,7 +998,8 @@ impl LedgerStateManager {
                 let asset_key = AssetKey::from_trustline_asset(&k.asset);
                 self.trustline_snapshots
                     .get(&(account_key, asset_key))
-                    .cloned().flatten()
+                    .cloned()
+                    .flatten()
                     .map(|entry| LedgerEntry {
                         last_modified_ledger_seq: last_modified,
                         data: LedgerEntryData::Trustline(entry),
@@ -1010,7 +1010,8 @@ impl LedgerStateManager {
                 let seller_key = account_id_to_bytes(&k.seller_id);
                 self.offer_snapshots
                     .get(&OfferKey::new(seller_key, k.offer_id))
-                    .cloned().flatten()
+                    .cloned()
+                    .flatten()
                     .map(|entry| LedgerEntry {
                         last_modified_ledger_seq: last_modified,
                         data: LedgerEntryData::Offer(entry),
@@ -1022,7 +1023,8 @@ impl LedgerStateManager {
                 let name = data_name_to_string(&k.data_name);
                 self.data_snapshots
                     .get(&(account_key, name))
-                    .cloned().flatten()
+                    .cloned()
+                    .flatten()
                     .map(|entry| LedgerEntry {
                         last_modified_ledger_seq: last_modified,
                         data: LedgerEntryData::Data(entry),
@@ -1034,7 +1036,8 @@ impl LedgerStateManager {
                     ContractDataKey::new(k.contract.clone(), k.key.clone(), k.durability);
                 self.contract_data_snapshots
                     .get(&lookup_key)
-                    .cloned().flatten()
+                    .cloned()
+                    .flatten()
                     .map(|entry| LedgerEntry {
                         last_modified_ledger_seq: last_modified,
                         data: LedgerEntryData::ContractData(entry),
@@ -1044,7 +1047,8 @@ impl LedgerStateManager {
             LedgerKey::ContractCode(k) => self
                 .contract_code_snapshots
                 .get(&k.hash.0)
-                .cloned().flatten()
+                .cloned()
+                .flatten()
                 .map(|entry| LedgerEntry {
                     last_modified_ledger_seq: last_modified,
                     data: LedgerEntryData::ContractCode(entry),
@@ -1053,7 +1057,8 @@ impl LedgerStateManager {
             LedgerKey::Ttl(k) => self
                 .ttl_snapshots
                 .get(&k.key_hash.0)
-                .cloned().flatten()
+                .cloned()
+                .flatten()
                 .map(|entry| LedgerEntry {
                     last_modified_ledger_seq: last_modified,
                     data: LedgerEntryData::Ttl(entry),
@@ -1063,7 +1068,8 @@ impl LedgerStateManager {
                 let key_bytes = claimable_balance_id_to_bytes(&k.balance_id);
                 self.claimable_balance_snapshots
                     .get(&key_bytes)
-                    .cloned().flatten()
+                    .cloned()
+                    .flatten()
                     .map(|entry| LedgerEntry {
                         last_modified_ledger_seq: last_modified,
                         data: LedgerEntryData::ClaimableBalance(entry),
@@ -1074,7 +1080,8 @@ impl LedgerStateManager {
                 let key_bytes = pool_id_to_bytes(&k.liquidity_pool_id);
                 self.liquidity_pool_snapshots
                     .get(&key_bytes)
-                    .cloned().flatten()
+                    .cloned()
+                    .flatten()
                     .map(|entry| LedgerEntry {
                         last_modified_ledger_seq: last_modified,
                         data: LedgerEntryData::LiquidityPool(entry),
@@ -1257,14 +1264,46 @@ impl LedgerStateManager {
 
         // Offers require special handling for aa_index and offer_index
         self.rollback_offer_snapshots(&sp);
-        rollback_new_snapshots(&mut self.accounts, &self.account_snapshots, &sp.account_snapshots);
-        rollback_new_snapshots(&mut self.trustlines, &self.trustline_snapshots, &sp.trustline_snapshots);
-        rollback_new_snapshots(&mut self.data_entries, &self.data_snapshots, &sp.data_snapshots);
-        rollback_new_snapshots(&mut self.contract_data, &self.contract_data_snapshots, &sp.contract_data_snapshots);
-        rollback_new_snapshots(&mut self.contract_code, &self.contract_code_snapshots, &sp.contract_code_snapshots);
-        rollback_new_snapshots(&mut self.ttl_entries, &self.ttl_snapshots, &sp.ttl_snapshots);
-        rollback_new_snapshots(&mut self.claimable_balances, &self.claimable_balance_snapshots, &sp.claimable_balance_snapshots);
-        rollback_new_snapshots(&mut self.liquidity_pools, &self.liquidity_pool_snapshots, &sp.liquidity_pool_snapshots);
+        rollback_new_snapshots(
+            &mut self.accounts,
+            &self.account_snapshots,
+            &sp.account_snapshots,
+        );
+        rollback_new_snapshots(
+            &mut self.trustlines,
+            &self.trustline_snapshots,
+            &sp.trustline_snapshots,
+        );
+        rollback_new_snapshots(
+            &mut self.data_entries,
+            &self.data_snapshots,
+            &sp.data_snapshots,
+        );
+        rollback_new_snapshots(
+            &mut self.contract_data,
+            &self.contract_data_snapshots,
+            &sp.contract_data_snapshots,
+        );
+        rollback_new_snapshots(
+            &mut self.contract_code,
+            &self.contract_code_snapshots,
+            &sp.contract_code_snapshots,
+        );
+        rollback_new_snapshots(
+            &mut self.ttl_entries,
+            &self.ttl_snapshots,
+            &sp.ttl_snapshots,
+        );
+        rollback_new_snapshots(
+            &mut self.claimable_balances,
+            &self.claimable_balance_snapshots,
+            &sp.claimable_balance_snapshots,
+        );
+        rollback_new_snapshots(
+            &mut self.liquidity_pools,
+            &self.liquidity_pool_snapshots,
+            &sp.liquidity_pool_snapshots,
+        );
 
         // Phase 2: Restore pre-savepoint values for entries already in snapshot maps.
         // These were modified before the savepoint AND potentially re-modified since.
@@ -1275,7 +1314,10 @@ impl LedgerStateManager {
         apply_pre_values(&mut self.contract_data, sp.contract_data_pre_values);
         apply_pre_values(&mut self.contract_code, sp.contract_code_pre_values);
         apply_pre_values(&mut self.ttl_entries, sp.ttl_pre_values);
-        apply_pre_values(&mut self.claimable_balances, sp.claimable_balance_pre_values);
+        apply_pre_values(
+            &mut self.claimable_balances,
+            sp.claimable_balance_pre_values,
+        );
         apply_pre_values(&mut self.liquidity_pools, sp.liquidity_pool_pre_values);
 
         // Phase 3: Restore snapshot maps and created sets
@@ -1319,12 +1361,26 @@ impl LedgerStateManager {
             .truncate(sp.modified_liquidity_pools_len);
 
         // Phase 6: Restore entry metadata
-        rollback_new_snapshots(&mut self.entry_last_modified, &self.entry_last_modified_snapshots, &sp.entry_last_modified_snapshots);
-        apply_pre_values(&mut self.entry_last_modified, sp.entry_last_modified_pre_values);
+        rollback_new_snapshots(
+            &mut self.entry_last_modified,
+            &self.entry_last_modified_snapshots,
+            &sp.entry_last_modified_snapshots,
+        );
+        apply_pre_values(
+            &mut self.entry_last_modified,
+            sp.entry_last_modified_pre_values,
+        );
         self.entry_last_modified_snapshots = sp.entry_last_modified_snapshots;
 
-        rollback_new_snapshots(&mut self.entry_sponsorships, &self.entry_sponsorship_snapshots, &sp.entry_sponsorship_snapshots);
-        apply_pre_values(&mut self.entry_sponsorships, sp.entry_sponsorship_pre_values);
+        rollback_new_snapshots(
+            &mut self.entry_sponsorships,
+            &self.entry_sponsorship_snapshots,
+            &sp.entry_sponsorship_snapshots,
+        );
+        apply_pre_values(
+            &mut self.entry_sponsorships,
+            sp.entry_sponsorship_pre_values,
+        );
         self.entry_sponsorship_snapshots = sp.entry_sponsorship_snapshots;
 
         // entry_sponsorship_ext uses HashSet + bool (not Option<V>), handle inline
@@ -1425,8 +1481,16 @@ impl LedgerStateManager {
             self.id_pool = snapshot;
         }
 
-        rollback_entries(&mut self.accounts, &mut self.account_snapshots, &mut self.created_accounts);
-        rollback_entries(&mut self.trustlines, &mut self.trustline_snapshots, &mut self.created_trustlines);
+        rollback_entries(
+            &mut self.accounts,
+            &mut self.account_snapshots,
+            &mut self.created_accounts,
+        );
+        rollback_entries(
+            &mut self.trustlines,
+            &mut self.trustline_snapshots,
+            &mut self.created_trustlines,
+        );
 
         // Restore offer snapshots and incrementally update the index.
         // Offers need special handling for aa_index and offer_index.
@@ -1451,10 +1515,26 @@ impl LedgerStateManager {
         }
         self.created_offers.clear();
 
-        rollback_entries(&mut self.data_entries, &mut self.data_snapshots, &mut self.created_data);
-        rollback_entries(&mut self.contract_data, &mut self.contract_data_snapshots, &mut self.created_contract_data);
-        rollback_entries(&mut self.contract_code, &mut self.contract_code_snapshots, &mut self.created_contract_code);
-        rollback_entries(&mut self.ttl_entries, &mut self.ttl_snapshots, &mut self.created_ttl);
+        rollback_entries(
+            &mut self.data_entries,
+            &mut self.data_snapshots,
+            &mut self.created_data,
+        );
+        rollback_entries(
+            &mut self.contract_data,
+            &mut self.contract_data_snapshots,
+            &mut self.created_contract_data,
+        );
+        rollback_entries(
+            &mut self.contract_code,
+            &mut self.contract_code_snapshots,
+            &mut self.created_contract_code,
+        );
+        rollback_entries(
+            &mut self.ttl_entries,
+            &mut self.ttl_snapshots,
+            &mut self.created_ttl,
+        );
 
         // Restore deferred RO TTL bumps to pre-transaction state.
         // In stellar-core, commitChangesFromSuccessfulOp is only called for
@@ -1466,8 +1546,16 @@ impl LedgerStateManager {
             self.deferred_ro_ttl_bumps.clear();
         }
 
-        rollback_entries(&mut self.claimable_balances, &mut self.claimable_balance_snapshots, &mut self.created_claimable_balances);
-        rollback_entries(&mut self.liquidity_pools, &mut self.liquidity_pool_snapshots, &mut self.created_liquidity_pools);
+        rollback_entries(
+            &mut self.claimable_balances,
+            &mut self.claimable_balance_snapshots,
+            &mut self.created_claimable_balances,
+        );
+        rollback_entries(
+            &mut self.liquidity_pools,
+            &mut self.liquidity_pool_snapshots,
+            &mut self.created_liquidity_pools,
+        );
 
         // Restore entry sponsorship snapshots
         for (key, snapshot) in self.entry_sponsorship_snapshots.drain() {
@@ -1881,10 +1969,16 @@ impl LedgerStateManager {
         &mut self,
         ledger_key: LedgerKey,
         fallback_pre: LedgerEntry,
-        post_state: LedgerEntry,
+        mut post_state: LedgerEntry,
     ) {
         let pre_state = self.resolve_pre_state(&ledger_key, fallback_pre);
         self.set_last_modified_key(ledger_key, self.ledger_seq);
+        // Stamp post_state with the current ledger sequence, matching
+        // stellar-core's maybeUpdateLastModified which sets
+        // lastModifiedLedgerSeq on every entry committed via LedgerTxn.
+        // The post_state was built before set_last_modified_key updated
+        // the entry_last_modified map, so it still carries the old value.
+        post_state.last_modified_ledger_seq = self.ledger_seq;
         self.delta.record_update(pre_state, post_state);
     }
 }
@@ -3821,7 +3915,11 @@ mod tests {
 
         // Bump is deferred — ttl_entries still has old value
         assert_eq!(
-            manager.ttl_entries.get(&key_hash.0).unwrap().live_until_ledger_seq,
+            manager
+                .ttl_entries
+                .get(&key_hash.0)
+                .unwrap()
+                .live_until_ledger_seq,
             100_000,
             "TTL entry must not be updated yet (deferred)"
         );
@@ -3853,7 +3951,9 @@ mod tests {
             use sha2::{Digest, Sha256};
             use stellar_xdr::curr::WriteXdr;
             let mut hasher = Sha256::new();
-            let bytes = contract_key.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
+            let bytes = contract_key
+                .to_xdr(stellar_xdr::curr::Limits::none())
+                .unwrap();
             hasher.update(&bytes);
             let result: [u8; 32] = hasher.finalize().into();
             result
@@ -3873,7 +3973,11 @@ mod tests {
 
         // After flush: TTL entry should be updated to the bumped value
         assert_eq!(
-            manager.ttl_entries.get(&actual_hash).unwrap().live_until_ledger_seq,
+            manager
+                .ttl_entries
+                .get(&actual_hash)
+                .unwrap()
+                .live_until_ledger_seq,
             800_000,
             "TTL must be flushed to bumped value for write footprint key"
         );
@@ -3902,9 +4006,9 @@ mod tests {
 
         // Flush with a non-Soroban key (Account)
         let account_key = LedgerKey::Account(LedgerKeyAccount {
-            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(
-                stellar_xdr::curr::Uint256([1; 32]),
-            )),
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+                [1; 32],
+            ))),
         });
         manager.flush_ro_ttl_bumps_for_write_footprint(&[account_key]);
 
@@ -3916,9 +4020,121 @@ mod tests {
         );
         // TTL entry should be unchanged
         assert_eq!(
-            manager.ttl_entries.get(&key_hash).unwrap().live_until_ledger_seq,
+            manager
+                .ttl_entries
+                .get(&key_hash)
+                .unwrap()
+                .live_until_ledger_seq,
             100_000,
             "TTL must remain unchanged for non-Soroban keys"
+        );
+    }
+
+    /// Regression test: flush_modified_entries must stamp
+    /// last_modified_ledger_seq on the post-state LedgerEntry recorded into
+    /// the delta.
+    ///
+    /// In stellar-core, LedgerTxn::Impl::commitChild calls
+    /// maybeUpdateLastModified which sets lastModifiedLedgerSeq = ledgerSeq on
+    /// every entry in mEntry (i.e. loaded with record).  Our
+    /// record_flush_update was building the post_state LedgerEntry *before*
+    /// calling set_last_modified_key, so the delta entry carried the stale
+    /// (original) LML.  This caused bucket-list-hash mismatches starting at
+    /// mainnet L59658048 where trustlines were touched via get_trustline_mut
+    /// during offer crossing but their data was unchanged.
+    #[test]
+    fn test_flush_modified_entries_stamps_current_ledger_on_post_state() {
+        let ledger_seq = 500;
+        let mut manager = LedgerStateManager::new(5_000_000, ledger_seq);
+
+        // Create an account (committed at ledger_seq)
+        let account = create_test_account_entry(1);
+        let account_id = account.account_id.clone();
+        manager.create_account(account);
+        manager.commit();
+
+        // Create a trustline (committed at ledger_seq)
+        let trustline = TrustLineEntry {
+            account_id: create_test_account_id(1),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+                issuer: create_test_account_id(99),
+            }),
+            balance: 1000,
+            limit: 10000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        let usd_asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+            issuer: create_test_account_id(99),
+        });
+        manager.create_trustline(trustline);
+        manager.commit();
+
+        // Advance to a new ledger
+        let new_ledger = 600;
+        manager.set_ledger_seq(new_ledger);
+        manager.delta = LedgerDelta::new(new_ledger);
+
+        // Simulate beginning a transaction: snapshot the delta
+        manager.snapshot_delta();
+
+        // Begin an operation snapshot
+        manager.begin_op_snapshot();
+
+        // Touch the trustline via get_trustline_mut (no data change)
+        // This is what happens during offer crossing: the trustline is loaded
+        // with record (get_trustline_mut) but its balance doesn't change.
+        let tl = manager.get_trustline_mut(&account_id, &usd_asset).unwrap();
+        let original_balance = tl.balance;
+        // Don't change the balance — the entry is touched but not modified
+
+        // Also touch the account via get_account_mut (no data change)
+        let acc = manager.get_account_mut(&account_id).unwrap();
+        let _original_acc_balance = acc.balance;
+        // Don't change the balance
+
+        // Flush modified entries (this is where the bug was)
+        manager.flush_modified_entries();
+
+        // End op snapshot
+        manager.end_op_snapshot();
+
+        // Verify the delta contains the updated entries with current ledger LML
+        // Find the trustline in the delta's updated entries
+        let updated = manager.delta().updated_entries();
+        let tl_post = updated
+            .iter()
+            .find(|e| matches!(&e.data, LedgerEntryData::Trustline(tl) if tl.account_id == account_id))
+            .expect("trustline should be in delta updated entries");
+        assert_eq!(
+            tl_post.last_modified_ledger_seq, new_ledger,
+            "Trustline post-state LML must be stamped to current ledger ({}), \
+             not the original ledger when the entry was created. \
+             Before the fix, it would be {} (the creation ledger).",
+            new_ledger, ledger_seq
+        );
+
+        // Verify data was NOT changed
+        if let LedgerEntryData::Trustline(tl_data) = &tl_post.data {
+            assert_eq!(
+                tl_data.balance, original_balance,
+                "Trustline balance should be unchanged"
+            );
+        } else {
+            panic!("Expected trustline entry in delta");
+        }
+
+        // Verify account too
+        let acc_post = updated
+            .iter()
+            .find(|e| matches!(&e.data, LedgerEntryData::Account(a) if a.account_id == account_id))
+            .expect("account should be in delta updated entries");
+        assert_eq!(
+            acc_post.last_modified_ledger_seq, new_ledger,
+            "Account post-state LML must be stamped to current ledger ({})",
+            new_ledger
         );
     }
 }
