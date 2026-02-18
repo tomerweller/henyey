@@ -27,7 +27,13 @@ decision points.
 
 ### <function_name>
 
-  (pseudocode)
+"<source comment about purpose>" (if any)
+
+  ```
+  (pseudocode body)
+  ```
+
+  **Calls**: [fn1](#fn1) | [fn2](OtherFile.pseudocode.md#fn2)
 
 ### Helper: <name>
   (shared helpers referenced by main functions)
@@ -44,7 +50,43 @@ decision points.
 The pseudocode must be **language-agnostic** — no Rust-isms (`Result`, `match`,
 `Option`, `unwrap`), no C++-isms (`shared_ptr`, `throw`, `LedgerTxn` nesting).
 
-Use these conventions consistently:
+### Rendering format
+
+Pseudocode bodies live in **fenced code blocks** for clean indentation and
+readability. Function references are placed in a rendered **Calls** line
+immediately after each code block, where markdown links are clickable.
+
+Each function follows this pattern:
+
+````
+### function_name
+
+"source comment about purpose/invariants" (if any)
+
+```
+GUARD !isAssetValid(sheep)  → MALFORMED
+
+@version(≥10):
+  availableLimit = wheatLine.getMaxAmountReceive()
+  GUARD availableLimit < getOfferBuyingLiabilities()  → LINE_FULL
+
+@version(<10):
+  getExchangeParametersBeforeV10(maxSheepSend, maxWheatReceive)
+```
+
+**Calls**: [buildOffer](#helper-buildoffer) | [canBuyAtMost](#canbuyatmost) | [canCreateEntryWithoutSponsorship](SponsorshipUtils.pseudocode.md)
+````
+
+The **Calls** line:
+- Listed after the code block, outside it, so links are rendered and clickable
+- Uses `|` as separator between function links
+- Same-file: `[function_name](#heading-anchor)`
+- Cross-file: `[function_name](File.pseudocode.md#heading-anchor)`
+- Not yet generated: `[function_name](File.pseudocode.md)` (file-level placeholder)
+- Omit the **Calls** line if the function makes no calls to other pseudocode
+  functions (e.g., pure leaf helpers)
+
+Use these conventions consistently within the code block:
 
 ### Guard checks
 ```
@@ -75,6 +117,8 @@ while <condition>:
 result = function_name(args)
 → delegate_to(other_function, args)
 ```
+Within the code block, write function names as plain text (no links). The
+rendered **Calls** line after the code block provides the navigable links.
 
 ### Annotations
 ```
@@ -129,16 +173,6 @@ Import comments that convey:
 
 Do NOT import mechanical comments that merely restate the code, or comments
 about logging, debugging, or build configuration.
-
-### Cross-file references
-```
-REF: <file>::<function_name>
-```
-Add after any function call whose implementation lives in a different source
-file. This creates a navigable web across pseudocode files:
-```
-result = apply_transaction(tx)    REF: TransactionFrame::apply
-```
 
 ### Named constants
 ```
@@ -196,7 +230,8 @@ Place this before the functions that implement the state machine logic.
   (e.g., "Load entries").
 - If a function is called from multiple places, show it once as a
   `### Helper:` section and reference it from the phases.
-- Place `REF:` annotations inline after the call they refer to, not on a
-  separate line.
+- Place the **Calls** line immediately after the closing ` ``` ` of each
+  function's code block. List every function that has (or will have) its
+  own pseudocode heading, both same-file and cross-file.
 - Use source comments sparingly — only import comments that add understanding
   beyond what the pseudocode already expresses.
