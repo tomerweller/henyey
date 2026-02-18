@@ -33,7 +33,7 @@ decision points.
   (pseudocode body)
   ```
 
-  **Calls**: [fn1](#fn1) | [fn2](OtherFile.pseudocode.md#fn2)
+  **Calls**: [fn1](#fn1) | [fn2](OtherFile.pc.md#fn2)
 
 ### Helper: <name>
   (shared helpers referenced by main functions)
@@ -74,15 +74,15 @@ GUARD !isAssetValid(sheep)  → MALFORMED
   getExchangeParametersBeforeV10(maxSheepSend, maxWheatReceive)
 ```
 
-**Calls**: [buildOffer](#helper-buildoffer) | [canBuyAtMost](#canbuyatmost) | [canCreateEntryWithoutSponsorship](SponsorshipUtils.pseudocode.md)
+**Calls**: [buildOffer](#helper-buildoffer) | [canBuyAtMost](#canbuyatmost) | [canCreateEntryWithoutSponsorship](SponsorshipUtils.pc.md)
 ````
 
 The **Calls** line:
 - Listed after the code block, outside it, so links are rendered and clickable
 - Uses `|` as separator between function links
 - Same-file: `[function_name](#heading-anchor)`
-- Cross-file: `[function_name](File.pseudocode.md#heading-anchor)`
-- Not yet generated: `[function_name](File.pseudocode.md)` (file-level placeholder)
+- Cross-file: `[function_name](File.pc.md#heading-anchor)`
+- Not yet generated: `[function_name](File.pc.md)` (file-level placeholder)
 - Omit the **Calls** line if the function makes no calls to other pseudocode
   functions (e.g., pure leaf helpers)
 
