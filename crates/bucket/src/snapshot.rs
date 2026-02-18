@@ -43,8 +43,8 @@
 use crate::{
     bucket_list::BUCKET_LIST_LEVELS,
     entry::{
-        get_ttl_key, is_soroban_entry, is_temporary_entry, is_ttl_expired, ledger_entry_to_key,
-        ledger_key_type,
+        get_ttl_key, is_soroban_entry, is_temporary_entry, is_ttl_expired,
+        ledger_entry_data_type, ledger_entry_to_key, ledger_key_type,
     },
     eviction::{
         update_starting_eviction_iterator, EvictionCandidate, EvictionIterator, EvictionResult,
@@ -842,7 +842,7 @@ impl SearchableBucketListSnapshot {
                         // Check entry type
                         let matches_type = match &bucket_entry {
                             BucketEntry::Live(e) | BucketEntry::Init(e) => {
-                                ledger_entry_type(&e.data) == entry_type
+                                ledger_entry_data_type(&e.data) == entry_type
                             }
                             BucketEntry::Dead(k) => ledger_key_type(k) == entry_type,
                             BucketEntry::Metadata(_) => false,
@@ -1088,24 +1088,6 @@ pub struct InflationWinner {
     /// Total votes (sum of balances of accounts voting for this destination).
     pub votes: i64,
 }
-
-/// Returns the ledger entry type for a given entry data.
-fn ledger_entry_type(data: &LedgerEntryData) -> LedgerEntryType {
-    match data {
-        LedgerEntryData::Account(_) => LedgerEntryType::Account,
-        LedgerEntryData::Trustline(_) => LedgerEntryType::Trustline,
-        LedgerEntryData::Offer(_) => LedgerEntryType::Offer,
-        LedgerEntryData::Data(_) => LedgerEntryType::Data,
-        LedgerEntryData::ClaimableBalance(_) => LedgerEntryType::ClaimableBalance,
-        LedgerEntryData::LiquidityPool(_) => LedgerEntryType::LiquidityPool,
-        LedgerEntryData::ContractData(_) => LedgerEntryType::ContractData,
-        LedgerEntryData::ContractCode(_) => LedgerEntryType::ContractCode,
-        LedgerEntryData::ConfigSetting(_) => LedgerEntryType::ConfigSetting,
-        LedgerEntryData::Ttl(_) => LedgerEntryType::Ttl,
-    }
-}
-
-// ledger_key_type is imported from crate::entry
 
 /// A searchable wrapper around a hot archive bucket list snapshot.
 pub struct SearchableHotArchiveBucketListSnapshot {

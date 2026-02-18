@@ -26,7 +26,7 @@ use stellar_xdr::curr::{
     Limits, PoolId, TrustLineAsset, WriteXdr,
 };
 
-use crate::entry::ledger_key_type;
+use crate::entry::{ledger_entry_data_type, ledger_key_type};
 
 use henyey_common::BucketListDbConfig;
 
@@ -111,13 +111,13 @@ impl BucketEntryCounters {
 
         match entry {
             BucketEntry::Live(e) => {
-                let entry_type = ledger_entry_type(&e.data);
+                let entry_type = ledger_entry_data_type(&e.data);
                 *self.live_entries.entry(entry_type).or_insert(0) += 1;
                 *self.entry_type_sizes.entry(entry_type).or_insert(0) += xdr_size;
                 self.record_soroban_durability(e);
             }
             BucketEntry::Init(e) => {
-                let entry_type = ledger_entry_type(&e.data);
+                let entry_type = ledger_entry_data_type(&e.data);
                 *self.init_entries.entry(entry_type).or_insert(0) += 1;
                 *self.entry_type_sizes.entry(entry_type).or_insert(0) += xdr_size;
                 self.record_soroban_durability(e);
@@ -1010,28 +1010,6 @@ impl LiveBucketIndex {
         }
     }
 }
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/// Returns the ledger entry type for a given entry data.
-fn ledger_entry_type(data: &LedgerEntryData) -> LedgerEntryType {
-    match data {
-        LedgerEntryData::Account(_) => LedgerEntryType::Account,
-        LedgerEntryData::Trustline(_) => LedgerEntryType::Trustline,
-        LedgerEntryData::Offer(_) => LedgerEntryType::Offer,
-        LedgerEntryData::Data(_) => LedgerEntryType::Data,
-        LedgerEntryData::ClaimableBalance(_) => LedgerEntryType::ClaimableBalance,
-        LedgerEntryData::LiquidityPool(_) => LedgerEntryType::LiquidityPool,
-        LedgerEntryData::ContractData(_) => LedgerEntryType::ContractData,
-        LedgerEntryData::ContractCode(_) => LedgerEntryType::ContractCode,
-        LedgerEntryData::ConfigSetting(_) => LedgerEntryType::ConfigSetting,
-        LedgerEntryData::Ttl(_) => LedgerEntryType::Ttl,
-    }
-}
-
-// `ledger_key_type` is imported from crate::entry
 
 #[cfg(test)]
 mod tests {

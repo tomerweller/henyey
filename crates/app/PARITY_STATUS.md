@@ -3,7 +3,7 @@
 **Crate**: `henyey-app`
 **Upstream**: `.upstream-v25/src/main/`
 **Overall Parity**: 62%
-**Last Updated**: 2026-02-14
+**Last Updated**: 2026-02-17
 
 ## Summary
 
@@ -29,9 +29,9 @@
 
 | stellar-core File | Rust Module | Notes |
 |--------------------|-------------|-------|
-| `Application.h` / `Application.cpp` | `app.rs` | App struct with lifecycle management |
-| `ApplicationImpl.h` / `ApplicationImpl.cpp` | `app.rs` | Merged into App struct |
-| `ApplicationUtils.h` / `ApplicationUtils.cpp` | `app.rs`, `catchup_cmd.rs`, `run_cmd.rs` | Distributed across modules |
+| `Application.h` / `Application.cpp` | `app/mod.rs` | App struct with lifecycle management |
+| `ApplicationImpl.h` / `ApplicationImpl.cpp` | `app/mod.rs`, `app/lifecycle.rs` | Merged into App struct and submodules |
+| `ApplicationUtils.h` / `ApplicationUtils.cpp` | `app/mod.rs`, `app/catchup_impl.rs`, `catchup_cmd.rs`, `run_cmd.rs` | Distributed across modules |
 | `Config.h` / `Config.cpp` | `config.rs` | TOML-based with serde |
 | `CommandHandler.h` / `CommandHandler.cpp` | `run_cmd.rs` (StatusServer) | Axum-based HTTP server |
 | `CommandLine.h` / `CommandLine.cpp` | `run_cmd.rs`, `catchup_cmd.rs`, `henyey` crate | CLI in separate binary crate |
@@ -47,7 +47,7 @@
 
 ## Component Mapping
 
-### Application (`app.rs`)
+### Application (`app/mod.rs`, `app/lifecycle.rs`, `app/ledger_close.rs`, `app/catchup_impl.rs`, `app/consensus.rs`)
 
 Corresponds to: `Application.h`, `ApplicationImpl.h`
 
@@ -193,7 +193,7 @@ Corresponds to: `Maintainer.h`
 | `start()` | `Maintainer::start()` | Full |
 | `performMaintenance()` | `Maintainer::perform_maintenance()` | Full |
 
-### ApplicationUtils (`app.rs`, `catchup_cmd.rs`, `run_cmd.rs`)
+### ApplicationUtils (`app/mod.rs`, `app/catchup_impl.rs`, `catchup_cmd.rs`, `run_cmd.rs`)
 
 Corresponds to: `ApplicationUtils.h`
 
@@ -402,7 +402,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
-| Config | 8 TEST_CASE / 18 SECTION | 19 `#[test]` | Good coverage of config loading, validation, and BucketListDB wiring |
+| Config | 8 TEST_CASE / 18 SECTION | 23 `#[test]` | Good coverage of config loading, validation, and BucketListDB wiring |
 | CommandHandler | 3 TEST_CASE / 25 SECTION | 6 `#[test]` | Rust tests cover run_cmd options; less endpoint testing |
 | ApplicationUtils | 4 TEST_CASE / 5 SECTION | 13 `#[test]` (catchup_cmd) | Catchup target parsing well tested |
 | SelfCheck | 1 TEST_CASE / 0 SECTION | 0 `#[test]` | No dedicated self-check tests |
@@ -423,6 +423,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 - **Testnet verification**: Node successfully syncs and tracks consensus on testnet, closing ledgers in parity with stellar-core validators.
 - **Catchup gap recovery**: Successfully bridges 20-30 slot gaps between catchup checkpoint and live consensus (verified January 2026).
+- **Event loop stability**: Multiple event loop freeze bugs identified and fixed (February 2026): blocking flood demand sends, unbounded buffered ledger close loops, blocking bucket GC during catchup, and SCP drain starvation.
 - **Survey protocol**: Time-sliced surveys successfully collect and report topology data from testnet peers.
 
 ## Parity Calculation

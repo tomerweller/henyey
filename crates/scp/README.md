@@ -4,7 +4,7 @@ Rust implementation of the Stellar Consensus Protocol (SCP).
 
 ## Overview
 
-SCP is a federated Byzantine agreement protocol that enables nodes to reach consensus without requiring a closed membership or central authority. This crate provides a complete, deterministic implementation of SCP suitable for use in Stellar network nodes. It corresponds to stellar-core's `src/scp/` and is the consensus engine used by `henyey-herder` to agree on transaction sets each ledger.
+SCP is a federated Byzantine agreement protocol that enables nodes to reach consensus without requiring a closed membership or central authority. This crate provides a complete, deterministic implementation of SCP suitable for use in Stellar network nodes. It corresponds to stellar-core's `src/scp/` (upstream reference at `.upstream-v25/src/scp/`) and is the consensus engine used by `henyey-herder` to agree on transaction sets each ledger.
 
 SCP operates in two phases per slot: **nomination** (propose and vote on candidate values) followed by the **ballot protocol** (commit to a single value through prepare, confirm, and externalize stages).
 
@@ -94,7 +94,7 @@ scp.force_externalize(ledger_seq, ledger_value);
 | `scp.rs` | `SCP<D>` coordinator: slot management, envelope routing, purging |
 | `slot.rs` | `Slot`: per-slot state combining nomination + ballot |
 | `nomination.rs` | `NominationProtocol`: value proposal, leader election, round advancement |
-| `ballot.rs` | `BallotProtocol`: prepare/confirm/externalize state machine, envelope emission |
+| `ballot/` | `BallotProtocol`: prepare/confirm/externalize state machine (`mod.rs` struct + public API, `state_machine.rs` transitions, `envelope.rs` emission, `statements.rs` comparison helpers) |
 | `quorum.rs` | Quorum set operations: `is_quorum`, `is_v_blocking`, normalization |
 | `quorum_config.rs` | Configuration parsing: threshold percent, validator strkeys |
 | `driver.rs` | `SCPDriver` trait definition and `SCPTimerType` |
@@ -124,7 +124,7 @@ Nearly every internal SCP function needs the same four parameters: local node ID
 | `scp.rs` | `src/scp/SCP.cpp` |
 | `slot.rs` | `src/scp/Slot.cpp` |
 | `nomination.rs` | `src/scp/NominationProtocol.cpp` |
-| `ballot.rs` | `src/scp/BallotProtocol.cpp` |
+| `ballot/` | `src/scp/BallotProtocol.cpp` |
 | `quorum.rs` | `src/scp/QuorumSetUtils.cpp` |
 | `driver.rs` | `src/scp/SCPDriver.h` |
 

@@ -88,10 +88,10 @@ fn get_rss_bytes() -> u64 {
 type OfferAccountAssetIndex = HashMap<([u8; 32], AssetKey), HashSet<i64>>;
 
 /// Extract the 32-byte public key from an AccountId.
+///
+/// Delegates to [`crate::execution::account_id_to_key`] to avoid duplication.
 fn account_id_bytes(account_id: &AccountId) -> [u8; 32] {
-    match &account_id.0 {
-        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => key.0,
-    }
+    crate::execution::account_id_to_key(account_id)
 }
 
 /// Insert an offer into the (account, asset) secondary index.

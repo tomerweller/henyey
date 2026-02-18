@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-work`
 **Upstream**: `.upstream-v25/src/work/`
-**Overall Parity**: 46%
-**Last Updated**: 2026-02-13
+**Overall Parity**: 39%
+**Last Updated**: 2026-02-17
 
 ## Summary
 
@@ -58,17 +58,11 @@ Corresponds to: `BasicWork.h`
 | `onAbort()` pure virtual | `WorkContext::is_cancelled()` cooperative | Full |
 | `shutdown()` | `WorkScheduler::cancel()` / `cancel_all()` | Full |
 | `isAborting()` | `CancellationToken::is_cancelled()` | Full |
-| `onReset()` | Not needed (work items are stateful across retries) | None |
 | `onSuccess()` callback | Not implemented (use `WorkWithCallback`) | None |
 | `onFailureRetry()` callback | Not implemented | None |
 | `onFailureRaise()` callback | Not implemented | None |
-| `wakeUp()` | Not needed (async handles waiting) | None |
-| `wakeSelfUpCallback()` | Not needed (async handles waiting) | None |
-| `setupWaitingCallback()` | Not needed (async handles waiting) | None |
 | `getRetryDelay()` exponential backoff | Work items control delay via `WorkOutcome::Retry { delay }` | Partial |
 | `getRetryETA()` | Not implemented | None |
-| `ALLOWED_TRANSITIONS` validation | Not implemented (simpler state model) | None |
-| `assertValidTransition()` | Not implemented | None |
 
 ### Work class - hierarchical work (`lib.rs`)
 
@@ -112,7 +106,6 @@ Corresponds to: `WorkScheduler.h`
 | `shutdown()` | `cancel_all()` | Full |
 | `doWork()` scheduler loop | `run_until_done_with_cancel()` | Full |
 | `scheduleOne()` IO posting | Tokio task spawning | Full |
-| `TRIGGER_PERIOD` constant | Not needed (async event-driven) | None |
 
 ### WorkSequence (`lib.rs`)
 
@@ -175,6 +168,9 @@ Features excluded by design. These are NOT counted against parity %.
 | `VirtualClock` / `VirtualTimer` integration | Rust uses Tokio async timers instead |
 | `postOnMainThread` scheduling | Rust uses Tokio task spawning |
 | `shouldYield()` cooperative yielding | Rust async yields naturally at `.await` points |
+| `wakeUp()` / `wakeSelfUpCallback()` / `setupWaitingCallback()` | Async/await eliminates explicit wake-up; waiting is implicit via `.await` |
+| `onReset()` lifecycle hook | Work items manage their own state across retries; Rust ownership model makes explicit reset unnecessary |
+| `TRIGGER_PERIOD` constant | Async event-driven scheduler does not need polling intervals |
 | `mApp` application context in work | Rust work receives minimal `WorkContext`; app state passed via closures |
 | Tracy profiling markers (`ZoneScoped`) | Not needed; can be added via `tracing` if required |
 | `CLOG_*` logging macros | Rust uses `tracing` crate equivalently |
@@ -191,7 +187,6 @@ Features not yet implemented. These ARE counted against parity %.
 | `Work` class (hierarchical parent-child) | Medium | Flat DAG covers current use cases; may be needed for complex work trees |
 | `BatchWork` class | Medium | Iterator-based parallel batch generation not yet needed |
 | `ConditionalWork` class | Medium | Condition-gated work execution not yet needed |
-| `onReset()` lifecycle hook | Low | Work items manage own state across retries |
 | `onSuccess()` lifecycle hook | Low | Can use `WorkWithCallback` instead |
 | `onFailureRetry()` lifecycle hook | Low | Work items handle retry logic in `run()` |
 | `onFailureRaise()` lifecycle hook | Low | Error info captured in `WorkOutcome::Failed` |
@@ -249,7 +244,13 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 30 |
-| Gaps (None + Partial) | 35 |
-| Intentional Omissions | 9 |
-| **Parity** | **30 / (30 + 35) = 46%** |
+| Implemented (Full) | 28 |
+| Gaps (None + Partial) | 44 |
+| Intentional Omissions | 12 |
+| **Parity** | **28 / (28 + 44) = 39%** |
+
+Detailed breakdown:
+- **Full (28)**: BasicWork mapping (12) + WorkScheduler (7) + WorkSequence (6) + WorkWithCallback (3)
+- **Partial (4)**: `RETRY_*` constants, `getStatus()` (BasicWork), `getRetryDelay()`, `getStatus()` (WorkSequence)
+- **None (40)**: Work class hierarchy (22) + BatchWork (8) + ConditionalWork (6) + BasicWork lifecycle hooks (3: onSuccess, onFailureRetry, onFailureRaise) + `getRetryETA()` (1)
+- **Intentional Omissions (12)**: Items excluded from the component tables entirely -- async-model replacements (6: VirtualClock/Timer, postOnMainThread, shouldYield, wakeUp/wakeSelfUpCallback/setupWaitingCallback, onReset, TRIGGER_PERIOD) + Rust-model replacements (2: NonMovableOrCopyable, enable_shared_from_this) + Logging/profiling (2: Tracy, CLOG) + App context (1: mApp) + State validation (1: ALLOWED_TRANSITIONS/assertValidTransition)

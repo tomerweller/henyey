@@ -798,29 +798,10 @@ impl BucketManager {
     {
         self.visit_ledger_entries(
             bucket_hashes,
-            |entry| ledger_entry_type(&entry.data) == entry_type,
+            |entry| crate::entry::ledger_entry_data_type(&entry.data) == entry_type,
             accept_entry,
             min_ledger,
         )
-    }
-}
-
-/// Returns the ledger entry type for a given entry data.
-fn ledger_entry_type(
-    data: &stellar_xdr::curr::LedgerEntryData,
-) -> stellar_xdr::curr::LedgerEntryType {
-    use stellar_xdr::curr::{LedgerEntryData, LedgerEntryType};
-    match data {
-        LedgerEntryData::Account(_) => LedgerEntryType::Account,
-        LedgerEntryData::Trustline(_) => LedgerEntryType::Trustline,
-        LedgerEntryData::Offer(_) => LedgerEntryType::Offer,
-        LedgerEntryData::Data(_) => LedgerEntryType::Data,
-        LedgerEntryData::ClaimableBalance(_) => LedgerEntryType::ClaimableBalance,
-        LedgerEntryData::LiquidityPool(_) => LedgerEntryType::LiquidityPool,
-        LedgerEntryData::ContractData(_) => LedgerEntryType::ContractData,
-        LedgerEntryData::ContractCode(_) => LedgerEntryType::ContractCode,
-        LedgerEntryData::ConfigSetting(_) => LedgerEntryType::ConfigSetting,
-        LedgerEntryData::Ttl(_) => LedgerEntryType::Ttl,
     }
 }
 

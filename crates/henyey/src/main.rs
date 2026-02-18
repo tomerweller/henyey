@@ -454,16 +454,12 @@ fn init_logging(cli: &Cli) -> anyhow::Result<()> {
         "info"
     };
 
-    let config = LogConfig::default().with_level(level);
+    let mut config = LogConfig::default().with_level(level);
 
-    let config = match cli.log_format {
-        CliLogFormat::Text => config,
-        CliLogFormat::Json => LogConfig {
-            format: LogFormat::Json,
-            ansi_colors: false,
-            ..config
-        },
-    };
+    if matches!(cli.log_format, CliLogFormat::Json) {
+        config.format = LogFormat::Json;
+        config.ansi_colors = false;
+    }
 
     logging::init(&config)?;
 
@@ -471,21 +467,59 @@ fn init_logging(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Creates a [`HistoryArchive`] from the first enabled archive in config.
+fn first_archive(config: &AppConfig) -> anyhow::Result<henyey_history::HistoryArchive> {
+    config
+        .history
+        .archives
+        .iter()
+        .filter(|a| a.get_enabled)
+        .find_map(|a| henyey_history::HistoryArchive::new(&a.url).ok())
+        .ok_or_else(|| anyhow::anyhow!("No history archives available"))
+}
+
+/// Creates all enabled [`HistoryArchive`] clients from config, warning on failures.
+fn all_archives(config: &AppConfig) -> anyhow::Result<Vec<henyey_history::HistoryArchive>> {
+    let archives: Vec<henyey_history::HistoryArchive> = config
+        .history
+        .archives
+        .iter()
+        .filter(|a| a.get_enabled)
+        .filter_map(|a| match henyey_history::HistoryArchive::new(&a.url) {
+            Ok(archive) => Some(archive),
+            Err(e) => {
+                println!("Warning: Failed to create archive {}: {}", a.url, e);
+                None
+            }
+        })
+        .collect();
+
+    if archives.is_empty() {
+        anyhow::bail!("No history archives available");
+    }
+
+    Ok(archives)
+}
+
 /// Load configuration from file or use defaults.
 fn load_config(cli: &Cli) -> anyhow::Result<AppConfig> {
-    let mut config = if let Some(ref config_path) = cli.config {
-        tracing::info!(path = ?config_path, "Loading configuration from file");
-        AppConfig::from_file_with_env(config_path)?
-    } else if cli.mainnet {
-        tracing::info!("Using mainnet configuration");
-        let mut config = AppConfig::mainnet();
-        config.apply_env_overrides();
-        config
-    } else {
-        tracing::info!("Using testnet configuration (default)");
-        let mut config = AppConfig::testnet();
-        config.apply_env_overrides();
-        config
+    let mut config = match (&cli.config, cli.mainnet) {
+        (Some(config_path), _) => {
+            tracing::info!(path = ?config_path, "Loading configuration from file");
+            AppConfig::from_file_with_env(config_path)?
+        }
+        (None, true) => {
+            tracing::info!("Using mainnet configuration");
+            let mut c = AppConfig::mainnet();
+            c.apply_env_overrides();
+            c
+        }
+        (None, false) => {
+            tracing::info!("Using testnet configuration (default)");
+            let mut c = AppConfig::testnet();
+            c.apply_env_overrides();
+            c
+        }
     };
 
     // CLI --metadata-output-stream overrides config file
@@ -651,30 +685,13 @@ async fn cmd_verify_history(
     from: Option<u32>,
     to: Option<u32>,
 ) -> anyhow::Result<()> {
-    use henyey_history::{verify, HistoryArchive};
+    use henyey_history::verify;
     use henyey_ledger::TransactionSetVariant;
 
     println!("Verifying history archives...");
     println!();
 
-    // Create archive clients from config
-    let archives: Vec<HistoryArchive> = config
-        .history
-        .archives
-        .iter()
-        .filter(|a| a.get_enabled)
-        .filter_map(|a| match HistoryArchive::new(&a.url) {
-            Ok(archive) => Some(archive),
-            Err(e) => {
-                println!("Warning: Failed to create archive {}: {}", a.url, e);
-                None
-            }
-        })
-        .collect();
-
-    if archives.is_empty() {
-        anyhow::bail!("No history archives available");
-    }
+    let archives = all_archives(&config)?;
 
     println!("Using {} archive(s)", archives.len());
 
@@ -1608,7 +1625,7 @@ async fn cmd_verify_execution(
         extract_ledger_close_data, extract_ledger_header, extract_transaction_results,
         CachedCdpDataLake,
     };
-    use henyey_history::{checkpoint, HistoryArchive};
+    use henyey_history::checkpoint;
     use henyey_ledger::{LedgerManager, LedgerManagerConfig};
 
     let VerifyExecutionOptions {
@@ -1663,13 +1680,7 @@ async fn cmd_verify_execution(
     };
 
     // Create archive client
-    let archive = config
-        .history
-        .archives
-        .iter()
-        .filter(|a| a.get_enabled)
-        .find_map(|a| HistoryArchive::new(&a.url).ok())
-        .ok_or_else(|| anyhow::anyhow!("No history archives available"))?;
+    let archive = first_archive(&config)?;
 
     if !quiet {
         println!("Archive: {}", config.history.archives[0].url);
@@ -2805,7 +2816,7 @@ async fn cmd_debug_bucket_entry(
     use std::sync::Arc;
     use henyey_bucket::{BucketEntry, BucketList, BucketManager};
     use henyey_common::Hash256;
-    use henyey_history::{is_checkpoint_ledger, HistoryArchive};
+    use henyey_history::is_checkpoint_ledger;
     use stellar_xdr::curr::{
         AccountId, LedgerEntryData, LedgerKey, LedgerKeyAccount, PublicKey, Uint256,
     };
@@ -2818,9 +2829,7 @@ async fn cmd_debug_bucket_entry(
     let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
         account_bytes.try_into().unwrap(),
     )));
-    let account_key = LedgerKey::Account(LedgerKeyAccount {
-        account_id: account_id.clone(),
-    });
+    let account_key = LedgerKey::Account(LedgerKeyAccount { account_id });
 
     println!("Debug Bucket Entry Inspection");
     println!("==============================");
@@ -2833,14 +2842,7 @@ async fn cmd_debug_bucket_entry(
         anyhow::bail!("{} is not a valid checkpoint ledger", checkpoint_seq);
     }
 
-    // Create archive client from config
-    let archive = config
-        .history
-        .archives
-        .iter()
-        .filter(|a| a.get_enabled)
-        .find_map(|a| HistoryArchive::new(&a.url).ok())
-        .ok_or_else(|| anyhow::anyhow!("No history archives available"))?;
+    let archive = first_archive(&config)?;
 
     println!("Archive: {}", config.history.archives[0].url);
 
@@ -3335,30 +3337,13 @@ async fn cmd_verify_checkpoints(
     to: Option<u32>,
 ) -> anyhow::Result<()> {
     use std::io::Write;
-    use henyey_history::{checkpoint, verify, HistoryArchive};
+    use henyey_history::{checkpoint, verify};
     use henyey_ledger::compute_header_hash;
 
     println!("Verifying checkpoint hashes...");
     println!();
 
-    // Create archive clients from config
-    let archives: Vec<HistoryArchive> = config
-        .history
-        .archives
-        .iter()
-        .filter(|a| a.get_enabled)
-        .filter_map(|a| match HistoryArchive::new(&a.url) {
-            Ok(archive) => Some(archive),
-            Err(e) => {
-                println!("Warning: Failed to create archive {}: {}", a.url, e);
-                None
-            }
-        })
-        .collect();
-
-    if archives.is_empty() {
-        anyhow::bail!("No history archives available");
-    }
+    let archives = all_archives(&config)?;
 
     println!("Using {} archive(s)", archives.len());
 

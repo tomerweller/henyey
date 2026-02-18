@@ -145,10 +145,10 @@ impl Curve25519Secret {
         };
 
         // Concatenate: shared_secret || publicA || publicB
-        let mut buf = Vec::with_capacity(32 + 32 + 32);
-        buf.extend_from_slice(&shared_secret);
-        buf.extend_from_slice(&public_a.to_bytes());
-        buf.extend_from_slice(&public_b.to_bytes());
+        let mut buf = [0u8; 96];
+        buf[..32].copy_from_slice(&shared_secret);
+        buf[32..64].copy_from_slice(&public_a.to_bytes());
+        buf[64..96].copy_from_slice(&public_b.to_bytes());
 
         // Apply HKDF-extract
         hkdf_extract(&buf)

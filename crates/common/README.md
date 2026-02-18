@@ -46,6 +46,8 @@ graph TD
 | `Rounding` | Rounding mode for 128-bit division operations (Down or Up) |
 | `MathError` | Error type for overflow, division-by-zero, and negative-input math failures |
 | `XdrOutputStream` | Size-prefixed XDR frame writer compatible with stellar-core wire format |
+| `XdrInputStream` | Size-prefixed XDR frame reader compatible with stellar-core wire format |
+| `BucketListDbConfig` | Configuration for BucketListDB indexing and caching behavior |
 | `NoIssuerError` | Error returned when requesting the issuer of a native asset |
 
 ## Usage
@@ -115,7 +117,7 @@ assert!(r.leq(&limit));
 | `network.rs` | `NetworkId` derived from network passphrase via SHA-256 |
 | `error.rs` | `Error` enum and `Result` type alias |
 | `time.rs` | Unix/Stellar epoch conversions, current timestamp helpers |
-| `xdr_stream.rs` | `XdrOutputStream` for writing size-prefixed XDR frames (RFC 4506 record marking) |
+| `xdr_stream.rs` | `XdrOutputStream` / `XdrInputStream` for reading and writing size-prefixed XDR frames (RFC 4506 record marking) |
 
 ## Design Notes
 
@@ -137,7 +139,7 @@ assert!(r.leq(&limit));
 | `config.rs` | `src/main/Config.h/.cpp` (Rust-native TOML implementation) |
 | `error.rs` | Rust-native (no direct upstream equivalent) |
 | `time.rs` | `src/util/Timer.h/.cpp` (subset) |
-| `xdr_stream.rs` | `src/util/XDRStream.h` |
+| `xdr_stream.rs` | `src/util/XDRStream.h` (output full, basic input) |
 
 ## Parity Status
 

@@ -1048,14 +1048,11 @@ impl App {
             }
         };
 
-        let is_checkpoint_boundary = Self::is_first_ledger_in_checkpoint(first_buffered);
-        let can_trigger_immediate = is_checkpoint_boundary && first_buffered < last_buffered;
         tracing::debug!(
             current_ledger,
             first_buffered,
             last_buffered,
-            is_checkpoint_boundary,
-            can_trigger_immediate,
+            is_checkpoint_boundary = Self::is_first_ledger_in_checkpoint(first_buffered),
             gap = first_buffered.saturating_sub(current_ledger),
             "maybe_start_buffered_catchup: evaluating"
         );
@@ -1487,11 +1484,7 @@ impl App {
                         }
                     }
 
-                    if self.is_validator {
-                        self.set_state(AppState::Validating).await;
-                    } else {
-                        self.set_state(AppState::Synced).await;
-                    }
+                    self.restore_operational_state().await;
                     tracing::info!(ledger_seq = result.ledger_seq, "{} catchup complete", label);
                     let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
                     let pending_count = self.herder.get_pending_tx_sets().len();
@@ -1579,11 +1572,7 @@ impl App {
                     );
                     // Restore operational state even when catchup was a no-op,
                     // since catchup() unconditionally sets CatchingUp on entry.
-                    if self.is_validator {
-                        self.set_state(AppState::Validating).await;
-                    } else {
-                        self.set_state(AppState::Synced).await;
-                    }
+                    self.restore_operational_state().await;
                 }
                 *self.last_catchup_completed_at.write().await = Some(Instant::now());
             }
@@ -1593,11 +1582,7 @@ impl App {
                 // participating in consensus. Without this, the node stays
                 // permanently stuck in CatchingUp after a failed catchup
                 // (e.g., archive checkpoint not yet published).
-                if self.is_validator {
-                    self.set_state(AppState::Validating).await;
-                } else {
-                    self.set_state(AppState::Synced).await;
-                }
+                self.restore_operational_state().await;
                 // Apply cooldown after failed catchup to prevent rapid-fire retries.
                 // Without this, a failed catchup (e.g., archive checkpoint not yet
                 // published) would re-trigger immediately on the next tick because

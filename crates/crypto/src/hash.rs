@@ -46,9 +46,9 @@ use henyey_common::Hash256;
 use stellar_xdr::curr::WriteXdr;
 
 /// Converts a 32-byte digest output into a [`Hash256`].
-fn hash256_from_slice(slice: &[u8]) -> Hash256 {
+fn hash256_from_digest(output: impl AsRef<[u8]>) -> Hash256 {
     let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(slice);
+    bytes.copy_from_slice(output.as_ref());
     Hash256(bytes)
 }
 
@@ -88,7 +88,7 @@ pub fn sha256_multi(chunks: &[&[u8]]) -> Hash256 {
     for chunk in chunks {
         hasher.update(chunk);
     }
-    hash256_from_slice(&hasher.finalize())
+    hash256_from_digest(hasher.finalize())
 }
 
 /// Computes a sub-seed SHA-256 hash from a seed and counter.
@@ -114,7 +114,7 @@ pub fn sub_sha256(seed: &[u8], counter: u64) -> Hash256 {
     hasher.update(seed);
     // XDR encodes uint64 as 8 bytes big-endian (network byte order)
     hasher.update(counter.to_be_bytes());
-    hash256_from_slice(&hasher.finalize())
+    hash256_from_digest(hasher.finalize())
 }
 
 /// A streaming SHA-256 hasher for incremental hash computation.
@@ -160,7 +160,7 @@ impl Sha256Hasher {
     ///
     /// After calling this method, the hasher cannot be used again.
     pub fn finalize(self) -> Hash256 {
-        hash256_from_slice(&self.inner.finalize())
+        hash256_from_digest(self.inner.finalize())
     }
 }
 
@@ -189,7 +189,7 @@ type Blake2b256 = Blake2b<blake2::digest::consts::U32>;
 pub fn blake2(data: &[u8]) -> Hash256 {
     let mut hasher = Blake2b256::new();
     hasher.update(data);
-    hash256_from_slice(&hasher.finalize())
+    hash256_from_digest(hasher.finalize())
 }
 
 /// Computes the BLAKE2b-256 hash of multiple data chunks.
@@ -211,7 +211,7 @@ pub fn blake2_multi(chunks: &[&[u8]]) -> Hash256 {
     for chunk in chunks {
         hasher.update(chunk);
     }
-    hash256_from_slice(&hasher.finalize())
+    hash256_from_digest(hasher.finalize())
 }
 
 /// A streaming BLAKE2b-256 hasher for incremental hash computation.
@@ -257,7 +257,7 @@ impl Blake2Hasher {
     ///
     /// After calling this method, the hasher cannot be used again.
     pub fn finalize(self) -> Hash256 {
-        hash256_from_slice(&self.inner.finalize())
+        hash256_from_digest(self.inner.finalize())
     }
 }
 

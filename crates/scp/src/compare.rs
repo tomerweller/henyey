@@ -1,5 +1,7 @@
 //! Ordering and comparison functions for SCP statements and ballots.
 
+use std::cmp::Ordering;
+
 use stellar_xdr::curr::{
     ScpBallot, ScpNomination, ScpStatement, ScpStatementConfirm, ScpStatementPledges,
     ScpStatementPrepare,
@@ -52,9 +54,9 @@ fn is_newer_nominate(old: &ScpNomination, new: &ScpNomination) -> bool {
 
 fn cmp_opt_ballot(a: &Option<ScpBallot>, b: &Option<ScpBallot>) -> std::cmp::Ordering {
     match (a, b) {
-        (None, None) => std::cmp::Ordering::Equal,
-        (None, Some(_)) => std::cmp::Ordering::Less,
-        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
         (Some(a), Some(b)) => a
             .counter
             .cmp(&b.counter)
@@ -64,19 +66,19 @@ fn cmp_opt_ballot(a: &Option<ScpBallot>, b: &Option<ScpBallot>) -> std::cmp::Ord
 
 fn is_newer_prepare(old: &ScpStatementPrepare, new: &ScpStatementPrepare) -> bool {
     match new.ballot.counter.cmp(&old.ballot.counter) {
-        std::cmp::Ordering::Greater => return true,
-        std::cmp::Ordering::Less => return false,
-        std::cmp::Ordering::Equal => {}
+        Ordering::Greater => return true,
+        Ordering::Less => return false,
+        Ordering::Equal => {}
     }
 
     match cmp_opt_ballot(&old.prepared, &new.prepared) {
-        std::cmp::Ordering::Less => true,
-        std::cmp::Ordering::Greater => false,
-        std::cmp::Ordering::Equal => {
+        Ordering::Less => true,
+        Ordering::Greater => false,
+        Ordering::Equal => {
             match cmp_opt_ballot(&old.prepared_prime, &new.prepared_prime) {
-                std::cmp::Ordering::Less => true,
-                std::cmp::Ordering::Greater => false,
-                std::cmp::Ordering::Equal => new.n_h > old.n_h,
+                Ordering::Less => true,
+                Ordering::Greater => false,
+                Ordering::Equal => new.n_h > old.n_h,
             }
         }
     }
@@ -84,14 +86,14 @@ fn is_newer_prepare(old: &ScpStatementPrepare, new: &ScpStatementPrepare) -> boo
 
 fn is_newer_confirm(old: &ScpStatementConfirm, new: &ScpStatementConfirm) -> bool {
     match new.ballot.counter.cmp(&old.ballot.counter) {
-        std::cmp::Ordering::Greater => return true,
-        std::cmp::Ordering::Less => return false,
-        std::cmp::Ordering::Equal => {}
+        Ordering::Greater => return true,
+        Ordering::Less => return false,
+        Ordering::Equal => {}
     }
     match new.n_prepared.cmp(&old.n_prepared) {
-        std::cmp::Ordering::Greater => return true,
-        std::cmp::Ordering::Less => return false,
-        std::cmp::Ordering::Equal => {}
+        Ordering::Greater => return true,
+        Ordering::Less => return false,
+        Ordering::Equal => {}
     }
     new.n_h > old.n_h
 }

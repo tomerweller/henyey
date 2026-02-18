@@ -1137,6 +1137,32 @@ impl App {
         }
     }
 
+    /// Transition to `Validating` (if validator) or `Synced` (if watcher).
+    ///
+    /// Used after catchup completes, fails, or is skipped to leave the
+    /// `CatchingUp` state and resume normal operation.
+    pub(crate) async fn restore_operational_state(&self) {
+        if self.is_validator {
+            self.set_state(AppState::Validating).await;
+        } else {
+            self.set_state(AppState::Synced).await;
+        }
+    }
+
+    /// Reset all tx-set tracking state so the main loop can make fresh requests.
+    ///
+    /// Clears the exhausted flag, don't-have map, last-request timestamps, and
+    /// exhaustion warnings. Callers that also need to clear `consensus_stuck_state`
+    /// should do so separately.
+    #[allow(dead_code)]
+    pub(crate) async fn reset_tx_set_tracking(&self) {
+        self.tx_set_all_peers_exhausted
+            .store(false, Ordering::SeqCst);
+        self.tx_set_dont_have.write().await.clear();
+        self.tx_set_last_request.write().await.clear();
+        self.tx_set_exhausted_warned.write().await.clear();
+    }
+
     /// Set the tracked current ledger sequence.
     pub(crate) async fn set_current_ledger(&self, seq: u32) {
         *self.current_ledger.write().await = seq;

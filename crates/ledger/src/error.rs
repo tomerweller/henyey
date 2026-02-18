@@ -30,8 +30,9 @@ pub enum LedgerError {
 
     /// Ledger sequence number doesn't match expected value.
     ///
-    /// This typically indicates an attempt to close a ledger out of order
-    /// or a mismatch between expected and actual ledger sequences.
+    /// This typically indicates an attempt to close a ledger out of order,
+    /// a mismatch between expected and actual ledger sequences, or a
+    /// state update with non-consecutive sequence numbers.
     #[error("invalid ledger sequence: expected {expected}, got {actual}")]
     InvalidSequence {
         /// The expected ledger sequence.
@@ -113,15 +114,4 @@ pub enum LedgerError {
     /// for the requested operation.
     #[error("invalid entry: {0}")]
     InvalidEntry(String),
-
-    /// Invalid ledger sequence for state update.
-    ///
-    /// Ledger sequences must progress by exactly one for state updates.
-    #[error("invalid ledger sequence: expected {expected}, got {actual}")]
-    InvalidLedgerSequence {
-        /// The expected ledger sequence.
-        expected: u32,
-        /// The actual ledger sequence received.
-        actual: u32,
-    },
 }

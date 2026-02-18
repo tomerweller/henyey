@@ -3,7 +3,7 @@
 **Crate**: `henyey-scp`
 **Upstream**: `.upstream-v25/src/scp/`
 **Overall Parity**: 100%
-**Last Updated**: 2026-02-13
+**Last Updated**: 2026-02-17
 
 ## Summary
 
@@ -29,7 +29,7 @@
 |--------------------|-------------|-------|
 | `SCP.h` / `SCP.cpp` | `scp.rs` | Main coordinator |
 | `Slot.h` / `Slot.cpp` | `slot.rs` | Per-slot state container |
-| `BallotProtocol.h` / `BallotProtocol.cpp` | `ballot.rs` | Ballot protocol state machine |
+| `BallotProtocol.h` / `BallotProtocol.cpp` | `ballot/` | Ballot protocol state machine |
 | `NominationProtocol.h` / `NominationProtocol.cpp` | `nomination.rs` | Nomination protocol |
 | `LocalNode.h` / `LocalNode.cpp` | `quorum.rs` | Quorum operations (class dissolved) |
 | `QuorumSetUtils.h` / `QuorumSetUtils.cpp` | `quorum.rs` | Sanity checks, normalization |
@@ -120,7 +120,7 @@ Corresponds to: `Slot.h`
 | `maybeSetGotVBlocking()` | `maybe_set_got_v_blocking()` | Full |
 | `timerIDs` enum | `SCPTimerType` enum | Full |
 
-### ballot (`ballot.rs`)
+### ballot (`ballot/`)
 
 Corresponds to: `BallotProtocol.h`
 

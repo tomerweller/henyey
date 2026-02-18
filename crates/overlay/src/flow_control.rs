@@ -175,7 +175,7 @@ impl FlowControlMessageCapacity {
     }
 
     fn lock_outbound_capacity(&mut self, msg: &StellarMessage) {
-        if is_flood_message(msg) {
+        if is_flow_controlled_message(msg) {
             let count = self.get_msg_resource_count(msg);
             debug_assert!(self.outbound_capacity >= count);
             self.outbound_capacity = self.outbound_capacity.saturating_sub(count);
@@ -192,7 +192,7 @@ impl FlowControlMessageCapacity {
             *total -= msg_resources;
         }
 
-        if is_flood_message(msg) {
+        if is_flow_controlled_message(msg) {
             if self.capacity.flood_capacity < msg_resources {
                 return false;
             }
@@ -210,7 +210,7 @@ impl FlowControlMessageCapacity {
             *total += resources_freed;
         }
 
-        if is_flood_message(msg) {
+        if is_flow_controlled_message(msg) {
             released_flood_capacity = resources_freed;
             self.capacity.flood_capacity += resources_freed;
         }
@@ -263,7 +263,7 @@ impl FlowControlByteCapacity {
     }
 
     fn lock_outbound_capacity(&mut self, msg: &StellarMessage) {
-        if is_flood_message(msg) {
+        if is_flow_controlled_message(msg) {
             let count = self.get_msg_resource_count(msg);
             debug_assert!(self.outbound_capacity >= count);
             self.outbound_capacity = self.outbound_capacity.saturating_sub(count);
@@ -274,7 +274,7 @@ impl FlowControlByteCapacity {
         let msg_resources = self.get_msg_resource_count(msg);
 
         // Byte capacity doesn't track total capacity
-        if is_flood_message(msg) {
+        if is_flow_controlled_message(msg) {
             if self.capacity.flood_capacity < msg_resources {
                 return false;
             }
@@ -288,7 +288,7 @@ impl FlowControlByteCapacity {
         let resources_freed = self.get_msg_resource_count(msg);
         let mut released_flood_capacity = 0;
 
-        if is_flood_message(msg) {
+        if is_flow_controlled_message(msg) {
             released_flood_capacity = resources_freed;
             self.capacity.flood_capacity += resources_freed;
         }
@@ -513,82 +513,7 @@ impl FlowControl {
             MessagePriority::Scp => {
                 let queue = &mut state.outbound_queues[queue_idx];
                 if queue.len() > limit {
-                    if let Some(ref cb) = self.scp_callback {
-                        // Intelligent trimming: use herder state to decide what to drop
-                        let min_slot = cb.min_slot_to_remember();
-                        let checkpoint_seq = cb.most_recent_checkpoint_seq();
-                        let mut value_replaced = false;
-
-                        let mut i = 0;
-                        while i < queue.len() {
-                            if queue[i].being_sent {
-                                i += 1;
-                                continue;
-                            }
-
-                            // Extract slot index from the SCP envelope
-                            let slot_index =
-                                if let StellarMessage::ScpMessage(ref env) = queue[i].message {
-                                    env.statement.slot_index
-                                } else {
-                                    i += 1;
-                                    continue;
-                                };
-
-                            // Drop messages for slots we no longer care about
-                            // (except the checkpoint sequence)
-                            if slot_index < min_slot && slot_index != checkpoint_seq {
-                                queue.remove(i);
-                                dropped += 1;
-                                continue;
-                            }
-
-                            // Replace older nomination/ballot with newer one from the back
-                            if !value_replaced
-                                && i + 1 < queue.len()
-                                && !queue.back().map(|m| m.being_sent).unwrap_or(true)
-                            {
-                                let back_st = queue.back().and_then(|m| {
-                                    if let StellarMessage::ScpMessage(ref env) = m.message {
-                                        Some(&env.statement)
-                                    } else {
-                                        None
-                                    }
-                                });
-                                let curr_st =
-                                    if let StellarMessage::ScpMessage(ref env) = queue[i].message {
-                                        Some(&env.statement)
-                                    } else {
-                                        None
-                                    };
-                                if let (Some(old_st), Some(new_st)) = (curr_st, back_st) {
-                                    if henyey_scp::is_newer_nomination_or_ballot_st(
-                                        old_st, new_st,
-                                    ) {
-                                        value_replaced = true;
-                                        let back = queue.pop_back().unwrap();
-                                        queue[i] = back;
-                                        dropped += 1;
-                                        i += 1;
-                                        continue;
-                                    }
-                                }
-                            }
-
-                            i += 1;
-                        }
-                    } else {
-                        // Fallback: naive FIFO trimming when no callback is set
-                        while queue.len() > limit / 2 {
-                            match queue.front() {
-                                Some(front) if !front.being_sent => {
-                                    queue.pop_front();
-                                    dropped += 1;
-                                }
-                                _ => break,
-                            }
-                        }
-                    }
+                    dropped = Self::trim_scp_queue(queue, limit, &self.scp_callback);
                     self.dropped_scp
                         .fetch_add(dropped as u64, Ordering::Relaxed);
                 }
@@ -626,6 +551,100 @@ impl FlowControl {
                 peer_str
             );
         }
+    }
+
+    /// Trim the SCP outbound queue when it exceeds the limit.
+    ///
+    /// Uses the SCP callback (if available) for intelligent trimming:
+    /// - Drops messages for slots below `min_slot_to_remember` (except checkpoint)
+    /// - Replaces older nomination/ballot messages with newer ones from the back
+    ///
+    /// Falls back to naive FIFO trimming when no callback is set.
+    /// Returns the number of messages dropped.
+    fn trim_scp_queue(
+        queue: &mut VecDeque<QueuedOutboundMessage>,
+        limit: usize,
+        scp_callback: &Option<Arc<dyn ScpQueueCallback>>,
+    ) -> usize {
+        let mut dropped = 0;
+
+        if let Some(ref cb) = scp_callback {
+            let min_slot = cb.min_slot_to_remember();
+            let checkpoint_seq = cb.most_recent_checkpoint_seq();
+            let mut value_replaced = false;
+
+            let mut i = 0;
+            while i < queue.len() {
+                if queue[i].being_sent {
+                    i += 1;
+                    continue;
+                }
+
+                // Extract slot index from the SCP envelope
+                let slot_index =
+                    if let StellarMessage::ScpMessage(ref env) = queue[i].message {
+                        env.statement.slot_index
+                    } else {
+                        i += 1;
+                        continue;
+                    };
+
+                // Drop messages for slots we no longer care about
+                // (except the checkpoint sequence)
+                if slot_index < min_slot && slot_index != checkpoint_seq {
+                    queue.remove(i);
+                    dropped += 1;
+                    continue;
+                }
+
+                // Replace older nomination/ballot with newer one from the back
+                if !value_replaced
+                    && i + 1 < queue.len()
+                    && !queue.back().map(|m| m.being_sent).unwrap_or(true)
+                {
+                    let back_st = queue.back().and_then(|m| {
+                        if let StellarMessage::ScpMessage(ref env) = m.message {
+                            Some(&env.statement)
+                        } else {
+                            None
+                        }
+                    });
+                    let curr_st =
+                        if let StellarMessage::ScpMessage(ref env) = queue[i].message {
+                            Some(&env.statement)
+                        } else {
+                            None
+                        };
+                    if let (Some(old_st), Some(new_st)) = (curr_st, back_st) {
+                        if henyey_scp::is_newer_nomination_or_ballot_st(
+                            old_st, new_st,
+                        ) {
+                            value_replaced = true;
+                            let back = queue.pop_back().unwrap();
+                            queue[i] = back;
+                            dropped += 1;
+                            i += 1;
+                            continue;
+                        }
+                    }
+                }
+
+                i += 1;
+            }
+        } else {
+            // Fallback: naive FIFO trimming when no callback is set
+            while queue.len() > limit / 2 {
+                match queue.front() {
+                    Some(front) if !front.being_sent => {
+                        queue.pop_front();
+                        dropped += 1;
+                    }
+                    _ => break,
+                }
+            }
+        }
+
+        dropped
     }
 
     /// Get the next batch of messages to send.
@@ -896,8 +915,14 @@ pub struct FlowControlStats {
     pub is_throttled: bool,
 }
 
-/// Check if a message is a flood message (requires flow control).
-pub fn is_flood_message(msg: &StellarMessage) -> bool {
+/// Check if a message requires flow control capacity tracking.
+///
+/// These are the message types that consume flow control capacity (messages
+/// and bytes) and are queued through the priority outbound queue. Note that
+/// survey messages are flooded at the network routing layer (see
+/// [`codec::helpers::is_flood_message`]) but do NOT consume flow control
+/// capacity, which is why they are excluded here.
+pub fn is_flow_controlled_message(msg: &StellarMessage) -> bool {
     matches!(
         msg,
         StellarMessage::Transaction(_)
@@ -1012,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn test_is_flood_message() {
+    fn test_is_flow_controlled_message() {
         let tx = make_tx_message();
         let scp = make_scp_message();
         let hello = StellarMessage::Hello(stellar_xdr::curr::Hello {
@@ -1033,9 +1058,9 @@ mod tests {
             nonce: stellar_xdr::curr::Uint256([0u8; 32]),
         });
 
-        assert!(is_flood_message(&tx));
-        assert!(is_flood_message(&scp));
-        assert!(!is_flood_message(&hello));
+        assert!(is_flow_controlled_message(&tx));
+        assert!(is_flow_controlled_message(&scp));
+        assert!(!is_flow_controlled_message(&hello));
     }
 
     #[test]

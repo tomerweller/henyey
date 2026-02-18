@@ -106,9 +106,9 @@ db.transaction(|tx| {
 | `migrations.rs` | Versioned migration system: `CURRENT_VERSION`, `run_migrations`, `verify_schema` |
 | `scp_persistence.rs` | `SqliteScpPersistence` bridging herder persistence to database queries |
 | `queries/mod.rs` | Re-exports all query traits |
-| `queries/ledger.rs` | `LedgerQueries` trait: store/load headers, get latest seq, delete old entries |
-| `queries/history.rs` | `HistoryQueries` trait: individual txs, tx sets, tx results |
-| `queries/scp.rs` | `ScpQueries` and `ScpStatePersistenceQueries` traits: envelopes, quorum sets, slot state |
+| `queries/ledger.rs` | `LedgerQueries` trait: store/load headers, load by hash, get latest seq, stream to XDR, delete old entries |
+| `queries/history.rs` | `HistoryQueries` trait: individual txs, tx sets, tx results, stream to XDR |
+| `queries/scp.rs` | `ScpQueries` and `ScpStatePersistenceQueries` traits: envelopes, quorum sets, stream to XDR, slot state |
 | `queries/state.rs` | `StateQueries` trait: generic key-value get/set/delete on storestate table |
 | `queries/peers.rs` | `PeerQueries` trait: store/load peers, random peer selection with filters |
 | `queries/bucket_list.rs` | `BucketListQueries` trait: store/load bucket list levels at checkpoint ledgers |
@@ -124,6 +124,8 @@ db.transaction(|tx| {
 - **SQLite tuning**: WAL journal mode, NORMAL synchronous, 64 MB cache, 30 s busy timeout, foreign keys ON, temp store in memory. The connection pool allows up to 10 concurrent connections for file-based databases and 1 for in-memory.
 
 - **XDR storage**: Unlike stellar-core which stores XDR as base64 TEXT, this crate stores XDR as raw BLOB for efficiency. The exception is SCP slot state and tx set data in the storestate table, which use base64 encoding since they share the TEXT-valued storestate table.
+
+- **History archive streaming**: The `copy_ledger_headers_to_stream`, `copy_tx_history_to_streams`, and `copy_scp_history_to_stream` methods write XDR records to `XdrOutputStream` for history archive checkpoint file generation. These correspond to stellar-core's `copyToStream` and `populateCheckpointFilesFromDB` functions.
 
 ## stellar-core Mapping
 

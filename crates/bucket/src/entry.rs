@@ -272,6 +272,29 @@ pub fn ledger_key_type(key: &LedgerKey) -> stellar_xdr::curr::LedgerEntryType {
     }
 }
 
+/// Returns the ledger entry type for a given entry data variant.
+///
+/// This is the canonical implementation used across the bucket crate. It maps
+/// each `LedgerEntryData` variant to its corresponding `LedgerEntryType`
+/// discriminant.
+pub fn ledger_entry_data_type(
+    data: &stellar_xdr::curr::LedgerEntryData,
+) -> stellar_xdr::curr::LedgerEntryType {
+    use stellar_xdr::curr::LedgerEntryType;
+    match data {
+        LedgerEntryData::Account(_) => LedgerEntryType::Account,
+        LedgerEntryData::Trustline(_) => LedgerEntryType::Trustline,
+        LedgerEntryData::Offer(_) => LedgerEntryType::Offer,
+        LedgerEntryData::Data(_) => LedgerEntryType::Data,
+        LedgerEntryData::ClaimableBalance(_) => LedgerEntryType::ClaimableBalance,
+        LedgerEntryData::LiquidityPool(_) => LedgerEntryType::LiquidityPool,
+        LedgerEntryData::ContractData(_) => LedgerEntryType::ContractData,
+        LedgerEntryData::ContractCode(_) => LedgerEntryType::ContractCode,
+        LedgerEntryData::ConfigSetting(_) => LedgerEntryType::ConfigSetting,
+        LedgerEntryData::Ttl(_) => LedgerEntryType::Ttl,
+    }
+}
+
 fn compare_keys_same_type(a: &LedgerKey, b: &LedgerKey) -> Ordering {
     match (a, b) {
         (LedgerKey::Account(a), LedgerKey::Account(b)) => a.account_id.cmp(&b.account_id),

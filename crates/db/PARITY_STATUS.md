@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-db`
 **Upstream**: `.upstream-v25/src/database/`, plus SQL operations from `src/overlay/PeerManager.*`, `src/overlay/BanManager*.*`, `src/herder/HerderPersistence*.*`, `src/main/PersistentState.*`, `src/ledger/LedgerHeaderUtils.*`, `src/transactions/TransactionSQL.*`, `src/history/HistoryManager*.*`
-**Overall Parity**: 87%
-**Last Updated**: 2026-02-13
+**Overall Parity**: 94%
+**Last Updated**: 2026-02-17
 
 ## Summary
 
@@ -12,17 +12,15 @@
 | Connection management | Full | r2d2 pool replaces SOCI sessions |
 | Schema migrations | Full | Independent versioning scheme |
 | State persistence (storestate) | Full | Key-value get/set/delete |
-| Ledger header SQL | Full | Store, load by seq, max seq, delete old |
-| SCP history persistence | Full | Envelopes and quorum sets |
+| Ledger header SQL | Full | Store, load by seq, load by hash, max seq, stream to XDR, delete old |
+| SCP history persistence | Full | Envelopes, quorum sets, stream to XDR |
 | SCP state crash recovery | Full | Slot state and tx set persistence |
 | Peer management SQL | Full | All CRUD and random peer queries |
 | Ban list SQL | Full | Ban/unban/check/list |
-| Transaction history SQL | Full | Store and load tx records, sets, results |
+| Transaction history SQL | Full | Store and load tx records, sets, results, stream to XDR |
 | Publish queue SQL | Full | Enqueue/dequeue/list |
 | Bucket list snapshots | Full | Rust-specific checkpoint storage |
-| History streaming to archives | None | copyToStream / populateCheckpointFilesFromDB |
 | Quorum info table | None | getNodeQuorumSet not implemented |
-| Ledger header load by hash | None | loadByHash not implemented |
 
 ## File Mapping
 
@@ -32,8 +30,8 @@
 | `DatabaseUtils.h` / `DatabaseUtils.cpp` | `queries/ledger.rs`, `queries/scp.rs` | `deleteOldEntriesHelper` inlined into query modules |
 | `PersistentState.h` / `PersistentState.cpp` | `queries/state.rs`, `queries/scp.rs`, `scp_persistence.rs` | Split across state and SCP modules |
 | `LedgerHeaderUtils.h` / `LedgerHeaderUtils.cpp` | `queries/ledger.rs` | Ledger header SQL operations |
-| `TransactionSQL.h` / `TransactionSQL.cpp` | `queries/history.rs` | Transaction history storage |
-| `HerderPersistence.h` / `HerderPersistenceImpl.cpp` | `queries/scp.rs`, `scp_persistence.rs` | SCP history and quorum set storage |
+| `TransactionSQL.h` / `TransactionSQL.cpp` | `queries/history.rs` | Transaction history storage and streaming |
+| `HerderPersistence.h` / `HerderPersistenceImpl.cpp` | `queries/scp.rs`, `scp_persistence.rs` | SCP history, quorum set storage, and streaming |
 | `PeerManager.h` / `PeerManager.cpp` | `queries/peers.rs` | Peer table CRUD and random queries |
 | `BanManager.h` / `BanManagerImpl.cpp` | `queries/ban.rs` | Ban list management |
 | `HistoryManagerImpl.cpp` (SQL subset) | `queries/publish_queue.rs` | Publish queue table operations |
@@ -111,10 +109,10 @@ Corresponds to: `LedgerHeaderUtils.h`
 | `storeInDatabase()` | `LedgerQueries::store_ledger_header()` | Full |
 | `decodeFromData()` | Handled in `load_ledger_header()` via XDR | Full |
 | `loadBySequence()` | `LedgerQueries::load_ledger_header()` | Full |
-| `loadByHash()` | Not implemented | None |
+| `loadByHash()` | `LedgerQueries::load_ledger_header_by_hash()` | Full |
 | `loadMaxLedgerSeq()` | `LedgerQueries::get_latest_ledger_seq()` | Full |
 | `deleteOldEntries()` | `LedgerQueries::delete_old_ledger_headers()` | Full |
-| `copyToStream()` | Not implemented | None |
+| `copyToStream()` | `LedgerQueries::copy_ledger_headers_to_stream()` | Full |
 | N/A | `LedgerQueries::get_ledger_hash()` | Full (Rust addition) |
 
 ### history (`queries/history.rs`)
@@ -123,7 +121,7 @@ Corresponds to: `TransactionSQL.h`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `populateCheckpointFilesFromDB()` | Not implemented | None |
+| `populateCheckpointFilesFromDB()` | `HistoryQueries::copy_tx_history_to_streams()` | Full |
 | `dropSupportTransactionFeeHistory()` | Not needed (deprecated table) | Full |
 | `dropSupportTxSetHistory()` | Not needed (deprecated table) | Full |
 | `dropSupportTxHistory()` | Handled by schema creation | Full |
@@ -141,7 +139,7 @@ Corresponds to: `HerderPersistence.h`, `HerderPersistenceImpl.h`
 | stellar-core | Rust | Status |
 |--------------|------|--------|
 | `saveSCPHistory()` | `ScpQueries::store_scp_history()` | Full |
-| `copySCPHistoryToStream()` | Not implemented | None |
+| `copySCPHistoryToStream()` | `ScpQueries::copy_scp_history_to_stream()` | Full |
 | `getNodeQuorumSet()` | Not implemented (quoruminfo table) | None |
 | `getQuorumSet()` | `ScpQueries::load_scp_quorum_set()` | Full |
 | `deleteOldEntries()` | `ScpQueries::delete_old_scp_entries()` | Full |
@@ -220,6 +218,7 @@ Features excluded by design. These are NOT counted against parity %.
 | `shouldRebuildForOfferTable()` / `clearRebuildForOfferTable()` / `setRebuildForOfferTable()` | No offer table rebuild in Rust; handled differently |
 | `migrateToSlotStateTable()` | Different schema evolution; Rust uses unified schema from start |
 | `dropSupportTransactionFeeHistory()` / `dropSupportTxSetHistory()` | Deprecated tables never created in Rust |
+| `LedgerHeaderUtils::getFlags()` / `LedgerHeaderUtils::isValid()` | Validation logic, not database operations; belongs in ledger crate |
 
 ## Gaps
 
@@ -227,10 +226,6 @@ Features not yet implemented. These ARE counted against parity %.
 
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
-| `LedgerHeaderUtils::loadByHash()` | Medium | Load ledger header by its hash |
-| `LedgerHeaderUtils::copyToStream()` | Low | History archive streaming; may belong in history crate |
-| `populateCheckpointFilesFromDB()` | Low | History archive checkpoint generation from DB |
-| `HerderPersistence::copySCPHistoryToStream()` | Low | SCP history streaming for archives |
 | `HerderPersistence::getNodeQuorumSet()` | Medium | quoruminfo table lookup (node -> qset hash) |
 | `PersistentState::getTxSetHashesForAllSlots()` | Low | Distinct hash-only query; achievable via existing API |
 | `PersistentState::deleteTxSets()` | Low | Currently a no-op; tx set cleanup not linked to slots |
@@ -273,12 +268,12 @@ Features not yet implemented. These ARE counted against parity %.
 |------|-------------------|------------|-------|
 | Database core | 5 TEST_CASE / 4 SECTION | 5 `#[test]` in `migrations.rs` | Schema and version tests covered |
 | Connection string | 1 TEST_CASE / 18 SECTION | 0 | Intentionally omitted (SQLite only) |
-| Ledger headers | Tested in LedgerManager tests | 4 `#[test]` in `ledger.rs` | Store, load, max seq, delete |
-| SCP persistence | Tested in Herder tests | 5 `#[test]` in `scp.rs` | Envelopes, quorum sets, cleanup |
+| Ledger headers | Tested in LedgerManager tests | 8 `#[test]` in `ledger.rs` | Store, load, max seq, hash, stream, delete |
+| SCP persistence | Tested in Herder tests | 8 `#[test]` in `scp.rs` | Envelopes, quorum sets, streaming, cleanup |
 | SCP state recovery | Tested in Herder tests | 2 `#[test]` in `scp_persistence.rs` | Slot state and tx set persistence |
 | Peer management | Tested in OverlayManager tests | 6 `#[test]` in `peers.rs` | CRUD, random queries, cleanup |
 | Ban list | Tested in BanManager tests | 0 (inline in `ban.rs`) | Functions tested via Database API |
-| Transaction history | Tested in TransactionSQL tests | 6 `#[test]` in `history.rs` | Store/load transactions, sets, results |
+| Transaction history | Tested in TransactionSQL tests | 10 `#[test]` in `history.rs` | Store/load transactions, sets, results, streaming |
 | Bucket list | N/A (Rust-specific) | 2 `#[test]` in `bucket_list.rs` | Rust-only checkpoint storage |
 | State queries | Tested in PersistentState tests | 3 `#[test]` in `state.rs` | Get, set, delete, LCL |
 | Publish queue | Tested in HistoryManager tests | 0 (inline in `publish_queue.rs`) | Functions tested via Database API |
@@ -294,7 +289,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 45 |
-| Gaps (None + Partial) | 7 |
-| Intentional Omissions | 16 |
-| **Parity** | **45 / (45 + 7) = 87%** |
+| Implemented (Full) | 49 |
+| Gaps (None + Partial) | 3 |
+| Intentional Omissions | 18 |
+| **Parity** | **49 / (49 + 3) = 94%** |

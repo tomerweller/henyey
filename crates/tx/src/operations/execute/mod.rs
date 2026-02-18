@@ -162,6 +162,18 @@ fn apply_balance_delta(
     Ok(())
 }
 
+/// Classify a ledger key for rent purposes: (is_persistent, is_code_entry).
+fn rent_classification(key: &stellar_xdr::curr::LedgerKey) -> (bool, bool) {
+    match key {
+        stellar_xdr::curr::LedgerKey::ContractCode(_) => (true, true),
+        stellar_xdr::curr::LedgerKey::ContractData(cd) => (
+            cd.durability == stellar_xdr::curr::ContractDataDurability::Persistent,
+            false,
+        ),
+        _ => (false, false),
+    }
+}
+
 /// Check if an asset code is valid per stellar-core's `isAssetValid()`.
 ///
 /// - Native → always valid
@@ -513,14 +525,7 @@ fn rent_snapshot_for_keys(
             .get_ttl(&key_hash)
             .map(|ttl| ttl.live_until_ledger_seq)
             .unwrap_or(0);
-        let (is_persistent, is_code_entry) = match key {
-            stellar_xdr::curr::LedgerKey::ContractCode(_) => (true, true),
-            stellar_xdr::curr::LedgerKey::ContractData(cd) => (
-                cd.durability == stellar_xdr::curr::ContractDataDurability::Persistent,
-                false,
-            ),
-            _ => (false, false),
-        };
+        let (is_persistent, is_code_entry) = rent_classification(key);
         snapshots.push(RentSnapshot {
             key: key.clone(),
             is_persistent,
@@ -848,15 +853,7 @@ pub fn execute_operation_with_soroban(
                                 entry_xdr.len() as u32,
                                 soroban_config.map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
                             );
-                            let (is_persistent, is_code_entry) = match key {
-                                stellar_xdr::curr::LedgerKey::ContractCode(_) => (true, true),
-                                stellar_xdr::curr::LedgerKey::ContractData(cd) => (
-                                    cd.durability
-                                        == stellar_xdr::curr::ContractDataDurability::Persistent,
-                                    false,
-                                ),
-                                _ => (false, false),
-                            };
+                            let (is_persistent, is_code_entry) = rent_classification(key);
                             snapshots.push(RentSnapshot {
                                 key: key.clone(),
                                 is_persistent,
@@ -874,15 +871,7 @@ pub fn execute_operation_with_soroban(
                         // This is different from expired entries where we use the actual old size.
                         if let Some(ha) = hot_archive {
                             if let Some(entry) = ha.get(key) {
-                                let (is_persistent, is_code_entry) = match key {
-                                    stellar_xdr::curr::LedgerKey::ContractCode(_) => (true, true),
-                                    stellar_xdr::curr::LedgerKey::ContractData(cd) => (
-                                        cd.durability
-                                            == stellar_xdr::curr::ContractDataDurability::Persistent,
-                                        false,
-                                    ),
-                                    _ => (false, false),
-                                };
+                                let (is_persistent, is_code_entry) = rent_classification(key);
                                 snapshots.push(RentSnapshot {
                                     key: key.clone(),
                                     is_persistent,

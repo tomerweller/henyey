@@ -18,13 +18,8 @@ henyey-crypto.workspace = true
 henyey-db.workspace = true
 henyey-bucket.workspace = true
 henyey-history.workspace = true
-henyey-historywork.workspace = true
-henyey-overlay.workspace = true
 henyey-scp.workspace = true
-henyey-herder.workspace = true
 henyey-ledger.workspace = true
-henyey-tx.workspace = true
-henyey-work.workspace = true
 
 # Stellar XDR
 stellar-xdr.workspace = true
@@ -36,25 +31,18 @@ clap.workspace = true
 tokio.workspace = true
 futures.workspace = true
 
-# HTTP server
-axum.workspace = true
-
 # Configuration
-toml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
 # Logging
 tracing.workspace = true
-tracing-subscriber.workspace = true
 
 # Error handling
 anyhow.workspace = true
-thiserror.workspace = true
 
 # Encoding
 hex.workspace = true
-base64.workspace = true
 flate2.workspace = true
 
 # Cryptography
@@ -71,8 +59,5 @@ tempfile.workspace = true
 
 # Directories
 dirs = "5"
-
-# Synchronization
-parking_lot.workspace = true
 
 [dev-dependencies]

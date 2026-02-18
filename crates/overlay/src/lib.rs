@@ -97,7 +97,7 @@ pub use connection::{Connection, ConnectionDirection, ConnectionPool, Listener};
 pub use error::OverlayError;
 pub use flood::{compute_message_hash, FloodGate, FloodGateStats, FloodRecord};
 pub use flow_control::{
-    is_flood_message, FlowControl, FlowControlConfig, FlowControlStats, MessagePriority,
+    is_flow_controlled_message, FlowControl, FlowControlConfig, FlowControlStats, MessagePriority,
     QueuedOutboundMessage, ScpQueueCallback, SendMoreCapacity,
 };
 pub use item_fetcher::{

@@ -1196,102 +1196,61 @@ pub fn extract_ledger_changes(
                     }
                 }
             }
+            // V2, V3, and V4 share the same before/operations/after structure
             TransactionMeta::V2(v2) => {
-                // Process txChangesBefore
-                for change in v2.tx_changes_before.iter() {
-                    process_ledger_entry_change(
-                        change,
-                        &mut init_entries,
-                        &mut live_entries,
-                        &mut dead_entries,
-                    );
-                }
-                // Process operation changes
-                for op_changes in v2.operations.iter() {
-                    for change in op_changes.changes.iter() {
-                        process_ledger_entry_change(
-                            change,
-                            &mut init_entries,
-                            &mut live_entries,
-                            &mut dead_entries,
-                        );
-                    }
-                }
-                // Process txChangesAfter
-                for change in v2.tx_changes_after.iter() {
-                    process_ledger_entry_change(
-                        change,
-                        &mut init_entries,
-                        &mut live_entries,
-                        &mut dead_entries,
-                    );
-                }
+                extract_before_ops_after_changes(
+                    &v2.tx_changes_before,
+                    v2.operations.iter().map(|op| &op.changes),
+                    &v2.tx_changes_after,
+                    &mut init_entries, &mut live_entries, &mut dead_entries,
+                );
             }
             TransactionMeta::V3(v3) => {
-                // Process txChangesBefore
-                for change in v3.tx_changes_before.iter() {
-                    process_ledger_entry_change(
-                        change,
-                        &mut init_entries,
-                        &mut live_entries,
-                        &mut dead_entries,
-                    );
-                }
-                // Process operation changes
-                for op_changes in v3.operations.iter() {
-                    for change in op_changes.changes.iter() {
-                        process_ledger_entry_change(
-                            change,
-                            &mut init_entries,
-                            &mut live_entries,
-                            &mut dead_entries,
-                        );
-                    }
-                }
-                // Process txChangesAfter
-                for change in v3.tx_changes_after.iter() {
-                    process_ledger_entry_change(
-                        change,
-                        &mut init_entries,
-                        &mut live_entries,
-                        &mut dead_entries,
-                    );
-                }
-                // Note: sorobanMeta is handled separately if needed
+                extract_before_ops_after_changes(
+                    &v3.tx_changes_before,
+                    v3.operations.iter().map(|op| &op.changes),
+                    &v3.tx_changes_after,
+                    &mut init_entries, &mut live_entries, &mut dead_entries,
+                );
             }
             TransactionMeta::V4(v4) => {
-                // V4 follows the same pattern as V3
-                for change in v4.tx_changes_before.iter() {
-                    process_ledger_entry_change(
-                        change,
-                        &mut init_entries,
-                        &mut live_entries,
-                        &mut dead_entries,
-                    );
-                }
-                for op_changes in v4.operations.iter() {
-                    for change in op_changes.changes.iter() {
-                        process_ledger_entry_change(
-                            change,
-                            &mut init_entries,
-                            &mut live_entries,
-                            &mut dead_entries,
-                        );
-                    }
-                }
-                for change in v4.tx_changes_after.iter() {
-                    process_ledger_entry_change(
-                        change,
-                        &mut init_entries,
-                        &mut live_entries,
-                        &mut dead_entries,
-                    );
-                }
+                extract_before_ops_after_changes(
+                    &v4.tx_changes_before,
+                    v4.operations.iter().map(|op| &op.changes),
+                    &v4.tx_changes_after,
+                    &mut init_entries, &mut live_entries, &mut dead_entries,
+                );
             }
         }
     }
 
     Ok((init_entries, live_entries, dead_entries))
+}
+
+/// Extract changes from V2/V3/V4 meta which share tx_changes_before, operations, tx_changes_after.
+///
+/// The `op_changes` parameter accepts an iterator of `LedgerEntryChanges` references to handle
+/// both `OperationMeta` (V2/V3) and `OperationMetaV2` (V4), which differ in type but both
+/// have a `.changes` field of type `LedgerEntryChanges`.
+fn extract_before_ops_after_changes<'a>(
+    tx_changes_before: &stellar_xdr::curr::LedgerEntryChanges,
+    op_changes: impl Iterator<Item = &'a stellar_xdr::curr::LedgerEntryChanges>,
+    tx_changes_after: &stellar_xdr::curr::LedgerEntryChanges,
+    init_entries: &mut Vec<LedgerEntry>,
+    live_entries: &mut Vec<LedgerEntry>,
+    dead_entries: &mut Vec<LedgerKey>,
+) {
+    for change in tx_changes_before.iter() {
+        process_ledger_entry_change(change, init_entries, live_entries, dead_entries);
+    }
+    for changes in op_changes {
+        for change in changes.iter() {
+            process_ledger_entry_change(change, init_entries, live_entries, dead_entries);
+        }
+    }
+    for change in tx_changes_after.iter() {
+        process_ledger_entry_change(change, init_entries, live_entries, dead_entries);
+    }
 }
 
 /// Process a single ledger entry change.

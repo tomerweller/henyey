@@ -837,8 +837,7 @@ impl App {
         peers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
 
         let now = Instant::now();
-        #[allow(clippy::type_complexity)]
-        let (requests, newly_exhausted): (Vec<(Hash256, henyey_overlay::PeerId)>, Vec<(Hash256, usize, usize)>) = {
+        let (requests, newly_exhausted) = {
             let mut dont_have = self.tx_set_dont_have.write().await;
             let pending_set: HashSet<Hash256> = pending_hashes.iter().copied().collect();
             dont_have.retain(|hash, _| pending_set.contains(hash));

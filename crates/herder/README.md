@@ -4,7 +4,7 @@ SCP coordination and ledger-close orchestration for henyey.
 
 ## Overview
 
-The Herder is the central coordinator that bridges the overlay network and the ledger manager through SCP (Stellar Consensus Protocol). It orchestrates the entire flow from receiving transactions and SCP messages, through consensus, to triggering ledger close. This crate corresponds to stellar-core's `src/herder/` directory and implements `HerderImpl`, `HerderSCPDriver`, `TransactionQueue`, `PendingEnvelopes`, `Upgrades`, and related components.
+The Herder is the central coordinator that bridges the overlay network and the ledger manager through SCP (Stellar Consensus Protocol). It orchestrates the entire flow from receiving transactions and SCP messages, through consensus, to triggering ledger close. This crate corresponds to stellar-core's `src/herder/` directory (upstream reference: `.upstream-v25/src/herder/`) and implements `HerderImpl`, `HerderSCPDriver`, `TransactionQueue`, `PendingEnvelopes`, `Upgrades`, and related components.
 
 The Herder operates in two modes: **Observer** (tracks consensus without voting) and **Validator** (proposes values and votes via SCP). It progresses through three states: Booting, Syncing, and Tracking.
 
@@ -167,7 +167,7 @@ let (tx_set, gen_tx_set) = queue.build_generalized_tx_set(
 | `lib.rs` | Crate root: re-exports, `PendingTransaction`, `ExternalizedValue`, `HerderCallback` trait |
 | `herder.rs` | Main `Herder` struct, `HerderConfig`, envelope processing, state transitions |
 | `scp_driver.rs` | `ScpDriver` and `HerderScpCallback`: SCP value validation, signing, tx set caching |
-| `tx_queue.rs` | `TransactionQueue`, `TransactionSet`, `QueuedTransaction`, tx set building |
+| `tx_queue/` | `TransactionQueue`, `TransactionSet`, `QueuedTransaction`, tx set building (`mod.rs`, `selection.rs`, `tx_set.rs`) |
 | `tx_queue_limiter.rs` | `TxQueueLimiter`: resource-aware queue admission and eviction |
 | `surge_pricing.rs` | `SurgePricingLaneConfig`, `SurgePricingPriorityQueue`: lane-based fee thresholds |
 | `parallel_tx_set_builder.rs` | Parallel Soroban tx set building: conflict detection, staging, bin packing |
@@ -191,9 +191,9 @@ let (tx_set, gen_tx_set) = queue.build_generalized_tx_set(
 
 ## Design Notes
 
-- **Observer EXTERNALIZE fast-forward**: Observers advance their tracking slot based on EXTERNALIZE messages from trusted validators. To prevent attacks, two checks are applied: (1) the sender must be in the transitive quorum set (`QuorumTracker::is_node_definitely_in_quorum`), and (2) the slot must be within `MAX_EXTERNALIZE_SLOT_DISTANCE` (1000 ledgers) of the current tracking slot.
+- **Observer EXTERNALIZE fast-forward**: Observers advance their tracking slot based on EXTERNALIZE messages from trusted validators. To prevent attacks, the sender must be in the transitive quorum set (`QuorumTracker::is_node_definitely_in_quorum`). When tracking, incoming envelopes for slots beyond `LEDGER_VALIDITY_BRACKET` (100 ledgers) ahead of the current tracking slot are rejected.
 
-- **Dual-mode SCP**: Validators create a full `SCP` instance and actively vote. Observers track consensus without an SCP instance by processing only EXTERNALIZE envelopes. Both modes share the same `Herder::build()` constructor, with mode selected by the presence of a secret key and `is_validator` config.
+- **Dual-mode SCP**: Validators create a full `SCP` instance and actively vote. Observers track consensus without an SCP instance by processing only EXTERNALIZE envelopes. Both modes share `Herder::new()` / `Herder::with_secret_key()` constructors, with mode selected by the presence of a secret key and `is_validator` config.
 
 - **Surge pricing determinism**: Transaction set building must be deterministic across all validators. The `SurgePricingPriorityQueue` uses a seed derived from the previous ledger hash to break ties consistently. Lane limits ensure DEX operations cannot crowd out other transaction types.
 
@@ -207,7 +207,7 @@ let (tx_set, gen_tx_set) = queue.build_generalized_tx_set(
 |------|--------------|
 | `herder.rs` | `src/herder/HerderImpl.cpp`, `src/herder/Herder.cpp` |
 | `scp_driver.rs` | `src/herder/HerderSCPDriver.cpp` |
-| `tx_queue.rs` | `src/herder/TransactionQueue.cpp`, `src/herder/TxSetFrame.cpp` |
+| `tx_queue/` | `src/herder/TransactionQueue.cpp`, `src/herder/TxSetFrame.cpp` |
 | `tx_queue_limiter.rs` | `src/herder/TxQueueLimiter.cpp` |
 | `surge_pricing.rs` | `src/herder/SurgePricingUtils.cpp` |
 | `parallel_tx_set_builder.rs` | `src/herder/ParallelTxSetBuilder.cpp` |

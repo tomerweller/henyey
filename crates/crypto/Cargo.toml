@@ -25,16 +25,11 @@ blake2.workspace = true
 # HMAC for message authentication
 hmac.workspace = true
 
-# HKDF for key derivation
-hkdf = "0.12"
-
 # Sealed box encryption for surveys (X25519 + XSalsa20-Poly1305)
 crypto_box.workspace = true
 
 # Random number generation - pure Rust
 rand.workspace = true
-rand_chacha.workspace = true
-getrandom.workspace = true
 
 # Encoding - pure Rust
 hex.workspace = true
@@ -46,4 +41,3 @@ zeroize.workspace = true
 siphasher = "0.3"
 
 [dev-dependencies]
-tempfile.workspace = true

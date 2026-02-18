@@ -506,15 +506,16 @@ fn sorted_for_apply_sequential(
     result
 }
 
-/// Sort stages/clusters for parallel apply, preserving the nested structure.
+/// Sort and canonicalize parallel execution stages.
 ///
-/// Returns stages > clusters > sorted (tx, base_fee) triples using the same
-/// canonical ordering as `sorted_for_apply_parallel`.
-fn sorted_stages_for_parallel(
+/// Each cluster's transactions are sorted by the XOR-based canonical ordering,
+/// and stages are sorted by their first cluster's first transaction.
+/// Clusters within a stage are NOT sorted -- they are independent, so stellar-core
+/// preserves XDR order to keep deterministic result ordering.
+fn sort_parallel_stages(
     stages: &[stellar_xdr::curr::ParallelTxExecutionStage],
-    set_hash: Hash256,
-    base_fee: Option<u32>,
-) -> Vec<Vec<Vec<TxWithFee>>> {
+    set_hash: &Hash256,
+) -> Vec<Vec<Vec<TransactionEnvelope>>> {
     let mut stage_vec: Vec<Vec<Vec<TransactionEnvelope>>> = stages
         .iter()
         .map(|stage| stage.0.iter().map(|cluster| cluster.0.to_vec()).collect())
@@ -522,12 +523,8 @@ fn sorted_stages_for_parallel(
 
     for stage in stage_vec.iter_mut() {
         for cluster in stage.iter_mut() {
-            cluster.sort_by(|a, b| apply_sort_cmp(a, b, &set_hash));
+            cluster.sort_by(|a, b| apply_sort_cmp(a, b, set_hash));
         }
-        // stellar-core does NOT sort clusters within a stage. Clusters are independent,
-        // so their execution order doesn't matter, and the original XDR order
-        // is preserved. Sorting clusters would change the transaction result
-        // ordering and produce a different result hash.
     }
 
     stage_vec.sort_by(|a, b| {
@@ -537,10 +534,22 @@ fn sorted_stages_for_parallel(
         if a[0].is_empty() || b[0].is_empty() {
             return a[0].len().cmp(&b[0].len());
         }
-        apply_sort_cmp(&a[0][0], &b[0][0], &set_hash)
+        apply_sort_cmp(&a[0][0], &b[0][0], set_hash)
     });
 
     stage_vec
+}
+
+/// Sort stages/clusters for parallel apply, preserving the nested structure.
+///
+/// Returns stages > clusters > sorted (tx, base_fee) triples using the same
+/// canonical ordering as `sorted_for_apply_parallel`.
+fn sorted_stages_for_parallel(
+    stages: &[stellar_xdr::curr::ParallelTxExecutionStage],
+    set_hash: Hash256,
+    base_fee: Option<u32>,
+) -> Vec<Vec<Vec<TxWithFee>>> {
+    sort_parallel_stages(stages, &set_hash)
         .into_iter()
         .map(|stage| {
             stage
@@ -556,40 +565,11 @@ fn sorted_for_apply_parallel(
     set_hash: Hash256,
     base_fee: Option<u32>,
 ) -> Vec<(TransactionEnvelope, Option<u32>)> {
-    let mut stage_vec: Vec<Vec<Vec<TransactionEnvelope>>> = stages
-        .iter()
-        .map(|stage| stage.0.iter().map(|cluster| cluster.0.to_vec()).collect())
-        .collect();
-
-    for stage in stage_vec.iter_mut() {
-        for cluster in stage.iter_mut() {
-            cluster.sort_by(|a, b| apply_sort_cmp(a, b, &set_hash));
-        }
-        // stellar-core does NOT sort clusters within a stage. Clusters are independent,
-        // so their execution order doesn't matter, and the original XDR order
-        // is preserved. Sorting clusters would change the transaction result
-        // ordering and produce a different result hash.
-    }
-
-    stage_vec.sort_by(|a, b| {
-        if a.is_empty() || b.is_empty() {
-            return a.len().cmp(&b.len());
-        }
-        if a[0].is_empty() || b[0].is_empty() {
-            return a[0].len().cmp(&b[0].len());
-        }
-        apply_sort_cmp(&a[0][0], &b[0][0], &set_hash)
-    });
-
-    let mut result = Vec::new();
-    for stage in stage_vec {
-        for cluster in stage {
-            for tx in cluster {
-                result.push((tx, base_fee));
-            }
-        }
-    }
-    result
+    sort_parallel_stages(stages, &set_hash)
+        .into_iter()
+        .flat_map(|stage| stage.into_iter().flatten())
+        .map(|tx| (tx, base_fee))
+        .collect()
 }
 
 /// A transaction paired with an optional per-component base fee override.

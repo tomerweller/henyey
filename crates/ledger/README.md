@@ -120,7 +120,12 @@ let entry = handle.get_entry(&key)?;
 | `lib.rs` | Public API, `LedgerInfo`, `LedgerChange`, `fees`, `reserves`, `trustlines` modules |
 | `manager.rs` | `LedgerManager` coordinator -- initialization, close pipeline, bucket list integration |
 | `close.rs` | `LedgerCloseData`, `LedgerCloseResult`, transaction set sorting, upgrade handling |
-| `execution.rs` | Transaction execution bridge to `henyey-tx`, Soroban config loading, fee charging |
+| `execution/mod.rs` | Transaction execution bridge to `henyey-tx`, Soroban config loading, fee charging |
+| `execution/config.rs` | Soroban configuration loading from ledger state |
+| `execution/meta.rs` | Transaction metadata and delta snapshot helpers |
+| `execution/result_mapping.rs` | Mapping execution failures to XDR result codes |
+| `execution/signatures.rs` | Operation result success checking and key utilities |
+| `execution/tx_set.rs` | Transaction set execution orchestration and prefetch |
 | `delta.rs` | `LedgerDelta` change tracking with coalescing, fee/coin deltas, entry categorization |
 | `header.rs` | Header hash, skip list computation, chain verification, `create_next_header` |
 | `snapshot.rs` | `LedgerSnapshot`, `SnapshotHandle`, `SnapshotBuilder` for point-in-time state |
@@ -171,11 +176,11 @@ provides an `RwLock`-guarded wrapper for concurrent access to the Soroban cache.
 |------|--------------|
 | `manager.rs` | `src/ledger/LedgerManagerImpl.h/.cpp` |
 | `close.rs` | `src/ledger/LedgerCloseMetaFrame.h/.cpp` |
-| `execution.rs` | `src/ledger/LedgerManagerImpl.cpp` (transaction apply loop) |
+| `execution/` | `src/ledger/LedgerManagerImpl.cpp` (transaction apply loop) |
 | `delta.rs` | `src/ledger/LedgerTxn.h/.cpp` (change tracking subset) |
 | `header.rs` | `src/ledger/LedgerHeaderUtils.h/.cpp` |
 | `snapshot.rs` | `src/ledger/LedgerStateSnapshot.h/.cpp` |
-| `soroban_state.rs` | `src/ledger/InMemoryLedgerTxn.h/.cpp` |
+| `soroban_state.rs` | `src/ledger/InMemorySorobanState.h/.cpp` |
 | `config_upgrade.rs` | `src/ledger/NetworkConfig.h/.cpp` (upgrade validation) |
 | `offer.rs` | `src/ledger/LedgerTxn.h` (offer ordering utilities) |
 | `error.rs` | Various error returns across stellar-core ledger files |

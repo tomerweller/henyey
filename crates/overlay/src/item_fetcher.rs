@@ -40,7 +40,7 @@
 //! }));
 //!
 //! // Update available peers
-//! fetcher.set_available_peers(overlay_manager.authenticated_peers());
+//! fetcher.set_available_peers(overlay_manager.connected_peers());
 //!
 //! // Start fetching - callback is invoked immediately
 //! fetcher.fetch(tx_set_hash, &envelope);
@@ -496,11 +496,12 @@ impl ItemFetcher {
                 duration
             );
 
-            // Collect all waiting envelopes
-            let mut envelopes = Vec::new();
-            while let Some(env) = tracker.pop() {
-                envelopes.push(env);
-            }
+            // Drain all waiting envelopes
+            let envelopes: Vec<ScpEnvelope> = tracker
+                .waiting_envelopes
+                .drain(..)
+                .map(|(_, env)| env)
+                .collect();
 
             tracker.reset_last_seen_slot_index();
             tracker.cancel();

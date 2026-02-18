@@ -11,7 +11,7 @@ consensus, and subsystem coordination are handled by the underlying library crat
 `henyey-ledger`, `henyey-overlay`, `henyey-herder`, etc.).
 
 The crate corresponds to stellar-core's `main.cpp` entry point and its collection of CLI
-subcommands.
+subcommands defined in `CommandLine.cpp`.
 
 ## Architecture
 
@@ -21,16 +21,18 @@ graph TD
     Config --> Dispatch["Command Dispatch"]
     Dispatch --> Run["run: start node"]
     Dispatch --> Catchup["catchup: sync from archives"]
-    Dispatch --> Offline["offline: XDR tools, verify-execution, self-check"]
+    Dispatch --> VerifyExec["verify-execution: CDP comparison"]
     Dispatch --> Admin["admin: new-db, new-keypair, info, sample-config"]
-    Dispatch --> History["history: verify-history, publish-history"]
+    Dispatch --> History["verify-history, publish-history, verify-checkpoints"]
+    Dispatch --> Tools["dump-ledger, bucket-info, self-check, debug-bucket-entry"]
     Dispatch --> Quorum["check-quorum-intersection"]
     Dispatch --> HttpCmd["http-command"]
     Run --> App["henyey-app"]
     Catchup --> App
-    Offline --> Ledger["henyey-ledger"]
-    Offline --> Bucket["henyey-bucket"]
-    Offline --> HistoryLib["henyey-history"]
+    VerifyExec --> Ledger["henyey-ledger"]
+    VerifyExec --> Bucket["henyey-bucket"]
+    VerifyExec --> HistoryLib["henyey-history (CDP)"]
+    Tools --> Bucket
     Quorum --> SCP["henyey-scp"]
 ```
 
@@ -38,9 +40,8 @@ graph TD
 
 | Type | Description |
 |------|-------------|
-| `Cli` | Top-level clap argument struct with global options (config, verbose, network) |
-| `Commands` | Enum of all CLI subcommands (Run, Catchup, NewDb, Offline, etc.) |
-| `OfflineCommands` | Enum of offline subcommands (ConvertKey, DecodeXdr, VerifyExecution, etc.) |
+| `Cli` | Top-level clap argument struct with global options (config, verbose, network, metadata-output-stream) |
+| `Commands` | Enum of all CLI subcommands (Run, Catchup, NewDb, VerifyExecution, DumpLedger, etc.) |
 | `CliLogFormat` | Log format selection enum (Text, Json) |
 | `VerifyExecutionOptions` | Options struct for the verify-execution command |
 | `CommandArchiveTarget` | Configuration for publishing to remote archives via shell commands |
@@ -49,44 +50,58 @@ graph TD
 
 ### Running a node
 
-```rust
-// From the command line:
-// henyey --testnet run
-// henyey --testnet run --validator
-// henyey --testnet run --watcher
+```bash
+# Run on testnet (default)
+henyey --testnet run
 
-// Internally, the CLI dispatches to henyey_app::run_node:
-let options = RunOptions {
-    mode: RunMode::Validator,
-    force_catchup: false,
-    ..Default::default()
-};
-run_node(config, options).await?;
+# Run as validator
+henyey --testnet run --validator
+
+# Run as watcher (observe only)
+henyey --testnet run --watcher
 ```
 
 ### Catching up from history archives
 
-```rust
-// henyey --testnet catchup current --mode complete --parallelism 16
+```bash
+# Catch up to current ledger (minimal mode)
+henyey --testnet catchup current
 
-let options = CatchupOptions {
-    target: "current".to_string(),
-    mode: CatchupModeInternal::Complete,
-    verify: true,
-    parallelism: 16,
-    keep_temp: false,
-};
-let result = run_catchup(config, options).await?;
+# Catch up with complete history, 16 parallel downloads
+henyey --testnet catchup current --mode complete --parallelism 16
 ```
 
 ### Offline verification against CDP
 
-```rust
-// henyey --testnet offline verify-execution --from 310000 --to 311000 --stop-on-error
+```bash
+# Compare transaction execution against CDP metadata
+henyey --testnet verify-execution --from 310000 --to 311000 --stop-on-error
 
-// This restores bucket list state from a checkpoint, then re-executes
-// transactions via close_ledger and compares results against CDP metadata.
-// Differences indicate execution divergence from stellar-core.
+# This restores bucket list state from a checkpoint, then re-executes
+# transactions via close_ledger and compares results against CDP metadata.
+# Differences indicate execution divergence from stellar-core.
+```
+
+### Other commands
+
+```bash
+# Generate a new node keypair
+henyey new-keypair
+
+# Create a fresh database
+henyey --testnet new-db --force
+
+# Verify history archive integrity
+henyey --testnet verify-history --from 1 --to 100000
+
+# Publish history to archives (validators only)
+henyey --config validator.toml publish-history
+
+# Check quorum intersection from JSON
+henyey check-quorum-intersection network.json
+
+# Send command to running node
+henyey http-command info
 ```
 
 ## Module Layout
@@ -101,8 +116,11 @@ let result = run_catchup(config, options).await?;
 
 - **Single-file command handlers**: All command implementations live in `main.rs` rather than
   being split across modules. This keeps the crate simple since it is a thin CLI wrapper, though
-  `cmd_verify_execution` and `cmd_publish_history` are notably large functions (~950 and ~380
-  lines respectively).
+  `cmd_verify_execution` and `cmd_publish_history` are notably large functions.
+
+- **Archive helper functions**: Common patterns for creating `HistoryArchive` clients from config
+  are factored into `first_archive()` and `all_archives()` helpers to reduce repetition across
+  the many commands that need archive access.
 
 - **Temporary directory lifetime management**: The `cmd_verify_execution` function uses
   `Option<tempfile::TempDir>` holders to keep temporary directories alive for the duration of
@@ -113,7 +131,7 @@ let result = run_catchup(config, options).await?;
   algorithm that enumerates all node subsets. It is capped at 20 nodes to prevent runaway
   computation. stellar-core also has a SAT-solver-based v2 algorithm which is not yet implemented.
 
-- **CDP integration**: The `verify-execution` and `debug-bucket-entry` offline commands use CDP
+- **CDP integration**: The `verify-execution` and `debug-bucket-entry` commands use CDP
   (Crypto Data Platform) as ground truth for comparing transaction execution results. This is
   unique to the Rust implementation and is the primary tool for parity testing.
 
@@ -127,11 +145,10 @@ let result = run_catchup(config, options).await?;
 | `main.rs` (`cmd_publish_history`) | `src/main/ApplicationUtils.cpp` (`publish`) |
 | `main.rs` (`cmd_verify_history`) | `src/main/ApplicationUtils.cpp` (`verifyHistory`) |
 | `main.rs` (`cmd_self_check`) | `src/main/ApplicationUtils.cpp` (`selfCheck`) |
-| `main.rs` (`convert_key`) | `src/main/CommandLine.cpp` (`convertId`) |
-| `main.rs` (`sign_transaction`) | `src/main/CommandLine.cpp` (`signTransaction`) |
-| `main.rs` (`sec_to_pub`) | `src/main/CommandLine.cpp` (`secToPub`) |
-| `main.rs` (`cmd_dump_ledger`) | `src/main/CommandLine.cpp` (`dumpLedger`) |
+| `main.rs` (`cmd_dump_ledger`) | `src/main/ApplicationUtils.cpp` (`dumpLedger`) |
 | `main.rs` (`cmd_http_command`) | `src/main/CommandLine.cpp` (`httpCommand`) |
+| `main.rs` (`cmd_new_keypair`) | `src/main/CommandLine.cpp` (`genSeed`) |
+| `main.rs` (`cmd_verify_checkpoints`) | `src/main/CommandLine.cpp` (`writeVerifiedCheckpointHashes`) |
 | `quorum_intersection.rs` | `src/herder/QuorumIntersectionChecker*` (v1 brute-force only) |
 | `bin/header_compare.rs` | No direct upstream equivalent (debugging tool) |
 

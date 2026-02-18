@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use super::*;
 use super::statements::{are_ballots_less_and_compatible, are_ballots_less_and_incompatible};
 
@@ -76,7 +78,7 @@ impl BallotProtocol {
             }
 
             if let Some(prepared_prime) = &self.prepared_prime {
-                if ballot_compare(ballot, prepared_prime) != std::cmp::Ordering::Greater {
+                if ballot_compare(ballot, prepared_prime) != Ordering::Greater {
                     continue;
                 }
             }
@@ -185,7 +187,7 @@ impl BallotProtocol {
     ) -> Option<(ScpBallot, usize)> {
         for (idx, ballot) in candidates.iter().enumerate().rev() {
             if let Some(high) = &self.high_ballot {
-                if ballot_compare(high, ballot) != std::cmp::Ordering::Less {
+                if ballot_compare(high, ballot) != Ordering::Less {
                     break;
                 }
             }
@@ -234,7 +236,7 @@ impl BallotProtocol {
 
         if can_set_commit {
             for ballot in candidates[..=new_h_index].iter().rev() {
-                if ballot_compare(ballot, &current) == std::cmp::Ordering::Less {
+                if ballot_compare(ballot, &current) == Ordering::Less {
                     break;
                 }
                 if !are_ballots_less_and_compatible(ballot, new_h_ballot) {
@@ -274,7 +276,7 @@ impl BallotProtocol {
             if self
                 .high_ballot
                 .as_ref()
-                .map(|b| ballot_compare(&new_h, b) == std::cmp::Ordering::Greater)
+                .map(|b| ballot_compare(&new_h, b) == Ordering::Greater)
                 .unwrap_or(true)
             {
                 self.high_ballot = Some(new_h.clone());
@@ -368,12 +370,12 @@ impl BallotProtocol {
         if self
             .high_ballot
             .as_ref()
-            .map(|b| ballot_compare(b, &h) != std::cmp::Ordering::Equal)
+            .map(|b| ballot_compare(b, &h) != Ordering::Equal)
             .unwrap_or(true)
             || self
                 .commit
                 .as_ref()
-                .map(|b| ballot_compare(b, &c) != std::cmp::Ordering::Equal)
+                .map(|b| ballot_compare(b, &c) != Ordering::Equal)
                 .unwrap_or(true)
         {
             self.commit = Some(c.clone());
@@ -553,7 +555,7 @@ impl BallotProtocol {
         if self
             .current_ballot
             .as_ref()
-            .map(|b| ballot_compare(b, ballot) == std::cmp::Ordering::Less)
+            .map(|b| ballot_compare(b, ballot) == Ordering::Less)
             .unwrap_or(true)
         {
             return self.bump_to_ballot(ballot, true);
@@ -577,7 +579,7 @@ impl BallotProtocol {
 
         // If we have a commit and the new ballot is incompatible, reject
         if let Some(ref commit) = self.commit {
-            if !ballot_compatible(&commit, ballot) {
+            if !ballot_compatible(commit, ballot) {
                 return false;
             }
         }
@@ -585,7 +587,7 @@ impl BallotProtocol {
         let comp = ballot_compare(self.current_ballot.as_ref().unwrap(), ballot);
 
         match comp {
-            std::cmp::Ordering::Less => {
+            Ordering::Less => {
                 self.bump_to_ballot(ballot, true);
                 true
             }
@@ -596,7 +598,7 @@ impl BallotProtocol {
     pub(super) fn bump_to_ballot(&mut self, ballot: &ScpBallot, check: bool) -> bool {
         if check {
             if let Some(current) = &self.current_ballot {
-                if ballot_compare(ballot, current) != std::cmp::Ordering::Greater {
+                if ballot_compare(ballot, current) != Ordering::Greater {
                     return false;
                 }
             }
@@ -717,18 +719,18 @@ impl BallotProtocol {
         let mut did_work = false;
         if let Some(ref current_prepared) = self.prepared {
             match ballot_compare(current_prepared, &ballot) {
-                std::cmp::Ordering::Less => {
+                Ordering::Less => {
                     if !ballot_compatible(current_prepared, &ballot) {
                         self.prepared_prime = Some(current_prepared.clone());
                     }
                     self.prepared = Some(ballot.clone());
                     did_work = true;
                 }
-                std::cmp::Ordering::Greater => {
+                Ordering::Greater => {
                     let should_update_prime = match &self.prepared_prime {
                         None => true,
                         Some(prepared_prime) => {
-                            ballot_compare(prepared_prime, &ballot) == std::cmp::Ordering::Less
+                            ballot_compare(prepared_prime, &ballot) == Ordering::Less
                                 && !ballot_compatible(current_prepared, &ballot)
                         }
                     };
@@ -737,7 +739,7 @@ impl BallotProtocol {
                         did_work = true;
                     }
                 }
-                std::cmp::Ordering::Equal => {}
+                Ordering::Equal => {}
             }
         } else {
             self.prepared = Some(ballot.clone());

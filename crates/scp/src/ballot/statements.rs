@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use super::*;
 
 impl BallotProtocol {
@@ -20,9 +22,9 @@ impl BallotProtocol {
             (ScpStatementPledges::Externalize(_), ScpStatementPledges::Externalize(_)) => false,
             (ScpStatementPledges::Confirm(old_c), ScpStatementPledges::Confirm(new_c)) => {
                 match ballot_compare(&old_c.ballot, &new_c.ballot) {
-                    std::cmp::Ordering::Less => true,
-                    std::cmp::Ordering::Greater => false,
-                    std::cmp::Ordering::Equal => {
+                    Ordering::Less => true,
+                    Ordering::Greater => false,
+                    Ordering::Equal => {
                         if old_c.n_prepared == new_c.n_prepared {
                             old_c.n_h < new_c.n_h
                         } else {
@@ -33,19 +35,19 @@ impl BallotProtocol {
             }
             (ScpStatementPledges::Prepare(old_p), ScpStatementPledges::Prepare(new_p)) => {
                 match ballot_compare(&old_p.ballot, &new_p.ballot) {
-                    std::cmp::Ordering::Less => return true,
-                    std::cmp::Ordering::Greater => return false,
-                    std::cmp::Ordering::Equal => {}
+                    Ordering::Less => return true,
+                    Ordering::Greater => return false,
+                    Ordering::Equal => {}
                 }
                 match cmp_opt_ballot(&old_p.prepared, &new_p.prepared) {
-                    std::cmp::Ordering::Less => return true,
-                    std::cmp::Ordering::Greater => return false,
-                    std::cmp::Ordering::Equal => {}
+                    Ordering::Less => return true,
+                    Ordering::Greater => return false,
+                    Ordering::Equal => {}
                 }
                 match cmp_opt_ballot(&old_p.prepared_prime, &new_p.prepared_prime) {
-                    std::cmp::Ordering::Less => true,
-                    std::cmp::Ordering::Greater => false,
-                    std::cmp::Ordering::Equal => old_p.n_h < new_p.n_h,
+                    Ordering::Less => true,
+                    Ordering::Greater => false,
+                    Ordering::Equal => old_p.n_h < new_p.n_h,
                 }
             }
             _ => false,
@@ -88,7 +90,7 @@ impl BallotProtocol {
                 if let (Some(prepared_prime), Some(prepared)) =
                     (&prep.prepared_prime, &prep.prepared)
                 {
-                    if ballot_compare(prepared_prime, prepared) != std::cmp::Ordering::Less
+                    if ballot_compare(prepared_prime, prepared) != Ordering::Less
                         || ballot_compatible(prepared_prime, prepared)
                     {
                         return false;
@@ -594,7 +596,7 @@ pub fn min_validation_level(left: ValidationLevel, right: ValidationLevel) -> Va
 /// Returns Greater if a > b, Less if a < b, Equal if a == b.
 pub fn ballot_compare(a: &ScpBallot, b: &ScpBallot) -> std::cmp::Ordering {
     match a.counter.cmp(&b.counter) {
-        std::cmp::Ordering::Equal => a.value.cmp(&b.value),
+        Ordering::Equal => a.value.cmp(&b.value),
         other => other,
     }
 }
@@ -602,9 +604,9 @@ pub fn ballot_compare(a: &ScpBallot, b: &ScpBallot) -> std::cmp::Ordering {
 /// Compare two optional ballots (None < Some).
 pub fn cmp_opt_ballot(a: &Option<ScpBallot>, b: &Option<ScpBallot>) -> std::cmp::Ordering {
     match (a, b) {
-        (None, None) => std::cmp::Ordering::Equal,
-        (None, Some(_)) => std::cmp::Ordering::Less,
-        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
         (Some(a), Some(b)) => ballot_compare(a, b),
     }
 }
@@ -615,10 +617,10 @@ pub fn ballot_compatible(a: &ScpBallot, b: &ScpBallot) -> bool {
 }
 
 pub(super) fn are_ballots_less_and_compatible(a: &ScpBallot, b: &ScpBallot) -> bool {
-    ballot_compare(a, b) != std::cmp::Ordering::Greater && ballot_compatible(a, b)
+    ballot_compare(a, b) != Ordering::Greater && ballot_compatible(a, b)
 }
 
 pub(super) fn are_ballots_less_and_incompatible(a: &ScpBallot, b: &ScpBallot) -> bool {
-    ballot_compare(a, b) != std::cmp::Ordering::Greater && !ballot_compatible(a, b)
+    ballot_compare(a, b) != Ordering::Greater && !ballot_compatible(a, b)
 }
 

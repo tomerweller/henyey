@@ -111,6 +111,27 @@ impl LedgerStateManager {
         }
     }
 
+    /// Record entry metadata (last_modified, sponsorship ext, sponsor) for a ledger key.
+    ///
+    /// This is shared by `load_entry` and `load_entry_without_snapshot` to avoid
+    /// duplicating the metadata bookkeeping in every match arm.
+    fn record_entry_metadata(
+        &mut self,
+        ledger_key: LedgerKey,
+        last_modified: u32,
+        has_sponsorship_ext: bool,
+        sponsor: Option<AccountId>,
+    ) {
+        self.entry_last_modified
+            .insert(ledger_key.clone(), last_modified);
+        if has_sponsorship_ext {
+            self.entry_sponsorship_ext.insert(ledger_key.clone());
+        }
+        if let Some(sponsor) = sponsor {
+            self.entry_sponsorships.insert(ledger_key, sponsor);
+        }
+    }
+
     /// Load a single entry into the state manager.
     pub fn load_entry(&mut self, entry: LedgerEntry) {
         let sponsor = sponsorship_from_entry_ext(&entry);
@@ -123,14 +144,7 @@ impl LedgerStateManager {
                     account_id: account.account_id.clone(),
                 });
                 self.accounts.insert(key, account);
-                self.entry_last_modified
-                    .insert(ledger_key.clone(), last_modified);
-                if has_sponsorship_ext {
-                    self.entry_sponsorship_ext.insert(ledger_key.clone());
-                }
-                if let Some(sponsor) = sponsor {
-                    self.entry_sponsorships.insert(ledger_key, sponsor);
-                }
+                self.record_entry_metadata(ledger_key, last_modified, has_sponsorship_ext, sponsor);
             }
             LedgerEntryData::Trustline(trustline) => {
                 let account_key = account_id_to_bytes(&trustline.account_id);
@@ -140,14 +154,7 @@ impl LedgerStateManager {
                     asset: trustline.asset.clone(),
                 });
                 self.trustlines.insert((account_key, asset_key), trustline);
-                self.entry_last_modified
-                    .insert(ledger_key.clone(), last_modified);
-                if has_sponsorship_ext {
-                    self.entry_sponsorship_ext.insert(ledger_key.clone());
-                }
-                if let Some(sponsor) = sponsor {
-                    self.entry_sponsorships.insert(ledger_key, sponsor);
-                }
+                self.record_entry_metadata(ledger_key, last_modified, has_sponsorship_ext, sponsor);
             }
             LedgerEntryData::Offer(offer) => {
                 let seller_key = account_id_to_bytes(&offer.seller_id);
@@ -159,14 +166,7 @@ impl LedgerStateManager {
                 self.offer_index.add_offer(&offer);
                 self.aa_index_insert(&offer);
                 self.offers.insert(OfferKey::new(seller_key, offer.offer_id), offer);
-                self.entry_last_modified
-                    .insert(ledger_key.clone(), last_modified);
-                if has_sponsorship_ext {
-                    self.entry_sponsorship_ext.insert(ledger_key.clone());
-                }
-                if let Some(sponsor) = sponsor {
-                    self.entry_sponsorships.insert(ledger_key, sponsor);
-                }
+                self.record_entry_metadata(ledger_key, last_modified, has_sponsorship_ext, sponsor);
             }
             LedgerEntryData::Data(data) => {
                 let account_key = account_id_to_bytes(&data.account_id);
@@ -176,14 +176,7 @@ impl LedgerStateManager {
                     data_name: data.data_name.clone(),
                 });
                 self.data_entries.insert((account_key, name), data);
-                self.entry_last_modified
-                    .insert(ledger_key.clone(), last_modified);
-                if has_sponsorship_ext {
-                    self.entry_sponsorship_ext.insert(ledger_key.clone());
-                }
-                if let Some(sponsor) = sponsor {
-                    self.entry_sponsorships.insert(ledger_key, sponsor);
-                }
+                self.record_entry_metadata(ledger_key, last_modified, has_sponsorship_ext, sponsor);
             }
             LedgerEntryData::ContractData(contract_data) => {
                 let key = ContractDataKey::new(
@@ -197,14 +190,7 @@ impl LedgerStateManager {
                     durability: contract_data.durability,
                 });
                 self.contract_data.insert(key, contract_data);
-                self.entry_last_modified
-                    .insert(ledger_key.clone(), last_modified);
-                if has_sponsorship_ext {
-                    self.entry_sponsorship_ext.insert(ledger_key.clone());
-                }
-                if let Some(sponsor) = sponsor {
-                    self.entry_sponsorships.insert(ledger_key, sponsor);
-                }
+                self.record_entry_metadata(ledger_key, last_modified, has_sponsorship_ext, sponsor);
             }
             LedgerEntryData::ContractCode(contract_code) => {
                 let key = contract_code.hash.0;
@@ -212,14 +198,7 @@ impl LedgerStateManager {
                     hash: contract_code.hash.clone(),
                 });
                 self.contract_code.insert(key, contract_code);
-                self.entry_last_modified
-                    .insert(ledger_key.clone(), last_modified);
-                if has_sponsorship_ext {
-                    self.entry_sponsorship_ext.insert(ledger_key.clone());
-                }
-                if let Some(sponsor) = sponsor {
-                    self.entry_sponsorships.insert(ledger_key, sponsor);
-                }
+                self.record_entry_metadata(ledger_key, last_modified, has_sponsorship_ext, sponsor);
             }
             LedgerEntryData::Ttl(ttl) => {
                 let key = ttl.key_hash.0;
@@ -233,14 +212,7 @@ impl LedgerStateManager {
                     .entry(key)
                     .or_insert(ttl.live_until_ledger_seq);
                 self.ttl_entries.insert(key, ttl);
-                self.entry_last_modified
-                    .insert(ledger_key.clone(), last_modified);
-                if has_sponsorship_ext {
-                    self.entry_sponsorship_ext.insert(ledger_key.clone());
-                }
-                if let Some(sponsor) = sponsor {
-                    self.entry_sponsorships.insert(ledger_key, sponsor);
-                }
+                self.record_entry_metadata(ledger_key, last_modified, has_sponsorship_ext, sponsor);
             }
             LedgerEntryData::ClaimableBalance(cb) => {
                 let key = claimable_balance_id_to_bytes(&cb.balance_id);
@@ -248,14 +220,7 @@ impl LedgerStateManager {
                     balance_id: cb.balance_id.clone(),
                 });
                 self.claimable_balances.insert(key, cb);
-                self.entry_last_modified
-                    .insert(ledger_key.clone(), last_modified);
-                if has_sponsorship_ext {
-                    self.entry_sponsorship_ext.insert(ledger_key.clone());
-                }
-                if let Some(sponsor) = sponsor {
-                    self.entry_sponsorships.insert(ledger_key, sponsor);
-                }
+                self.record_entry_metadata(ledger_key, last_modified, has_sponsorship_ext, sponsor);
             }
             LedgerEntryData::LiquidityPool(lp) => {
                 let key = pool_id_to_bytes(&lp.liquidity_pool_id);
@@ -263,14 +228,7 @@ impl LedgerStateManager {
                     liquidity_pool_id: lp.liquidity_pool_id.clone(),
                 });
                 self.liquidity_pools.insert(key, lp);
-                self.entry_last_modified
-                    .insert(ledger_key.clone(), last_modified);
-                if has_sponsorship_ext {
-                    self.entry_sponsorship_ext.insert(ledger_key.clone());
-                }
-                if let Some(sponsor) = sponsor {
-                    self.entry_sponsorships.insert(ledger_key, sponsor);
-                }
+                self.record_entry_metadata(ledger_key, last_modified, has_sponsorship_ext, sponsor);
             }
             _ => {}
         }
@@ -294,14 +252,7 @@ impl LedgerStateManager {
                 });
                 // Insert account but do NOT save snapshot or mark as modified
                 self.accounts.insert(key, account);
-                self.entry_last_modified
-                    .insert(ledger_key.clone(), last_modified);
-                if has_sponsorship_ext {
-                    self.entry_sponsorship_ext.insert(ledger_key.clone());
-                }
-                if let Some(sponsor) = sponsor {
-                    self.entry_sponsorships.insert(ledger_key, sponsor);
-                }
+                self.record_entry_metadata(ledger_key, last_modified, has_sponsorship_ext, sponsor);
             }
             // For other entry types, delegate to regular load_entry since they don't
             // have the same snapshotting concern
@@ -311,9 +262,7 @@ impl LedgerStateManager {
                     data: other,
                     ext: if has_sponsorship_ext {
                         LedgerEntryExt::V1(stellar_xdr::curr::LedgerEntryExtensionV1 {
-                            sponsoring_id: sponsor
-                                .map(|s| SponsorshipDescriptor(Some(s)))
-                                .unwrap_or(SponsorshipDescriptor(None)),
+                            sponsoring_id: SponsorshipDescriptor(sponsor),
                             ext: stellar_xdr::curr::LedgerEntryExtensionV1Ext::V0,
                         })
                     } else {
@@ -2054,125 +2003,87 @@ impl LedgerStateManager {
         self.account_to_ledger_entry(entry)
     }
 
-    /// Convert an AccountEntry to a LedgerEntry.
-    pub(super) fn account_to_ledger_entry(&self, entry: &AccountEntry) -> LedgerEntry {
-        let ledger_key = LedgerKey::Account(LedgerKeyAccount {
-            account_id: entry.account_id.clone(),
-        });
-        let last_modified = self.last_modified_for_key(&ledger_key);
+    /// Build a LedgerEntry from a LedgerKey and LedgerEntryData.
+    ///
+    /// Shared helper for all typed `*_to_ledger_entry` methods. Looks up
+    /// `last_modified` and sponsorship metadata from the key.
+    pub(super) fn build_ledger_entry(
+        &self,
+        ledger_key: &LedgerKey,
+        data: LedgerEntryData,
+    ) -> LedgerEntry {
         LedgerEntry {
-            last_modified_ledger_seq: last_modified,
-            data: LedgerEntryData::Account(entry.clone()),
-            ext: self.ledger_entry_ext_for(&ledger_key),
+            last_modified_ledger_seq: self.last_modified_for_key(ledger_key),
+            data,
+            ext: self.ledger_entry_ext_for(ledger_key),
         }
     }
 
-    /// Convert a TrustLineEntry to a LedgerEntry.
+    pub(super) fn account_to_ledger_entry(&self, entry: &AccountEntry) -> LedgerEntry {
+        let key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: entry.account_id.clone(),
+        });
+        self.build_ledger_entry(&key, LedgerEntryData::Account(entry.clone()))
+    }
+
     pub(super) fn trustline_to_ledger_entry(&self, entry: &TrustLineEntry) -> LedgerEntry {
-        let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+        let key = LedgerKey::Trustline(LedgerKeyTrustLine {
             account_id: entry.account_id.clone(),
             asset: entry.asset.clone(),
         });
-        let last_modified = self.last_modified_for_key(&ledger_key);
-        LedgerEntry {
-            last_modified_ledger_seq: last_modified,
-            data: LedgerEntryData::Trustline(entry.clone()),
-            ext: self.ledger_entry_ext_for(&ledger_key),
-        }
+        self.build_ledger_entry(&key, LedgerEntryData::Trustline(entry.clone()))
     }
 
-    /// Convert an OfferEntry to a LedgerEntry.
     pub(super) fn offer_to_ledger_entry(&self, entry: &OfferEntry) -> LedgerEntry {
-        let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
+        let key = LedgerKey::Offer(LedgerKeyOffer {
             seller_id: entry.seller_id.clone(),
             offer_id: entry.offer_id,
         });
-        let last_modified = self.last_modified_for_key(&ledger_key);
-        LedgerEntry {
-            last_modified_ledger_seq: last_modified,
-            data: LedgerEntryData::Offer(entry.clone()),
-            ext: self.ledger_entry_ext_for(&ledger_key),
-        }
+        self.build_ledger_entry(&key, LedgerEntryData::Offer(entry.clone()))
     }
 
-    /// Convert a DataEntry to a LedgerEntry.
     pub(super) fn data_to_ledger_entry(&self, entry: &DataEntry) -> LedgerEntry {
-        let ledger_key = LedgerKey::Data(LedgerKeyData {
+        let key = LedgerKey::Data(LedgerKeyData {
             account_id: entry.account_id.clone(),
             data_name: entry.data_name.clone(),
         });
-        let last_modified = self.last_modified_for_key(&ledger_key);
-        LedgerEntry {
-            last_modified_ledger_seq: last_modified,
-            data: LedgerEntryData::Data(entry.clone()),
-            ext: self.ledger_entry_ext_for(&ledger_key),
-        }
+        self.build_ledger_entry(&key, LedgerEntryData::Data(entry.clone()))
     }
 
-    /// Convert a ContractDataEntry to a LedgerEntry.
     pub(super) fn contract_data_to_ledger_entry(&self, entry: &ContractDataEntry) -> LedgerEntry {
-        let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
             contract: entry.contract.clone(),
             key: entry.key.clone(),
             durability: entry.durability,
         });
-        let last_modified = self.last_modified_for_key(&ledger_key);
-        LedgerEntry {
-            last_modified_ledger_seq: last_modified,
-            data: LedgerEntryData::ContractData(entry.clone()),
-            ext: self.ledger_entry_ext_for(&ledger_key),
-        }
+        self.build_ledger_entry(&key, LedgerEntryData::ContractData(entry.clone()))
     }
 
-    /// Convert a ContractCodeEntry to a LedgerEntry.
     pub(super) fn contract_code_to_ledger_entry(&self, entry: &ContractCodeEntry) -> LedgerEntry {
-        let ledger_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+        let key = LedgerKey::ContractCode(LedgerKeyContractCode {
             hash: entry.hash.clone(),
         });
-        let last_modified = self.last_modified_for_key(&ledger_key);
-        LedgerEntry {
-            last_modified_ledger_seq: last_modified,
-            data: LedgerEntryData::ContractCode(entry.clone()),
-            ext: self.ledger_entry_ext_for(&ledger_key),
-        }
+        self.build_ledger_entry(&key, LedgerEntryData::ContractCode(entry.clone()))
     }
 
-    /// Convert a TtlEntry to a LedgerEntry.
     pub(super) fn ttl_to_ledger_entry(&self, entry: &TtlEntry) -> LedgerEntry {
-        let ledger_key = LedgerKey::Ttl(LedgerKeyTtl {
+        let key = LedgerKey::Ttl(LedgerKeyTtl {
             key_hash: entry.key_hash.clone(),
         });
-        let last_modified = self.last_modified_for_key(&ledger_key);
-        LedgerEntry {
-            last_modified_ledger_seq: last_modified,
-            data: LedgerEntryData::Ttl(entry.clone()),
-            ext: self.ledger_entry_ext_for(&ledger_key),
-        }
+        self.build_ledger_entry(&key, LedgerEntryData::Ttl(entry.clone()))
     }
 
-    /// Convert a ClaimableBalanceEntry to a LedgerEntry.
     pub(super) fn claimable_balance_to_ledger_entry(&self, entry: &ClaimableBalanceEntry) -> LedgerEntry {
-        let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+        let key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
             balance_id: entry.balance_id.clone(),
         });
-        let last_modified = self.last_modified_for_key(&ledger_key);
-        LedgerEntry {
-            last_modified_ledger_seq: last_modified,
-            data: LedgerEntryData::ClaimableBalance(entry.clone()),
-            ext: self.ledger_entry_ext_for(&ledger_key),
-        }
+        self.build_ledger_entry(&key, LedgerEntryData::ClaimableBalance(entry.clone()))
     }
 
-    /// Convert a LiquidityPoolEntry to a LedgerEntry.
     pub(super) fn liquidity_pool_to_ledger_entry(&self, entry: &LiquidityPoolEntry) -> LedgerEntry {
-        let ledger_key = LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
+        let key = LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
             liquidity_pool_id: entry.liquidity_pool_id.clone(),
         });
-        let last_modified = self.last_modified_for_key(&ledger_key);
-        LedgerEntry {
-            last_modified_ledger_seq: last_modified,
-            data: LedgerEntryData::LiquidityPool(entry.clone()),
-            ext: self.ledger_entry_ext_for(&ledger_key),
-        }
+        self.build_ledger_entry(&key, LedgerEntryData::LiquidityPool(entry.clone()))
     }
 }

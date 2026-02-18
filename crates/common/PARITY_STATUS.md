@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-common`
 **Upstream**: `.upstream-v25/src/util/`
-**Overall Parity**: 95%
-**Last Updated**: 2026-02-13
+**Overall Parity**: 98%
+**Last Updated**: 2026-02-17
 
 ## Summary
 
@@ -16,7 +16,7 @@
 | Resource Accounting | Full | All Resource methods and friends |
 | Metadata Normalization | Full | Sorting matches stellar-core exactly |
 | XDR Output Stream | Full | writeOne with size-prefix framing |
-| XDR Input Stream | None | readOne, readPage not implemented |
+| XDR Input Stream | Partial | readOne implemented; readPage missing |
 | Network Identity | Full | Passphrase-based derivation |
 | Time Utilities | Full | Epoch conversions implemented |
 | Configuration | Full | Rust-native TOML approach |
@@ -29,10 +29,10 @@
 | `ProtocolVersion.h` / `ProtocolVersion.cpp` | `protocol.rs` | Full parity |
 | `types.h` / `types.cpp` | `asset.rs`, `types.rs` | Full parity |
 | `numeric.h` / `numeric.cpp` | `math.rs` | Full parity |
-| `numeric128.h` | `math.rs` | Missing hugeDivide |
+| `numeric128.h` | `math.rs` | hugeDivide inlined in henyey-tx |
 | `TxResource.h` / `TxResource.cpp` | `resource.rs` | Full parity |
 | `MetaUtils.h` / `MetaUtils.cpp` | `meta.rs` | Full parity |
-| `XDRStream.h` | `xdr_stream.rs` | Output only; input missing |
+| `XDRStream.h` | `xdr_stream.rs` | Output full; input partial (readPage missing) |
 | `Math.h` / `Math.cpp` | `math.rs` | Numeric only; random omitted |
 
 ## Component Mapping
@@ -189,9 +189,10 @@ Corresponds to: `XDRStream.h`
 | `OutputFileStream::fdopen()` | `XdrOutputStream::from_fd()` | Full |
 | `OutputFileStream::flush()` | `XdrOutputStream::flush()` | Full |
 | `XDROutputFileStream::durableWriteOne()` | -- | None |
-| `XDRInputFileStream::readOne()` | -- | None |
+| `XDRInputFileStream::open()` | `XdrInputStream::open()` | Full |
+| `XDRInputFileStream::readOne()` | `XdrInputStream::read_one()` | Full |
+| `XDRInputFileStream::getXDRSize()` | Inlined in `read_one()` | Full |
 | `XDRInputFileStream::readPage()` | -- | None |
-| `XDRInputFileStream::getXDRSize()` | -- | None |
 
 ## Intentional Omissions
 
@@ -242,9 +243,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
-| `XDRInputFileStream::readOne()` | Medium | Needed for history archive replay and bucket reading |
 | `XDRInputFileStream::readPage()` | Low | Page-based reading with key search; optimization |
-| `XDRInputFileStream::getXDRSize()` | Low | Static helper for reading XDR size headers |
 | `XDROutputFileStream::durableWriteOne()` | Low | Durable write with fsync; needed for crash safety |
 
 ## Architectural Differences
@@ -271,8 +270,8 @@ Features not yet implemented. These ARE counted against parity %.
 
 5. **XDR Stream I/O**
    - **stellar-core**: ASIO-based buffered streams with fsync support and dual read/write classes
-   - **Rust**: Simple `BufWriter`-based output stream; input stream not yet implemented
-   - **Rationale**: Incremental implementation; output needed first for meta streaming
+   - **Rust**: `BufWriter`-based output stream and `BufReader`-based input stream; no fsync/durable write support
+   - **Rationale**: Rust standard library buffered I/O suffices; fsync can be added when crash safety is needed
 
 ## Test Coverage
 
@@ -281,7 +280,7 @@ Features not yet implemented. These ARE counted against parity %.
 | Balance | 1 TEST_CASE | 1 #[test] | Covered |
 | BigDivide | 4 TEST_CASE / 8 SECTION | 10 #[test] | Good coverage |
 | Uint128 | 3 TEST_CASE / 5 SECTION | 2 #[test] | Adequate |
-| XDRStream | 2 TEST_CASE / 3 SECTION | 3 #[test] | Output-only coverage |
+| XDRStream | 2 TEST_CASE / 3 SECTION | 10 #[test] | Output and input roundtrip coverage |
 | Timer | 8 TEST_CASE | 2 #[test] | Rust covers epoch conversions only |
 | Math (random) | 1 TEST_CASE / 5 SECTION | 0 #[test] | Intentionally omitted (rand crate) |
 | Cache | 8 TEST_CASE | 0 #[test] | Intentionally omitted |
@@ -302,14 +301,14 @@ Features not yet implemented. These ARE counted against parity %.
 ### Test Gaps
 
 - **Metadata normalization**: No dedicated unit tests in `meta.rs`; upstream has no dedicated test file either, but parity is verified through integration testing.
-- **XDR input streaming**: Not tested because not implemented.
+- **XDR readPage**: `readPage()` not tested because not implemented.
 - **hugeDivide**: Algorithm inlined in `henyey-tx` `exchange_with_pool()`; tested via offer exchange tests.
 
 ## Parity Calculation
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 73 |
-| Gaps (None + Partial) | 4 |
+| Implemented (Full) | 92 |
+| Gaps (None) | 2 |
 | Intentional Omissions | 35 |
-| **Parity** | **73 / (73 + 4) = 95%** |
+| **Parity** | **92 / (92 + 2) = 98%** |

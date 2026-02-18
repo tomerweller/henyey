@@ -2,7 +2,7 @@
 
 **Crate**: `henyey-herder`
 **Upstream**: `.upstream-v25/src/herder/`
-**Overall Parity**: 76%
+**Overall Parity**: 77%
 **Last Updated**: 2026-02-17
 
 ## Summary
@@ -78,7 +78,7 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `getMaxTxSize()` | via `flow_control` module | Full |
 | `getFlowControlExtraBuffer()` | `FLOW_CONTROL_BYTES_EXTRA_BUFFER` | Full |
 | `getMinLedgerSeqToAskPeers()` | `get_min_ledger_seq_to_ask_peers()` | Full |
-| `getMinLedgerSeqToRemember()` | _(not implemented)_ | None |
+| `getMinLedgerSeqToRemember()` | `get_min_ledger_seq_to_remember()` | Full |
 | `isNewerNominationOrBallotSt()` | _(not implemented)_ | None |
 | `getMostRecentCheckpointSeq()` | `get_most_recent_checkpoint_seq()` | Full |
 | `triggerNextLedger()` | `trigger_next_ledger()` | Full |
@@ -450,7 +450,6 @@ Features not yet implemented. These ARE counted against parity %.
 | `isNewerNominationOrBallotSt()` | Medium | Envelope dedup optimization |
 | `resolveNodeID()` | Low | Config-based node name lookup |
 | `setUpgrades()` / `getUpgradesJson()` | Medium | Admin API for upgrade scheduling |
-| `getMinLedgerSeqToRemember()` | Low | Memory management hint |
 | `checkAndMaybeReanalyzeQuorumMap()` | Low | Background quorum analysis |
 | `persistUpgrades()` / `restoreUpgrades()` | Low | Upgrade parameters persisted via Serde; functionally equivalent |
 | `getMoreSCPState()` | Low | Peer SCP state request |
@@ -532,7 +531,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 130 |
-| Gaps (None + Partial) | 40 |
+| Implemented (Full) | 131 |
+| Gaps (None + Partial) | 39 |
 | Intentional Omissions | 12 |
-| **Parity** | **130 / (130 + 40) = 76%** |
+| **Parity** | **131 / (131 + 39) = 77%** |

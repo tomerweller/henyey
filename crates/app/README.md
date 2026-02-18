@@ -35,6 +35,7 @@ graph TD
 | `RunOptions` | Options for the run command (mode, force catchup, sync behavior) |
 | `CatchupMode` | History download mode: Minimal, Complete, Recent |
 | `CatchupOptions` | Options for the catchup command (target ledger, mode, parallelism) |
+| `CatchupTarget` | Catchup destination: Current, specific Ledger, or Checkpoint |
 | `CatchupResult` | Result of a catchup operation (final ledger, buckets applied) |
 | `SurveyReport` | Collected network topology survey data |
 | `NodeStatsSnapshot` | Baseline node statistics captured at survey collection start |
@@ -93,7 +94,14 @@ let config = ConfigBuilder::new()
 | Module | Description |
 |--------|-------------|
 | `lib.rs` | Crate root with module declarations and public re-exports |
-| `app.rs` | Core `App` struct, subsystem initialization, ledger close pipeline, catchup orchestration, overlay message handling, survey coordination, and sync recovery |
+| `app/mod.rs` | Core `App` struct definition, field declarations, subsystem initialization (`App::new`), builder, helper functions, and types (`AppState`, `CatchupTarget`, `CatchupResult`, `SurveyReport`) |
+| `app/lifecycle.rs` | Main event loop (`App::run`), signal handling, heartbeat watchdog, rapid-close cycle, and graceful shutdown |
+| `app/ledger_close.rs` | Ledger close pipeline: `persist_ledger_close`, transaction application, bucket list hashing, SCP history persistence, and meta stream emission |
+| `app/catchup_impl.rs` | Catchup orchestration: `App::catchup`, buffered catchup triggering, history archive download coordination, bucket application, and ledger replay |
+| `app/consensus.rs` | SCP integration: out-of-sync recovery, consensus stuck detection, recovery escalation to catchup |
+| `app/tx_flooding.rs` | Transaction set demand/fetch protocol: tx-set request scheduling, peer rotation, DontHave tracking, and exhaustion detection |
+| `app/peers.rs` | Peer management helpers: snapshot queries, connect/disconnect, ban/unban, preferred peer configuration |
+| `app/survey_impl.rs` | Survey message handling: processing survey requests/responses, building topology data, peer data collection |
 | `config.rs` | Configuration types (`AppConfig`, `NodeConfig`, `NetworkConfig`, etc.), TOML loading, environment variable overrides, and `ConfigBuilder` |
 | `run_cmd.rs` | `run_node` entry point, `NodeRunner` lifecycle, `StatusServer` HTTP API with axum handlers for all REST endpoints |
 | `catchup_cmd.rs` | `run_catchup` entry point, `CatchupOptions` parsing, progress callbacks |
@@ -140,7 +148,14 @@ All ledger-close and state-transition logic must be deterministic and match stel
 
 | Rust | stellar-core |
 |------|--------------|
-| `app.rs` | `src/main/ApplicationImpl.cpp`, `src/main/ApplicationImpl.h` |
+| `app/mod.rs` | `src/main/ApplicationImpl.cpp`, `src/main/ApplicationImpl.h` |
+| `app/lifecycle.rs` | `src/main/ApplicationImpl.cpp` (run loop, shutdown) |
+| `app/ledger_close.rs` | `src/ledger/LedgerManagerImpl.cpp` (closeLedger pipeline) |
+| `app/catchup_impl.rs` | `src/catchup/CatchupManagerImpl.cpp` |
+| `app/consensus.rs` | `src/herder/HerderImpl.cpp` (out-of-sync recovery) |
+| `app/tx_flooding.rs` | `src/overlay/ItemFetcher.cpp` (tx set fetching) |
+| `app/peers.rs` | `src/overlay/OverlayManagerImpl.cpp` (peer queries) |
+| `app/survey_impl.rs` | `src/overlay/SurveyManager.cpp` (message handling) |
 | `config.rs` | `src/main/Config.cpp`, `src/main/Config.h` |
 | `run_cmd.rs` | `src/main/CommandHandler.cpp`, `src/main/CommandLine.cpp` |
 | `catchup_cmd.rs` | `src/main/CommandLine.cpp` (catchup command) |

@@ -36,11 +36,10 @@ pub const LIQUIDITY_POOL_FEE_V18: i32 = 30;
 
 /// Check if a character is ASCII alphanumeric (a-z, A-Z, 0-9).
 ///
-/// This is a locale-independent check matching the stellar-core implementation.
+/// Locale-independent check matching stellar-core `isAsciiAlphaNumeric`.
 #[inline]
 pub fn is_ascii_alphanumeric(c: char) -> bool {
-    let uc = c as u8;
-    uc.is_ascii_lowercase() || uc.is_ascii_uppercase() || uc.is_ascii_digit()
+    c.is_ascii_alphanumeric()
 }
 
 /// Check if a character is a printable ASCII non-control character.
@@ -48,8 +47,7 @@ pub fn is_ascii_alphanumeric(c: char) -> bool {
 /// Returns true for characters in the range 0x20-0x7E (space through tilde).
 #[inline]
 pub fn is_ascii_non_control(c: char) -> bool {
-    let uc = c as u8;
-    0x1f < uc && uc < 0x7f
+    matches!(c, ' '..='~')
 }
 
 /// Convert a character to ASCII lowercase.
@@ -57,12 +55,7 @@ pub fn is_ascii_non_control(c: char) -> bool {
 /// Only converts A-Z; other characters are returned unchanged.
 #[inline]
 pub fn to_ascii_lower(c: char) -> char {
-    let uc = c as u8;
-    if uc.is_ascii_uppercase() {
-        (uc + (b'a' - b'A')) as char
-    } else {
-        c
-    }
+    c.to_ascii_lowercase()
 }
 
 /// Check if a string contains only valid ASCII non-control characters.
@@ -121,14 +114,8 @@ pub fn iequals(a: &str, b: &str) -> bool {
 /// assert_eq!(asset_code_to_str(&code12), "MYTOKEN");
 /// ```
 pub fn asset_code_to_str<const N: usize>(code: &[u8; N]) -> String {
-    let mut result = String::new();
-    for &b in code {
-        if b == 0 {
-            break;
-        }
-        result.push(b as char);
-    }
-    result
+    let len = code.iter().position(|&b| b == 0).unwrap_or(N);
+    String::from_utf8_lossy(&code[..len]).into_owned()
 }
 
 /// Convert a string to an asset code byte array.
@@ -184,42 +171,13 @@ pub fn asset_to_string(asset: &Asset) -> String {
 // Asset Validation
 // ============================================================================
 
-/// Validate an asset code (alphaNum4).
-///
-/// Checks that:
-/// - At least one non-zero character exists
-/// - All non-zero bytes are ASCII alphanumeric
-/// - Zeros only appear as trailing padding
-fn is_asset_code4_valid(code: &AssetCode4) -> bool {
-    let mut zeros = false;
-    let mut one_char = false;
-
-    for &b in code.0.iter() {
-        if b == 0 {
-            zeros = true;
-        } else if zeros {
-            // zeros can only be trailing
-            return false;
-        } else if b > 0x7f || !is_ascii_alphanumeric(b as char) {
-            return false;
-        } else {
-            one_char = true;
-        }
-    }
-    one_char
-}
-
-/// Validate an asset code (alphaNum12).
-///
-/// Checks that:
-/// - At least 5 non-zero characters exist
-/// - All non-zero bytes are ASCII alphanumeric
-/// - Zeros only appear as trailing padding
-fn is_asset_code12_valid(code: &AssetCode12) -> bool {
+/// Validate an asset code byte slice: all non-zero bytes must be ASCII
+/// alphanumeric, zeros may only be trailing, and `char_count >= min_chars`.
+fn is_asset_code_valid(code: &[u8], min_chars: usize) -> bool {
     let mut zeros = false;
     let mut char_count = 0;
 
-    for &b in code.0.iter() {
+    for &b in code {
         if b == 0 {
             zeros = true;
         } else if zeros {
@@ -231,7 +189,19 @@ fn is_asset_code12_valid(code: &AssetCode12) -> bool {
             char_count += 1;
         }
     }
-    char_count > 4
+    char_count >= min_chars
+}
+
+/// Validate an asset code (alphaNum4): at least 1 alphanumeric character,
+/// zeros only trailing.
+fn is_asset_code4_valid(code: &AssetCode4) -> bool {
+    is_asset_code_valid(&code.0, 1)
+}
+
+/// Validate an asset code (alphaNum12): at least 5 alphanumeric characters,
+/// zeros only trailing.
+fn is_asset_code12_valid(code: &AssetCode12) -> bool {
+    is_asset_code_valid(&code.0, 5)
 }
 
 /// Check if an Asset is valid for the given protocol version.

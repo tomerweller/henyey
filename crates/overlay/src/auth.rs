@@ -608,19 +608,7 @@ impl AuthContext {
     ) -> Result<StellarMessage> {
         match auth_msg {
             AuthenticatedMessage::V0(v0) => {
-                let msg_type = match &v0.message {
-                    StellarMessage::Hello(_) => "HELLO",
-                    StellarMessage::Auth(_) => "AUTH",
-                    StellarMessage::ErrorMsg(_) => "ERROR",
-                    StellarMessage::Peers(_) => "PEERS",
-                    StellarMessage::SendMore(_) => "SEND_MORE",
-                    StellarMessage::SendMoreExtended(_) => "SEND_MORE_EXT",
-                    StellarMessage::ScpMessage(_) => "SCP",
-                    StellarMessage::FloodAdvert(_) => "FLOOD_ADVERT",
-                    StellarMessage::FloodDemand(_) => "FLOOD_DEMAND",
-                    StellarMessage::Transaction(_) => "TX",
-                    _ => "OTHER",
-                };
+                let msg_type = crate::codec::helpers::message_type_name(&v0.message);
                 tracing::debug!(
                     "unwrap_message: seq={}, is_auth={}, msg_is_auth={}, expected_seq={}, type={}",
                     v0.sequence,

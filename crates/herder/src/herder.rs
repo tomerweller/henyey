@@ -401,8 +401,10 @@ impl Herder {
 
     /// Get the next consensus ledger index.
     /// Matches stellar-core `HerderImpl::nextConsensusLedgerIndex()`.
+    ///
+    /// Equivalent to [`tracking_slot`](Self::tracking_slot); both read the same field.
     pub fn next_consensus_ledger_index(&self) -> u64 {
-        *self.tracking_slot.read()
+        self.tracking_slot()
     }
 
     /// Get the most recent checkpoint sequence.

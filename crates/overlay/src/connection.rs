@@ -20,7 +20,9 @@ use crate::{
     OverlayError, PeerAddress, Result,
 };
 use futures::{SinkExt, StreamExt};
-use std::net::SocketAddr;
+use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use stellar_xdr::curr::AuthenticatedMessage;
 use tokio::net::{TcpListener, TcpStream};
@@ -383,9 +385,9 @@ pub struct ConnectionPool {
     /// Extra slots for connections from preferred IP addresses.
     possibly_preferred_extra: usize,
     /// Set of preferred IP addresses that qualify for extra slots.
-    preferred_ips: parking_lot::RwLock<std::collections::HashSet<std::net::IpAddr>>,
+    preferred_ips: parking_lot::RwLock<HashSet<IpAddr>>,
     /// Current number of active connections.
-    current_count: std::sync::atomic::AtomicUsize,
+    current_count: AtomicUsize,
 }
 
 impl ConnectionPool {
@@ -394,8 +396,8 @@ impl ConnectionPool {
         Self {
             max_connections,
             possibly_preferred_extra: 0,
-            preferred_ips: parking_lot::RwLock::new(std::collections::HashSet::new()),
-            current_count: std::sync::atomic::AtomicUsize::new(0),
+            preferred_ips: parking_lot::RwLock::new(HashSet::new()),
+            current_count: AtomicUsize::new(0),
         }
     }
 
@@ -403,21 +405,19 @@ impl ConnectionPool {
     pub fn with_preferred(
         max_connections: usize,
         possibly_preferred_extra: usize,
-        preferred_ips: std::collections::HashSet<std::net::IpAddr>,
+        preferred_ips: HashSet<IpAddr>,
     ) -> Self {
         Self {
             max_connections,
             possibly_preferred_extra,
             preferred_ips: parking_lot::RwLock::new(preferred_ips),
-            current_count: std::sync::atomic::AtomicUsize::new(0),
+            current_count: AtomicUsize::new(0),
         }
     }
 
     /// Returns true if there's room for another connection.
     pub fn can_accept(&self) -> bool {
-        self.current_count
-            .load(std::sync::atomic::Ordering::Relaxed)
-            < self.max_connections
+        self.current_count.load(Ordering::Relaxed) < self.max_connections
     }
 
     /// Attempts to reserve a connection slot.
@@ -433,13 +433,11 @@ impl ConnectionPool {
     /// If `ip` is provided and matches a preferred IP, the connection may be
     /// allowed even when the pool is at `max_connections`, up to
     /// `max_connections + possibly_preferred_extra`.
-    pub fn try_reserve_with_ip(&self, ip: Option<std::net::IpAddr>) -> bool {
-        let mut current = self
-            .current_count
-            .load(std::sync::atomic::Ordering::Relaxed);
+    pub fn try_reserve_with_ip(&self, ip: Option<IpAddr>) -> bool {
+        let mut current = self.current_count.load(Ordering::Relaxed);
         loop {
             let effective_max = if current >= self.max_connections {
-                // Over the base limit — only allow if IP is preferred
+                // Over the base limit -- only allow if IP is preferred
                 // and we haven't exceeded the extra slots
                 if let Some(ref addr) = ip {
                     let preferred = self.preferred_ips.read();
@@ -461,8 +459,8 @@ impl ConnectionPool {
             match self.current_count.compare_exchange_weak(
                 current,
                 current + 1,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
             ) {
                 Ok(_) => return true,
                 Err(new_current) => current = new_current,
@@ -474,14 +472,12 @@ impl ConnectionPool {
     ///
     /// Call this when a connection is closed.
     pub fn release(&self) {
-        self.current_count
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.current_count.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Returns the current number of connections.
     pub fn count(&self) -> usize {
-        self.current_count
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.current_count.load(Ordering::Relaxed)
     }
 }
 

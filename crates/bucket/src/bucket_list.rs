@@ -946,40 +946,6 @@ pub struct BucketList {
     merge_counters: Arc<MergeCounters>,
 }
 
-/// Get the LedgerEntryType from LedgerEntryData.
-fn entry_type_of_data(data: &stellar_xdr::curr::LedgerEntryData) -> stellar_xdr::curr::LedgerEntryType {
-    use stellar_xdr::curr::{LedgerEntryData, LedgerEntryType};
-    match data {
-        LedgerEntryData::Account(_) => LedgerEntryType::Account,
-        LedgerEntryData::Trustline(_) => LedgerEntryType::Trustline,
-        LedgerEntryData::Offer(_) => LedgerEntryType::Offer,
-        LedgerEntryData::Data(_) => LedgerEntryType::Data,
-        LedgerEntryData::ClaimableBalance(_) => LedgerEntryType::ClaimableBalance,
-        LedgerEntryData::LiquidityPool(_) => LedgerEntryType::LiquidityPool,
-        LedgerEntryData::ContractData(_) => LedgerEntryType::ContractData,
-        LedgerEntryData::ContractCode(_) => LedgerEntryType::ContractCode,
-        LedgerEntryData::ConfigSetting(_) => LedgerEntryType::ConfigSetting,
-        LedgerEntryData::Ttl(_) => LedgerEntryType::Ttl,
-    }
-}
-
-/// Get the LedgerEntryType from a LedgerKey.
-fn entry_type_of_key(key: &stellar_xdr::curr::LedgerKey) -> stellar_xdr::curr::LedgerEntryType {
-    use stellar_xdr::curr::{LedgerEntryType, LedgerKey};
-    match key {
-        LedgerKey::Account(_) => LedgerEntryType::Account,
-        LedgerKey::Trustline(_) => LedgerEntryType::Trustline,
-        LedgerKey::Offer(_) => LedgerEntryType::Offer,
-        LedgerKey::Data(_) => LedgerEntryType::Data,
-        LedgerKey::ClaimableBalance(_) => LedgerEntryType::ClaimableBalance,
-        LedgerKey::LiquidityPool(_) => LedgerEntryType::LiquidityPool,
-        LedgerKey::ContractData(_) => LedgerEntryType::ContractData,
-        LedgerKey::ContractCode(_) => LedgerEntryType::ContractCode,
-        LedgerKey::ConfigSetting(_) => LedgerEntryType::ConfigSetting,
-        LedgerKey::Ttl(_) => LedgerEntryType::Ttl,
-    }
-}
-
 /// Deduplicate ledger entries by key, keeping only the last occurrence.
 /// This ensures that when the same entry is updated multiple times in a single
 /// ledger, only the final state is included in the bucket.
@@ -1398,43 +1364,12 @@ impl BucketList {
     pub fn scan_for_entries_of_type<F>(
         &self,
         entry_type: stellar_xdr::curr::LedgerEntryType,
-        mut callback: F,
+        callback: F,
     ) -> bool
     where
         F: FnMut(&BucketEntry) -> bool,
     {
-        use stellar_xdr::curr::LedgerKey;
-
-        let mut seen_keys: HashSet<LedgerKey> = HashSet::new();
-
-        for level in &self.levels {
-            for bucket in [&*level.curr, &*level.snap] {
-                for entry in bucket.iter() {
-                    if let Some(key) = entry.key() {
-                        if seen_keys.contains(&key) {
-                            continue;
-                        }
-
-                        let matches_type = match &entry {
-                            BucketEntry::Live(e) | BucketEntry::Init(e) => {
-                                entry_type_of_data(&e.data) == entry_type
-                            }
-                            BucketEntry::Dead(k) => entry_type_of_key(k) == entry_type,
-                            BucketEntry::Metadata(_) => false,
-                        };
-
-                        if matches_type {
-                            seen_keys.insert(key);
-
-                            if !entry.is_dead() && !callback(&entry) {
-                                return false;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        true
+        self.scan_for_entries_of_types(&[entry_type], callback)
     }
 
     /// Scan the bucket list for live entries matching ANY of the given types.
@@ -1481,9 +1416,9 @@ impl BucketList {
 
                         let entry_type = match &entry {
                             BucketEntry::Live(e) | BucketEntry::Init(e) => {
-                                entry_type_of_data(&e.data)
+                                crate::entry::ledger_entry_data_type(&e.data)
                             }
-                            BucketEntry::Dead(k) => entry_type_of_key(k),
+                            BucketEntry::Dead(k) => crate::entry::ledger_key_type(k),
                             BucketEntry::Metadata(_) => continue,
                         };
 

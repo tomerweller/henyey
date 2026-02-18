@@ -179,27 +179,27 @@ henyey/
 
 | Crate | Purpose | Parity |
 |-------|---------|--------|
-| [`henyey`](crates/henyey/README.md) | CLI entrypoint, argument parsing, command dispatch | [61%](crates/henyey/PARITY_STATUS.md) |
+| [`henyey`](crates/henyey/README.md) | CLI entrypoint, argument parsing, command dispatch | [43%](crates/henyey/PARITY_STATUS.md) |
 | [`henyey-app`](crates/henyey-app/README.md) | Application wiring, lifecycle management, run/catchup orchestration | [62%](crates/henyey-app/PARITY_STATUS.md) |
-| [`henyey-common`](crates/henyey-common/README.md) | Shared types, config helpers, time utilities | [95%](crates/henyey-common/PARITY_STATUS.md) |
+| [`henyey-common`](crates/henyey-common/README.md) | Shared types, config helpers, time utilities | [98%](crates/henyey-common/PARITY_STATUS.md) |
 | [`henyey-crypto`](crates/henyey-crypto/README.md) | Ed25519 signing, SHA-256 hashing, strkey encoding | [79%](crates/henyey-crypto/PARITY_STATUS.md) |
-| [`henyey-db`](crates/henyey-db/README.md) | SQLite schema, migrations, query layer | [87%](crates/henyey-db/PARITY_STATUS.md) |
+| [`henyey-db`](crates/henyey-db/README.md) | SQLite schema, migrations, query layer | [94%](crates/henyey-db/PARITY_STATUS.md) |
 
 ### Consensus Layer
 
 | Crate | Purpose | Parity |
 |-------|---------|--------|
 | [`henyey-scp`](crates/henyey-scp/README.md) | Stellar Consensus Protocol: nomination, balloting, quorum logic | [100%](crates/henyey-scp/PARITY_STATUS.md) |
-| [`henyey-herder`](crates/henyey-herder/README.md) | Consensus coordination, transaction queue, ledger close triggers | [76%](crates/henyey-herder/PARITY_STATUS.md) |
-| [`henyey-overlay`](crates/henyey-overlay/README.md) | P2P overlay network, peer management, message flooding | [83%](crates/henyey-overlay/PARITY_STATUS.md) |
+| [`henyey-herder`](crates/henyey-herder/README.md) | Consensus coordination, transaction queue, ledger close triggers | [77%](crates/henyey-herder/PARITY_STATUS.md) |
+| [`henyey-overlay`](crates/henyey-overlay/README.md) | P2P overlay network, peer management, message flooding | [88%](crates/henyey-overlay/PARITY_STATUS.md) |
 
 ### Execution Layer
 
 | Crate | Purpose | Parity |
 |-------|---------|--------|
 | [`henyey-ledger`](crates/henyey-ledger/README.md) | Ledger close pipeline, per-operation savepoints, state snapshots, delta tracking | [64%](crates/henyey-ledger/PARITY_STATUS.md) |
-| [`henyey-tx`](crates/henyey-tx/README.md) | Transaction validation and execution (classic + Soroban), savepoint-based rollback | [95%](crates/henyey-tx/PARITY_STATUS.md) |
-| [`henyey-bucket`](crates/henyey-bucket/README.md) | BucketList implementation, merges, on-disk state | [92%](crates/henyey-bucket/PARITY_STATUS.md) |
+| [`henyey-tx`](crates/henyey-tx/README.md) | Transaction validation and execution (classic + Soroban), savepoint-based rollback | [97%](crates/henyey-tx/PARITY_STATUS.md) |
+| [`henyey-bucket`](crates/henyey-bucket/README.md) | BucketList implementation, merges, on-disk state | [93%](crates/henyey-bucket/PARITY_STATUS.md) |
 
 ### History & Sync
 
@@ -212,7 +212,7 @@ henyey/
 
 | Crate | Purpose | Parity |
 |-------|---------|--------|
-| [`henyey-work`](crates/henyey-work/README.md) | Generic DAG-based work scheduler | [46%](crates/henyey-work/PARITY_STATUS.md) |
+| [`henyey-work`](crates/henyey-work/README.md) | Generic DAG-based work scheduler | [39%](crates/henyey-work/PARITY_STATUS.md) |
 
 ## Design Constraints
 

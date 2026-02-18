@@ -491,8 +491,7 @@ impl<D: SCPDriver> SCP<D> {
     {
         let slots = self.slots.read();
         let mut indices: Vec<_> = slots.keys().copied().filter(|s| *s <= from_slot).collect();
-        indices.sort_unstable();
-        indices.reverse();
+        indices.sort_unstable_by(|a, b| b.cmp(a));
 
         for slot_index in indices {
             if !f(slot_index) {

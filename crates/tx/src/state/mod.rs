@@ -88,6 +88,28 @@ fn apply_pre_values<K, V>(
     }
 }
 
+/// Rollback a set of entries from their snapshot map.
+///
+/// For each snapshotted key: if the key is in `created`, remove the entry
+/// from the live map (it was created during this transaction). Otherwise
+/// restore the pre-transaction value from the snapshot.
+fn rollback_entries<K, V>(
+    live_map: &mut HashMap<K, V>,
+    snapshots: &mut HashMap<K, Option<V>>,
+    created: &mut HashSet<K>,
+) where
+    K: Eq + std::hash::Hash,
+{
+    for (key, snapshot) in snapshots.drain() {
+        if created.contains(&key) {
+            live_map.remove(&key);
+        } else if let Some(entry) = snapshot {
+            live_map.insert(key, entry);
+        }
+    }
+    created.clear();
+}
+
 pub use offer_index::{AssetPair, OfferDescriptor, OfferIndex, OfferKey};
 
 pub struct SorobanState {
@@ -965,7 +987,7 @@ impl LedgerStateManager {
                 let account_key = account_id_to_bytes(&k.account_id);
                 self.account_snapshots
                     .get(&account_key)
-                    .and_then(|entry| entry.clone())
+                    .cloned().flatten()
                     .map(|entry| LedgerEntry {
                         last_modified_ledger_seq: last_modified,
                         data: LedgerEntryData::Account(entry),
@@ -977,7 +999,7 @@ impl LedgerStateManager {
                 let asset_key = AssetKey::from_trustline_asset(&k.asset);
                 self.trustline_snapshots
                     .get(&(account_key, asset_key))
-                    .and_then(|entry| entry.clone())
+                    .cloned().flatten()
                     .map(|entry| LedgerEntry {
                         last_modified_ledger_seq: last_modified,
                         data: LedgerEntryData::Trustline(entry),
@@ -988,7 +1010,7 @@ impl LedgerStateManager {
                 let seller_key = account_id_to_bytes(&k.seller_id);
                 self.offer_snapshots
                     .get(&OfferKey::new(seller_key, k.offer_id))
-                    .and_then(|entry| entry.clone())
+                    .cloned().flatten()
                     .map(|entry| LedgerEntry {
                         last_modified_ledger_seq: last_modified,
                         data: LedgerEntryData::Offer(entry),
@@ -1000,7 +1022,7 @@ impl LedgerStateManager {
                 let name = data_name_to_string(&k.data_name);
                 self.data_snapshots
                     .get(&(account_key, name))
-                    .and_then(|entry| entry.clone())
+                    .cloned().flatten()
                     .map(|entry| LedgerEntry {
                         last_modified_ledger_seq: last_modified,
                         data: LedgerEntryData::Data(entry),
@@ -1012,7 +1034,7 @@ impl LedgerStateManager {
                     ContractDataKey::new(k.contract.clone(), k.key.clone(), k.durability);
                 self.contract_data_snapshots
                     .get(&lookup_key)
-                    .and_then(|entry| entry.clone())
+                    .cloned().flatten()
                     .map(|entry| LedgerEntry {
                         last_modified_ledger_seq: last_modified,
                         data: LedgerEntryData::ContractData(entry),
@@ -1022,7 +1044,7 @@ impl LedgerStateManager {
             LedgerKey::ContractCode(k) => self
                 .contract_code_snapshots
                 .get(&k.hash.0)
-                .and_then(|entry| entry.clone())
+                .cloned().flatten()
                 .map(|entry| LedgerEntry {
                     last_modified_ledger_seq: last_modified,
                     data: LedgerEntryData::ContractCode(entry),
@@ -1031,7 +1053,7 @@ impl LedgerStateManager {
             LedgerKey::Ttl(k) => self
                 .ttl_snapshots
                 .get(&k.key_hash.0)
-                .and_then(|entry| entry.clone())
+                .cloned().flatten()
                 .map(|entry| LedgerEntry {
                     last_modified_ledger_seq: last_modified,
                     data: LedgerEntryData::Ttl(entry),
@@ -1041,7 +1063,7 @@ impl LedgerStateManager {
                 let key_bytes = claimable_balance_id_to_bytes(&k.balance_id);
                 self.claimable_balance_snapshots
                     .get(&key_bytes)
-                    .and_then(|entry| entry.clone())
+                    .cloned().flatten()
                     .map(|entry| LedgerEntry {
                         last_modified_ledger_seq: last_modified,
                         data: LedgerEntryData::ClaimableBalance(entry),
@@ -1052,7 +1074,7 @@ impl LedgerStateManager {
                 let key_bytes = pool_id_to_bytes(&k.liquidity_pool_id);
                 self.liquidity_pool_snapshots
                     .get(&key_bytes)
-                    .and_then(|entry| entry.clone())
+                    .cloned().flatten()
                     .map(|entry| LedgerEntry {
                         last_modified_ledger_seq: last_modified,
                         data: LedgerEntryData::LiquidityPool(entry),
@@ -1403,32 +1425,11 @@ impl LedgerStateManager {
             self.id_pool = snapshot;
         }
 
-        // Restore account snapshots. Entries created in this transaction are removed,
-        // others are restored from their snapshot.
-        for (key, snapshot) in self.account_snapshots.drain() {
-            if self.created_accounts.contains(&key) {
-                // Entry was created in this transaction - remove it
-                self.accounts.remove(&key);
-            } else if let Some(entry) = snapshot {
-                // Entry existed before - restore it
-                self.accounts.insert(key, entry);
-            }
-        }
-        self.created_accounts.clear();
-
-        // Restore trustline snapshots
-        for (key, snapshot) in self.trustline_snapshots.drain() {
-            if self.created_trustlines.contains(&key) {
-                self.trustlines.remove(&key);
-            } else if let Some(entry) = snapshot {
-                self.trustlines.insert(key, entry);
-            }
-        }
-        self.created_trustlines.clear();
+        rollback_entries(&mut self.accounts, &mut self.account_snapshots, &mut self.created_accounts);
+        rollback_entries(&mut self.trustlines, &mut self.trustline_snapshots, &mut self.created_trustlines);
 
         // Restore offer snapshots and incrementally update the index.
-        // Instead of rebuilding the full index from scratch (O(n log n) for all offers),
-        // we only undo index changes for offers touched by this transaction.
+        // Offers need special handling for aa_index and offer_index.
         let offer_snapshots: Vec<_> = self.offer_snapshots.drain().collect();
         for (key, snapshot) in offer_snapshots {
             if self.created_offers.contains(&key) {
@@ -1450,45 +1451,10 @@ impl LedgerStateManager {
         }
         self.created_offers.clear();
 
-        // Restore data entry snapshots
-        for (key, snapshot) in self.data_snapshots.drain() {
-            if self.created_data.contains(&key) {
-                self.data_entries.remove(&key);
-            } else if let Some(entry) = snapshot {
-                self.data_entries.insert(key, entry);
-            }
-        }
-        self.created_data.clear();
-
-        // Restore contract data snapshots
-        for (key, snapshot) in self.contract_data_snapshots.drain() {
-            if self.created_contract_data.contains(&key) {
-                self.contract_data.remove(&key);
-            } else if let Some(entry) = snapshot {
-                self.contract_data.insert(key, entry);
-            }
-        }
-        self.created_contract_data.clear();
-
-        // Restore contract code snapshots
-        for (key, snapshot) in self.contract_code_snapshots.drain() {
-            if self.created_contract_code.contains(&key) {
-                self.contract_code.remove(&key);
-            } else if let Some(entry) = snapshot {
-                self.contract_code.insert(key, entry);
-            }
-        }
-        self.created_contract_code.clear();
-
-        // Restore TTL entry snapshots
-        for (key, snapshot) in self.ttl_snapshots.drain() {
-            if self.created_ttl.contains(&key) {
-                self.ttl_entries.remove(&key);
-            } else if let Some(entry) = snapshot {
-                self.ttl_entries.insert(key, entry);
-            }
-        }
-        self.created_ttl.clear();
+        rollback_entries(&mut self.data_entries, &mut self.data_snapshots, &mut self.created_data);
+        rollback_entries(&mut self.contract_data, &mut self.contract_data_snapshots, &mut self.created_contract_data);
+        rollback_entries(&mut self.contract_code, &mut self.contract_code_snapshots, &mut self.created_contract_code);
+        rollback_entries(&mut self.ttl_entries, &mut self.ttl_snapshots, &mut self.created_ttl);
 
         // Restore deferred RO TTL bumps to pre-transaction state.
         // In stellar-core, commitChangesFromSuccessfulOp is only called for
@@ -1500,25 +1466,8 @@ impl LedgerStateManager {
             self.deferred_ro_ttl_bumps.clear();
         }
 
-        // Restore claimable balance snapshots
-        for (key, snapshot) in self.claimable_balance_snapshots.drain() {
-            if self.created_claimable_balances.contains(&key) {
-                self.claimable_balances.remove(&key);
-            } else if let Some(entry) = snapshot {
-                self.claimable_balances.insert(key, entry);
-            }
-        }
-        self.created_claimable_balances.clear();
-
-        // Restore liquidity pool snapshots
-        for (key, snapshot) in self.liquidity_pool_snapshots.drain() {
-            if self.created_liquidity_pools.contains(&key) {
-                self.liquidity_pools.remove(&key);
-            } else if let Some(entry) = snapshot {
-                self.liquidity_pools.insert(key, entry);
-            }
-        }
-        self.created_liquidity_pools.clear();
+        rollback_entries(&mut self.claimable_balances, &mut self.claimable_balance_snapshots, &mut self.created_claimable_balances);
+        rollback_entries(&mut self.liquidity_pools, &mut self.liquidity_pool_snapshots, &mut self.created_liquidity_pools);
 
         // Restore entry sponsorship snapshots
         for (key, snapshot) in self.entry_sponsorship_snapshots.drain() {
@@ -1735,31 +1684,15 @@ impl LedgerStateManager {
         for key in modified_accounts {
             if let Some(Some(snapshot_entry)) = self.account_snapshots.get(&key) {
                 if let Some(entry) = self.accounts.get(&key).cloned() {
-                    // Build ledger key for op_snapshot lookup
                     let ledger_key = LedgerKey::Account(LedgerKeyAccount {
                         account_id: entry.account_id.clone(),
                     });
-                    // Record update if:
-                    // 1. Entry was accessed during operation (in op_entry_snapshots) - stellar-core records all loadAccount calls
-                    // 2. Entry actually changed - always record real value changes
-                    // Note: We use accessed_in_op for both single-op and multi-op transactions because
-                    // stellar-core records per-operation changes only for entries actually accessed.
                     let accessed_in_op = self.op_snapshots_active
                         && self.op_entry_snapshots.contains_key(&ledger_key);
-                    let should_record = accessed_in_op || &entry != snapshot_entry;
-                    if should_record {
-                        // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
-                        // Otherwise fall back to transaction-level snapshot
-                        let pre_state =
-                            if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
-                                op_snapshot.clone()
-                            } else {
-                                self.account_to_ledger_entry(snapshot_entry)
-                            };
-                        self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
-                        let post_state = self.account_to_ledger_entry(&entry);
-                        self.delta.record_update(pre_state, post_state);
-                        // DO NOT update account_snapshots - preserve for rollback
+                    if accessed_in_op || &entry != snapshot_entry {
+                        let fallback = self.account_to_ledger_entry(snapshot_entry);
+                        let post = self.account_to_ledger_entry(&entry);
+                        self.record_flush_update(ledger_key, fallback, post);
                     }
                 }
             }
@@ -1769,30 +1702,16 @@ impl LedgerStateManager {
         for key in modified_trustlines {
             if let Some(Some(snapshot_entry)) = self.trustline_snapshots.get(&key) {
                 if let Some(entry) = self.trustlines.get(&key).cloned() {
-                    // Build ledger key for op_snapshot lookup
                     let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
                         account_id: entry.account_id.clone(),
                         asset: entry.asset.clone(),
                     });
-                    // Record update if:
-                    // 1. Entry was accessed during operation (in op_entry_snapshots) - stellar-core records all load calls
-                    // 2. Entry actually changed - always record real value changes
                     let accessed_in_op = self.op_snapshots_active
                         && self.op_entry_snapshots.contains_key(&ledger_key);
-                    let should_record = accessed_in_op || &entry != snapshot_entry;
-                    if should_record {
-                        // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
-                        // Otherwise fall back to transaction-level snapshot
-                        let pre_state =
-                            if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
-                                op_snapshot.clone()
-                            } else {
-                                self.trustline_to_ledger_entry(snapshot_entry)
-                            };
-                        self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
-                        let post_state = self.trustline_to_ledger_entry(&entry);
-                        self.delta.record_update(pre_state, post_state);
-                        // DO NOT update trustline_snapshots - preserve for rollback
+                    if accessed_in_op || &entry != snapshot_entry {
+                        let fallback = self.trustline_to_ledger_entry(snapshot_entry);
+                        let post = self.trustline_to_ledger_entry(&entry);
+                        self.record_flush_update(ledger_key, fallback, post);
                     }
                 }
             }
@@ -1806,26 +1725,11 @@ impl LedgerStateManager {
                         seller_id: entry.seller_id.clone(),
                         offer_id: entry.offer_id,
                     });
-                    // Record update if:
-                    // 1. Entry was accessed during operation (in op_entry_snapshots) - stellar-core records all load calls
-                    //    This is important for sponsorship-only changes where the entry data doesn't change
-                    //    but the ext (sponsor) changes.
-                    // 2. Entry actually changed - always record real value changes
                     let accessed_in_op = self.op_entry_snapshots.contains_key(&ledger_key);
-                    let should_record = accessed_in_op || &entry != snapshot_entry;
-                    if should_record {
-                        // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
-                        // Otherwise fall back to transaction-level snapshot
-                        let pre_state =
-                            if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
-                                op_snapshot.clone()
-                            } else {
-                                self.offer_to_ledger_entry(snapshot_entry)
-                            };
-                        self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
-                        let post_state = self.offer_to_ledger_entry(&entry);
-                        self.delta.record_update(pre_state, post_state);
-                        // DO NOT update offer_snapshots - preserve for rollback
+                    if accessed_in_op || &entry != snapshot_entry {
+                        let fallback = self.offer_to_ledger_entry(snapshot_entry);
+                        let post = self.offer_to_ledger_entry(&entry);
+                        self.record_flush_update(ledger_key, fallback, post);
                     }
                 }
             }
@@ -1835,30 +1739,16 @@ impl LedgerStateManager {
         for key in modified_data {
             if let Some(Some(snapshot_entry)) = self.data_snapshots.get(&key) {
                 if let Some(entry) = self.data_entries.get(&key).cloned() {
-                    // Build ledger key for op_snapshot lookup
                     let ledger_key = LedgerKey::Data(LedgerKeyData {
                         account_id: entry.account_id.clone(),
                         data_name: entry.data_name.clone(),
                     });
-                    // Record update if:
-                    // 1. Entry was accessed during operation (in op_entry_snapshots) - stellar-core records all load calls
-                    // 2. Entry actually changed - always record real value changes
                     let accessed_in_op = self.op_snapshots_active
                         && self.op_entry_snapshots.contains_key(&ledger_key);
-                    let should_record = accessed_in_op || &entry != snapshot_entry;
-                    if should_record {
-                        // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
-                        // Otherwise fall back to transaction-level snapshot
-                        let pre_state =
-                            if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
-                                op_snapshot.clone()
-                            } else {
-                                self.data_to_ledger_entry(snapshot_entry)
-                            };
-                        self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
-                        let post_state = self.data_to_ledger_entry(&entry);
-                        self.delta.record_update(pre_state, post_state);
-                        // DO NOT update data_snapshots - preserve for rollback
+                    if accessed_in_op || &entry != snapshot_entry {
+                        let fallback = self.data_to_ledger_entry(snapshot_entry);
+                        let post = self.data_to_ledger_entry(&entry);
+                        self.record_flush_update(ledger_key, fallback, post);
                     }
                 }
             }
@@ -1868,25 +1758,15 @@ impl LedgerStateManager {
         for key in modified_contract_data {
             if let Some(Some(snapshot_entry)) = self.contract_data_snapshots.get(&key) {
                 if let Some(entry) = self.contract_data.get(&key).cloned() {
-                    // Only record update if entry actually changed from snapshot
                     if &entry != snapshot_entry {
                         let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
                             contract: entry.contract.clone(),
                             key: entry.key.clone(),
                             durability: entry.durability,
                         });
-                        // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
-                        // Otherwise fall back to transaction-level snapshot
-                        let pre_state =
-                            if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
-                                op_snapshot.clone()
-                            } else {
-                                self.contract_data_to_ledger_entry(snapshot_entry)
-                            };
-                        self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
-                        let post_state = self.contract_data_to_ledger_entry(&entry);
-                        self.delta.record_update(pre_state, post_state);
-                        // DO NOT update contract_data_snapshots - preserve for rollback
+                        let fallback = self.contract_data_to_ledger_entry(snapshot_entry);
+                        let post = self.contract_data_to_ledger_entry(&entry);
+                        self.record_flush_update(ledger_key, fallback, post);
                     }
                 }
             }
@@ -1896,23 +1776,13 @@ impl LedgerStateManager {
         for key in modified_contract_code {
             if let Some(Some(snapshot_entry)) = self.contract_code_snapshots.get(&key) {
                 if let Some(entry) = self.contract_code.get(&key).cloned() {
-                    // Only record update if entry actually changed from snapshot
                     if &entry != snapshot_entry {
                         let ledger_key = LedgerKey::ContractCode(LedgerKeyContractCode {
                             hash: entry.hash.clone(),
                         });
-                        // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
-                        // Otherwise fall back to transaction-level snapshot
-                        let pre_state =
-                            if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
-                                op_snapshot.clone()
-                            } else {
-                                self.contract_code_to_ledger_entry(snapshot_entry)
-                            };
-                        self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
-                        let post_state = self.contract_code_to_ledger_entry(&entry);
-                        self.delta.record_update(pre_state, post_state);
-                        // DO NOT update contract_code_snapshots - preserve for rollback
+                        let fallback = self.contract_code_to_ledger_entry(snapshot_entry);
+                        let post = self.contract_code_to_ledger_entry(&entry);
+                        self.record_flush_update(ledger_key, fallback, post);
                     }
                 }
             }
@@ -1935,30 +1805,19 @@ impl LedgerStateManager {
                 );
                 if let Some(snapshot_entry) = snapshot {
                     if let Some(entry) = self.ttl_entries.get(&key).cloned() {
-                        // Only record update if entry actually changed from snapshot
                         if entry != snapshot_entry {
                             let ledger_key = LedgerKey::Ttl(LedgerKeyTtl {
                                 key_hash: entry.key_hash.clone(),
                             });
-                            // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
-                            // Otherwise fall back to transaction-level snapshot
-                            let pre_state = if let Some(op_snapshot) =
-                                self.op_entry_snapshots.get(&ledger_key)
-                            {
-                                op_snapshot.clone()
-                            } else {
-                                self.ttl_to_ledger_entry(&snapshot_entry)
-                            };
-                            self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
-                            let post_state = self.ttl_to_ledger_entry(&entry);
                             tracing::debug!(
                                 ?key_hash,
                                 pre_live_until = snapshot_entry.live_until_ledger_seq,
                                 post_live_until = entry.live_until_ledger_seq,
                                 "flush_modified_entries: TTL record_update"
                             );
-                            self.delta.record_update(pre_state, post_state);
-                            // DO NOT update ttl_snapshots - preserve for rollback
+                            let fallback = self.ttl_to_ledger_entry(&snapshot_entry);
+                            let post = self.ttl_to_ledger_entry(&entry);
+                            self.record_flush_update(ledger_key, fallback, post);
                         }
                     }
                 }
@@ -1972,26 +1831,11 @@ impl LedgerStateManager {
                     let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
                         balance_id: entry.balance_id.clone(),
                     });
-                    // Record update if:
-                    // 1. Entry was accessed during operation (in op_entry_snapshots) - stellar-core records all load calls
-                    //    This is important for sponsorship-only changes where the entry data doesn't change
-                    //    but the ext (sponsor) changes.
-                    // 2. Entry actually changed - always record real value changes
                     let accessed_in_op = self.op_entry_snapshots.contains_key(&ledger_key);
-                    let should_record = accessed_in_op || &entry != snapshot_entry;
-                    if should_record {
-                        // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
-                        // Otherwise fall back to transaction-level snapshot
-                        let pre_state =
-                            if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
-                                op_snapshot.clone()
-                            } else {
-                                self.claimable_balance_to_ledger_entry(snapshot_entry)
-                            };
-                        self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
-                        let post_state = self.claimable_balance_to_ledger_entry(&entry);
-                        self.delta.record_update(pre_state, post_state);
-                        // DO NOT update claimable_balance_snapshots - preserve for rollback
+                    if accessed_in_op || &entry != snapshot_entry {
+                        let fallback = self.claimable_balance_to_ledger_entry(snapshot_entry);
+                        let post = self.claimable_balance_to_ledger_entry(&entry);
+                        self.record_flush_update(ledger_key, fallback, post);
                     }
                 }
             }
@@ -2004,26 +1848,11 @@ impl LedgerStateManager {
                     let ledger_key = LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
                         liquidity_pool_id: entry.liquidity_pool_id.clone(),
                     });
-                    // Record update if:
-                    // 1. Entry was accessed during operation (in op_entry_snapshots) - stellar-core records all load calls
-                    //    This is important for sponsorship-only changes where the entry data doesn't change
-                    //    but the ext (sponsor) changes.
-                    // 2. Entry actually changed - always record real value changes
                     let accessed_in_op = self.op_entry_snapshots.contains_key(&ledger_key);
-                    let should_record = accessed_in_op || &entry != snapshot_entry;
-                    if should_record {
-                        // Use op_entry_snapshots for STATE if available (captures per-op state correctly)
-                        // Otherwise fall back to transaction-level snapshot
-                        let pre_state =
-                            if let Some(op_snapshot) = self.op_entry_snapshots.get(&ledger_key) {
-                                op_snapshot.clone()
-                            } else {
-                                self.liquidity_pool_to_ledger_entry(snapshot_entry)
-                            };
-                        self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
-                        let post_state = self.liquidity_pool_to_ledger_entry(&entry);
-                        self.delta.record_update(pre_state, post_state);
-                        // DO NOT update liquidity_pool_snapshots - preserve for rollback
+                    if accessed_in_op || &entry != snapshot_entry {
+                        let fallback = self.liquidity_pool_to_ledger_entry(snapshot_entry);
+                        let post = self.liquidity_pool_to_ledger_entry(&entry);
+                        self.record_flush_update(ledger_key, fallback, post);
                     }
                 }
             }
@@ -2031,6 +1860,33 @@ impl LedgerStateManager {
     }
 
     // ==================== Helper Methods ====================
+
+    /// Resolve the pre-state for a modified entry during flush.
+    ///
+    /// If an op-level snapshot exists for this key, use it (captures per-op
+    /// state correctly). Otherwise fall back to the provided transaction-level
+    /// snapshot converted to a `LedgerEntry`.
+    fn resolve_pre_state(&self, ledger_key: &LedgerKey, fallback: LedgerEntry) -> LedgerEntry {
+        self.op_entry_snapshots
+            .get(ledger_key)
+            .cloned()
+            .unwrap_or(fallback)
+    }
+
+    /// Record a flush update: resolve pre-state, set last_modified, and record delta.
+    ///
+    /// Common tail shared by every entry-type block in `flush_modified_entries`.
+    #[allow(dead_code)]
+    fn record_flush_update(
+        &mut self,
+        ledger_key: LedgerKey,
+        fallback_pre: LedgerEntry,
+        post_state: LedgerEntry,
+    ) {
+        let pre_state = self.resolve_pre_state(&ledger_key, fallback_pre);
+        self.set_last_modified_key(ledger_key, self.ledger_seq);
+        self.delta.record_update(pre_state, post_state);
+    }
 }
 
 // ==================== Helper Functions ====================

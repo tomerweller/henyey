@@ -104,7 +104,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -974,7 +974,7 @@ impl WorkScheduler {
                         self.emit_event(completion.id, WorkState::Success, completion.attempt);
                     }
                     self.finalize_entry(completion.id, completion.work);
-                    self.enqueue_ready(&mut queue, &mut queued, &running);
+                    self.enqueue_dependents(completion.id, &mut queue, &mut queued, &running);
                 }
                 WorkOutcome::Retry { delay } => {
                     if cancelled {
@@ -1008,15 +1008,9 @@ impl WorkScheduler {
                         delay
                     };
                     self.emit_event(completion.id, WorkState::Pending, completion.attempt);
-                    let (wake_tx, wake_rx) = oneshot::channel::<WorkId>();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(retry_delay).await;
-                        let _ = wake_tx.send(completion.id);
-                    });
-                    if let Ok(id) = wake_rx.await {
-                        if queued.insert(id) {
-                            queue.push_back(id);
-                        }
+                    tokio::time::sleep(retry_delay).await;
+                    if queued.insert(completion.id) {
+                        queue.push_back(completion.id);
                     }
                 }
                 WorkOutcome::Failed(err) => {
@@ -1061,22 +1055,30 @@ impl WorkScheduler {
             .collect()
     }
 
-    /// Adds any newly-ready work items to the queue.
+    /// Enqueues dependents of a completed work item that are now ready to run.
     ///
-    /// Called after a work item succeeds to check if its dependents
-    /// can now be scheduled.
-    fn enqueue_ready(
+    /// Only checks the direct dependents of `completed_id` rather than
+    /// scanning all entries, since those are the only items whose readiness
+    /// could have changed.
+    fn enqueue_dependents(
         &self,
+        completed_id: WorkId,
         queue: &mut VecDeque<WorkId>,
         queued: &mut HashSet<WorkId>,
         running: &HashSet<WorkId>,
     ) {
-        for id in self.ready_queue() {
-            if running.contains(&id) {
+        let Some(children) = self.dependents.get(&completed_id) else {
+            return;
+        };
+        for &child in children {
+            if running.contains(&child) {
                 continue;
             }
-            if queued.insert(id) {
-                queue.push_back(id);
+            if !matches!(self.states.get(&child), Some(WorkState::Pending)) {
+                continue;
+            }
+            if self.can_run(child) && queued.insert(child) {
+                queue.push_back(child);
             }
         }
     }
@@ -1147,8 +1149,7 @@ impl WorkScheduler {
         let name = self
             .entries
             .get(&id)
-            .map(|entry| entry.name.clone())
-            .unwrap_or_else(|| "unknown".to_string());
+            .map_or_else(|| "unknown".into(), |entry| entry.name.clone());
         let _ = tx.try_send(WorkEvent {
             id,
             name,

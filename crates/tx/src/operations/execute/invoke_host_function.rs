@@ -437,49 +437,35 @@ fn disk_read_bytes_exceeded(
         false
     };
 
+    // Returns true (exceeded) after metering the entry, with a warning log.
+    let mut meter_and_check = |key: &LedgerKey| -> bool {
+        if meter_entry(key, &mut total_read_bytes) {
+            tracing::warn!(
+                total_read_bytes,
+                specified_read_bytes = limit,
+                "Disk read bytes exceeded specified limit"
+            );
+            true
+        } else {
+            false
+        }
+    };
+
     let meter_all = protocol_version_is_before(protocol_version, ProtocolVersion::V23);
 
     if meter_all {
         for key in soroban_data.resources.footprint.read_only.iter() {
-            if meter_entry(key, &mut total_read_bytes) {
-                tracing::warn!(
-                    total_read_bytes,
-                    specified_read_bytes = limit,
-                    "Disk read bytes exceeded specified limit"
-                );
-                return true;
-            }
+            if meter_and_check(key) { return true; }
         }
         for key in soroban_data.resources.footprint.read_write.iter() {
-            if meter_entry(key, &mut total_read_bytes) {
-                tracing::warn!(
-                    total_read_bytes,
-                    specified_read_bytes = limit,
-                    "Disk read bytes exceeded specified limit"
-                );
-                return true;
-            }
+            if meter_and_check(key) { return true; }
         }
     } else {
         for key in soroban_data.resources.footprint.read_only.iter() {
-            if !is_soroban_key(key) && meter_entry(key, &mut total_read_bytes) {
-                tracing::warn!(
-                    total_read_bytes,
-                    specified_read_bytes = limit,
-                    "Disk read bytes exceeded specified limit"
-                );
-                return true;
-            }
+            if !is_soroban_key(key) && meter_and_check(key) { return true; }
         }
         for key in soroban_data.resources.footprint.read_write.iter() {
-            if !is_soroban_key(key) && meter_entry(key, &mut total_read_bytes) {
-                tracing::warn!(
-                    total_read_bytes,
-                    specified_read_bytes = limit,
-                    "Disk read bytes exceeded specified limit"
-                );
-                return true;
-            }
+            if !is_soroban_key(key) && meter_and_check(key) { return true; }
         }
 
         if let SorobanTransactionDataExt::V1(ext) = &soroban_data.ext {
@@ -505,14 +491,7 @@ fn disk_read_bytes_exceeded(
                     if !is_still_archived {
                         continue;
                     }
-                    if meter_entry(key, &mut total_read_bytes) {
-                        tracing::warn!(
-                            total_read_bytes,
-                            specified_read_bytes = limit,
-                            "Disk read bytes exceeded specified limit"
-                        );
-                        return true;
-                    }
+                    if meter_and_check(key) { return true; }
                 }
             }
         }

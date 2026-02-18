@@ -1732,14 +1732,6 @@ impl OverlayManager {
         self.send_to(peer_id, message).await
     }
 
-    /// Get all authenticated peer IDs.
-    ///
-    /// Returns the list of peers that have completed authentication handshake.
-    /// Used by ItemFetcher to know which peers are available for fetching.
-    pub fn authenticated_peers(&self) -> Vec<PeerId> {
-        self.connected_peers()
-    }
-
     /// Add a peer to connect to.
     ///
     /// This is used for peer discovery when we receive a Peers message.

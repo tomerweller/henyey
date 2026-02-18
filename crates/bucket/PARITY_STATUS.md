@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-bucket`
 **Upstream**: `.upstream-v25/src/bucket/`
-**Overall Parity**: 92%
-**Last Updated**: 2026-02-13
+**Overall Parity**: 93%
+**Last Updated**: 2026-02-17
 
 ## Summary
 
@@ -15,7 +15,7 @@
 | BucketBase (merge, hash, index) | Full | Unified Bucket type covers both Live/HotArchive |
 | LiveBucket (fresh, merge, in-memory) | Full | Includes mergeInMemory and freshInMemoryOnly |
 | HotArchiveBucket (fresh, merge) | Full | Full merge semantics |
-| BucketManager (lifecycle, GC, state) | Partial | Missing some medida metrics, visitLedgerEntries |
+| BucketManager (lifecycle, GC, state) | Partial | Missing some medida metrics, merge future integration |
 | FutureBucket (async merging) | Full | Tokio-based equivalent |
 | BucketSnapshot (thread-safe reads) | Full | Full snapshot hierarchy |
 | BucketSnapshotManager (snapshot lifecycle) | Full | Historical snapshots supported |
@@ -213,7 +213,7 @@ Corresponds to: `BucketManager.h`
 | `loadCompleteLedgerState()` | `BucketManager::load_complete_ledger_state()` | Full |
 | `loadCompleteHotArchiveState()` | *(partial, via hot archive iteration)* | Partial |
 | `mergeBuckets()` | `BucketManager::merge_all_buckets()` | Full |
-| `visitLedgerEntries()` | Not implemented | None |
+| `visitLedgerEntries()` | `BucketManager::visit_ledger_entries()` / `visit_ledger_entries_of_type()` | Full |
 | `scheduleVerifyReferencedBucketsWork()` | `BucketManager::verify_bucket_hashes()` | Partial |
 | `getConfig()` | Configuration via constructor params | Full |
 | `reportBucketEntryCountMetrics()` | `BucketEntryCounters` | Partial |
@@ -448,7 +448,6 @@ Features not yet implemented. These ARE counted against parity %.
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
 | `BucketManager::getMergeFuture()` / `putMergeFuture()` | Medium | MergeMap exists but not wired into merge workflow |
-| `BucketManager::visitLedgerEntries()` | Medium | Visitor-based iteration with filter/accept callbacks |
 | `BucketManager::getBloomMissMeter()` / `getBloomLookupMeter()` | Low | Medida-style meter not integrated |
 | `BucketManager::loadCompleteHotArchiveState()` (full) | Low | Partial via hot archive iteration |
 | `BucketManager::scheduleVerifyReferencedBucketsWork()` (as Work) | Low | Verification exists but not as Work class |
@@ -491,7 +490,7 @@ Features not yet implemented. These ARE counted against parity %.
 | BucketManagerTests.cpp | 10 TEST_CASE / 0 SECTION | ~27 #[test] | Lifecycle, persistence, reattachment |
 | BucketIndexTests.cpp | 13 TEST_CASE / 10 SECTION | ~21 #[test] | Index types, serialization, cache |
 | BucketMergeMapTests.cpp | 1 TEST_CASE / 0 SECTION | ~6 #[test] | Merge deduplication |
-| **Total** | **49 TEST_CASE / 46 SECTION** | **~252 #[test]** | Rust tests more granular |
+| **Total** | **49 TEST_CASE / 46 SECTION** | **~306 #[test]** | Rust tests more granular |
 
 ### Test Gaps
 
@@ -504,7 +503,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 137 |
-| Gaps (None + Partial) | 12 |
+| Implemented (Full) | 138 |
+| Gaps (None + Partial) | 11 |
 | Intentional Omissions | 7 |
-| **Parity** | **137 / (137 + 12) = 92%** |
+| **Parity** | **138 / (138 + 11) = 93%** |

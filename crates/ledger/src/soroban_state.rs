@@ -846,7 +846,7 @@ impl InMemorySorobanState {
     ) -> Result<()> {
         // Validate sequence progression
         if self.last_closed_ledger_seq > 0 && ledger_seq != self.last_closed_ledger_seq + 1 {
-            return Err(LedgerError::InvalidLedgerSequence {
+            return Err(LedgerError::InvalidSequence {
                 expected: self.last_closed_ledger_seq + 1,
                 actual: ledger_seq,
             });

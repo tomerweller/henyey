@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-tx`
 **Upstream**: `.upstream-v25/src/transactions/`
-**Overall Parity**: 95%
-**Last Updated**: 2026-02-13
+**Overall Parity**: 97%
+**Last Updated**: 2026-02-17
 
 ## Summary
 
@@ -21,7 +21,7 @@
 | Offer Exchange | Full | exchangeV10, pool exchange, price bounds |
 | Sponsorship Utils | Full | Inline in state.rs |
 | Per-Operation Rollback | Full | Savepoint matches nested LedgerTxn |
-| Soroban Fee Computation | Partial | Pre-apply fee computation not implemented |
+| Soroban Fee Computation | Partial | Static surge pricing fee computation not implemented |
 | Flooding Validation | None | validateSorobanTxForFlooding not needed |
 | Parallel Execution | None | Not implemented by design |
 
@@ -203,6 +203,8 @@ Corresponds to: `TransactionFrame::processFeeSeqNum()`, `processPostApply()`, et
 | `removeOneTimeSignerKeyFromAllSourceAccounts()` | `remove_one_time_signers()` | Full |
 | `getFee()` (baseFee-aware) | `calculate_fee_to_charge()` | Full |
 | `applyOperations()` | `apply_transaction()` | Full |
+| `commonPreApply()` | `process_fee_seq_num()` + ledger signatures | Full |
+| `processSignatures()` | `execution/signatures.rs` (ledger crate) | Full |
 | Protocol version checks | Protocol constants | Full |
 
 ### TransactionMetaBuilder (`meta_builder.rs`)
@@ -331,6 +333,7 @@ Corresponds to: `TransactionUtils.h`
 | `makeAccountAddress()` | `make_account_address()` | Full |
 | `getLumenContractInfo()` / `getAssetContractID()` | `contract_id_from_asset()` | Full |
 | `validateContractLedgerEntry()` | Inline in soroban host | Full |
+| `createEntryRentChangeWithoutModification()` | Inline in `execute/mod.rs` rent computation | Full |
 
 ### SignatureUtils (distributed)
 
@@ -473,11 +476,8 @@ Features not yet implemented. These ARE counted against parity %.
 | `computePreApplySorobanResourceFee()` | Low | Pre-apply resource fee estimation; related to above |
 | `checkValidWithOptionallyChargedFee()` | Low | Fee-optional validation path for tx acceptance; validation works but this specific interface not exposed |
 | `setInsufficientFeeErrorWithFeeCharged()` | Low | Used in tx acceptance queue flow |
-| `commonPreApply()` | Low | Refactored into `apply_transaction()` directly |
-| `processSignatures()` (separate) | Low | Signature processing integrated into apply flow |
 | `hasMuxedAccount()` (TransactionUtils) | Low | Muxed account detection on envelope |
 | `getUpperBoundCloseTimeOffset()` | Low | Close time offset computation for validation |
-| `createEntryRentChangeWithoutModification()` (TransactionUtils) | Low | Rent change creation for TTL-only operations |
 | `validateSorobanOpsConsistency()` | Low | Validates Soroban tx has exactly one Soroban op; checked implicitly |
 
 ## Architectural Differences
@@ -519,41 +519,41 @@ Features not yet implemented. These ARE counted against parity %.
 | InvokeHostFunction | 70 TEST_CASE / 301 SECTION | 19 #[test] | Testnet integration covers gaps |
 | Offer management | 2 TEST_CASE / 178 SECTION | 34 #[test] | Good unit coverage |
 | TxEnvelope/Signatures | 5 TEST_CASE / 154 SECTION | 15 #[test] | Testnet integration covers gaps |
-| PathPaymentStrictReceive | 2 TEST_CASE / 123 SECTION | 20 #[test] | Testnet integration covers gaps |
+| PathPaymentStrictReceive | 2 TEST_CASE / 123 SECTION | 21 #[test] | Testnet integration covers gaps |
 | Exchange mechanics | 6 TEST_CASE / 85 SECTION | 16 #[test] | Good exchange math coverage |
-| LiquidityPool trading | 2 TEST_CASE / 86 SECTION | 13 #[test] | Testnet integration covers gaps |
-| Payment | 2 TEST_CASE / 76 SECTION | 24 #[test] | Good coverage |
-| ClaimableBalance | 1 TEST_CASE / 72 SECTION | 23 #[test] | Good coverage |
-| SetTrustLineFlags | 2 TEST_CASE / 70 SECTION | 11 #[test] | Testnet integration covers gaps |
-| ManageBuyOffer | 8 TEST_CASE / 69 SECTION | 34 #[test] (shared) | Shared with sell offer tests |
+| LiquidityPool trading | 2 TEST_CASE / 86 SECTION | 14 #[test] | Testnet integration covers gaps |
+| Payment | 2 TEST_CASE / 76 SECTION | 26 #[test] | Good coverage |
+| ClaimableBalance | 1 TEST_CASE / 72 SECTION | 28 #[test] | Good coverage |
+| SetTrustLineFlags | 2 TEST_CASE / 70 SECTION | 12 #[test] | Testnet integration covers gaps |
+| ManageBuyOffer | 8 TEST_CASE / 69 SECTION | 35 #[test] (shared) | Shared with sell offer tests |
 | RevokeSponsorship | 1 TEST_CASE / 65 SECTION | 15 #[test] | Testnet integration covers gaps |
-| PathPaymentStrictSend | 2 TEST_CASE / 58 SECTION | 20 #[test] (shared) | Shared with strict receive tests |
-| AllowTrust | 2 TEST_CASE / 54 SECTION | 11 #[test] | Testnet integration covers gaps |
-| AccountMerge | 2 TEST_CASE / 46 SECTION | 13 #[test] | Good coverage |
+| PathPaymentStrictSend | 2 TEST_CASE / 58 SECTION | 21 #[test] (shared) | Shared with strict receive tests |
+| AllowTrust | 2 TEST_CASE / 54 SECTION | 12 #[test] | Testnet integration covers gaps |
+| AccountMerge | 2 TEST_CASE / 46 SECTION | 17 #[test] | Good coverage |
 | TxResults | 1 TEST_CASE / 38 SECTION | 28 #[test] | Good coverage |
-| ChangeTrust | 2 TEST_CASE / 37 SECTION | 20 #[test] | Good coverage |
+| ChangeTrust | 2 TEST_CASE / 37 SECTION | 21 #[test] | Good coverage |
 | FeeBumpTransaction | 1 TEST_CASE / 23 SECTION | 19 #[test] | Good coverage |
-| SetOptions | 1 TEST_CASE / 21 SECTION | 23 #[test] | Exceeds upstream |
-| ClawbackOps | 1 TEST_CASE / 18 SECTION | 12 #[test] | Good coverage |
+| SetOptions | 1 TEST_CASE / 21 SECTION | 24 #[test] | Exceeds upstream |
+| ClawbackOps | 1 TEST_CASE / 18 SECTION | 14 #[test] | Good coverage |
 | Inflation | 2 TEST_CASE / 16 SECTION | 7 #[test] | Deprecated operation |
-| ClawbackClaimableBalance | 1 TEST_CASE / 14 SECTION | 12 #[test] (shared) | Shared with clawback tests |
-| LiquidityPoolDeposit | 1 TEST_CASE / 12 SECTION | 13 #[test] (shared) | Shared pool tests |
-| LiquidityPoolWithdraw | 1 TEST_CASE / 12 SECTION | 13 #[test] (shared) | Shared pool tests |
+| ClawbackClaimableBalance | 1 TEST_CASE / 14 SECTION | 14 #[test] (shared) | Shared with clawback tests |
+| LiquidityPoolDeposit | 1 TEST_CASE / 12 SECTION | 14 #[test] (shared) | Shared pool tests |
+| LiquidityPoolWithdraw | 1 TEST_CASE / 12 SECTION | 14 #[test] (shared) | Shared pool tests |
 | BumpSequence | 1 TEST_CASE / 11 SECTION | 6 #[test] | Adequate coverage |
-| CreateAccount | 1 TEST_CASE / 10 SECTION | 11 #[test] | Exceeds upstream |
+| CreateAccount | 1 TEST_CASE / 10 SECTION | 13 #[test] | Exceeds upstream |
 | BeginSponsoring | 1 TEST_CASE / 9 SECTION | 15 #[test] (shared) | Shared sponsorship tests |
 | Events | 1 TEST_CASE / 8 SECTION | 60 #[test] | Exceeds upstream |
 | ManageData | 1 TEST_CASE / 4 SECTION | 14 #[test] | Exceeds upstream |
 | EndSponsoring | 1 TEST_CASE / 2 SECTION | 15 #[test] (shared) | Shared sponsorship tests |
 | SignatureUtils | 2 TEST_CASE / 0 SECTION | 15 #[test] | Good coverage |
 | ParallelApply | 4 TEST_CASE / 0 SECTION | 0 #[test] | N/A (not implemented) |
-| State management | - | 43 #[test] | Rust-only: savepoint, rollback, offer index |
+| State management | - | 51 #[test] | Rust-only: savepoint, rollback, offer index |
 | Meta building | - | 20 #[test] | Rust-only: TransactionMeta construction |
 | Lumen reconciler | - | 17 #[test] | Rust-only: SAC event reconciliation |
 | Result tracking | - | 28 #[test] | Rust-only: MutableTransactionResult |
-| Live execution | - | 27 #[test] | Rust-only: fee/seq/refund flow |
+| Live execution | - | 28 #[test] | Rust-only: fee/seq/refund flow |
 | History apply | - | 20 #[test] | Rust-only: catchup mode |
-| Frame properties | - | 33 #[test] | Rust-only: envelope accessors |
+| Frame properties | - | 40 #[test] | Rust-only: envelope accessors |
 | Validation | - | 26 #[test] | Rust-only: precondition checks |
 | Soroban types | - | 19 #[test] | Rust-only: protocol type mapping |
 | Soroban errors | - | 15 #[test] | Rust-only: error code mapping |
@@ -562,7 +562,7 @@ Features not yet implemented. These ARE counted against parity %.
 | Soroban budget | - | 9 #[test] | Rust-only: budget tracking |
 | Soroban host | - | 7 #[test] | Rust-only: host configuration |
 
-**Total: 127 TEST_CASE / ~1,753 SECTION upstream vs. 767 #[test] in Rust**
+**Total: 130 TEST_CASE / 1,672 SECTION upstream vs. 815 #[test] in Rust**
 
 ### Test Gaps
 
@@ -661,24 +661,24 @@ Both approaches ensure WASM compilation costs are NOT charged against transactio
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 192 |
-| Gaps (None + Partial) | 10 |
+| Implemented (Full) | 195 |
+| Gaps (None + Partial) | 7 |
 | Intentional Omissions | 29 |
-| **Parity** | **192 / (192 + 10) = 95%** |
+| **Parity** | **195 / (195 + 7) = 97%** |
 
-Breakdown of the 192 implemented items:
+Breakdown of the 195 implemented items:
 - TransactionFrame accessors/methods: 26
 - Validation functions: 13
 - SignatureChecker functions: 10
 - MutableTransactionResult functions: 16
 - FeeBumpTransactionFrame functions: 11
-- Live execution functions: 12
+- Live execution functions: 14 (+2: commonPreApply, processSignatures)
 - TransactionMetaBuilder functions: 9
 - Event emission functions: 18
 - Offer exchange functions: 12
 - OperationFrame/ThresholdLevel: 11
 - SponsorshipUtils functions: 14
-- TransactionUtils functions: 20
+- TransactionUtils functions: 21 (+1: createEntryRentChangeWithoutModification)
 - Classic operations (24 ops, doApply + doCheckValid each): 27
 - Soroban operations (3 ops): 3
 - Soroban integration components: 11
@@ -687,14 +687,11 @@ Breakdown of the 192 implemented items:
 - LumenEventReconciler: 1
 - SignatureUtils (verify functions): 4
 
-Breakdown of the 10 gaps:
+Breakdown of the 7 gaps:
 - `computeSorobanResourceFee()` (static fee computation)
 - `computePreApplySorobanResourceFee()`
 - `checkValidWithOptionallyChargedFee()`
 - `setInsufficientFeeErrorWithFeeCharged()`
-- `commonPreApply()` (separate refactored method)
-- `processSignatures()` (separate method)
 - `hasMuxedAccount()`
 - `getUpperBoundCloseTimeOffset()`
-- `createEntryRentChangeWithoutModification()`
 - `validateSorobanOpsConsistency()` (explicit check)

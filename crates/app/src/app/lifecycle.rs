@@ -42,11 +42,7 @@ impl App {
         self.request_scp_state_from_peers().await;
 
         // Set state based on validator mode
-        if self.is_validator {
-            self.set_state(AppState::Validating).await;
-        } else {
-            self.set_state(AppState::Synced).await;
-        }
+        self.restore_operational_state().await;
 
         // Start sync recovery tracking to enable the consensus stuck timer
         self.start_sync_recovery_tracking();

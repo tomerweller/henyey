@@ -2,8 +2,8 @@
 
 **Crate**: `henyey`
 **Upstream**: `.upstream-v25/src/main/` (CLI subset only)
-**Overall Parity**: 61%
-**Last Updated**: 2026-02-13
+**Overall Parity**: 43%
+**Last Updated**: 2026-02-17
 
 ## Summary
 
@@ -15,11 +15,13 @@
 | Database Commands | Full | `new-db`, `upgrade-db` |
 | History Publish (`publish`) | Full | Local and remote (put command) archives |
 | History Verification | Full | `verify-checkpoints`, `verify-history` |
-| Key/Crypto Utilities | Full | `gen-seed`, `convert-id`, `sec-to-pub`, `sign-transaction` |
+| Key Generation | Full | `new-keypair` (genSeed equivalent) |
 | HTTP Command | Full | `http-command` to local node |
 | Self-Check | Full | Header chain, bucket hash, crypto benchmark |
+| Dump Ledger | Full | `dump-ledger` with type/modified filters |
 | Quorum Intersection | Partial | V1 brute-force only; V2 SAT-solver not implemented |
-| XDR Tools | Partial | `decode-xdr`/`encode-xdr` cover limited types; `dump-xdr` not implemented |
+| Key/Crypto Utilities | None | `convert-id`, `sec-to-pub`, `sign-transaction` removed |
+| XDR Tools | None | `decode-xdr`/`encode-xdr` removed; `dump-xdr` not implemented |
 | Diagnostic CLI Commands | None | `diag-bucket-stats`, `merge-bucketlist`, `dump-archival-stats` etc. |
 | Settings Upgrade Transactions | None | `get-settings-upgrade-txs` not implemented |
 
@@ -29,8 +31,9 @@
 |--------------------|-------------|-------|
 | `CommandLine.h` / `CommandLine.cpp` | `main.rs` | CLI commands and argument parsing |
 | `main.cpp` | `main.rs` | Process entrypoint, initialization |
+| `ApplicationUtils.h` / `ApplicationUtils.cpp` | `main.rs` | run, catchup, publish, selfCheck, dumpLedger |
 | `StellarCoreVersion.h` | `main.rs` (via `clap` version) | Version string |
-| `dumpxdr.h` / `dumpxdr.cpp` | `main.rs` (`decode_xdr`, `encode_xdr`, `sign_transaction`, `sec_to_pub`) | Partial coverage |
+| `dumpxdr.h` / `dumpxdr.cpp` | -- | Removed from Rust; was partial |
 
 ## Component Mapping
 
@@ -44,8 +47,8 @@ Corresponds to: `CommandLine.h`, `main.cpp`
 | `handleCommandLine()` | `main()` + clap dispatch | Full |
 | `runVersion()` | clap `--version` | Full |
 | `writeWithTextFlow()` | clap help formatting | Full |
-| `checkXDRFileIdentity()` | — | Omitted |
-| `checkStellarCoreMajorVersionProtocolIdentity()` | — | Omitted |
+| `checkXDRFileIdentity()` | -- | Omitted |
+| `checkStellarCoreMajorVersionProtocolIdentity()` | -- | Omitted |
 
 ### CLI Commands (`main.rs`)
 
@@ -70,39 +73,39 @@ Corresponds to: `CommandLine.cpp`
 |--------------|------|--------|
 | `runWriteVerifiedCheckpointHashes()` | `cmd_verify_checkpoints()` | Full |
 | `runCheckQuorumIntersection()` | `cmd_check_quorum_intersection()` | Partial |
-| `runReportLastHistoryCheckpoint()` | — | None |
-| `runPrintPublishQueue()` | — | None |
-| `runNewHist()` | — | None |
+| `runReportLastHistoryCheckpoint()` | -- | None |
+| `runPrintPublishQueue()` | -- | None |
+| `runNewHist()` | -- | None |
 
 #### Key and Crypto Utilities
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
 | `runGenSeed()` | `cmd_new_keypair()` | Full |
-| `runConvertId()` | `convert_key()` | Full |
-| `runSecToPub()` | `sec_to_pub()` | Full |
-| `runSignTransaction()` | `sign_transaction()` | Full |
+| `runConvertId()` | -- | None |
+| `runSecToPub()` | -- | None |
+| `runSignTransaction()` | -- | None |
 
 #### XDR and Diagnostic Tools
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `runPrintXdr()` | `decode_xdr()` | Partial |
-| `runEncodeAsset()` | `encode_xdr()` | Full |
 | `runDumpLedger()` | `cmd_dump_ledger()` | Full |
-| `runDumpXDR()` | — | None |
-| `runDumpWasm()` | — | None |
-| `diagBucketStats()` | — | None |
-| `runMergeBucketList()` | — | None |
-| `runDumpStateArchivalStatistics()` | — | None |
+| `runPrintXdr()` | -- | None |
+| `runEncodeAsset()` | -- | None |
+| `runDumpXDR()` | -- | None |
+| `runDumpWasm()` | -- | None |
+| `diagBucketStats()` | -- | None |
+| `runMergeBucketList()` | -- | None |
+| `runDumpStateArchivalStatistics()` | -- | None |
 
 #### Other Commands
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `runReplayDebugMeta()` | — | None |
-| `getSettingsUpgradeTransactions()` | — | None |
-| `runForceSCP()` | — | Omitted |
+| `runReplayDebugMeta()` | -- | None |
+| `getSettingsUpgradeTransactions()` | -- | None |
+| `runForceSCP()` | -- | Omitted |
 | `runVersion()` | clap `--version` + `info` | Full |
 
 ### Quorum Intersection (`quorum_intersection.rs`)
@@ -112,23 +115,23 @@ Corresponds to: `CommandLine.cpp` (`runCheckQuorumIntersection`)
 | stellar-core | Rust | Status |
 |--------------|------|--------|
 | V1 brute-force intersection check | `check_quorum_intersection_from_json()` | Full |
-| V2 SAT-based intersection check | — | None |
-| `--analyze-critical-groups` | — | None |
-| `--time-limit-ms` / `--memory-limit-bytes` | — | None |
-| `--result-json` output | — | None |
+| V2 SAT-based intersection check | -- | None |
+| `--analyze-critical-groups` | -- | None |
+| `--time-limit-ms` / `--memory-limit-bytes` | -- | None |
+| `--result-json` output | -- | None |
 
-### XDR Utilities (`main.rs`)
+### XDR Utilities
 
 Corresponds to: `dumpxdr.h` / `dumpxdr.cpp`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `dumpXdrStream()` | — | None |
-| `printXdr()` | `decode_xdr()` | Partial |
-| `signtxns()` | — | None |
-| `signtxn()` | `sign_transaction()` | Full |
-| `priv2pub()` | `sec_to_pub()` | Full |
-| `readFile()` | — | None |
+| `dumpXdrStream()` | -- | None |
+| `printXdr()` | -- | None |
+| `signtxns()` | -- | None |
+| `signtxn()` | -- | None |
+| `priv2pub()` | -- | None |
+| `readFile()` | -- | None |
 
 ## Intentional Omissions
 
@@ -153,8 +156,13 @@ Features not yet implemented. These ARE counted against parity %.
 
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
+| `runConvertId()` | Medium | Convert between key formats (removed from Rust, should re-add) |
+| `runSecToPub()` / `priv2pub()` | Medium | Derive public key from secret (removed from Rust, should re-add) |
+| `runSignTransaction()` / `signtxn()` | Medium | Sign a transaction envelope (removed from Rust, should re-add) |
+| `runPrintXdr()` / `printXdr()` | Low | Decode and pretty-print XDR (removed from Rust) |
+| `runEncodeAsset()` | Low | Encode asset to XDR (removed from Rust) |
 | `runReplayDebugMeta()` | Low | Apply ledgers from local debug metadata files |
-| `runDumpXDR()` | Low | Stream and dump XDR files |
+| `runDumpXDR()` / `dumpXdrStream()` | Low | Stream and dump XDR files |
 | `runDumpWasm()` | Low | Dump WASM blobs from ledger state |
 | `diagBucketStats()` | Low | Per-account bucket statistics |
 | `runMergeBucketList()` | Low | Write diagnostic merged bucket list |
@@ -164,7 +172,8 @@ Features not yet implemented. These ARE counted against parity %.
 | `getSettingsUpgradeTransactions()` | Low | Generate settings upgrade transaction set |
 | `runPrintPublishQueue()` | Low | Print scheduled publish checkpoints |
 | V2 SAT-based quorum intersection | Medium | `check-quorum-intersection --v2` with SAT solver |
-| Full `printXdr()` type support | Low | Only 3 XDR types supported; upstream handles many more |
+| `signtxns()` (batch sign) | Low | Batch transaction signing |
+| `readFile()` | Low | Generic XDR file reader |
 
 ## Architectural Differences
 
@@ -175,8 +184,8 @@ Features not yet implemented. These ARE counted against parity %.
 
 2. **Command Organization**
    - **stellar-core**: All commands are flat at the top level (`stellar-core <command>`).
-   - **Rust**: Main commands are top-level, but diagnostic/offline tools are nested under `offline` subcommand (`rs-stellar-core offline <command>`).
-   - **Rationale**: Nested subcommands reduce top-level clutter and group related functionality.
+   - **Rust**: All commands are also flat at the top level. Previously had an `offline` subcommand grouping but this was flattened to match stellar-core's approach.
+   - **Rationale**: Flat commands are simpler and match the upstream CLI experience.
 
 3. **Configuration Loading**
    - **stellar-core**: Uses `ConfigOption` struct with per-command config parsing; config file defaults to `stellar-core.cfg`.
@@ -266,7 +275,11 @@ The `verify-execution` tool compares transaction execution against CDP (Crypto D
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 19 |
-| Gaps (None + Partial) | 12 |
+| Implemented (Full) | 15 |
+| Gaps (None + Partial) | 20 |
 | Intentional Omissions | 10 |
-| **Parity** | **19 / (19 + 12) = 61%** |
+| **Parity** | **15 / (15 + 20) = 43%** |
+
+Note: Parity decreased from the previous 61% because five previously-implemented key/XDR utility
+commands (`convert-id`, `sec-to-pub`, `sign-transaction`, `decode-xdr`, `encode-xdr`) were removed
+during a crate reorganization. These are medium-priority items to re-add.

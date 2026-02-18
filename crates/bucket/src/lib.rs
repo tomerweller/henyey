@@ -138,8 +138,8 @@ pub use bloom_filter::{BucketBloomFilter, HashSeed, HASH_KEY_BYTES};
 // ============================================================================
 
 pub use entry::{
-    compare_entries, compare_keys, get_ttl_key, is_persistent_entry, ledger_entry_to_key,
-    ledger_key_type, BucketEntry,
+    compare_entries, compare_keys, get_ttl_key, is_persistent_entry, ledger_entry_data_type,
+    ledger_entry_to_key, ledger_key_type, BucketEntry,
 };
 
 // ============================================================================

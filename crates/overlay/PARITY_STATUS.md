@@ -3,7 +3,7 @@
 **Crate**: `henyey-overlay`
 **Upstream**: `.upstream-v25/src/overlay/`
 **Overall Parity**: 88%
-**Last Updated**: 2026-02-16
+**Last Updated**: 2026-02-17
 
 ## Summary
 

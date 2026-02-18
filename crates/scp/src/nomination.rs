@@ -652,11 +652,11 @@ impl NominationProtocol {
 
         if is_newer {
             self.last_envelope = Some(envelope.clone());
-            if self.fully_validated {
-                if self.last_envelope_emit.as_ref() != Some(&envelope) {
-                    self.last_envelope_emit = Some(envelope.clone());
-                    ctx.driver.emit_envelope(&envelope);
-                }
+            if self.fully_validated
+                && self.last_envelope_emit.as_ref() != Some(&envelope)
+            {
+                self.last_envelope_emit = Some(envelope.clone());
+                ctx.driver.emit_envelope(&envelope);
             }
         }
     }
@@ -907,7 +907,8 @@ impl NominationProtocol {
         local_node_id: &NodeId,
         node_id: &NodeId,
     ) -> u64 {
-        let weight = self.get_node_weight(local_quorum_set, local_node_id, node_id);
+        let is_local = node_id == local_node_id;
+        let weight = crate::driver::base_get_node_weight(node_id, local_quorum_set, is_local);
         if weight == 0 {
             return 0;
         }
@@ -918,49 +919,6 @@ impl NominationProtocol {
         } else {
             0
         }
-    }
-
-    fn get_node_weight(
-        &self,
-        quorum_set: &ScpQuorumSet,
-        local_node_id: &NodeId,
-        node_id: &NodeId,
-    ) -> u64 {
-        if node_id == local_node_id {
-            return u64::MAX;
-        }
-
-        let total = quorum_set.validators.len() + quorum_set.inner_sets.len();
-        let threshold = quorum_set.threshold as u64;
-        if threshold == 0 || total == 0 {
-            return 0;
-        }
-
-        if quorum_set.validators.contains(node_id) {
-            return self.compute_weight(u64::MAX, total as u64, threshold);
-        }
-
-        for inner in quorum_set.inner_sets.iter() {
-            let weight = self.get_node_weight(inner, local_node_id, node_id);
-            if weight > 0 {
-                return self.compute_weight(weight, total as u64, threshold);
-            }
-        }
-
-        0
-    }
-
-    fn compute_weight(&self, m: u64, total: u64, threshold: u64) -> u64 {
-        if threshold == 0 || total == 0 {
-            return 0;
-        }
-        let numerator = (m as u128) * (threshold as u128);
-        let denominator = total as u128;
-        let mut res = numerator / denominator;
-        if numerator % denominator != 0 {
-            res += 1;
-        }
-        res as u64
     }
 
     /// Iterate over all nodes in a quorum set (stellar-core `LocalNode::forAllNodes`).
@@ -1086,18 +1044,16 @@ mod tests {
             vec![node0.clone(), node1.clone(), node2.clone(), node3.clone()],
             3,
         );
-        let protocol = NominationProtocol::new();
-    
-        let weight = protocol.get_node_weight(&qset, &node0, &node2);
+        let weight = crate::driver::base_get_node_weight(&node2, &qset, false);
         assert!(is_near_weight(weight, 0.75));
-    
-        let weight = protocol.get_node_weight(&qset, &node0, &node4);
+
+        let weight = crate::driver::base_get_node_weight(&node4, &qset, false);
         assert_eq!(weight, 0);
-    
+
         let inner = make_quorum_set(vec![node4.clone(), node5.clone()], 1);
         qset.inner_sets = vec![inner].try_into().unwrap_or_default();
-    
-        let weight = protocol.get_node_weight(&qset, &node0, &node4);
+
+        let weight = crate::driver::base_get_node_weight(&node4, &qset, false);
         assert!(is_near_weight(weight, 0.6 * 0.5));
     }
     

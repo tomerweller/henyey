@@ -127,7 +127,7 @@ iter = result.end_iterator;
 | Module | Description |
 |--------|-------------|
 | `lib.rs` | Crate root: re-exports all public types and protocol version constants |
-| `entry.rs` | `BucketEntry` enum, key comparison (`compare_keys`), eviction helpers |
+| `entry.rs` | `BucketEntry` enum, key/type comparison (`compare_keys`, `ledger_entry_data_type`, `ledger_key_type`), eviction helpers |
 | `bucket.rs` | `Bucket` struct with in-memory and disk-backed storage modes |
 | `bucket_list.rs` | `BucketList`, `BucketLevel`, spill mechanics, hash computation, async merge orchestration |
 | `merge.rs` | Bucket merging with CAP-0020 INITENTRY semantics, two-pointer merge algorithm |

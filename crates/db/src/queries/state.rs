@@ -42,14 +42,13 @@ pub trait StateQueries {
 
 impl StateQueries for Connection {
     fn get_state(&self, key: &str) -> Result<Option<String>, DbError> {
-        let result = self
-            .query_row(
-                "SELECT state FROM storestate WHERE statename = ?1",
-                params![key],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(result)
+        self.query_row(
+            "SELECT state FROM storestate WHERE statename = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(DbError::from)
     }
 
     fn set_state(&self, key: &str, value: &str) -> Result<(), DbError> {
@@ -66,16 +65,13 @@ impl StateQueries for Connection {
     }
 
     fn get_last_closed_ledger(&self) -> Result<Option<u32>, DbError> {
-        let result: Option<String> = self.get_state(state_keys::LAST_CLOSED_LEDGER)?;
-        match result {
-            Some(s) => {
-                let seq = s.parse::<u32>().map_err(|e| {
+        self.get_state(state_keys::LAST_CLOSED_LEDGER)?
+            .map(|s| {
+                s.parse::<u32>().map_err(|e| {
                     DbError::Integrity(format!("Invalid last closed ledger value: {}", e))
-                })?;
-                Ok(Some(seq))
-            }
-            None => Ok(None),
-        }
+                })
+            })
+            .transpose()
     }
 
     fn set_last_closed_ledger(&self, seq: u32) -> Result<(), DbError> {

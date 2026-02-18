@@ -41,7 +41,7 @@ use std::sync::Arc;
 use stellar_xdr::curr::{LedgerEntry, LedgerEntryType, LedgerKey};
 
 use crate::bucket::Bucket;
-use crate::entry::{ledger_entry_to_key, BucketEntry};
+use crate::entry::{ledger_entry_data_type, ledger_entry_to_key, ledger_key_type, BucketEntry};
 use crate::Result;
 
 /// Default number of entries to process in each chunk.
@@ -333,7 +333,7 @@ impl BucketApplicator {
 
                         self.seen_keys.insert(key.clone());
 
-                        let entry_type = ledger_entry_type(&ledger_entry.data);
+                        let entry_type = ledger_entry_data_type(&ledger_entry.data);
                         counters.record_upsert(entry_type);
                         batch.push(EntryToApply::Upsert(key, Box::new(ledger_entry.clone())));
                     }
@@ -396,39 +396,6 @@ impl BucketApplicator {
     /// Returns the number of unique keys seen so far.
     pub fn unique_keys_seen(&self) -> usize {
         self.seen_keys.len()
-    }
-}
-
-/// Returns the ledger entry type for a given entry data.
-fn ledger_entry_type(data: &stellar_xdr::curr::LedgerEntryData) -> LedgerEntryType {
-    use stellar_xdr::curr::LedgerEntryData;
-    match data {
-        LedgerEntryData::Account(_) => LedgerEntryType::Account,
-        LedgerEntryData::Trustline(_) => LedgerEntryType::Trustline,
-        LedgerEntryData::Offer(_) => LedgerEntryType::Offer,
-        LedgerEntryData::Data(_) => LedgerEntryType::Data,
-        LedgerEntryData::ClaimableBalance(_) => LedgerEntryType::ClaimableBalance,
-        LedgerEntryData::LiquidityPool(_) => LedgerEntryType::LiquidityPool,
-        LedgerEntryData::ContractData(_) => LedgerEntryType::ContractData,
-        LedgerEntryData::ContractCode(_) => LedgerEntryType::ContractCode,
-        LedgerEntryData::ConfigSetting(_) => LedgerEntryType::ConfigSetting,
-        LedgerEntryData::Ttl(_) => LedgerEntryType::Ttl,
-    }
-}
-
-/// Returns the ledger entry type for a given ledger key.
-fn ledger_key_type(key: &LedgerKey) -> LedgerEntryType {
-    match key {
-        LedgerKey::Account(_) => LedgerEntryType::Account,
-        LedgerKey::Trustline(_) => LedgerEntryType::Trustline,
-        LedgerKey::Offer(_) => LedgerEntryType::Offer,
-        LedgerKey::Data(_) => LedgerEntryType::Data,
-        LedgerKey::ClaimableBalance(_) => LedgerEntryType::ClaimableBalance,
-        LedgerKey::LiquidityPool(_) => LedgerEntryType::LiquidityPool,
-        LedgerKey::ContractData(_) => LedgerEntryType::ContractData,
-        LedgerKey::ContractCode(_) => LedgerEntryType::ContractCode,
-        LedgerKey::ConfigSetting(_) => LedgerEntryType::ConfigSetting,
-        LedgerKey::Ttl(_) => LedgerEntryType::Ttl,
     }
 }
 

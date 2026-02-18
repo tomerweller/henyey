@@ -115,6 +115,9 @@ scheduler.run_until_done_with_cancel(cancel).await;
 - **Thread safety**: The scheduler is not thread-safe and should be driven from
   a single async task. Work items execute on Tokio's thread pool and must be
   `Send`.
+- **Targeted enqueuing**: When a work item succeeds, only its direct dependents
+  are checked for readiness rather than scanning all entries. This keeps the
+  scheduler efficient as the number of work items grows.
 - **No hierarchical work**: Unlike stellar-core's parent-child `Work` class
   hierarchy, henyey uses a flat DAG model with explicit dependency IDs. This is
   simpler and sufficient for the catchup/history workflows.
