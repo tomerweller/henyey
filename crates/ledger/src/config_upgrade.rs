@@ -18,12 +18,13 @@
 //! 3. When the upgrade time arrives, the ConfigUpgradeSet is loaded and validated
 //! 4. If valid, the CONFIG_SETTING entries are updated in the ledger
 
-use sha2::{Digest, Sha256};
-use std::sync::Arc;
 use henyey_common::protocol::{
-    protocol_version_starts_from, ProtocolVersion, PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION,
+    protocol_version_is_before, protocol_version_starts_from, ProtocolVersion,
+    PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION,
 };
 use henyey_common::Hash256;
+use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use stellar_xdr::curr::{
     ConfigSettingEntry, ConfigSettingId, ConfigUpgradeSet, ConfigUpgradeSetKey,
     ContractDataDurability, Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerKey,
@@ -411,10 +412,7 @@ impl ConfigUpgradeSetFrame {
                 }
             }
 
-            if matches!(
-                setting_id,
-                ConfigSettingId::ContractCostParamsMemoryBytes
-            ) {
+            if matches!(setting_id, ConfigSettingId::ContractCostParamsMemoryBytes) {
                 memory_cost_params_changed = true;
             }
 
@@ -446,11 +444,14 @@ impl ConfigUpgradeSetFrame {
             self.maybe_update_state_size_window(snapshot, delta)?;
         }
 
-        let entry_changes = stellar_xdr::curr::LedgerEntryChanges(
-            changes.try_into().unwrap_or_default(),
-        );
+        let entry_changes =
+            stellar_xdr::curr::LedgerEntryChanges(changes.try_into().unwrap_or_default());
 
-        Ok((state_archival_changed, memory_cost_params_changed, entry_changes))
+        Ok((
+            state_archival_changed,
+            memory_cost_params_changed,
+            entry_changes,
+        ))
     }
 
     /// Resize the LiveSorobanStateSizeWindow when liveSorobanStateSizeWindowSampleSize
@@ -481,19 +482,12 @@ impl ConfigUpgradeSetFrame {
         };
 
         // Load the current window from the snapshot
-        let window_key = LedgerKey::ConfigSetting(
-            stellar_xdr::curr::LedgerKeyConfigSetting {
-                config_setting_id: ConfigSettingId::LiveSorobanStateSizeWindow,
-            },
-        );
-        let window_entry = snapshot
-            .get_entry(&window_key)
-            .map_err(|e| {
-                LedgerError::Internal(format!(
-                    "Failed to load LiveSorobanStateSizeWindow: {}",
-                    e
-                ))
-            })?;
+        let window_key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::LiveSorobanStateSizeWindow,
+        });
+        let window_entry = snapshot.get_entry(&window_key).map_err(|e| {
+            LedgerError::Internal(format!("Failed to load LiveSorobanStateSizeWindow: {}", e))
+        })?;
 
         let window_entry = match window_entry {
             Some(entry) => entry,
@@ -501,9 +495,7 @@ impl ConfigUpgradeSetFrame {
         };
 
         let window = match &window_entry.data {
-            LedgerEntryData::ConfigSetting(
-                ConfigSettingEntry::LiveSorobanStateSizeWindow(w),
-            ) => w,
+            LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(w)) => w,
             _ => return Ok(()),
         };
 
@@ -538,9 +530,9 @@ impl ConfigUpgradeSetFrame {
 
         let new_window_entry = LedgerEntry {
             last_modified_ledger_seq: delta.ledger_seq(),
-            data: LedgerEntryData::ConfigSetting(
-                ConfigSettingEntry::LiveSorobanStateSizeWindow(new_window),
-            ),
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(
+                new_window,
+            )),
             ext: LedgerEntryExt::V0,
         };
 
@@ -591,6 +583,48 @@ impl ConfigUpgradeSetFrame {
         )
     }
 
+    /// Validate cost parameters by count and sign.
+    ///
+    /// Matches stellar-core `SorobanNetworkConfig::isValidCostParams` from
+    /// NetworkConfig.cpp:2480-2520. Checks that:
+    /// 1. The parameter count matches the expected number for the protocol version
+    /// 2. All constTerm and linearTerm values are non-negative
+    ///
+    /// Expected counts by protocol version (from ContractCostType enum):
+    /// - V20 (before V21): ChaCha20DrawBytes(22) + 1 = 23
+    /// - V21 (before V22): VerifyEcdsaSecp256r1Sig(44) + 1 = 45
+    /// - V22-V24 (before V25): Bls12381FrInv(69) + 1 = 70
+    /// - V25+: Bn254FrInv(84) + 1 = 85
+    fn is_valid_cost_params(
+        params: &stellar_xdr::curr::ContractCostParams,
+        ledger_version: u32,
+    ) -> bool {
+        // Determine expected number of cost types by protocol version.
+        // These values come from the ContractCostType XDR enum.
+        let expected_count: usize =
+            if protocol_version_is_before(ledger_version, ProtocolVersion::V21) {
+                23 // ChaCha20DrawBytes(22) + 1
+            } else if protocol_version_is_before(ledger_version, ProtocolVersion::V22) {
+                45 // VerifyEcdsaSecp256r1Sig(44) + 1
+            } else if protocol_version_is_before(ledger_version, ProtocolVersion::V25) {
+                70 // Bls12381FrInv(69) + 1
+            } else {
+                85 // Bn254FrInv(84) + 1
+            };
+
+        if params.0.len() != expected_count {
+            return false;
+        }
+
+        for param in params.0.iter() {
+            if param.const_term < 0 || param.linear_term < 0 {
+                return false;
+            }
+        }
+
+        true
+    }
+
     /// Validate a config setting entry against constraints.
     ///
     /// Matches stellar-core `SorobanNetworkConfig::isValidConfigSettingEntry` from
@@ -599,13 +633,11 @@ impl ConfigUpgradeSetFrame {
     fn is_valid_config_setting_entry(entry: &ConfigSettingEntry, ledger_version: u32) -> bool {
         match entry {
             ConfigSettingEntry::ContractMaxSizeBytes(v) => *v >= min_config::MAX_CONTRACT_SIZE,
-            ConfigSettingEntry::ContractCostParamsCpuInstructions(_) => {
-                // Cost params validation is complex, accept for now
-                true
+            ConfigSettingEntry::ContractCostParamsCpuInstructions(params) => {
+                Self::is_valid_cost_params(params, ledger_version)
             }
-            ConfigSettingEntry::ContractCostParamsMemoryBytes(_) => {
-                // Cost params validation is complex, accept for now
-                true
+            ConfigSettingEntry::ContractCostParamsMemoryBytes(params) => {
+                Self::is_valid_cost_params(params, ledger_version)
             }
             ConfigSettingEntry::ContractDataKeySizeBytes(v) => {
                 *v >= min_config::MAX_CONTRACT_DATA_KEY_SIZE_BYTES
@@ -905,15 +937,130 @@ mod tests {
             min_persistent_ttl: 10,   // stellar-core min
             persistent_rent_rate_denominator: 1,
             temp_rent_rate_denominator: 1,
-            max_entries_to_archive: 0,                     // stellar-core min
+            max_entries_to_archive: 0, // stellar-core min
             live_soroban_state_size_window_sample_size: 1, // stellar-core min
-            eviction_scan_size: 0,                         // stellar-core min (was 1000)
-            starting_eviction_scan_level: 1,               // stellar-core min (was 7)
+            eviction_scan_size: 0,     // stellar-core min (was 1000)
+            starting_eviction_scan_level: 1, // stellar-core min (was 7)
             live_soroban_state_size_window_sample_period: 1,
         });
         assert!(
             ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
             "StateArchival at stellar-core min must be accepted"
+        );
+    }
+
+    /// Helper to create valid cost params with the given count.
+    fn make_cost_params(count: usize) -> stellar_xdr::curr::ContractCostParams {
+        use stellar_xdr::curr::{ContractCostParamEntry, ExtensionPoint};
+
+        let entries: Vec<ContractCostParamEntry> = (0..count)
+            .map(|_| ContractCostParamEntry {
+                ext: ExtensionPoint::V0,
+                const_term: 100,
+                linear_term: 10,
+            })
+            .collect();
+        stellar_xdr::curr::ContractCostParams(entries.try_into().unwrap())
+    }
+
+    #[test]
+    fn test_cost_params_validation_v25_correct_count() {
+        // V25 expects 85 params (Bn254FrInv=84 + 1)
+        let params = make_cost_params(85);
+        assert!(ConfigUpgradeSetFrame::is_valid_cost_params(&params, 25));
+    }
+
+    #[test]
+    fn test_cost_params_validation_v25_wrong_count() {
+        // V25 expects 85, not 70
+        let params = make_cost_params(70);
+        assert!(!ConfigUpgradeSetFrame::is_valid_cost_params(&params, 25));
+
+        // Not 23 either
+        let params = make_cost_params(23);
+        assert!(!ConfigUpgradeSetFrame::is_valid_cost_params(&params, 25));
+    }
+
+    #[test]
+    fn test_cost_params_validation_v20_correct_count() {
+        // V20 (before V21) expects 23 params (ChaCha20DrawBytes=22 + 1)
+        let params = make_cost_params(23);
+        assert!(ConfigUpgradeSetFrame::is_valid_cost_params(&params, 20));
+    }
+
+    #[test]
+    fn test_cost_params_validation_v21_correct_count() {
+        // V21 (before V22) expects 45 params (VerifyEcdsaSecp256r1Sig=44 + 1)
+        let params = make_cost_params(45);
+        assert!(ConfigUpgradeSetFrame::is_valid_cost_params(&params, 21));
+    }
+
+    #[test]
+    fn test_cost_params_validation_v22_correct_count() {
+        // V22-V24 (before V25) expects 70 params (Bls12381FrInv=69 + 1)
+        let params = make_cost_params(70);
+        assert!(ConfigUpgradeSetFrame::is_valid_cost_params(&params, 22));
+        assert!(ConfigUpgradeSetFrame::is_valid_cost_params(&params, 23));
+        assert!(ConfigUpgradeSetFrame::is_valid_cost_params(&params, 24));
+    }
+
+    #[test]
+    fn test_cost_params_validation_negative_values_rejected() {
+        use stellar_xdr::curr::{ContractCostParamEntry, ExtensionPoint};
+
+        // Create 85 valid params for V25, then make one have negative constTerm
+        let mut entries: Vec<ContractCostParamEntry> = (0..85)
+            .map(|_| ContractCostParamEntry {
+                ext: ExtensionPoint::V0,
+                const_term: 100,
+                linear_term: 10,
+            })
+            .collect();
+        entries[42].const_term = -1;
+        let params = stellar_xdr::curr::ContractCostParams(entries.try_into().unwrap());
+        assert!(
+            !ConfigUpgradeSetFrame::is_valid_cost_params(&params, 25),
+            "Negative constTerm should be rejected"
+        );
+
+        // Same but negative linearTerm
+        let mut entries: Vec<ContractCostParamEntry> = (0..85)
+            .map(|_| ContractCostParamEntry {
+                ext: ExtensionPoint::V0,
+                const_term: 100,
+                linear_term: 10,
+            })
+            .collect();
+        entries[10].linear_term = -5;
+        let params = stellar_xdr::curr::ContractCostParams(entries.try_into().unwrap());
+        assert!(
+            !ConfigUpgradeSetFrame::is_valid_cost_params(&params, 25),
+            "Negative linearTerm should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_cost_params_validation_via_config_setting_entry() {
+        // Verify it works when called through is_valid_config_setting_entry
+        let valid_cpu_params = make_cost_params(85);
+        let entry = ConfigSettingEntry::ContractCostParamsCpuInstructions(valid_cpu_params.clone());
+        assert!(
+            ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
+            "Valid CPU cost params should be accepted"
+        );
+
+        let entry = ConfigSettingEntry::ContractCostParamsMemoryBytes(valid_cpu_params);
+        assert!(
+            ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
+            "Valid memory cost params should be accepted"
+        );
+
+        // Wrong count should be rejected
+        let invalid_params = make_cost_params(70); // V22 count, not V25
+        let entry = ConfigSettingEntry::ContractCostParamsCpuInstructions(invalid_params);
+        assert!(
+            !ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
+            "Wrong count CPU cost params should be rejected"
         );
     }
 }
