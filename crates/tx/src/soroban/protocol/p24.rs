@@ -476,11 +476,9 @@ pub fn invoke_host_function(
             let (le, ttl) = encode_entry(key, &entry, live_until)?;
             encoded_ledger_entries.push(le);
             encoded_ttl_entries.push(ttl);
-        } else {
-            // Entry not found — add empty buffers to maintain index alignment.
-            encoded_ledger_entries.push(Vec::new());
-            encoded_ttl_entries.push(Vec::new());
         }
+        // If entry not found, skip it — e2e_invoke's footprint loop will
+        // add it to the storage map as None (entry doesn't exist yet).
     }
 
     // Collect read_write entries, handling archived entries specially
@@ -514,11 +512,9 @@ pub fn invoke_host_function(
                 let (le, ttl) = encode_entry(key, &entry_p24, live_until)?;
                 encoded_ledger_entries.push(le);
                 encoded_ttl_entries.push(ttl);
-            } else {
-                // Restored entry not found — add empty buffers to maintain index alignment.
-                encoded_ledger_entries.push(Vec::new());
-                encoded_ttl_entries.push(Vec::new());
             }
+            // If restored entry not found, skip it — e2e_invoke's footprint
+            // loop will add it to the storage map as None.
         } else {
             // Normal entry - use standard TTL-filtered lookup
             let key_p24 = convert_ledger_key_to_p24(key).ok_or_else(|| {
@@ -534,11 +530,9 @@ pub fn invoke_host_function(
                 let (le, ttl) = encode_entry(key, &entry, live_until)?;
                 encoded_ledger_entries.push(le);
                 encoded_ttl_entries.push(ttl);
-            } else {
-                // Entry not found — add empty buffers to maintain index alignment.
-                encoded_ledger_entries.push(Vec::new());
-                encoded_ttl_entries.push(Vec::new());
             }
+            // If entry not found, skip it — e2e_invoke's footprint loop will
+            // add it to the storage map as None (entry doesn't exist yet).
         }
     }
 

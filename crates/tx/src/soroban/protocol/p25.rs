@@ -667,11 +667,9 @@ pub fn invoke_host_function(
             let (le, ttl) = encode_entry(key, entry.as_ref(), live_until)?;
             encoded_ledger_entries.push(le);
             encoded_ttl_entries.push(ttl);
-        } else {
-            // Entry not found — add empty buffers to maintain index alignment.
-            encoded_ledger_entries.push(Vec::new());
-            encoded_ttl_entries.push(Vec::new());
         }
+        // If entry not found, skip it — e2e_invoke's footprint loop will
+        // add it to the storage map as None (entry doesn't exist yet).
     }
 
     // Track entries restored from live BucketList (expired TTL but not yet evicted)
@@ -705,22 +703,18 @@ pub fn invoke_host_function(
                 if let Some(live_bl_restore) = restore_info.live_bl_restore {
                     live_bl_restores.push(live_bl_restore);
                 }
-            } else {
-                // Restored entry not found — add empty buffers to maintain index alignment.
-                encoded_ledger_entries.push(Vec::new());
-                encoded_ttl_entries.push(Vec::new());
             }
+            // If restored entry not found, skip it — e2e_invoke's footprint
+            // loop will add it to the storage map as None.
         } else {
             // Normal entry - use standard TTL-filtered lookup
             if let Some((entry, live_until)) = snapshot.get_local(key)? {
                 let (le, ttl) = encode_entry(key, entry.as_ref(), live_until)?;
                 encoded_ledger_entries.push(le);
                 encoded_ttl_entries.push(ttl);
-            } else {
-                // Entry not found — add empty buffers to maintain index alignment.
-                encoded_ledger_entries.push(Vec::new());
-                encoded_ttl_entries.push(Vec::new());
             }
+            // If entry not found, skip it — e2e_invoke's footprint loop will
+            // add it to the storage map as None (entry doesn't exist yet).
         }
     }
 

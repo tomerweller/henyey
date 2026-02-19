@@ -391,8 +391,16 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
         ) {
             if let Some(ttl) = live_until {
                 if ttl < self.current_ledger {
+                    tracing::debug!(
+                        current_ledger = self.current_ledger,
+                        live_until = ttl,
+                        "P24 SnapshotSource: Filtering out entry with expired TTL"
+                    );
                     return Ok(None);
                 }
+            } else {
+                // No TTL means entry doesn't exist in Soroban state yet
+                // (will be created by the contract invocation).
             }
         }
 
@@ -1110,19 +1118,13 @@ fn encode_footprint_entries(
             let (le, ttl) = encode_entry(key, &entry, live_until)?;
             encoded_ledger_entries.push(le);
             encoded_ttl_entries.push(ttl);
-        } else {
-            // Entry not found — add empty buffers to maintain index alignment.
-            // stellar-core always adds a buffer slot for every footprint key,
-            // even for entries that don't exist (CxxBuf{} in addReads).
-            // The Soroban host maps entries to footprint keys by position,
-            // so skipping entries would misalign all subsequent entries.
-            encoded_ledger_entries.push(Vec::new());
-            encoded_ttl_entries.push(Vec::new());
         }
+        // If entry not found, skip it — e2e_invoke's footprint loop will
+        // add it to the storage map as None (entry doesn't exist yet).
     }
 
     if !restored_indices_set.is_empty() {
-        tracing::warn!(
+        tracing::debug!(
             restored_count = restored_rw_entry_indices.len(),
             restored_indices = ?restored_rw_entry_indices,
             "P24: Transaction has archived entries to restore"
@@ -1188,16 +1190,9 @@ fn encode_footprint_entries(
                     encoded_ledger_entries.push(le);
                     encoded_ttl_entries.push(ttl);
                 }
-            } else {
-                tracing::warn!(
-                    idx = idx,
-                    key_type = ?std::mem::discriminant(key),
-                    "P24: Archived entry being restored but NOT FOUND in state"
-                );
-                // Add empty buffers to maintain index alignment.
-                encoded_ledger_entries.push(Vec::new());
-                encoded_ttl_entries.push(Vec::new());
             }
+            // If archived entry not found, skip it — e2e_invoke's footprint
+            // loop will add it to the storage map as None.
         } else {
             if let Some((entry, live_until)) = snapshot
                 .get(&Rc::new(key_p24))
@@ -1210,11 +1205,9 @@ fn encode_footprint_entries(
                 let (le, ttl) = encode_entry(key, &entry, live_until)?;
                 encoded_ledger_entries.push(le);
                 encoded_ttl_entries.push(ttl);
-            } else {
-                // Entry not found — add empty buffers to maintain index alignment.
-                encoded_ledger_entries.push(Vec::new());
-                encoded_ttl_entries.push(Vec::new());
             }
+            // If entry not found, skip it — e2e_invoke's footprint loop will
+            // add it to the storage map as None (entry doesn't exist yet).
         }
     }
 
@@ -1339,6 +1332,13 @@ fn execute_host_function_p24(
 
     // Call e2e_invoke - iterator yields &Vec<u8> which implements AsRef<[u8]>
     let invoke_start = std::time::Instant::now();
+    tracing::debug!(
+        instruction_limit,
+        memory_limit,
+        ledger_entries_count = encoded_ledger_entries.len(),
+        ttl_entries_count = encoded_ttl_entries.len(),
+        "P24: About to call e2e_invoke"
+    );
     let mut diagnostic_events: Vec<soroban_env_host24::xdr::DiagnosticEvent> = Vec::new();
     let result = match e2e_invoke::invoke_host_function(
         &budget,
@@ -1367,6 +1367,12 @@ fn execute_host_function_p24(
             r
         }
         Err(e) => {
+            tracing::debug!(
+                error = %e,
+                cpu_consumed = budget.get_cpu_insns_consumed().unwrap_or(0),
+                mem_consumed = budget.get_mem_bytes_consumed().unwrap_or(0),
+                "P24: e2e_invoke returned error"
+            );
             return Err(SorobanExecutionError {
                 host_error: convert_host_error_p24_to_p25(e),
                 cpu_insns_consumed: budget.get_cpu_insns_consumed().unwrap_or(0),
@@ -1382,6 +1388,10 @@ fn execute_host_function_p24(
             (val, bytes.len() as u32)
         }
         Err(ref e) => {
+            tracing::debug!(
+                error = %e,
+                "P24: e2e_invoke result contained error"
+            );
             return Err(SorobanExecutionError {
                 host_error: convert_host_error_p24_to_p25(e.clone()),
                 cpu_insns_consumed: budget.get_cpu_insns_consumed().unwrap_or(0),
@@ -1732,15 +1742,13 @@ fn execute_host_function_p25(
             let (le, ttl) = encode_entry_p25(key, entry.as_ref(), live_until)?;
             encoded_ledger_entries.push(le);
             encoded_ttl_entries.push(ttl);
-        } else {
-            // Entry not found — add empty buffers to maintain index alignment.
-            encoded_ledger_entries.push(Vec::new());
-            encoded_ttl_entries.push(Vec::new());
         }
+        // If entry not found, skip it — e2e_invoke's footprint loop will
+        // add it to the storage map as None (entry doesn't exist yet).
     }
 
     if !restored_indices_set.is_empty() {
-        tracing::warn!(
+        tracing::debug!(
             restored_count = restored_rw_entry_indices.len(),
             restored_indices = ?restored_rw_entry_indices,
             "P25: Transaction has archived entries to restore"
@@ -1819,27 +1827,18 @@ fn execute_host_function_p25(
                     encoded_ledger_entries.push(le);
                     encoded_ttl_entries.push(ttl);
                 }
-            } else {
-                tracing::warn!(
-                    idx = idx,
-                    key_type = ?std::mem::discriminant(key),
-                    "P25: Archived entry being restored but NOT FOUND in state"
-                );
-                // Add empty buffers to maintain index alignment.
-                encoded_ledger_entries.push(Vec::new());
-                encoded_ttl_entries.push(Vec::new());
             }
+            // If archived entry not found, skip it — e2e_invoke's footprint
+            // loop will add it to the storage map as None.
         } else {
             // Normal entry - use standard TTL-filtered lookup
             if let Some((entry, live_until)) = snapshot.get_local(key).map_err(make_setup_error)? {
                 let (le, ttl) = encode_entry_p25(key, entry.as_ref(), live_until)?;
                 encoded_ledger_entries.push(le);
                 encoded_ttl_entries.push(ttl);
-            } else {
-                // Entry not found — add empty buffers to maintain index alignment.
-                encoded_ledger_entries.push(Vec::new());
-                encoded_ttl_entries.push(Vec::new());
             }
+            // If entry not found, skip it — e2e_invoke's footprint loop will
+            // add it to the storage map as None (entry doesn't exist yet).
         }
     }
 
