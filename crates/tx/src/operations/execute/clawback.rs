@@ -12,6 +12,7 @@ use stellar_xdr::curr::{
 };
 
 use super::is_asset_valid;
+use super::trustline_liabilities;
 use crate::frame::muxed_to_account_id;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
@@ -83,8 +84,11 @@ pub fn execute_clawback(
         return Ok(make_clawback_result(ClawbackResultCode::NotClawbackEnabled));
     }
 
-    // Check trustline has sufficient balance
-    if trustline.balance < op.amount {
+    // Check trustline has sufficient balance.
+    // C++ uses addBalanceSkipAuthorization which checks that
+    // newBalance (balance - amount) >= sellingLiabilities.
+    let selling_liabilities = trustline_liabilities(&trustline).selling;
+    if trustline.balance - op.amount < selling_liabilities {
         return Ok(make_clawback_result(ClawbackResultCode::Underfunded));
     }
 
@@ -917,5 +921,154 @@ mod tests {
         // Verify trustline balance is now zero
         let trustline = state.get_trustline(&holder_id, &asset).unwrap();
         assert_eq!(trustline.balance, 0, "Expected balance to be 0");
+    }
+
+    /// Test Clawback respects selling liabilities.
+    ///
+    /// C++ uses `addBalanceSkipAuthorization` which checks that
+    /// `newBalance >= sellingLiabilities`. If a trustline has balance=1000
+    /// and sellingLiabilities=400, then only 600 can be clawed back.
+    /// Trying to clawback 700 should fail with Underfunded.
+    ///
+    /// C++ Reference: TransactionUtils.cpp:534-558 (addBalanceSkipAuthorization)
+    #[test]
+    fn test_clawback_underfunded_due_to_selling_liabilities() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(50);
+        let holder_id = create_test_account_id(51);
+
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AUTH_CLAWBACK_ENABLED_FLAG,
+        ));
+        state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
+
+        let asset = create_asset(&issuer_id);
+
+        // Create trustline with balance=1000, selling liabilities=400
+        // Available = 1000 - 400 = 600
+        let tl_asset = match asset.clone() {
+            Asset::CreditAlphanum4(a) => TrustLineAsset::CreditAlphanum4(a),
+            Asset::CreditAlphanum12(a) => TrustLineAsset::CreditAlphanum12(a),
+            Asset::Native => TrustLineAsset::Native,
+        };
+        let trustline = TrustLineEntry {
+            account_id: holder_id.clone(),
+            asset: tl_asset,
+            balance: 1000,
+            limit: 10_000,
+            flags: TRUSTLINE_CLAWBACK_ENABLED_FLAG | AUTHORIZED_FLAG,
+            ext: TrustLineEntryExt::V1(TrustLineEntryV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: 400,
+                },
+                ext: TrustLineEntryV1Ext::V0,
+            }),
+        };
+        state.create_trustline(trustline);
+
+        // Try to clawback 700 — more than available (600), should fail
+        let op = ClawbackOp {
+            asset: asset.clone(),
+            from: MuxedAccount::Ed25519(match holder_id.0.clone() {
+                PublicKey::PublicKeyTypeEd25519(k) => k,
+            }),
+            amount: 700,
+        };
+
+        let result = execute_clawback(&op, &issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Clawback(r)) => {
+                assert!(
+                    matches!(r, ClawbackResult::Underfunded),
+                    "Expected Underfunded when clawback exceeds available balance (balance - selling liabilities), got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+
+        // Verify balance unchanged
+        let tl = state.get_trustline(&holder_id, &asset).unwrap();
+        assert_eq!(
+            tl.balance, 1000,
+            "Balance should be unchanged after failed clawback"
+        );
+    }
+
+    /// Test Clawback succeeds when amount equals available balance (balance - selling liabilities).
+    ///
+    /// C++ Reference: TransactionUtils.cpp:534-558 (addBalanceSkipAuthorization)
+    #[test]
+    fn test_clawback_succeeds_up_to_available_balance() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(52);
+        let holder_id = create_test_account_id(53);
+
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AUTH_CLAWBACK_ENABLED_FLAG,
+        ));
+        state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
+
+        let asset = create_asset(&issuer_id);
+
+        // Create trustline with balance=1000, selling liabilities=400
+        // Available = 1000 - 400 = 600
+        let tl_asset = match asset.clone() {
+            Asset::CreditAlphanum4(a) => TrustLineAsset::CreditAlphanum4(a),
+            Asset::CreditAlphanum12(a) => TrustLineAsset::CreditAlphanum12(a),
+            Asset::Native => TrustLineAsset::Native,
+        };
+        let trustline = TrustLineEntry {
+            account_id: holder_id.clone(),
+            asset: tl_asset,
+            balance: 1000,
+            limit: 10_000,
+            flags: TRUSTLINE_CLAWBACK_ENABLED_FLAG | AUTHORIZED_FLAG,
+            ext: TrustLineEntryExt::V1(TrustLineEntryV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: 400,
+                },
+                ext: TrustLineEntryV1Ext::V0,
+            }),
+        };
+        state.create_trustline(trustline);
+
+        // Clawback exactly 600 — the available amount — should succeed
+        let op = ClawbackOp {
+            asset: asset.clone(),
+            from: MuxedAccount::Ed25519(match holder_id.0.clone() {
+                PublicKey::PublicKeyTypeEd25519(k) => k,
+            }),
+            amount: 600,
+        };
+
+        let result = execute_clawback(&op, &issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Clawback(r)) => {
+                assert!(
+                    matches!(r, ClawbackResult::Success),
+                    "Expected Success when clawback equals available balance, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+
+        // Verify balance was reduced (remaining = selling liabilities)
+        let tl = state.get_trustline(&holder_id, &asset).unwrap();
+        assert_eq!(
+            tl.balance, 400,
+            "Balance should equal selling liabilities after max clawback"
+        );
     }
 }
