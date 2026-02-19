@@ -45,12 +45,12 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use henyey_common::Hash256;
+use henyey_tx::operations::execute::entry_size_for_rent_by_protocol_with_cost_params;
 use soroban_env_host_p25::budget::Budget;
 use soroban_env_host_p25::e2e_invoke::entry_size_for_rent as entry_size_for_rent_p25;
 use soroban_env_host_p25::xdr as soroban_xdr_p25;
 use soroban_xdr_p25::ReadXdr;
-use henyey_common::Hash256;
-use henyey_tx::operations::execute::entry_size_for_rent_by_protocol_with_cost_params;
 use stellar_xdr::curr::{
     ConfigSettingId, ContractCostParams, LedgerEntry, LedgerEntryData, LedgerKey,
     LedgerKeyConfigSetting, LedgerKeyContractCode, LedgerKeyContractData, LedgerKeyTtl, Limits,
@@ -355,13 +355,15 @@ impl InMemorySorobanState {
     }
 
     /// Check if a key type should be stored in memory.
+    ///
+    /// Matches stellar-core's `isInMemoryType()` which only returns true for
+    /// CONTRACT_DATA, CONTRACT_CODE, and TTL. ConfigSetting entries are NOT
+    /// stored in the in-memory Soroban state — they are always read from the
+    /// database.
     pub fn is_in_memory_type(key: &LedgerKey) -> bool {
         matches!(
             key,
-            LedgerKey::ContractData(_)
-                | LedgerKey::ContractCode(_)
-                | LedgerKey::Ttl(_)
-                | LedgerKey::ConfigSetting(_)
+            LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) | LedgerKey::Ttl(_)
         )
     }
 
@@ -1020,8 +1022,7 @@ impl InMemorySorobanState {
                     })
                     .unwrap_or(xdr_size)
             } else {
-                let cost_params =
-                    rent_config.map(|rc| (&rc.cpu_cost_params, &rc.mem_cost_params));
+                let cost_params = rent_config.map(|rc| (&rc.cpu_cost_params, &rc.mem_cost_params));
                 entry_size_for_rent_by_protocol_with_cost_params(
                     protocol_version,
                     &entry.ledger_entry,
@@ -1478,6 +1479,53 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("contract code already exists"));
+    }
+
+    /// Test that is_in_memory_type returns false for ConfigSetting keys.
+    ///
+    /// stellar-core's isInMemoryType() only returns true for CONTRACT_DATA,
+    /// CONTRACT_CODE, and TTL. ConfigSetting entries should NOT be routed through
+    /// the in-memory Soroban state cache — they should always go to the database.
+    #[test]
+    fn test_config_setting_not_in_memory_type() {
+        use stellar_xdr::curr::{ConfigSettingId, LedgerKeyConfigSetting};
+
+        // ConfigSetting should NOT be an in-memory type
+        let config_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::ContractMaxSizeBytes,
+        });
+        assert!(
+            !InMemorySorobanState::is_in_memory_type(&config_key),
+            "ConfigSetting should NOT be an in-memory type (C++ isInMemoryType excludes it)"
+        );
+
+        // Verify the types that SHOULD be in-memory
+        let contract_data_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: make_contract_address(),
+            key: ScVal::I32(0),
+            durability: ContractDataDurability::Persistent,
+        });
+        assert!(InMemorySorobanState::is_in_memory_type(&contract_data_key));
+
+        let contract_code_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: Hash([0u8; 32]),
+        });
+        assert!(InMemorySorobanState::is_in_memory_type(&contract_code_key));
+
+        let ttl_key = LedgerKey::Ttl(LedgerKeyTtl {
+            key_hash: Hash([0u8; 32]),
+        });
+        assert!(InMemorySorobanState::is_in_memory_type(&ttl_key));
+
+        // Account should also not be an in-memory type
+        let account_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: stellar_xdr::curr::AccountId(
+                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+                    [0u8; 32],
+                )),
+            ),
+        });
+        assert!(!InMemorySorobanState::is_in_memory_type(&account_key));
     }
 
     /// Regression test: Creating ContractData that already exists should fail.
