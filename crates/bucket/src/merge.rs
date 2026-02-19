@@ -45,8 +45,8 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use sha2::{Digest, Sha256};
 use henyey_common::Hash256;
+use sha2::{Digest, Sha256};
 use stellar_xdr::curr::{BucketMetadata, BucketMetadataExt, LedgerKey, Limits, WriteXdr};
 
 use crate::bucket::{Bucket, BucketIter};
@@ -231,10 +231,8 @@ fn merge_with_shadows_impl(
                     Ordering::Greater => {
                         // New entry comes first
                         if should_keep_entry(new_entry, keep_dead_entries) {
-                            let entry = maybe_normalize_entry(
-                                new_entry.clone(),
-                                normalize_init_entries,
-                            );
+                            let entry =
+                                maybe_normalize_entry(new_entry.clone(), normalize_init_entries);
                             record_entry_type(counters, &entry);
                             maybe_put(
                                 entry,
@@ -1041,7 +1039,7 @@ fn merge_entries(
     old: &BucketEntry,
     new: &BucketEntry,
     keep_dead_entries: bool,
-    normalize_init_entries: bool,
+    _normalize_init_entries: bool,
 ) -> Option<BucketEntry> {
     match (old, new) {
         // CAP-0020: INITENTRY + DEADENTRY → Both annihilated
@@ -1063,13 +1061,11 @@ fn merge_entries(
         // New Live shadows old Dead - live wins
         (BucketEntry::Dead(_), BucketEntry::Live(entry)) => Some(BucketEntry::Live(entry.clone())),
 
-        // Any old + new Init (not covered above) → convert to Live only if crossing levels
-        (_, BucketEntry::Init(entry)) => {
-            if normalize_init_entries {
-                Some(BucketEntry::Live(entry.clone()))
-            } else {
-                Some(BucketEntry::Init(entry.clone()))
-            }
+        // LIVE + INIT or INIT + INIT: malformed bucket.
+        // The only legal old + new-INIT case is DEAD + INIT (handled above).
+        // C++ throws "Malformed bucket: old non-DEAD + new INIT."
+        (_, BucketEntry::Init(_)) => {
+            panic!("Malformed bucket: old non-DEAD + new INIT.");
         }
 
         // LIVEENTRY + DEADENTRY → Dead entry (tombstone) if keeping, else nothing
@@ -1602,30 +1598,34 @@ mod tests {
     }
 
     #[test]
-    fn test_cap0020_init_init_undefined() {
-        // Two INITs for the same key should not happen in practice (it's undefined behavior).
-        // Our implementation converts it to LIVE through the catch-all case.
+    #[should_panic(expected = "Malformed bucket: old non-DEAD + new INIT")]
+    fn test_cap0020_init_plus_init_panics() {
+        // Two INITs for the same key is malformed — C++ throws
+        // "Malformed bucket: old non-DEAD + new INIT."
         let old_entries = vec![BucketEntry::Init(make_account_entry([1u8; 32], 100))];
         let new_entries = vec![BucketEntry::Init(make_account_entry([1u8; 32], 200))];
 
         let old_bucket = Bucket::from_entries(old_entries).unwrap();
         let new_bucket = Bucket::from_entries(new_entries).unwrap();
 
-        let merged = merge_buckets(&old_bucket, &new_bucket, true, 0).unwrap();
-        assert_eq!(merged.len(), 1);
+        // This should panic
+        let _ = merge_buckets(&old_bucket, &new_bucket, true, 0);
+    }
 
-        // New entry wins and becomes LIVE (via catch-all)
-        let entry = &merged.entries()[0];
-        assert!(
-            entry.is_live(),
-            "INIT + INIT should become LIVE (undefined case)"
-        );
+    #[test]
+    #[should_panic(expected = "Malformed bucket: old non-DEAD + new INIT")]
+    fn test_cap0020_live_plus_init_panics() {
+        // LIVE + INIT is malformed — C++ throws
+        // "Malformed bucket: old non-DEAD + new INIT."
+        // The only legal old + new-INIT case is DEAD + INIT.
+        let old_entries = vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))];
+        let new_entries = vec![BucketEntry::Init(make_account_entry([1u8; 32], 200))];
 
-        let key = make_account_key([1u8; 32]);
-        let ledger_entry = merged.get_entry(&key).unwrap().unwrap();
-        if let LedgerEntryData::Account(account) = &ledger_entry.data {
-            assert_eq!(account.balance, 200, "New value should win");
-        }
+        let old_bucket = Bucket::from_entries(old_entries).unwrap();
+        let new_bucket = Bucket::from_entries(new_entries).unwrap();
+
+        // This should panic
+        let _ = merge_buckets(&old_bucket, &new_bucket, true, 0);
     }
 
     #[test]
@@ -2065,8 +2065,7 @@ mod tests {
     fn test_shadow_filtering_pre_protocol_12() {
         // Pre-protocol-12: shadowed LIVE entries should be filtered out
         let shadow_entry = make_account_entry([1u8; 32], 500);
-        let shadow_bucket =
-            Bucket::from_entries(vec![BucketEntry::Live(shadow_entry)]).unwrap();
+        let shadow_bucket = Bucket::from_entries(vec![BucketEntry::Live(shadow_entry)]).unwrap();
 
         let old_entries = vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))];
         let new_entries = vec![BucketEntry::Live(make_account_entry([2u8; 32], 200))];
@@ -2103,8 +2102,7 @@ mod tests {
     fn test_shadow_filtering_disabled_post_protocol_12() {
         // Post-protocol-12: shadow filtering is disabled
         let shadow_entry = make_account_entry([1u8; 32], 500);
-        let shadow_bucket =
-            Bucket::from_entries(vec![BucketEntry::Live(shadow_entry)]).unwrap();
+        let shadow_bucket = Bucket::from_entries(vec![BucketEntry::Live(shadow_entry)]).unwrap();
 
         let old_entries = vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))];
         let new_entries = vec![BucketEntry::Live(make_account_entry([2u8; 32], 200))];
@@ -2165,8 +2163,7 @@ mod tests {
     fn test_shadow_preserves_init_entries_in_init_era() {
         // In protocol 11+ (INITENTRY era), INIT entries should NOT be filtered by shadows
         let shadow_entry = make_account_entry([1u8; 32], 500);
-        let shadow_bucket =
-            Bucket::from_entries(vec![BucketEntry::Live(shadow_entry)]).unwrap();
+        let shadow_bucket = Bucket::from_entries(vec![BucketEntry::Live(shadow_entry)]).unwrap();
 
         let old_entries = vec![
             BucketEntry::Init(make_account_entry([1u8; 32], 100)), // shadowed, but INIT
@@ -2182,7 +2179,7 @@ mod tests {
             &new_bucket,
             true,
             FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY, // protocol 11
-            false, // don't normalize init entries
+            false,                                             // don't normalize init entries
             &[shadow_bucket],
         )
         .unwrap();
@@ -2192,7 +2189,10 @@ mod tests {
         let key2 = make_account_key([2u8; 32]);
 
         let entry1 = merged.get(&key1).unwrap();
-        assert!(entry1.is_some(), "INIT entry should NOT be filtered by shadow in INITENTRY era");
+        assert!(
+            entry1.is_some(),
+            "INIT entry should NOT be filtered by shadow in INITENTRY era"
+        );
         assert!(entry1.unwrap().is_init(), "Should remain INIT");
 
         let entry2 = merged.get(&key2).unwrap();
@@ -2204,8 +2204,7 @@ mod tests {
     fn test_shadow_preserves_dead_entries_in_init_era() {
         // In protocol 11+, DEAD entries should also NOT be filtered by shadows
         let shadow_entry = make_account_entry([1u8; 32], 500);
-        let shadow_bucket =
-            Bucket::from_entries(vec![BucketEntry::Live(shadow_entry)]).unwrap();
+        let shadow_bucket = Bucket::from_entries(vec![BucketEntry::Live(shadow_entry)]).unwrap();
 
         let old_entries = vec![
             BucketEntry::Dead(make_account_key([1u8; 32])), // shadowed, but DEAD
@@ -2291,22 +2290,17 @@ mod tests {
         // even with shadows present.
 
         // Level 5 (oldest): INIT entry for key [1]
-        let b5 = Bucket::from_entries(vec![BucketEntry::Init(make_account_entry(
-            [1u8; 32],
-            100,
-        ))])
-        .unwrap();
-
-        // Level 4: DEAD entry for key [1]
-        let b4 = Bucket::from_entries(vec![BucketEntry::Dead(make_account_key([1u8; 32]))])
+        let b5 = Bucket::from_entries(vec![BucketEntry::Init(make_account_entry([1u8; 32], 100))])
             .unwrap();
 
+        // Level 4: DEAD entry for key [1]
+        let b4 =
+            Bucket::from_entries(vec![BucketEntry::Dead(make_account_key([1u8; 32]))]).unwrap();
+
         // Shadow bucket contains the same key (from a higher level)
-        let shadow = Bucket::from_entries(vec![BucketEntry::Live(make_account_entry(
-            [1u8; 32],
-            999,
-        ))])
-        .unwrap();
+        let shadow =
+            Bucket::from_entries(vec![BucketEntry::Live(make_account_entry([1u8; 32], 999))])
+                .unwrap();
 
         // Merge b4 (newer) with b5 (older) = INIT + DEAD should annihilate
         // regardless of shadow presence
@@ -2334,23 +2328,15 @@ mod tests {
         // Even when an INIT entry is "shadowed" by a higher-level entry,
         // it must be kept for correct annihilation behavior at deeper levels.
 
-        let shadow = Bucket::from_entries(vec![BucketEntry::Live(make_account_entry(
-            [1u8; 32],
-            999,
-        ))])
-        .unwrap();
+        let shadow =
+            Bucket::from_entries(vec![BucketEntry::Live(make_account_entry([1u8; 32], 999))])
+                .unwrap();
 
         // Create two buckets both with INIT for key [1]
-        let b1 = Bucket::from_entries(vec![BucketEntry::Init(make_account_entry(
-            [1u8; 32],
-            100,
-        ))])
-        .unwrap();
-        let b2 = Bucket::from_entries(vec![BucketEntry::Init(make_account_entry(
-            [2u8; 32],
-            200,
-        ))])
-        .unwrap();
+        let b1 = Bucket::from_entries(vec![BucketEntry::Init(make_account_entry([1u8; 32], 100))])
+            .unwrap();
+        let b2 = Bucket::from_entries(vec![BucketEntry::Init(make_account_entry([2u8; 32], 200))])
+            .unwrap();
 
         let merged = merge_buckets_with_options_and_shadows(
             &b1,
@@ -2364,14 +2350,8 @@ mod tests {
 
         let key1 = make_account_key([1u8; 32]);
         let entry = merged.get(&key1).unwrap();
-        assert!(
-            entry.is_some(),
-            "Shadow should NOT eliminate INIT entries"
-        );
-        assert!(
-            entry.unwrap().is_init(),
-            "INIT entry must remain as INIT"
-        );
+        assert!(entry.is_some(), "Shadow should NOT eliminate INIT entries");
+        assert!(entry.unwrap().is_init(), "INIT entry must remain as INIT");
     }
 
     // ============ P0-3: Output Iterator Version Rejection ============
@@ -2420,7 +2400,7 @@ mod tests {
             &old_bucket,
             &new_bucket,
             true,
-            25, // current protocol
+            25,   // current protocol
             true, // normalize_init = true (spill merge)
         )
         .unwrap();
@@ -2500,10 +2480,8 @@ mod tests {
     #[test]
     fn test_merge_counters_populated_after_merge() {
         let counters = MergeCounters::new();
-        let old = Bucket::from_entries(vec![
-            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
-        ])
-        .unwrap();
+        let old = Bucket::from_entries(vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))])
+            .unwrap();
         let new = Bucket::from_entries(vec![
             BucketEntry::Live(make_account_entry([1u8; 32], 200)), // shadows old
             BucketEntry::Live(make_account_entry([2u8; 32], 300)), // new entry
@@ -2532,10 +2510,8 @@ mod tests {
     fn test_merge_counters_annihilation() {
         let counters = MergeCounters::new();
         let key = make_account_key([1u8; 32]);
-        let old = Bucket::from_entries(vec![
-            BucketEntry::Init(make_account_entry([1u8; 32], 100)),
-        ])
-        .unwrap();
+        let old = Bucket::from_entries(vec![BucketEntry::Init(make_account_entry([1u8; 32], 100))])
+            .unwrap();
         let new = Bucket::from_entries(vec![BucketEntry::Dead(key)]).unwrap();
 
         let _result = merge_buckets_with_options_and_shadows_and_counters(
@@ -2560,14 +2536,11 @@ mod tests {
     fn test_merge_counters_shadow_elision() {
         let counters = MergeCounters::new();
         // Create a shadow bucket that contains the key we'll try to merge
-        let shadow_bucket = Bucket::from_entries(vec![BucketEntry::Live(
-            make_account_entry([1u8; 32], 999),
-        )])
-        .unwrap();
-        let old = Bucket::from_entries(vec![BucketEntry::Live(make_account_entry(
-            [1u8; 32], 100,
-        ))])
-        .unwrap();
+        let shadow_bucket =
+            Bucket::from_entries(vec![BucketEntry::Live(make_account_entry([1u8; 32], 999))])
+                .unwrap();
+        let old = Bucket::from_entries(vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))])
+            .unwrap();
         let new = Bucket::from_entries(vec![]).unwrap();
 
         // Use pre-protocol-12 to enable shadow filtering
