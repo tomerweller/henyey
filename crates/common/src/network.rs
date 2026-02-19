@@ -91,6 +91,13 @@ impl NetworkId {
     pub fn mainnet() -> Self {
         Self::from_passphrase("Public Global Stellar Network ; September 2015")
     }
+
+    /// Returns `true` if this network ID matches the Stellar public mainnet.
+    ///
+    /// This is used for mainnet-only corrections (e.g., V24 fee pool fix).
+    pub fn is_mainnet(&self) -> bool {
+        *self == Self::mainnet()
+    }
 }
 
 impl From<NetworkId> for stellar_xdr::curr::Hash {
@@ -115,5 +122,12 @@ mod tests {
         let id = NetworkId::mainnet();
         // Known mainnet network ID hash
         assert!(!id.0.is_zero());
+    }
+
+    #[test]
+    fn test_is_mainnet() {
+        assert!(NetworkId::mainnet().is_mainnet());
+        assert!(!NetworkId::testnet().is_mainnet());
+        assert!(!NetworkId::from_passphrase("Custom Network").is_mainnet());
     }
 }

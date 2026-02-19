@@ -2304,6 +2304,19 @@ impl<'a> LedgerCloseContext<'a> {
                 self.create_cost_types_for_v25()?;
                 version_upgrade_memory_cost_changed = true;
             }
+
+            // Parity: Upgrades.cpp:1244-1251
+            // prevVersion==V_23 && newVersion==V_24 && gIsProductionNetwork
+            // Correct for 3.1879035 XLM fee burn that occurred during protocol 23 on mainnet.
+            if prev_version == 23
+                && protocol_version == 24
+                && self.manager.network_id().is_mainnet()
+            {
+                self.delta.record_fee_pool_delta(31_879_035);
+                tracing::info!(
+                    "Applied V24 mainnet fee pool correction: +31879035 stroops"
+                );
+            }
             // Extract changes made during version upgrade side effects
             let mut changes: Vec<LedgerEntryChange> = Vec::new();
             let delta_after = self.delta.num_changes();
