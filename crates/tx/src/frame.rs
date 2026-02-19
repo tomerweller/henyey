@@ -27,9 +27,9 @@
 //! let hash = frame.hash(&NetworkId::testnet())?;
 //! ```
 
-use soroban_env_host_p25::fees::TransactionResources;
 use henyey_common::{Hash256, NetworkId, Resource};
 use henyey_crypto::sha256;
+use soroban_env_host_p25::fees::TransactionResources;
 use stellar_xdr::curr::Limits;
 use stellar_xdr::curr::{
     AccountId, DecoratedSignature, EnvelopeType, FeeBumpTransactionInnerTx, Hash,
@@ -340,9 +340,7 @@ impl TransactionFrame {
         if self.is_fee_bump() {
             let inner = self.inner_source_account_id();
             if inner != self.source_account_id() {
-                keys.push(LedgerKey::Account(LedgerKeyAccount {
-                    account_id: inner,
-                }));
+                keys.push(LedgerKey::Account(LedgerKeyAccount { account_id: inner }));
             }
         }
         keys
@@ -632,12 +630,22 @@ impl TransactionFrame {
 
     /// Validate Soroban memo and muxed account constraints.
     ///
-    /// Soroban transactions must have MEMO_NONE and must not use muxed
-    /// source accounts (neither at the transaction level nor at the operation level).
+    /// Only InvokeHostFunction transactions must have MEMO_NONE and must not use
+    /// muxed source accounts. ExtendFootprintTtl and RestoreFootprint are exempt.
     ///
     /// Parity: TransactionFrame.cpp:314-342
     pub fn validate_soroban_memo(&self) -> bool {
         if !self.is_soroban() {
+            return true;
+        }
+
+        let ops = self.operations();
+        if ops.len() != 1 {
+            return true;
+        }
+
+        // C++ only enforces memo/muxed restriction for InvokeHostFunction
+        if !matches!(ops[0].body, OperationBody::InvokeHostFunction(_)) {
             return true;
         }
 
@@ -1049,7 +1057,10 @@ mod tests {
         let frame = TransactionFrame::new(envelope);
 
         // For non-fee-bump, fee source is same as inner source
-        assert_eq!(frame.fee_source_account_id(), frame.inner_source_account_id());
+        assert_eq!(
+            frame.fee_source_account_id(),
+            frame.inner_source_account_id()
+        );
     }
 
     #[test]
@@ -1308,14 +1319,121 @@ mod tests {
         let mut envelope = create_soroban_transaction();
         if let TransactionEnvelope::Tx(ref mut env) = envelope {
             let mut ops: Vec<Operation> = env.tx.operations.to_vec();
-            ops[0].source_account =
-                Some(MuxedAccount::MuxedEd25519(MuxedAccountMed25519 {
-                    id: 99,
-                    ed25519: Uint256([5u8; 32]),
-                }));
+            ops[0].source_account = Some(MuxedAccount::MuxedEd25519(MuxedAccountMed25519 {
+                id: 99,
+                ed25519: Uint256([5u8; 32]),
+            }));
             env.tx.operations = ops.try_into().unwrap();
         }
         let frame = TransactionFrame::new(envelope);
         assert!(!frame.validate_soroban_memo());
+    }
+
+    /// Test that ExtendFootprintTtl with memo passes validate_soroban_memo.
+    ///
+    /// C++ only rejects memo for InvokeHostFunction, not ExtendFootprintTtl
+    /// or RestoreFootprint (TransactionFrame.cpp:327-330).
+    #[test]
+    fn test_validate_soroban_memo_extend_ttl_with_memo_passes() {
+        let source = MuxedAccount::Ed25519(Uint256([2u8; 32]));
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::ExtendFootprintTtl(ExtendFootprintTtlOp {
+                ext: ExtensionPoint::V0,
+                extend_to: 1000,
+            }),
+        };
+
+        let footprint = LedgerFootprint {
+            read_only: vec![LedgerKey::ContractCode(LedgerKeyContractCode {
+                hash: Hash([6u8; 32]),
+            })]
+            .try_into()
+            .unwrap(),
+            read_write: vec![].try_into().unwrap(),
+        };
+        let resources = SorobanResources {
+            footprint,
+            instructions: 0,
+            disk_read_bytes: 0,
+            write_bytes: 0,
+        };
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::Text(StringM::try_from("hello").unwrap()), // Non-NONE memo
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V1(SorobanTransactionData {
+                ext: SorobanTransactionDataExt::V0,
+                resources,
+                resource_fee: 0,
+            }),
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+        let frame = TransactionFrame::new(envelope);
+        assert!(frame.is_soroban(), "ExtendFootprintTtl is a Soroban op");
+        assert!(
+            frame.validate_soroban_memo(),
+            "ExtendFootprintTtl with memo should pass (C++ only rejects memo for InvokeHostFunction)"
+        );
+    }
+
+    /// Test that RestoreFootprint with memo passes validate_soroban_memo.
+    #[test]
+    fn test_validate_soroban_memo_restore_footprint_with_memo_passes() {
+        let source = MuxedAccount::Ed25519(Uint256([2u8; 32]));
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::RestoreFootprint(RestoreFootprintOp {
+                ext: ExtensionPoint::V0,
+            }),
+        };
+
+        let footprint = LedgerFootprint {
+            read_only: vec![].try_into().unwrap(),
+            read_write: vec![LedgerKey::ContractCode(LedgerKeyContractCode {
+                hash: Hash([6u8; 32]),
+            })]
+            .try_into()
+            .unwrap(),
+        };
+        let resources = SorobanResources {
+            footprint,
+            instructions: 0,
+            disk_read_bytes: 0,
+            write_bytes: 0,
+        };
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::Text(StringM::try_from("hello").unwrap()), // Non-NONE memo
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V1(SorobanTransactionData {
+                ext: SorobanTransactionDataExt::V0,
+                resources,
+                resource_fee: 0,
+            }),
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+        let frame = TransactionFrame::new(envelope);
+        assert!(frame.is_soroban(), "RestoreFootprint is a Soroban op");
+        assert!(
+            frame.validate_soroban_memo(),
+            "RestoreFootprint with memo should pass (C++ only rejects memo for InvokeHostFunction)"
+        );
     }
 }
