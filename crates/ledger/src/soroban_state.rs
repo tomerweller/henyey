@@ -920,6 +920,11 @@ impl InMemorySorobanState {
     }
 
     /// Process a single entry update.
+    ///
+    /// Parity: stellar-core's updateContractData / updateContractCode assert
+    /// that the entry already exists (`releaseAssertOrThrow`). We mirror that
+    /// by returning an error when the entry is missing instead of silently
+    /// creating it.
     pub fn process_entry_update(
         &mut self,
         entry: &LedgerEntry,
@@ -927,36 +932,9 @@ impl InMemorySorobanState {
         rent_config: Option<&SorobanRentConfig>,
     ) -> Result<()> {
         match &entry.data {
-            LedgerEntryData::ContractData(_) => {
-                // Check if this is actually an update or a create
-                let key = match &entry.data {
-                    LedgerEntryData::ContractData(cd) => LedgerKeyContractData {
-                        contract: cd.contract.clone(),
-                        key: cd.key.clone(),
-                        durability: cd.durability,
-                    },
-                    _ => unreachable!(),
-                };
-                let key_hash = Self::contract_data_key_hash(&key);
-                if self.contract_data_entries.contains_key(&key_hash) {
-                    self.update_contract_data(entry.clone())
-                } else {
-                    self.create_contract_data(entry.clone())
-                }
-            }
+            LedgerEntryData::ContractData(_) => self.update_contract_data(entry.clone()),
             LedgerEntryData::ContractCode(_) => {
-                let key = match &entry.data {
-                    LedgerEntryData::ContractCode(cc) => LedgerKeyContractCode {
-                        hash: cc.hash.clone(),
-                    },
-                    _ => unreachable!(),
-                };
-                let key_hash = Self::contract_code_key_hash(&key);
-                if self.contract_code_entries.contains_key(&key_hash) {
-                    self.update_contract_code(entry.clone(), protocol_version, rent_config)
-                } else {
-                    self.create_contract_code(entry.clone(), protocol_version, rent_config)
-                }
+                self.update_contract_code(entry.clone(), protocol_version, rent_config)
             }
             LedgerEntryData::Ttl(_) => self.process_ttl_entry_update(entry),
             LedgerEntryData::ConfigSetting(cs) => {
@@ -969,18 +947,14 @@ impl InMemorySorobanState {
     }
 
     /// Process a single entry deletion.
+    ///
+    /// Parity: stellar-core's deleteContractData / deleteContractCode assert
+    /// that the entry exists (`releaseAssertOrThrow`). We propagate the error
+    /// rather than silently ignoring missing entries.
     pub fn process_entry_delete(&mut self, key: &LedgerKey) -> Result<()> {
         match key {
-            LedgerKey::ContractData(cd) => {
-                // Ignore error if entry doesn't exist
-                let _ = self.delete_contract_data(cd);
-                Ok(())
-            }
-            LedgerKey::ContractCode(cc) => {
-                // Ignore error if entry doesn't exist
-                let _ = self.delete_contract_code(cc);
-                Ok(())
-            }
+            LedgerKey::ContractData(cd) => self.delete_contract_data(cd),
+            LedgerKey::ContractCode(cc) => self.delete_contract_code(cc),
             LedgerKey::Ttl(ttl) => {
                 // TTL deletion is handled implicitly when data/code is deleted
                 let key_hash = ttl.key_hash.0;
@@ -1549,24 +1523,25 @@ mod tests {
             .contains("contract data already exists"));
     }
 
-    /// Test that process_entry_update handles the case where entry doesn't exist
-    /// by creating it (used when moving entries from INIT to LIVE for soroban_state).
+    /// Test that process_entry_update returns an error when entry doesn't exist.
+    ///
+    /// Parity: stellar-core asserts entry exists in updateContractData /
+    /// updateContractCode (releaseAssertOrThrow). We mirror that by returning
+    /// an error rather than silently creating.
     #[test]
-    fn test_process_entry_update_creates_if_not_exists() {
+    fn test_process_entry_update_errors_if_not_exists() {
         let mut state = InMemorySorobanState::new();
 
-        // ContractCode update when entry doesn't exist should create it
+        // ContractCode update when entry doesn't exist should error
         let code_entry = make_contract_code_entry([42u8; 32]);
-        state
-            .process_entry_update(&code_entry, 25, None)
-            .expect("should create code entry");
-        assert_eq!(state.contract_code_count(), 1);
+        let result = state.process_entry_update(&code_entry, 25, None);
+        assert!(result.is_err(), "update of missing code entry should fail");
+        assert_eq!(state.contract_code_count(), 0);
 
-        // ContractData update when entry doesn't exist should create it
+        // ContractData update when entry doesn't exist should error
         let data_entry = make_contract_data_entry([43u8; 32]);
-        state
-            .process_entry_update(&data_entry, 25, None)
-            .expect("should create data entry");
-        assert_eq!(state.contract_data_count(), 1);
+        let result = state.process_entry_update(&data_entry, 25, None);
+        assert!(result.is_err(), "update of missing data entry should fail");
+        assert_eq!(state.contract_data_count(), 0);
     }
 }
