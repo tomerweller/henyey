@@ -336,18 +336,23 @@ pub fn execute_liquidity_pool_withdraw(
         }
     };
 
-    // Check source has pool share trustline with sufficient balance
+    // Check source has pool share trustline with sufficient available balance.
+    // C++ uses getAvailableBalance which subtracts selling liabilities.
     let pool_share_asset = TrustLineAsset::PoolShare(op.liquidity_pool_id.clone());
-    let shares_balance = match state.get_trustline_by_trustline_asset(source, &pool_share_asset) {
-        Some(tl) => tl.balance,
-        None => {
-            return Ok(make_withdraw_result(
-                LiquidityPoolWithdrawResultCode::NoTrust,
-            ));
-        }
-    };
+    let (_shares_balance, shares_available) =
+        match state.get_trustline_by_trustline_asset(source, &pool_share_asset) {
+            Some(tl) => {
+                let selling = trustline_liabilities(tl).selling;
+                (tl.balance, tl.balance - selling)
+            }
+            None => {
+                return Ok(make_withdraw_result(
+                    LiquidityPoolWithdrawResultCode::NoTrust,
+                ));
+            }
+        };
 
-    if shares_balance < op.amount {
+    if shares_available < op.amount {
         return Ok(make_withdraw_result(
             LiquidityPoolWithdrawResultCode::Underfunded,
         ));
@@ -459,6 +464,7 @@ fn is_bad_price(amount_a: i64, amount_b: i64, min_price: &Price, max_price: &Pri
     amount_a * min_d < amount_b * min_n || amount_a * max_d > amount_b * max_n
 }
 
+#[derive(Debug)]
 enum DepositOutcome {
     Success { a: i64, b: i64, shares: i64 },
     Underfunded,
@@ -508,9 +514,22 @@ fn deposit_into_non_empty_pool(
     min_price: &Price,
     max_price: &Price,
 ) -> Result<DepositOutcome> {
-    let shares_a = big_divide(total_shares, max_amount_a, reserve_a, Round::Down)?;
-    let shares_b = big_divide(total_shares, max_amount_b, reserve_b, Round::Down)?;
-    let pool_shares = shares_a.min(shares_b);
+    let shares_a = big_divide_checked(total_shares, max_amount_a, reserve_a, Round::Down);
+    let shares_b = big_divide_checked(total_shares, max_amount_b, reserve_b, Round::Down);
+
+    // minAmongValid: if one overflows, use the other; if both overflow, fail.
+    // Matches stellar-core LiquidityPoolDepositOpFrame.cpp:78-98.
+    let pool_shares = match (shares_a, shares_b) {
+        (Some(a), Some(b)) => a.min(b),
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => {
+            // This can't happen in practice (see C++ comment: it is guaranteed
+            // that either reserveA >= totalPoolShares or reserveB >= totalPoolShares),
+            // but we handle it the same way C++ does: throw / panic.
+            panic!("both shares calculations overflowed");
+        }
+    };
 
     let amount_a = big_divide(pool_shares, reserve_a, total_shares, Round::Up)?;
     let amount_b = big_divide(pool_shares, reserve_b, total_shares, Round::Up)?;
@@ -634,6 +653,30 @@ fn big_divide(a: i64, b: i64, c: i64, round: Round) -> Result<i64> {
         return Ok(0);
     }
     Ok(result as i64)
+}
+
+/// Checked variant of big_divide that returns None on overflow instead of Ok(0).
+/// Matches stellar-core's bigDivide which returns false on overflow.
+fn big_divide_checked(a: i64, b: i64, c: i64, round: Round) -> Option<i64> {
+    if c == 0 {
+        return Some(0);
+    }
+    let numerator = (a as i128) * (b as i128);
+    let denominator = c as i128;
+    let result = match round {
+        Round::Down => numerator / denominator,
+        Round::Up => {
+            if numerator == 0 {
+                0
+            } else {
+                (numerator + denominator - 1) / denominator
+            }
+        }
+    };
+    if result > i64::MAX as i128 {
+        return None;
+    }
+    Some(result as i64)
 }
 
 /// Check if an account is the issuer of an asset.
@@ -1568,6 +1611,107 @@ mod tests {
         }
     }
 
+    /// Test LiquidityPoolWithdraw underfunded due to selling liabilities on pool shares.
+    ///
+    /// C++ uses `getAvailableBalance(header, tlPool)` which subtracts selling
+    /// liabilities. If pool share trustline has balance=1000 and selling
+    /// liabilities=400, only 600 shares are available for withdrawal.
+    ///
+    /// C++ Reference: LiquidityPoolWithdrawOpFrame.cpp:47
+    #[test]
+    fn test_withdraw_underfunded_due_to_selling_liabilities() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(60);
+        let issuer_a = create_test_account_id(61);
+        let issuer_b = create_test_account_id(62);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000, 0));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_a,
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: issuer_b,
+        });
+        let pool_id = PoolId(Hash([60u8; 32]));
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            1_000_000,
+            1_000_000,
+            1_000_000,
+        ));
+
+        let trustline_a = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_a {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 0,
+            limit: 10_000_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        let trustline_b = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_b {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 0,
+            limit: 10_000_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        // Pool share trustline with balance=1000 and selling liabilities=400
+        // Available = 1000 - 400 = 600
+        let pool_share_tl = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 1000,
+            limit: i64::MAX,
+            flags: 0,
+            ext: TrustLineEntryExt::V1(TrustLineEntryV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: 400,
+                },
+                ext: TrustLineEntryV1Ext::V0,
+            }),
+        };
+        state.create_trustline(trustline_a);
+        state.create_trustline(trustline_b);
+        state.create_trustline(pool_share_tl);
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+
+        // Try to withdraw 700 shares — more than available (600)
+        let op = LiquidityPoolWithdrawOp {
+            liquidity_pool_id: pool_id,
+            amount: 700,
+            min_amount_a: 0,
+            min_amount_b: 0,
+        };
+
+        let result = execute_liquidity_pool_withdraw(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolWithdraw(r)) => {
+                assert!(
+                    matches!(r, LiquidityPoolWithdrawResult::Underfunded),
+                    "Expected Underfunded when withdrawal exceeds available balance (balance - selling liabilities), got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
     /// Test deposit fails when price is outside specified bounds (BadPrice).
     ///
     /// C++ Reference: LiquidityPoolDepositTests.cpp - "bad price" section
@@ -1848,6 +1992,83 @@ mod tests {
                 );
             }
             other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    /// Test that big_divide_checked returns None on overflow (matching C++ bigDivide
+    /// returning false).
+    #[test]
+    fn test_big_divide_checked_overflow() {
+        // Normal case: should return Some
+        let result = big_divide_checked(100, 200, 10, Round::Down);
+        assert_eq!(result, Some(2000));
+
+        // Overflow case: i64::MAX * i64::MAX / 1 overflows i64
+        let result = big_divide_checked(i64::MAX, i64::MAX, 1, Round::Down);
+        assert_eq!(result, None, "Should return None on overflow");
+
+        // Just under overflow: should succeed
+        let result = big_divide_checked(i64::MAX, 1, 1, Round::Down);
+        assert_eq!(result, Some(i64::MAX));
+    }
+
+    /// Test minAmongValid logic in deposit_into_non_empty_pool.
+    ///
+    /// When one of the two bigDivide share calculations overflows, C++ uses the
+    /// other valid result via minAmongValid. Henyey must do the same instead of
+    /// silently using 0 for the overflowed value.
+    #[test]
+    fn test_deposit_non_empty_pool_one_share_overflows() {
+        // Set up a scenario where shares_a overflows but shares_b is valid.
+        //
+        // shares_a = bigDivide(total_shares, max_amount_a, reserve_a, ROUND_DOWN)
+        // shares_b = bigDivide(total_shares, max_amount_b, reserve_b, ROUND_DOWN)
+        //
+        // To make shares_a overflow: total_shares * max_amount_a must overflow i64
+        // when divided by reserve_a. Use very large total_shares and max_amount_a
+        // with small reserve_a.
+        let total_shares = i64::MAX; // ~9.2e18
+        let reserve_a = 1; // Makes shares_a = total_shares * max_amount_a / 1
+        let max_amount_a = i64::MAX; // shares_a = i64::MAX * i64::MAX = overflow
+
+        // For shares_b: use values that won't overflow
+        let reserve_b = i64::MAX;
+        let max_amount_b = 100; // shares_b = i64::MAX * 100 / i64::MAX = 100
+
+        let min_price = Price { n: 1, d: i32::MAX };
+        let max_price = Price { n: i32::MAX, d: 1 };
+
+        let result = deposit_into_non_empty_pool(
+            max_amount_a,
+            max_amount_b,
+            i64::MAX, // available_a
+            i64::MAX, // available_b
+            i64::MAX, // available_pool_share_limit
+            reserve_a,
+            reserve_b,
+            total_shares,
+            &min_price,
+            &max_price,
+        );
+
+        // The key assertion: with minAmongValid, when shares_a overflows,
+        // pool_shares should be shares_b (100), not min(0, 100) = 0.
+        // Previously big_divide returned Ok(0) on overflow, causing pool_shares = 0.
+        match result.unwrap() {
+            DepositOutcome::Success { shares, .. } => {
+                assert!(
+                    shares > 0,
+                    "With minAmongValid, when one share overflows, pool_shares should be the valid one (> 0), got {}",
+                    shares
+                );
+                assert_eq!(shares, 100, "pool_shares should be shares_b=100");
+            }
+            other => {
+                // Any non-success result is acceptable as long as it's not caused
+                // by pool_shares being 0 due to overflow.
+                // But in this case we expect Success since all limits are i64::MAX.
+                panic!("Expected Success, got {:?}", other);
+            }
         }
     }
 }
