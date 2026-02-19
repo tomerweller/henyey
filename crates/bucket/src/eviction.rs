@@ -435,7 +435,17 @@ pub fn update_starting_eviction_iterator(
 
     // Check if the bucket we're scanning has received new data
     if iter.is_curr_bucket {
-        // Curr bucket receives data when the level below spills
+        // Curr bucket receives data when the level below spills.
+        // Parity: stellar-core asserts `iter.bucketListLevel > 0` here
+        // (LiveBucketList.cpp:92-101). Level 0 curr is unreachable in production
+        // because the minimum starting scan level is always >= 1. We warn rather
+        // than assert because tests may exercise level 0 for simplicity.
+        if iter.bucket_list_level == 0 {
+            tracing::warn!(
+                "eviction iterator scanning level 0 curr bucket; \
+                 this is unreachable in production"
+            );
+        }
         if iter.bucket_list_level > 0 {
             let level_below = iter.bucket_list_level - 1;
             if level_should_spill(prev_ledger, level_below) {
@@ -704,7 +714,9 @@ mod tests {
 
     #[test]
     fn test_update_starting_eviction_iterator_level_0_always_resets() {
-        // Level 0 curr bucket receives data every ledger
+        // Level 0 curr is unreachable in production (minimum scan level >= 1).
+        // Parity: stellar-core asserts `iter.bucketListLevel > 0`. We emit a
+        // warning instead — verify the graceful fallback still works.
         let mut iter = EvictionIterator {
             bucket_file_offset: 5000,
             bucket_list_level: 0,
