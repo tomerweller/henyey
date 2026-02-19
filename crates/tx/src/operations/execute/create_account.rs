@@ -2,8 +2,8 @@
 
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountId, CreateAccountOp, CreateAccountResult,
-    CreateAccountResultCode, LedgerKey, LedgerKeyAccount, OperationResult,
-    OperationResultTr, SequenceNumber, String32, Thresholds,
+    CreateAccountResultCode, LedgerKey, LedgerKeyAccount, OperationResult, OperationResultTr,
+    SequenceNumber, String32, Thresholds,
 };
 
 use super::account_liabilities;
@@ -51,8 +51,7 @@ pub fn execute_create_account(
         }
     } else {
         // Non-sponsored path: starting balance must meet minimum reserve.
-        let min_balance =
-            state.minimum_balance_with_counts(context.protocol_version, 0, 0, 0)?;
+        let min_balance = state.minimum_balance_with_counts(context.protocol_version, 0, 0, 0)?;
         if op.starting_balance < min_balance {
             return Ok(make_result(CreateAccountResultCode::LowReserve));
         }

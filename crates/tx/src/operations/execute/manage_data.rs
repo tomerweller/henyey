@@ -4,8 +4,8 @@
 //! which allows accounts to attach arbitrary key-value data.
 
 use stellar_xdr::curr::{
-    AccountId, DataEntry, DataEntryExt, LedgerKey, LedgerKeyData,
-    ManageDataOp, ManageDataResult, ManageDataResultCode, OperationResult, OperationResultTr,
+    AccountId, DataEntry, DataEntryExt, LedgerKey, LedgerKeyData, ManageDataOp, ManageDataResult,
+    ManageDataResultCode, OperationResult, OperationResultTr,
 };
 
 use super::{account_liabilities, ACCOUNT_SUBENTRY_LIMIT};

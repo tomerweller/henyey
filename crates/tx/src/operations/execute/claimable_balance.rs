@@ -15,7 +15,10 @@ use stellar_xdr::curr::{
     OperationResult, OperationResultTr, SequenceNumber,
 };
 
-use super::{account_liabilities, add_account_balance, add_trustline_balance, is_trustline_authorized, trustline_liabilities};
+use super::{
+    account_liabilities, add_account_balance, add_trustline_balance, is_trustline_authorized,
+    trustline_liabilities,
+};
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
@@ -140,7 +143,8 @@ pub fn execute_create_claimable_balance(
                         }
                         // stellar-core uses trustline.addBalance(header, -amount)
                         // which fails if newBalance < sellingLiabilities
-                        let available = tl.balance.saturating_sub(trustline_liabilities(tl).selling);
+                        let available =
+                            tl.balance.saturating_sub(trustline_liabilities(tl).selling);
                         if available < op.amount {
                             return Ok(make_create_result(
                                 CreateClaimableBalanceResultCode::Underfunded,

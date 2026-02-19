@@ -6,12 +6,12 @@
 //! - RevokeSponsorship
 
 use stellar_xdr::curr::{
-    AccountId, BeginSponsoringFutureReservesOp,
-    BeginSponsoringFutureReservesResult, BeginSponsoringFutureReservesResultCode,
-    EndSponsoringFutureReservesResult, EndSponsoringFutureReservesResultCode, LedgerEntryData,
-    LedgerKey, LedgerKeyAccount, LedgerKeyClaimableBalance, LedgerKeyData, LedgerKeyOffer,
-    LedgerKeyTrustLine, OperationResult, OperationResultTr, RevokeSponsorshipOp,
-    RevokeSponsorshipResult, RevokeSponsorshipResultCode, SponsorshipDescriptor, TrustLineAsset,
+    AccountId, BeginSponsoringFutureReservesOp, BeginSponsoringFutureReservesResult,
+    BeginSponsoringFutureReservesResultCode, EndSponsoringFutureReservesResult,
+    EndSponsoringFutureReservesResultCode, LedgerEntryData, LedgerKey, LedgerKeyAccount,
+    LedgerKeyClaimableBalance, LedgerKeyData, LedgerKeyOffer, LedgerKeyTrustLine, OperationResult,
+    OperationResultTr, RevokeSponsorshipOp, RevokeSponsorshipResult, RevokeSponsorshipResultCode,
+    SponsorshipDescriptor, TrustLineAsset,
 };
 
 use super::account_liabilities;

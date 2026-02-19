@@ -8,14 +8,13 @@
 use std::collections::HashSet;
 
 use stellar_xdr::curr::{
-    AccountId, AllowTrustOp, Asset, AssetCode, BeginSponsoringFutureReservesOp,
-    ChangeTrustAsset, ChangeTrustOp, ClaimClaimableBalanceOp, ClawbackClaimableBalanceOp,
-    ClawbackOp, CreateAccountOp, CreateClaimableBalanceOp, CreatePassiveSellOfferOp,
-    LedgerKey, LedgerKeyAccount, LedgerKeyClaimableBalance, LedgerKeyData, LedgerKeyOffer,
-    LedgerKeyTrustLine, LiquidityPoolDepositOp, LiquidityPoolWithdrawOp, ManageBuyOfferOp,
-    ManageDataOp, ManageSellOfferOp, MuxedAccount, OperationBody,
-    PathPaymentStrictReceiveOp, PathPaymentStrictSendOp, PaymentOp, SetTrustLineFlagsOp,
-    TrustLineAsset,
+    AccountId, AllowTrustOp, Asset, AssetCode, BeginSponsoringFutureReservesOp, ChangeTrustAsset,
+    ChangeTrustOp, ClaimClaimableBalanceOp, ClawbackClaimableBalanceOp, ClawbackOp,
+    CreateAccountOp, CreateClaimableBalanceOp, CreatePassiveSellOfferOp, LedgerKey,
+    LedgerKeyAccount, LedgerKeyClaimableBalance, LedgerKeyData, LedgerKeyOffer, LedgerKeyTrustLine,
+    LiquidityPoolDepositOp, LiquidityPoolWithdrawOp, ManageBuyOfferOp, ManageDataOp,
+    ManageSellOfferOp, MuxedAccount, OperationBody, PathPaymentStrictReceiveOp,
+    PathPaymentStrictSendOp, PaymentOp, SetTrustLineFlagsOp, TrustLineAsset,
 };
 
 use crate::frame::muxed_to_account_id;
@@ -85,16 +84,11 @@ pub fn prefetch_keys_create_account(
     keys.insert(account_key(&op.destination));
 }
 
-pub fn prefetch_keys_payment(
-    op: &PaymentOp,
-    source: &AccountId,
-    keys: &mut HashSet<LedgerKey>,
-) {
+pub fn prefetch_keys_payment(op: &PaymentOp, source: &AccountId, keys: &mut HashSet<LedgerKey>) {
     let dest = muxed_to_account_id(&op.destination);
     keys.insert(account_key(&dest));
     insert_asset_trustline(keys, source, &op.asset);
     insert_asset_trustline(keys, &dest, &op.asset);
-
 }
 
 pub fn prefetch_keys_path_payment_strict_receive(
@@ -106,7 +100,6 @@ pub fn prefetch_keys_path_payment_strict_receive(
     keys.insert(account_key(&dest));
     insert_asset_trustline(keys, source, &op.send_asset);
     insert_asset_trustline(keys, &dest, &op.dest_asset);
-
 }
 
 pub fn prefetch_keys_path_payment_strict_send(
@@ -118,7 +111,6 @@ pub fn prefetch_keys_path_payment_strict_send(
     keys.insert(account_key(&dest));
     insert_asset_trustline(keys, source, &op.send_asset);
     insert_asset_trustline(keys, &dest, &op.dest_asset);
-
 }
 
 pub fn prefetch_keys_manage_sell_offer(
@@ -131,7 +123,6 @@ pub fn prefetch_keys_manage_sell_offer(
     }
     insert_asset_trustline(keys, source, &op.selling);
     insert_asset_trustline(keys, source, &op.buying);
-
 }
 
 pub fn prefetch_keys_manage_buy_offer(
@@ -144,7 +135,6 @@ pub fn prefetch_keys_manage_buy_offer(
     }
     insert_asset_trustline(keys, source, &op.selling);
     insert_asset_trustline(keys, source, &op.buying);
-
 }
 
 pub fn prefetch_keys_create_passive_sell_offer(
@@ -154,7 +144,6 @@ pub fn prefetch_keys_create_passive_sell_offer(
 ) {
     insert_asset_trustline(keys, source, &op.selling);
     insert_asset_trustline(keys, source, &op.buying);
-
 }
 
 pub fn prefetch_keys_change_trust(
@@ -253,11 +242,7 @@ pub fn prefetch_keys_create_claimable_balance(
     insert_asset_trustline(keys, source, &op.asset);
 }
 
-pub fn prefetch_keys_clawback(
-    op: &ClawbackOp,
-    _source: &AccountId,
-    keys: &mut HashSet<LedgerKey>,
-) {
+pub fn prefetch_keys_clawback(op: &ClawbackOp, _source: &AccountId, keys: &mut HashSet<LedgerKey>) {
     let from = muxed_to_account_id(&op.from);
     insert_asset_trustline(keys, &from, &op.asset);
 }
@@ -536,7 +521,10 @@ mod tests {
         let mut keys = HashSet::new();
         let source = test_account_id(1);
         // Soroban ops should not insert any keys
-        let body = OperationBody::ExtendFootprintTtl(ExtendFootprintTtlOp { ext: ExtensionPoint::V0, extend_to: 100 });
+        let body = OperationBody::ExtendFootprintTtl(ExtendFootprintTtlOp {
+            ext: ExtensionPoint::V0,
+            extend_to: 100,
+        });
         collect_prefetch_keys(&body, &source, &mut keys);
         assert!(keys.is_empty());
     }
@@ -548,5 +536,4 @@ mod tests {
         collect_prefetch_keys(&OperationBody::Inflation, &source, &mut keys);
         assert!(keys.is_empty());
     }
-
 }

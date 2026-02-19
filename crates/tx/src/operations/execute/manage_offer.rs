@@ -6,11 +6,11 @@
 use std::cmp::Ordering;
 
 use stellar_xdr::curr::{
-    AccountId,
-    Asset, ClaimAtom, ClaimOfferAtom, CreatePassiveSellOfferOp, LedgerKey, LedgerKeyOffer,
-    Liabilities, ManageBuyOfferOp, ManageOfferSuccessResult, ManageOfferSuccessResultOffer,
-    ManageSellOfferOp, ManageSellOfferResult, ManageSellOfferResultCode, OfferEntry, OfferEntryExt,
-    OfferEntryFlags, OperationResult, OperationResultTr, Price,
+    AccountId, Asset, ClaimAtom, ClaimOfferAtom, CreatePassiveSellOfferOp, LedgerKey,
+    LedgerKeyOffer, Liabilities, ManageBuyOfferOp, ManageOfferSuccessResult,
+    ManageOfferSuccessResultOffer, ManageSellOfferOp, ManageSellOfferResult,
+    ManageSellOfferResultCode, OfferEntry, OfferEntryExt, OfferEntryFlags, OperationResult,
+    OperationResultTr, Price,
 };
 
 use super::offer_exchange::{
@@ -856,9 +856,11 @@ fn convert_with_offers(
     let mut need_more = max_sheep_send > 0 && max_wheat_receive > 0;
 
     while need_more {
-        let offer = params.state.best_offer_filtered(params.selling, params.buying, |offer| {
-            offer.seller_id != *params.source || offer.offer_id != updating_offer_id
-        });
+        let offer = params
+            .state
+            .best_offer_filtered(params.selling, params.buying, |offer| {
+                offer.seller_id != *params.source || offer.offer_id != updating_offer_id
+            });
 
         let Some(offer) = offer else {
             break;
@@ -1163,8 +1165,8 @@ fn make_sell_offer_result(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::{AUTHORIZED_FLAG, AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG};
+    use super::*;
     use stellar_xdr::curr::*;
 
     fn create_test_account_id(seed: u8) -> AccountId {
@@ -3044,11 +3046,7 @@ mod tests {
                     success.offer
                 );
                 // Should have claimed the counterparty's offer
-                assert_eq!(
-                    success.offers_claimed.len(),
-                    1,
-                    "Expected 1 offer claimed"
-                );
+                assert_eq!(success.offers_claimed.len(), 1, "Expected 1 offer claimed");
             }
             other => panic!("Expected success, got {:?}", other),
         }

@@ -455,17 +455,25 @@ fn disk_read_bytes_exceeded(
 
     if meter_all {
         for key in soroban_data.resources.footprint.read_only.iter() {
-            if meter_and_check(key) { return true; }
+            if meter_and_check(key) {
+                return true;
+            }
         }
         for key in soroban_data.resources.footprint.read_write.iter() {
-            if meter_and_check(key) { return true; }
+            if meter_and_check(key) {
+                return true;
+            }
         }
     } else {
         for key in soroban_data.resources.footprint.read_only.iter() {
-            if !is_soroban_key(key) && meter_and_check(key) { return true; }
+            if !is_soroban_key(key) && meter_and_check(key) {
+                return true;
+            }
         }
         for key in soroban_data.resources.footprint.read_write.iter() {
-            if !is_soroban_key(key) && meter_and_check(key) { return true; }
+            if !is_soroban_key(key) && meter_and_check(key) {
+                return true;
+            }
         }
 
         if let SorobanTransactionDataExt::V1(ext) = &soroban_data.ext {
@@ -491,7 +499,9 @@ fn disk_read_bytes_exceeded(
                     if !is_still_archived {
                         continue;
                     }
-                    if meter_and_check(key) { return true; }
+                    if meter_and_check(key) {
+                        return true;
+                    }
                 }
             }
         }

@@ -1,12 +1,11 @@
 //! ChangeTrust operation execution.
 
 use stellar_xdr::curr::{
-    AccountId, Asset, ChangeTrustAsset, ChangeTrustOp, ChangeTrustResult,
-    ChangeTrustResultCode, LedgerKey, LedgerKeyTrustLine, Liabilities, LiquidityPoolEntry,
-    LiquidityPoolEntryBody, LiquidityPoolEntryConstantProduct, LiquidityPoolParameters,
-    OperationResult, OperationResultTr, TrustLineAsset, TrustLineEntry, TrustLineEntryExt,
-    TrustLineEntryExtensionV2, TrustLineEntryExtensionV2Ext, TrustLineEntryV1,
-    TrustLineEntryV1Ext, TrustLineFlags,
+    AccountId, Asset, ChangeTrustAsset, ChangeTrustOp, ChangeTrustResult, ChangeTrustResultCode,
+    LedgerKey, LedgerKeyTrustLine, Liabilities, LiquidityPoolEntry, LiquidityPoolEntryBody,
+    LiquidityPoolEntryConstantProduct, LiquidityPoolParameters, OperationResult, OperationResultTr,
+    TrustLineAsset, TrustLineEntry, TrustLineEntryExt, TrustLineEntryExtensionV2,
+    TrustLineEntryExtensionV2Ext, TrustLineEntryV1, TrustLineEntryV1Ext, TrustLineFlags,
 };
 
 use super::{
@@ -1433,7 +1432,10 @@ mod tests {
         let selling_liabilities = 200i64;
         // Create source with selling liabilities and enough balance so that
         // available = balance - selling_liabilities >= min_balance_with_tl
-        let mut source = create_test_account(source_id.clone(), min_balance_with_tl + selling_liabilities + 100);
+        let mut source = create_test_account(
+            source_id.clone(),
+            min_balance_with_tl + selling_liabilities + 100,
+        );
         source.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
             liabilities: Liabilities {
                 buying: 0,
@@ -1667,7 +1669,10 @@ mod tests {
         //   balance = new_min_balance + selling_liabilities - 1
         //   available = balance - selling_liabilities = new_min_balance - 1 < new_min_balance
         let balance = new_min_balance + selling_liabilities - 1;
-        assert!(balance >= new_min_balance, "raw balance must be >= new_min_balance");
+        assert!(
+            balance >= new_min_balance,
+            "raw balance must be >= new_min_balance"
+        );
         assert!(
             balance - selling_liabilities < new_min_balance,
             "available balance must be < new_min_balance"
@@ -1726,10 +1731,15 @@ mod tests {
 
         let result2 = execute_change_trust(&op2, &source_id2, &mut state, &context).unwrap();
         match result2 {
-            OperationResult::OpInner(OperationResultTr::ChangeTrust(ChangeTrustResult::Success)) => {
+            OperationResult::OpInner(OperationResultTr::ChangeTrust(
+                ChangeTrustResult::Success,
+            )) => {
                 // Expected: without liabilities, same balance is sufficient
             }
-            other => panic!("Expected Success without selling liabilities, got {:?}", other),
+            other => panic!(
+                "Expected Success without selling liabilities, got {:?}",
+                other
+            ),
         }
     }
 

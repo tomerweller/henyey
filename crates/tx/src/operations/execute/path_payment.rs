@@ -5,10 +5,9 @@
 
 use sha2::{Digest, Sha256};
 use stellar_xdr::curr::{
-    AccountId,
-    Asset, ClaimAtom, ClaimLiquidityAtom, ClaimOfferAtom, Hash, LedgerKey, LedgerKeyOffer,
-    Liabilities, Limits, LiquidityPoolEntryBody, LiquidityPoolParameters, OperationResult,
-    OperationResultTr, PathPaymentStrictReceiveOp, PathPaymentStrictReceiveResult,
+    AccountId, Asset, ClaimAtom, ClaimLiquidityAtom, ClaimOfferAtom, Hash, LedgerKey,
+    LedgerKeyOffer, Liabilities, Limits, LiquidityPoolEntryBody, LiquidityPoolParameters,
+    OperationResult, OperationResultTr, PathPaymentStrictReceiveOp, PathPaymentStrictReceiveResult,
     PathPaymentStrictReceiveResultCode, PathPaymentStrictReceiveResultSuccess,
     PathPaymentStrictSendOp, PathPaymentStrictSendResult, PathPaymentStrictSendResultCode,
     PathPaymentStrictSendResultSuccess, PoolId, Price, SimplePaymentResult, WriteXdr,
@@ -20,8 +19,8 @@ use super::offer_exchange::{
     ConversionParams, RoundingType,
 };
 use super::{
-    account_liabilities, add_account_balance, add_trustline_balance,
-    apply_balance_delta, ensure_account_liabilities, ensure_trustline_liabilities,
+    account_liabilities, add_account_balance, add_trustline_balance, apply_balance_delta,
+    ensure_account_liabilities, ensure_trustline_liabilities,
     is_authorized_to_maintain_liabilities, is_trustline_authorized, issuer_for_asset,
     map_exchange_error, trustline_liabilities,
 };
@@ -1293,8 +1292,8 @@ fn make_strict_send_result_with_asset(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::AUTHORIZED_FLAG;
+    use super::*;
     use stellar_xdr::curr::*;
 
     const AUTH_REQUIRED_FLAG: u32 = 0x1;
@@ -2240,5 +2239,4 @@ mod tests {
 
         assert_eq!(result.unwrap(), ConvertResult::CrossedTooMany);
     }
-
 }
