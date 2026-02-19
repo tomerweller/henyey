@@ -634,14 +634,15 @@ pub fn invoke_host_function(
     let mut encoded_ledger_entries = Vec::new();
     let mut encoded_ttl_entries = Vec::new();
 
-    let mut add_entry =
-        |key: &LedgerKey, entry: &LedgerEntry, live_until: Option<u32>| -> Result<(), HostError> {
-            encoded_ledger_entries.push(entry.to_xdr(Limits::none()).map_err(|_| {
+    // Helper to encode an entry and its TTL, returning the encoded bytes.
+    let encode_entry =
+        |key: &LedgerKey, entry: &LedgerEntry, live_until: Option<u32>| -> Result<(Vec<u8>, Vec<u8>), HostError> {
+            let entry_bytes = entry.to_xdr(Limits::none()).map_err(|_| {
                 HostError::from(soroban_env_host_p25::Error::from_type_and_code(
                     soroban_env_host_p25::xdr::ScErrorType::Context,
                     soroban_env_host_p25::xdr::ScErrorCode::InternalError,
                 ))
-            })?);
+            })?;
 
             let ttl_bytes = if let Some(lu) = live_until {
                 let key_hash = compute_key_hash(key);
@@ -658,13 +659,18 @@ pub fn invoke_host_function(
             } else {
                 Vec::new()
             };
-            encoded_ttl_entries.push(ttl_bytes);
-            Ok(())
+            Ok((entry_bytes, ttl_bytes))
         };
 
     for key in soroban_data.resources.footprint.read_only.iter() {
         if let Some((entry, live_until)) = snapshot.get_local(key)? {
-            add_entry(key, entry.as_ref(), live_until)?;
+            let (le, ttl) = encode_entry(key, entry.as_ref(), live_until)?;
+            encoded_ledger_entries.push(le);
+            encoded_ttl_entries.push(ttl);
+        } else {
+            // Entry not found — add empty buffers to maintain index alignment.
+            encoded_ledger_entries.push(Vec::new());
+            encoded_ttl_entries.push(Vec::new());
         }
     }
 
@@ -691,17 +697,29 @@ pub fn invoke_host_function(
                     is_live_bl_restore = restore_info.live_bl_restore.is_some(),
                     "Fetching archived entry for restoration"
                 );
-                add_entry(key, &restore_info.entry, restore_info.live_until)?;
+                let (le, ttl) = encode_entry(key, &restore_info.entry, restore_info.live_until)?;
+                encoded_ledger_entries.push(le);
+                encoded_ttl_entries.push(ttl);
 
                 // Track live BL restorations
                 if let Some(live_bl_restore) = restore_info.live_bl_restore {
                     live_bl_restores.push(live_bl_restore);
                 }
+            } else {
+                // Restored entry not found — add empty buffers to maintain index alignment.
+                encoded_ledger_entries.push(Vec::new());
+                encoded_ttl_entries.push(Vec::new());
             }
         } else {
             // Normal entry - use standard TTL-filtered lookup
             if let Some((entry, live_until)) = snapshot.get_local(key)? {
-                add_entry(key, entry.as_ref(), live_until)?;
+                let (le, ttl) = encode_entry(key, entry.as_ref(), live_until)?;
+                encoded_ledger_entries.push(le);
+                encoded_ttl_entries.push(ttl);
+            } else {
+                // Entry not found — add empty buffers to maintain index alignment.
+                encoded_ledger_entries.push(Vec::new());
+                encoded_ttl_entries.push(Vec::new());
             }
         }
     }

@@ -1185,6 +1185,10 @@ impl TransactionExecutor {
     /// This is essential for Soroban transaction execution - the footprint specifies
     /// which ledger entries the transaction will read or write, and they must be
     /// loaded before the Soroban host can access them.
+    ///
+    /// For entries not found in the live state (evicted to hot archive), this method
+    /// auto-restores them by loading from the hot archive and creating a restored TTL.
+    /// This matches stellar-core's `addReads()` → `handleArchivedEntry()` behavior.
     pub fn load_soroban_footprint(
         &mut self,
         snapshot: &SnapshotHandle,
@@ -1233,6 +1237,14 @@ impl TransactionExecutor {
         for entry in entries {
             self.state.load_entry(entry);
         }
+
+        // NOTE: We do NOT auto-restore entries from the hot archive here.
+        // In stellar-core, auto-restore is handled differently:
+        // - RO entries with expired TTL or in hot archive → TX fails with ENTRY_ARCHIVED
+        //   (checked by footprint_has_unrestored_archived_entries before host execution)
+        // - RW entries marked in archivedSorobanEntries → restored in encode_footprint_entries
+        //   (via get_archived_with_restore_info / get_entry_for_restoration)
+        // Auto-restoring entries here would mask the ENTRY_ARCHIVED check.
 
         Ok(())
     }

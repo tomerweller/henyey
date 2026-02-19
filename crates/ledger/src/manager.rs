@@ -1469,21 +1469,23 @@ impl LedgerManager {
         });
         let bls_for_lookup = bucket_list_snapshot.clone();
         let lookup_fn: crate::snapshot::EntryLookupFn = Arc::new(move |key: &LedgerKey| {
-            // For Soroban entry types, use in-memory state exclusively (no bucket list fallback)
+            // For Soroban entry types, check in-memory state first (O(1)),
+            // then fall back to bucket list if not found.
             if crate::soroban_state::InMemorySorobanState::is_in_memory_type(key) {
-                return Ok(soroban_state_lookup
-                    .read()
-                    .get(key)
-                    .map(|entry| (*entry).clone()));
+                if let Some(entry) = soroban_state_lookup.read().get(key) {
+                    return Ok(Some((*entry).clone()));
+                }
+                // Fall through to bucket list for entries not in in-memory state
             }
-            // Non-Soroban types: use bucket list snapshot
+            // Non-Soroban types or Soroban cache miss: use bucket list snapshot
             Ok(bls_for_lookup.get(key))
         });
 
         // Batch lookup function for loading multiple entries in a single pass.
         // Checks in-memory Soroban state first for ContractData/ContractCode/TTL/ConfigSetting
-        // entries (O(1) cache hits), then batch-loads remaining keys from the bucket list
-        // in a single traversal.
+        // entries (O(1) cache hits), then falls back to the bucket list for any
+        // Soroban entries not found in the in-memory state, then batch-loads
+        // remaining non-Soroban keys from the bucket list in a single traversal.
         let soroban_state_batch = self.soroban_state.clone();
         let bls_for_batch = bucket_list_snapshot.clone();
         let batch_lookup_fn: crate::snapshot::BatchEntryLookupFn =
@@ -1491,16 +1493,19 @@ impl LedgerManager {
                 let mut result = Vec::new();
                 let mut bucket_list_keys = Vec::new();
 
-                // Check soroban state cache for soroban types — authoritative, no fallback
+                // Check soroban state cache for soroban types first (O(1))
                 {
                     let soroban = soroban_state_batch.read();
                     for key in keys {
                         if crate::soroban_state::InMemorySorobanState::is_in_memory_type(key) {
                             if let Some(entry) = soroban.get(key) {
                                 result.push((*entry).clone());
+                            } else {
+                                // Fall through to bucket list for Soroban entries not
+                                // found in the in-memory state. This handles entries
+                                // that the initialization scan may have missed.
+                                bucket_list_keys.push(key.clone());
                             }
-                            // Whether found or not, soroban state is authoritative
-                            // for in-memory types — do not fall through to bucket list
                             continue;
                         }
                         bucket_list_keys.push(key.clone());
@@ -1688,6 +1693,73 @@ impl LedgerManager {
         }
         let snapshot = self.create_snapshot().ok()?;
         load_soroban_network_info(&snapshot)
+    }
+
+    /// Rebuild the module cache for a new protocol version.
+    ///
+    /// When a protocol upgrade changes the version (e.g., P24→P25), the module
+    /// cache must be rebuilt for the new protocol. This scans the bucket list
+    /// for all CONTRACT_CODE entries and compiles them into a new cache.
+    ///
+    /// Parity: In stellar-core, the module cache is pre-compiled for all
+    /// supported protocol versions simultaneously. Since Henyey only maintains
+    /// a single-protocol cache, we rebuild it on protocol upgrade instead.
+    fn rebuild_module_cache(&self, protocol_version: u32) {
+        let start = std::time::Instant::now();
+
+        let new_cache = match PersistentModuleCache::new_for_protocol(protocol_version) {
+            Some(cache) => cache,
+            None => {
+                tracing::warn!(
+                    protocol_version,
+                    "Failed to create module cache for new protocol version"
+                );
+                return;
+            }
+        };
+
+        let bucket_list = self.bucket_list.read();
+        let mut compiled = 0u32;
+        let mut seen_hashes = std::collections::HashSet::<[u8; 32]>::new();
+
+        // Scan levels from 0 (newest) to 10 (oldest). Within each level,
+        // curr shadows snap. Dead entries shadow live entries at higher levels.
+        for level in bucket_list.levels() {
+            for bucket in [level.curr.as_ref(), level.snap.as_ref()] {
+                for entry in bucket.iter() {
+                    match &entry {
+                        henyey_bucket::BucketEntry::Live(le)
+                        | henyey_bucket::BucketEntry::Init(le) => {
+                            if let LedgerEntryData::ContractCode(ref cc) = le.data {
+                                let hash: [u8; 32] =
+                                    <sha2::Sha256 as sha2::Digest>::digest(cc.code.as_slice())
+                                        .into();
+                                if seen_hashes.insert(hash) {
+                                    if new_cache
+                                        .add_contract(cc.code.as_slice(), protocol_version)
+                                    {
+                                        compiled += 1;
+                                    }
+                                }
+                            }
+                        }
+                        henyey_bucket::BucketEntry::Dead(_)
+                        | henyey_bucket::BucketEntry::Metadata(_) => {}
+                    }
+                }
+            }
+        }
+        drop(bucket_list);
+
+        *self.module_cache.write() = Some(new_cache);
+
+        let elapsed = start.elapsed();
+        tracing::info!(
+            protocol_version,
+            compiled,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "Rebuilt module cache for protocol upgrade"
+        );
     }
 
     /// Look up a pending ConfigUpgradeSet by its key.
@@ -3354,6 +3426,13 @@ impl<'a> LedgerCloseContext<'a> {
         self.manager
             .commit_close(self.delta, new_header.clone(), header_hash)?;
         let commit_close_us = commit_close_start.elapsed().as_micros() as u64;
+
+        // If protocol upgraded to a new major version, rebuild the module cache.
+        // Transactions in THIS ledger ran under prev_version; the NEXT ledger
+        // needs a cache matching the new protocol version.
+        if prev_version < 25 && protocol_version >= 25 {
+            self.manager.rebuild_module_cache(protocol_version);
+        }
 
         self.stats
             .set_close_time(self.start.elapsed().as_millis() as u64);

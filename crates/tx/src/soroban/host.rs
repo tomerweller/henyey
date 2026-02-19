@@ -1068,12 +1068,12 @@ fn encode_footprint_entries(
     let mut encoded_ledger_entries = Vec::new();
     let mut encoded_ttl_entries = Vec::new();
 
-    // Helper to encode an entry and its TTL
-    let mut add_entry = |key: &LedgerKey,
-                         entry: &soroban_env_host24::xdr::LedgerEntry,
-                         live_until: Option<u32>|
-     -> Result<(), SorobanExecutionError> {
-        encoded_ledger_entries.push(xdr_encode_p24_setup(entry)?);
+    // Helper to encode an entry and its TTL, returning the encoded bytes.
+    let encode_entry = |key: &LedgerKey,
+                        entry: &soroban_env_host24::xdr::LedgerEntry,
+                        live_until: Option<u32>|
+     -> Result<(Vec<u8>, Vec<u8>), SorobanExecutionError> {
+        let entry_bytes = xdr_encode_p24_setup(entry)?;
 
         let needs_ttl = matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_));
         let ttl_bytes = if let Some(lu) = live_until {
@@ -1092,8 +1092,7 @@ fn encode_footprint_entries(
             Vec::new()
         };
 
-        encoded_ttl_entries.push(ttl_bytes);
-        Ok(())
+        Ok((entry_bytes, ttl_bytes))
     };
 
     // Read-only footprint entries
@@ -1108,7 +1107,17 @@ fn encode_footprint_entries(
                 mem_bytes_consumed: 0,
             })?
         {
-            add_entry(key, &entry, live_until)?;
+            let (le, ttl) = encode_entry(key, &entry, live_until)?;
+            encoded_ledger_entries.push(le);
+            encoded_ttl_entries.push(ttl);
+        } else {
+            // Entry not found — add empty buffers to maintain index alignment.
+            // stellar-core always adds a buffer slot for every footprint key,
+            // even for entries that don't exist (CxxBuf{} in addReads).
+            // The Soroban host maps entries to footprint keys by position,
+            // so skipping entries would misalign all subsequent entries.
+            encoded_ledger_entries.push(Vec::new());
+            encoded_ttl_entries.push(Vec::new());
         }
     }
 
@@ -1161,7 +1170,9 @@ fn encode_footprint_entries(
                         is_live_bl_restore = live_bl_restore.is_some(),
                         "P24: Archived entry found for restoration"
                     );
-                    add_entry(key, &entry, restored_live_until)?;
+                    let (le, ttl) = encode_entry(key, &entry, restored_live_until)?;
+                    encoded_ledger_entries.push(le);
+                    encoded_ttl_entries.push(ttl);
                     actual_restored_indices.push(idx as u32);
                     if let Some(restore) = live_bl_restore {
                         live_bl_restores.push(restore);
@@ -1173,7 +1184,9 @@ fn encode_footprint_entries(
                         live_until = ?live_until,
                         "P24: Entry marked for restore but already live (restored by earlier TX)"
                     );
-                    add_entry(key, &entry, live_until)?;
+                    let (le, ttl) = encode_entry(key, &entry, live_until)?;
+                    encoded_ledger_entries.push(le);
+                    encoded_ttl_entries.push(ttl);
                 }
             } else {
                 tracing::warn!(
@@ -1181,6 +1194,9 @@ fn encode_footprint_entries(
                     key_type = ?std::mem::discriminant(key),
                     "P24: Archived entry being restored but NOT FOUND in state"
                 );
+                // Add empty buffers to maintain index alignment.
+                encoded_ledger_entries.push(Vec::new());
+                encoded_ttl_entries.push(Vec::new());
             }
         } else {
             if let Some((entry, live_until)) = snapshot
@@ -1191,7 +1207,13 @@ fn encode_footprint_entries(
                     mem_bytes_consumed: 0,
                 })?
             {
-                add_entry(key, &entry, live_until)?;
+                let (le, ttl) = encode_entry(key, &entry, live_until)?;
+                encoded_ledger_entries.push(le);
+                encoded_ttl_entries.push(ttl);
+            } else {
+                // Entry not found — add empty buffers to maintain index alignment.
+                encoded_ledger_entries.push(Vec::new());
+                encoded_ttl_entries.push(Vec::new());
             }
         }
     }
@@ -1653,22 +1675,22 @@ fn execute_host_function_p25(
 
     let mut encoded_ledger_entries = Vec::new();
     let mut encoded_ttl_entries = Vec::new();
-    let current_ledger_p25 = context.sequence; // Capture for use in closure
+    let current_ledger_p25 = context.sequence;
 
-    let mut add_entry = |key: &LedgerKey,
-                         entry: &LedgerEntry,
-                         live_until: Option<u32>|
-     -> Result<(), SorobanExecutionError> {
-        encoded_ledger_entries.push(entry.to_xdr(Limits::none()).map_err(|_| {
+    // Helper to encode an entry and its TTL, returning the encoded bytes.
+    let encode_entry_p25 = |key: &LedgerKey,
+                            entry: &LedgerEntry,
+                            live_until: Option<u32>|
+     -> Result<(Vec<u8>, Vec<u8>), SorobanExecutionError> {
+        let entry_bytes = entry.to_xdr(Limits::none()).map_err(|_| {
             make_setup_error(HostErrorP25::from(
                 soroban_env_host25::Error::from_type_and_code(
                     soroban_env_host25::xdr::ScErrorType::Context,
                     soroban_env_host25::xdr::ScErrorCode::InternalError,
                 ),
             ))
-        })?);
+        })?;
 
-        // For contract entries (ContractData, ContractCode), we always need TTL
         let needs_ttl = matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_));
         let ttl_bytes = if let Some(lu) = live_until {
             let key_hash = compute_key_hash(key);
@@ -1685,13 +1707,10 @@ fn execute_host_function_p25(
                 ))
             })?
         } else if needs_ttl {
-            // For archived entries being restored, provide a TTL at the current ledger.
-            // The host validates that TTL >= current_ledger, so we can't use 0 or an expired value.
-            // The actual TTL extension happens as part of the restoration operation.
             let key_hash = compute_key_hash(key);
             let ttl_entry = stellar_xdr::curr::TtlEntry {
                 key_hash,
-                live_until_ledger_seq: current_ledger_p25, // Use current ledger as minimum valid TTL
+                live_until_ledger_seq: current_ledger_p25,
             };
             ttl_entry.to_xdr(Limits::none()).map_err(|_| {
                 make_setup_error(HostErrorP25::from(
@@ -1704,13 +1723,19 @@ fn execute_host_function_p25(
         } else {
             Vec::new()
         };
-        encoded_ttl_entries.push(ttl_bytes);
-        Ok(())
+
+        Ok((entry_bytes, ttl_bytes))
     };
 
     for key in soroban_data.resources.footprint.read_only.iter() {
         if let Some((entry, live_until)) = snapshot.get_local(key).map_err(make_setup_error)? {
-            add_entry(key, entry.as_ref(), live_until)?;
+            let (le, ttl) = encode_entry_p25(key, entry.as_ref(), live_until)?;
+            encoded_ledger_entries.push(le);
+            encoded_ttl_entries.push(ttl);
+        } else {
+            // Entry not found — add empty buffers to maintain index alignment.
+            encoded_ledger_entries.push(Vec::new());
+            encoded_ttl_entries.push(Vec::new());
         }
     }
 
@@ -1770,7 +1795,9 @@ fn execute_host_function_p25(
                         is_live_bl_restore = live_bl_restore.is_some(),
                         "P25: Archived entry found for restoration"
                     );
-                    add_entry(key, entry.as_ref(), restored_live_until)?;
+                    let (le, ttl) = encode_entry_p25(key, entry.as_ref(), restored_live_until)?;
+                    encoded_ledger_entries.push(le);
+                    encoded_ttl_entries.push(ttl);
 
                     // Track this index as actually being restored
                     actual_restored_indices.push(idx as u32);
@@ -1788,7 +1815,9 @@ fn execute_host_function_p25(
                         live_until = ?live_until,
                         "P25: Entry marked for restore but already live (restored by earlier TX)"
                     );
-                    add_entry(key, entry.as_ref(), live_until)?;
+                    let (le, ttl) = encode_entry_p25(key, entry.as_ref(), live_until)?;
+                    encoded_ledger_entries.push(le);
+                    encoded_ttl_entries.push(ttl);
                 }
             } else {
                 tracing::warn!(
@@ -1796,11 +1825,20 @@ fn execute_host_function_p25(
                     key_type = ?std::mem::discriminant(key),
                     "P25: Archived entry being restored but NOT FOUND in state"
                 );
+                // Add empty buffers to maintain index alignment.
+                encoded_ledger_entries.push(Vec::new());
+                encoded_ttl_entries.push(Vec::new());
             }
         } else {
             // Normal entry - use standard TTL-filtered lookup
             if let Some((entry, live_until)) = snapshot.get_local(key).map_err(make_setup_error)? {
-                add_entry(key, entry.as_ref(), live_until)?;
+                let (le, ttl) = encode_entry_p25(key, entry.as_ref(), live_until)?;
+                encoded_ledger_entries.push(le);
+                encoded_ttl_entries.push(ttl);
+            } else {
+                // Entry not found — add empty buffers to maintain index alignment.
+                encoded_ledger_entries.push(Vec::new());
+                encoded_ttl_entries.push(Vec::new());
             }
         }
     }

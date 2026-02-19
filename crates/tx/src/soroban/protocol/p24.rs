@@ -393,23 +393,20 @@ pub fn invoke_host_function(
     let mut encoded_ttl_entries = Vec::new();
     let current_ledger = context.sequence; // Capture for use in closure
 
-    let mut add_entry = |key: &LedgerKey,
-                         entry: &soroban_env_host_p24::xdr::LedgerEntry,
-                         live_until: Option<u32>|
-     -> Result<(), HostErrorP25> {
-        encoded_ledger_entries.push(
-            entry
-                .to_xdr(soroban_env_host_p24::xdr::Limits::none())
-                .map_err(|_| {
-                    HostErrorP25::from(soroban_env_host_p25::Error::from_type_and_code(
-                        soroban_env_host_p25::xdr::ScErrorType::Context,
-                        soroban_env_host_p25::xdr::ScErrorCode::InternalError,
-                    ))
-                })?,
-        );
+    // Helper to encode an entry and its TTL, returning the encoded bytes.
+    let encode_entry = |key: &LedgerKey,
+                        entry: &soroban_env_host_p24::xdr::LedgerEntry,
+                        live_until: Option<u32>|
+     -> Result<(Vec<u8>, Vec<u8>), HostErrorP25> {
+        let entry_bytes = entry
+            .to_xdr(soroban_env_host_p24::xdr::Limits::none())
+            .map_err(|_| {
+                HostErrorP25::from(soroban_env_host_p25::Error::from_type_and_code(
+                    soroban_env_host_p25::xdr::ScErrorType::Context,
+                    soroban_env_host_p25::xdr::ScErrorCode::InternalError,
+                ))
+            })?;
 
-        // Encode TTL entry if present, otherwise provide appropriate default
-        // For contract entries (ContractData, ContractCode), we always need TTL
         let needs_ttl = matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_));
         let ttl_bytes = if let Some(lu) = live_until {
             let key_hash = compute_key_hash(key);
@@ -426,13 +423,10 @@ pub fn invoke_host_function(
                     ))
                 })?
         } else if needs_ttl {
-            // For archived entries being restored, provide a TTL at the current ledger.
-            // The host validates that TTL >= current_ledger, so we can't use 0 or an expired value.
-            // The actual TTL extension happens as part of the restoration operation.
             let key_hash = compute_key_hash(key);
             let ttl_entry = soroban_env_host_p24::xdr::TtlEntry {
                 key_hash: soroban_env_host_p24::xdr::Hash(key_hash.0),
-                live_until_ledger_seq: current_ledger, // Use current ledger as minimum valid TTL
+                live_until_ledger_seq: current_ledger,
             };
             ttl_entry
                 .to_xdr(soroban_env_host_p24::xdr::Limits::none())
@@ -443,11 +437,9 @@ pub fn invoke_host_function(
                     ))
                 })?
         } else {
-            // Empty bytes for entries that don't need TTL (non-contract entries)
             Vec::new()
         };
-        encoded_ttl_entries.push(ttl_bytes);
-        Ok(())
+        Ok((entry_bytes, ttl_bytes))
     };
 
     // Extract archived entry indices for TTL restoration BEFORE collecting entries
@@ -481,7 +473,13 @@ pub fn invoke_host_function(
             .get(&Rc::new(key_p24))
             .map_err(convert_host_error_p24_to_p25)?
         {
-            add_entry(key, &entry, live_until)?;
+            let (le, ttl) = encode_entry(key, &entry, live_until)?;
+            encoded_ledger_entries.push(le);
+            encoded_ttl_entries.push(ttl);
+        } else {
+            // Entry not found — add empty buffers to maintain index alignment.
+            encoded_ledger_entries.push(Vec::new());
+            encoded_ttl_entries.push(Vec::new());
         }
     }
 
@@ -513,7 +511,13 @@ pub fn invoke_host_function(
                     is_live_bl_restore = live_until.map(|lu| lu < context.sequence).unwrap_or(false),
                     "P24: Archived entry found for restoration"
                 );
-                add_entry(key, &entry_p24, live_until)?;
+                let (le, ttl) = encode_entry(key, &entry_p24, live_until)?;
+                encoded_ledger_entries.push(le);
+                encoded_ttl_entries.push(ttl);
+            } else {
+                // Restored entry not found — add empty buffers to maintain index alignment.
+                encoded_ledger_entries.push(Vec::new());
+                encoded_ttl_entries.push(Vec::new());
             }
         } else {
             // Normal entry - use standard TTL-filtered lookup
@@ -527,7 +531,13 @@ pub fn invoke_host_function(
                 .get(&Rc::new(key_p24))
                 .map_err(convert_host_error_p24_to_p25)?
             {
-                add_entry(key, &entry, live_until)?;
+                let (le, ttl) = encode_entry(key, &entry, live_until)?;
+                encoded_ledger_entries.push(le);
+                encoded_ttl_entries.push(ttl);
+            } else {
+                // Entry not found — add empty buffers to maintain index alignment.
+                encoded_ledger_entries.push(Vec::new());
+                encoded_ttl_entries.push(Vec::new());
             }
         }
     }
