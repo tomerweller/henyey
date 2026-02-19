@@ -949,7 +949,14 @@ pub struct BucketList {
 /// Deduplicate ledger entries by key, keeping only the last occurrence.
 /// This ensures that when the same entry is updated multiple times in a single
 /// ledger, only the final state is included in the bucket.
+///
+/// Parity: stellar-core uses `releaseAssert` with `adjacent_find` to crash on
+/// duplicates after sorting (`LiveBucket.cpp:414`). We keep the dedup behavior
+/// for resilience but warn when duplicates are actually found, since their
+/// presence indicates a bug in the entry-generation path.
 fn deduplicate_entries(entries: Vec<LedgerEntry>) -> Vec<LedgerEntry> {
+    let original_count = entries.len();
+
     // Use a HashMap to track the last position of each key
     let mut key_positions: HashMap<Vec<u8>, usize> = HashMap::new();
 
@@ -964,7 +971,7 @@ fn deduplicate_entries(entries: Vec<LedgerEntry>) -> Vec<LedgerEntry> {
 
     // Second pass: collect only entries at the recorded positions (final state of each key)
     let positions: HashSet<usize> = key_positions.values().copied().collect();
-    entries
+    let result: Vec<LedgerEntry> = entries
         .into_iter()
         .enumerate()
         .filter_map(|(idx, entry)| {
@@ -974,7 +981,19 @@ fn deduplicate_entries(entries: Vec<LedgerEntry>) -> Vec<LedgerEntry> {
                 None
             }
         })
-        .collect()
+        .collect();
+
+    let removed = original_count - result.len();
+    if removed > 0 {
+        tracing::warn!(
+            removed,
+            original_count,
+            "deduplicate_entries removed duplicate bucket entries; \
+             this indicates a bug in the entry-generation path"
+        );
+    }
+
+    result
 }
 
 /// Perform a single bucket merge, writing to disk if a bucket directory is provided,
