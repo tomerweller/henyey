@@ -2305,6 +2305,26 @@ impl<'a> LedgerCloseContext<'a> {
                 version_upgrade_memory_cost_changed = true;
             }
 
+            // Parity: Upgrades.cpp:1189-1193
+            // needUpgradeToVersion(V_10, prev, new) → prepareLiabilities
+            // In stellar-core, the version upgrade runs prepareLiabilities with
+            // the OLD base_reserve (the header hasn't been updated for reserve
+            // yet). If there's also a reserve increase, applyReserveUpgrade
+            // will run prepareLiabilities a second time with the new reserve.
+            //
+            // NOTE: Henyey supports protocol 24+ only, so prev_version < 10
+            // should never be true in production. This is included for
+            // completeness.
+            if prev_version < 10 && protocol_version >= 10 {
+                crate::prepare_liabilities::prepare_liabilities(
+                    &self.snapshot,
+                    &mut self.delta,
+                    protocol_version,
+                    self.prev_header.base_reserve,
+                    self.close_data.ledger_seq,
+                )?;
+            }
+
             // Parity: Upgrades.cpp:1244-1251
             // prevVersion==V_23 && newVersion==V_24 && gIsProductionNetwork
             // Correct for 3.1879035 XLM fee burn that occurred during protocol 23 on mainnet.
@@ -2340,6 +2360,59 @@ impl<'a> LedgerCloseContext<'a> {
                 }
             }
             LedgerEntryChanges(changes.try_into().unwrap_or_default())
+        } else {
+            LedgerEntryChanges(VecM::default())
+        };
+
+        // Parity: Upgrades.cpp:1254-1267 applyReserveUpgrade
+        // If the base reserve increased and protocol >= V10, run prepareLiabilities.
+        // This handles the case where a reserve increase makes some offers
+        // unsupportable due to the higher minimum balance.
+        //
+        // NOTE: The V10 version upgrade path above could theoretically also
+        // trigger prepareLiabilities, but Henyey only supports protocol 24+,
+        // so that path is never reached. If both were active, stellar-core
+        // would run prepareLiabilities twice (once per upgrade). Our
+        // snapshot-based architecture doesn't support that two-pass pattern
+        // without a merged snapshot view, but since the V10 path is dead code,
+        // this is not an issue in practice.
+        let reserve_changes = if let Some(new_reserve) = self.upgrade_ctx.base_reserve_upgrade() {
+            let did_reserve_increase = new_reserve > self.prev_header.base_reserve;
+            if protocol_version >= 10 && did_reserve_increase {
+                let delta_before = self.delta.num_changes();
+                crate::prepare_liabilities::prepare_liabilities(
+                    &self.snapshot,
+                    &mut self.delta,
+                    protocol_version,
+                    new_reserve,
+                    self.close_data.ledger_seq,
+                )?;
+                // Extract changes for UpgradeEntryMeta
+                let mut changes: Vec<LedgerEntryChange> = Vec::new();
+                let delta_after = self.delta.num_changes();
+                if delta_after > delta_before {
+                    for change in self.delta.changes().skip(delta_before) {
+                        match change {
+                            crate::delta::EntryChange::Created(entry) => {
+                                changes.push(LedgerEntryChange::Created(entry.clone()));
+                            }
+                            crate::delta::EntryChange::Updated { previous, current } => {
+                                changes.push(LedgerEntryChange::State(previous.clone()));
+                                changes.push(LedgerEntryChange::Updated(current.as_ref().clone()));
+                            }
+                            crate::delta::EntryChange::Deleted { previous } => {
+                                if let Ok(key) = crate::delta::entry_to_key(previous) {
+                                    changes.push(LedgerEntryChange::State(previous.clone()));
+                                    changes.push(LedgerEntryChange::Removed(key));
+                                }
+                            }
+                        }
+                    }
+                }
+                LedgerEntryChanges(changes.try_into().unwrap_or_default())
+            } else {
+                LedgerEntryChanges(VecM::default())
+            }
         } else {
             LedgerEntryChanges(VecM::default())
         };
@@ -2394,6 +2467,7 @@ impl<'a> LedgerCloseContext<'a> {
                     })
                 }
                 LedgerUpgrade::MaxSorobanTxSetSize(_) => max_soroban_changes.clone(),
+                LedgerUpgrade::BaseReserve(_) => reserve_changes.clone(),
                 _ => LedgerEntryChanges(VecM::default()),
             };
             upgrades_meta.push(UpgradeEntryMeta {

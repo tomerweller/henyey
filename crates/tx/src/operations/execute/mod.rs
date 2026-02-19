@@ -276,7 +276,10 @@ pub use manage_data::execute_manage_data;
 pub use manage_offer::{
     execute_create_passive_sell_offer, execute_manage_buy_offer, execute_manage_sell_offer,
 };
-pub use offer_exchange::{exchange_v10, ExchangeError, ExchangeResult, RoundingType};
+pub use offer_exchange::{
+    adjust_offer_amount, exchange_v10, exchange_v10_without_price_error_thresholds, ExchangeError,
+    ExchangeResult, RoundingType,
+};
 pub use path_payment::{execute_path_payment_strict_receive, execute_path_payment_strict_send};
 pub use payment::execute_payment;
 pub use restore_footprint::execute_restore_footprint;

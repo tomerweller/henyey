@@ -111,7 +111,7 @@ fn check_price_error_bound(
     }
 }
 
-pub(crate) fn exchange_v10_without_price_error_thresholds(
+pub fn exchange_v10_without_price_error_thresholds(
     price: Price,
     max_wheat_send: i64,
     max_wheat_receive: i64,
@@ -181,7 +181,7 @@ pub(crate) fn exchange_v10_without_price_error_thresholds(
     })
 }
 
-pub(crate) fn adjust_offer_amount(
+pub fn adjust_offer_amount(
     price: Price,
     max_wheat_send: i64,
     max_sheep_receive: i64,
