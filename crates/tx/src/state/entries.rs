@@ -609,6 +609,11 @@ impl LedgerStateManager {
             .contains_key(&(account_key, asset_key))
     }
 
+    /// Iterate over all trustlines as (key, entry) pairs.
+    pub fn trustlines_iter(&self) -> impl Iterator<Item = (&TrustlineKey, &TrustLineEntry)> {
+        self.trustlines.iter()
+    }
+
     /// Get a mutable reference to a trustline by trustline asset.
     pub fn get_trustline_by_trustline_asset_mut(
         &mut self,

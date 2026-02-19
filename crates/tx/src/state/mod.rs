@@ -1986,7 +1986,7 @@ impl LedgerStateManager {
 // ==================== Helper Functions ====================
 
 /// Convert an AccountId to its raw bytes.
-fn account_id_to_bytes(account_id: &AccountId) -> [u8; 32] {
+pub(crate) fn account_id_to_bytes(account_id: &AccountId) -> [u8; 32] {
     match &account_id.0 {
         PublicKey::PublicKeyTypeEd25519(key) => key.0,
     }

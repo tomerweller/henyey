@@ -5,24 +5,28 @@
 //! - SetTrustLineFlags
 
 use stellar_xdr::curr::{
-    AccountId, AllowTrustOp, AllowTrustResult, AllowTrustResultCode, Asset, LedgerKey,
-    LedgerKeyOffer, OfferEntry, OperationResult, OperationResultTr, SetTrustLineFlagsOp,
-    SetTrustLineFlagsResult, SetTrustLineFlagsResultCode,
+    AccountId, AllowTrustOp, AllowTrustResult, AllowTrustResultCode, Asset, ClaimPredicate,
+    ClaimableBalanceEntry, ClaimableBalanceId, Claimant, ClaimantV0, Hash, HashIdPreimage,
+    HashIdPreimageRevokeId, LedgerKey, LedgerKeyClaimableBalance, LedgerKeyOffer,
+    LedgerKeyTrustLine, LiquidityPoolEntryBody, OfferEntry, OperationResult, OperationResultTr,
+    PoolId, SequenceNumber, SetTrustLineFlagsOp, SetTrustLineFlagsResult,
+    SetTrustLineFlagsResultCode, TrustLineAsset, TrustLineFlags,
 };
 
-use crate::operations::execute::offer_exchange::{
-    exchange_v10_without_price_error_thresholds, RoundingType,
-};
+use super::offer_exchange::{exchange_v10_without_price_error_thresholds, RoundingType};
 use super::{
-    ensure_account_liabilities, ensure_trustline_liabilities, is_authorized_to_maintain_liabilities,
-    issuer_for_asset, AUTHORIZED_FLAG, AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG,
+    ensure_account_liabilities, ensure_trustline_liabilities,
+    is_authorized_to_maintain_liabilities, issuer_for_asset, AUTHORIZED_FLAG,
+    AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG,
 };
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::Result;
+use henyey_common::protocol::{protocol_version_is_before, ProtocolVersion};
 
 const AUTH_REVOCABLE_FLAG: u32 = 0x2;
 const TRUSTLINE_AUTH_FLAGS: u32 = AUTHORIZED_FLAG | AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG;
+const TRUSTLINE_CLAWBACK_ENABLED_FLAG: u32 = TrustLineFlags::TrustlineClawbackEnabledFlag as u32;
 
 /// Execute an AllowTrust operation (deprecated).
 ///
@@ -31,6 +35,9 @@ const TRUSTLINE_AUTH_FLAGS: u32 = AUTHORIZED_FLAG | AUTHORIZED_TO_MAINTAIN_LIABI
 pub fn execute_allow_trust(
     op: &AllowTrustOp,
     source: &AccountId,
+    tx_source_id: &AccountId,
+    tx_seq: i64,
+    op_index: u32,
     state: &mut LedgerStateManager,
     _context: &LedgerContext,
 ) -> Result<OperationResult> {
@@ -106,6 +113,23 @@ pub fn execute_allow_trust(
         // Remove all offers owned by the trustor that are buying or selling this asset
         // This also handles liability release, subentry updates, and sponsorship
         remove_offers_with_cleanup(state, &op.trustor, &asset);
+
+        // Also redeem pool share trustlines (protocol >= 18)
+        let result = redeem_pool_share_trustlines(
+            state,
+            _context,
+            &op.trustor,
+            &asset,
+            tx_source_id,
+            tx_seq,
+            op_index,
+        )?;
+        match result {
+            RemoveResult::Success => {}
+            RemoveResult::LowReserve => {
+                return Ok(make_allow_trust_result(AllowTrustResultCode::LowReserve));
+            }
+        }
     }
 
     // Update the trustline
@@ -122,6 +146,9 @@ pub fn execute_allow_trust(
 pub fn execute_set_trust_line_flags(
     op: &SetTrustLineFlagsOp,
     source: &AccountId,
+    tx_source_id: &AccountId,
+    tx_seq: i64,
+    op_index: u32,
     state: &mut LedgerStateManager,
     _context: &LedgerContext,
 ) -> Result<OperationResult> {
@@ -224,8 +251,25 @@ pub fn execute_set_trust_line_flags(
         // Remove all offers owned by the trustor that are buying or selling this asset
         // This also handles liability release, subentry updates, and sponsorship
         remove_offers_with_cleanup(state, &op.trustor, &op.asset);
-        // Note: Pool share trustline redemption is not yet implemented.
-        // The stellar-core code also redeems pool share trustlines here (removeOffersAndPoolShareTrustLines).
+
+        // Also redeem pool share trustlines (protocol >= 18)
+        let result = redeem_pool_share_trustlines(
+            state,
+            _context,
+            &op.trustor,
+            &op.asset,
+            tx_source_id,
+            tx_seq,
+            op_index,
+        )?;
+        match result {
+            RemoveResult::Success => {}
+            RemoveResult::LowReserve => {
+                return Ok(make_set_flags_result(
+                    SetTrustLineFlagsResultCode::LowReserve,
+                ));
+            }
+        }
     }
 
     // Update the trustline
@@ -362,6 +406,397 @@ fn offer_liabilities(amount: &i64, price: &stellar_xdr::curr::Price) -> Result<(
     Ok((res.num_wheat_received, res.num_sheep_send))
 }
 
+/// Result of removing offers and pool share trustlines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoveResult {
+    Success,
+    LowReserve,
+}
+
+/// Generate a claimable balance ID for a pool share revocation.
+///
+/// Uses `ENVELOPE_TYPE_POOL_REVOKE_OP_ID` (different from regular claimable balance IDs
+/// which use `ENVELOPE_TYPE_OP_ID`).
+fn get_revoke_id(
+    tx_source_id: &AccountId,
+    tx_seq_num: i64,
+    op_index: u32,
+    pool_id: &PoolId,
+    asset: &Asset,
+) -> Result<ClaimableBalanceId> {
+    let preimage = HashIdPreimage::PoolRevokeOpId(HashIdPreimageRevokeId {
+        source_account: tx_source_id.clone(),
+        seq_num: SequenceNumber(tx_seq_num),
+        op_num: op_index,
+        liquidity_pool_id: pool_id.clone(),
+        asset: asset.clone(),
+    });
+    let hash = henyey_common::Hash256::hash_xdr(&preimage)
+        .map_err(|e| crate::TxError::Internal(format!("revoke id hash error: {}", e)))?;
+    Ok(ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash(hash.0)))
+}
+
+/// Check if an account is the issuer of an asset.
+fn is_issuer(account_id: &AccountId, asset: &Asset) -> bool {
+    match asset {
+        Asset::Native => false,
+        Asset::CreditAlphanum4(a) => &a.issuer == account_id,
+        Asset::CreditAlphanum12(a) => &a.issuer == account_id,
+    }
+}
+
+/// Calculate pool withdrawal amount: floor(amount * reserve / total_shares).
+fn get_pool_withdrawal_amount(amount: i64, total_shares: i64, reserve: i64) -> i64 {
+    if total_shares == 0 {
+        return 0;
+    }
+    let numerator = (amount as i128) * (reserve as i128);
+    let result = numerator / (total_shares as i128);
+    if result > i64::MAX as i128 {
+        return 0;
+    }
+    result as i64
+}
+
+/// Redeem pool share trustlines for an account when deauthorizing an asset.
+///
+/// This implements the second half of C++ `removeOffersAndPoolShareTrustLines`
+/// (the pool share trustline part). When an issuer deauthorizes a trustline,
+/// any pool share trustlines that reference the deauthorized asset must be
+/// redeemed: the trustline is deleted and the account's share of the pool
+/// is converted to claimable balances.
+///
+/// Protocol < 18: no-op (pool shares didn't exist).
+fn redeem_pool_share_trustlines(
+    state: &mut LedgerStateManager,
+    context: &LedgerContext,
+    account_id: &AccountId,
+    asset: &Asset,
+    tx_source_id: &AccountId,
+    tx_seq: i64,
+    op_index: u32,
+) -> Result<RemoveResult> {
+    if protocol_version_is_before(context.protocol_version, ProtocolVersion::V18) {
+        return Ok(RemoveResult::Success);
+    }
+
+    // Find all pool share trustlines for this account that reference the
+    // deauthorized asset. We need to collect them first since we'll be
+    // mutating state.
+    let pool_share_tl_keys = find_pool_share_trustlines_for_asset(state, account_id, asset);
+    if pool_share_tl_keys.is_empty() {
+        return Ok(RemoveResult::Success);
+    }
+
+    for (pool_id, tl_asset) in pool_share_tl_keys {
+        // Load pool share trustline data
+        let Some(pool_tl) = state.get_trustline_by_trustline_asset(account_id, &tl_asset) else {
+            continue;
+        };
+        let balance = pool_tl.balance;
+
+        // Get the backer (sponsor or the account itself)
+        let tl_ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: account_id.clone(),
+            asset: tl_asset.clone(),
+        });
+        let cb_sponsoring_acc_id = state
+            .entry_sponsor(&tl_ledger_key)
+            .cloned()
+            .unwrap_or_else(|| account_id.clone());
+
+        // Delete the pool share trustline: release reserves and remove
+        // Pool share trustlines have multiplier 2
+        let multiplier: i64 = 2;
+        if state.entry_sponsor(&tl_ledger_key).is_some() {
+            state.remove_entry_sponsorship_and_update_counts(
+                &tl_ledger_key,
+                account_id,
+                multiplier,
+            )?;
+        }
+
+        // Decrease sub-entries BEFORE deleting trustline
+        if let Some(account) = state.get_account_mut(account_id) {
+            if account.num_sub_entries >= multiplier as u32 {
+                account.num_sub_entries -= multiplier as u32;
+            }
+        }
+
+        state.delete_trustline_by_trustline_asset(account_id, &tl_asset);
+
+        // Load pool data for withdrawal calculation
+        let Some(pool) = state.get_liquidity_pool(&pool_id) else {
+            continue;
+        };
+        let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &pool.body;
+        let total_pool_shares = cp.total_pool_shares;
+        let reserve_a = cp.reserve_a;
+        let reserve_b = cp.reserve_b;
+        let asset_a = cp.params.asset_a.clone();
+        let asset_b = cp.params.asset_b.clone();
+
+        if balance != 0 {
+            let amount_a = get_pool_withdrawal_amount(balance, total_pool_shares, reserve_a);
+
+            let res = redeem_into_claimable_balance(
+                state,
+                &asset_a,
+                amount_a,
+                account_id,
+                &cb_sponsoring_acc_id,
+                tx_source_id,
+                tx_seq,
+                op_index,
+                &pool_id,
+            )?;
+            if res != RemoveResult::Success {
+                return Ok(res);
+            }
+
+            let amount_b = get_pool_withdrawal_amount(balance, total_pool_shares, reserve_b);
+
+            let res = redeem_into_claimable_balance(
+                state,
+                &asset_b,
+                amount_b,
+                account_id,
+                &cb_sponsoring_acc_id,
+                tx_source_id,
+                tx_seq,
+                op_index,
+                &pool_id,
+            )?;
+            if res != RemoveResult::Success {
+                return Ok(res);
+            }
+
+            // Update pool reserves and shares
+            if let Some(pool) = state.get_liquidity_pool_mut(&pool_id) {
+                let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &mut pool.body;
+                cp.total_pool_shares -= balance;
+                cp.reserve_a -= amount_a;
+                cp.reserve_b -= amount_b;
+            }
+        }
+
+        // Decrement liquidity pool use count on asset trustlines
+        decrement_liquidity_pool_use_count(state, &asset_a, account_id);
+        decrement_liquidity_pool_use_count(state, &asset_b, account_id);
+
+        // Decrement pool shares trust line count (may delete pool if count reaches 0)
+        decrement_pool_shares_trust_line_count(state, &pool_id);
+    }
+
+    Ok(RemoveResult::Success)
+}
+
+/// Create a claimable balance for a pool share redemption.
+fn redeem_into_claimable_balance(
+    state: &mut LedgerStateManager,
+    asset: &Asset,
+    amount: i64,
+    account_id: &AccountId,
+    cb_sponsoring_acc_id: &AccountId,
+    tx_source_id: &AccountId,
+    tx_seq: i64,
+    op_index: u32,
+    pool_id: &PoolId,
+) -> Result<RemoveResult> {
+    // If amount is 0, nothing to do
+    if amount == 0 {
+        return Ok(RemoveResult::Success);
+    }
+
+    // If the account is the issuer, no claimable balance needed
+    if is_issuer(account_id, asset) {
+        return Ok(RemoveResult::Success);
+    }
+
+    // Create the claimable balance entry
+    let balance_id = get_revoke_id(tx_source_id, tx_seq, op_index, pool_id, asset)?;
+
+    let claimant = Claimant::ClaimantTypeV0(ClaimantV0 {
+        destination: account_id.clone(),
+        predicate: ClaimPredicate::Unconditional,
+    });
+
+    let mut cb_entry = ClaimableBalanceEntry {
+        balance_id: balance_id.clone(),
+        claimants: vec![claimant].try_into().unwrap(),
+        asset: asset.clone(),
+        amount,
+        ext: stellar_xdr::curr::ClaimableBalanceEntryExt::V0,
+    };
+
+    // If asset is not native, check clawback flag
+    if !matches!(asset, Asset::Native) {
+        if let Some(asset_tl) = state.get_trustline(account_id, asset) {
+            if asset_tl.flags & TRUSTLINE_CLAWBACK_ENABLED_FLAG != 0 {
+                cb_entry.ext = stellar_xdr::curr::ClaimableBalanceEntryExt::V1(
+                    stellar_xdr::curr::ClaimableBalanceEntryExtensionV1 {
+                        ext: stellar_xdr::curr::ClaimableBalanceEntryExtensionV1Ext::V0,
+                        flags: stellar_xdr::curr::ClaimableBalanceFlags::ClaimableBalanceClawbackEnabledFlag as u32,
+                    },
+                );
+            }
+        }
+    }
+
+    // Handle sponsorship for the claimable balance.
+    let cb_ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+        balance_id: balance_id.clone(),
+    });
+
+    // Check if the sponsoring account is itself in a sponsorship sandwich
+    if let Some(sandwich_sponsor) = state.active_sponsor_for(cb_sponsoring_acc_id) {
+        let sponsor_account = state.get_account(&sandwich_sponsor);
+        if sponsor_account.is_none() {
+            return Ok(RemoveResult::LowReserve);
+        }
+
+        if let Err(_) = state.apply_entry_sponsorship_with_sponsor(
+            cb_ledger_key.clone(),
+            &sandwich_sponsor,
+            None, // claimable balances are not subentries
+            1,
+        ) {
+            return Ok(RemoveResult::LowReserve);
+        }
+    } else {
+        // Not in a sandwich — directly establish sponsorship from cb_sponsoring_acc_id.
+        let (num_sponsoring, _) = state
+            .sponsorship_counts_for_account(cb_sponsoring_acc_id)
+            .unwrap_or((0, 0));
+        if num_sponsoring > u32::MAX as i64 - 1 {
+            panic!("no numSponsoring available for revoke");
+        }
+
+        state.set_entry_sponsor(cb_ledger_key.clone(), cb_sponsoring_acc_id.clone());
+        state.update_num_sponsoring(cb_sponsoring_acc_id, 1)?;
+    }
+
+    state.create_claimable_balance(cb_entry);
+    Ok(RemoveResult::Success)
+}
+
+/// Find pool share trustlines for an account that reference a given asset.
+fn find_pool_share_trustlines_for_asset(
+    state: &LedgerStateManager,
+    account_id: &AccountId,
+    asset: &Asset,
+) -> Vec<(PoolId, TrustLineAsset)> {
+    let mut result = Vec::new();
+
+    let account_bytes = crate::state::account_id_to_bytes(account_id);
+    for (key, _tl) in state.trustlines_iter() {
+        let (acct_bytes, asset_key) = key;
+        if *acct_bytes != account_bytes {
+            continue;
+        }
+        let pool_id_bytes = match asset_key {
+            crate::state::AssetKey::PoolShare(bytes) => bytes,
+            _ => continue,
+        };
+
+        let pool_id = PoolId(Hash(*pool_id_bytes));
+        let Some(pool) = state.get_liquidity_pool(&pool_id) else {
+            continue;
+        };
+
+        let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &pool.body;
+        if &cp.params.asset_a == asset || &cp.params.asset_b == asset {
+            result.push((
+                pool_id,
+                TrustLineAsset::PoolShare(PoolId(Hash(*pool_id_bytes))),
+            ));
+        }
+    }
+
+    result
+}
+
+/// Decrement the liquidity pool use count on an asset trustline.
+fn decrement_liquidity_pool_use_count(
+    state: &mut LedgerStateManager,
+    asset: &Asset,
+    account_id: &AccountId,
+) {
+    if matches!(asset, Asset::Native) {
+        return;
+    }
+    if is_issuer(account_id, asset) {
+        return;
+    }
+    if let Some(tl) = state.get_trustline_mut(account_id, asset) {
+        let v2 = ensure_trustline_ext_v2(tl);
+        if v2.liquidity_pool_use_count > 0 {
+            v2.liquidity_pool_use_count -= 1;
+        }
+    }
+}
+
+/// Ensure a trustline has the V2 extension and return a mutable reference to it.
+fn ensure_trustline_ext_v2(
+    trustline: &mut stellar_xdr::curr::TrustLineEntry,
+) -> &mut stellar_xdr::curr::TrustLineEntryExtensionV2 {
+    use stellar_xdr::curr::{
+        Liabilities, TrustLineEntryExt, TrustLineEntryExtensionV2, TrustLineEntryExtensionV2Ext,
+        TrustLineEntryV1, TrustLineEntryV1Ext,
+    };
+
+    match &mut trustline.ext {
+        TrustLineEntryExt::V0 => {
+            trustline.ext = TrustLineEntryExt::V1(TrustLineEntryV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: 0,
+                },
+                ext: TrustLineEntryV1Ext::V2(TrustLineEntryExtensionV2 {
+                    liquidity_pool_use_count: 0,
+                    ext: TrustLineEntryExtensionV2Ext::V0,
+                }),
+            });
+        }
+        TrustLineEntryExt::V1(v1) => match v1.ext {
+            TrustLineEntryV1Ext::V0 => {
+                v1.ext = TrustLineEntryV1Ext::V2(TrustLineEntryExtensionV2 {
+                    liquidity_pool_use_count: 0,
+                    ext: TrustLineEntryExtensionV2Ext::V0,
+                });
+            }
+            TrustLineEntryV1Ext::V2(_) => {}
+        },
+    }
+
+    match &mut trustline.ext {
+        TrustLineEntryExt::V1(v1) => match &mut v1.ext {
+            TrustLineEntryV1Ext::V2(v2) => v2,
+            TrustLineEntryV1Ext::V0 => unreachable!(),
+        },
+        TrustLineEntryExt::V0 => unreachable!(),
+    }
+}
+
+/// Decrement the pool shares trust line count and delete the pool if it reaches 0.
+fn decrement_pool_shares_trust_line_count(state: &mut LedgerStateManager, pool_id: &PoolId) {
+    let should_delete = {
+        let Some(pool) = state.get_liquidity_pool_mut(pool_id) else {
+            return;
+        };
+        let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &mut pool.body;
+        cp.pool_shares_trust_line_count -= 1;
+        if cp.pool_shares_trust_line_count < 0 {
+            panic!("poolSharesTrustLineCount is negative");
+        }
+        cp.pool_shares_trust_line_count == 0
+    };
+
+    if should_delete {
+        state.delete_liquidity_pool(pool_id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,7 +907,7 @@ mod tests {
             authorize: 1,
         };
 
-        let result = execute_allow_trust(&op, &issuer_id, &mut state, &context);
+        let result = execute_allow_trust(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context);
         assert!(result.is_ok());
 
         // In protocol 16+, AllowTrust succeeds even without AUTH_REQUIRED
@@ -524,7 +959,8 @@ mod tests {
             authorize: 0,
         };
 
-        let result = execute_allow_trust(&op, &issuer_id, &mut state, &context).unwrap();
+        let result =
+            execute_allow_trust(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context).unwrap();
         match result {
             OperationResult::OpInner(OperationResultTr::AllowTrust(r)) => {
                 assert!(matches!(r, AllowTrustResult::CantRevoke));
@@ -551,8 +987,8 @@ mod tests {
             authorize: 1,
         };
 
-        let result =
-            execute_allow_trust(&op, &issuer_id, &mut state, &context).expect("allow trust");
+        let result = execute_allow_trust(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context)
+            .expect("allow trust");
         match result {
             OperationResult::OpInner(OperationResultTr::AllowTrust(r)) => {
                 assert!(matches!(r, AllowTrustResult::SelfNotAllowed));
@@ -596,7 +1032,9 @@ mod tests {
             set_flags: 0,
         };
 
-        let result = execute_set_trust_line_flags(&op, &issuer_id, &mut state, &context).unwrap();
+        let result =
+            execute_set_trust_line_flags(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context)
+                .unwrap();
         match result {
             OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
                 assert!(matches!(r, SetTrustLineFlagsResult::CantRevoke));
@@ -642,7 +1080,8 @@ mod tests {
             set_flags: AUTHORIZED_FLAG,
         };
 
-        let result = execute_set_trust_line_flags(&op, &issuer_id, &mut state, &context);
+        let result =
+            execute_set_trust_line_flags(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context);
         assert!(result.is_ok());
 
         match result.unwrap() {
@@ -712,7 +1151,8 @@ mod tests {
             set_flags: 0,
         };
 
-        let result = execute_set_trust_line_flags(&op, &issuer_id, &mut state, &context);
+        let result =
+            execute_set_trust_line_flags(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context);
         assert!(result.is_ok());
 
         // Flush changes to delta
@@ -787,7 +1227,7 @@ mod tests {
             authorize: 0, // Revoke
         };
 
-        let result = execute_allow_trust(&op, &issuer_id, &mut state, &context);
+        let result = execute_allow_trust(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context);
         assert!(result.is_ok());
 
         // Flush changes to delta
@@ -854,8 +1294,16 @@ mod tests {
             set_flags: TrustLineFlags::AuthorizedFlag as u32,
         };
 
-        let result =
-            execute_set_trust_line_flags(&op, &non_issuer_id, &mut state, &context).unwrap();
+        let result = execute_set_trust_line_flags(
+            &op,
+            &non_issuer_id,
+            &non_issuer_id,
+            1,
+            0,
+            &mut state,
+            &context,
+        )
+        .unwrap();
         match result {
             OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
                 // When source != issuer, the check happens before trustline lookup,
@@ -894,7 +1342,9 @@ mod tests {
             set_flags: TrustLineFlags::AuthorizedFlag as u32,
         };
 
-        let result = execute_set_trust_line_flags(&op, &issuer_id, &mut state, &context).unwrap();
+        let result =
+            execute_set_trust_line_flags(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context)
+                .unwrap();
         match result {
             OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
                 assert!(
@@ -929,7 +1379,8 @@ mod tests {
             authorize: 1,
         };
 
-        let result = execute_allow_trust(&op, &issuer_id, &mut state, &context).unwrap();
+        let result =
+            execute_allow_trust(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context).unwrap();
         match result {
             OperationResult::OpInner(OperationResultTr::AllowTrust(r)) => {
                 assert!(
@@ -970,7 +1421,9 @@ mod tests {
             set_flags: 0,
         };
 
-        let result = execute_set_trust_line_flags(&op, &issuer_id, &mut state, &context).unwrap();
+        let result =
+            execute_set_trust_line_flags(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context)
+                .unwrap();
         match result {
             OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
                 // stellar-core checks AUTH_REVOCABLE before trustline existence,
@@ -1025,7 +1478,9 @@ mod tests {
             set_flags: TrustLineFlags::AuthorizedToMaintainLiabilitiesFlag as u32,
         };
 
-        let result = execute_set_trust_line_flags(&op, &issuer_id, &mut state, &context).unwrap();
+        let result =
+            execute_set_trust_line_flags(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context)
+                .unwrap();
         match result {
             OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
                 assert!(
@@ -1036,5 +1491,564 @@ mod tests {
             }
             _ => panic!("Unexpected result type"),
         }
+    }
+
+    // --- T-02 regression tests: pool share trustline redemption on deauthorize ---
+
+    fn create_pool_entry(
+        pool_id: PoolId,
+        asset_a: Asset,
+        asset_b: Asset,
+        reserve_a: i64,
+        reserve_b: i64,
+        total_shares: i64,
+        trust_line_count: i64,
+    ) -> LiquidityPoolEntry {
+        LiquidityPoolEntry {
+            liquidity_pool_id: pool_id,
+            body: LiquidityPoolEntryBody::LiquidityPoolConstantProduct(
+                LiquidityPoolEntryConstantProduct {
+                    params: LiquidityPoolConstantProductParameters {
+                        asset_a,
+                        asset_b,
+                        fee: 30,
+                    },
+                    reserve_a,
+                    reserve_b,
+                    total_pool_shares: total_shares,
+                    pool_shares_trust_line_count: trust_line_count,
+                },
+            ),
+        }
+    }
+
+    fn create_trustline_v2(
+        account_id: AccountId,
+        asset: TrustLineAsset,
+        balance: i64,
+        limit: i64,
+        flags: u32,
+        pool_use_count: i32,
+    ) -> TrustLineEntry {
+        TrustLineEntry {
+            account_id,
+            asset,
+            balance,
+            limit,
+            flags,
+            ext: TrustLineEntryExt::V1(TrustLineEntryV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: 0,
+                },
+                ext: TrustLineEntryV1Ext::V2(TrustLineEntryExtensionV2 {
+                    liquidity_pool_use_count: pool_use_count,
+                    ext: TrustLineEntryExtensionV2Ext::V0,
+                }),
+            }),
+        }
+    }
+
+    /// T-02: Verify that deauthorizing via SetTrustLineFlags redeems pool share
+    /// trustlines and creates claimable balances for each asset in the pool.
+    ///
+    /// C++ Reference: TransactionUtils.cpp `removeOffersAndPoolShareTrustLines`
+    #[test]
+    fn test_set_trust_line_flags_redeems_pool_shares_on_deauthorize() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(60);
+        let trustor_id = create_test_account_id(61);
+        let other_issuer_id = create_test_account_id(62);
+
+        // Issuer needs AUTH_REQUIRED | AUTH_REVOCABLE
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AUTH_REQUIRED_FLAG | AUTH_REVOCABLE_FLAG,
+        ));
+        state.create_account(create_test_account(trustor_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(other_issuer_id.clone(), 100_000_000, 0));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id.clone(),
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: other_issuer_id.clone(),
+        });
+
+        let pool_id = PoolId(Hash([60u8; 32]));
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            1000,
+            2000,
+            500,
+            1,
+        ));
+
+        // Asset A trustline (the one being deauthorized)
+        state.create_trustline(create_trustline_v2(
+            trustor_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: issuer_id.clone(),
+            }),
+            5000,
+            100_000,
+            AUTHORIZED_FLAG,
+            1,
+        ));
+
+        // Asset B trustline
+        state.create_trustline(create_trustline_v2(
+            trustor_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"EUR\0"),
+                issuer: other_issuer_id.clone(),
+            }),
+            5000,
+            100_000,
+            AUTHORIZED_FLAG,
+            1,
+        ));
+
+        // Pool share trustline: trustor holds 100 of 500 total shares
+        state.create_trustline(TrustLineEntry {
+            account_id: trustor_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 100,
+            limit: i64::MAX,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        });
+
+        // Adjust sub-entries: 2 asset TLs (1 each) + 1 pool share TL (counts as 2) = 4
+        if let Some(acct) = state.get_account_mut(&trustor_id) {
+            acct.num_sub_entries += 4;
+        }
+
+        let tx_source_id = issuer_id.clone();
+        let tx_seq: i64 = 1;
+        let op_index: u32 = 0;
+
+        let op = SetTrustLineFlagsOp {
+            trustor: trustor_id.clone(),
+            asset: asset_a.clone(),
+            clear_flags: AUTHORIZED_FLAG,
+            set_flags: 0,
+        };
+
+        let result = execute_set_trust_line_flags(
+            &op,
+            &issuer_id,
+            &tx_source_id,
+            tx_seq,
+            op_index,
+            &mut state,
+            &context,
+        )
+        .unwrap();
+
+        match &result {
+            OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
+                assert!(
+                    matches!(r, SetTrustLineFlagsResult::Success),
+                    "Expected Success, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+
+        // Pool share trustline should be deleted
+        assert!(state
+            .get_trustline_by_trustline_asset(
+                &trustor_id,
+                &TrustLineAsset::PoolShare(pool_id.clone())
+            )
+            .is_none());
+
+        // Claimable balances should exist:
+        // amount_a = floor(100 * 1000 / 500) = 200
+        // amount_b = floor(100 * 2000 / 500) = 400
+        let cb_id_a = get_revoke_id(&tx_source_id, tx_seq, op_index, &pool_id, &asset_a).unwrap();
+        let cb_id_b = get_revoke_id(&tx_source_id, tx_seq, op_index, &pool_id, &asset_b).unwrap();
+
+        let cb_a = state
+            .get_claimable_balance(&cb_id_a)
+            .expect("claimable balance for asset_a should exist");
+        assert_eq!(cb_a.amount, 200);
+        assert_eq!(cb_a.asset, asset_a);
+
+        let cb_b = state
+            .get_claimable_balance(&cb_id_b)
+            .expect("claimable balance for asset_b should exist");
+        assert_eq!(cb_b.amount, 400);
+        assert_eq!(cb_b.asset, asset_b);
+
+        // Pool should be deleted (only 1 trust line count, now 0)
+        assert!(state.get_liquidity_pool(&pool_id).is_none());
+
+        // Pool use counts should be decremented on asset trustlines
+        let tl_a = state
+            .get_trustline(&trustor_id, &asset_a)
+            .expect("asset A trustline should still exist");
+        match &tl_a.ext {
+            TrustLineEntryExt::V1(v1) => match &v1.ext {
+                TrustLineEntryV1Ext::V2(v2) => {
+                    assert_eq!(v2.liquidity_pool_use_count, 0);
+                }
+                _ => panic!("expected V2 ext"),
+            },
+            _ => panic!("expected V1 ext"),
+        }
+    }
+
+    /// T-02: Verify that deauthorizing via AllowTrust also triggers pool share
+    /// trustline redemption.
+    #[test]
+    fn test_allow_trust_redeems_pool_shares_on_deauthorize() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(63);
+        let trustor_id = create_test_account_id(64);
+        let other_issuer_id = create_test_account_id(65);
+
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AUTH_REQUIRED_FLAG | AUTH_REVOCABLE_FLAG,
+        ));
+        state.create_account(create_test_account(trustor_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(other_issuer_id.clone(), 100_000_000, 0));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id.clone(),
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: other_issuer_id.clone(),
+        });
+
+        let pool_id = PoolId(Hash([63u8; 32]));
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            800,
+            400,
+            200,
+            1,
+        ));
+
+        state.create_trustline(create_trustline_v2(
+            trustor_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: issuer_id.clone(),
+            }),
+            5000,
+            100_000,
+            AUTHORIZED_FLAG,
+            1,
+        ));
+
+        state.create_trustline(create_trustline_v2(
+            trustor_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"EUR\0"),
+                issuer: other_issuer_id.clone(),
+            }),
+            5000,
+            100_000,
+            AUTHORIZED_FLAG,
+            1,
+        ));
+
+        state.create_trustline(TrustLineEntry {
+            account_id: trustor_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 50,
+            limit: i64::MAX,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        });
+
+        if let Some(acct) = state.get_account_mut(&trustor_id) {
+            acct.num_sub_entries += 4;
+        }
+
+        let tx_source_id = issuer_id.clone();
+
+        // Revoke via AllowTrust (authorize=0)
+        let op = AllowTrustOp {
+            trustor: trustor_id.clone(),
+            asset: AssetCode::CreditAlphanum4(AssetCode4(*b"USD\0")),
+            authorize: 0,
+        };
+
+        let result =
+            execute_allow_trust(&op, &issuer_id, &tx_source_id, 1, 0, &mut state, &context)
+                .unwrap();
+
+        match &result {
+            OperationResult::OpInner(OperationResultTr::AllowTrust(r)) => {
+                assert!(
+                    matches!(r, AllowTrustResult::Success),
+                    "Expected Success, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+
+        // Pool share trustline should be deleted
+        assert!(state
+            .get_trustline_by_trustline_asset(
+                &trustor_id,
+                &TrustLineAsset::PoolShare(pool_id.clone())
+            )
+            .is_none());
+
+        // Claimable balances: floor(50*800/200)=200, floor(50*400/200)=100
+        let cb_id_a = get_revoke_id(&tx_source_id, 1, 0, &pool_id, &asset_a).unwrap();
+        let cb_id_b = get_revoke_id(&tx_source_id, 1, 0, &pool_id, &asset_b).unwrap();
+
+        let cb_a = state
+            .get_claimable_balance(&cb_id_a)
+            .expect("claimable balance for asset_a");
+        assert_eq!(cb_a.amount, 200);
+
+        let cb_b = state
+            .get_claimable_balance(&cb_id_b)
+            .expect("claimable balance for asset_b");
+        assert_eq!(cb_b.amount, 100);
+    }
+
+    /// T-02: When pool share trustline has zero balance, no claimable balances
+    /// are created but the trustline is still deleted and pool counts are updated.
+    #[test]
+    fn test_deauthorize_zero_balance_pool_share_no_claimable_balances() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(66);
+        let trustor_id = create_test_account_id(67);
+        let other_issuer_id = create_test_account_id(68);
+
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AUTH_REQUIRED_FLAG | AUTH_REVOCABLE_FLAG,
+        ));
+        state.create_account(create_test_account(trustor_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(other_issuer_id.clone(), 100_000_000, 0));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id.clone(),
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: other_issuer_id.clone(),
+        });
+
+        let pool_id = PoolId(Hash([66u8; 32]));
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            1000,
+            2000,
+            500,
+            1,
+        ));
+
+        state.create_trustline(create_trustline_v2(
+            trustor_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: issuer_id.clone(),
+            }),
+            5000,
+            100_000,
+            AUTHORIZED_FLAG,
+            1,
+        ));
+
+        state.create_trustline(create_trustline_v2(
+            trustor_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"EUR\0"),
+                issuer: other_issuer_id.clone(),
+            }),
+            5000,
+            100_000,
+            AUTHORIZED_FLAG,
+            1,
+        ));
+
+        // Pool share trustline with ZERO balance
+        state.create_trustline(TrustLineEntry {
+            account_id: trustor_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 0,
+            limit: i64::MAX,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        });
+
+        if let Some(acct) = state.get_account_mut(&trustor_id) {
+            acct.num_sub_entries += 4;
+        }
+
+        let op = SetTrustLineFlagsOp {
+            trustor: trustor_id.clone(),
+            asset: asset_a.clone(),
+            clear_flags: AUTHORIZED_FLAG,
+            set_flags: 0,
+        };
+
+        let result =
+            execute_set_trust_line_flags(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context)
+                .unwrap();
+
+        match &result {
+            OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
+                assert!(
+                    matches!(r, SetTrustLineFlagsResult::Success),
+                    "Expected Success, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+
+        // Pool share trustline should be deleted even with 0 balance
+        assert!(state
+            .get_trustline_by_trustline_asset(
+                &trustor_id,
+                &TrustLineAsset::PoolShare(pool_id.clone())
+            )
+            .is_none());
+
+        // No claimable balances should be created for zero balance
+        let cb_id_a = get_revoke_id(&issuer_id, 1, 0, &pool_id, &asset_a).unwrap();
+        let cb_id_b = get_revoke_id(&issuer_id, 1, 0, &pool_id, &asset_b).unwrap();
+        assert!(state.get_claimable_balance(&cb_id_a).is_none());
+        assert!(state.get_claimable_balance(&cb_id_b).is_none());
+
+        // Pool should still be deleted (trust line count was 1, now 0)
+        assert!(state.get_liquidity_pool(&pool_id).is_none());
+    }
+
+    /// T-02: When the trustor is the issuer of one of the pool's assets,
+    /// no claimable balance is created for that asset (issuer can mint).
+    #[test]
+    fn test_deauthorize_pool_share_issuer_skips_claimable_balance() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(69);
+        let trustor_id = create_test_account_id(70);
+
+        // The trustor is the issuer of asset_b
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AUTH_REQUIRED_FLAG | AUTH_REVOCABLE_FLAG,
+        ));
+        state.create_account(create_test_account(trustor_id.clone(), 100_000_000, 0));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id.clone(),
+        });
+        // trustor IS the issuer of asset_b
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: trustor_id.clone(),
+        });
+
+        let pool_id = PoolId(Hash([69u8; 32]));
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            1000,
+            2000,
+            500,
+            1,
+        ));
+
+        state.create_trustline(create_trustline_v2(
+            trustor_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: issuer_id.clone(),
+            }),
+            5000,
+            100_000,
+            AUTHORIZED_FLAG,
+            1,
+        ));
+
+        // No asset_b trustline needed since trustor IS the issuer
+
+        state.create_trustline(TrustLineEntry {
+            account_id: trustor_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 100,
+            limit: i64::MAX,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        });
+
+        if let Some(acct) = state.get_account_mut(&trustor_id) {
+            acct.num_sub_entries += 3; // 1 asset TL + 1 pool share TL (2 subentries)
+        }
+
+        let op = SetTrustLineFlagsOp {
+            trustor: trustor_id.clone(),
+            asset: asset_a.clone(),
+            clear_flags: AUTHORIZED_FLAG,
+            set_flags: 0,
+        };
+
+        let result =
+            execute_set_trust_line_flags(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context)
+                .unwrap();
+
+        match &result {
+            OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
+                assert!(
+                    matches!(r, SetTrustLineFlagsResult::Success),
+                    "Expected Success, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+
+        // Claimable balance for asset_a should exist (trustor is NOT issuer of A)
+        let cb_id_a = get_revoke_id(&issuer_id, 1, 0, &pool_id, &asset_a).unwrap();
+        let cb_a = state
+            .get_claimable_balance(&cb_id_a)
+            .expect("claimable balance for asset_a should exist");
+        assert_eq!(cb_a.amount, 200); // floor(100 * 1000 / 500)
+
+        // Claimable balance for asset_b should NOT exist (trustor IS issuer of B)
+        let cb_id_b = get_revoke_id(&issuer_id, 1, 0, &pool_id, &asset_b).unwrap();
+        assert!(
+            state.get_claimable_balance(&cb_id_b).is_none(),
+            "No claimable balance should be created when trustor is the asset issuer"
+        );
     }
 }
