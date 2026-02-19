@@ -28,18 +28,17 @@ Each issue is classified as:
 
 ## Ledger Crate
 
-### L-01 [Critical] Genesis header constants diverge from stellar-core
+### L-01 [Critical] ~~Genesis header constants diverge from stellar-core~~ **NOT APPLICABLE**
 
 - **Henyey**: `crates/ledger/src/manager.rs:3485-3508`
 - **stellar-core**: `src/ledger/LedgerManagerImpl.cpp:110-113`
-- **Description**: Henyey genesis header uses `total_coins: 0`,
-  `base_reserve: 5_000_000` (0.5 XLM), `max_tx_set_size: 1000`. stellar-core
-  uses `GENESIS_LEDGER_TOTAL_COINS = 1_000_000_000_000_000_000` (100B XLM),
-  `GENESIS_LEDGER_BASE_RESERVE = 100_000_000` (100 XLM),
-  `GENESIS_LEDGER_MAX_TX_SIZE = 100`. Any node starting from genesis would
-  produce a completely different ledger chain. This may be intentional if
-  Henyey always starts from a checkpoint, but it means Henyey cannot validate
-  the genesis block or produce a correct bucket list hash from ledger 1.
+- **Resolution**: The genesis header is a placeholder sentinel, never used in
+  production. `create_genesis_header()` is called in `LedgerManager::new()`
+  with `initialized: false`, always overwritten by `initialize()` from a
+  checkpoint before any ledger close. The `begin_close()` method guards
+  against use before initialization. Since Henyey always starts from a
+  checkpoint (never from genesis), the genesis constants have no observable
+  impact on ledger state.
 
 ### L-02 [Critical] ~~Version upgrade side effects not implemented~~ **PARTIALLY FIXED**
 
@@ -70,17 +69,24 @@ Each issue is classified as:
   - **V25 `enableRustDalekVerify()`**: N/A — this is a C++ internal flag
     that enables Rust ed25519 verification within stellar-core and has no
     ledger state impact.
-- **Remaining gap**: `prepareLiabilities()` on base reserve upgrade (see
-  L-03) is theoretically missing but is a no-op on protocol 24+ since all
-  existing accounts already have correct liabilities from earlier upgrades.
+- **Remaining gap**: None. `prepareLiabilities()` on base reserve upgrade is
+  now implemented (see L-03).
 
-### L-03 [High] Reserve upgrade does not trigger liability recalculation
+### L-03 [High] ~~Reserve upgrade does not trigger liability recalculation~~ **FIXED**
 
-- **Henyey**: `crates/ledger/src/close.rs:920-957`
-- **stellar-core**: `src/herder/Upgrades.cpp:1254-1267` (applyReserveUpgrade)
-- **Description**: stellar-core calls `prepareLiabilities()` when the base
-  reserve increases and protocol >= V10. Henyey does not. A reserve increase
-  upgrade would leave offer liabilities incorrect.
+- **Henyey**: `crates/ledger/src/prepare_liabilities.rs`,
+  `crates/ledger/src/manager.rs` (apply_upgrades_to_delta)
+- **stellar-core**: `src/herder/Upgrades.cpp:1254-1267` (applyReserveUpgrade),
+  `src/herder/Upgrades.cpp:949-1127` (prepareLiabilities)
+- **Resolution**: Implemented full `prepare_liabilities` module matching C++.
+  When the base reserve increases and protocol >= V10, all offers are scanned
+  per account: initial buying/selling liabilities are computed, offers that
+  exceed available balance or limit are deleted (with proper sponsorship
+  count adjustments), surviving offers have their amounts adjusted via
+  `adjustOffer`, and account/trustline liabilities are reconciled. Changes
+  are recorded in the ledger delta and included in the `UpgradeEntryMeta`
+  for the `BaseReserve` upgrade. The V10 version-upgrade path is also wired
+  (dead code for P24+).
 
 ### L-04 [High] ~~Cost params validation skipped entirely~~ **FIXED**
 
@@ -111,34 +117,37 @@ Each issue is classified as:
   For protocols 20-22, the state size snapshot would be computed from a
   different source, potentially affecting Soroban fee calculations.
 
-### L-07 [High] Module cache eviction misses archived entries
+### L-07 [High] ~~Module cache eviction misses archived entries~~ **NOT A GAP**
 
 - **Henyey**: `crates/ledger/src/manager.rs:1012-1013`
 - **stellar-core**: `src/ledger/LedgerManagerImpl.cpp:2988-3001`
-- **Description**: stellar-core evicts both `deletedKeys` and
-  `archivedEntries` from the module cache after ledger close. Henyey only
-  evicts on `ContractCode` dead entries, omitting archived entries. Stale
-  module cache entries for archived contracts could lead to incorrect Soroban
-  execution.
+- **Resolution**: Investigation showed that Henyey's `evicted_keys` in
+  `ResolvedEviction` includes BOTH temporary data keys AND archived persistent
+  data keys (unlike C++ `deletedKeys` which only has temporary). The single
+  loop over `dead_entries` (which comes from `evicted_keys`) correctly evicts
+  both temporary and archived entries. The structural approach differs but
+  the result is identical.
 
-### L-08 [Medium] Missing sorobanStateRentFeeGrowthFactor validation
+### L-08 [Medium] ~~Missing sorobanStateRentFeeGrowthFactor validation~~ **NOT A GAP**
 
-- **Henyey**: `crates/ledger/src/config_upgrade.rs:363`
+- **Henyey**: `crates/ledger/src/config_upgrade.rs:661-677`
 - **stellar-core**: `src/ledger/NetworkConfig.cpp:1271`
-- **Description**: stellar-core validates that
-  `sorobanStateRentFeeGrowthFactor >= 0` during config upgrade. Henyey is
-  missing this check. A negative growth factor would be accepted.
+- **Resolution**: The field is `u32` in XDR, so the C++ `>= 0` check on
+  `uint32_t` is a no-op (always true). Henyey has an explicit comment at
+  `config_upgrade.rs:661-677` explaining this. No code change needed.
 
-### L-09 [Medium] InMemorySorobanState update_state may create entries that C++ asserts must exist
+### L-09 [Medium] ~~InMemorySorobanState update_state may create entries that C++ asserts must exist~~ **FIXED**
 
-- **Henyey**: `crates/ledger/src/soroban_state.rs:320-334`
+- **Henyey**: `crates/ledger/src/soroban_state.rs:922-969`
 - **stellar-core**: `src/ledger/InMemorySorobanState.cpp:526-538`
-- **Description**: Henyey's `process_entry_update` does update-or-create for
-  ContractData/ContractCode entries. stellar-core's `updateState` only calls
-  `updateContractData`/`updateContractCode` for live entries and would assert
-  if the entry doesn't already exist. If Henyey receives a LIVE entry for a
-  key not in the in-memory state, it would silently create it; stellar-core
-  would crash.
+- **Resolution**: Changed `process_entry_update` to delegate directly to
+  `update_contract_data`/`update_contract_code` (which error if the entry
+  doesn't exist), removing the silent create-if-missing fallback. Changed
+  `process_entry_delete` to propagate errors from `delete_contract_data`/
+  `delete_contract_code` instead of silently ignoring missing entries. This
+  matches C++'s `releaseAssertOrThrow` behavior. Callers in `manager.rs`
+  already catch and log errors at trace level. Test
+  `test_process_entry_update_errors_if_not_exists` verifies the new behavior.
 
 ---
 
@@ -175,72 +184,63 @@ Each issue is classified as:
   concern that "the map-based approach may produce entries in a different
   iteration order" was incorrect — the explicit sort ensures identical ordering.
 
-### B-03 [High] calculateMergeProtocolVersion ignores shadow bucket versions
+### B-03 [High] ~~calculateMergeProtocolVersion ignores shadow bucket versions~~ **NOT APPLICABLE**
 
 - **Henyey**: `henyey-pc/bucket/merge.pc.md:634-664` (build_output_metadata)
 - **stellar-core**: `src/bucket/BucketBase.cpp:184-233`
-- **Description**: stellar-core's `calculateMergeProtocolVersion` considers
-  shadow bucket metadata versions (for shadows with version <
-  `FIRST_PROTOCOL_SHADOWS_REMOVED`) when computing the output protocol version.
-  Henyey's `build_output_metadata` only considers `old_meta` and `new_meta`
-  versions. For pre-protocol-12 merges where shadow buckets exist, the output
-  metadata protocol version could differ, potentially affecting merge behavior
-  for protocol-version-conditional logic.
+- **Resolution**: Shadows were removed at protocol 12. On P24+, the shadow
+  list is always empty — the shadow construction in `bucket_list.rs:1663` is
+  guarded by `protocol_version < FIRST_PROTOCOL_SHADOWS_REMOVED`. Since Henyey
+  only supports protocol 24+, shadow bucket version calculation is dead code.
 
-### B-04 [High] Level 0 prepare_first_level fallback always synchronous
+### B-04 [High] ~~Level 0 prepare_first_level fallback always synchronous~~ **NOT A GAP**
 
 - **Henyey**: `henyey-pc/bucket/bucket_list.pc.md:317-352`
 - **stellar-core**: `src/bucket/BucketListBase.cpp:196-238`
-- **Description**: stellar-core's `prepareFirstLevel` falls back to creating a
-  `FutureBucket` (async merge via `prepare()`) when the bucket doesn't have
-  in-memory entries. Henyey's `prepare_first_level` always uses synchronous
-  in-memory merge. While the merge result should be the same, this affects
-  timing and could cause issues if the merge is expected to be deferred.
+- **Resolution**: Performance/architecture difference only. Both sync and
+  async paths produce identical merge output. The FutureBucket in C++ is
+  an I/O optimization, not a correctness feature. No observable ledger
+  state or bucket hash difference.
 
-### B-05 [Medium] convertToBucketEntry: graceful dedup vs assertion on duplicates
+### B-05 [Medium] ~~convertToBucketEntry: graceful dedup vs assertion on duplicates~~ **MITIGATED**
 
-- **Henyey**: `henyey-pc/bucket/bucket_list.pc.md:456-474`
+- **Henyey**: `crates/bucket/src/bucket_list.rs` (`deduplicate_entries`)
 - **stellar-core**: `src/bucket/LiveBucket.cpp:414-419`
-- **Description**: stellar-core asserts (via `releaseAssert` and
-  `adjacent_find`) that no duplicate keys exist in a single ledger's batch
-  input to bucket list. Henyey uses a `deduplicate_entries` helper that
-  silently keeps the last occurrence of each key. This means Henyey would
-  silently handle a bug in the caller that produces duplicate keys, while
-  stellar-core would crash. The bucket output should be the same (assuming
-  last-wins semantics), but the safety invariant is weaker.
+- **Resolution**: Added a `tracing::warn!` when `deduplicate_entries` actually
+  removes duplicates, logging the count of removed entries. This flags the
+  condition that C++ would crash on (`releaseAssert` + `adjacent_find`) while
+  preserving Henyey's resilient behavior. The bucket output is identical (both
+  use last-wins semantics). The warning surfaces potential bugs in the
+  entry-generation path.
 
-### B-06 [Medium] addBatchInternal shadow list construction ambiguity
+### B-06 [Medium] ~~addBatchInternal shadow list construction ambiguity~~ **NOT A GAP**
 
-- **Henyey**: `henyey-pc/bucket/bucket_list.pc.md:522-525`
+- **Henyey**: `crates/bucket/src/bucket_list.rs` (`add_batch_internal`)
 - **stellar-core**: `src/bucket/BucketListBase.cpp:691-726`
-- **Description**: stellar-core builds the shadow list by collecting all
-  level curr+snap buckets, then popping pairs from the end as it iterates
-  down levels. At level i, shadows contain levels 0 through i-2. Henyey
-  collects shadows from "levels 0..i-1" which is ambiguous — it could mean
-  0 through i-2 (correct, matching C++) or 0 through i-1 (incorrect, would
-  include the spilling level itself). Needs source verification.
+- **Resolution**: Henyey's `take(i - 1)` iterates levels 0..i-2 inclusive,
+  which matches C++ exactly. Also dead code on P24+ — the shadow construction
+  is behind a `protocol_version < FIRST_PROTOCOL_SHADOWS_REMOVED` guard
+  (shadows were removed at protocol 12).
 
-### B-07 [Medium] BucketMetadata.ext propagation differs in merge
+### B-07 [Medium] ~~BucketMetadata.ext propagation differs in merge~~ **NOT A GAP**
 
 - **Henyey**: `henyey-pc/bucket/merge.pc.md:653-663`
 - **stellar-core**: `src/bucket/BucketBase.cpp:377-390`
-- **Description**: stellar-core propagates `BucketMetadata.ext` from input
-  buckets — it sets the output ext from whichever input has `ext.v()==1`.
-  Henyey always sets ext based solely on protocol version (V1 for >=
-  `FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION`). This could differ if
-  input buckets have mixed ext versions and the protocol threshold hasn't been
-  reached yet.
+- **Resolution**: On P24+ (≥ V23), both implementations produce
+  `V1(BucketListType::Live)` for Live bucket metadata ext. C++ propagates
+  from inputs, Henyey constructs from protocol version — same result since
+  all Live bucket inputs on P24+ have V1 ext. Mixed ext versions only occur
+  on protocols before `FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION` (V23),
+  which is before Henyey's minimum supported protocol.
 
-### B-08 [Medium] Eviction iterator level 0 curr: graceful reset vs assertion
+### B-08 [Medium] ~~Eviction iterator level 0 curr: graceful reset vs assertion~~ **MITIGATED**
 
-- **Henyey**: `henyey-pc/bucket/eviction.pc.md:248-258`
+- **Henyey**: `crates/bucket/src/eviction.rs` (`update_starting_eviction_iterator`)
 - **stellar-core**: `src/bucket/LiveBucketList.cpp:92-101`
-- **Description**: stellar-core has `releaseAssert(iter.bucketListLevel != 0)`
-  for the `isCurrBucket` case in `updateStartingEvictionIterator`, asserting
-  that the eviction iterator should never point to level 0 curr. Henyey
-  handles level 0 curr by resetting the offset. If the iterator somehow
-  points to level 0 curr, stellar-core crashes while Henyey silently
-  continues.
+- **Resolution**: Added `tracing::warn!` when the eviction iterator is at
+  level 0 curr, which is unreachable in production (minimum starting scan
+  level is always >= 1). The warning flags the same condition that C++ asserts
+  on while preserving the graceful fallback behavior.
 
 ---
 
@@ -300,7 +300,7 @@ Each issue is classified as:
   `test_big_divide_checked_overflow` and
   `test_deposit_non_empty_pool_one_share_overflows` verify correctness.
 
-### T-06 [High] Sponsorship tooManySponsoring combined limit not enforced
+### T-06 [Low] Sponsorship tooManySponsoring combined limit not enforced
 
 - **Henyey**: `henyey-pc/tx/operations/execute/sponsorship.pc.md`
 - **stellar-core**: `src/transactions/SponsorshipUtils.cpp:32-40`
@@ -310,6 +310,10 @@ Each issue is classified as:
   sub-entry + sponsoring sum check prevents overflow of the aggregate
   counter. Henyey does not model this combined limit, potentially allowing
   sponsorship counts that would be rejected by stellar-core.
+- **Assessment**: Reclassified from High to Low. The combined limit only
+  differs from the existing check by ≤1000 (the subentry cap). An account
+  would need ~4.29 billion sponsorships to trigger the difference, which is
+  economically impossible given current Stellar economics.
 
 ### T-07 [High] ~~validateSorobanMemo scope difference~~ **FIXED**
 
@@ -376,32 +380,21 @@ Each issue is classified as:
 
 ## Summary Statistics
 
-| Severity | Count | Crate Breakdown |
-|----------|-------|-----------------|
-| Critical | 3     | Ledger: 2, Bucket: 1, Tx: 0* |
-| High     | 10    | Ledger: 4, Bucket: 1, Tx: 5 |
-| Medium   | 9     | Ledger: 2, Bucket: 3, Tx: 4 |
-| Low      | 1     | Bucket: 1 |
-| **Total** | **23** | |
+| Severity | Open | Fixed/Closed | Crate Breakdown (open) |
+|----------|------|--------------|------------------------|
+| Critical | 0    | 3            | — |
+| High     | 1    | 9            | Ledger: 1 (L-06) |
+| Medium   | 0    | 9            | — |
+| Low      | 2    | 1            | Bucket: 1 (B-02), Tx: 1 (T-06) |
+| **Total** | **3** | **22** | |
 
 \* T-01 (Inflation) is Critical for historical replay but only affects
 pre-V12 ledgers. Classified as separate from "reachable on current protocol."
 
-### Most impactful issues for current-protocol correctness
+### Remaining open issues for current-protocol correctness
 
-The following issues could produce state divergence on **current protocol (V25)**
-ledgers and should be prioritized:
-
-1. ~~**L-02** — Version upgrade side effects (if a protocol upgrade occurs)~~ **PARTIALLY FIXED** (V24 fee pool correction implemented; pre-V24 effects N/A for P24+)
-2. ~~**L-04** — Cost params validation (if a config upgrade is proposed)~~ **FIXED**
-3. ~~**T-02** — Pool share trustline redemption (any deauthorization of pooled asset)~~ **FIXED**
-4. ~~**T-03** — Clawback selling liabilities (any clawback on trustline with offers)~~ **FIXED**
-5. ~~**T-04** — Pool withdraw selling liabilities (any withdrawal with pool share offers)~~ **FIXED**
-6. ~~**T-05** — Pool deposit overflow (large deposits near 128-bit boundary)~~ **FIXED**
-7. ~~**B-01** — Merge entry validation (malformed bucket data during catchup)~~ **FIXED**
-8. ~~**B-02** — Hot archive merge ordering (any hot archive bucket merge)~~ **NOT A BUG** (reclassified to Low/performance-only)
-9. ~~**L-05** — ConfigSetting in-memory routing (Soroban config lookups)~~ **FIXED**
-10. ~~**T-07** — Soroban memo scope (RestoreFootprint/ExtendTTL with memo)~~ **FIXED**
+1. **L-06** — State size window uses wrong source for pre-V23 (only affects
+   protocols 20-22; irrelevant on P24+)
 
 ### Issues only affecting historical replay (pre-V16 or earlier)
 
@@ -412,7 +405,38 @@ These issues are irrelevant if Henyey only processes V16+ ledgers:
 - T-10 (AllowTrust AUTH_REQUIRED, pre-V16)
 - T-11 (BumpSequence meta, pre-V19)
 - T-12 (SetOptions ed25519SignedPayload, pre-V19)
-- B-03 (shadow bucket version calculation, pre-V12)
+
+### Resolved issues (this round)
+
+| ID | Resolution |
+|----|------------|
+| L-01 | Not applicable (genesis header is a placeholder, never used in production) |
+| L-03 | Fixed — `prepare_liabilities` module implements full C++ algorithm |
+| L-07 | Not a gap — `evicted_keys` already includes archived entries |
+| L-08 | Not a gap — `uint32` >= 0 check is tautological |
+| L-09 | Fixed — assertions match C++ `releaseAssertOrThrow` |
+| B-03 | Not applicable — shadows removed at P12, dead code on P24+ |
+| B-04 | Not a gap — performance difference only |
+| B-05 | Mitigated — warning log on duplicate detection |
+| B-06 | Not a gap — `take(i-1)` matches C++ exactly, dead code on P24+ |
+| B-07 | Not a gap — identical output on P24+ |
+| B-08 | Mitigated — warning log on unreachable level 0 |
+| T-06 | Reclassified to Low — economically impossible trigger condition |
+
+### Previously resolved issues
+
+| ID | Resolution |
+|----|------------|
+| B-01 | Fixed — panic on LIVE+INIT and INIT+INIT in merge_entries |
+| B-02 | Reclassified to Low/performance — map-based merge produces identical output |
+| L-02 | Partially fixed — V24 fee pool correction; pre-V24 effects N/A for P24+ |
+| L-04 | Fixed — cost params validation by protocol version |
+| L-05 | Fixed — ConfigSetting removed from in-memory types |
+| T-02 | Fixed — pool share trustline redemption during deauthorization |
+| T-03 | Fixed — selling liabilities in clawback |
+| T-04 | Fixed — pool withdraw available balance check |
+| T-05 | Fixed — big_divide_checked + minAmongValid overflow handling |
+| T-07 | Fixed — Soroban memo narrowed to InvokeHostFunction only |
 
 ### Notes on methodology
 
