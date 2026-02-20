@@ -1,6 +1,6 @@
 # Henyey Overlay Crate — Specification Adherence Evaluation
 
-**Evaluated against:** `docs/OVERLAY_SPEC.md` (Stellar Overlay Protocol Specification v25)
+**Evaluated against:** `docs/specs/OVERLAY_SPEC.md` (Stellar Overlay Protocol Specification v25)
 **Crate:** `crates/overlay/` (henyey-overlay)
 **Date:** 2026-02-20
 
@@ -628,7 +628,7 @@ All identified risks have been mitigated by closing all 17 gaps:
 ## 6. Recommendations
 
 All 17 specification gaps have been closed. The overlay implementation now
-achieves **100% spec adherence** against `docs/OVERLAY_SPEC.md`.
+achieves **100% spec adherence** against `docs/specs/OVERLAY_SPEC.md`.
 
 ### Intentional Deviations (Documented)
 
