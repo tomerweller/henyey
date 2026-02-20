@@ -2395,9 +2395,9 @@ flowchart LR
 graph TD
     Root["LedgerTxnRoot — Database + BucketList"]
     Root --> LC["LedgerTxn (ledger close) — Accumulates all changes"]
-    LC --> FP["LedgerTxn (fee pass) — Fee deductions, seq num advances\ncommitted before ops"]
+    LC --> FP["LedgerTxn (fee pass) — Fee deductions, seq num advances<br/>committed before ops"]
     LC --> TA["LedgerTxn (tx apply) — Transaction scope"]
-    TA --> Op1["LedgerTxn (op 1) — Success → commit to parent\nFailure → rollback"]
+    TA --> Op1["LedgerTxn (op 1) — Success → commit to parent<br/>Failure → rollback"]
     TA --> Op2["LedgerTxn (op 2)"]
     TA --> OpN["LedgerTxn (op N)"]
 ```

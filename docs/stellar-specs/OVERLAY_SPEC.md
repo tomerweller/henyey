@@ -2390,8 +2390,8 @@ through the end of the MAC (inclusive).
 stateDiagram-v2
     [*] --> CONNECTING : TCP CONNECT (outbound only)
     CONNECTING --> CONNECTED : TCP established
-    CONNECTED --> GOT_HELLO : Valid HELLO received\n(MAC keys derived)
-    GOT_HELLO --> GOT_AUTH : Valid AUTH received & accepted\n(fully authenticated)
+    CONNECTED --> GOT_HELLO : Valid HELLO received<br/>(MAC keys derived)
+    GOT_HELLO --> GOT_AUTH : Valid AUTH received & accepted<br/>(fully authenticated)
     GOT_AUTH --> CLOSING : Drop triggered (any reason)
     CLOSING --> [*] : 5-second delay
     CONNECTING --> CLOSING : Error / timeout

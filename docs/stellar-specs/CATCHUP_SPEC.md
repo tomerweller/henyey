@@ -166,14 +166,14 @@ is exactly at a checkpoint boundary and no replay is requested.
 ```mermaid
 graph TD
     SCP["SCP / Herder"]
-    LAM["Ledger Apply Manager\n(buffers externalized ledgers;\ndecides: apply sequentially or trigger catchup)"]
-    LCP["Ledger Close Pipeline\n(normal sequential apply)"]
-    CP["Catchup Pipeline\n(when gap detected)"]
-    HAM["History Archive Manager\n(select archive, download files)"]
-    LCV["Ledger Chain Verification\n(verify hash chain)"]
-    BA["Bucket Application\n(restore BucketList state)"]
-    TR["Transaction Replay\n(apply historical ledgers)"]
-    BLA["Buffered Ledger Application\n(drain SCP-buffered ledgers)"]
+    LAM["Ledger Apply Manager<br/>(buffers externalized ledgers;<br/>decides: apply sequentially or trigger catchup)"]
+    LCP["Ledger Close Pipeline<br/>(normal sequential apply)"]
+    CP["Catchup Pipeline<br/>(when gap detected)"]
+    HAM["History Archive Manager<br/>(select archive, download files)"]
+    LCV["Ledger Chain Verification<br/>(verify hash chain)"]
+    BA["Bucket Application<br/>(restore BucketList state)"]
+    TR["Transaction Replay<br/>(apply historical ledgers)"]
+    BLA["Buffered Ledger Application<br/>(drain SCP-buffered ledgers)"]
 
     SCP --> LAM
     LAM --> LCP
@@ -1268,18 +1268,18 @@ successor:
 
 ```mermaid
 graph RL
-    TRUST["Trust from SCP\nor config hash"]
-    CPn["CPₙ\n(highest)"]
+    TRUST["Trust from SCP<br/>or config hash"]
+    CPn["CPₙ<br/>(highest)"]
     CPn1["CPₙ₋₁"]
     CPdot["..."]
     CP2["CP₂"]
-    CP1["CP₁\n(lowest)"]
+    CP1["CP₁<br/>(lowest)"]
 
     CPn -- "verifies against" --> TRUST
-    CPn1 -- "verifies against CPₙ's\noutgoing hash-link" --> CPn
+    CPn1 -- "verifies against CPₙ's<br/>outgoing hash-link" --> CPn
     CPdot --> CPn1
     CP2 --> CPdot
-    CP1 -- "verifies against CP₂'s\noutgoing hash-link" --> CP2
+    CP1 -- "verifies against CP₂'s<br/>outgoing hash-link" --> CP2
 ```
 
 ### Appendix E: Catchup Range Examples

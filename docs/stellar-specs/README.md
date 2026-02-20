@@ -28,13 +28,13 @@ dedicated specification document in this directory.
 
 ```mermaid
 graph TD
-    OV["**Overlay**\npeer networking, message flooding"]
-    HD["**Herder**\norchestration, tx pool, tx sets"]
-    SCP["**SCP**\nconsensus"]
-    CU["**Catchup**\nhistory archives"]
-    LD["**Ledger**\nclose pipeline, state management"]
-    TX["**Transactions**\nvalidation, application"]
-    BL["**BucketListDB**\npersistent state storage"]
+    OV["**Overlay**<br/>peer networking, message flooding"]
+    HD["**Herder**<br/>orchestration, tx pool, tx sets"]
+    SCP["**SCP**<br/>consensus"]
+    CU["**Catchup**<br/>history archives"]
+    LD["**Ledger**<br/>close pipeline, state management"]
+    TX["**Transactions**<br/>validation, application"]
+    BL["**BucketListDB**<br/>persistent state storage"]
 
     OV --> HD
     HD --> SCP
