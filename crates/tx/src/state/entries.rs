@@ -415,11 +415,7 @@ impl LedgerStateManager {
         }
 
         // Update state
-        self.accounts.insert(key, entry.clone());
-
-        // Update snapshot to current value so flush_modified_entries doesn't record a duplicate.
-        // The update was already recorded above, so the snapshot should reflect the new state.
-        self.account_snapshots.insert(key, Some(entry));
+        self.accounts.insert(key, entry);
     }
 
     /// Set an account entry directly without delta tracking.
@@ -1311,10 +1307,7 @@ impl LedgerStateManager {
         }
 
         // Update state
-        self.data_entries.insert(key.clone(), entry.clone());
-
-        // Update snapshot to current value so flush_modified_entries doesn't record a duplicate.
-        self.data_snapshots.insert(key, Some(entry));
+        self.data_entries.insert(key, entry);
     }
 
     /// Delete a data entry.
@@ -1775,10 +1768,7 @@ impl LedgerStateManager {
         }
 
         // Update state
-        self.claimable_balances.insert(key, entry.clone());
-
-        // Update snapshot to current value so flush_modified_entries doesn't record a duplicate.
-        self.claimable_balance_snapshots.insert(key, Some(entry));
+        self.claimable_balances.insert(key, entry);
     }
 
     /// Get a liquidity pool by ID (read-only).

@@ -4198,4 +4198,143 @@ mod tests {
             "Entry must be restored to original value after rollback_to_savepoint"
         );
     }
+
+    /// Regression test: update_account must not overwrite the snapshot with the
+    /// modified value. If it did, rollback_to_savepoint Phase 1 would restore
+    /// the wrong (post-update) balance instead of the original.
+    #[test]
+    fn test_rollback_to_savepoint_restores_account_after_update() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        let mut account = create_test_account_entry(1);
+        account.balance = 1_000_000;
+        let account_id = account.account_id.clone();
+
+        // Create entry and commit (simulates bucket-list state).
+        manager.create_account(account);
+        manager.commit();
+
+        // Start TX: take savepoint before the operation.
+        manager.snapshot_delta();
+        let savepoint = manager.create_savepoint();
+
+        // Update account (e.g., fee deduction or transfer).
+        let mut modified = manager.get_account(&account_id).unwrap().clone();
+        modified.balance = 900_000;
+        manager.update_account(modified);
+
+        assert_eq!(
+            manager.get_account(&account_id).unwrap().balance,
+            900_000,
+            "Entry should be modified before rollback"
+        );
+
+        // Operation fails: rollback.
+        manager.rollback_to_savepoint(savepoint);
+
+        assert_eq!(
+            manager.get_account(&account_id).unwrap().balance,
+            1_000_000,
+            "Account balance must be restored to original after rollback_to_savepoint"
+        );
+    }
+
+    /// Regression test: update_data must not overwrite the snapshot.
+    #[test]
+    fn test_rollback_to_savepoint_restores_data_after_update() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        let account_id = create_test_account_id(1);
+        let name = "my_key";
+        let original_entry = DataEntry {
+            account_id: account_id.clone(),
+            data_name: name.as_bytes().to_vec().try_into().unwrap(),
+            data_value: DataValue(vec![1u8].try_into().unwrap()),
+            ext: DataEntryExt::V0,
+        };
+
+        manager.create_data(original_entry);
+        manager.commit();
+
+        manager.snapshot_delta();
+        let savepoint = manager.create_savepoint();
+
+        let modified_entry = DataEntry {
+            account_id: account_id.clone(),
+            data_name: name.as_bytes().to_vec().try_into().unwrap(),
+            data_value: DataValue(vec![2u8].try_into().unwrap()),
+            ext: DataEntryExt::V0,
+        };
+        manager.update_data(modified_entry);
+
+        let modified_val: DataValue = vec![2u8].try_into().unwrap();
+        assert_eq!(
+            manager.get_data(&account_id, name).map(|e| e.data_value.clone()),
+            Some(modified_val),
+            "Entry should be modified before rollback"
+        );
+
+        manager.rollback_to_savepoint(savepoint);
+
+        let original_val: DataValue = vec![1u8].try_into().unwrap();
+        assert_eq!(
+            manager.get_data(&account_id, name).map(|e| e.data_value.clone()),
+            Some(original_val),
+            "Data entry must be restored to original after rollback_to_savepoint"
+        );
+    }
+
+    /// Regression test: update_claimable_balance must not overwrite the snapshot.
+    #[test]
+    fn test_rollback_to_savepoint_restores_claimable_balance_after_update() {
+        let mut manager = LedgerStateManager::new(5_000_000, 100);
+
+        let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([5u8; 32]));
+        let original_entry = ClaimableBalanceEntry {
+            balance_id: balance_id.clone(),
+            claimants: vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+                destination: create_test_account_id(1),
+                predicate: ClaimPredicate::Unconditional,
+            })]
+            .try_into()
+            .unwrap(),
+            asset: Asset::Native,
+            amount: 1_000_000,
+            ext: ClaimableBalanceEntryExt::V0,
+        };
+
+        manager.create_claimable_balance(original_entry);
+        manager.commit();
+
+        manager.snapshot_delta();
+        let savepoint = manager.create_savepoint();
+
+        let modified_entry = ClaimableBalanceEntry {
+            balance_id: balance_id.clone(),
+            claimants: vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+                destination: create_test_account_id(1),
+                predicate: ClaimPredicate::Unconditional,
+            })]
+            .try_into()
+            .unwrap(),
+            asset: Asset::Native,
+            amount: 500_000,
+            ext: ClaimableBalanceEntryExt::V0,
+        };
+        manager.update_claimable_balance(modified_entry);
+
+        assert_eq!(
+            manager.get_claimable_balance(&balance_id).map(|e| e.amount),
+            Some(500_000),
+            "Entry should be modified before rollback"
+        );
+
+        manager.rollback_to_savepoint(savepoint);
+
+        assert_eq!(
+            manager.get_claimable_balance(&balance_id).map(|e| e.amount),
+            Some(1_000_000),
+            "Claimable balance amount must be restored to original after rollback_to_savepoint"
+        );
+    }
 }
