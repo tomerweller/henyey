@@ -1,9 +1,9 @@
 # Correctness Gaps: Henyey vs stellar-core
 
-> **Generated**: 2026-02-18
+> **Generated**: 2026-02-20
 > **stellar-core reference**: v25.0.1 (`ac5427a148203e8269294cf50866200cbe4ec1d3`)
 > **Crates analyzed**: `tx`, `bucket`, `ledger`
-> **Method**: Pseudocode comparison of all Henyey Rust source files against stellar-core C++ source
+> **Method**: Pseudocode comparison of all Henyey Rust source files against stellar-core C++ source + verify-execution sweep
 
 This document catalogs every **behavioral delta** found between Henyey and
 stellar-core that could produce different observable outcomes (ledger state,
@@ -422,6 +422,12 @@ These issues are irrelevant if Henyey only processes V16+ ledgers:
 | B-07 | Not a gap — identical output on P24+ |
 | B-08 | Mitigated — warning log on unreachable level 0 |
 | T-06 | Reclassified to Low — economically impossible trigger condition |
+
+### Runtime bugs found via verify-execution sweep
+
+| ID | Description | Resolution |
+|----|-------------|------------|
+| VE-01 | `update_contract_data` overwrote `contract_data_snapshots` with the modified value after updating the live map. This corrupted `rollback_to_savepoint` Phase 1, which uses `rollback_new_snapshots` to restore entries from the snapshot map. When a TX with `InvokeHostFunction(InsufficientRefundableFee)` (invoke_success=true) modified contract data, the rollback restored the modified value instead of the original. Stale contract state accumulated across TXs. Found at mainnet L59658059. | Fixed — removed snapshot overwrite in `update_contract_data` (entries.rs) and matching overwrite+push in `update_contract_code`. Regression test `test_rollback_to_savepoint_restores_contract_data_after_update` added. Commit `741c484`. |
 
 ### Previously resolved issues
 
