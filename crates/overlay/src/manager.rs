@@ -404,15 +404,17 @@ impl OverlayManager {
                                             if shared.banned_peers.read().contains(&peer_id) {
                                                 warn!("Rejected banned peer {}", peer_id);
                                                 peer.close().await;
-                                                pool.release();
+                                                pool.release_pending();
                                                 return;
                                             }
                                             if shared.peers.contains_key(&peer_id) {
                                                 debug!("Rejected duplicate inbound peer {}", peer_id);
                                                 peer.close().await;
-                                                pool.release();
+                                                pool.release_pending();
                                                 return;
                                             }
+                                            // Handshake succeeded: promote from pending to authenticated
+                                            pool.mark_authenticated();
                                             info!("Accepted peer: {}", peer_id);
 
                                             let peer_info = peer.info().clone();
@@ -473,7 +475,7 @@ impl OverlayManager {
                                             shared.peers.remove(&peer_id);
                                             shared.peer_info_cache.remove(&peer_id);
                                             shared.dropped_authenticated_peers.fetch_add(1, Ordering::Relaxed);
-                                            pool.release();
+                                            pool.release_authenticated();
                                         }
                                         Err(e) => {
                                             warn!("Failed to accept peer: {}", e);
@@ -490,7 +492,7 @@ impl OverlayManager {
                                                     ))
                                                     .await;
                                             }
-                                            pool.release();
+                                            pool.release_pending();
                                         }
                                     }
                                 });
@@ -1317,7 +1319,7 @@ impl OverlayManager {
         let peer = match Peer::connect(addr, local_node, timeout_secs).await {
             Ok(peer) => peer,
             Err(e) => {
-                pool.release();
+                pool.release_pending();
                 if let Some(tx) = shared.peer_event_tx.clone() {
                     let _ = tx
                         .send(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
@@ -1329,15 +1331,17 @@ impl OverlayManager {
 
         let peer_id = peer.id().clone();
         if shared.banned_peers.read().contains(&peer_id) {
-            pool.release();
+            pool.release_pending();
             return Err(OverlayError::PeerBanned(peer_id.to_string()));
         }
 
         if shared.peers.contains_key(&peer_id) {
-            pool.release();
+            pool.release_pending();
             return Err(OverlayError::AlreadyConnected);
         }
 
+        // Handshake succeeded: promote from pending to authenticated
+        pool.mark_authenticated();
         info!("Connected to peer: {} at {}", peer_id, addr);
 
         let peer_info = peer.info().clone();
@@ -1363,7 +1367,7 @@ impl OverlayManager {
             shared_clone.peers.remove(&peer_id_clone);
             shared_clone.peer_info_cache.remove(&peer_id_clone);
             shared_clone.dropped_authenticated_peers.fetch_add(1, Ordering::Relaxed);
-            pool_clone.release();
+            pool_clone.release_authenticated();
         });
 
         shared.peer_handles.write().push(handle);
@@ -1754,7 +1758,7 @@ impl OverlayManager {
             entry.value().address.to_string() == target_addr
         });
         if already_connected {
-            self.outbound_pool.release();
+            self.outbound_pool.release_pending();
             debug!("Already connected to {}", addr);
             return Ok(false);
         }
@@ -1775,6 +1779,9 @@ impl OverlayManager {
                     let peer_id = peer.id().clone();
                     info!("Connected to discovered peer: {} at {}", peer_id, addr);
 
+                    // Handshake succeeded: promote from pending to authenticated
+                    pool.mark_authenticated();
+
                     if let Some(tx) = shared.peer_event_tx.clone() {
                         let _ = tx
                             .send(PeerEvent::Connected(addr.clone(), PeerType::Outbound))
@@ -1794,7 +1801,7 @@ impl OverlayManager {
                     // Cleanup
                     shared.peers.remove(&peer_id);
                     shared.peer_info_cache.remove(&peer_id);
-                    pool.release();
+                    pool.release_authenticated();
                 }
                 Err(e) => {
                     debug!("Failed to connect to discovered peer {}: {}", addr, e);
@@ -1803,7 +1810,7 @@ impl OverlayManager {
                             .send(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
                             .await;
                     }
-                    pool.release();
+                    pool.release_pending();
                 }
             }
         });

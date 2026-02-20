@@ -375,6 +375,10 @@ impl Listener {
 /// Used to track inbound and outbound connection counts separately,
 /// ensuring we don't exceed configured limits.
 ///
+/// Tracks both pending (unauthenticated) and authenticated connections
+/// separately, matching stellar-core's `OverlayManagerImpl` which
+/// distinguishes `mPendingPeers` from `mAuthenticatedPeers`.
+///
 /// For inbound pools, supports "possibly preferred" extra slots:
 /// connections from preferred IP addresses can exceed `max_connections`
 /// by up to `possibly_preferred_extra` slots, matching upstream's
@@ -386,8 +390,14 @@ pub struct ConnectionPool {
     possibly_preferred_extra: usize,
     /// Set of preferred IP addresses that qualify for extra slots.
     preferred_ips: parking_lot::RwLock<HashSet<IpAddr>>,
-    /// Current number of active connections.
+    /// Current number of active connections (pending + authenticated).
     current_count: AtomicUsize,
+    /// Number of pending (unauthenticated) connections.
+    /// A connection starts as pending and transitions to authenticated
+    /// after the Hello/Auth handshake completes.
+    pending_count: AtomicUsize,
+    /// Number of authenticated connections.
+    authenticated_count: AtomicUsize,
 }
 
 impl ConnectionPool {
@@ -398,6 +408,8 @@ impl ConnectionPool {
             possibly_preferred_extra: 0,
             preferred_ips: parking_lot::RwLock::new(HashSet::new()),
             current_count: AtomicUsize::new(0),
+            pending_count: AtomicUsize::new(0),
+            authenticated_count: AtomicUsize::new(0),
         }
     }
 
@@ -412,6 +424,8 @@ impl ConnectionPool {
             possibly_preferred_extra,
             preferred_ips: parking_lot::RwLock::new(preferred_ips),
             current_count: AtomicUsize::new(0),
+            pending_count: AtomicUsize::new(0),
+            authenticated_count: AtomicUsize::new(0),
         }
     }
 
@@ -423,6 +437,7 @@ impl ConnectionPool {
     /// Attempts to reserve a connection slot.
     ///
     /// Returns true if a slot was reserved, false if the limit is reached.
+    /// The reserved slot starts as "pending" (unauthenticated).
     /// Uses atomic compare-and-swap for thread safety.
     pub fn try_reserve(&self) -> bool {
         self.try_reserve_with_ip(None)
@@ -433,6 +448,9 @@ impl ConnectionPool {
     /// If `ip` is provided and matches a preferred IP, the connection may be
     /// allowed even when the pool is at `max_connections`, up to
     /// `max_connections + possibly_preferred_extra`.
+    ///
+    /// The reserved slot starts as "pending" (unauthenticated). Call
+    /// [`mark_authenticated`] after the handshake completes.
     pub fn try_reserve_with_ip(&self, ip: Option<IpAddr>) -> bool {
         let mut current = self.current_count.load(Ordering::Relaxed);
         loop {
@@ -462,7 +480,10 @@ impl ConnectionPool {
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return true,
+                Ok(_) => {
+                    self.pending_count.fetch_add(1, Ordering::Relaxed);
+                    return true;
+                }
                 Err(new_current) => current = new_current,
             }
         }
@@ -470,14 +491,51 @@ impl ConnectionPool {
 
     /// Releases a previously reserved connection slot.
     ///
-    /// Call this when a connection is closed.
+    /// Call this when a connection is closed. If the connection was still
+    /// pending (never promoted to authenticated), the pending count is
+    /// also decremented.
     pub fn release(&self) {
         self.current_count.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Returns the current number of connections.
+    /// Releases a pending connection slot.
+    ///
+    /// Call this when a pending (unauthenticated) connection fails or is
+    /// rejected before completing the handshake.
+    pub fn release_pending(&self) {
+        self.pending_count.fetch_sub(1, Ordering::Relaxed);
+        self.current_count.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Releases an authenticated connection slot.
+    ///
+    /// Call this when an authenticated peer disconnects.
+    pub fn release_authenticated(&self) {
+        self.authenticated_count.fetch_sub(1, Ordering::Relaxed);
+        self.current_count.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Marks a connection as authenticated (promotes from pending).
+    ///
+    /// Call this after the Hello/Auth handshake completes successfully.
+    pub fn mark_authenticated(&self) {
+        self.pending_count.fetch_sub(1, Ordering::Relaxed);
+        self.authenticated_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Returns the current number of connections (pending + authenticated).
     pub fn count(&self) -> usize {
         self.current_count.load(Ordering::Relaxed)
+    }
+
+    /// Returns the number of pending (unauthenticated) connections.
+    pub fn pending_count(&self) -> usize {
+        self.pending_count.load(Ordering::Relaxed)
+    }
+
+    /// Returns the number of authenticated connections.
+    pub fn authenticated_count(&self) -> usize {
+        self.authenticated_count.load(Ordering::Relaxed)
     }
 }
 
@@ -496,19 +554,38 @@ mod tests {
         let pool = ConnectionPool::new(2);
         assert!(pool.can_accept());
         assert_eq!(pool.count(), 0);
+        assert_eq!(pool.pending_count(), 0);
+        assert_eq!(pool.authenticated_count(), 0);
 
         assert!(pool.try_reserve());
         assert_eq!(pool.count(), 1);
+        assert_eq!(pool.pending_count(), 1);
 
         assert!(pool.try_reserve());
         assert_eq!(pool.count(), 2);
+        assert_eq!(pool.pending_count(), 2);
 
         assert!(!pool.try_reserve());
         assert!(!pool.can_accept());
 
-        pool.release();
-        assert!(pool.can_accept());
+        // Promote one to authenticated
+        pool.mark_authenticated();
+        assert_eq!(pool.pending_count(), 1);
+        assert_eq!(pool.authenticated_count(), 1);
+        assert_eq!(pool.count(), 2); // total unchanged
+
+        // Release the pending one
+        pool.release_pending();
         assert_eq!(pool.count(), 1);
+        assert_eq!(pool.pending_count(), 0);
+        assert_eq!(pool.authenticated_count(), 1);
+
+        // Release the authenticated one
+        pool.release_authenticated();
+        assert!(pool.can_accept());
+        assert_eq!(pool.count(), 0);
+        assert_eq!(pool.pending_count(), 0);
+        assert_eq!(pool.authenticated_count(), 0);
     }
 
     #[test]
