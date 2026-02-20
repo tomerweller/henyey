@@ -427,7 +427,7 @@ These issues are irrelevant if Henyey only processes V16+ ledgers:
 
 | ID | Description | Resolution |
 |----|-------------|------------|
-| VE-01 | `update_contract_data` overwrote `contract_data_snapshots` with the modified value after updating the live map. This corrupted `rollback_to_savepoint` Phase 1, which uses `rollback_new_snapshots` to restore entries from the snapshot map. When a TX with `InvokeHostFunction(InsufficientRefundableFee)` (invoke_success=true) modified contract data, the rollback restored the modified value instead of the original. Stale contract state accumulated across TXs. Found at mainnet L59658059. | Fixed — removed snapshot overwrite in `update_contract_data` (entries.rs) and matching overwrite+push in `update_contract_code`. Regression test `test_rollback_to_savepoint_restores_contract_data_after_update` added. Commit `741c484`. |
+| VE-01 | **Snapshot overwrite bug in 5 update methods.** `update_contract_data`, `update_contract_code`, `update_account`, `update_data`, and `update_claimable_balance` all took a correct pre-update snapshot but then overwrote it with the post-update value. This corrupted `rollback_to_savepoint` Phase 1 (`rollback_new_snapshots`), which reads the snapshot map to restore entries to their pre-TX values. When a TX with `InvokeHostFunction(InsufficientRefundableFee)` modified contract data, the rollback restored the modified value instead of the original; stale state then affected subsequent TXs. Found at mainnet L59658059. | Fixed — removed all 5 snapshot overwrites. Regression tests added for all 5 methods. Commits `741c484` (contract_data/code), `58c5203` (account/data/claimable_balance). |
 
 ### Previously resolved issues
 
