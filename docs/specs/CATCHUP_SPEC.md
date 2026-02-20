@@ -33,7 +33,7 @@
 ### 1.1 Purpose and Scope
 
 This document specifies the catchup, replay, and history publishing
-subsystems as implemented in stellar-core v25.x. Together, these
+subsystems as defined for stellar-core protocol 25. Together, these
 subsystems enable:
 
 - **Checkpoint publishing**: Periodically writing ledger state snapshots
@@ -414,7 +414,7 @@ The HAS is serialized as JSON:
 ```json
 {
     "version": 1,
-    "server": "stellar-core v25.0.1",
+    "server": "<implementation-defined version string>",
     "networkPassphrase": "Public Global Stellar Network ; September 2015",
     "currentLedger": 127,
     "currentBuckets": [
@@ -838,7 +838,7 @@ For each non-empty live bucket that does not already have an index,
 create one (either by loading from disk or building from the bucket
 file). Indexing MAY proceed in parallel across buckets.
 
-**Step 2: Apply entries to database**
+**Step 2: Apply entries to persistent storage**
 
 Iterate through buckets in priority order (highest priority first):
 - Level 0 current, Level 0 snapshot, Level 1 current, Level 1
@@ -848,7 +848,7 @@ For each bucket:
 1. Create a bucket applicator that streams entries from the bucket.
 2. For each entry, check if its key has been seen in a higher-priority
    bucket. If so, skip it.
-3. If the key has not been seen, write it to the database.
+3. If the key has not been seen, write it to persistent storage.
 4. Add the key to the seen-keys set.
 
 This process ensures that only the newest version of each entry
@@ -866,9 +866,9 @@ This process ensures that only the newest version of each entry
 After bucket application completes:
 
 1. Set the LCL to the verified ledger at the bucket checkpoint.
-2. Store the ledger header in the persistent database.
-3. If the protocol version supports it (p25+): compile all WASM
-   contracts and populate the in-memory Soroban state.
+2. Store the ledger header in persistent storage.
+3. If the protocol version supports it (p25+): compile all contract
+   modules and populate the in-memory Soroban state.
 4. Transition the apply state from `SETTING_UP_STATE` to
    `READY_TO_APPLY`.
 
@@ -1028,7 +1028,7 @@ If the node crashes during catchup:
 
 1. On restart, the checkpoint builder recovers valid checkpoint files
    (Section 5.7).
-2. The LCL is restored from the persistent database.
+2. The LCL is restored from persistent storage.
 3. If the crash occurred after bucket application but before
    completing transaction replay, the node will re-trigger catchup
    from the current LCL (which was advanced by the bucket apply).

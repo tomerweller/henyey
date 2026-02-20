@@ -1854,7 +1854,7 @@ transactions (abbreviated "ltx"). Each ltx provides a scoped, mutable
 view of ledger state with commit/rollback semantics:
 
 ```
-LedgerTxnRoot (database + BucketList)
+LedgerTxnRoot (persistent storage + BucketList)
   └─ LedgerTxn (ledger close)
        └─ LedgerTxn (fee processing)
        └─ LedgerTxn (transaction apply)
@@ -1918,8 +1918,8 @@ Entries are loaded by key through the ltx hierarchy:
 1. Check the current ltx's entry map.
 2. If not found, recurse to the parent.
 3. At the root: check the entry cache, then the in-memory state (for
-   Soroban entries), then the database (for offers and accounts), then
-   the BucketList snapshot.
+   Soroban entries), then persistent storage (for offers and
+   accounts), then the BucketList snapshot.
 4. Once found, the entry is recorded in the current ltx as LIVE.
 
 **Load without record**: A read-only load that does NOT record the
@@ -1929,8 +1929,8 @@ affect the changeset.
 ### 9.8 Root Commit
 
 When the root ltx's child is committed:
-1. All modified/created OFFER entries are batch-upserted to SQL.
-2. All deleted OFFER entries are batch-deleted from SQL.
+1. All modified/created OFFER entries are batch-upserted to persistent storage.
+2. All deleted OFFER entries are batch-deleted from persistent storage.
 3. Non-OFFER entries are handled by the BucketList.
 4. Entries are committed in batches of 4095 (`0xFFF`).
 5. All caches are invalidated.
@@ -2305,26 +2305,16 @@ may be updated via network upgrades:
 
 ## 15. References
 
-### 15.1 Normative References
-
-- [rfc2119] Bradner, S., "Key words for use in RFCs to Indicate
-  Requirement Levels", BCP 14, RFC 2119, March 1997.
-- Stellar XDR definitions: `Stellar-transaction.x`,
-  `Stellar-ledger-entries.x`, `Stellar-ledger.x`, `Stellar-types.x`.
-  https://github.com/stellar/stellar-xdr/tree/curr/
-
-### 15.2 Informative References
-
-- stellar-core v25.x source code:
-  https://github.com/stellar/stellar-core (tag v25.0.1).
-- Stellar CAP-0021 (Preconditions V2):
-  https://stellar.org/protocol/cap-21
-- Stellar CAP-0046 (Soroban Smart Contracts):
-  https://stellar.org/protocol/cap-46
-- Stellar Consensus Protocol whitepaper:
-  https://www.stellar.org/papers/stellar-consensus-protocol
-- Companion specifications: Overlay Protocol Specification
-  (`OVERLAY_SPEC.md`), SCP Specification (`SCP_SPEC.md`).
+| Reference | Description |
+|-----------|-------------|
+| [rfc2119] | Bradner, S., "Key words for use in RFCs to Indicate Requirement Levels", BCP 14, RFC 2119, March 1997. |
+| [stellar-xdr] | Stellar XDR definitions: `Stellar-transaction.x`, `Stellar-ledger-entries.x`, `Stellar-ledger.x`, `Stellar-types.x`. https://github.com/stellar/stellar-xdr/tree/curr/ |
+| [stellar-core] | stellar-core v25.x source code (tag v25.0.1). https://github.com/stellar/stellar-core |
+| [CAP-0021] | Stellar CAP-0021, "Preconditions V2". https://stellar.org/protocol/cap-21 |
+| [CAP-0046] | Stellar CAP-0046, "Soroban Smart Contracts". https://stellar.org/protocol/cap-46 |
+| [SCP whitepaper] | Stellar Consensus Protocol whitepaper. https://www.stellar.org/papers/stellar-consensus-protocol |
+| [Overlay Spec] | Stellar Overlay Protocol Specification (companion document). |
+| [SCP Spec] | Stellar Consensus Protocol (SCP) Specification (companion document). |
 
 ---
 

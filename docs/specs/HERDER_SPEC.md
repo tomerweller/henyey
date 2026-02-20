@@ -1487,8 +1487,8 @@ When the herder purges SCP state for old slots:
    discarded) for purged slots.
 3. Evict transaction set cache entries whose tagged slot is
    older than the retention window (but preserve entries
-   tagged with slot 0, which represent data loaded from the
-   database with unknown slot association).
+   tagged with slot 0, which represent data loaded from
+   persistent storage with unknown slot association).
 4. Clean up expired weak references.
 
 ### 14.7 Quorum Tracking
@@ -1506,7 +1506,7 @@ The tracker is rebuilt lazily:
   queued.
 - A full rebuild resolves each node's quorum set using (in
   priority order): the local node's quorum set, the latest
-  SCP message from that node, or the database.
+  SCP message from that node, or persistent storage.
 
 ### 14.8 Envelope Processing Order
 
@@ -1813,17 +1813,11 @@ graph TD
 
 ## References
 
-- [rfc2119]: Bradner, S., "Key words for use in RFCs to Indicate
-  Requirement Levels", BCP 14, RFC 2119, March 1997.
-- **SCP_SPEC**: Stellar Consensus Protocol Specification (companion
-  document).
-- **LEDGER_SPEC**: Ledger Close Pipeline Specification (companion
-  document).
-- **TX_SPEC**: Transaction Processing Specification (companion
-  document).
-- **OVERLAY_SPEC**: Overlay Protocol Specification (companion
-  document).
-- **CATCHUP_SPEC**: Catchup and History Archive Specification
-  (companion document).
-
-[rfc2119]: https://datatracker.ietf.org/doc/html/rfc2119
+| Reference | Description |
+|-----------|-------------|
+| [rfc2119] | Bradner, S., "Key words for use in RFCs to Indicate Requirement Levels", BCP 14, RFC 2119, March 1997. |
+| [SCP Spec] | Stellar Consensus Protocol (SCP) Specification (companion document). |
+| [Ledger Spec] | Stellar Ledger Close Pipeline Specification (companion document). |
+| [TX Spec] | Stellar Transaction Processing Specification (companion document). |
+| [Overlay Spec] | Stellar Overlay Protocol Specification (companion document). |
+| [Catchup Spec] | Stellar Catchup and History Archive Specification (companion document). |

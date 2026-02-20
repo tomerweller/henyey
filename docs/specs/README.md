@@ -227,10 +227,7 @@ affect consensus or ledger state.
 
 ## References
 
-- [rfc2119]: Bradner, S., "Key words for use in RFCs to Indicate
-  Requirement Levels", BCP 14, RFC 2119, March 1997.
-- [stellar-xdr]: Stellar XDR definitions,
-  https://github.com/stellar/stellar-xdr
-
-[rfc2119]: https://datatracker.ietf.org/doc/html/rfc2119
-[stellar-xdr]: https://github.com/stellar/stellar-xdr
+| Reference | Description |
+|-----------|-------------|
+| [rfc2119] | Bradner, S., "Key words for use in RFCs to Indicate Requirement Levels", BCP 14, RFC 2119, March 1997. https://datatracker.ietf.org/doc/html/rfc2119 |
+| [stellar-xdr] | Stellar XDR definitions. https://github.com/stellar/stellar-xdr |

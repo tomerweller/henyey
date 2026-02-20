@@ -77,7 +77,7 @@ document are to be interpreted as described in [RFC 2119][rfc2119].
 | **SCP Value** | The `StellarValue` agreed upon by consensus for a given slot, containing the transaction set hash, close time, and optional upgrades. |
 | **Transaction Set** | An ordered collection of transactions, possibly organized into phases (classic and Soroban), to be applied in a single ledger close. |
 | **LedgerTxn** | A nested, copy-on-write transactional abstraction for reading and modifying ledger entries during a ledger close. |
-| **LedgerTxnRoot** | The root of the LedgerTxn hierarchy, connected to the persistent database. Commits at the root flush changes to the database. |
+| **LedgerTxnRoot** | The root of the LedgerTxn hierarchy, connected to persistent storage. Commits at the root flush changes to persistent storage. |
 | **Protocol Upgrade** | A network-wide change to a consensus parameter (protocol version, base fee, base reserve, max transaction set size, or Soroban configuration) embedded in the SCP value. |
 | **Entry** | A single ledger state record: an account, trust line, offer, data entry, claimable balance, liquidity pool, contract data, contract code, TTL entry, or configuration setting. |
 | **LedgerKey** | The unique identifier for a ledger entry, sufficient to locate it in the BucketList or database. |
@@ -338,9 +338,9 @@ It MUST execute the following steps in exact order:
 
 #### Step 1: Finish Pending Compilation
 
-If a background WASM module cache compilation from the previous ledger
-is still in progress, the pipeline MUST block until it completes and
-swap in the new module cache.
+If a background contract module cache compilation from the previous
+ledger is still in progress, the pipeline MUST block until it
+completes and swap in the new module cache.
 
 #### Step 2: Enter APPLYING Phase
 
@@ -459,9 +459,8 @@ exact order:
 
 1. **Queue history checkpoint**: If this ledger is at a checkpoint
    boundary, queue the checkpoint for publishing.
-2. **Commit LedgerTxn**: Call `ltx.commit()` on the top-level
-   `LedgerTxn`, flushing all accumulated changes to the persistent
-   database.
+2. **Commit LedgerTxn**: Commit the top-level `LedgerTxn`, flushing
+   all accumulated changes to persistent storage.
 3. **Finalize checkpoint**: If a checkpoint was queued, finalize the
    checkpoint files.
 4. **Start background eviction scan**: Begin the eviction scan for
@@ -615,18 +614,18 @@ LedgerTxnRoot (connected to persistent database)
 The `LedgerTxnRoot` is the root of the hierarchy and the interface to
 persistent storage. It:
 
-1. SHALL maintain the connection to the persistent database.
+1. SHALL maintain the connection to persistent storage.
 2. SHALL provide the initial entry data for lookups that miss all
    child caches — this data comes from the BucketList snapshot, not
-   the SQL database.
+   persistent storage.
 3. SHALL maintain an in-memory representation of the order book (the
    "multi-order book") for efficient offer queries.
 4. SHALL track the "best offer" for each asset pair, used to
    optimize path finding.
-5. SHALL commit accumulated changes to the database when the
+5. SHALL commit accumulated changes to persistent storage when the
    top-level `LedgerTxn` commits. Only offer entries are written to
-   the SQL database; all other entry types are stored exclusively in
-   the BucketList.
+   persistent storage; all other entry types are stored exclusively
+   in the BucketList.
 
 ### 6.3 Nesting Rules
 
@@ -760,14 +759,14 @@ replaced with the child's version.
 
 When the top-level `LedgerTxn` commits to the `LedgerTxnRoot`:
 
-1. All accumulated offer changes are flushed to the SQL database
+1. All accumulated offer changes are flushed to persistent storage
    (inserts, updates, deletes).
 2. The in-memory order book is updated.
-3. The database transaction is committed.
+3. The persistent storage transaction is committed.
 
-Non-offer entry types are NOT written to the database during root
-commit — they are persisted exclusively through the BucketList batch
-add that occurs during the seal-and-store step (Section 11).
+Non-offer entry types are NOT written to persistent storage during
+root commit — they are persisted exclusively through the BucketList
+batch add that occurs during the seal-and-store step (Section 11).
 
 ### 6.7 Rollback Semantics
 
@@ -1141,7 +1140,7 @@ computation.
 
 ### 10.5 Module Cache
 
-For protocol 25+, a WASM module cache is maintained to avoid
+For protocol 25+, a contract module cache is maintained to avoid
 recompiling smart contract bytecode on every invocation:
 
 1. **Compilation**: All `CONTRACT_CODE` entries are compiled for all
@@ -1163,7 +1162,7 @@ recompiling smart contract bytecode on every invocation:
 
 ### 11.1 Seal and Store Procedure
 
-The `sealLedgerTxnAndStoreInBucketsAndDB` procedure finalizes the
+The seal-and-store procedure finalizes the
 ledger close by committing all accumulated state changes. It MUST
 execute the following steps under a ledger state mutex:
 
@@ -1215,7 +1214,7 @@ Via the `unsealHeader` callback:
 2. **Update header**: Set `header.bucketListHash` to the computed
    hash.
 
-3. **Store persistent state**: Write to the database:
+3. **Store persistent state**: Write to persistent storage:
    a. The LCL hash in `PersistentState::kLastClosedLedger`.
    b. The `HistoryArchiveState` (derived from the current BucketList
       structure) in `PersistentState::kHistoryArchiveState`.
@@ -1363,7 +1362,7 @@ The ledger close pipeline uses two primary thread contexts:
 
 | Thread | Responsibilities |
 |--------|-----------------|
-| **Main thread** | Handles all LCL state queries, `advanceLedgerStateAndPublish`, herder notification, and state machine transitions that require main-thread context. |
+| **Main thread** | Handles all LCL state queries, LCL state publishing, herder notification, and state machine transitions that require main-thread context. |
 | **Apply thread** | Executes the `applyLedger` pipeline (may be the main thread in single-threaded mode). |
 
 Additionally, for parallel Soroban execution (protocol 22+):
@@ -1376,24 +1375,23 @@ Additionally, for parallel Soroban execution (protocol 22+):
 
 1. The `CompleteConstLedgerState` (LCL) is immutable and can be read
    from any thread.
-2. The apply state (`mApplyState`) is writable only during the
+2. The apply state is writable only during the
    `SETTING_UP_STATE` and `COMMITTING` phases. During `APPLYING`, it
    is read-only (except through the `LedgerTxn` system).
-3. The `sealLedgerTxnAndStoreInBucketsAndDB` procedure executes under
-   a ledger state mutex.
-4. The `advanceLedgerStateAndPublish` procedure MUST execute on the
-   main thread. If the apply thread is separate, this is achieved by
-   posting the work to the main thread's event loop.
-5. Bucket garbage collection (`forgetUnreferencedBuckets`) executes
-   under the same ledger state mutex as the seal procedure.
+3. The seal-and-store procedure executes under a ledger state mutex.
+4. The LCL publish procedure MUST execute on the main thread. If the
+   apply thread is separate, this is achieved by posting the work to
+   the main thread's event loop.
+5. Bucket garbage collection executes under the same ledger state
+   mutex as the seal procedure.
 
 ### 14.3 Background Work
 
 The following operations may execute on background threads:
 
-- **WASM module cache compilation**: May run in the background during
-  a ledger close, with the pipeline blocking at the start of the next
-  ledger to await completion.
+- **Contract module cache compilation**: May run in the background
+  during a ledger close, with the pipeline blocking at the start of
+  the next ledger to await completion.
 - **Eviction scanning**: Background scans for expired Soroban entries
   run between ledger closes and are resolved at the start of the next
   commit phase.
@@ -1487,13 +1485,13 @@ execute in the specified order. Reordering any step may cause
 incorrect history publishing, database inconsistency, or crash
 recovery failures.
 
-### 15.14 Offer-Only SQL Persistence
+### 15.14 Offer-Only Persistent Storage
 
-**INV-L14**: Only offer entries are persisted to the SQL database
-during `LedgerTxnRoot` commit. All other entry types are persisted
-exclusively through the BucketList. This ensures the SQL database
-contains only the data needed for the in-memory order book and path
-finding.
+**INV-L14**: Only offer entries are persisted to the persistent
+storage layer during `LedgerTxnRoot` commit. All other entry types
+are persisted exclusively through the BucketList. This ensures the
+order book store contains only the data needed for the in-memory
+order book and path finding.
 
 ---
 
@@ -1510,7 +1508,7 @@ finding.
 | `CHECKPOINT_FREQUENCY` | 64 | Ledger interval between history checkpoints. |
 | `CURRENT_LEDGER_PROTOCOL_VERSION` | 25 | Maximum supported protocol version. |
 | `TARGET_LEDGER_CLOSE_TIME_BEFORE_P23_MS` | 5000 | Expected ledger close time before protocol 23 (5 seconds). |
-| `REUSABLE_SOROBAN_MODULE_CACHE_PROTOCOL_VERSION` | 25 | Protocol version at which the reusable WASM module cache is activated. |
+| `REUSABLE_CONTRACT_MODULE_CACHE_PROTOCOL_VERSION` | 25 | Protocol version at which the reusable contract module cache is activated. |
 
 ---
 
@@ -1652,14 +1650,14 @@ flowchart TD
 The 8-step commit sequence from Section 4.2, Step 17:
 
 ```
-Step 1: maybeQueueHistoryCheckpoint(ledgerSeq)
-Step 2: ltx.commit()                              ← SQL commit
-Step 3: maybeCheckpointComplete(ledgerSeq)
-Step 4: startBackgroundEvictionScan(ledgerSeq+1)
-Step 5: markEndOfCommitting()                      ← phase transition
-Step 6: maybeCopySorobanStateForInvariant()
-Step 7: advanceLedgerStateAndPublish()             ← must be on main thread
-Step 8: ledgerCloseComplete()                      ← notify herder
+Step 1: Queue history checkpoint if this ledger closes a checkpoint interval
+Step 2: Commit the LedgerTxn to persistent storage     ← offer flush + commit
+Step 3: Finalize checkpoint if queued and now complete
+Step 4: Begin background eviction scan for the next ledger
+Step 5: Transition pipeline state: COMMITTING → READY_TO_APPLY
+Step 6: Snapshot Soroban state for invariant verification (if enabled)
+Step 7: Publish the new LCL and notify subscribers     ← MUST run on main thread
+Step 8: Notify herder that ledger close is complete
 ```
 
 [rfc2119]: https://www.rfc-editor.org/rfc/rfc2119

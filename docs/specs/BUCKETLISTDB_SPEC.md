@@ -1529,7 +1529,7 @@ HistoryArchiveState (HAS):
 ```json
 {
     "version": 1,
-    "server": "stellar-core v25.x",
+    "server": "<implementation-defined version string>",
     "currentLedger": 12345,
     "currentBuckets": [
         {
@@ -1685,15 +1685,15 @@ states from different ledgers.
 
 ## 17. References
 
-- [rfc2119]: Bradner, S., "Key words for use in RFCs to Indicate Requirement Levels", BCP 14, RFC 2119, March 1997.
-- [CAP-0020]: Stellar CAP-0020, "Bucket Merge Logic and INITENTRY", introduces INIT/DEAD annihilation semantics.
-- [CAP-0035]: Stellar CAP-0035, "Asset Clawback", adds clawback-related entries.
-- [CAP-0046]: Stellar CAP-0046, "Soroban Smart Contracts", introduces CONTRACT_DATA, CONTRACT_CODE, TTL entries.
-- [CAP-0057]: Stellar CAP-0057, "Hot Archive BucketList", introduces the Hot Archive for persistent entry eviction.
-- stellar-core v25.x source: `src/bucket/` directory.
-- stellar-core-pc pseudocode: `src/bucket/` directory.
-
-[rfc2119]: https://www.rfc-editor.org/rfc/rfc2119
+| Reference | Description |
+|-----------|-------------|
+| [rfc2119] | Bradner, S., "Key words for use in RFCs to Indicate Requirement Levels", BCP 14, RFC 2119, March 1997. |
+| [CAP-0020] | Stellar CAP-0020, "Bucket Merge Logic and INITENTRY", introduces INIT/DEAD annihilation semantics. |
+| [CAP-0035] | Stellar CAP-0035, "Asset Clawback", adds clawback-related entries. |
+| [CAP-0046] | Stellar CAP-0046, "Soroban Smart Contracts", introduces CONTRACT_DATA, CONTRACT_CODE, TTL entries. |
+| [CAP-0057] | Stellar CAP-0057, "Hot Archive BucketList", introduces the Hot Archive for persistent entry eviction. |
+| [stellar-core] | stellar-core v25.x source code, `src/bucket/` directory. |
+| [stellar-core-pc] | stellar-core pseudocode companion, `src/bucket/` directory. |
 
 ---
 
