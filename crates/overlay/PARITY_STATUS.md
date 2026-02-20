@@ -2,27 +2,28 @@
 
 **Crate**: `henyey-overlay`
 **Upstream**: `stellar-core/src/overlay/`
-**Overall Parity**: 88%
-**Last Updated**: 2026-02-17
+**Overall Parity**: 100%
+**Last Updated**: 2026-02-20
 
 ## Summary
 
 | Area | Status | Notes |
 |------|--------|-------|
 | Authentication (PeerAuth, Hmac) | Full | HKDF key derivation, HMAC-SHA256 MAC |
-| Peer Connection (Peer, TCPPeer) | Partial | Missing ping/pong latency tracking |
-| OverlayManager | Partial | Missing DNS re-resolution, some peer list queries |
+| Peer Connection (Peer, TCPPeer) | Full | Ping/pong RTT tracking, 2s auth timeout, keepalive |
+| OverlayManager | Full | 3s tick loop, DNS re-resolution, peer rotation, connection pool tracking |
 | Floodgate | Full | Message deduplication, ledger-based cleanup |
-| FlowControl | Full | Capacity tracking, throttling, SCP-aware trimming |
+| FlowControl | Full | Capacity tracking, throttling, SCP-aware trimming, CapacityGuard RAII |
 | ItemFetcher / Tracker | Full | Fetch lifecycle, retry, envelope tracking |
-| BanManager | Full | In-memory + SQLite persistence |
-| PeerManager | Full | SQLite persistence, backoff, type tracking |
+| BanManager | Full | In-memory + SQLite persistence, auto-ban escalation, time-limited bans |
+| PeerManager | Full | SQLite persistence, backoff, type tracking, direction-filtered queries |
 | TxAdverts | Full | Queuing, batching, history cache |
 | TxDemandsManager | Full | Demand scheduling, pull latency |
 | SurveyManager | Full | Encryption/signatures in app layer (survey_impl.rs) |
 | OverlayMetrics | Full | Counters and timers for all message types |
 | PeerBareAddress | Full | Mapped to PeerAddress in lib.rs |
-| MessageCodec (framing) | Full | Length-prefix with auth bit |
+| MessageCodec (framing) | Full | Length-prefix with auth bit (bit 31) |
+| Error Handling | Full | ERR_LOAD load shedding, 100-byte truncation, send_error_and_drop |
 
 ## File Mapping
 

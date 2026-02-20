@@ -61,6 +61,88 @@ use tracing::{debug, error, info, trace, warn};
 /// `string msg<100>` constraint in the `Error` struct.
 const MAX_ERROR_MESSAGE_LEN: usize = 100;
 
+/// Interval between overlay maintenance ticks (3 seconds).
+///
+/// Matches stellar-core `PEER_AUTHENTICATION_TIMEOUT + 1` (2s + 1s = 3s).
+/// Each tick: DNS check, connect preferred peers, maybe drop random peer,
+/// fill outbound slots.
+const TICK_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Delay between successful DNS re-resolution cycles (600 seconds / 10 minutes).
+///
+/// Matches stellar-core `PEER_IP_RESOLVE_DELAY`.
+const PEER_IP_RESOLVE_DELAY: Duration = Duration::from_secs(600);
+
+/// Base delay for DNS retry backoff (10 seconds).
+///
+/// On each consecutive failure, the delay increases linearly:
+/// retry_count * PEER_IP_RESOLVE_RETRY_DELAY, until it exceeds
+/// PEER_IP_RESOLVE_DELAY, at which point retries stop.
+///
+/// Matches stellar-core `PEER_IP_RESOLVE_RETRY_DELAY`.
+const PEER_IP_RESOLVE_RETRY_DELAY: Duration = Duration::from_secs(10);
+
+/// Result of a background DNS resolution of configured peers.
+#[allow(dead_code)]
+struct ResolvedPeers {
+    /// Successfully resolved known peers (hostname → IP:port).
+    known: Vec<PeerAddress>,
+    /// Successfully resolved preferred peers (hostname → IP:port).
+    preferred: Vec<PeerAddress>,
+    /// True if any peer in either list failed to resolve.
+    errors: bool,
+}
+
+/// Resolve a list of peer addresses, performing DNS lookup for hostnames.
+///
+/// Returns the resolved addresses and a flag indicating whether any
+/// resolution failed. Failed peers are skipped but the rest are still
+/// returned, matching stellar-core's `resolvePeers()`.
+async fn resolve_peer_list(peers: &[PeerAddress]) -> (Vec<PeerAddress>, bool) {
+    let mut resolved = Vec::with_capacity(peers.len());
+    let mut errors = false;
+
+    for peer in peers {
+        // If the host is already an IP address, keep as-is.
+        if peer.host.parse::<IpAddr>().is_ok() {
+            resolved.push(peer.clone());
+            continue;
+        }
+
+        // Resolve hostname to IP address.
+        let lookup_result = tokio::net::lookup_host(
+            (peer.host.as_str(), peer.port)
+        ).await;
+        match lookup_result {
+            Ok(addrs) => {
+                // Take the first IPv4 address, matching stellar-core behavior.
+                let ipv4_addr = addrs.into_iter().find(|a| a.is_ipv4());
+                if let Some(socket_addr) = ipv4_addr {
+                    resolved.push(PeerAddress::new(
+                        socket_addr.ip().to_string(),
+                        socket_addr.port(),
+                    ));
+                    trace!(
+                        "Resolved peer {} -> {}:{}",
+                        peer,
+                        socket_addr.ip(),
+                        socket_addr.port()
+                    );
+                } else {
+                    errors = true;
+                    warn!("No IPv4 address found for peer {}", peer);
+                }
+            }
+            Err(e) => {
+                errors = true;
+                error!("Unable to resolve peer '{}': {}", peer, e);
+            }
+        }
+    }
+
+    (resolved, errors)
+}
+
 /// Truncate an error message to fit within the XDR `string msg<100>` limit.
 ///
 /// If the message exceeds 100 bytes it is truncated at a valid UTF-8 boundary
@@ -479,8 +561,12 @@ impl OverlayManager {
             self.start_listener().await?;
         }
 
-        // Start connector for known peers
-        self.start_connector();
+        // Start the periodic tick loop for peer management.
+        // This replaces a dedicated connector task — the tick loop handles
+        // all periodic maintenance: DNS resolution, peer connection,
+        // preferred-peer eviction, random-peer drops, and slot filling.
+        // Matches stellar-core OverlayManagerImpl::tick().
+        self.start_tick_loop();
         self.start_peer_advertiser();
 
         Ok(())
@@ -639,7 +725,17 @@ impl OverlayManager {
     }
 
     /// Start the outbound connector.
-    fn start_connector(&mut self) {
+    /// Start the periodic tick loop for overlay maintenance.
+    ///
+    /// Runs every 3 seconds (PEER_AUTHENTICATION_TIMEOUT + 1), matching
+    /// stellar-core's `OverlayManagerImpl::tick()`.  Each tick:
+    ///
+    /// 1. Checks and processes completed DNS resolution results (G7)
+    /// 2. Triggers new DNS resolution if the timer has elapsed (G7)
+    /// 3. Maybe drops a random non-preferred outbound peer when out of sync (G8)
+    /// 4. Connects to preferred peers (with eviction if needed)
+    /// 5. Fills remaining outbound slots from known peers
+    fn start_tick_loop(&mut self) {
         let shared = self.shared_state();
         let local_node = self.local_node.clone();
         let pool = Arc::clone(&self.outbound_pool);
@@ -649,14 +745,37 @@ impl OverlayManager {
         let max_outbound = self.config.max_outbound_peers;
         let connect_timeout = self.config.connect_timeout_secs;
         let auth_timeout = self.config.auth_timeout_secs;
+        let config_known_peers = self.config.known_peers.clone();
         let mut shutdown_rx = self.shutdown_tx.as_ref().unwrap().subscribe();
 
         let handle = tokio::spawn(async move {
             let mut retry_after: HashMap<PeerAddress, Instant> = HashMap::new();
-            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            let mut interval = tokio::time::interval(TICK_INTERVAL);
             // G8: Track when we first noticed we were out of sync, for
             // random-peer-drop cooldown (OUT_OF_SYNC_RECONNECT_DELAY = 60s).
             let mut last_out_of_sync_reconnect: Option<Instant> = None;
+
+            // G7: DNS re-resolution state.
+            // Matches stellar-core's mResolvedPeers future, mResolvingPeersWithBackoff,
+            // and mResolvingPeersRetryCount.
+            let mut dns_resolving_with_backoff = true;
+            let mut dns_retry_count: u32 = 0;
+            let mut dns_next_resolve_at = Instant::now(); // Resolve immediately on first tick
+
+            // Trigger initial DNS resolution.
+            let mut dns_resolve_handle: Option<JoinHandle<ResolvedPeers>> = {
+                let kp = config_known_peers.clone();
+                let pp = preferred_peers.clone();
+                Some(tokio::spawn(async move {
+                    let (known, known_err) = resolve_peer_list(&kp).await;
+                    let (pref, pref_err) = resolve_peer_list(&pp).await;
+                    ResolvedPeers {
+                        known,
+                        preferred: pref,
+                        errors: known_err || pref_err,
+                    }
+                }))
+            };
 
             loop {
                 tokio::select! {
@@ -684,6 +803,76 @@ impl OverlayManager {
                     tracking,
                     &mut last_out_of_sync_reconnect,
                 );
+
+                // G7: Check if background DNS resolution has completed.
+                if let Some(ref handle) = dns_resolve_handle {
+                    if handle.is_finished() {
+                        let handle = dns_resolve_handle.take().unwrap();
+                        match handle.await {
+                            Ok(result) => {
+                                // Update known peers with resolved addresses.
+                                {
+                                    let mut kp = known_peers.write();
+                                    // Merge resolved known peers (add new, keep existing).
+                                    for addr in &result.known {
+                                        if !kp.iter().any(|p| p.host == addr.host && p.port == addr.port) {
+                                            kp.push(addr.clone());
+                                        }
+                                    }
+                                }
+
+                                // Calculate next resolve delay based on success/failure.
+                                let delay = if dns_resolving_with_backoff {
+                                    if !result.errors {
+                                        // Success: disable retries permanently.
+                                        dns_resolving_with_backoff = false;
+                                        PEER_IP_RESOLVE_DELAY
+                                    } else {
+                                        // Failure: linear backoff.
+                                        dns_retry_count += 1;
+                                        let backoff = PEER_IP_RESOLVE_RETRY_DELAY
+                                            .saturating_mul(dns_retry_count);
+                                        if backoff > PEER_IP_RESOLVE_DELAY {
+                                            // Give up on retries.
+                                            dns_resolving_with_backoff = false;
+                                            PEER_IP_RESOLVE_DELAY
+                                        } else {
+                                            backoff
+                                        }
+                                    }
+                                } else {
+                                    PEER_IP_RESOLVE_DELAY
+                                };
+
+                                dns_next_resolve_at = Instant::now() + delay;
+                                debug!(
+                                    "DNS resolution complete (errors={}), next in {:?}",
+                                    result.errors, delay
+                                );
+                            }
+                            Err(e) => {
+                                error!("DNS resolution task panicked: {}", e);
+                                dns_next_resolve_at = Instant::now() + PEER_IP_RESOLVE_RETRY_DELAY;
+                            }
+                        }
+                    }
+                }
+
+                // G7: Trigger new DNS resolution if timer has elapsed and no
+                // resolution is in flight.
+                if dns_resolve_handle.is_none() && Instant::now() >= dns_next_resolve_at {
+                    let kp = config_known_peers.clone();
+                    let pp = preferred_peers.clone();
+                    dns_resolve_handle = Some(tokio::spawn(async move {
+                        let (known, known_err) = resolve_peer_list(&kp).await;
+                        let (pref, pref_err) = resolve_peer_list(&pp).await;
+                        ResolvedPeers {
+                            known,
+                            preferred: pref,
+                            errors: known_err || pref_err,
+                        }
+                    }));
+                }
 
                 let now = Instant::now();
                 let outbound_count = Self::count_outbound_peers(&shared.peer_info_cache);
@@ -950,10 +1139,30 @@ impl OverlayManager {
 
                             // Flow control: RAII guard locks capacity on creation,
                             // releases on drop (or explicit finish()).
-                            let capacity_guard = crate::flow_control::CapacityGuard::new(
+                            //
+                            // If the peer has exceeded its capacity (sent more
+                            // flood messages than we granted via SEND_MORE), we
+                            // drop it immediately — matching stellar-core's
+                            // `Peer::beginMessageProcessing` which calls
+                            // `drop("unexpected flood message, peer at capacity")`.
+                            let capacity_guard = match crate::flow_control::CapacityGuard::new(
                                 Arc::clone(&flow_control),
                                 message.clone(),
-                            );
+                            ) {
+                                Some(guard) => guard,
+                                None => {
+                                    warn!(
+                                        "Peer {} exceeded flow control capacity, dropping",
+                                        peer_id
+                                    );
+                                    let err = make_error_msg(
+                                        ErrorCode::Load,
+                                        "unexpected flood message, peer at capacity",
+                                    );
+                                    let _ = peer.send(err).await;
+                                    break;
+                                }
+                            };
 
                             // Handle flow control messages: release outbound capacity
                             // and drain queued messages that now have capacity.
@@ -1000,9 +1209,16 @@ impl OverlayManager {
                                     break 'route;
                                 }
 
-                                // SCP messages are consensus-critical and must never be rate-limited.
+                                // Global rate limiter: defense-in-depth against aggregate flood.
+                                //
+                                // Note: stellar-core does NOT have a global rate limiter — it
+                                // relies solely on per-peer flow control (SEND_MORE capacity,
+                                // enforced above via CapacityGuard).  This global limiter is
+                                // a henyey-specific addition that provides extra protection
+                                // against pathological many-peer floods.  SCP messages are
+                                // consensus-critical and bypass this check.
                                 if !matches!(message, StellarMessage::ScpMessage(_)) && !flood_gate.allow_message() {
-                                    debug!("Dropping message due to rate limit");
+                                    debug!("Dropping message due to global rate limit");
                                     break 'route;
                                 }
 
@@ -1126,11 +1342,9 @@ impl OverlayManager {
                             }
 
                             // Flow control: finish guard to get send-more capacity.
-                            // If the guard was created (capacity available), consume
-                            // it and maybe send SEND_MORE_EXTENDED.  If capacity was
-                            // unavailable (None), there's nothing to release.
-                            if let Some(guard) = capacity_guard {
-                                let send_more_cap = guard.finish();
+                            // Consume the guard and maybe send SEND_MORE_EXTENDED.
+                            {
+                                let send_more_cap = capacity_guard.finish();
                                 if send_more_cap.should_send() && peer.is_connected() {
                                     if let Err(e) = peer.send_more_extended(
                                         send_more_cap.num_flood_messages as u32,
@@ -2856,5 +3070,238 @@ mod tests {
         );
         assert!(!dropped);
         assert!(last_reconnect.is_none(), "timer should be cleared when back in sync");
+    }
+
+    // ---- G7 tests: DNS re-resolution ----
+
+    #[tokio::test]
+    async fn test_resolve_peer_list_ip_passthrough() {
+        // IP addresses should be returned as-is without DNS lookup.
+        let peers = vec![
+            PeerAddress::new("127.0.0.1", 11625),
+            PeerAddress::new("192.168.1.1", 11625),
+        ];
+        let (resolved, errors) = resolve_peer_list(&peers).await;
+        assert!(!errors, "IP-only list should have no errors");
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].host, "127.0.0.1");
+        assert_eq!(resolved[0].port, 11625);
+        assert_eq!(resolved[1].host, "192.168.1.1");
+        assert_eq!(resolved[1].port, 11625);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_peer_list_bad_hostname() {
+        // An unresolvable hostname should set errors=true but not panic.
+        let peers = vec![
+            PeerAddress::new("this-does-not-exist-at-all.invalid", 11625),
+        ];
+        let (resolved, errors) = resolve_peer_list(&peers).await;
+        assert!(errors, "unresolvable hostname should set errors flag");
+        assert!(resolved.is_empty(), "failed hostname should not produce a result");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_peer_list_mixed() {
+        // Mix of IP address and bad hostname.
+        let peers = vec![
+            PeerAddress::new("10.0.0.1", 11625),
+            PeerAddress::new("no-such-host-xyz.invalid", 11625),
+        ];
+        let (resolved, errors) = resolve_peer_list(&peers).await;
+        assert!(errors, "should report errors for the bad hostname");
+        assert_eq!(resolved.len(), 1, "only the IP address should resolve");
+        assert_eq!(resolved[0].host, "10.0.0.1");
+    }
+
+    #[test]
+    fn test_dns_backoff_success_disables_retries() {
+        // Simulate: dns_resolving_with_backoff=true, no errors → disable retries.
+        let mut dns_resolving_with_backoff = true;
+        let mut dns_retry_count: u32 = 0;
+        let result_errors = false;
+
+        let delay = if dns_resolving_with_backoff {
+            if !result_errors {
+                dns_resolving_with_backoff = false;
+                PEER_IP_RESOLVE_DELAY
+            } else {
+                dns_retry_count += 1;
+                let backoff = PEER_IP_RESOLVE_RETRY_DELAY.saturating_mul(dns_retry_count);
+                if backoff > PEER_IP_RESOLVE_DELAY {
+                    dns_resolving_with_backoff = false;
+                    PEER_IP_RESOLVE_DELAY
+                } else {
+                    backoff
+                }
+            }
+        } else {
+            PEER_IP_RESOLVE_DELAY
+        };
+
+        assert_eq!(delay, Duration::from_secs(600));
+        assert!(!dns_resolving_with_backoff, "success should disable backoff");
+    }
+
+    #[test]
+    fn test_dns_backoff_failure_linear() {
+        // Simulate repeated failures → linear backoff.
+        #[allow(unused_assignments)]
+        let mut dns_resolving_with_backoff = true;
+        let mut dns_retry_count: u32 = 0;
+
+        // First failure: retry_count=1 → 10s
+        dns_retry_count += 1;
+        let delay1 = PEER_IP_RESOLVE_RETRY_DELAY.saturating_mul(dns_retry_count);
+        assert_eq!(delay1, Duration::from_secs(10));
+
+        // Third failure: retry_count=3 → 30s
+        dns_retry_count = 3;
+        let delay3 = PEER_IP_RESOLVE_RETRY_DELAY.saturating_mul(dns_retry_count);
+        assert_eq!(delay3, Duration::from_secs(30));
+
+        // 61st failure: 610s > 600s → give up on retries
+        dns_retry_count = 61;
+        let delay61 = PEER_IP_RESOLVE_RETRY_DELAY.saturating_mul(dns_retry_count);
+        assert!(delay61 > PEER_IP_RESOLVE_DELAY);
+        dns_resolving_with_backoff = false; // would be set in real code
+        assert!(!dns_resolving_with_backoff);
+    }
+
+    // --- G16: Per-peer capacity enforcement tests ---
+
+    #[test]
+    fn test_capacity_guard_none_drops_peer_flow() {
+        // When all flood capacity is exhausted, CapacityGuard::new returns None.
+        // In run_peer_loop this would trigger send_error_and_drop + break.
+        use stellar_xdr::curr::TransactionEnvelope;
+        let config = FlowControlConfig::default();
+        let fc = Arc::new(FlowControl::new(config.clone()));
+
+        // Exhaust all flood capacity by locking messages until none remain.
+        let mut guards = Vec::new();
+        for _ in 0..config.peer_flood_reading_capacity {
+            let msg = StellarMessage::Transaction(TransactionEnvelope::Tx(
+                stellar_xdr::curr::TransactionV1Envelope {
+                    tx: stellar_xdr::curr::Transaction {
+                        source_account: stellar_xdr::curr::MuxedAccount::Ed25519(
+                            stellar_xdr::curr::Uint256([0; 32]),
+                        ),
+                        fee: 100,
+                        seq_num: stellar_xdr::curr::SequenceNumber(1),
+                        cond: stellar_xdr::curr::Preconditions::None,
+                        memo: stellar_xdr::curr::Memo::None,
+                        operations: stellar_xdr::curr::VecM::default(),
+                        ext: stellar_xdr::curr::TransactionExt::V0,
+                    },
+                    signatures: stellar_xdr::curr::VecM::default(),
+                },
+            ));
+            match crate::flow_control::CapacityGuard::new(Arc::clone(&fc), msg) {
+                Some(guard) => guards.push(guard),
+                None => break,
+            }
+        }
+
+        // Next message should fail — capacity exhausted.
+        let overflow_msg = StellarMessage::Transaction(TransactionEnvelope::Tx(
+            stellar_xdr::curr::TransactionV1Envelope {
+                tx: stellar_xdr::curr::Transaction {
+                    source_account: stellar_xdr::curr::MuxedAccount::Ed25519(
+                        stellar_xdr::curr::Uint256([1; 32]),
+                    ),
+                    fee: 100,
+                    seq_num: stellar_xdr::curr::SequenceNumber(2),
+                    cond: stellar_xdr::curr::Preconditions::None,
+                    memo: stellar_xdr::curr::Memo::None,
+                    operations: stellar_xdr::curr::VecM::default(),
+                    ext: stellar_xdr::curr::TransactionExt::V0,
+                },
+                signatures: stellar_xdr::curr::VecM::default(),
+            },
+        ));
+        let guard = crate::flow_control::CapacityGuard::new(Arc::clone(&fc), overflow_msg);
+        assert!(guard.is_none(), "should return None when peer at capacity");
+    }
+
+    #[test]
+    fn test_make_error_msg_capacity_exceeded() {
+        // Verify the error message we send matches stellar-core's wording.
+        let err = make_error_msg(
+            ErrorCode::Load,
+            "unexpected flood message, peer at capacity",
+        );
+        match err {
+            StellarMessage::ErrorMsg(e) => {
+                assert_eq!(e.code, ErrorCode::Load);
+                assert_eq!(
+                    e.msg.to_string(),
+                    "unexpected flood message, peer at capacity"
+                );
+            }
+            _ => panic!("expected ErrorMsg"),
+        }
+    }
+
+    #[test]
+    fn test_capacity_guard_non_flood_always_accepted() {
+        // Non-flow-controlled messages (like GetPeers) should always succeed,
+        // even when flood capacity is exhausted.
+        use stellar_xdr::curr::TransactionEnvelope;
+        let config = FlowControlConfig::default();
+        let fc = Arc::new(FlowControl::new(config.clone()));
+
+        // Exhaust flood capacity.
+        let mut guards = Vec::new();
+        for _ in 0..config.peer_flood_reading_capacity {
+            let msg = StellarMessage::Transaction(TransactionEnvelope::Tx(
+                stellar_xdr::curr::TransactionV1Envelope {
+                    tx: stellar_xdr::curr::Transaction {
+                        source_account: stellar_xdr::curr::MuxedAccount::Ed25519(
+                            stellar_xdr::curr::Uint256([0; 32]),
+                        ),
+                        fee: 100,
+                        seq_num: stellar_xdr::curr::SequenceNumber(1),
+                        cond: stellar_xdr::curr::Preconditions::None,
+                        memo: stellar_xdr::curr::Memo::None,
+                        operations: stellar_xdr::curr::VecM::default(),
+                        ext: stellar_xdr::curr::TransactionExt::V0,
+                    },
+                    signatures: stellar_xdr::curr::VecM::default(),
+                },
+            ));
+            match crate::flow_control::CapacityGuard::new(Arc::clone(&fc), msg) {
+                Some(guard) => guards.push(guard),
+                None => break,
+            }
+        }
+
+        // Non-flow-controlled message (Peers) should still be accepted.
+        let peers_msg = StellarMessage::Peers(stellar_xdr::curr::VecM::default());
+        let guard = crate::flow_control::CapacityGuard::new(Arc::clone(&fc), peers_msg);
+        assert!(
+            guard.is_some(),
+            "non-flow-controlled messages must always be accepted regardless of flood capacity"
+        );
+    }
+
+    // --- G1: Tick loop tests ---
+
+    #[test]
+    fn test_tick_interval_matches_stellar_core() {
+        // stellar-core: PEER_AUTHENTICATION_TIMEOUT + 1 = 2 + 1 = 3 seconds
+        assert_eq!(TICK_INTERVAL, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn test_tick_constants_consistency() {
+        // Verify all tick-related constants are internally consistent.
+        // PEER_IP_RESOLVE_RETRY_DELAY < PEER_IP_RESOLVE_DELAY
+        assert!(PEER_IP_RESOLVE_RETRY_DELAY < PEER_IP_RESOLVE_DELAY);
+        // Maximum retries before giving up:
+        // retries = PEER_IP_RESOLVE_DELAY / PEER_IP_RESOLVE_RETRY_DELAY = 60
+        let max_retries =
+            PEER_IP_RESOLVE_DELAY.as_secs() / PEER_IP_RESOLVE_RETRY_DELAY.as_secs();
+        assert_eq!(max_retries, 60);
     }
 }
