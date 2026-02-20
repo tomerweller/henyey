@@ -25,7 +25,7 @@
 //! ```
 
 use crate::{OverlayError, PeerAddress, Result};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rand::seq::SliceRandom;
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
@@ -175,7 +175,7 @@ pub struct PeerManager {
     /// In-memory cache of peers for fast lookups.
     cache: RwLock<HashMap<(String, u16), PeerRecord>>,
     /// Database connection (optional - if None, peers are in-memory only).
-    db: Option<Arc<RwLock<Connection>>>,
+    db: Option<Arc<Mutex<Connection>>>,
 }
 
 impl std::fmt::Debug for PeerManager {
@@ -211,8 +211,7 @@ impl PeerManager {
             info!("Loaded {} peers from database", num_loaded);
         }
 
-        #[allow(clippy::arc_with_non_send_sync)]
-        let db = Arc::new(RwLock::new(conn));
+        let db = Arc::new(Mutex::new(conn));
 
         Ok(Self {
             cache: RwLock::new(cache),
@@ -226,8 +225,7 @@ impl PeerManager {
 
         let cache = Self::load_all_from_db(&conn)?;
 
-        #[allow(clippy::arc_with_non_send_sync)]
-        let db = Arc::new(RwLock::new(conn));
+        let db = Arc::new(Mutex::new(conn));
 
         Ok(Self {
             cache: RwLock::new(cache),
@@ -297,7 +295,7 @@ impl PeerManager {
 
         // Insert into database
         if let Some(ref db) = self.db {
-            let conn = db.write();
+            let conn = db.lock();
             conn.execute(
                 "INSERT OR IGNORE INTO peers (ip, port, nextattempt, numfailures, type) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
@@ -333,7 +331,7 @@ impl PeerManager {
 
         // Update database
         if let Some(ref db) = self.db {
-            let conn = db.write();
+            let conn = db.lock();
             conn.execute(
                 "INSERT OR REPLACE INTO peers (ip, port, nextattempt, numfailures, type) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
@@ -484,7 +482,7 @@ impl PeerManager {
     pub fn remove_peers_with_many_failures(&self, min_num_failures: u32) -> Result<()> {
         // Remove from database
         if let Some(ref db) = self.db {
-            let conn = db.write();
+            let conn = db.lock();
             conn.execute(
                 "DELETE FROM peers WHERE numfailures >= ?1",
                 params![min_num_failures as i32],
@@ -550,7 +548,7 @@ impl PeerManager {
     /// Clear all peers.
     pub fn clear_all(&self) -> Result<()> {
         if let Some(ref db) = self.db {
-            let conn = db.write();
+            let conn = db.lock();
             conn.execute("DELETE FROM peers", []).map_err(|e| {
                 OverlayError::DatabaseError(format!("Failed to clear peers: {}", e))
             })?;
