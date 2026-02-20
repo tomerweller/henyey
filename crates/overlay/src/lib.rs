@@ -185,6 +185,9 @@ pub struct OverlayConfig {
     /// Peer authentication timeout in seconds.
     ///
     /// Maximum time to wait for the Hello/Auth handshake to complete.
+    /// Matches stellar-core's `Peer::getIOTimeout()` which returns 2s
+    /// for unauthenticated peers (during handshake). The separate 30s
+    /// idle timeout for authenticated peers is enforced in the peer loop.
     pub auth_timeout_secs: u64,
 
     /// Connection timeout in seconds.
@@ -220,6 +223,14 @@ pub struct OverlayConfig {
     /// If set, the overlay manager will send [`PeerEvent`] notifications
     /// when peers connect or disconnect.
     pub peer_event_tx: Option<mpsc::Sender<PeerEvent>>,
+
+    /// Optional peer manager for persistent peer storage.
+    ///
+    /// When provided, the overlay will:
+    /// - Store `known_peers` and `preferred_peers` on startup (G5)
+    /// - Purge peers with >= 120 failures on startup (G6)
+    /// - Use stored peers for connection rotation in the tick loop
+    pub peer_manager: Option<std::sync::Arc<PeerManager>>,
 }
 
 /// Peer connection events emitted by the overlay.
@@ -253,13 +264,14 @@ impl Default for OverlayConfig {
             known_peers: Vec::new(),
             preferred_peers: Vec::new(),
             network_passphrase: "Test SDF Network ; September 2015".to_string(),
-            auth_timeout_secs: 30,
+            auth_timeout_secs: 2,
             connect_timeout_secs: 10,
             flood_ttl_secs: 300,
             listen_enabled: true,
             is_validator: true,
             version_string: VERSION_STRING.to_string(),
             peer_event_tx: None,
+            peer_manager: None,
         }
     }
 }
@@ -637,6 +649,14 @@ mod tests {
             config.network_passphrase,
             "Test SDF Network ; September 2015"
         );
+    }
+
+    #[test]
+    fn test_auth_timeout_matches_upstream_g2() {
+        // G2: stellar-core Peer::getIOTimeout() returns 2s for unauthenticated
+        // peers (during handshake). The default auth_timeout_secs must be 2.
+        let config = OverlayConfig::default();
+        assert_eq!(config.auth_timeout_secs, 2, "auth_timeout_secs should be 2s matching stellar-core getIOTimeout()");
     }
 
     #[test]

@@ -178,6 +178,15 @@ pub struct PeerManager {
     db: Option<Arc<RwLock<Connection>>>,
 }
 
+impl std::fmt::Debug for PeerManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerManager")
+            .field("peer_count", &self.cache.read().len())
+            .field("has_db", &self.db.is_some())
+            .finish()
+    }
+}
+
 impl PeerManager {
     /// Create a new peer manager with in-memory storage only.
     pub fn new_in_memory() -> Self {
