@@ -1794,15 +1794,16 @@ Restores archived Soroban ledger entries to live state.
 `@version(≥23)`: Soroban transactions MAY be grouped into a parallel
 execution structure:
 
-```
-Phase (Soroban)
-  └─ Stage 1
-  │    ├─ Cluster A  [tx1, tx2]     ← parallel
-  │    ├─ Cluster B  [tx3]          ← parallel
-  │    └─ Cluster C  [tx4, tx5]     ← parallel
-  └─ Stage 2
-       ├─ Cluster D  [tx6]          ← parallel
-       └─ Cluster E  [tx7, tx8]     ← parallel
+```mermaid
+graph TD
+    Phase[Phase - Soroban]
+    Phase --> S1[Stage 1]
+    Phase --> S2[Stage 2]
+    S1 --> CA["Cluster A  [tx1, tx2]  ← parallel"]
+    S1 --> CB["Cluster B  [tx3]  ← parallel"]
+    S1 --> CC["Cluster C  [tx4, tx5]  ← parallel"]
+    S2 --> CD["Cluster D  [tx6]  ← parallel"]
+    S2 --> CE["Cluster E  [tx7, tx8]  ← parallel"]
 ```
 
 **Invariants**:
@@ -1853,14 +1854,15 @@ Ledger state is accessed through a hierarchical nesting of ledger
 transactions (abbreviated "ltx"). Each ltx provides a scoped, mutable
 view of ledger state with commit/rollback semantics:
 
-```
-LedgerTxnRoot (persistent storage + BucketList)
-  └─ LedgerTxn (ledger close)
-       └─ LedgerTxn (fee processing)
-       └─ LedgerTxn (transaction apply)
-            └─ LedgerTxn (operation 1)
-            └─ LedgerTxn (operation 2)
-            ...
+```mermaid
+graph TD
+    Root["LedgerTxnRoot (persistent storage + BucketList)"]
+    Root --> LC["LedgerTxn (ledger close)"]
+    LC --> FP["LedgerTxn (fee processing)"]
+    LC --> TA["LedgerTxn (transaction apply)"]
+    TA --> Op1["LedgerTxn (operation 1)"]
+    TA --> Op2["LedgerTxn (operation 2)"]
+    TA --> Opn["..."]
 ```
 
 ### 9.2 Entry States
@@ -2389,38 +2391,30 @@ flowchart LR
 
 ### Appendix D: Nested Ledger Transaction Model
 
-```
-LedgerTxnRoot ─────────────── Database + BucketList
-  │
-  └─ LedgerTxn (ledger close) ─── Accumulates all changes
-       │
-       ├─ LedgerTxn (fee pass) ──── Fee deductions, seq num advances
-       │                              → committed before ops
-       │
-       └─ LedgerTxn (tx apply) ─── Transaction scope
-            │
-            ├─ LedgerTxn (op 1) ── Success → commit to parent
-            │                       Failure → rollback
-            ├─ LedgerTxn (op 2)
-            │    ...
-            └─ LedgerTxn (op N)
+```mermaid
+graph TD
+    Root["LedgerTxnRoot — Database + BucketList"]
+    Root --> LC["LedgerTxn (ledger close) — Accumulates all changes"]
+    LC --> FP["LedgerTxn (fee pass) — Fee deductions, seq num advances\ncommitted before ops"]
+    LC --> TA["LedgerTxn (tx apply) — Transaction scope"]
+    TA --> Op1["LedgerTxn (op 1) — Success → commit to parent\nFailure → rollback"]
+    TA --> Op2["LedgerTxn (op 2)"]
+    TA --> OpN["LedgerTxn (op N)"]
 ```
 
 ### Appendix E: State Merge Table
 
 When a child ledger transaction commits, entries merge into the parent:
 
-```
-Parent\Child │  INIT       │  LIVE       │  DELETED
-─────────────┼─────────────┼─────────────┼─────────────
-  (none)     │  INIT       │  LIVE       │  DELETED
-  INIT       │  (invalid)  │  INIT†      │  (erased)‡
-  LIVE       │  (invalid)  │  LIVE†      │  DELETED
-  DELETED    │  LIVE§      │  (invalid)  │  (invalid)
+| Parent \ Child | INIT | LIVE | DELETED |
+|---|---|---|---|
+| (none) | INIT | LIVE | DELETED |
+| INIT | (invalid) | INIT † | (erased) ‡ |
+| LIVE | (invalid) | LIVE † | DELETED |
+| DELETED | LIVE § | (invalid) | (invalid) |
 
-† Data updated from child
-‡ Annihilation: entry erased entirely
+† Data updated from child  
+‡ Annihilation: entry erased entirely  
 § Re-creation
-```
 
 [rfc2119]: https://www.rfc-editor.org/rfc/rfc2119

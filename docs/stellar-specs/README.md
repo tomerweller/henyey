@@ -26,36 +26,22 @@ these documents are to be interpreted as described in
 The Stellar protocol is composed of seven subsystems. Each has a
 dedicated specification document in this directory.
 
-```
-                         ┌──────────────────────┐
-                         │       Overlay         │
-                         │  (peer networking,    │
-                         │   message flooding)   │
-                         └──────────┬───────────┘
-                                    │
-                         ┌──────────┴───────────┐
-                         │       Herder          │
-                         │  (orchestration,      │
-                         │   tx pool, tx sets)   │
-                         └──┬───────┬────────┬──┘
-                            │       │        │
-                 ┌──────────┴──┐    │   ┌────┴──────────┐
-                 │     SCP      │    │   │    Catchup     │
-                 │  (consensus) │    │   │  (history      │
-                 │              │    │   │   archives)    │
-                 └──────────────┘    │   └───────────────┘
-                                     │
-                         ┌───────────┴──────────┐
-                         │       Ledger          │
-                         │  (close pipeline,     │
-                         │   state management)   │
-                         └──┬────────────────┬──┘
-                            │                │
-                 ┌──────────┴──┐    ┌────────┴──────────┐
-                 │ Transactions │    │    BucketListDB    │
-                 │ (validation, │    │  (persistent       │
-                 │  application)│    │   state storage)   │
-                 └──────────────┘    └───────────────────┘
+```mermaid
+graph TD
+    OV["**Overlay**\npeer networking, message flooding"]
+    HD["**Herder**\norchestration, tx pool, tx sets"]
+    SCP["**SCP**\nconsensus"]
+    CU["**Catchup**\nhistory archives"]
+    LD["**Ledger**\nclose pipeline, state management"]
+    TX["**Transactions**\nvalidation, application"]
+    BL["**BucketListDB**\npersistent state storage"]
+
+    OV --> HD
+    HD --> SCP
+    HD --> CU
+    HD --> LD
+    LD --> TX
+    LD --> BL
 ```
 
 ---

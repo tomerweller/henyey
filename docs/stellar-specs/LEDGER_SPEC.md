@@ -598,15 +598,16 @@ transactions.
 
 The system forms a tree:
 
-```
-LedgerTxnRoot (connected to persistent database)
-  └── LedgerTxn (top-level, one per ledger close)
-        ├── LedgerTxn (fee processing)
-        ├── LedgerTxn (transaction 1 application)
-        ├── LedgerTxn (transaction 2 application)
-        │     └── LedgerTxn (inner operation)
-        ├── LedgerTxn (upgrade 1)
-        └── LedgerTxn (upgrade 2)
+```mermaid
+graph TD
+    Root["LedgerTxnRoot (persistent storage)"]
+    Root --> TL["LedgerTxn (top-level, one per ledger close)"]
+    TL --> Fee["LedgerTxn (fee processing)"]
+    TL --> Tx1["LedgerTxn (transaction 1 application)"]
+    TL --> Tx2["LedgerTxn (transaction 2 application)"]
+    TL --> Up1["LedgerTxn (upgrade 1)"]
+    TL --> Up2["LedgerTxn (upgrade 2)"]
+    Tx2 --> Op["LedgerTxn (inner operation)"]
 ```
 
 ### 6.2 LedgerTxnRoot

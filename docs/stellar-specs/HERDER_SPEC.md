@@ -121,11 +121,12 @@ The herder operates as a three-state machine:
 
 The following transitions are permitted:
 
-```
-BOOTING ──→ SYNCING
-BOOTING ──→ TRACKING
-SYNCING ──→ TRACKING
-TRACKING ──→ SYNCING
+```mermaid
+stateDiagram-v2
+    BOOTING --> SYNCING
+    BOOTING --> TRACKING
+    SYNCING --> TRACKING
+    TRACKING --> SYNCING
 ```
 
 The following transitions are **forbidden**:
@@ -557,16 +558,17 @@ non-conflicting transactions.
 
 A parallel Soroban phase has the following structure:
 
-```
-Phase 1 (Soroban)
-├── Stage 0
-│   ├── Cluster 0: [tx_a, tx_b, ...]
-│   ├── Cluster 1: [tx_c, tx_d, ...]
-│   └── ...
-├── Stage 1
-│   ├── Cluster 0: [tx_e, tx_f, ...]
-│   └── ...
-└── ...
+```mermaid
+graph TD
+    Phase["Phase 1 (Soroban)"]
+    Phase --> S0[Stage 0]
+    Phase --> S1[Stage 1]
+    Phase --> Sdot["..."]
+    S0 --> C00["Cluster 0: [tx_a, tx_b, ...]"]
+    S0 --> C01["Cluster 1: [tx_c, tx_d, ...]"]
+    S0 --> C0dot["..."]
+    S1 --> C10["Cluster 0: [tx_e, tx_f, ...]"]
+    S1 --> C1dot["..."]
 ```
 
 **Execution model:**
@@ -1388,10 +1390,12 @@ Each SCP envelope passes through the following states:
 
 Transitions:
 
-```
-[received] ──→ Fetching ──→ Ready ──→ Processed
-                  │
-                  └──→ Discarded
+```mermaid
+stateDiagram-v2
+    [*] --> Fetching : received
+    Fetching --> Ready
+    Fetching --> Discarded
+    Ready --> Processed
 ```
 
 An envelope MUST NOT transition backward (e.g., from Ready to

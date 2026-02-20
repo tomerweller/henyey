@@ -163,21 +163,26 @@ is exactly at a checkpoint boundary and no replay is requested.
 
 ### 2.3 Component Relationships
 
-```
-SCP / Herder
-     │
-     ▼
-Ledger Apply Manager  ←── buffers externalized ledgers
-     │                     decides: apply sequentially or trigger catchup
-     ├──→ Ledger Close Pipeline (normal sequential apply)
-     │
-     └──→ Catchup Pipeline (when gap detected)
-            │
-            ├── History Archive Manager (select archive, download files)
-            ├── Ledger Chain Verification (verify hash chain)
-            ├── Bucket Application (restore BucketList state)
-            ├── Transaction Replay (apply historical ledgers)
-            └── Buffered Ledger Application (drain SCP-buffered ledgers)
+```mermaid
+graph TD
+    SCP["SCP / Herder"]
+    LAM["Ledger Apply Manager\n(buffers externalized ledgers;\ndecides: apply sequentially or trigger catchup)"]
+    LCP["Ledger Close Pipeline\n(normal sequential apply)"]
+    CP["Catchup Pipeline\n(when gap detected)"]
+    HAM["History Archive Manager\n(select archive, download files)"]
+    LCV["Ledger Chain Verification\n(verify hash chain)"]
+    BA["Bucket Application\n(restore BucketList state)"]
+    TR["Transaction Replay\n(apply historical ledgers)"]
+    BLA["Buffered Ledger Application\n(drain SCP-buffered ledgers)"]
+
+    SCP --> LAM
+    LAM --> LCP
+    LAM --> CP
+    CP --> HAM
+    CP --> LCV
+    CP --> BA
+    CP --> TR
+    CP --> BLA
 ```
 
 ---
@@ -1257,20 +1262,24 @@ sequenceDiagram
 
 ### Appendix D: Ledger Chain Verification Direction
 
-```
-Checkpoint files:  [CP₁] [CP₂] [CP₃] ... [CPₙ₋₁] [CPₙ]
-                   low ──────────────────────────── high
+Verification proceeds from the highest checkpoint down to the lowest,
+with each checkpoint verified against the hash-link provided by its
+successor:
 
-Verification:       ◄──── ◄──── ◄──── ... ◄────── ◄────
-                                                    │
-                                            Trust from SCP
-                                            or config hash
+```mermaid
+graph RL
+    TRUST["Trust from SCP\nor config hash"]
+    CPn["CPₙ\n(highest)"]
+    CPn1["CPₙ₋₁"]
+    CPdot["..."]
+    CP2["CP₂"]
+    CP1["CP₁\n(lowest)"]
 
-Each checkpoint passes a hash-link backward:
-  CPₙ verifies against SCP trust
-  CPₙ₋₁ verifies against CPₙ's outgoing hash-link
-  ...
-  CP₁ verifies against CP₂'s outgoing hash-link
+    CPn -- "verifies against" --> TRUST
+    CPn1 -- "verifies against CPₙ's\noutgoing hash-link" --> CPn
+    CPdot --> CPn1
+    CP2 --> CPdot
+    CP1 -- "verifies against CP₂'s\noutgoing hash-link" --> CP2
 ```
 
 ### Appendix E: Catchup Range Examples

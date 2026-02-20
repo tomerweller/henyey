@@ -109,23 +109,17 @@ derivation (Section 5.3).
 
 ### 2.3 Protocol Stack
 
-```
-┌─────────────────────────────────────┐
-│  Application (SCP, Transactions)    │
-├─────────────────────────────────────┤
-│  Overlay Protocol (this spec)       │
-│  ┌───────────────────────────────┐  │
-│  │ Flow Control & Flooding       │  │
-│  ├───────────────────────────────┤  │
-│  │ Authenticated Messages (HMAC) │  │
-│  ├───────────────────────────────┤  │
-│  │ XDR Serialization             │  │
-│  └───────────────────────────────┘  │
-├─────────────────────────────────────┤
-│  Record Marking (RFC 5531)          │
-├─────────────────────────────────────┤
-│  TCP                                │
-└─────────────────────────────────────┘
+```mermaid
+block-beta
+    columns 1
+    APP["Application (SCP, Transactions)"]
+    block:OVL["Overlay Protocol (this spec)"]:1
+        FLOOD["Flow Control & Flooding"]
+        HMAC["Authenticated Messages (HMAC)"]
+        XDR["XDR Serialization"]
+    end
+    REC["Record Marking (RFC 5531)"]
+    TCP["TCP"]
 ```
 
 ---
@@ -238,29 +232,22 @@ derives per-connection MAC keys for message integrity.
 
 #### 4.4.1 Handshake Sequence
 
-```
-  Initiator (A)                          Responder (B)
-  ─────────────                          ─────────────
-  State: CONNECTING                      State: CONNECTED
-
-  ──── HELLO(CertA, NonceA) ────────>
-                                         Verify CertA
-                                         Derive keys
-                                         State → GOT_HELLO
-  <──── HELLO(CertB, NonceB) ────────
-  Verify CertB
-  Derive keys
-  State → GOT_HELLO
-
-  ──── AUTH(seq=0, MAC_AB) ──────────>
-                                         Verify MAC
-                                         State → GOT_AUTH
-  <──── AUTH(seq=0, MAC_BA) ──────────
-  <──── PEERS ────────────────────────
-  Verify MAC
-  State → GOT_AUTH
-
-  (Authenticated: all messages MACed with increasing sequence numbers)
+```mermaid
+sequenceDiagram
+    participant A as Initiator (A)
+    participant B as Responder (B)
+    note over A: State: CONNECTING
+    note over B: State: CONNECTED
+    A->>B: HELLO(CertA, NonceA)
+    note over B: Verify CertA, derive keys<br/>State → GOT_HELLO
+    B->>A: HELLO(CertB, NonceB)
+    note over A: Verify CertB, derive keys<br/>State → GOT_HELLO
+    A->>B: AUTH(seq=0, MAC_AB)
+    note over B: Verify MAC<br/>State → GOT_AUTH
+    B->>A: AUTH(seq=0, MAC_BA)
+    B->>A: PEERS
+    note over A: Verify MAC<br/>State → GOT_AUTH
+    note over A,B: Authenticated: all messages MACed with increasing sequence numbers
 ```
 
 The initiator sends HELLO first, then AUTH. The responder sends HELLO in
@@ -1083,16 +1070,16 @@ maximum-size transaction before needing an acknowledgment.
 Transactions are disseminated across the network using a **pull-mode**
 protocol:
 
-```
-  Node A                    Node B
-  ──────                    ──────
-  Has new tx T
-
-  ── FLOOD_ADVERT(hash(T)) ──>
-                              Checks: do I need T?
-  <── FLOOD_DEMAND(hash(T)) ──
-                              (yes, demand it)
-  ── TRANSACTION(T) ──────────>
+```mermaid
+sequenceDiagram
+    participant A as Node A
+    participant B as Node B
+    note over A: Has new tx T
+    A->>B: FLOOD_ADVERT(hash(T))
+    note over B: Checks: do I need T?
+    B->>A: FLOOD_DEMAND(hash(T))
+    note over B: (yes, demand it)
+    A->>B: TRANSACTION(T)
 ```
 
 This model reduces bandwidth by ensuring each node only receives
@@ -2385,52 +2372,31 @@ Key assignment:
 
 Example of a complete authenticated message on the wire:
 
-```
-Byte offset  Field                    Size       Description
-──────────── ────────────────────────  ─────────  ──────────────────────
-0            Record Marking Header     4 bytes    Length (31 bits) + last-fragment bit
-4            AuthenticatedMessage.v    4 bytes    Version tag (0x00000000)
-8            v0.sequence               8 bytes    Sequence number (big-endian uint64)
-16           v0.message.type           4 bytes    MessageType tag (big-endian int32)
-20           v0.message.<payload>      variable   XDR-encoded message payload
-20+N         v0.mac                    36 bytes   HmacSha256Mac (4-byte length + 32-byte MAC)
-```
+| Byte offset | Field | Size | Description |
+|-------------|-------|------|-------------|
+| 0 | Record Marking Header | 4 bytes | Length (31 bits) + last-fragment bit |
+| 4 | AuthenticatedMessage.v | 4 bytes | Version tag (0x00000000) |
+| 8 | v0.sequence | 8 bytes | Sequence number (big-endian uint64) |
+| 16 | v0.message.type | 4 bytes | MessageType tag (big-endian int32) |
+| 20 | v0.message.\<payload\> | variable | XDR-encoded message payload |
+| 20+N | v0.mac | 36 bytes | HmacSha256Mac (4-byte length + 32-byte MAC) |
 
 The Record Marking header length field covers everything from byte 4
 through the end of the MAC (inclusive).
 
 ### Appendix D: Handshake State Machine
 
+```mermaid
+stateDiagram-v2
+    [*] --> CONNECTING : TCP CONNECT (outbound only)
+    CONNECTING --> CONNECTED : TCP established
+    CONNECTED --> GOT_HELLO : Valid HELLO received\n(MAC keys derived)
+    GOT_HELLO --> GOT_AUTH : Valid AUTH received & accepted\n(fully authenticated)
+    GOT_AUTH --> CLOSING : Drop triggered (any reason)
+    CLOSING --> [*] : 5-second delay
+    CONNECTING --> CLOSING : Error / timeout
+    CONNECTED --> CLOSING : Error / timeout
+    GOT_HELLO --> CLOSING : Error / timeout
 ```
-                         TCP CONNECT
-                             │
-                             ▼
-                      ┌─────────────┐
-                      │ CONNECTING  │  (outbound only)
-                      └──────┬──────┘
-                             │ TCP established
-                             ▼
-                      ┌─────────────┐
-                      │  CONNECTED  │  (both inbound and outbound)
-                      └──────┬──────┘
-                             │ Valid HELLO received
-                             ▼
-                      ┌─────────────┐
-                      │  GOT_HELLO  │  MAC keys derived
-                      └──────┬──────┘
-                             │ Valid AUTH received & accepted
-                             ▼
-                      ┌─────────────┐
-                      │  GOT_AUTH   │  Fully authenticated
-                      └──────┬──────┘
-                             │ Drop triggered (any reason)
-                             ▼
-                      ┌─────────────┐
-                      │   CLOSING   │  Socket shutdown scheduled
-                      └──────┬──────┘
-                             │ 5-second delay
-                             ▼
-                        [Disconnected]
 
 Any state can transition to CLOSING on error, timeout, or explicit drop.
-```
