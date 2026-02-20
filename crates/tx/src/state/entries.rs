@@ -1464,10 +1464,7 @@ impl LedgerStateManager {
         }
 
         // Update state
-        self.contract_data.insert(key.clone(), entry.clone());
-
-        // Update snapshot to current value so flush_modified_entries doesn't record a duplicate.
-        self.contract_data_snapshots.insert(key, Some(entry));
+        self.contract_data.insert(key, entry);
     }
 
     /// Delete a contract data entry.
@@ -1605,15 +1602,7 @@ impl LedgerStateManager {
         }
 
         // Update state
-        self.contract_code.insert(key, entry.clone());
-
-        // Update snapshot to current value so flush_modified_entries doesn't record a duplicate.
-        self.contract_code_snapshots.insert(key, Some(entry));
-
-        // Track modification
-        if !self.modified_contract_code.contains(&key) {
-            self.modified_contract_code.push(key);
-        }
+        self.contract_code.insert(key, entry);
     }
 
     /// Delete a contract code entry.

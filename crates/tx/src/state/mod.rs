@@ -4137,4 +4137,65 @@ mod tests {
             new_ledger
         );
     }
+
+    /// Regression test: update_contract_data used to overwrite contract_data_snapshots with the
+    /// new (modified) value, causing rollback_to_savepoint to restore the wrong entry.
+    ///
+    /// Scenario: a Pail entry with zeros=6 exists in the committed state. A TX invokes a contract
+    /// that updates it to zeros=7, then InsufficientRefundableFee triggers rollback_to_savepoint.
+    /// After the fix, the entry must be restored to zeros=6.
+    #[test]
+    fn test_rollback_to_savepoint_restores_contract_data_after_update() {
+        let ledger_seq = 100u32;
+        let mut manager = LedgerStateManager::new(5_000_000, ledger_seq);
+
+        let contract = ScAddress::Contract(ContractId(Hash([1u8; 32])));
+        let key = ScVal::I32(42);
+
+        // Create the entry (simulating a bucket-list value) and commit it.
+        let original_entry = ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: contract.clone(),
+            key: key.clone(),
+            durability: ContractDataDurability::Temporary,
+            val: ScVal::I32(6),
+        };
+        manager.create_contract_data(original_entry);
+        manager.commit();
+
+        // Start the failing TX: take savepoint before the operation.
+        manager.snapshot_delta();
+        let savepoint = manager.create_savepoint();
+
+        // Contract invocation updates the entry (zeros: 6 -> 7).
+        let modified_entry = ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: contract.clone(),
+            key: key.clone(),
+            durability: ContractDataDurability::Temporary,
+            val: ScVal::I32(7),
+        };
+        manager.update_contract_data(modified_entry);
+
+        // Modification is visible before rollback.
+        assert_eq!(
+            manager
+                .get_contract_data(&contract, &key, ContractDataDurability::Temporary)
+                .map(|e| e.val.clone()),
+            Some(ScVal::I32(7)),
+            "Entry should be modified before rollback"
+        );
+
+        // InsufficientRefundableFee: roll back the operation.
+        manager.rollback_to_savepoint(savepoint);
+
+        // Entry must be restored to the original value.
+        assert_eq!(
+            manager
+                .get_contract_data(&contract, &key, ContractDataDurability::Temporary)
+                .map(|e| e.val.clone()),
+            Some(ScVal::I32(6)),
+            "Entry must be restored to original value after rollback_to_savepoint"
+        );
+    }
 }
