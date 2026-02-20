@@ -63,15 +63,6 @@ document are to be interpreted as described in [RFC 2119][rfc2119].
 | **Nonce** | A 32-byte random value generated per connection, used in key derivation. |
 | **AuthCert** | An ephemeral Curve25519 public key signed by a node's Ed25519 key, with an expiration. |
 
-### 1.3 Document Organization
-
-Sections 2–3 provide an overview of the protocol architecture and data
-encoding. Sections 4–5 specify the connection lifecycle and message
-authentication. Sections 6–7 define the complete message catalog. Sections
-8–9 specify flow control and transaction flooding. Section 10 covers peer
-management. Section 11 specifies the survey subsystem. Sections 12–14
-cover error handling, security, and protocol constants.
-
 ---
 
 ## 2. Protocol Overview

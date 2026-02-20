@@ -1449,6 +1449,11 @@ The system tracks:
 
 ## 13. Catchup and State Reconstruction
 
+The full catchup pipeline — including bucket download, verification,
+indexing, application, and post-apply state setup — is described in
+**CATCHUP_SPEC §10**. This section covers the BucketList-specific
+implementation details of bucket application.
+
 ### 13.1 Bucket Application
 
 During catchup, bucket files downloaded from history archives are
@@ -1478,13 +1483,10 @@ allow interleaving with other work (such as downloading more files).
 ### 13.2 Application Order
 
 Buckets MUST be applied from the **shallowest level to the deepest**
-(level 0 curr, level 0 snap, level 1 curr, ..., level 10 snap). Since
-shallower buckets contain more recent data, and duplicate keys at deeper
-levels should be ignored, this ordering ensures correct state by
-skipping entries whose keys have already been seen.
-
-The applicator maintains a set of already-applied keys to perform this
-deduplication.
+(level 0 curr, level 0 snap, level 1 curr, ..., level 10 snap).
+The applicator maintains a set of already-applied keys; entries
+whose keys have already been seen in higher-priority buckets are
+skipped. See CATCHUP_SPEC §10.2 Step 2 for the complete algorithm.
 
 ### 13.3 State Reconstruction from Buckets
 

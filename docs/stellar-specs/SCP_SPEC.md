@@ -89,18 +89,6 @@ This specification uses the following notation conventions:
 - **Ballot comparison**: `b1 < b2` denotes the total ordering defined
   in Section 3.3. `b1 ~ b2` denotes ballot compatibility (same value).
 
-### 1.4 Document Organization
-
-Sections 2–3 provide an overview and define data types. Section 4
-specifies quorum structure and validation. Section 5 defines the
-federated agreement primitives. Section 6 specifies the driver
-interface contract. Section 7 describes the slot model. Sections 8–9
-specify the two protocol phases (nomination and ballot). Sections 10–11
-cover message processing and statement ordering. Section 12 defines
-timer behavior. Section 13 states protocol invariants. Section 14
-collects all constants. Section 15 lists references and Section 16
-contains appendices with diagrams and examples.
-
 ---
 
 ## 2. Protocol Overview

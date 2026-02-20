@@ -118,18 +118,6 @@ This specification uses the following notation conventions:
   the required width (8 characters for checkpoint numbers, 64
   characters for bucket hashes).
 
-### 1.4 Document Organization
-
-Section 2 provides an architectural overview. Section 3 defines key
-data types. Section 4 specifies the history archive file structure.
-Section 5 describes checkpoint publishing. Section 6 covers catchup
-configuration and range computation. Section 7 specifies the ledger
-apply manager. Section 8 describes the full catchup pipeline. Sections
-9–12 detail the four catchup phases: verification, bucket application,
-transaction replay, and buffered ledger application. Section 13 covers
-error handling. Section 14 states invariants. Section 15 lists
-constants. Sections 16–17 contain references and appendices.
-
 ---
 
 ## 2. Architecture Overview
@@ -835,7 +823,8 @@ Buckets are downloaded differentially:
 
 ### 10.2 Bucket Application Algorithm
 
-After all buckets are downloaded and verified:
+After all buckets are downloaded and verified (see also
+**BUCKETLISTDB_SPEC §13** for BucketApplicator implementation details):
 
 **Step 1: Index buckets**
 

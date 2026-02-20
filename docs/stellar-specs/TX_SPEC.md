@@ -95,20 +95,6 @@ This specification uses the following notation conventions:
 - **Result codes**: Written in `SCREAMING_SNAKE_CASE` matching the XDR
   enum values (e.g., `txSUCCESS`, `opBAD_AUTH`).
 
-### 1.4 Document Organization
-
-Sections 2–3 provide a processing overview and define the XDR data
-types. Section 4 specifies transaction validation. Section 5 covers
-the fee framework including surge pricing, fee-bump semantics, and
-refunds. Section 6 specifies the complete application pipeline.
-Section 7 defines per-operation execution semantics. Section 8 covers
-Soroban-specific execution. Section 9 specifies the state management
-model. Section 10 defines metadata construction. Section 11 covers
-event emission. Section 12 specifies error handling. Section 13 states
-invariants and safety properties. Section 14 collects all constants.
-Section 15 lists references and Section 16 contains appendices with
-diagrams and examples.
-
 ---
 
 ## 2. Processing Overview
@@ -626,37 +612,16 @@ inclusionFee (Soroban) = totalFee - declaredResourceFee
 ### 5.2 Surge Pricing
 
 When the number of submitted transactions exceeds the ledger's
-capacity, surge pricing increases the effective base fee:
+capacity, surge pricing increases the effective base fee. The full
+algorithm — including fee rate comparison, the lane model, multi-
+dimensional Soroban resource limits, transaction set selection, queue
+eviction, and per-lane base fee computation — is defined in
+**HERDER_SPEC §12** ("Surge Pricing and Eviction") and **§6.6**
+("Per-Lane Base Fee Computation").
 
-1. Transactions are ordered by **fee rate** (inclusion fee per
-   operation) in descending order.
-
-2. The top N transactions that fit within the ledger's operation
-   limit are selected.
-
-3. The **base fee** for the ledger is the minimum fee rate among the
-   selected transactions, but never less than the ledger header's
-   `baseFee`.
-
-4. **Multi-dimensional resource limits** (Soroban): For the Soroban
-   phase, surge pricing considers multiple resource dimensions (ops,
-   instructions, transaction bytes, disk read bytes, write bytes, read
-   entries, write entries). A transaction is included only if adding
-   it does not exceed any resource dimension's limit.
-
-5. **Lane model** (classic): The classic phase uses a two-lane model:
-   - Lane 0 (generic): overall operation limit.
-   - Lane 1 (DEX): limit for transactions containing DEX operations
-     (manage offer, path payment). DEX transactions must fit in both
-     their own lane limit and the generic lane limit.
-
-6. **Fee rate comparison**: Fee rates are compared using
-   cross-multiplication (`fee1 * ops2` vs `fee2 * ops1`) using
-   128-bit arithmetic to avoid division truncation.
-
-7. **Per-operation fee rounding**: `@version(≥20)`: per-op fee
-   computation uses floor division. Prior versions use ceiling
-   division.
+**Per-operation fee rounding**: `@version(≥20)`: per-op fee
+computation uses floor division. Prior versions use ceiling
+division.
 
 ### 5.3 Effective Fee Computation
 
@@ -1792,36 +1757,10 @@ Restores archived Soroban ledger entries to live state.
 ### 8.7 Parallel Soroban Execution
 
 `@version(≥23)`: Soroban transactions MAY be grouped into a parallel
-execution structure:
-
-```mermaid
-graph TD
-    Phase[Phase - Soroban]
-    Phase --> S1[Stage 1]
-    Phase --> S2[Stage 2]
-    S1 --> CA["Cluster A  [tx1, tx2]  ← parallel"]
-    S1 --> CB["Cluster B  [tx3]  ← parallel"]
-    S1 --> CC["Cluster C  [tx4, tx5]  ← parallel"]
-    S2 --> CD["Cluster D  [tx6]  ← parallel"]
-    S2 --> CE["Cluster E  [tx7, tx8]  ← parallel"]
-```
-
-**Invariants**:
-1. **Stages are sequential**: Stage N+1 begins only after Stage N
-   completes and its results are merged.
-2. **Clusters within a stage are independent**: No read-write
-   conflicts exist between clusters in the same stage. Specifically:
-   - No key appears in the read-write footprint of two different
-     clusters.
-   - A key in the read-only footprint of one cluster MAY appear in
-     the read-only footprint of another cluster (read-read is safe).
-3. **Transactions within a cluster are sequential**: Transactions in
-   the same cluster are applied in order.
-4. **Instruction limit**: The total instructions for a stage is
-   `max(sum of instructions per cluster)`. The sum across all stages
-   MUST be ≤ `ledgerMaxInstructions`.
-5. **Cluster limit**: Each stage MAY have at most
-   `ledgerMaxDependentTxClusters` clusters.
+execution structure of stages and clusters. The stage/cluster model,
+footprint conflict rules, instruction budget, cluster limits, and
+canonical ordering are defined in **HERDER_SPEC §7** ("Parallel
+Soroban Transaction Sets").
 
 **Execution model**:
 1. For each stage:
@@ -1848,102 +1787,18 @@ parallel execution begins:
 
 ## 9. State Management
 
-### 9.1 Nested Ledger Transaction Model
+The nested ledger transaction (ltx) model — including hierarchy,
+entry states, commit/rollback semantics, merge rules, and entry
+loading — is defined in **LEDGER_SPEC §6** ("LedgerTxn: Nested
+Transactional State"). This section covers only the aspects specific
+to transaction execution.
 
-Ledger state is accessed through a hierarchical nesting of ledger
-transactions (abbreviated "ltx"). Each ltx provides a scoped, mutable
-view of ledger state with commit/rollback semantics:
+### 9.1 Root Commit Batch Size
 
-```mermaid
-graph TD
-    Root["LedgerTxnRoot (persistent storage + BucketList)"]
-    Root --> LC["LedgerTxn (ledger close)"]
-    LC --> FP["LedgerTxn (fee processing)"]
-    LC --> TA["LedgerTxn (transaction apply)"]
-    TA --> Op1["LedgerTxn (operation 1)"]
-    TA --> Op2["LedgerTxn (operation 2)"]
-    TA --> Opn["..."]
-```
+When the root ltx's child is committed, entries are committed in
+batches of 4095 (`0xFFF`).
 
-### 9.2 Entry States
-
-Each entry within an ltx is in one of three states:
-
-| State | Meaning |
-|-------|---------|
-| **INIT** | Entry was created at this ltx level. |
-| **LIVE** | Entry was loaded/modified at this ltx level. |
-| **DELETED** | Entry was deleted at this ltx level. |
-
-### 9.3 Commit Semantics
-
-When a child ltx is committed, its entries are merged into the parent
-using the following state transition table:
-
-| Parent State | Child State | Result |
-|-------------|-------------|--------|
-| (none) | INIT | INIT |
-| (none) | LIVE | LIVE |
-| (none) | DELETED | DELETED |
-| INIT | LIVE | INIT (data updated) |
-| INIT | DELETED | entry erased (annihilation) |
-| LIVE | LIVE | LIVE (data updated) |
-| LIVE | DELETED | DELETED |
-| DELETED | INIT | LIVE (re-creation) |
-
-**Annihilation**: When an entry that was INIT in the current ltx level
-is deleted, the entry is completely erased from the map as if it
-never existed. This is handled during `updateEntry`, not during
-merge.
-
-### 9.4 Rollback Semantics
-
-When a child ltx is rolled back, all its entries and modifications
-are discarded. The parent's state is unchanged.
-
-### 9.5 Single-Child Invariant
-
-Each ltx level MUST have at most one active child at any time. Creating
-a new child while a child already exists is an error.
-
-### 9.6 Active Entry Tracking
-
-When an entry is loaded for modification, it is marked as "active"
-in the ltx. At most one mutable handle to each entry can be
-outstanding at any time. This prevents concurrent modification of the
-same entry.
-
-### 9.7 Entry Loading
-
-Entries are loaded by key through the ltx hierarchy:
-
-1. Check the current ltx's entry map.
-2. If not found, recurse to the parent.
-3. At the root: check the entry cache, then the in-memory state (for
-   Soroban entries), then persistent storage (for offers and
-   accounts), then the BucketList snapshot.
-4. Once found, the entry is recorded in the current ltx as LIVE.
-
-**Load without record**: A read-only load that does NOT record the
-entry in the current ltx. Used for validation checks that should not
-affect the changeset.
-
-### 9.8 Root Commit
-
-When the root ltx's child is committed:
-1. All modified/created OFFER entries are batch-upserted to persistent storage.
-2. All deleted OFFER entries are batch-deleted from persistent storage.
-3. Non-OFFER entries are handled by the BucketList.
-4. Entries are committed in batches of 4095 (`0xFFF`).
-5. All caches are invalidated.
-
-### 9.9 Last-Modified Stamping
-
-On commit, each entry's `lastModifiedLedgerSeq` is updated to the
-current ledger sequence number. This applies to both INIT and LIVE
-entries.
-
-### 9.10 Restored Entries
+### 9.2 Restored Entries
 
 `@version(≥23)`: The ltx tracks entries restored during Soroban
 execution in two categories:
@@ -2388,33 +2243,5 @@ flowchart LR
     E --> H[Events Consumed]
     E --> I[Refund to Fee Source]
 ```
-
-### Appendix D: Nested Ledger Transaction Model
-
-```mermaid
-graph TD
-    Root["LedgerTxnRoot — Database + BucketList"]
-    Root --> LC["LedgerTxn (ledger close) — Accumulates all changes"]
-    LC --> FP["LedgerTxn (fee pass) — Fee deductions, seq num advances<br/>committed before ops"]
-    LC --> TA["LedgerTxn (tx apply) — Transaction scope"]
-    TA --> Op1["LedgerTxn (op 1) — Success → commit to parent<br/>Failure → rollback"]
-    TA --> Op2["LedgerTxn (op 2)"]
-    TA --> OpN["LedgerTxn (op N)"]
-```
-
-### Appendix E: State Merge Table
-
-When a child ledger transaction commits, entries merge into the parent:
-
-| Parent \ Child | INIT | LIVE | DELETED |
-|---|---|---|---|
-| (none) | INIT | LIVE | DELETED |
-| INIT | (invalid) | INIT † | (erased) ‡ |
-| LIVE | (invalid) | LIVE † | DELETED |
-| DELETED | LIVE § | (invalid) | (invalid) |
-
-† Data updated from child  
-‡ Annihilation: entry erased entirely  
-§ Re-creation
 
 [rfc2119]: https://www.rfc-editor.org/rfc/rfc2119

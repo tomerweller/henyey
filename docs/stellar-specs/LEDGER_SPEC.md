@@ -100,19 +100,6 @@ This specification uses the following notation conventions:
 - **Protocol versions**: `pN` denotes "protocol version N" (e.g., p20
   means protocol version 20).
 
-### 1.4 Document Organization
-
-Sections 2–3 provide an architectural overview and define key data
-types. Section 4 specifies the full ledger close pipeline. Section 5
-details transaction application. Section 6 specifies the LedgerTxn
-nested transactional state system. Section 7 covers protocol upgrades.
-Section 8 describes ledger header management. Section 9 covers network
-configuration. Section 10 addresses Soroban state management. Section 11
-specifies the commit and persistence sequence. Section 12 describes
-ledger close metadata. Section 13 defines the genesis ledger. Section 14
-describes the threading model. Sections 15–16 state invariants and
-constants. Sections 17–18 contain references and appendices.
-
 ---
 
 ## 2. Architecture Overview
@@ -545,8 +532,11 @@ individually:
 ### 5.4 Parallel Phase Application
 
 In the parallel phase (protocol 22+, used for Soroban transactions),
-transactions are organized into stages, where each stage contains
-clusters of non-conflicting transactions:
+transactions are organized into stages and clusters as defined in
+**HERDER_SPEC §7** ("Parallel Soroban Transaction Sets"). The
+execution mechanics are specified in **TX_SPEC §8.7**.
+
+The ledger-close orchestration for the parallel phase is:
 
 1. The transaction set provides a `TxStageFrameList` — an ordered
    list of stages, where each stage contains clusters.
