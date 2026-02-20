@@ -1,7 +1,7 @@
 # Overlay Protocol Gap Closure Plan
 
 This plan closes all 17 gaps (G1–G17) identified in
-`docs/OVERLAY_SPEC_HENYEY_EVAL.md`, achieving 100% adherence to the overlay
+`docs/spec-eval/OVERLAY_SPEC_HENYEY_EVAL.md`, achieving 100% adherence to the overlay
 protocol specification. Gaps are grouped into 6 implementation phases ordered
 by dependency — each phase builds on the prior one.
 

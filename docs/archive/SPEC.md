@@ -74,8 +74,9 @@ henyey/
 ├── Cargo.toml                 # Workspace root
 ├── README.md                  # Project overview
 ├── docs/                      # Specifications and architecture docs
-│   ├── SPEC.md                # This document
-│   └── ARCHITECTURE_EVAL.md   # Architecture evaluation
+│   ├── archive/SPEC.md        # This document (archived)
+│   ├── spec-eval/             # Spec evaluation reports
+│   └── stellar-specs/         # Protocol specifications
 ├── configs/                   # Example configs
 └── crates/                    # Subsystem crates (14 crates)
 ```
