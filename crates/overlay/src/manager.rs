@@ -49,11 +49,66 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use stellar_xdr::curr::{PeerAddress as XdrPeerAddress, PeerAddressIp, StellarMessage, VecM};
+use stellar_xdr::curr::{
+    ErrorCode, PeerAddress as XdrPeerAddress, PeerAddressIp, SError, StellarMessage, StringM, VecM,
+};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 use sha2::Digest;
 use tracing::{debug, error, info, trace, warn};
+
+/// Maximum length for error messages sent to peers, matching the XDR
+/// `string msg<100>` constraint in the `Error` struct.
+const MAX_ERROR_MESSAGE_LEN: usize = 100;
+
+/// Truncate an error message to fit within the XDR `string msg<100>` limit.
+///
+/// If the message exceeds 100 bytes it is truncated at a valid UTF-8 boundary
+/// (since the XDR string is opaque bytes, this is a convenience for logs).
+fn truncate_error_msg(msg: &str) -> &str {
+    if msg.len() <= MAX_ERROR_MESSAGE_LEN {
+        return msg;
+    }
+    // Find the largest char boundary <= MAX_ERROR_MESSAGE_LEN
+    let mut end = MAX_ERROR_MESSAGE_LEN;
+    while !msg.is_char_boundary(end) && end > 0 {
+        end -= 1;
+    }
+    &msg[..end]
+}
+
+/// Build a `StellarMessage::ErrorMsg` with proper truncation.
+///
+/// Matches stellar-core `Peer::sendError` (Peer.cpp:710-720) but adds
+/// truncation so that `StringM<100>::try_from` cannot fail.
+fn make_error_msg(code: ErrorCode, message: &str) -> StellarMessage {
+    let truncated = truncate_error_msg(message);
+    // safe: truncated.len() <= 100
+    let msg = StringM::<100>::try_from(truncated).unwrap_or_default();
+    StellarMessage::ErrorMsg(SError { code, msg })
+}
+
+/// Send an error to a peer then request its task to shut down.
+///
+/// Matches stellar-core `Peer::sendErrorAndDrop` (Peer.cpp:722-729).
+/// Uses `try_send` so this never blocks; if the channel is full the error
+/// is silently dropped but the shutdown still proceeds.
+fn send_error_and_drop(
+    peer_id: &PeerId,
+    outbound_tx: &mpsc::Sender<OutboundMessage>,
+    code: ErrorCode,
+    message: &str,
+) {
+    let err_msg = make_error_msg(code, message);
+    let _ = outbound_tx.try_send(OutboundMessage::Send(err_msg));
+    let _ = outbound_tx.try_send(OutboundMessage::Shutdown);
+    debug!(
+        "Sent error to {} and requested drop: code={:?} msg={}",
+        peer_id,
+        code,
+        truncate_error_msg(message),
+    );
+}
 
 fn is_fetch_message(message: &StellarMessage) -> bool {
     matches!(
@@ -1356,7 +1411,12 @@ impl OverlayManager {
         if let Some((peer_id, _)) = youngest {
             info!("Evicting non-preferred peer {} to make room for preferred peer", peer_id);
             if let Some(entry) = peers.get(&peer_id) {
-                let _ = entry.value().outbound_tx.try_send(OutboundMessage::Shutdown);
+                send_error_and_drop(
+                    &peer_id,
+                    &entry.value().outbound_tx,
+                    ErrorCode::Load,
+                    "preferred peer selected instead",
+                );
             }
             true
         } else {
@@ -2205,5 +2265,92 @@ mod tests {
         assert_eq!(preferred_record.peer_type, StoredPeerType::Preferred);
 
         manager.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn test_truncate_error_msg_short() {
+        // Messages <= 100 bytes pass through unchanged
+        let msg = "short message";
+        assert_eq!(truncate_error_msg(msg), msg);
+    }
+
+    #[test]
+    fn test_truncate_error_msg_exactly_100() {
+        let msg = "a".repeat(100);
+        assert_eq!(truncate_error_msg(&msg), msg.as_str());
+    }
+
+    #[test]
+    fn test_truncate_error_msg_over_100() {
+        let msg = "b".repeat(150);
+        let truncated = truncate_error_msg(&msg);
+        assert_eq!(truncated.len(), 100);
+        assert_eq!(truncated, "b".repeat(100).as_str());
+    }
+
+    #[test]
+    fn test_truncate_error_msg_multibyte_boundary() {
+        // A string that would split a multi-byte char at byte 100.
+        // 'é' is 2 bytes (0xC3 0xA9). Fill 99 ASCII bytes then 'é'.
+        let mut msg = "x".repeat(99);
+        msg.push('é'); // bytes 99..101 → exceeds 100
+        assert_eq!(msg.len(), 101);
+        let truncated = truncate_error_msg(&msg);
+        // Should truncate to 99 (before the 'é'), not 100 (mid-char)
+        assert_eq!(truncated.len(), 99);
+        assert_eq!(truncated, "x".repeat(99).as_str());
+    }
+
+    #[test]
+    fn test_truncate_error_msg_empty() {
+        assert_eq!(truncate_error_msg(""), "");
+    }
+
+    #[test]
+    fn test_make_error_msg_creates_valid_xdr() {
+        let msg = make_error_msg(ErrorCode::Load, "peer rejected");
+        match msg {
+            StellarMessage::ErrorMsg(err) => {
+                assert_eq!(err.code, ErrorCode::Load);
+                assert_eq!(err.msg.to_string(), "peer rejected");
+            }
+            _ => panic!("expected ErrorMsg"),
+        }
+    }
+
+    #[test]
+    fn test_make_error_msg_truncates_long_message() {
+        let long_msg = "z".repeat(200);
+        let msg = make_error_msg(ErrorCode::Misc, &long_msg);
+        match msg {
+            StellarMessage::ErrorMsg(err) => {
+                assert_eq!(err.code, ErrorCode::Misc);
+                assert_eq!(err.msg.len(), 100);
+            }
+            _ => panic!("expected ErrorMsg"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_error_and_drop_sends_error_then_shutdown() {
+        let (tx, mut rx) = mpsc::channel::<OutboundMessage>(16);
+        let peer_id = PeerId::from_bytes([1u8; 32]);
+
+        send_error_and_drop(&peer_id, &tx, ErrorCode::Load, "test message");
+
+        // First message should be the error
+        match rx.recv().await.unwrap() {
+            OutboundMessage::Send(StellarMessage::ErrorMsg(err)) => {
+                assert_eq!(err.code, ErrorCode::Load);
+                assert_eq!(err.msg.to_string(), "test message");
+            }
+            other => panic!("expected Send(ErrorMsg), got {:?}", std::mem::discriminant(&other)),
+        }
+
+        // Second message should be shutdown
+        match rx.recv().await.unwrap() {
+            OutboundMessage::Shutdown => {}
+            other => panic!("expected Shutdown, got {:?}", std::mem::discriminant(&other)),
+        }
     }
 }

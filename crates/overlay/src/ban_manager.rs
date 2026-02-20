@@ -8,6 +8,7 @@
 //! - Nodes are identified by their Ed25519 public key (NodeID)
 //! - Bans are stored in SQLite for persistence across restarts
 //! - The ban list is checked during peer connection acceptance
+//! - Supports both permanent bans (manual) and time-limited bans (automatic)
 //!
 //! # Database Schema
 //!
@@ -20,17 +21,26 @@
 use crate::{OverlayError, PeerId, Result};
 use parking_lot::RwLock;
 use rusqlite::Connection;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracing::{debug, info};
+
+/// Default failure threshold before a peer is auto-banned.
+pub const AUTO_BAN_FAILURE_THRESHOLD: u32 = 10;
+
+/// Default duration for an auto-ban (5 minutes).
+pub const AUTO_BAN_DURATION: Duration = Duration::from_secs(300);
 
 /// Ban manager for maintaining a persistent ban list.
 ///
 /// Thread-safe manager that stores banned node IDs in SQLite.
+/// Supports both permanent bans (manual) and time-limited bans (automatic).
 pub struct BanManager {
-    /// In-memory cache of banned nodes for fast lookups.
-    cache: RwLock<HashSet<PeerId>>,
+    /// In-memory cache of banned nodes with optional expiry time.
+    /// `None` expiry means permanent ban (manual).
+    cache: RwLock<HashMap<PeerId, Option<Instant>>>,
     /// Database connection (optional - if None, bans are in-memory only).
     db: Option<Arc<RwLock<Connection>>>,
 }
@@ -39,7 +49,7 @@ impl BanManager {
     /// Create a new ban manager with in-memory storage only.
     pub fn new_in_memory() -> Self {
         Self {
-            cache: RwLock::new(HashSet::new()),
+            cache: RwLock::new(HashMap::new()),
             db: None,
         }
     }
@@ -69,8 +79,8 @@ impl BanManager {
         )
         .map_err(|e| OverlayError::DatabaseError(format!("Failed to create ban table: {}", e)))?;
 
-        // Load existing bans into cache
-        let mut cache = HashSet::new();
+        // Load existing bans into cache (all DB bans are permanent)
+        let mut cache = HashMap::new();
         {
             let mut stmt = conn.prepare("SELECT nodeid FROM ban").map_err(|e| {
                 OverlayError::DatabaseError(format!("Failed to prepare query: {}", e))
@@ -82,7 +92,7 @@ impl BanManager {
 
             for row in rows.flatten() {
                 if let Ok(peer_id) = PeerId::from_strkey(&row) {
-                    cache.insert(peer_id);
+                    cache.insert(peer_id, None); // permanent
                 }
             }
         }
@@ -96,16 +106,21 @@ impl BanManager {
         })
     }
 
-    /// Ban a node by its ID.
+    /// Ban a node permanently by its ID.
     ///
-    /// If the node is already banned, this is a no-op.
+    /// If the node is already permanently banned, this is a no-op.
+    /// If the node has a time-limited ban, it is upgraded to permanent.
     pub fn ban_node(&self, node_id: &PeerId) -> Result<()> {
         // Check cache first
         {
             let cache = self.cache.read();
-            if cache.contains(node_id) {
-                debug!("Node {} is already banned", node_id);
-                return Ok(());
+            if let Some(expiry) = cache.get(node_id) {
+                if expiry.is_none() {
+                    // Already permanently banned
+                    debug!("Node {} is already permanently banned", node_id);
+                    return Ok(());
+                }
+                // Upgrade from time-limited to permanent below
             }
         }
 
@@ -122,13 +137,64 @@ impl BanManager {
             .map_err(|e| OverlayError::DatabaseError(format!("Failed to insert ban: {}", e)))?;
         }
 
-        // Update cache
+        // Update cache (permanent = None expiry)
         {
             let mut cache = self.cache.write();
-            cache.insert(node_id.clone());
+            cache.insert(node_id.clone(), None);
         }
 
         Ok(())
+    }
+
+    /// Ban a node for a limited duration.
+    ///
+    /// Time-limited bans are stored in memory only (not persisted to DB).
+    /// If the node is already permanently banned, this is a no-op.
+    pub fn ban_node_for(&self, node_id: &PeerId, duration: Duration) {
+        let mut cache = self.cache.write();
+        if let Some(existing) = cache.get(node_id) {
+            if existing.is_none() {
+                // Already permanently banned — don't downgrade
+                return;
+            }
+        }
+        let expires_at = Instant::now() + duration;
+        info!("Auto-banning node {} for {}s", node_id, duration.as_secs());
+        cache.insert(node_id.clone(), Some(expires_at));
+    }
+
+    /// Automatically ban a peer if its failure count exceeds the threshold.
+    ///
+    /// Called on peer disconnect. If `num_failures >= AUTO_BAN_FAILURE_THRESHOLD`,
+    /// bans the peer for `AUTO_BAN_DURATION`. Returns `true` if a ban was applied.
+    pub fn maybe_auto_ban(&self, node_id: &PeerId, num_failures: u32) -> bool {
+        if num_failures < AUTO_BAN_FAILURE_THRESHOLD {
+            return false;
+        }
+        if self.is_banned(node_id) {
+            return false;
+        }
+        self.ban_node_for(node_id, AUTO_BAN_DURATION);
+        true
+    }
+
+    /// Remove expired time-limited bans.
+    ///
+    /// Should be called periodically from the tick loop.
+    /// Returns the number of bans that expired.
+    pub fn cleanup_expired_bans(&self) -> usize {
+        let now = Instant::now();
+        let mut cache = self.cache.write();
+        let before = cache.len();
+        cache.retain(|_, expiry| match expiry {
+            None => true, // permanent bans never expire
+            Some(expires_at) => *expires_at > now,
+        });
+        let removed = before - cache.len();
+        if removed > 0 {
+            debug!("Cleaned up {} expired time-limited bans", removed);
+        }
+        removed
     }
 
     /// Unban a node by its ID.
@@ -154,28 +220,55 @@ impl BanManager {
         Ok(())
     }
 
-    /// Check if a node is banned.
+    /// Check if a node is banned (either permanently or time-limited).
     pub fn is_banned(&self, node_id: &PeerId) -> bool {
         let cache = self.cache.read();
-        cache.contains(node_id)
+        match cache.get(node_id) {
+            None => false,
+            Some(None) => true, // permanent
+            Some(Some(expires_at)) => Instant::now() < *expires_at,
+        }
     }
 
     /// Get a list of all banned nodes as strkey strings.
     pub fn get_bans(&self) -> Vec<String> {
         let cache = self.cache.read();
-        cache.iter().map(|id| id.to_strkey()).collect()
+        let now = Instant::now();
+        cache
+            .iter()
+            .filter(|(_, expiry)| match expiry {
+                None => true,
+                Some(expires_at) => now < *expires_at,
+            })
+            .map(|(id, _)| id.to_strkey())
+            .collect()
     }
 
     /// Get a list of all banned node IDs.
     pub fn get_banned_ids(&self) -> Vec<PeerId> {
         let cache = self.cache.read();
-        cache.iter().cloned().collect()
+        let now = Instant::now();
+        cache
+            .iter()
+            .filter(|(_, expiry)| match expiry {
+                None => true,
+                Some(expires_at) => now < *expires_at,
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
-    /// Get the number of banned nodes.
+    /// Get the number of banned nodes (including unexpired time-limited bans).
     pub fn ban_count(&self) -> usize {
         let cache = self.cache.read();
-        cache.len()
+        let now = Instant::now();
+        cache
+            .values()
+            .filter(|expiry| match expiry {
+                None => true,
+                Some(expires_at) => now < *expires_at,
+            })
+            .count()
     }
 
     /// Clear all bans.
@@ -375,6 +468,135 @@ mod tests {
         assert_eq!(manager.ban_count(), 1);
 
         manager.drop_and_create().unwrap();
+        assert_eq!(manager.ban_count(), 0);
+    }
+
+    // --- G10 tests: time-limited bans and auto-ban escalation ---
+
+    #[test]
+    fn test_ban_node_for_time_limited() {
+        let manager = BanManager::new_in_memory();
+        let peer = make_peer_id(10);
+
+        assert!(!manager.is_banned(&peer));
+
+        // Ban for 1 hour (will still be active during this test)
+        manager.ban_node_for(&peer, Duration::from_secs(3600));
+        assert!(manager.is_banned(&peer));
+        assert_eq!(manager.ban_count(), 1);
+    }
+
+    #[test]
+    fn test_ban_node_for_does_not_downgrade_permanent() {
+        let manager = BanManager::new_in_memory();
+        let peer = make_peer_id(10);
+
+        // Permanently ban
+        manager.ban_node(&peer).unwrap();
+        assert!(manager.is_banned(&peer));
+
+        // Time-limited ban should not downgrade a permanent ban
+        manager.ban_node_for(&peer, Duration::from_millis(1));
+        assert!(manager.is_banned(&peer));
+
+        // Even after cleanup, permanent ban persists
+        manager.cleanup_expired_bans();
+        assert!(manager.is_banned(&peer));
+    }
+
+    #[test]
+    fn test_ban_node_permanent_upgrades_time_limited() {
+        let manager = BanManager::new_in_memory();
+        let peer = make_peer_id(10);
+
+        // Time-limited ban first
+        manager.ban_node_for(&peer, Duration::from_millis(1));
+        assert!(manager.is_banned(&peer));
+
+        // Upgrade to permanent
+        manager.ban_node(&peer).unwrap();
+
+        // Even after cleanup, permanent ban persists
+        std::thread::sleep(Duration::from_millis(5));
+        manager.cleanup_expired_bans();
+        assert!(manager.is_banned(&peer));
+    }
+
+    #[test]
+    fn test_cleanup_expired_bans() {
+        let manager = BanManager::new_in_memory();
+        let peer1 = make_peer_id(1);
+        let peer2 = make_peer_id(2);
+        let peer3 = make_peer_id(3);
+
+        // peer1: permanent ban
+        manager.ban_node(&peer1).unwrap();
+        // peer2: expires immediately
+        manager.ban_node_for(&peer2, Duration::from_millis(1));
+        // peer3: expires in the future
+        manager.ban_node_for(&peer3, Duration::from_secs(3600));
+
+        assert_eq!(manager.ban_count(), 3);
+
+        // Wait for peer2's ban to expire
+        std::thread::sleep(Duration::from_millis(5));
+
+        let removed = manager.cleanup_expired_bans();
+        assert_eq!(removed, 1);
+        assert_eq!(manager.ban_count(), 2);
+        assert!(manager.is_banned(&peer1)); // permanent
+        assert!(!manager.is_banned(&peer2)); // expired
+        assert!(manager.is_banned(&peer3)); // still active
+    }
+
+    #[test]
+    fn test_maybe_auto_ban_below_threshold() {
+        let manager = BanManager::new_in_memory();
+        let peer = make_peer_id(1);
+
+        // Below threshold: no ban
+        assert!(!manager.maybe_auto_ban(&peer, AUTO_BAN_FAILURE_THRESHOLD - 1));
+        assert!(!manager.is_banned(&peer));
+    }
+
+    #[test]
+    fn test_maybe_auto_ban_at_threshold() {
+        let manager = BanManager::new_in_memory();
+        let peer = make_peer_id(1);
+
+        // At threshold: banned
+        assert!(manager.maybe_auto_ban(&peer, AUTO_BAN_FAILURE_THRESHOLD));
+        assert!(manager.is_banned(&peer));
+        assert_eq!(manager.ban_count(), 1);
+    }
+
+    #[test]
+    fn test_maybe_auto_ban_already_banned() {
+        let manager = BanManager::new_in_memory();
+        let peer = make_peer_id(1);
+
+        // Already permanently banned
+        manager.ban_node(&peer).unwrap();
+
+        // Should not re-ban (returns false)
+        assert!(!manager.maybe_auto_ban(&peer, AUTO_BAN_FAILURE_THRESHOLD + 5));
+    }
+
+    #[test]
+    fn test_time_limited_ban_expires_naturally() {
+        let manager = BanManager::new_in_memory();
+        let peer = make_peer_id(1);
+
+        // Ban for 1ms
+        manager.ban_node_for(&peer, Duration::from_millis(1));
+        assert!(manager.is_banned(&peer));
+
+        // Wait for expiry
+        std::thread::sleep(Duration::from_millis(5));
+
+        // is_banned checks expiry lazily
+        assert!(!manager.is_banned(&peer));
+        // ban_count also filters expired
         assert_eq!(manager.ban_count(), 0);
     }
 }

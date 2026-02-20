@@ -424,6 +424,21 @@ impl PeerManager {
 
     /// Load random peers matching the query.
     pub fn load_random_peers(&self, query: &PeerQuery, size: usize) -> Vec<PeerAddress> {
+        self.load_random_peers_filtered(query, size, |_| true)
+    }
+
+    /// Load random peers matching the query, applying an additional predicate.
+    ///
+    /// Matches stellar-core `RandomPeerSource::getRandomPeers(size, pred)` which
+    /// uses a `keep` callback to skip already-connected peers.  The `pred`
+    /// closure is called for each candidate and only addresses for which it
+    /// returns `true` are included.
+    pub fn load_random_peers_filtered(
+        &self,
+        query: &PeerQuery,
+        size: usize,
+        pred: impl Fn(&PeerAddress) -> bool,
+    ) -> Vec<PeerAddress> {
         let cache = self.cache.read();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -455,12 +470,13 @@ impl PeerManager {
             })
             .collect();
 
-        // Shuffle and take up to size
+        // Shuffle and take up to size, applying the predicate
         candidates.shuffle(&mut rand::thread_rng());
         candidates
             .into_iter()
-            .take(size)
             .map(|r| r.to_peer_address())
+            .filter(|addr| pred(addr))
+            .take(size)
             .collect()
     }
 
@@ -790,5 +806,83 @@ mod tests {
         // Should exclude the "exclude" address
         assert_eq!(peers.len(), 3);
         assert!(!peers.contains(&exclude));
+    }
+
+    #[test]
+    fn test_load_random_peers_filtered_excludes_connected() {
+        // G13: load_random_peers_filtered applies a predicate to skip
+        // already-connected peers, matching stellar-core's keep callback.
+        let manager = PeerManager::new_in_memory();
+
+        for i in 1..=5 {
+            let addr = PeerAddress::new(format!("1.2.3.{}", i), 11625);
+            manager.ensure_exists(&addr).unwrap();
+            manager
+                .update_type(&addr, StoredPeerType::Outbound, false)
+                .unwrap();
+        }
+
+        let connected = PeerAddress::new("1.2.3.3".to_string(), 11625);
+        let query = PeerQuery {
+            use_next_attempt: true,
+            max_num_failures: Some(MAX_FAILURES),
+            type_filter: PeerTypeFilter::AnyOutbound,
+        };
+
+        // Without filter: all 5 are returned
+        let all = manager.load_random_peers(&query, 10);
+        assert_eq!(all.len(), 5);
+
+        // With filter: exclude the connected peer
+        let filtered = manager.load_random_peers_filtered(&query, 10, |addr| *addr != connected);
+        assert_eq!(filtered.len(), 4);
+        assert!(!filtered.contains(&connected));
+    }
+
+    #[test]
+    fn test_load_random_peers_filtered_by_direction() {
+        // G13: direction-aware peer loading — only return outbound-typed
+        // peers when filling outbound slots, only inbound when promoting.
+        let manager = PeerManager::new_in_memory();
+
+        // Add 3 inbound and 3 outbound peers
+        for i in 1..=3 {
+            let addr = PeerAddress::new(format!("10.0.0.{}", i), 11625);
+            manager.ensure_exists(&addr).unwrap();
+            // stays Inbound (default)
+        }
+        for i in 4..=6 {
+            let addr = PeerAddress::new(format!("10.0.0.{}", i), 11625);
+            manager.ensure_exists(&addr).unwrap();
+            manager
+                .update_type(&addr, StoredPeerType::Outbound, false)
+                .unwrap();
+        }
+
+        // Outbound-only query should return only the 3 outbound peers
+        let outbound_query = PeerQuery {
+            use_next_attempt: false,
+            max_num_failures: None,
+            type_filter: PeerTypeFilter::OutboundOnly,
+        };
+        let outbound = manager.load_random_peers(&outbound_query, 10);
+        assert_eq!(outbound.len(), 3);
+        for addr in &outbound {
+            let port: u8 = addr.host.split('.').last().unwrap().parse().unwrap();
+            assert!(port >= 4, "expected outbound peer, got {}", addr);
+        }
+
+        // Inbound-only query should return only the 3 inbound peers
+        let inbound_query = PeerQuery {
+            use_next_attempt: false,
+            max_num_failures: None,
+            type_filter: PeerTypeFilter::InboundOnly,
+        };
+        let inbound = manager.load_random_peers(&inbound_query, 10);
+        assert_eq!(inbound.len(), 3);
+        for addr in &inbound {
+            let port: u8 = addr.host.split('.').last().unwrap().parse().unwrap();
+            assert!(port <= 3, "expected inbound peer, got {}", addr);
+        }
     }
 }
