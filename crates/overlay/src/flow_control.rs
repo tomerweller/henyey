@@ -28,7 +28,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use stellar_xdr::curr::{Limits, Limited, StellarMessage, WriteXdr};
+use stellar_xdr::curr::{Limited, Limits, StellarMessage, WriteXdr};
 use tracing::{debug, trace, warn};
 
 /// Callback trait for SCP queue trimming decisions.
@@ -581,13 +581,12 @@ impl FlowControl {
                 }
 
                 // Extract slot index from the SCP envelope
-                let slot_index =
-                    if let StellarMessage::ScpMessage(ref env) = queue[i].message {
-                        env.statement.slot_index
-                    } else {
-                        i += 1;
-                        continue;
-                    };
+                let slot_index = if let StellarMessage::ScpMessage(ref env) = queue[i].message {
+                    env.statement.slot_index
+                } else {
+                    i += 1;
+                    continue;
+                };
 
                 // Drop messages for slots we no longer care about
                 // (except the checkpoint sequence)
@@ -609,16 +608,13 @@ impl FlowControl {
                             None
                         }
                     });
-                    let curr_st =
-                        if let StellarMessage::ScpMessage(ref env) = queue[i].message {
-                            Some(&env.statement)
-                        } else {
-                            None
-                        };
+                    let curr_st = if let StellarMessage::ScpMessage(ref env) = queue[i].message {
+                        Some(&env.statement)
+                    } else {
+                        None
+                    };
                     if let (Some(old_st), Some(new_st)) = (curr_st, back_st) {
-                        if henyey_scp::is_newer_nomination_or_ballot_st(
-                            old_st, new_st,
-                        ) {
+                        if henyey_scp::is_newer_nomination_or_ballot_st(old_st, new_st) {
                             value_replaced = true;
                             let back = queue.pop_back().unwrap();
                             queue[i] = back;
@@ -952,6 +948,56 @@ pub fn msg_body_size(msg: &StellarMessage) -> u64 {
     msg.write_xdr(&mut w).map(|_| w.inner.0).unwrap_or(0)
 }
 
+/// RAII guard for flow control capacity tracking.
+///
+/// Mirrors stellar-core's `CapacityTrackedMessage`: the constructor calls
+/// `begin_message_processing` to lock local capacity, and `Drop` calls
+/// `end_message_processing` to release it.  This guarantees capacity is
+/// always released even on early returns or panics.
+///
+/// For the normal path, call [`CapacityGuard::finish`] to consume the guard
+/// and retrieve the [`SendMoreCapacity`] needed to decide whether to send
+/// `SEND_MORE_EXTENDED` back to the peer.
+pub struct CapacityGuard {
+    flow_control: Arc<FlowControl>,
+    message: Option<StellarMessage>,
+}
+
+impl CapacityGuard {
+    /// Create a new guard, locking local capacity for `msg`.
+    ///
+    /// Returns `None` if the flow control rejected the message (no capacity).
+    pub fn new(flow_control: Arc<FlowControl>, msg: StellarMessage) -> Option<Self> {
+        if flow_control.begin_message_processing(&msg) {
+            Some(Self {
+                flow_control,
+                message: Some(msg),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Consume the guard and return the send-more capacity.
+    ///
+    /// This is the normal-path exit: it releases capacity and tells the
+    /// caller whether to send `SEND_MORE_EXTENDED`.
+    pub fn finish(mut self) -> SendMoreCapacity {
+        // Take the message so Drop becomes a no-op.
+        let msg = self.message.take().expect("finish called twice");
+        self.flow_control.end_message_processing(&msg)
+    }
+}
+
+impl Drop for CapacityGuard {
+    fn drop(&mut self) {
+        // If `finish()` was called, `message` is `None` and this is a no-op.
+        if let Some(ref msg) = self.message {
+            let _ = self.flow_control.end_message_processing(msg);
+        }
+    }
+}
+
 /// Compare two messages for equality (by XDR serialization).
 fn messages_equal(a: &StellarMessage, b: &StellarMessage) -> bool {
     // Quick check on type first
@@ -1255,7 +1301,7 @@ mod tests {
         fc.add_msg_and_maybe_trim_queue(make_scp_message_at_slot(10)); // old, should drop
         fc.add_msg_and_maybe_trim_queue(make_scp_message_at_slot(50)); // checkpoint, should keep
         fc.add_msg_and_maybe_trim_queue(make_scp_message_at_slot(80)); // old, should drop
-        // Queue is at 3 — not over limit yet
+                                                                       // Queue is at 3 — not over limit yet
 
         // This 4th message triggers trimming (queue > limit of 3)
         fc.add_msg_and_maybe_trim_queue(make_scp_message_at_slot(100)); // current, should keep
@@ -1327,5 +1373,87 @@ mod tests {
         assert_eq!(scp_size, scp_xdr.len() as u64);
         assert!(tx_size > 0);
         assert!(scp_size > 0);
+    }
+
+    #[test]
+    fn test_capacity_guard_finish_returns_send_more() {
+        let fc = Arc::new(FlowControl::with_defaults());
+        let tx = make_tx_message();
+
+        // Process enough messages to trigger a SEND_MORE batch
+        let batch = fc.config.flow_control_send_more_batch_size;
+        for _ in 0..batch {
+            let guard = CapacityGuard::new(Arc::clone(&fc), tx.clone()).unwrap();
+            let cap = guard.finish();
+            // Only the last one (or once threshold is met) should trigger
+            if cap.should_send() {
+                assert!(cap.num_flood_messages > 0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_capacity_guard_drop_releases_capacity() {
+        let mut config = FlowControlConfig::default();
+        config.peer_reading_capacity = 2;
+        config.peer_flood_reading_capacity = 2;
+        let fc = Arc::new(FlowControl::new(config));
+        let tx = make_tx_message();
+
+        // Lock capacity with a guard, then drop without finish()
+        {
+            let _guard = CapacityGuard::new(Arc::clone(&fc), tx.clone()).unwrap();
+            // Guard dropped here — capacity should be released
+        }
+
+        // We should still be able to create another guard (capacity was released)
+        let guard2 = CapacityGuard::new(Arc::clone(&fc), tx.clone());
+        assert!(
+            guard2.is_some(),
+            "capacity should have been released by Drop"
+        );
+    }
+
+    #[test]
+    fn test_capacity_guard_none_when_no_capacity() {
+        let mut config = FlowControlConfig::default();
+        config.peer_reading_capacity = 1;
+        config.peer_flood_reading_capacity = 1;
+        let fc = Arc::new(FlowControl::new(config));
+        let tx = make_tx_message();
+
+        // First guard takes the only capacity slot
+        let guard1 = CapacityGuard::new(Arc::clone(&fc), tx.clone());
+        assert!(guard1.is_some());
+
+        // Second guard should fail — no capacity
+        let guard2 = CapacityGuard::new(Arc::clone(&fc), tx.clone());
+        assert!(guard2.is_none(), "should fail when no capacity");
+
+        // Drop first guard — capacity returns
+        drop(guard1);
+
+        // Now should succeed again
+        let guard3 = CapacityGuard::new(Arc::clone(&fc), tx.clone());
+        assert!(guard3.is_some());
+    }
+
+    #[test]
+    fn test_capacity_guard_finish_prevents_double_release() {
+        let fc = Arc::new(FlowControl::with_defaults());
+        let tx = make_tx_message();
+
+        let initial_stats = fc.get_stats();
+
+        let guard = CapacityGuard::new(Arc::clone(&fc), tx.clone()).unwrap();
+        let _cap = guard.finish(); // consumes guard, calls end once
+
+        // After finish + implicit drop (no-op), capacity should match
+        // one begin + one end cycle
+        let final_stats = fc.get_stats();
+        assert_eq!(
+            initial_stats.local_flood_capacity, final_stats.local_flood_capacity,
+            "capacity should be fully restored after finish"
+        );
     }
 }

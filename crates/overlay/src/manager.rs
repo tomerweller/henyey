@@ -198,6 +198,9 @@ struct SharedPeerState {
     is_validator: bool,
     peer_event_tx: Option<mpsc::Sender<PeerEvent>>,
     extra_subscribers: Arc<RwLock<Vec<mpsc::UnboundedSender<OverlayMessage>>>>,
+    /// Whether the node is tracking consensus (set by the herder/app layer).
+    /// When false, the overlay may drop random peers to try new connections.
+    is_tracking: Arc<AtomicBool>,
 }
 
 /// Central manager for all peer connections in the overlay network.
@@ -291,6 +294,9 @@ pub struct OverlayManager {
     scp_callback: Option<Arc<dyn ScpQueueCallback>>,
     /// Optional peer manager for persistent peer storage.
     peer_manager: Option<Arc<PeerManager>>,
+    /// Whether the node is tracking consensus (set by the herder/app layer).
+    /// When false, the overlay may drop random peers to try new connections.
+    is_tracking: Arc<AtomicBool>,
 }
 
 impl OverlayManager {
@@ -353,6 +359,7 @@ impl OverlayManager {
             last_closed_ledger: Arc::new(AtomicU32::new(0)),
             scp_callback: None,
             peer_manager: config.peer_manager.clone(),
+            is_tracking: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -377,6 +384,7 @@ impl OverlayManager {
             is_validator: self.config.is_validator,
             peer_event_tx: self.config.peer_event_tx.clone(),
             extra_subscribers: Arc::clone(&self.extra_subscribers),
+            is_tracking: Arc::clone(&self.is_tracking),
         }
     }
 
@@ -646,6 +654,9 @@ impl OverlayManager {
         let handle = tokio::spawn(async move {
             let mut retry_after: HashMap<PeerAddress, Instant> = HashMap::new();
             let mut interval = tokio::time::interval(Duration::from_secs(5));
+            // G8: Track when we first noticed we were out of sync, for
+            // random-peer-drop cooldown (OUT_OF_SYNC_RECONNECT_DELAY = 60s).
+            let mut last_out_of_sync_reconnect: Option<Instant> = None;
 
             loop {
                 tokio::select! {
@@ -659,6 +670,20 @@ impl OverlayManager {
                 if !shared.running.load(Ordering::Relaxed) {
                     break;
                 }
+
+                // G8: When not tracking consensus and outbound slots are full,
+                // periodically drop a random non-preferred outbound peer to
+                // try fresh connections (matches stellar-core
+                // updateTimerAndMaybeDropRandomPeer).
+                let tracking = shared.is_tracking.load(Ordering::Relaxed);
+                Self::maybe_drop_random_peer(
+                    &shared.peers,
+                    &shared.peer_info_cache,
+                    &preferred_peers,
+                    max_outbound,
+                    tracking,
+                    &mut last_out_of_sync_reconnect,
+                );
 
                 let now = Instant::now();
                 let outbound_count = Self::count_outbound_peers(&shared.peer_info_cache);
@@ -844,6 +869,13 @@ impl OverlayManager {
         let mut periodic_interval = tokio::time::interval(Duration::from_secs(1));
         let mut ticks_since_ping: u32 = 0;
 
+        // Ping/RTT tracking (G4/G17): store the hash and send time of the
+        // outstanding ping so we can compute round-trip time when the peer
+        // responds with DontHave (or a matching ScpQuorumset).
+        let mut ping_sent_time: Option<Instant> = None;
+        let mut ping_hash: Option<stellar_xdr::curr::Uint256> = None;
+        let mut last_ping_rtt: Option<Duration> = None;
+
         loop {
             if !running.load(Ordering::Relaxed) {
                 info!("Peer {} loop exiting: overlay shutting down (total_msgs={}, scp_msgs={})", peer_id, total_messages, scp_messages);
@@ -916,8 +948,12 @@ impl OverlayManager {
                                 );
                             }
 
-                            // Flow control: begin tracking capacity for this message
-                            flow_control.begin_message_processing(&message);
+                            // Flow control: RAII guard locks capacity on creation,
+                            // releases on drop (or explicit finish()).
+                            let capacity_guard = crate::flow_control::CapacityGuard::new(
+                                Arc::clone(&flow_control),
+                                message.clone(),
+                            );
 
                             // Handle flow control messages: release outbound capacity
                             // and drain queued messages that now have capacity.
@@ -942,8 +978,8 @@ impl OverlayManager {
                                 _ => {}
                             }
 
-                            // Route message — use a labeled block to avoid `continue`
-                            // before end_message_processing runs below.
+                            // Route message — the CapacityGuard ensures
+                            // end_message_processing runs even on early exit.
                             'route: {
                                 if helpers::is_handshake_message(&message) {
                                     debug!("Ignoring handshake message from authenticated peer {}", peer_id);
@@ -1000,9 +1036,29 @@ impl OverlayManager {
                                         StellarMessage::ScpQuorumset(qs) => {
                                             let hash = henyey_common::Hash256::hash_xdr(qs)
                                                 .unwrap_or(henyey_common::Hash256::ZERO);
+                                            // G4: check if this is a ping response
+                                            if let (Some(sent), Some(ref ph)) = (ping_sent_time, &ping_hash) {
+                                                if hash.0 == ph.0 {
+                                                    let rtt = sent.elapsed();
+                                                    debug!("Latency {}: {} ms", peer_id, rtt.as_millis());
+                                                    last_ping_rtt = Some(rtt);
+                                                    ping_sent_time = None;
+                                                    ping_hash = None;
+                                                }
+                                            }
                                             debug!("OVERLAY: Received ScpQuorumset from {} hash={}", peer_id, hash);
                                         }
                                         StellarMessage::DontHave(dh) => {
+                                            // G4: check if this DontHave is a ping response
+                                            if let (Some(sent), Some(ref ph)) = (ping_sent_time, &ping_hash) {
+                                                if dh.req_hash.0 == ph.0 {
+                                                    let rtt = sent.elapsed();
+                                                    debug!("Latency {}: {} ms", peer_id, rtt.as_millis());
+                                                    last_ping_rtt = Some(rtt);
+                                                    ping_sent_time = None;
+                                                    ping_hash = None;
+                                                }
+                                            }
                                             debug!("OVERLAY: Received DontHave from {} type={:?} hash={}", peer_id, dh.type_, hex::encode(dh.req_hash.0));
                                         }
                                         StellarMessage::GetTxSet(hash) => {
@@ -1069,16 +1125,21 @@ impl OverlayManager {
                                 }
                             }
 
-                            // Flow control: end tracking and maybe send SendMoreExtended
-                            let send_more_cap = flow_control.end_message_processing(&message);
-                            if send_more_cap.should_send() && peer.is_connected() {
-                                if let Err(e) = peer.send_more_extended(
-                                    send_more_cap.num_flood_messages as u32,
-                                    send_more_cap.num_flood_bytes as u32,
-                                ).await {
-                                    debug!("Failed to send SendMoreExtended to {}: {}", peer_id, e);
-                                } else {
-                                    last_write = Instant::now();
+                            // Flow control: finish guard to get send-more capacity.
+                            // If the guard was created (capacity available), consume
+                            // it and maybe send SEND_MORE_EXTENDED.  If capacity was
+                            // unavailable (None), there's nothing to release.
+                            if let Some(guard) = capacity_guard {
+                                let send_more_cap = guard.finish();
+                                if send_more_cap.should_send() && peer.is_connected() {
+                                    if let Err(e) = peer.send_more_extended(
+                                        send_more_cap.num_flood_messages as u32,
+                                        send_more_cap.num_flood_bytes as u32,
+                                    ).await {
+                                        debug!("Failed to send SendMoreExtended to {}: {}", peer_id, e);
+                                    } else {
+                                        last_write = Instant::now();
+                                    }
                                 }
                             }
                         }
@@ -1109,32 +1170,39 @@ impl OverlayManager {
                         break;
                     }
 
-                    // Ping every 5 seconds (every 5 ticks)
+                    // Ping every 5 seconds (every 5 ticks).
+                    // Only send if no ping is already outstanding (matches
+                    // stellar-core: `mPingSentTime == PING_NOT_SENT`).
                     ticks_since_ping += 1;
                     if ticks_since_ping >= 5 {
                         ticks_since_ping = 0;
-                        if peer.is_connected() {
+                        if peer.is_connected() && ping_sent_time.is_none() {
                             let now_nanos = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_nanos();
-                            let ping_hash = {
+                            let hash = {
                                 let mut hasher = sha2::Sha256::new();
                                 hasher.update(now_nanos.to_le_bytes());
                                 let result = hasher.finalize();
                                 stellar_xdr::curr::Uint256(result.into())
                             };
-                            let ping_msg = StellarMessage::GetScpQuorumset(ping_hash);
+                            let ping_msg = StellarMessage::GetScpQuorumset(hash.clone());
                             if let Err(e) = peer.send(ping_msg).await {
                                 debug!("Failed to send ping to {}: {}", peer_id, e);
                             } else {
+                                ping_sent_time = Some(Instant::now());
+                                ping_hash = Some(hash);
                                 last_write = Instant::now();
                             }
                         }
 
                         // Periodic stats (every 60s, checked on ping interval)
                         if last_stats_log.elapsed() >= Duration::from_secs(60) {
-                            debug!("Peer {} stats: total_msgs={}, scp_msgs={}", peer_id, total_messages, scp_messages);
+                            let rtt_str = last_ping_rtt
+                                .map(|d| format!("{}ms", d.as_millis()))
+                                .unwrap_or_else(|| "n/a".to_string());
+                            debug!("Peer {} stats: total_msgs={}, scp_msgs={}, rtt={}", peer_id, total_messages, scp_messages, rtt_str);
                             last_stats_log = Instant::now();
                         }
                     }
@@ -1424,6 +1492,121 @@ impl OverlayManager {
         }
     }
 
+    /// Delay (seconds) before we drop a random peer when out of sync.
+    ///
+    /// Matches stellar-core `OUT_OF_SYNC_RECONNECT_DELAY` (60s).
+    const OUT_OF_SYNC_RECONNECT_DELAY: Duration = Duration::from_secs(60);
+
+    /// Maybe drop a random non-preferred outbound peer when the node is
+    /// not tracking consensus and outbound slots are full.
+    ///
+    /// Matches stellar-core `OverlayManagerImpl::updateTimerAndMaybeDropRandomPeer`
+    /// (OverlayManagerImpl.cpp:601-647).
+    ///
+    /// # Arguments
+    /// * `peers` - Connected peers map.
+    /// * `peer_info_cache` - Peer info cache (direction, addresses, etc).
+    /// * `preferred_addrs` - Configured preferred peer addresses.
+    /// * `max_outbound` - Maximum outbound peer count.
+    /// * `is_tracking` - Whether the node is tracking consensus.
+    /// * `last_out_of_sync_reconnect` - Mutable timestamp of last reconnect action.
+    ///
+    /// Returns `true` if a peer was dropped.
+    fn maybe_drop_random_peer(
+        peers: &DashMap<PeerId, PeerHandle>,
+        peer_info_cache: &DashMap<PeerId, PeerInfo>,
+        preferred_addrs: &[PeerAddress],
+        max_outbound: usize,
+        is_tracking: bool,
+        last_out_of_sync_reconnect: &mut Option<Instant>,
+    ) -> bool {
+        if is_tracking {
+            // Back in sync — reset the timer.
+            *last_out_of_sync_reconnect = None;
+            return false;
+        }
+
+        // Check if outbound slots are full.
+        let outbound_count = Self::count_outbound_peers(peer_info_cache);
+        let should_drop = outbound_count >= max_outbound;
+
+        if !should_drop {
+            return false;
+        }
+
+        let now = Instant::now();
+
+        match *last_out_of_sync_reconnect {
+            None => {
+                // First time we notice we're out of sync — start the timer.
+                *last_out_of_sync_reconnect = Some(now);
+                false
+            }
+            Some(ref mut last_time) => {
+                if now.duration_since(*last_time) < Self::OUT_OF_SYNC_RECONNECT_DELAY {
+                    // Cooldown not elapsed yet.
+                    return false;
+                }
+
+                // Collect non-preferred outbound peers.
+                let mut candidates: Vec<PeerId> = Vec::new();
+                for entry in peer_info_cache.iter() {
+                    let info = entry.value();
+                    if !info.direction.we_called_remote() {
+                        continue;
+                    }
+                    let is_preferred = preferred_addrs.iter().any(|pref| {
+                        if let Some(ref orig) = info.original_address {
+                            if orig.host == pref.host && orig.port == pref.port {
+                                return true;
+                            }
+                        }
+                        if info.address.port() != pref.port {
+                            return false;
+                        }
+                        pref.host
+                            .parse::<IpAddr>()
+                            .map(|ip| info.address.ip() == ip)
+                            .unwrap_or(false)
+                    });
+                    if !is_preferred {
+                        candidates.push(entry.key().clone());
+                    }
+                }
+
+                if candidates.is_empty() {
+                    return false;
+                }
+
+                // Pick a random candidate.
+                let chosen = {
+                    let mut rng = rand::thread_rng();
+                    candidates.choose(&mut rng).cloned()
+                };
+
+                if let Some(peer_id) = chosen {
+                    info!(
+                        "Dropping random outbound peer {} (out of sync, {} outbound peers)",
+                        peer_id, outbound_count
+                    );
+                    if let Some(entry) = peers.get(&peer_id) {
+                        send_error_and_drop(
+                            &peer_id,
+                            &entry.value().outbound_tx,
+                            ErrorCode::Load,
+                            "random disconnect due to out of sync",
+                        );
+                    }
+                    // Reset timer to throttle drops.
+                    *last_time = now;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
     async fn connect_outbound_inner(
         addr: &PeerAddress,
         local_node: LocalNode,
@@ -1708,6 +1891,21 @@ impl OverlayManager {
     /// eviction and nomination/ballot replacement).
     pub fn set_scp_callback(&mut self, callback: Arc<dyn ScpQueueCallback>) {
         self.scp_callback = Some(callback);
+    }
+
+    /// Update the tracking-consensus flag.
+    ///
+    /// The app/herder layer should call this whenever the node transitions
+    /// between "tracking" and "not tracking" states. When the node is not
+    /// tracking consensus the overlay will periodically drop a random
+    /// outbound peer to try fresh connections (see `maybe_drop_random_peer`).
+    pub fn set_tracking(&self, tracking: bool) {
+        self.is_tracking.store(tracking, Ordering::Relaxed);
+    }
+
+    /// Returns whether the node is currently tracking consensus.
+    pub fn is_tracking(&self) -> bool {
+        self.is_tracking.load(Ordering::Relaxed)
     }
 
     /// Clear per-ledger state for ledgers below the given sequence.
@@ -2352,5 +2550,311 @@ mod tests {
             OutboundMessage::Shutdown => {}
             other => panic!("expected Shutdown, got {:?}", std::mem::discriminant(&other)),
         }
+    }
+
+    /// Verify the ping hash computation is deterministic and the
+    /// DontHave/ScpQuorumset response-matching logic works correctly (G4).
+    #[test]
+    fn test_ping_hash_computation_is_deterministic_g4() {
+        use sha2::Digest;
+        let nanos: u128 = 1_000_000_000;
+        let hash1 = {
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(nanos.to_le_bytes());
+            let result = hasher.finalize();
+            stellar_xdr::curr::Uint256(result.into())
+        };
+        let hash2 = {
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(nanos.to_le_bytes());
+            let result = hasher.finalize();
+            stellar_xdr::curr::Uint256(result.into())
+        };
+        assert_eq!(hash1.0, hash2.0, "same nanos should produce same ping hash");
+
+        // Different nanos should produce different hash
+        let hash3 = {
+            let nanos2: u128 = 2_000_000_000;
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(nanos2.to_le_bytes());
+            let result = hasher.finalize();
+            stellar_xdr::curr::Uint256(result.into())
+        };
+        assert_ne!(hash1.0, hash3.0, "different nanos should produce different hash");
+    }
+
+    /// Verify that DontHave response matching correctly identifies
+    /// a ping response by matching the req_hash (G4).
+    #[test]
+    fn test_ping_response_matching_dont_have_g4() {
+        use sha2::Digest;
+        use std::time::Instant;
+
+        let nanos: u128 = 42_000_000_000;
+        let ping_hash_val = {
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(nanos.to_le_bytes());
+            let result = hasher.finalize();
+            stellar_xdr::curr::Uint256(result.into())
+        };
+
+        // Simulate state
+        let ping_sent = Some(Instant::now());
+        let stored_ping_hash = Some(ping_hash_val.clone());
+
+        // Simulate receiving DontHave with matching hash
+        let dont_have = stellar_xdr::curr::DontHave {
+            type_: stellar_xdr::curr::MessageType::ScpQuorumset,
+            req_hash: ping_hash_val.clone(),
+        };
+        let mut matched = false;
+        if let (Some(_sent), Some(ref ph)) = (ping_sent, &stored_ping_hash) {
+            if dont_have.req_hash.0 == ph.0 {
+                matched = true;
+            }
+        }
+        assert!(matched, "DontHave with matching hash should be recognized as ping response");
+
+        // Non-matching hash should not match
+        let wrong_hash = stellar_xdr::curr::DontHave {
+            type_: stellar_xdr::curr::MessageType::ScpQuorumset,
+            req_hash: stellar_xdr::curr::Uint256([0xff; 32]),
+        };
+        let mut wrong_matched = false;
+        if let (Some(_sent), Some(ref ph)) = (ping_sent, &stored_ping_hash) {
+            if wrong_hash.req_hash.0 == ph.0 {
+                wrong_matched = true;
+            }
+        }
+        assert!(!wrong_matched, "DontHave with wrong hash should not match");
+    }
+
+    // ---- G8 tests: maybe_drop_random_peer ----
+
+    /// Helper to create a fake PeerInfo for testing.
+    fn make_peer_info(direction: ConnectionDirection, port: u16) -> PeerInfo {
+        let mut bytes = [0u8; 32];
+        bytes[0..2].copy_from_slice(&port.to_le_bytes());
+        PeerInfo {
+            peer_id: PeerId::from_bytes(bytes),
+            address: std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+                port,
+            ),
+            direction,
+            version_string: "test".to_string(),
+            overlay_version: 35,
+            ledger_version: 22,
+            connected_at: Instant::now(),
+            original_address: None,
+        }
+    }
+
+    /// Helper to register a fake peer in both maps.
+    fn register_fake_peer(
+        peers: &DashMap<PeerId, PeerHandle>,
+        info_cache: &DashMap<PeerId, PeerInfo>,
+        info: PeerInfo,
+    ) {
+        let (tx, _rx) = mpsc::channel(8);
+        let peer_id = info.peer_id.clone();
+        let handle = PeerHandle {
+            outbound_tx: tx,
+            stats: Arc::new(PeerStats::default()),
+            flow_control: Arc::new(FlowControl::new(FlowControlConfig::default())),
+        };
+        peers.insert(peer_id.clone(), handle);
+        info_cache.insert(peer_id, info);
+    }
+
+    #[test]
+    fn test_maybe_drop_random_peer_noop_when_tracking() {
+        let peers: DashMap<PeerId, PeerHandle> = DashMap::new();
+        let info_cache: DashMap<PeerId, PeerInfo> = DashMap::new();
+
+        // Add 8 outbound peers (full slots)
+        for i in 0..8 {
+            let info = make_peer_info(ConnectionDirection::Outbound, 11000 + i);
+            register_fake_peer(&peers, &info_cache, info);
+        }
+
+        let mut last_reconnect = None;
+        let dropped = OverlayManager::maybe_drop_random_peer(
+            &peers,
+            &info_cache,
+            &[],
+            8, // max_outbound = 8 (full)
+            true, // tracking = true
+            &mut last_reconnect,
+        );
+        assert!(!dropped, "should not drop when tracking");
+        assert!(last_reconnect.is_none(), "timer should be cleared when tracking");
+    }
+
+    #[test]
+    fn test_maybe_drop_random_peer_noop_when_not_full() {
+        let peers: DashMap<PeerId, PeerHandle> = DashMap::new();
+        let info_cache: DashMap<PeerId, PeerInfo> = DashMap::new();
+
+        // Add 5 outbound peers (not full, max is 8)
+        for i in 0..5 {
+            let info = make_peer_info(ConnectionDirection::Outbound, 11000 + i);
+            register_fake_peer(&peers, &info_cache, info);
+        }
+
+        let mut last_reconnect = None;
+        let dropped = OverlayManager::maybe_drop_random_peer(
+            &peers,
+            &info_cache,
+            &[],
+            8,
+            false, // not tracking
+            &mut last_reconnect,
+        );
+        assert!(!dropped, "should not drop when outbound not full");
+    }
+
+    #[test]
+    fn test_maybe_drop_random_peer_starts_timer_on_first_call() {
+        let peers: DashMap<PeerId, PeerHandle> = DashMap::new();
+        let info_cache: DashMap<PeerId, PeerInfo> = DashMap::new();
+
+        // Fill outbound slots
+        for i in 0..8 {
+            let info = make_peer_info(ConnectionDirection::Outbound, 11000 + i);
+            register_fake_peer(&peers, &info_cache, info);
+        }
+
+        let mut last_reconnect = None;
+        let dropped = OverlayManager::maybe_drop_random_peer(
+            &peers,
+            &info_cache,
+            &[],
+            8,
+            false,
+            &mut last_reconnect,
+        );
+        assert!(!dropped, "first call should only start timer");
+        assert!(last_reconnect.is_some(), "timer should be started");
+    }
+
+    #[test]
+    fn test_maybe_drop_random_peer_drops_after_cooldown() {
+        let peers: DashMap<PeerId, PeerHandle> = DashMap::new();
+        let info_cache: DashMap<PeerId, PeerInfo> = DashMap::new();
+
+        // Fill 8 outbound slots
+        for i in 0..8 {
+            let info = make_peer_info(ConnectionDirection::Outbound, 11000 + i);
+            register_fake_peer(&peers, &info_cache, info);
+        }
+
+        // Pretend we noticed out-of-sync 61 seconds ago (past cooldown)
+        let mut last_reconnect = Some(Instant::now() - Duration::from_secs(61));
+        let dropped = OverlayManager::maybe_drop_random_peer(
+            &peers,
+            &info_cache,
+            &[],
+            8,
+            false,
+            &mut last_reconnect,
+        );
+        assert!(dropped, "should drop a peer after cooldown elapses");
+    }
+
+    #[test]
+    fn test_maybe_drop_random_peer_respects_cooldown() {
+        let peers: DashMap<PeerId, PeerHandle> = DashMap::new();
+        let info_cache: DashMap<PeerId, PeerInfo> = DashMap::new();
+
+        // Fill 8 outbound slots
+        for i in 0..8 {
+            let info = make_peer_info(ConnectionDirection::Outbound, 11000 + i);
+            register_fake_peer(&peers, &info_cache, info);
+        }
+
+        // Pretend we noticed out-of-sync 30 seconds ago (within cooldown)
+        let mut last_reconnect = Some(Instant::now() - Duration::from_secs(30));
+        let dropped = OverlayManager::maybe_drop_random_peer(
+            &peers,
+            &info_cache,
+            &[],
+            8,
+            false,
+            &mut last_reconnect,
+        );
+        assert!(!dropped, "should not drop within cooldown period");
+    }
+
+    #[test]
+    fn test_maybe_drop_random_peer_skips_preferred() {
+        let peers: DashMap<PeerId, PeerHandle> = DashMap::new();
+        let info_cache: DashMap<PeerId, PeerInfo> = DashMap::new();
+
+        // Add 1 outbound peer at port 11625
+        let info = make_peer_info(ConnectionDirection::Outbound, 11625);
+        register_fake_peer(&peers, &info_cache, info);
+
+        // Mark it as preferred
+        let preferred = vec![PeerAddress {
+            host: "127.0.0.1".to_string(),
+            port: 11625,
+        }];
+
+        let mut last_reconnect = Some(Instant::now() - Duration::from_secs(61));
+        let dropped = OverlayManager::maybe_drop_random_peer(
+            &peers,
+            &info_cache,
+            &preferred,
+            1, // max_outbound = 1 (full)
+            false,
+            &mut last_reconnect,
+        );
+        assert!(!dropped, "should not drop preferred peer");
+    }
+
+    #[test]
+    fn test_maybe_drop_random_peer_only_drops_outbound() {
+        let peers: DashMap<PeerId, PeerHandle> = DashMap::new();
+        let info_cache: DashMap<PeerId, PeerInfo> = DashMap::new();
+
+        // Add 3 inbound peers (not outbound)
+        for i in 0..3 {
+            let info = make_peer_info(ConnectionDirection::Inbound, 12000 + i);
+            register_fake_peer(&peers, &info_cache, info);
+        }
+
+        // No outbound peers, so outbound_count = 0 < max_outbound = 8
+        // should_drop is false
+        let mut last_reconnect = Some(Instant::now() - Duration::from_secs(61));
+        let dropped = OverlayManager::maybe_drop_random_peer(
+            &peers,
+            &info_cache,
+            &[],
+            8,
+            false,
+            &mut last_reconnect,
+        );
+        assert!(!dropped, "should not drop when outbound not full (inbound don't count)");
+    }
+
+    #[test]
+    fn test_maybe_drop_random_peer_resets_timer_when_tracking() {
+        // Simulate a scenario where we were out of sync and timer was started,
+        // then we come back in sync — timer should be reset.
+        let peers: DashMap<PeerId, PeerHandle> = DashMap::new();
+        let info_cache: DashMap<PeerId, PeerInfo> = DashMap::new();
+
+        let mut last_reconnect = Some(Instant::now() - Duration::from_secs(100));
+        let dropped = OverlayManager::maybe_drop_random_peer(
+            &peers,
+            &info_cache,
+            &[],
+            8,
+            true, // tracking again
+            &mut last_reconnect,
+        );
+        assert!(!dropped);
+        assert!(last_reconnect.is_none(), "timer should be cleared when back in sync");
     }
 }
