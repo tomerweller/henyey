@@ -37,10 +37,10 @@
 //! - [`AuthState`] - Current state of the authentication handshake
 
 use crate::{LocalNode, OverlayError, PeerId, Result};
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use henyey_common::Hash256;
 use henyey_crypto::PublicKey;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use stellar_xdr::curr::{
     self as xdr, AuthCert as XdrAuthCert, AuthenticatedMessage, AuthenticatedMessageV0,
     Curve25519Public, EnvelopeType, Hello, HmacSha256Key, HmacSha256Mac, StellarMessage, Uint256,
@@ -754,5 +754,211 @@ mod tests {
         assert_eq!(hello.overlay_version, 38);
         assert_eq!(hello.overlay_min_version, 35);
         assert_eq!(hello.ledger_version, 25);
+    }
+
+    // ---- G14: Auth flag (bit 31) gates MAC verification in unwrap_message ----
+
+    /// Helper: Complete a full handshake between two AuthContexts.
+    /// Returns (initiator, acceptor) both in Authenticated state.
+    fn complete_handshake() -> (AuthContext, AuthContext) {
+        let secret_a = SecretKey::generate();
+        let secret_b = SecretKey::generate();
+        let node_a = LocalNode::new_testnet(secret_a);
+        let node_b = LocalNode::new_testnet(secret_b);
+
+        let mut ctx_a = AuthContext::new(node_a, true); // initiator
+        let mut ctx_b = AuthContext::new(node_b, false); // acceptor
+
+        // Exchange Hello messages
+        let hello_a = ctx_a.create_hello();
+        let hello_b = ctx_b.create_hello();
+
+        ctx_a.hello_sent();
+        ctx_b.hello_sent();
+
+        ctx_b
+            .process_hello(&hello_a)
+            .expect("B should accept A's hello");
+        ctx_a
+            .process_hello(&hello_b)
+            .expect("A should accept B's hello");
+
+        // Exchange Auth messages
+        ctx_a.auth_sent();
+        ctx_b.auth_sent();
+        ctx_a.process_auth().expect("A should complete auth");
+        ctx_b.process_auth().expect("B should complete auth");
+
+        assert!(ctx_a.is_authenticated());
+        assert!(ctx_b.is_authenticated());
+
+        (ctx_a, ctx_b)
+    }
+
+    #[test]
+    fn test_unwrap_authenticated_message_verifies_mac_g14() {
+        // After handshake, wrapping and unwrapping should succeed with valid MAC.
+        let (mut ctx_a, mut ctx_b) = complete_handshake();
+
+        let msg = StellarMessage::Peers(xdr::VecM::default());
+        let wrapped = ctx_a.wrap_message(msg.clone()).unwrap();
+
+        // message_is_authenticated=true → MAC should be verified
+        let unwrapped = ctx_b.unwrap_message(wrapped, true).unwrap();
+        assert!(matches!(unwrapped, StellarMessage::Peers(_)));
+    }
+
+    #[test]
+    fn test_unwrap_bad_mac_rejected_when_authenticated_g14() {
+        // After handshake, a message with a wrong MAC should be rejected
+        // when bit 31 is set (message_is_authenticated=true).
+        let (mut ctx_a, mut ctx_b) = complete_handshake();
+
+        let msg = StellarMessage::Peers(xdr::VecM::default());
+        let wrapped = ctx_a.wrap_message(msg).unwrap();
+
+        // Tamper with the MAC
+        let tampered = match wrapped {
+            AuthenticatedMessage::V0(mut v0) => {
+                v0.mac.mac[0] ^= 0xff;
+                AuthenticatedMessage::V0(v0)
+            }
+        };
+
+        let result = ctx_b.unwrap_message(tampered, true);
+        assert!(
+            result.is_err(),
+            "tampered MAC should be rejected when is_authenticated=true"
+        );
+        assert!(
+            matches!(result, Err(OverlayError::MacVerificationFailed)),
+            "error should be MacVerificationFailed"
+        );
+    }
+
+    #[test]
+    fn test_unwrap_skips_mac_when_not_authenticated_g14() {
+        // During handshake (bit 31 clear), MAC is not checked.
+        // This is the Hello/Auth path.
+        let (mut _ctx_a, mut ctx_b) = complete_handshake();
+
+        // Create a message with garbage MAC but message_is_authenticated=false
+        let msg = AuthenticatedMessage::V0(AuthenticatedMessageV0 {
+            sequence: 0,
+            message: StellarMessage::Hello(Default::default()),
+            mac: HmacSha256Mac { mac: [0xAA; 32] }, // garbage MAC
+        });
+
+        // message_is_authenticated=false → MAC should NOT be verified
+        let result = ctx_b.unwrap_message(msg, false);
+        assert!(
+            result.is_ok(),
+            "MAC check should be skipped when is_authenticated=false"
+        );
+    }
+
+    #[test]
+    fn test_unwrap_skips_mac_before_authentication_g14() {
+        // Before handshake completes, even if is_authenticated=true,
+        // MAC is not verified (ctx.is_authenticated() is false).
+        let secret = SecretKey::generate();
+        let node = LocalNode::new_testnet(secret);
+        let mut ctx = AuthContext::new(node, true);
+
+        assert!(!ctx.is_authenticated());
+
+        let msg = AuthenticatedMessage::V0(AuthenticatedMessageV0 {
+            sequence: 0,
+            message: StellarMessage::Hello(Default::default()),
+            mac: HmacSha256Mac { mac: [0xBB; 32] }, // garbage MAC
+        });
+
+        // Even with message_is_authenticated=true, pre-auth messages aren't checked
+        let result = ctx.unwrap_message(msg, true);
+        assert!(
+            result.is_ok(),
+            "pre-auth messages should not be MAC-checked"
+        );
+    }
+
+    #[test]
+    fn test_unwrap_sequence_mismatch_rejected_g14() {
+        // After handshake, a message with wrong sequence number should be rejected.
+        let (mut ctx_a, mut ctx_b) = complete_handshake();
+
+        let msg = StellarMessage::Peers(xdr::VecM::default());
+        let wrapped = ctx_a.wrap_message(msg).unwrap();
+
+        // Tamper with the sequence number
+        let tampered = match wrapped {
+            AuthenticatedMessage::V0(mut v0) => {
+                v0.sequence = 999; // wrong sequence
+                AuthenticatedMessage::V0(v0)
+            }
+        };
+
+        let result = ctx_b.unwrap_message(tampered, true);
+        assert!(result.is_err(), "wrong sequence should be rejected");
+        match result {
+            Err(OverlayError::AuthenticationFailed(msg)) => {
+                assert!(
+                    msg.contains("sequence mismatch"),
+                    "error should mention sequence: {}",
+                    msg
+                );
+            }
+            other => panic!("expected AuthenticationFailed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_unwrap_error_msg_skips_mac_g14() {
+        // ErrorMsg messages skip MAC verification even after authentication,
+        // matching stellar-core behavior where errors can use sequence 0.
+        let (mut _ctx_a, mut ctx_b) = complete_handshake();
+
+        let error_msg = StellarMessage::ErrorMsg(xdr::SError {
+            code: xdr::ErrorCode::Misc,
+            msg: "test error".try_into().unwrap_or_default(),
+        });
+
+        let msg = AuthenticatedMessage::V0(AuthenticatedMessageV0 {
+            sequence: 0,
+            message: error_msg,
+            mac: HmacSha256Mac { mac: [0; 32] }, // zero MAC (invalid)
+        });
+
+        // Error messages should bypass MAC check
+        let result = ctx_b.unwrap_message(msg, true);
+        assert!(
+            result.is_ok(),
+            "error messages should skip MAC verification"
+        );
+    }
+
+    #[test]
+    fn test_wrap_unwrap_roundtrip_multiple_messages_g14() {
+        // Verify that multiple messages can be wrapped and unwrapped in sequence,
+        // with sequence numbers incrementing correctly.
+        let (mut ctx_a, mut ctx_b) = complete_handshake();
+
+        for i in 0..5 {
+            let msg = StellarMessage::Peers(xdr::VecM::default());
+            let wrapped = ctx_a.wrap_message(msg).unwrap();
+
+            // Verify sequence increments
+            match &wrapped {
+                AuthenticatedMessage::V0(v0) => {
+                    assert_eq!(
+                        v0.sequence,
+                        i + 1,
+                        "send sequence should start at 1 and increment"
+                    );
+                }
+            }
+
+            let unwrapped = ctx_b.unwrap_message(wrapped, true).unwrap();
+            assert!(matches!(unwrapped, StellarMessage::Peers(_)));
+        }
     }
 }

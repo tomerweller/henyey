@@ -116,3 +116,144 @@ pub fn open_from_curve25519_secret_key(
         .unseal(ciphertext)
         .map_err(|_| CryptoError::DecryptionFailed)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- G3: Survey crypto roundtrip tests ----
+
+    #[test]
+    fn test_seal_open_ed25519_roundtrip_g3() {
+        // Encrypt with Ed25519 public key, decrypt with Ed25519 secret key.
+        let secret = SecretKey::generate();
+        let public = secret.public_key();
+        let plaintext = b"survey response payload";
+
+        let ciphertext = seal_to_public_key(&public, plaintext).unwrap();
+
+        // Ciphertext should be longer than plaintext (ephemeral key + tag overhead)
+        assert!(ciphertext.len() > plaintext.len());
+
+        let decrypted = open_from_secret_key(&secret, &ciphertext).unwrap();
+        assert_eq!(
+            decrypted, plaintext,
+            "decrypted should match original plaintext"
+        );
+    }
+
+    #[test]
+    fn test_seal_open_curve25519_roundtrip_g3() {
+        // Encrypt/decrypt using raw Curve25519 keys (the path used by survey_impl.rs).
+        // This matches: seal_to_curve25519_public_key + open_from_curve25519_secret_key.
+        let curve_secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let curve_public = x25519_dalek::PublicKey::from(&curve_secret);
+
+        let secret_bytes: [u8; 32] = curve_secret.to_bytes();
+        let public_bytes: [u8; 32] = *curve_public.as_bytes();
+
+        let plaintext = b"encrypted survey topology data";
+        let ciphertext = seal_to_curve25519_public_key(&public_bytes, plaintext).unwrap();
+
+        assert!(ciphertext.len() > plaintext.len());
+
+        let decrypted = open_from_curve25519_secret_key(&secret_bytes, &ciphertext).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_decryption_with_wrong_key_fails_g3() {
+        // Encrypting to one key and decrypting with another must fail.
+        let secret_a = SecretKey::generate();
+        let public_a = secret_a.public_key();
+        let secret_b = SecretKey::generate();
+
+        let plaintext = b"secret data";
+        let ciphertext = seal_to_public_key(&public_a, plaintext).unwrap();
+
+        let result = open_from_secret_key(&secret_b, &ciphertext);
+        assert!(result.is_err(), "decryption with wrong key should fail");
+        assert!(matches!(result, Err(CryptoError::DecryptionFailed)));
+    }
+
+    #[test]
+    fn test_tampered_ciphertext_fails_g3() {
+        // Authenticated encryption should reject tampered ciphertext.
+        let secret = SecretKey::generate();
+        let public = secret.public_key();
+        let plaintext = b"integrity-protected data";
+
+        let mut ciphertext = seal_to_public_key(&public, plaintext).unwrap();
+
+        // Tamper with the last byte (inside the encrypted payload, past the ephemeral key)
+        let last = ciphertext.len() - 1;
+        ciphertext[last] ^= 0xff;
+
+        let result = open_from_secret_key(&secret, &ciphertext);
+        assert!(
+            result.is_err(),
+            "tampered ciphertext should fail decryption"
+        );
+    }
+
+    #[test]
+    fn test_empty_plaintext_roundtrip_g3() {
+        // Edge case: empty plaintext should still work.
+        let secret = SecretKey::generate();
+        let public = secret.public_key();
+        let plaintext = b"";
+
+        let ciphertext = seal_to_public_key(&public, plaintext).unwrap();
+        let decrypted = open_from_secret_key(&secret, &ciphertext).unwrap();
+        assert_eq!(decrypted, plaintext.as_slice());
+    }
+
+    #[test]
+    fn test_large_plaintext_roundtrip_g3() {
+        // Survey responses can be large. Test with a realistic payload size.
+        let secret = SecretKey::generate();
+        let public = secret.public_key();
+        let plaintext = vec![0xABu8; 4096]; // 4 KB payload
+
+        let ciphertext = seal_to_public_key(&public, &plaintext).unwrap();
+        let decrypted = open_from_secret_key(&secret, &ciphertext).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_each_encryption_produces_different_ciphertext_g3() {
+        // Sealed boxes use ephemeral keys, so encrypting the same plaintext twice
+        // should produce different ciphertexts (non-deterministic).
+        let secret = SecretKey::generate();
+        let public = secret.public_key();
+        let plaintext = b"same payload";
+
+        let ct1 = seal_to_public_key(&public, plaintext).unwrap();
+        let ct2 = seal_to_public_key(&public, plaintext).unwrap();
+
+        assert_ne!(
+            ct1, ct2,
+            "sealed box encryption should be non-deterministic"
+        );
+
+        // Both should decrypt to the same plaintext
+        let pt1 = open_from_secret_key(&secret, &ct1).unwrap();
+        let pt2 = open_from_secret_key(&secret, &ct2).unwrap();
+        assert_eq!(pt1, plaintext.as_slice());
+        assert_eq!(pt2, plaintext.as_slice());
+    }
+
+    #[test]
+    fn test_curve25519_wrong_key_fails_g3() {
+        // Same wrong-key test but for the Curve25519 path used by surveys.
+        let sk_a = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let pk_a = x25519_dalek::PublicKey::from(&sk_a);
+        let sk_b = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+
+        let plaintext = b"survey data";
+        let ciphertext = seal_to_curve25519_public_key(pk_a.as_bytes(), plaintext).unwrap();
+
+        let result = open_from_curve25519_secret_key(&sk_b.to_bytes(), &ciphertext);
+        assert!(result.is_err(), "wrong Curve25519 key should fail");
+    }
+}

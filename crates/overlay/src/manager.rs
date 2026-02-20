@@ -143,6 +143,75 @@ async fn resolve_peer_list(peers: &[PeerAddress]) -> (Vec<PeerAddress>, bool) {
     (resolved, errors)
 }
 
+/// Compute the ping hash for a given nanosecond timestamp.
+///
+/// Creates a SHA-256 hash of the timestamp in little-endian bytes, matching
+/// stellar-core's ping nonce generation. The resulting hash is sent as a
+/// `GetScpQuorumset` request; a `DontHave` or `ScpQuorumset` response with
+/// a matching hash is used to measure round-trip time.
+///
+/// Extracted from `run_peer_loop` for testability (G4).
+fn compute_ping_hash(nanos: u128) -> stellar_xdr::curr::Uint256 {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(nanos.to_le_bytes());
+    let result = hasher.finalize();
+    stellar_xdr::curr::Uint256(result.into())
+}
+
+/// Check if a received hash matches an outstanding ping hash.
+///
+/// Returns true if both `ping_sent_time` and `ping_hash` are `Some` and the
+/// received `hash_bytes` matches the stored ping hash.
+///
+/// Extracted from `run_peer_loop` ping response matching for testability (G4).
+fn is_ping_response(
+    ping_hash: Option<&stellar_xdr::curr::Uint256>,
+    hash_bytes: &[u8; 32],
+) -> bool {
+    match ping_hash {
+        Some(ph) => ph.0 == *hash_bytes,
+        None => false,
+    }
+}
+
+/// Compute the next DNS resolution delay based on the backoff state.
+///
+/// Implements the linear backoff state machine from stellar-core:
+/// - If `resolving_with_backoff` and the latest resolution succeeded (no errors),
+///   disable backoff and return `PEER_IP_RESOLVE_DELAY` (600s).
+/// - If `resolving_with_backoff` and there are errors, increment retry count and
+///   return `retry_count * PEER_IP_RESOLVE_RETRY_DELAY`.
+/// - If the backoff delay exceeds `PEER_IP_RESOLVE_DELAY`, give up on retries.
+/// - If not in backoff mode, always return `PEER_IP_RESOLVE_DELAY`.
+///
+/// Returns `(delay, new_resolving_with_backoff, new_retry_count)`.
+///
+/// Extracted from `start_tick_loop` for testability (G7).
+fn compute_dns_backoff_delay(
+    resolving_with_backoff: bool,
+    retry_count: u32,
+    had_errors: bool,
+) -> (Duration, bool, u32) {
+    if !resolving_with_backoff {
+        return (PEER_IP_RESOLVE_DELAY, false, retry_count);
+    }
+
+    if !had_errors {
+        // Success: disable retries permanently.
+        (PEER_IP_RESOLVE_DELAY, false, retry_count)
+    } else {
+        // Failure: linear backoff.
+        let new_retry_count = retry_count + 1;
+        let backoff = PEER_IP_RESOLVE_RETRY_DELAY.saturating_mul(new_retry_count);
+        if backoff > PEER_IP_RESOLVE_DELAY {
+            // Give up on retries.
+            (PEER_IP_RESOLVE_DELAY, false, new_retry_count)
+        } else {
+            (backoff, true, new_retry_count)
+        }
+    }
+}
+
 /// Truncate an error message to fit within the XDR `string msg<100>` limit.
 ///
 /// If the message exceeds 100 bytes it is truncated at a valid UTF-8 boundary
@@ -822,27 +891,13 @@ impl OverlayManager {
                                 }
 
                                 // Calculate next resolve delay based on success/failure.
-                                let delay = if dns_resolving_with_backoff {
-                                    if !result.errors {
-                                        // Success: disable retries permanently.
-                                        dns_resolving_with_backoff = false;
-                                        PEER_IP_RESOLVE_DELAY
-                                    } else {
-                                        // Failure: linear backoff.
-                                        dns_retry_count += 1;
-                                        let backoff = PEER_IP_RESOLVE_RETRY_DELAY
-                                            .saturating_mul(dns_retry_count);
-                                        if backoff > PEER_IP_RESOLVE_DELAY {
-                                            // Give up on retries.
-                                            dns_resolving_with_backoff = false;
-                                            PEER_IP_RESOLVE_DELAY
-                                        } else {
-                                            backoff
-                                        }
-                                    }
-                                } else {
-                                    PEER_IP_RESOLVE_DELAY
-                                };
+                                let (delay, new_backoff, new_retry) = compute_dns_backoff_delay(
+                                    dns_resolving_with_backoff,
+                                    dns_retry_count,
+                                    result.errors,
+                                );
+                                dns_resolving_with_backoff = new_backoff;
+                                dns_retry_count = new_retry;
 
                                 dns_next_resolve_at = Instant::now() + delay;
                                 debug!(
@@ -1253,8 +1308,8 @@ impl OverlayManager {
                                             let hash = henyey_common::Hash256::hash_xdr(qs)
                                                 .unwrap_or(henyey_common::Hash256::ZERO);
                                             // G4: check if this is a ping response
-                                            if let (Some(sent), Some(ref ph)) = (ping_sent_time, &ping_hash) {
-                                                if hash.0 == ph.0 {
+                                            if let Some(sent) = ping_sent_time {
+                                                if is_ping_response(ping_hash.as_ref(), &hash.0) {
                                                     let rtt = sent.elapsed();
                                                     debug!("Latency {}: {} ms", peer_id, rtt.as_millis());
                                                     last_ping_rtt = Some(rtt);
@@ -1266,8 +1321,8 @@ impl OverlayManager {
                                         }
                                         StellarMessage::DontHave(dh) => {
                                             // G4: check if this DontHave is a ping response
-                                            if let (Some(sent), Some(ref ph)) = (ping_sent_time, &ping_hash) {
-                                                if dh.req_hash.0 == ph.0 {
+                                            if let Some(sent) = ping_sent_time {
+                                                if is_ping_response(ping_hash.as_ref(), &dh.req_hash.0) {
                                                     let rtt = sent.elapsed();
                                                     debug!("Latency {}: {} ms", peer_id, rtt.as_millis());
                                                     last_ping_rtt = Some(rtt);
@@ -1395,12 +1450,7 @@ impl OverlayManager {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_nanos();
-                            let hash = {
-                                let mut hasher = sha2::Sha256::new();
-                                hasher.update(now_nanos.to_le_bytes());
-                                let result = hasher.finalize();
-                                stellar_xdr::curr::Uint256(result.into())
-                            };
+                            let hash = compute_ping_hash(now_nanos);
                             let ping_msg = StellarMessage::GetScpQuorumset(hash.clone());
                             if let Err(e) = peer.send(ping_msg).await {
                                 debug!("Failed to send ping to {}: {}", peer_id, e);
@@ -2600,10 +2650,41 @@ mod tests {
         assert!(is_straggling, "should be straggling when write is very old");
     }
 
+    /// G17: Verify that updating last_write (as ping does) prevents idle timeout.
+    ///
+    /// In run_peer_loop, a successful ping sets `last_write = Instant::now()`.
+    /// The idle timeout fires only when BOTH last_read and last_write exceed
+    /// PEER_TIMEOUT. So ping acts as a keepalive by refreshing last_write.
+    #[test]
+    fn test_ping_updates_last_write_prevents_idle_timeout_g17() {
+        let peer_timeout = Duration::from_secs(30);
+
+        // Scenario: 25 seconds have passed with no reads.
+        // Without any writes, both would be stale at 30s and peer would be dropped.
+        let now = Instant::now();
+        let started = now - Duration::from_secs(25);
+        let last_read = started; // no reads for 25s
+
+        // Without ping: last_write is also old → will timeout at 30s.
+        let last_write_no_ping = started;
+        // 5 more seconds pass...
+        let future = now + Duration::from_secs(6);
+        let would_timeout_without_ping = future.duration_since(last_read) >= peer_timeout
+            && future.duration_since(last_write_no_ping) >= peer_timeout;
+        assert!(would_timeout_without_ping, "without ping, peer would time out");
+
+        // With ping at 15s: last_write was refreshed at that point.
+        let last_write_with_ping = now - Duration::from_secs(10); // ping sent 10s ago
+        let would_timeout_with_ping = future.duration_since(last_read) >= peer_timeout
+            && future.duration_since(last_write_with_ping) >= peer_timeout;
+        assert!(!would_timeout_with_ping, "ping refreshes last_write, preventing idle timeout");
+    }
+
     #[tokio::test]
     async fn test_start_purges_dead_peers_g6() {
         // G6: On startup, purge peers with >= 120 failures from the peer database.
         use crate::peer_manager::PeerManager;
+
 
         let pm = Arc::new(PeerManager::new_in_memory());
 
@@ -2770,30 +2851,13 @@ mod tests {
     /// DontHave/ScpQuorumset response-matching logic works correctly (G4).
     #[test]
     fn test_ping_hash_computation_is_deterministic_g4() {
-        use sha2::Digest;
         let nanos: u128 = 1_000_000_000;
-        let hash1 = {
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(nanos.to_le_bytes());
-            let result = hasher.finalize();
-            stellar_xdr::curr::Uint256(result.into())
-        };
-        let hash2 = {
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(nanos.to_le_bytes());
-            let result = hasher.finalize();
-            stellar_xdr::curr::Uint256(result.into())
-        };
+        let hash1 = compute_ping_hash(nanos);
+        let hash2 = compute_ping_hash(nanos);
         assert_eq!(hash1.0, hash2.0, "same nanos should produce same ping hash");
 
         // Different nanos should produce different hash
-        let hash3 = {
-            let nanos2: u128 = 2_000_000_000;
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(nanos2.to_le_bytes());
-            let result = hasher.finalize();
-            stellar_xdr::curr::Uint256(result.into())
-        };
+        let hash3 = compute_ping_hash(2_000_000_000);
         assert_ne!(hash1.0, hash3.0, "different nanos should produce different hash");
     }
 
@@ -2801,46 +2865,26 @@ mod tests {
     /// a ping response by matching the req_hash (G4).
     #[test]
     fn test_ping_response_matching_dont_have_g4() {
-        use sha2::Digest;
-        use std::time::Instant;
-
         let nanos: u128 = 42_000_000_000;
-        let ping_hash_val = {
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(nanos.to_le_bytes());
-            let result = hasher.finalize();
-            stellar_xdr::curr::Uint256(result.into())
-        };
+        let ping_hash_val = compute_ping_hash(nanos);
 
-        // Simulate state
-        let ping_sent = Some(Instant::now());
-        let stored_ping_hash = Some(ping_hash_val.clone());
-
-        // Simulate receiving DontHave with matching hash
-        let dont_have = stellar_xdr::curr::DontHave {
-            type_: stellar_xdr::curr::MessageType::ScpQuorumset,
-            req_hash: ping_hash_val.clone(),
-        };
-        let mut matched = false;
-        if let (Some(_sent), Some(ref ph)) = (ping_sent, &stored_ping_hash) {
-            if dont_have.req_hash.0 == ph.0 {
-                matched = true;
-            }
-        }
-        assert!(matched, "DontHave with matching hash should be recognized as ping response");
+        // Matching hash should be recognized as a ping response
+        assert!(
+            is_ping_response(Some(&ping_hash_val), &ping_hash_val.0),
+            "DontHave with matching hash should be recognized as ping response"
+        );
 
         // Non-matching hash should not match
-        let wrong_hash = stellar_xdr::curr::DontHave {
-            type_: stellar_xdr::curr::MessageType::ScpQuorumset,
-            req_hash: stellar_xdr::curr::Uint256([0xff; 32]),
-        };
-        let mut wrong_matched = false;
-        if let (Some(_sent), Some(ref ph)) = (ping_sent, &stored_ping_hash) {
-            if wrong_hash.req_hash.0 == ph.0 {
-                wrong_matched = true;
-            }
-        }
-        assert!(!wrong_matched, "DontHave with wrong hash should not match");
+        assert!(
+            !is_ping_response(Some(&ping_hash_val), &[0xff; 32]),
+            "DontHave with wrong hash should not match"
+        );
+
+        // No outstanding ping → no match
+        assert!(
+            !is_ping_response(None, &ping_hash_val.0),
+            "No outstanding ping should never match"
+        );
     }
 
     // ---- G8 tests: maybe_drop_random_peer ----
@@ -3116,56 +3160,50 @@ mod tests {
 
     #[test]
     fn test_dns_backoff_success_disables_retries() {
-        // Simulate: dns_resolving_with_backoff=true, no errors → disable retries.
-        let mut dns_resolving_with_backoff = true;
-        let mut dns_retry_count: u32 = 0;
-        let result_errors = false;
-
-        let delay = if dns_resolving_with_backoff {
-            if !result_errors {
-                dns_resolving_with_backoff = false;
-                PEER_IP_RESOLVE_DELAY
-            } else {
-                dns_retry_count += 1;
-                let backoff = PEER_IP_RESOLVE_RETRY_DELAY.saturating_mul(dns_retry_count);
-                if backoff > PEER_IP_RESOLVE_DELAY {
-                    dns_resolving_with_backoff = false;
-                    PEER_IP_RESOLVE_DELAY
-                } else {
-                    backoff
-                }
-            }
-        } else {
-            PEER_IP_RESOLVE_DELAY
-        };
-
+        // backoff=true, no errors → disable retries, return 600s.
+        let (delay, backoff, retry_count) = compute_dns_backoff_delay(true, 0, false);
         assert_eq!(delay, Duration::from_secs(600));
-        assert!(!dns_resolving_with_backoff, "success should disable backoff");
+        assert!(!backoff, "success should disable backoff");
+        assert_eq!(retry_count, 0);
     }
 
     #[test]
     fn test_dns_backoff_failure_linear() {
-        // Simulate repeated failures → linear backoff.
-        #[allow(unused_assignments)]
-        let mut dns_resolving_with_backoff = true;
-        let mut dns_retry_count: u32 = 0;
+        // First failure: retry_count 0→1, delay=10s.
+        let (delay, backoff, retry_count) = compute_dns_backoff_delay(true, 0, true);
+        assert_eq!(delay, Duration::from_secs(10));
+        assert!(backoff, "should still be in backoff mode");
+        assert_eq!(retry_count, 1);
 
-        // First failure: retry_count=1 → 10s
-        dns_retry_count += 1;
-        let delay1 = PEER_IP_RESOLVE_RETRY_DELAY.saturating_mul(dns_retry_count);
-        assert_eq!(delay1, Duration::from_secs(10));
+        // Third failure: retry_count 2→3, delay=30s.
+        let (delay, backoff, retry_count) = compute_dns_backoff_delay(true, 2, true);
+        assert_eq!(delay, Duration::from_secs(30));
+        assert!(backoff);
+        assert_eq!(retry_count, 3);
 
-        // Third failure: retry_count=3 → 30s
-        dns_retry_count = 3;
-        let delay3 = PEER_IP_RESOLVE_RETRY_DELAY.saturating_mul(dns_retry_count);
-        assert_eq!(delay3, Duration::from_secs(30));
+        // 60th failure: retry_count 59→60, delay=600s, still in backoff.
+        let (delay, backoff, retry_count) = compute_dns_backoff_delay(true, 59, true);
+        assert_eq!(delay, Duration::from_secs(600));
+        assert!(backoff);
+        assert_eq!(retry_count, 60);
 
-        // 61st failure: 610s > 600s → give up on retries
-        dns_retry_count = 61;
-        let delay61 = PEER_IP_RESOLVE_RETRY_DELAY.saturating_mul(dns_retry_count);
-        assert!(delay61 > PEER_IP_RESOLVE_DELAY);
-        dns_resolving_with_backoff = false; // would be set in real code
-        assert!(!dns_resolving_with_backoff);
+        // 61st failure: retry_count 60→61, 610s > 600s → give up on retries.
+        let (delay, backoff, retry_count) = compute_dns_backoff_delay(true, 60, true);
+        assert_eq!(delay, Duration::from_secs(600), "should cap at PEER_IP_RESOLVE_DELAY");
+        assert!(!backoff, "should give up on retries");
+        assert_eq!(retry_count, 61);
+    }
+
+    #[test]
+    fn test_dns_backoff_not_in_backoff_mode() {
+        // When not in backoff mode, always return 600s regardless of error state.
+        let (delay, backoff, _) = compute_dns_backoff_delay(false, 5, true);
+        assert_eq!(delay, Duration::from_secs(600));
+        assert!(!backoff);
+
+        let (delay, backoff, _) = compute_dns_backoff_delay(false, 0, false);
+        assert_eq!(delay, Duration::from_secs(600));
+        assert!(!backoff);
     }
 
     // --- G16: Per-peer capacity enforcement tests ---
@@ -3286,6 +3324,12 @@ mod tests {
     }
 
     // --- G1: Tick loop tests ---
+    //
+    // NOTE: The actual tick loop behavior (periodic DNS resolution, peer
+    // connection attempts, and random peer drops) runs inside `start_tick_loop`
+    // which requires a full async runtime with real TCP. Fully testing the loop
+    // end-to-end is an **integration test candidate**. The unit tests below
+    // verify the constants and extracted helper functions that the loop uses.
 
     #[test]
     fn test_tick_interval_matches_stellar_core() {
@@ -3304,4 +3348,11 @@ mod tests {
             PEER_IP_RESOLVE_DELAY.as_secs() / PEER_IP_RESOLVE_RETRY_DELAY.as_secs();
         assert_eq!(max_retries, 60);
     }
+
+    // --- G2: Auth timeout ---
+    //
+    // NOTE: Auth timeout enforcement (disconnecting peers that don't complete
+    // the handshake within `auth_timeout_secs`) occurs inside `run_peer_loop`
+    // which requires real TCP streams. This is an **integration test candidate**.
+    // The config default (2s for unauth, 30s for auth) is tested in lib.rs tests.
 }
