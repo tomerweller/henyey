@@ -371,15 +371,20 @@ pub fn check_operation_signatures(
     let mut tracker = SignatureTracker::new(tx_hash, signatures);
 
     // Step 1: Re-check TX-level source account signatures with tracking.
-    // This mirrors stellar-core's commonValid -> checkAllTransactionSignatures,
+    // This mirrors stellar-core's commonPreApply -> checkAllTransactionSignatures,
     // which is done with the same SignatureChecker instance that later checks
     // per-op signatures.
+    //
+    // For fee-bump transactions, inner sig failures are caught here (after the
+    // outer fee has been charged) rather than in validate_preconditions. A prior
+    // tx in the same ledger may have modified the inner source's signer set so
+    // that the inner sigs are no longer valid at apply-time.
     if let Some(source_account) = state.get_account(inner_source_id) {
         let tx_threshold = threshold_low(source_account);
         if !tracker.check_signature(source_account, tx_threshold) {
-            // TX-level auth failed — but this should have been caught earlier.
-            // We still need to handle it for used-signature consistency.
-            return None; // Let the existing checks handle this
+            // TX-level auth failed. Return InvalidSignature so the caller records
+            // txBadAuth / txFeeBumpInnerFailed with the fee already charged.
+            return Some((Vec::new(), ExecutionFailure::InvalidSignature));
         }
     } else {
         return None; // Source account gone — shouldn't happen after seq bump

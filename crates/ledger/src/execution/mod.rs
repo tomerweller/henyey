@@ -1814,21 +1814,13 @@ impl TransactionExecutor {
             return Ok(Err(post_seq_fail(ExecutionFailure::InvalidSignature, "Invalid signature")));
         }
 
-        if frame.is_fee_bump() {
-            let inner_hash = fee_bump_inner_hash(&frame, &self.network_id)?;
-            // stellar-core's checkAllTransactionSignatures uses THRESHOLD_LOW
-            // for all TX source account signatures, including fee-bump inner TXs
-            let inner_threshold = threshold_low(&source_account);
-            if !has_sufficient_signer_weight(
-                &inner_hash,
-                frame.inner_signatures(),
-                &source_account,
-                inner_threshold,
-            ) {
-                tracing::debug!("Signature check failed: fee_bump inner check");
-                return Ok(Err(post_seq_fail(ExecutionFailure::InvalidSignature, "Invalid inner signature")));
-            }
-        }
+        // NOTE: For fee-bump transactions, we deliberately do NOT check the inner
+        // transaction's signatures here. In stellar-core, fee is charged by
+        // processFeeSeqNum() BEFORE apply() re-validates inner signatures. If a
+        // prior transaction in the same ledger modifies the inner source's signer
+        // set, the inner sig check must fail at apply-time (after fee charging),
+        // not here. The check_operation_signatures call in execute_transaction_with_fee_mode
+        // handles inner sig validation after the fee has been deducted.
 
         let required_weight = threshold_low(&source_account);
         if !frame.is_fee_bump()

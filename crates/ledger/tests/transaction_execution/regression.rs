@@ -2747,3 +2747,186 @@ fn test_set_trust_line_flags_redeems_pool_shares_loaded_from_snapshot() {
         "exactly 2 claimable balances should be created (one per pool asset)"
     );
 }
+
+/// Regression test for VE-03: fee-bump outer fee must be charged even when the inner
+/// transaction's auth fails at apply time due to a prior transaction removing the signer.
+///
+/// In stellar-core, `processFeeSeqNum()` charges the outer fee BEFORE `apply()` re-validates
+/// the inner transaction's signatures. If a prior transaction in the same ledger removes a
+/// signer from the inner source account, the inner sig check fails during `apply()` with
+/// `txBadAuth`, but the outer fee is still charged.
+///
+/// Our previous implementation checked inner signatures inside `validate_preconditions()`
+/// (before fee charging) and returned early with `fee_charged=0`, which was incorrect.
+///
+/// The fix: for fee-bump transactions, inner sig validation is deferred to
+/// `check_operation_signatures()` which runs after the outer fee has been deducted.
+#[test]
+fn test_fee_bump_charges_outer_fee_when_inner_auth_fails_at_apply() {
+    let inner_secret = SecretKey::from_seed(&[30u8; 32]);
+    let inner_account_id: AccountId = (&inner_secret.public_key()).into();
+
+    // An additional signer that will be removed before the fee-bump executes
+    let signer_secret = SecretKey::from_seed(&[31u8; 32]);
+    let signer_pubkey = signer_secret.public_key();
+
+    let fee_secret = SecretKey::from_seed(&[32u8; 32]);
+    let fee_account_id: AccountId = (&fee_secret.public_key()).into();
+
+    let network_id = NetworkId::testnet();
+
+    // inner_source: master_weight=1, all thresholds=1, plus one additional signer
+    let inner_signer = Signer {
+        key: SignerKey::Ed25519(Uint256(*signer_pubkey.as_bytes())),
+        weight: 1,
+    };
+    let inner_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        account_id: inner_account_id.clone(),
+    });
+    let inner_entry = LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::Account(AccountEntry {
+            account_id: inner_account_id.clone(),
+            balance: 20_000_000,
+            seq_num: SequenceNumber(1),
+            num_sub_entries: 1,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 1, 1, 1]),
+            signers: vec![inner_signer].try_into().unwrap(),
+            ext: AccountEntryExt::V0,
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+
+    // 20_000_000 gives the fee source ample room above the 2*base_reserve minimum (10_000_000)
+    let (fee_key, fee_entry) = create_account_entry(fee_account_id.clone(), 1, 20_000_000);
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(inner_key, inner_entry)
+        .expect("add inner")
+        .add_entry(fee_key, fee_entry)
+        .expect("add fee")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 24, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    // TX1: SetOptions from inner_source (master key) — removes signer_pubkey (weight=0).
+    // This simulates a prior tx that changes the inner source's signer set mid-ledger.
+    let set_options_op = Operation {
+        source_account: None,
+        body: OperationBody::SetOptions(SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: None,
+            set_flags: None,
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: Some(Signer {
+                key: SignerKey::Ed25519(Uint256(*signer_pubkey.as_bytes())),
+                weight: 0, // weight=0 removes the signer
+            }),
+        }),
+    };
+
+    let tx1 = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*inner_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![set_options_op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut env1 = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: tx1,
+        signatures: VecM::default(),
+    });
+    let sig1 = sign_envelope(&env1, &inner_secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut e) = env1 {
+        e.signatures = vec![sig1].try_into().unwrap();
+    }
+
+    let result1 = executor
+        .execute_transaction(&snapshot, &env1, 100, None)
+        .expect("execute tx1");
+    assert!(result1.success, "TX1 (SetOptions remove signer) should succeed");
+
+    // TX2: fee-bump wrapping an inner tx signed by signer_secret (now removed by TX1).
+    let payment_op = Operation {
+        source_account: None,
+        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+            destination: MuxedAccount::Ed25519(Uint256([9u8; 32])),
+            asset: Asset::Native,
+            amount: 1,
+        }),
+    };
+
+    let inner_tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*inner_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(3), // inner_source seq is 2 after TX1, next is 3
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![payment_op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    // Sign the inner tx with signer_secret — this key was removed from inner_source by TX1
+    let inner_env_for_signing = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: inner_tx.clone(),
+        signatures: VecM::default(),
+    });
+    let inner_sig = sign_envelope(&inner_env_for_signing, &signer_secret, &network_id);
+
+    let inner_v1 = TransactionV1Envelope {
+        tx: inner_tx,
+        signatures: vec![inner_sig].try_into().unwrap(),
+    };
+
+    let fee_bump = FeeBumpTransaction {
+        fee_source: MuxedAccount::Ed25519(Uint256(*fee_secret.public_key().as_bytes())),
+        fee: 200,
+        inner_tx: FeeBumpTransactionInnerTx::Tx(inner_v1),
+        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+    };
+
+    let mut env2 = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+        tx: fee_bump,
+        signatures: VecM::default(),
+    });
+    let outer_sig = sign_envelope(&env2, &fee_secret, &network_id);
+    if let TransactionEnvelope::TxFeeBump(ref mut e) = env2 {
+        e.signatures = vec![outer_sig].try_into().unwrap();
+    }
+
+    let result2 = executor
+        .execute_transaction(&snapshot, &env2, 100, None)
+        .expect("execute tx2");
+
+    // The inner tx's signer was removed by TX1, so inner auth fails at apply time.
+    assert!(!result2.success, "fee-bump should fail (inner auth invalid)");
+    assert_eq!(
+        result2.failure,
+        Some(ExecutionFailure::InvalidSignature),
+        "inner tx should fail with InvalidSignature (txBadAuth)"
+    );
+
+    // The outer fee (200) MUST be charged even though the inner tx failed auth.
+    // Before VE-03 fix, this was 0 because inner sig check happened before fee charging.
+    assert_eq!(
+        result2.fee_charged, 200,
+        "outer fee-bump fee must be charged even when inner auth fails at apply time"
+    );
+}
