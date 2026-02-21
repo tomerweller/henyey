@@ -16,6 +16,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::bucket_list::BUCKET_LIST_LEVELS;
+
 // ============================================================================
 // Merge Counters
 // ============================================================================
@@ -314,9 +316,9 @@ pub struct BucketListMetrics {
     /// Number of non-empty buckets.
     pub bucket_count: AtomicU64,
     /// Number of entries by level.
-    pub entries_by_level: [AtomicU64; 11],
+    pub entries_by_level: [AtomicU64; BUCKET_LIST_LEVELS],
     /// Size by level in bytes.
-    pub size_by_level: [AtomicU64; 11],
+    pub size_by_level: [AtomicU64; BUCKET_LIST_LEVELS],
 }
 
 impl BucketListMetrics {
@@ -327,7 +329,7 @@ impl BucketListMetrics {
 
     /// Updates metrics for a specific level.
     pub fn update_level(&self, level: usize, entry_count: u64, size_bytes: u64) {
-        if level < 11 {
+        if level < BUCKET_LIST_LEVELS {
             self.entries_by_level[level].store(entry_count, Ordering::Relaxed);
             self.size_by_level[level].store(size_bytes, Ordering::Relaxed);
         }
@@ -339,7 +341,7 @@ impl BucketListMetrics {
         let mut total_size = 0u64;
         let mut bucket_count = 0u64;
 
-        for level in 0..11 {
+        for level in 0..BUCKET_LIST_LEVELS {
             let entries = self.entries_by_level[level].load(Ordering::Relaxed);
             let size = self.size_by_level[level].load(Ordering::Relaxed);
             total_entries += entries;
@@ -356,10 +358,10 @@ impl BucketListMetrics {
 
     /// Returns a snapshot of the metrics.
     pub fn snapshot(&self) -> BucketListMetricsSnapshot {
-        let mut entries_by_level = [0u64; 11];
-        let mut size_by_level = [0u64; 11];
+        let mut entries_by_level = [0u64; BUCKET_LIST_LEVELS];
+        let mut size_by_level = [0u64; BUCKET_LIST_LEVELS];
 
-        for level in 0..11 {
+        for level in 0..BUCKET_LIST_LEVELS {
             entries_by_level[level] = self.entries_by_level[level].load(Ordering::Relaxed);
             size_by_level[level] = self.size_by_level[level].load(Ordering::Relaxed);
         }
@@ -378,7 +380,7 @@ impl BucketListMetrics {
         self.total_entries.store(0, Ordering::Relaxed);
         self.total_size_bytes.store(0, Ordering::Relaxed);
         self.bucket_count.store(0, Ordering::Relaxed);
-        for level in 0..11 {
+        for level in 0..BUCKET_LIST_LEVELS {
             self.entries_by_level[level].store(0, Ordering::Relaxed);
             self.size_by_level[level].store(0, Ordering::Relaxed);
         }
@@ -391,8 +393,8 @@ pub struct BucketListMetricsSnapshot {
     pub total_entries: u64,
     pub total_size_bytes: u64,
     pub bucket_count: u64,
-    pub entries_by_level: [u64; 11],
-    pub size_by_level: [u64; 11],
+    pub entries_by_level: [u64; BUCKET_LIST_LEVELS],
+    pub size_by_level: [u64; BUCKET_LIST_LEVELS],
 }
 
 impl BucketListMetricsSnapshot {
@@ -412,7 +414,7 @@ impl BucketListMetricsSnapshot {
 
     /// Returns the size for a specific level in MB.
     pub fn size_mb_for_level(&self, level: usize) -> f64 {
-        if level < 11 {
+        if level < BUCKET_LIST_LEVELS {
             self.size_by_level[level] as f64 / (1024.0 * 1024.0)
         } else {
             0.0

@@ -1092,7 +1092,6 @@ pub struct InflationWinner {
 /// A searchable wrapper around a hot archive bucket list snapshot.
 pub struct SearchableHotArchiveBucketListSnapshot {
     snapshot: HotArchiveBucketListSnapshot,
-    // TODO: Add methods to query historical snapshots (like SearchableBucketListSnapshot)
     _historical_snapshots: BTreeMap<u32, HotArchiveBucketListSnapshot>,
 }
 

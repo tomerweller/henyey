@@ -369,21 +369,7 @@ impl FutureBucket {
                 })?;
 
                 let bucket = handle.resolve().await?;
-                let bucket = Arc::new(bucket);
-                let hash = bucket.hash();
-
-                // Clear inputs
-                self.input_curr = None;
-                self.input_snap = None;
-                self.input_curr_hash = None;
-                self.input_snap_hash = None;
-
-                // Set output
-                self.output = Some(bucket.clone());
-                self.output_hash = Some(hash);
-                self.state = FutureBucketState::LiveOutput;
-
-                Ok(bucket)
+                Ok(self.finalize_merge(bucket))
             }
             _ => Err(BucketError::Merge(format!(
                 "cannot resolve FutureBucket in state {:?}",
@@ -416,28 +402,33 @@ impl FutureBucket {
                     self.protocol_version,
                     self.normalize_init,
                 )?;
-                let bucket = Arc::new(bucket);
-                let hash = bucket.hash();
-
-                // Clear inputs
-                self.input_curr = None;
-                self.input_snap = None;
-                self.input_curr_hash = None;
-                self.input_snap_hash = None;
-                self.merge_handle = None;
-
-                // Set output
-                self.output = Some(bucket.clone());
-                self.output_hash = Some(hash);
-                self.state = FutureBucketState::LiveOutput;
-
-                Ok(bucket)
+                Ok(self.finalize_merge(bucket))
             }
             _ => Err(BucketError::Merge(format!(
                 "cannot resolve FutureBucket in state {:?}",
                 self.state
             ))),
         }
+    }
+
+    /// Clears inputs, stores the merged bucket as output, and transitions to LiveOutput.
+    fn finalize_merge(&mut self, bucket: Bucket) -> Arc<Bucket> {
+        let bucket = Arc::new(bucket);
+        let hash = bucket.hash();
+
+        // Clear inputs
+        self.input_curr = None;
+        self.input_snap = None;
+        self.input_curr_hash = None;
+        self.input_snap_hash = None;
+        self.merge_handle = None;
+
+        // Set output
+        self.output = Some(bucket.clone());
+        self.output_hash = Some(hash);
+        self.state = FutureBucketState::LiveOutput;
+
+        bucket
     }
 
     /// Get the output hash if available.
