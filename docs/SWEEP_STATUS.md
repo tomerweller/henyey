@@ -1,6 +1,6 @@
 # Verify-Execution Sweep Status
 
-> **Updated**: 2026-02-21 18:12
+> **Updated**: 2026-02-21 19:27
 > **Mainnet cache range**: L59501248–L59939046
 > **Supported protocol**: P24+ (L59501312 is first P24 ledger; L59501248–L59501311 are P23 and unverifiable)
 
@@ -22,7 +22,9 @@ Ledgers L59501248–L59501311 (P23) cannot be verified by Henyey (min supported:
 | L59845023 | **CLEAN** | VE-02 confirmed fixed — verified with 0 mismatches post-fix (commit 710ae8d) |
 | L59845024–L59863186 | **CLEAN** | Sweep 3 restart ran clean up to VE-04 |
 | L59863187 | **CLEAN** | VE-04 confirmed fixed — verified with 0 mismatches post-fix (commit 3930486) |
-| L59863188–L59939046 | In progress (Sweep 3 restart 3, PID 3439084) | No errors found so far |
+| L59863188–L59875307 | **CLEAN** | Sweep 3 restart 3 ran clean through this range |
+| L59875308–L59907177 | In progress (Sweep 3a, PID 3498117) | No errors found so far |
+| L59907178–L59939046 | In progress (Sweep 3b, PID 3498118) | No errors found so far |
 
 ## VE-04 (confirmed fixed)
 
@@ -79,4 +81,5 @@ Ledgers L59501248–L59501311 (P23) cannot be verified by Henyey (min supported:
 | Sweep | Range | PID | Started |
 |-------|-------|-----|---------|
 | Sweep 2 (restart) | L59747051–L59799999 | 3255803 | 2026-02-21 |
-| Sweep 3 (restart 3) | L59863188–L59939046 | 3439084 | 2026-02-21 |
+| Sweep 3a | L59875308–L59907177 | 3498117 | 2026-02-21 |
+| Sweep 3b | L59907178–L59939046 | 3498118 | 2026-02-21 |
