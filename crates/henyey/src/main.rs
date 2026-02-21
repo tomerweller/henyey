@@ -1882,7 +1882,7 @@ async fn cmd_verify_execution(
     }
 
     // Create and initialize LedgerManager
-    let ledger_manager = LedgerManager::new(
+    let mut ledger_manager = LedgerManager::new(
         config.network.passphrase.clone(),
         LedgerManagerConfig {
             validate_bucket_hash: true,
@@ -1890,6 +1890,12 @@ async fn cmd_verify_execution(
             ..Default::default()
         },
     );
+
+    // Wire merge map for bucket merge deduplication during replay.
+    let finished_merges = std::sync::Arc::new(std::sync::RwLock::new(
+        henyey_bucket::BucketMergeMap::new(),
+    ));
+    ledger_manager.set_merge_map(finished_merges);
 
     let init_header_entry = init_header_entry
         .ok_or_else(|| anyhow::anyhow!("No header found for checkpoint {}", init_checkpoint))?;

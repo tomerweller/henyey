@@ -14,7 +14,9 @@
 //! The size header has bit 31 set (the "continuation bit"), matching the
 //! XDR record marking standard (RFC 1832 / RFC 4506).
 
+use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::path::Path;
 
 use stellar_xdr::curr::{Limits, ReadXdr, WriteXdr};
 
@@ -116,6 +118,82 @@ impl XdrOutputStream {
     /// Flush the underlying writer.
     pub fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()
+    }
+}
+
+/// A durable XDR output stream that fsyncs after every write.
+///
+/// This matches stellar-core's `XDROutputFileStream` with `fsyncOnClose=true`
+/// and its `durableWriteOne()` method (flush + fsync after every entry).
+///
+/// Used during crash recovery to write truncated checkpoint entries, where
+/// each entry must be durably persisted before proceeding.
+///
+/// Unlike [`XdrOutputStream`], this wraps a [`File`] directly so that
+/// `sync_all()` can be called on the underlying file descriptor.
+pub struct DurableXdrOutputStream {
+    writer: BufWriter<File>,
+}
+
+impl DurableXdrOutputStream {
+    /// Open a durable XDR output stream writing to a file path.
+    ///
+    /// Creates the file if it doesn't exist, truncates if it does.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        Ok(Self {
+            writer: BufWriter::new(file),
+        })
+    }
+
+    /// Write an XDR entry durably: serialize, flush buffer, then fsync.
+    ///
+    /// This matches stellar-core's `durableWriteOne()`: the entry is written
+    /// to the buffer, the buffer is flushed to the OS, and then `fsync` is
+    /// called to ensure the data is on stable storage.
+    ///
+    /// Returns the total number of bytes written (4-byte header + payload).
+    pub fn durable_write_one<T: WriteXdr>(&mut self, value: &T) -> io::Result<usize> {
+        let payload = value
+            .to_xdr(Limits::none())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        let sz = payload.len() as u32;
+        assert!(
+            sz < 0x8000_0000,
+            "XDR payload size {} exceeds maximum (0x80000000)",
+            sz
+        );
+
+        // Write 4-byte size header with continuation bit (bit 31) set
+        let header: [u8; 4] = [
+            ((sz >> 24) & 0xFF) as u8 | 0x80,
+            ((sz >> 16) & 0xFF) as u8,
+            ((sz >> 8) & 0xFF) as u8,
+            (sz & 0xFF) as u8,
+        ];
+
+        self.writer.write_all(&header)?;
+        self.writer.write_all(&payload)?;
+
+        // Flush the BufWriter to the OS
+        self.writer.flush()?;
+
+        // Fsync to stable storage
+        self.writer.get_ref().sync_all()?;
+
+        Ok(4 + payload.len())
+    }
+
+    /// Close the stream, flushing and fsyncing.
+    pub fn close(mut self) -> io::Result<()> {
+        self.writer.flush()?;
+        self.writer.get_ref().sync_all()?;
+        Ok(())
     }
 }
 
@@ -410,10 +488,7 @@ mod tests {
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         let fd = file.into_raw_fd();
 
         let mut stream = XdrOutputStream::from_fd(fd).unwrap();
@@ -425,10 +500,83 @@ mod tests {
         let data = std::fs::read(&path).unwrap();
         assert!(data[0] & 0x80 != 0);
         let sz = read_frame_size(&data, 0);
-        let _decoded = LedgerCloseMeta::from_xdr(
-            &data[4..4 + sz as usize],
-            stellar_xdr::curr::Limits::none(),
-        )
-        .unwrap();
+        let _decoded =
+            LedgerCloseMeta::from_xdr(&data[4..4 + sz as usize], stellar_xdr::curr::Limits::none())
+                .unwrap();
+    }
+
+    #[test]
+    fn test_durable_write_one_basic() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        // Write durably
+        {
+            let mut stream = DurableXdrOutputStream::open(&path).unwrap();
+            let meta = LedgerCloseMeta::V2(LedgerCloseMetaV2::default());
+            let bytes_written = stream.durable_write_one(&meta).unwrap();
+            assert!(bytes_written > 4); // header + payload
+            stream.close().unwrap();
+        }
+
+        // Read back with XdrInputStream
+        {
+            let mut input = XdrInputStream::open(path.to_str().unwrap()).unwrap();
+            let entries: Vec<LedgerCloseMeta> = input.read_all().unwrap();
+            assert_eq!(entries.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_durable_write_one_multiple_entries() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        // Write 3 entries durably
+        {
+            let mut stream = DurableXdrOutputStream::open(&path).unwrap();
+            for _ in 0..3 {
+                let meta = LedgerCloseMeta::V2(LedgerCloseMetaV2::default());
+                stream.durable_write_one(&meta).unwrap();
+            }
+            stream.close().unwrap();
+        }
+
+        // Read back
+        {
+            let mut input = XdrInputStream::open(path.to_str().unwrap()).unwrap();
+            let entries: Vec<LedgerCloseMeta> = input.read_all().unwrap();
+            assert_eq!(entries.len(), 3);
+        }
+    }
+
+    #[test]
+    fn test_durable_write_one_wire_compatible_with_xdr_output_stream() {
+        // Verify that DurableXdrOutputStream produces the same wire format as XdrOutputStream
+        let tmp_durable = tempfile::NamedTempFile::new().unwrap();
+        let tmp_normal = tempfile::NamedTempFile::new().unwrap();
+        let path_durable = tmp_durable.path().to_path_buf();
+        let path_normal = tmp_normal.path().to_path_buf();
+
+        let meta = LedgerCloseMeta::V2(LedgerCloseMetaV2::default());
+
+        // Write with durable stream
+        {
+            let mut stream = DurableXdrOutputStream::open(&path_durable).unwrap();
+            stream.durable_write_one(&meta).unwrap();
+            stream.close().unwrap();
+        }
+
+        // Write with normal stream
+        {
+            let mut stream = XdrOutputStream::open(path_normal.to_str().unwrap()).unwrap();
+            stream.write_one(&meta).unwrap();
+            drop(stream);
+        }
+
+        // Compare bytes — should be identical
+        let bytes_durable = std::fs::read(&path_durable).unwrap();
+        let bytes_normal = std::fs::read(&path_normal).unwrap();
+        assert_eq!(bytes_durable, bytes_normal, "Wire format must be identical");
     }
 }

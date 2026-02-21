@@ -3,9 +3,9 @@
 //! The History Archive State is a JSON file that describes the current state
 //! of a Stellar history archive, including the current ledger and bucket list hashes.
 
-use std::collections::HashSet;
-use serde::{Deserialize, Serialize};
 use henyey_common::Hash256;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 use crate::error::HistoryError;
 
@@ -73,6 +73,70 @@ fn parse_level_hashes(level: &HASBucketLevel) -> (Option<Hash256>, Option<Hash25
         parse_nonzero_hash(&level.curr),
         parse_nonzero_hash(&level.snap),
     )
+}
+
+/// Compute the differential bucket set for a single bucket type (live or hot archive).
+///
+/// This mirrors the `processBuckets` lambda inside stellar-core's `differingBuckets()`.
+///
+/// 1. Build inhibit set from `other_levels` (all curr, snap, and next output hashes).
+/// 2. Walk `self_levels` from bottom (highest index) to top.
+/// 3. For each level, collect snap, next output, curr — in that order — if not inhibited.
+/// 4. Add collected hashes to the inhibit set.
+fn differing_buckets_for_levels(
+    self_levels: &[HASBucketLevel],
+    other_levels: &[HASBucketLevel],
+) -> Vec<Hash256> {
+    let mut inhibit: HashSet<Hash256> = HashSet::new();
+    inhibit.insert(Hash256::ZERO);
+
+    // Populate inhibit set from `other` (local state).
+    for level in other_levels {
+        if let Some(h) = parse_nonzero_hash(&level.curr) {
+            inhibit.insert(h);
+        }
+        if let Some(h) = parse_nonzero_hash(&level.snap) {
+            inhibit.insert(h);
+        }
+        // If the future has an output hash (state == 1), inhibit it too.
+        if level.next.has_output_hash() {
+            if let Some(ref output) = level.next.output {
+                if let Some(h) = parse_nonzero_hash(output) {
+                    inhibit.insert(h);
+                }
+            }
+        }
+    }
+
+    let mut result = Vec::new();
+
+    // Walk levels from bottom (highest index) to top (index 0).
+    for i in (0..self_levels.len()).rev() {
+        let level = &self_levels[i];
+
+        // Collect in order: snap, next output, curr
+        // (stellar-core: auto bs = {s, n, c})
+        let snap = parse_nonzero_hash(&level.snap);
+        let next_output = if level.next.has_output_hash() {
+            level
+                .next
+                .output
+                .as_ref()
+                .and_then(|o| parse_nonzero_hash(o))
+        } else {
+            snap.clone() // n = s when no output hash (mirrors stellar-core: auto n = s)
+        };
+        let curr = parse_nonzero_hash(&level.curr);
+
+        for hash in [&snap, &next_output, &curr].into_iter().flatten() {
+            if !inhibit.contains(hash) {
+                result.push(hash.clone());
+                inhibit.insert(hash.clone());
+            }
+        }
+    }
+
+    result
 }
 
 /// History Archive State - the root JSON file describing archive state.
@@ -144,6 +208,17 @@ pub struct HASBucketNext {
     /// Shadow bucket hashes for pending merge (state == 2, pre-protocol 12).
     #[serde(default)]
     pub shadow: Option<Vec<String>>,
+}
+
+impl HASBucketNext {
+    /// Check if this future bucket has a known output hash.
+    ///
+    /// Matches stellar-core's `FutureBucket::hasOutputHash()`:
+    /// state == 1 (FB_HASH_OUTPUT) means the merge is complete and the
+    /// output hash is known.
+    pub fn has_output_hash(&self) -> bool {
+        self.state == 1 && self.output.is_some()
+    }
 }
 
 impl HistoryArchiveState {
@@ -334,7 +409,10 @@ impl HistoryArchiveState {
     /// 4. For state==1 futures, the output hash exists in `known_hashes`
     ///
     /// This matches stellar-core's `containsValidBuckets` check.
-    pub fn contains_valid_buckets(&self, known_hashes: &HashSet<Hash256>) -> Result<(), HistoryError> {
+    pub fn contains_valid_buckets(
+        &self,
+        known_hashes: &HashSet<Hash256>,
+    ) -> Result<(), HistoryError> {
         // Level 0 next must be clear
         if let Some(level0) = self.current_buckets.first() {
             if level0.next.state != 0 {
@@ -350,8 +428,7 @@ impl HistoryArchiveState {
                 if !known_hashes.contains(&h) {
                     return Err(HistoryError::VerificationFailed(format!(
                         "unknown curr bucket hash at level {}: {}",
-                        i,
-                        level.curr
+                        i, level.curr
                     )));
                 }
             }
@@ -361,8 +438,7 @@ impl HistoryArchiveState {
                 if !known_hashes.contains(&h) {
                     return Err(HistoryError::VerificationFailed(format!(
                         "unknown snap bucket hash at level {}: {}",
-                        i,
-                        level.snap
+                        i, level.snap
                     )));
                 }
             }
@@ -412,11 +488,54 @@ impl HistoryArchiveState {
         Ok(())
     }
 
+    /// Compute the differential set of bucket hashes needed to convert `other` into `self`.
+    ///
+    /// This mirrors stellar-core's `HistoryArchiveState::differingBuckets()`.
+    ///
+    /// Algorithm:
+    /// 1. Build an inhibit set containing the zero hash and all bucket hashes
+    ///    present in `other` (curr, snap, and any future output hashes).
+    /// 2. Walk levels from bottom (highest index) to top (index 0) in `self`.
+    /// 3. For each level, collect snap, next output hash, and curr — in that order
+    ///    — if they are not in the inhibit set.
+    /// 4. Add collected hashes to the inhibit set to avoid duplicates.
+    /// 5. Return separate lists for live and hot archive buckets, sorted
+    ///    largest-to-smallest with snapshot buckets before current buckets.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - The local HAS representing current state (what we already have).
+    ///
+    /// # Returns
+    ///
+    /// A tuple of `(live_hashes, hot_archive_hashes)` — only the hashes that
+    /// need to be downloaded.
+    pub fn differing_bucket_hashes(
+        &self,
+        other: &HistoryArchiveState,
+    ) -> (Vec<Hash256>, Vec<Hash256>) {
+        let live = differing_buckets_for_levels(&self.current_buckets, &other.current_buckets);
+        let hot = differing_buckets_for_levels(
+            self.hot_archive_buckets.as_deref().unwrap_or(&[]),
+            other.hot_archive_buckets.as_deref().unwrap_or(&[]),
+        );
+        (live, hot)
+    }
+
+    /// Convenience wrapper that returns all differing hashes (live + hot) as a single list.
+    pub fn all_differing_bucket_hashes(&self, other: &HistoryArchiveState) -> Vec<Hash256> {
+        let (mut live, hot) = self.differing_bucket_hashes(other);
+        live.extend(hot);
+        live
+    }
+
     /// Check if all future bucket merges are clear (state == 0).
     ///
     /// This means no merges are pending or in progress.
     pub fn futures_all_clear(&self) -> bool {
-        self.current_buckets.iter().all(|level| level.next.state == 0)
+        self.current_buckets
+            .iter()
+            .all(|level| level.next.state == 0)
     }
 
     /// Check if all future bucket merges are resolved (state <= 1).
@@ -424,7 +543,9 @@ impl HistoryArchiveState {
     /// State 0 (clear) and state 1 (output hash known) are both "resolved".
     /// Only state 2 (inputs known, merge in progress) is "unresolved".
     pub fn futures_all_resolved(&self) -> bool {
-        self.current_buckets.iter().all(|level| level.next.state <= 1)
+        self.current_buckets
+            .iter()
+            .all(|level| level.next.state <= 1)
     }
 
     /// Resolve all completed futures: convert state 1 (output) to state 0 (clear).
@@ -853,5 +974,157 @@ mod tests {
         for level in &has.current_buckets {
             assert_eq!(level.next.state, 0);
         }
+    }
+
+    // ── differing_bucket_hashes tests ──────────────────────────────────
+
+    /// Helper: create a minimal HAS with given bucket levels (curr, snap pairs).
+    fn make_has(levels: Vec<(&str, &str)>) -> HistoryArchiveState {
+        let buckets = levels
+            .into_iter()
+            .map(|(curr, snap)| HASBucketLevel {
+                curr: curr.to_string(),
+                snap: snap.to_string(),
+                next: HASBucketNext::default(),
+            })
+            .collect();
+        HistoryArchiveState {
+            version: 2,
+            server: None,
+            current_ledger: 100,
+            network_passphrase: None,
+            current_buckets: buckets,
+            hot_archive_buckets: None,
+        }
+    }
+
+    const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const HASH_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const HASH_D: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const HASH_E: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+    #[test]
+    fn test_differing_buckets_identical_has() {
+        let remote = make_has(vec![(HASH_A, HASH_B), (HASH_C, HASH_D)]);
+        let local = make_has(vec![(HASH_A, HASH_B), (HASH_C, HASH_D)]);
+        let (live, hot) = remote.differing_bucket_hashes(&local);
+        assert!(live.is_empty(), "identical HAS should produce no diff");
+        assert!(hot.is_empty());
+    }
+
+    #[test]
+    fn test_differing_buckets_completely_new() {
+        let remote = make_has(vec![(HASH_A, HASH_B), (HASH_C, HASH_D)]);
+        let local = make_has(vec![]); // fresh node, no buckets
+        let (live, _hot) = remote.differing_bucket_hashes(&local);
+        // All 4 hashes should be in the differential
+        assert_eq!(live.len(), 4);
+    }
+
+    #[test]
+    fn test_differing_buckets_partial_overlap() {
+        // Remote has A,B at level 0 and C,D at level 1.
+        // Local has A,B at level 0 only.
+        // Diff should be C,D (from level 1).
+        let remote = make_has(vec![(HASH_A, HASH_B), (HASH_C, HASH_D)]);
+        let local = make_has(vec![(HASH_A, HASH_B)]);
+        let (live, _) = remote.differing_bucket_hashes(&local);
+        let live_set: HashSet<_> = live.iter().collect();
+        let c = Hash256::from_hex(HASH_C).unwrap();
+        let d = Hash256::from_hex(HASH_D).unwrap();
+        assert!(live_set.contains(&c), "should include HASH_C");
+        assert!(live_set.contains(&d), "should include HASH_D");
+        assert_eq!(live.len(), 2);
+    }
+
+    #[test]
+    fn test_differing_buckets_no_duplicates() {
+        // Remote uses same hash in curr and snap at different levels.
+        let remote = make_has(vec![(HASH_A, HASH_A), (HASH_A, HASH_B)]);
+        let local = make_has(vec![]);
+        let (live, _) = remote.differing_bucket_hashes(&local);
+        // HASH_A appears multiple times but should only be in result once
+        let a = Hash256::from_hex(HASH_A).unwrap();
+        let a_count = live.iter().filter(|h| **h == a).count();
+        assert_eq!(a_count, 1, "dedup should prevent duplicate A");
+    }
+
+    #[test]
+    fn test_differing_buckets_zero_hashes_excluded() {
+        let zero = ZERO_HASH;
+        let remote = make_has(vec![(HASH_A, zero)]);
+        let local = make_has(vec![]);
+        let (live, _) = remote.differing_bucket_hashes(&local);
+        let a = Hash256::from_hex(HASH_A).unwrap();
+        assert_eq!(live, vec![a], "zero hash should not appear in result");
+    }
+
+    #[test]
+    fn test_differing_buckets_inhibits_future_output() {
+        // Local has a future with output hash E — E should be inhibited.
+        let mut local = make_has(vec![(HASH_A, HASH_B)]);
+        local.current_buckets[0].next = HASBucketNext {
+            state: 1,
+            output: Some(HASH_E.to_string()),
+            ..Default::default()
+        };
+
+        // Remote has E as curr at level 0.
+        let remote = make_has(vec![(HASH_E, HASH_C)]);
+        let (live, _) = remote.differing_bucket_hashes(&local);
+        let e = Hash256::from_hex(HASH_E).unwrap();
+        // E is in local's future output → inhibited → not in diff
+        assert!(
+            !live.contains(&e),
+            "E should be inhibited by local future output"
+        );
+        // C should still be needed
+        let c = Hash256::from_hex(HASH_C).unwrap();
+        assert!(live.contains(&c), "C should be in diff");
+    }
+
+    #[test]
+    fn test_differing_buckets_ordering_bottom_to_top() {
+        // Levels are walked bottom (highest index) to top (index 0).
+        // Level 1 (bottom) has C,D. Level 0 (top) has A,B.
+        // With empty local, result should start with level 1 hashes.
+        let remote = make_has(vec![(HASH_A, HASH_B), (HASH_C, HASH_D)]);
+        let local = make_has(vec![]);
+        let (live, _) = remote.differing_bucket_hashes(&local);
+        assert_eq!(live.len(), 4);
+        // First hashes should be from level 1 (bottom): D snap, then C curr
+        // (snap before curr per stellar-core order: s, n, c)
+        let d = Hash256::from_hex(HASH_D).unwrap();
+        let c = Hash256::from_hex(HASH_C).unwrap();
+        assert_eq!(live[0], d, "snap of bottom level should come first");
+        assert_eq!(live[1], c, "curr of bottom level should come second");
+    }
+
+    #[test]
+    fn test_differing_buckets_hot_archive() {
+        let mut remote = make_has(vec![(HASH_A, HASH_B)]);
+        remote.hot_archive_buckets = Some(vec![HASBucketLevel {
+            curr: HASH_C.to_string(),
+            snap: HASH_D.to_string(),
+            next: HASBucketNext::default(),
+        }]);
+        let local = make_has(vec![]);
+        let (live, hot) = remote.differing_bucket_hashes(&local);
+        assert_eq!(live.len(), 2); // A, B
+        assert_eq!(hot.len(), 2); // C, D
+    }
+
+    #[test]
+    fn test_all_differing_bucket_hashes() {
+        let mut remote = make_has(vec![(HASH_A, HASH_B)]);
+        remote.hot_archive_buckets = Some(vec![HASBucketLevel {
+            curr: HASH_C.to_string(),
+            snap: HASH_D.to_string(),
+            next: HASBucketNext::default(),
+        }]);
+        let local = make_has(vec![]);
+        let all = remote.all_differing_bucket_hashes(&local);
+        assert_eq!(all.len(), 4); // A, B, C, D combined
     }
 }

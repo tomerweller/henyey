@@ -37,6 +37,8 @@ use xorf::BinaryFuse16;
 
 use crate::bloom_filter::BucketBloomFilter;
 use crate::index::{AssetPoolIdMap, BucketEntryCounters, DiskIndex, RangeEntry, TypeRange};
+use henyey_common::fs_utils::durable_rename;
+
 use crate::BucketError;
 
 /// Current version of the index file format.
@@ -348,13 +350,13 @@ pub fn save_disk_index(index: &DiskIndex, bucket_path: &Path) -> Result<(), Buck
         writer.flush()?;
     }
 
-    // Atomic rename
-    match std::fs::rename(&tmp_path, &index_path) {
+    // Durable atomic rename (with directory fsync for crash safety)
+    match durable_rename(&tmp_path, &index_path) {
         Ok(()) => {}
         Err(_) => {
             // Retry after short delay (race condition workaround)
             std::thread::sleep(Duration::from_millis(100));
-            std::fs::rename(&tmp_path, &index_path)?;
+            durable_rename(&tmp_path, &index_path)?;
         }
     }
 

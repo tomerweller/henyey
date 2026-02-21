@@ -9,8 +9,8 @@
 //! Transaction sets and results are used for history archive publishing
 //! and catchup operations.
 
-use rusqlite::{params, Connection, OptionalExtension};
 use henyey_common::xdr_stream::XdrOutputStream;
+use rusqlite::{params, Connection, OptionalExtension};
 use stellar_xdr::curr::{
     Limits, ReadXdr, TransactionHistoryEntry, TransactionHistoryResultEntry, WriteXdr,
 };
@@ -244,9 +244,9 @@ impl HistoryQueries for Connection {
             for row in rows {
                 let data = row?;
                 let entry = TransactionHistoryEntry::from_xdr(data.as_slice(), Limits::none())?;
-                tx_stream.write_one(&entry).map_err(|e| {
-                    DbError::Integrity(format!("Failed to write tx entry: {}", e))
-                })?;
+                tx_stream
+                    .write_one(&entry)
+                    .map_err(|e| DbError::Integrity(format!("Failed to write tx entry: {}", e)))?;
                 tx_written += 1;
             }
         }
@@ -467,8 +467,7 @@ mod tests {
         let tx_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let result_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
 
-        let mut tx_stream =
-            XdrOutputStream::from_writer(Box::new(SharedBufRB(tx_buf.clone())));
+        let mut tx_stream = XdrOutputStream::from_writer(Box::new(SharedBufRB(tx_buf.clone())));
         let mut result_stream =
             XdrOutputStream::from_writer(Box::new(SharedBufRB(result_buf.clone())));
 
@@ -482,8 +481,7 @@ mod tests {
         // Read back tx entries
         let tx_data = tx_buf.lock().unwrap().clone();
         let cursor = std::io::Cursor::new(tx_data);
-        let mut input =
-            henyey_common::xdr_stream::XdrInputStream::from_reader(Box::new(cursor));
+        let mut input = henyey_common::xdr_stream::XdrInputStream::from_reader(Box::new(cursor));
         let tx_entries: Vec<TransactionHistoryEntry> = input.read_all().unwrap();
         assert_eq!(tx_entries.len(), 3);
         assert_eq!(tx_entries[0].ledger_seq, 100);
@@ -493,8 +491,7 @@ mod tests {
         // Read back result entries
         let result_data = result_buf.lock().unwrap().clone();
         let cursor = std::io::Cursor::new(result_data);
-        let mut input =
-            henyey_common::xdr_stream::XdrInputStream::from_reader(Box::new(cursor));
+        let mut input = henyey_common::xdr_stream::XdrInputStream::from_reader(Box::new(cursor));
         let result_entries: Vec<TransactionHistoryResultEntry> = input.read_all().unwrap();
         assert_eq!(result_entries.len(), 3);
         assert_eq!(result_entries[0].ledger_seq, 100);
@@ -541,8 +538,7 @@ mod tests {
         let tx_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let result_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
 
-        let mut tx_stream =
-            XdrOutputStream::from_writer(Box::new(SharedBufP(tx_buf.clone())));
+        let mut tx_stream = XdrOutputStream::from_writer(Box::new(SharedBufP(tx_buf.clone())));
         let mut result_stream =
             XdrOutputStream::from_writer(Box::new(SharedBufP(result_buf.clone())));
 

@@ -148,7 +148,8 @@ pub use remote_archive::{RemoteArchive, RemoteArchiveConfig};
 pub use replay::{ReplayConfig, ReplayedLedgerState};
 pub use archive_state::MAX_HISTORY_ARCHIVE_BUCKET_SIZE;
 pub use verify::{
-    compute_header_hash, verify_bucket_hash, verify_header_chain, verify_tx_result_ordering,
+    compute_header_hash, verify_bucket_hash, verify_chain_anchors, verify_has_passphrase,
+    verify_header_chain, verify_tx_result_ordering, ChainTrustAnchors,
 };
 
 /// Result type for history operations.

@@ -44,7 +44,7 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use henyey_bucket::{
-    BucketEntry, BucketList, BucketListSnapshot, EvictionIterator, EvictionResult,
+    BucketEntry, BucketList, BucketListSnapshot, BucketMergeMap, EvictionIterator, EvictionResult,
     HotArchiveBucketList, StateArchivalSettings,
 };
 use henyey_common::{BucketListDbConfig, Hash256, NetworkId};
@@ -807,6 +807,13 @@ pub struct LedgerManager {
     /// at ledger N+1 using a snapshot of the bucket list. When N+1 arrives, the
     /// result is resolved instead of running an inline scan, reducing close latency.
     pending_eviction_scan: Mutex<Option<PendingEvictionScan>>,
+
+    /// Shared merge map for bucket merge deduplication.
+    ///
+    /// When set, completed merges are recorded here after each `add_batch`,
+    /// and `prepare_with_normalization` checks it before starting new merges.
+    /// This avoids redundant merge computations across restarts and catchup.
+    finished_merges: Option<Arc<std::sync::RwLock<BucketMergeMap>>>,
 }
 
 // Compile-time assertion: LedgerManager must be Send + Sync for spawn_blocking.
@@ -843,6 +850,7 @@ impl LedgerManager {
             soroban_state: Arc::new(crate::soroban_state::SharedSorobanState::new()),
             executor: Mutex::new(None),
             pending_eviction_scan: Mutex::new(None),
+            finished_merges: None,
         }
     }
 
@@ -896,6 +904,19 @@ impl LedgerManager {
     /// state including pending merges.
     pub fn bucket_list(&self) -> parking_lot::RwLockReadGuard<'_, BucketList> {
         self.bucket_list.read()
+    }
+
+    /// Set the shared merge map for bucket merge deduplication.
+    ///
+    /// This wires the merge map from `BucketManager` into the `LedgerManager`,
+    /// enabling two behaviors:
+    /// 1. `prepare_with_normalization` checks the map before starting new merges
+    /// 2. Completed merges are recorded in the map after each `add_batch`
+    ///
+    /// Should be called once during initialization, before any `close_ledger` calls.
+    pub fn set_merge_map(&mut self, merge_map: Arc<std::sync::RwLock<BucketMergeMap>>) {
+        self.bucket_list.write().set_merge_map(merge_map.clone());
+        self.finished_merges = Some(merge_map);
     }
 
     /// Resolve all pending async merges in the bucket list.
@@ -1040,6 +1061,10 @@ impl LedgerManager {
             let mut bl = self.bucket_list.write();
             bl.set_ledger_seq(header.ledger_seq);
             bl.set_bucket_list_db_config(self.config.bucket_list_db.clone());
+            // Re-wire merge map on the new bucket list if one is configured.
+            if let Some(ref merge_map) = self.finished_merges {
+                bl.set_merge_map(merge_map.clone());
+            }
         }
         if let Some(ref mut habl) = *self.hot_archive_bucket_list.write() {
             habl.set_ledger_seq(header.ledger_seq);
@@ -1853,6 +1878,717 @@ impl<'a> LedgerCloseContext<'a> {
         }
     }
 
+    /// Create the initial Soroban configuration entries for protocol v20.
+    ///
+    /// Parity: NetworkConfig.cpp:1388-1430 `createLedgerEntriesForV20`
+    /// Creates 14 CONFIG_SETTING ledger entries with initial values for Soroban.
+    /// This is called when the network upgrades from pre-Soroban (< v20) to v20+.
+    fn create_ledger_entries_for_v20(&mut self) -> Result<()> {
+        use stellar_xdr::curr::{
+            ConfigSettingContractBandwidthV0, ConfigSettingContractComputeV0,
+            ConfigSettingContractEventsV0, ConfigSettingContractExecutionLanesV0,
+            ConfigSettingContractHistoricalDataV0, ConfigSettingContractLedgerCostV0,
+            ContractCostParams, EvictionIterator, StateArchivalSettings,
+        };
+
+        let ledger_seq = self.close_data.ledger_seq;
+        let make_entry = |config: ConfigSettingEntry| -> LedgerEntry {
+            LedgerEntry {
+                last_modified_ledger_seq: ledger_seq,
+                data: LedgerEntryData::ConfigSetting(config),
+                ext: LedgerEntryExt::V0,
+            }
+        };
+
+        // 1. CONFIG_SETTING_CONTRACT_MAX_SIZE_BYTES
+        // Parity: NetworkConfig.cpp:44-58 initialMaxContractSizeEntry
+        // MinimumSorobanNetworkConfig::MAX_CONTRACT_SIZE = 2000
+        self.delta.record_create(make_entry(
+            ConfigSettingEntry::ContractMaxSizeBytes(2_000),
+        ))?;
+
+        // 2. CONFIG_SETTING_CONTRACT_DATA_KEY_SIZE_BYTES
+        // Parity: NetworkConfig.cpp:60-74 initialMaxContractDataKeySizeEntry
+        // MinimumSorobanNetworkConfig::MAX_CONTRACT_DATA_KEY_SIZE_BYTES = 200
+        self.delta.record_create(make_entry(
+            ConfigSettingEntry::ContractDataKeySizeBytes(200),
+        ))?;
+
+        // 3. CONFIG_SETTING_CONTRACT_DATA_ENTRY_SIZE_BYTES
+        // Parity: NetworkConfig.cpp:76-90 initialMaxContractDataEntrySizeEntry
+        // MinimumSorobanNetworkConfig::MAX_CONTRACT_DATA_ENTRY_SIZE_BYTES = 2000
+        self.delta.record_create(make_entry(
+            ConfigSettingEntry::ContractDataEntrySizeBytes(2_000),
+        ))?;
+
+        // 4. CONFIG_SETTING_CONTRACT_COMPUTE_V0
+        // Parity: NetworkConfig.cpp:92-116 initialContractComputeSettingsEntry
+        self.delta.record_create(make_entry(
+            ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
+                // TX_MAX_INSTRUCTIONS = MinimumSorobanNetworkConfig::TX_MAX_INSTRUCTIONS = 2_500_000
+                ledger_max_instructions: 2_500_000, // LEDGER_MAX_INSTRUCTIONS = TX_MAX_INSTRUCTIONS
+                tx_max_instructions: 2_500_000,
+                fee_rate_per_instructions_increment: 100,
+                tx_memory_limit: 2_000_000, // MEMORY_LIMIT = MinimumSorobanNetworkConfig::MEMORY_LIMIT
+            }),
+        ))?;
+
+        // 5. CONFIG_SETTING_CONTRACT_LEDGER_COST_V0
+        // Parity: NetworkConfig.cpp:118-175 initialContractLedgerAccessSettingsEntry
+        self.delta.record_create(make_entry(
+            ConfigSettingEntry::ContractLedgerCostV0(ConfigSettingContractLedgerCostV0 {
+                ledger_max_disk_read_entries: 3,      // LEDGER_MAX_READ_LEDGER_ENTRIES = TX_MAX
+                ledger_max_disk_read_bytes: 3_200,    // LEDGER_MAX_READ_BYTES = TX_MAX
+                ledger_max_write_ledger_entries: 2,    // TX_MAX_WRITE_LEDGER_ENTRIES
+                ledger_max_write_bytes: 3_200,         // TX_MAX_WRITE_BYTES
+                tx_max_disk_read_entries: 3,
+                tx_max_disk_read_bytes: 3_200,
+                tx_max_write_ledger_entries: 2,
+                tx_max_write_bytes: 3_200,
+                fee_disk_read_ledger_entry: 5_000,
+                fee_write_ledger_entry: 20_000,
+                fee_disk_read1_kb: 1_000,
+                soroban_state_target_size_bytes: 30 * 1024 * 1024 * 1024_i64, // 30 GB
+                rent_fee1_kb_soroban_state_size_low: 1_000,
+                rent_fee1_kb_soroban_state_size_high: 10_000,
+                soroban_state_rent_fee_growth_factor: 1,
+            }),
+        ))?;
+
+        // 6. CONFIG_SETTING_CONTRACT_HISTORICAL_DATA_V0
+        // Parity: NetworkConfig.cpp:177-186 initialContractHistoricalDataSettingsEntry
+        self.delta.record_create(make_entry(
+            ConfigSettingEntry::ContractHistoricalDataV0(ConfigSettingContractHistoricalDataV0 {
+                fee_historical1_kb: 100,
+            }),
+        ))?;
+
+        // 7. CONFIG_SETTING_CONTRACT_EVENTS_V0
+        // Parity: NetworkConfig.cpp:188-205 initialContractEventsSettingsEntry
+        self.delta.record_create(make_entry(
+            ConfigSettingEntry::ContractEventsV0(ConfigSettingContractEventsV0 {
+                tx_max_contract_events_size_bytes: 200, // MinimumSorobanNetworkConfig
+                fee_contract_events1_kb: 200,
+            }),
+        ))?;
+
+        // 8. CONFIG_SETTING_CONTRACT_BANDWIDTH_V0
+        // Parity: NetworkConfig.cpp:207-227 initialContractBandwidthSettingsEntry
+        self.delta.record_create(make_entry(
+            ConfigSettingEntry::ContractBandwidthV0(ConfigSettingContractBandwidthV0 {
+                ledger_max_txs_size_bytes: 10_000, // TX_MAX_SIZE_BYTES = LEDGER_MAX
+                tx_max_size_bytes: 10_000,
+                fee_tx_size1_kb: 2_000,
+            }),
+        ))?;
+
+        // 9. CONFIG_SETTING_CONTRACT_EXECUTION_LANES
+        // Parity: NetworkConfig.cpp:229-243 initialContractExecutionLanesSettingsEntry
+        self.delta.record_create(make_entry(
+            ConfigSettingEntry::ContractExecutionLanes(ConfigSettingContractExecutionLanesV0 {
+                ledger_max_tx_count: 1,
+            }),
+        ))?;
+
+        // 10. CONFIG_SETTING_CONTRACT_COST_PARAMS_CPU_INSTRUCTIONS
+        // Parity: NetworkConfig.cpp:246-338 initialCpuCostParamsEntryForV20
+        let cpu_params = Self::initial_cpu_cost_params_for_v20();
+        self.delta.record_create(make_entry(
+            ConfigSettingEntry::ContractCostParamsCpuInstructions(ContractCostParams(
+                cpu_params.try_into().map_err(|_| {
+                    LedgerError::Internal("Failed to create V20 CPU cost params".to_string())
+                })?,
+            )),
+        ))?;
+
+        // 11. CONFIG_SETTING_CONTRACT_COST_PARAMS_MEMORY_BYTES
+        // Parity: NetworkConfig.cpp:688-776 initialMemCostParamsEntryForV20
+        let mem_params = Self::initial_mem_cost_params_for_v20();
+        self.delta.record_create(make_entry(
+            ConfigSettingEntry::ContractCostParamsMemoryBytes(ContractCostParams(
+                mem_params.try_into().map_err(|_| {
+                    LedgerError::Internal("Failed to create V20 memory cost params".to_string())
+                })?,
+            )),
+        ))?;
+
+        // 12. CONFIG_SETTING_STATE_ARCHIVAL
+        // Parity: NetworkConfig.cpp:632-685 initialStateArchivalSettings
+        self.delta.record_create(make_entry(
+            ConfigSettingEntry::StateArchival(StateArchivalSettings {
+                max_entry_ttl: 1_054_080,                   // MAXIMUM_ENTRY_LIFETIME (61 days)
+                min_persistent_ttl: 4_096,                  // Live until level 6
+                min_temporary_ttl: 16,
+                persistent_rent_rate_denominator: 252_480,
+                temp_rent_rate_denominator: 2_524_800,
+                max_entries_to_archive: 100,
+                live_soroban_state_size_window_sample_size: 30,
+                live_soroban_state_size_window_sample_period: 64,
+                eviction_scan_size: 100_000,                // 100 kb
+                starting_eviction_scan_level: 6,
+            }),
+        ))?;
+
+        // 13. CONFIG_SETTING_LIVE_SOROBAN_STATE_SIZE_WINDOW
+        // Parity: NetworkConfig.cpp:1110-1126 initialliveSorobanStateSizeWindow
+        // Populates 30-entry window with copies of current bucket list size.
+        let bl_size = self.manager.bucket_list.read().sum_bucket_entry_counters().total_size();
+        let window: Vec<u64> = vec![bl_size; 30]; // BUCKET_LIST_SIZE_WINDOW_SAMPLE_SIZE = 30
+        self.delta.record_create(make_entry(
+            ConfigSettingEntry::LiveSorobanStateSizeWindow(
+                window.try_into().map_err(|_| {
+                    LedgerError::Internal(
+                        "Failed to create state size window".to_string(),
+                    )
+                })?,
+            ),
+        ))?;
+
+        // 14. CONFIG_SETTING_EVICTION_ITERATOR
+        // Parity: NetworkConfig.cpp:1128-1139 initialEvictionIterator
+        self.delta.record_create(make_entry(
+            ConfigSettingEntry::EvictionIterator(EvictionIterator {
+                bucket_list_level: 6, // STARTING_EVICTION_SCAN_LEVEL
+                is_curr_bucket: true,
+                bucket_file_offset: 0,
+            }),
+        ))?;
+
+        tracing::info!(
+            ledger_seq = self.close_data.ledger_seq,
+            "Applied createLedgerEntriesForV20: created 14 CONFIG_SETTING entries"
+        );
+
+        Ok(())
+    }
+
+    /// Build the initial V20 CPU cost parameter table (23 entries: indices 0..=22).
+    ///
+    /// Parity: NetworkConfig.cpp:246-338 `initialCpuCostParamsEntryForV20`
+    fn initial_cpu_cost_params_for_v20() -> Vec<stellar_xdr::curr::ContractCostParamEntry> {
+        use stellar_xdr::curr::{ContractCostParamEntry, ExtensionPoint};
+        let e = |const_term: i64, linear_term: i64| ContractCostParamEntry {
+            ext: ExtensionPoint::V0,
+            const_term,
+            linear_term,
+        };
+        // Indices 0..=22 (ChaCha20DrawBytes)
+        vec![
+            e(4, 0),           // 0: WasmInsnExec
+            e(434, 16),        // 1: MemAlloc
+            e(42, 16),         // 2: MemCpy
+            e(44, 16),         // 3: MemCmp
+            e(310, 0),         // 4: DispatchHostFunction
+            e(61, 0),          // 5: VisitObject
+            e(230, 29),        // 6: ValSer
+            e(59052, 4001),    // 7: ValDeser
+            e(3738, 7012),     // 8: ComputeSha256Hash
+            e(40253, 0),       // 9: ComputeEd25519PubKey
+            e(377524, 4068),   // 10: VerifyEd25519Sig
+            e(451626, 45405),  // 11: VmInstantiation
+            e(451626, 45405),  // 12: VmCachedInstantiation
+            e(1948, 0),        // 13: InvokeVmFunction
+            e(3766, 5969),     // 14: ComputeKeccak256Hash
+            e(710, 0),         // 15: DecodeEcdsaCurve256Sig
+            e(2315295, 0),     // 16: RecoverEcdsaSecp256k1Key
+            e(4404, 0),        // 17: Int256AddSub
+            e(4947, 0),        // 18: Int256Mul
+            e(4911, 0),        // 19: Int256Div
+            e(4286, 0),        // 20: Int256Pow
+            e(913, 0),         // 21: Int256Shift
+            e(1058, 501),      // 22: ChaCha20DrawBytes
+        ]
+    }
+
+    /// Build the initial V20 memory cost parameter table (23 entries: indices 0..=22).
+    ///
+    /// Parity: NetworkConfig.cpp:688-776 `initialMemCostParamsEntryForV20`
+    fn initial_mem_cost_params_for_v20() -> Vec<stellar_xdr::curr::ContractCostParamEntry> {
+        use stellar_xdr::curr::{ContractCostParamEntry, ExtensionPoint};
+        let e = |const_term: i64, linear_term: i64| ContractCostParamEntry {
+            ext: ExtensionPoint::V0,
+            const_term,
+            linear_term,
+        };
+        // Indices 0..=22 (ChaCha20DrawBytes)
+        vec![
+            e(0, 0),           // 0: WasmInsnExec
+            e(16, 128),        // 1: MemAlloc
+            e(0, 0),           // 2: MemCpy
+            e(0, 0),           // 3: MemCmp
+            e(0, 0),           // 4: DispatchHostFunction
+            e(0, 0),           // 5: VisitObject
+            e(242, 384),       // 6: ValSer
+            e(0, 384),         // 7: ValDeser
+            e(0, 0),           // 8: ComputeSha256Hash
+            e(0, 0),           // 9: ComputeEd25519PubKey
+            e(0, 0),           // 10: VerifyEd25519Sig
+            e(130065, 5064),   // 11: VmInstantiation
+            e(130065, 5064),   // 12: VmCachedInstantiation
+            e(14, 0),          // 13: InvokeVmFunction
+            e(0, 0),           // 14: ComputeKeccak256Hash
+            e(0, 0),           // 15: DecodeEcdsaCurve256Sig
+            e(181, 0),         // 16: RecoverEcdsaSecp256k1Key
+            e(99, 0),          // 17: Int256AddSub
+            e(99, 0),          // 18: Int256Mul
+            e(99, 0),          // 19: Int256Div
+            e(99, 0),          // 20: Int256Pow
+            e(99, 0),          // 21: Int256Shift
+            e(0, 0),           // 22: ChaCha20DrawBytes
+        ]
+    }
+
+    /// Apply version upgrade side effects for protocol 21.
+    ///
+    /// Parity: NetworkConfig.cpp:1432-1439 `createCostTypesForV21`
+    /// Resizes CPU and memory cost params to include ParseWasm/InstantiateWasm types
+    /// and updates VmCachedInstantiation.
+    fn create_cost_types_for_v21(&mut self) -> Result<()> {
+        use stellar_xdr::curr::{ContractCostParamEntry, ContractCostParams, ExtensionPoint};
+
+        // V21 last cost type: VerifyEcdsaSecp256r1Sig = 44
+        const NEW_SIZE: usize = 45;
+
+        let make_entry = |const_term: i64, linear_term: i64| ContractCostParamEntry {
+            ext: ExtensionPoint::V0,
+            const_term,
+            linear_term,
+        };
+
+        // --- Update CPU cost params ---
+        // Parity: NetworkConfig.cpp:340-441 updateCpuCostParamsEntryForV21
+        let cpu_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::ContractCostParamsCpuInstructions,
+        });
+        let cpu_entry = self.load_entry(&cpu_key)?.ok_or_else(|| {
+            LedgerError::Internal("ContractCostParamsCpuInstructions entry not found".to_string())
+        })?;
+        let mut cpu_params = if let LedgerEntryData::ConfigSetting(
+            ConfigSettingEntry::ContractCostParamsCpuInstructions(params),
+        ) = &cpu_entry.data
+        {
+            params.0.to_vec()
+        } else {
+            return Err(LedgerError::Internal(
+                "Unexpected entry type for CPU cost params".to_string(),
+            ));
+        };
+
+        cpu_params.resize(NEW_SIZE, make_entry(0, 0));
+
+        // Updated existing entry:
+        cpu_params[12] = make_entry(41142, 634);          // VmCachedInstantiation
+        // New entries (indices 23..=44):
+        cpu_params[23] = make_entry(73077, 25410);         // ParseWasmInstructions
+        cpu_params[24] = make_entry(0, 540752);            // ParseWasmFunctions
+        cpu_params[25] = make_entry(0, 176363);            // ParseWasmGlobals
+        cpu_params[26] = make_entry(0, 29989);             // ParseWasmTableEntries
+        cpu_params[27] = make_entry(0, 1061449);           // ParseWasmTypes
+        cpu_params[28] = make_entry(0, 237336);            // ParseWasmDataSegments
+        cpu_params[29] = make_entry(0, 328476);            // ParseWasmElemSegments
+        cpu_params[30] = make_entry(0, 701845);            // ParseWasmImports
+        cpu_params[31] = make_entry(0, 429383);            // ParseWasmExports
+        cpu_params[32] = make_entry(0, 28);                // ParseWasmDataSegmentBytes
+        cpu_params[33] = make_entry(43030, 0);             // InstantiateWasmInstructions
+        cpu_params[34] = make_entry(0, 7556);              // InstantiateWasmFunctions
+        cpu_params[35] = make_entry(0, 10711);             // InstantiateWasmGlobals
+        cpu_params[36] = make_entry(0, 3300);              // InstantiateWasmTableEntries
+        cpu_params[37] = make_entry(0, 0);                 // InstantiateWasmTypes
+        cpu_params[38] = make_entry(0, 23038);             // InstantiateWasmDataSegments
+        cpu_params[39] = make_entry(0, 42488);             // InstantiateWasmElemSegments
+        cpu_params[40] = make_entry(0, 828974);            // InstantiateWasmImports
+        cpu_params[41] = make_entry(0, 297100);            // InstantiateWasmExports
+        cpu_params[42] = make_entry(0, 14);                // InstantiateWasmDataSegmentBytes
+        cpu_params[43] = make_entry(1882, 0);              // Sec1DecodePointUncompressed
+        cpu_params[44] = make_entry(3000906, 0);           // VerifyEcdsaSecp256r1Sig
+
+        let new_cpu_entry = LedgerEntry {
+            last_modified_ledger_seq: self.close_data.ledger_seq,
+            data: LedgerEntryData::ConfigSetting(
+                ConfigSettingEntry::ContractCostParamsCpuInstructions(ContractCostParams(
+                    cpu_params.try_into().map_err(|_| {
+                        LedgerError::Internal("Failed to convert V21 CPU cost params".to_string())
+                    })?,
+                )),
+            ),
+            ext: LedgerEntryExt::V0,
+        };
+        self.delta.record_update(cpu_entry, new_cpu_entry)?;
+
+        // --- Update memory cost params ---
+        // Parity: NetworkConfig.cpp:778-880 updateMemCostParamsEntryForV21
+        let mem_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::ContractCostParamsMemoryBytes,
+        });
+        let mem_entry = self.load_entry(&mem_key)?.ok_or_else(|| {
+            LedgerError::Internal("ContractCostParamsMemoryBytes entry not found".to_string())
+        })?;
+        let mut mem_params = if let LedgerEntryData::ConfigSetting(
+            ConfigSettingEntry::ContractCostParamsMemoryBytes(params),
+        ) = &mem_entry.data
+        {
+            params.0.to_vec()
+        } else {
+            return Err(LedgerError::Internal(
+                "Unexpected entry type for memory cost params".to_string(),
+            ));
+        };
+
+        mem_params.resize(NEW_SIZE, make_entry(0, 0));
+
+        // Updated existing entry:
+        mem_params[12] = make_entry(69472, 1217);          // VmCachedInstantiation
+        // New entries (indices 23..=44):
+        mem_params[23] = make_entry(17564, 6457);          // ParseWasmInstructions
+        mem_params[24] = make_entry(0, 47464);             // ParseWasmFunctions
+        mem_params[25] = make_entry(0, 13420);             // ParseWasmGlobals
+        mem_params[26] = make_entry(0, 6285);              // ParseWasmTableEntries
+        mem_params[27] = make_entry(0, 64670);             // ParseWasmTypes
+        mem_params[28] = make_entry(0, 29074);             // ParseWasmDataSegments
+        mem_params[29] = make_entry(0, 48095);             // ParseWasmElemSegments
+        mem_params[30] = make_entry(0, 103229);            // ParseWasmImports
+        mem_params[31] = make_entry(0, 36394);             // ParseWasmExports
+        mem_params[32] = make_entry(0, 257);               // ParseWasmDataSegmentBytes
+        mem_params[33] = make_entry(70704, 0);             // InstantiateWasmInstructions
+        mem_params[34] = make_entry(0, 14613);             // InstantiateWasmFunctions
+        mem_params[35] = make_entry(0, 6833);              // InstantiateWasmGlobals
+        mem_params[36] = make_entry(0, 1025);              // InstantiateWasmTableEntries
+        mem_params[37] = make_entry(0, 0);                 // InstantiateWasmTypes
+        mem_params[38] = make_entry(0, 129632);            // InstantiateWasmDataSegments
+        mem_params[39] = make_entry(0, 13665);             // InstantiateWasmElemSegments
+        mem_params[40] = make_entry(0, 97637);             // InstantiateWasmImports
+        mem_params[41] = make_entry(0, 9176);              // InstantiateWasmExports
+        mem_params[42] = make_entry(0, 126);               // InstantiateWasmDataSegmentBytes
+        mem_params[43] = make_entry(0, 0);                 // Sec1DecodePointUncompressed
+        mem_params[44] = make_entry(0, 0);                 // VerifyEcdsaSecp256r1Sig
+
+        let new_mem_entry = LedgerEntry {
+            last_modified_ledger_seq: self.close_data.ledger_seq,
+            data: LedgerEntryData::ConfigSetting(
+                ConfigSettingEntry::ContractCostParamsMemoryBytes(ContractCostParams(
+                    mem_params.try_into().map_err(|_| {
+                        LedgerError::Internal("Failed to convert V21 memory cost params".to_string())
+                    })?,
+                )),
+            ),
+            ext: LedgerEntryExt::V0,
+        };
+        self.delta.record_update(mem_entry, new_mem_entry)?;
+
+        tracing::info!(
+            ledger_seq = self.close_data.ledger_seq,
+            new_size = NEW_SIZE,
+            "Applied createCostTypesForV21: resized cost params with ParseWasm/InstantiateWasm entries"
+        );
+
+        Ok(())
+    }
+
+    /// Apply version upgrade side effects for protocol 22.
+    ///
+    /// Parity: NetworkConfig.cpp:1441-1448 `createCostTypesForV22`
+    /// Resizes CPU and memory cost params to include BLS12-381 curve types.
+    fn create_cost_types_for_v22(&mut self) -> Result<()> {
+        use stellar_xdr::curr::{ContractCostParamEntry, ContractCostParams, ExtensionPoint};
+
+        // V22 last cost type: Bls12381FrInv = 69
+        const NEW_SIZE: usize = 70;
+
+        let make_entry = |const_term: i64, linear_term: i64| ContractCostParamEntry {
+            ext: ExtensionPoint::V0,
+            const_term,
+            linear_term,
+        };
+
+        // --- Update CPU cost params ---
+        // Parity: NetworkConfig.cpp:443-553 updateCpuCostParamsEntryForV22
+        let cpu_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::ContractCostParamsCpuInstructions,
+        });
+        let cpu_entry = self.load_entry(&cpu_key)?.ok_or_else(|| {
+            LedgerError::Internal("ContractCostParamsCpuInstructions entry not found".to_string())
+        })?;
+        let mut cpu_params = if let LedgerEntryData::ConfigSetting(
+            ConfigSettingEntry::ContractCostParamsCpuInstructions(params),
+        ) = &cpu_entry.data
+        {
+            params.0.to_vec()
+        } else {
+            return Err(LedgerError::Internal(
+                "Unexpected entry type for CPU cost params".to_string(),
+            ));
+        };
+
+        cpu_params.resize(NEW_SIZE, make_entry(0, 0));
+
+        // New BLS12-381 entries (indices 45..=69):
+        cpu_params[45] = make_entry(661, 0);               // Bls12381EncodeFp
+        cpu_params[46] = make_entry(985, 0);               // Bls12381DecodeFp
+        cpu_params[47] = make_entry(1934, 0);              // Bls12381G1CheckPointOnCurve
+        cpu_params[48] = make_entry(730510, 0);            // Bls12381G1CheckPointInSubgroup
+        cpu_params[49] = make_entry(5921, 0);              // Bls12381G2CheckPointOnCurve
+        cpu_params[50] = make_entry(1057822, 0);           // Bls12381G2CheckPointInSubgroup
+        cpu_params[51] = make_entry(92642, 0);             // Bls12381G1ProjectiveToAffine
+        cpu_params[52] = make_entry(100742, 0);            // Bls12381G2ProjectiveToAffine
+        cpu_params[53] = make_entry(7689, 0);              // Bls12381G1Add
+        cpu_params[54] = make_entry(2458985, 0);           // Bls12381G1Mul
+        cpu_params[55] = make_entry(2426722, 96397671);    // Bls12381G1Msm
+        cpu_params[56] = make_entry(1541554, 0);           // Bls12381MapFpToG1
+        cpu_params[57] = make_entry(3211191, 6713);        // Bls12381HashToG1
+        cpu_params[58] = make_entry(25207, 0);             // Bls12381G2Add
+        cpu_params[59] = make_entry(7873219, 0);           // Bls12381G2Mul
+        cpu_params[60] = make_entry(8035968, 309667335);   // Bls12381G2Msm
+        cpu_params[61] = make_entry(2420202, 0);           // Bls12381MapFp2ToG2
+        cpu_params[62] = make_entry(7050564, 6797);        // Bls12381HashToG2
+        cpu_params[63] = make_entry(10558948, 632860943);  // Bls12381Pairing
+        cpu_params[64] = make_entry(1994, 0);              // Bls12381FrFromU256
+        cpu_params[65] = make_entry(1155, 0);              // Bls12381FrToU256
+        cpu_params[66] = make_entry(74, 0);                // Bls12381FrAddSub
+        cpu_params[67] = make_entry(332, 0);               // Bls12381FrMul
+        cpu_params[68] = make_entry(691, 74558);           // Bls12381FrPow
+        cpu_params[69] = make_entry(35421, 0);             // Bls12381FrInv
+
+        let new_cpu_entry = LedgerEntry {
+            last_modified_ledger_seq: self.close_data.ledger_seq,
+            data: LedgerEntryData::ConfigSetting(
+                ConfigSettingEntry::ContractCostParamsCpuInstructions(ContractCostParams(
+                    cpu_params.try_into().map_err(|_| {
+                        LedgerError::Internal("Failed to convert V22 CPU cost params".to_string())
+                    })?,
+                )),
+            ),
+            ext: LedgerEntryExt::V0,
+        };
+        self.delta.record_update(cpu_entry, new_cpu_entry)?;
+
+        // --- Update memory cost params ---
+        // Parity: NetworkConfig.cpp:882-990 updateMemCostParamsEntryForV22
+        let mem_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::ContractCostParamsMemoryBytes,
+        });
+        let mem_entry = self.load_entry(&mem_key)?.ok_or_else(|| {
+            LedgerError::Internal("ContractCostParamsMemoryBytes entry not found".to_string())
+        })?;
+        let mut mem_params = if let LedgerEntryData::ConfigSetting(
+            ConfigSettingEntry::ContractCostParamsMemoryBytes(params),
+        ) = &mem_entry.data
+        {
+            params.0.to_vec()
+        } else {
+            return Err(LedgerError::Internal(
+                "Unexpected entry type for memory cost params".to_string(),
+            ));
+        };
+
+        mem_params.resize(NEW_SIZE, make_entry(0, 0));
+
+        // New BLS12-381 entries (indices 45..=69):
+        mem_params[45] = make_entry(0, 0);                 // Bls12381EncodeFp
+        mem_params[46] = make_entry(0, 0);                 // Bls12381DecodeFp
+        mem_params[47] = make_entry(0, 0);                 // Bls12381G1CheckPointOnCurve
+        mem_params[48] = make_entry(0, 0);                 // Bls12381G1CheckPointInSubgroup
+        mem_params[49] = make_entry(0, 0);                 // Bls12381G2CheckPointOnCurve
+        mem_params[50] = make_entry(0, 0);                 // Bls12381G2CheckPointInSubgroup
+        mem_params[51] = make_entry(0, 0);                 // Bls12381G1ProjectiveToAffine
+        mem_params[52] = make_entry(0, 0);                 // Bls12381G2ProjectiveToAffine
+        mem_params[53] = make_entry(0, 0);                 // Bls12381G1Add
+        mem_params[54] = make_entry(0, 0);                 // Bls12381G1Mul
+        mem_params[55] = make_entry(109494, 354667);       // Bls12381G1Msm
+        mem_params[56] = make_entry(5552, 0);              // Bls12381MapFpToG1
+        mem_params[57] = make_entry(9424, 0);              // Bls12381HashToG1
+        mem_params[58] = make_entry(0, 0);                 // Bls12381G2Add
+        mem_params[59] = make_entry(0, 0);                 // Bls12381G2Mul
+        mem_params[60] = make_entry(219654, 354667);       // Bls12381G2Msm
+        mem_params[61] = make_entry(3344, 0);              // Bls12381MapFp2ToG2
+        mem_params[62] = make_entry(6816, 0);              // Bls12381HashToG2
+        mem_params[63] = make_entry(2204, 9340474);        // Bls12381Pairing
+        mem_params[64] = make_entry(0, 0);                 // Bls12381FrFromU256
+        mem_params[65] = make_entry(248, 0);               // Bls12381FrToU256
+        mem_params[66] = make_entry(0, 0);                 // Bls12381FrAddSub
+        mem_params[67] = make_entry(0, 0);                 // Bls12381FrMul
+        mem_params[68] = make_entry(0, 128);               // Bls12381FrPow
+        mem_params[69] = make_entry(0, 0);                 // Bls12381FrInv
+
+        let new_mem_entry = LedgerEntry {
+            last_modified_ledger_seq: self.close_data.ledger_seq,
+            data: LedgerEntryData::ConfigSetting(
+                ConfigSettingEntry::ContractCostParamsMemoryBytes(ContractCostParams(
+                    mem_params.try_into().map_err(|_| {
+                        LedgerError::Internal("Failed to convert V22 memory cost params".to_string())
+                    })?,
+                )),
+            ),
+            ext: LedgerEntryExt::V0,
+        };
+        self.delta.record_update(mem_entry, new_mem_entry)?;
+
+        tracing::info!(
+            ledger_seq = self.close_data.ledger_seq,
+            new_size = NEW_SIZE,
+            "Applied createCostTypesForV22: resized cost params with BLS12-381 entries"
+        );
+
+        Ok(())
+    }
+
+    /// Apply version upgrade side effects for protocol 23.
+    ///
+    /// Parity: NetworkConfig.cpp:1459-1484 `createAndUpdateLedgerEntriesForV23`
+    /// Creates 3 new CONFIG_SETTING entries (parallel compute, SCP timing,
+    /// ledger cost extension) and updates rent cost parameters.
+    fn create_and_update_ledger_entries_for_v23(&mut self) -> Result<()> {
+        use stellar_xdr::curr::{
+            ConfigSettingContractLedgerCostExtV0, ConfigSettingContractParallelComputeV0,
+            ConfigSettingScpTiming,
+        };
+
+        let ledger_seq = self.close_data.ledger_seq;
+
+        // 1. CONFIG_SETTING_CONTRACT_PARALLEL_COMPUTE_V0
+        // Parity: NetworkConfig.cpp:1069-1076 initialParallelComputeEntry
+        self.delta.record_create(LedgerEntry {
+            last_modified_ledger_seq: ledger_seq,
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractParallelComputeV0(
+                ConfigSettingContractParallelComputeV0 {
+                    ledger_max_dependent_tx_clusters: 1, // LEDGER_MAX_DEPENDENT_TX_CLUSTERS
+                },
+            )),
+            ext: LedgerEntryExt::V0,
+        })?;
+
+        // 2. CONFIG_SETTING_SCP_TIMING
+        // Parity: NetworkConfig.cpp:1092-1108 initialScpTimingEntry
+        self.delta.record_create(LedgerEntry {
+            last_modified_ledger_seq: ledger_seq,
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::ScpTiming(
+                ConfigSettingScpTiming {
+                    ledger_target_close_time_milliseconds: 5000,
+                    nomination_timeout_initial_milliseconds: 1000,
+                    nomination_timeout_increment_milliseconds: 1000,
+                    ballot_timeout_initial_milliseconds: 1000,
+                    ballot_timeout_increment_milliseconds: 1000,
+                },
+            )),
+            ext: LedgerEntryExt::V0,
+        })?;
+
+        // 3. CONFIG_SETTING_CONTRACT_LEDGER_COST_EXT_V0
+        // Parity: NetworkConfig.cpp:1078-1090 initialLedgerCostExtEntry
+        // Reads txMaxDiskReadEntries from the existing V0 cost setting.
+        let cost_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::ContractLedgerCostV0,
+        });
+        let cost_entry = self.load_entry(&cost_key)?.ok_or_else(|| {
+            LedgerError::Internal(
+                "CONFIG_SETTING_CONTRACT_LEDGER_COST_V0 not found (required for V23 upgrade)"
+                    .to_string(),
+            )
+        })?;
+        let tx_max_disk_read_entries = if let LedgerEntryData::ConfigSetting(
+            ConfigSettingEntry::ContractLedgerCostV0(ref settings),
+        ) = cost_entry.data
+        {
+            settings.tx_max_disk_read_entries
+        } else {
+            return Err(LedgerError::Internal(
+                "Unexpected entry type for ContractLedgerCost".to_string(),
+            ));
+        };
+
+        self.delta.record_create(LedgerEntry {
+            last_modified_ledger_seq: ledger_seq,
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractLedgerCostExtV0(
+                ConfigSettingContractLedgerCostExtV0 {
+                    tx_max_footprint_entries: tx_max_disk_read_entries,
+                    fee_write1_kb: 3_500, // FEE_LEDGER_WRITE_1KB
+                },
+            )),
+            ext: LedgerEntryExt::V0,
+        })?;
+
+        // 4. Update rent cost parameters
+        // Parity: NetworkConfig.cpp:1142-1171 updateRentCostParamsForV23
+        self.update_rent_cost_params_for_v23()?;
+
+        tracing::info!(
+            ledger_seq = self.close_data.ledger_seq,
+            "Applied createAndUpdateLedgerEntriesForV23: 3 new entries + rent param update"
+        );
+
+        Ok(())
+    }
+
+    /// Update rent cost parameters for the V23 protocol upgrade.
+    ///
+    /// Parity: NetworkConfig.cpp:1142-1171 `updateRentCostParamsForV23`
+    /// Updates ContractLedgerCost and StateArchival settings with new rent parameters.
+    fn update_rent_cost_params_for_v23(&mut self) -> Result<()> {
+        let ledger_seq = self.close_data.ledger_seq;
+
+        // Update CONFIG_SETTING_CONTRACT_LEDGER_COST_V0
+        let cost_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::ContractLedgerCostV0,
+        });
+        let cost_entry = self.load_entry(&cost_key)?.ok_or_else(|| {
+            LedgerError::Internal("ContractLedgerCostV0 entry not found".to_string())
+        })?;
+
+        if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractLedgerCostV0(
+            ref settings,
+        )) = cost_entry.data
+        {
+            let mut new_settings = settings.clone();
+            // Protcol23UpgradedConfig values (note: typo matches stellar-core)
+            new_settings.soroban_state_target_size_bytes = 3_000_000_000; // 3 GB
+            new_settings.rent_fee1_kb_soroban_state_size_low = -17_000;
+            new_settings.rent_fee1_kb_soroban_state_size_high = 10_000;
+
+            let new_entry = LedgerEntry {
+                last_modified_ledger_seq: ledger_seq,
+                data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractLedgerCostV0(
+                    new_settings,
+                )),
+                ext: LedgerEntryExt::V0,
+            };
+            self.delta.record_update(cost_entry, new_entry)?;
+        } else {
+            return Err(LedgerError::Internal(
+                "Unexpected entry type for ContractLedgerCostV0".to_string(),
+            ));
+        }
+
+        // Update CONFIG_SETTING_STATE_ARCHIVAL
+        let archival_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::StateArchival,
+        });
+        let archival_entry = self.load_entry(&archival_key)?.ok_or_else(|| {
+            LedgerError::Internal("StateArchival entry not found".to_string())
+        })?;
+
+        if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(ref settings)) =
+            archival_entry.data
+        {
+            let mut new_settings = settings.clone();
+            new_settings.persistent_rent_rate_denominator = 1_215;
+            new_settings.temp_rent_rate_denominator = 2_430;
+
+            let new_entry = LedgerEntry {
+                last_modified_ledger_seq: ledger_seq,
+                data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(
+                    new_settings,
+                )),
+                ext: LedgerEntryExt::V0,
+            };
+            self.delta.record_update(archival_entry, new_entry)?;
+        } else {
+            return Err(LedgerError::Internal(
+                "Unexpected entry type for StateArchival".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Apply version upgrade side effects for protocol 25.
     ///
     /// Parity: NetworkConfig.cpp:1450-1457 `createCostTypesForV25`
@@ -2370,6 +3106,34 @@ impl<'a> LedgerCloseContext<'a> {
         // We record the delta state before and after to extract changes.
         let version_changes = if prev_version != protocol_version {
             let delta_before = self.delta.num_changes();
+            // Parity: Upgrades.cpp:1189-1212
+            // needUpgradeToVersion(V_20, prev, new) → createLedgerEntriesForV20
+            if prev_version < 20 && protocol_version >= 20 {
+                self.create_ledger_entries_for_v20()?;
+                version_upgrade_memory_cost_changed = true;
+            }
+
+            // Parity: Upgrades.cpp:1213-1217
+            // needUpgradeToVersion(V_21, prev, new) → createCostTypesForV21
+            if prev_version < 21 && protocol_version >= 21 {
+                self.create_cost_types_for_v21()?;
+                version_upgrade_memory_cost_changed = true;
+            }
+
+            // Parity: Upgrades.cpp:1219-1223
+            // needUpgradeToVersion(V_22, prev, new) → createCostTypesForV22
+            if prev_version < 22 && protocol_version >= 22 {
+                self.create_cost_types_for_v22()?;
+                version_upgrade_memory_cost_changed = true;
+            }
+
+            // Parity: Upgrades.cpp:1225-1229
+            // needUpgradeToVersion(V_23, prev, new) → createAndUpdateLedgerEntriesForV23
+            if prev_version < 23 && protocol_version >= 23 {
+                self.create_and_update_ledger_entries_for_v23()?;
+                version_upgrade_memory_cost_changed = true;
+            }
+
             // Parity: Upgrades.cpp:1229-1233
             // needUpgradeToVersion(V_25, prev, new) → createCostTypesForV25
             if prev_version < 25 && protocol_version >= 25 {
@@ -3312,6 +4076,24 @@ impl<'a> LedgerCloseContext<'a> {
                 dead_entries,
             )?;
             let add_batch_us = add_batch_start.elapsed().as_micros() as u64;
+
+            // Record completed merges in the shared merge map for deduplication.
+            // This matches stellar-core's adoptFileAsBucket() -> recordMerge() flow.
+            if let Some(ref merge_map) = self.manager.finished_merges {
+                let completed = bucket_list.drain_completed_merges();
+                if !completed.is_empty() {
+                    let mut map = merge_map.write().unwrap();
+                    for (key, output_hash) in completed {
+                        tracing::debug!(
+                            level_curr = %key.curr_hash,
+                            level_snap = %key.snap_hash,
+                            output = %output_hash,
+                            "Recording completed merge in merge map"
+                        );
+                        map.record_merge(key, output_hash);
+                    }
+                }
+            }
 
             let live_hash = bucket_list.hash();
 
@@ -4481,5 +5263,537 @@ mod tests {
         let result = handle.join().expect("thread should not panic").unwrap();
         assert_eq!(result.candidates.len(), 3, "Should find 3 expired entries");
         assert!(result.bytes_scanned > 0);
+    }
+
+    // ---- Genesis createLedgerEntries tests ----
+
+    /// Helper to create a minimal `LedgerCloseContext` for testing genesis entry creation.
+    ///
+    /// The returned context has an empty snapshot and delta at the given ledger_seq.
+    /// The manager is initialized with an empty bucket list.
+    fn make_test_close_context(
+        manager: &LedgerManager,
+        ledger_seq: u32,
+    ) -> LedgerCloseContext<'_> {
+        let header = create_genesis_header();
+        let header_hash = crate::compute_header_hash(&header).expect("hash");
+        let snapshot = SnapshotHandle::new(crate::snapshot::LedgerSnapshot::empty(0));
+
+        LedgerCloseContext {
+            manager,
+            close_data: LedgerCloseData::new(
+                ledger_seq,
+                TransactionSetVariant::Classic(TransactionSet {
+                    previous_ledger_hash: header_hash.into(),
+                    txs: VecM::default(),
+                }),
+                1,
+                header_hash,
+            ),
+            prev_header: header.clone(),
+            prev_header_hash: header_hash,
+            delta: LedgerDelta::new(ledger_seq),
+            snapshot,
+            stats: LedgerCloseStats::new(),
+            upgrade_ctx: UpgradeContext::new(0),
+            id_pool: 0,
+            tx_results: Vec::new(),
+            tx_result_metas: Vec::new(),
+            hot_archive_restored_keys: Vec::new(),
+            runtime_handle: None,
+            start: std::time::Instant::now(),
+            timing_begin_close_us: 0,
+            timing_tx_exec_us: 0,
+            timing_classic_exec_us: 0,
+            timing_soroban_exec_us: 0,
+            tx_perf: Vec::new(),
+        }
+    }
+
+    /// Helper to extract a ConfigSettingEntry from the delta by ConfigSettingId.
+    fn get_config_setting_from_delta(
+        delta: &LedgerDelta,
+        id: ConfigSettingId,
+    ) -> Option<ConfigSettingEntry> {
+        let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: id,
+        });
+        delta.get_change(&key).ok().flatten().and_then(|change| {
+            change.current_entry().and_then(|entry| {
+                if let LedgerEntryData::ConfigSetting(ref cs) = entry.data {
+                    Some(cs.clone())
+                } else {
+                    None
+                }
+            })
+        })
+    }
+
+    #[test]
+    fn test_create_ledger_entries_for_v20_creates_14_entries() {
+        let manager = LedgerManager::new(
+            "Test SDF Network ; September 2015".to_string(),
+            LedgerManagerConfig {
+                validate_bucket_hash: false,
+                ..Default::default()
+            },
+        );
+
+        // Initialize with an empty bucket list
+        let bucket_list = henyey_bucket::BucketList::new();
+        let hot_archive_bucket_list = henyey_bucket::HotArchiveBucketList::new();
+        let header = create_genesis_header();
+        let header_hash = crate::compute_header_hash(&header).expect("hash");
+        manager
+            .initialize(bucket_list, hot_archive_bucket_list, header, header_hash)
+            .expect("init");
+
+        let mut ctx = make_test_close_context(&manager, 2);
+        ctx.create_ledger_entries_for_v20()
+            .expect("V20 entries should be created");
+
+        // Verify all 14 entries were created
+        // 1. ContractMaxSizeBytes
+        let entry =
+            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractMaxSizeBytes);
+        assert!(entry.is_some(), "ContractMaxSizeBytes should exist");
+        if let Some(ConfigSettingEntry::ContractMaxSizeBytes(v)) = entry {
+            assert_eq!(v, 2_000);
+        } else {
+            panic!("Wrong type for ContractMaxSizeBytes");
+        }
+
+        // 2. ContractDataKeySizeBytes
+        let entry = get_config_setting_from_delta(
+            &ctx.delta,
+            ConfigSettingId::ContractDataKeySizeBytes,
+        );
+        assert!(entry.is_some(), "ContractDataKeySizeBytes should exist");
+
+        // 3. ContractDataEntrySizeBytes
+        let entry = get_config_setting_from_delta(
+            &ctx.delta,
+            ConfigSettingId::ContractDataEntrySizeBytes,
+        );
+        assert!(entry.is_some(), "ContractDataEntrySizeBytes should exist");
+
+        // 4. ContractComputeV0
+        let entry =
+            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractComputeV0);
+        assert!(entry.is_some(), "ContractComputeV0 should exist");
+        if let Some(ConfigSettingEntry::ContractComputeV0(ref compute)) = entry {
+            assert_eq!(compute.tx_max_instructions, 2_500_000);
+            assert_eq!(compute.tx_memory_limit, 2_000_000);
+        }
+
+        // 5. ContractLedgerCostV0
+        let entry =
+            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractLedgerCostV0);
+        assert!(entry.is_some(), "ContractLedgerCostV0 should exist");
+        if let Some(ConfigSettingEntry::ContractLedgerCostV0(ref cost)) = entry {
+            assert_eq!(cost.tx_max_disk_read_entries, 3);
+            assert_eq!(
+                cost.soroban_state_target_size_bytes,
+                30 * 1024 * 1024 * 1024_i64
+            );
+        }
+
+        // 6-9. Historical data, events, bandwidth, execution lanes
+        assert!(
+            get_config_setting_from_delta(
+                &ctx.delta,
+                ConfigSettingId::ContractHistoricalDataV0
+            )
+            .is_some(),
+            "ContractHistoricalDataV0 should exist"
+        );
+        assert!(
+            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractEventsV0)
+                .is_some(),
+            "ContractEventsV0 should exist"
+        );
+        assert!(
+            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractBandwidthV0)
+                .is_some(),
+            "ContractBandwidthV0 should exist"
+        );
+        assert!(
+            get_config_setting_from_delta(
+                &ctx.delta,
+                ConfigSettingId::ContractExecutionLanes
+            )
+            .is_some(),
+            "ContractExecutionLanes should exist"
+        );
+
+        // 10-11. CPU and memory cost params (23 entries each)
+        let cpu = get_config_setting_from_delta(
+            &ctx.delta,
+            ConfigSettingId::ContractCostParamsCpuInstructions,
+        );
+        assert!(cpu.is_some(), "CPU cost params should exist");
+        if let Some(ConfigSettingEntry::ContractCostParamsCpuInstructions(ref params)) = cpu {
+            assert_eq!(
+                params.0.len(),
+                23,
+                "V20 CPU cost params should have 23 entries"
+            );
+        }
+
+        let mem = get_config_setting_from_delta(
+            &ctx.delta,
+            ConfigSettingId::ContractCostParamsMemoryBytes,
+        );
+        assert!(mem.is_some(), "Memory cost params should exist");
+        if let Some(ConfigSettingEntry::ContractCostParamsMemoryBytes(ref params)) = mem {
+            assert_eq!(
+                params.0.len(),
+                23,
+                "V20 memory cost params should have 23 entries"
+            );
+        }
+
+        // 12. StateArchival
+        let archival =
+            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::StateArchival);
+        assert!(archival.is_some(), "StateArchival should exist");
+        if let Some(ConfigSettingEntry::StateArchival(ref sa)) = archival {
+            assert_eq!(sa.max_entry_ttl, 1_054_080);
+            assert_eq!(sa.min_temporary_ttl, 16);
+            assert_eq!(sa.min_persistent_ttl, 4_096);
+            assert_eq!(sa.starting_eviction_scan_level, 6);
+        }
+
+        // 13. LiveSorobanStateSizeWindow (30-entry window)
+        let window = get_config_setting_from_delta(
+            &ctx.delta,
+            ConfigSettingId::LiveSorobanStateSizeWindow,
+        );
+        assert!(window.is_some(), "LiveSorobanStateSizeWindow should exist");
+        if let Some(ConfigSettingEntry::LiveSorobanStateSizeWindow(ref w)) = window {
+            assert_eq!(w.len(), 30, "Window should have 30 entries");
+        }
+
+        // 14. EvictionIterator
+        let eviction =
+            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::EvictionIterator);
+        assert!(eviction.is_some(), "EvictionIterator should exist");
+        if let Some(ConfigSettingEntry::EvictionIterator(ref ei)) = eviction {
+            assert_eq!(ei.bucket_list_level, 6);
+            assert!(ei.is_curr_bucket);
+            assert_eq!(ei.bucket_file_offset, 0);
+        }
+    }
+
+    #[test]
+    fn test_create_cost_types_for_v21_resizes_to_45() {
+        let manager = LedgerManager::new(
+            "Test SDF Network ; September 2015".to_string(),
+            LedgerManagerConfig {
+                validate_bucket_hash: false,
+                ..Default::default()
+            },
+        );
+        let bucket_list = henyey_bucket::BucketList::new();
+        let hot_archive_bucket_list = henyey_bucket::HotArchiveBucketList::new();
+        let header = create_genesis_header();
+        let header_hash = crate::compute_header_hash(&header).expect("hash");
+        manager
+            .initialize(bucket_list, hot_archive_bucket_list, header, header_hash)
+            .expect("init");
+
+        let mut ctx = make_test_close_context(&manager, 2);
+
+        // First create V20 entries (prerequisite)
+        ctx.create_ledger_entries_for_v20()
+            .expect("V20 entries should be created");
+
+        // Now apply V21 upgrade
+        ctx.create_cost_types_for_v21()
+            .expect("V21 cost types should be created");
+
+        // CPU params should now be 45 entries
+        let cpu = get_config_setting_from_delta(
+            &ctx.delta,
+            ConfigSettingId::ContractCostParamsCpuInstructions,
+        );
+        if let Some(ConfigSettingEntry::ContractCostParamsCpuInstructions(ref params)) = cpu {
+            assert_eq!(
+                params.0.len(),
+                45,
+                "V21 CPU cost params should have 45 entries"
+            );
+            // Check VmCachedInstantiation was updated (index 12)
+            assert_eq!(params.0[12].const_term, 41142);
+            assert_eq!(params.0[12].linear_term, 634);
+            // Check new ParseWasmInstructions entry (index 23)
+            assert_eq!(params.0[23].const_term, 73077);
+            // Check last entry VerifyEcdsaSecp256r1Sig (index 44)
+            assert_eq!(params.0[44].const_term, 3000906);
+        } else {
+            panic!("CPU cost params not found or wrong type");
+        }
+
+        // Memory params should now be 45 entries
+        let mem = get_config_setting_from_delta(
+            &ctx.delta,
+            ConfigSettingId::ContractCostParamsMemoryBytes,
+        );
+        if let Some(ConfigSettingEntry::ContractCostParamsMemoryBytes(ref params)) = mem {
+            assert_eq!(
+                params.0.len(),
+                45,
+                "V21 memory cost params should have 45 entries"
+            );
+            // Check VmCachedInstantiation was updated (index 12)
+            assert_eq!(params.0[12].const_term, 69472);
+        } else {
+            panic!("Memory cost params not found or wrong type");
+        }
+    }
+
+    #[test]
+    fn test_create_cost_types_for_v22_resizes_to_70() {
+        let manager = LedgerManager::new(
+            "Test SDF Network ; September 2015".to_string(),
+            LedgerManagerConfig {
+                validate_bucket_hash: false,
+                ..Default::default()
+            },
+        );
+        let bucket_list = henyey_bucket::BucketList::new();
+        let hot_archive_bucket_list = henyey_bucket::HotArchiveBucketList::new();
+        let header = create_genesis_header();
+        let header_hash = crate::compute_header_hash(&header).expect("hash");
+        manager
+            .initialize(bucket_list, hot_archive_bucket_list, header, header_hash)
+            .expect("init");
+
+        let mut ctx = make_test_close_context(&manager, 2);
+
+        // Chain V20 -> V21 -> V22
+        ctx.create_ledger_entries_for_v20().expect("V20");
+        ctx.create_cost_types_for_v21().expect("V21");
+        ctx.create_cost_types_for_v22().expect("V22");
+
+        // CPU params should now be 70 entries
+        let cpu = get_config_setting_from_delta(
+            &ctx.delta,
+            ConfigSettingId::ContractCostParamsCpuInstructions,
+        );
+        if let Some(ConfigSettingEntry::ContractCostParamsCpuInstructions(ref params)) = cpu {
+            assert_eq!(
+                params.0.len(),
+                70,
+                "V22 CPU cost params should have 70 entries"
+            );
+            // Check first BLS12-381 entry (index 45): Bls12381EncodeFp
+            assert_eq!(params.0[45].const_term, 661);
+            // Check last BLS12-381 entry (index 69): Bls12381FrInv
+            assert_eq!(params.0[69].const_term, 35421);
+        } else {
+            panic!("CPU cost params not found or wrong type");
+        }
+
+        // Memory params should now be 70 entries
+        let mem = get_config_setting_from_delta(
+            &ctx.delta,
+            ConfigSettingId::ContractCostParamsMemoryBytes,
+        );
+        if let Some(ConfigSettingEntry::ContractCostParamsMemoryBytes(ref params)) = mem {
+            assert_eq!(
+                params.0.len(),
+                70,
+                "V22 memory cost params should have 70 entries"
+            );
+            // Check Bls12381G1Msm memory (index 55) has non-zero values
+            assert_eq!(params.0[55].const_term, 109494);
+            assert_eq!(params.0[55].linear_term, 354667);
+        } else {
+            panic!("Memory cost params not found or wrong type");
+        }
+    }
+
+    #[test]
+    fn test_create_and_update_ledger_entries_for_v23() {
+        let manager = LedgerManager::new(
+            "Test SDF Network ; September 2015".to_string(),
+            LedgerManagerConfig {
+                validate_bucket_hash: false,
+                ..Default::default()
+            },
+        );
+        let bucket_list = henyey_bucket::BucketList::new();
+        let hot_archive_bucket_list = henyey_bucket::HotArchiveBucketList::new();
+        let header = create_genesis_header();
+        let header_hash = crate::compute_header_hash(&header).expect("hash");
+        manager
+            .initialize(bucket_list, hot_archive_bucket_list, header, header_hash)
+            .expect("init");
+
+        let mut ctx = make_test_close_context(&manager, 2);
+
+        // Chain V20 -> V21 -> V22 -> V23
+        ctx.create_ledger_entries_for_v20().expect("V20");
+        ctx.create_cost_types_for_v21().expect("V21");
+        ctx.create_cost_types_for_v22().expect("V22");
+        ctx.create_and_update_ledger_entries_for_v23().expect("V23");
+
+        // 1. ContractParallelComputeV0
+        let parallel = get_config_setting_from_delta(
+            &ctx.delta,
+            ConfigSettingId::ContractParallelComputeV0,
+        );
+        assert!(
+            parallel.is_some(),
+            "ContractParallelComputeV0 should exist"
+        );
+        if let Some(ConfigSettingEntry::ContractParallelComputeV0(ref p)) = parallel {
+            assert_eq!(p.ledger_max_dependent_tx_clusters, 1);
+        }
+
+        // 2. ScpTiming
+        let timing =
+            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ScpTiming);
+        assert!(timing.is_some(), "ScpTiming should exist");
+        if let Some(ConfigSettingEntry::ScpTiming(ref t)) = timing {
+            assert_eq!(t.ledger_target_close_time_milliseconds, 5000);
+            assert_eq!(t.nomination_timeout_initial_milliseconds, 1000);
+        }
+
+        // 3. ContractLedgerCostExtV0
+        let ext = get_config_setting_from_delta(
+            &ctx.delta,
+            ConfigSettingId::ContractLedgerCostExtV0,
+        );
+        assert!(ext.is_some(), "ContractLedgerCostExtV0 should exist");
+        if let Some(ConfigSettingEntry::ContractLedgerCostExtV0(ref e)) = ext {
+            // tx_max_footprint_entries should match the V0 tx_max_disk_read_entries
+            assert_eq!(e.tx_max_footprint_entries, 3);
+            assert_eq!(e.fee_write1_kb, 3_500);
+        }
+
+        // 4. Verify rent cost params were updated
+        let cost = get_config_setting_from_delta(
+            &ctx.delta,
+            ConfigSettingId::ContractLedgerCostV0,
+        );
+        if let Some(ConfigSettingEntry::ContractLedgerCostV0(ref c)) = cost {
+            assert_eq!(c.soroban_state_target_size_bytes, 3_000_000_000);
+            assert_eq!(c.rent_fee1_kb_soroban_state_size_low, -17_000);
+            assert_eq!(c.rent_fee1_kb_soroban_state_size_high, 10_000);
+        } else {
+            panic!("ContractLedgerCostV0 not found or wrong type after V23 upgrade");
+        }
+
+        let archival =
+            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::StateArchival);
+        if let Some(ConfigSettingEntry::StateArchival(ref sa)) = archival {
+            assert_eq!(sa.persistent_rent_rate_denominator, 1_215);
+            assert_eq!(sa.temp_rent_rate_denominator, 2_430);
+        } else {
+            panic!("StateArchival not found or wrong type after V23 upgrade");
+        }
+    }
+
+    #[test]
+    fn test_full_chain_v20_through_v25_cost_params() {
+        let manager = LedgerManager::new(
+            "Test SDF Network ; September 2015".to_string(),
+            LedgerManagerConfig {
+                validate_bucket_hash: false,
+                ..Default::default()
+            },
+        );
+        let bucket_list = henyey_bucket::BucketList::new();
+        let hot_archive_bucket_list = henyey_bucket::HotArchiveBucketList::new();
+        let header = create_genesis_header();
+        let header_hash = crate::compute_header_hash(&header).expect("hash");
+        manager
+            .initialize(bucket_list, hot_archive_bucket_list, header, header_hash)
+            .expect("init");
+
+        let mut ctx = make_test_close_context(&manager, 2);
+
+        // Full chain: V20 -> V21 -> V22 -> V23 -> V25
+        ctx.create_ledger_entries_for_v20().expect("V20");
+        ctx.create_cost_types_for_v21().expect("V21");
+        ctx.create_cost_types_for_v22().expect("V22");
+        ctx.create_and_update_ledger_entries_for_v23().expect("V23");
+        ctx.create_cost_types_for_v25().expect("V25");
+
+        // CPU cost params should have 85 entries (BN254)
+        let cpu = get_config_setting_from_delta(
+            &ctx.delta,
+            ConfigSettingId::ContractCostParamsCpuInstructions,
+        );
+        if let Some(ConfigSettingEntry::ContractCostParamsCpuInstructions(ref params)) = cpu {
+            assert_eq!(
+                params.0.len(),
+                85,
+                "V25 CPU cost params should have 85 entries"
+            );
+            // Verify original V20 entry preserved (index 0: WasmInsnExec)
+            assert_eq!(params.0[0].const_term, 4);
+            // Verify V21 entry preserved (index 23: ParseWasmInstructions)
+            assert_eq!(params.0[23].const_term, 73077);
+            // Verify V22 entry preserved (index 45: Bls12381EncodeFp)
+            assert_eq!(params.0[45].const_term, 661);
+            // Verify V25 BN254 entry (index 70: Bn254EncodeFp)
+            assert_eq!(params.0[70].const_term, 344);
+            // Verify last V25 entry (index 84: Bn254FrInv)
+            assert_eq!(params.0[84].const_term, 33151);
+        } else {
+            panic!("CPU cost params not found after full chain");
+        }
+
+        // Memory cost params should also have 85 entries
+        let mem = get_config_setting_from_delta(
+            &ctx.delta,
+            ConfigSettingId::ContractCostParamsMemoryBytes,
+        );
+        if let Some(ConfigSettingEntry::ContractCostParamsMemoryBytes(ref params)) = mem {
+            assert_eq!(
+                params.0.len(),
+                85,
+                "V25 memory cost params should have 85 entries"
+            );
+        } else {
+            panic!("Memory cost params not found after full chain");
+        }
+    }
+
+    #[test]
+    fn test_v20_cpu_cost_params_values_match_stellar_core() {
+        // Parity: NetworkConfig.cpp:246-338 initialCpuCostParamsEntryForV20
+        let cpu_params = LedgerCloseContext::initial_cpu_cost_params_for_v20();
+        assert_eq!(cpu_params.len(), 23);
+
+        // Spot-check key values against stellar-core
+        assert_eq!(cpu_params[0].const_term, 4); // WasmInsnExec
+        assert_eq!(cpu_params[0].linear_term, 0);
+        assert_eq!(cpu_params[7].const_term, 59052); // ValDeser
+        assert_eq!(cpu_params[7].linear_term, 4001);
+        assert_eq!(cpu_params[10].const_term, 377524); // VerifyEd25519Sig
+        assert_eq!(cpu_params[11].const_term, 451626); // VmInstantiation
+        assert_eq!(cpu_params[12].const_term, 451626); // VmCachedInstantiation (same as VmInstantiation in V20)
+        assert_eq!(cpu_params[16].const_term, 2315295); // RecoverEcdsaSecp256k1Key
+        assert_eq!(cpu_params[22].const_term, 1058); // ChaCha20DrawBytes
+        assert_eq!(cpu_params[22].linear_term, 501);
+    }
+
+    #[test]
+    fn test_v20_mem_cost_params_values_match_stellar_core() {
+        // Parity: NetworkConfig.cpp:688-776 initialMemCostParamsEntryForV20
+        let mem_params = LedgerCloseContext::initial_mem_cost_params_for_v20();
+        assert_eq!(mem_params.len(), 23);
+
+        // Spot-check key values
+        assert_eq!(mem_params[0].const_term, 0); // WasmInsnExec (no memory)
+        assert_eq!(mem_params[1].const_term, 16); // MemAlloc
+        assert_eq!(mem_params[1].linear_term, 128);
+        assert_eq!(mem_params[11].const_term, 130065); // VmInstantiation
+        assert_eq!(mem_params[11].linear_term, 5064);
+        assert_eq!(mem_params[16].const_term, 181); // RecoverEcdsaSecp256k1Key
     }
 }

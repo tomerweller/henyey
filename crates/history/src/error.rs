@@ -153,3 +153,28 @@ pub enum HistoryError {
     #[error("archive not found: {0}")]
     ArchiveNotFound(String),
 }
+
+impl HistoryError {
+    /// Returns `true` if this error indicates a **fatal catchup failure** — the
+    /// verified ledger chain from the archive disagrees with local state.
+    ///
+    /// Per the spec (§13.3), a fatal catchup failure occurs when a
+    /// verification/integrity check fails in a way that implies the local
+    /// ledger state is corrupt (not just stale or unreachable).  Specifically:
+    ///
+    /// - Hash chain verification failures (`InvalidPreviousHash`)
+    /// - Bucket list / ledger hash mismatches (`VerificationFailed`)
+    /// - Transaction set hash mismatches (`InvalidTxSetHash`)
+    ///
+    /// Transient errors (network, download, archive unreachable) are **not**
+    /// fatal — the node should retry those.
+    pub fn is_fatal_catchup_failure(&self) -> bool {
+        matches!(
+            self,
+            HistoryError::VerificationFailed(_)
+                | HistoryError::InvalidPreviousHash { .. }
+                | HistoryError::InvalidTxSetHash { .. }
+                | HistoryError::InvalidSequence { .. }
+        )
+    }
+}

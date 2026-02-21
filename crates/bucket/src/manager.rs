@@ -46,6 +46,7 @@ use std::sync::{Arc, RwLock};
 
 use stellar_xdr::curr::{LedgerEntry, LedgerKey, Limits, WriteXdr};
 
+use henyey_common::fs_utils::durable_rename;
 use henyey_common::Hash256;
 
 use crate::bucket::Bucket;
@@ -453,7 +454,7 @@ impl BucketManager {
         // Move to final canonical path
         let final_path = self.bucket_path(&hash);
         if !final_path.exists() {
-            std::fs::rename(&temp_path, &final_path)?;
+            durable_rename(&temp_path, &final_path)?;
         } else {
             let _ = std::fs::remove_file(&temp_path);
         }

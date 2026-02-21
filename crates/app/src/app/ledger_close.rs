@@ -211,6 +211,13 @@ impl App {
             return Ok(false);
         }
 
+        // Step 1b: Restore checkpoint state (crash recovery).
+        // Mirrors stellar-core's restoreCheckpoint(lcl) called from
+        // loadLastKnownLedger: cleans up partial checkpoint files left
+        // by a previous crash and finalizes any complete checkpoint at
+        // the current boundary.
+        self.restore_checkpoint(lcl_seq);
+
         // Step 2: Read HAS JSON from DB
         let has_json = self.db.with_connection(|conn| {
             conn.get_state(state_keys::HISTORY_ARCHIVE_STATE)
@@ -321,6 +328,74 @@ impl App {
         );
 
         Ok(true)
+    }
+
+    /// Restore checkpoint state on startup (crash recovery).
+    ///
+    /// Mirrors stellar-core's `HistoryManagerImpl::restoreCheckpoint(lcl)`:
+    ///
+    /// 1. **Guard**: Skip if publishing is not enabled (no writable archives)
+    /// 2. **Cleanup**: Call `CheckpointBuilder::cleanup(lcl)` to recover
+    ///    partial dirty checkpoint files left by a previous crash
+    /// 3. **Finalize**: If LCL is at a checkpoint boundary, rename recovered
+    ///    dirty files to their final paths
+    ///
+    /// This is a best-effort operation — errors are logged but do not prevent
+    /// startup, since checkpoint publishing is independent of ledger state.
+    fn restore_checkpoint(&self, lcl: u32) {
+        // Guard: only run if publishing is enabled (at least one writable archive).
+        let publish_enabled = self
+            .config
+            .history
+            .archives
+            .iter()
+            .any(|a| a.put_enabled && a.get_enabled);
+        if !publish_enabled {
+            return;
+        }
+
+        // Derive publish directory from bucket directory, mirroring
+        // stellar-core's BUCKET_DIR_PATH / "history" layout.
+        let publish_dir = self.bucket_manager.bucket_dir().join("history");
+        if !publish_dir.exists() {
+            tracing::debug!(
+                publish_dir = %publish_dir.display(),
+                "Publish directory does not exist, skipping checkpoint restore"
+            );
+            return;
+        }
+
+        tracing::info!(
+            lcl,
+            publish_dir = %publish_dir.display(),
+            "Restoring checkpoint state on startup"
+        );
+
+        let mut builder = henyey_history::checkpoint_builder::CheckpointBuilder::new(
+            publish_dir,
+        );
+
+        // Phase 1: Clean up partial/corrupt dirty files
+        if let Err(e) = builder.cleanup(lcl) {
+            tracing::warn!(
+                lcl,
+                error = %e,
+                "Checkpoint cleanup failed (non-fatal)"
+            );
+            return;
+        }
+
+        // Phase 2: If LCL is at a checkpoint boundary, finalize recovered
+        // dirty files by renaming them to final paths.
+        if is_checkpoint_ledger(lcl) {
+            if let Err(e) = builder.finalize_recovered_checkpoint(lcl) {
+                tracing::warn!(
+                    lcl,
+                    error = %e,
+                    "Checkpoint finalization failed (non-fatal)"
+                );
+            }
+        }
     }
 
     /// Reconstruct both live and hot archive bucket lists from a parsed HAS,

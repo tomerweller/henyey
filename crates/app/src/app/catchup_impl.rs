@@ -20,6 +20,16 @@ impl App {
         target: CatchupTarget,
         mode: CatchupMode,
     ) -> anyhow::Result<CatchupResult> {
+        // Fatal-failure guard (spec §13.3): a previous catchup detected a
+        // verification/integrity failure.  Further attempts are futile and
+        // must be blocked until the operator intervenes.
+        if self.catchup_fatal_failure.load(Ordering::SeqCst) {
+            anyhow::bail!(
+                "catchup blocked: previous fatal verification failure — \
+                 manual intervention required"
+            );
+        }
+
         self.set_state(AppState::CatchingUp).await;
 
         let progress = Arc::new(CatchupProgress::new());
@@ -521,6 +531,7 @@ impl App {
             self.bucket_manager.clone(),
             Arc::new(self.db.clone()),
         );
+        catchup_manager.set_network_passphrase(self.config.network.passphrase.clone());
 
         // Run catchup
         progress.set_phase(CatchupPhase::DownloadingBuckets);
@@ -924,6 +935,12 @@ impl App {
     }
 
     pub(super) async fn maybe_start_buffered_catchup(&self) {
+        // Fatal-failure guard (spec §13.3): block further catchup after a
+        // verification/integrity failure.
+        if self.catchup_fatal_failure.load(Ordering::SeqCst) {
+            return;
+        }
+
         // Early cooldown check: if we recently completed or skipped catchup,
         // skip re-evaluating. This prevents log spam and avoids re-triggering
         // catchup while the node is still stabilizing after a catchup cycle.
@@ -1577,7 +1594,26 @@ impl App {
                 *self.last_catchup_completed_at.write().await = Some(Instant::now());
             }
             Err(err) => {
-                tracing::error!(error = %err, "{} catchup failed", label);
+                // Check if this is a fatal catchup failure (verification/integrity
+                // error indicating local state corruption).  Per spec §13.3, once
+                // a fatal failure is detected, further catchup attempts must be
+                // blocked — they will keep failing and waste resources.
+                let is_fatal = err
+                    .downcast_ref::<henyey_history::HistoryError>()
+                    .is_some_and(|e| e.is_fatal_catchup_failure());
+                if is_fatal {
+                    tracing::error!(
+                        error = %err,
+                        "{} catchup FATAL: verification/integrity failure — \
+                         local state may be corrupt.  Further catchup attempts \
+                         will be blocked.  Manual intervention required \
+                         (wipe state or restore from known-good snapshot).",
+                        label,
+                    );
+                    self.catchup_fatal_failure.store(true, Ordering::SeqCst);
+                } else {
+                    tracing::error!(error = %err, "{} catchup failed", label);
+                }
                 // Restore operational state so the node can continue
                 // participating in consensus. Without this, the node stays
                 // permanently stuck in CatchingUp after a failed catchup
@@ -1604,6 +1640,12 @@ impl App {
     }
 
     pub(super) async fn maybe_start_externalized_catchup(&self, latest_externalized: u64) {
+        // Fatal-failure guard (spec §13.3): block further catchup after a
+        // verification/integrity failure.
+        if self.catchup_fatal_failure.load(Ordering::SeqCst) {
+            return;
+        }
+
         let current_ledger = match self.get_current_ledger().await {
             Ok(seq) => seq,
             Err(_) => return,

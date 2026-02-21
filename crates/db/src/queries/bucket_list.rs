@@ -12,8 +12,8 @@
 //!
 //! This structure allows efficient merging and pruning of ledger state.
 
-use rusqlite::{params, Connection};
 use henyey_common::Hash256;
+use rusqlite::{params, Connection};
 
 use crate::error::DbError;
 

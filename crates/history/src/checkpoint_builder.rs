@@ -44,19 +44,183 @@
 
 use crate::paths::{checkpoint_path, checkpoint_path_dirty, dirty_to_final_path, is_dirty_path};
 use crate::{HistoryError, Result};
+use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use henyey_common::fs_utils::durable_rename;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use stellar_xdr::curr::{
-    LedgerHeaderHistoryEntry, Limits, TransactionHistoryEntry, TransactionHistoryResultEntry,
-    WriteXdr,
+    LedgerHeaderHistoryEntry, Limits, ReadXdr, TransactionHistoryEntry,
+    TransactionHistoryResultEntry, WriteXdr,
 };
 use tracing::{debug, info, warn};
 
 /// File categories for checkpoint files.
 const FILE_CATEGORIES: &[&str] = &["ledger", "transactions", "results"];
+
+/// Read one XDR entry from a gzip-compressed stream using record marking format.
+///
+/// Reads a 4-byte length-prefixed entry (with bit 31 set as the "last fragment" marker),
+/// followed by the XDR payload padded to 4-byte boundary. Returns `None` at EOF,
+/// or `Err` on deserialization failure (which indicates a partial/corrupt write).
+fn read_one_from_gz<T: ReadXdr>(reader: &mut impl Read) -> io::Result<Option<T>> {
+    // Read 4-byte length header
+    let mut header = [0u8; 4];
+    match reader.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+
+    // Extract size (strip the "last fragment" bit)
+    let marked_len = u32::from_be_bytes(header);
+    let len = marked_len & 0x7FFF_FFFF;
+
+    // Read payload
+    let mut payload = vec![0u8; len as usize];
+    reader.read_exact(&mut payload)?;
+
+    // Read padding (XDR entries are padded to 4-byte boundary)
+    let padding = (4 - (len % 4)) % 4;
+    if padding > 0 {
+        let mut pad = vec![0u8; padding as usize];
+        reader.read_exact(&mut pad)?;
+    }
+
+    // Deserialize XDR
+    let value = T::from_xdr(&payload, Limits::none())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    Ok(Some(value))
+}
+
+/// Write one XDR entry to a gzip-compressed stream using record marking format.
+///
+/// Mirrors `XdrStreamWriter::write_xdr()`: writes a 4-byte length prefix with the
+/// "last fragment" bit set, followed by the XDR payload padded to 4-byte boundary.
+fn write_one_to_gz<T: WriteXdr>(writer: &mut impl Write, entry: &T) -> io::Result<()> {
+    let xdr_bytes = entry
+        .to_xdr(Limits::none())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    let len = xdr_bytes.len() as u32;
+    let marked_len = len | 0x8000_0000;
+    writer.write_all(&marked_len.to_be_bytes())?;
+    writer.write_all(&xdr_bytes)?;
+
+    // Pad to 4-byte boundary
+    let padding = (4 - (len % 4)) % 4;
+    if padding > 0 {
+        writer.write_all(&vec![0u8; padding as usize])?;
+    }
+
+    Ok(())
+}
+
+/// Recover a gzip-compressed dirty checkpoint file by truncating entries beyond LCL.
+///
+/// This reads all valid entries from `dirty_path`, writes those with ledger_seq <= lcl
+/// to a temp file, then durably renames the temp over the dirty path.
+///
+/// If `enforce_lcl` is true, the file must end exactly at LCL (used for ledger headers
+/// where every ledger has an entry). For transactions/results, gaps are allowed since
+/// empty ledgers don't produce entries.
+///
+/// Matches stellar-core's `CheckpointBuilder::cleanup()` recovery closure.
+fn recover_dirty_file<T, F>(
+    dirty_path: &Path,
+    lcl: u32,
+    enforce_lcl: bool,
+    get_ledger_seq: F,
+) -> Result<()>
+where
+    T: ReadXdr + WriteXdr,
+    F: Fn(&T) -> u32,
+{
+    let tmp_dir = dirty_path
+        .parent()
+        .ok_or_else(|| HistoryError::CatchupFailed("dirty path has no parent".into()))?;
+    let tmp_file = tmp_dir.join(format!(
+        "truncated-{}",
+        dirty_path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+
+    // Read from dirty, write to temp
+    let file_in = File::open(dirty_path)?;
+    let mut reader = BufReader::new(GzDecoder::new(file_in));
+
+    let file_out = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp_file)?;
+    let buf_out = BufWriter::new(file_out);
+    let mut writer = GzEncoder::new(buf_out, Compression::default());
+
+    let mut last_read_ledger_seq: u32 = 0;
+
+    loop {
+        match read_one_from_gz::<T>(&mut reader) {
+            Ok(Some(entry)) => {
+                let seq = get_ledger_seq(&entry);
+                if seq > lcl {
+                    info!(
+                        dirty = %dirty_path.display(),
+                        lcl,
+                        truncated_at = seq,
+                        "Truncating dirty file at LCL"
+                    );
+                    break;
+                }
+                last_read_ledger_seq = seq;
+                write_one_to_gz(&mut writer, &entry)?;
+            }
+            Ok(None) => {
+                // EOF — check LCL enforcement
+                if enforce_lcl && last_read_ledger_seq != 0 && last_read_ledger_seq != lcl {
+                    return Err(HistoryError::CatchupFailed(format!(
+                        "Corrupt checkpoint file {}, ends on ledger {}, LCL is {}",
+                        dirty_path.display(),
+                        last_read_ledger_seq,
+                        lcl,
+                    )));
+                }
+                break;
+            }
+            Err(e) => {
+                // Deserialization error — partial write, truncate here
+                info!(
+                    dirty = %dirty_path.display(),
+                    error = %e,
+                    last_ledger = last_read_ledger_seq,
+                    "Encountered partial write in dirty file, truncating"
+                );
+                break;
+            }
+        }
+    }
+
+    // Finalize the gzip stream and sync
+    let buf_writer = writer.finish()?;
+    let file = buf_writer
+        .into_inner()
+        .map_err(|e| HistoryError::Io(e.into_error()))?;
+    file.sync_all()?;
+    drop(file);
+
+    // Durable rename temp → dirty
+    durable_rename(&tmp_file, dirty_path)?;
+
+    info!(
+        dirty = %dirty_path.display(),
+        last_ledger = last_read_ledger_seq,
+        "Recovered dirty file"
+    );
+
+    Ok(())
+}
 
 /// XDR stream writer with gzip compression.
 ///
@@ -324,7 +488,7 @@ impl CheckpointBuilder {
             if let Some(parent) = final_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::rename(dirty, final_path)?;
+            durable_rename(dirty, final_path)?;
             debug!(
                 dirty = %dirty.display(),
                 final_path = %final_path.display(),
@@ -410,15 +574,60 @@ impl CheckpointBuilder {
                 fs::remove_file(dirty_path)?;
             }
             (true, false) => {
-                // Only dirty exists - this is a partial checkpoint
-                // For simplicity, we delete it and let the checkpoint be rebuilt
-                // A more sophisticated implementation would truncate to LCL
-                warn!(
-                    dirty = %dirty_path.display(),
-                    lcl,
-                    "Deleting partial dirty file (will be rebuilt)"
-                );
-                fs::remove_file(dirty_path)?;
+                // Only dirty exists — truncate entries beyond LCL to recover
+                // partial checkpoint. Determine file category from path to
+                // select the right XDR type and LCL enforcement.
+                let category = self.category_from_dirty_path(dirty_path);
+                match category.as_deref() {
+                    Some("ledger") => {
+                        info!(
+                            dirty = %dirty_path.display(),
+                            lcl,
+                            "Recovering dirty ledger header file (enforceLCL=true)"
+                        );
+                        recover_dirty_file::<LedgerHeaderHistoryEntry, _>(
+                            dirty_path,
+                            lcl,
+                            true, // enforceLCL
+                            |entry| entry.header.ledger_seq,
+                        )?;
+                    }
+                    Some("transactions") => {
+                        info!(
+                            dirty = %dirty_path.display(),
+                            lcl,
+                            "Recovering dirty transactions file"
+                        );
+                        recover_dirty_file::<TransactionHistoryEntry, _>(
+                            dirty_path,
+                            lcl,
+                            false,
+                            |entry| entry.ledger_seq,
+                        )?;
+                    }
+                    Some("results") => {
+                        info!(
+                            dirty = %dirty_path.display(),
+                            lcl,
+                            "Recovering dirty results file"
+                        );
+                        recover_dirty_file::<TransactionHistoryResultEntry, _>(
+                            dirty_path,
+                            lcl,
+                            false,
+                            |entry| entry.ledger_seq,
+                        )?;
+                    }
+                    _ => {
+                        // Unknown category — can't recover, delete
+                        warn!(
+                            dirty = %dirty_path.display(),
+                            lcl,
+                            "Unknown file category, deleting dirty file"
+                        );
+                        fs::remove_file(dirty_path)?;
+                    }
+                }
             }
             (false, true) => {
                 // Only final exists - this is normal, nothing to do
@@ -435,9 +644,63 @@ impl CheckpointBuilder {
         Ok(())
     }
 
+    /// Extract the file category from a dirty path.
+    ///
+    /// The category is the top-level directory under publish_dir, e.g. "ledger",
+    /// "transactions", or "results".
+    fn category_from_dirty_path(&self, dirty_path: &Path) -> Option<String> {
+        let relative = dirty_path.strip_prefix(&self.publish_dir).ok()?;
+        let first_component = relative.components().next()?;
+        Some(first_component.as_os_str().to_string_lossy().into_owned())
+    }
+
     /// Check if startup validation has been performed.
     pub fn is_validated(&self) -> bool {
         self.startup_validated
+    }
+
+    /// Finalize a recovered checkpoint by renaming dirty files to final paths.
+    ///
+    /// This mirrors the rename portion of stellar-core's `checkpointComplete()`:
+    /// for each file category, if a dirty file exists but the final file does not,
+    /// durably rename dirty → final.
+    ///
+    /// Called from `restore_checkpoint` after `cleanup()` when LCL sits on a
+    /// checkpoint boundary.
+    pub fn finalize_recovered_checkpoint(&self, checkpoint: u32) -> Result<()> {
+        for category in FILE_CATEGORIES {
+            let dirty = self
+                .publish_dir
+                .join(checkpoint_path_dirty(category, checkpoint, "xdr.gz"));
+            let final_path = self
+                .publish_dir
+                .join(checkpoint_path(category, checkpoint, "xdr.gz"));
+
+            if !dirty.exists() {
+                continue;
+            }
+            if final_path.exists() {
+                debug!(
+                    category,
+                    final_path = %final_path.display(),
+                    "Final file already exists, skipping rename"
+                );
+                continue;
+            }
+
+            // Create parent directories for final path if needed
+            if let Some(parent) = final_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            durable_rename(&dirty, &final_path)?;
+            info!(
+                category,
+                dirty = %dirty.display(),
+                final_path = %final_path.display(),
+                "Renamed recovered dirty file to final"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -549,11 +812,11 @@ mod tests {
     }
 
     #[test]
-    fn test_cleanup_removes_stale_dirty_files() {
+    fn test_cleanup_recovers_corrupt_dirty_files() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut builder = CheckpointBuilder::new(temp_dir.path().to_path_buf());
 
-        // Create a dirty file manually (simulating a crash)
+        // Create a dirty file with garbage data (simulating a corrupt crash)
         let dirty_path = temp_dir
             .path()
             .join("ledger/00/00/00/ledger-0000003f.xdr.gz.dirty");
@@ -562,10 +825,12 @@ mod tests {
 
         assert!(dirty_path.exists());
 
-        // Cleanup should remove it
+        // Cleanup should recover it (corrupt gzip → empty recovered file)
         builder.cleanup(63).unwrap();
 
-        assert!(!dirty_path.exists());
+        // The dirty file still exists (recovered, not deleted), but is now
+        // a valid empty gzip file
+        assert!(dirty_path.exists());
         assert!(builder.is_validated());
     }
 
@@ -610,5 +875,223 @@ mod tests {
 
         assert!(!dirty_path.exists());
         assert!(final_path.exists());
+    }
+
+    /// Helper: write entries to a gzip-compressed dirty file in the same format
+    /// as `XdrStreamWriter`.
+    fn write_gz_dirty<T: WriteXdr>(path: &Path, entries: &[T]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = File::create(path).unwrap();
+        let buf = BufWriter::new(file);
+        let mut encoder = GzEncoder::new(buf, Compression::default());
+        for entry in entries {
+            write_one_to_gz(&mut encoder, entry).unwrap();
+        }
+        let buf = encoder.finish().unwrap();
+        let file = buf.into_inner().unwrap();
+        file.sync_all().unwrap();
+    }
+
+    /// Helper: read all entries from a gzip-compressed file.
+    fn read_gz_all<T: ReadXdr>(path: &Path) -> Vec<T> {
+        let file = File::open(path).unwrap();
+        let mut reader = BufReader::new(GzDecoder::new(file));
+        let mut entries = Vec::new();
+        while let Ok(Some(entry)) = read_one_from_gz::<T>(&mut reader) {
+            entries.push(entry);
+        }
+        entries
+    }
+
+    #[test]
+    fn test_recovery_truncates_entries_beyond_lcl() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut builder = CheckpointBuilder::new(temp_dir.path().to_path_buf());
+
+        // Write ledger headers 1..=65 to a dirty file (checkpoint 63, plus 2 beyond)
+        let dirty_path = temp_dir
+            .path()
+            .join("ledger/00/00/00/ledger-0000003f.xdr.gz.dirty");
+        let headers: Vec<_> = (1..=65).map(make_header).collect();
+        write_gz_dirty(&dirty_path, &headers);
+
+        // LCL is 63 — entries 64 and 65 should be truncated
+        builder.cleanup(63).unwrap();
+
+        // Read back the recovered file
+        let recovered = read_gz_all::<LedgerHeaderHistoryEntry>(&dirty_path);
+        assert_eq!(recovered.len(), 63);
+        assert_eq!(recovered.last().unwrap().header.ledger_seq, 63);
+    }
+
+    #[test]
+    fn test_recovery_keeps_all_entries_when_at_lcl() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut builder = CheckpointBuilder::new(temp_dir.path().to_path_buf());
+
+        // Write ledger headers 1..=63 (exactly at LCL)
+        let dirty_path = temp_dir
+            .path()
+            .join("ledger/00/00/00/ledger-0000003f.xdr.gz.dirty");
+        let headers: Vec<_> = (1..=63).map(make_header).collect();
+        write_gz_dirty(&dirty_path, &headers);
+
+        builder.cleanup(63).unwrap();
+
+        let recovered = read_gz_all::<LedgerHeaderHistoryEntry>(&dirty_path);
+        assert_eq!(recovered.len(), 63);
+    }
+
+    #[test]
+    fn test_recovery_transactions_no_enforce_lcl() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut builder = CheckpointBuilder::new(temp_dir.path().to_path_buf());
+
+        // Write transaction entries for ledgers 5, 10, 15 (sparse — some ledgers have no txs)
+        let dirty_path = temp_dir
+            .path()
+            .join("transactions/00/00/00/transactions-0000003f.xdr.gz.dirty");
+        let entries: Vec<_> = [5, 10, 15].iter().map(|&seq| make_tx_entry(seq)).collect();
+        write_gz_dirty(&dirty_path, &entries);
+
+        // LCL is 12 — entry with seq 15 should be truncated, but no error
+        // even though last_read_ledger_seq (10) != lcl (12) because enforceLCL=false
+        builder.cleanup(12).unwrap();
+
+        let recovered = read_gz_all::<TransactionHistoryEntry>(&dirty_path);
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].ledger_seq, 5);
+        assert_eq!(recovered[1].ledger_seq, 10);
+    }
+
+    #[test]
+    fn test_recovery_results_truncation() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut builder = CheckpointBuilder::new(temp_dir.path().to_path_buf());
+
+        let dirty_path = temp_dir
+            .path()
+            .join("results/00/00/00/results-0000003f.xdr.gz.dirty");
+        let entries: Vec<_> = (1..=10).map(make_result_entry).collect();
+        write_gz_dirty(&dirty_path, &entries);
+
+        builder.cleanup(7).unwrap();
+
+        let recovered = read_gz_all::<TransactionHistoryResultEntry>(&dirty_path);
+        assert_eq!(recovered.len(), 7);
+        assert_eq!(recovered.last().unwrap().ledger_seq, 7);
+    }
+
+    #[test]
+    fn test_recovery_enforce_lcl_fails_on_short_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut builder = CheckpointBuilder::new(temp_dir.path().to_path_buf());
+
+        // Write only ledger headers 1..=50, but LCL is 63
+        // enforceLCL=true should fail because the file ends at 50, not 63
+        let dirty_path = temp_dir
+            .path()
+            .join("ledger/00/00/00/ledger-0000003f.xdr.gz.dirty");
+        let headers: Vec<_> = (1..=50).map(make_header).collect();
+        write_gz_dirty(&dirty_path, &headers);
+
+        let result = builder.cleanup(63);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("Corrupt checkpoint file"));
+        assert!(err_msg.contains("ends on ledger 50"));
+    }
+
+    #[test]
+    fn test_read_write_gz_roundtrip() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("test.xdr.gz");
+
+        let headers: Vec<_> = (1..=5).map(make_header).collect();
+        write_gz_dirty(&path, &headers);
+
+        let recovered = read_gz_all::<LedgerHeaderHistoryEntry>(&path);
+        assert_eq!(recovered.len(), 5);
+        for (i, hdr) in recovered.iter().enumerate() {
+            assert_eq!(hdr.header.ledger_seq, (i + 1) as u32);
+        }
+    }
+
+    #[test]
+    fn test_finalize_recovered_checkpoint_renames_dirty_to_final() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let publish_dir = temp_dir.path().to_path_buf();
+        let checkpoint = 63;
+
+        // Create dirty files for all 3 categories at checkpoint 63
+        let dirty_ledger = publish_dir.join("ledger/00/00/00/ledger-0000003f.xdr.gz.dirty");
+        let dirty_tx = publish_dir.join("transactions/00/00/00/transactions-0000003f.xdr.gz.dirty");
+        let dirty_results = publish_dir.join("results/00/00/00/results-0000003f.xdr.gz.dirty");
+
+        let headers: Vec<_> = (1..=63).map(make_header).collect();
+        write_gz_dirty(&dirty_ledger, &headers);
+
+        let txs: Vec<_> = (1..=63).map(make_tx_entry).collect();
+        write_gz_dirty(&dirty_tx, &txs);
+
+        let results: Vec<_> = (1..=63).map(make_result_entry).collect();
+        write_gz_dirty(&dirty_results, &results);
+
+        assert!(dirty_ledger.exists());
+        assert!(dirty_tx.exists());
+        assert!(dirty_results.exists());
+
+        // Finalize should rename dirty → final
+        let builder = CheckpointBuilder::new(publish_dir.clone());
+        builder.finalize_recovered_checkpoint(checkpoint).unwrap();
+
+        // Final files should exist, dirty files should be gone
+        let final_ledger = publish_dir.join("ledger/00/00/00/ledger-0000003f.xdr.gz");
+        let final_tx = publish_dir.join("transactions/00/00/00/transactions-0000003f.xdr.gz");
+        let final_results = publish_dir.join("results/00/00/00/results-0000003f.xdr.gz");
+
+        assert!(final_ledger.exists());
+        assert!(final_tx.exists());
+        assert!(final_results.exists());
+        assert!(!dirty_ledger.exists());
+        assert!(!dirty_tx.exists());
+        assert!(!dirty_results.exists());
+    }
+
+    #[test]
+    fn test_finalize_skips_when_final_exists() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let publish_dir = temp_dir.path().to_path_buf();
+        let checkpoint = 63;
+
+        // Create both dirty and final for ledger
+        let dirty_ledger = publish_dir.join("ledger/00/00/00/ledger-0000003f.xdr.gz.dirty");
+        let final_ledger = publish_dir.join("ledger/00/00/00/ledger-0000003f.xdr.gz");
+
+        let dirty_headers: Vec<_> = (1..=63).map(make_header).collect();
+        write_gz_dirty(&dirty_ledger, &dirty_headers);
+        write_gz_dirty(&final_ledger, &dirty_headers);
+
+        assert!(dirty_ledger.exists());
+        assert!(final_ledger.exists());
+
+        // Finalize should NOT rename (final already exists)
+        let builder = CheckpointBuilder::new(publish_dir);
+        builder.finalize_recovered_checkpoint(checkpoint).unwrap();
+
+        // Both should still exist (dirty was not renamed/deleted by finalize)
+        assert!(dirty_ledger.exists());
+        assert!(final_ledger.exists());
+    }
+
+    #[test]
+    fn test_finalize_noop_when_no_dirty_files() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let publish_dir = temp_dir.path().to_path_buf();
+
+        // No files at all
+        let builder = CheckpointBuilder::new(publish_dir);
+        builder.finalize_recovered_checkpoint(63).unwrap();
+        // Should succeed silently
     }
 }

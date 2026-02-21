@@ -140,16 +140,17 @@ impl Database {
     fn initialize(&self) -> Result<()> {
         let conn = self.connection()?;
 
-        // Configure SQLite for performance:
+        // Configure SQLite for durability and performance:
         // - WAL mode for concurrent reads during writes
-        // - NORMAL sync for balance of safety and speed
+        // - FULL sync for durability (required for WAL mode to survive OS crashes;
+        //   NORMAL only guarantees app-crash safety, not power-loss safety)
         // - 64MB cache for frequently accessed pages
         // - Foreign keys for referential integrity
         // - Memory-based temp storage for performance
         conn.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;
+            PRAGMA synchronous = FULL;
             PRAGMA cache_size = -64000;
             PRAGMA foreign_keys = ON;
             PRAGMA temp_store = MEMORY;

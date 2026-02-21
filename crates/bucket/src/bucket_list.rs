@@ -51,6 +51,7 @@ use stellar_xdr::curr::{
 };
 use tokio::sync::oneshot;
 
+use henyey_common::fs_utils::durable_rename;
 use henyey_common::{BucketListDbConfig, Hash256};
 
 use crate::bucket::Bucket;
@@ -284,7 +285,7 @@ impl AsyncMergeHandle {
                             // load_last_known_ledger().
                             let permanent_path = dir.join(canonical_bucket_filename(&hash));
                             if !permanent_path.exists() {
-                                match std::fs::rename(&temp_path, &permanent_path) {
+                                match durable_rename(&temp_path, &permanent_path) {
                                     Ok(()) => Bucket::from_xdr_file_disk_backed(&permanent_path),
                                     Err(e) => {
                                         tracing::warn!(
@@ -1022,7 +1023,7 @@ fn perform_merge(
         } else {
             let permanent_path = dir.join(canonical_bucket_filename(&hash));
             if !permanent_path.exists() {
-                if let Err(e) = std::fs::rename(&temp_path, &permanent_path) {
+                if let Err(e) = durable_rename(&temp_path, &permanent_path) {
                     tracing::warn!(
                         error = %e,
                         "Failed to rename merge output, using temp path"

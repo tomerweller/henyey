@@ -368,6 +368,13 @@ pub struct App {
     last_processed_slot: RwLock<u64>,
     /// Prevent concurrent catchup runs when we fall behind.
     catchup_in_progress: AtomicBool,
+    /// Fatal catchup failure flag (spec §13.3).
+    ///
+    /// Set when catchup verification detects that the local ledger state is
+    /// corrupt (chain disagrees with archive data obtained via SCP trust).
+    /// Once set, **no further catchup attempts are made** — the node requires
+    /// manual intervention (restart with fresh state).
+    catchup_fatal_failure: AtomicBool,
     /// Buffered externalized ledgers waiting to apply.
     syncing_ledgers: RwLock<BTreeMap<u32, henyey_herder::LedgerCloseInfo>>,
     /// Latest externalized slot we've observed (for liveness checks).
@@ -856,7 +863,7 @@ impl App {
         tracing::info!("Bucket manager initialized");
 
         // Initialize ledger manager
-        let ledger_manager = Arc::new(LedgerManager::new(
+        let mut ledger_manager = LedgerManager::new(
             config.network.passphrase.clone(),
             LedgerManagerConfig {
                 validate_bucket_hash: true,
@@ -864,7 +871,16 @@ impl App {
                 backfill_stellar_asset_events: config.events.backfill_stellar_asset_events,
                 bucket_list_db: config.buckets.bucket_list_db.clone(),
             },
+        );
+
+        // Wire merge map from BucketManager into LedgerManager for merge deduplication.
+        // This enables reuse of previously computed merge results across restarts.
+        let finished_merges = Arc::new(std::sync::RwLock::new(
+            henyey_bucket::BucketMergeMap::new(),
         ));
+        ledger_manager.set_merge_map(finished_merges);
+
+        let ledger_manager = Arc::new(ledger_manager);
         tracing::info!("Ledger manager initialized");
 
         // Create herder configuration
@@ -960,6 +976,7 @@ impl App {
             scp_envelope_rx: TokioMutex::new(scp_envelope_rx),
             last_processed_slot: RwLock::new(0),
             catchup_in_progress: AtomicBool::new(false),
+            catchup_fatal_failure: AtomicBool::new(false),
             syncing_ledgers: RwLock::new(BTreeMap::new()),
             last_externalized_slot: AtomicU64::new(0),
             last_externalized_at: RwLock::new(Instant::now()),

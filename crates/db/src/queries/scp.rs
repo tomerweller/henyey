@@ -12,12 +12,12 @@
 //! - History archive publishing
 //! - Crash recovery (resuming consensus after restart)
 
-use rusqlite::{params, Connection, OptionalExtension};
-use henyey_common::Hash256;
 use henyey_common::xdr_stream::XdrOutputStream;
+use henyey_common::Hash256;
+use rusqlite::{params, Connection, OptionalExtension};
 use stellar_xdr::curr::{
-    Hash, Limits, NodeId, PublicKey, ReadXdr, ScpEnvelope, ScpQuorumSet, Uint256, WriteXdr,
-    ScpHistoryEntry, ScpHistoryEntryV0, LedgerScpMessages,
+    Hash, LedgerScpMessages, Limits, NodeId, PublicKey, ReadXdr, ScpEnvelope, ScpHistoryEntry,
+    ScpHistoryEntryV0, ScpQuorumSet, Uint256, WriteXdr,
 };
 
 use crate::error::DbError;
@@ -449,10 +449,9 @@ impl ScpStatePersistenceQueries for Connection {
             let Ok(hash_arr): Result<[u8; 32], _> = hash_bytes.try_into() else {
                 continue;
             };
-            let Ok(data) = base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                &encoded,
-            ) else {
+            let Ok(data) =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &encoded)
+            else {
                 continue;
             };
             results.push((Hash(hash_arr), data));
@@ -622,7 +621,9 @@ mod tests {
         let writer = SharedBuf(buf.clone());
         let mut stream = XdrOutputStream::from_writer(Box::new(writer));
 
-        let written = conn.copy_scp_history_to_stream(100, 1, &mut stream).unwrap();
+        let written = conn
+            .copy_scp_history_to_stream(100, 1, &mut stream)
+            .unwrap();
         assert_eq!(written, 1);
 
         // Verify data was written
@@ -684,14 +685,15 @@ mod tests {
         let writer = SharedBufR(buf.clone());
         let mut stream = XdrOutputStream::from_writer(Box::new(writer));
 
-        let written = conn.copy_scp_history_to_stream(100, 2, &mut stream).unwrap();
+        let written = conn
+            .copy_scp_history_to_stream(100, 2, &mut stream)
+            .unwrap();
         assert_eq!(written, 2);
 
         // Read back with XdrInputStream
         let data = buf.lock().unwrap().clone();
         let cursor = std::io::Cursor::new(data);
-        let mut input =
-            henyey_common::xdr_stream::XdrInputStream::from_reader(Box::new(cursor));
+        let mut input = henyey_common::xdr_stream::XdrInputStream::from_reader(Box::new(cursor));
         let entries: Vec<ScpHistoryEntry> = input.read_all().unwrap();
         assert_eq!(entries.len(), 2);
 
@@ -720,7 +722,9 @@ mod tests {
         let writer = SharedBuf2(buf.clone());
         let mut stream = XdrOutputStream::from_writer(Box::new(writer));
 
-        let written = conn.copy_scp_history_to_stream(200, 10, &mut stream).unwrap();
+        let written = conn
+            .copy_scp_history_to_stream(200, 10, &mut stream)
+            .unwrap();
         assert_eq!(written, 0);
     }
 

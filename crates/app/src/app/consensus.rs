@@ -118,6 +118,16 @@ impl App {
 
         // --- Escalation: after many failed attempts, force catchup ---
         if attempts >= RECOVERY_ESCALATION_CATCHUP {
+            // Fatal-failure guard (spec §13.3): block further catchup after a
+            // verification/integrity failure.
+            if self.catchup_fatal_failure.load(Ordering::SeqCst) {
+                tracing::warn!(
+                    "Recovery escalation blocked: previous fatal catchup failure — \
+                     manual intervention required"
+                );
+                return;
+            }
+
             tracing::warn!(
                 current_ledger,
                 latest_externalized,

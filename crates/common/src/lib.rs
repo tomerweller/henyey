@@ -46,6 +46,7 @@
 pub mod asset;
 pub mod config;
 pub mod error;
+pub mod fs_utils;
 pub mod math;
 pub mod meta;
 pub mod network;

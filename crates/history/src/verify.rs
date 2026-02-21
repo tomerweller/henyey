@@ -32,14 +32,41 @@
 //! state must match `header.bucket_list_hash`. This proves that we have correctly
 //! rebuilt the entire ledger state.
 
-use crate::{archive_state::HistoryArchiveState, checkpoint, HistoryError, Result, GENESIS_LEDGER_SEQ};
+use crate::{
+    archive_state::HistoryArchiveState, checkpoint, HistoryError, Result, GENESIS_LEDGER_SEQ,
+};
 use henyey_common::Hash256;
 use henyey_crypto::Sha256Hasher;
 use henyey_ledger::TransactionSetVariant;
 use stellar_xdr::curr::{
-    LedgerHeader, Limits, ScpHistoryEntry, ScpStatement,
-    TransactionHistoryResultEntry, WriteXdr,
+    LedgerHeader, Limits, ScpHistoryEntry, ScpStatement, TransactionHistoryResultEntry, WriteXdr,
 };
+
+/// Optional trust anchors for ledger chain verification (spec §9.2).
+///
+/// These allow the verification to be anchored to externally trusted hashes,
+/// closing the trust gap between "the chain is internally consistent" and
+/// "the chain connects to state we independently know to be correct".
+#[derive(Debug, Default, Clone)]
+pub struct ChainTrustAnchors {
+    /// Hash of the ledger header just before the first header in the chain.
+    ///
+    /// For replay-from-checkpoint scenarios this is the checkpoint header hash.
+    /// For online catchup this can be derived from the LCL.
+    ///
+    /// When set, the first header's `previous_ledger_hash` is verified against
+    /// this value.
+    pub previous_ledger_hash: Option<Hash256>,
+
+    /// Sequence number of the local LCL (Last Closed Ledger).
+    /// Together with `lcl_hash`, enables detection of local state corruption
+    /// (spec §9.3 step 2c: if a downloaded header matches LCL seq but has a
+    /// different hash, the local state is corrupt).
+    pub lcl_seq: Option<u32>,
+
+    /// Hash of the local LCL header. Used together with `lcl_seq`.
+    pub lcl_hash: Option<Hash256>,
+}
 
 /// Verify that a chain of ledger headers is correctly linked.
 ///
@@ -79,6 +106,65 @@ pub fn verify_header_chain(headers: &[LedgerHeader]) -> Result<()> {
             return Err(HistoryError::InvalidPreviousHash {
                 ledger: curr_header.ledger_seq,
             });
+        }
+    }
+
+    Ok(())
+}
+
+/// Verify trust anchors against a verified header chain (spec §9.2–§9.5).
+///
+/// This function should be called **after** [`verify_header_chain`] has confirmed
+/// the internal consistency of the header slice.  It checks that the chain
+/// connects to externally trusted state:
+///
+/// 1. **Bottom anchor**: the first header's `previous_ledger_hash` matches the
+///    provided `previous_ledger_hash` (e.g., the checkpoint header hash).
+/// 2. **LCL comparison**: if any header in the chain corresponds to the local
+///    LCL sequence, its hash must match `lcl_hash`.  A mismatch means the
+///    local state diverges from the archive-provided (SCP-verified) chain,
+///    indicating local state corruption.
+///
+/// # Errors
+///
+/// Returns [`HistoryError::VerificationFailed`] if any anchor check fails.
+pub fn verify_chain_anchors(headers: &[LedgerHeader], anchors: &ChainTrustAnchors) -> Result<()> {
+    if headers.is_empty() {
+        return Ok(());
+    }
+
+    // 1. Bottom anchor: first header must link to the provided previous hash.
+    if let Some(expected_prev) = &anchors.previous_ledger_hash {
+        let first = &headers[0];
+        let actual_prev = Hash256::from(first.previous_ledger_hash.clone());
+        if actual_prev != *expected_prev {
+            return Err(HistoryError::VerificationFailed(format!(
+                "chain trust anchor mismatch at ledger {}: first header's \
+                 previous_ledger_hash {} != expected {}",
+                first.ledger_seq,
+                actual_prev.to_hex(),
+                expected_prev.to_hex(),
+            )));
+        }
+    }
+
+    // 2. LCL comparison: if a header matches the LCL sequence, its hash must
+    //    match.  This detects local state corruption (spec §9.3 step 2c).
+    if let (Some(lcl_seq), Some(lcl_hash)) = (anchors.lcl_seq, &anchors.lcl_hash) {
+        for header in headers {
+            if header.ledger_seq == lcl_seq {
+                let header_hash = compute_header_hash(header)?;
+                if header_hash != *lcl_hash {
+                    return Err(HistoryError::VerificationFailed(format!(
+                        "local state corruption detected: archive header at LCL \
+                         seq {} has hash {}, but local LCL hash is {}",
+                        lcl_seq,
+                        header_hash.to_hex(),
+                        lcl_hash.to_hex(),
+                    )));
+                }
+                break;
+            }
         }
     }
 
@@ -264,6 +350,29 @@ pub struct VerificationResult {
     pub ledgers_verified: u32,
     /// The final ledger hash.
     pub final_ledger_hash: Hash256,
+}
+
+/// Verify the HAS network passphrase matches the expected passphrase.
+///
+/// Per stellar-core semantics: if the HAS has a non-empty `networkPassphrase`
+/// field and it does not match the configured passphrase, catchup fails.
+/// If the HAS passphrase is absent or empty (version 1 archives), validation
+/// is skipped.
+///
+/// # Arguments
+///
+/// * `has` - The History Archive State to validate
+/// * `expected` - The configured network passphrase to compare against
+pub fn verify_has_passphrase(has: &HistoryArchiveState, expected: &str) -> Result<()> {
+    if let Some(ref has_passphrase) = has.network_passphrase {
+        if !has_passphrase.is_empty() && has_passphrase != expected {
+            return Err(HistoryError::VerificationFailed(format!(
+                "HAS network passphrase mismatch: expected '{}', got '{}'",
+                expected, has_passphrase
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Verify the History Archive State (HAS) structure.
@@ -501,8 +610,8 @@ mod tests {
     #[test]
     fn test_verify_tx_result_ordering_valid() {
         use stellar_xdr::curr::{
-            TransactionHistoryResultEntry, TransactionHistoryResultEntryExt,
-            TransactionResultSet, VecM,
+            TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionResultSet,
+            VecM,
         };
 
         let entries = vec![
@@ -534,8 +643,8 @@ mod tests {
     #[test]
     fn test_verify_tx_result_ordering_out_of_range() {
         use stellar_xdr::curr::{
-            TransactionHistoryResultEntry, TransactionHistoryResultEntryExt,
-            TransactionResultSet, VecM,
+            TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionResultSet,
+            VecM,
         };
 
         let entries = vec![TransactionHistoryResultEntry {
@@ -551,8 +660,8 @@ mod tests {
     #[test]
     fn test_verify_tx_result_ordering_not_increasing() {
         use stellar_xdr::curr::{
-            TransactionHistoryResultEntry, TransactionHistoryResultEntryExt,
-            TransactionResultSet, VecM,
+            TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionResultSet,
+            VecM,
         };
 
         let entries = vec![
@@ -583,8 +692,8 @@ mod tests {
     #[test]
     fn test_verify_tx_result_ordering_descending() {
         use stellar_xdr::curr::{
-            TransactionHistoryResultEntry, TransactionHistoryResultEntryExt,
-            TransactionResultSet, VecM,
+            TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionResultSet,
+            VecM,
         };
 
         let entries = vec![
@@ -609,8 +718,8 @@ mod tests {
     #[test]
     fn test_verify_tx_result_ordering_single_entry() {
         use stellar_xdr::curr::{
-            TransactionHistoryResultEntry, TransactionHistoryResultEntryExt,
-            TransactionResultSet, VecM,
+            TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionResultSet,
+            VecM,
         };
 
         let entries = vec![TransactionHistoryResultEntry {
@@ -623,11 +732,125 @@ mod tests {
         assert!(verify_tx_result_ordering(&entries, 127).is_ok());
     }
 
+    // ── verify_chain_anchors tests ──────────────────────────────────────
+
+    #[test]
+    fn test_chain_anchors_empty_headers_is_noop() {
+        let anchors = ChainTrustAnchors {
+            previous_ledger_hash: Some(Hash256::ZERO),
+            lcl_seq: Some(5),
+            lcl_hash: Some(Hash256::ZERO),
+        };
+        assert!(verify_chain_anchors(&[], &anchors).is_ok());
+    }
+
+    #[test]
+    fn test_chain_anchors_no_anchors_is_noop() {
+        let h1 = make_test_header(1, Hash256::ZERO);
+        let hash1 = compute_header_hash(&h1).unwrap();
+        let h2 = make_test_header(2, hash1);
+        assert!(verify_chain_anchors(&[h1, h2], &ChainTrustAnchors::default()).is_ok());
+    }
+
+    #[test]
+    fn test_chain_anchors_valid_bottom_anchor() {
+        let prev_hash = Hash256::hash(b"checkpoint header bytes");
+        let h1 = make_test_header(10, prev_hash.clone());
+        let anchors = ChainTrustAnchors {
+            previous_ledger_hash: Some(prev_hash),
+            ..Default::default()
+        };
+        assert!(verify_chain_anchors(&[h1], &anchors).is_ok());
+    }
+
+    #[test]
+    fn test_chain_anchors_invalid_bottom_anchor() {
+        let h1 = make_test_header(10, Hash256::ZERO);
+        let wrong_hash = Hash256::hash(b"wrong");
+        let anchors = ChainTrustAnchors {
+            previous_ledger_hash: Some(wrong_hash),
+            ..Default::default()
+        };
+        let result = verify_chain_anchors(&[h1], &anchors);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("chain trust anchor mismatch"), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_chain_anchors_lcl_hash_match() {
+        let h1 = make_test_header(5, Hash256::ZERO);
+        let h1_hash = compute_header_hash(&h1).unwrap();
+        let anchors = ChainTrustAnchors {
+            previous_ledger_hash: None,
+            lcl_seq: Some(5),
+            lcl_hash: Some(h1_hash),
+        };
+        assert!(verify_chain_anchors(&[h1], &anchors).is_ok());
+    }
+
+    #[test]
+    fn test_chain_anchors_lcl_hash_mismatch_detects_corruption() {
+        let h1 = make_test_header(5, Hash256::ZERO);
+        let wrong_lcl_hash = Hash256::hash(b"corrupted local state");
+        let anchors = ChainTrustAnchors {
+            previous_ledger_hash: None,
+            lcl_seq: Some(5),
+            lcl_hash: Some(wrong_lcl_hash),
+        };
+        let result = verify_chain_anchors(&[h1], &anchors);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("local state corruption"), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_chain_anchors_lcl_seq_not_in_chain_is_ok() {
+        // LCL seq doesn't appear in the chain — no comparison to make
+        let h1 = make_test_header(10, Hash256::ZERO);
+        let anchors = ChainTrustAnchors {
+            previous_ledger_hash: None,
+            lcl_seq: Some(5),
+            lcl_hash: Some(Hash256::ZERO),
+        };
+        assert!(verify_chain_anchors(&[h1], &anchors).is_ok());
+    }
+
+    #[test]
+    fn test_chain_anchors_lcl_seq_without_hash_is_noop() {
+        // lcl_seq set but lcl_hash is None — the guard requires both
+        let h1 = make_test_header(5, Hash256::ZERO);
+        let anchors = ChainTrustAnchors {
+            previous_ledger_hash: None,
+            lcl_seq: Some(5),
+            lcl_hash: None,
+        };
+        assert!(verify_chain_anchors(&[h1], &anchors).is_ok());
+    }
+
+    #[test]
+    fn test_chain_anchors_both_bottom_and_lcl() {
+        // Test both anchors simultaneously
+        let prev_hash = Hash256::hash(b"prev");
+        let h1 = make_test_header(10, prev_hash.clone());
+        let h1_hash = compute_header_hash(&h1).unwrap();
+        let h2 = make_test_header(11, h1_hash.clone());
+
+        let anchors = ChainTrustAnchors {
+            previous_ledger_hash: Some(prev_hash),
+            lcl_seq: Some(10),
+            lcl_hash: Some(h1_hash),
+        };
+        assert!(verify_chain_anchors(&[h1, h2], &anchors).is_ok());
+    }
+
+    // ── end verify_chain_anchors tests ──────────────────────────────────
+
     #[test]
     fn test_verify_tx_result_ordering_first_checkpoint() {
         use stellar_xdr::curr::{
-            TransactionHistoryResultEntry, TransactionHistoryResultEntryExt,
-            TransactionResultSet, VecM,
+            TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionResultSet,
+            VecM,
         };
 
         // Checkpoint 63: range is 0-63
@@ -648,5 +871,58 @@ mod tests {
             },
         ];
         assert!(verify_tx_result_ordering(&entries, 63).is_ok());
+    }
+
+    // ── verify_has_passphrase tests ─────────────────────────────────────
+
+    fn make_test_has(passphrase: Option<&str>) -> HistoryArchiveState {
+        use crate::archive_state::{HASBucketLevel, HASBucketNext};
+        HistoryArchiveState {
+            version: 2,
+            server: None,
+            current_ledger: 63,
+            network_passphrase: passphrase.map(|s| s.to_string()),
+            current_buckets: vec![HASBucketLevel {
+                curr: "00".repeat(32),
+                snap: "00".repeat(32),
+                next: HASBucketNext {
+                    state: 0,
+                    output: None,
+                    curr: None,
+                    snap: None,
+                    shadow: None,
+                },
+            }],
+            hot_archive_buckets: None,
+        }
+    }
+
+    #[test]
+    fn test_verify_has_passphrase_matching() {
+        let has = make_test_has(Some("Test SDF Network ; September 2015"));
+        assert!(verify_has_passphrase(&has, "Test SDF Network ; September 2015").is_ok());
+    }
+
+    #[test]
+    fn test_verify_has_passphrase_mismatch() {
+        let has = make_test_has(Some("Test SDF Network ; September 2015"));
+        let result = verify_has_passphrase(&has, "Public Global Stellar Network ; September 2015");
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("passphrase mismatch"));
+    }
+
+    #[test]
+    fn test_verify_has_passphrase_none_skipped() {
+        // Version 1 archives may have no passphrase — validation is skipped.
+        let has = make_test_has(None);
+        assert!(verify_has_passphrase(&has, "Test SDF Network ; September 2015").is_ok());
+    }
+
+    #[test]
+    fn test_verify_has_passphrase_empty_skipped() {
+        // Empty string passphrase is treated as absent — validation is skipped.
+        let has = make_test_has(Some(""));
+        assert!(verify_has_passphrase(&has, "Test SDF Network ; September 2015").is_ok());
     }
 }

@@ -4,9 +4,9 @@
 //! the metadata for each closed ledger including sequence numbers, timestamps,
 //! hashes, and protocol version information.
 
-use rusqlite::{params, Connection, OptionalExtension};
-use henyey_common::Hash256;
 use henyey_common::xdr_stream::XdrOutputStream;
+use henyey_common::Hash256;
+use rusqlite::{params, Connection, OptionalExtension};
 use stellar_xdr::curr::{LedgerHeader, LedgerHeaderHistoryEntry, Limits, ReadXdr};
 
 use crate::error::DbError;
@@ -335,7 +335,9 @@ mod tests {
         let writer = SharedBuf(buf.clone());
         let mut stream = XdrOutputStream::from_writer(Box::new(writer));
 
-        let written = conn.copy_ledger_headers_to_stream(10, 5, &mut stream).unwrap();
+        let written = conn
+            .copy_ledger_headers_to_stream(10, 5, &mut stream)
+            .unwrap();
         assert_eq!(written, 5);
 
         // Verify we can read them back
@@ -378,7 +380,9 @@ mod tests {
         let mut stream = XdrOutputStream::from_writer(Box::new(writer));
 
         // Request 5 ledgers starting at 10, but only 2 exist
-        let written = conn.copy_ledger_headers_to_stream(10, 5, &mut stream).unwrap();
+        let written = conn
+            .copy_ledger_headers_to_stream(10, 5, &mut stream)
+            .unwrap();
         assert_eq!(written, 2);
     }
 

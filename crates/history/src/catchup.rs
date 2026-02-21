@@ -257,6 +257,13 @@ pub struct CatchupManager {
 
     /// Configuration for the replay phase.
     replay_config: ReplayConfig,
+
+    /// Configured network passphrase for HAS validation.
+    ///
+    /// When set, the HAS `networkPassphrase` field is validated against this
+    /// value during catchup (per stellar-core §8.2 step 2). If `None`,
+    /// passphrase validation is skipped.
+    network_passphrase: Option<String>,
 }
 
 impl CatchupManager {
@@ -274,6 +281,7 @@ impl CatchupManager {
             db: Arc::new(db),
             progress: CatchupProgress::default(),
             replay_config: ReplayConfig::default(),
+            network_passphrase: None,
         }
     }
 
@@ -289,6 +297,7 @@ impl CatchupManager {
             db,
             progress: CatchupProgress::default(),
             replay_config: ReplayConfig::default(),
+            network_passphrase: None,
         }
     }
 
@@ -300,6 +309,15 @@ impl CatchupManager {
     /// Set the replay configuration.
     pub fn set_replay_config(&mut self, config: ReplayConfig) {
         self.replay_config = config;
+    }
+
+    /// Set the expected network passphrase for HAS validation.
+    ///
+    /// When set, the `networkPassphrase` field of downloaded HAS files is
+    /// validated against this value. A mismatch causes catchup to fail
+    /// immediately (per stellar-core §8.2 step 2).
+    pub fn set_network_passphrase(&mut self, passphrase: String) {
+        self.network_passphrase = Some(passphrase);
     }
 
     /// Catch up to a specific target ledger.
@@ -347,6 +365,9 @@ impl CatchupManager {
         let has = self.download_has(checkpoint_seq).await?;
         verify::verify_has_structure(&has)?;
         verify::verify_has_checkpoint(&has, checkpoint_seq)?;
+        if let Some(ref expected) = self.network_passphrase {
+            verify::verify_has_passphrase(&has, expected)?;
+        }
 
         let scp_history = self.download_scp_history(checkpoint_seq).await?;
         if !scp_history.is_empty() {
@@ -360,7 +381,7 @@ impl CatchupManager {
             2,
             "Downloading bucket files",
         );
-        let bucket_hashes = has.unique_bucket_hashes();
+        let bucket_hashes = self.compute_bucket_download_set(&has);
         let buckets_total = bucket_hashes.len() as u32;
         self.progress.buckets_total = buckets_total;
         let buckets = self.download_buckets(&bucket_hashes).await?;
@@ -409,7 +430,13 @@ impl CatchupManager {
 
         // Step 6: Verify the header chain
         self.update_progress(CatchupStatus::Verifying, 5, "Verifying header chain");
-        self.verify_downloaded_data(&ledger_data)?;
+        // The checkpoint header hash serves as the bottom trust anchor:
+        // the first replayed header's previous_ledger_hash must match it.
+        let anchors = verify::ChainTrustAnchors {
+            previous_ledger_hash: Some(checkpoint_hash),
+            ..Default::default()
+        };
+        self.verify_downloaded_data(&ledger_data, &anchors)?;
 
         let network_id = has
             .network_passphrase
@@ -510,6 +537,9 @@ impl CatchupManager {
             let has = self.download_has(bucket_apply_at).await?;
             verify::verify_has_structure(&has)?;
             verify::verify_has_checkpoint(&has, bucket_apply_at)?;
+            if let Some(ref expected) = self.network_passphrase {
+                verify::verify_has_passphrase(&has, expected)?;
+            }
 
             let scp_history = self.download_scp_history(bucket_apply_at).await?;
             if !scp_history.is_empty() {
@@ -523,7 +553,7 @@ impl CatchupManager {
                 2,
                 "Downloading bucket files",
             );
-            let bucket_hashes = has.unique_bucket_hashes();
+            let bucket_hashes = self.compute_bucket_download_set(&has);
             self.progress.buckets_total = bucket_hashes.len() as u32;
             let buckets = self.download_buckets(&bucket_hashes).await?;
 
@@ -620,7 +650,15 @@ impl CatchupManager {
 
             // Verify the header chain
             self.update_progress(CatchupStatus::Verifying, 5, "Verifying header chain");
-            self.verify_downloaded_data(&ledger_data)?;
+            // Anchor the chain to the ledger manager's current state: the hash
+            // of the header at `download_from_checkpoint` (either the bucket
+            // apply checkpoint or the existing LCL).
+            let anchor_hash = ledger_manager.current_header_hash();
+            let anchors = verify::ChainTrustAnchors {
+                previous_ledger_hash: Some(anchor_hash),
+                ..Default::default()
+            };
+            self.verify_downloaded_data(&ledger_data, &anchors)?;
 
             // Replay ledgers via close_ledger
             self.update_progress(CatchupStatus::Replaying, 6, "Replaying ledgers");
@@ -689,6 +727,9 @@ impl CatchupManager {
         );
         verify::verify_has_structure(&data.has)?;
         verify::verify_has_checkpoint(&data.has, checkpoint_seq)?;
+        if let Some(ref expected) = self.network_passphrase {
+            verify::verify_has_passphrase(&data.has, expected)?;
+        }
 
         // Step 3: Verify bucket files exist on disk
         // Hash verification was already performed at download time by DownloadBucketsWork.
@@ -807,7 +848,11 @@ impl CatchupManager {
 
         // Step 6: Verify the header chain
         self.update_progress(CatchupStatus::Verifying, 5, "Verifying header chain");
-        self.verify_downloaded_data(&ledger_data)?;
+        let anchors = verify::ChainTrustAnchors {
+            previous_ledger_hash: Some(checkpoint_hash),
+            ..Default::default()
+        };
+        self.verify_downloaded_data(&ledger_data, &anchors)?;
 
         let network_id = data
             .has
@@ -1690,7 +1735,11 @@ impl CatchupManager {
     }
 
     /// Verify the downloaded ledger data.
-    fn verify_downloaded_data(&self, ledger_data: &[LedgerData]) -> Result<()> {
+    fn verify_downloaded_data(
+        &self,
+        ledger_data: &[LedgerData],
+        anchors: &verify::ChainTrustAnchors,
+    ) -> Result<()> {
         if ledger_data.is_empty() {
             return Ok(());
         }
@@ -1698,6 +1747,10 @@ impl CatchupManager {
         // Extract headers for chain verification
         let headers: Vec<_> = ledger_data.iter().map(|d| d.header.clone()).collect();
         verify::verify_header_chain(&headers)?;
+
+        // Verify trust anchors (spec §9.2–§9.5): ensures the chain connects
+        // to externally trusted state (checkpoint header hash, LCL hash).
+        verify::verify_chain_anchors(&headers, anchors)?;
 
         // Verify transaction sets match header hashes
         for data in ledger_data {
@@ -1907,6 +1960,50 @@ impl CatchupManager {
         Ok(())
     }
 
+    /// Load the local History Archive State from the database, if available.
+    ///
+    /// This is used by `differing_bucket_hashes()` to compute the differential
+    /// bucket download set — only downloading buckets that differ between the
+    /// remote HAS and local state. Returns `None` if no local HAS exists (fresh node).
+    fn load_local_has(&self) -> Option<HistoryArchiveState> {
+        self.db
+            .with_connection(|conn| {
+                use henyey_db::queries::StateQueries;
+                conn.get_state(henyey_db::schema::state_keys::HISTORY_ARCHIVE_STATE)
+            })
+            .ok()
+            .flatten()
+            .and_then(|json| HistoryArchiveState::from_json(&json).ok())
+    }
+
+    /// Compute the bucket hashes to download from a remote HAS.
+    ///
+    /// If a local HAS is available in the database, computes the differential
+    /// set (only buckets we don't already have). Otherwise falls back to all
+    /// unique bucket hashes from the remote HAS.
+    ///
+    /// This mirrors stellar-core's use of `differingBuckets(mLocalState)` in
+    /// `CatchupWork.cpp`.
+    fn compute_bucket_download_set(&self, remote_has: &HistoryArchiveState) -> Vec<Hash256> {
+        match self.load_local_has() {
+            Some(local_has) => {
+                let hashes = remote_has.all_differing_bucket_hashes(&local_has);
+                info!(
+                    "Computed differential bucket set: {} buckets to download \
+                     (remote has {} unique, local has {} unique)",
+                    hashes.len(),
+                    remote_has.unique_bucket_hashes().len(),
+                    local_has.unique_bucket_hashes().len(),
+                );
+                hashes
+            }
+            None => {
+                info!("No local HAS found, downloading all unique buckets");
+                remote_has.unique_bucket_hashes()
+            }
+        }
+    }
+
     /// Download the header for a specific ledger with its pre-computed hash.
     ///
     /// Returns the header and its hash as recorded in the history archive.
@@ -2078,6 +2175,7 @@ pub struct CatchupManagerBuilder {
     bucket_manager: Option<BucketManager>,
     db: Option<Database>,
     options: CatchupOptions,
+    network_passphrase: Option<String>,
 }
 
 impl CatchupManagerBuilder {
@@ -2088,6 +2186,7 @@ impl CatchupManagerBuilder {
             bucket_manager: None,
             db: None,
             options: CatchupOptions::default(),
+            network_passphrase: None,
         }
     }
 
@@ -2115,6 +2214,12 @@ impl CatchupManagerBuilder {
         self
     }
 
+    /// Set the expected network passphrase for HAS validation.
+    pub fn network_passphrase(mut self, passphrase: String) -> Self {
+        self.network_passphrase = Some(passphrase);
+        self
+    }
+
     /// Build the CatchupManager.
     pub fn build(self) -> Result<CatchupManager> {
         let bucket_manager = self
@@ -2132,6 +2237,10 @@ impl CatchupManagerBuilder {
         }
 
         let mut manager = CatchupManager::new(self.archives, bucket_manager, db);
+
+        if let Some(passphrase) = self.network_passphrase {
+            manager.set_network_passphrase(passphrase);
+        }
 
         manager.replay_config = ReplayConfig {
             verify_results: self.options.verify_headers,
