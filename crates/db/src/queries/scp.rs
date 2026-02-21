@@ -159,13 +159,11 @@ impl ScpQueries for Connection {
                 |row| row.get(0),
             )
             .optional()?;
-        match result {
-            Some(data) => Ok(Some(ScpQuorumSet::from_xdr(
-                data.as_slice(),
-                Limits::none(),
-            )?)),
-            None => Ok(None),
-        }
+        result
+            .map(|data| {
+                ScpQuorumSet::from_xdr(data.as_slice(), Limits::none()).map_err(DbError::from)
+            })
+            .transpose()
     }
 
     fn copy_scp_history_to_stream(
@@ -195,9 +193,8 @@ impl ScpQueries for Connection {
             // Collect referenced quorum set hashes
             let mut qset_hashes = std::collections::HashSet::new();
             for env in &envelopes {
-                if let Some(hash) = scp_envelope_quorum_set_hash(env) {
-                    qset_hashes.insert(hash);
-                }
+                let hash = scp_envelope_quorum_set_hash(env);
+                qset_hashes.insert(hash);
             }
 
             // Load referenced quorum sets
@@ -266,14 +263,14 @@ impl ScpQueries for Connection {
 }
 
 /// Extract the quorum set hash from an SCP envelope's statement.
-fn scp_envelope_quorum_set_hash(envelope: &ScpEnvelope) -> Option<Hash256> {
+fn scp_envelope_quorum_set_hash(envelope: &ScpEnvelope) -> Hash256 {
     let hash = match &envelope.statement.pledges {
         stellar_xdr::curr::ScpStatementPledges::Nominate(nom) => &nom.quorum_set_hash,
         stellar_xdr::curr::ScpStatementPledges::Prepare(prep) => &prep.quorum_set_hash,
         stellar_xdr::curr::ScpStatementPledges::Confirm(conf) => &conf.quorum_set_hash,
         stellar_xdr::curr::ScpStatementPledges::Externalize(ext) => &ext.commit_quorum_set_hash,
     };
-    Some(Hash256::from_bytes(hash.0))
+    Hash256::from_bytes(hash.0)
 }
 
 /// Converts a NodeId to a hex string for database storage and sorting.
@@ -413,17 +410,12 @@ impl ScpStatePersistenceQueries for Connection {
                 |row| row.get(0),
             )
             .optional()?;
-        match result {
-            Some(encoded) => {
-                let data =
-                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &encoded)
-                        .map_err(|e| {
-                            DbError::Integrity(format!("Invalid base64 tx set data: {}", e))
-                        })?;
-                Ok(Some(data))
-            }
-            None => Ok(None),
-        }
+        result
+            .map(|encoded| {
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &encoded)
+                    .map_err(|e| DbError::Integrity(format!("Invalid base64 tx set data: {}", e)))
+            })
+            .transpose()
     }
 
     fn load_all_tx_set_data(&self) -> Result<Vec<(Hash, Vec<u8>)>, DbError> {

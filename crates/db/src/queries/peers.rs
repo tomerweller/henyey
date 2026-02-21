@@ -181,25 +181,26 @@ impl PeerQueries for Connection {
         now: i64,
         peer_type: Option<i32>,
     ) -> Result<Vec<(String, u16, PeerRecord)>, DbError> {
-        let mut sql = String::from(
-            "SELECT ip, port, nextattempt, numfailures, type FROM peers WHERE numfailures <= ?1 AND nextattempt <= ?2",
-        );
-        if peer_type.is_some() {
-            sql.push_str(" AND type = ?3");
-        }
-        sql.push_str(" ORDER BY RANDOM() LIMIT ?4");
-
-        let mut stmt = self.prepare(&sql)?;
-        let rows = if let Some(peer_type) = peer_type {
-            stmt.query_map(
+        if let Some(peer_type) = peer_type {
+            let sql = "SELECT ip, port, nextattempt, numfailures, type FROM peers \
+                       WHERE numfailures <= ?1 AND nextattempt <= ?2 AND type = ?3 \
+                       ORDER BY RANDOM() LIMIT ?4";
+            let mut stmt = self.prepare(sql)?;
+            let rows = stmt.query_map(
                 params![max_failures as i64, now, peer_type, limit as i64],
                 peer_row,
-            )?
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(DbError::from)
         } else {
-            stmt.query_map(params![max_failures as i64, now, limit as i64], peer_row)?
-        };
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(DbError::from)
+            let sql = "SELECT ip, port, nextattempt, numfailures, type FROM peers \
+                       WHERE numfailures <= ?1 AND nextattempt <= ?2 \
+                       ORDER BY RANDOM() LIMIT ?3";
+            let mut stmt = self.prepare(sql)?;
+            let rows = stmt.query_map(params![max_failures as i64, now, limit as i64], peer_row)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(DbError::from)
+        }
     }
 
     fn load_random_peers_any_outbound(

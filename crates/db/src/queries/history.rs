@@ -182,13 +182,12 @@ impl HistoryQueries for Connection {
                 |row| row.get(0),
             )
             .optional()?;
-        match result {
-            Some(data) => Ok(Some(TransactionHistoryEntry::from_xdr(
-                data.as_slice(),
-                Limits::none(),
-            )?)),
-            None => Ok(None),
-        }
+        result
+            .map(|data| {
+                TransactionHistoryEntry::from_xdr(data.as_slice(), Limits::none())
+                    .map_err(DbError::from)
+            })
+            .transpose()
     }
 
     fn store_tx_result_entry(
@@ -215,13 +214,12 @@ impl HistoryQueries for Connection {
                 |row| row.get(0),
             )
             .optional()?;
-        match result {
-            Some(data) => Ok(Some(TransactionHistoryResultEntry::from_xdr(
-                data.as_slice(),
-                Limits::none(),
-            )?)),
-            None => Ok(None),
-        }
+        result
+            .map(|data| {
+                TransactionHistoryResultEntry::from_xdr(data.as_slice(), Limits::none())
+                    .map_err(DbError::from)
+            })
+            .transpose()
     }
 
     fn copy_tx_history_to_streams(

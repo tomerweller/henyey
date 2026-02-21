@@ -76,19 +76,15 @@ impl LedgerQueries for Connection {
             )
             .optional()?;
 
-        match result {
-            Some(data) => {
-                let header = LedgerHeader::from_xdr(&data, Limits::none())?;
-                Ok(Some(header))
-            }
-            None => Ok(None),
-        }
+        result
+            .map(|data| LedgerHeader::from_xdr(&data, Limits::none()).map_err(DbError::from))
+            .transpose()
     }
 
     fn store_ledger_header(&self, header: &LedgerHeader, data: &[u8]) -> Result<(), DbError> {
         let ledger_hash = Hash256::hash(data);
-        let prev_hash = Hash256::from(header.previous_ledger_hash.clone());
-        let bucket_list_hash = Hash256::from(header.bucket_list_hash.clone());
+        let prev_hash = Hash256::from_bytes(header.previous_ledger_hash.0);
+        let bucket_list_hash = Hash256::from_bytes(header.bucket_list_hash.0);
 
         self.execute(
             r#"
@@ -127,14 +123,12 @@ impl LedgerQueries for Connection {
             )
             .optional()?;
 
-        match result {
-            Some(hex) => {
-                let hash = Hash256::from_hex(&hex)
-                    .map_err(|e| DbError::Integrity(format!("Invalid ledger hash: {}", e)))?;
-                Ok(Some(hash))
-            }
-            None => Ok(None),
-        }
+        result
+            .map(|hex| {
+                Hash256::from_hex(&hex)
+                    .map_err(|e| DbError::Integrity(format!("Invalid ledger hash: {}", e)))
+            })
+            .transpose()
     }
 
     fn load_ledger_header_by_hash(&self, hash: &str) -> Result<Option<LedgerHeader>, DbError> {
@@ -146,13 +140,9 @@ impl LedgerQueries for Connection {
             )
             .optional()?;
 
-        match result {
-            Some(data) => {
-                let header = LedgerHeader::from_xdr(&data, Limits::none())?;
-                Ok(Some(header))
-            }
-            None => Ok(None),
-        }
+        result
+            .map(|data| LedgerHeader::from_xdr(&data, Limits::none()).map_err(DbError::from))
+            .transpose()
     }
 
     fn copy_ledger_headers_to_stream(

@@ -78,6 +78,18 @@ use tracing::info;
 /// Result type for database operations.
 pub type Result<T> = std::result::Result<T, DbError>;
 
+/// Maximum number of connections in the pool for file-backed databases.
+const POOL_MAX_SIZE: u32 = 10;
+
+/// Timeout in seconds for acquiring a connection from the pool.
+const CONNECTION_TIMEOUT_SECS: u64 = 30;
+
+/// SQLite busy timeout in milliseconds for lock contention handling.
+const BUSY_TIMEOUT_MS: u32 = 30_000;
+
+/// SQLite cache size in kibibytes (negative value = KiB for PRAGMA cache_size).
+const CACHE_SIZE_KIB: i32 = -64_000;
+
 impl Database {
     /// Opens a database at the given path, creating it if necessary.
     ///
@@ -105,12 +117,12 @@ impl Database {
 
         let manager = r2d2_sqlite::SqliteConnectionManager::file(path).with_init(|conn| {
             // Set busy_timeout on every new connection for lock contention handling
-            conn.execute_batch("PRAGMA busy_timeout = 30000;")?;
+            conn.execute_batch(&format!("PRAGMA busy_timeout = {};", BUSY_TIMEOUT_MS))?;
             Ok(())
         });
         let pool = r2d2::Pool::builder()
-            .max_size(10)
-            .connection_timeout(std::time::Duration::from_secs(30))
+            .max_size(POOL_MAX_SIZE)
+            .connection_timeout(std::time::Duration::from_secs(CONNECTION_TIMEOUT_SECS))
             .build(manager)?;
 
         let db = Self { pool };
@@ -147,16 +159,17 @@ impl Database {
         // - 64MB cache for frequently accessed pages
         // - Foreign keys for referential integrity
         // - Memory-based temp storage for performance
-        conn.execute_batch(
+        conn.execute_batch(&format!(
             r#"
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = FULL;
-            PRAGMA cache_size = -64000;
+            PRAGMA cache_size = {};
             PRAGMA foreign_keys = ON;
             PRAGMA temp_store = MEMORY;
-            PRAGMA busy_timeout = 30000;
+            PRAGMA busy_timeout = {};
         "#,
-        )?;
+            CACHE_SIZE_KIB, BUSY_TIMEOUT_MS
+        ))?;
 
         // Check if this is a fresh database by looking for the storestate table
         let tables_exist: bool = conn
