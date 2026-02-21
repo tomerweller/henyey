@@ -1,6 +1,6 @@
 # Verify-Execution Sweep Status
 
-> **Updated**: 2026-02-21
+> **Updated**: 2026-02-21 18:12
 > **Mainnet cache range**: L59501248–L59939046
 > **Supported protocol**: P24+ (L59501312 is first P24 ledger; L59501248–L59501311 are P23 and unverifiable)
 
@@ -21,7 +21,25 @@ Ledgers L59501248–L59501311 (P23) cannot be verified by Henyey (min supported:
 | L59800000–L59845022 | **CLEAN** | Sweep 3 ran through these ledgers with no hash mismatches |
 | L59845023 | **CLEAN** | VE-02 confirmed fixed — verified with 0 mismatches post-fix (commit 710ae8d) |
 | L59845024–L59863186 | **CLEAN** | Sweep 3 restart ran clean up to VE-04 |
-| L59863187–L59939046 | In progress (Sweep 3 restart 2, PID 3256156) | Testing if VE-04 also fixed by VE-03 fix |
+| L59863187 | **CLEAN** | VE-04 confirmed fixed — verified with 0 mismatches post-fix (commit 3930486) |
+| L59863188–L59939046 | In progress (Sweep 3 restart 3, PID 3439084) | No errors found so far |
+
+## VE-04 (confirmed fixed)
+
+- **Ledger**: L59863187
+- **Transaction**: TX 124 (hash a90e1a0c...), ops 2,3,4,6,7,9 returning `opNO_ACCOUNT` (ours) vs `opBAD_AUTH` (CDP)
+  for per-op source `GAXWT6262PRQCYOEO7QFCI3DTATF2DBDSA67NHWSCA6VCUVDUBSBMG7K`.
+- **Root cause**: `check_signature_from_signers` returned `total_weight >= needed_weight` at the end,
+  evaluating `0 >= 0 = true` even when no signer matched. TX 69 (earlier in same ledger) merged GAXWT6262
+  into GDVAAPR. TX 124's custodian key (an additional signer) was in the envelope, but GAXWT6262's master
+  key was not. `check_signature_no_account` created a synthetic signer for the master key only and called
+  `check_signature_from_signers` with `needed_weight=0`. No signer matched, but the function returned `true`
+  (the `0 >= 0` bug), allowing the ops to execute and hit `opNO_ACCOUNT`.
+  Stellar-core's `SignatureChecker::checkSignature` falls through to `return false` when nothing matched,
+  producing `opBAD_AUTH`.
+- **Fix**: Changed final return to `total_weight >= needed_weight && total_weight > 0`.
+- **Fixed**: Commit `3930486` (2026-02-21).
+- **Confirmed**: Single-ledger verify-execution on L59863187 passed with 0 mismatches post-fix.
 
 ## VE-03 (confirmed fixed)
 
@@ -61,4 +79,4 @@ Ledgers L59501248–L59501311 (P23) cannot be verified by Henyey (min supported:
 | Sweep | Range | PID | Started |
 |-------|-------|-----|---------|
 | Sweep 2 (restart) | L59747051–L59799999 | 3255803 | 2026-02-21 |
-| Sweep 3 (restart 2) | L59863187–L59939046 | 3256156 | 2026-02-21 |
+| Sweep 3 (restart 3) | L59863188–L59939046 | 3439084 | 2026-02-21 |
