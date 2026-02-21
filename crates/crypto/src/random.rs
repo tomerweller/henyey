@@ -45,22 +45,6 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
     bytes
 }
 
-/// Generates 32 random bytes.
-///
-/// This is a convenience function equivalent to `random_bytes::<32>()`.
-/// Commonly used for generating 256-bit keys or hashes.
-pub fn random_bytes_32() -> [u8; 32] {
-    random_bytes()
-}
-
-/// Generates 64 random bytes.
-///
-/// This is a convenience function equivalent to `random_bytes::<64>()`.
-/// Commonly used for generating 512-bit values.
-pub fn random_bytes_64() -> [u8; 64] {
-    random_bytes()
-}
-
 /// Generates a random 64-bit unsigned integer.
 pub fn random_u64() -> u64 {
     OsRng.next_u64()

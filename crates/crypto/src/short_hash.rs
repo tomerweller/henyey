@@ -47,7 +47,6 @@ use stellar_xdr::curr::{Limits, WriteXdr};
 const KEY_BYTES: usize = 16;
 
 /// Internal state for the global short hash key.
-#[derive(Clone)]
 struct KeyState {
     /// The 128-bit SipHash key.
     key: [u8; KEY_BYTES],

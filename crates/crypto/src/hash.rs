@@ -40,16 +40,14 @@
 //! ```
 
 use blake2::Blake2b;
+use henyey_common::Hash256;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use henyey_common::Hash256;
 use stellar_xdr::curr::WriteXdr;
 
 /// Converts a 32-byte digest output into a [`Hash256`].
-fn hash256_from_digest(output: impl AsRef<[u8]>) -> Hash256 {
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(output.as_ref());
-    Hash256(bytes)
+fn hash256_from_digest(output: impl Into<[u8; 32]>) -> Hash256 {
+    Hash256(output.into())
 }
 
 /// Computes the SHA-256 hash of the given data.
@@ -500,70 +498,6 @@ pub fn xdr_sha256<T: WriteXdr>(value: &T) -> Result<Hash256, stellar_xdr::curr::
 pub fn xdr_blake2<T: WriteXdr>(value: &T) -> Result<Hash256, stellar_xdr::curr::Error> {
     let bytes = value.to_xdr(stellar_xdr::curr::Limits::none())?;
     Ok(blake2(&bytes))
-}
-
-/// A streaming SHA-256 hasher that can be used with XDR streaming serialization.
-///
-/// This provides slightly better performance than [`xdr_sha256`] for large
-/// values by avoiding a separate XDR buffer allocation, though it still
-/// needs to serialize through the standard XDR writer interface.
-pub struct XdrSha256Hasher {
-    hasher: Sha256Hasher,
-}
-
-impl XdrSha256Hasher {
-    /// Creates a new XDR SHA-256 hasher.
-    pub fn new() -> Self {
-        Self {
-            hasher: Sha256Hasher::new(),
-        }
-    }
-
-    /// Hashes raw bytes (used during XDR serialization).
-    pub fn hash_bytes(&mut self, bytes: &[u8]) {
-        self.hasher.update(bytes);
-    }
-
-    /// Finalizes the hash computation.
-    pub fn finalize(self) -> Hash256 {
-        self.hasher.finalize()
-    }
-}
-
-impl Default for XdrSha256Hasher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// A streaming BLAKE2b-256 hasher that can be used with XDR streaming serialization.
-pub struct XdrBlake2Hasher {
-    hasher: Blake2Hasher,
-}
-
-impl XdrBlake2Hasher {
-    /// Creates a new XDR BLAKE2b-256 hasher.
-    pub fn new() -> Self {
-        Self {
-            hasher: Blake2Hasher::new(),
-        }
-    }
-
-    /// Hashes raw bytes (used during XDR serialization).
-    pub fn hash_bytes(&mut self, bytes: &[u8]) {
-        self.hasher.update(bytes);
-    }
-
-    /// Finalizes the hash computation.
-    pub fn finalize(self) -> Hash256 {
-        self.hasher.finalize()
-    }
-}
-
-impl Default for XdrBlake2Hasher {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 #[cfg(test)]
