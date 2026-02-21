@@ -124,14 +124,14 @@ fn differing_buckets_for_levels(
                 .as_ref()
                 .and_then(|o| parse_nonzero_hash(o))
         } else {
-            snap.clone() // n = s when no output hash (mirrors stellar-core: auto n = s)
+            snap // n = s when no output hash (mirrors stellar-core: auto n = s)
         };
         let curr = parse_nonzero_hash(&level.curr);
 
         for hash in [&snap, &next_output, &curr].into_iter().flatten() {
             if !inhibit.contains(hash) {
-                result.push(hash.clone());
-                inhibit.insert(hash.clone());
+                result.push(*hash);
+                inhibit.insert(*hash);
             }
         }
     }
