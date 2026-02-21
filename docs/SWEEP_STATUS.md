@@ -1,6 +1,6 @@
 # Verify-Execution Sweep Status
 
-> **Updated**: 2026-02-21 19:27
+> **Updated**: 2026-02-21 23:10
 > **Mainnet cache range**: L59501248–L59939046
 > **Supported protocol**: P24+ (L59501312 is first P24 ledger; L59501248–L59501311 are P23 and unverifiable)
 
@@ -17,14 +17,14 @@ Ledgers L59501248–L59501311 (P23) cannot be verified by Henyey (min supported:
 | L59501312–L59659967 | **CLEAN** | Sweep 1 completed — 158,656 ledgers, 0 mismatches |
 | L59659968–L59747049 | **CLEAN** | Sweep 2 ran clean up to VE-03 |
 | L59747050 | **CLEAN** | VE-03 confirmed fixed — verified with 0 mismatches post-fix (commit acf4472) |
-| L59747051–L59799999 | In progress (Sweep 2 restart, PID 3255803) | No errors found so far |
+| L59747051–L59799999 | **CLEAN** | Sweep 2 restart completed — 52,949 ledgers, 0 mismatches |
 | L59800000–L59845022 | **CLEAN** | Sweep 3 ran through these ledgers with no hash mismatches |
 | L59845023 | **CLEAN** | VE-02 confirmed fixed — verified with 0 mismatches post-fix (commit 710ae8d) |
 | L59845024–L59863186 | **CLEAN** | Sweep 3 restart ran clean up to VE-04 |
 | L59863187 | **CLEAN** | VE-04 confirmed fixed — verified with 0 mismatches post-fix (commit 3930486) |
 | L59863188–L59875307 | **CLEAN** | Sweep 3 restart 3 ran clean through this range |
-| L59875308–L59907177 | In progress (Sweep 3a, PID 3498117) | No errors found so far |
-| L59907178–L59939046 | In progress (Sweep 3b, PID 3498118) | No errors found so far |
+| L59875308–L59907177 | **CLEAN** | Sweep 3a completed — 31,870 ledgers, 0 mismatches |
+| L59907178–L59939046 | **CLEAN** | Sweep 3b completed — 31,869 ledgers, 0 mismatches |
 
 ## VE-04 (confirmed fixed)
 
@@ -78,8 +78,4 @@ Ledgers L59501248–L59501311 (P23) cannot be verified by Henyey (min supported:
 
 ## Running sweeps
 
-| Sweep | Range | PID | Started |
-|-------|-------|-----|---------|
-| Sweep 2 (restart) | L59747051–L59799999 | 3255803 | 2026-02-21 |
-| Sweep 3a | L59875308–L59907177 | 3498117 | 2026-02-21 |
-| Sweep 3b | L59907178–L59939046 | 3498118 | 2026-02-21 |
+None — all ranges complete.
