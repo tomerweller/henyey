@@ -99,7 +99,10 @@ pub use header::{
     verify_skip_list, SKIP_1, SKIP_2, SKIP_3, SKIP_4, SKIP_LIST_SIZE,
 };
 pub use manager::{prepend_fee_event, LedgerManager, LedgerManagerConfig};
-pub use snapshot::{EntriesLookupFn, LedgerSnapshot, SnapshotBuilder, SnapshotHandle};
+pub use snapshot::{
+    EntriesLookupFn, EntryLookupFn, LedgerSnapshot, PoolShareTrustlinesByAccountFn,
+    SnapshotBuilder, SnapshotHandle,
+};
 pub use soroban_state::{
     ContractCodeMapEntry, ContractDataMapEntry, InMemorySorobanState, SharedSorobanState,
     SorobanRentConfig, SorobanStateStats, TtlData,

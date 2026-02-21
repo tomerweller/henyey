@@ -2425,3 +2425,325 @@ fn test_classic_fees_deducted_upfront_before_tx_execution() {
     );
 }
 
+/// Regression test for VE-02: pool share trustlines not in memory are correctly
+/// redeemed when `SetTrustLineFlags` deauthorizes an account.
+///
+/// Before this fix, `find_pool_share_trustlines_for_asset` only searched
+/// in-memory state. When pool share trustlines existed in the bucket list but
+/// hadn't been loaded into memory, `redeem_pool_share_trustlines` found nothing
+/// and returned early — no claimable balances were created, and the pool remained
+/// stale. This caused the hash mismatch at mainnet ledger L59845023.
+///
+/// The fix adds:
+/// 1. A secondary index (`pool_share_tl_account_index`) built from the bucket list
+///    scan, mirroring how `offer_account_asset_index` works for offers.
+/// 2. `load_pool_share_trustlines_for_account_and_asset` called during
+///    `SetTrustLineFlags`/`AllowTrust` operation loading, which uses the index
+///    to pre-load all pool share trustlines for the trustor before the op runs.
+#[test]
+fn test_set_trust_line_flags_redeems_pool_shares_loaded_from_snapshot() {
+    use henyey_ledger::{EntryLookupFn, PoolShareTrustlinesByAccountFn};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use stellar_xdr::curr::{
+        Liabilities, Limits, TrustLineEntryExt, TrustLineEntryExtensionV2,
+        TrustLineEntryExtensionV2Ext, TrustLineEntryV1, TrustLineEntryV1Ext, TrustLineFlags,
+        WriteXdr,
+    };
+
+    let network_id = NetworkId::testnet();
+
+    // Accounts: issuer (AUTH_REQUIRED | AUTH_REVOCABLE), trustor, other_issuer for asset_b.
+    let issuer_secret = SecretKey::from_seed(&[80u8; 32]);
+    let issuer_id: AccountId = (&issuer_secret.public_key()).into();
+    let trustor_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([81u8; 32])));
+    let other_issuer_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([82u8; 32])));
+
+    let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+        asset_code: AssetCode4(*b"RUV\0"),
+        issuer: issuer_id.clone(),
+    });
+    let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+        asset_code: AssetCode4(*b"XLM\0"),
+        issuer: other_issuer_id.clone(),
+    });
+
+    let pool_id = PoolId(Hash([80u8; 32]));
+
+    // Pool share trustline (100 of 500 total shares) — stored ONLY via the
+    // lookup function, NOT in the snapshot's initial entries.  This simulates
+    // the VE-02 scenario where the entry lives in the bucket list on disk.
+    let pool_share_tl_asset = TrustLineAsset::PoolShare(pool_id.clone());
+    let pool_share_tl_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+        account_id: trustor_id.clone(),
+        asset: pool_share_tl_asset.clone(),
+    });
+    let pool_share_tl_entry = LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::Trustline(TrustLineEntry {
+            account_id: trustor_id.clone(),
+            asset: pool_share_tl_asset,
+            balance: 100,
+            limit: i64::MAX,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+
+    // Asset A trustline for trustor (authorized, pool_use_count=1)
+    let (asset_a_tl_key, asset_a_tl_entry) = {
+        let asset = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"RUV\0"),
+            issuer: issuer_id.clone(),
+        });
+        let key = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: trustor_id.clone(),
+            asset: asset.clone(),
+        });
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Trustline(TrustLineEntry {
+                account_id: trustor_id.clone(),
+                asset,
+                balance: 5000,
+                limit: 100_000,
+                flags: TrustLineFlags::AuthorizedFlag as u32,
+                ext: TrustLineEntryExt::V1(TrustLineEntryV1 {
+                    liabilities: Liabilities {
+                        buying: 0,
+                        selling: 0,
+                    },
+                    ext: TrustLineEntryV1Ext::V2(TrustLineEntryExtensionV2 {
+                        liquidity_pool_use_count: 1,
+                        ext: TrustLineEntryExtensionV2Ext::V0,
+                    }),
+                }),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        (key, entry)
+    };
+
+    // Asset B trustline for trustor (authorized, pool_use_count=1)
+    let (asset_b_tl_key, asset_b_tl_entry) = {
+        let asset = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"XLM\0"),
+            issuer: other_issuer_id.clone(),
+        });
+        let key = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: trustor_id.clone(),
+            asset: asset.clone(),
+        });
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Trustline(TrustLineEntry {
+                account_id: trustor_id.clone(),
+                asset,
+                balance: 5000,
+                limit: 100_000,
+                flags: TrustLineFlags::AuthorizedFlag as u32,
+                ext: TrustLineEntryExt::V1(TrustLineEntryV1 {
+                    liabilities: Liabilities {
+                        buying: 0,
+                        selling: 0,
+                    },
+                    ext: TrustLineEntryV1Ext::V2(TrustLineEntryExtensionV2 {
+                        liquidity_pool_use_count: 1,
+                        ext: TrustLineEntryExtensionV2Ext::V0,
+                    }),
+                }),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        (key, entry)
+    };
+
+    // Issuer account (AUTH_REQUIRED | AUTH_REVOCABLE)
+    let (issuer_key, issuer_entry) =
+        create_account_entry_with_flags(issuer_id.clone(), 1, 100_000_000, 0x1 | 0x2);
+
+    // Trustor account — num_sub_entries=4 (2 asset TLs × 1 each + pool share TL counts as 2)
+    let trustor_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        account_id: trustor_id.clone(),
+    });
+    let trustor_entry = LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::Account(AccountEntry {
+            account_id: trustor_id.clone(),
+            balance: 100_000_000,
+            seq_num: SequenceNumber(0),
+            num_sub_entries: 4,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: VecM::default(),
+            ext: AccountEntryExt::V0,
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+
+    // Other issuer account (needed for asset_b trustline validation)
+    let (other_issuer_key, other_issuer_entry) =
+        create_account_entry(other_issuer_id.clone(), 0, 100_000_000);
+
+    // Liquidity pool: reserve_a=1000, reserve_b=2000, total_shares=500, tl_count=1
+    let (pool_key, pool_entry) = create_liquidity_pool_entry(
+        pool_id.clone(),
+        asset_a.clone(),
+        asset_b.clone(),
+        1000,
+        2000,
+        500,
+        1,
+    );
+
+    // Build snapshot WITHOUT the pool share trustline — it's "on disk" only.
+    let snapshot = SnapshotBuilder::new(10)
+        .add_entry(issuer_key, issuer_entry)
+        .unwrap()
+        .add_entry(trustor_key, trustor_entry)
+        .unwrap()
+        .add_entry(other_issuer_key, other_issuer_entry)
+        .unwrap()
+        .add_entry(pool_key, pool_entry)
+        .unwrap()
+        .add_entry(asset_a_tl_key, asset_a_tl_entry)
+        .unwrap()
+        .add_entry(asset_b_tl_key, asset_b_tl_entry)
+        .unwrap()
+        .build_with_default_header();
+
+    // Encode the pool share TL key for lookup.
+    let pool_share_tl_key_bytes = pool_share_tl_key
+        .to_xdr(Limits::none())
+        .expect("encode pool share TL key");
+
+    // Lookup function: returns the pool share TL for the trustor when queried by key.
+    let extra_entries: Arc<HashMap<Vec<u8>, LedgerEntry>> = Arc::new({
+        let mut m = HashMap::new();
+        m.insert(pool_share_tl_key_bytes, pool_share_tl_entry);
+        m
+    });
+    let lookup_fn: EntryLookupFn = Arc::new(move |key| {
+        let key_bytes = key
+            .to_xdr(Limits::none())
+            .map_err(|e| henyey_ledger::LedgerError::Serialization(e.to_string()))?;
+        Ok(extra_entries.get(&key_bytes).cloned())
+    });
+
+    // Pool share TL secondary index: trustor → [pool_id]
+    let captured_pool_id = pool_id.clone();
+    let captured_trustor_id = trustor_id.clone();
+    let pool_share_index_fn: PoolShareTrustlinesByAccountFn = Arc::new(move |account_id| {
+        if account_id == &captured_trustor_id {
+            Ok(vec![captured_pool_id.clone()])
+        } else {
+            Ok(vec![])
+        }
+    });
+
+    let mut handle = SnapshotHandle::new(snapshot);
+    handle.set_lookup(lookup_fn);
+    handle.set_pool_share_tls_by_account(pool_share_index_fn);
+
+    // Build and sign a SetTrustLineFlags transaction issued by the RUV issuer
+    // to deauthorize the trustor's RUV trustline.
+    let op = Operation {
+        source_account: None,
+        body: OperationBody::SetTrustLineFlags(SetTrustLineFlagsOp {
+            trustor: trustor_id.clone(),
+            asset: asset_a.clone(),
+            clear_flags: TrustLineFlags::AuthorizedFlag as u32,
+            set_flags: 0,
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*issuer_secret.public_key().as_bytes())),
+        fee: 1000,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    let decorated = sign_envelope(&envelope, &issuer_secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let context = henyey_tx::LedgerContext::new(10, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    let result = executor
+        .execute_transaction(&handle, &envelope, 100, None)
+        .expect("execute SetTrustLineFlags");
+
+    assert!(
+        result.success,
+        "SetTrustLineFlags should succeed, got failure: {:?}",
+        result.failure
+    );
+
+    // Verify claimable balances were created for both pool assets:
+    //   amount_a = floor(100 * 1000 / 500) = 200
+    //   amount_b = floor(100 * 2000 / 500) = 400
+    let tx_meta = result.tx_meta.expect("tx meta");
+    let TransactionMeta::V4(ref meta) = tx_meta else {
+        panic!("expected TransactionMeta::V4");
+    };
+
+    // Collect all ledger entry changes across fee-change frames and operation meta.
+    let mut found_asset_a_cb = false;
+    let mut found_asset_b_cb = false;
+    let mut cb_count = 0;
+    let all_op_changes: Vec<&LedgerEntryChange> = meta
+        .operations
+        .iter()
+        .flat_map(|op| op.changes.iter())
+        .collect();
+    for change in all_op_changes {
+        let entry = match change {
+            LedgerEntryChange::Created(e) => e,
+            _ => continue,
+        };
+        if let LedgerEntryData::ClaimableBalance(ref cb) = entry.data {
+            cb_count += 1;
+            if cb.asset == asset_a {
+                assert_eq!(cb.amount, 200, "asset_a claimable balance amount");
+                found_asset_a_cb = true;
+            } else if cb.asset == asset_b {
+                assert_eq!(cb.amount, 400, "asset_b claimable balance amount");
+                found_asset_b_cb = true;
+            }
+        }
+    }
+
+    assert!(
+        found_asset_a_cb,
+        "claimable balance for asset_a (RUV) should have been created — \
+         before VE-02 fix, pool share TL was not loaded from snapshot"
+    );
+    assert!(
+        found_asset_b_cb,
+        "claimable balance for asset_b (XLM) should have been created — \
+         before VE-02 fix, pool share TL was not loaded from snapshot"
+    );
+    assert_eq!(
+        cb_count,
+        2,
+        "exactly 2 claimable balances should be created (one per pool asset)"
+    );
+}

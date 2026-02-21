@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use henyey_common::Hash256;
 use stellar_xdr::curr::{
-    AccountEntry, AccountId, LedgerEntry, LedgerEntryData, LedgerHeader, LedgerKey,
+    AccountEntry, AccountId, LedgerEntry, LedgerEntryData, LedgerHeader, LedgerKey, PoolId,
 };
 
 /// Statistics from a prefetch operation.
@@ -225,6 +225,13 @@ pub type BatchEntryLookupFn = Arc<dyn Fn(&[LedgerKey]) -> Result<Vec<LedgerEntry
 pub type OffersByAccountAssetFn =
     Arc<dyn Fn(&AccountId, &stellar_xdr::curr::Asset) -> Result<Vec<LedgerEntry>> + Send + Sync>;
 
+/// Lookup function for pool share trustlines by account.
+///
+/// Returns the pool IDs for all pool share trustlines owned by the given account.
+/// Used to ensure pool share trustlines are loaded before authorization revocation.
+pub type PoolShareTrustlinesByAccountFn =
+    Arc<dyn Fn(&AccountId) -> Result<Vec<PoolId>> + Send + Sync>;
+
 /// Thread-safe handle to a ledger snapshot with optional lazy loading.
 ///
 /// `SnapshotHandle` wraps a [`LedgerSnapshot`] in an `Arc` for efficient
@@ -258,6 +265,8 @@ pub struct SnapshotHandle {
     batch_lookup_fn: Option<BatchEntryLookupFn>,
     /// Optional index-based lookup for offers by (account, asset).
     offers_by_account_asset_fn: Option<OffersByAccountAssetFn>,
+    /// Optional index-based lookup for pool share trustline pool IDs by account.
+    pool_share_tls_by_account_fn: Option<PoolShareTrustlinesByAccountFn>,
     /// Cache populated by prefetch, checked before falling through to lookup_fn.
     /// Uses Arc<RwLock> so clones of SnapshotHandle share the same cache.
     prefetch_cache: Arc<parking_lot::RwLock<HashMap<Vec<u8>, LedgerEntry>>>,
@@ -272,6 +281,7 @@ impl SnapshotHandle {
             entries_fn: None,
             batch_lookup_fn: None,
             offers_by_account_asset_fn: None,
+            pool_share_tls_by_account_fn: None,
             prefetch_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
@@ -284,6 +294,7 @@ impl SnapshotHandle {
             entries_fn: None,
             batch_lookup_fn: None,
             offers_by_account_asset_fn: None,
+            pool_share_tls_by_account_fn: None,
             prefetch_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
@@ -300,6 +311,7 @@ impl SnapshotHandle {
             entries_fn: Some(entries_fn),
             batch_lookup_fn: None,
             offers_by_account_asset_fn: None,
+            pool_share_tls_by_account_fn: None,
             prefetch_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
@@ -322,6 +334,21 @@ impl SnapshotHandle {
     /// Set the offers-by-(account, asset) lookup function.
     pub fn set_offers_by_account_asset(&mut self, f: OffersByAccountAssetFn) {
         self.offers_by_account_asset_fn = Some(f);
+    }
+
+    /// Set the pool-share-trustlines-by-account lookup function.
+    pub fn set_pool_share_tls_by_account(&mut self, f: PoolShareTrustlinesByAccountFn) {
+        self.pool_share_tls_by_account_fn = Some(f);
+    }
+
+    /// Look up all pool IDs for pool share trustlines owned by `account_id`.
+    ///
+    /// Returns an empty vec if no index is available.
+    pub fn pool_share_tls_by_account(&self, account_id: &AccountId) -> Result<Vec<PoolId>> {
+        if let Some(ref f) = self.pool_share_tls_by_account_fn {
+            return f(account_id);
+        }
+        Ok(Vec::new())
     }
 
     /// Look up all offers owned by `account_id` that buy or sell `asset`.

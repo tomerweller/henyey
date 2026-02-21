@@ -192,6 +192,8 @@ struct CacheInitResult {
     offers: HashMap<i64, LedgerEntry>,
     /// Secondary index: (account, asset) → set of offer_ids.
     offer_index: OfferAccountAssetIndex,
+    /// Secondary index: account_bytes → set of pool_id_bytes for pool share trustlines.
+    pool_share_tl_account_index: HashMap<[u8; 32], HashSet<[u8; 32]>>,
     /// Pre-compiled Soroban module cache (if Soroban is supported).
     module_cache: Option<PersistentModuleCache>,
     /// In-memory Soroban state (contract data, code, TTLs, config).
@@ -308,7 +310,8 @@ fn scan_single_level(
                     | LedgerKey::ContractData(_)
                     | LedgerKey::Ttl(_)
                     | LedgerKey::ConfigSetting(_)
-            );
+            ) || matches!(&key, LedgerKey::Trustline(tl_key)
+                if matches!(tl_key.asset, stellar_xdr::curr::TrustLineAsset::PoolShare(_)));
             if !is_scan_relevant {
                 continue;
             }
@@ -348,6 +351,7 @@ fn merge_level_results(
 ) -> CacheInitResult {
     let mut soroban_state = crate::soroban_state::InMemorySorobanState::new();
     let mut mem_offers: HashMap<i64, LedgerEntry> = HashMap::new();
+    let mut pool_share_tl_account_index: HashMap<[u8; 32], HashSet<[u8; 32]>> = HashMap::new();
     let mut global_seen: HashSet<LedgerKey> = HashSet::new();
     let mut global_ttl_seen: HashSet<[u8; 32]> = HashSet::new();
 
@@ -377,6 +381,14 @@ fn merge_level_results(
                 LedgerEntryData::Offer(ref offer) => {
                     mem_offers.insert(offer.offer_id, entry.clone());
                     offer_count += 1;
+                }
+                LedgerEntryData::Trustline(ref tl) => {
+                    if let stellar_xdr::curr::TrustLineAsset::PoolShare(ref pool_id) = tl.asset {
+                        pool_share_tl_account_index
+                            .entry(account_id_bytes(&tl.account_id))
+                            .or_default()
+                            .insert(pool_id.0 .0);
+                    }
                 }
                 LedgerEntryData::ContractCode(_) => {
                     // Module cache was already populated during scan_single_level
@@ -445,6 +457,7 @@ fn merge_level_results(
     CacheInitResult {
         offers: mem_offers,
         offer_index,
+        pool_share_tl_account_index,
         module_cache,
         soroban_state,
     }
@@ -781,6 +794,15 @@ pub struct LedgerManager {
     /// Used for O(k) lookups in `load_offers_by_account_and_asset` instead of O(n) full scans.
     offer_account_asset_index: Arc<RwLock<OfferAccountAssetIndex>>,
 
+    /// Secondary index: account_bytes → set of pool_id_bytes for pool share trustlines.
+    ///
+    /// Built at initialization by scanning the bucket list for pool share trustlines.
+    /// Maintained incrementally in `commit_close`.
+    /// Used by `load_pool_share_trustlines_for_account_and_asset` to find pool share
+    /// trustlines without a full bucket list scan (mirroring stellar-core's SQL
+    /// `SELECT * FROM trustlines WHERE account_id=? AND asset_type=POOL_SHARE`).
+    pool_share_tl_account_index: Arc<RwLock<HashMap<[u8; 32], HashSet<[u8; 32]>>>>,
+
     /// In-memory Soroban state for Protocol 20+ contract data/code tracking.
     ///
     /// This tracks all CONTRACT_DATA, CONTRACT_CODE, and TTL entries in memory,
@@ -847,6 +869,7 @@ impl LedgerManager {
             offers_initialized: Arc::new(RwLock::new(false)),
             offer_store: Arc::new(RwLock::new(HashMap::new())),
             offer_account_asset_index: Arc::new(RwLock::new(HashMap::new())),
+            pool_share_tl_account_index: Arc::new(RwLock::new(HashMap::new())),
             soroban_state: Arc::new(crate::soroban_state::SharedSorobanState::new()),
             executor: Mutex::new(None),
             pending_eviction_scan: Mutex::new(None),
@@ -1205,6 +1228,7 @@ impl LedgerManager {
 
         *self.offer_store.write() = cache_data.offers;
         *self.offer_account_asset_index.write() = cache_data.offer_index;
+        *self.pool_share_tl_account_index.write() = cache_data.pool_share_tl_account_index;
         *self.module_cache.write() = cache_data.module_cache;
         *self.soroban_state.write() = cache_data.soroban_state;
         *self.offers_initialized.write() = true;
@@ -1583,9 +1607,31 @@ impl LedgerManager {
             },
         );
 
+        // Create index-based lookup for pool share trustlines by account.
+        // This mirrors stellar-core's `getPoolShareTrustLine(accountID, asset)` which
+        // queries SQL for all pool share trustlines owned by an account.  Without this
+        // loader, `find_pool_share_trustlines_for_asset` would only find trustlines
+        // already in the in-memory state, missing pool shares loaded from the bucket list.
+        let pool_share_idx = self.pool_share_tl_account_index.clone();
+        let pool_share_tls_by_account_fn: crate::snapshot::PoolShareTrustlinesByAccountFn =
+            Arc::new(move |account_id| {
+                let idx = pool_share_idx.read();
+                let account_bytes = account_id_bytes(account_id);
+                Ok(idx
+                    .get(&account_bytes)
+                    .map(|pool_ids| {
+                        pool_ids
+                            .iter()
+                            .map(|id| stellar_xdr::curr::PoolId(stellar_xdr::curr::Hash(*id)))
+                            .collect()
+                    })
+                    .unwrap_or_default())
+            });
+
         let mut handle = SnapshotHandle::with_lookups_and_entries(snapshot, lookup_fn, entries_fn);
         handle.set_batch_lookup(batch_lookup_fn);
         handle.set_offers_by_account_asset(offers_by_account_asset_fn);
+        handle.set_pool_share_tls_by_account(pool_share_tls_by_account_fn);
         Ok(handle)
     }
 
@@ -1695,6 +1741,52 @@ impl LedgerManager {
                 for offer_id in &offer_deletes {
                     store.remove(offer_id);
                 }
+            }
+        }
+
+        // Update pool share trustline secondary index with changes from this ledger.
+        for change in delta.changes() {
+            let key = match change.key() {
+                Ok(k) => k,
+                Err(_) => continue,
+            };
+            let tl_key = match &key {
+                LedgerKey::Trustline(tl_key)
+                    if matches!(
+                        tl_key.asset,
+                        stellar_xdr::curr::TrustLineAsset::PoolShare(_)
+                    ) =>
+                {
+                    tl_key
+                }
+                _ => continue,
+            };
+            let account_bytes = account_id_bytes(&tl_key.account_id);
+            match change {
+                EntryChange::Created(entry) => {
+                    if let LedgerEntryData::Trustline(ref tl) = entry.data {
+                        if let stellar_xdr::curr::TrustLineAsset::PoolShare(ref pool_id) = tl.asset
+                        {
+                            self.pool_share_tl_account_index
+                                .write()
+                                .entry(account_bytes)
+                                .or_default()
+                                .insert(pool_id.0 .0);
+                        }
+                    }
+                }
+                EntryChange::Deleted { previous } => {
+                    if let LedgerEntryData::Trustline(ref tl) = previous.data {
+                        if let stellar_xdr::curr::TrustLineAsset::PoolShare(ref pool_id) = tl.asset
+                        {
+                            let mut idx = self.pool_share_tl_account_index.write();
+                            if let Some(pools) = idx.get_mut(&account_bytes) {
+                                pools.remove(&pool_id.0 .0);
+                            }
+                        }
+                    }
+                }
+                _ => {} // Updated pool share trustlines: no index change needed
             }
         }
 

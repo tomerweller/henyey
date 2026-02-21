@@ -1156,6 +1156,67 @@ impl TransactionExecutor {
         Ok(())
     }
 
+    /// Load pool share trustlines and their dependencies for an account+asset pair.
+    ///
+    /// When `SetTrustLineFlags` or `AllowTrust` revokes authorization, all pool share
+    /// trustlines referencing that asset must be redeemed as claimable balances.
+    /// This requires the pool share trustlines, their associated liquidity pools, and
+    /// the non-target asset trustlines to be in-memory before execution.
+    ///
+    /// This mirrors stellar-core's `getPoolShareTrustLine(accountID, asset)` SQL query.
+    pub fn load_pool_share_trustlines_for_account_and_asset(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        account_id: &AccountId,
+        asset: &Asset,
+    ) -> Result<()> {
+        // Get pool IDs for this account from the secondary index.
+        let pool_ids = snapshot
+            .pool_share_tls_by_account(account_id)
+            .map_err(|e| LedgerError::Internal(e.to_string()))?;
+
+        if pool_ids.is_empty() {
+            return Ok(());
+        }
+
+        // Batch-load all pool share trustlines and their associated liquidity pools.
+        let mut keys = Vec::with_capacity(pool_ids.len() * 2);
+        for pool_id in &pool_ids {
+            keys.push(LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
+                liquidity_pool_id: pool_id.clone(),
+            }));
+            let pool_share_asset = TrustLineAsset::PoolShare(pool_id.clone());
+            keys.push(make_trustline_key(account_id, &pool_share_asset));
+        }
+        self.batch_load_keys(snapshot, &keys)?;
+
+        // For each pool that contains the target asset, also load the other asset's
+        // trustline for the account so `decrement_liquidity_pool_use_count` can find it.
+        let mut other_assets: Vec<Asset> = Vec::new();
+        for pool_id in &pool_ids {
+            let Some(pool) = self.state.get_liquidity_pool(pool_id) else {
+                continue;
+            };
+            let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(ref cp) = pool.body;
+            if &cp.params.asset_a != asset && &cp.params.asset_b != asset {
+                continue;
+            }
+            let other = if &cp.params.asset_a == asset {
+                cp.params.asset_b.clone()
+            } else {
+                cp.params.asset_a.clone()
+            };
+            other_assets.push(other);
+        }
+        for other_asset in &other_assets {
+            if let Some(tl_asset) = asset_to_trustline_asset(other_asset) {
+                self.load_trustline(snapshot, account_id, &tl_asset)?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Load a ledger entry from the snapshot into the state manager.
     ///
     /// This handles all entry types including contract data, contract code, and TTL entries.
@@ -2859,6 +2920,12 @@ impl TransactionExecutor {
                 self.batch_load_keys(snapshot, &keys)?;
                 // Load offers by account/asset so they can be removed if authorization is revoked
                 self.load_offers_by_account_and_asset(snapshot, &op_data.trustor, &asset)?;
+                // Load pool share trustlines so they can be redeemed if authorization is revoked
+                self.load_pool_share_trustlines_for_account_and_asset(
+                    snapshot,
+                    &op_data.trustor,
+                    &asset,
+                )?;
             }
             OperationBody::Payment(op_data) => {
                 let dest = henyey_tx::muxed_to_account_id(&op_data.destination);
@@ -2914,6 +2981,12 @@ impl TransactionExecutor {
                 self.batch_load_keys(snapshot, &keys)?;
                 // Load offers by account/asset so they can be removed if authorization is revoked
                 self.load_offers_by_account_and_asset(snapshot, &op_data.trustor, &op_data.asset)?;
+                // Load pool share trustlines so they can be redeemed if authorization is revoked
+                self.load_pool_share_trustlines_for_account_and_asset(
+                    snapshot,
+                    &op_data.trustor,
+                    &op_data.asset,
+                )?;
             }
             OperationBody::Clawback(op_data) => {
                 let from_account = henyey_tx::muxed_to_account_id(&op_data.from);
