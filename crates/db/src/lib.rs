@@ -447,6 +447,18 @@ impl Database {
         })
     }
 
+    /// Removes all publish queue entries above the given LCL.
+    ///
+    /// Called during startup recovery to clean up stale entries that
+    /// refer to checkpoints beyond what has been committed to the database.
+    /// Returns the number of entries removed.
+    pub fn remove_publish_above_lcl(&self, lcl: u32) -> Result<u64> {
+        self.with_connection(|conn| {
+            use queries::PublishQueueQueries;
+            conn.remove_above_lcl(lcl)
+        })
+    }
+
     /// Loads queued checkpoint ledgers pending publication.
     ///
     /// Returns ledger sequence numbers in ascending order.

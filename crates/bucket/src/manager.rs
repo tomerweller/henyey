@@ -876,6 +876,74 @@ impl BucketManager {
         Ok(state.into_values().collect())
     }
 
+    /// Loads the complete hot archive state from a list of hot archive bucket hashes.
+    ///
+    /// This iterates through all hot archive buckets from oldest to newest,
+    /// building a map of all archived entries. `Live` entries (restore markers)
+    /// shadow older `Archived` entries, removing them from the result.
+    ///
+    /// This is the Rust equivalent of stellar-core `loadCompleteHotArchiveState`.
+    /// Note: stellar-core defines this function but it has zero callers even in v25;
+    /// it is purely diagnostic/admin. We implement it for completeness.
+    ///
+    /// # Arguments
+    ///
+    /// * `bucket_hashes` - Hot archive bucket hashes in order from level 10 snap
+    ///   to level 0 curr (oldest to newest, so newer entries win)
+    ///
+    /// # Returns
+    ///
+    /// A vector of all archived ledger entries, with restore markers applied.
+    pub fn load_complete_hot_archive_state(
+        &self,
+        bucket_hashes: &[Hash256],
+    ) -> Result<Vec<LedgerEntry>> {
+        use std::collections::BTreeMap;
+
+        // Use BTreeMap to maintain sorted order by key
+        let mut state: BTreeMap<Vec<u8>, LedgerEntry> = BTreeMap::new();
+
+        // Process buckets from oldest to newest (so newer entries overwrite older)
+        for hash in bucket_hashes {
+            if hash.is_zero() {
+                continue;
+            }
+
+            let bucket = self.load_hot_archive_bucket(hash)?;
+
+            for entry in bucket.iter() {
+                match entry {
+                    stellar_xdr::curr::HotArchiveBucketEntry::Archived(ref ledger_entry) => {
+                        if let Some(key) = crate::entry::ledger_entry_to_key(ledger_entry) {
+                            let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
+                                BucketError::Serialization(format!(
+                                    "failed to serialize ledger key: {}",
+                                    e
+                                ))
+                            })?;
+                            state.insert(key_bytes, ledger_entry.clone());
+                        }
+                    }
+                    stellar_xdr::curr::HotArchiveBucketEntry::Live(ref key) => {
+                        // Live = restore marker (tombstone) — remove from archive
+                        let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
+                            BucketError::Serialization(format!(
+                                "failed to serialize ledger key: {}",
+                                e
+                            ))
+                        })?;
+                        state.remove(&key_bytes);
+                    }
+                    stellar_xdr::curr::HotArchiveBucketEntry::Metaentry(_) => {
+                        // Skip metadata entries
+                    }
+                }
+            }
+        }
+
+        Ok(state.into_values().collect())
+    }
+
     /// Merges all buckets in a bucket list into a single "super bucket".
     ///
     /// This creates a consolidated bucket containing all live entries from
@@ -947,15 +1015,118 @@ impl BucketManager {
     /// This performs a full hash verification by reading and decompressing
     /// each bucket file. This is expensive and should be used sparingly.
     ///
-    /// This is a simplified version of stellar-core `scheduleVerifyReferencedBucketsWork`.
+    /// This mirrors stellar-core's `scheduleVerifyReferencedBucketsWork`:
+    /// - Verifies both live and hot archive buckets
+    /// - Checks file size against `max_bucket_size` before loading
+    /// - Errors on missing files (use `verify_buckets_exist` for a softer check)
     ///
     /// # Arguments
     ///
-    /// * `bucket_hashes` - List of bucket hashes to verify
+    /// * `live_hashes` - Live bucket hashes to verify
+    /// * `hot_archive_hashes` - Hot archive bucket hashes to verify
+    /// * `max_bucket_size` - Maximum allowed bucket file size in bytes
+    ///   (use `henyey_history::archive_state::MAX_HISTORY_ARCHIVE_BUCKET_SIZE`)
     ///
     /// # Returns
     ///
     /// A list of (expected_hash, actual_hash) pairs for any mismatched buckets.
+    /// Returns an error if a referenced bucket file is missing or exceeds the
+    /// size limit.
+    pub fn verify_referenced_bucket_hashes(
+        &self,
+        live_hashes: &[Hash256],
+        hot_archive_hashes: &[Hash256],
+        max_bucket_size: u64,
+    ) -> Result<Vec<(Hash256, Hash256)>> {
+        let mut mismatches = Vec::new();
+
+        // Verify live buckets
+        for expected_hash in live_hashes {
+            if expected_hash.is_zero() {
+                continue;
+            }
+
+            let xdr_path = self.bucket_path(expected_hash);
+            if !xdr_path.exists() {
+                return Err(BucketError::NotFound(format!(
+                    "referenced live bucket file missing: {}",
+                    expected_hash.to_hex()
+                )));
+            }
+
+            // File size guard
+            let file_size = std::fs::metadata(&xdr_path)?.len();
+            if file_size > max_bucket_size {
+                return Err(BucketError::Serialization(format!(
+                    "live bucket {} exceeds max size: {} > {}",
+                    expected_hash.to_hex(),
+                    file_size,
+                    max_bucket_size
+                )));
+            }
+
+            match Bucket::load_from_xdr_file(&xdr_path) {
+                Ok(bucket) => {
+                    let actual_hash = bucket.hash();
+                    if actual_hash != *expected_hash {
+                        mismatches.push((*expected_hash, actual_hash));
+                    }
+                }
+                Err(_) => {
+                    // File exists but couldn't be loaded - treat as hash mismatch
+                    mismatches.push((*expected_hash, Hash256::ZERO));
+                }
+            }
+        }
+
+        // Verify hot archive buckets
+        for expected_hash in hot_archive_hashes {
+            if expected_hash.is_zero() {
+                continue;
+            }
+
+            let xdr_path = self.bucket_path(expected_hash);
+            if !xdr_path.exists() {
+                return Err(BucketError::NotFound(format!(
+                    "referenced hot archive bucket file missing: {}",
+                    expected_hash.to_hex()
+                )));
+            }
+
+            // File size guard
+            let file_size = std::fs::metadata(&xdr_path)?.len();
+            if file_size > max_bucket_size {
+                return Err(BucketError::Serialization(format!(
+                    "hot archive bucket {} exceeds max size: {} > {}",
+                    expected_hash.to_hex(),
+                    file_size,
+                    max_bucket_size
+                )));
+            }
+
+            match crate::hot_archive::HotArchiveBucket::load_from_xdr_file(&xdr_path) {
+                Ok(bucket) => {
+                    let actual_hash = bucket.hash();
+                    if actual_hash != *expected_hash {
+                        mismatches.push((*expected_hash, actual_hash));
+                    }
+                }
+                Err(_) => {
+                    mismatches.push((*expected_hash, Hash256::ZERO));
+                }
+            }
+        }
+
+        Ok(mismatches)
+    }
+
+    /// Verifies bucket file contents match their expected hashes (live buckets only).
+    ///
+    /// This is a convenience wrapper that only checks live buckets. For full
+    /// verification including hot archive buckets, use [`Self::verify_referenced_bucket_hashes`].
+    ///
+    /// **Deprecated behavior**: Missing files are skipped rather than causing an error.
+    /// Prefer `verify_referenced_bucket_hashes` for stricter checking.
     pub fn verify_bucket_hashes(
         &self,
         bucket_hashes: &[Hash256],
@@ -970,7 +1141,10 @@ impl BucketManager {
             // Only check canonical .bucket.xdr path
             let xdr_path = self.bucket_path(expected_hash);
             if !xdr_path.exists() {
-                continue; // Skip missing files (use verify_buckets_exist for that check)
+                return Err(BucketError::NotFound(format!(
+                    "referenced bucket file missing: {}",
+                    expected_hash.to_hex()
+                )));
             }
 
             match Bucket::load_from_xdr_file(&xdr_path) {

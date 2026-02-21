@@ -38,6 +38,7 @@
 - Run focused tests when possible to speed iteration, then run `cargo test --all` before submitting.
 - No fuzz testing is required for this project.
 - No baseline transaction meta testing is required.
+- **Invariant testing is out of scope** — do not write unit tests for the `henyey-invariant` crate. Invariants are verified at runtime during ledger close; correctness is validated by the online/offline integration tests.
 - Perform testing on testnet, not mainnet.
 - **Bug investigation workflow**: When investigating a bug, always start by writing a narrow unit test that reproduces the bug and fails. Then fix the code until the test passes. Do not skip the failing-test-first step.
 - **Unit test coverage**: When writing new code, ensure it is thoroughly covered by unit tests. Every public function and significant code path should have corresponding tests.

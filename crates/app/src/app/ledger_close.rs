@@ -385,6 +385,29 @@ impl App {
             return;
         }
 
+        // Phase 1b: Remove stale publish queue entries above LCL.
+        //
+        // This mirrors stellar-core's `restoreCheckpoint()` which iterates
+        // `.checkpoint.dirty` files and removes entries above LCL. Since
+        // henyey uses a SQLite-backed publish queue, this is a simple DELETE.
+        match self.db.remove_publish_above_lcl(lcl) {
+            Ok(removed) if removed > 0 => {
+                tracing::info!(
+                    lcl,
+                    removed,
+                    "Removed stale publish queue entries above LCL"
+                );
+            }
+            Ok(_) => {} // nothing removed
+            Err(e) => {
+                tracing::warn!(
+                    lcl,
+                    error = %e,
+                    "Failed to clean stale publish queue entries (non-fatal)"
+                );
+            }
+        }
+
         // Phase 2: If LCL is at a checkpoint boundary, finalize recovered
         // dirty files by renaming them to final paths.
         if is_checkpoint_ledger(lcl) {

@@ -211,10 +211,10 @@ Corresponds to: `BucketManager.h`
 | `assumeState()` | `BucketList::assume_state()` | Full |
 | `shutdown()` / `isShutdown()` | *(drop semantics)* | Full |
 | `loadCompleteLedgerState()` | `BucketManager::load_complete_ledger_state()` | Full |
-| `loadCompleteHotArchiveState()` | *(partial, via hot archive iteration)* | Partial |
+| `loadCompleteHotArchiveState()` | `BucketManager::load_complete_hot_archive_state()` | Full |
 | `mergeBuckets()` | `BucketManager::merge_all_buckets()` | Full |
 | `visitLedgerEntries()` | `BucketManager::visit_ledger_entries()` / `visit_ledger_entries_of_type()` | Full |
-| `scheduleVerifyReferencedBucketsWork()` | `BucketManager::verify_bucket_hashes()` | Partial |
+| `scheduleVerifyReferencedBucketsWork()` | `BucketManager::verify_referenced_bucket_hashes()` | Full |
 | `getConfig()` | Configuration via constructor params | Full |
 | `reportBucketEntryCountMetrics()` | `BucketEntryCounters` | Partial |
 | `calculateSkipValues()` | `BucketList::calculate_skip_values()` | Full |

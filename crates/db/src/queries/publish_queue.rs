@@ -28,6 +28,14 @@ pub trait PublishQueueQueries {
     /// ledger is not in the queue.
     fn remove_publish(&self, ledger_seq: u32) -> Result<(), DbError>;
 
+    /// Removes all queued checkpoint ledgers above the given LCL.
+    ///
+    /// This is called during startup recovery (restore_checkpoint) to clean
+    /// up stale publish queue entries that refer to ledgers beyond what has
+    /// been committed. Mirrors stellar-core's `restoreCheckpoint()` which
+    /// iterates `.checkpoint.dirty` files and removes entries above LCL.
+    fn remove_above_lcl(&self, lcl: u32) -> Result<u64, DbError>;
+
     /// Loads queued checkpoint ledgers in ascending order.
     ///
     /// Optionally limited to a maximum count.
@@ -49,6 +57,14 @@ impl PublishQueueQueries for Connection {
             params![ledger_seq as i64],
         )?;
         Ok(())
+    }
+
+    fn remove_above_lcl(&self, lcl: u32) -> Result<u64, DbError> {
+        let count = self.execute(
+            "DELETE FROM publishqueue WHERE ledgerseq > ?1",
+            params![lcl as i64],
+        )?;
+        Ok(count as u64)
     }
 
     fn load_publish_queue(&self, limit: Option<usize>) -> Result<Vec<u32>, DbError> {
