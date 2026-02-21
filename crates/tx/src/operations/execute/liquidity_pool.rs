@@ -12,7 +12,8 @@ use stellar_xdr::curr::{
 
 use super::{
     account_liabilities, add_account_balance, add_trustline_balance,
-    is_authorized_to_maintain_liabilities, is_trustline_authorized, trustline_liabilities,
+    is_authorized_to_maintain_liabilities, is_trustline_authorized,
+    trustline_balance_after_liabilities, trustline_liabilities,
 };
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
@@ -132,14 +133,14 @@ pub fn execute_liquidity_pool_deposit(
         Asset::Native => available_native_balance(source, state, context)?,
         _ if is_issuer(source, &asset_a) => i64::MAX, // Issuers have unlimited capacity
         _ => trustline_a
-            .map(|tl| tl.balance.saturating_sub(trustline_liabilities(tl).selling))
+            .map(|tl| trustline_balance_after_liabilities(tl))
             .unwrap_or(0),
     };
     let available_b = match &asset_b {
         Asset::Native => available_native_balance(source, state, context)?,
         _ if is_issuer(source, &asset_b) => i64::MAX, // Issuers have unlimited capacity
         _ => trustline_b
-            .map(|tl| tl.balance.saturating_sub(trustline_liabilities(tl).selling))
+            .map(|tl| trustline_balance_after_liabilities(tl))
             .unwrap_or(0),
     };
     let available_pool_share_limit = pool_share_trustline

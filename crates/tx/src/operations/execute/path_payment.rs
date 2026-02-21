@@ -6,8 +6,8 @@
 use sha2::{Digest, Sha256};
 use stellar_xdr::curr::{
     AccountId, Asset, ClaimAtom, ClaimLiquidityAtom, ClaimOfferAtom, Hash, LedgerKey,
-    LedgerKeyOffer, Liabilities, Limits, LiquidityPoolEntryBody, LiquidityPoolParameters,
-    OperationResult, OperationResultTr, PathPaymentStrictReceiveOp, PathPaymentStrictReceiveResult,
+    LedgerKeyOffer, Limits, LiquidityPoolEntryBody, LiquidityPoolParameters, OperationResult,
+    OperationResultTr, PathPaymentStrictReceiveOp, PathPaymentStrictReceiveResult,
     PathPaymentStrictReceiveResultCode, PathPaymentStrictReceiveResultSuccess,
     PathPaymentStrictSendOp, PathPaymentStrictSendResult, PathPaymentStrictSendResultCode,
     PathPaymentStrictSendResultSuccess, PoolId, Price, SimplePaymentResult, WriteXdr,
@@ -20,9 +20,8 @@ use super::offer_exchange::{
 };
 use super::{
     account_liabilities, add_account_balance, add_trustline_balance, apply_balance_delta,
-    ensure_account_liabilities, ensure_trustline_liabilities,
-    is_authorized_to_maintain_liabilities, is_trustline_authorized, issuer_for_asset,
-    map_exchange_error, trustline_liabilities,
+    apply_liabilities_delta, can_buy_at_most, is_authorized_to_maintain_liabilities,
+    is_trustline_authorized, issuer_for_asset, map_exchange_error, trustline_liabilities,
 };
 use crate::frame::muxed_to_account_id;
 use crate::state::LedgerStateManager;
@@ -848,29 +847,6 @@ fn can_sell_at_most(
     Ok(available.max(0))
 }
 
-fn can_buy_at_most(source: &AccountId, asset: &Asset, state: &LedgerStateManager) -> i64 {
-    if matches!(asset, Asset::Native) {
-        let Some(account) = state.get_account(source) else {
-            return 0;
-        };
-        let available = i64::MAX - account.balance - account_liabilities(account).buying;
-        return available.max(0);
-    }
-
-    if issuer_for_asset(asset) == Some(source) {
-        return i64::MAX;
-    }
-
-    let Some(trustline) = state.get_trustline(source, asset) else {
-        return 0;
-    };
-    if !is_authorized_to_maintain_liabilities(trustline.flags) {
-        return 0;
-    }
-    let available = trustline.limit - trustline.balance - trustline_liabilities(trustline).buying;
-    available.max(0)
-}
-
 fn offer_liabilities_sell(amount: i64, price: &Price) -> Result<(i64, i64)> {
     let res = exchange_v10_without_price_error_thresholds(
         price.clone(),
@@ -882,66 +858,6 @@ fn offer_liabilities_sell(amount: i64, price: &Price) -> Result<(i64, i64)> {
     )
     .map_err(map_exchange_error)?;
     Ok((res.num_wheat_received, res.num_sheep_send))
-}
-
-fn apply_liabilities_delta(
-    account_id: &AccountId,
-    selling: &Asset,
-    buying: &Asset,
-    selling_delta: i64,
-    buying_delta: i64,
-    state: &mut LedgerStateManager,
-) -> Result<()> {
-    if matches!(selling, Asset::Native) {
-        let Some(account) = state.get_account_mut(account_id) else {
-            return Err(TxError::Internal("missing account for liabilities".into()));
-        };
-        let liab = ensure_account_liabilities(account);
-        update_liabilities(liab, 0, selling_delta)?;
-    } else if issuer_for_asset(selling) != Some(account_id) {
-        let Some(trustline) = state.get_trustline_mut(account_id, selling) else {
-            return Err(TxError::Internal(
-                "missing trustline for liabilities".into(),
-            ));
-        };
-        let liab = ensure_trustline_liabilities(trustline);
-        update_liabilities(liab, 0, selling_delta)?;
-    }
-
-    if matches!(buying, Asset::Native) {
-        let Some(account) = state.get_account_mut(account_id) else {
-            return Err(TxError::Internal("missing account for liabilities".into()));
-        };
-        let liab = ensure_account_liabilities(account);
-        update_liabilities(liab, buying_delta, 0)?;
-    } else if issuer_for_asset(buying) != Some(account_id) {
-        let Some(trustline) = state.get_trustline_mut(account_id, buying) else {
-            return Err(TxError::Internal(
-                "missing trustline for liabilities".into(),
-            ));
-        };
-        let liab = ensure_trustline_liabilities(trustline);
-        update_liabilities(liab, buying_delta, 0)?;
-    }
-
-    Ok(())
-}
-
-fn update_liabilities(liab: &mut Liabilities, buying_delta: i64, selling_delta: i64) -> Result<()> {
-    let new_buying = liab
-        .buying
-        .checked_add(buying_delta)
-        .ok_or_else(|| TxError::Internal("liabilities overflow".into()))?;
-    let new_selling = liab
-        .selling
-        .checked_add(selling_delta)
-        .ok_or_else(|| TxError::Internal("liabilities overflow".into()))?;
-    if new_buying < 0 || new_selling < 0 {
-        return Err(TxError::Internal("liabilities underflow".into()));
-    }
-    liab.buying = new_buying;
-    liab.selling = new_selling;
-    Ok(())
 }
 
 struct PoolExchange {

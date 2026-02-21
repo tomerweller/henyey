@@ -6,7 +6,7 @@ use stellar_xdr::curr::{
     SequenceNumber, String32, Thresholds,
 };
 
-use super::account_liabilities;
+use super::{account_balance_after_liabilities, account_liabilities};
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
@@ -43,9 +43,7 @@ pub fn execute_create_account(
             num_sponsoring + account_multiplier,
             num_sponsored,
         )?;
-        let available = sponsor_account
-            .balance
-            .saturating_sub(account_liabilities(sponsor_account).selling);
+        let available = account_balance_after_liabilities(sponsor_account);
         if available < sponsor_min_balance {
             return Ok(make_result(CreateAccountResultCode::LowReserve));
         }

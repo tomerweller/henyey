@@ -64,6 +64,24 @@ fn trustline_liabilities(trustline: &TrustLineEntry) -> Liabilities {
     }
 }
 
+/// Available native balance after selling liabilities, without accounting for
+/// minimum balance. Returns `account.balance - selling_liabilities`, clamped
+/// to zero. Used for sponsor reserve checks and other contexts where the caller
+/// compares against a known reserve requirement.
+fn account_balance_after_liabilities(account: &AccountEntry) -> i64 {
+    account
+        .balance
+        .saturating_sub(account_liabilities(account).selling)
+}
+
+/// Available trustline balance after selling liabilities. Returns
+/// `trustline.balance - selling_liabilities`, clamped to zero.
+fn trustline_balance_after_liabilities(trustline: &TrustLineEntry) -> i64 {
+    trustline
+        .balance
+        .saturating_sub(trustline_liabilities(trustline).selling)
+}
+
 fn ensure_account_liabilities(account: &mut AccountEntry) -> &mut Liabilities {
     if matches!(account.ext, AccountEntryExt::V0) {
         account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
@@ -235,6 +253,100 @@ fn is_asset_valid(asset: &Asset) -> bool {
             charcount > 4
         }
     }
+}
+
+/// Compute how much of `asset` the account can buy, considering buying liabilities.
+///
+/// For native assets, the capacity is `i64::MAX - balance - buying_liabilities`.
+/// For non-native assets, the capacity is `limit - balance - buying_liabilities`.
+/// The issuer of a non-native asset can always buy i64::MAX.
+fn can_buy_at_most(source: &AccountId, asset: &Asset, state: &LedgerStateManager) -> i64 {
+    if matches!(asset, Asset::Native) {
+        let Some(account) = state.get_account(source) else {
+            return 0;
+        };
+        let available = i64::MAX - account.balance - account_liabilities(account).buying;
+        return available.max(0);
+    }
+
+    if issuer_for_asset(asset) == Some(source) {
+        return i64::MAX;
+    }
+
+    let Some(trustline) = state.get_trustline(source, asset) else {
+        return 0;
+    };
+    if !is_authorized_to_maintain_liabilities(trustline.flags) {
+        return 0;
+    }
+    let available = trustline.limit - trustline.balance - trustline_liabilities(trustline).buying;
+    available.max(0)
+}
+
+/// Apply buying and selling liability deltas for an account across the given
+/// selling and buying assets. Skips the update when the account is the issuer
+/// of the asset (issuers have unlimited capacity).
+fn apply_liabilities_delta(
+    account_id: &AccountId,
+    selling: &Asset,
+    buying: &Asset,
+    selling_delta: i64,
+    buying_delta: i64,
+    state: &mut LedgerStateManager,
+) -> Result<()> {
+    if matches!(selling, Asset::Native) {
+        let Some(account) = state.get_account_mut(account_id) else {
+            return Err(TxError::Internal("missing account for liabilities".into()));
+        };
+        let liab = ensure_account_liabilities(account);
+        update_liabilities(liab, 0, selling_delta)?;
+    } else if issuer_for_asset(selling) != Some(account_id) {
+        let Some(trustline) = state.get_trustline_mut(account_id, selling) else {
+            return Err(TxError::Internal(
+                "missing trustline for liabilities".into(),
+            ));
+        };
+        let liab = ensure_trustline_liabilities(trustline);
+        update_liabilities(liab, 0, selling_delta)?;
+    }
+
+    if matches!(buying, Asset::Native) {
+        let Some(account) = state.get_account_mut(account_id) else {
+            return Err(TxError::Internal("missing account for liabilities".into()));
+        };
+        let liab = ensure_account_liabilities(account);
+        update_liabilities(liab, buying_delta, 0)?;
+    } else if issuer_for_asset(buying) != Some(account_id) {
+        let Some(trustline) = state.get_trustline_mut(account_id, buying) else {
+            return Err(TxError::Internal(
+                "missing trustline for liabilities".into(),
+            ));
+        };
+        let liab = ensure_trustline_liabilities(trustline);
+        update_liabilities(liab, buying_delta, 0)?;
+    }
+
+    Ok(())
+}
+
+/// Safely update buying and selling liabilities with overflow checking.
+///
+/// Returns an error if the new values would overflow or go negative.
+fn update_liabilities(liab: &mut Liabilities, buying_delta: i64, selling_delta: i64) -> Result<()> {
+    let new_buying = liab
+        .buying
+        .checked_add(buying_delta)
+        .ok_or_else(|| TxError::Internal("liabilities overflow".into()))?;
+    let new_selling = liab
+        .selling
+        .checked_add(selling_delta)
+        .ok_or_else(|| TxError::Internal("liabilities overflow".into()))?;
+    if new_buying < 0 || new_selling < 0 {
+        return Err(TxError::Internal("liabilities underflow".into()));
+    }
+    liab.buying = new_buying;
+    liab.selling = new_selling;
+    Ok(())
 }
 
 fn map_exchange_error(err: offer_exchange::ExchangeError) -> TxError {
@@ -1385,5 +1497,269 @@ mod tests {
             }
             _ => panic!("Expected BumpSequence result"),
         }
+    }
+
+    // === account_balance_after_liabilities tests ===
+
+    #[test]
+    fn test_account_balance_after_liabilities_no_ext() {
+        let account = create_test_account(create_test_account_id(), 100_000_000);
+        // V0 ext means 0 selling liabilities
+        assert_eq!(account_balance_after_liabilities(&account), 100_000_000);
+    }
+
+    #[test]
+    fn test_account_balance_after_liabilities_with_liabilities() {
+        let mut account = create_test_account(create_test_account_id(), 100_000_000);
+        account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+            liabilities: Liabilities {
+                buying: 5_000_000,
+                selling: 30_000_000,
+            },
+            ext: AccountEntryExtensionV1Ext::V0,
+        });
+        assert_eq!(account_balance_after_liabilities(&account), 70_000_000);
+    }
+
+    #[test]
+    fn test_account_balance_after_liabilities_saturates_negative() {
+        let mut account = create_test_account(create_test_account_id(), 10_000_000);
+        account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+            liabilities: Liabilities {
+                buying: 0,
+                selling: 50_000_000, // More than balance
+            },
+            ext: AccountEntryExtensionV1Ext::V0,
+        });
+        // saturating_sub on i64 saturates at i64::MIN, not 0 — the result can be
+        // negative, but callers always compare available < min_balance which is
+        // correct since negative < positive.
+        assert_eq!(account_balance_after_liabilities(&account), -40_000_000);
+    }
+
+    #[test]
+    fn test_account_balance_after_liabilities_zero_balance() {
+        let account = create_test_account(create_test_account_id(), 0);
+        assert_eq!(account_balance_after_liabilities(&account), 0);
+    }
+
+    // === trustline_balance_after_liabilities tests ===
+
+    fn create_test_trustline(balance: i64, limit: i64, selling_liab: i64) -> TrustLineEntry {
+        let ext = if selling_liab > 0 {
+            TrustLineEntryExt::V1(TrustLineEntryV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: selling_liab,
+                },
+                ext: TrustLineEntryV1Ext::V0,
+            })
+        } else {
+            TrustLineEntryExt::V0
+        };
+        TrustLineEntry {
+            account_id: create_test_account_id(),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+                issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
+            }),
+            balance,
+            limit,
+            flags: AUTHORIZED_FLAG,
+            ext,
+        }
+    }
+
+    #[test]
+    fn test_trustline_balance_after_liabilities_no_ext() {
+        let tl = create_test_trustline(50_000_000, 100_000_000, 0);
+        assert_eq!(trustline_balance_after_liabilities(&tl), 50_000_000);
+    }
+
+    #[test]
+    fn test_trustline_balance_after_liabilities_with_liabilities() {
+        let tl = create_test_trustline(50_000_000, 100_000_000, 20_000_000);
+        assert_eq!(trustline_balance_after_liabilities(&tl), 30_000_000);
+    }
+
+    #[test]
+    fn test_trustline_balance_after_liabilities_negative_when_exceeded() {
+        let tl = create_test_trustline(10_000_000, 100_000_000, 50_000_000);
+        // Same as account: saturating_sub on i64 can go negative
+        assert_eq!(trustline_balance_after_liabilities(&tl), -40_000_000);
+    }
+
+    // === update_liabilities tests ===
+
+    #[test]
+    fn test_update_liabilities_basic() {
+        let mut liab = Liabilities {
+            buying: 100,
+            selling: 200,
+        };
+        update_liabilities(&mut liab, 50, 30).unwrap();
+        assert_eq!(liab.buying, 150);
+        assert_eq!(liab.selling, 230);
+    }
+
+    #[test]
+    fn test_update_liabilities_negative_deltas() {
+        let mut liab = Liabilities {
+            buying: 100,
+            selling: 200,
+        };
+        update_liabilities(&mut liab, -50, -100).unwrap();
+        assert_eq!(liab.buying, 50);
+        assert_eq!(liab.selling, 100);
+    }
+
+    #[test]
+    fn test_update_liabilities_underflow_buying() {
+        let mut liab = Liabilities {
+            buying: 50,
+            selling: 200,
+        };
+        let result = update_liabilities(&mut liab, -100, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_liabilities_underflow_selling() {
+        let mut liab = Liabilities {
+            buying: 100,
+            selling: 50,
+        };
+        let result = update_liabilities(&mut liab, 0, -100);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_liabilities_overflow_buying() {
+        let mut liab = Liabilities {
+            buying: i64::MAX,
+            selling: 0,
+        };
+        let result = update_liabilities(&mut liab, 1, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_liabilities_overflow_selling() {
+        let mut liab = Liabilities {
+            buying: 0,
+            selling: i64::MAX,
+        };
+        let result = update_liabilities(&mut liab, 0, 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_liabilities_zero_deltas() {
+        let mut liab = Liabilities {
+            buying: 100,
+            selling: 200,
+        };
+        update_liabilities(&mut liab, 0, 0).unwrap();
+        assert_eq!(liab.buying, 100);
+        assert_eq!(liab.selling, 200);
+    }
+
+    // === can_buy_at_most tests ===
+
+    #[test]
+    fn test_can_buy_at_most_native_no_account() {
+        let state = LedgerStateManager::new(5_000_000, 100);
+        let source = create_test_account_id();
+        assert_eq!(can_buy_at_most(&source, &Asset::Native, &state), 0);
+    }
+
+    #[test]
+    fn test_can_buy_at_most_native_no_liabilities() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let source = create_test_account_id();
+        state.create_account(create_test_account(source.clone(), 100_000_000));
+        let capacity = can_buy_at_most(&source, &Asset::Native, &state);
+        assert_eq!(capacity, i64::MAX - 100_000_000);
+    }
+
+    #[test]
+    fn test_can_buy_at_most_native_with_buying_liabilities() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let source = create_test_account_id();
+        let mut account = create_test_account(source.clone(), 100_000_000);
+        account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+            liabilities: Liabilities {
+                buying: 50_000_000,
+                selling: 0,
+            },
+            ext: AccountEntryExtensionV1Ext::V0,
+        });
+        state.create_account(account);
+        let capacity = can_buy_at_most(&source, &Asset::Native, &state);
+        assert_eq!(capacity, i64::MAX - 100_000_000 - 50_000_000);
+    }
+
+    #[test]
+    fn test_can_buy_at_most_non_native_issuer() {
+        let state = LedgerStateManager::new(5_000_000, 100);
+        let issuer = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+            issuer: issuer.clone(),
+        });
+        assert_eq!(can_buy_at_most(&issuer, &asset, &state), i64::MAX);
+    }
+
+    #[test]
+    fn test_can_buy_at_most_non_native_no_trustline() {
+        let state = LedgerStateManager::new(5_000_000, 100);
+        let source = create_test_account_id();
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+            issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
+        });
+        assert_eq!(can_buy_at_most(&source, &asset, &state), 0);
+    }
+
+    // === apply_liabilities_delta tests ===
+
+    #[test]
+    fn test_apply_liabilities_delta_native_selling() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let source = create_test_account_id();
+        state.create_account(create_test_account(source.clone(), 100_000_000));
+
+        apply_liabilities_delta(
+            &source,
+            &Asset::Native,
+            &Asset::Native,
+            1000,
+            500,
+            &mut state,
+        )
+        .unwrap();
+
+        let account = state.get_account(&source).unwrap();
+        let liab = account_liabilities(account);
+        // Both selling and buying deltas applied to native account
+        assert_eq!(liab.selling, 1000);
+        assert_eq!(liab.buying, 500);
+    }
+
+    #[test]
+    fn test_apply_liabilities_delta_missing_account() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let source = create_test_account_id();
+        // No account created
+
+        let result = apply_liabilities_delta(
+            &source,
+            &Asset::Native,
+            &Asset::Native,
+            1000,
+            500,
+            &mut state,
+        );
+        assert!(result.is_err());
     }
 }

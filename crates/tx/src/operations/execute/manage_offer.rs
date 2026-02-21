@@ -7,10 +7,9 @@ use std::cmp::Ordering;
 
 use stellar_xdr::curr::{
     AccountId, Asset, ClaimAtom, ClaimOfferAtom, CreatePassiveSellOfferOp, LedgerKey,
-    LedgerKeyOffer, Liabilities, ManageBuyOfferOp, ManageOfferSuccessResult,
-    ManageOfferSuccessResultOffer, ManageSellOfferOp, ManageSellOfferResult,
-    ManageSellOfferResultCode, OfferEntry, OfferEntryExt, OfferEntryFlags, OperationResult,
-    OperationResultTr, Price,
+    LedgerKeyOffer, ManageBuyOfferOp, ManageOfferSuccessResult, ManageOfferSuccessResultOffer,
+    ManageSellOfferOp, ManageSellOfferResult, ManageSellOfferResultCode, OfferEntry, OfferEntryExt,
+    OfferEntryFlags, OperationResult, OperationResultTr, Price,
 };
 
 use super::offer_exchange::{
@@ -18,9 +17,10 @@ use super::offer_exchange::{
     ConversionParams, RoundingType,
 };
 use super::{
-    account_liabilities, apply_balance_delta, ensure_account_liabilities,
-    ensure_trustline_liabilities, is_authorized_to_maintain_liabilities, is_trustline_authorized,
-    issuer_for_asset, map_exchange_error, trustline_liabilities, ACCOUNT_SUBENTRY_LIMIT,
+    account_balance_after_liabilities, account_liabilities, apply_balance_delta,
+    apply_liabilities_delta, can_buy_at_most, is_authorized_to_maintain_liabilities,
+    is_trustline_authorized, issuer_for_asset, map_exchange_error, trustline_liabilities,
+    ACCOUNT_SUBENTRY_LIMIT,
 };
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
@@ -207,9 +207,7 @@ fn execute_manage_offer(
                 1,
                 0,
             )?;
-            let available = sponsor_account
-                .balance
-                .saturating_sub(account_liabilities(sponsor_account).selling);
+            let available = account_balance_after_liabilities(sponsor_account);
             if available < min_balance {
                 return Ok(make_sell_offer_result(
                     ManageSellOfferResultCode::LowReserve,
@@ -219,9 +217,7 @@ fn execute_manage_offer(
         } else if let Some(account) = state.get_account(source) {
             let min_balance =
                 state.minimum_balance_for_account(account, context.protocol_version, 1)?;
-            let available = account
-                .balance
-                .saturating_sub(account_liabilities(account).selling);
+            let available = account_balance_after_liabilities(account);
             if available < min_balance {
                 return Ok(make_sell_offer_result(
                     ManageSellOfferResultCode::LowReserve,
@@ -801,29 +797,6 @@ fn can_sell_at_most(
     Ok(available.max(0))
 }
 
-fn can_buy_at_most(source: &AccountId, asset: &Asset, state: &LedgerStateManager) -> i64 {
-    if matches!(asset, Asset::Native) {
-        let Some(account) = state.get_account(source) else {
-            return 0;
-        };
-        let available = i64::MAX - account.balance - account_liabilities(account).buying;
-        return available.max(0);
-    }
-
-    if issuer_for_asset(asset) == Some(source) {
-        return i64::MAX;
-    }
-
-    let Some(trustline) = state.get_trustline(source, asset) else {
-        return 0;
-    };
-    if !is_authorized_to_maintain_liabilities(trustline.flags) {
-        return 0;
-    }
-    let available = trustline.limit - trustline.balance - trustline_liabilities(trustline).buying;
-    available.max(0)
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConvertResult {
     Ok,
@@ -1043,55 +1016,6 @@ fn compare_price(lhs: &Price, rhs: &Price) -> Ordering {
     let lhs_value = i128::from(lhs.n) * i128::from(rhs.d);
     let rhs_value = i128::from(rhs.n) * i128::from(lhs.d);
     lhs_value.cmp(&rhs_value)
-}
-
-fn apply_liabilities_delta(
-    source: &AccountId,
-    selling: &Asset,
-    buying: &Asset,
-    selling_delta: i64,
-    buying_delta: i64,
-    state: &mut LedgerStateManager,
-) -> Result<()> {
-    if matches!(selling, Asset::Native) {
-        let account = state
-            .get_account_mut(source)
-            .ok_or_else(|| TxError::Internal("missing account".into()))?;
-        let liab = ensure_account_liabilities(account);
-        update_liabilities(liab, 0, selling_delta)?;
-    } else if issuer_for_asset(selling) != Some(source) {
-        let trustline = state
-            .get_trustline_mut(source, selling)
-            .ok_or_else(|| TxError::Internal("missing trustline".into()))?;
-        let liab = ensure_trustline_liabilities(trustline);
-        update_liabilities(liab, 0, selling_delta)?;
-    }
-
-    if matches!(buying, Asset::Native) {
-        let account = state
-            .get_account_mut(source)
-            .ok_or_else(|| TxError::Internal("missing account".into()))?;
-        let liab = ensure_account_liabilities(account);
-        update_liabilities(liab, buying_delta, 0)?;
-    } else if issuer_for_asset(buying) != Some(source) {
-        let trustline = state
-            .get_trustline_mut(source, buying)
-            .ok_or_else(|| TxError::Internal("missing trustline".into()))?;
-        let liab = ensure_trustline_liabilities(trustline);
-        update_liabilities(liab, buying_delta, 0)?;
-    }
-    Ok(())
-}
-
-fn update_liabilities(liab: &mut Liabilities, buying_delta: i64, selling_delta: i64) -> Result<()> {
-    let buying = liab.buying + buying_delta;
-    let selling = liab.selling + selling_delta;
-    if buying < 0 || selling < 0 {
-        return Err(TxError::Internal("liabilities underflow".into()));
-    }
-    liab.buying = buying;
-    liab.selling = selling;
-    Ok(())
 }
 
 /// Create an OfferEntry for result.

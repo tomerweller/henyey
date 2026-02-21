@@ -10,7 +10,7 @@ use stellar_xdr::curr::{
     SignerKeyEd25519SignedPayload, SignerKeyType, SponsorshipDescriptor, MASK_ACCOUNT_FLAGS_V17,
 };
 
-use super::{account_liabilities, ACCOUNT_SUBENTRY_LIMIT};
+use super::{account_balance_after_liabilities, ACCOUNT_SUBENTRY_LIMIT};
 use crate::state::{ensure_account_ext_v2, LedgerStateManager};
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
@@ -139,9 +139,7 @@ pub fn execute_set_options(
             1,
             0,
         )?;
-        let available = sponsor_account
-            .balance
-            .saturating_sub(account_liabilities(sponsor_account).selling);
+        let available = account_balance_after_liabilities(sponsor_account);
         Some((sponsor_id, available, min_balance))
     } else {
         None
@@ -310,9 +308,7 @@ pub fn execute_set_options(
                     ));
                 }
                 let new_min_balance = effective_entries * base_reserve;
-                let available = source_account_mut
-                    .balance
-                    .saturating_sub(account_liabilities(source_account_mut).selling);
+                let available = account_balance_after_liabilities(source_account_mut);
                 if available < new_min_balance {
                     return Ok(make_result(SetOptionsResultCode::LowReserve));
                 }

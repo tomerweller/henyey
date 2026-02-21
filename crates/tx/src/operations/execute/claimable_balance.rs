@@ -16,8 +16,8 @@ use stellar_xdr::curr::{
 };
 
 use super::{
-    account_liabilities, add_account_balance, add_trustline_balance, is_trustline_authorized,
-    trustline_liabilities,
+    account_balance_after_liabilities, account_liabilities, add_account_balance,
+    add_trustline_balance, is_trustline_authorized, trustline_balance_after_liabilities,
 };
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
@@ -143,8 +143,7 @@ pub fn execute_create_claimable_balance(
                         }
                         // stellar-core uses trustline.addBalance(header, -amount)
                         // which fails if newBalance < sellingLiabilities
-                        let available =
-                            tl.balance.saturating_sub(trustline_liabilities(tl).selling);
+                        let available = trustline_balance_after_liabilities(tl);
                         if available < op.amount {
                             return Ok(make_create_result(
                                 CreateClaimableBalanceResultCode::Underfunded,
@@ -194,9 +193,7 @@ pub fn execute_create_claimable_balance(
         sponsorship_multiplier,
         0,
     )?;
-    let available = sponsor_account
-        .balance
-        .saturating_sub(account_liabilities(sponsor_account).selling);
+    let available = account_balance_after_liabilities(sponsor_account);
     if available < sponsor_min_balance {
         return Ok(make_create_result(
             CreateClaimableBalanceResultCode::LowReserve,

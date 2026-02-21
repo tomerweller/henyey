@@ -8,7 +8,7 @@ use stellar_xdr::curr::{
     ManageDataResultCode, OperationResult, OperationResultTr,
 };
 
-use super::{account_liabilities, ACCOUNT_SUBENTRY_LIMIT};
+use super::{account_balance_after_liabilities, ACCOUNT_SUBENTRY_LIMIT};
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
@@ -117,9 +117,7 @@ pub fn execute_manage_data(
                         1,
                         0,
                     )?;
-                    let available = sponsor_account
-                        .balance
-                        .saturating_sub(account_liabilities(sponsor_account).selling);
+                    let available = account_balance_after_liabilities(sponsor_account);
                     if available < new_min_balance {
                         return Ok(make_result(ManageDataResultCode::LowReserve));
                     }
@@ -129,9 +127,7 @@ pub fn execute_manage_data(
                         context.protocol_version,
                         1,
                     )?;
-                    let available = source_account
-                        .balance
-                        .saturating_sub(account_liabilities(source_account).selling);
+                    let available = account_balance_after_liabilities(source_account);
                     if available < new_min_balance {
                         return Ok(make_result(ManageDataResultCode::LowReserve));
                     }

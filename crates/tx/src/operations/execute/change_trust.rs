@@ -9,8 +9,8 @@ use stellar_xdr::curr::{
 };
 
 use super::{
-    account_liabilities, is_authorized_to_maintain_liabilities, trustline_liabilities,
-    ACCOUNT_SUBENTRY_LIMIT, AUTHORIZED_FLAG,
+    account_balance_after_liabilities, is_authorized_to_maintain_liabilities,
+    trustline_liabilities, ACCOUNT_SUBENTRY_LIMIT, AUTHORIZED_FLAG,
 };
 use crate::apply::account_id_to_key;
 use crate::state::LedgerStateManager;
@@ -176,9 +176,7 @@ pub fn execute_change_trust(
                 multiplier,
                 0,
             )?;
-            let available = sponsor_account
-                .balance
-                .saturating_sub(account_liabilities(sponsor_account).selling);
+            let available = account_balance_after_liabilities(sponsor_account);
             if available < new_min_balance {
                 return Ok(make_result(ChangeTrustResultCode::LowReserve));
             }
@@ -191,9 +189,7 @@ pub fn execute_change_trust(
                 context.protocol_version,
                 multiplier,
             )?;
-            let available = source_account
-                .balance
-                .saturating_sub(account_liabilities(source_account).selling);
+            let available = account_balance_after_liabilities(source_account);
             if available < new_min_balance {
                 return Ok(make_result(ChangeTrustResultCode::LowReserve));
             }
