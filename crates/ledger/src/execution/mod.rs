@@ -2296,6 +2296,22 @@ impl TransactionExecutor {
                 },
             ));
 
+        // Set up pool-share-trustlines-by-account loader (defense in depth).
+        // This mirrors the offers loader pattern: `find_pool_share_trustlines_for_asset`
+        // calls `ensure_pool_share_trustlines_loaded` which uses this loader to
+        // discover pool IDs from the secondary index.  Even if the pre-loading in
+        // `load_operation_accounts` is bypassed (e.g. by a future code path), the
+        // state manager will load pool share TLs on demand before iterating.
+        let snapshot_for_pool_shares = snapshot.clone();
+        self.state
+            .set_pool_share_tls_by_account_loader(std::sync::Arc::new(
+                move |account_id| {
+                    snapshot_for_pool_shares
+                        .pool_share_tls_by_account(account_id)
+                        .map_err(|e| henyey_tx::TxError::Internal(e.to_string()))
+                },
+            ));
+
         // Execute operations
         let mut operation_results = Vec::new();
         let num_ops = frame.operations().len();

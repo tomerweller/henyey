@@ -26,6 +26,11 @@ type BatchEntryLoaderFn = dyn Fn(&[LedgerKey]) -> Result<Vec<LedgerEntry>> + Sen
 /// to mirror stellar-core `loadOffersByAccountAndAsset` which queries the SQL database.
 type OffersByAccountAssetLoaderFn =
     dyn Fn(&AccountId, &Asset) -> Result<Vec<LedgerEntry>> + Send + Sync;
+/// Callback type for loading pool share trustline pool IDs by account from the
+/// secondary index.  Used by `find_pool_share_trustlines_for_asset` to discover
+/// pool share trustlines that may only exist in the bucket list (not yet in memory).
+/// Mirrors stellar-core `loadPoolShareTrustLinesByAccountAndAsset` SQL query.
+type PoolShareTlsByAccountLoaderFn = dyn Fn(&AccountId) -> Result<Vec<PoolId>> + Send + Sync;
 
 /// Key for trustline entries: (account_id bytes, asset key).
 pub type TrustlineKey = ([u8; 32], AssetKey);
@@ -434,6 +439,13 @@ pub struct LedgerStateManager {
     /// only contain offers that happened to be loaded during prior TX execution,
     /// causing non-deterministic offer removal in `SetTrustLineFlags` / `AllowTrust`.
     offers_by_account_asset_loader: Option<Arc<OffersByAccountAssetLoaderFn>>,
+    /// Optional callback to load pool share trustline pool IDs for a given account
+    /// from the secondary index.  Mirrors stellar-core
+    /// `loadPoolShareTrustLinesByAccountAndAsset` which queries SQL for all pool
+    /// share trustlines owned by an account.  Without this loader,
+    /// `find_pool_share_trustlines_for_asset` would only find pool shares already
+    /// in memory, missing those only in the bucket list (VE-02).
+    pool_share_tls_by_account_loader: Option<Arc<PoolShareTlsByAccountLoaderFn>>,
     /// Per-source-account maximum sequence number across all transactions in the
     /// current tx set.  Populated by `run_transactions_on_executor` when any
     /// transaction contains an AccountMerge operation.  `MergeOpFrame::isSeqnumTooFar`
@@ -520,6 +532,7 @@ impl LedgerStateManager {
             entry_loader: None,
             batch_entry_loader: None,
             offers_by_account_asset_loader: None,
+            pool_share_tls_by_account_loader: None,
             max_seq_num_to_apply: HashMap::new(),
         }
     }
@@ -701,6 +714,19 @@ impl LedgerStateManager {
         loader: Arc<OffersByAccountAssetLoaderFn>,
     ) {
         self.offers_by_account_asset_loader = Some(loader);
+    }
+
+    /// Set the loader that returns pool IDs for pool share trustlines owned by an account.
+    ///
+    /// This mirrors stellar-core `loadPoolShareTrustLinesByAccountAndAsset` and is used
+    /// by `find_pool_share_trustlines_for_asset` (called during authorization revocation)
+    /// to ensure ALL matching pool share trustlines are found, not just those that
+    /// happened to be loaded into memory during prior TX execution.
+    pub fn set_pool_share_tls_by_account_loader(
+        &mut self,
+        loader: Arc<PoolShareTlsByAccountLoaderFn>,
+    ) {
+        self.pool_share_tls_by_account_loader = Some(loader);
     }
 
     /// Batch-load all entries needed to cross an offer (seller account + trustlines).
@@ -904,6 +930,7 @@ impl LedgerStateManager {
         }
         self.entry_loader = None;
         self.offers_by_account_asset_loader = None;
+        self.pool_share_tls_by_account_loader = None;
 
         // Clear all transaction-level state
         self.op_entry_snapshots.clear();
@@ -4269,7 +4296,9 @@ mod tests {
 
         let modified_val: DataValue = vec![2u8].try_into().unwrap();
         assert_eq!(
-            manager.get_data(&account_id, name).map(|e| e.data_value.clone()),
+            manager
+                .get_data(&account_id, name)
+                .map(|e| e.data_value.clone()),
             Some(modified_val),
             "Entry should be modified before rollback"
         );
@@ -4278,7 +4307,9 @@ mod tests {
 
         let original_val: DataValue = vec![1u8].try_into().unwrap();
         assert_eq!(
-            manager.get_data(&account_id, name).map(|e| e.data_value.clone()),
+            manager
+                .get_data(&account_id, name)
+                .map(|e| e.data_value.clone()),
             Some(original_val),
             "Data entry must be restored to original after rollback_to_savepoint"
         );

@@ -681,11 +681,25 @@ fn redeem_into_claimable_balance(
 }
 
 /// Find pool share trustlines for an account that reference a given asset.
+///
+/// Calls `ensure_pool_share_trustlines_loaded` first to load any pool share
+/// trustlines from the bucket list secondary index that aren't yet in memory.
+/// This prevents the VE-02 bug where pool share TLs only on disk were silently
+/// missed.
 fn find_pool_share_trustlines_for_asset(
-    state: &LedgerStateManager,
+    state: &mut LedgerStateManager,
     account_id: &AccountId,
     asset: &Asset,
 ) -> Vec<(PoolId, TrustLineAsset)> {
+    // Load all pool share trustlines and their liquidity pools from the
+    // authoritative secondary index so the in-memory state is complete.
+    if let Err(e) = state.ensure_pool_share_trustlines_loaded(account_id) {
+        tracing::warn!(
+            error = %e,
+            "find_pool_share_trustlines_for_asset: failed to load from index"
+        );
+    }
+
     let mut result = Vec::new();
 
     let account_bytes = crate::state::account_id_to_bytes(account_id);

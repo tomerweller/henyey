@@ -606,8 +606,79 @@ impl LedgerStateManager {
     }
 
     /// Iterate over all trustlines as (key, entry) pairs.
-    pub fn trustlines_iter(&self) -> impl Iterator<Item = (&TrustlineKey, &TrustLineEntry)> {
+    ///
+    /// WARNING: This only iterates over trustlines currently loaded in memory.
+    /// For pool share trustline discovery, use `ensure_pool_share_trustlines_loaded`
+    /// first to guarantee completeness.
+    pub(crate) fn trustlines_iter(&self) -> impl Iterator<Item = (&TrustlineKey, &TrustLineEntry)> {
         self.trustlines.iter()
+    }
+
+    /// Ensure all pool share trustlines for an account are loaded into memory.
+    ///
+    /// Uses the `pool_share_tls_by_account_loader` to discover pool IDs from the
+    /// secondary index, then loads the pool share trustlines and their associated
+    /// liquidity pools via the `entry_loader`.  This mirrors the defense-in-depth
+    /// pattern used by `remove_offers_by_account_and_asset`, which loads all
+    /// matching offers from the authoritative store before iterating.
+    ///
+    /// After this call, `trustlines_iter()` is guaranteed to contain all pool share
+    /// trustlines for the account (not just those loaded during prior TX execution).
+    pub fn ensure_pool_share_trustlines_loaded(&mut self, account_id: &AccountId) -> Result<()> {
+        // Query the secondary index for pool IDs.
+        let pool_ids = if let Some(loader) = self.pool_share_tls_by_account_loader.take() {
+            let result = loader(account_id);
+            self.pool_share_tls_by_account_loader = Some(loader);
+            result?
+        } else {
+            return Ok(());
+        };
+
+        if pool_ids.is_empty() {
+            return Ok(());
+        }
+
+        let account_bytes = account_id_to_bytes(account_id);
+
+        // Load each pool share trustline and its liquidity pool if not already in memory.
+        for pool_id in &pool_ids {
+            let pool_share_asset_key = AssetKey::PoolShare(pool_id.0 .0);
+
+            // Load pool share trustline if not already tracked.
+            if !self
+                .trustlines
+                .contains_key(&(account_bytes, pool_share_asset_key))
+            {
+                let tl_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+                    account_id: account_id.clone(),
+                    asset: TrustLineAsset::PoolShare(pool_id.clone()),
+                });
+                if let Some(loader) = self.entry_loader.take() {
+                    let result = loader(&tl_key);
+                    self.entry_loader = Some(loader);
+                    if let Some(entry) = result? {
+                        self.load_entry(entry);
+                    }
+                }
+            }
+
+            // Load the liquidity pool if not already tracked.
+            let pool_id_bytes = pool_id.0 .0;
+            if !self.liquidity_pools.contains_key(&pool_id_bytes) {
+                let pool_key = LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
+                    liquidity_pool_id: pool_id.clone(),
+                });
+                if let Some(loader) = self.entry_loader.take() {
+                    let result = loader(&pool_key);
+                    self.entry_loader = Some(loader);
+                    if let Some(entry) = result? {
+                        self.load_entry(entry);
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Get a mutable reference to a trustline by trustline asset.
@@ -1030,7 +1101,12 @@ impl LedgerStateManager {
     }
 
     /// Iterate over all offers.
-    pub fn offers_iter(&self) -> impl Iterator<Item = &OfferEntry> {
+    ///
+    /// WARNING: This only iterates over offers currently loaded in memory.
+    /// Not currently used — offer lookups go through the indexed
+    /// `get_offers_by_account_and_asset` or `best_offer` methods instead.
+    #[allow(dead_code)]
+    fn offers_iter(&self) -> impl Iterator<Item = &OfferEntry> {
         self.offers.values()
     }
 
