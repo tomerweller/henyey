@@ -56,23 +56,29 @@ For each finding, classify it into exactly one category:
 11. **MAGIC NUMBERS** — hardcoded numeric or string literals that should be
     named constants.
 
+### Visibility
+12. **OVERLY BROAD VISIBILITY** — functions, methods, or types marked `pub` that
+    are only used within the current module or crate. Suggest narrowing to
+    `pub(crate)`, `pub(super)`, or private. Every `pub` item should be
+    justifiably public — if no external crate uses it, restrict its scope.
+
 ### Clippy & Types
-12. **CLIPPY SUPPRESSIONS** — any `#[allow(clippy::...)]` or `#[allow(dead_code)]`.
+13. **CLIPPY SUPPRESSIONS** — any `#[allow(clippy::...)]` or `#[allow(dead_code)]`.
     For each, determine whether the underlying issue can be fixed so the
     suppression can be removed. If the suppression is genuinely necessary
     (e.g., false positive, upstream requirement), note why.
-13. **TYPE COMPLEXITY** — types that are hard to read at a glance, especially
+14. **TYPE COMPLEXITY** — types that are hard to read at a glance, especially
     those marked `#[allow(clippy::type_complexity)]`. Suggest type aliases,
     wrapper structs, or simplified signatures.
 
 ### Documentation
-14. **STALE COMMENTS** — comments that no longer match the code they describe,
+15. **STALE COMMENTS** — comments that no longer match the code they describe,
     or that reference removed/renamed items. Fix or remove.
-15. **COMMENTED-OUT CODE** — dead code left as comments instead of being deleted.
+16. **COMMENTED-OUT CODE** — dead code left as comments instead of being deleted.
     Remove it (git preserves history).
-16. **TODO/FIXME/HACK** — unresolved markers. For each: still relevant? If yes,
+17. **TODO/FIXME/HACK** — unresolved markers. For each: still relevant? If yes,
     describe the fix. If no, remove the marker.
-17. **MISSING MODULE DOC** — .rs files over 100 lines with no top-level `//!` doc
+18. **MISSING MODULE DOC** — .rs files over 100 lines with no top-level `//!` doc
     comment explaining the module's purpose. Suggest a one-line summary.
 
 ## Ranking

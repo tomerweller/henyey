@@ -434,7 +434,7 @@ pub fn big_divide_resource(
 ) -> Result<Resource, crate::math::MathError> {
     let mut values = Vec::with_capacity(res.values.len());
     for &v in &res.values {
-        values.push(crate::math::big_divide_or_throw(v, b, c, rounding)?);
+        values.push(crate::math::big_divide(v, b, c, rounding)?);
     }
     Ok(Resource::new(values))
 }

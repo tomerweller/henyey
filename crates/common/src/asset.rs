@@ -7,17 +7,11 @@
 //! # Examples
 //!
 //! ```rust
-//! use henyey_common::asset::{is_ascii_alphanumeric, is_string_valid};
+//! use henyey_common::asset::is_string_valid;
 //!
 //! // Check if string is valid for Stellar
 //! assert!(is_string_valid("Hello World"));
 //! assert!(!is_string_valid("Hello\x00World")); // Contains control character
-//!
-//! // Check ASCII alphanumeric
-//! assert!(is_ascii_alphanumeric('A'));
-//! assert!(is_ascii_alphanumeric('z'));
-//! assert!(is_ascii_alphanumeric('5'));
-//! assert!(!is_ascii_alphanumeric(' '));
 //! ```
 
 use stellar_xdr::curr::{
@@ -34,28 +28,12 @@ pub const LIQUIDITY_POOL_FEE_V18: i32 = 30;
 // ASCII Utilities
 // ============================================================================
 
-/// Check if a character is ASCII alphanumeric (a-z, A-Z, 0-9).
-///
-/// Locale-independent check matching stellar-core `isAsciiAlphaNumeric`.
-#[inline]
-pub fn is_ascii_alphanumeric(c: char) -> bool {
-    c.is_ascii_alphanumeric()
-}
-
 /// Check if a character is a printable ASCII non-control character.
 ///
 /// Returns true for characters in the range 0x20-0x7E (space through tilde).
 #[inline]
 pub fn is_ascii_non_control(c: char) -> bool {
     matches!(c, ' '..='~')
-}
-
-/// Convert a character to ASCII lowercase.
-///
-/// Only converts A-Z; other characters are returned unchanged.
-#[inline]
-pub fn to_ascii_lower(c: char) -> char {
-    c.to_ascii_lowercase()
 }
 
 /// Check if a string contains only valid ASCII non-control characters.
@@ -75,23 +53,6 @@ pub fn to_ascii_lower(c: char) -> char {
 /// ```
 pub fn is_string_valid(s: &str) -> bool {
     s.chars().all(is_ascii_non_control)
-}
-
-/// Case-insensitive string comparison.
-///
-/// Compares two strings for equality, ignoring ASCII case differences.
-///
-/// # Examples
-///
-/// ```rust
-/// use henyey_common::asset::iequals;
-///
-/// assert!(iequals("Hello", "hello"));
-/// assert!(iequals("WORLD", "world"));
-/// assert!(!iequals("foo", "bar"));
-/// ```
-pub fn iequals(a: &str, b: &str) -> bool {
-    a.eq_ignore_ascii_case(b)
 }
 
 // ============================================================================
@@ -183,7 +144,7 @@ fn is_asset_code_valid(code: &[u8], min_chars: usize) -> bool {
         } else if zeros {
             // zeros can only be trailing
             return false;
-        } else if b > 0x7f || !is_ascii_alphanumeric(b as char) {
+        } else if b > 0x7f || !(b as char).is_ascii_alphanumeric() {
             return false;
         } else {
             char_count += 1;
@@ -254,25 +215,6 @@ pub fn is_change_trust_asset_valid(asset: &ChangeTrustAsset, ledger_version: u32
                 && cp.fee == LIQUIDITY_POOL_FEE_V18
         }
     }
-}
-
-/// Compare two assets for equality.
-///
-/// Two assets are equal if they have the same type, and for credit assets,
-/// the same issuer and asset code.
-///
-/// # Examples
-///
-/// ```rust
-/// use henyey_common::asset::compare_asset;
-/// use stellar_xdr::curr::Asset;
-///
-/// let native1 = Asset::Native;
-/// let native2 = Asset::Native;
-/// assert!(compare_asset(&native1, &native2));
-/// ```
-pub fn compare_asset(first: &Asset, second: &Asset) -> bool {
-    first == second
 }
 
 // ============================================================================
@@ -487,97 +429,6 @@ pub fn ledger_entry_key(entry: &LedgerEntry) -> LedgerKey {
 }
 
 // ============================================================================
-// Numeric Utilities
-// ============================================================================
-
-/// Round a value down to the largest multiple of m, where m must be a power of 2.
-///
-/// # Examples
-///
-/// ```rust
-/// use henyey_common::asset::round_down;
-///
-/// assert_eq!(round_down(100u64, 16), 96); // 96 is the largest multiple of 16 <= 100
-/// assert_eq!(round_down(64u64, 16), 64);  // 64 is already a multiple of 16
-/// assert_eq!(round_down(15u64, 16), 0);   // 0 is the largest multiple of 16 <= 15
-/// ```
-#[inline]
-pub fn round_down<T>(v: T, m: T) -> T
-where
-    T: std::ops::BitAnd<Output = T>
-        + std::ops::Not<Output = T>
-        + std::ops::Sub<Output = T>
-        + Copy
-        + From<u8>,
-{
-    v & !(m - T::from(1u8))
-}
-
-/// Convert an unsigned 32-bit integer to signed, checking for overflow.
-///
-/// # Errors
-///
-/// Returns `None` if the value is greater than `i32::MAX`.
-///
-/// # Examples
-///
-/// ```rust
-/// use henyey_common::asset::unsigned_to_signed_32;
-///
-/// assert_eq!(unsigned_to_signed_32(100), Some(100));
-/// assert_eq!(unsigned_to_signed_32(2_147_483_647), Some(2_147_483_647)); // i32::MAX
-/// assert_eq!(unsigned_to_signed_32(2_147_483_648), None); // i32::MAX + 1
-/// ```
-pub fn unsigned_to_signed_32(v: u32) -> Option<i32> {
-    i32::try_from(v).ok()
-}
-
-/// Convert an unsigned 64-bit integer to signed, checking for overflow.
-///
-/// # Errors
-///
-/// Returns `None` if the value is greater than `i64::MAX`.
-///
-/// # Examples
-///
-/// ```rust
-/// use henyey_common::asset::unsigned_to_signed_64;
-///
-/// assert_eq!(unsigned_to_signed_64(100), Some(100));
-/// assert_eq!(unsigned_to_signed_64(9_223_372_036_854_775_807), Some(9_223_372_036_854_775_807)); // i64::MAX
-/// assert_eq!(unsigned_to_signed_64(9_223_372_036_854_775_808), None); // i64::MAX + 1
-/// ```
-pub fn unsigned_to_signed_64(v: u64) -> Option<i64> {
-    i64::try_from(v).ok()
-}
-
-/// Format a byte size with appropriate units.
-///
-/// # Examples
-///
-/// ```rust
-/// use henyey_common::asset::format_size;
-///
-/// assert_eq!(format_size(512), "512.00B");
-/// assert_eq!(format_size(1536), "1.50KB");
-/// assert_eq!(format_size(1_572_864), "1.50MB");
-/// assert_eq!(format_size(1_610_612_736), "1.50GB");
-/// ```
-pub fn format_size(size: usize) -> String {
-    const SUFFIXES: [&str; 4] = ["B", "KB", "MB", "GB"];
-
-    let mut dsize = size as f64;
-    let mut i = 0;
-
-    while dsize >= 1024.0 && i < SUFFIXES.len() - 1 {
-        dsize /= 1024.0;
-        i += 1;
-    }
-
-    format!("{:.2}{}", dsize, SUFFIXES[i])
-}
-
-// ============================================================================
 // Price Comparison
 // ============================================================================
 
@@ -611,11 +462,6 @@ pub fn price_gt(a: &Price, b: &Price) -> bool {
     let l = (a.n as u128) * (b.d as u128);
     let r = (a.d as u128) * (b.n as u128);
     l > r
-}
-
-/// Compare two prices for equality.
-pub fn price_eq(a: &Price, b: &Price) -> bool {
-    a == b
 }
 
 // ============================================================================
@@ -679,19 +525,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_ascii_alphanumeric() {
-        assert!(is_ascii_alphanumeric('a'));
-        assert!(is_ascii_alphanumeric('z'));
-        assert!(is_ascii_alphanumeric('A'));
-        assert!(is_ascii_alphanumeric('Z'));
-        assert!(is_ascii_alphanumeric('0'));
-        assert!(is_ascii_alphanumeric('9'));
-        assert!(!is_ascii_alphanumeric(' '));
-        assert!(!is_ascii_alphanumeric('!'));
-        assert!(!is_ascii_alphanumeric('\n'));
-    }
-
-    #[test]
     fn test_is_ascii_non_control() {
         assert!(is_ascii_non_control(' '));
         assert!(is_ascii_non_control('~'));
@@ -702,14 +535,6 @@ mod tests {
     }
 
     #[test]
-    fn test_to_ascii_lower() {
-        assert_eq!(to_ascii_lower('A'), 'a');
-        assert_eq!(to_ascii_lower('Z'), 'z');
-        assert_eq!(to_ascii_lower('a'), 'a');
-        assert_eq!(to_ascii_lower('1'), '1');
-    }
-
-    #[test]
     fn test_is_string_valid() {
         assert!(is_string_valid("Hello World!"));
         assert!(is_string_valid("test@example.com"));
@@ -717,15 +542,6 @@ mod tests {
         assert!(!is_string_valid("\n"));
         assert!(!is_string_valid("\0"));
         assert!(!is_string_valid("hello\x00world"));
-    }
-
-    #[test]
-    fn test_iequals() {
-        assert!(iequals("Hello", "hello"));
-        assert!(iequals("HELLO", "hello"));
-        assert!(iequals("hello", "hello"));
-        assert!(!iequals("hello", "world"));
-        assert!(!iequals("hello", "helloworld"));
     }
 
     #[test]
@@ -779,21 +595,6 @@ mod tests {
     }
 
     #[test]
-    fn test_compare_asset() {
-        assert!(compare_asset(&Asset::Native, &Asset::Native));
-
-        let usd1 = make_asset4("USD", 1);
-        let usd2 = make_asset4("USD", 1);
-        let usd3 = make_asset4("USD", 2); // different issuer
-        let eur = make_asset4("EUR", 1);
-
-        assert!(compare_asset(&usd1, &usd2));
-        assert!(!compare_asset(&usd1, &usd3)); // different issuer
-        assert!(!compare_asset(&usd1, &eur)); // different code
-        assert!(!compare_asset(&Asset::Native, &usd1)); // different type
-    }
-
-    #[test]
     fn test_get_issuer() {
         assert!(get_issuer(&Asset::Native).is_err());
 
@@ -838,35 +639,6 @@ mod tests {
     }
 
     #[test]
-    fn test_round_down() {
-        assert_eq!(round_down(100u64, 16), 96);
-        assert_eq!(round_down(64u64, 16), 64);
-        assert_eq!(round_down(15u64, 16), 0);
-        assert_eq!(round_down(255u64, 256), 0);
-        assert_eq!(round_down(256u64, 256), 256);
-    }
-
-    #[test]
-    fn test_unsigned_to_signed() {
-        assert_eq!(unsigned_to_signed_32(100), Some(100));
-        assert_eq!(unsigned_to_signed_32(i32::MAX as u32), Some(i32::MAX));
-        assert_eq!(unsigned_to_signed_32(i32::MAX as u32 + 1), None);
-
-        assert_eq!(unsigned_to_signed_64(100), Some(100));
-        assert_eq!(unsigned_to_signed_64(i64::MAX as u64), Some(i64::MAX));
-        assert_eq!(unsigned_to_signed_64(i64::MAX as u64 + 1), None);
-    }
-
-    #[test]
-    fn test_format_size() {
-        assert_eq!(format_size(512), "512.00B");
-        assert_eq!(format_size(1024), "1.00KB");
-        assert_eq!(format_size(1536), "1.50KB");
-        assert_eq!(format_size(1048576), "1.00MB");
-        assert_eq!(format_size(1073741824), "1.00GB");
-    }
-
-    #[test]
     fn test_price_comparison() {
         let p1 = Price { n: 1, d: 2 }; // 0.5
         let p2 = Price { n: 2, d: 3 }; // 0.667
@@ -879,9 +651,6 @@ mod tests {
         assert!(price_ge(&p2, &p1));
         assert!(!price_ge(&p1, &p2));
         assert!(price_ge(&p1, &p3));
-
-        assert!(price_eq(&p1, &p3));
-        assert!(!price_eq(&p1, &p2));
     }
 
     #[test]

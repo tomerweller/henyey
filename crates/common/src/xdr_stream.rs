@@ -20,6 +20,50 @@ use std::path::Path;
 
 use stellar_xdr::curr::{Limits, ReadXdr, WriteXdr};
 
+/// Serialize a value to XDR and write it as a size-prefixed frame.
+///
+/// Returns the total number of bytes written (4-byte header + payload).
+///
+/// # Wire Format
+///
+/// ```text
+/// byte[0] = ((sz >> 24) & 0xFF) | 0x80   // continuation bit set
+/// byte[1] = (sz >> 16) & 0xFF
+/// byte[2] = (sz >> 8) & 0xFF
+/// byte[3] = sz & 0xFF
+/// byte[4..4+sz] = XDR payload
+/// ```
+///
+/// # Panics
+///
+/// Panics if the serialized XDR payload is >= 0x80000000 bytes (2 GiB),
+/// matching stellar-core's `releaseAssertOrThrow`.
+fn write_frame<W: Write>(writer: &mut W, value: &impl WriteXdr) -> io::Result<usize> {
+    let payload = value
+        .to_xdr(Limits::none())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    let sz = payload.len() as u32;
+    assert!(
+        sz < 0x8000_0000,
+        "XDR payload size {} exceeds maximum (0x80000000)",
+        sz
+    );
+
+    // Write 4-byte size header with continuation bit (bit 31) set
+    let header: [u8; 4] = [
+        ((sz >> 24) & 0xFF) as u8 | 0x80,
+        ((sz >> 16) & 0xFF) as u8,
+        ((sz >> 8) & 0xFF) as u8,
+        (sz & 0xFF) as u8,
+    ];
+
+    writer.write_all(&header)?;
+    writer.write_all(&payload)?;
+
+    Ok(4 + payload.len())
+}
+
 /// An output stream that writes XDR values with size-prefix framing.
 ///
 /// Each value is serialized to XDR, then written as a 4-byte big-endian
@@ -73,46 +117,10 @@ impl XdrOutputStream {
     /// Serialize a value to XDR and write it as a size-prefixed frame.
     ///
     /// Returns the total number of bytes written (4-byte header + payload).
-    ///
-    /// # Wire Format
-    ///
-    /// ```text
-    /// byte[0] = ((sz >> 24) & 0xFF) | 0x80   // continuation bit set
-    /// byte[1] = (sz >> 16) & 0xFF
-    /// byte[2] = (sz >> 8) & 0xFF
-    /// byte[3] = sz & 0xFF
-    /// byte[4..4+sz] = XDR payload
-    /// ```
-    ///
-    /// # Panics
-    ///
-    /// Panics if the serialized XDR payload is >= 0x80000000 bytes (2 GiB),
-    /// matching stellar-core's `releaseAssertOrThrow`.
     pub fn write_one<T: WriteXdr>(&mut self, value: &T) -> io::Result<usize> {
-        let payload = value
-            .to_xdr(stellar_xdr::curr::Limits::none())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        let sz = payload.len() as u32;
-        assert!(
-            sz < 0x8000_0000,
-            "XDR payload size {} exceeds maximum (0x80000000)",
-            sz
-        );
-
-        // Write 4-byte size header with continuation bit (bit 31) set
-        let header: [u8; 4] = [
-            ((sz >> 24) & 0xFF) as u8 | 0x80,
-            ((sz >> 16) & 0xFF) as u8,
-            ((sz >> 8) & 0xFF) as u8,
-            (sz & 0xFF) as u8,
-        ];
-
-        self.writer.write_all(&header)?;
-        self.writer.write_all(&payload)?;
+        let n = write_frame(&mut self.writer, value)?;
         self.writer.flush()?;
-
-        Ok(4 + payload.len())
+        Ok(n)
     }
 
     /// Flush the underlying writer.
@@ -158,27 +166,7 @@ impl DurableXdrOutputStream {
     ///
     /// Returns the total number of bytes written (4-byte header + payload).
     pub fn durable_write_one<T: WriteXdr>(&mut self, value: &T) -> io::Result<usize> {
-        let payload = value
-            .to_xdr(Limits::none())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        let sz = payload.len() as u32;
-        assert!(
-            sz < 0x8000_0000,
-            "XDR payload size {} exceeds maximum (0x80000000)",
-            sz
-        );
-
-        // Write 4-byte size header with continuation bit (bit 31) set
-        let header: [u8; 4] = [
-            ((sz >> 24) & 0xFF) as u8 | 0x80,
-            ((sz >> 16) & 0xFF) as u8,
-            ((sz >> 8) & 0xFF) as u8,
-            (sz & 0xFF) as u8,
-        ];
-
-        self.writer.write_all(&header)?;
-        self.writer.write_all(&payload)?;
+        let n = write_frame(&mut self.writer, value)?;
 
         // Flush the BufWriter to the OS
         self.writer.flush()?;
@@ -186,7 +174,7 @@ impl DurableXdrOutputStream {
         // Fsync to stable storage
         self.writer.get_ref().sync_all()?;
 
-        Ok(4 + payload.len())
+        Ok(n)
     }
 
     /// Close the stream, flushing and fsyncing.

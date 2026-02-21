@@ -6,10 +6,9 @@
 //!
 //! # Key Functions
 //!
-//! - [`big_divide`] / [`big_divide_or_throw`]: Calculate `A * B / C` using
+//! - [`big_divide`]: Calculate `A * B / C` using
 //!   128-bit intermediate precision to avoid overflow
 //! - [`saturating_multiply`]: Overflow-safe multiplication capped at `i64::MAX`
-//! - [`saturating_add`]: Overflow-safe addition capped at type maximum
 //! - [`big_square_root`]: Square root of `a * b` using 128-bit precision
 //!
 //! # Rounding
@@ -21,10 +20,10 @@
 //! # Example
 //!
 //! ```
-//! use henyey_common::math::{big_divide_or_throw, Rounding};
+//! use henyey_common::math::{big_divide, Rounding};
 //!
 //! // Calculate (large_a * large_b) / divisor without overflow
-//! let result = big_divide_or_throw(1_000_000_000, 1_000_000, 1000, Rounding::Down);
+//! let result = big_divide(1_000_000_000, 1_000_000, 1000, Rounding::Down);
 //! assert_eq!(result.unwrap(), 1_000_000_000_000);
 //! ```
 
@@ -152,28 +151,6 @@ pub fn big_divide_unsigned(a: u64, b: u64, c: u64, rounding: Rounding) -> Result
     Ok(result as u64)
 }
 
-/// Calculates `A * B / C`, throwing on overflow.
-///
-/// This is the throwing variant of [`big_divide`]. Use this when overflow
-/// should be treated as a programming error rather than a recoverable condition.
-///
-/// # Panics
-///
-/// Panics if inputs are invalid (negative A/B, non-positive C) or if the
-/// result overflows `i64`.
-///
-/// # Example
-///
-/// ```
-/// use henyey_common::math::{big_divide_or_throw, Rounding};
-///
-/// let result = big_divide_or_throw(1_000_000, 1_000_000, 1000, Rounding::Down);
-/// assert_eq!(result.unwrap(), 1_000_000_000);
-/// ```
-pub fn big_divide_or_throw(a: i64, b: i64, c: i64, rounding: Rounding) -> Result<i64, MathError> {
-    big_divide(a, b, c, rounding)
-}
-
 /// Divides a 128-bit value by a 64-bit divisor.
 ///
 /// Used when the numerator is already a 128-bit product.
@@ -286,48 +263,6 @@ pub fn saturating_multiply(a: i64, b: i64) -> i64 {
     }
 
     a * b
-}
-
-/// Saturating addition: returns `a + b`, capped at type maximum on overflow.
-///
-/// # Example
-///
-/// ```
-/// use henyey_common::math::saturating_add;
-///
-/// assert_eq!(saturating_add(100u64, 200u64), 300u64);
-/// assert_eq!(saturating_add(u64::MAX, 1u64), u64::MAX); // Saturates
-/// ```
-#[inline]
-pub fn saturating_add<T: SaturatingOps>(a: T, b: T) -> T {
-    a.saturating_add(b)
-}
-
-/// Trait extension for saturating arithmetic.
-pub trait SaturatingOps: Sized {
-    /// Saturating addition.
-    fn saturating_add(self, rhs: Self) -> Self;
-}
-
-impl SaturatingOps for u64 {
-    #[inline]
-    fn saturating_add(self, rhs: Self) -> Self {
-        u64::saturating_add(self, rhs)
-    }
-}
-
-impl SaturatingOps for u32 {
-    #[inline]
-    fn saturating_add(self, rhs: Self) -> Self {
-        u32::saturating_add(self, rhs)
-    }
-}
-
-impl SaturatingOps for i64 {
-    #[inline]
-    fn saturating_add(self, rhs: Self) -> Self {
-        i64::saturating_add(self, rhs)
-    }
 }
 
 /// Checks if a double can be safely converted to i64.
@@ -496,13 +431,6 @@ mod tests {
     #[should_panic]
     fn test_saturating_multiply_negative() {
         saturating_multiply(-1, 1);
-    }
-
-    #[test]
-    fn test_saturating_add() {
-        assert_eq!(saturating_add(100u64, 200u64), 300u64);
-        assert_eq!(saturating_add(u64::MAX, 1u64), u64::MAX);
-        assert_eq!(saturating_add(u64::MAX - 10, 20u64), u64::MAX);
     }
 
     #[test]
