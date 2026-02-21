@@ -83,12 +83,9 @@ const PEER_IP_RESOLVE_DELAY: Duration = Duration::from_secs(600);
 const PEER_IP_RESOLVE_RETRY_DELAY: Duration = Duration::from_secs(10);
 
 /// Result of a background DNS resolution of configured peers.
-#[allow(dead_code)]
 struct ResolvedPeers {
     /// Successfully resolved known peers (hostname → IP:port).
     known: Vec<PeerAddress>,
-    /// Successfully resolved preferred peers (hostname → IP:port).
-    preferred: Vec<PeerAddress>,
     /// True if any peer in either list failed to resolve.
     errors: bool,
 }
@@ -837,10 +834,9 @@ impl OverlayManager {
                 let pp = preferred_peers.clone();
                 Some(tokio::spawn(async move {
                     let (known, known_err) = resolve_peer_list(&kp).await;
-                    let (pref, pref_err) = resolve_peer_list(&pp).await;
+                    let (_pref, pref_err) = resolve_peer_list(&pp).await;
                     ResolvedPeers {
                         known,
-                        preferred: pref,
                         errors: known_err || pref_err,
                     }
                 }))
@@ -920,10 +916,9 @@ impl OverlayManager {
                     let pp = preferred_peers.clone();
                     dns_resolve_handle = Some(tokio::spawn(async move {
                         let (known, known_err) = resolve_peer_list(&kp).await;
-                        let (pref, pref_err) = resolve_peer_list(&pp).await;
+                        let (_pref, pref_err) = resolve_peer_list(&pp).await;
                         ResolvedPeers {
                             known,
-                            preferred: pref,
                             errors: known_err || pref_err,
                         }
                     }));
