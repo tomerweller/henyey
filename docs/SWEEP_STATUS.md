@@ -1,6 +1,6 @@
 # Verify-Execution Sweep Status
 
-> **Updated**: 2026-02-21 23:10
+> **Updated**: 2026-02-21 23:29
 > **Mainnet cache range**: L59501248–L59939046
 > **Supported protocol**: P24+ (L59501312 is first P24 ledger; L59501248–L59501311 are P23 and unverifiable)
 
