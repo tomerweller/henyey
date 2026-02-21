@@ -1,13 +1,15 @@
 # Verify-Execution Sweep Status
 
 > **Updated**: 2026-02-21 23:29
-> **Mainnet cache range**: L59501248–L59939046
+> **CDP data lake range**: L59501248–L61339818 (latest available as of 2026-02-21)
 > **Supported protocol**: P24+ (L59501312 is first P24 ledger; L59501248–L59501311 are P23 and unverifiable)
+> **P25 boundary**: TBD (to be identified during sweeps)
 
 ## Protocol boundary
 
 Protocol 24 activated at **L59501312** (exactly 64 ledgers after the cache start at L59501248).
 Ledgers L59501248–L59501311 (P23) cannot be verified by Henyey (min supported: P24).
+Protocol 25 boundary: TBD — to be identified during Sweep 4 of L59939047+.
 
 ## Verified ranges
 
@@ -25,6 +27,13 @@ Ledgers L59501248–L59501311 (P23) cannot be verified by Henyey (min supported:
 | L59863188–L59875307 | **CLEAN** | Sweep 3 restart 3 ran clean through this range |
 | L59875308–L59907177 | **CLEAN** | Sweep 3a completed — 31,870 ledgers, 0 mismatches |
 | L59907178–L59939046 | **CLEAN** | Sweep 3b completed — 31,869 ledgers, 0 mismatches |
+| L59939047–L60139046 | In progress (s4a, PID 3710662) | No errors found so far |
+| L60139047–L60339046 | In progress (s4b, PID 3710664) | No errors found so far |
+| L60339047–L60539046 | In progress (s4c, PID 3710665) | No errors found so far |
+| L60539047–L60739046 | Pending | Queued — starts when a slot opens |
+| L60739047–L60939046 | Pending | Queued — starts when a slot opens |
+| L60939047–L61139046 | Pending | Queued — starts when a slot opens |
+| L61139047–L61339818 | Pending | Queued — starts when a slot opens |
 
 ## VE-04 (confirmed fixed)
 
@@ -78,4 +87,10 @@ Ledgers L59501248–L59501311 (P23) cannot be verified by Henyey (min supported:
 
 ## Running sweeps
 
-None — all ranges complete.
+| Sweep | Range | PID | Started |
+|-------|-------|-----|---------|
+| s4a | L59939047–L60139046 | 3710662 | 2026-02-21 |
+| s4b | L60139047–L60339046 | 3710664 | 2026-02-21 |
+| s4c | L60339047–L60539046 | 3710665 | 2026-02-21 |
+
+Monitor daemon PID: 3711113 (checks every 10 min, auto-starts next chunks)
