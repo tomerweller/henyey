@@ -3600,7 +3600,13 @@ impl<'a> SignatureTracker<'a> {
             }
         }
 
-        total_weight >= needed_weight
+        // Mirror stellar-core's SignatureChecker::checkSignature(): only return
+        // true if at least one signer actually matched (total_weight > 0).
+        // stellar-core has no final "total >= needed" return; it falls through
+        // to `return false` when nothing matched. This matters when needed_weight=0
+        // (checkSignatureNoAccount): if the account's master key is not in the TX
+        // signatures, we must return false (opBAD_AUTH), not true.
+        total_weight >= needed_weight && total_weight > 0
     }
 
     /// Check that all signatures have been consumed.

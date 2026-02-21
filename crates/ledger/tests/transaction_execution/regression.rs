@@ -2930,3 +2930,155 @@ fn test_fee_bump_charges_outer_fee_when_inner_auth_fails_at_apply() {
         "outer fee-bump fee must be charged even when inner auth fails at apply time"
     );
 }
+
+/// Regression test for VE-04: op with per-op source merged in a prior TX must return
+/// `opBAD_AUTH`, not `opNO_ACCOUNT`, when the current TX lacks the merged account's master key.
+///
+/// Scenario (mirrors L59863187 TX 69 / TX 124):
+/// - TX1: account_merge of `op_source` into `dest` (signed by both source + op_source). Succeeds.
+/// - TX2: a payment op whose explicit source is `op_source`, signed ONLY by `source_secret`
+///   (no master-key sig for `op_source`).
+///
+/// Root cause (before fix): `check_signature_from_signers` returned `total_weight >= needed_weight`
+/// at the end, evaluating `0 >= 0 = true` even when no signer matched. This caused
+/// `check_signature_no_account` to return `true`, allowing the op to proceed to execution
+/// where it hit `opNO_ACCOUNT` instead of the correct `opBAD_AUTH`.
+///
+/// Fix: changed final return to `total_weight >= needed_weight && total_weight > 0`, mirroring
+/// stellar-core's `SignatureChecker::checkSignature` which falls through to `return false` when
+/// nothing matched.
+#[test]
+fn test_op_source_merged_in_prior_tx_returns_bad_auth() {
+    let source_secret = SecretKey::from_seed(&[60u8; 32]);
+    let source_id: AccountId = (&source_secret.public_key()).into();
+
+    let op_source_secret = SecretKey::from_seed(&[61u8; 32]);
+    let op_source_id: AccountId = (&op_source_secret.public_key()).into();
+
+    let dest_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([62u8; 32])));
+
+    let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 100_000_000);
+    // op_source needs enough balance to survive after fees (base_reserve = 1 XLM per entry)
+    let (op_source_key, op_source_entry) =
+        create_account_entry(op_source_id.clone(), 1, 20_000_000);
+    let (dest_key, dest_entry) = create_account_entry(dest_id.clone(), 1, 10_000_000);
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .expect("add source")
+        .add_entry(op_source_key, op_source_entry)
+        .expect("add op_source")
+        .add_entry(dest_key, dest_entry)
+        .expect("add dest")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let network_id = NetworkId::testnet();
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    // ===== TX1: merge op_source into dest =====
+    // The AccountMerge op has op_source as its explicit source.
+    let op_source_muxed = MuxedAccount::Ed25519(Uint256(
+        *op_source_secret.public_key().as_bytes(),
+    ));
+    let dest_muxed = MuxedAccount::Ed25519(match &dest_id.0 {
+        PublicKey::PublicKeyTypeEd25519(k) => k.clone(),
+    });
+
+    let merge_op = Operation {
+        source_account: Some(op_source_muxed.clone()),
+        body: OperationBody::AccountMerge(dest_muxed),
+    };
+
+    let tx1 = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*source_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![merge_op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope1 = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: tx1,
+        signatures: VecM::default(),
+    });
+    // Both source and op_source must sign
+    let source_sig1 = sign_envelope(&envelope1, &source_secret, &network_id);
+    let op_source_sig1 = sign_envelope(&envelope1, &op_source_secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope1 {
+        env.signatures = vec![source_sig1, op_source_sig1].try_into().unwrap();
+    }
+
+    let result1 = executor
+        .execute_transaction(&snapshot, &envelope1, 100, None)
+        .expect("TX1 execute");
+
+    assert!(
+        result1.success,
+        "TX1 (account merge) should succeed. Result: {:?}",
+        result1.operation_results
+    );
+
+    // Advance to the next TX context (simulates between-transaction state advance)
+    executor.state_mut().snapshot_delta();
+
+    // ===== TX2: payment op sourced from op_source (now merged/deleted) =====
+    // Signed only by source_secret — op_source's master key is NOT in the signatures.
+    // stellar-core: checkSignatureNoAccount(op_source) creates synthetic signer for master key,
+    // finds no match → returns false → opBAD_AUTH.
+    // Before fix: Henyey returned true (0 >= 0 bug) → op executed → opNO_ACCOUNT.
+    let payment_op = Operation {
+        source_account: Some(op_source_muxed),
+        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+            destination: MuxedAccount::Ed25519(match &dest_id.0 {
+                PublicKey::PublicKeyTypeEd25519(k) => k.clone(),
+            }),
+            asset: Asset::Native,
+            amount: 1,
+        }),
+    };
+
+    let tx2 = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*source_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(3),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![payment_op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope2 = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: tx2,
+        signatures: VecM::default(),
+    });
+    // Sign with source ONLY — deliberately omit op_source's master key
+    let source_sig2 = sign_envelope(&envelope2, &source_secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope2 {
+        env.signatures = vec![source_sig2].try_into().unwrap();
+    }
+
+    let result2 = executor
+        .execute_transaction(&snapshot, &envelope2, 100, None)
+        .expect("TX2 execute");
+
+    // TX2 should fail: the op's per-op source (op_source) no longer exists,
+    // and the TX does not carry op_source's master key signature.
+    assert!(!result2.success, "TX2 should fail");
+
+    // The op result must be opBAD_AUTH, NOT opNO_ACCOUNT.
+    // opNO_ACCOUNT would mean the sig check incorrectly passed (the pre-fix bug).
+    assert_eq!(
+        result2.operation_results.get(0),
+        Some(&OperationResult::OpBadAuth),
+        "op sourced from merged account with no master-key sig must return opBAD_AUTH, not opNO_ACCOUNT"
+    );
+}
