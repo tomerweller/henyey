@@ -62,7 +62,7 @@
   - Other agents: Use the agent/tool name, not the model name
 - **Documentation updates**: Before committing new code, ensure the affected crate's README documentation and `PARITY_STATUS.md` are updated to reflect the changes.
 - **Bug fixes**: As soon as a bug is fixed and its regression test passes, commit and push immediately. Do not wait to be told.
-- **Other changes**: Commit and push when explicitly directed by the user.
+- **Fix review**: After committing a fix, review and consider: Is it true to the design of the system? Can there be similar issues? Can we redesign the system to avoid these category of issues.
 - PRs should include: a clear description, the tests run, and documentation updates when behavior changes.
 - Link related issues or stellar-core references where relevant.
 - When possible, fixes should be committed alongside regression tests that would have caught the bug.
