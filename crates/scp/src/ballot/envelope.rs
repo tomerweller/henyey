@@ -34,10 +34,7 @@ impl BallotProtocol {
     /// fields in the self-envelope contribute to `federated_accept`/`federated_ratify`).
     /// However, the envelope is NOT emitted to the network when `current_ballot`
     /// is `None` (matching stellar-core `canEmit = mCurrentBallot != nullptr`).
-    fn emit_prepare<'a, D: SCPDriver>(
-        &mut self,
-        ctx: &SlotContext<'a, D>,
-    ) -> Option<ScpStatement> {
+    fn emit_prepare<'a, D: SCPDriver>(&mut self, ctx: &SlotContext<'a, D>) -> Option<ScpStatement> {
         // Use the current ballot if set, otherwise use a default zero ballot
         // (matching stellar-core which creates a PREPARE with default ballot {0, ""} when
         // mCurrentBallot is null).
@@ -102,10 +99,7 @@ impl BallotProtocol {
 
     /// Build and record a confirm statement envelope.
     /// Returns the statement if a new envelope was recorded (for self-processing).
-    fn emit_confirm<'a, D: SCPDriver>(
-        &mut self,
-        ctx: &SlotContext<'a, D>,
-    ) -> Option<ScpStatement> {
+    fn emit_confirm<'a, D: SCPDriver>(&mut self, ctx: &SlotContext<'a, D>) -> Option<ScpStatement> {
         if let Some(ref ballot) = self.current_ballot {
             let conf = ScpStatementConfirm {
                 ballot: ballot.clone(),
@@ -159,29 +153,17 @@ impl BallotProtocol {
     /// accept-commit) can happen within a single top-level `receiveEnvelope` call.
     /// The `current_message_level` guard in `send_latest_envelope` ensures only the
     /// final envelope is actually emitted to the network.
-    pub(super) fn emit_current_state<'a, D: SCPDriver>(
-        &mut self,
-        ctx: &SlotContext<'a, D>,
-    ) {
+    pub(super) fn emit_current_state<'a, D: SCPDriver>(&mut self, ctx: &SlotContext<'a, D>) {
         let maybe_statement = match self.phase {
-            BallotPhase::Prepare => {
-                self.emit_prepare(ctx)
-            }
-            BallotPhase::Confirm => {
-                self.emit_confirm(ctx)
-            }
-            BallotPhase::Externalize => {
-                self.emit_externalize(ctx)
-            }
+            BallotPhase::Prepare => self.emit_prepare(ctx),
+            BallotPhase::Confirm => self.emit_confirm(ctx),
+            BallotPhase::Externalize => self.emit_externalize(ctx),
         };
         // Recursive self-processing: feed the self-envelope back into advance_slot
         // so cascading state transitions complete within a single receiveEnvelope.
         // This matches stellar-core emitCurrentStateStatement() calling processEnvelope(self).
         if let Some(statement) = maybe_statement {
-            self.advance_slot(
-                &statement,
-                ctx,
-            );
+            self.advance_slot(&statement, ctx);
         }
         // Emit the latest envelope after self-processing completes.
         // If advance_slot caused cascading state changes, last_envelope

@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 
-use super::*;
 use super::statements::{are_ballots_less_and_compatible, are_ballots_less_and_incompatible};
+use super::*;
 
 impl BallotProtocol {
     /// Try to advance the slot state based on received messages.
@@ -18,19 +18,10 @@ impl BallotProtocol {
         }
         let mut did_work = false;
 
-        did_work =
-            self.attempt_accept_prepared(hint, ctx)
-                || did_work;
-        did_work = self.attempt_confirm_prepared(
-            hint,
-            ctx,
-        ) || did_work;
-        did_work =
-            self.attempt_accept_commit(hint, ctx)
-                || did_work;
-        did_work =
-            self.attempt_confirm_commit(hint, ctx)
-                || did_work;
+        did_work = self.attempt_accept_prepared(hint, ctx) || did_work;
+        did_work = self.attempt_confirm_prepared(hint, ctx) || did_work;
+        did_work = self.attempt_accept_commit(hint, ctx) || did_work;
+        did_work = self.attempt_confirm_commit(hint, ctx) || did_work;
 
         if self.current_message_level == 1 {
             loop {
@@ -97,12 +88,7 @@ impl BallotProtocol {
                 ctx.driver,
             );
 
-            if accepted
-                && self.set_accept_prepared(
-                    ballot.clone(),
-                    ctx,
-                )
-            {
+            if accepted && self.set_accept_prepared(ballot.clone(), ctx) {
                 return true;
             }
         }
@@ -157,26 +143,15 @@ impl BallotProtocol {
         }
 
         let candidates = self.get_prepare_candidates(hint);
-        let (new_h_ballot, new_h_index) = match self.find_highest_confirmed_prepared(
-            &candidates,
-            ctx,
-        ) {
-            Some(result) => result,
-            None => return false,
-        };
+        let (new_h_ballot, new_h_index) =
+            match self.find_highest_confirmed_prepared(&candidates, ctx) {
+                Some(result) => result,
+                None => return false,
+            };
 
-        let new_c = self.find_lowest_commit_ballot(
-            &candidates,
-            &new_h_ballot,
-            new_h_index,
-            ctx,
-        );
+        let new_c = self.find_lowest_commit_ballot(&candidates, &new_h_ballot, new_h_index, ctx);
 
-        self.set_confirm_prepared(
-            new_c,
-            new_h_ballot,
-            ctx,
-        )
+        self.set_confirm_prepared(new_c, new_h_ballot, ctx)
     }
 
     /// Find the highest ballot that a quorum has confirmed prepared.
@@ -348,11 +323,7 @@ impl BallotProtocol {
                 counter: candidate.1,
                 value: ballot.value.clone(),
             };
-            return self.set_accept_commit(
-                c,
-                h,
-                ctx,
-            );
+            return self.set_accept_commit(c, h, ctx);
         }
 
         false
@@ -468,10 +439,7 @@ impl BallotProtocol {
         true
     }
 
-    fn attempt_bump<'a, D: SCPDriver>(
-        &mut self,
-        ctx: &SlotContext<'a, D>,
-    ) -> bool {
+    fn attempt_bump<'a, D: SCPDriver>(&mut self, ctx: &SlotContext<'a, D>) -> bool {
         if !matches!(self.phase, BallotPhase::Prepare | BallotPhase::Confirm) {
             return false;
         }
@@ -534,17 +502,9 @@ impl BallotProtocol {
                     .as_ref()
                     .map(|b| b.counter + 1)
                     .unwrap_or(1);
-                self.bump_state(
-                    ctx,
-                    value,
-                    n,
-                )
+                self.bump_state(ctx, value, n)
             } else {
-                self.bump_state(
-                    ctx,
-                    value,
-                    counter,
-                )
+                self.bump_state(ctx, value, counter)
             }
         } else {
             false

@@ -1,3 +1,10 @@
+//! JSON-serializable information types for SCP debugging and monitoring.
+//!
+//! This module provides structured representations of SCP slot, ballot,
+//! nomination, and quorum state that can be serialized to JSON. These types
+//! match the stellar-core `getJsonInfo()` and `getJsonQuorumInfo()` output
+//! format, enabling compatible diagnostics and monitoring tooling.
+
 /// JSON-serializable SCP slot information for debugging and monitoring.
 ///
 /// This provides a structured view of slot state that can be serialized

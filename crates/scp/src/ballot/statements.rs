@@ -434,7 +434,11 @@ impl BallotProtocol {
         is_quorum(local_quorum_set, &supporters, get_qs)
     }
 
-    pub(super) fn statement_votes_for_ballot(&self, ballot: &ScpBallot, statement: &ScpStatement) -> bool {
+    pub(super) fn statement_votes_for_ballot(
+        &self,
+        ballot: &ScpBallot,
+        statement: &ScpStatement,
+    ) -> bool {
         match &statement.pledges {
             ScpStatementPledges::Prepare(prep) => {
                 are_ballots_less_and_compatible(ballot, &prep.ballot)
@@ -494,10 +498,7 @@ impl BallotProtocol {
         }
     }
 
-    pub(super) fn check_heard_from_quorum<'a, D: SCPDriver>(
-        &mut self,
-        ctx: &SlotContext<'a, D>,
-    ) {
+    pub(super) fn check_heard_from_quorum<'a, D: SCPDriver>(&mut self, ctx: &SlotContext<'a, D>) {
         let current = match self.current_ballot.as_ref() {
             Some(ballot) => ballot.clone(),
             None => return,
@@ -534,19 +535,26 @@ impl BallotProtocol {
             let old = self.heard_from_quorum;
             self.heard_from_quorum = true;
             if !old {
-                ctx.driver.ballot_did_hear_from_quorum(ctx.slot_index, &current);
+                ctx.driver
+                    .ballot_did_hear_from_quorum(ctx.slot_index, &current);
                 // If we transition from not heard -> heard, start the ballot timer
                 if self.phase != BallotPhase::Externalize {
                     let timeout = ctx.driver.compute_timeout(current.counter, false);
-                    ctx.driver.setup_timer(ctx.slot_index, crate::driver::SCPTimerType::Ballot, timeout);
+                    ctx.driver.setup_timer(
+                        ctx.slot_index,
+                        crate::driver::SCPTimerType::Ballot,
+                        timeout,
+                    );
                 }
             }
             if self.phase == BallotPhase::Externalize {
-                ctx.driver.stop_timer(ctx.slot_index, crate::driver::SCPTimerType::Ballot);
+                ctx.driver
+                    .stop_timer(ctx.slot_index, crate::driver::SCPTimerType::Ballot);
             }
         } else {
             self.heard_from_quorum = false;
-            ctx.driver.stop_timer(ctx.slot_index, crate::driver::SCPTimerType::Ballot);
+            ctx.driver
+                .stop_timer(ctx.slot_index, crate::driver::SCPTimerType::Ballot);
         }
     }
 }
@@ -623,4 +631,3 @@ pub(super) fn are_ballots_less_and_compatible(a: &ScpBallot, b: &ScpBallot) -> b
 pub(super) fn are_ballots_less_and_incompatible(a: &ScpBallot, b: &ScpBallot) -> bool {
     ballot_compare(a, b) != Ordering::Greater && !ballot_compatible(a, b)
 }
-
