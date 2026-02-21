@@ -757,13 +757,13 @@ impl WorkScheduler {
             return false;
         }
 
-        if let Some(entry) = self.entries.get_mut(&id) {
-            entry.cancel_token.cancel();
-            let attempts = entry.attempts;
-            self.fail_or_cancel(id, WorkState::Cancelled, attempts);
-            return true;
-        }
-        false
+        let Some(entry) = self.entries.get_mut(&id) else {
+            return false;
+        };
+        entry.cancel_token.cancel();
+        let attempts = entry.attempts;
+        self.fail_or_cancel(id, WorkState::Cancelled, attempts);
+        true
     }
 
     /// Cancels all registered work items.
@@ -910,13 +910,12 @@ impl WorkScheduler {
                 running.insert(id);
 
                 tokio::spawn(async move {
-                    let outcome = work
-                        .run(WorkContext {
-                            id,
-                            attempt,
-                            cancel_token: cancel_token.clone(),
-                        })
-                        .await;
+                    let ctx = WorkContext {
+                        id,
+                        attempt,
+                        cancel_token: cancel_token.clone(),
+                    };
+                    let outcome = work.run(ctx).await;
                     let _ = completion_tx
                         .send(WorkCompletion {
                             id,
@@ -1102,12 +1101,15 @@ impl WorkScheduler {
     /// Called when a work item fails, is cancelled, or is blocked itself.
     /// Only affects dependents that are still in the Pending state.
     fn block_dependents(&mut self, id: WorkId) {
-        if let Some(children) = self.dependents.get(&id).cloned() {
-            for child in children {
-                if matches!(self.states.get(&child), Some(WorkState::Pending)) {
-                    self.states.insert(child, WorkState::Blocked);
-                    self.emit_event(child, WorkState::Blocked, 0);
-                }
+        let Some(children) = self.dependents.get(&id) else {
+            return;
+        };
+        // Collect IDs to avoid holding an immutable borrow while mutating states.
+        let children: Vec<WorkId> = children.clone();
+        for child in children {
+            if matches!(self.states.get(&child), Some(WorkState::Pending)) {
+                self.states.insert(child, WorkState::Blocked);
+                self.emit_event(child, WorkState::Blocked, 0);
             }
         }
     }
