@@ -14,11 +14,29 @@ Ledgers L59501248–L59501311 (P23) cannot be verified by Henyey (min supported:
 | Range | Status | Notes |
 |-------|--------|-------|
 | L59501248–L59501311 | **SKIPPED** | Protocol 23 — Henyey does not support P23 |
-| L59501312–L59659967 | In progress (Sweep 1, PID 2029106) | No errors found so far |
-| L59659968–L59799999 | In progress (Sweep 2, PID 1963937) | No errors found so far |
+| L59501312–L59659967 | **CLEAN** | Sweep 1 completed — 158,656 ledgers, 0 mismatches |
+| L59659968–L59747049 | **CLEAN** | Sweep 2 ran clean up to VE-03 |
+| L59747050 | **CLEAN** | VE-03 confirmed fixed — verified with 0 mismatches post-fix (commit acf4472) |
+| L59747051–L59799999 | In progress (Sweep 2 restart, PID 3255803) | No errors found so far |
 | L59800000–L59845022 | **CLEAN** | Sweep 3 ran through these ledgers with no hash mismatches |
 | L59845023 | **CLEAN** | VE-02 confirmed fixed — verified with 0 mismatches post-fix (commit 710ae8d) |
-| L59845024–L59939046 | In progress (Sweep 3 restart, PID 2970740) | No errors found so far |
+| L59845024–L59863186 | **CLEAN** | Sweep 3 restart ran clean up to VE-04 |
+| L59863187–L59939046 | In progress (Sweep 3 restart 2, PID 3256156) | Testing if VE-04 also fixed by VE-03 fix |
+
+## VE-03 (confirmed fixed)
+
+- **Ledger**: L59747050
+- **Transaction**: TX 187 (hash 472d28944e2a6a73...), a fee-bump with `txFeeBumpInnerFailed/TxBadAuth`
+- **Root cause**: `validate_preconditions()` checked inner transaction signatures before fee charging.
+  A prior transaction in the same ledger had removed a signer from the inner source account,
+  so the inner sig check failed in `validate_preconditions()` and returned early with `fee_charged=0`.
+  In stellar-core, `processFeeSeqNum()` charges the outer fee BEFORE `apply()` re-validates inner sigs.
+- **Fix**:
+  - Removed inner sig check for fee-bump txs from `validate_preconditions()` (outer/fee-source check kept).
+  - Fixed `check_operation_signatures()` Step 1 to return `InvalidSignature` (instead of `None`) when
+    TX-level source sig check fails — this runs after the outer fee has been deducted.
+- **Fixed**: Commit `acf4472` (2026-02-21).
+- **Confirmed**: Single-ledger verify-execution on L59747050 passed with 0 mismatches post-fix.
 
 ## VE-02 (confirmed fixed)
 
@@ -42,6 +60,5 @@ Ledgers L59501248–L59501311 (P23) cannot be verified by Henyey (min supported:
 
 | Sweep | Range | PID | Started |
 |-------|-------|-----|---------|
-| Sweep 1 | L59501312–L59659967 | 2029106 | 2026-02-20 22:19 |
-| Sweep 2 | L59659968–L59799999 | 1963937 | 2026-02-20 21:50 |
-| Sweep 3 (restart) | L59845024–L59939046 | 2970740 | 2026-02-21 07:55 |
+| Sweep 2 (restart) | L59747051–L59799999 | 3255803 | 2026-02-21 |
+| Sweep 3 (restart 2) | L59863187–L59939046 | 3256156 | 2026-02-21 |
