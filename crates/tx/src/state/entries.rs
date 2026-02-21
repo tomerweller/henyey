@@ -1100,16 +1100,6 @@ impl LedgerStateManager {
         self.remove_last_modified_key(&ledger_key);
     }
 
-    /// Iterate over all offers.
-    ///
-    /// WARNING: This only iterates over offers currently loaded in memory.
-    /// Not currently used — offer lookups go through the indexed
-    /// `get_offers_by_account_and_asset` or `best_offer` methods instead.
-    #[allow(dead_code)]
-    fn offers_iter(&self) -> impl Iterator<Item = &OfferEntry> {
-        self.offers.values()
-    }
-
     /// Get the best offer for a buying/selling pair (lowest price, then offer ID).
     ///
     /// Uses the offer index for O(log n) lookup instead of scanning all offers.

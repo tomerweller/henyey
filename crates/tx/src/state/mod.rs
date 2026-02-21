@@ -1991,7 +1991,6 @@ impl LedgerStateManager {
     /// Record a flush update: resolve pre-state, set last_modified, and record delta.
     ///
     /// Common tail shared by every entry-type block in `flush_modified_entries`.
-    #[allow(dead_code)]
     fn record_flush_update(
         &mut self,
         ledger_key: LedgerKey,

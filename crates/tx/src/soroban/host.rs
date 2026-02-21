@@ -34,9 +34,8 @@ use soroban_env_host25::{
 // while our workspace uses a git revision of stellar-xdr. We need to convert
 // between the two via XDR serialization when crossing the boundary.
 use stellar_xdr::curr::{
-    AccountId, DiagnosticEvent, Hash, HostFunction, LedgerEntry,
-    LedgerKey, Limits, ReadXdr, ScVal, SorobanAuthorizationEntry, SorobanTransactionData,
-    SorobanTransactionDataExt, WriteXdr,
+    AccountId, DiagnosticEvent, Hash, HostFunction, LedgerEntry, LedgerKey, Limits, ReadXdr, ScVal,
+    SorobanAuthorizationEntry, SorobanTransactionData, SorobanTransactionDataExt, WriteXdr,
 };
 
 // Type aliases for soroban-env-host P25's XDR types (from stellar-xdr 25.0.0)
@@ -448,10 +447,7 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
     /// Get an entry using our workspace XDR types (for internal use).
     /// This is separate from the `SnapshotSource::get()` trait impl which uses
     /// soroban-env-host's XDR types.
-    pub fn get_local(
-        &self,
-        key: &LedgerKey,
-    ) -> Result<Option<EntryWithTtl>, HostErrorP25> {
+    pub fn get_local(&self, key: &LedgerKey) -> Result<Option<EntryWithTtl>, HostErrorP25> {
         // For ContractData and ContractCode, check TTL from bucket list snapshot.
         // This matches stellar-core behavior for parallel Soroban execution:
         // - Entries with valid TTL (live_until >= current_ledger): pass to host
@@ -460,13 +456,10 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
         let live_until = get_entry_ttl(self.state, key, self.current_ledger);
 
         // Check TTL expiration for contract entries before looking up the entry.
-        if matches!(
-            key,
-            LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)
-        ) {
+        if matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)) {
             match live_until {
                 Some(ttl) if ttl >= self.current_ledger => {} // live, proceed
-                _ => return Ok(None), // expired or no TTL
+                _ => return Ok(None),                         // expired or no TTL
             }
         }
 
@@ -487,10 +480,7 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
     /// then falls back to the hot archive bucket list (for truly evicted entries).
     ///
     /// Returns entries in our workspace XDR types (not soroban-env-host's types).
-    pub fn get_archived(
-        &self,
-        key: &Rc<LedgerKey>,
-    ) -> Result<Option<EntryWithTtl>, HostErrorP25> {
+    pub fn get_archived(&self, key: &Rc<LedgerKey>) -> Result<Option<EntryWithTtl>, HostErrorP25> {
         // Get TTL but don't check if it's expired - this is for archived entries
         let live_until = get_entry_ttl(self.state, key.as_ref(), self.current_ledger);
 
@@ -584,7 +574,7 @@ impl<'a> soroban_env_host25::storage::SnapshotSource for LedgerSnapshotAdapterP2
         ) {
             match live_until {
                 Some(ttl) if ttl >= self.current_ledger => {} // live, proceed
-                _ => return Ok(None), // expired or no TTL
+                _ => return Ok(None),                         // expired or no TTL
             }
         }
 
@@ -1030,7 +1020,8 @@ fn make_xdr_setup_error() -> SorobanExecutionError {
 fn xdr_encode_setup<T: stellar_xdr::curr::WriteXdr>(
     val: &T,
 ) -> Result<Vec<u8>, SorobanExecutionError> {
-    val.to_xdr(Limits::none()).map_err(|_| make_xdr_setup_error())
+    val.to_xdr(Limits::none())
+        .map_err(|_| make_xdr_setup_error())
 }
 
 /// Encode a p24 XDR value, mapping errors to a setup error.
@@ -1105,15 +1096,15 @@ fn encode_footprint_entries(
 
     // Read-only footprint entries
     for key in soroban_data.resources.footprint.read_only.iter() {
-        let key_p24 = convert_ledger_key_to_p24(key)
-            .ok_or_else(make_setup_error)?;
-        if let Some((entry, live_until)) = snapshot
-            .get(&Rc::new(key_p24))
-            .map_err(|e| SorobanExecutionError {
-                host_error: convert_host_error_p24_to_p25(e),
-                cpu_insns_consumed: 0,
-                mem_bytes_consumed: 0,
-            })?
+        let key_p24 = convert_ledger_key_to_p24(key).ok_or_else(make_setup_error)?;
+        if let Some((entry, live_until)) =
+            snapshot
+                .get(&Rc::new(key_p24))
+                .map_err(|e| SorobanExecutionError {
+                    host_error: convert_host_error_p24_to_p25(e),
+                    cpu_insns_consumed: 0,
+                    mem_bytes_consumed: 0,
+                })?
         {
             let (le, ttl) = encode_entry(key, &entry, live_until)?;
             encoded_ledger_entries.push(le);
@@ -1142,8 +1133,7 @@ fn encode_footprint_entries(
         .iter()
         .enumerate()
     {
-        let key_p24 = convert_ledger_key_to_p24(key)
-            .ok_or_else(make_setup_error)?;
+        let key_p24 = convert_ledger_key_to_p24(key).ok_or_else(make_setup_error)?;
 
         let is_being_restored = restored_indices_set.contains(&(idx as u32));
         if is_being_restored {
@@ -1194,13 +1184,14 @@ fn encode_footprint_entries(
             // If archived entry not found, skip it — e2e_invoke's footprint
             // loop will add it to the storage map as None.
         } else {
-            if let Some((entry, live_until)) = snapshot
-                .get(&Rc::new(key_p24))
-                .map_err(|e| SorobanExecutionError {
-                    host_error: convert_host_error_p24_to_p25(e),
-                    cpu_insns_consumed: 0,
-                    mem_bytes_consumed: 0,
-                })?
+            if let Some((entry, live_until)) =
+                snapshot
+                    .get(&Rc::new(key_p24))
+                    .map_err(|e| SorobanExecutionError {
+                        host_error: convert_host_error_p24_to_p25(e),
+                        cpu_insns_consumed: 0,
+                        mem_bytes_consumed: 0,
+                    })?
             {
                 let (le, ttl) = encode_entry(key, &entry, live_until)?;
                 encoded_ledger_entries.push(le);
