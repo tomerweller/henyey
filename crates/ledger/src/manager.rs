@@ -87,6 +87,9 @@ fn get_rss_bytes() -> u64 {
 /// Secondary index type: (account_bytes, asset) → set of offer_ids.
 type OfferAccountAssetIndex = HashMap<([u8; 32], AssetKey), HashSet<i64>>;
 
+/// Secondary index type: account_bytes → set of pool_id bytes for pool share trustlines.
+type PoolShareTlAccountIndex = HashMap<[u8; 32], HashSet<[u8; 32]>>;
+
 /// Extract the 32-byte public key from an AccountId.
 ///
 /// Delegates to [`crate::execution::account_id_to_key`] to avoid duplication.
@@ -801,7 +804,7 @@ pub struct LedgerManager {
     /// Used by `load_pool_share_trustlines_for_account_and_asset` to find pool share
     /// trustlines without a full bucket list scan (mirroring stellar-core's SQL
     /// `SELECT * FROM trustlines WHERE account_id=? AND asset_type=POOL_SHARE`).
-    pool_share_tl_account_index: Arc<RwLock<HashMap<[u8; 32], HashSet<[u8; 32]>>>>,
+    pool_share_tl_account_index: Arc<RwLock<PoolShareTlAccountIndex>>,
 
     /// In-memory Soroban state for Protocol 20+ contract data/code tracking.
     ///

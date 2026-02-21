@@ -592,6 +592,7 @@ fn redeem_pool_share_trustlines(
 }
 
 /// Create a claimable balance for a pool share redemption.
+#[allow(clippy::too_many_arguments)]
 fn redeem_into_claimable_balance(
     state: &mut LedgerStateManager,
     asset: &Asset,
