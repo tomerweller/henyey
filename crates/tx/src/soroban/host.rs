@@ -91,6 +91,15 @@ pub struct SorobanExecutionResult {
     /// excluding entries that were already restored by a previous transaction
     /// in the same ledger. Used to determine whether to emit INIT vs LIVE changes.
     pub actual_restored_indices: Vec<u32>,
+    /// Entries restored from hot archive that the host did NOT emit storage changes for
+    /// (i.e., the host only read them without modifying them or extending their TTL).
+    ///
+    /// These must still be recorded in the ledger delta so that subsequent stages/clusters
+    /// can see the restoration. This mirrors stellar-core's handleArchivedEntry which
+    /// unconditionally calls mOpState.upsertEntry(lk, le, ...) regardless of host access.
+    ///
+    /// Key → (entry, restored_live_until).
+    pub hot_archive_read_only_restored_entries: std::collections::HashMap<LedgerKey, (LedgerEntry, u32)>,
 }
 
 /// Error from Soroban execution that includes consumed resources.
@@ -316,6 +325,38 @@ impl<'a> LedgerSnapshotAdapter<'a> {
         }
 
         Ok(None)
+    }
+
+    /// Get an archived entry in curr (stellar_xdr) format, without P24 conversion.
+    ///
+    /// This is used to capture the entry data for hot archive restorations so
+    /// that read-only restorations (where the host doesn't modify the entry) can
+    /// still be recorded in the ledger delta.
+    ///
+    /// Parity: stellar-core InvokeHostFunctionOpFrame::handleArchivedEntry unconditionally
+    /// calls mOpState.upsertEntry(lk, le, ...) regardless of whether the host modifies the
+    /// entry. This method enables henyey to replicate that behavior.
+    pub fn get_curr_archived(
+        &self,
+        key: &LedgerKey,
+    ) -> Option<(LedgerEntry, Option<u32>)> {
+        // Get TTL but don't check if it's expired - this is for archived entries
+        let live_until = get_entry_ttl(self.state, key, self.current_ledger);
+
+        // Check live state first (entry may be in live BL with expired TTL)
+        if let Some(e) = self.state.get_entry(key) {
+            return Some((e, live_until));
+        }
+
+        // Fall back to hot archive
+        if let Some(hot_archive) = self.hot_archive {
+            if let Some(archived_entry) = hot_archive.get(key) {
+                // Hot archive entries have no TTL (they are archived/expired)
+                return Some((archived_entry, None));
+            }
+        }
+
+        None
     }
 
     /// Get an archived entry and check if it's a live BL restore.
@@ -1038,6 +1079,10 @@ struct EncodedFootprint {
     ttl_entries: Vec<Vec<u8>>,
     actual_restored_indices: Vec<u32>,
     live_bl_restores: Vec<super::protocol::LiveBucketListRestore>,
+    /// Entries actually restored from hot archive, in curr format.
+    /// Key → (entry, restored_live_until). Used to record read-only
+    /// restorations (where the host doesn't emit a storage change) in the delta.
+    restored_entries: std::collections::HashMap<LedgerKey, (LedgerEntry, u32)>,
 }
 
 /// Collect and encode ledger entries from the transaction footprint.
@@ -1124,6 +1169,8 @@ fn encode_footprint_entries(
 
     let mut live_bl_restores: Vec<super::protocol::LiveBucketListRestore> = Vec::new();
     let mut actual_restored_indices: Vec<u32> = Vec::new();
+    let mut restored_entries: std::collections::HashMap<LedgerKey, (LedgerEntry, u32)> =
+        std::collections::HashMap::new();
 
     // Read-write footprint entries (with archived entry restoration)
     for (idx, key) in soroban_data
@@ -1169,6 +1216,14 @@ fn encode_footprint_entries(
                     if let Some(restore) = live_bl_restore {
                         live_bl_restores.push(restore);
                     }
+                    // Capture the curr-format entry for read-only restoration tracking.
+                    // Even if the host only reads this entry (no storage change emitted),
+                    // we need to record it in the delta. See parity note in get_curr_archived.
+                    if let Some((curr_entry, _)) = snapshot.get_curr_archived(key) {
+                        if let Some(lu) = restored_live_until {
+                            restored_entries.insert(key.clone(), (curr_entry, lu));
+                        }
+                    }
                 } else {
                     tracing::debug!(
                         idx = idx,
@@ -1207,6 +1262,7 @@ fn encode_footprint_entries(
         ttl_entries: encoded_ttl_entries,
         actual_restored_indices,
         live_bl_restores,
+        restored_entries,
     })
 }
 
@@ -1304,6 +1360,7 @@ fn execute_host_function_p24(
         ttl_entries: encoded_ttl_entries,
         actual_restored_indices,
         live_bl_restores,
+        restored_entries: footprint_restored_entries,
     } = encode_footprint_entries(soroban_data, &snapshot, context, soroban_config)?;
 
     // Use existing module cache — it must always be provided.
@@ -1423,7 +1480,7 @@ fn execute_host_function_p24(
     }
 
     // Convert ledger changes to our format
-    let storage_changes = result.ledger_changes
+    let storage_changes: Vec<crate::soroban::StorageChange> = result.ledger_changes
         .into_iter()
         .filter_map(|change| {
             // stellar-core behavior for transaction meta and state updates:
@@ -1502,6 +1559,22 @@ fn execute_host_function_p24(
         })
         .collect();
 
+    // Compute hot_archive_read_only_restored_entries: entries restored from hot archive
+    // that the host did NOT emit storage changes for (read-only access).
+    // These must be recorded in the delta to match stellar-core's behavior where
+    // handleArchivedEntry unconditionally calls mOpState.upsertEntry(lk, le, ...).
+    let hot_archive_read_only_restored_entries = {
+        let emitted_keys: std::collections::HashSet<&LedgerKey> = storage_changes
+            .iter()
+            .filter(|c| c.new_entry.is_some())
+            .map(|c| &c.key)
+            .collect();
+        footprint_restored_entries
+            .into_iter()
+            .filter(|(k, _)| !emitted_keys.contains(k))
+            .collect::<std::collections::HashMap<_, _>>()
+    };
+
     // Get budget consumption
     let cpu_insns = budget.get_cpu_insns_consumed().unwrap_or(0);
     let mem_bytes = budget.get_mem_bytes_consumed().unwrap_or(0);
@@ -1528,6 +1601,7 @@ fn execute_host_function_p24(
         rent_fee,
         live_bucket_list_restores: live_bl_restores,
         actual_restored_indices,
+        hot_archive_read_only_restored_entries,
     })
 }
 
@@ -1749,6 +1823,10 @@ fn execute_host_function_p25(
     // Track entries restored from live BucketList (expired TTL but not yet evicted)
     let mut live_bl_restores: Vec<super::protocol::LiveBucketListRestore> = Vec::new();
 
+    // Track entries restored from hot archive in curr format for read-only restoration handling.
+    let mut p25_restored_entries: std::collections::HashMap<LedgerKey, (LedgerEntry, u32)> =
+        std::collections::HashMap::new();
+
     // Build the ACTUAL list of indices being restored in THIS transaction.
     // The transaction envelope's archived_soroban_entries may list indices that were
     // already restored by a previous transaction in the same ledger. We only want to
@@ -1804,6 +1882,15 @@ fn execute_host_function_p25(
                     // Track live BL restorations
                     if let Some(restore) = live_bl_restore {
                         live_bl_restores.push(restore);
+                    }
+
+                    // Capture the curr-format entry for read-only restoration tracking.
+                    // Even if the host only reads this entry (no storage change emitted),
+                    // we need to record it in the delta (parity with stellar-core handleArchivedEntry).
+                    if let Some(lu) = restored_live_until {
+                        if let Ok(Some((curr_entry, _))) = snapshot.get_archived(&Rc::new(key.clone())) {
+                            p25_restored_entries.insert(key.clone(), ((*curr_entry).clone(), lu));
+                        }
                     }
                 } else {
                     // Entry is already live (restored by previous TX in this ledger).
@@ -1934,7 +2021,7 @@ fn execute_host_function_p25(
     let rent_changes: Vec<soroban_env_host25::fees::LedgerEntryRentChange> =
         e2e_invoke::extract_rent_changes(&result.ledger_changes);
 
-    let storage_changes = result
+    let storage_changes: Vec<crate::soroban::StorageChange> = result
         .ledger_changes
         .into_iter()
         .filter_map(|change| {
@@ -1988,6 +2075,19 @@ fn execute_host_function_p25(
         })
         .collect();
 
+    // Compute hot_archive_read_only_restored_entries for P25 (same logic as P24).
+    let hot_archive_read_only_restored_entries = {
+        let emitted_keys: std::collections::HashSet<&LedgerKey> = storage_changes
+            .iter()
+            .filter(|c| c.new_entry.is_some())
+            .map(|c| &c.key)
+            .collect();
+        p25_restored_entries
+            .into_iter()
+            .filter(|(k, _)| !emitted_keys.contains(k))
+            .collect::<std::collections::HashMap<_, _>>()
+    };
+
     let cpu_insns = budget.get_cpu_insns_consumed().unwrap_or(0);
     let mem_bytes = budget.get_mem_bytes_consumed().unwrap_or(0);
     let contract_events_and_return_value_size =
@@ -2010,6 +2110,7 @@ fn execute_host_function_p25(
         rent_fee,
         live_bucket_list_restores: live_bl_restores,
         actual_restored_indices,
+        hot_archive_read_only_restored_entries,
     })
 }
 
