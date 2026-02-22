@@ -1,6 +1,6 @@
 # Verify-Execution Sweep Status
 
-> **Updated**: 2026-02-22 19:19
+> **Updated**: 2026-02-22 19:37
 > **CDP data lake range**: L59501248–L61339818 (latest available as of 2026-02-21)
 > **Supported protocol**: P24+ (L59501312 is first P24 ledger; L59501248–L59501311 are P23 and unverifiable)
 > **P25 boundary**: TBD (to be identified during sweeps)
@@ -27,9 +27,9 @@ Protocol 25 boundary: TBD — to be identified during Sweep 4 of L59939047+.
 | L59863188–L59875307 | **CLEAN** | Sweep 3 restart 3 ran clean through this range |
 | L59875308–L59907177 | **CLEAN** | Sweep 3a completed — 31,870 ledgers, 0 mismatches |
 | L59907178–L59939046 | **CLEAN** | Sweep 3b completed — 31,869 ledgers, 0 mismatches |
-| L59939047–L60139046 | In progress (s4a, PID 3710662) | No errors found so far |
-| L60139047–L60339046 | In progress (s4b, PID 3710664) | No errors found so far |
-| L60339047–L60539046 | In progress (s4c, PID 3710665) | No errors found so far |
+| L59939047–L60139046 | In progress (s4a, PID 515420) | Restarted with VE-05 fix; at L59940220 |
+| L60139047–L60339046 | In progress (s4b, PID 515421) | Restarted with VE-05 fix; at L60140278 |
+| L60339047–L60539046 | In progress (s4c, PID 515422) | Restarted with VE-05 fix; at L60340227 |
 | L60539047–L60739046 | Pending | Queued — starts when a slot opens |
 | L60739047–L60939046 | Pending | Queued — starts when a slot opens |
 | L60939047–L61139046 | Pending | Queued — starts when a slot opens |
@@ -85,11 +85,26 @@ Protocol 25 boundary: TBD — to be identified during Sweep 4 of L59939047+.
 - **Fixed**: Commits `0fb052d` (contract_data/code), `d482c43` (account/data/claimable_balance).
 - **Confirmed**: Post-fix sweep passed L59658059 without error (2026-02-20).
 
+## VE-05 (confirmed fixed)
+
+- **Ledger**: L60269153 (first divergence)
+- **Root cause**: In parallel Soroban execution, when a TX restored entries from the hot archive but the
+  host only *read* them (no modification, no TTL extension), `storage_changes` excluded those entries.
+  `apply_soroban_storage_changes` was never called for them → not recorded in ledger delta → subsequent
+  parallel stages saw them as absent (HOT_ARCHIVE_ARCHIVED) → re-restored them → duplicate INIT entries
+  → bucket list hash mismatch across all levels.
+  Parity: stellar-core's `handleArchivedEntry` unconditionally calls `mOpState.upsertEntry(lk, le, ...)`
+  regardless of whether the host modifies the entry.
+- **Fix**: Added `record_hot_archive_read_only_restores()` in `invoke_host_function.rs` to create INIT
+  entries in the delta for restored entries the host did not emit changes for.
+- **Fixed**: Commit `990ca50` (2026-02-22).
+
 ## Running sweeps
 
 | Sweep | Range | PID | Started |
-| s4a | L59939047-L60139046 | 3710662 | 2026-02-22 |
-| s4d | L60539047-L60739046 | 109661 | 2026-02-22 |
-| s4f | L60939047-L61139046 | 121973 | 2026-02-22 |
+|-------|-------|-----|---------|
+| s4a | L59939047-L60139046 | 515420 | 2026-02-22 19:29 |
+| s4b | L60139047-L60339046 | 515421 | 2026-02-22 19:29 |
+| s4c | L60339047-L60539046 | 515422 | 2026-02-22 19:29 |
 
 Monitor PID: 3902604 (10-min interval)
