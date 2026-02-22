@@ -1,7 +1,7 @@
 # Verify-Execution Sweep Status
 
 > **Updated**: 2026-02-22 23:28
-> **CDP data lake range**: L59501248–L61339818 (latest available as of 2026-02-21)
+> **CDP data lake range**: L59501248–L61354687 (latest available as of 2026-02-22)
 > **Supported protocol**: P24+ (L59501312 is first P24 ledger; L59501248–L59501311 are P23 and unverifiable)
 > **P25 boundary**: TBD (to be identified during sweeps)
 
@@ -34,6 +34,7 @@ Protocol 25 boundary: TBD — to be identified during Sweep 4 of L59939047+.
 | L60739047–L60939046 | Pending | Queued — starts when a slot opens |
 | L60939047–L61139046 | Pending | Queued — starts when a slot opens |
 | L61139047–L61339818 | Pending | Queued — starts when a slot opens |
+| L61339819–L61354687 | Pending (s5a) | Extended range — new CDP data as of 2026-02-22 |
 
 ## VE-04 (confirmed fixed)
 
@@ -108,4 +109,4 @@ Protocol 25 boundary: TBD — to be identified during Sweep 4 of L59939047+.
 | s4b | L60139047-L60339046 | 716330 | 2026-02-22 |
 | s4c | L60339047-L60539046 | 716335 | 2026-02-22 |
 
-Monitor PID: 716290 (10-min interval)
+Monitor PID: 755062 (10-min interval)
