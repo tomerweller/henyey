@@ -1,6 +1,6 @@
 # Verify-Execution Sweep Status
 
-> **Updated**: 2026-02-22 23:18
+> **Updated**: 2026-02-22 23:28
 > **CDP data lake range**: L59501248–L61339818 (latest available as of 2026-02-21)
 > **Supported protocol**: P24+ (L59501312 is first P24 ledger; L59501248–L59501311 are P23 and unverifiable)
 > **P25 boundary**: TBD (to be identified during sweeps)
