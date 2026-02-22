@@ -286,19 +286,16 @@ fn execute_contract_invocation(
                 &hot_archive_restored_keys,
             );
 
-            // Parity: stellar-core handleArchivedEntry unconditionally calls
-            // mOpState.upsertEntry(lk, le, ...) for hot archive restorations, regardless
-            // of whether the host modifies the entry. If the host only reads a restored
-            // entry (no storage change emitted), we must still record it in the delta so
-            // subsequent stages/clusters see the restoration via prior_stage_entries.
-            //
-            // Without this, a TX in a later stage that has the same entry in its footprint
-            // would find it absent from state, look it up in the hot archive, and incorrectly
-            // re-restore it — adding duplicate INIT entries to the live bucket list.
-            record_hot_archive_read_only_restores(
-                state,
-                &result.hot_archive_read_only_restored_entries,
-            );
+            // TODO(VE-05): Investigate correct fix for hot archive read-only restoration.
+            // The original fix (record_hot_archive_read_only_restores) was wrong:
+            // stellar-core InvokeHostFunction ERASES archived entries that the host
+            // doesn't return in out.modified_ledger_entries, so pure read-only restores
+            // produce NO net INIT entry. Creating INIT for them causes hash mismatches.
+            // See investigation at L59940765 (mismatch with fix) and L60269153 (mismatch without).
+            // record_hot_archive_read_only_restores(
+            //     state,
+            //     &result.hot_archive_read_only_restored_entries,
+            // );
 
             // Compute result hash from success preimage (return value + events)
             let result_hash =
@@ -647,6 +644,7 @@ fn extract_hot_archive_restored_keys(
 /// back from hot archive to live bucket list). It only processes entries that are NOT
 /// already in the delta (key_already_created_in_delta check), to avoid double-creates when
 /// the host DID emit a storage change for the entry.
+#[allow(dead_code)]
 fn record_hot_archive_read_only_restores(
     state: &mut LedgerStateManager,
     restored_entries: &std::collections::HashMap<LedgerKey, (LedgerEntry, u32)>,
@@ -947,6 +945,13 @@ fn apply_soroban_storage_change(
         }
     } else if let Some(live_until) = change.live_until {
         if live_until == 0 {
+            return;
+        }
+        // For hot archive read-only restores (new_entry=None), skip TTL INIT.
+        // stellar-core's handleArchivedEntry creates DATA+TTL INIT then erases both
+        // for read-only access → net: nothing in live BL.
+        // HOT_ARCHIVE_LIVE tombstone is still added correctly via hot_archive_restored_keys.
+        if is_hot_archive_restore {
             return;
         }
         // TTL-only change: the data entry wasn't modified, but its TTL was bumped.
@@ -2487,6 +2492,93 @@ mod tests {
         assert_eq!(
             created_count_before, created_count_after,
             "record_hot_archive_read_only_restores should not duplicate entries already in delta"
+        );
+    }
+
+    /// Regression test for VE-05 / L59940765: hot archive read-only restores must NOT
+    /// emit a spurious TTL INIT in the live bucket list.
+    ///
+    /// When the host reads a restored archived entry but does not write it back
+    /// (read-only access), `storage_changes` includes the entry with `new_entry=None`
+    /// and `live_until=Some(restored_live_until)` because:
+    ///   - `is_deletion = !read_only && encoded_new_value.is_none() = true` (false positive)
+    ///   - `ttl_extended = restored_live_until > ledger_start_ttl(=0) = true` (false positive)
+    ///
+    /// Before the fix, `apply_soroban_storage_change` reached the TTL-only branch
+    /// (`new_entry=None, live_until=Some(...)`) and called `state.create_ttl(ttl)`,
+    /// inserting a spurious TTL INIT into the live bucket list.
+    ///
+    /// In stellar-core, `handleArchivedEntry` creates DATA+TTL INIT and then immediately
+    /// erases both for read-only access → net effect: nothing in the live bucket list.
+    /// (The HOT_ARCHIVE_LIVE tombstone is still written, which is correct.)
+    ///
+    /// Fix: early-return in the TTL-only block when `is_hot_archive_restore=true`.
+    #[test]
+    fn test_hot_archive_read_only_restore_no_spurious_ttl_init() {
+        let contract_id = ScAddress::Contract(ContractId(Hash([0xBBu8; 32])));
+        let contract_key = ScVal::U32(77);
+        let durability = ContractDataDurability::Persistent;
+
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability,
+        });
+        let key_hash = compute_key_hash(&key);
+
+        // Simulate the storage change produced for a hot archive entry that the host
+        // only read (no data returned).  The "is_deletion" and "ttl_extended" flags are
+        // true as false-positives — the entry was never in the live BL so
+        // ledger_start_ttl=0, and the host-side read_only=false because it came from
+        // archived_soroban_entries (RW footprint).
+        let restored_live_until: u32 = 62_014_364; // from L59940765 log
+        let change = StorageChange {
+            key: key.clone(),
+            new_entry: None, // host did not return data (read-only access)
+            live_until: Some(restored_live_until),
+            ttl_extended: true,        // false positive: restored_live_until > 0 = ledger_start_ttl
+            is_rent_related: false,
+            is_read_only_ttl_bump: false,
+        };
+
+        // Mark the key as a hot-archive restore.
+        let mut hot_archive_restored_keys = std::collections::HashSet::new();
+        hot_archive_restored_keys.insert(key.clone());
+
+        let mut state = LedgerStateManager::new(5_000_000, 59_940_765);
+
+        // Entry is not in state (never was in live BL — it came from hot archive).
+        assert!(
+            state.get_ttl(&key_hash).is_none(),
+            "TTL should not be in state before the call"
+        );
+        assert_eq!(
+            state.delta().created_entries().len(),
+            0,
+            "Delta should be empty before the call"
+        );
+
+        apply_soroban_storage_change(&mut state, &change, &hot_archive_restored_keys);
+
+        // KEY ASSERTION: no TTL INIT should have been created.
+        // Before the fix, create_ttl() was called, producing a spurious TTL INIT that
+        // diverged the live BL hash from stellar-core.
+        let ttl_init_count = state
+            .delta()
+            .created_entries()
+            .iter()
+            .filter(|e| matches!(&e.data, LedgerEntryData::Ttl(t) if t.key_hash == key_hash))
+            .count();
+        assert_eq!(
+            ttl_init_count, 0,
+            "No TTL INIT should be emitted for a hot archive read-only restore (VE-05)"
+        );
+
+        // And no data entry either.
+        assert_eq!(
+            state.delta().created_entries().len(),
+            0,
+            "Delta should remain empty after a hot archive read-only restore"
         );
     }
 }
