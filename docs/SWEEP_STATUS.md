@@ -27,9 +27,9 @@ Protocol 25 boundary: TBD — to be identified during Sweep 4 of L59939047+.
 | L59863188–L59875307 | **CLEAN** | Sweep 3 restart 3 ran clean through this range |
 | L59875308–L59907177 | **CLEAN** | Sweep 3a completed — 31,870 ledgers, 0 mismatches |
 | L59907178–L59939046 | **CLEAN** | Sweep 3b completed — 31,869 ledgers, 0 mismatches |
-| L59939047–L60139046 | In progress (s4a, PID 515420) | Restarted with VE-05 fix; at L59940220 |
-| L60139047–L60339046 | In progress (s4b, PID 515421) | Restarted with VE-05 fix; at L60140278 |
-| L60339047–L60539046 | In progress (s4c, PID 515422) | Restarted with VE-05 fix; at L60340227 |
+| L59939047–L60139046 | In progress (s4a, PID 716325) | Restarted with correct VE-05 fix (16933b2) |
+| L60139047–L60339046 | In progress (s4b, PID 716330) | Restarted with correct VE-05 fix (16933b2) |
+| L60339047–L60539046 | In progress (s4c, PID 716335) | Restarted with correct VE-05 fix (16933b2) |
 | L60539047–L60739046 | Pending | Queued — starts when a slot opens |
 | L60739047–L60939046 | Pending | Queued — starts when a slot opens |
 | L60939047–L61139046 | Pending | Queued — starts when a slot opens |
@@ -87,17 +87,19 @@ Protocol 25 boundary: TBD — to be identified during Sweep 4 of L59939047+.
 
 ## VE-05 (confirmed fixed)
 
-- **Ledger**: L60269153 (first divergence)
-- **Root cause**: In parallel Soroban execution, when a TX restored entries from the hot archive but the
-  host only *read* them (no modification, no TTL extension), `storage_changes` excluded those entries.
-  `apply_soroban_storage_changes` was never called for them → not recorded in ledger delta → subsequent
-  parallel stages saw them as absent (HOT_ARCHIVE_ARCHIVED) → re-restored them → duplicate INIT entries
-  → bucket list hash mismatch across all levels.
-  Parity: stellar-core's `handleArchivedEntry` unconditionally calls `mOpState.upsertEntry(lk, le, ...)`
-  regardless of whether the host modifies the entry.
-- **Fix**: Added `record_hot_archive_read_only_restores()` in `invoke_host_function.rs` to create INIT
-  entries in the delta for restored entries the host did not emit changes for.
-- **Fixed**: Commit `990ca50` (2026-02-22).
+- **Ledger**: L59940765 (first hit in sweep; L60269153 also affected)
+- **Root cause**: When the host reads a restored archived entry without writing it back (read-only
+  access from `archived_soroban_entries`), `storage_changes` includes it with `new_entry=None` and
+  `live_until=Some(restored_live_until)` due to false-positive `is_deletion` and `ttl_extended` flags
+  (the entry was never in the live BL so `ledger_start_ttl=0`). `apply_soroban_storage_change` reached
+  the TTL-only branch (`new_entry=None, live_until=Some(...)`) and called `state.create_ttl()`,
+  inserting a spurious TTL INIT into the live bucket list → hash mismatch.
+  Parity: stellar-core's `handleArchivedEntry` creates DATA+TTL INIT then immediately erases both for
+  read-only access → net: nothing in live BL. HOT_ARCHIVE_LIVE tombstone is still written (correct).
+- **Fix**: Early-return in the TTL-only block of `apply_soroban_storage_change` when
+  `is_hot_archive_restore=true`, preventing the spurious TTL INIT. Regression test added.
+- **Fixed**: Commit `16933b2` (2026-02-22).
+- **Confirmed**: Single-ledger verify-execution on L59940765 passed with 0 mismatches post-fix.
 
 ## Running sweeps
 
