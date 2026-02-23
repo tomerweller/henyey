@@ -665,27 +665,29 @@ pub fn execute_single_cluster(
 
         // Execute with deduct_fee=false — fees were already pre-deducted from
         // the main delta by pre_deduct_soroban_fees().
-        let mut result = executor.execute_transaction_with_fee_mode(
+        //
+        // Pass should_apply from pre-deduction: when the fee source had
+        // insufficient balance, should_apply=false and the executor will
+        // perform the pre-apply phase (validation, seq bump, signer removal)
+        // but skip the operation body entirely. This matches stellar-core's
+        // parallelApply which returns {false, {}} when !txResult.isSuccess()
+        // after preParallelApply detected insufficient balance.
+        let pre = &params.pre_charged_fees[local_idx];
+        let mut result = executor.execute_transaction_with_fee_mode_and_pre_state(
             snapshot,
             tx,
             tx_fee,
             Some(tx_prng_seed),
             false,
+            None,
+            pre.should_apply,
         )?;
 
         // Override fee_charged and fee_changes from pre-deduction.
         // The executor computed fee_refund correctly (based on resource consumption),
         // but fee_charged=0 because deduct_fee=false. We use the pre-charged values.
-        let pre = &params.pre_charged_fees[local_idx];
         result.fee_charged = pre.charged_fee.saturating_sub(result.fee_refund);
         result.fee_changes = Some(pre.fee_changes.clone());
-
-        // If pre-deduction determined insufficient balance, force the TX to fail.
-        if !pre.should_apply && result.success {
-            result.success = false;
-            result.failure = Some(ExecutionFailure::InsufficientBalance);
-            result.error = Some("Insufficient balance for fee".into());
-        }
 
         let frame = TransactionFrame::with_network(tx.clone(), executor.network_id);
         let tx_result = build_tx_result_pair(
@@ -724,11 +726,11 @@ pub fn execute_single_cluster(
     executor.state_mut().flush_deferred_ro_ttl_bumps();
 
     // Collect hot archive restored keys from SUCCESSFUL transactions only.
-    // When !pre.should_apply, the TX body is still executed (unlike stellar-core
-    // which skips execution entirely), so operations succeed and hot archive keys
-    // are collected. But the TX is later forced to fail, and these keys must not
-    // propagate — otherwise they produce spurious HOT_ARCHIVE_LIVE tombstones
-    // (same class of bug as VE-06, but at the TX level instead of operation level).
+    // With the should_apply early-exit fix, skipped TXs no longer produce hot
+    // archive keys (the operation body never executes). This guard is retained
+    // as defense-in-depth against future regressions — if a TX somehow fails
+    // after execution, its hot archive keys must not propagate as they would
+    // produce spurious HOT_ARCHIVE_LIVE tombstones (VE-06 class bug).
     let mut restored_keys: Vec<LedgerKey> = Vec::new();
     for r in &results {
         if r.success {

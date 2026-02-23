@@ -3472,3 +3472,192 @@ fn test_fee_bump_soroban_checks_inner_signatures() {
          Before VE-08 fix, the `!frame.is_soroban()` guard skipped the sig check."
     );
 }
+
+/// Regression test: when `should_apply=false` is passed to
+/// `execute_transaction_with_fee_mode_and_pre_state`, the operation body must
+/// NOT execute. This matches stellar-core's `parallelApply` which returns
+/// `{false, {}}` immediately when `!txResult.isSuccess()` after
+/// `preParallelApply` determined insufficient balance.
+///
+/// Before the fix, henyey always executed the full TX body and then post-hoc
+/// forced `success=false`. This leaked state changes, RO TTL bumps, hot archive
+/// keys, and operation meta.
+#[test]
+fn test_should_apply_false_skips_operation_body() {
+    let secret = SecretKey::from_seed(&[44u8; 32]);
+    let source_id: AccountId = (&secret.public_key()).into();
+
+    // Account with enough balance to pass validation but we'll set should_apply=false
+    // to simulate the parallel path where pre-deduction found insufficient balance.
+    let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 20_000_000);
+
+    // Create a contract code entry and TTL — the TX will try to extend its TTL.
+    let code_hash = Hash([44u8; 32]);
+    let contract_code = ContractCodeEntry {
+        ext: ContractCodeEntryExt::V0,
+        hash: code_hash.clone(),
+        code: BytesM::try_from(vec![1u8, 2u8, 3u8]).unwrap(),
+    };
+    let contract_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+        hash: code_hash.clone(),
+    });
+    let contract_entry = LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::ContractCode(contract_code),
+        ext: LedgerEntryExt::V0,
+    };
+
+    let key_hash = {
+        use sha2::{Digest, Sha256};
+        use stellar_xdr::curr::WriteXdr;
+
+        let mut hasher = Sha256::new();
+        let bytes = contract_key
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .unwrap_or_default();
+        hasher.update(&bytes);
+        Hash(hasher.finalize().into())
+    };
+    let ttl_entry = LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::Ttl(TtlEntry {
+            key_hash: key_hash.clone(),
+            live_until_ledger_seq: 10,
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+    let ttl_key = LedgerKey::Ttl(LedgerKeyTtl { key_hash });
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .expect("add source")
+        .add_entry(contract_key.clone(), contract_entry)
+        .expect("add contract")
+        .add_entry(ttl_key, ttl_entry)
+        .expect("add ttl")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::ExtendFootprintTtl(ExtendFootprintTtlOp {
+            ext: ExtensionPoint::V0,
+            extend_to: 100,
+        }),
+    };
+
+    let soroban_data = SorobanTransactionData {
+        ext: SorobanTransactionDataExt::V0,
+        resources: SorobanResources {
+            footprint: LedgerFootprint {
+                read_only: vec![contract_key].try_into().unwrap(),
+                read_write: VecM::default(),
+            },
+            instructions: 0,
+            disk_read_bytes: 0,
+            write_bytes: 0,
+        },
+        resource_fee: 900,
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 1000,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V1(soroban_data),
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    // Execute with should_apply=false and deduct_fee=false, simulating the
+    // parallel Soroban path where pre-deduction found insufficient balance.
+    let result = executor
+        .execute_transaction_with_fee_mode_and_pre_state(
+            &snapshot,
+            &envelope,
+            100,
+            Some([0u8; 32]), // soroban_prng_seed
+            false,           // deduct_fee=false (fees pre-deducted in parallel path)
+            None,            // no fee_source_pre_state
+            false,           // should_apply=false — this is what we're testing
+        )
+        .expect("execute should not error");
+
+    // 1. TX must report failure.
+    assert!(!result.success, "TX must fail when should_apply=false");
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::InsufficientBalance),
+        "failure reason must be InsufficientBalance"
+    );
+
+    // 2. No operation results — the body was never executed.
+    assert!(
+        result.operation_results.is_empty(),
+        "operation_results must be empty when body is skipped"
+    );
+
+    // 3. No hot archive restored keys leaked.
+    assert!(
+        result.hot_archive_restored_keys.is_empty(),
+        "hot_archive_restored_keys must be empty when body is skipped"
+    );
+
+    // 4. Verify meta structure: tx_changes_before populated, operations empty.
+    let tx_meta = result.tx_meta.expect("tx meta must be present");
+    let TransactionMeta::V4(meta) = tx_meta else {
+        panic!("expected TransactionMeta::V4");
+    };
+
+    // tx_changes_before should be non-empty (contains seq bump changes).
+    assert!(
+        !meta.tx_changes_before.is_empty(),
+        "tx_changes_before must contain seq bump changes"
+    );
+
+    // operations must be empty — no operation body executed.
+    assert!(
+        meta.operations.is_empty(),
+        "operations meta must be empty when body is skipped"
+    );
+
+    // 5. Soroban meta must be present (fee info activates it) with zero consumed fees.
+    let soroban_meta = meta
+        .soroban_meta
+        .expect("soroban_meta must be present for Soroban TX");
+    assert!(
+        soroban_meta.return_value.is_none(),
+        "return_value must be None when body is skipped"
+    );
+
+    // 6. Verify the executor state: sequence number was bumped (pre-apply committed).
+    let account = executor
+        .state()
+        .get_account(&source_id)
+        .expect("source account must exist in executor state");
+    assert_eq!(
+        account.seq_num,
+        SequenceNumber(2),
+        "sequence number must be bumped to 2 (the TX's seq_num) even though body was skipped"
+    );
+}

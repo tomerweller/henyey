@@ -1135,7 +1135,9 @@ pub fn build_transaction_meta(
         })
         .collect();
 
-    let has_soroban = soroban_return_value.is_some() || !diagnostic_events.is_empty();
+    let has_soroban = soroban_return_value.is_some()
+        || !diagnostic_events.is_empty()
+        || soroban_fee_info.is_some();
     let soroban_meta = if has_soroban {
         let ext =
             if let Some((non_refundable, refundable_consumed, rent_consumed)) = soroban_fee_info {
@@ -1178,4 +1180,3 @@ pub fn empty_transaction_meta() -> TransactionMeta {
         None,
     )
 }
-

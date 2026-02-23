@@ -1583,6 +1583,7 @@ impl TransactionExecutor {
             soroban_prng_seed,
             deduct_fee,
             None,
+            true, // should_apply: always execute body in sequential path
         )
     }
 
@@ -1873,9 +1874,17 @@ impl TransactionExecutor {
     /// When `deduct_fee` is false, fee validation still occurs but no fee
     /// processing changes are applied to the state or delta.
     ///
+    /// When `should_apply` is false, the transaction's pre-apply phase (validation,
+    /// sequence bump, signer removal) executes normally, but the operation body is
+    /// **not** executed. This matches stellar-core's `parallelApply` which returns
+    /// `{false, {}}` immediately when `!txResult.isSuccess()` after `preParallelApply`
+    /// determined insufficient balance. The returned result has `success=false` with
+    /// proper tx_changes_before (seq bump + signer removal) but empty tx_apply_processing.
+    ///
     /// For fee bump transactions in two-phase mode, `fee_source_pre_state` should be provided
     /// with the fee source account state BEFORE fee processing. This is used for the STATE entry
     /// in tx_changes_before to match stellar-core behavior.
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_transaction_with_fee_mode_and_pre_state(
         &mut self,
         snapshot: &SnapshotHandle,
@@ -1884,6 +1893,7 @@ impl TransactionExecutor {
         soroban_prng_seed: Option<[u8; 32]>,
         deduct_fee: bool,
         fee_source_pre_state: Option<LedgerEntry>,
+        should_apply: bool,
     ) -> Result<TransactionExecutionResult> {
         let tx_timing_start = std::time::Instant::now();
 
@@ -2229,6 +2239,52 @@ impl TransactionExecutor {
         // Commit pre-apply changes so rollback doesn't revert them.
         self.state.commit();
         let fee_seq_us = tx_timing_start.elapsed().as_micros() as u64 - validation_us;
+
+        // Early exit when the caller determined the TX should not be applied
+        // (e.g., insufficient fee source balance in the parallel Soroban path).
+        //
+        // This matches stellar-core's parallelApply which checks
+        // `if (!txResult.isSuccess()) return {false, {}};` after preParallelApply
+        // determined the TX failed validation. The pre-apply phase (validation,
+        // sequence bump, signer removal) has already committed above, but the
+        // operation body must NOT execute — no state changes, no RO TTL bumps,
+        // no hot archive key collection, no operation meta.
+        if !should_apply {
+            // Build soroban fee info for meta (consumed = 0 since no ops ran).
+            let soroban_fee_info = refundable_fee_tracker.as_ref().map(|t| {
+                (t.non_refundable_fee, t.consumed_refundable_fee, t.consumed_rent_fee)
+            });
+            let fee_refund = refundable_fee_tracker
+                .as_ref()
+                .map(|t| t.refund_amount())
+                .unwrap_or(0);
+
+            let tx_meta = build_transaction_meta(
+                tx_changes_before.clone(),
+                vec![],  // no operation changes
+                vec![],  // no operation events
+                vec![],  // no tx events
+                None,    // no soroban return value
+                vec![],  // no diagnostic events
+                soroban_fee_info,
+            );
+
+            let total_us = tx_timing_start.elapsed().as_micros() as u64;
+            return Ok(TransactionExecutionResult {
+                success: false,
+                fee_charged: 0, // overridden by caller from pre-charged fees
+                fee_refund,
+                operation_results: vec![],
+                error: Some("Insufficient balance for fee".into()),
+                failure: Some(ExecutionFailure::InsufficientBalance),
+                tx_meta: Some(tx_meta),
+                fee_changes: Some(fee_changes),
+                post_fee_changes: Some(empty_entry_changes()),
+                hot_archive_restored_keys: Vec::new(),
+                op_type_timings: HashMap::new(),
+                exec_time_us: total_us,
+            });
+        }
 
         // Create ledger context for operation execution
         let ledger_context = if let Some(prng_seed) = soroban_prng_seed {
