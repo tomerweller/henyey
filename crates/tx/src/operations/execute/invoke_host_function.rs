@@ -2397,7 +2397,10 @@ mod tests {
 
         // Now apply the fix: record_hot_archive_read_only_restores should record the entry
         let mut restored_entries: HashMap<LedgerKey, (LedgerEntry, u32)> = HashMap::new();
-        restored_entries.insert(contract_key.clone(), (restored_entry.clone(), restored_live_until));
+        restored_entries.insert(
+            contract_key.clone(),
+            (restored_entry.clone(), restored_live_until),
+        );
 
         record_hot_archive_read_only_restores(&mut state, &restored_entries);
 
@@ -2546,7 +2549,7 @@ mod tests {
             key: key.clone(),
             new_entry: None, // host did not return data (read-only access)
             live_until: Some(restored_live_until),
-            ttl_extended: true,        // false positive: restored_live_until > 0 = ledger_start_ttl
+            ttl_extended: true, // false positive: restored_live_until > 0 = ledger_start_ttl
             is_rent_related: false,
             is_read_only_ttl_bump: false,
         };
@@ -2589,6 +2592,89 @@ mod tests {
             state.delta().created_entries().len(),
             0,
             "Delta should remain empty after a hot archive read-only restore"
+        );
+    }
+
+    /// Integration test for VE-05: exercises `apply_soroban_storage_changes` (plural) with a
+    /// hot archive read-only restore entry in the RW footprint.
+    ///
+    /// This tests the full flow through the wrapper function:
+    /// 1. The TTL-only branch early-returns for `is_hot_archive_restore` (the VE-05 fix)
+    /// 2. The erase-RW loop skips the entry because it's not in state
+    ///
+    /// Net result: no INIT, no deletion — matching stellar-core's create-then-erase behavior.
+    #[test]
+    fn test_apply_soroban_storage_changes_hot_archive_read_only_no_side_effects() {
+        let contract_id = ScAddress::Contract(ContractId(Hash([0xCCu8; 32])));
+        let contract_key = ScVal::U32(99);
+        let durability = ContractDataDurability::Persistent;
+
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability,
+        });
+        let key_hash = compute_key_hash(&key);
+
+        // Storage change for a hot archive entry the host only read (no data returned).
+        let restored_live_until: u32 = 62_014_364;
+        let change = StorageChange {
+            key: key.clone(),
+            new_entry: None,
+            live_until: Some(restored_live_until),
+            ttl_extended: true,
+            is_rent_related: false,
+            is_read_only_ttl_bump: false,
+        };
+
+        let mut hot_archive_restored_keys = std::collections::HashSet::new();
+        hot_archive_restored_keys.insert(key.clone());
+
+        // The key is in the RW footprint (as it would be for an archived entry in
+        // archivedSorobanEntries). This means the erase-RW loop will iterate over it.
+        let footprint = LedgerFootprint {
+            read_only: VecM::default(),
+            read_write: vec![key.clone()].try_into().unwrap(),
+        };
+
+        let mut state = LedgerStateManager::new(5_000_000, 59_940_765);
+
+        assert_eq!(
+            state.delta().created_entries().len(),
+            0,
+            "Delta should be empty before the call"
+        );
+
+        // Call the wrapper (plural) which also runs the erase-RW loop.
+        apply_soroban_storage_changes(
+            &mut state,
+            &[change],
+            &footprint,
+            &hot_archive_restored_keys,
+        );
+
+        // No TTL INIT should have been created (VE-05 fix).
+        let ttl_init_count = state
+            .delta()
+            .created_entries()
+            .iter()
+            .filter(|e| matches!(&e.data, LedgerEntryData::Ttl(t) if t.key_hash == key_hash))
+            .count();
+        assert_eq!(
+            ttl_init_count, 0,
+            "No TTL INIT should be emitted for a hot archive read-only restore (VE-05)"
+        );
+
+        // No data entry created or deleted either.
+        assert_eq!(
+            state.delta().created_entries().len(),
+            0,
+            "No entries should be created for a hot archive read-only restore"
+        );
+        assert_eq!(
+            state.delta().deleted_keys().len(),
+            0,
+            "No entries should be deleted for a hot archive read-only restore (not in state)"
         );
     }
 }
