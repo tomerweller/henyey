@@ -57,6 +57,7 @@ graph TD
 | `TransactionSetVariant` | Classic or generalized (v1) transaction set |
 | `LedgerCloseStats` | Statistics from ledger close processing |
 | `ConfigUpgradeSetFrame` | Loads, validates, and applies Soroban config upgrades |
+| `ConfigUpgradeResult` | Named result from config upgrade application (replaces tuple) |
 | `InMemorySorobanState` | In-memory cache for contract data/code with co-located TTLs |
 | `SharedSorobanState` | Thread-safe `RwLock` wrapper around `InMemorySorobanState` |
 | `SorobanNetworkInfo` | Network-level Soroban configuration (passphrase, limits) |
@@ -120,18 +121,19 @@ let entry = handle.get_entry(&key)?;
 | `lib.rs` | Public API, `LedgerInfo`, `LedgerChange`, `fees`, `reserves`, `trustlines` modules |
 | `manager.rs` | `LedgerManager` coordinator -- initialization, close pipeline, bucket list integration |
 | `close.rs` | `LedgerCloseData`, `LedgerCloseResult`, transaction set sorting, upgrade handling |
-| `execution/mod.rs` | Transaction execution bridge to `henyey-tx`, Soroban config loading, fee charging |
+| `execution/mod.rs` | `TransactionExecutor` with pre_apply/apply_body phase split, fee charging, Soroban config |
 | `execution/config.rs` | Soroban configuration loading from ledger state |
-| `execution/meta.rs` | Transaction metadata and delta snapshot helpers |
+| `execution/meta.rs` | Transaction metadata construction and delta snapshot helpers |
 | `execution/result_mapping.rs` | Mapping execution failures to XDR result codes |
-| `execution/signatures.rs` | Operation result success checking and key utilities |
-| `execution/tx_set.rs` | Transaction set execution orchestration and prefetch |
+| `execution/signatures.rs` | Signature verification, threshold checks, and key utilities |
+| `execution/tx_set.rs` | Transaction set execution orchestration, parallel Soroban, fee pre-deduction |
 | `delta.rs` | `LedgerDelta` change tracking with coalescing, fee/coin deltas, entry categorization |
 | `header.rs` | Header hash, skip list computation, chain verification, `create_next_header` |
 | `snapshot.rs` | `LedgerSnapshot`, `SnapshotHandle`, `SnapshotBuilder` for point-in-time state |
 | `soroban_state.rs` | `InMemorySorobanState` cache with TTL co-location for contract data/code |
 | `config_upgrade.rs` | `ConfigUpgradeSetFrame` for Soroban network configuration upgrades |
 | `offer.rs` | `OfferDescriptor`, `AssetPair`, offer sorting and comparison for DEX |
+| `prepare_liabilities.rs` | Liability preparation for protocol upgrades and reserve increases |
 | `error.rs` | `LedgerError` enum with variants for all ledger failure modes |
 
 ## Design Notes
@@ -183,6 +185,7 @@ provides an `RwLock`-guarded wrapper for concurrent access to the Soroban cache.
 | `soroban_state.rs` | `src/ledger/InMemorySorobanState.h/.cpp` |
 | `config_upgrade.rs` | `src/ledger/NetworkConfig.h/.cpp` (upgrade validation) |
 | `offer.rs` | `src/ledger/LedgerTxn.h` (offer ordering utilities) |
+| `prepare_liabilities.rs` | `src/herder/Upgrades.cpp` (prepareLiabilities) |
 | `error.rs` | Various error returns across stellar-core ledger files |
 | `lib.rs` (fees/reserves) | Inline calculations in `LedgerTxnImpl.cpp` |
 
