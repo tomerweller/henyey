@@ -376,6 +376,56 @@ struct ValidationFailure {
     past_seq_check: bool,
 }
 
+/// Result of the pre-apply phase of transaction execution.
+///
+/// This captures all data produced by `pre_apply()` that is needed by the
+/// subsequent `apply_body()` phase. It bridges the two phases, matching
+/// stellar-core's architecture where `preParallelApply` produces state
+/// (via `MutableTransactionResultBase&` and `AbstractLedgerTxn&`) that
+/// `parallelApply` consumes.
+///
+/// The pre-apply phase validates the transaction, deducts fees (if applicable),
+/// removes one-time signers, bumps the sequence number, and commits these
+/// changes. The apply phase then executes operations using this context.
+struct PreApplyResult {
+    // Transaction identity
+    frame: TransactionFrame,
+    fee_source_id: AccountId,
+    inner_source_id: AccountId,
+    outer_hash: Hash256,
+
+    // Pre-apply outputs
+    tx_changes_before: LedgerEntryChanges,
+    fee_changes: LedgerEntryChanges,
+    refundable_fee_tracker: Option<RefundableFeeTracker>,
+    tx_event_manager: TxEventManager,
+    preflight_failure: Option<ExecutionFailure>,
+    fee: i64,
+
+    // Rollback data (entry snapshots for restoring on op failure)
+    fee_entries: DeltaEntries,
+    seq_entries: DeltaEntries,
+    signer_entries: DeltaEntries,
+
+    // Config carried forward
+    soroban_prng_seed: Option<[u8; 32]>,
+    base_fee: u32,
+    deduct_fee: bool,
+
+    // Timing
+    validation_us: u64,
+    fee_seq_us: u64,
+    tx_timing_start: std::time::Instant,
+}
+
+/// Snapshot of created/updated/deleted entries for a delta phase (fee, seq, signer).
+/// Used for rollback restoration when a transaction's operation body fails.
+struct DeltaEntries {
+    created: Vec<LedgerEntry>,
+    updated: Vec<LedgerEntry>,
+    deleted: Vec<LedgerKey>,
+}
+
 /// Context for executing transactions during ledger close.
 pub struct TransactionExecutor {
     /// Ledger sequence being processed.
@@ -1869,23 +1919,18 @@ impl TransactionExecutor {
         }))
     }
 
-    /// Execute a transaction with configurable fee deduction and optional pre-fee state.
+    /// Pre-apply phase: validate, charge fees, remove one-time signers, bump sequence.
     ///
-    /// When `deduct_fee` is false, fee validation still occurs but no fee
-    /// processing changes are applied to the state or delta.
+    /// This matches stellar-core's `commonPreApply` + `preParallelApply` flow.
+    /// On success, returns a `PreApplyResult` containing all data needed by the
+    /// subsequent `apply_body()` phase. On validation failure, returns an early
+    /// `TransactionExecutionResult` directly.
     ///
-    /// When `should_apply` is false, the transaction's pre-apply phase (validation,
-    /// sequence bump, signer removal) executes normally, but the operation body is
-    /// **not** executed. This matches stellar-core's `parallelApply` which returns
-    /// `{false, {}}` immediately when `!txResult.isSuccess()` after `preParallelApply`
-    /// determined insufficient balance. The returned result has `success=false` with
-    /// proper tx_changes_before (seq bump + signer removal) but empty tx_apply_processing.
-    ///
-    /// For fee bump transactions in two-phase mode, `fee_source_pre_state` should be provided
-    /// with the fee source account state BEFORE fee processing. This is used for the STATE entry
-    /// in tx_changes_before to match stellar-core behavior.
+    /// After this method returns `Ok(Ok(..))`, the executor's state has committed
+    /// fee deduction, signer removal, and sequence bump. These changes persist
+    /// even if the operation body later fails (matching stellar-core behavior).
     #[allow(clippy::too_many_arguments)]
-    pub fn execute_transaction_with_fee_mode_and_pre_state(
+    fn pre_apply(
         &mut self,
         snapshot: &SnapshotHandle,
         tx_envelope: &TransactionEnvelope,
@@ -1893,8 +1938,7 @@ impl TransactionExecutor {
         soroban_prng_seed: Option<[u8; 32]>,
         deduct_fee: bool,
         fee_source_pre_state: Option<LedgerEntry>,
-        should_apply: bool,
-    ) -> Result<TransactionExecutionResult> {
+    ) -> Result<std::result::Result<PreApplyResult, TransactionExecutionResult>> {
         let tx_timing_start = std::time::Instant::now();
 
         // For Soroban TXs, compute the max refundable fee BEFORE validation.
@@ -1958,7 +2002,7 @@ impl TransactionExecutor {
                     self.state.commit();
                 }
 
-                return Ok(failure_result);
+                return Ok(Err(failure_result));
             }
         };
         let ValidatedTransaction {
@@ -1996,13 +2040,13 @@ impl TransactionExecutor {
             }
         }
 
-        let mut tx_event_manager = TxEventManager::new(
+        let tx_event_manager = TxEventManager::new(
             true,
             self.protocol_version,
             self.network_id,
             self.classic_events,
         );
-        let mut refundable_fee_tracker = if frame.is_soroban() {
+        let refundable_fee_tracker = if frame.is_soroban() {
             let (non_refundable_fee, _initial_refundable_fee) = compute_soroban_resource_fee(
                 &frame,
                 self.protocol_version,
@@ -2240,51 +2284,147 @@ impl TransactionExecutor {
         self.state.commit();
         let fee_seq_us = tx_timing_start.elapsed().as_micros() as u64 - validation_us;
 
-        // Early exit when the caller determined the TX should not be applied
-        // (e.g., insufficient fee source balance in the parallel Soroban path).
-        //
-        // This matches stellar-core's parallelApply which checks
-        // `if (!txResult.isSuccess()) return {false, {}};` after preParallelApply
-        // determined the TX failed validation. The pre-apply phase (validation,
-        // sequence bump, signer removal) has already committed above, but the
-        // operation body must NOT execute — no state changes, no RO TTL bumps,
-        // no hot archive key collection, no operation meta.
-        if !should_apply {
-            // Build soroban fee info for meta (consumed = 0 since no ops ran).
-            let soroban_fee_info = refundable_fee_tracker.as_ref().map(|t| {
-                (t.non_refundable_fee, t.consumed_refundable_fee, t.consumed_rent_fee)
-            });
-            let fee_refund = refundable_fee_tracker
-                .as_ref()
-                .map(|t| t.refund_amount())
-                .unwrap_or(0);
+        Ok(Ok(PreApplyResult {
+            frame,
+            fee_source_id,
+            inner_source_id,
+            outer_hash,
+            tx_changes_before,
+            fee_changes,
+            refundable_fee_tracker,
+            tx_event_manager,
+            preflight_failure,
+            fee,
+            fee_entries: DeltaEntries {
+                created: fee_created,
+                updated: fee_updated,
+                deleted: fee_deleted,
+            },
+            seq_entries: DeltaEntries {
+                created: seq_created,
+                updated: seq_updated,
+                deleted: seq_deleted,
+            },
+            signer_entries: DeltaEntries {
+                created: signer_created,
+                updated: signer_updated,
+                deleted: signer_deleted,
+            },
+            soroban_prng_seed,
+            base_fee,
+            deduct_fee,
+            validation_us,
+            fee_seq_us,
+            tx_timing_start,
+        }))
+    }
 
-            let tx_meta = build_transaction_meta(
-                tx_changes_before.clone(),
-                vec![],  // no operation changes
-                vec![],  // no operation events
-                vec![],  // no tx events
-                None,    // no soroban return value
-                vec![],  // no diagnostic events
-                soroban_fee_info,
-            );
+    /// Build a `TransactionExecutionResult` for a TX whose operation body was
+    /// skipped (e.g., insufficient fee source balance in the parallel path).
+    ///
+    /// This matches stellar-core's `parallelApply` returning `{false, {}}` when
+    /// `!txResult.isSuccess()` after `preParallelApply`.
+    fn build_skipped_result(pre: &PreApplyResult) -> TransactionExecutionResult {
+        let soroban_fee_info = pre.refundable_fee_tracker.as_ref().map(|t| {
+            (t.non_refundable_fee, t.consumed_refundable_fee, t.consumed_rent_fee)
+        });
+        let fee_refund = pre.refundable_fee_tracker
+            .as_ref()
+            .map(|t| t.refund_amount())
+            .unwrap_or(0);
 
-            let total_us = tx_timing_start.elapsed().as_micros() as u64;
-            return Ok(TransactionExecutionResult {
-                success: false,
-                fee_charged: 0, // overridden by caller from pre-charged fees
-                fee_refund,
-                operation_results: vec![],
-                error: Some("Insufficient balance for fee".into()),
-                failure: Some(ExecutionFailure::InsufficientBalance),
-                tx_meta: Some(tx_meta),
-                fee_changes: Some(fee_changes),
-                post_fee_changes: Some(empty_entry_changes()),
-                hot_archive_restored_keys: Vec::new(),
-                op_type_timings: HashMap::new(),
-                exec_time_us: total_us,
-            });
+        let tx_meta = build_transaction_meta(
+            pre.tx_changes_before.clone(),
+            vec![],  // no operation changes
+            vec![],  // no operation events
+            vec![],  // no tx events
+            None,    // no soroban return value
+            vec![],  // no diagnostic events
+            soroban_fee_info,
+        );
+
+        let total_us = pre.tx_timing_start.elapsed().as_micros() as u64;
+        TransactionExecutionResult {
+            success: false,
+            fee_charged: 0, // overridden by caller from pre-charged fees
+            fee_refund,
+            operation_results: vec![],
+            error: Some("Insufficient balance for fee".into()),
+            failure: Some(ExecutionFailure::InsufficientBalance),
+            tx_meta: Some(tx_meta),
+            fee_changes: Some(pre.fee_changes.clone()),
+            post_fee_changes: Some(empty_entry_changes()),
+            hot_archive_restored_keys: Vec::new(),
+            op_type_timings: HashMap::new(),
+            exec_time_us: total_us,
         }
+    }
+
+    /// Execute a transaction with configurable fee deduction and optional pre-fee state.
+    ///
+    /// This is the main orchestrator that calls `pre_apply()` for validation,
+    /// fee charging, signer removal, and sequence bumping, then conditionally
+    /// calls through to the operation body execution phase.
+    ///
+    /// When `deduct_fee` is false, fee validation still occurs but no fee
+    /// processing changes are applied to the state or delta.
+    ///
+    /// When `should_apply` is false, the transaction's pre-apply phase executes
+    /// normally, but the operation body is **not** executed. This matches
+    /// stellar-core's `parallelApply` which returns `{false, {}}` immediately
+    /// when `!txResult.isSuccess()` after `preParallelApply` determined
+    /// insufficient balance.
+    ///
+    /// For fee bump transactions in two-phase mode, `fee_source_pre_state` should be provided
+    /// with the fee source account state BEFORE fee processing. This is used for the STATE entry
+    /// in tx_changes_before to match stellar-core behavior.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_transaction_with_fee_mode_and_pre_state(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        tx_envelope: &TransactionEnvelope,
+        base_fee: u32,
+        soroban_prng_seed: Option<[u8; 32]>,
+        deduct_fee: bool,
+        fee_source_pre_state: Option<LedgerEntry>,
+        should_apply: bool,
+    ) -> Result<TransactionExecutionResult> {
+        // Phase 1: Pre-apply (validate, charge fees, remove signers, bump seq)
+        let pre = match self.pre_apply(
+            snapshot, tx_envelope, base_fee,
+            soroban_prng_seed, deduct_fee, fee_source_pre_state,
+        )? {
+            Ok(pre) => pre,
+            Err(early_result) => return Ok(early_result),
+        };
+
+        // Phase 2: Skip operation body when caller determined TX should not apply
+        if !should_apply {
+            return Ok(Self::build_skipped_result(&pre));
+        }
+
+        // Phase 3: Execute operation body
+        let PreApplyResult {
+            frame,
+            fee_source_id,
+            inner_source_id,
+            outer_hash,
+            tx_changes_before,
+            fee_changes,
+            mut refundable_fee_tracker,
+            mut tx_event_manager,
+            preflight_failure,
+            fee,
+            fee_entries,
+            seq_entries,
+            signer_entries,
+            soroban_prng_seed,
+            base_fee,
+            deduct_fee,
+            validation_us,
+            fee_seq_us,
+            tx_timing_start,
+        } = pre;
 
         // Create ledger context for operation execution
         let ledger_context = if let Some(prng_seed) = soroban_prng_seed {
@@ -2819,7 +2959,12 @@ impl TransactionExecutor {
                 "Transaction failed; rolling back changes"
             );
             self.state.rollback();
-            restore_delta_entries(&mut self.state, &fee_created, &fee_updated, &fee_deleted);
+            restore_delta_entries(
+                &mut self.state,
+                &fee_entries.created,
+                &fee_entries.updated,
+                &fee_entries.deleted,
+            );
             // Re-add the fee to the delta after rollback.
             // rollback() restores the delta from the snapshot taken BEFORE fee deduction,
             // so we must explicitly re-add this transaction's fee to preserve it.
@@ -2827,12 +2972,17 @@ impl TransactionExecutor {
             if deduct_fee && fee > 0 {
                 self.state.delta_mut().add_fee(fee);
             }
-            restore_delta_entries(&mut self.state, &seq_created, &seq_updated, &seq_deleted);
             restore_delta_entries(
                 &mut self.state,
-                &signer_created,
-                &signer_updated,
-                &signer_deleted,
+                &seq_entries.created,
+                &seq_entries.updated,
+                &seq_entries.deleted,
+            );
+            restore_delta_entries(
+                &mut self.state,
+                &signer_entries.created,
+                &signer_entries.updated,
+                &signer_entries.deleted,
             );
             op_changes.clear();
             op_events.clear();
