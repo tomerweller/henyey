@@ -30,8 +30,8 @@ Protocol 25 boundary: TBD — to be identified during Sweep 4 of L59939047+.
 | L59939047–L60139046 | In progress (s4a, PID 716325) | Running — at L60087016 |
 | L60139047–L60269152 | **CLEAN** | s4b ran clean up to VE-06 |
 | L60269153 | **VE-06** | bucket_list_hash mismatch — fix 54c1221, awaiting confirmation |
-| L60269154–L60339046 | Pending | s4b restart with VE-06 fix needed |
-| L60339047–L60539046 | Failed (OOM kill) | s4c killed by OOM at L60458153 — not a real mismatch, restart needed |
+| L60269154–L60339046 | Pending (s4b) | State cleared — monitor will restart with VE-06 fix (54c1221) |
+| L60339047–L60539046 | Pending (s4c) | OOM kill — state cleared, monitor will restart with VE-06 fix (54c1221) |
 | L60539047–L60739046 | In progress (s4d, PID 1299488) | Running — at L60551891 |
 | L60739047–L60939046 | In progress (s4e, PID 1311968) | Running |
 | L60939047–L61139046 | Pending | Queued — starts when a slot opens |
@@ -130,4 +130,4 @@ Protocol 25 boundary: TBD — to be identified during Sweep 4 of L59939047+.
 | s4e | L60739047-L60939046 | 1311968 | 2026-02-23 | running |
 
 Monitor PID: 755062 (10-min interval)
-Pending restarts: s4b (L60269153-L60339046 with VE-06 fix), s4c (L60339047-L60539046 — OOM kill, not a mismatch)
+Pending (state cleared, will auto-start when slots open): s4b (L60139047-L60339046), s4c (L60339047-L60539046)
