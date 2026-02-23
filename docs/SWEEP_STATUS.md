@@ -1,7 +1,7 @@
 # Verify-Execution Sweep Status
 
-> **Updated**: 2026-02-23 17:07
-> **CDP data lake range**: L59501248–L61354687 (latest available as of 2026-02-22)
+> **Updated**: 2026-02-23 17:51
+> **CDP data lake range**: L59501248–L61366079 (latest available as of 2026-02-23)
 > **Supported protocol**: P24+ (L59501312 is first P24 ledger; L59501248–L59501311 are P23 and unverifiable)
 > **P25 boundary**: TBD (to be identified during sweeps)
 
@@ -27,16 +27,16 @@ Protocol 25 boundary: TBD — to be identified during Sweep 4 of L59939047+.
 | L59863188–L59875307 | **CLEAN** | Sweep 3 restart 3 ran clean through this range |
 | L59875308–L59907177 | **CLEAN** | Sweep 3a completed — 31,870 ledgers, 0 mismatches |
 | L59907178–L59939046 | **CLEAN** | Sweep 3b completed — 31,869 ledgers, 0 mismatches |
-| L59939047–L60139046 | In progress (s4a, PID 716325) | Running — at L60087016 |
+| L59939047–L60139046 | In progress (s4a) | Restarted after disk cleanup (2026-02-23 17:51) |
 | L60139047–L60269152 | **CLEAN** | s4b ran clean up to VE-06 |
 | L60269153 | **VE-06** | bucket_list_hash mismatch — fix 54c1221, awaiting confirmation |
-| L60269154–L60339046 | Pending (s4b) | State cleared — monitor will restart with VE-06 fix (54c1221) |
-| L60339047–L60539046 | Pending (s4c) | OOM kill — state cleared, monitor will restart with VE-06 fix (54c1221) |
-| L60539047–L60739046 | In progress (s4d, PID 1299488) | Running — at L60551891 |
-| L60739047–L60939046 | In progress (s4e, PID 1311968) | Running |
-| L60939047–L61139046 | Pending | Queued — starts when a slot opens |
-| L61139047–L61339818 | Pending | Queued — starts when a slot opens |
-| L61339819–L61354687 | Pending (s5a) | Extended range — new CDP data as of 2026-02-22 |
+| L60269154–L60339046 | In progress (s4b) | Restarted with VE-06 fix (54c1221) — will confirm at L60269153 |
+| L60339047–L60539046 | In progress (s4c) | Restarted after disk cleanup |
+| L60539047–L60739046 | Pending (s4d) | Queued — starts when slot opens |
+| L60739047–L60939046 | Pending (s4e) | Queued — starts when slot opens |
+| L60939047–L61139046 | Pending (s4f) | Queued — starts when slot opens |
+| L61139047–L61339818 | Pending (s4g) | Queued — starts when slot opens |
+| L61339819–L61366079 | Pending (s5a) | Extended range — covers new CDP data through 2026-02-23 |
 
 ## VE-04 (confirmed fixed)
 
@@ -104,7 +104,7 @@ Protocol 25 boundary: TBD — to be identified during Sweep 4 of L59939047+.
 - **Fix**: Gate `collected_hot_archive_keys.extend(...)` on `is_operation_success(&op_result)`.
   Regression test `test_ve06_failed_op_hot_archive_keys_not_collected` added.
 - **Fixed**: Commit `54c1221` (2026-02-23).
-- **Pending**: Single-ledger verify-execution on L60269153 (will run when memory frees up).
+- **Confirmation**: s4b restart (2026-02-23 17:51) with fix will traverse L60269153 and confirm.
 
 ## VE-05 (confirmed fixed)
 
@@ -124,4 +124,9 @@ Protocol 25 boundary: TBD — to be identified during Sweep 4 of L59939047+.
 
 ## Running sweeps
 
-None — all chunks complete.
+| Sweep | Range | PID | Started |
+| s4a | L59939047-L60139046 | 1720238 | 2026-02-23 |
+| s4b | L60139047-L60339046 | 1720243 | 2026-02-23 |
+| s4c | L60339047-L60539046 | 1720248 | 2026-02-23 |
+
+Monitor PID: 1720133 (10-min interval)
