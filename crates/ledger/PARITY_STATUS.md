@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-ledger`
 **Upstream**: `stellar-core/src/ledger/`
-**Overall Parity**: 64%
-**Last Updated**: 2026-02-17
+**Overall Parity**: 66%
+**Last Updated**: 2026-02-23
 
 ## Summary
 
@@ -21,7 +21,7 @@
 | In-Memory Soroban State | Full | Contract data/code with TTL |
 | Config Upgrade Handling | Full | Validation and application |
 | LedgerTxn Nested Transactions | Partial | Savepoints cover operation rollback |
-| Parallel Apply / Threading | None | Single-threaded execution |
+| Parallel Apply / Threading | Partial | Parallel cluster execution via tokio; no ApplyState phase machine |
 | Soroban Metrics | None | No metrics collection |
 | Shared Module Cache | Partial | Per-TX caching via `PersistentModuleCache` in `henyey-tx`; no global shared cache |
 
@@ -94,7 +94,9 @@ Corresponds to: `LedgerManager.h`, `LedgerManagerImpl.h`
 | `LedgerManager::isApplying()` | Not applicable (single-threaded) | None |
 | `LedgerManager::markApplyStateReset()` | Not applicable (single-threaded) | None |
 | `LedgerManagerImpl::setupLedgerCloseMetaStream()` | Not implemented | None |
-| `LedgerManagerImpl::applySorobanStages()` | Not implemented (parallel) | None |
+| `LedgerManagerImpl::applySorobanStages()` | `execute_soroban_parallel_phase()` | Full |
+| `LedgerManagerImpl::applySorobanStageClustersInParallel()` | `execute_stage_clusters()` (tokio parallel) | Full |
+| `LedgerManagerImpl::applyThread()` | `execute_single_cluster()` (per-cluster executor) | Full |
 | `LedgerManagerImpl::prefetchTransactionData()` | Not implemented | None |
 | `LedgerManagerImpl::ApplyState` (phase machine) | Not implemented | None |
 
@@ -174,12 +176,15 @@ Corresponds to: `LedgerStateSnapshot.h`
 
 ### execution (`execution/mod.rs`, `execution/config.rs`, `execution/meta.rs`, `execution/result_mapping.rs`, `execution/signatures.rs`, `execution/tx_set.rs`)
 
-Corresponds to: `LedgerManagerImpl.h` (transaction execution), `NetworkConfig.h`, `LedgerCloseMetaFrame.h`
+Corresponds to: `LedgerManagerImpl.h` (transaction execution), `NetworkConfig.h`, `LedgerCloseMetaFrame.h`, `TransactionFrame.h` (apply phases)
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
 | `processFeesSeqNums()` | Fee charging in `run_transactions_on_executor()` | Full |
 | `applyTransactions()` | `run_transactions_on_executor()` | Full |
+| `TransactionFrame::commonPreApply()` | `pre_apply()` (private) | Full |
+| `TransactionFrame::preParallelApply()` | `pre_apply()` (private) | Full |
+| `TransactionFrame::parallelApply()` | `apply_body()` (private) | Full |
 | `SorobanNetworkConfig::loadFromLedger()` | `load_soroban_network_info()` | Full |
 | `SorobanNetworkConfig` field getters | `SorobanNetworkInfo` struct fields | Full |
 | `SorobanNetworkConfig::maybeSnapshotSorobanStateSize()` | `compute_state_size_window_entry()` | Full |
@@ -323,7 +328,6 @@ Features not yet implemented. These ARE counted against parity %.
 |------------------------|----------|-------|
 | `SharedModuleCacheCompiler` (WASM module caching) | Low | Per-TX `PersistentModuleCache` in `henyey-tx` provides functionally equivalent caching; architectural difference (per-TX vs global) |
 | `LedgerManagerImpl::ApplyState` phase machine | Medium | Multi-threaded apply coordination |
-| `applySorobanStages()` / parallel Soroban threads | Medium | Multi-threaded Soroban execution |
 | `SorobanMetrics` class | Low | Observability, not correctness |
 | `SorobanNetworkConfig::createLedgerEntriesForV20()` | Medium | Genesis config initialization |
 | `SorobanNetworkConfig::createCostTypesForV21/V22/V25()` | Medium | Protocol upgrade config creation |
@@ -344,9 +348,9 @@ Features not yet implemented. These ARE counted against parity %.
    - **Rationale**: The delta+savepoint model is simpler while covering the primary use case (per-operation rollback during transaction execution). General nesting is not needed by the current execution pipeline. The `InternalLedgerEntry` generalization is unnecessary because sponsorship tracking is handled inline during operation execution.
 
 2. **Threading Model**
-   - **stellar-core**: Multi-threaded with dedicated apply thread and parallel Soroban execution threads. Uses an `ApplyState` phase machine (SETTING_UP_STATE -> READY_TO_APPLY -> APPLYING -> COMMITTING) to coordinate thread access. `LedgerTxn` enforces same-thread invariant.
-   - **Rust**: Single-threaded ledger close execution. Thread safety is provided via `RwLock` for concurrent reads during idle periods, not for parallel apply.
-   - **Rationale**: Simpler concurrency model avoids complex phase coordination. Parallel apply can be added later without changing the core close semantics.
+   - **stellar-core**: Multi-threaded with dedicated apply thread and parallel Soroban execution threads. Uses an `ApplyState` phase machine (SETTING_UP_STATE -> READY_TO_APPLY -> APPLYING -> COMMITTING) to coordinate thread access. `LedgerTxn` enforces same-thread invariant. Transaction execution split into `preParallelApply` (sequential on primary thread) and `parallelApply` (on worker threads).
+   - **Rust**: Parallel Soroban cluster execution via `tokio::spawn_blocking` in `execute_stage_clusters()`. Each cluster gets its own `TransactionExecutor` and `LedgerDelta`, merged back into the parent delta after completion. Transaction execution split into `pre_apply()` (validation, fee, seq bump) and `apply_body()` (operations) matching the upstream architecture. No `ApplyState` phase machine — ledger close orchestration is sequential at the stage level.
+   - **Rationale**: The `pre_apply`/`apply_body` split mirrors stellar-core's `preParallelApply`/`parallelApply` architecture, enabling correct parallel execution without an explicit phase machine. Tokio's blocking thread pool replaces `std::async` for cluster parallelism.
 
 3. **Persistence Layer**
    - **stellar-core**: Dual SQL + Bucket List with SQL being phased out. Maintains offer tables in SQL with complex bulk upsert/delete operations. Supports read-only and read-write SQL transaction modes. Uses `RandomEvictionCache` for entry caching, `BulkLedgerEntryChangeAccumulator` for batch SQL operations.
@@ -398,13 +402,13 @@ The ledger crate has been verified against testnet for ledger close correctness.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 84 |
-| Gaps (None + Partial) | 47 |
+| Implemented (Full) | 90 |
+| Gaps (None + Partial) | 46 |
 | Intentional Omissions | 30 |
-| **Parity** | **84 / (84 + 47) = 64%** |
+| **Parity** | **90 / (90 + 46) = 66%** |
 
-The 84 implemented items cover: LedgerManager core operations (28), header utilities (8), delta/change tracking (13), close data (8), snapshots (8), execution pipeline (18), config upgrade (6), offer utilities (5), in-memory Soroban state (15), fee/reserve calculations (9), trustline utilities (7). Note that some upstream items map to the same Rust function, so the Rust function count is lower.
+The 90 implemented items cover: LedgerManager core operations (30, including `applySorobanStages`, `applySorobanStageClustersInParallel`, `applyThread`), header utilities (8), delta/change tracking (13), close data (8), snapshots (8), execution pipeline (21, including `commonPreApply`→`pre_apply`, `preParallelApply`→`pre_apply`, `parallelApply`→`apply_body`), config upgrade (6), offer utilities (5), in-memory Soroban state (15), fee/reserve calculations (9), trustline utilities (7). Note that some upstream items map to the same Rust function, so the Rust function count is lower.
 
-The 47 gap items include: LedgerManager threading/metrics methods (8 counted as gaps), NetworkConfig creation functions (5), parallel apply infrastructure (2), module cache (1), nested transaction model (1), snapshot unification (1), timing utilities (2), metrics (1), prefetch (1), meta streaming (1), and the None items from each Component Mapping that are not classified as omissions.
+The 46 gap items include: LedgerManager threading/metrics methods (7 counted as gaps), NetworkConfig creation functions (5), ApplyState phase machine (1), module cache (1), nested transaction model (1), snapshot unification (1), timing utilities (2), metrics (1), prefetch (1), meta streaming (1), and the None items from each Component Mapping that are not classified as omissions.
 
 The 30 intentional omissions are primarily SQL backend features (LedgerTxnRoot, offer SQL, header SQL operations), debug tooling (P23HotArchiveBug, FlushAndRotateMetaDebugWork), deprecated functionality (inflation), C++ implementation artifacts (InternalLedgerEntry, EntryPtrState, ThreadInvariant), and features handled by other crates (catchup, checkpoint ranges, app state machine).
