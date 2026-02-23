@@ -1,6 +1,6 @@
 # Verify-Execution Sweep Status
 
-> **Updated**: 2026-02-23 19:08
+> **Updated**: 2026-02-23 21:41
 > **CDP data lake range**: L59501248–L61366079 (latest available as of 2026-02-23)
 > **Supported protocol**: P24+ (L59501312 is first P24 ledger; L59501248–L59501311 are P23 and unverifiable)
 > **P25 boundary**: TBD (to be identified during sweeps)
@@ -27,15 +27,18 @@ Protocol 25 boundary: TBD — to be identified during Sweep 4 of L59939047+.
 | L59863188–L59875307 | **CLEAN** | Sweep 3 restart 3 ran clean through this range |
 | L59875308–L59907177 | **CLEAN** | Sweep 3a completed — 31,870 ledgers, 0 mismatches |
 | L59907178–L59939046 | **CLEAN** | Sweep 3b completed — 31,869 ledgers, 0 mismatches |
-| L59939047–L60139046 | In progress (s4a) | Restarted 17:58 UTC with binary including both VE-06 fixes |
-| L60139047–L60269152 | **CLEAN** | s4b ran clean up to VE-06 |
+| L59939047–L59986395 | **CLEAN** | s4a at L59986395 (23%) with 0 mismatches — swept clean, paused 2026-02-23 21:46 UTC |
+| L59986396–L60139046 | Pending (s4a) | Remaining s4a range — paused, awaiting restart |
+| L60139047–L60169210 | **CLEAN** | s4b at L60169210 (15%) with 0 mismatches — swept clean through VE-06 approach, paused 2026-02-23 21:46 UTC |
+| L60169211–L60269152 | Pending (s4b) | Remaining pre-VE-06 range — paused, awaiting restart |
 | L60269153 | **VE-06** | bucket_list_hash mismatch — fix e8d22fa + 7a172d7, awaiting confirmation |
-| L60269154–L60339046 | In progress (s4b) | Restarted 17:58 UTC with both VE-06 fixes (e8d22fa + 7a172d7) |
-| L60339047–L60539046 | In progress (s4c) | Restarted 17:58 UTC with both VE-06 fixes |
-| L60539047–L60739046 | Pending (s4d) | Queued — starts when slot opens |
-| L60739047–L60939046 | Pending (s4e) | Queued — starts when slot opens |
-| L60939047–L61139046 | Pending (s4f) | Queued — starts when slot opens |
-| L61139047–L61339818 | Pending (s4g) | Queued — starts when slot opens |
+| L60269154–L60339046 | Pending (s4b) | Awaiting restart |
+| L60339047–L60539046 | Pending (s4c) | Not yet started this round |
+| L60539047–L60582251 | **CLEAN** | s4d at L60582251 (21%) with 0 mismatches — swept clean, paused 2026-02-23 21:46 UTC |
+| L60582252–L60739046 | Pending (s4d) | Remaining s4d range — paused, awaiting restart |
+| L60739047–L60939046 | Pending (s4e) | Not yet started |
+| L60939047–L61139046 | Pending (s4f) | Not yet started |
+| L61139047–L61339818 | Pending (s4g) | Not yet started |
 | L61339819–L61366079 | Pending (s5a) | Extended range — covers new CDP data through 2026-02-23 |
 
 ## VE-04 (confirmed fixed)
