@@ -1,6 +1,6 @@
 # Verify-Execution Sweep Status
 
-> **Updated**: 2026-02-23 10:42
+> **Updated**: 2026-02-23 12:05
 > **CDP data lake range**: L59501248–L61354687 (latest available as of 2026-02-22)
 > **Supported protocol**: P24+ (L59501312 is first P24 ledger; L59501248–L59501311 are P23 and unverifiable)
 > **P25 boundary**: TBD (to be identified during sweeps)
@@ -27,11 +27,13 @@ Protocol 25 boundary: TBD — to be identified during Sweep 4 of L59939047+.
 | L59863188–L59875307 | **CLEAN** | Sweep 3 restart 3 ran clean through this range |
 | L59875308–L59907177 | **CLEAN** | Sweep 3a completed — 31,870 ledgers, 0 mismatches |
 | L59907178–L59939046 | **CLEAN** | Sweep 3b completed — 31,869 ledgers, 0 mismatches |
-| L59939047–L60139046 | In progress (s4a, PID 716325) | Restarted with correct VE-05 fix (16933b2) |
-| L60139047–L60339046 | In progress (s4b, PID 716330) | Restarted with correct VE-05 fix (16933b2) |
-| L60339047–L60539046 | In progress (s4c, PID 716335) | Restarted with correct VE-05 fix (16933b2) |
-| L60539047–L60739046 | Pending | Queued — starts when a slot opens |
-| L60739047–L60939046 | Pending | Queued — starts when a slot opens |
+| L59939047–L60139046 | In progress (s4a, PID 716325) | Running — at L60087016 |
+| L60139047–L60269152 | **CLEAN** | s4b ran clean up to VE-06 |
+| L60269153 | **VE-06** | bucket_list_hash mismatch — fix 54c1221, awaiting confirmation |
+| L60269154–L60339046 | Pending | s4b restart with VE-06 fix needed |
+| L60339047–L60539046 | Failed (OOM kill) | s4c killed by OOM at L60458153 — not a real mismatch, restart needed |
+| L60539047–L60739046 | In progress (s4d, PID 1299488) | Running — at L60551891 |
+| L60739047–L60939046 | In progress (s4e, PID 1311968) | Running |
 | L60939047–L61139046 | Pending | Queued — starts when a slot opens |
 | L61139047–L61339818 | Pending | Queued — starts when a slot opens |
 | L61339819–L61354687 | Pending (s5a) | Extended range — new CDP data as of 2026-02-22 |
@@ -86,9 +88,27 @@ Protocol 25 boundary: TBD — to be identified during Sweep 4 of L59939047+.
 - **Fixed**: Commits `0fb052d` (contract_data/code), `d482c43` (account/data/claimable_balance).
 - **Confirmed**: Post-fix sweep passed L59658059 without error (2026-02-20).
 
+## VE-06 (fix applied, awaiting confirmation)
+
+- **Ledger**: L60269153 (bucket_list_hash mismatch; TX result and meta both match CDP)
+- **Root cause**: When an InvokeHostFunction operation fails and is rolled back, stellar-core
+  rolls back the nested LedgerTxn, canceling any hot archive restorations set up by
+  `handleArchivedEntry`. No HOT_ARCHIVE_LIVE tombstones are written for failed operations.
+  Before the fix, our code added hot archive keys from `actual_restored_indices` to
+  `collected_hot_archive_keys` unconditionally — even for failed operations. This produced
+  spurious HOT_ARCHIVE_LIVE tombstones via `add_batch()` at ledger close, diverging the
+  hot archive bucket list hash from stellar-core.
+  Evidence: CDP meta shows `restored=0` (no entries actually restored — TX failed before
+  restoration completed), but we wrote 2 HOT_ARCHIVE_LIVE tombstones (ContractData + ContractCode,
+  both with `old_live_until=None`, idx=2 and idx=3 in RW footprint).
+- **Fix**: Gate `collected_hot_archive_keys.extend(...)` on `is_operation_success(&op_result)`.
+  Regression test `test_ve06_failed_op_hot_archive_keys_not_collected` added.
+- **Fixed**: Commit `54c1221` (2026-02-23).
+- **Pending**: Single-ledger verify-execution on L60269153 (will run when memory frees up).
+
 ## VE-05 (confirmed fixed)
 
-- **Ledger**: L59940765 (first hit in sweep; L60269153 also affected)
+- **Ledger**: L59940765
 - **Root cause**: When the host reads a restored archived entry without writing it back (read-only
   access from `archived_soroban_entries`), `storage_changes` includes it with `new_entry=None` and
   `live_until=Some(restored_live_until)` due to false-positive `is_deletion` and `ttl_extended` flags
@@ -104,9 +124,10 @@ Protocol 25 boundary: TBD — to be identified during Sweep 4 of L59939047+.
 
 ## Running sweeps
 
-| Sweep | Range | PID | Started |
-| s4a | L59939047-L60139046 | 716325 | 2026-02-23 |
-| s4d | L60539047-L60739046 | 1299488 | 2026-02-23 |
-| s4e | L60739047-L60939046 | 1311968 | 2026-02-23 |
+| Sweep | Range | PID | Started | Current |
+| s4a | L59939047-L60139046 | 716325 | 2026-02-23 | L60087016 |
+| s4d | L60539047-L60739046 | 1299488 | 2026-02-23 | L60551891 |
+| s4e | L60739047-L60939046 | 1311968 | 2026-02-23 | running |
 
 Monitor PID: 755062 (10-min interval)
+Pending restarts: s4b (L60269153-L60339046 with VE-06 fix), s4c (L60339047-L60539046 — OOM kill, not a mismatch)
