@@ -1,6 +1,6 @@
 # Verify-Execution Sweep Status
 
-> **Updated**: 2026-02-23 17:51
+> **Updated**: 2026-02-23 17:58
 > **CDP data lake range**: L59501248–L61366079 (latest available as of 2026-02-23)
 > **Supported protocol**: P24+ (L59501312 is first P24 ledger; L59501248–L59501311 are P23 and unverifiable)
 > **P25 boundary**: TBD (to be identified during sweeps)
@@ -27,11 +27,11 @@ Protocol 25 boundary: TBD — to be identified during Sweep 4 of L59939047+.
 | L59863188–L59875307 | **CLEAN** | Sweep 3 restart 3 ran clean through this range |
 | L59875308–L59907177 | **CLEAN** | Sweep 3a completed — 31,870 ledgers, 0 mismatches |
 | L59907178–L59939046 | **CLEAN** | Sweep 3b completed — 31,869 ledgers, 0 mismatches |
-| L59939047–L60139046 | In progress (s4a) | Restarted after disk cleanup (2026-02-23 17:51) |
+| L59939047–L60139046 | In progress (s4a) | Restarted 17:58 UTC with binary including both VE-06 fixes |
 | L60139047–L60269152 | **CLEAN** | s4b ran clean up to VE-06 |
-| L60269153 | **VE-06** | bucket_list_hash mismatch — fix 54c1221, awaiting confirmation |
-| L60269154–L60339046 | In progress (s4b) | Restarted with VE-06 fix (54c1221) — will confirm at L60269153 |
-| L60339047–L60539046 | In progress (s4c) | Restarted after disk cleanup |
+| L60269153 | **VE-06** | bucket_list_hash mismatch — fix e8d22fa + 7a172d7, awaiting confirmation |
+| L60269154–L60339046 | In progress (s4b) | Restarted 17:58 UTC with both VE-06 fixes (e8d22fa + 7a172d7) |
+| L60339047–L60539046 | In progress (s4c) | Restarted 17:58 UTC with both VE-06 fixes |
 | L60539047–L60739046 | Pending (s4d) | Queued — starts when slot opens |
 | L60739047–L60939046 | Pending (s4e) | Queued — starts when slot opens |
 | L60939047–L61139046 | Pending (s4f) | Queued — starts when slot opens |
@@ -101,10 +101,14 @@ Protocol 25 boundary: TBD — to be identified during Sweep 4 of L59939047+.
   Evidence: CDP meta shows `restored=0` (no entries actually restored — TX failed before
   restoration completed), but we wrote 2 HOT_ARCHIVE_LIVE tombstones (ContractData + ContractCode,
   both with `old_live_until=None`, idx=2 and idx=3 in RW footprint).
-- **Fix**: Gate `collected_hot_archive_keys.extend(...)` on `is_operation_success(&op_result)`.
-  Regression test `test_ve06_failed_op_hot_archive_keys_not_collected` added.
-- **Fixed**: Commit `54c1221` (2026-02-23).
-- **Confirmation**: s4b restart (2026-02-23 17:51) with fix will traverse L60269153 and confirm.
+- **Fix part 1** (`e8d22fa`, formerly `54c1221`): Gate `collected_hot_archive_keys.extend(...)` on
+  `is_operation_success(&op_result)` in `execution/mod.rs`. Regression test added.
+- **Fix part 2** (`7a172d7`): Related bug in parallel path (`execute_single_cluster` in `tx_set.rs`):
+  when `!pre.should_apply` (insufficient fee), TX body still executes and hot archive keys are
+  collected even though TX is later force-failed. Fixed by gating `restored_keys` collection on
+  `r.success` for each TX result.
+- **Fixed**: Commits `e8d22fa` + `7a172d7` (2026-02-23). Binary rebuilt at 17:58 UTC.
+- **Confirmation**: s4b restart (2026-02-23 17:58 UTC) with both fixes will traverse L60269153.
 
 ## VE-05 (confirmed fixed)
 
@@ -125,8 +129,8 @@ Protocol 25 boundary: TBD — to be identified during Sweep 4 of L59939047+.
 ## Running sweeps
 
 | Sweep | Range | PID | Started |
-| s4a | L59939047-L60139046 | 1720238 | 2026-02-23 |
-| s4b | L60139047-L60339046 | 1720243 | 2026-02-23 |
-| s4c | L60339047-L60539046 | 1720248 | 2026-02-23 |
+| s4a | L59939047-L60139046 | 1732890 | 2026-02-23 |
+| s4b | L60139047-L60339046 | 1732923 | 2026-02-23 |
+| s4c | L60339047-L60539046 | 1732965 | 2026-02-23 |
 
-Monitor PID: 1720133 (10-min interval)
+Monitor PID: 1732802 (10-min interval)
