@@ -387,7 +387,7 @@ struct ValidationFailure {
 /// The pre-apply phase validates the transaction, deducts fees (if applicable),
 /// removes one-time signers, bumps the sequence number, and commits these
 /// changes. The apply phase then executes operations using this context.
-struct PreApplyResult {
+pub struct PreApplyResult {
     // Transaction identity
     frame: TransactionFrame,
     fee_source_id: AccountId,
@@ -420,10 +420,10 @@ struct PreApplyResult {
 
 /// Snapshot of created/updated/deleted entries for a delta phase (fee, seq, signer).
 /// Used for rollback restoration when a transaction's operation body fails.
-struct DeltaEntries {
-    created: Vec<LedgerEntry>,
-    updated: Vec<LedgerEntry>,
-    deleted: Vec<LedgerKey>,
+pub struct DeltaEntries {
+    pub created: Vec<LedgerEntry>,
+    pub updated: Vec<LedgerEntry>,
+    pub deleted: Vec<LedgerKey>,
 }
 
 /// Context for executing transactions during ledger close.
@@ -1930,7 +1930,7 @@ impl TransactionExecutor {
     /// fee deduction, signer removal, and sequence bump. These changes persist
     /// even if the operation body later fails (matching stellar-core behavior).
     #[allow(clippy::too_many_arguments)]
-    fn pre_apply(
+    pub fn pre_apply(
         &mut self,
         snapshot: &SnapshotHandle,
         tx_envelope: &TransactionEnvelope,
@@ -2324,7 +2324,7 @@ impl TransactionExecutor {
     ///
     /// This matches stellar-core's `parallelApply` returning `{false, {}}` when
     /// `!txResult.isSuccess()` after `preParallelApply`.
-    fn build_skipped_result(pre: &PreApplyResult) -> TransactionExecutionResult {
+    pub fn build_skipped_result(pre: &PreApplyResult) -> TransactionExecutionResult {
         let soroban_fee_info = pre.refundable_fee_tracker.as_ref().map(|t| {
             (t.non_refundable_fee, t.consumed_refundable_fee, t.consumed_rent_fee)
         });
@@ -2417,7 +2417,7 @@ impl TransactionExecutor {
     ///
     /// This matches the body of stellar-core's `parallelApply` (for Soroban) /
     /// `TransactionFrame::apply` (for classic) — everything after `commonPreApply`.
-    fn apply_body(
+    pub fn apply_body(
         &mut self,
         snapshot: &SnapshotHandle,
         pre: PreApplyResult,
