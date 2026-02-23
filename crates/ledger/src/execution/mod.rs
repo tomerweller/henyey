@@ -2404,6 +2404,24 @@ impl TransactionExecutor {
         }
 
         // Phase 3: Execute operation body
+        self.apply_body(snapshot, pre)
+    }
+
+    /// Apply phase: execute operations, build meta, handle rollback on failure.
+    ///
+    /// This is the second half of transaction execution, consuming the
+    /// `PreApplyResult` produced by `pre_apply()`. It loads footprint entries,
+    /// executes each operation, handles rollback on failure (restoring
+    /// fee/seq/signer entries from the pre-apply phase), builds transaction
+    /// meta, and returns the final `TransactionExecutionResult`.
+    ///
+    /// This matches the body of stellar-core's `parallelApply` (for Soroban) /
+    /// `TransactionFrame::apply` (for classic) — everything after `commonPreApply`.
+    fn apply_body(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        pre: PreApplyResult,
+    ) -> Result<TransactionExecutionResult> {
         let PreApplyResult {
             frame,
             fee_source_id,
