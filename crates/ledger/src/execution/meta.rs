@@ -1,6 +1,6 @@
 use super::*;
 
-pub fn asset_to_trustline_asset(
+pub(super) fn asset_to_trustline_asset(
     asset: &stellar_xdr::curr::Asset,
 ) -> Option<stellar_xdr::curr::TrustLineAsset> {
     match asset {
@@ -14,7 +14,7 @@ pub fn asset_to_trustline_asset(
     }
 }
 
-pub fn asset_issuer_id(asset: &stellar_xdr::curr::Asset) -> Option<AccountId> {
+pub(super) fn asset_issuer_id(asset: &stellar_xdr::curr::Asset) -> Option<AccountId> {
     match asset {
         stellar_xdr::curr::Asset::Native => None,
         stellar_xdr::curr::Asset::CreditAlphanum4(a) => Some(a.issuer.clone()),
@@ -22,13 +22,13 @@ pub fn asset_issuer_id(asset: &stellar_xdr::curr::Asset) -> Option<AccountId> {
     }
 }
 
-pub fn make_account_key(account_id: &AccountId) -> LedgerKey {
+pub(super) fn make_account_key(account_id: &AccountId) -> LedgerKey {
     LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
         account_id: account_id.clone(),
     })
 }
 
-pub fn make_trustline_key(
+pub(super) fn make_trustline_key(
     account_id: &AccountId,
     asset: &stellar_xdr::curr::TrustLineAsset,
 ) -> LedgerKey {
@@ -38,7 +38,7 @@ pub fn make_trustline_key(
     })
 }
 
-pub fn delta_snapshot(state: &LedgerStateManager) -> DeltaSnapshot {
+pub(super) fn delta_snapshot(state: &LedgerStateManager) -> DeltaSnapshot {
     let delta = state.delta();
     DeltaSnapshot {
         created: delta.created_entries().len(),
@@ -48,7 +48,7 @@ pub fn delta_snapshot(state: &LedgerStateManager) -> DeltaSnapshot {
     }
 }
 
-pub fn delta_changes_between(
+pub(super) fn delta_changes_between(
     delta: &henyey_tx::LedgerDelta,
     start: DeltaSnapshot,
     end: DeltaSnapshot,
@@ -102,7 +102,7 @@ pub fn delta_changes_between(
     }
 }
 
-pub fn allow_trust_asset(op: &AllowTrustOp, issuer: &AccountId) -> Asset {
+pub(super) fn allow_trust_asset(op: &AllowTrustOp, issuer: &AccountId) -> Asset {
     match &op.asset {
         AssetCode::CreditAlphanum4(code) => Asset::CreditAlphanum4(AlphaNum4 {
             asset_code: code.clone(),
@@ -115,7 +115,7 @@ pub fn allow_trust_asset(op: &AllowTrustOp, issuer: &AccountId) -> Asset {
     }
 }
 
-pub fn pool_reserves(pool: &LiquidityPoolEntry) -> Option<(Asset, Asset, i64, i64)> {
+pub(super) fn pool_reserves(pool: &LiquidityPoolEntry) -> Option<(Asset, Asset, i64, i64)> {
     match &pool.body {
         LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => Some((
             cp.params.asset_a.clone(),
@@ -138,7 +138,7 @@ pub fn pool_reserves(pool: &LiquidityPoolEntry) -> Option<(Asset, Asset, i64, i6
 ///
 /// Per CAP-0066, these entries should be emitted as RESTORED (not CREATED or STATE/UPDATED)
 /// in the transaction meta. Both the data/code entry AND its associated TTL entry are restored.
-pub fn extract_hot_archive_restored_keys(
+pub(super) fn extract_hot_archive_restored_keys(
     soroban_data: Option<&SorobanTransactionData>,
     op_type: OperationType,
     actual_restored_indices: &[u32],
@@ -180,7 +180,7 @@ pub fn extract_hot_archive_restored_keys(
     keys
 }
 
-pub fn emit_classic_events_for_operation(
+pub(super) fn emit_classic_events_for_operation(
     op_event_manager: &mut OpEventManager,
     op: &Operation,
     op_result: &OperationResult,
@@ -423,7 +423,7 @@ pub fn emit_classic_events_for_operation(
 /// For updates, we use the entry as both pre-state and post-state since
 /// we're just tracking the final state (the pre-state is not relevant
 /// for bucket updates which is what the delta is used for).
-pub fn restore_delta_entries(
+pub(super) fn restore_delta_entries(
     state: &mut LedgerStateManager,
     created: &[LedgerEntry],
     updated: &[LedgerEntry],
@@ -447,7 +447,7 @@ pub fn restore_delta_entries(
     }
 }
 
-pub fn build_entry_changes_with_state(
+pub(super) fn build_entry_changes_with_state(
     state: &LedgerStateManager,
     created: &[LedgerEntry],
     updated: &[LedgerEntry],
@@ -456,7 +456,7 @@ pub fn build_entry_changes_with_state(
     build_entry_changes_with_state_overrides(state, created, updated, deleted, &HashMap::new())
 }
 
-pub fn build_entry_changes_with_state_overrides(
+pub(super) fn build_entry_changes_with_state_overrides(
     state: &LedgerStateManager,
     created: &[LedgerEntry],
     updated: &[LedgerEntry],
@@ -512,7 +512,7 @@ pub struct LedgerChanges<'a> {
 /// For classic operations, entries are ordered according to the execution order tracked
 /// in `change_order` to match stellar-core behavior, emitting STATE/UPDATED pairs
 /// for EACH modification (not deduplicated).
-pub fn build_entry_changes_with_hot_archive(
+pub(super) fn build_entry_changes_with_hot_archive(
     state: &LedgerStateManager,
     changes: &LedgerChanges<'_>,
     footprint: Option<&stellar_xdr::curr::LedgerFootprint>,
@@ -1103,11 +1103,11 @@ pub fn build_entry_changes_with_hot_archive(
     LedgerEntryChanges(changes.try_into().unwrap_or_default())
 }
 
-pub fn empty_entry_changes() -> LedgerEntryChanges {
+pub(super) fn empty_entry_changes() -> LedgerEntryChanges {
     LedgerEntryChanges(VecM::default())
 }
 
-pub fn build_transaction_meta(
+pub(super) fn build_transaction_meta(
     tx_changes_before: LedgerEntryChanges,
     op_changes: Vec<LedgerEntryChanges>,
     op_events: Vec<Vec<ContractEvent>>,
@@ -1169,7 +1169,7 @@ pub fn build_transaction_meta(
     })
 }
 
-pub fn empty_transaction_meta() -> TransactionMeta {
+pub(super) fn empty_transaction_meta() -> TransactionMeta {
     build_transaction_meta(
         empty_entry_changes(),
         Vec::new(),

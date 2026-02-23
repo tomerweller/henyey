@@ -87,10 +87,13 @@ mod signatures;
 mod tx_set;
 
 pub use config::{load_config_setting, load_soroban_config, load_soroban_network_info, compute_soroban_resource_fee};
-pub use meta::*;
-pub use result_mapping::*;
-pub use signatures::*;
-pub use tx_set::*;
+pub use result_mapping::build_tx_result_pair;
+pub(crate) use signatures::account_id_to_key;
+pub use tx_set::{execute_transaction_set, execute_transaction_set_with_fee_mode, run_transactions_on_executor, execute_soroban_parallel_phase, pre_deduct_all_fees_on_delta, compute_state_size_window_entry};
+
+use meta::*;
+use result_mapping::*;
+use signatures::*;
 
 /// Wrapper around HotArchiveBucketList that implements the HotArchiveLookup trait.
 ///
@@ -387,7 +390,7 @@ struct ValidationFailure {
 /// The pre-apply phase validates the transaction, deducts fees (if applicable),
 /// removes one-time signers, bumps the sequence number, and commits these
 /// changes. The apply phase then executes operations using this context.
-pub struct PreApplyResult {
+struct PreApplyResult {
     // Transaction identity
     frame: TransactionFrame,
     fee_source_id: AccountId,
@@ -420,10 +423,10 @@ pub struct PreApplyResult {
 
 /// Snapshot of created/updated/deleted entries for a delta phase (fee, seq, signer).
 /// Used for rollback restoration when a transaction's operation body fails.
-pub struct DeltaEntries {
-    pub created: Vec<LedgerEntry>,
-    pub updated: Vec<LedgerEntry>,
-    pub deleted: Vec<LedgerKey>,
+struct DeltaEntries {
+    created: Vec<LedgerEntry>,
+    updated: Vec<LedgerEntry>,
+    deleted: Vec<LedgerKey>,
 }
 
 /// Context for executing transactions during ledger close.
@@ -548,36 +551,6 @@ impl TransactionExecutor {
         self.state.set_ledger_seq(ledger_seq);
         // Note: loaded_accounts cache is preserved - this is intentional because
         // accounts that were loaded/created in previous ledgers remain valid
-    }
-
-    /// Advance to a new ledger and clear all cached entries.
-    ///
-    /// This is used in verification mode where we apply authoritative CDP metadata
-    /// to the bucket list between ledgers. Clearing cached entries ensures that
-    /// all entries are reloaded from the bucket list, reflecting the true state
-    /// after the previous ledger's changes.
-    ///
-    /// Without this, stale entries (e.g., offers that were deleted in the bucket list)
-    /// would remain in the executor's cache and cause incorrect execution results.
-    pub fn advance_to_ledger_with_fresh_state(
-        &mut self,
-        ledger_seq: u32,
-        close_time: u64,
-        base_reserve: u32,
-        protocol_version: u32,
-        _id_pool: u64,
-        soroban_config: SorobanConfig,
-    ) {
-        self.ledger_seq = ledger_seq;
-        self.close_time = close_time;
-        self.base_reserve = base_reserve;
-        self.protocol_version = protocol_version;
-        self.soroban_config = soroban_config;
-        self.state.set_ledger_seq(ledger_seq);
-        // Clear all cached entries so they're reloaded from the bucket list
-        self.state.clear_cached_entries();
-        // Also clear loaded_accounts cache
-        self.loaded_accounts.clear();
     }
 
     /// Advance to a new ledger, clearing cached entries but preserving offers.
@@ -1454,18 +1427,6 @@ impl TransactionExecutor {
         self.state.commit();
     }
 
-    /// Apply a fee refund to an account WITHOUT delta tracking.
-    ///
-    /// This is used during verification to sync the fee refund from CDP's
-    /// sorobanMeta.totalFeeRefund field, which is tracked separately from entry changes.
-    pub fn apply_fee_refund(&mut self, account_id: &AccountId, refund: i64) {
-        if let Some(acc) = self.state.get_account_mut(account_id) {
-            acc.balance += refund;
-        }
-        // Commit to clear snapshots so the refund is preserved for subsequent transactions
-        self.state.commit();
-    }
-
     /// Execute a transaction.
     ///
     /// # Arguments
@@ -1930,7 +1891,7 @@ impl TransactionExecutor {
     /// fee deduction, signer removal, and sequence bump. These changes persist
     /// even if the operation body later fails (matching stellar-core behavior).
     #[allow(clippy::too_many_arguments)]
-    pub fn pre_apply(
+    fn pre_apply(
         &mut self,
         snapshot: &SnapshotHandle,
         tx_envelope: &TransactionEnvelope,
@@ -2324,7 +2285,7 @@ impl TransactionExecutor {
     ///
     /// This matches stellar-core's `parallelApply` returning `{false, {}}` when
     /// `!txResult.isSuccess()` after `preParallelApply`.
-    pub fn build_skipped_result(pre: &PreApplyResult) -> TransactionExecutionResult {
+    fn build_skipped_result(pre: PreApplyResult) -> TransactionExecutionResult {
         let soroban_fee_info = pre.refundable_fee_tracker.as_ref().map(|t| {
             (t.non_refundable_fee, t.consumed_refundable_fee, t.consumed_rent_fee)
         });
@@ -2334,7 +2295,7 @@ impl TransactionExecutor {
             .unwrap_or(0);
 
         let tx_meta = build_transaction_meta(
-            pre.tx_changes_before.clone(),
+            pre.tx_changes_before,
             vec![],  // no operation changes
             vec![],  // no operation events
             vec![],  // no tx events
@@ -2352,7 +2313,7 @@ impl TransactionExecutor {
             error: Some("Insufficient balance for fee".into()),
             failure: Some(ExecutionFailure::InsufficientBalance),
             tx_meta: Some(tx_meta),
-            fee_changes: Some(pre.fee_changes.clone()),
+            fee_changes: Some(pre.fee_changes),
             post_fee_changes: Some(empty_entry_changes()),
             hot_archive_restored_keys: Vec::new(),
             op_type_timings: HashMap::new(),
@@ -2400,7 +2361,7 @@ impl TransactionExecutor {
 
         // Phase 2: Skip operation body when caller determined TX should not apply
         if !should_apply {
-            return Ok(Self::build_skipped_result(&pre));
+            return Ok(Self::build_skipped_result(pre));
         }
 
         // Phase 3: Execute operation body
@@ -2417,7 +2378,7 @@ impl TransactionExecutor {
     ///
     /// This matches the body of stellar-core's `parallelApply` (for Soroban) /
     /// `TransactionFrame::apply` (for classic) — everything after `commonPreApply`.
-    pub fn apply_body(
+    fn apply_body(
         &mut self,
         snapshot: &SnapshotHandle,
         pre: PreApplyResult,

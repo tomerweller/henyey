@@ -23,16 +23,26 @@ use henyey_crypto::Sha256Hasher;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use stellar_xdr::curr::{
-    ConfigUpgradeSetKey, GeneralizedTransactionSet, LedgerCloseMeta, LedgerHeader,
-    LedgerHeaderExt, LedgerHeaderExtensionV1, LedgerHeaderExtensionV1Ext, LedgerUpgrade, Limits,
-    ScpHistoryEntry, StellarValueExt, TransactionEnvelope, TransactionResultPair,
-    TransactionResultSet, TransactionSet, WriteXdr,
+    ConfigUpgradeSetKey, GeneralizedTransactionSet, LedgerCloseMeta, LedgerHeader, LedgerHeaderExt,
+    LedgerHeaderExtensionV1, LedgerHeaderExtensionV1Ext, LedgerUpgrade, Limits, ScpHistoryEntry,
+    StellarValueExt, TransactionEnvelope, TransactionResultPair, TransactionResultSet,
+    TransactionSet, WriteXdr,
 };
 
 use crate::config_upgrade::{ConfigUpgradeSetFrame, ConfigUpgradeValidity};
 use crate::delta::LedgerDelta;
 use crate::error::LedgerError;
 use crate::snapshot::SnapshotHandle;
+
+/// Result of applying config upgrades during ledger close.
+pub struct ConfigUpgradeResult {
+    /// Whether state archival settings changed (requires eviction scan resize).
+    pub state_archival_changed: bool,
+    /// Whether Soroban memory cost parameters changed (requires cost model reload).
+    pub memory_cost_params_changed: bool,
+    /// Per-upgrade entry changes, keyed by serialized `ConfigUpgradeSetKey`.
+    pub per_upgrade_changes: HashMap<Vec<u8>, stellar_xdr::curr::LedgerEntryChanges>,
+}
 
 /// Complete input data for closing a ledger.
 ///
@@ -854,12 +864,11 @@ impl UpgradeContext {
     /// - A config upgrade cannot be loaded from the ledger
     /// - A config upgrade fails validation
     /// - The delta update fails
-    #[allow(clippy::type_complexity)]
     pub fn apply_config_upgrades(
         &self,
         snapshot: &SnapshotHandle,
         delta: &mut LedgerDelta,
-    ) -> Result<(bool, bool, HashMap<Vec<u8>, stellar_xdr::curr::LedgerEntryChanges>), LedgerError> {
+    ) -> Result<ConfigUpgradeResult, LedgerError> {
         use stellar_xdr::curr::{Limits, WriteXdr};
 
         let mut state_archival_changed = false;
@@ -913,7 +922,11 @@ impl UpgradeContext {
             );
         }
 
-        Ok((state_archival_changed, memory_cost_params_changed, per_upgrade_changes))
+        Ok(ConfigUpgradeResult {
+            state_archival_changed,
+            memory_cost_params_changed,
+            per_upgrade_changes,
+        })
     }
 
     /// Apply upgrades to a header, returning the modified values.

@@ -196,7 +196,7 @@ pub fn run_transactions_on_executor(
         let tx_prng_seed = sub_sha256(&soroban_base_prng_seed, tx_index as u32);
         // Execute with deduct_fee=false — fees were already pre-deducted above
         // (when deduct_fee=true) or not needed (when deduct_fee=false from caller).
-        let result = executor.execute_transaction_with_fee_mode(
+        let mut result = executor.execute_transaction_with_fee_mode(
             snapshot,
             tx,
             tx_fee,
@@ -214,7 +214,7 @@ pub fn run_transactions_on_executor(
         )?;
         let tx_meta = result
             .tx_meta
-            .clone()
+            .take()
             .unwrap_or_else(empty_transaction_meta);
         // Use pre-captured fee_changes from the upfront fee deduction pass
         // (either internal or external), or the per-TX result if fees were
@@ -224,12 +224,12 @@ pub fn run_transactions_on_executor(
         } else {
             result
                 .fee_changes
-                .clone()
+                .take()
                 .unwrap_or_else(empty_entry_changes)
         };
         let post_fee_changes = result
             .post_fee_changes
-            .clone()
+            .take()
             .unwrap_or_else(empty_entry_changes);
         let tx_result_meta = TransactionResultMetaV1 {
             ext: ExtensionPoint::V0,
@@ -606,7 +606,7 @@ fn soroban_write_footprint(tx: &TransactionEnvelope) -> Option<Vec<LedgerKey>> {
 /// Fees are NOT deducted by the executor (deduct_fee=false) because they
 /// were pre-deducted from the main delta by `pre_deduct_soroban_fees`.
 /// Returns `(TxSetResult, per_cluster_delta, total_fees)`.
-pub fn execute_single_cluster(
+pub(super) fn execute_single_cluster(
     snapshot: &SnapshotHandle,
     cluster: &[(TransactionEnvelope, Option<u32>)],
     cluster_offset: usize,
@@ -699,15 +699,15 @@ pub fn execute_single_cluster(
         )?;
         let tx_meta = result
             .tx_meta
-            .clone()
+            .take()
             .unwrap_or_else(empty_transaction_meta);
         let fee_changes = result
             .fee_changes
-            .clone()
+            .take()
             .unwrap_or_else(empty_entry_changes);
         let post_fee_changes = result
             .post_fee_changes
-            .clone()
+            .take()
             .unwrap_or_else(empty_entry_changes);
         let tx_result_meta = TransactionResultMetaV1 {
             ext: ExtensionPoint::V0,
@@ -767,7 +767,7 @@ pub fn execute_single_cluster(
 /// When a stage has multiple clusters, they are executed in parallel using
 /// `tokio::task::spawn_blocking` (one blocking task per cluster). Results are
 /// merged into `delta` in deterministic cluster order.
-pub fn execute_stage_clusters(
+pub(super) fn execute_stage_clusters(
     snapshot: &SnapshotHandle,
     clusters: &[Vec<(TransactionEnvelope, Option<u32>)>],
     global_tx_offset: usize,

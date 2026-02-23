@@ -3357,12 +3357,12 @@ impl<'a> LedgerCloseContext<'a> {
         let mut per_config_changes: HashMap<Vec<u8>, LedgerEntryChanges> = HashMap::new();
         let delta_count_before_upgrades = self.delta.num_changes();
         if self.upgrade_ctx.has_config_upgrades() {
-            let (archival, memory_cost, config_changes) = self
+            let result = self
                 .upgrade_ctx
                 .apply_config_upgrades(&self.snapshot, &mut self.delta)?;
-            config_state_archival_changed = archival;
-            config_memory_cost_params_changed = memory_cost;
-            per_config_changes = config_changes;
+            config_state_archival_changed = result.state_archival_changed;
+            config_memory_cost_params_changed = result.memory_cost_params_changed;
+            per_config_changes = result.per_upgrade_changes;
             tracing::info!(
                 ledger_seq = self.close_data.ledger_seq,
                 delta_before = delta_count_before_upgrades,

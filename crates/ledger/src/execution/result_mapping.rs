@@ -1,6 +1,6 @@
 use super::*;
 
-pub fn map_failure_to_result(failure: &ExecutionFailure) -> TransactionResultResult {
+pub(super) fn map_failure_to_result(failure: &ExecutionFailure) -> TransactionResultResult {
     match failure {
         ExecutionFailure::Malformed => TransactionResultResult::TxMalformed,
         ExecutionFailure::MissingOperation => TransactionResultResult::TxMissingOperation,
@@ -22,7 +22,7 @@ pub fn map_failure_to_result(failure: &ExecutionFailure) -> TransactionResultRes
     }
 }
 
-pub fn insufficient_refundable_fee_result(op: &Operation) -> OperationResult {
+pub(super) fn insufficient_refundable_fee_result(op: &Operation) -> OperationResult {
     match &op.body {
         OperationBody::InvokeHostFunction(_) => {
             OperationResult::OpInner(OperationResultTr::InvokeHostFunction(
@@ -43,7 +43,7 @@ pub fn insufficient_refundable_fee_result(op: &Operation) -> OperationResult {
     }
 }
 
-pub fn map_failure_to_inner_result(
+pub(super) fn map_failure_to_inner_result(
     failure: &ExecutionFailure,
     op_results: &[OperationResult],
 ) -> InnerTransactionResultResult {
@@ -174,4 +174,3 @@ pub fn build_tx_result_pair(
         result,
     })
 }
-

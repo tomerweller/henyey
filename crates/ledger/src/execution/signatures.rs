@@ -1,14 +1,14 @@
 use super::*;
 
 /// Convert AccountId to key bytes.
-pub fn account_id_to_key(account_id: &AccountId) -> [u8; 32] {
+pub(crate) fn account_id_to_key(account_id: &AccountId) -> [u8; 32] {
     match &account_id.0 {
         stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => key.0,
     }
 }
 
 /// Check if an operation result indicates success.
-pub fn is_operation_success(result: &OperationResult) -> bool {
+pub(super) fn is_operation_success(result: &OperationResult) -> bool {
     match result {
         OperationResult::OpInner(inner) => {
             use stellar_xdr::curr::OperationResultTr;
@@ -102,7 +102,7 @@ pub fn is_operation_success(result: &OperationResult) -> bool {
     }
 }
 
-pub fn has_sufficient_signer_weight(
+pub(super) fn has_sufficient_signer_weight(
     tx_hash: &Hash256,
     signatures: &[stellar_xdr::curr::DecoratedSignature],
     account: &AccountEntry,
@@ -181,7 +181,7 @@ pub fn has_sufficient_signer_weight(
     total >= required_weight && total > 0
 }
 
-pub fn has_required_extra_signers(
+pub(super) fn has_required_extra_signers(
     tx_hash: &Hash256,
     signatures: &[stellar_xdr::curr::DecoratedSignature],
     extra_signers: &[SignerKey],
@@ -202,7 +202,10 @@ pub fn has_required_extra_signers(
     })
 }
 
-pub fn fee_bump_inner_hash(frame: &TransactionFrame, network_id: &NetworkId) -> Result<Hash256> {
+pub(super) fn fee_bump_inner_hash(
+    frame: &TransactionFrame,
+    network_id: &NetworkId,
+) -> Result<Hash256> {
     match frame.envelope() {
         TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
             stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
@@ -219,21 +222,21 @@ pub fn fee_bump_inner_hash(frame: &TransactionFrame, network_id: &NetworkId) -> 
     }
 }
 
-pub fn threshold_low(account: &AccountEntry) -> u32 {
+pub(super) fn threshold_low(account: &AccountEntry) -> u32 {
     account.thresholds.0[1] as u32
 }
 
-pub fn threshold_medium(account: &AccountEntry) -> u32 {
+pub(super) fn threshold_medium(account: &AccountEntry) -> u32 {
     account.thresholds.0[2] as u32
 }
 
-pub fn threshold_high(account: &AccountEntry) -> u32 {
+pub(super) fn threshold_high(account: &AccountEntry) -> u32 {
     account.thresholds.0[3] as u32
 }
 
 /// Determine the threshold level required for an operation type.
 /// Matches stellar-core's per-OperationFrame getThresholdLevel() overrides.
-pub fn get_threshold_for_op(op: &Operation) -> ThresholdLevel {
+pub(super) fn get_threshold_for_op(op: &Operation) -> ThresholdLevel {
     match &op.body {
         // LOW threshold operations
         OperationBody::BumpSequence(_) => ThresholdLevel::Low,
@@ -267,7 +270,7 @@ pub fn get_threshold_for_op(op: &Operation) -> ThresholdLevel {
 }
 
 /// Get the needed threshold weight for an operation based on its threshold level.
-pub fn get_needed_threshold(account: &AccountEntry, level: ThresholdLevel) -> u32 {
+pub(super) fn get_needed_threshold(account: &AccountEntry, level: ThresholdLevel) -> u32 {
     match level {
         ThresholdLevel::Low => threshold_low(account),
         ThresholdLevel::Medium => threshold_medium(account),
@@ -276,7 +279,7 @@ pub fn get_needed_threshold(account: &AccountEntry, level: ThresholdLevel) -> u3
 }
 
 /// Check if a decorated signature matches an Ed25519SignedPayload signer key.
-pub fn has_signed_payload_match(
+pub(super) fn has_signed_payload_match(
     sig: &stellar_xdr::curr::DecoratedSignature,
     signed_payload: &stellar_xdr::curr::SignerKeyEd25519SignedPayload,
 ) -> bool {
@@ -329,7 +332,7 @@ pub fn has_signed_payload_match(
 /// Check extra signers against the signature tracker.
 /// Each extra signer must be matched by at least one signature.
 /// Mirrors stellar-core's TransactionFrame::checkExtraSigners().
-pub fn check_extra_signers_with_tracker(
+pub(super) fn check_extra_signers_with_tracker(
     tracker: &mut SignatureTracker,
     extra_signers: &[SignerKey],
 ) -> bool {
@@ -360,7 +363,7 @@ pub fn check_extra_signers_with_tracker(
 /// Returns:
 /// - `None` if all checks pass (proceed to operation execution)
 /// - `Some((results, failure))` if checks fail
-pub fn check_operation_signatures(
+pub(super) fn check_operation_signatures(
     frame: &TransactionFrame,
     state: &LedgerStateManager,
     tx_hash: &Hash256,
@@ -480,7 +483,7 @@ pub fn check_operation_signatures(
 /// the passing op keeps its default-initialized result. In stellar-core's XDR,
 /// OperationResult defaults to opINNER with a default inner result for the
 /// operation type (typically the "Success" variant).
-pub fn default_success_op_result(op: &Operation) -> OperationResult {
+pub(super) fn default_success_op_result(op: &Operation) -> OperationResult {
     match &op.body {
         OperationBody::CreateAccount(_) => OperationResult::OpInner(
             OperationResultTr::CreateAccount(stellar_xdr::curr::CreateAccountResult::Success),
@@ -488,44 +491,42 @@ pub fn default_success_op_result(op: &Operation) -> OperationResult {
         OperationBody::Payment(_) => OperationResult::OpInner(OperationResultTr::Payment(
             stellar_xdr::curr::PaymentResult::Success,
         )),
-        OperationBody::PathPaymentStrictReceive(_) => {
-            OperationResult::OpInner(OperationResultTr::PathPaymentStrictReceive(
-                PathPaymentStrictReceiveResult::Success(
-                    stellar_xdr::curr::PathPaymentStrictReceiveResultSuccess {
-                        offers: Vec::new().try_into().unwrap_or_default(),
-                        last: stellar_xdr::curr::SimplePaymentResult {
-                            destination: AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                                stellar_xdr::curr::Uint256([0; 32]),
-                            )),
-                            asset: Asset::Native,
-                            amount: 0,
-                        },
+        OperationBody::PathPaymentStrictReceive(_) => OperationResult::OpInner(
+            OperationResultTr::PathPaymentStrictReceive(PathPaymentStrictReceiveResult::Success(
+                stellar_xdr::curr::PathPaymentStrictReceiveResultSuccess {
+                    offers: Vec::new().try_into().unwrap_or_default(),
+                    last: stellar_xdr::curr::SimplePaymentResult {
+                        destination: AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                            stellar_xdr::curr::Uint256([0; 32]),
+                        )),
+                        asset: Asset::Native,
+                        amount: 0,
                     },
-                ),
+                },
+            )),
+        ),
+        OperationBody::ManageSellOffer(_) => {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(
+                ManageSellOfferResult::Success(stellar_xdr::curr::ManageOfferSuccessResult {
+                    offers_claimed: Vec::new().try_into().unwrap_or_default(),
+                    offer: stellar_xdr::curr::ManageOfferSuccessResultOffer::Deleted,
+                }),
             ))
         }
-        OperationBody::ManageSellOffer(_) => OperationResult::OpInner(
-            OperationResultTr::ManageSellOffer(ManageSellOfferResult::Success(
-                stellar_xdr::curr::ManageOfferSuccessResult {
+        OperationBody::CreatePassiveSellOffer(_) => {
+            OperationResult::OpInner(OperationResultTr::CreatePassiveSellOffer(
+                ManageSellOfferResult::Success(stellar_xdr::curr::ManageOfferSuccessResult {
                     offers_claimed: Vec::new().try_into().unwrap_or_default(),
                     offer: stellar_xdr::curr::ManageOfferSuccessResultOffer::Deleted,
-                },
-            )),
-        ),
-        OperationBody::CreatePassiveSellOffer(_) => OperationResult::OpInner(
-            OperationResultTr::CreatePassiveSellOffer(ManageSellOfferResult::Success(
-                stellar_xdr::curr::ManageOfferSuccessResult {
-                    offers_claimed: Vec::new().try_into().unwrap_or_default(),
-                    offer: stellar_xdr::curr::ManageOfferSuccessResultOffer::Deleted,
-                },
-            )),
-        ),
+                }),
+            ))
+        }
         OperationBody::SetOptions(_) => OperationResult::OpInner(OperationResultTr::SetOptions(
             stellar_xdr::curr::SetOptionsResult::Success,
         )),
-        OperationBody::ChangeTrust(_) => OperationResult::OpInner(
-            OperationResultTr::ChangeTrust(stellar_xdr::curr::ChangeTrustResult::Success),
-        ),
+        OperationBody::ChangeTrust(_) => OperationResult::OpInner(OperationResultTr::ChangeTrust(
+            stellar_xdr::curr::ChangeTrustResult::Success,
+        )),
         OperationBody::AllowTrust(_) => OperationResult::OpInner(OperationResultTr::AllowTrust(
             stellar_xdr::curr::AllowTrustResult::Success,
         )),
@@ -541,106 +542,102 @@ pub fn default_success_op_result(op: &Operation) -> OperationResult {
         OperationBody::BumpSequence(_) => OperationResult::OpInner(
             OperationResultTr::BumpSequence(stellar_xdr::curr::BumpSequenceResult::Success),
         ),
-        OperationBody::ManageBuyOffer(_) => OperationResult::OpInner(
-            OperationResultTr::ManageBuyOffer(ManageBuyOfferResult::Success(
-                stellar_xdr::curr::ManageOfferSuccessResult {
+        OperationBody::ManageBuyOffer(_) => {
+            OperationResult::OpInner(OperationResultTr::ManageBuyOffer(
+                ManageBuyOfferResult::Success(stellar_xdr::curr::ManageOfferSuccessResult {
                     offers_claimed: Vec::new().try_into().unwrap_or_default(),
                     offer: stellar_xdr::curr::ManageOfferSuccessResultOffer::Deleted,
+                }),
+            ))
+        }
+        OperationBody::PathPaymentStrictSend(_) => OperationResult::OpInner(
+            OperationResultTr::PathPaymentStrictSend(PathPaymentStrictSendResult::Success(
+                stellar_xdr::curr::PathPaymentStrictSendResultSuccess {
+                    offers: Vec::new().try_into().unwrap_or_default(),
+                    last: stellar_xdr::curr::SimplePaymentResult {
+                        destination: AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                            stellar_xdr::curr::Uint256([0; 32]),
+                        )),
+                        asset: Asset::Native,
+                        amount: 0,
+                    },
                 },
             )),
         ),
-        OperationBody::PathPaymentStrictSend(_) => {
-            OperationResult::OpInner(OperationResultTr::PathPaymentStrictSend(
-                PathPaymentStrictSendResult::Success(
-                    stellar_xdr::curr::PathPaymentStrictSendResultSuccess {
-                        offers: Vec::new().try_into().unwrap_or_default(),
-                        last: stellar_xdr::curr::SimplePaymentResult {
-                            destination: AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                                stellar_xdr::curr::Uint256([0; 32]),
-                            )),
-                            asset: Asset::Native,
-                            amount: 0,
-                        },
-                    },
-                ),
-            ))
-        }
         OperationBody::CreateClaimableBalance(_) => OperationResult::OpInner(
             OperationResultTr::CreateClaimableBalance(CreateClaimableBalanceResult::Success(
                 ClaimableBalanceId::ClaimableBalanceIdTypeV0(stellar_xdr::curr::Hash([0; 32])),
             )),
         ),
-        OperationBody::ClaimClaimableBalance(_) => OperationResult::OpInner(
-            OperationResultTr::ClaimClaimableBalance(
+        OperationBody::ClaimClaimableBalance(_) => {
+            OperationResult::OpInner(OperationResultTr::ClaimClaimableBalance(
                 stellar_xdr::curr::ClaimClaimableBalanceResult::Success,
-            ),
-        ),
-        OperationBody::BeginSponsoringFutureReserves(_) => OperationResult::OpInner(
-            OperationResultTr::BeginSponsoringFutureReserves(
+            ))
+        }
+        OperationBody::BeginSponsoringFutureReserves(_) => {
+            OperationResult::OpInner(OperationResultTr::BeginSponsoringFutureReserves(
                 stellar_xdr::curr::BeginSponsoringFutureReservesResult::Success,
-            ),
-        ),
-        OperationBody::EndSponsoringFutureReserves => OperationResult::OpInner(
-            OperationResultTr::EndSponsoringFutureReserves(
+            ))
+        }
+        OperationBody::EndSponsoringFutureReserves => {
+            OperationResult::OpInner(OperationResultTr::EndSponsoringFutureReserves(
                 stellar_xdr::curr::EndSponsoringFutureReservesResult::Success,
-            ),
-        ),
-        OperationBody::RevokeSponsorship(_) => OperationResult::OpInner(
-            OperationResultTr::RevokeSponsorship(
+            ))
+        }
+        OperationBody::RevokeSponsorship(_) => {
+            OperationResult::OpInner(OperationResultTr::RevokeSponsorship(
                 stellar_xdr::curr::RevokeSponsorshipResult::Success,
-            ),
-        ),
+            ))
+        }
         OperationBody::Clawback(_) => OperationResult::OpInner(OperationResultTr::Clawback(
             stellar_xdr::curr::ClawbackResult::Success,
         )),
-        OperationBody::ClawbackClaimableBalance(_) => OperationResult::OpInner(
-            OperationResultTr::ClawbackClaimableBalance(
+        OperationBody::ClawbackClaimableBalance(_) => {
+            OperationResult::OpInner(OperationResultTr::ClawbackClaimableBalance(
                 stellar_xdr::curr::ClawbackClaimableBalanceResult::Success,
-            ),
-        ),
-        OperationBody::SetTrustLineFlags(_) => OperationResult::OpInner(
-            OperationResultTr::SetTrustLineFlags(
+            ))
+        }
+        OperationBody::SetTrustLineFlags(_) => {
+            OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(
                 stellar_xdr::curr::SetTrustLineFlagsResult::Success,
-            ),
-        ),
-        OperationBody::LiquidityPoolDeposit(_) => OperationResult::OpInner(
-            OperationResultTr::LiquidityPoolDeposit(
+            ))
+        }
+        OperationBody::LiquidityPoolDeposit(_) => {
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolDeposit(
                 stellar_xdr::curr::LiquidityPoolDepositResult::Success,
-            ),
-        ),
-        OperationBody::LiquidityPoolWithdraw(_) => OperationResult::OpInner(
-            OperationResultTr::LiquidityPoolWithdraw(
+            ))
+        }
+        OperationBody::LiquidityPoolWithdraw(_) => {
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolWithdraw(
                 stellar_xdr::curr::LiquidityPoolWithdrawResult::Success,
-            ),
-        ),
-        OperationBody::InvokeHostFunction(_) => OperationResult::OpInner(
-            OperationResultTr::InvokeHostFunction(
+            ))
+        }
+        OperationBody::InvokeHostFunction(_) => {
+            OperationResult::OpInner(OperationResultTr::InvokeHostFunction(
                 stellar_xdr::curr::InvokeHostFunctionResult::Success(stellar_xdr::curr::Hash(
                     [0; 32],
                 )),
-            ),
-        ),
-        OperationBody::ExtendFootprintTtl(_) => OperationResult::OpInner(
-            OperationResultTr::ExtendFootprintTtl(
+            ))
+        }
+        OperationBody::ExtendFootprintTtl(_) => {
+            OperationResult::OpInner(OperationResultTr::ExtendFootprintTtl(
                 stellar_xdr::curr::ExtendFootprintTtlResult::Success,
-            ),
-        ),
+            ))
+        }
         OperationBody::RestoreFootprint(_) => OperationResult::OpInner(
-            OperationResultTr::RestoreFootprint(
-                stellar_xdr::curr::RestoreFootprintResult::Success,
-            ),
+            OperationResultTr::RestoreFootprint(stellar_xdr::curr::RestoreFootprintResult::Success),
         ),
     }
 }
 
-pub fn signer_key_id(key: &SignerKey) -> Hash256 {
+pub(super) fn signer_key_id(key: &SignerKey) -> Hash256 {
     let bytes = key
         .to_xdr(stellar_xdr::curr::Limits::none())
         .unwrap_or_default();
     Hash256::hash(&bytes)
 }
 
-pub fn has_ed25519_signature(
+pub(super) fn has_ed25519_signature(
     tx_hash: &Hash256,
     signatures: &[stellar_xdr::curr::DecoratedSignature],
     pk: &henyey_crypto::PublicKey,
@@ -650,7 +647,7 @@ pub fn has_ed25519_signature(
         .any(|sig| validation::verify_signature_with_key(tx_hash, sig, pk))
 }
 
-pub fn has_hashx_signature(
+pub(super) fn has_hashx_signature(
     signatures: &[stellar_xdr::curr::DecoratedSignature],
     key: &stellar_xdr::curr::Uint256,
 ) -> bool {
@@ -668,7 +665,7 @@ pub fn has_hashx_signature(
     })
 }
 
-pub fn has_signed_payload_signature(
+pub(super) fn has_signed_payload_signature(
     _tx_hash: &Hash256,
     signatures: &[stellar_xdr::curr::DecoratedSignature],
     signed_payload: &stellar_xdr::curr::SignerKeyEd25519SignedPayload,
@@ -735,7 +732,7 @@ pub fn has_signed_payload_signature(
 ///
 /// Note: stellar-core uses `static_cast<uint64_t>(index)` before passing to `xdr::xdr_to_opaque`,
 /// so even though the index is originally an int, it's serialized as 8 bytes.
-pub fn sub_sha256(base_seed: &[u8; 32], index: u32) -> [u8; 32] {
+pub(super) fn sub_sha256(base_seed: &[u8; 32], index: u32) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(base_seed);
@@ -743,4 +740,3 @@ pub fn sub_sha256(base_seed: &[u8; 32], index: u32) -> [u8; 32] {
     hasher.update((index as u64).to_be_bytes());
     hasher.finalize().into()
 }
-
