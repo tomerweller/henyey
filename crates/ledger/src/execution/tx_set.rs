@@ -723,10 +723,17 @@ pub fn execute_single_cluster(
     // Flush deferred RO TTL bumps within this cluster.
     executor.state_mut().flush_deferred_ro_ttl_bumps();
 
-    // Collect hot archive restored keys.
+    // Collect hot archive restored keys from SUCCESSFUL transactions only.
+    // When !pre.should_apply, the TX body is still executed (unlike stellar-core
+    // which skips execution entirely), so operations succeed and hot archive keys
+    // are collected. But the TX is later forced to fail, and these keys must not
+    // propagate — otherwise they produce spurious HOT_ARCHIVE_LIVE tombstones
+    // (same class of bug as VE-06, but at the TX level instead of operation level).
     let mut restored_keys: Vec<LedgerKey> = Vec::new();
     for r in &results {
-        restored_keys.extend(r.hot_archive_restored_keys.iter().cloned());
+        if r.success {
+            restored_keys.extend(r.hot_archive_restored_keys.iter().cloned());
+        }
     }
 
     let total_fees = executor.total_fees();
