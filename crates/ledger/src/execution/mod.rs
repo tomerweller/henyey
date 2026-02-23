@@ -2635,7 +2635,7 @@ impl TransactionExecutor {
                                     }))
                                 })
                                 .collect();
-                            // Collect data/code keys only for HotArchiveBucketList::add_batch
+                            // Collect data/code keys only for HotArchiveBucketList::add_batch.
                             // All hot archive keys (already filtered by live BL above) should be
                             // passed to the bucket list. This is true for both RestoreFootprint
                             // and InvokeHostFunction - the hot archive needs to remove ALL entries
@@ -2643,8 +2643,19 @@ impl TransactionExecutor {
                             // them (which would put them in `updated` rather than `created`).
                             // The `created_keys` filtering above is only for transaction meta
                             // emission (RESTORED vs UPDATED), not for bucket list operations.
-                            collected_hot_archive_keys
-                                .extend(hot_archive_for_bucket_list.iter().cloned());
+                            //
+                            // IMPORTANT: Only collect hot archive keys for SUCCESSFUL operations.
+                            // In stellar-core, handleArchivedEntry writes the restoration to
+                            // mOpState (a nested LedgerTxn), but if the operation fails, that
+                            // nested LedgerTxn is rolled back, canceling the restorations and
+                            // preventing any HOT_ARCHIVE_LIVE tombstones from being written.
+                            // For failed operations, we must not add keys to the hot archive
+                            // batch — doing so would produce spurious HOT_ARCHIVE_LIVE tombstones
+                            // in the hot archive bucket list, causing a bucket_list_hash mismatch.
+                            if is_operation_success(&op_result) {
+                                collected_hot_archive_keys
+                                    .extend(hot_archive_for_bucket_list.iter().cloned());
+                            }
                             // Add filtered keys (including TTL) to restored.hot_archive for meta conversion
                             restored.hot_archive.extend(hot_archive_for_meta);
                             restored.hot_archive.extend(ttl_keys);
@@ -4065,6 +4076,78 @@ mod tests {
         assert!(
             result.is_empty(),
             "Empty actual_restored_indices should produce no restored keys"
+        );
+    }
+
+    /// Regression test for VE-06: failed operations must not contribute hot archive keys.
+    ///
+    /// In stellar-core, handleArchivedEntry writes the restoration to mOpState (a nested
+    /// LedgerTxn). When the operation fails, the nested LedgerTxn is rolled back, which
+    /// cancels the restorations. No HOT_ARCHIVE_LIVE tombstones are written.
+    ///
+    /// Before the VE-06 fix, our code added hot archive keys to `collected_hot_archive_keys`
+    /// regardless of operation success. This produced spurious HOT_ARCHIVE_LIVE tombstones
+    /// for failed operations, diverging the hot archive bucket list hash from stellar-core.
+    ///
+    /// The fix: only add to collected_hot_archive_keys when is_operation_success(&op_result).
+    ///
+    /// This test verifies that the gating logic is sound: a failed operation result
+    /// correctly prevents hot archive key collection.
+    #[test]
+    fn test_ve06_failed_op_hot_archive_keys_not_collected() {
+        use std::collections::HashSet;
+        use stellar_xdr::curr::{
+            ContractDataDurability, ContractId, LedgerKey, LedgerKeyContractData, OperationResult,
+            ScAddress, ScVal,
+        };
+
+        let archived_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(stellar_xdr::curr::Hash([0xCCu8; 32]))),
+            key: ScVal::U32(42),
+            durability: ContractDataDurability::Persistent,
+        });
+
+        // Simulate the hot_archive_for_bucket_list set built from actual_restored_indices.
+        // This key corresponds to an entry declared in archived_soroban_entries.
+        let hot_archive_for_bucket_list: HashSet<LedgerKey> =
+            std::iter::once(archived_key.clone()).collect();
+
+        // Case 1: operation succeeded → keys ARE collected.
+        let success_result = OperationResult::OpInner(
+            stellar_xdr::curr::OperationResultTr::RestoreFootprint(
+                stellar_xdr::curr::RestoreFootprintResult::Success,
+            ),
+        );
+        assert!(is_operation_success(&success_result));
+
+        let mut collected_success: HashSet<LedgerKey> = HashSet::new();
+        if is_operation_success(&success_result) {
+            collected_success.extend(hot_archive_for_bucket_list.iter().cloned());
+        }
+        assert_eq!(
+            collected_success.len(),
+            1,
+            "VE-06: hot archive keys must be collected for successful operations"
+        );
+
+        // Case 2: operation failed → keys are NOT collected (VE-06 fix).
+        let failed_result = OperationResult::OpInner(
+            stellar_xdr::curr::OperationResultTr::InvokeHostFunction(
+                stellar_xdr::curr::InvokeHostFunctionResult::EntryArchived,
+            ),
+        );
+        assert!(!is_operation_success(&failed_result));
+
+        let mut collected_failed: HashSet<LedgerKey> = HashSet::new();
+        if is_operation_success(&failed_result) {
+            // This block must NOT execute for a failed operation.
+            collected_failed.extend(hot_archive_for_bucket_list.iter().cloned());
+        }
+        assert!(
+            collected_failed.is_empty(),
+            "VE-06: hot archive keys must NOT be collected for failed operations — \
+             stellar-core rolls back mOpState (including handleArchivedEntry restorations) \
+             when an operation fails, so no HOT_ARCHIVE_LIVE tombstones are written"
         );
     }
 

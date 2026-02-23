@@ -742,6 +742,16 @@ fn apply_soroban_storage_changes(
             continue;
         }
 
+        // Skip hot archive read-only restores. These entries were never in the live
+        // bucket list — the host read them from the hot archive but did not write
+        // them back. stellar-core's handleArchivedEntry creates DATA+TTL INIT then
+        // immediately erases both for read-only access, so the net effect on the
+        // live BL is zero. If we deleted them here we would create a spurious DEAD
+        // entry that CDP does not have.
+        if hot_archive_restored_keys.contains(key) {
+            continue;
+        }
+
         // Only delete Soroban entries (ContractData, ContractCode)
         // Account and Trustline entries are handled differently
         match key {
