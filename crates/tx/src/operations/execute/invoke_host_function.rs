@@ -2398,4 +2398,102 @@ mod tests {
             "No entries should be deleted for a hot archive read-only restore (not in state)"
         );
     }
+
+    /// Regression test for VE-06 (erase-RW skip): when a hot archive entry is pre-loaded
+    /// into state (from InMemorySorobanState) but the host only reads it (no write-back),
+    /// the erase-RW loop must NOT delete it.
+    ///
+    /// Without the skip at invoke_host_function.rs:667, the erase-RW loop finds the entry
+    /// via `get_contract_data().is_some()` and calls `delete_contract_data()`, producing a
+    /// spurious DEAD entry in the live bucket list delta. This DEAD entry would diverge the
+    /// bucket_list_hash from stellar-core, where `handleArchivedEntry` creates DATA+TTL INIT
+    /// and immediately erases both for read-only access (net zero effect on live BL).
+    ///
+    /// This test differs from `test_apply_soroban_storage_changes_hot_archive_read_only_no_side_effects`
+    /// (VE-05) which does NOT pre-load the entry into state, so the erase-RW loop's
+    /// `get_contract_data().is_some()` returns false regardless of the skip.
+    #[test]
+    fn test_erase_rw_skips_preloaded_hot_archive_read_only_entry() {
+        let contract_id = ScAddress::Contract(ContractId(Hash([0xDDu8; 32])));
+        let contract_key = ScVal::U32(55);
+        let durability = ContractDataDurability::Persistent;
+
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability,
+        });
+
+        // Pre-load the archived entry into state via load_entry (simulates how
+        // InMemorySorobanState entries are loaded before host execution). This does
+        // NOT record a delta — it just makes get_contract_data() return Some.
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 50_000_000,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: contract_id.clone(),
+                key: contract_key.clone(),
+                durability,
+                val: ScVal::U64(999),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let mut state = LedgerStateManager::new(5_000_000, 60_000_000);
+        state.load_entry(entry);
+
+        // Confirm the entry is visible in state.
+        assert!(
+            state
+                .get_contract_data(&contract_id, &contract_key, durability)
+                .is_some(),
+            "Entry must be in state (pre-loaded from hot archive)"
+        );
+
+        // No storage changes — the host only read this entry, did not write it back.
+        let changes: Vec<StorageChange> = vec![];
+
+        // The key is in the RW footprint (archived entries are placed in read_write).
+        let footprint = LedgerFootprint {
+            read_only: VecM::default(),
+            read_write: vec![key.clone()].try_into().unwrap(),
+        };
+
+        // Mark it as a hot archive restored key.
+        let mut hot_archive_restored_keys = std::collections::HashSet::new();
+        hot_archive_restored_keys.insert(key.clone());
+
+        // Delta should be clean before the call.
+        assert_eq!(state.delta().created_entries().len(), 0);
+        assert_eq!(state.delta().deleted_keys().len(), 0);
+
+        // Call apply_soroban_storage_changes — this runs the erase-RW loop.
+        apply_soroban_storage_changes(&mut state, &changes, &footprint, &hot_archive_restored_keys);
+
+        // KEY ASSERTION: no DEAD entry should be created.
+        // Before the VE-06 fix (hot archive skip at line 667), the erase-RW loop
+        // would find the pre-loaded entry via get_contract_data().is_some() and
+        // call delete_contract_data(), creating a spurious DEAD delta entry.
+        assert_eq!(
+            state.delta().deleted_keys().len(),
+            0,
+            "Erase-RW loop must skip hot archive read-only entries — \
+             deleting them creates a spurious DEAD in the live bucket list"
+        );
+
+        // The entry should still be accessible in state (not deleted).
+        assert!(
+            state
+                .get_contract_data(&contract_id, &contract_key, durability)
+                .is_some(),
+            "Hot archive read-only entry must remain in state after apply_soroban_storage_changes"
+        );
+
+        // No creates either (the entry was pre-loaded, not created via delta).
+        assert_eq!(
+            state.delta().created_entries().len(),
+            0,
+            "No entries should be created for a hot archive read-only restore"
+        );
+    }
 }
