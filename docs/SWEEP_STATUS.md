@@ -1,6 +1,6 @@
 # Verify-Execution Sweep Status
 
-> **Updated**: 2026-02-23 16:57
+> **Updated**: 2026-02-23 17:07
 > **CDP data lake range**: L59501248–L61354687 (latest available as of 2026-02-22)
 > **Supported protocol**: P24+ (L59501312 is first P24 ledger; L59501248–L59501311 are P23 and unverifiable)
 > **P25 boundary**: TBD (to be identified during sweeps)
@@ -124,9 +124,4 @@ Protocol 25 boundary: TBD — to be identified during Sweep 4 of L59939047+.
 
 ## Running sweeps
 
-| Sweep | Range | PID | Started |
-| s5k | L61355584-L61355711 | 1668838 | 2026-02-23 |
-| s5l | L61355712-L61355839 | 1668843 | 2026-02-23 |
-| s5m | L61355840-L61355903 | 1668848 | 2026-02-23 |
-
-Monitor PID: 755062 (10-min interval)
+None — all chunks complete.
