@@ -1,6 +1,6 @@
 # Verify-Execution Sweep Status
 
-> **Updated**: 2026-02-24 11:46 UTC
+> **Updated**: 2026-02-24 14:25 UTC
 > **Session**: b5e87aee (fresh start)
 > **CDP data lake range**: L59501248–L61366079 (latest available as of 2026-02-23)
 > **Supported protocol**: P24+ (L59501312 is first P24 ledger; L59501248–L59501311 are P23 and unverifiable)
@@ -27,6 +27,7 @@ Ledgers L59501248–L59501311 (P23) cannot be verified by Henyey (min supported:
 | L59591312–L59601311 | **CLEAN** | s10 completed — 10,000 ledgers, 0 mismatches |
 | L59601312–L59611311 | **CLEAN** | s11 completed — 10,000 ledgers, 0 mismatches |
 | L59611312–L59621311 | **CLEAN** | s12 completed — 10,000 ledgers, 0 mismatches |
+| L59621312–L59631311 | **CLEAN** | s13 completed — 10,000 ledgers, 0 mismatches |
 
 ## Previously confirmed bug fixes (from prior sessions)
 
@@ -45,11 +46,17 @@ Ledgers L59501248–L59501311 (P23) cannot be verified by Henyey (min supported:
   - **Root cause**: `remove_one_time_signers_from_all_sources` ran BEFORE `check_operation_signatures`. A prior TX in the same ledger added a PreAuthTx signer for this TX's hash, but our code consumed it before the signature check could see it.
   - **Fix**: Move signature checking to before one-time signer removal, matching stellar-core's ordering (checkAllTransactionSignatures → processSeqNum → checkOperationSignatures → removeOneTimeSignerFromAllSourceAccounts).
 
+- **VE-08**: Signature check skipped for Soroban transactions — fixed in `dc2d81b`
+  - **Ledger**: L59638512, TX 171 (hash `d9096fb5...`)
+  - **Symptom**: txFeeBumpInnerSuccess (ours) vs txFeeBumpInnerFailed/TxBadAuth (CDP) for a fee-bump wrapping InvokeHostFunction. Fee pool off by 5782 stroops.
+  - **Root cause**: The `!frame.is_soroban()` guard on the apply-time signature check skipped checking for all Soroban transactions. For fee-bump Soroban TXs, a prior TX in the same ledger modified the inner source's signer set, invalidating the inner signatures. stellar-core's `processSignatures()` calls `checkOperationSignatures()` for all transaction types.
+  - **Fix**: Remove the `!frame.is_soroban()` guard so signature checking runs for all transaction types, matching stellar-core's behavior.
+
 ## Running sweeps
 
 | Sweep | Range | Status | Started |
 |-------|-------|--------|---------|
-| s13 | L59621312–L59631311 | running | 2026-02-24 11:46 UTC |
+| s14 | L59631312–L59641311 | re-running after VE-08 fix | 2026-02-24 14:25 UTC |
 
 ## Tracker
 
