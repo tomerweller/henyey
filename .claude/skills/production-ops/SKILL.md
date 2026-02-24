@@ -31,10 +31,12 @@ testnet-only guideline in CLAUDE.md.
    ```
    CARGO_TARGET_DIR=~/data/<session-id>/cargo-target cargo build --release
    ```
-5. Create two git worktrees for concurrent operation:
+5. Create git worktrees for concurrent operation (use `--detach` since
+   `main` is already checked out):
    ```
-   git worktree add ~/data/<session-id>/worktree-tracker main
-   git worktree add ~/data/<session-id>/worktree-sweeper main
+   git worktree add --detach ~/data/<session-id>/worktree-tracker HEAD
+   git worktree add --detach ~/data/<session-id>/worktree-sweeper-1 HEAD
+   git worktree add --detach ~/data/<session-id>/worktree-sweeper-2 HEAD
    ```
 6. Start the status monitor background loop (see Status Updates below).
 
@@ -61,28 +63,41 @@ mismatches, panics, or crashes. When an issue is found:
 2. Rebuild the binary.
 3. Restart the validator.
 
-### Task 2: Sweeper
+### Task 2: Sweepers (2 concurrent)
 
-Verify historical mainnet ledger ranges using verify-execution. Operates
-in the `worktree-sweeper` worktree. Only one verify-execution process
-runs at a time.
+Verify historical mainnet ledger ranges using verify-execution. Up to 2
+verify-execution processes run concurrently, each in its own worktree.
 
-**Resume point:** Read from `docs/SWEEP_STATUS.md`. Start from the first
-unverified ledger after the last clean range.
-
-**Chunk size:** 10,000 ledgers per invocation.
-
-**Invocation:**
+**Worktrees:** `worktree-sweeper-1` and `worktree-sweeper-2`. Create
+both during startup:
 ```
+git worktree add --detach ~/data/<session-id>/worktree-sweeper-1 HEAD
+git worktree add --detach ~/data/<session-id>/worktree-sweeper-2 HEAD
+```
+
+**Resume point:** Read from `docs/SWEEP_STATUS.md`. Assign each sweeper
+a non-overlapping chunk starting from the first unverified ledger.
+
+**Chunk size:** 100,000 ledgers per invocation.
+
+**Invocation (per sweeper):**
+```
+cd ~/data/<session-id>/worktree-sweeper-N && \
 ~/data/<session-id>/cargo-target/release/henyey verify-execution \
-  --from <START> --to <END> \
+  --mainnet --from <START> --to <END> \
   --stop-on-error --quiet \
   --cache-dir ~/data/<session-id>/cache \
   2>&1 | tee ~/data/<session-id>/logs/sweep-<START>-<END>.log
 ```
 
 **On success:** Update `docs/SWEEP_STATUS.md` with the verified range.
-Advance to the next chunk.
+Clean stale cache from the completed range (bucket files that won't be
+reused by the next chunk):
+```
+# Remove checkpoint-specific cache entries for completed ranges
+find ~/data/<session-id>/cache -name "*.xdr*" -mmin +30 -delete 2>/dev/null
+```
+Advance that sweeper to the next unverified chunk.
 
 **On error:** Follow the Bug Fix Workflow below. After the fix, rebuild
 the binary and resume from the failed ledger.
@@ -139,18 +154,26 @@ When a hash mismatch, error, or crash is encountered:
    git add <files>
    git commit -m "<Imperative description of fix>"
    ```
-8. **Run `/review-fix --apply`** on the commit.
-9. **Rebuild** the binary:
-   ```
-   CARGO_TARGET_DIR=~/data/<session-id>/cargo-target cargo build --release
-   ```
-10. **Pull the fix** into both worktrees:
+8. **Push** immediately: `git push` (if rejected, `git pull --rebase && git push`).
+9. **Run `/review-fix --apply`** on the commit.
+10. **Rebuild** the binary:
+    ```
+    CARGO_TARGET_DIR=~/data/<session-id>/cargo-target cargo build --release
+    ```
+11. **Pull the fix** into all worktrees:
     ```
     cd ~/data/<session-id>/worktree-tracker && git pull --rebase
-    cd ~/data/<session-id>/worktree-sweeper && git pull --rebase
+    cd ~/data/<session-id>/worktree-sweeper-1 && git pull --rebase
+    cd ~/data/<session-id>/worktree-sweeper-2 && git pull --rebase
     ```
-11. **Update `docs/SWEEP_STATUS.md`** with the bug details and fix.
-12. **Resume** the sweep or restart the tracker.
+12. **Update `docs/SWEEP_STATUS.md`** with the bug details and fix.
+13. **Commit and push** the updated SWEEP_STATUS.md:
+    ```
+    git add docs/SWEEP_STATUS.md
+    git commit -m "SWEEP_STATUS.md: document <bug-id> fix"
+    git push
+    ```
+14. **Resume** the sweep or restart the tracker.
 
 ## State & Persistence
 
@@ -197,10 +220,13 @@ SWEEP
   Remaining:   ~<N> ledgers to tip
 
 TRACKER
-  Status:   <synced/behind/down>
-  Ledger:   L<latest>
-  Uptime:   <duration>
-  Errors:   <count since start>
+  Public Key: <public key from startup log>
+  Peer Port:  <peer_port from config>
+  HTTP Port:  <http port from config>
+  Status:     <synced/behind/down>
+  Ledger:     L<latest>
+  Uptime:     <duration>
+  Errors:     <count since start>
 
 BUGS
   Fixed:    <N> (this session: <M>)
@@ -209,18 +235,24 @@ BUGS
 DISK
   ~/data usage: <size> / <total> (<percent>%)
   Session:      <size>
+
+FOLLOW LOGS
+  Tracker:    tail -f ~/data/<session-id>/logs/tracker.log
+  Sweeper 1:  tail -f ~/data/<session-id>/logs/sweep-<START1>-<END1>.log
+  Sweeper 2:  tail -f ~/data/<session-id>/logs/sweep-<START2>-<END2>.log
 ═══════════════════════════════════════════
 ```
 
 ## Concurrency Model
 
-- **Tracker** and **Sweeper** run in separate git worktrees so they can
+- **Tracker** and **Sweepers** run in separate git worktrees so they can
   operate independently without interfering with each other's working
   directory state.
+- Up to **2 sweeper processes** run concurrently on non-overlapping
+  ledger ranges. Each sweeper uses its own worktree.
 - Bug fixes are committed on `main` in the primary repo, then pulled
-  into both worktrees via `git pull --rebase`.
-- Only one verify-execution process runs at a time.
-- The status monitor runs as a background loop independent of both tasks.
+  into all worktrees via `git pull --rebase`.
+- The status monitor runs as a background loop independent of all tasks.
 
 ## Teardown
 
@@ -230,7 +262,8 @@ When stopping (user interrupts or all ledgers verified):
 3. Remove worktrees:
    ```
    git worktree remove ~/data/<session-id>/worktree-tracker
-   git worktree remove ~/data/<session-id>/worktree-sweeper
+   git worktree remove ~/data/<session-id>/worktree-sweeper-1
+   git worktree remove ~/data/<session-id>/worktree-sweeper-2
    ```
 4. Print a final status summary.
 5. Do NOT remove logs or cache — they may be useful for debugging.
@@ -245,6 +278,12 @@ When stopping (user interrupts or all ledgers verified):
 - When fixing bugs, follow the test-first workflow strictly. Do not skip
   writing a failing test.
 - Commit bug fixes immediately after the test passes. Do not batch fixes.
+- **Push after every fix commit** — do not accumulate unpushed commits.
+- **Commit and push `docs/SWEEP_STATUS.md`** immediately after documenting
+  a new bug or fix.
+- **Daily commit**: Commit and push the sweep status report at least once
+  per day, even if no bugs were found. Use message format:
+  `SWEEP_STATUS.md: daily update — <summary>`.
 - If a push is rejected, pull with rebase and retry.
 - All commits must include the appropriate `Co-authored-by` trailer per
   CLAUDE.md.
