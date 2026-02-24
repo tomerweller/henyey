@@ -80,13 +80,20 @@ a non-overlapping chunk starting from the first unverified ledger.
 
 **Chunk size:** 100,000 ledgers per invocation.
 
+**Cache directories:** Each sweeper MUST use its own cache directory to
+avoid corruption from concurrent bucket downloads:
+```
+~/data/<session-id>/cache-1   # for sweeper-1
+~/data/<session-id>/cache-2   # for sweeper-2
+```
+
 **Invocation (per sweeper):**
 ```
 cd ~/data/<session-id>/worktree-sweeper-N && \
 ~/data/<session-id>/cargo-target/release/henyey verify-execution \
   --mainnet --from <START> --to <END> \
   --stop-on-error --quiet \
-  --cache-dir ~/data/<session-id>/cache \
+  --cache-dir ~/data/<session-id>/cache-N \
   2>&1 | tee ~/data/<session-id>/logs/sweep-<START>-<END>.log
 ```
 
@@ -99,8 +106,14 @@ find ~/data/<session-id>/cache -name "*.xdr*" -mmin +30 -delete 2>/dev/null
 ```
 Advance that sweeper to the next unverified chunk.
 
-**On error:** Follow the Bug Fix Workflow below. After the fix, rebuild
-the binary and resume from the failed ledger.
+**On error:**
+1. Mark the range from chunk start to (failed ledger - 1) as **CLEAN**
+   in `docs/SWEEP_STATUS.md` — those ledgers were verified successfully
+   and must not be scanned again.
+2. Follow the Bug Fix Workflow below.
+3. After the fix, rebuild the binary and resume from the **failed
+   ledger** (not the chunk start). Use a new chunk that starts at the
+   failed ledger and ends at the original chunk end.
 
 **On unfixable bug (3 failed attempts):** Document the issue in
 `docs/SWEEP_STATUS.md` under a "Known Issues" section with: ledger
@@ -273,8 +286,10 @@ When stopping (user interrupts or all ledgers verified):
 - Always build with `--release` — debug builds are too slow for mainnet.
 - Keep `docs/SWEEP_STATUS.md` up to date — it is the contract between
   sessions.
-- Do not run verify-execution on ranges already marked clean in
-  SWEEP_STATUS.md unless `$FRESH = true`.
+- **Never re-scan clean ranges.** Do not run verify-execution on ranges
+  already marked clean in SWEEP_STATUS.md unless `$FRESH = true`. When
+  resuming after a bug fix, start from the exact failed ledger, not
+  from the beginning of the chunk.
 - When fixing bugs, follow the test-first workflow strictly. Do not skip
   writing a failing test.
 - Commit bug fixes immediately after the test passes. Do not batch fixes.

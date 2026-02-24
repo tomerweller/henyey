@@ -58,6 +58,7 @@ Ledgers L59501248–L59501311 (P23) cannot be verified by Henyey (min supported:
 | Sweep | Range | Status | Started |
 |-------|-------|--------|---------|
 | s15 | L59641312–L59741311 | running (100k chunk) | 2026-02-24 15:30 UTC |
+| s16 | L59741312–L59841311 | running (100k chunk) | 2026-02-24 16:53 UTC |
 
 ## Tracker
 
