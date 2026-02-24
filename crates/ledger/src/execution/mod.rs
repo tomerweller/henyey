@@ -2090,6 +2090,43 @@ impl TransactionExecutor {
             vec![]
         };
 
+        // Check signatures BEFORE removing one-time signers.
+        // In stellar-core, checkAllTransactionSignatures runs in commonValid()
+        // and checkOperationSignatures runs in processSignatures(), both BEFORE
+        // removeOneTimeSignerFromAllSourceAccounts(). PreAuthTx signers must
+        // still be present during the check so their weight is counted.
+        let mut sig_check_failure: Option<(Vec<OperationResult>, ExecutionFailure)> = None;
+        if preflight_failure.is_none() && !frame.is_soroban() {
+            // Pre-load per-operation source accounts from snapshot so they're
+            // available to check_operation_signatures.
+            for op in frame.operations().iter() {
+                if let Some(ref source) = op.source_account {
+                    let op_source_id = henyey_tx::muxed_to_account_id(source);
+                    self.load_account(snapshot, &op_source_id)?;
+                }
+            }
+            let sig_hash = if frame.is_fee_bump() {
+                fee_bump_inner_hash(&frame, &self.network_id)?
+            } else {
+                outer_hash
+            };
+            let sig_signatures = if frame.is_fee_bump() {
+                frame.inner_signatures()
+            } else {
+                frame.signatures()
+            };
+            sig_check_failure = check_operation_signatures(
+                &frame,
+                &self.state,
+                &sig_hash,
+                sig_signatures,
+                &inner_source_id,
+            );
+        }
+
+        // Remove one-time (PreAuthTx) signers from all source accounts.
+        // This must happen AFTER the signature check above so PreAuthTx signers
+        // are still present when their weight is evaluated.
         let mut signer_changes = empty_entry_changes();
         if self.protocol_version != 7 {
             let mut source_accounts = Vec::new();
@@ -2326,49 +2363,11 @@ impl TransactionExecutor {
         let mut collected_hot_archive_keys: HashSet<LedgerKey> = HashSet::new();
         let mut op_type_timings: HashMap<OperationType, (u64, u32)> = HashMap::new();
 
-        // Per-operation signature checking (protocol v10+).
-        // This mirrors stellar-core's processSignatures() + checkOperationSignatures().
-        // For each operation, check the per-op source account's signatures at the
-        // appropriate threshold level. Also checks that all signatures are used
-        // (txBAD_AUTH_EXTRA).
-        //
-        // Uses the inner hash and inner signatures for fee-bump TXs, matching
-        // stellar-core where the inner TransactionFrame::commonPreApply creates the
-        // SignatureChecker with getContentsHash() and getSignatures(mEnvelope).
-        //
-        // Pre-load per-operation source accounts first, since load_operation_accounts
-        // normally handles this during the operation loop (which runs after sig checks).
-        if preflight_failure.is_none() && !frame.is_soroban() {
-            for op in frame.operations().iter() {
-                if let Some(ref source) = op.source_account {
-                    let op_source_id = henyey_tx::muxed_to_account_id(source);
-                    // Best-effort load; account may not exist (handled by
-                    // checkSignatureNoAccount path in check_operation_signatures).
-                    self.load_account(snapshot, &op_source_id)?;
-                }
-            }
-            let sig_hash = if frame.is_fee_bump() {
-                fee_bump_inner_hash(&frame, &self.network_id)?
-            } else {
-                outer_hash
-            };
-            let sig_signatures = if frame.is_fee_bump() {
-                frame.inner_signatures()
-            } else {
-                frame.signatures()
-            };
-
-            if let Some((op_results, sig_failure)) = check_operation_signatures(
-                &frame,
-                &self.state,
-                &sig_hash,
-                sig_signatures,
-                &inner_source_id,
-            ) {
-                all_success = false;
-                operation_results = op_results;
-                failure = Some(sig_failure);
-            }
+        // Apply the signature check result from above (checked before signer removal).
+        if let Some((op_results, sig_failure)) = sig_check_failure {
+            all_success = false;
+            operation_results = op_results;
+            failure = Some(sig_failure);
         }
 
         if let Some(preflight_failure) = preflight_failure {

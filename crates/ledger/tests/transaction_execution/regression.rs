@@ -3082,3 +3082,207 @@ fn test_op_source_merged_in_prior_tx_returns_bad_auth() {
         "op sourced from merged account with no master-key sig must return opBAD_AUTH, not opNO_ACCOUNT"
     );
 }
+
+/// Regression test for VE-07: PreAuthTx signer removed before signature check.
+///
+/// Scenario: Two transactions in the same ledger from the same source account.
+///
+/// TX 1 (SetOptions × 3):
+///   1. Add a PreAuthTx signer whose key = hash(TX 2), weight = 1
+///   2. Set master weight to 0
+///   3. Set thresholds to [low=1, med=1, high=1]
+///   (TX 1 is signed normally by the master key.)
+///
+/// TX 2 (Payment):
+///   No signatures — authorized solely by the PreAuthTx signer added by TX 1.
+///
+/// In stellar-core, checkAllTransactionSignatures runs BEFORE
+/// removeOneTimeSignerFromAllSourceAccounts. This means TX 2's signature check
+/// sees the PreAuthTx signer (weight=1 >= threshold=1) and passes. The signer
+/// is then consumed.
+///
+/// Bug: Our code removed one-time signers BEFORE checking signatures, so TX 2's
+/// check saw an account with master_weight=0, no signers, no sigs → txBAD_AUTH.
+#[test]
+fn test_pre_auth_tx_signer_checked_before_removal() {
+    use henyey_ledger::execution::{execute_transaction_set_with_fee_mode, SorobanContext};
+    use henyey_ledger::LedgerDelta;
+
+    let secret = SecretKey::from_seed(&[42u8; 32]);
+    let source_id: AccountId = (&secret.public_key()).into();
+    let dest_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([99u8; 32])));
+
+    let network_id = NetworkId::testnet();
+    let base_fee: u32 = 100;
+    let base_reserve: i64 = 5_000_000;
+
+    // Source account: master_weight=1, all thresholds=0 (so SetOptions passes at low=0).
+    // Needs enough balance for 2 TXs' fees + payment + reserve for 1 sub-entry (the signer).
+    let (source_key, source_entry) =
+        create_account_entry(source_id.clone(), 100, 100_000_000);
+    let (dest_key, dest_entry) =
+        create_account_entry(dest_id.clone(), 1, 10_000_000);
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .expect("add source")
+        .add_entry(dest_key, dest_entry)
+        .expect("add dest")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    // Build TX 2 first (unsigned Payment) so we can compute its hash for the
+    // PreAuthTx signer in TX 1.
+    let payment_op = Operation {
+        source_account: None,
+        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+            destination: MuxedAccount::Ed25519(Uint256([99u8; 32])),
+            asset: stellar_xdr::curr::Asset::Native,
+            amount: 1000,
+        }),
+    };
+
+    let tx2 = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: base_fee,
+        seq_num: SequenceNumber(102), // TX 1 is seq 101
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![payment_op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    // TX 2 envelope with NO signatures (authorized by PreAuthTx signer).
+    let tx2_envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: tx2,
+        signatures: VecM::default(),
+    });
+
+    // Compute TX 2's hash — this becomes the PreAuthTx signer key.
+    let tx2_frame =
+        henyey_tx::TransactionFrame::with_network(tx2_envelope.clone(), network_id);
+    let tx2_hash = tx2_frame.hash(&network_id).expect("tx2 hash");
+
+    // Build TX 1: SetOptions × 3.
+    //   Op 1: Add PreAuthTx signer (key = tx2_hash, weight = 1)
+    //   Op 2: Set master weight to 0
+    //   Op 3: Set thresholds to low=1, med=1, high=1
+    let add_signer_op = Operation {
+        source_account: None,
+        body: OperationBody::SetOptions(SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: None,
+            set_flags: None,
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: Some(Signer {
+                key: SignerKey::PreAuthTx(Uint256(tx2_hash.0)),
+                weight: 1,
+            }),
+        }),
+    };
+
+    let set_master_weight_op = Operation {
+        source_account: None,
+        body: OperationBody::SetOptions(SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: None,
+            set_flags: None,
+            master_weight: Some(0),
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: None,
+        }),
+    };
+
+    let set_thresholds_op = Operation {
+        source_account: None,
+        body: OperationBody::SetOptions(SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: None,
+            set_flags: None,
+            master_weight: None,
+            low_threshold: Some(1),
+            med_threshold: Some(1),
+            high_threshold: Some(1),
+            home_domain: None,
+            signer: None,
+        }),
+    };
+
+    let tx1 = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: base_fee * 3, // 3 ops
+        seq_num: SequenceNumber(101),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![add_signer_op, set_master_weight_op, set_thresholds_op]
+            .try_into()
+            .unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut tx1_envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: tx1,
+        signatures: VecM::default(),
+    });
+
+    // Sign TX 1 with the master key.
+    let tx1_sig = sign_envelope(&tx1_envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = tx1_envelope {
+        env.signatures = vec![tx1_sig].try_into().unwrap();
+    }
+
+    // Execute both TXs in a single ledger.
+    let tx_set: Vec<(TransactionEnvelope, Option<u32>)> =
+        vec![(tx1_envelope, None), (tx2_envelope, None)];
+
+    let context = henyey_tx::LedgerContext::new(
+        2,     // ledger_seq
+        1_000, // close_time
+        base_fee,
+        base_reserve as u32,
+        25, // protocol version
+        network_id,
+    );
+    let mut delta = LedgerDelta::new(2);
+    let soroban = SorobanContext {
+        config: SorobanConfig::default(),
+        base_prng_seed: [0u8; 32],
+        classic_events: ClassicEventConfig::default(),
+        module_cache: None,
+        hot_archive: None,
+        runtime_handle: None,
+    };
+
+    let result = execute_transaction_set_with_fee_mode(
+        &snapshot,
+        &tx_set,
+        &context,
+        &mut delta,
+        soroban,
+        true,
+    )
+    .expect("execute tx set");
+
+    // TX 1 (SetOptions): must succeed.
+    assert!(
+        result.results[0].success,
+        "TX 1 (SetOptions) should succeed; got failure: {:?}",
+        result.results[0].failure
+    );
+
+    // TX 2 (Payment authorized by PreAuthTx signer): must succeed.
+    // Before the fix, this returned txBAD_AUTH because the PreAuthTx signer
+    // was removed before the signature check could see it.
+    assert!(
+        result.results[1].success,
+        "TX 2 (PreAuthTx-authorized payment) should succeed; got failure: {:?}",
+        result.results[1].failure
+    );
+}
