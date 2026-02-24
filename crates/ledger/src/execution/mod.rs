@@ -2091,12 +2091,13 @@ impl TransactionExecutor {
         };
 
         // Check signatures BEFORE removing one-time signers.
-        // In stellar-core, checkAllTransactionSignatures runs in commonValid()
-        // and checkOperationSignatures runs in processSignatures(), both BEFORE
-        // removeOneTimeSignerFromAllSourceAccounts(). PreAuthTx signers must
-        // still be present during the check so their weight is counted.
+        // In stellar-core, processSignatures() calls checkOperationSignatures()
+        // for ALL transaction types (classic and Soroban), and both run BEFORE
+        // removeOneTimeSignerFromAllSourceAccounts(). For fee-bump Soroban
+        // transactions, a prior TX in the same ledger may modify the inner
+        // source's signer set, making this check essential.
         let mut sig_check_failure: Option<(Vec<OperationResult>, ExecutionFailure)> = None;
-        if preflight_failure.is_none() && !frame.is_soroban() {
+        if preflight_failure.is_none() {
             // Pre-load per-operation source accounts from snapshot so they're
             // available to check_operation_signatures.
             for op in frame.operations().iter() {

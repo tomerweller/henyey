@@ -3286,3 +3286,189 @@ fn test_pre_auth_tx_signer_checked_before_removal() {
         result.results[1].failure
     );
 }
+
+/// Regression test for VE-08: fee-bump wrapping a Soroban (InvokeHostFunction) transaction
+/// must check inner source signatures at apply time, not skip them.
+///
+/// In stellar-core, `processSignatures()` calls `checkOperationSignatures()` for ALL
+/// transaction types, including Soroban. Our code had `!frame.is_soroban()` which skipped
+/// the check entirely for Soroban transactions. For fee-bump Soroban transactions, a prior
+/// TX in the same ledger can modify the inner source's signer set, making the inner
+/// signatures invalid. Without the check, the inner TX incorrectly succeeds.
+///
+/// The fix: remove the `!frame.is_soroban()` guard so signature checking runs for all
+/// transaction types, matching stellar-core's behavior.
+#[test]
+fn test_fee_bump_soroban_checks_inner_signatures() {
+    let inner_secret = SecretKey::from_seed(&[40u8; 32]);
+    let inner_account_id: AccountId = (&inner_secret.public_key()).into();
+
+    // An additional signer that will be removed before the fee-bump executes
+    let signer_secret = SecretKey::from_seed(&[41u8; 32]);
+    let signer_pubkey = signer_secret.public_key();
+
+    let fee_secret = SecretKey::from_seed(&[42u8; 32]);
+    let fee_account_id: AccountId = (&fee_secret.public_key()).into();
+
+    let network_id = NetworkId::testnet();
+
+    // inner_source: master_weight=1, thresholds=1, plus an additional signer
+    let inner_signer = Signer {
+        key: SignerKey::Ed25519(Uint256(*signer_pubkey.as_bytes())),
+        weight: 1,
+    };
+    let inner_key = LedgerKey::Account(LedgerKeyAccount {
+        account_id: inner_account_id.clone(),
+    });
+    let inner_entry = LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::Account(AccountEntry {
+            account_id: inner_account_id.clone(),
+            balance: 20_000_000,
+            seq_num: SequenceNumber(1),
+            num_sub_entries: 1,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 1, 1, 1]),
+            signers: vec![inner_signer].try_into().unwrap(),
+            ext: AccountEntryExt::V0,
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+
+    let (fee_key, fee_entry) = create_account_entry(fee_account_id.clone(), 1, 20_000_000);
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(inner_key, inner_entry)
+        .expect("add inner")
+        .add_entry(fee_key, fee_entry)
+        .expect("add fee")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 24, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    // TX1: SetOptions — removes signer_pubkey (weight=0) from inner_source.
+    let set_options_op = Operation {
+        source_account: None,
+        body: OperationBody::SetOptions(SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: None,
+            set_flags: None,
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: Some(Signer {
+                key: SignerKey::Ed25519(Uint256(*signer_pubkey.as_bytes())),
+                weight: 0,
+            }),
+        }),
+    };
+
+    let tx1 = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*inner_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![set_options_op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut env1 = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: tx1,
+        signatures: VecM::default(),
+    });
+    let sig1 = sign_envelope(&env1, &inner_secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut e) = env1 {
+        e.signatures = vec![sig1].try_into().unwrap();
+    }
+
+    let result1 = executor
+        .execute_transaction(&snapshot, &env1, 100, None)
+        .expect("execute tx1");
+    assert!(
+        result1.success,
+        "TX1 (SetOptions remove signer) should succeed"
+    );
+
+    // TX2: fee-bump wrapping an InvokeHostFunction (Soroban) inner TX,
+    // signed by signer_secret which was removed by TX1.
+    // The inner TX should fail with TxBadAuth.
+    let invoke_op = Operation {
+        source_account: None,
+        body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+            host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                contract_address: ScAddress::Contract(ContractId(Hash([99u8; 32]))),
+                function_name: ScSymbol("test".try_into().unwrap()),
+                args: VecM::default(),
+            }),
+            auth: VecM::default(),
+        }),
+    };
+
+    let inner_tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*inner_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(3),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![invoke_op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let inner_env_for_signing = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: inner_tx.clone(),
+        signatures: VecM::default(),
+    });
+    let inner_sig = sign_envelope(&inner_env_for_signing, &signer_secret, &network_id);
+
+    let inner_v1 = TransactionV1Envelope {
+        tx: inner_tx,
+        signatures: vec![inner_sig].try_into().unwrap(),
+    };
+
+    let fee_bump = FeeBumpTransaction {
+        fee_source: MuxedAccount::Ed25519(Uint256(*fee_secret.public_key().as_bytes())),
+        fee: 200,
+        inner_tx: FeeBumpTransactionInnerTx::Tx(inner_v1),
+        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+    };
+
+    let mut env2 = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+        tx: fee_bump,
+        signatures: VecM::default(),
+    });
+    let outer_sig = sign_envelope(&env2, &fee_secret, &network_id);
+    if let TransactionEnvelope::TxFeeBump(ref mut e) = env2 {
+        e.signatures = vec![outer_sig].try_into().unwrap();
+    }
+
+    let result2 = executor
+        .execute_transaction(&snapshot, &env2, 100, None)
+        .expect("execute tx2");
+
+    // The inner tx's signer was removed by TX1, so inner auth must fail.
+    // Before the VE-08 fix, the `!frame.is_soroban()` guard skipped signature
+    // checking for Soroban transactions, causing this to incorrectly succeed
+    // or fail with a different error than InvalidSignature.
+    assert!(
+        !result2.success,
+        "fee-bump Soroban TX should fail (inner auth invalid after signer removal)"
+    );
+    assert_eq!(
+        result2.failure,
+        Some(ExecutionFailure::InvalidSignature),
+        "Failure must be InvalidSignature (TxBadAuth), not a Soroban execution error. \
+         Before VE-08 fix, the `!frame.is_soroban()` guard skipped the sig check."
+    );
+}
