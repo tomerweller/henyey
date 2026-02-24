@@ -395,7 +395,6 @@ struct PreApplyResult {
     frame: TransactionFrame,
     fee_source_id: AccountId,
     inner_source_id: AccountId,
-    outer_hash: Hash256,
 
     // Pre-apply outputs
     tx_changes_before: LedgerEntryChanges,
@@ -403,6 +402,7 @@ struct PreApplyResult {
     refundable_fee_tracker: Option<RefundableFeeTracker>,
     tx_event_manager: TxEventManager,
     preflight_failure: Option<ExecutionFailure>,
+    sig_check_failure: Option<(Vec<OperationResult>, ExecutionFailure)>,
     fee: i64,
 
     // Rollback data (entry snapshots for restoring on op failure)
@@ -2249,12 +2249,12 @@ impl TransactionExecutor {
             frame,
             fee_source_id,
             inner_source_id,
-            outer_hash,
             tx_changes_before,
             fee_changes,
             refundable_fee_tracker,
             tx_event_manager,
             preflight_failure,
+            sig_check_failure,
             fee,
             fee_entries: DeltaEntries {
                 created: fee_created,
@@ -2387,12 +2387,12 @@ impl TransactionExecutor {
             frame,
             fee_source_id,
             inner_source_id,
-            outer_hash,
             tx_changes_before,
             fee_changes,
             mut refundable_fee_tracker,
             mut tx_event_manager,
             preflight_failure,
+            sig_check_failure,
             fee,
             fee_entries,
             seq_entries,
