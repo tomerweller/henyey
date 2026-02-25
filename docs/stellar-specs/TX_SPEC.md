@@ -524,8 +524,16 @@ function checkSignature(signers, neededWeight, contentHash, signatures):
                     if totalWeight >= neededWeight: return true
                     break  // next signature
 
-    return totalWeight >= neededWeight
+    return false
 ```
+
+The final `return false` mirrors stellar-core's `SignatureChecker::checkSignature()`:
+the **only** path to `true` is via the early returns inside the loops when
+`totalWeight >= neededWeight`. If execution reaches the end of the function,
+no sufficient match was found, so the result is `false` regardless of
+`neededWeight`. This is critical for correctness when `neededWeight == 0`
+(used by `checkSignatureNoAccount` below): a `neededWeight` of 0 does NOT
+mean the check automatically passes — at least one signer must match.
 
 **PRE_AUTH_TX signer consumption**: When a PRE_AUTH_TX signer matches,
 it MUST be removed from the source account's signer list regardless
@@ -538,10 +546,11 @@ signature in the envelope. Each extra signer requires a weight of 1
 (i.e., the total weight needed for extra signers equals the count of
 extra signers). Result: `txBAD_AUTH_EXTRA`.
 
-**Unused signature check**: After operation execution, if any signature
-in the envelope was not consumed by either the transaction-level check
-or any operation-level check, the transaction MUST fail with
-`txBAD_AUTH`.
+**Unused signature check**: After all signature checks complete (inside
+`processSignatures`, Section 6.2), if any signature in the envelope
+was not consumed by either the transaction-level check or any
+operation-level check, the transaction MUST fail with
+`txBAD_AUTH_EXTRA`.
 
 ### 4.8 Operation-Level Validation
 
@@ -555,9 +564,39 @@ The common operation-level checks are:
    current protocol version (see Section 3.4).
    Result: `opNOT_SUPPORTED`.
 
-2. **Source account existence**: If the operation specifies a source
-   account override, that account MUST exist.
-   Result: `opNO_ACCOUNT`.
+2. **Source account resolution and signature check**: Determine the
+   effective source account (Section 6.6) and verify authorization:
+
+   a. If the source account **exists**: check the operation's signature
+      against the account's signers at the required threshold level
+      (Section 6.5). If the signature check fails → `opBAD_AUTH`.
+
+   b. If the source account **does not exist** and the operation has
+      an **explicit** `sourceAccount` override (and `forApply` is
+      `false`): attempt `checkSignatureNoAccount` — construct a
+      synthetic signer list containing only the account's master
+      public key with weight 1, and call `checkSignature` with
+      `neededWeight = 0`. If no matching signature is found →
+      `opBAD_AUTH`. If a matching signature is found, the operation
+      proceeds to validation (where it will typically fail with the
+      operation-specific "no account" error).
+
+   c. If the source account **does not exist** and either `forApply`
+      is `true` or the operation **inherits** the transaction source
+      (no explicit `sourceAccount`) → `opNO_ACCOUNT`.
+
+   **Account merged by prior operation**: When a transaction contains
+   multiple operations, an earlier operation (e.g., `ACCOUNT_MERGE`)
+   may delete an account that a later operation uses as its source.
+   During the `processSignatures` per-operation check (which runs
+   with `forApply = false` and uses a pre-operation snapshot — see
+   Section 6.1), the account may still exist. However, during the
+   actual `op.apply()` call (which runs with `forApply = true`), the
+   account may have been deleted by a prior operation in the same
+   transaction. In this case, rule (c) applies: the result is
+   `opNO_ACCOUNT`. This is intentional — the `processSignatures`
+   pass has already verified authorization against the pre-operation
+   state.
 
 3. **Operation-specific validation**: Each operation type defines its
    own `doCheckValid()` checks (Section 7).
@@ -718,8 +757,9 @@ the per-transaction `processFeeSeqNum`. The algorithm:
 
 ### 5.5 Soroban Fee Refunds
 
-After a Soroban transaction's operations complete, unused refundable
-fees are returned to the fee source:
+After a Soroban transaction completes (including when validation
+fails — see Section 6.1), unused refundable fees are returned to the
+fee source:
 
 ```
 function processRefund(tx, ltx):
@@ -779,6 +819,20 @@ source and higher fee:
    (subtracting from inner to add to outer) is removed. The inner
    `feeCharged` is simply the charged fee of the inner transaction.
 
+8. **Apply-time inner signature re-validation**: When a fee-bump
+   transaction is applied, the outer fee has already been charged and
+   committed during the `processFeeSeqNum` pre-processing pass
+   (Section 5.4). During `apply()`, the inner transaction goes through
+   `commonPreApply`, which re-validates the inner transaction's
+   signatures against the inner source account's **current** signer set
+   (which may have been modified by prior transactions in the same
+   ledger). If the inner transaction's signatures are no longer valid
+   at apply time, the inner result is `txBAD_AUTH`, the outer result is
+   `txFEE_BUMP_INNER_FAILED`, and the outer fee remains charged. The
+   `feeCharged` field in the result reflects the full fee that was
+   deducted during pre-processing — it is never zero for a fee-bump
+   transaction that reached the apply phase.
+
 ---
 
 ## 6. Transaction Application Pipeline
@@ -793,20 +847,25 @@ function apply(tx, ltx, metaBuilder):
     // Phase 1: Pre-apply (signatures, final validation)
     sigChecker = commonPreApply(tx, ltx, metaBuilder)
 
-    if sigChecker is null:
-        // Validation failed; result already set
-        return
+    // Phase 2: Apply operations (only if pre-apply succeeded)
+    if sigChecker is not null:
+        applyOperations(tx, sigChecker, ltx, metaBuilder)
 
-    // Phase 2: Apply operations
-    applyOperations(tx, sigChecker, ltx, metaBuilder)
-
-    // Phase 3: Verify all signatures used
-    if not sigChecker.allSignaturesUsed():
-        tx.setError(txBAD_AUTH)
-
-    // Phase 4: Post-apply (Soroban refunds)
+    // Phase 3: Post-apply (Soroban refunds)
+    // Called UNCONDITIONALLY — even when commonPreApply fails.
+    // For Soroban TXs, the refundable fee tracker was initialized
+    // in commonPreApply before validation, so the refund is
+    // computed regardless of the transaction result. For non-Soroban
+    // transactions, processPostApply is a no-op.
     processPostApply(tx, ltx, metaBuilder)
 ```
+
+Note: Phase 3 (`processPostApply`) runs **unconditionally** after
+`apply()`, even when `commonPreApply` returns null. This ensures
+Soroban fee refunds are correctly subtracted from `feeCharged` even
+for failed transactions. The unused-signature check
+(`allSignaturesUsed`) is performed inside `processSignatures` (called
+from `commonPreApply` — see below), NOT after operation execution.
 
 ### 6.2 Pre-Apply Phase (commonPreApply)
 
@@ -821,30 +880,106 @@ function commonPreApply(tx, ltx, metaBuilder):
     // Build signature checker
     sigChecker = SignatureChecker(tx.contentHash, tx.signatures)
 
+    // @version(≥20): For Soroban TXs, initialize the refundable fee
+    // tracker BEFORE commonValid. This ensures the refund is computed
+    // and feeCharged is adjusted even when validation fails.
+    if tx.isSoroban():
+        sorobanResourceFee = computePreApplySorobanResourceFee(tx)
+        txResult.initializeRefundableFeeTracker(
+            declaredResourceFee - sorobanResourceFee.nonRefundable)
+
     // Run stateful validation (commonValid)
     validity = commonValid(tx, sigChecker, ltxPreApply, applying=true)
 
-    if validity == kInvalid:
-        rollback(ltxPreApply)
-        return null
+    // @version(≥10): If validation passed the sequence number check
+    // but failed on a later check (kInvalidUpdateSeqNum), advance
+    // the sequence number. This ensures the TX's sequence slot is
+    // consumed even on validation failure (e.g., Soroban resource
+    // validation failure or signature failure).
+    if validity >= kInvalidUpdateSeqNum:
+        processSeqNum(tx, ltxPreApply)
 
-    // @version(<10): advance sequence number here (already done in
-    // processFeeSeqNum for ≥10)
+    // @version(<10): advance sequence number here unconditionally
     if protocolVersion < 10:
         processSeqNum(tx, ltxPreApply)
 
     // Verify transaction-level signatures
     if not checkAccountSignatures(tx.sourceAccount, sigChecker, LOW):
-        rollback(ltxPreApply)
-        tx.setError(txBAD_AUTH)
-        return null
+        txResult.setError(txBAD_AUTH)
+        validity = kInvalid
 
-    // Record pre-operation state changes in metadata
+    // Process per-operation signatures, one-time signer removal,
+    // and unused-signature check
+    signaturesValid = processSignatures(
+        validity, sigChecker, ltxPreApply, txResult)
+
+    // ALWAYS record changes and commit — never rollback.
+    // Even on validation failure, the sequence number advancement,
+    // one-time signer removal, and refundable fee tracker state
+    // must be committed.
     metaBuilder.pushTxChangesBefore(ltxPreApply.getChanges())
     commit(ltxPreApply)
 
-    return sigChecker
+    if signaturesValid and validity == kMaybeValid:
+        return sigChecker
+    else:
+        return null
 ```
+
+#### processSignatures
+
+`@version(≥10)`: The `processSignatures` function performs per-operation
+signature checking, one-time signer removal, and unused-signature
+verification. It is called from `commonPreApply` **before** any
+operations execute. The ordering of steps within this function is
+critical for correctness.
+
+```
+function processSignatures(cv, sigChecker, ltx, txResult):
+    maybeValid = (cv == kMaybeValid)
+
+    // @version(<10): no-op, return maybeValid
+    if protocolVersion < 10: return maybeValid
+
+    // @version(≥13): fast-fail on validation failure
+    // Still remove one-time signers even on failure
+    if protocolVersion >= 13 and not maybeValid:
+        removeOneTimeSignerFromAllSourceAccounts(ltx)
+        return false
+
+    // @version(10..12): fast-fail for pre-auth failures
+    if protocolVersion < 13 and cv < kInvalidPostAuth:
+        return false
+
+    // Step 1: Check per-operation source account signatures
+    // Uses a snapshot of the current ledger state
+    allOpsValid = checkOperationSignatures(sigChecker, snapshot(ltx), txResult)
+
+    // Step 2: Remove one-time (PreAuthTx) signers from ALL source accounts
+    // MUST happen AFTER operation signature checks so that PreAuthTx
+    // signers are still present when their weight is evaluated.
+    removeOneTimeSignerFromAllSourceAccounts(ltx)
+
+    // Step 3: Handle operation signature failures
+    if not allOpsValid:
+        txResult.setError(txFAILED)
+        return false
+
+    // Step 4: Check all signatures were consumed
+    if not sigChecker.checkAllSignaturesUsed():
+        txResult.setError(txBAD_AUTH_EXTRA)
+        return false
+
+    return maybeValid
+```
+
+**Ordering invariant**: The sequence `checkOperationSignatures` →
+`removeOneTimeSignerFromAllSourceAccounts` → `checkAllSignaturesUsed`
+is mandatory. PreAuthTx signers MUST be present during signature
+weight evaluation (Step 1) and MUST be removed regardless of outcome
+(Step 2). The `checkAllSignaturesUsed` check (Step 4) runs after
+signer removal because it only checks `mUsedSignatures` flags, which
+are set during Steps 1 and the earlier transaction-level check.
 
 ### 6.3 Stateful Validation (commonValid)
 
@@ -907,8 +1042,13 @@ function applyOperations(tx, sigChecker, ltx, metaBuilder):
         op = tx.operations[i]
         ltxOp = createChild(ltx)
 
-        // op.apply() handles source resolution, signature check,
-        // validation, and execution internally.
+        // op.apply() handles source resolution, validation, and
+        // execution internally. Per-operation signature authorization
+        // has already been verified in processSignatures (Section 6.2)
+        // using a pre-operation state snapshot. During apply, op source
+        // accounts are resolved against current state — if the source
+        // was merged by a prior op, the result is opNO_ACCOUNT (see
+        // Section 4.8, rule 2c).
         txRes = op.apply(sigChecker, ltxOp, ...)
 
         if not txRes:
@@ -996,16 +1136,22 @@ Creates a new account with a starting XLM balance.
 1. Load source account.
 2. Verify destination account does not already exist.
    Result: `CREATE_ACCOUNT_ALREADY_EXIST`.
-3. Verify source has sufficient native balance (startingBalance ≤
-   available balance). Result: `CREATE_ACCOUNT_UNDERFUNDED`.
-4. Debit `startingBalance` from source.
-5. Create new `ACCOUNT` entry for destination with:
+3. Create with sponsorship support (Section 7.28). Note: this
+   increments `numSponsoring` on the sponsoring account BEFORE the
+   balance check. When the source account is itself the sponsor,
+   this increases the minimum balance, reducing available balance.
+   Result: `CREATE_ACCOUNT_LOW_RESERVE` if insufficient reserve.
+4. Verify source has sufficient native balance: `startingBalance`
+   MUST be ≤ source's available balance (`balance - minBalance
+   - sellingLiabilities`), where `minBalance` reflects the updated
+   `numSponsoring` from step 3.
+   Result: `CREATE_ACCOUNT_UNDERFUNDED`.
+5. Debit `startingBalance` from source.
+6. Create new `ACCOUNT` entry for destination with:
    - `balance = startingBalance`
    - `seqNum = ledgerSeq << 32` (current ledger shifted left by 32
      bits)
    - All thresholds set to 0 (master weight defaults to 1 implicitly).
-6. Create with sponsorship support (Section 7.28).
-   Result: `CREATE_ACCOUNT_LOW_RESERVE` if insufficient reserve.
 
 ### 7.2 Payment
 
@@ -1218,7 +1364,9 @@ signers. MEDIUM otherwise.
    `AUTH_IMMUTABLE_FLAG`, MUST fail.
    Result: `SET_OPTIONS_CANT_CHANGE`.
 3. **Set flags**: Set the specified flags. Same immutability check.
-   `AUTH_CLAWBACK_ENABLED_FLAG` requires `AUTH_REVOCABLE_FLAG`.
+   After both clear and set are applied, validate the **resulting**
+   flag combination: `AUTH_CLAWBACK_ENABLED_FLAG` requires
+   `AUTH_REVOCABLE_FLAG` in the resulting flags.
    Result: `SET_OPTIONS_AUTH_REVOCABLE_REQUIRED`.
 4. **Home domain**: Set the home domain string.
    Result: `SET_OPTIONS_INVALID_HOME_DOMAIN` if invalid.
@@ -1246,14 +1394,15 @@ Creates, updates, or removes a trustline.
    - Remove with sponsorship cleanup.
 
 2. If trustline does not exist (create):
-   - `@version(<13)`: Issuer account MUST exist.
+   - `@version(<13)`: Issuer account MUST exist. This check MUST
+     be performed before the subentry/reserve check.
      Result: `CHANGE_TRUST_NO_ISSUER`.
    - `@version(≥13)`: If asset is `ASSET_TYPE_POOL_SHARE`, the pool
      MUST exist or will be created.
    - Verify issuer has `AUTH_REQUIRED_FLAG` implications.
-   - Create TRUSTLINE entry with sponsorship support.
+   - Create TRUSTLINE entry with sponsorship support. Result:
+     `CHANGE_TRUST_LOW_RESERVE` (checked after issuer existence).
    - For pool shares: increment both asset trustline pool counts.
-   - Result: `CHANGE_TRUST_LOW_RESERVE`.
 
 3. If trustline exists (update limit):
    - `limit` MUST be ≥ current buying liabilities.
@@ -1280,8 +1429,24 @@ Authorizes or deauthorizes a trustline (issuer only).
 3. Load trustline. Result: `ALLOW_TRUST_NO_TRUST_LINE`.
 4. Set authorization flags.
 5. If deauthorizing from `AUTHORIZED_TO_MAINTAIN_LIABILITIES` to
-   fully deauthorized `@version(≥10)`: remove all offers and pool
-   share trustlines for the deauthorized asset.
+   fully deauthorized `@version(≥10)`:
+   a. Remove all offers for the account in the deauthorized asset
+      (same mechanism as AccountMerge offer removal).
+   b. Redeem all pool share trustlines for the account that reference
+      the deauthorized asset `@version(≥18)`:
+      - Find pool share trustlines by querying the **full ledger state**
+        (see BUCKETLISTDB_SPEC §10.5
+        `loadPoolShareTrustLinesByAccountAndAsset`), not only entries
+        already in the transaction's working set. This requires a
+        secondary index mapping `(accountID, asset)` → pool IDs.
+      - For each such pool share trustline:
+        1. Withdraw the account's proportional share from the pool.
+        2. Create a claimable balance for each withdrawn asset
+           (claimant: the account, predicate: unconditional).
+        3. Delete the pool share trustline (reserve multiplier = 2).
+        4. Decrement liquidity pool use counts on the underlying
+           asset trustlines.
+        5. If the pool's total shares reach zero, delete the pool.
 
 ### 7.11 AccountMerge
 
@@ -1389,8 +1554,13 @@ Creates a claimable balance with specified claim predicates.
   exactly 2 children, absolute/relative time values ≥ 0.
 
 **Execution**:
-1. Debit source (native or via trustline). Result: `UNDERFUNDED`,
-   `NO_TRUST`, `NOT_AUTHORIZED`.
+1. Debit source (native or via trustline). For native assets,
+   `amount` MUST be ≤ the source's available balance
+   (`balance - minBalance - sellingLiabilities`). For non-native
+   assets, `amount` MUST be ≤ the trustline's available balance
+   (`balance - sellingLiabilities`). The trustline MUST exist
+   (`NO_TRUST`), MUST be authorized (`NOT_AUTHORIZED`), and MUST
+   have sufficient available balance (`UNDERFUNDED`).
 2. `@version(≥17)`: Determine clawback flag from issuer account or
    source trustline.
 3. Generate `balanceID = sha256(ENVELOPE_TYPE_OP_ID || sourceID
@@ -1498,8 +1668,10 @@ Claws back an asset amount from a trustline (issuer only).
 1. Load trustline. Result: `CLAWBACK_NO_TRUST`.
 2. Trustline MUST have `CLAWBACK_ENABLED` flag.
    Result: `CLAWBACK_NOT_CLAWBACK_ENABLED`.
-3. Debit the trustline (bypasses authorization check).
-   Result: `CLAWBACK_UNDERFUNDED`.
+3. Debit the trustline (bypasses authorization check but respects
+   liabilities): the trustline's new balance (`balance - amount`)
+   MUST be ≥ `sellingLiabilities`. If not, result:
+   `CLAWBACK_UNDERFUNDED`.
 
 The clawed-back amount is destroyed (not credited to the issuer).
 
@@ -1539,8 +1711,23 @@ only). `@version(≥17)`.
    Result: `SET_TRUST_LINE_FLAGS_CANT_REVOKE`.
 4. Load trustline. Result: `NO_TRUST_LINE`.
 5. If transitioning from `AUTHORIZED_TO_MAINTAIN_LIABILITIES` to
-   fully deauthorized: remove all offers and pool share trustlines
-   for the affected asset.
+   fully deauthorized:
+   a. Remove all offers for the account in the affected asset.
+   b. Redeem all pool share trustlines for the account that reference
+      the affected asset `@version(≥18)`:
+      - Find pool share trustlines by querying the **full ledger state**
+        (see BUCKETLISTDB_SPEC §10.5
+        `loadPoolShareTrustLinesByAccountAndAsset`), not only entries
+        already in the transaction's working set. This requires a
+        secondary index mapping `(accountID, asset)` → pool IDs.
+      - For each such pool share trustline:
+        1. Withdraw the account's proportional share from the pool.
+        2. Create a claimable balance for each withdrawn asset
+           (claimant: the account, predicate: unconditional).
+        3. Delete the pool share trustline (reserve multiplier = 2).
+        4. Decrement liquidity pool use counts on the underlying
+           asset trustlines.
+        5. If the pool's total shares reach zero, delete the pool.
 6. Set the new flags.
 
 ### 7.23 LiquidityPoolDeposit
@@ -1562,12 +1749,23 @@ Deposits assets into a liquidity pool. `@version(≥18)`.
    Shares = `floor(sqrt(maxAmountA * maxAmountB))`.
    Check price bounds: `maxAmountB/maxAmountA` within
    `[minPrice, maxPrice]`. Result: `BAD_PRICE`.
-5. **Non-empty pool**: compute proportional amounts. The deposit
-   provides the maximum of one asset (up to `maxAmountA` or
-   `maxAmountB`) and the proportional amount of the other (rounded
-   up). Result: `UNDERFUNDED`, `BAD_PRICE`, `LINE_FULL`.
+5. **Non-empty pool**: compute proportional deposit amounts and
+   shares. Two candidate share amounts are computed using 128-bit
+   checked arithmetic (`bigDivide`):
+   `sharesA = floor(maxAmountA * totalPoolShares / reserveA)`
+   `sharesB = floor(maxAmountB * totalPoolShares / reserveB)`
+   If a computation overflows, that candidate is invalid. The final
+   share count is `min` among valid candidates (`minAmongValid`):
+   if one overflows, use the other; if both overflow, the
+   implementation MUST panic (corrupted pool state). The deposit
+   then provides the proportional amount of each asset for the
+   chosen share count (one at the maximum, the other rounded up).
+   Result: `UNDERFUNDED`, `BAD_PRICE`, `LINE_FULL`.
 6. Check for reserve overflow. Result: `POOL_FULL`.
-7. Debit source, credit pool reserves and pool shares.
+7. Debit source (using **available balance**: `balance -
+   sellingLiabilities` for each deposited asset), credit pool
+   reserves and pool shares. Result: `UNDERFUNDED` if the available
+   balance is insufficient for either asset.
 
 ### 7.24 LiquidityPoolWithdraw
 
@@ -1580,7 +1778,9 @@ Withdraws assets from a liquidity pool. `@version(≥18)`.
 
 **Execution**:
 1. Load pool share trustline. Result: `NO_TRUST`.
-2. Verify sufficient pool shares. Result: `UNDERFUNDED`.
+2. Verify sufficient **available** pool shares: the pool share
+   trustline's `balance - sellingLiabilities` MUST be ≥ `amount`.
+   Result: `UNDERFUNDED`.
 3. Load liquidity pool.
 4. Compute withdrawal amounts:
    `amountA = floor(amount * reserveA / totalPoolShares)`.
@@ -1801,11 +2001,17 @@ resource fee MUST be ≤ the declared `resourceFee`.
 ```
 function doApply(op, ltx):
     // 1. Load footprint entries
+    // NOTE: When loading entries, the full LedgerEntry structure
+    // including ext (sponsorship data) and lastModifiedLedgerSeq
+    // MUST be preserved from the source (BucketList or in-memory
+    // state). The host meters CPU based on XDR-encoded entry sizes,
+    // and V1 entries with sponsorship data are larger than V0.
     addFootprint(op.sorobanResources, ltx):
         for each key in footprint (readOnly + readWrite):
             entry = loadEntry(key, ltx)
             check TTL liveness
-            @version(≥23): handle archived entries (auto-restore)
+            @version(≥23): handle archived entries (auto-restore,
+                see details below)
             meter disk read bytes:
                 @version(<23): meter for all entries
                 @version(≥23): meter only for disk-read entries
@@ -1826,12 +2032,18 @@ function doApply(op, ltx):
         return INVOKE_HOST_FUNCTION_TRAPPED
 
     // 3. Record storage changes
+    // 3a. Upsert/delete entries the host explicitly returned
     for each modified entry in result:
         if entry was deleted:
             delete entry and its TTL entry from ltx
         else:
             upsert entry in ltx
             validate write byte limits
+
+    // 3b. Erase unreturned read-write entries
+    for each key in readWrite footprint:
+        if key NOT in result.createdAndModifiedKeys:
+            erase the entry and its TTL entry from ltx (if they exist)
 
     // 4. Collect events
     events = result.contractEvents
@@ -1889,6 +2101,60 @@ contains `archivedSorobanEntries`, the listed entries are restored from
 the hot archive before execution. The restoration cost (rent fee) is
 charged against the refundable budget.
 
+**handleArchivedEntry detail** `@version(≥23)`: For each archived entry
+in the read-write footprint that is marked in `archivedSorobanEntries`:
+- Validate entry size and meter disk read bytes.
+- **Hot archive entries** (evicted from live state): Create (INIT) the
+  DATA entry and a new TTL entry in the per-operation LedgerTxn. Record
+  the key as a hot archive restore.
+- **Live BucketList archived entries** (expired but not yet evicted):
+  Update the existing TTL entry's `liveUntilLedgerSeq` to
+  `currentLedgerSeq + minPersistentTTL - 1`. Record as a live BucketList
+  restore.
+- Archived entries in the **read-only** footprint are NOT auto-restored;
+  they fail with `INVOKE_HOST_FUNCTION_ENTRY_ARCHIVED`.
+
+**Erase-RW loop (step 3b)**: After recording the host's storage changes,
+the implementation iterates over all read-write footprint keys. Any key
+NOT present in the host's returned `createdAndModifiedKeys` set has its
+entry and TTL entry erased from the LedgerTxn. This is essential for
+correctness of auto-restored entries that were only read (not written
+back) by the host.
+
+**Read-only access to auto-restored entries**: When a hot-archive
+auto-restored entry is read by the host but not written back, the
+erase-RW loop (step 3b) removes the DATA INIT and TTL INIT created by
+`handleArchivedEntry`. Because INIT + erase = annihilation (see
+LEDGER_SPEC §6.4.4), the net effect on the live bucket list is zero.
+Only the `HOT_ARCHIVE_LIVE` tombstone in the hot archive bucket list
+persists. This ensures that read-only access to an archived entry does
+not leave any residual state in the live bucket list.
+
+**Unconditional restoration visibility**: Although the erase-RW loop
+annihilates read-only hot-archive restorations within the per-operation
+LedgerTxn (producing zero net state in the live bucket list), the
+restoration itself MUST be recorded unconditionally in the transaction's
+state output (entry map / delta) so that the restored entry is visible
+to subsequent transactions in the same ledger. In stellar-core,
+`handleArchivedEntry` calls `mOpState.upsertEntry(lk, le, ...)`
+which writes the entry to the `globalEntryMap` outside the LedgerTxn
+scope, ensuring it persists regardless of the erase-RW loop's
+annihilation. A conforming implementation MUST ensure that hot-archive
+restored entries appear as INIT entries in the transaction's committed
+delta even when the host does not emit storage changes for them.
+
+**Failure rollback**: When InvokeHostFunction returns a non-success
+result (`TRAPPED`, `INSUFFICIENT_REFUNDABLE_FEE`,
+`RESOURCE_LIMIT_EXCEEDED`, etc.), the operation has failed. Per
+Section 6.4, the per-operation `LedgerTxn` is NOT committed — all
+storage modifications made during the invocation (contract data
+creates, updates, and deletes) are rolled back to their
+pre-invocation state. The transaction result is `txFAILED`, and the
+parent `LedgerTxn` is also not committed. The fee remains charged
+(per Section 2.3). Subsequent transactions in the same ledger MUST
+see the pre-invocation state of all entries that were in the failed
+transaction's footprint.
+
 ### 8.5 ExtendFootprintTTL Execution
 
 Extends the time-to-live of Soroban ledger entries.
@@ -1937,6 +2203,11 @@ Restores archived Soroban ledger entries to live state.
    - Mark entry as restored in metadata.
 2. Result: `RESOURCE_LIMIT_EXCEEDED`, `INSUFFICIENT_REFUNDABLE_FEE`.
 
+**Hot archive interaction**: Entries restored from the hot archive
+during RestoreFootprint execution record hot archive restore keys in
+the per-operation LedgerTxn. If the operation fails, these keys are
+discarded on rollback (see Section 9.2).
+
 ### 8.7 Parallel Soroban Execution
 
 `@version(≥23)`: Soroban transactions MAY be grouped into a parallel
@@ -1957,6 +2228,12 @@ Soroban Transaction Sets").
       into the global ledger state. Read-only TTL extensions are
       merged using maximum values.
 2. After all stages: commit all changes to the main ledger transaction.
+
+**Inter-stage entry visibility**: The read-only snapshot created at the
+start of each stage (step 1a) MUST reflect all state changes from prior
+stages, including hot-archive entries restored by prior-stage
+transactions that were only read (not modified) by the host. See
+"Unconditional restoration visibility" in Section 8.4.
 
 **Pre-parallel apply**: For each Soroban transaction in the parallel
 phase, the following steps are performed on the main thread before
@@ -1992,6 +2269,18 @@ execution in two categories:
   BucketList with TTL extensions.
 
 These are propagated through commit and discarded on rollback.
+
+**Consequence for hot archive tombstones**: Because hot archive restore
+keys are tracked in the LedgerTxn and follow commit/rollback semantics,
+a failed operation's LedgerTxn rollback (Section 6.4) discards any hot
+archive restore keys set up during that operation's execution (e.g., by
+`handleArchivedEntry` during footprint loading). Similarly, if the
+entire transaction fails (e.g., `txFAILED` because an operation failed,
+or insufficient fee balance during pre-apply), no hot archive restore
+keys from that transaction reach the root LedgerTxn. As a result, no
+`HOT_ARCHIVE_LIVE` tombstones are written to the Hot Archive BucketList
+for entries that were tentatively restored during a failed operation or
+transaction.
 
 ---
 
@@ -2412,6 +2701,13 @@ Fee deduction MUST be committed before any operations execute. The
 fee is charged regardless of whether the transaction's operations
 succeed or fail.
 
+For fee-bump transactions, this applies to the outer fee: the outer
+fee is charged from the fee source account during pre-processing
+(Section 5.4), and this charge is irrevocable even if the inner
+transaction fails signature validation at apply time (e.g., because
+a prior transaction in the same ledger removed a signer from the
+inner source account). See Section 5.6, item 8.
+
 ### 13.3 Balance Conservation
 
 The total number of stroops in the network MUST be conserved across
@@ -2467,13 +2763,26 @@ results in transaction failure.
 
 A PRE_AUTH_TX signer, once matched during signature verification,
 MUST be removed from the account's signer list. This removal persists
-regardless of the transaction outcome.
+regardless of the transaction outcome. The removal MUST occur AFTER
+all signature checks (both transaction-level and per-operation) have
+completed, so that PreAuthTx signers are still present when their
+weight is evaluated (see `processSignatures` in Section 6.2).
 
 ### 13.10 Sponsorship Pairing
 
 Every `BeginSponsoringFutureReserves` within a transaction MUST have
 a corresponding `EndSponsoringFutureReserves`. Unmatched pairs cause
 the transaction to fail with `txBAD_SPONSORSHIP`.
+
+### 13.11 Operation Rollback Completeness
+
+When an operation fails, ALL state modifications made by that
+operation MUST be fully reversed. No partial state from a failed
+operation SHALL be visible to subsequent operations or transactions.
+This applies to all entry types including accounts, trustlines,
+offers, contract data, contract code, claimable balances, data
+entries, TTL entries, and liquidity pools. Hot archive restore keys
+tracked during the operation are also discarded (see Section 9.2).
 
 ---
 

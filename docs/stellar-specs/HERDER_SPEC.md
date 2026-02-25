@@ -367,9 +367,14 @@ following constraints:
 When computing a proposed close time, the herder SHOULD use:
 
 ```
-proposedCloseTime = max(previousLedgerCloseTime + 1,
-                        currentWallClock + closeTimeDriftOffset)
+proposedCloseTime = min(
+    currentWallClock + MAX_TIME_SLIP_SECONDS,
+    max(previousLedgerCloseTime + 1,
+        currentWallClock + closeTimeDriftOffset))
 ```
+
+The `min` clamp ensures the proposed close time never exceeds the
+upper bound, even when the drift offset is positive.
 
 **Close time drift detection**: The herder SHOULD track the
 difference between observed close times and its local wall clock

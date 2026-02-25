@@ -529,6 +529,12 @@ individually:
    b. Create a `TransactionMetaBuilder` to track state changes.
    c. For Soroban transactions, compute a per-transaction sub-seed:
       `subSeed = SHA256(baseSeed || transactionIndex)`.
+      The `transactionIndex` is a **global counter** across all
+      phases, NOT a per-phase counter. Phases are applied in order
+      (Phase 0, then Phase 1), and the index increments sequentially
+      across them. For example, if Phase 0 contains N transactions
+      and Phase 1 contains M transactions, Phase 0 TXs receive
+      indices 0..N-1 and Phase 1 TXs receive indices N..N+M-1.
    d. Call `transaction.apply(...)` to execute the transaction.
    e. Call `transaction.processPostApply(...)` for post-application
       processing.
@@ -779,6 +785,16 @@ destruction without commit):
 Rollback is the default behavior — if a `LedgerTxn` is destroyed
 without calling `commit()`, it implicitly rolls back.
 
+**Snapshot immutability invariant**: When an entry is first loaded
+or copied into a `LedgerTxn`'s local cache (copy-on-write), the
+entry's value at that point becomes the rollback target. Subsequent
+modifications to the entry within the same `LedgerTxn` MUST NOT
+alter the original cached copy in any ancestor scope.
+Implementations that use alternative state management approaches
+(e.g., flat state with savepoint snapshots) MUST ensure that the
+pre-scope entry value is captured exactly once and is never
+overwritten by later updates within the same scope.
+
 ### 6.8 Unseal Header
 
 The `unsealHeader` operation is a special mechanism used during the
@@ -842,7 +858,10 @@ upgrade MUST be validated:
 4. For `LEDGER_UPGRADE_CONFIG`: the `ConfigUpgradeSet` MUST exist in
    the ledger state, entries MUST be sorted by `configSettingID` with
    no duplicates, and each setting MUST pass its specific validation
-   logic.
+   logic. For cost parameters (`CONTRACT_COST_PARAMS_CPU` and
+   `CONTRACT_COST_PARAMS_MEMORY`): the array length MUST equal the
+   expected count for the target protocol version (see Section 9.5),
+   and every `constTerm` and `linearTerm` value MUST be non-negative.
 
 #### 7.3.3 Combination
 
@@ -904,6 +923,22 @@ During ledger close, upgrades are applied in the order they appear in
 
    **Base reserve upgrade** (`LEDGER_UPGRADE_BASE_RESERVE`):
    - Set `header.baseReserve` to the new value.
+   - `@version(≥10)`: Run `prepareLiabilities` to reconcile all offers
+     against the new minimum balance. The algorithm:
+     1. Iterate all offers grouped by `accountID`, then by `offerID`.
+     2. For each account's offers, compute the new minimum balance
+        given the updated `baseReserve`.
+     3. Delete offers whose reserve can no longer be supported (the
+        account has insufficient balance to cover the minimum balance
+        plus selling liabilities after the offer is removed).
+     4. For surviving offers, recompute `amount` so that selling
+        liabilities fit within the account's available balance. Adjust
+        buying liabilities accordingly using the exchange function
+        (`exchangeV10WithoutPriceErrorThresholds`).
+     5. Update the liabilities fields on the account entry and any
+        affected trustline entries.
+     6. Record all changes (offer deletions, amount adjustments,
+        account/trustline liability updates) in `UpgradeEntryMeta`.
 
    **Flags upgrade** (`LEDGER_UPGRADE_FLAGS`):
    - Set the ledger header flags to the new value.
