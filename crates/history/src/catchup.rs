@@ -2065,9 +2065,18 @@ impl CatchupManager {
         }
 
         let total = ledger_data.len();
+        // CATCHUP_SPEC §5.6: Publish queue backpressure state.
+        // When the queue exceeds PUBLISH_QUEUE_MAX_SIZE, replay pauses until
+        // it drains to PUBLISH_QUEUE_UNBLOCK_APPLICATION.
+        let mut pq_fell_behind = false;
 
         for (i, data) in ledger_data.iter().enumerate() {
             self.progress.current_ledger = data.header.ledger_seq;
+
+            // Apply publish queue backpressure if enabled (offline catchup).
+            if self.replay_config.wait_for_publish {
+                self.wait_for_publish_queue(&mut pq_fell_behind).await?;
+            }
 
             // Decode upgrades from the header's scp_value.upgrades
             let upgrades = decode_upgrades_from_header(&data.header);
@@ -2116,6 +2125,39 @@ impl CatchupManager {
         }
 
         Ok(())
+    }
+
+    /// Wait until the publish queue is below the backpressure threshold.
+    ///
+    /// CATCHUP_SPEC §5.6 / §11.4: Uses hysteresis (high/low water marks) to
+    /// avoid oscillation. Sets `pq_fell_behind` when queue > 16, clears it
+    /// when queue <= 8.
+    async fn wait_for_publish_queue(&self, pq_fell_behind: &mut bool) -> Result<()> {
+        use crate::publish_queue::{
+            PublishQueue, PUBLISH_QUEUE_MAX_SIZE, PUBLISH_QUEUE_UNBLOCK_APPLICATION,
+        };
+
+        let pq = PublishQueue::new(Arc::clone(&self.db));
+        loop {
+            let queue_len = pq.len()?;
+
+            if queue_len <= PUBLISH_QUEUE_UNBLOCK_APPLICATION {
+                *pq_fell_behind = false;
+            }
+            if queue_len > PUBLISH_QUEUE_MAX_SIZE {
+                *pq_fell_behind = true;
+            }
+
+            if !*pq_fell_behind {
+                return Ok(());
+            }
+
+            debug!(
+                queue_len,
+                "Publish queue backpressure: waiting for queue to drain"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
     }
 }
 
@@ -2255,6 +2297,7 @@ impl CatchupManagerBuilder {
             backfill_stellar_asset_events: false,
             run_eviction: true,
             eviction_settings: henyey_bucket::StateArchivalSettings::default(),
+            wait_for_publish: false,
         };
 
         Ok(manager)

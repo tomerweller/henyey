@@ -212,11 +212,19 @@ pub mod fees {
     /// # Returns
     ///
     /// The fee amount in stroops that would be charged for this transaction.
+    ///
+    /// # Limitations
+    ///
+    /// This is a simplified utility for classic transactions only. For fee-bump
+    /// transactions, use the outer fee. For Soroban transactions, the actual fee
+    /// includes the resource fee from `SorobanTransactionData`. The authoritative
+    /// fee charging happens in `processFeeSeqNum` during ledger close, not here.
     pub fn calculate_fee(tx: &Transaction, base_fee: u32) -> u64 {
         let num_ops = tx.operations.len() as u64;
         let min_fee = num_ops * base_fee as u64;
 
-        // The transaction's fee field is the maximum the user is willing to pay
+        // The transaction's fee field is the maximum the user is willing to pay.
+        // The actual charge is min(declared_fee, num_ops * base_fee).
         std::cmp::min(tx.fee as u64, min_fee)
     }
 

@@ -15,6 +15,7 @@
 //!    with the fewest stages that achieves >= 99.9% of the maximum total
 //!    inclusion fee.
 
+use henyey_common::types::Hash256;
 use henyey_common::NetworkId;
 use henyey_tx::TransactionFrame;
 use stellar_xdr::curr::{
@@ -194,9 +195,7 @@ impl Stage {
     /// Try to add a transaction to this stage. Returns true if successful.
     fn try_add(&mut self, tx: &BuilderTx) -> bool {
         // Fast fail: check if total instructions would exceed stage limit.
-        if self.total_instructions + tx.instructions as u64
-            > self.config.instructions_per_stage()
-        {
+        if self.total_instructions + tx.instructions as u64 > self.config.instructions_per_stage() {
             return false;
         }
 
@@ -618,11 +617,48 @@ pub fn build_parallel_soroban_phase(
 }
 
 /// Convert parallel phase stages into a TransactionPhase::V1 XDR structure.
+///
+/// HERDER_SPEC §7.7: Applies canonical ordering before serialization:
+/// 1. Transactions within each cluster sorted by full hash (ascending).
+/// 2. Clusters within each stage sorted by first-TX hash (ascending).
+/// 3. Stages sorted by first-TX-of-first-cluster hash (ascending).
 pub fn stages_to_xdr_phase(
     stages: Vec<Vec<Vec<TransactionEnvelope>>>,
     base_fee: Option<i64>,
 ) -> TransactionPhase {
-    let execution_stages: Vec<ParallelTxExecutionStage> = stages
+    let mut sorted_stages: Vec<Vec<Vec<TransactionEnvelope>>> = stages
+        .into_iter()
+        .map(|stage| {
+            let mut sorted_clusters: Vec<Vec<TransactionEnvelope>> = stage
+                .into_iter()
+                .map(|mut cluster| {
+                    // 1. Sort transactions within each cluster by hash
+                    cluster.sort_by(|a, b| {
+                        let ha = Hash256::hash_xdr(a).unwrap_or_default();
+                        let hb = Hash256::hash_xdr(b).unwrap_or_default();
+                        ha.0.cmp(&hb.0)
+                    });
+                    cluster
+                })
+                .collect();
+            // 2. Sort clusters within each stage by first-TX hash
+            sorted_clusters.sort_by(|a, b| {
+                let ha = Hash256::hash_xdr(&a[0]).unwrap_or_default();
+                let hb = Hash256::hash_xdr(&b[0]).unwrap_or_default();
+                ha.0.cmp(&hb.0)
+            });
+            sorted_clusters
+        })
+        .collect();
+
+    // 3. Sort stages by first-TX-of-first-cluster hash
+    sorted_stages.sort_by(|a, b| {
+        let ha = Hash256::hash_xdr(&a[0][0]).unwrap_or_default();
+        let hb = Hash256::hash_xdr(&b[0][0]).unwrap_or_default();
+        ha.0.cmp(&hb.0)
+    });
+
+    let execution_stages: Vec<ParallelTxExecutionStage> = sorted_stages
         .into_iter()
         .map(|stage| {
             let clusters: Vec<DependentTxCluster> = stage
@@ -696,7 +732,9 @@ mod tests {
     /// Create a contract data ledger key with a unique identifier.
     fn contract_key(id: u8) -> LedgerKey {
         LedgerKey::ContractData(LedgerKeyContractData {
-            contract: ScAddress::Contract(stellar_xdr::curr::ContractId(stellar_xdr::curr::Hash([id; 32]))),
+            contract: ScAddress::Contract(stellar_xdr::curr::ContractId(stellar_xdr::curr::Hash(
+                [id; 32],
+            ))),
             key: ScVal::U32(id as u32),
             durability: stellar_xdr::curr::ContractDataDurability::Persistent,
         })
@@ -811,11 +849,7 @@ mod tests {
         );
 
         // All three TXs should be in one cluster
-        let total_txs: usize = stages
-            .iter()
-            .flat_map(|s| s.iter())
-            .map(|c| c.len())
-            .sum();
+        let total_txs: usize = stages.iter().flat_map(|s| s.iter()).map(|c| c.len()).sum();
         assert_eq!(total_txs, 3);
         // With one stage, there should be 1 cluster containing all 3
         assert_eq!(stages.len(), 1);
@@ -830,14 +864,8 @@ mod tests {
         let tx_a = make_soroban_tx(1, 1, vec![], vec![key1], 1000);
         let tx_b = make_soroban_tx(2, 1, vec![], vec![key2], 1000);
 
-        let stages = build_parallel_soroban_phase(
-            &[tx_a, tx_b],
-            test_network_id(),
-            100_000,
-            8,
-            1,
-            1,
-        );
+        let stages =
+            build_parallel_soroban_phase(&[tx_a, tx_b], test_network_id(), 100_000, 8, 1, 1);
 
         // No conflicts: should be 2 separate clusters in 1 stage
         assert_eq!(stages.len(), 1);
@@ -865,30 +893,16 @@ mod tests {
             1,
         );
 
-        let total_txs: usize = stages
-            .iter()
-            .flat_map(|s| s.iter())
-            .map(|c| c.len())
-            .sum();
+        let total_txs: usize = stages.iter().flat_map(|s| s.iter()).map(|c| c.len()).sum();
         assert_eq!(total_txs, 1);
 
         // With 2 stages and 1 cluster each: instructions_per_cluster = 100k/2 = 50k
         // Each TX is 60k > 50k, so neither fits. Use higher ledger max instead.
         // ledger_max=120k, 2 stages, 1 cluster each: cluster limit = 60k, stage limit = 60k.
-        let stages = build_parallel_soroban_phase(
-            &[tx_a, tx_b],
-            test_network_id(),
-            120_000,
-            1,
-            2,
-            2,
-        );
+        let stages =
+            build_parallel_soroban_phase(&[tx_a, tx_b], test_network_id(), 120_000, 1, 2, 2);
 
-        let total_txs: usize = stages
-            .iter()
-            .flat_map(|s| s.iter())
-            .map(|c| c.len())
-            .sum();
+        let total_txs: usize = stages.iter().flat_map(|s| s.iter()).map(|c| c.len()).sum();
         assert_eq!(total_txs, 2);
     }
 
@@ -974,22 +988,11 @@ mod tests {
             })
             .collect();
 
-        let stages = build_parallel_soroban_phase(
-            &txs,
-            test_network_id(),
-            1_000_000,
-            8,
-            1,
-            4,
-        );
+        let stages = build_parallel_soroban_phase(&txs, test_network_id(), 1_000_000, 8, 1, 4);
 
         // Should use 1 stage since all fit
         assert_eq!(stages.len(), 1);
-        let total_txs: usize = stages
-            .iter()
-            .flat_map(|s| s.iter())
-            .map(|c| c.len())
-            .sum();
+        let total_txs: usize = stages.iter().flat_map(|s| s.iter()).map(|c| c.len()).sum();
         assert_eq!(total_txs, 5);
     }
 

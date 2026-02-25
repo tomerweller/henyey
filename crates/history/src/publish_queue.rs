@@ -58,6 +58,14 @@ use crate::checkpoint::is_checkpoint_ledger;
 use crate::{HistoryError, Result};
 use tracing::{debug, info, warn};
 
+/// Maximum publish queue depth before transaction replay is paused during
+/// offline catchup. CATCHUP_SPEC §5.6.
+pub const PUBLISH_QUEUE_MAX_SIZE: usize = 16;
+
+/// Queue depth at which transaction replay resumes after being paused.
+/// CATCHUP_SPEC §5.6.
+pub const PUBLISH_QUEUE_UNBLOCK_APPLICATION: usize = 8;
+
 /// Persistent queue for checkpoints pending publication.
 ///
 /// This queue is backed by a SQLite database, ensuring checkpoints
@@ -214,9 +222,7 @@ impl PublishQueue {
                     Ok(json) => {
                         let has: HistoryArchiveState =
                             serde_json::from_str(&json).map_err(|e| {
-                                henyey_db::DbError::Integrity(format!(
-                                    "JSON parse failed: {e}"
-                                ))
+                                henyey_db::DbError::Integrity(format!("JSON parse failed: {e}"))
                             })?;
                         Ok(Some(has))
                     }

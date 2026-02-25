@@ -3638,6 +3638,21 @@ impl<'a> LedgerCloseContext<'a> {
     }
 
     /// Commit the ledger close and produce the new header.
+    /// Commit the ledger close: finalize state, update bucket list, persist to DB.
+    ///
+    /// LEDGER_SPEC §6 defines an 8-step commit sequence:
+    ///   1. Compute tx result hash
+    ///   2. Apply upgrades
+    ///   3. Update bucket list with delta
+    ///   4. Run eviction scan (protocol 23+)
+    ///   5. Compute bucket list hash
+    ///   6. Build new ledger header
+    ///   7. Persist header + history to DB
+    ///   8. Emit ledger close meta
+    ///
+    /// Henyey combines some of these steps (e.g., bucket list update and hash
+    /// computation happen together under a single write lock), but the logical
+    /// ordering is preserved.
     fn commit(mut self, rss_before: u64) -> Result<LedgerCloseResult> {
         tracing::debug!(
             ledger_seq = self.close_data.ledger_seq,
@@ -4508,6 +4523,9 @@ fn build_ledger_close_meta(
 
     let tx_set = build_generalized_tx_set(&close_data.tx_set);
 
+    // NOTE: The spec (LEDGER_SPEC §8.1) branches on `initialLedgerVers` to
+    // select V0/V1/V2 meta format. Henyey supports protocol 24+ only, which
+    // always uses V2, so we unconditionally produce V2 meta here.
     LedgerCloseMeta::V2(LedgerCloseMetaV2 {
         ext: LedgerCloseMetaExt::V0,
         ledger_header,

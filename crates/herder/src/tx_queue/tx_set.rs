@@ -250,6 +250,10 @@ impl TransactionSet {
             }
         }
 
+        // HERDER_SPEC §8.3 / §6.5: No two transactions across ALL phases may
+        // share the same source account in a generalized transaction set.
+        check_no_duplicate_source_accounts(&all_transactions)?;
+
         let hash = gen
             .to_xdr(Limits::none())
             .map(|bytes| Hash256::hash(&bytes))
@@ -379,7 +383,69 @@ fn validate_parallel_component(
             }
         }
     }
+    // HERDER_SPEC §7.7: Validate canonical ordering for parallel phases.
+    // Clusters within each stage must be sorted by first-TX hash (ascending).
+    // Stages must be sorted by first-TX-of-first-cluster hash (ascending).
+    for stage in parallel.execution_stages.iter() {
+        // Check clusters within this stage are sorted by first-TX hash
+        let cluster_sorted = stage.windows(2).all(|pair| {
+            let hash_a = Hash256::hash_xdr(&pair[0][0]).unwrap_or_default();
+            let hash_b = Hash256::hash_xdr(&pair[1][0]).unwrap_or_default();
+            hash_a.0 < hash_b.0
+        });
+        if !cluster_sorted {
+            return Err(
+                "Clusters within stage are not in canonical order (by first-TX hash)".to_string(),
+            );
+        }
+    }
+    // Check stages are sorted by first-TX-of-first-cluster hash
+    let stages = &parallel.execution_stages;
+    let stages_sorted = stages.windows(2).all(|pair| {
+        let hash_a = Hash256::hash_xdr(&pair[0][0][0]).unwrap_or_default();
+        let hash_b = Hash256::hash_xdr(&pair[1][0][0]).unwrap_or_default();
+        hash_a.0 < hash_b.0
+    });
+    if !stages_sorted {
+        return Err(
+            "Stages are not in canonical order (by first-TX-of-first-cluster hash)".to_string(),
+        );
+    }
+
     Ok(())
+}
+
+/// Check that no two transactions share the same source account across all phases.
+///
+/// HERDER_SPEC §8.3 item 4 / §6.5: Generalized transaction sets MUST NOT contain
+/// duplicate source accounts across phases.
+fn check_no_duplicate_source_accounts(
+    txs: &[TransactionEnvelope],
+) -> std::result::Result<(), String> {
+    let mut seen = HashSet::new();
+    for env in txs {
+        let source_key = source_account_ed25519(env);
+        if !seen.insert(source_key) {
+            return Err("Duplicate source account across phases in generalized tx set".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Extract the ed25519 public key bytes from a transaction envelope's source account.
+///
+/// For fee-bump transactions, uses the *inner* transaction source (matching stellar-core's
+/// `getSourceID()` which returns the inner source for fee bumps).
+fn source_account_ed25519(env: &TransactionEnvelope) -> [u8; 32] {
+    match env {
+        TransactionEnvelope::TxV0(e) => e.tx.source_account_ed25519.0,
+        TransactionEnvelope::Tx(e) => henyey_tx::muxed_to_ed25519(&e.tx.source_account).0,
+        TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
+            FeeBumpTransactionInnerTx::Tx(inner) => {
+                henyey_tx::muxed_to_ed25519(&inner.tx.source_account).0
+            }
+        },
+    }
 }
 
 /// Validate that a transaction envelope has a valid fee for inclusion in a tx set.

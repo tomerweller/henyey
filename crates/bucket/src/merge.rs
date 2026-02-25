@@ -1278,13 +1278,20 @@ fn extract_metadata(entries: &[BucketEntry]) -> Option<BucketMetadata> {
     })
 }
 
+/// Build output metadata for a merged bucket.
+///
+/// Calculates the merge protocol version as max of input bucket versions.
+/// This matches stellar-core's `calculateMergeProtocolVersion()` in `BucketBase.cpp`.
+///
+/// NOTE (BUCKETLISTDB_SPEC §7.2): stellar-core also includes shadow bucket
+/// versions in the max calculation. Since shadow filtering was removed in
+/// protocol 12, and henyey only supports protocol 24+, shadow versions are
+/// never present and can be safely ignored here.
 fn build_output_metadata(
     old_meta: Option<&BucketMetadata>,
     new_meta: Option<&BucketMetadata>,
     max_protocol_version: u32,
 ) -> Result<(u32, Option<BucketEntry>)> {
-    // Calculate the merge protocol version as max of input bucket versions.
-    // This matches stellar-core's calculateMergeProtocolVersion() in BucketBase.cpp.
     let mut protocol_version = 0u32;
     if let Some(meta) = old_meta {
         protocol_version = protocol_version.max(meta.ledger_version);

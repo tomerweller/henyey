@@ -142,7 +142,9 @@ pub use paths::{
     bucket_path, checkpoint_ledger, checkpoint_path, checkpoint_path_dirty, dirty_to_final_path,
     final_to_dirty_path, is_dirty_path,
 };
-pub use publish_queue::{PublishQueue, PublishQueueStats};
+pub use publish_queue::{
+    PublishQueue, PublishQueueStats, PUBLISH_QUEUE_MAX_SIZE, PUBLISH_QUEUE_UNBLOCK_APPLICATION,
+};
 pub use publish::build_history_archive_state;
 pub use remote_archive::{RemoteArchive, RemoteArchiveConfig};
 pub use replay::{ReplayConfig, ReplayedLedgerState};

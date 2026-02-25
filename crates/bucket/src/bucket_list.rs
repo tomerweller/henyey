@@ -2446,6 +2446,15 @@ impl BucketList {
     /// - `deleted_keys`: Temporary entries that should be deleted
     ///
     /// An entry is considered expired when its TTL's `live_until_ledger_seq < current_ledger`.
+    /// Scan the entire bucket list for expired entries (non-incremental).
+    ///
+    /// Iterates levels from shallowest (newest) to deepest (oldest). Because
+    /// shallowest entries shadow deeper ones, the first occurrence of each key
+    /// is authoritative and a separate point-lookup is unnecessary — the
+    /// iteration order itself provides deduplication.
+    ///
+    /// BUCKETLISTDB_SPEC §8.3: Temporary entries are deleted; persistent entries
+    /// are archived to the hot archive bucket list.
     pub fn scan_for_eviction(
         &self,
         current_ledger: u32,
@@ -2453,10 +2462,11 @@ impl BucketList {
         let mut archived_entries: Vec<LedgerEntry> = Vec::new();
         let mut deleted_keys: Vec<LedgerKey> = Vec::new();
 
-        // Track which keys we've already processed (to avoid duplicates from different levels)
+        // Track which keys we've already processed (to avoid duplicates from different levels).
+        // Shallowest-first iteration means the first occurrence is the newest version.
         let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
 
-        // Iterate through all levels from newest to oldest
+        // Iterate through all levels from shallowest (newest) to deepest (oldest)
         for level in &self.levels {
             for bucket in [&level.curr, &level.snap] {
                 for entry in bucket.iter() {

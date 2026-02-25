@@ -359,6 +359,16 @@ pub struct ReplayConfig {
     ///
     /// Controls parameters like the starting level and scan rate.
     pub eviction_settings: StateArchivalSettings,
+
+    /// Enable publish queue backpressure during replay.
+    ///
+    /// When true, replay pauses when the publish queue exceeds
+    /// `PUBLISH_QUEUE_MAX_SIZE` (16) and resumes when it drains to
+    /// `PUBLISH_QUEUE_UNBLOCK_APPLICATION` (8). CATCHUP_SPEC §5.6.
+    ///
+    /// This should be enabled for offline catchup modes to prevent
+    /// unbounded queue growth when replaying faster than publishing.
+    pub wait_for_publish: bool,
 }
 
 impl Default for ReplayConfig {
@@ -376,6 +386,7 @@ impl Default for ReplayConfig {
             backfill_stellar_asset_events: false,
             run_eviction: true,
             eviction_settings: StateArchivalSettings::default(),
+            wait_for_publish: false,
         }
     }
 }
@@ -1479,6 +1490,7 @@ mod tests {
             backfill_stellar_asset_events: false,
             run_eviction: false,
             eviction_settings: StateArchivalSettings::default(),
+            wait_for_publish: false,
         };
 
         let result = replay_ledger(&header, &tx_set, &tx_results, &tx_metas, &config).unwrap();
@@ -1608,6 +1620,7 @@ mod tests {
             backfill_stellar_asset_events: false,
             run_eviction: true, // Required for P23+ verification
             eviction_settings: StateArchivalSettings::default(),
+            wait_for_publish: false,
         };
 
         // Pass an eviction_iterator for P23+ verification (eviction_running check)
@@ -1646,6 +1659,7 @@ mod tests {
             backfill_stellar_asset_events: false,
             run_eviction: false,
             eviction_settings: StateArchivalSettings::default(),
+            wait_for_publish: false,
         };
 
         let result = replay_ledger_with_execution(
@@ -1684,6 +1698,7 @@ mod tests {
             backfill_stellar_asset_events: false,
             run_eviction: false,
             eviction_settings: StateArchivalSettings::default(),
+            wait_for_publish: false,
         };
 
         let result = replay_ledger_with_execution(
