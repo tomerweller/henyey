@@ -4569,3 +4569,197 @@ mod tests {
         assert!(err.contains("read entries"), "Error: {}", err);
     }
 }
+
+#[cfg(test)]
+mod pending_depth_tests {
+    use super::*;
+    use stellar_xdr::curr::{
+        CreateAccountOp, DecoratedSignature, Memo, MuxedAccount, Operation, OperationBody,
+        Preconditions, SequenceNumber, SignatureHint, Transaction, TransactionEnvelope,
+        TransactionExt, TransactionV1Envelope, Uint256,
+    };
+
+    fn make_test_envelope(fee: u32, ops: usize) -> TransactionEnvelope {
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let operations: Vec<Operation> = (0..ops)
+            .map(|_| Operation {
+                source_account: None,
+                body: OperationBody::CreateAccount(CreateAccountOp {
+                    destination: stellar_xdr::curr::AccountId(
+                        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])),
+                    ),
+                    starting_balance: 1_000_000_000,
+                }),
+            })
+            .collect();
+        let tx = Transaction {
+            source_account: source,
+            fee,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: operations.try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        })
+    }
+
+    fn set_source(envelope: &mut TransactionEnvelope, seed: u8) {
+        match envelope {
+            TransactionEnvelope::Tx(env) => {
+                env.tx.source_account = MuxedAccount::Ed25519(Uint256([seed; 32]));
+            }
+            _ => {}
+        }
+    }
+
+    // =========================================================================
+    // DEFAULT_PENDING_DEPTH auto-ban tests
+    // =========================================================================
+
+    #[test]
+    fn test_default_pending_depth_is_4() {
+        assert_eq!(DEFAULT_PENDING_DEPTH, 4);
+    }
+
+    #[test]
+    fn test_pending_tx_not_auto_banned_before_depth() {
+        // With pending_depth=4, a pending TX should survive 3 shifts
+        let queue = TransactionQueue::with_depths(TxQueueConfig::default(), 10, 4);
+
+        let mut tx = make_test_envelope(200, 1);
+        set_source(&mut tx, 50);
+        let hash = Hash256::hash_xdr(&tx).unwrap();
+
+        assert_eq!(queue.try_add(tx), TxQueueResult::Added);
+        assert_eq!(queue.len(), 1);
+
+        // Shift 3 times — TX should still be in the queue (age < pending_depth)
+        for i in 1..=3 {
+            let result = queue.shift();
+            assert_eq!(
+                result.evicted_due_to_age, 0,
+                "Shift {} should not evict (age {} < pending_depth 4)",
+                i, i
+            );
+            assert_eq!(queue.len(), 1, "TX should still be in queue after shift {}", i);
+        }
+
+        // TX should not be banned
+        assert!(!queue.is_banned(&hash));
+    }
+
+    #[test]
+    fn test_pending_tx_auto_banned_at_depth() {
+        // With pending_depth=4, a pending TX should be auto-banned on the 4th shift
+        let queue = TransactionQueue::with_depths(TxQueueConfig::default(), 10, 4);
+
+        let mut tx = make_test_envelope(200, 1);
+        set_source(&mut tx, 51);
+        let hash = Hash256::hash_xdr(&tx).unwrap();
+
+        assert_eq!(queue.try_add(tx.clone()), TxQueueResult::Added);
+
+        // Shift 4 times — TX should be evicted on the 4th shift
+        for _ in 0..3 {
+            queue.shift();
+        }
+        let result = queue.shift();
+        assert_eq!(result.evicted_due_to_age, 1, "4th shift should auto-ban the TX");
+        assert_eq!(queue.len(), 0, "Queue should be empty after auto-ban");
+
+        // TX should be banned
+        assert!(queue.is_banned(&hash));
+
+        // Trying to re-add should fail (either Banned or Duplicate depending on seen set)
+        let add_result = queue.try_add(tx);
+        assert!(
+            add_result == TxQueueResult::Banned || add_result == TxQueueResult::Duplicate,
+            "Auto-banned TX should not be re-addable, got: {:?}",
+            add_result
+        );
+    }
+
+    #[test]
+    fn test_pending_depth_1_evicts_immediately() {
+        // With pending_depth=1, TX should be evicted on the very first shift
+        let queue = TransactionQueue::with_depths(TxQueueConfig::default(), 10, 1);
+
+        let mut tx = make_test_envelope(200, 1);
+        set_source(&mut tx, 52);
+        let hash = Hash256::hash_xdr(&tx).unwrap();
+
+        assert_eq!(queue.try_add(tx), TxQueueResult::Added);
+
+        let result = queue.shift();
+        assert_eq!(result.evicted_due_to_age, 1);
+        assert!(queue.is_banned(&hash));
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn test_multiple_pending_txs_age_independently() {
+        // Two TXs added at different times should age independently
+        let queue = TransactionQueue::with_depths(TxQueueConfig::default(), 10, 3);
+
+        // Add TX A
+        let mut tx_a = make_test_envelope(200, 1);
+        set_source(&mut tx_a, 60);
+        let hash_a = Hash256::hash_xdr(&tx_a).unwrap();
+        assert_eq!(queue.try_add(tx_a), TxQueueResult::Added);
+
+        // Shift once (TX A age = 1)
+        queue.shift();
+
+        // Add TX B (TX A age = 1, TX B age = 0)
+        let mut tx_b = make_test_envelope(200, 1);
+        set_source(&mut tx_b, 61);
+        let hash_b = Hash256::hash_xdr(&tx_b).unwrap();
+        assert_eq!(queue.try_add(tx_b), TxQueueResult::Added);
+
+        // Shift twice more (TX A age = 3, TX B age = 2)
+        queue.shift();
+        let result = queue.shift();
+
+        // TX A should be evicted (age=3 >= pending_depth=3), TX B should not
+        assert_eq!(result.evicted_due_to_age, 1);
+        assert!(queue.is_banned(&hash_a), "TX A should be auto-banned");
+        assert!(!queue.is_banned(&hash_b), "TX B should not be banned yet");
+        assert_eq!(queue.len(), 1, "Only TX B should remain");
+
+        // One more shift should evict TX B
+        let result = queue.shift();
+        assert_eq!(result.evicted_due_to_age, 1);
+        assert!(queue.is_banned(&hash_b), "TX B should now be auto-banned");
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn test_shift_result_unbanned_count() {
+        // Verify that unbanned_count correctly reports bans being rotated out
+        let queue = TransactionQueue::with_depths(TxQueueConfig::default(), 2, 100);
+
+        let mut tx = make_test_envelope(200, 1);
+        set_source(&mut tx, 70);
+        let hash = Hash256::hash_xdr(&tx).unwrap();
+
+        // Ban the TX
+        queue.ban(&[hash]);
+        assert!(queue.is_banned(&hash));
+
+        // With ban_depth=2, shift twice to unban
+        let r1 = queue.shift();
+        assert_eq!(r1.unbanned_count, 0);
+        let r2 = queue.shift();
+        assert_eq!(r2.unbanned_count, 1);
+        assert!(!queue.is_banned(&hash));
+    }
+}

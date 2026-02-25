@@ -3134,3 +3134,204 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod compare_tx_sets_tests {
+    use super::*;
+    use crate::tx_queue::TransactionSet;
+
+    fn make_config() -> ScpDriverConfig {
+        ScpDriverConfig::default()
+    }
+
+    fn make_driver() -> ScpDriver {
+        ScpDriver::new(make_config(), Hash256::ZERO)
+    }
+
+    /// Create a simple transaction with a given fee and operation count.
+    fn make_tx(seed: u8, fee: u32, ops: usize) -> stellar_xdr::curr::TransactionEnvelope {
+        use stellar_xdr::curr::{
+            CreateAccountOp, DecoratedSignature, Memo, MuxedAccount, Operation, OperationBody,
+            Preconditions, SequenceNumber, SignatureHint, Transaction, TransactionEnvelope,
+            TransactionExt, TransactionV1Envelope, Uint256,
+        };
+        let source = MuxedAccount::Ed25519(Uint256([seed; 32]));
+        let dest = stellar_xdr::curr::AccountId(
+            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
+                [seed.wrapping_add(1); 32],
+            )),
+        );
+        let operations: Vec<Operation> = (0..ops)
+            .map(|_| Operation {
+                source_account: None,
+                body: OperationBody::CreateAccount(CreateAccountOp {
+                    destination: dest.clone(),
+                    starting_balance: 1_000_000_000,
+                }),
+            })
+            .collect();
+        let tx = Transaction {
+            source_account: source,
+            fee,
+            seq_num: SequenceNumber(seed as i64),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: operations.try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        })
+    }
+
+    fn cache_tx_set(driver: &ScpDriver, tx_set: TransactionSet) -> Hash256 {
+        let hash = tx_set.hash;
+        driver.cache_tx_set(tx_set);
+        hash
+    }
+
+    // =========================================================================
+    // compare_tx_sets — 5-criteria comparison via combine_candidates_impl
+    // =========================================================================
+
+    #[test]
+    fn test_compare_tx_sets_more_ops_wins() {
+        let driver = make_driver();
+        let candidates_hash = [0u8; 32];
+
+        // Set A: 2 ops, fee 200
+        let tx_set_a = TransactionSet::new(Hash256::ZERO, vec![make_tx(1, 200, 2)]);
+        let hash_a = cache_tx_set(&driver, tx_set_a);
+
+        // Set B: 1 op, fee 200
+        let tx_set_b = TransactionSet::new(Hash256::ZERO, vec![make_tx(2, 200, 1)]);
+        let hash_b = cache_tx_set(&driver, tx_set_b);
+
+        // A has more ops, so A > B
+        let result = driver.compare_tx_sets(&hash_a, &hash_b, &candidates_hash);
+        assert_eq!(result, std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_tx_sets_fewer_ops_loses() {
+        let driver = make_driver();
+        let candidates_hash = [0u8; 32];
+
+        // Set A: 1 op
+        let tx_set_a = TransactionSet::new(Hash256::ZERO, vec![make_tx(1, 200, 1)]);
+        let hash_a = cache_tx_set(&driver, tx_set_a);
+
+        // Set B: 3 ops
+        let tx_set_b = TransactionSet::new(Hash256::ZERO, vec![make_tx(2, 200, 3)]);
+        let hash_b = cache_tx_set(&driver, tx_set_b);
+
+        // A has fewer ops, so A < B
+        let result = driver.compare_tx_sets(&hash_a, &hash_b, &candidates_hash);
+        assert_eq!(result, std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn test_compare_tx_sets_equal_ops_higher_fee_wins() {
+        let driver = make_driver();
+        let candidates_hash = [0u8; 32];
+
+        // Same ops (1), different fees
+        let tx_set_a = TransactionSet::new(Hash256::ZERO, vec![make_tx(1, 300, 1)]);
+        let hash_a = cache_tx_set(&driver, tx_set_a);
+
+        let tx_set_b = TransactionSet::new(Hash256::ZERO, vec![make_tx(2, 100, 1)]);
+        let hash_b = cache_tx_set(&driver, tx_set_b);
+
+        // For legacy tx sets (no generalized), inclusion fee == full fee.
+        // A has higher fee → A > B
+        let result = driver.compare_tx_sets(&hash_a, &hash_b, &candidates_hash);
+        assert_eq!(result, std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_tx_sets_smaller_encoded_size_wins_when_tied() {
+        let driver = make_driver();
+        let candidates_hash = [0u8; 32];
+
+
+        // To test criterion 4 (encoded size), we need sets with same
+        // ops and fees but genuinely different sizes.
+        // 1 tx with 2 ops, fee 200 -> total_ops=2, total_fee=200 (small XDR)
+        // 2 txs each 1 op, fee 100 -> total_ops=2, total_fee=200 (bigger XDR)
+        let tx_set_small = TransactionSet::new(Hash256::ZERO, vec![make_tx(10, 200, 2)]);
+        let hash_small = cache_tx_set(&driver, tx_set_small);
+
+        let tx_set_big =
+            TransactionSet::new(Hash256::ZERO, vec![make_tx(11, 100, 1), make_tx(12, 100, 1)]);
+        let hash_big = cache_tx_set(&driver, tx_set_big);
+
+        // Both have ops=2, total_fee=200, inclusion_fee=200.
+        // Smaller encoded size wins (criterion 4).
+        let result = driver.compare_tx_sets(&hash_small, &hash_big, &candidates_hash);
+        assert_eq!(
+            result,
+            std::cmp::Ordering::Greater,
+            "Smaller encoded size should win when ops and fees are equal"
+        );
+    }
+
+    #[test]
+    fn test_compare_tx_sets_xor_tiebreak() {
+        let driver = make_driver();
+        // Use a known candidates_hash for deterministic tiebreak
+        let candidates_hash = [0xAA; 32];
+
+        // Two empty tx sets with different hashes
+        let tx_set_a = TransactionSet::new(Hash256::from_bytes([1u8; 32]), vec![]);
+        let hash_a = cache_tx_set(&driver, tx_set_a);
+
+        let tx_set_b = TransactionSet::new(Hash256::from_bytes([2u8; 32]), vec![]);
+        let hash_b = cache_tx_set(&driver, tx_set_b);
+
+        // Both have 0 ops, 0 fees, 0 size → goes to XOR tiebreak
+        let result = driver.compare_tx_sets(&hash_a, &hash_b, &candidates_hash);
+        // The result should be deterministic based on hash XOR
+        let a_xored = ScpDriver::xor_hash(&hash_a.0, &candidates_hash);
+        let b_xored = ScpDriver::xor_hash(&hash_b.0, &candidates_hash);
+        assert_eq!(result, a_xored.cmp(&b_xored));
+    }
+
+    #[test]
+    fn test_compare_tx_sets_missing_set_falls_through_to_xor() {
+        let driver = make_driver();
+        let candidates_hash = [0u8; 32];
+
+        // Only cache set A, leave B uncached
+        let tx_set_a = TransactionSet::new(Hash256::ZERO, vec![make_tx(1, 300, 3)]);
+        let hash_a = cache_tx_set(&driver, tx_set_a);
+
+        // B is not cached (just a made-up hash)
+        let hash_b = Hash256::from_bytes([99u8; 32]);
+
+        // When one or both sets are missing from cache, all 4 criteria are skipped
+        // and comparison goes straight to XOR tiebreak (criterion 5)
+        let result = driver.compare_tx_sets(&hash_a, &hash_b, &candidates_hash);
+        let a_xored = ScpDriver::xor_hash(&hash_a.0, &candidates_hash);
+        let b_xored = ScpDriver::xor_hash(&hash_b.0, &candidates_hash);
+        assert_eq!(result, a_xored.cmp(&b_xored));
+    }
+
+    #[test]
+    fn test_compare_tx_sets_equal_sets_returns_equal_xor() {
+        let driver = make_driver();
+        let candidates_hash = [0u8; 32];
+
+        let tx_set = TransactionSet::new(Hash256::ZERO, vec![make_tx(1, 100, 1)]);
+        let hash = cache_tx_set(&driver, tx_set);
+
+        // Comparing a set with itself should return Equal
+        let result = driver.compare_tx_sets(&hash, &hash, &candidates_hash);
+        assert_eq!(result, std::cmp::Ordering::Equal);
+    }
+}

@@ -3226,4 +3226,144 @@ mod tests {
             "bump with force should use value_override"
         );
     }
+
+    // ── SCP_SPEC §9.13: set_state_from_envelope sets last_envelope_emit ──
+
+    #[test]
+    fn test_set_state_from_envelope_prepare_sets_last_envelope_emit() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let mut bp = BallotProtocol::new();
+
+        assert!(bp.last_envelope_emit.is_none(), "should start as None");
+
+        let value = make_value(&[1, 2, 3]);
+        let envelope = make_prepare_envelope_with_counters(
+            node.clone(),
+            1,
+            &quorum_set,
+            ScpBallot {
+                counter: 5,
+                value: value.clone(),
+            },
+            Some(ScpBallot {
+                counter: 3,
+                value: value.clone(),
+            }),
+            None,
+            2,
+            3,
+        );
+
+        assert!(bp.set_state_from_envelope(&envelope));
+        assert_eq!(
+            bp.last_envelope_emit.as_ref(),
+            Some(&envelope),
+            "Prepare: last_envelope_emit must equal the restored envelope"
+        );
+        assert_eq!(
+            bp.last_envelope.as_ref(),
+            bp.last_envelope_emit.as_ref(),
+            "last_envelope and last_envelope_emit must match after restore"
+        );
+    }
+
+    #[test]
+    fn test_set_state_from_envelope_confirm_sets_last_envelope_emit() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let mut bp = BallotProtocol::new();
+
+        let value = make_value(&[4, 5, 6]);
+        let envelope = make_confirm_envelope_with_counters(
+            node.clone(),
+            2,
+            &quorum_set,
+            ScpBallot {
+                counter: 10,
+                value: value.clone(),
+            },
+            8,
+            5,
+            9,
+        );
+
+        assert!(bp.set_state_from_envelope(&envelope));
+        assert_eq!(
+            bp.last_envelope_emit.as_ref(),
+            Some(&envelope),
+            "Confirm: last_envelope_emit must equal the restored envelope"
+        );
+    }
+
+    #[test]
+    fn test_set_state_from_envelope_externalize_sets_last_envelope_emit() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let mut bp = BallotProtocol::new();
+
+        let value = make_value(&[7, 8, 9]);
+        let envelope = make_externalize_envelope(
+            node.clone(),
+            3,
+            &quorum_set,
+            ScpBallot {
+                counter: 3,
+                value: value.clone(),
+            },
+            5,
+        );
+
+        assert!(bp.set_state_from_envelope(&envelope));
+        assert_eq!(
+            bp.last_envelope_emit.as_ref(),
+            Some(&envelope),
+            "Externalize: last_envelope_emit must equal the restored envelope"
+        );
+    }
+
+    #[test]
+    fn test_set_state_from_envelope_nomination_does_not_set_last_envelope_emit() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let mut bp = BallotProtocol::new();
+
+        let envelope = make_nomination_envelope(node.clone(), 4, &quorum_set);
+
+        assert!(!bp.set_state_from_envelope(&envelope));
+        assert!(
+            bp.last_envelope_emit.is_none(),
+            "Nomination: last_envelope_emit must remain None"
+        );
+    }
+
+    #[test]
+    fn test_set_state_from_envelope_prevents_reemission() {
+        // After restoring state, send_latest_envelope should NOT re-emit
+        // because last_envelope_emit already matches last_envelope.
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(BallotParityDriver::new(quorum_set.clone()));
+        let mut bp = BallotProtocol::new();
+        bp.fully_validated = true;
+
+        let value = make_value(&[1, 2, 3]);
+        let envelope = make_prepare_envelope(
+            node.clone(),
+            1,
+            &quorum_set,
+            ScpBallot { counter: 1, value },
+        );
+
+        bp.set_state_from_envelope(&envelope);
+
+        let emit_before = driver.emit_count.load(Ordering::SeqCst);
+        bp.send_latest_envelope(&driver);
+        let emit_after = driver.emit_count.load(Ordering::SeqCst);
+
+        assert_eq!(
+            emit_before, emit_after,
+            "send_latest_envelope must NOT re-emit when last_envelope_emit already set"
+        );
+    }
 }

@@ -481,4 +481,32 @@ mod tests {
         queue.clear().unwrap();
         assert!(queue.is_empty().unwrap());
     }
+
+    // ── CATCHUP_SPEC §5.6: Publish queue constants ──────────────────
+
+    #[test]
+    fn test_publish_queue_max_size_is_16() {
+        assert_eq!(
+            PUBLISH_QUEUE_MAX_SIZE, 16,
+            "CATCHUP_SPEC §5.6: PUBLISH_QUEUE_MAX_SIZE must be 16"
+        );
+    }
+
+    #[test]
+    fn test_publish_queue_unblock_is_8() {
+        assert_eq!(
+            PUBLISH_QUEUE_UNBLOCK_APPLICATION, 8,
+            "CATCHUP_SPEC §5.6: PUBLISH_QUEUE_UNBLOCK_APPLICATION must be 8"
+        );
+    }
+
+    #[test]
+    fn test_publish_queue_hysteresis_invariant() {
+        // The unblock threshold must be strictly less than the max size
+        // for hysteresis to work correctly.
+        assert!(
+            PUBLISH_QUEUE_UNBLOCK_APPLICATION < PUBLISH_QUEUE_MAX_SIZE,
+            "unblock threshold must be less than max size for hysteresis"
+        );
+    }
 }

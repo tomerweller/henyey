@@ -934,4 +934,90 @@ mod tests {
         let has = make_test_has(Some(""));
         assert!(verify_has_passphrase(&has, "Test SDF Network ; September 2015").is_ok());
     }
+
+    // ── CATCHUP_SPEC §3.1: verify_has_structure tests ────────────────
+
+    fn make_has_with_levels(
+        n_levels: usize,
+        version: u32,
+        passphrase: Option<&str>,
+    ) -> HistoryArchiveState {
+        use crate::archive_state::{HASBucketLevel, HASBucketNext};
+        let level = HASBucketLevel {
+            curr: "00".repeat(32),
+            snap: "00".repeat(32),
+            next: HASBucketNext {
+                state: 0,
+                output: None,
+                curr: None,
+                snap: None,
+                shadow: None,
+            },
+        };
+        HistoryArchiveState {
+            version,
+            server: None,
+            current_ledger: 63,
+            network_passphrase: passphrase.map(|s| s.to_string()),
+            current_buckets: vec![level; n_levels],
+            hot_archive_buckets: None,
+        }
+    }
+
+    #[test]
+    fn test_verify_has_structure_valid_v1() {
+        // Version 1 with 11 levels, no passphrase — valid.
+        let has = make_has_with_levels(11, 1, None);
+        assert!(verify_has_structure(&has).is_ok());
+    }
+
+    #[test]
+    fn test_verify_has_structure_valid_v2_with_passphrase() {
+        // Version 2 with 11 levels and passphrase — valid.
+        let has = make_has_with_levels(11, 2, Some("Test SDF Network ; September 2015"));
+        assert!(verify_has_structure(&has).is_ok());
+    }
+
+    #[test]
+    fn test_verify_has_structure_wrong_level_count() {
+        // Not 11 levels — must fail.
+        let has = make_has_with_levels(10, 1, None);
+        let result = verify_has_structure(&has);
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("bucket levels"));
+
+        let has = make_has_with_levels(12, 1, None);
+        assert!(verify_has_structure(&has).is_err());
+
+        let has = make_has_with_levels(0, 1, None);
+        assert!(verify_has_structure(&has).is_err());
+    }
+
+    #[test]
+    fn test_verify_has_structure_unsupported_version() {
+        // Version 0 and version 3 should fail.
+        let has = make_has_with_levels(11, 0, None);
+        let result = verify_has_structure(&has);
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("version"));
+
+        let has = make_has_with_levels(11, 3, None);
+        assert!(verify_has_structure(&has).is_err());
+    }
+
+    #[test]
+    fn test_verify_has_structure_v2_without_passphrase() {
+        // Version 2 without networkPassphrase — must fail.
+        let has = make_has_with_levels(11, 2, None);
+        let result = verify_has_structure(&has);
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("networkPassphrase"));
+    }
+
+    #[test]
+    fn test_verify_has_structure_v1_without_passphrase_ok() {
+        // Version 1 without passphrase — should be fine.
+        let has = make_has_with_levels(11, 1, None);
+        assert!(verify_has_structure(&has).is_ok());
+    }
 }

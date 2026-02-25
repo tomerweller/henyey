@@ -1094,4 +1094,52 @@ mod tests {
         assert_eq!(data.dropped_authenticated_peers, 1);
         assert_eq!(data.initial_lost_sync_count, 5);
     }
+
+    // ── OVERLAY_SPEC §8.3: Survey constants ──────────────────────────
+
+    #[test]
+    fn test_max_reporting_phase_duration_is_3_hours() {
+        let config = SurveyConfig::default();
+        assert_eq!(
+            config.max_reporting_duration,
+            Duration::from_secs(3 * 60 * 60),
+            "OVERLAY_SPEC §8.3: MAX_REPORTING_PHASE_DURATION must be 3 hours"
+        );
+    }
+
+    #[test]
+    fn test_num_ledgers_before_ignore_is_6() {
+        let config = SurveyConfig::default();
+        assert_eq!(
+            config.num_ledgers_before_ignore, 6,
+            "OVERLAY_SPEC §8.3: NUM_LEDGERS_BEFORE_IGNORE must be 6"
+        );
+    }
+
+    #[test]
+    fn test_max_request_limit_per_ledger_is_10() {
+        let config = SurveyConfig::default();
+        assert_eq!(
+            config.max_request_limit_per_ledger, 10,
+            "OVERLAY_SPEC §8.3: MAX_REQUEST_LIMIT_PER_LEDGER must be 10"
+        );
+    }
+
+    #[test]
+    fn test_max_collecting_phase_duration_is_30_minutes() {
+        let config = SurveyConfig::default();
+        assert_eq!(
+            config.max_collecting_duration,
+            Duration::from_secs(30 * 60),
+            "OVERLAY_SPEC §8.3: MAX_COLLECTING_PHASE_DURATION must be 30 minutes"
+        );
+    }
+
+    #[test]
+    fn test_survey_throttle_timeout_mult_is_3() {
+        assert_eq!(
+            SURVEY_THROTTLE_TIMEOUT_MULT, 3,
+            "OVERLAY_SPEC §8.3: SURVEY_THROTTLE_TIMEOUT_MULT must be 3"
+        );
+    }
 }

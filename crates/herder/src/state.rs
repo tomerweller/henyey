@@ -128,4 +128,46 @@ mod tests {
         assert_eq!(HerderState::Syncing.to_string(), "Syncing");
         assert_eq!(HerderState::Tracking.to_string(), "Tracking");
     }
+
+    /// Exhaustive 3x3 matrix test for can_transition_to per HERDER_SPEC §3.2.
+    #[test]
+    fn test_can_transition_to_exhaustive() {
+        use HerderState::*;
+        let states = [Booting, Syncing, Tracking];
+
+        // (from, to, expected)
+        let expected = [
+            // From Booting
+            (Booting, Booting, true),
+            (Booting, Syncing, true),
+            (Booting, Tracking, true),
+            // From Syncing
+            (Syncing, Booting, false), // forbidden
+            (Syncing, Syncing, true),
+            (Syncing, Tracking, true),
+            // From Tracking
+            (Tracking, Booting, false), // forbidden
+            (Tracking, Syncing, true),
+            (Tracking, Tracking, true),
+        ];
+
+        for (from, to, ok) in &expected {
+            assert_eq!(
+                from.can_transition_to(*to),
+                *ok,
+                "can_transition_to({from} -> {to}) should be {ok}"
+            );
+        }
+
+        // Double-check: exactly 2 forbidden transitions out of 9
+        let forbidden_count: usize = states
+            .iter()
+            .flat_map(|from| states.iter().map(move |to| from.can_transition_to(*to)))
+            .filter(|allowed| !allowed)
+            .count();
+        assert_eq!(
+            forbidden_count, 2,
+            "exactly 2 transitions should be forbidden"
+        );
+    }
 }

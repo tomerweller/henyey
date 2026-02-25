@@ -1061,6 +1061,38 @@ mod tests {
         })
     }
 
+    // ── OVERLAY_SPEC §5.1: FlowControl default constants ─────────────
+
+    #[test]
+    fn test_default_config_byte_batch_size_is_100k() {
+        let config = FlowControlConfig::default();
+        assert_eq!(
+            config.flow_control_bytes_batch_size, 100_000,
+            "OVERLAY_SPEC §5.1: byte batch size must be 100,000"
+        );
+    }
+
+    #[test]
+    fn test_default_config_constants() {
+        let config = FlowControlConfig::default();
+        assert_eq!(config.peer_flood_reading_capacity, 200);
+        assert_eq!(config.peer_reading_capacity, 201);
+        assert_eq!(config.flow_control_send_more_batch_size, 40);
+        assert_eq!(config.outbound_tx_queue_byte_limit, 3 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_initial_byte_capacity_equals_batch_size() {
+        // OVERLAY_SPEC §5.1: initial byte capacity = flow_control_bytes_batch_size,
+        // NOT flood_reading_capacity * batch_size.
+        let fc = FlowControl::with_defaults();
+        let stats = fc.get_stats();
+        assert_eq!(
+            stats.local_flood_bytes_capacity, 100_000,
+            "initial byte capacity must equal flow_control_bytes_batch_size"
+        );
+    }
+
     #[test]
     fn test_flow_control_creation() {
         let fc = FlowControl::with_defaults();

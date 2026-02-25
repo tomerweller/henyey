@@ -2368,4 +2368,22 @@ mod tests {
         let path = well_known_stellar_history_path();
         assert_eq!(path, ".well-known/stellar-history.json");
     }
+
+    // ── CATCHUP_SPEC §9.1: Retry constants re-exported from download ─
+
+    #[test]
+    fn test_retry_a_few_constant() {
+        assert_eq!(
+            RETRY_A_FEW, 10,
+            "RETRY_A_FEW must be 10 (matches stellar-core)"
+        );
+    }
+
+    #[test]
+    fn test_retry_a_lot_constant() {
+        assert_eq!(
+            RETRY_A_LOT, 32,
+            "RETRY_A_LOT must be 32 (matches stellar-core)"
+        );
+    }
 }

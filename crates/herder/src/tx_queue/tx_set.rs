@@ -678,3 +678,419 @@ fn summary_generalized_tx_set(gen: &GeneralizedTransactionSet) -> String {
 
     parts.join(", ")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::curr::{
+        CreateAccountOp, DecoratedSignature, DependentTxCluster, FeeBumpTransaction,
+        FeeBumpTransactionEnvelope, FeeBumpTransactionExt, FeeBumpTransactionInnerTx,
+        GeneralizedTransactionSet, Memo, MuxedAccount, Operation, OperationBody,
+        ParallelTxExecutionStage, ParallelTxsComponent, Preconditions, SequenceNumber,
+        SignatureHint, Transaction, TransactionEnvelope, TransactionExt, TransactionPhase,
+        TransactionV1Envelope, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
+        TransactionSetV1, Uint256,
+    };
+
+    fn make_tx_envelope(seed: u8, fee: u32) -> TransactionEnvelope {
+        let source = MuxedAccount::Ed25519(Uint256([seed; 32]));
+        let dest = stellar_xdr::curr::AccountId(
+            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
+                [seed.wrapping_add(1); 32],
+            )),
+        );
+        let tx = Transaction {
+            source_account: source,
+            fee,
+            seq_num: SequenceNumber(seed as i64),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::CreateAccount(CreateAccountOp {
+                    destination: dest,
+                    starting_balance: 1_000_000_000,
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V0,
+        };
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        })
+    }
+
+    fn make_fee_bump_envelope(
+        outer_source_seed: u8,
+        inner_source_seed: u8,
+        fee: i64,
+    ) -> TransactionEnvelope {
+        let inner_tx = make_tx_envelope(inner_source_seed, 100);
+        let inner_v1 = match inner_tx {
+            TransactionEnvelope::Tx(v1) => v1,
+            _ => unreachable!(),
+        };
+        let outer_source = MuxedAccount::Ed25519(Uint256([outer_source_seed; 32]));
+        TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: FeeBumpTransaction {
+                fee_source: outer_source,
+                fee,
+                inner_tx: FeeBumpTransactionInnerTx::Tx(inner_v1),
+                ext: FeeBumpTransactionExt::V0,
+            },
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        })
+    }
+
+    // =========================================================================
+    // source_account_ed25519
+    // =========================================================================
+
+    #[test]
+    fn test_source_account_ed25519_regular_tx() {
+        let env = make_tx_envelope(42, 100);
+        let result = source_account_ed25519(&env);
+        assert_eq!(result, [42u8; 32]);
+    }
+
+    #[test]
+    fn test_source_account_ed25519_fee_bump_returns_inner_source() {
+        // For fee-bump, source_account_ed25519 should return the INNER tx source,
+        // not the outer fee source.
+        let env = make_fee_bump_envelope(99, 42, 200);
+        let result = source_account_ed25519(&env);
+        assert_eq!(
+            result, [42u8; 32],
+            "fee-bump should return inner source, not outer fee source"
+        );
+    }
+
+    // =========================================================================
+    // check_no_duplicate_source_accounts
+    // =========================================================================
+
+    #[test]
+    fn test_check_no_duplicate_source_accounts_empty() {
+        assert!(check_no_duplicate_source_accounts(&[]).is_ok());
+    }
+
+    #[test]
+    fn test_check_no_duplicate_source_accounts_unique() {
+        let txs = vec![make_tx_envelope(1, 100), make_tx_envelope(2, 100)];
+        assert!(check_no_duplicate_source_accounts(&txs).is_ok());
+    }
+
+    #[test]
+    fn test_check_no_duplicate_source_accounts_duplicate() {
+        let txs = vec![make_tx_envelope(1, 100), make_tx_envelope(1, 200)];
+        let result = check_no_duplicate_source_accounts(&txs);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Duplicate source account"));
+    }
+
+    #[test]
+    fn test_check_no_duplicate_source_accounts_fee_bump_uses_inner() {
+        // Fee-bump with inner source = 1, regular tx with source = 1 → duplicate
+        let txs = vec![make_fee_bump_envelope(99, 1, 200), make_tx_envelope(1, 100)];
+        let result = check_no_duplicate_source_accounts(&txs);
+        assert!(
+            result.is_err(),
+            "Fee-bump inner source duplicating regular source should be detected"
+        );
+    }
+
+    #[test]
+    fn test_check_no_duplicate_source_accounts_fee_bump_different_inner() {
+        // Fee-bump with inner source = 2 and outer = 99, regular tx with source = 1 → OK
+        let txs = vec![make_fee_bump_envelope(99, 2, 200), make_tx_envelope(1, 100)];
+        assert!(check_no_duplicate_source_accounts(&txs).is_ok());
+    }
+
+    // =========================================================================
+    // is_sorted_by_hash
+    // =========================================================================
+
+    #[test]
+    fn test_is_sorted_by_hash_empty() {
+        assert!(is_sorted_by_hash(&[]));
+    }
+
+    #[test]
+    fn test_is_sorted_by_hash_single() {
+        assert!(is_sorted_by_hash(&[make_tx_envelope(1, 100)]));
+    }
+
+    #[test]
+    fn test_is_sorted_by_hash_sorted() {
+        let mut txs = vec![
+            make_tx_envelope(1, 100),
+            make_tx_envelope(2, 100),
+            make_tx_envelope(3, 100),
+        ];
+        sort_txs_by_hash(&mut txs);
+        assert!(is_sorted_by_hash(&txs));
+    }
+
+    #[test]
+    fn test_is_sorted_by_hash_unsorted() {
+        let mut txs = vec![
+            make_tx_envelope(1, 100),
+            make_tx_envelope(2, 100),
+            make_tx_envelope(3, 100),
+        ];
+        sort_txs_by_hash(&mut txs);
+        // Reverse to guarantee unsorted
+        txs.reverse();
+        // Only fails if there were at least 2 distinct elements in non-ascending order
+        if txs.len() >= 2 {
+            // The reversed sorted order is descending, which is not ascending
+            assert!(
+                !is_sorted_by_hash(&txs),
+                "Reversed sorted list should not be considered sorted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_sorted_by_hash_allows_equal_adjacent_hashes() {
+        // is_sorted_by_hash uses <=, so equal adjacent hashes are acceptable
+        let tx = make_tx_envelope(1, 100);
+        let txs = vec![tx.clone(), tx];
+        assert!(is_sorted_by_hash(&txs));
+    }
+
+    // =========================================================================
+    // sort_txs_by_hash
+    // =========================================================================
+
+    #[test]
+    fn test_sort_txs_by_hash_produces_sorted_output() {
+        let mut txs = vec![
+            make_tx_envelope(5, 100),
+            make_tx_envelope(1, 100),
+            make_tx_envelope(3, 100),
+        ];
+        sort_txs_by_hash(&mut txs);
+        assert!(is_sorted_by_hash(&txs));
+    }
+
+    #[test]
+    fn test_sort_txs_by_hash_is_idempotent() {
+        let mut txs = vec![
+            make_tx_envelope(5, 100),
+            make_tx_envelope(1, 100),
+            make_tx_envelope(3, 100),
+        ];
+        sort_txs_by_hash(&mut txs);
+        let sorted_once: Vec<[u8; 32]> = txs
+            .iter()
+            .map(|t| Hash256::hash_xdr(t).unwrap_or_default().0)
+            .collect();
+        sort_txs_by_hash(&mut txs);
+        let sorted_twice: Vec<[u8; 32]> = txs
+            .iter()
+            .map(|t| Hash256::hash_xdr(t).unwrap_or_default().0)
+            .collect();
+        assert_eq!(sorted_once, sorted_twice);
+    }
+
+    // =========================================================================
+    // validate_generalized_tx_set_xdr_structure
+    // =========================================================================
+
+    fn make_classic_component(
+        txs: Vec<TransactionEnvelope>,
+        base_fee: Option<i64>,
+    ) -> TxSetComponent {
+        TxSetComponent::TxsetCompTxsMaybeDiscountedFee(TxSetComponentTxsMaybeDiscountedFee {
+            base_fee,
+            txs: txs.try_into().unwrap(),
+        })
+    }
+
+    fn make_parallel_component(
+        stages: Vec<Vec<Vec<TransactionEnvelope>>>,
+        base_fee: Option<i64>,
+    ) -> ParallelTxsComponent {
+        let execution_stages: Vec<ParallelTxExecutionStage> = stages
+            .into_iter()
+            .map(|stage| {
+                let clusters: Vec<DependentTxCluster> = stage
+                    .into_iter()
+                    .map(|cluster| DependentTxCluster(cluster.try_into().unwrap()))
+                    .collect();
+                ParallelTxExecutionStage(clusters.try_into().unwrap())
+            })
+            .collect();
+        ParallelTxsComponent {
+            base_fee,
+            execution_stages: execution_stages.try_into().unwrap(),
+        }
+    }
+
+    fn make_gen_tx_set(phases: Vec<TransactionPhase>) -> GeneralizedTransactionSet {
+        GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            phases: phases.try_into().unwrap(),
+        })
+    }
+
+    #[test]
+    fn test_validate_generalized_tx_set_requires_two_phases() {
+        // 1 phase → should fail
+        let one_phase = make_gen_tx_set(vec![TransactionPhase::V0(
+            vec![make_classic_component(vec![make_tx_envelope(1, 100)], None)]
+                .try_into()
+                .unwrap(),
+        )]);
+        let result = validate_generalized_tx_set_xdr_structure(&one_phase);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("2 phases"));
+
+        // 3 phases → should fail
+        let three_phases = make_gen_tx_set(vec![
+            TransactionPhase::V0(
+                vec![make_classic_component(vec![make_tx_envelope(1, 100)], None)]
+                    .try_into()
+                    .unwrap(),
+            ),
+            TransactionPhase::V0(
+                vec![make_classic_component(vec![make_tx_envelope(2, 100)], None)]
+                    .try_into()
+                    .unwrap(),
+            ),
+            TransactionPhase::V0(
+                vec![make_classic_component(vec![make_tx_envelope(3, 100)], None)]
+                    .try_into()
+                    .unwrap(),
+            ),
+        ]);
+        let result = validate_generalized_tx_set_xdr_structure(&three_phases);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_generalized_tx_set_rejects_parallel_in_classic_phase() {
+        // Phase 0 (classic) should not be V1 (parallel)
+        let mut sorted_tx = vec![make_tx_envelope(1, 100)];
+        sort_txs_by_hash(&mut sorted_tx);
+        let gen = make_gen_tx_set(vec![
+            TransactionPhase::V1(make_parallel_component(
+                vec![vec![sorted_tx]],
+                Some(100),
+            )),
+            TransactionPhase::V0(
+                vec![make_classic_component(vec![make_tx_envelope(2, 100)], None)]
+                    .try_into()
+                    .unwrap(),
+            ),
+        ]);
+        let result = validate_generalized_tx_set_xdr_structure(&gen);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Non-Soroban parallel phase"));
+    }
+
+    // =========================================================================
+    // validate_parallel_component
+    // =========================================================================
+
+    #[test]
+    fn test_validate_parallel_component_rejects_empty_stage() {
+        let parallel = ParallelTxsComponent {
+            base_fee: Some(100),
+            execution_stages: vec![ParallelTxExecutionStage(vec![].try_into().unwrap())]
+                .try_into()
+                .unwrap(),
+        };
+        let result = validate_parallel_component(&parallel);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Empty stage"));
+    }
+
+    #[test]
+    fn test_validate_parallel_component_rejects_empty_cluster() {
+        let parallel = ParallelTxsComponent {
+            base_fee: Some(100),
+            execution_stages: vec![ParallelTxExecutionStage(
+                vec![DependentTxCluster(vec![].try_into().unwrap())]
+                    .try_into()
+                    .unwrap(),
+            )]
+            .try_into()
+            .unwrap(),
+        };
+        let result = validate_parallel_component(&parallel);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Empty cluster"));
+    }
+
+    #[test]
+    fn test_validate_parallel_component_valid_single_stage() {
+        let tx = make_tx_envelope(1, 100);
+        let parallel = ParallelTxsComponent {
+            base_fee: Some(100),
+            execution_stages: vec![ParallelTxExecutionStage(
+                vec![DependentTxCluster(vec![tx].try_into().unwrap())]
+                    .try_into()
+                    .unwrap(),
+            )]
+            .try_into()
+            .unwrap(),
+        };
+        assert!(validate_parallel_component(&parallel).is_ok());
+    }
+
+    // =========================================================================
+    // TransactionSet construction and hash
+    // =========================================================================
+
+    #[test]
+    fn test_transaction_set_new_sorts_transactions() {
+        let tx1 = make_tx_envelope(5, 100);
+        let tx2 = make_tx_envelope(1, 100);
+        let tx3 = make_tx_envelope(3, 100);
+        let tx_set = TransactionSet::new(Hash256::ZERO, vec![tx1, tx2, tx3]);
+
+        // Verify transactions are sorted by hash after construction
+        assert!(is_sorted_by_hash(&tx_set.transactions));
+    }
+
+    #[test]
+    fn test_transaction_set_new_computes_deterministic_hash() {
+        let tx1 = make_tx_envelope(1, 100);
+        let tx2 = make_tx_envelope(2, 100);
+
+        // Same inputs should produce same hash regardless of input order
+        let set_a = TransactionSet::new(Hash256::ZERO, vec![tx1.clone(), tx2.clone()]);
+        let set_b = TransactionSet::new(Hash256::ZERO, vec![tx2, tx1]);
+        assert_eq!(set_a.hash, set_b.hash);
+    }
+
+    #[test]
+    fn test_transaction_set_empty() {
+        let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
+        assert!(tx_set.is_empty());
+        assert_eq!(tx_set.len(), 0);
+    }
+
+    #[test]
+    fn test_transaction_set_recompute_hash_matches() {
+        let tx_set = TransactionSet::new(
+            Hash256::ZERO,
+            vec![make_tx_envelope(1, 100), make_tx_envelope(2, 200)],
+        );
+        assert_eq!(tx_set.recompute_hash(), Some(tx_set.hash));
+    }
+}

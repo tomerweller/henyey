@@ -786,4 +786,40 @@ mod tests {
         assert_eq!(stats.demand_history_size, 1);
         assert!(stats.running);
     }
+
+    // ── OVERLAY_SPEC §6.3.2: Demand timing constants ─────────────────
+
+    #[test]
+    fn test_default_demand_period_is_200ms() {
+        let config = TxDemandsConfig::default();
+        assert_eq!(
+            config.demand_period,
+            Duration::from_millis(200),
+            "OVERLAY_SPEC §6.3.2: DEMAND_PERIOD must be 200ms"
+        );
+    }
+
+    #[test]
+    fn test_default_backoff_delay_is_500ms() {
+        let config = TxDemandsConfig::default();
+        assert_eq!(
+            config.backoff_delay,
+            Duration::from_millis(500),
+            "OVERLAY_SPEC §6.3.2: BACKOFF_DELAY must be 500ms"
+        );
+    }
+
+    #[test]
+    fn test_default_max_demand_size() {
+        let config = TxDemandsConfig::default();
+        assert_eq!(config.max_demand_size, 1000);
+        assert_eq!(TX_DEMAND_VECTOR_MAX_SIZE, 1000);
+    }
+
+    #[test]
+    fn test_default_max_retry_count() {
+        let config = TxDemandsConfig::default();
+        assert_eq!(config.max_retry_count, 15);
+        assert_eq!(MAX_RETRY_COUNT, 15);
+    }
 }

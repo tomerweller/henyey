@@ -1817,4 +1817,134 @@ mod tests {
         assert!(display.contains("5"));
         assert!(display.contains("3"));
     }
+
+    // ── TX_SPEC §4.2.3: maxLedger boundary condition ─────────────────
+
+    #[test]
+    fn test_validate_ledger_bounds_at_exact_max_ledger() {
+        // TX_SPEC §4.2.3: ledger sequence MUST be strictly less than maxLedger.
+        // When current == max_ledger, the tx should be rejected.
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let dest = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: dest,
+                asset: Asset::Native,
+                amount: 1000,
+            }),
+        };
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::V2(PreconditionsV2 {
+                time_bounds: None,
+                ledger_bounds: Some(LedgerBounds {
+                    min_ledger: 0,
+                    max_ledger: 100,
+                }),
+                min_seq_num: None,
+                min_seq_ledger_gap: 0,
+                min_seq_age: Duration(0),
+                extra_signers: VecM::default(),
+            }),
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+
+        let frame = TransactionFrame::new(envelope);
+
+        // current == max_ledger: should fail
+        let context = LedgerContext::testnet(100, 1000);
+        assert!(
+            matches!(
+                validate_ledger_bounds(&frame, &context),
+                Err(ValidationError::BadLedgerBounds { .. })
+            ),
+            "current == max_ledger must be rejected (strictly less than)"
+        );
+
+        // current == max_ledger - 1: should pass
+        let context = LedgerContext::testnet(99, 1000);
+        assert!(
+            validate_ledger_bounds(&frame, &context).is_ok(),
+            "current < max_ledger must pass"
+        );
+    }
+
+    // ── TX_SPEC §4.2.6: non-Soroban tx with SorobanTransactionData ──
+
+    #[test]
+    fn test_reject_non_soroban_tx_with_soroban_data() {
+        // A non-Soroban transaction carrying SorobanTransactionData MUST be rejected.
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let dest = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+
+        // Payment = non-Soroban operation
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: dest,
+                asset: Asset::Native,
+                amount: 1000,
+            }),
+        };
+
+        // Attach SorobanTransactionData to a non-Soroban tx
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: VecM::default(),
+                    read_write: VecM::default(),
+                },
+                instructions: 100,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 100,
+        };
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 200,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V1(soroban_data),
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+
+        let frame = TransactionFrame::new(envelope);
+        let context = LedgerContext::testnet(100, 1000);
+
+        let result = validate_basic(&frame, &context);
+        assert!(
+            result.is_err(),
+            "non-Soroban tx with SorobanTransactionData must be rejected"
+        );
+        let errors = result.unwrap_err();
+        let has_non_soroban_error = errors.iter().any(|e| match e {
+            ValidationError::InvalidStructure(msg) => msg.contains("non-Soroban"),
+            _ => false,
+        });
+        assert!(
+            has_non_soroban_error,
+            "errors should include InvalidStructure mentioning non-Soroban: {errors:?}"
+        );
+    }
 }

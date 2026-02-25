@@ -582,4 +582,32 @@ mod tests {
         handle.shutdown().await;
         let _ = timeout(Duration::from_millis(100), manager_task).await;
     }
+
+    // ── HERDER_SPEC §3.3/§3.4: Sync recovery constants ──────────────
+
+    #[test]
+    fn test_consensus_stuck_timeout_is_35s() {
+        assert_eq!(
+            CONSENSUS_STUCK_TIMEOUT,
+            Duration::from_secs(35),
+            "HERDER_SPEC §3.3: CONSENSUS_STUCK_TIMEOUT must be 35 seconds"
+        );
+    }
+
+    #[test]
+    fn test_out_of_sync_recovery_interval_is_10s() {
+        assert_eq!(
+            OUT_OF_SYNC_RECOVERY_INTERVAL,
+            Duration::from_secs(10),
+            "HERDER_SPEC §3.4: OUT_OF_SYNC_RECOVERY_INTERVAL must be 10 seconds"
+        );
+    }
+
+    #[test]
+    fn test_ledger_validity_bracket_is_100() {
+        assert_eq!(
+            LEDGER_VALIDITY_BRACKET, 100,
+            "HERDER_SPEC §3.4: LEDGER_VALIDITY_BRACKET must be 100"
+        );
+    }
 }

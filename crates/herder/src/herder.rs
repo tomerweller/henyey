@@ -2915,3 +2915,118 @@ mod tests {
         assert_eq!(result, EnvelopeState::Invalid);
     }
 }
+
+// NOTE: Additional set_state tests are appended below (outside the `mod tests` block
+// was closed above). We re-open a *second* cfg(test) module to avoid touching
+// earlier test code.
+
+#[cfg(test)]
+mod set_state_tests {
+    use super::*;
+
+    fn make_test_herder() -> Herder {
+        Herder::new(HerderConfig::default())
+    }
+
+    // =========================================================================
+    // set_state — forbidden transition tests
+    // =========================================================================
+
+    #[test]
+    fn test_set_state_tracking_to_booting_is_forbidden() {
+        let herder = make_test_herder();
+        // Advance to Tracking
+        herder.set_state(HerderState::Syncing);
+        herder.set_state(HerderState::Tracking);
+        assert_eq!(herder.state(), HerderState::Tracking);
+
+        // Attempt forbidden transition Tracking → Booting
+        herder.set_state(HerderState::Booting);
+        assert_eq!(
+            herder.state(),
+            HerderState::Tracking,
+            "Tracking→Booting must be ignored"
+        );
+    }
+
+    #[test]
+    fn test_set_state_syncing_to_booting_is_forbidden() {
+        let herder = make_test_herder();
+        herder.set_state(HerderState::Syncing);
+        assert_eq!(herder.state(), HerderState::Syncing);
+
+        // Attempt forbidden transition Syncing → Booting
+        herder.set_state(HerderState::Booting);
+        assert_eq!(
+            herder.state(),
+            HerderState::Syncing,
+            "Syncing→Booting must be ignored"
+        );
+    }
+
+    #[test]
+    fn test_set_state_allowed_transitions() {
+        let herder = make_test_herder();
+
+        // Booting → Syncing (allowed)
+        herder.set_state(HerderState::Syncing);
+        assert_eq!(herder.state(), HerderState::Syncing);
+
+        // Syncing → Tracking (allowed)
+        herder.set_state(HerderState::Tracking);
+        assert_eq!(herder.state(), HerderState::Tracking);
+
+        // Tracking → Syncing (allowed)
+        herder.set_state(HerderState::Syncing);
+        assert_eq!(herder.state(), HerderState::Syncing);
+
+        // Syncing → Syncing (allowed, same state)
+        herder.set_state(HerderState::Syncing);
+        assert_eq!(herder.state(), HerderState::Syncing);
+
+        // Back to Tracking
+        herder.set_state(HerderState::Tracking);
+        assert_eq!(herder.state(), HerderState::Tracking);
+
+        // Tracking → Tracking (allowed, same state)
+        herder.set_state(HerderState::Tracking);
+        assert_eq!(herder.state(), HerderState::Tracking);
+    }
+
+    #[test]
+    fn test_set_state_booting_to_tracking_directly() {
+        let herder = make_test_herder();
+        assert_eq!(herder.state(), HerderState::Booting);
+
+        // Booting → Tracking (allowed)
+        herder.set_state(HerderState::Tracking);
+        assert_eq!(herder.state(), HerderState::Tracking);
+    }
+
+    #[test]
+    fn test_set_state_booting_identity() {
+        let herder = make_test_herder();
+        assert_eq!(herder.state(), HerderState::Booting);
+
+        // Booting → Booting (same state, should be allowed)
+        herder.set_state(HerderState::Booting);
+        assert_eq!(herder.state(), HerderState::Booting);
+    }
+
+    #[test]
+    fn test_set_state_multiple_forbidden_attempts_do_not_change_state() {
+        let herder = make_test_herder();
+        herder.set_state(HerderState::Tracking);
+        assert_eq!(herder.state(), HerderState::Tracking);
+
+        // Multiple forbidden attempts
+        for _ in 0..5 {
+            herder.set_state(HerderState::Booting);
+        }
+        assert_eq!(
+            herder.state(),
+            HerderState::Tracking,
+            "Repeated Tracking→Booting must all be ignored"
+        );
+    }
+}

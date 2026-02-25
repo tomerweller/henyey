@@ -983,4 +983,126 @@ mod tests {
             assert!(matches!(unwrapped, StellarMessage::Peers(_)));
         }
     }
+
+    // ── OVERLAY_SPEC §4.2: Auth state transitions ─────────────────────
+
+    #[test]
+    fn test_constant_time_eq_equal() {
+        assert!(constant_time_eq(b"hello", b"hello"));
+        assert!(constant_time_eq(&[], &[]));
+        assert!(constant_time_eq(&[0u8; 32], &[0u8; 32]));
+    }
+
+    #[test]
+    fn test_constant_time_eq_unequal() {
+        assert!(!constant_time_eq(b"hello", b"world"));
+        assert!(!constant_time_eq(&[0u8; 32], &[1u8; 32]));
+    }
+
+    #[test]
+    fn test_constant_time_eq_different_lengths() {
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"", b"x"));
+    }
+
+    #[test]
+    fn test_constant_time_eq_single_bit_difference() {
+        let a = [0u8; 32];
+        let mut b = [0u8; 32];
+        b[31] = 1; // differ in only the last byte's lowest bit
+        assert!(!constant_time_eq(&a, &b));
+    }
+
+    #[test]
+    fn test_hello_sent_initiator_transitions_to_hello_sent() {
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+        let mut ctx = AuthContext::new(local_node, true);
+
+        assert_eq!(ctx.state(), AuthState::Initial);
+        ctx.hello_sent();
+        assert_eq!(ctx.state(), AuthState::HelloSent);
+    }
+
+    #[test]
+    fn test_hello_sent_noop_when_already_hello_received() {
+        // Responder receives Hello first, transitions to HelloReceived.
+        // Calling hello_sent() afterwards should be a no-op.
+        let secret_a = SecretKey::generate();
+        let secret_b = SecretKey::generate();
+        let node_a = LocalNode::new_testnet(secret_a);
+        let node_b = LocalNode::new_testnet(secret_b);
+
+        let ctx_a = AuthContext::new(node_a, true);
+        let mut ctx_b = AuthContext::new(node_b, false);
+
+        let hello_a = ctx_a.create_hello();
+        ctx_b.process_hello(&hello_a).unwrap();
+        assert_eq!(ctx_b.state(), AuthState::HelloReceived);
+
+        // hello_sent should be a no-op
+        ctx_b.hello_sent();
+        assert_eq!(
+            ctx_b.state(),
+            AuthState::HelloReceived,
+            "hello_sent must be a no-op when already HelloReceived"
+        );
+    }
+
+    #[test]
+    fn test_auth_sent_transitions_from_hello_received() {
+        let secret_a = SecretKey::generate();
+        let secret_b = SecretKey::generate();
+        let node_a = LocalNode::new_testnet(secret_a);
+        let node_b = LocalNode::new_testnet(secret_b);
+
+        let ctx_a = AuthContext::new(node_a, true);
+        let mut ctx_b = AuthContext::new(node_b, false);
+
+        let hello_a = ctx_a.create_hello();
+        ctx_b.process_hello(&hello_a).unwrap();
+        assert_eq!(ctx_b.state(), AuthState::HelloReceived);
+
+        ctx_b.auth_sent();
+        assert_eq!(ctx_b.state(), AuthState::AuthSent);
+    }
+
+    #[test]
+    fn test_auth_sent_noop_when_not_hello_received() {
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+        let mut ctx = AuthContext::new(local_node, true);
+
+        // In Initial state, auth_sent should be a no-op
+        ctx.auth_sent();
+        assert_eq!(
+            ctx.state(),
+            AuthState::Initial,
+            "auth_sent must be a no-op when not in HelloReceived state"
+        );
+
+        // In HelloSent state, also a no-op
+        ctx.hello_sent();
+        assert_eq!(ctx.state(), AuthState::HelloSent);
+        ctx.auth_sent();
+        assert_eq!(
+            ctx.state(),
+            AuthState::HelloSent,
+            "auth_sent must be a no-op when in HelloSent state"
+        );
+    }
+
+    #[test]
+    fn test_auth_cert_xdr_roundtrip() {
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+        let ephemeral = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
+        let cert = AuthCert::new(&local_node, &ephemeral);
+
+        let xdr = cert.to_xdr();
+        let restored = AuthCert::from_xdr(&xdr);
+        assert!(restored
+            .verify(&local_node.network_id, &local_node.public_key())
+            .is_ok());
+    }
 }

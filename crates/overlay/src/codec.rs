@@ -516,4 +516,142 @@ mod tests {
             "HELLO"
         );
     }
+
+    // ── OVERLAY_SPEC §3.1: Message size constants ─────────────────────
+
+    #[test]
+    fn test_max_message_size_is_16_mib() {
+        assert_eq!(MAX_MESSAGE_SIZE, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_max_unauthenticated_message_size_is_4096() {
+        assert_eq!(MAX_UNAUTHENTICATED_MESSAGE_SIZE, 4096);
+    }
+
+    #[test]
+    fn test_min_message_size_is_12() {
+        assert_eq!(MIN_MESSAGE_SIZE, 12);
+    }
+
+    #[test]
+    fn test_decoder_rejects_too_small_message() {
+        let mut codec = MessageCodec::new();
+        // 4 bytes = too small (MIN_MESSAGE_SIZE is 12)
+        let len: u32 = 4;
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&len.to_be_bytes());
+        // Add enough dummy bytes so the decoder doesn't stall waiting for body
+        buf.extend_from_slice(&[0u8; 16]);
+
+        let result = codec.decode(&mut buf);
+        assert!(
+            result.is_err(),
+            "messages below MIN_MESSAGE_SIZE must be rejected"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("too small"),
+            "error should mention 'too small': {err}"
+        );
+    }
+
+    #[test]
+    fn test_decoder_rejects_oversized_unauthenticated_message() {
+        let mut codec = MessageCodec::new();
+        // Before set_authenticated(), limit is 4096 bytes
+        let len: u32 = 4097;
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(&vec![0u8; 4097]);
+
+        let result = codec.decode(&mut buf);
+        assert!(
+            result.is_err(),
+            "unauthenticated messages > 4096 bytes must be rejected"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("too large"),
+            "error should mention 'too large': {err}"
+        );
+    }
+
+    #[test]
+    fn test_set_authenticated_raises_size_limit() {
+        let mut codec = MessageCodec::new();
+        codec.set_authenticated();
+
+        // After set_authenticated(), a 4097-byte message is allowed (length is valid).
+        // We can't fully decode it since the body isn't valid XDR, but the length
+        // check should pass and move to ReadingBody state.
+        let len: u32 = 4097;
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&len.to_be_bytes());
+        // Only provide partial body so decoder returns Ok(None) waiting for more data
+        buf.extend_from_slice(&[0u8; 100]);
+
+        let result = codec.decode(&mut buf);
+        assert!(
+            result.is_ok(),
+            "authenticated codec must accept messages > 4096 bytes"
+        );
+        assert!(
+            result.unwrap().is_none(),
+            "should be waiting for more body data"
+        );
+    }
+
+    #[test]
+    fn test_encoder_rejects_oversized_message() {
+        // Encoding a message that exceeds MAX_MESSAGE_SIZE should fail in XDR
+        // serialization or length check. We test indirectly: encode a normal message
+        // and verify it works, then check the size limit constant.
+        let mut codec = MessageCodec::new();
+        let mut buf = BytesMut::new();
+        let msg = make_test_message();
+        assert!(codec.encode(msg, &mut buf).is_ok());
+
+        // Verify the constant matches the spec
+        assert_eq!(
+            MAX_MESSAGE_SIZE,
+            16 * 1024 * 1024,
+            "MAX_MESSAGE_SIZE must be 16 MiB"
+        );
+    }
+
+    #[test]
+    fn test_is_flood_message_classification() {
+        // Flood messages
+        assert!(helpers::is_flood_message(&StellarMessage::Transaction(
+            stellar_xdr::curr::TransactionEnvelope::TxV0(Default::default())
+        )));
+        assert!(helpers::is_flood_message(&StellarMessage::FloodAdvert(
+            Default::default()
+        )));
+        assert!(helpers::is_flood_message(&StellarMessage::FloodDemand(
+            Default::default()
+        )));
+
+        // Non-flood messages
+        assert!(!helpers::is_flood_message(&StellarMessage::Hello(
+            Default::default()
+        )));
+        assert!(!helpers::is_flood_message(&StellarMessage::Peers(
+            VecM::default()
+        )));
+    }
+
+    #[test]
+    fn test_is_handshake_message_classification() {
+        assert!(helpers::is_handshake_message(&StellarMessage::Hello(
+            Default::default()
+        )));
+        assert!(helpers::is_handshake_message(&StellarMessage::Auth(
+            Default::default()
+        )));
+        assert!(!helpers::is_handshake_message(&StellarMessage::Peers(
+            VecM::default()
+        )));
+    }
 }

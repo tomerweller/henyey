@@ -451,6 +451,34 @@ mod tests {
         assert!(client.is_ok());
     }
 
-    // XDR parsing tests would require actual XDR test data
-    // which is typically done in integration tests with the stellar-xdr crate
+    // ── CATCHUP_SPEC §9.1: Retry constants ──────────────────────────
+
+    #[test]
+    fn test_retry_a_few_is_10() {
+        assert_eq!(
+            RETRY_A_FEW, 10,
+            "CATCHUP_SPEC §9.1: RETRY_A_FEW must be 10"
+        );
+    }
+
+    #[test]
+    fn test_retry_a_lot_is_32() {
+        assert_eq!(
+            RETRY_A_LOT, 32,
+            "CATCHUP_SPEC §9.1: RETRY_A_LOT must be 32"
+        );
+    }
+
+    #[test]
+    fn test_default_retries_uses_retry_a_few() {
+        assert_eq!(
+            DEFAULT_RETRIES, RETRY_A_FEW,
+            "DEFAULT_RETRIES must equal RETRY_A_FEW"
+        );
+    }
+
+    #[test]
+    fn test_default_retry_delay_is_1s() {
+        assert_eq!(DEFAULT_RETRY_DELAY, Duration::from_secs(1));
+    }
 }

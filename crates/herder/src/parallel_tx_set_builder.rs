@@ -1014,3 +1014,244 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod stages_to_xdr_phase_tests {
+    use super::*;
+    use stellar_xdr::curr::{
+        LedgerFootprint, LedgerKey, LedgerKeyContractData, Memo, MuxedAccount, Preconditions,
+        ScAddress, ScVal, SorobanResources, SorobanTransactionData, SorobanTransactionDataExt,
+        Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, VecM,
+    };
+
+    fn make_soroban_tx(
+        seed: u8,
+        seq: i64,
+        read_only_keys: Vec<LedgerKey>,
+        read_write_keys: Vec<LedgerKey>,
+        instructions: u32,
+    ) -> TransactionEnvelope {
+        let source = MuxedAccount::Ed25519(Uint256([seed; 32]));
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: read_only_keys.try_into().unwrap_or_default(),
+                    read_write: read_write_keys.try_into().unwrap_or_default(),
+                },
+                instructions,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 100,
+        };
+        let tx = Transaction {
+            source_account: source,
+            fee: 1000,
+            seq_num: stellar_xdr::curr::SequenceNumber(seq),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: VecM::default(),
+            ext: TransactionExt::V1(soroban_data),
+        };
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        })
+    }
+
+    fn contract_key(id: u8) -> LedgerKey {
+        LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(stellar_xdr::curr::ContractId(stellar_xdr::curr::Hash(
+                [id; 32],
+            ))),
+            key: ScVal::U32(id as u32),
+            durability: stellar_xdr::curr::ContractDataDurability::Persistent,
+        })
+    }
+
+    fn tx_hash(tx: &TransactionEnvelope) -> Hash256 {
+        Hash256::hash_xdr(tx).unwrap_or_default()
+    }
+
+    // =========================================================================
+    // Multi-stage, multi-cluster tests for stages_to_xdr_phase
+    // =========================================================================
+
+    #[test]
+    fn test_stages_to_xdr_phase_sorts_txs_within_cluster() {
+        // Create cluster with 3 TXs in arbitrary order
+        let tx_a = make_soroban_tx(10, 1, vec![], vec![contract_key(10)], 1000);
+        let tx_b = make_soroban_tx(20, 1, vec![], vec![contract_key(20)], 1000);
+        let tx_c = make_soroban_tx(30, 1, vec![], vec![contract_key(30)], 1000);
+
+        let stages = vec![vec![vec![tx_c.clone(), tx_a.clone(), tx_b.clone()]]];
+        let phase = stages_to_xdr_phase(stages, Some(100));
+
+        match phase {
+            TransactionPhase::V1(parallel) => {
+                let cluster = &parallel.execution_stages[0].0[0].0;
+                // Verify TXs within cluster are sorted by hash ascending
+                for i in 1..cluster.len() {
+                    let prev = tx_hash(&cluster[i - 1]);
+                    let curr = tx_hash(&cluster[i]);
+                    assert!(
+                        prev.0 <= curr.0,
+                        "TXs within cluster should be sorted by hash"
+                    );
+                }
+            }
+            _ => panic!("Expected V1 phase"),
+        }
+    }
+
+    #[test]
+    fn test_stages_to_xdr_phase_sorts_clusters_within_stage() {
+        // Two independent clusters in one stage
+        let tx_a = make_soroban_tx(10, 1, vec![], vec![contract_key(10)], 1000);
+        let tx_b = make_soroban_tx(20, 1, vec![], vec![contract_key(20)], 1000);
+
+        let stages = vec![vec![vec![tx_b.clone()], vec![tx_a.clone()]]];
+        let phase = stages_to_xdr_phase(stages, Some(100));
+
+        match phase {
+            TransactionPhase::V1(parallel) => {
+                let stage = &parallel.execution_stages[0];
+                assert_eq!(stage.0.len(), 2, "Should have 2 clusters");
+                // Clusters should be sorted by first-TX hash ascending
+                let first_hash_0 = tx_hash(&stage.0[0].0[0]);
+                let first_hash_1 = tx_hash(&stage.0[1].0[0]);
+                assert!(
+                    first_hash_0.0 < first_hash_1.0,
+                    "Clusters should be sorted by first-TX hash"
+                );
+            }
+            _ => panic!("Expected V1 phase"),
+        }
+    }
+
+    #[test]
+    fn test_stages_to_xdr_phase_sorts_stages_by_first_tx() {
+        // Two stages, each with one cluster, one TX
+        let tx_a = make_soroban_tx(10, 1, vec![], vec![contract_key(10)], 1000);
+        let tx_b = make_soroban_tx(20, 1, vec![], vec![contract_key(20)], 1000);
+
+        // Put stages in reverse order to test sorting
+        let stages = vec![vec![vec![tx_b.clone()]], vec![vec![tx_a.clone()]]];
+        let phase = stages_to_xdr_phase(stages, Some(100));
+
+        match phase {
+            TransactionPhase::V1(parallel) => {
+                assert_eq!(parallel.execution_stages.len(), 2, "Should have 2 stages");
+                let first_tx_stage0 = &parallel.execution_stages[0].0[0].0[0];
+                let first_tx_stage1 = &parallel.execution_stages[1].0[0].0[0];
+                let hash_0 = tx_hash(first_tx_stage0);
+                let hash_1 = tx_hash(first_tx_stage1);
+                assert!(
+                    hash_0.0 < hash_1.0,
+                    "Stages should be sorted by first-TX-of-first-cluster hash"
+                );
+            }
+            _ => panic!("Expected V1 phase"),
+        }
+    }
+
+    #[test]
+    fn test_stages_to_xdr_phase_multi_stage_multi_cluster() {
+        // Stage 1: cluster_a=[tx1, tx2], cluster_b=[tx3]
+        // Stage 2: cluster_c=[tx4]
+        let tx1 = make_soroban_tx(1, 1, vec![], vec![contract_key(1)], 1000);
+        let tx2 = make_soroban_tx(2, 1, vec![], vec![contract_key(2)], 1000);
+        let tx3 = make_soroban_tx(3, 1, vec![], vec![contract_key(3)], 1000);
+        let tx4 = make_soroban_tx(4, 1, vec![], vec![contract_key(4)], 1000);
+
+        let stages = vec![
+            vec![vec![tx1, tx2], vec![tx3]],
+            vec![vec![tx4]],
+        ];
+        let phase = stages_to_xdr_phase(stages, Some(200));
+
+        match phase {
+            TransactionPhase::V1(parallel) => {
+                assert_eq!(parallel.base_fee, Some(200));
+                assert_eq!(parallel.execution_stages.len(), 2);
+
+                // Verify total TX count is preserved
+                let total_txs: usize = parallel
+                    .execution_stages
+                    .iter()
+                    .flat_map(|s| s.0.iter())
+                    .map(|c| c.0.len())
+                    .sum();
+                assert_eq!(total_txs, 4);
+
+                // Verify all sort invariants:
+                // 1. TXs within each cluster sorted
+                // 2. Clusters within each stage sorted
+                // 3. Stages sorted
+                for stage in parallel.execution_stages.iter() {
+                    for cluster in stage.0.iter() {
+                        for i in 1..cluster.0.len() {
+                            let h1 = tx_hash(&cluster.0[i - 1]);
+                            let h2 = tx_hash(&cluster.0[i]);
+                            assert!(h1.0 <= h2.0, "TXs in cluster not sorted");
+                        }
+                    }
+                    for i in 1..stage.0.len() {
+                        let h1 = tx_hash(&stage.0[i - 1].0[0]);
+                        let h2 = tx_hash(&stage.0[i].0[0]);
+                        assert!(h1.0 < h2.0, "Clusters in stage not sorted");
+                    }
+                }
+                for i in 1..parallel.execution_stages.len() {
+                    let h1 = tx_hash(&parallel.execution_stages[i - 1].0[0].0[0]);
+                    let h2 = tx_hash(&parallel.execution_stages[i].0[0].0[0]);
+                    assert!(h1.0 < h2.0, "Stages not sorted");
+                }
+            }
+            _ => panic!("Expected V1 phase"),
+        }
+    }
+
+    #[test]
+    fn test_stages_to_xdr_phase_none_base_fee() {
+        let tx = make_soroban_tx(1, 1, vec![], vec![contract_key(1)], 1000);
+        let stages = vec![vec![vec![tx]]];
+        let phase = stages_to_xdr_phase(stages, None);
+
+        match phase {
+            TransactionPhase::V1(parallel) => {
+                assert_eq!(parallel.base_fee, None);
+            }
+            _ => panic!("Expected V1 phase"),
+        }
+    }
+
+    #[test]
+    fn test_stages_to_xdr_phase_sorting_is_idempotent() {
+        // Build once, extract TXs, rebuild — should get same result
+        let tx_a = make_soroban_tx(10, 1, vec![], vec![contract_key(10)], 1000);
+        let tx_b = make_soroban_tx(20, 1, vec![], vec![contract_key(20)], 1000);
+        let tx_c = make_soroban_tx(30, 1, vec![], vec![contract_key(30)], 1000);
+
+        let stages = vec![vec![vec![tx_c, tx_a, tx_b]]];
+        let phase1 = stages_to_xdr_phase(stages.clone(), Some(100));
+
+        // Extract the TXs back from phase1 and feed them in again
+        let extracted_txs = match &phase1 {
+            TransactionPhase::V1(p) => p.execution_stages[0].0[0].0.to_vec(),
+            _ => panic!("Expected V1"),
+        };
+        let stages2 = vec![vec![extracted_txs]];
+        let phase2 = stages_to_xdr_phase(stages2, Some(100));
+
+        // Both phases should produce the same XDR
+        let xdr1 = phase1
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .unwrap();
+        let xdr2 = phase2
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .unwrap();
+        assert_eq!(xdr1, xdr2, "stages_to_xdr_phase should be idempotent");
+    }
+}
