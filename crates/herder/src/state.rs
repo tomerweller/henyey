@@ -73,6 +73,19 @@ impl HerderState {
             HerderState::Tracking => None,
         }
     }
+
+    /// Check if a transition from the current state to `new_state` is allowed.
+    ///
+    /// Spec: HERDER_SPEC §3.2 — forbidden transitions:
+    /// - TRACKING → BOOTING
+    /// - SYNCING → BOOTING
+    pub fn can_transition_to(&self, new_state: HerderState) -> bool {
+        match (self, new_state) {
+            (HerderState::Tracking, HerderState::Booting) => false,
+            (HerderState::Syncing, HerderState::Booting) => false,
+            _ => true,
+        }
+    }
 }
 
 impl fmt::Display for HerderState {

@@ -384,7 +384,20 @@ impl Herder {
     }
 
     /// Set the Herder state.
+    ///
+    /// Validates the transition per HERDER_SPEC §3.2: TRACKING→BOOTING and
+    /// SYNCING→BOOTING are forbidden.  If an invalid transition is attempted,
+    /// it is logged and ignored.
     pub fn set_state(&self, state: HerderState) {
+        let current = *self.state.read();
+        if !current.can_transition_to(state) {
+            tracing::warn!(
+                from = %current,
+                to = %state,
+                "ignoring forbidden herder state transition"
+            );
+            return;
+        }
         *self.state.write() = state;
     }
 

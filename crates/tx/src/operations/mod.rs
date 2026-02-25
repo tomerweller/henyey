@@ -236,7 +236,9 @@ pub fn validate_operation(op: &Operation) -> std::result::Result<(), OperationVa
 fn validate_create_account(
     op: &CreateAccountOp,
 ) -> std::result::Result<(), OperationValidationError> {
-    if op.starting_balance <= 0 {
+    // Spec: TX_SPEC §12.1 — @version(>=14): startingBalance MUST be >= 0.
+    // Henyey only supports protocol 24+, so zero is allowed.
+    if op.starting_balance < 0 {
         return Err(OperationValidationError::InvalidAmount(op.starting_balance));
     }
     Ok(())
@@ -726,11 +728,19 @@ mod tests {
         };
         assert!(validate_create_account(&valid).is_ok());
 
-        let invalid = CreateAccountOp {
+        // P14+ allows startingBalance == 0
+        let zero = CreateAccountOp {
             destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
             starting_balance: 0,
         };
-        assert!(validate_create_account(&invalid).is_err());
+        assert!(validate_create_account(&zero).is_ok());
+
+        // Negative startingBalance is always rejected
+        let negative = CreateAccountOp {
+            destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
+            starting_balance: -1,
+        };
+        assert!(validate_create_account(&negative).is_err());
     }
 
     #[test]
@@ -1339,7 +1349,9 @@ mod tests {
         assert!(!OperationType::PathPaymentStrictSend.name().is_empty());
         assert!(!OperationType::CreateClaimableBalance.name().is_empty());
         assert!(!OperationType::ClaimClaimableBalance.name().is_empty());
-        assert!(!OperationType::BeginSponsoringFutureReserves.name().is_empty());
+        assert!(!OperationType::BeginSponsoringFutureReserves
+            .name()
+            .is_empty());
         assert!(!OperationType::EndSponsoringFutureReserves.name().is_empty());
         assert!(!OperationType::RevokeSponsorship.name().is_empty());
         assert!(!OperationType::Clawback.name().is_empty());
@@ -1362,7 +1374,10 @@ mod tests {
             destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
             starting_balance: 10_000_000,
         });
-        assert_eq!(OperationType::from_body(&create_account), OperationType::CreateAccount);
+        assert_eq!(
+            OperationType::from_body(&create_account),
+            OperationType::CreateAccount
+        );
 
         // Test ManageSellOffer
         let manage_sell = OperationBody::ManageSellOffer(ManageSellOfferOp {
@@ -1372,7 +1387,10 @@ mod tests {
             price: Price { n: 1, d: 1 },
             offer_id: 0,
         });
-        assert_eq!(OperationType::from_body(&manage_sell), OperationType::ManageSellOffer);
+        assert_eq!(
+            OperationType::from_body(&manage_sell),
+            OperationType::ManageSellOffer
+        );
 
         // Test ManageBuyOffer
         let manage_buy = OperationBody::ManageBuyOffer(ManageBuyOfferOp {
@@ -1382,11 +1400,17 @@ mod tests {
             price: Price { n: 1, d: 1 },
             offer_id: 0,
         });
-        assert_eq!(OperationType::from_body(&manage_buy), OperationType::ManageBuyOffer);
+        assert_eq!(
+            OperationType::from_body(&manage_buy),
+            OperationType::ManageBuyOffer
+        );
 
         // Test Inflation
         let inflation = OperationBody::Inflation;
-        assert_eq!(OperationType::from_body(&inflation), OperationType::Inflation);
+        assert_eq!(
+            OperationType::from_body(&inflation),
+            OperationType::Inflation
+        );
     }
 
     /// Test OperationValidationError display.

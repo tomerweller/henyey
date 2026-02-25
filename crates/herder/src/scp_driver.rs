@@ -1178,8 +1178,12 @@ impl ScpDriver {
 
     /// Compare two transaction sets for combine_candidates.
     ///
-    /// Parity: HerderSCPDriver.cpp:614-653 compareTxSets.
-    /// Compares: num ops > total fees > XOR hash tiebreak.
+    /// Spec: HERDER_SPEC §10.2 — 5-criteria ordered comparison:
+    /// 1. Most operations (more is better)
+    /// 2. Highest total inclusion fees (more is better)
+    /// 3. Highest total full fees (more is better)
+    /// 4. Smallest encoded size (less is better)
+    /// 5. XOR hash tiebreak (lexicographically smallest)
     fn compare_tx_sets(
         &self,
         a_hash: &Hash256,
@@ -1190,7 +1194,7 @@ impl ScpDriver {
         let b_set = self.tx_set_cache.get(b_hash);
 
         if let (Some(a), Some(b)) = (a_set.as_ref(), b_set.as_ref()) {
-            // Compare by number of operations (more is better)
+            // 1. Compare by number of operations (more is better)
             let a_ops = Self::tx_set_num_ops(&a.tx_set);
             let b_ops = Self::tx_set_num_ops(&b.tx_set);
             let ops_cmp = a_ops.cmp(&b_ops);
@@ -1198,16 +1202,32 @@ impl ScpDriver {
                 return ops_cmp;
             }
 
-            // Compare by total fees (higher is better)
+            // 2. Compare by total inclusion fees (higher is better)
+            let a_inclusion_fees = Self::tx_set_total_inclusion_fees(&a.tx_set);
+            let b_inclusion_fees = Self::tx_set_total_inclusion_fees(&b.tx_set);
+            let inclusion_fees_cmp = a_inclusion_fees.cmp(&b_inclusion_fees);
+            if inclusion_fees_cmp != std::cmp::Ordering::Equal {
+                return inclusion_fees_cmp;
+            }
+
+            // 3. Compare by total full fees (higher is better)
             let a_fees = Self::tx_set_total_fees(&a.tx_set);
             let b_fees = Self::tx_set_total_fees(&b.tx_set);
             let fees_cmp = a_fees.cmp(&b_fees);
             if fees_cmp != std::cmp::Ordering::Equal {
                 return fees_cmp;
             }
+
+            // 4. Compare by encoded size (smaller is better — note reversed order)
+            let a_size = Self::tx_set_encoded_size(&a.tx_set);
+            let b_size = Self::tx_set_encoded_size(&b.tx_set);
+            let size_cmp = b_size.cmp(&a_size); // reversed: smaller is better
+            if size_cmp != std::cmp::Ordering::Equal {
+                return size_cmp;
+            }
         }
 
-        // XOR hash tiebreak
+        // 5. XOR hash tiebreak
         let a_xored = Self::xor_hash(&a_hash.0, candidates_hash);
         let b_xored = Self::xor_hash(&b_hash.0, candidates_hash);
         a_xored.cmp(&b_xored)
@@ -1252,6 +1272,59 @@ impl ScpDriver {
             .sum()
     }
 
+    /// Compute total inclusion fees for a transaction set.
+    ///
+    /// For generalized tx sets, the inclusion fee per tx is
+    /// `min(tx.fee, numOps * componentBaseFee)`. For legacy tx sets,
+    /// inclusion fee == full fee (no discounting).
+    fn tx_set_total_inclusion_fees(tx_set: &TransactionSet) -> i64 {
+        if let Some(ref gen) = tx_set.generalized_tx_set {
+            let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = gen;
+            let mut total = 0i64;
+            for phase in set_v1.phases.iter() {
+                match phase {
+                    stellar_xdr::curr::TransactionPhase::V0(components) => {
+                        for comp in components.iter() {
+                            let stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                                c,
+                            ) = comp;
+                            for tx in c.txs.iter() {
+                                let full_fee = Self::envelope_fee(tx);
+                                let inclusion_fee = if let Some(base_fee) = c.base_fee {
+                                    let ops = Self::envelope_num_ops(tx) as i64;
+                                    full_fee.min(ops * base_fee)
+                                } else {
+                                    full_fee
+                                };
+                                total += inclusion_fee;
+                            }
+                        }
+                    }
+                    stellar_xdr::curr::TransactionPhase::V1(parallel) => {
+                        for stage in parallel.execution_stages.iter() {
+                            for cluster in stage.iter() {
+                                for tx in cluster.0.iter() {
+                                    let full_fee = Self::envelope_fee(tx);
+                                    let inclusion_fee = if let Some(base_fee) = parallel.base_fee {
+                                        let ops = Self::envelope_num_ops(tx) as i64;
+                                        full_fee.min(ops * base_fee)
+                                    } else {
+                                        full_fee
+                                    };
+                                    total += inclusion_fee;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            total
+        } else {
+            // Legacy tx set: inclusion fee == full fee
+            Self::tx_set_total_fees(tx_set)
+        }
+    }
+
     /// Compute total fees for a transaction set.
     fn tx_set_total_fees(tx_set: &TransactionSet) -> i64 {
         tx_set
@@ -1263,6 +1336,50 @@ impl ScpDriver {
                 stellar_xdr::curr::TransactionEnvelope::TxFeeBump(e) => e.tx.fee,
             })
             .sum()
+    }
+
+    /// Get fee from a transaction envelope.
+    fn envelope_fee(env: &stellar_xdr::curr::TransactionEnvelope) -> i64 {
+        match env {
+            stellar_xdr::curr::TransactionEnvelope::TxV0(e) => e.tx.fee as i64,
+            stellar_xdr::curr::TransactionEnvelope::Tx(e) => e.tx.fee as i64,
+            stellar_xdr::curr::TransactionEnvelope::TxFeeBump(e) => e.tx.fee,
+        }
+    }
+
+    /// Get number of operations from a transaction envelope.
+    fn envelope_num_ops(env: &stellar_xdr::curr::TransactionEnvelope) -> usize {
+        match env {
+            stellar_xdr::curr::TransactionEnvelope::TxV0(e) => e.tx.operations.len(),
+            stellar_xdr::curr::TransactionEnvelope::Tx(e) => e.tx.operations.len(),
+            stellar_xdr::curr::TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
+                stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+                    inner.tx.operations.len()
+                }
+            },
+        }
+    }
+
+    /// Compute XDR-encoded size of a transaction set.
+    ///
+    /// For generalized tx sets, encodes the generalized set. For legacy,
+    /// sums the XDR-encoded size of all transactions.
+    fn tx_set_encoded_size(tx_set: &TransactionSet) -> usize {
+        if let Some(ref gen) = tx_set.generalized_tx_set {
+            gen.to_xdr(stellar_xdr::curr::Limits::none())
+                .map(|bytes| bytes.len())
+                .unwrap_or(0)
+        } else {
+            tx_set
+                .transactions
+                .iter()
+                .map(|tx| {
+                    tx.to_xdr(stellar_xdr::curr::Limits::none())
+                        .map(|bytes| bytes.len())
+                        .unwrap_or(0)
+                })
+                .sum()
+        }
     }
 
     /// XOR a 32-byte hash with another 32-byte value for tiebreaking.
@@ -2926,10 +3043,9 @@ mod tests {
             TransactionExt, TransactionV1Envelope, Uint256,
         };
         let source = MuxedAccount::Ed25519(Uint256([seed; 32]));
-        let dest =
-            stellar_xdr::curr::AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                Uint256([seed.wrapping_add(1); 32]),
-            ));
+        let dest = stellar_xdr::curr::AccountId(
+            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256([seed.wrapping_add(1); 32])),
+        );
         let tx = Transaction {
             source_account: source,
             fee: 100,
@@ -2951,9 +3067,7 @@ mod tests {
             tx,
             signatures: vec![DecoratedSignature {
                 hint: SignatureHint([0u8; 4]),
-                signature: stellar_xdr::curr::Signature(
-                    vec![0u8; 64].try_into().unwrap(),
-                ),
+                signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
             }]
             .try_into()
             .unwrap(),

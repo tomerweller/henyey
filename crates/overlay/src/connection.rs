@@ -83,8 +83,10 @@ impl Connection {
     pub fn new(stream: TcpStream, direction: ConnectionDirection) -> Result<Self> {
         let remote_addr = stream.peer_addr()?;
 
-        // Disable Nagle's algorithm for lower latency
+        // Spec: OVERLAY_SPEC §4.1 — TCP_NODELAY and SO_LINGER MUST be set.
         stream.set_nodelay(true)?;
+        // SO_LINGER with timeout=0 causes immediate close (RST) without waiting.
+        stream.set_linger(Some(Duration::from_secs(0)))?;
 
         let framed = Framed::new(stream, MessageCodec::new());
 

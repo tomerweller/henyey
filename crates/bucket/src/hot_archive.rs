@@ -1885,11 +1885,10 @@ pub fn is_hot_archive_tombstone(entry: &HotArchiveBucketEntry) -> bool {
 
 /// Merge two hot archive buckets.
 ///
-/// Hot archive merge rules:
-/// - Archived + Live = Annihilate (entry was restored)
-/// - Live + Archived = Keep Archived (re-archived)
-/// - Archived + Archived = Keep newer (from curr)
-/// - At bottom level: Live entries are dropped
+/// Spec: BUCKETLISTDB_SPEC §11.4 — Hot archive merge follows strict "newest wins"
+/// semantics with NO annihilation cases. The `snap` (newer/shallower) entry
+/// always takes precedence over `curr` (older/deeper) when keys are equal.
+/// At the bottom level, LIVE tombstones are dropped by the output iterator.
 pub fn merge_hot_archive_buckets(
     curr: &HotArchiveBucket,
     snap: &HotArchiveBucket,

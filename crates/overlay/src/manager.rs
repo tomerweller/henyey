@@ -1217,8 +1217,11 @@ impl OverlayManager {
                             // Handle flow control messages: release outbound capacity
                             // and drain queued messages that now have capacity.
                             match &message {
-                                StellarMessage::SendMore(sm) => {
-                                    debug!("Peer {} sent SEND_MORE: num_messages={}", peer_id, sm.num_messages);
+                                StellarMessage::SendMore(_) => {
+                                    // Spec: OVERLAY_SPEC §7.6.1 — SEND_MORE (non-extended)
+                                    // is deprecated. Receiving it MUST drop the connection.
+                                    warn!("Peer {} sent deprecated SEND_MORE, dropping connection", peer_id);
+                                    break;
                                 }
                                 StellarMessage::SendMoreExtended(sme) => {
                                     debug!("Peer {} sent SEND_MORE_EXTENDED: num_messages={}, num_bytes={}", peer_id, sme.num_messages, sme.num_bytes);
@@ -1431,6 +1434,13 @@ impl OverlayManager {
                     }
                     if now.duration_since(last_write) >= PEER_STRAGGLER_TIMEOUT {
                         warn!("Dropping peer {} due to straggler timeout (total_msgs={}, scp_msgs={})", peer_id, total_messages, scp_messages);
+                        break;
+                    }
+                    // Spec: OVERLAY_SPEC §8.5 — PEER_SEND_MODE_IDLE_TIMEOUT (60s):
+                    // if the peer has not sent SEND_MORE_EXTENDED for 60 seconds
+                    // while we have no outbound capacity, drop the connection.
+                    if flow_control.no_outbound_capacity_timeout(60) {
+                        warn!("Dropping peer {} due to PEER_SEND_MODE_IDLE_TIMEOUT (no SEND_MORE_EXTENDED for 60s)", peer_id);
                         break;
                     }
 

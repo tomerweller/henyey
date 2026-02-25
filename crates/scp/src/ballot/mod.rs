@@ -694,6 +694,9 @@ impl BallotProtocol {
                 self.latest_envelopes
                     .insert(envelope.statement.node_id.clone(), envelope.clone());
                 self.last_envelope = Some(envelope.clone());
+                // Spec: SCP_SPEC §9.13 — set last_envelope_emit to prevent re-emission
+                // after crash recovery.
+                self.last_envelope_emit = Some(envelope.clone());
                 true
             }
             ScpStatementPledges::Confirm(conf) => {
@@ -716,6 +719,8 @@ impl BallotProtocol {
                 self.latest_envelopes
                     .insert(envelope.statement.node_id.clone(), envelope.clone());
                 self.last_envelope = Some(envelope.clone());
+                // Spec: SCP_SPEC §9.13 — set last_envelope_emit to prevent re-emission.
+                self.last_envelope_emit = Some(envelope.clone());
                 true
             }
             ScpStatementPledges::Externalize(ext) => {
@@ -738,6 +743,8 @@ impl BallotProtocol {
                 self.latest_envelopes
                     .insert(envelope.statement.node_id.clone(), envelope.clone());
                 self.last_envelope = Some(envelope.clone());
+                // Spec: SCP_SPEC §9.13 — set last_envelope_emit to prevent re-emission.
+                self.last_envelope_emit = Some(envelope.clone());
                 true
             }
             _ => false,
