@@ -140,6 +140,14 @@ impl Connection {
         self.closed
     }
 
+    /// Marks the codec as authenticated, allowing full-size messages.
+    ///
+    /// Must be called after the handshake completes. Before this,
+    /// incoming messages are limited to 4,096 bytes.
+    pub fn set_authenticated(&mut self) {
+        self.framed.codec_mut().set_authenticated();
+    }
+
     /// Sends an authenticated message to the peer.
     ///
     /// # Errors

@@ -297,6 +297,7 @@ impl Peer {
         }
 
         self.state = PeerState::Authenticated;
+        self.connection.set_authenticated();
         let handshake_ms = handshake_start.elapsed().as_millis();
         info!(
             "Authenticated with peer {} ({}) handshake_ms={}",
