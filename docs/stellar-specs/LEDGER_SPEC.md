@@ -863,9 +863,20 @@ During ledger close, upgrades are applied in the order they appear in
      entries with their default values.
    - If upgrading to p21, p22, p23, or p25: update cost model
      parameters for the new protocol.
-   - If upgrading from p23 to p24: apply the P23 hot archive bug fix,
-     adjusting corrupted entries. Also adjust the fee pool to reflect
-     the actual coin distribution.
+   - If upgrading from p23 to p24 **on the production (mainnet)
+     network only** (`gIsProductionNetwork`): apply the CAP-0076
+     P23 hot archive bug remediation. In protocol 23, the
+     persistent entry eviction scan could archive a stale
+     version of an entry from a deeper bucket level instead of
+     the newest version, because no point lookup was performed.
+     This corrupted 478 entries on mainnet. The remediation:
+     (a) Add `31,879,035` stroops to `feePool` to account for
+     unintentional XLM burns from restored corrupted SAC
+     balance entries.
+     (b) The hot archive entry fix is applied during
+     `finalizeLedgerTxnChanges` (Section 11.1, Step 1c).
+     Note: These fixes are mainnet-specific; testnet and
+     private networks MUST NOT apply them.
    - If upgrading to p25: promote the eviction state size to a window
      and enable stale entry purging.
 
@@ -1190,8 +1201,23 @@ The `finalizeLedgerTxnChanges` procedure:
    c. For protocol 24+ (persistent eviction):
       - Collect restored hot archive keys.
       - Run consistency invariant checks.
-      - Handle the P23 hot archive bug fix if upgrading from p23 to p24.
+      - If upgrading from p23 to p24 **on mainnet only**
+        (CAP-0076): apply the hot archive entry fix. For each
+        of 478 hardcoded (corrupted, correct) entry pairs:
+        (1) entry MUST exist in the Hot Archive,
+        (2) entry state MUST match the known corrupted state,
+        (3) entry MUST NOT exist in live state,
+        (4) entry MUST NOT be in the current eviction batch.
+        If all checks pass, append the correct entry to the
+        hot archive batch (overwriting the corrupted version).
+        These amendments are NOT reflected in `LedgerCloseMeta`
+        but are observable via the `bucketListHash` change.
       - Otherwise, add hot archive entries via `addHotArchiveBatch`.
+      - Note: From protocol 24+, the eviction scan itself is
+        fixed — for persistent entries, a BucketList point
+        lookup is performed to ensure the newest version of
+        the entry is archived (see BUCKETLISTDB_SPEC
+        Invariant 10).
    d. Populate evicted entries in the meta frame.
    e. Remove evicted `CONTRACT_CODE` entries from the module cache.
    f. Commit the eviction `LedgerTxn`.
@@ -1537,6 +1563,7 @@ order book and path finding.
 | [TX Spec] | Stellar Transaction Processing Specification (companion document). |
 | [Overlay Spec] | Stellar Overlay Protocol Specification (companion document). |
 | [CAP-0046] | Soroban Smart Contracts proposal. |
+| [CAP-0076] | P23 State Archival bug remediation. |
 
 ---
 

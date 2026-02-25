@@ -861,11 +861,15 @@ Each criterion is a tiebreaker for the previous one:
    more phases (i.e., prefer sets that include a Soroban phase
    over those that do not).
 
-2. **Most transactions**: Among sets with equal phase count,
-   prefer the set containing the most total transactions.
+2. **Most operations**: Among sets with equal phase count,
+   prefer the set containing the most total operations
+   (sum of `getNumOperations()` across all transactions in
+   all phases). Before protocol 11, transaction count was
+   used instead of operation count; from protocol 11+
+   (CAP-0005), operation count is used.
 
 3. **Highest total inclusion fees**: Among sets with equal
-   transaction count, prefer the set with the highest sum
+   operation count, prefer the set with the highest sum
    of inclusion fees.
 
 4. **Highest total full fees**: Among sets with equal total
@@ -1300,11 +1304,26 @@ Each period, a budget of operations (classic) or multi-dimensional
 resources (Soroban) is computed:
 
 ```
-periodBudget = (ratePerLedger / periodsPerLedgerClose) + carryOver
+periodsPerLedgerClose = expectedLedgerCloseTime / floodPeriodMs
+periodBudget = (ratePerLedger * maxLedgerResources / periodsPerLedgerClose) + carryOver
 ```
 
-Where `carryOver` is any unused budget from the previous period,
-capped at a maximum to prevent burst flooding.
+Where:
+- `expectedLedgerCloseTime` is the expected ledger close time:
+  before protocol 23, this is hardcoded at 5000ms; from protocol
+  23+, it is `ledgerTargetCloseTimeMilliseconds` from the on-chain
+  `CONFIG_SETTING_SCP_TIMING` (see Section 17.3).
+- `floodPeriodMs` is `FLOOD_TX_PERIOD_MS` (classic) or
+  `FLOOD_SOROBAN_TX_PERIOD_MS` (Soroban).
+- `maxLedgerResources` is `lastMaxTxSetSizeOps` (classic) or
+  the multi-dimensional Soroban ledger limits (Soroban).
+- `carryOver` is any unused budget from the previous period,
+  capped at a maximum to prevent burst flooding.
+
+Note: Changing `ledgerTargetCloseTimeMilliseconds` (e.g., from
+5000ms to 4000ms) changes the number of flood periods per ledger
+and the per-period budget, but the total per-ledger flood budget
+(`ratePerLedger * maxLedgerResources`) remains constant.
 
 ### 13.3 Best-Fee-First Ordering
 

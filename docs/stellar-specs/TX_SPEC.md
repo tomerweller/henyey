@@ -567,12 +567,26 @@ For Soroban transactions, the declared resources in
 1. `instructions` MUST be ≤ `txMaxInstructions` (network config).
 2. `diskReadBytes` MUST be ≤ `txMaxDiskReadBytes`.
 3. `writeBytes` MUST be ≤ `txMaxWriteBytes`.
-4. The total number of read-only footprint entries MUST be ≤
-   `txMaxReadLedgerEntries`.
+4. The number of disk-read entries MUST be ≤
+   `txMaxReadLedgerEntries` (called `txMaxDiskReadEntries`
+   from protocol 23+).
+   - `@version(<23)`: disk-read entries = all footprint entries
+     (readOnly + readWrite).
+   - `@version(≥23)`: disk-read entries = classic (non-Soroban)
+     footprint entries + archived Soroban entries (from
+     `archivedSorobanEntries`). Soroban entries
+     (`CONTRACT_DATA`, `CONTRACT_CODE`) that are live
+     in-memory are excluded from the disk-read count
+     (CAP-0066). For `RestoreFootprint` operations, all
+     readWrite entries count as disk reads.
 5. The total number of read-write footprint entries MUST be ≤
    `txMaxWriteLedgerEntries`.
-6. The total number of all footprint entries (read-only + read-write)
-   MUST be ≤ `txMaxReadLedgerEntries`.
+6. `@version(<23)`: The total number of all footprint entries
+   (read-only + read-write) MUST be ≤ `txMaxReadLedgerEntries`.
+   `@version(≥23)`: The total number of all footprint entries
+   MUST be ≤ `txMaxFootprintEntries` (from
+   `CONFIG_SETTING_CONTRACT_LEDGER_COST_EXT`, see
+   LEDGER_SPEC Section 9.2).
 7. Each footprint key MUST have a serialized size ≤
    `maxContractDataKeySizeBytes`.
 8. The serialized transaction size MUST be ≤ `txMaxSizeBytes`.
@@ -1764,7 +1778,11 @@ function doApply(op, ltx):
             entry = loadEntry(key, ltx)
             check TTL liveness
             @version(≥23): handle archived entries (auto-restore)
-            meter disk read bytes
+            meter disk read bytes:
+                @version(<23): meter for all entries
+                @version(≥23): meter only for disk-read entries
+                    (classic entries + archived Soroban entries;
+                     skip live in-memory Soroban entries, CAP-0066)
             validate entry size limits
 
     // 2. Invoke host function via Soroban runtime
