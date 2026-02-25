@@ -772,12 +772,20 @@ function processRefund(tx, ltx):
 
     if refund > 0:
         feeSource = loadAccount(tx.feeSourceAccount, ltx)
-        feeSource.balance += refund
+        if feeSource is None:
+            return                          // account merged, no refund
+        if not addBalance(feeSource, refund):
+            return                          // overflow or buying liabilities
         ledgerHeader.feePool -= refund
         tx.result.feeCharged -= refund
 
     commit(ltx)
 ```
+
+`addBalance` checks `@version(≥10)`: (1) `balance + refund` does not
+overflow `INT64_MAX`, and (2) the new balance does not exceed
+`INT64_MAX - buyingLiabilities`. If either check fails, the refund is
+silently skipped.
 
 The resource fee is split into **non-refundable** and **refundable**
 components by the resource fee computation function:
@@ -1418,6 +1426,10 @@ Creates, updates, or removes a trustline.
    - `@version(≥13)`: If asset is `ASSET_TYPE_POOL_SHARE`, the pool
      MUST exist or will be created.
    - Verify issuer has `AUTH_REQUIRED_FLAG` implications.
+   - Verify the source account's sub-entry count plus the entry
+     multiplier (2 for pool share trustlines, 1 for regular
+     trustlines) does not exceed `ACCOUNT_SUBENTRY_LIMIT` (1000).
+     Result: `opTOO_MANY_SUBENTRIES`.
    - Create TRUSTLINE entry with sponsorship support. Result:
      `CHANGE_TRUST_LOW_RESERVE` (checked after issuer existence).
    - For pool shares: increment both asset trustline pool counts.
@@ -1704,7 +1716,8 @@ Claws back an asset amount from a trustline (issuer only).
 **Validation**:
 - `from` MUST NOT be the source account. Result: `CLAWBACK_MALFORMED`.
 - `amount` MUST be > 0. Result: `CLAWBACK_MALFORMED`.
-- Asset MUST NOT be native. Result: `CLAWBACK_MALFORMED`.
+- Asset MUST NOT be native and MUST be valid (`isAssetValid`).
+  Result: `CLAWBACK_MALFORMED`.
 - Source MUST be the asset issuer. Result: `CLAWBACK_MALFORMED`.
 
 **Execution**:
@@ -1897,10 +1910,21 @@ liquidity pools `@version(≥18)`:
 1. Compare the best offer from the order book with the best price
    from the liquidity pool (if any) for the given asset pair.
 2. Cross the better-priced source first.
-3. For order book offers:
+3. For order book offers (`crossOfferV10`):
    - Load the offer and the seller's account/trustlines.
-   - Compute the exchange using the offer's price.
-   - `@version(≥10)`: Adjust buying/selling liabilities.
+   - `@version(≥10)`: **Release** the offer's current liabilities
+     first (decrement selling liabilities on the selling side and
+     buying liabilities on the buying side). This MUST happen
+     before computing available amounts.
+   - Compute `maxWheatSend` and `maxSheepReceive` from the seller's
+     available balance/limit (which now reflect the released
+     liabilities). Adjust the offer amount via `adjustOffer`.
+   - Compute the exchange using the offer's price (Section 7.29.1).
+   - Apply balance changes (credit buying asset, debit selling
+     asset) for the exchanged amounts.
+   - If the offer stays: re-adjust the remaining amount and
+     **re-acquire** liabilities for the updated offer. If the
+     adjusted remaining amount is zero, delete the offer.
    - If offer is fully consumed, remove it.
    - A `ClaimAtom` is **always** appended to the result's offer
      trail, even when the exchanged amounts are zero (e.g., when

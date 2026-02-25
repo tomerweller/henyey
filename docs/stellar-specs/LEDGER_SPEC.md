@@ -1321,7 +1321,11 @@ The `finalizeLedgerTxnChanges` procedure:
 1. **Resolve eviction** (protocol 20+):
    a. Load the Soroban configuration and collect all TTL keys.
    b. Resolve the background eviction scan started at the previous
-      ledger. This produces a set of evicted entries.
+      ledger. This produces a set of eviction candidates. Filter
+      candidates: any entry whose TTL key appears in the current
+      ledger's modified TTL key set (i.e., was touched by a
+      transaction in this ledger) MUST be excluded from eviction.
+      The remaining candidates form the final set of evicted entries.
    c. For protocol 24+ (persistent eviction):
       - Collect restored hot archive keys.
       - Run consistency invariant checks.
