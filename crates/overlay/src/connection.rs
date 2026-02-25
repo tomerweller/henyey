@@ -86,6 +86,7 @@ impl Connection {
         // Spec: OVERLAY_SPEC §4.1 — TCP_NODELAY and SO_LINGER MUST be set.
         stream.set_nodelay(true)?;
         // SO_LINGER with timeout=0 causes immediate close (RST) without waiting.
+        #[allow(deprecated)]
         stream.set_linger(Some(Duration::from_secs(0)))?;
 
         let framed = Framed::new(stream, MessageCodec::new());
