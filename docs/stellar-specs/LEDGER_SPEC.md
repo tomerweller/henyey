@@ -656,14 +656,38 @@ A `LedgerTxn` supports the following operations on entries:
 
 `load(key) → LedgerTxnEntry | null`
 
-1. If the key exists in this transaction's local cache, return the
-   cached entry (creating an active handle).
+1. If the key exists in this transaction's local cache:
+   a. If the entry's lifecycle state is `DELETED`, return null.
+   b. Otherwise, return the cached entry (creating an active handle).
 2. Otherwise, recursively load from the parent.
 3. If found, create a copy in this transaction's cache (copy-on-write)
    with lifecycle state `LIVE`.
 4. If not found, return null.
 
 A load SHALL NOT modify the entry in any ancestor.
+
+**Deleted-key visibility invariant**: A `load` for a key that has been
+erased (lifecycle state `DELETED`) in *any* scope within the current
+ledger close MUST return null. Implementations MUST NOT fall through
+to the backing store (e.g., BucketList snapshot) for a key that was
+deleted, regardless of whether the deletion occurred in the current
+scope, a sibling scope that has already committed, or a parent scope.
+
+This invariant has two practical consequences for implementations that
+use flat state with scoped snapshots rather than true nested
+transactions:
+
+1. **Intra-transaction**: When multiple operations execute within the
+   same transaction, an entry deleted by an earlier operation MUST
+   remain invisible to later operations' preloading, even though
+   per-operation snapshot state may have been cleared.
+2. **Cross-transaction**: When multiple transactions execute within
+   the same ledger, an entry deleted by an earlier transaction MUST
+   remain invisible to later transactions' preloading, even though
+   per-transaction state is committed and cleared between transactions.
+   The ledger-level accumulator of deleted keys (the "delta") persists
+   across transaction boundaries and MUST be consulted before loading
+   from the backing store.
 
 #### 6.4.2 Load Without Record
 

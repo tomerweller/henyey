@@ -1213,7 +1213,7 @@ loadKeys(inKeys):
     for level in 0..10:
         for bucket in [curr, snap]:
             bucket.loadKeys(keys, result)
-            // found keys are removed from 'keys' set
+            // found keys — both live AND dead — are removed from 'keys'
             if keys is empty: break
     return result
 ```
@@ -1223,9 +1223,20 @@ the sorted key set and the bucket's index:
 
 1. Start with the first key and the index iterator at the beginning.
 2. For each key, advance the index iterator to find a lower-bound match.
-3. If found, load the entry (from cache or disk), add to result, and
-   remove the key from the search set.
-4. Continue with the next key.
+3. If found and the entry is **live** (`LIVEENTRY` or `INITENTRY`), add
+   it to the result and remove the key from the search set.
+4. If found and the entry is a **tombstone** (`DEADENTRY`), do NOT add
+   it to the result but still remove the key from the search set. This
+   ensures the tombstone shadows any live entry for the same key at
+   deeper (older) levels (see Invariant 11, Section 15.11).
+5. Continue with the next key.
+
+**Implementation note — parallel / batched scanning**: An implementation
+that scans multiple levels in parallel (rather than sequentially) must
+collect dead keys from each level and propagate them into a global
+"seen" set during the merge phase. Dead keys at shallower levels must
+be registered before processing live entries from deeper levels;
+otherwise stale entries will leak into the result.
 
 This provides O(k log n) performance for loading k keys from a bucket
 of n entries.

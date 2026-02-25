@@ -1193,8 +1193,9 @@ destination amount.
 5. At each hop, call the DEX conversion engine with
    `ROUND_TYPE_STRICT_RECEIVE` to exchange the needed amount.
 6. `@version(≥11)`: Enforce `MAX_OFFERS_TO_CROSS` (1000) limit across
-   all hops. Result:
-   `PATH_PAYMENT_STRICT_RECEIVE_EXCEEDED_WORK_LIMIT`.
+   all hops. If the limit is exceeded, the operation returns the
+   outer-level result `opEXCEEDED_WORK_LIMIT` (not an inner
+   path-payment result code).
 7. If total source amount exceeds `sendMax`:
    Result: `PATH_PAYMENT_STRICT_RECEIVE_OVER_SENDMAX`.
 8. Debit source account.
@@ -1221,7 +1222,9 @@ minimum destination amount. `@version(≥12)`.
    strict receive).
 4. Walk conversion path forward from source asset to destination asset
    using `ROUND_TYPE_STRICT_SEND`.
-5. Enforce `MAX_OFFERS_TO_CROSS` limit `@version(≥11)`.
+5. Enforce `MAX_OFFERS_TO_CROSS` limit `@version(≥11)`. If the limit
+   is exceeded, the operation returns the outer-level result
+   `opEXCEEDED_WORK_LIMIT` (not an inner path-payment result code).
 6. If destination amount received < `destMin`:
    Result: `PATH_PAYMENT_STRICT_SEND_UNDER_DESTMIN`.
 7. Credit destination.
@@ -1264,17 +1267,32 @@ a common base):
      Result: `MANAGE_SELL_OFFER_CROSS_SELF`.
    - Enforce `MAX_OFFERS_TO_CROSS` limit `@version(≥11)`.
 
-6. If residual amount remains and this is not a delete:
+6. If the new offer (`offerID == 0`) was fully consumed during
+   crossing (no residual amount remains):
+   - `@version(≥14)`: stellar-core still performs the full sponsorship
+     create/remove cycle — it calls `createEntryWithPossibleSponsorship`
+     (which increments `sponsor.numSponsoring` and loads the sponsor
+     account) followed immediately by `removeEntryWithPossibleSponsorship`
+     (which decrements `sponsor.numSponsoring`). The net effect on all
+     account fields is zero, but both the source account and the sponsor
+     account (if any) are loaded into the transaction and receive an
+     updated `lastModifiedLedgerSeq`.
+   - If updating an existing offer (`offerID != 0`) that was fully
+     consumed: remove the offer entry with sponsorship cleanup
+     (Section 7.28).
+
+7. If residual amount remains and this is not a delete:
    - If this is a new offer (`offerID == 0`): create a new OFFER
      entry with sponsorship support.
    - If this is an update: modify the existing offer.
-   - Validate the seller has sufficient selling liabilities capacity
-     and the buyer has sufficient buying liabilities capacity
-     `@version(≥10)`.
+   - Validate liabilities capacity `@version(≥10)`. Checks are
+     performed in this order: buying capacity first (`LINE_FULL`),
+     then selling capacity (`UNDERFUNDED`). When both fail, the
+     first failing check determines the result code.
    - Result: `MANAGE_SELL_OFFER_LOW_RESERVE`, `MANAGE_SELL_OFFER_LINE_FULL`,
      `MANAGE_SELL_OFFER_UNDERFUNDED`.
 
-7. Passive offers (CreatePassiveSellOffer): do not cross offers at the
+8. Passive offers (CreatePassiveSellOffer): do not cross offers at the
    same price; only cross at strictly better prices.
 
 ### 7.6 ManageBuyOffer
@@ -1326,11 +1344,11 @@ function (Section 7.29.1):
 - `offerSellingLiabilities` = amount of selling asset committed
 - `offerBuyingLiabilities` = amount of buying asset expected
 
-**Validation invariant** `@version(≥10)`:
-- `availableBalance >= offerSellingLiabilities`, else
-  `MANAGE_SELL_OFFER_UNDERFUNDED`.
+**Validation invariant** `@version(≥10)` (checked in this order):
 - `availableLimit >= offerBuyingLiabilities`, else
   `MANAGE_SELL_OFFER_LINE_FULL`.
+- `availableBalance >= offerSellingLiabilities`, else
+  `MANAGE_SELL_OFFER_UNDERFUNDED`.
 
 **Lifecycle**: Liabilities are incremented when offers are created or
 updated, and decremented when offers are deleted, fully consumed, or
@@ -1431,7 +1449,15 @@ Authorizes or deauthorizes a trustline (issuer only).
 5. If deauthorizing from `AUTHORIZED_TO_MAINTAIN_LIABILITIES` to
    fully deauthorized `@version(≥10)`:
    a. Remove all offers for the account in the deauthorized asset
-      (same mechanism as AccountMerge offer removal).
+      (same mechanism as AccountMerge offer removal). Offers are
+      discovered by querying the **full ledger state** (bucket list
+      snapshot via secondary index), not only entries already in the
+      transaction's working set. Because this snapshot reflects the
+      state at ledger open and does not include in-ledger mutations,
+      offers that were already deleted by an earlier transaction in
+      the same ledger MUST be skipped (i.e., entries whose keys
+      appear in the current ledger's deleted-key set are excluded
+      before processing).
    b. Redeem all pool share trustlines for the account that reference
       the deauthorized asset `@version(≥18)`:
       - Find pool share trustlines by querying the **full ledger state**
@@ -1583,8 +1609,25 @@ Claims a claimable balance. `@version(≥14)`.
    account.
 3. Evaluate the claimant's predicate against the current ledger
    close time. Result: `CANNOT_CLAIM`.
-4. Credit the source (native or via trustline).
-   Result: `NO_TRUST`, `NOT_AUTHORIZED`, `LINE_FULL`.
+4. Credit the source account with the claimed amount:
+   - **Trustline (non-native asset)**:
+     a. Load the trustline for the asset. Result: `NO_TRUST`.
+     b. Trustline MUST be authorized. Result: `NOT_AUTHORIZED`.
+     c. The available capacity (`limit − balance`) MUST be ≥ `amount`.
+        Result: `LINE_FULL`.
+     d. The new balance (`balance + amount`) MUST be
+        ≤ `limit − buyingLiabilities`. Result: `LINE_FULL`.
+     e. Credit the trustline.
+   - **Native asset**:
+     a. `INT64_MAX − balance` MUST be ≥ `amount`. Result: `LINE_FULL`.
+     b. The new balance (`balance + amount`) MUST be
+        ≤ `INT64_MAX − buyingLiabilities`. Result: `LINE_FULL`.
+     c. Credit the account balance.
+
+   > **Implementation note**: All capacity checks use the
+   > overflow-safe form `maxVal − balance < amount` (rather than
+   > `balance + amount > maxVal`) because `maxVal ≥ balance ≥ 0`.
+   > This matches stellar-core's `addBalance` in `types.cpp`.
 5. Remove claimable balance with sponsorship cleanup.
 
 **Predicate evaluation**:
@@ -1713,6 +1756,12 @@ only). `@version(≥17)`.
 5. If transitioning from `AUTHORIZED_TO_MAINTAIN_LIABILITIES` to
    fully deauthorized:
    a. Remove all offers for the account in the affected asset.
+      Offers are discovered by querying the **full ledger state**
+      (bucket list snapshot via secondary index). Because this
+      snapshot reflects the state at ledger open, offers already
+      deleted by an earlier transaction in the same ledger MUST be
+      skipped (entries whose keys appear in the current ledger's
+      deleted-key set are excluded before processing).
    b. Redeem all pool share trustlines for the account that reference
       the affected asset `@version(≥18)`:
       - Find pool share trustlines by querying the **full ledger state**
@@ -1853,6 +1902,10 @@ liquidity pools `@version(≥18)`:
    - Compute the exchange using the offer's price.
    - `@version(≥10)`: Adjust buying/selling liabilities.
    - If offer is fully consumed, remove it.
+   - A `ClaimAtom` is **always** appended to the result's offer
+     trail, even when the exchanged amounts are zero (e.g., when
+     the 1% price-error threshold zeroes out the trade). This is
+     unconditional — no rounding mode skips it.
 4. For liquidity pools `@version(≥18)`:
    - The 30 bps fee is integrated into the constant-product formula
      (applied to the input amount before computing output), not
@@ -1864,6 +1917,17 @@ liquidity pools `@version(≥18)`:
    - Strict-receive: `toPool = ceil(maxBps * reservesToPool *
      fromPool / ((reservesFromPool - fromPool) *
      (maxBps - feeBps)))`.
+   - **Overflow-safe division (hugeDivide)**: Both formulas above
+     are of the form `result = round(A * B / C)` where `A` is a
+     small constant (≤10000) and `B`, `C` are products of two i64
+     values (fitting in u128). The product `A * B` can overflow
+     u128 when pool reserves are large. Implementations MUST use
+     the decomposition: `Q = B / C`, `R = B % C`, then
+     `result = A*Q + round(A*R / C)` (floor for strict-send,
+     ceil for strict-receive), which avoids computing `A * B`
+     directly. If the final result exceeds `INT64_MAX`, the
+     exchange is not possible (return false) — this MUST NOT be
+     treated as an internal error.
    - Note: `NORMAL` rounding mode (ManageSellOffer/ManageBuyOffer)
      does NOT cross liquidity pools — only path payments do.
    - Update pool reserves.
@@ -1902,6 +1966,10 @@ wheatStays = (wheatValue > sheepValue)
    `sendMax` provides protection).
 5. In `PATH_PAYMENT_STRICT_SEND` mode: `sheepSend > 0` is always
    guaranteed when a trade occurs.
+6. Regardless of rounding mode or resulting amounts, a `ClaimAtom`
+   is emitted for every offer crossing. When `wheatReceive = 0`
+   (e.g., strict-send with rounding to zero on the receive side),
+   the `ClaimAtom` with zero amounts is still recorded.
 
 **Computation branches** (determined by `wheatStays`, `price.n`
 vs `price.d`, and rounding mode):
@@ -2019,12 +2087,28 @@ function doApply(op, ltx):
                      skip live in-memory Soroban entries, CAP-0066)
             validate entry size limits
 
+    // The loaded entries are collected into two parallel vectors:
+    //   encodedLedgerEntries[i]  — XDR-encoded LedgerEntry (or empty)
+    //   encodedTtlEntries[i]     — XDR-encoded TtlEntry (or empty)
+    //
+    // IMPORTANT: Positional alignment invariant.
+    // These vectors MUST be 1:1 positionally aligned with the
+    // footprint keys (readOnly keys ++ readWrite keys). The Soroban
+    // host maps entries to footprint keys by vector index, not by
+    // key lookup. Every footprint key MUST have a corresponding slot
+    // in both vectors, even if the entry does not exist in the
+    // current ledger state. For missing entries, the slot contains
+    // an empty buffer (zero-length XDR). Skipping a missing entry
+    // (i.e., not inserting a slot) shifts all subsequent entries and
+    // causes the host to execute with misaligned key-entry pairs.
+
     // 2. Invoke host function via Soroban runtime
     result = invokeHostFunction(
         hostFunction = op.hostFunction,
         auth = op.auth,
         resources = sorobanResources,
-        ledgerEntries = loaded entries,
+        ledgerEntries = encodedLedgerEntries,
+        ttlEntries = encodedTtlEntries,
         ledgerInfo = current ledger info
     )
 
@@ -2220,12 +2304,32 @@ Soroban Transaction Sets").
 1. For each stage:
    a. Create a read-only snapshot of the current ledger state.
    b. For each cluster (potentially in parallel):
-      - Create a thread-local writable state layer.
-      - Apply each transaction in the cluster sequentially against
-        the thread-local state.
+      - Create a thread-local writable state layer. Read-only TTL
+        bumps (from `ExtendFootprintTTL` operations) are deferred:
+        they are recorded for transaction metadata but NOT applied
+        to the thread-local state's TTL entries immediately.
+      - For each transaction in the cluster, sequentially:
+        i. **Flush deferred RO TTL bumps for write footprint keys**
+           (`flushRoTTLBumpsInTxWriteFootprint`): For each Soroban
+           entry key (`CONTRACT_DATA`, `CONTRACT_CODE`) in the
+           transaction's read-write footprint, if a deferred RO TTL
+           bump exists for that key (from a prior transaction in this
+           cluster), apply it to the thread-local TTL state and remove
+           it from the deferred set. This MUST occur before the
+           transaction snapshot (next step), so that flushed values
+           survive transaction rollback.
+        ii. Snapshot the thread-local state (for rollback on failure).
+        iii. Execute the transaction against the thread-local state.
+        iv. On success: commit changes; deferred RO TTL bumps from
+            this transaction are retained.
+        v. On failure: roll back the thread-local state to the
+           snapshot, including rolling back any deferred RO TTL bumps
+           recorded by this transaction.
       - Record results and metadata.
    c. After all clusters complete: merge thread-local state changes
-      into the global ledger state. Read-only TTL extensions are
+      into the global ledger state. Any remaining deferred read-only
+      TTL bumps (not already flushed in step 1b-i) are applied to
+      TTL entries. Read-only TTL extensions across clusters are
       merged using maximum values.
 2. After all stages: commit all changes to the main ledger transaction.
 
@@ -2242,6 +2346,22 @@ parallel execution begins:
    Section 5.4).
 2. Signature verification.
 3. Operation validation (`doCheckValid`).
+
+**Failed pre-apply handling**: If the pre-parallel apply phase
+determines the transaction cannot succeed — specifically, if the fee
+source account had insufficient balance during fee deduction (Section
+5.4) — the operation body is **not** executed. The pre-apply side
+effects (sequence number bump, signer removal) are committed, but
+the parallel executor returns immediately with a failure result:
+- `success = false`
+- `txChangesBefore` populated (sequence bump + signer removal)
+- `operations` meta array is empty (no operation changes, no events)
+- No hot archive restored keys are collected
+- No read-only TTL bumps are applied
+
+This matches stellar-core's `parallelApply`, which checks
+`if (!txResult.isSuccess()) return {false, {}}` immediately after
+`preParallelApply`.
 
 ---
 
@@ -2313,7 +2433,12 @@ Each transaction's metadata contains:
 3. **`txChangesAfter`**: Ledger entry changes from post-apply
    processing (Soroban fee refunds). Empty for classic transactions.
 
-4. **`sorobanMeta`** (v3/v4): Present for Soroban transactions:
+4. **`sorobanMeta`** (v3/v4): Present for Soroban transactions,
+   including those that fail during pre-apply (e.g., insufficient fee
+   balance). stellar-core's `setNonRefundableResourceFee()` activates
+   the soroban meta field in `commonPreApply` before any failure path,
+   so even a failed Soroban TX produces soroban meta with fee extension
+   fields when the Soroban resource fee has been set. Contents:
    - Contract events (v3: all events here; v4: events moved to
      per-operation `OperationMetaV2.events`).
    - Return value from host function invocation.

@@ -985,10 +985,10 @@ Once all buffered ledgers are drained:
 | Component | Retry Policy |
 |-----------|-------------|
 | Catchup pipeline (top-level) | No retry — single attempt. |
-| HAS download | Up to 10 retries with archive rotation. |
-| Ledger header download | Multiple retries with archive rotation. |
-| Bucket download | Multiple retries with archive rotation. |
-| Transaction file download | Multiple retries with archive rotation. |
+| HAS download | Up to `RETRY_A_FEW` (5) retries with archive rotation. |
+| Ledger header download | Up to `RETRY_A_LOT` (32) retries with archive rotation. |
+| Bucket download | Up to `RETRY_A_LOT` (32) retries with archive rotation. |
+| Transaction file download | Up to `RETRY_A_LOT` (32) retries with archive rotation. |
 | Ledger chain verification | No retry. |
 | Bucket application | No retry. |
 | Transaction replay (per-checkpoint) | No retry. |
