@@ -60,11 +60,12 @@ use henyey_scp::SlotIndex;
 pub const CONSENSUS_STUCK_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// Interval for out-of-sync recovery attempts.
-pub const OUT_OF_SYNC_RECOVERY_INTERVAL: Duration = Duration::from_secs(5);
+/// Spec: HERDER_SPEC §16 — OUT_OF_SYNC_RECOVERY_TIMER = 10 seconds.
+pub const OUT_OF_SYNC_RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Maximum number of slots to keep ahead when purging during recovery.
-/// Matches stellar-core LEDGER_VALIDITY_BRACKET.
-pub const LEDGER_VALIDITY_BRACKET: u32 = 15;
+/// Spec: HERDER_SPEC §16 — LEDGER_VALIDITY_BRACKET = 100.
+pub const LEDGER_VALIDITY_BRACKET: u32 = 100;
 
 /// Commands sent to the sync recovery manager.
 #[derive(Debug)]

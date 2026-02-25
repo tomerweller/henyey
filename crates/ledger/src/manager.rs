@@ -4537,14 +4537,15 @@ fn create_genesis_header() -> LedgerHeader {
         },
         tx_set_result_hash: Hash([0u8; 32]),
         bucket_list_hash: Hash([0u8; 32]),
-        ledger_seq: 0,
-        total_coins: 0,
+        // Spec: LEDGER_SPEC §13.1 — genesis ledger constants.
+        ledger_seq: 1,
+        total_coins: 1_000_000_000_000_000_000, // 100 billion XLM in stroops
         fee_pool: 0,
         inflation_seq: 0,
         id_pool: 0,
         base_fee: 100,
-        base_reserve: 5_000_000,
-        max_tx_set_size: 1000,
+        base_reserve: 100_000_000, // 10 XLM in stroops
+        max_tx_set_size: 100,
         skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
         ext: stellar_xdr::curr::LedgerHeaderExt::V0,
     }
@@ -4954,7 +4955,7 @@ mod tests {
     #[test]
     fn test_genesis_header() {
         let header = create_genesis_header();
-        // Validate ALL genesis header fields (parity: LedgerHeaderTests.cpp:26 "genesisledger")
+        // Validate ALL genesis header fields per LEDGER_SPEC §13.1.
         assert_eq!(header.ledger_version, 0);
         assert_eq!(header.previous_ledger_hash, Hash([0u8; 32]));
         assert_eq!(header.scp_value.tx_set_hash, Hash([0u8; 32]));
@@ -4962,14 +4963,14 @@ mod tests {
         assert_eq!(header.scp_value.upgrades.len(), 0);
         assert_eq!(header.tx_set_result_hash, Hash([0u8; 32]));
         assert_eq!(header.bucket_list_hash, Hash([0u8; 32]));
-        assert_eq!(header.ledger_seq, 0);
-        assert_eq!(header.total_coins, 0);
+        assert_eq!(header.ledger_seq, 1);
+        assert_eq!(header.total_coins, 1_000_000_000_000_000_000);
         assert_eq!(header.fee_pool, 0);
         assert_eq!(header.inflation_seq, 0);
         assert_eq!(header.id_pool, 0);
         assert_eq!(header.base_fee, 100);
-        assert_eq!(header.base_reserve, 5_000_000);
-        assert_eq!(header.max_tx_set_size, 1000);
+        assert_eq!(header.base_reserve, 100_000_000);
+        assert_eq!(header.max_tx_set_size, 100);
         assert_eq!(header.skip_list.len(), 4);
         for skip in &header.skip_list {
             assert_eq!(*skip, Hash([0u8; 32]));

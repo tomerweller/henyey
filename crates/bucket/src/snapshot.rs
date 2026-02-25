@@ -908,9 +908,15 @@ impl SearchableBucketListSnapshot {
                                 seen_accounts.insert(account.account_id.clone());
 
                                 // Only count accounts with an inflation destination
+                                // and balance >= 100 XLM (1,000,000,000 stroops).
+                                // Spec: BUCKETLISTDB_SPEC §10.6 — minimum balance for
+                                // vote counting is hardcoded at 100 XLM, independent of
+                                // the minBalance parameter.
                                 if let Some(dest) = &account.inflation_dest {
-                                    *vote_counts.entry(dest.clone()).or_insert(0) +=
-                                        account.balance;
+                                    if account.balance >= 1_000_000_000 {
+                                        *vote_counts.entry(dest.clone()).or_insert(0) +=
+                                            account.balance;
+                                    }
                                 }
                             }
                         }
@@ -1632,12 +1638,14 @@ mod tests {
         let dest1 = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0xAA; 32])));
         let dest2 = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0xBB; 32])));
 
-        // Account 1 votes for dest1 with 100 stroops
+        // Account 1 votes for dest1 with balance below 100 XLM threshold (500M stroops).
+        // Per BUCKETLISTDB_SPEC §10.6, accounts with balance < 1B stroops (100 XLM)
+        // are excluded from vote counting entirely.
         let entry1 = LedgerEntry {
             last_modified_ledger_seq: 1,
             data: LedgerEntryData::Account(AccountEntry {
                 account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1; 32]))),
-                balance: 100,
+                balance: 500_000_000, // 50 XLM — below 100 XLM threshold
                 seq_num: SequenceNumber(1),
                 num_sub_entries: 0,
                 inflation_dest: Some(dest1.clone()),
@@ -1650,12 +1658,12 @@ mod tests {
             ext: LedgerEntryExt::V0,
         };
 
-        // Account 2 votes for dest2 with 1000 stroops
+        // Account 2 votes for dest2 with balance above 100 XLM threshold (2B stroops).
         let entry2 = LedgerEntry {
             last_modified_ledger_seq: 1,
             data: LedgerEntryData::Account(AccountEntry {
                 account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2; 32]))),
-                balance: 1000,
+                balance: 2_000_000_000, // 200 XLM — above 100 XLM threshold
                 seq_num: SequenceNumber(1),
                 num_sub_entries: 0,
                 inflation_dest: Some(dest2.clone()),
@@ -1682,18 +1690,19 @@ mod tests {
         let snapshot = BucketListSnapshot::new(&bucket_list, header);
         let searchable = SearchableBucketListSnapshot::new(snapshot, BTreeMap::new());
 
-        // With min_balance=500, only dest2 should qualify
+        // With min_balance=500, only dest2 should qualify (account 1 is below
+        // the 100 XLM vote counting threshold so its votes aren't counted at all)
         let winners = searchable.load_inflation_winners(10, 500);
         assert_eq!(winners.len(), 1);
         assert_eq!(winners[0].account_id, dest2);
-        assert_eq!(winners[0].votes, 1000);
+        assert_eq!(winners[0].votes, 2_000_000_000);
 
-        // With min_balance=0, both should qualify
+        // With min_balance=0, only dest2 qualifies — account 1 is below the
+        // hardcoded 100 XLM threshold and its votes are not counted.
         let winners = searchable.load_inflation_winners(10, 0);
-        assert_eq!(winners.len(), 2);
-        // dest2 should be first (higher votes)
+        assert_eq!(winners.len(), 1);
         assert_eq!(winners[0].account_id, dest2);
-        assert_eq!(winners[1].account_id, dest1);
+        assert_eq!(winners[0].votes, 2_000_000_000);
     }
 
     #[tokio::test(flavor = "multi_thread")]

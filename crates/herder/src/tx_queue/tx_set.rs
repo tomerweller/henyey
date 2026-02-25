@@ -204,10 +204,7 @@ impl TransactionSet {
     ///
     /// For legacy (non-generalized) transaction sets, only basic fee validation and
     /// sort order checks are performed.
-    pub fn prepare_for_apply(
-        &self,
-        network_id: NetworkId,
-    ) -> std::result::Result<Self, String> {
+    pub fn prepare_for_apply(&self, network_id: NetworkId) -> std::result::Result<Self, String> {
         if let Some(ref gen) = self.generalized_tx_set {
             Self::prepare_generalized_for_apply(gen, network_id)
         } else {
@@ -245,11 +242,7 @@ impl TransactionSet {
                 TransactionPhase::V1(parallel) => {
                     for stage in parallel.execution_stages.iter() {
                         for cluster in stage.iter() {
-                            validate_wire_txs(
-                                cluster.as_slice(),
-                                network_id,
-                                expect_soroban,
-                            )?;
+                            validate_wire_txs(cluster.as_slice(), network_id, expect_soroban)?;
                             all_transactions.extend(cluster.iter().cloned());
                         }
                     }
@@ -280,24 +273,18 @@ impl TransactionSet {
     ) -> std::result::Result<Self, String> {
         for env in transactions {
             validate_tx_fee(env)?;
-            let frame =
-                henyey_tx::TransactionFrame::with_network(env.clone(), network_id);
+            let frame = henyey_tx::TransactionFrame::with_network(env.clone(), network_id);
             if frame.is_soroban() {
-                return Err(
-                    "Legacy transaction set contains Soroban transaction".to_string(),
-                );
+                return Err("Legacy transaction set contains Soroban transaction".to_string());
             }
         }
 
         if !is_sorted_by_hash(transactions) {
-            return Err(
-                "Legacy transaction set transactions are not sorted correctly".to_string(),
-            );
+            return Err("Legacy transaction set transactions are not sorted correctly".to_string());
         }
 
-        let hash =
-            Self::compute_non_generalized_hash(previous_ledger_hash, transactions)
-                .ok_or_else(|| "Failed to compute tx set hash".to_string())?;
+        let hash = Self::compute_non_generalized_hash(previous_ledger_hash, transactions)
+            .ok_or_else(|| "Failed to compute tx set hash".to_string())?;
 
         Ok(Self {
             hash,
@@ -307,7 +294,6 @@ impl TransactionSet {
         })
     }
 }
-
 
 /// Maximum allowed Soroban resource fee (2^50), matching upstream MAX_RESOURCE_FEE.
 const MAX_RESOURCE_FEE: i64 = 1i64 << 50;
@@ -334,10 +320,7 @@ fn validate_generalized_tx_set_xdr_structure(
             }
             TransactionPhase::V1(parallel) => {
                 if phase_id != 1 {
-                    return Err(format!(
-                        "Non-Soroban parallel phase at index {}",
-                        phase_id
-                    ));
+                    return Err(format!("Non-Soroban parallel phase at index {}", phase_id));
                 }
                 validate_parallel_component(parallel)?;
             }
@@ -439,9 +422,7 @@ fn validate_tx_fee(env: &TransactionEnvelope) -> std::result::Result<(), String>
             }
             TransactionEnvelope::Tx(e) => match &e.tx.ext {
                 stellar_xdr::curr::TransactionExt::V0 => {
-                    return Err(
-                        "Soroban transaction missing SorobanTransactionData".to_string(),
-                    );
+                    return Err("Soroban transaction missing SorobanTransactionData".to_string());
                 }
                 stellar_xdr::curr::TransactionExt::V1(data) => {
                     let resource_fee = data.resource_fee;

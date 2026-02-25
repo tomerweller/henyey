@@ -80,6 +80,21 @@ pub struct AuthCert {
     pub sig: [u8; 64],
 }
 
+/// Constant-time byte array comparison to prevent timing side-channel attacks.
+///
+/// Returns `true` if `a` and `b` are equal, without leaking information about
+/// which bytes differ through timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 impl AuthCert {
     /// Creates a new authentication certificate.
     ///
@@ -646,7 +661,9 @@ impl AuthContext {
                         &v0.mac.mac[..8],
                         &recv_key.key[..8]
                     );
-                    if expected_mac.mac != v0.mac.mac {
+                    // Spec: OVERLAY_SPEC §3.4 — MAC comparison MUST be constant-time
+                    // to prevent timing side-channel attacks.
+                    if !constant_time_eq(&expected_mac.mac, &v0.mac.mac) {
                         return Err(OverlayError::MacVerificationFailed);
                     }
                 }

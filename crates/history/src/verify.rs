@@ -380,12 +380,14 @@ pub fn verify_has_passphrase(has: &HistoryArchiveState, expected: &str) -> Resul
 /// The HAS contains bucket hashes for each level of the BucketList.
 /// This function verifies the structure is well-formed.
 pub fn verify_has_structure(has: &HistoryArchiveState) -> Result<()> {
-    // Check we have the expected number of levels (typically 11)
-    // but we allow flexibility since the structure may vary
-    if has.current_buckets.is_empty() {
-        return Err(HistoryError::VerificationFailed(
-            "HAS has no bucket levels".to_string(),
-        ));
+    // Spec: CATCHUP_SPEC §3.1 — the number of levels MUST equal 11.
+    const EXPECTED_BUCKET_LEVELS: usize = 11;
+    if has.current_buckets.len() != EXPECTED_BUCKET_LEVELS {
+        return Err(HistoryError::VerificationFailed(format!(
+            "HAS has {} bucket levels, expected {}",
+            has.current_buckets.len(),
+            EXPECTED_BUCKET_LEVELS
+        )));
     }
 
     // Check version is supported
@@ -394,6 +396,13 @@ pub fn verify_has_structure(has: &HistoryArchiveState) -> Result<()> {
             "unsupported HAS version: {}",
             has.version
         )));
+    }
+
+    // Spec: CATCHUP_SPEC §3.1 — version 2 MUST include a networkPassphrase field.
+    if has.version >= 2 && has.network_passphrase.is_none() {
+        return Err(HistoryError::VerificationFailed(
+            "HAS version 2 requires networkPassphrase field".to_string(),
+        ));
     }
 
     Ok(())

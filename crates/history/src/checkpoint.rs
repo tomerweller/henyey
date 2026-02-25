@@ -85,13 +85,20 @@ pub fn next_checkpoint(seq: u32) -> u32 {
 /// ```
 /// use henyey_history::checkpoint::checkpoint_start;
 ///
-/// assert_eq!(checkpoint_start(0), 0);
-/// assert_eq!(checkpoint_start(63), 0);
+/// assert_eq!(checkpoint_start(0), 1);
+/// assert_eq!(checkpoint_start(63), 1);
 /// assert_eq!(checkpoint_start(64), 64);
 /// assert_eq!(checkpoint_start(127), 64);
 /// ```
+///
+/// Spec: CATCHUP_SPEC §4.3 — `firstInCheckpointContaining(L) = checkpointContaining(L) - sizeOf(L) + 1`.
+/// For the first checkpoint (L < 64): 63 - 63 + 1 = 1.
 pub fn checkpoint_start(seq: u32) -> u32 {
-    (seq / CHECKPOINT_FREQUENCY) * CHECKPOINT_FREQUENCY
+    if seq < CHECKPOINT_FREQUENCY {
+        1
+    } else {
+        (seq / CHECKPOINT_FREQUENCY) * CHECKPOINT_FREQUENCY
+    }
 }
 
 /// Alias for checkpoint_start to match stellar-core HistoryManager naming.
@@ -101,7 +108,8 @@ pub use checkpoint_start as first_ledger_in_checkpoint_containing;
 
 /// Get the ledger immediately before the checkpoint containing `seq`.
 ///
-/// Returns `None` if `seq` is in the first checkpoint (ledgers 0-63).
+/// Returns `None` if `seq` is in the first checkpoint (ledgers 1-63).
+/// The first checkpoint starts at ledger 1 (there is no real ledger 0).
 ///
 /// # Examples
 ///
@@ -116,7 +124,8 @@ pub use checkpoint_start as first_ledger_in_checkpoint_containing;
 /// ```
 pub fn last_ledger_before_checkpoint_containing(seq: u32) -> Option<u32> {
     let start = checkpoint_start(seq);
-    if start == 0 {
+    // First checkpoint starts at ledger 1; there's no real ledger before it.
+    if start <= 1 {
         None
     } else {
         Some(start - 1)
@@ -125,21 +134,26 @@ pub fn last_ledger_before_checkpoint_containing(seq: u32) -> Option<u32> {
 
 /// Get the size (number of ledgers) in the checkpoint containing `seq`.
 ///
-/// This is always 64 except for the first checkpoint which contains
-/// ledgers 0-63 (64 ledgers total, but ledger 0 is genesis).
+/// The first checkpoint contains ledgers 1-63 (63 ledgers, since ledger 0
+/// is not a real ledger). All subsequent checkpoints contain exactly 64 ledgers.
+/// Spec: CATCHUP_SPEC §4.3 — `sizeOfCheckpointContaining(L) = L < freq ? freq - 1 : freq`.
 ///
 /// # Examples
 ///
 /// ```
 /// use henyey_history::checkpoint::size_of_checkpoint_containing;
 ///
-/// assert_eq!(size_of_checkpoint_containing(0), 64);
-/// assert_eq!(size_of_checkpoint_containing(63), 64);
+/// assert_eq!(size_of_checkpoint_containing(0), 63);
+/// assert_eq!(size_of_checkpoint_containing(63), 63);
 /// assert_eq!(size_of_checkpoint_containing(64), 64);
 /// assert_eq!(size_of_checkpoint_containing(127), 64);
 /// ```
-pub fn size_of_checkpoint_containing(_seq: u32) -> u32 {
-    CHECKPOINT_FREQUENCY
+pub fn size_of_checkpoint_containing(seq: u32) -> u32 {
+    if seq < CHECKPOINT_FREQUENCY {
+        CHECKPOINT_FREQUENCY - 1
+    } else {
+        CHECKPOINT_FREQUENCY
+    }
 }
 
 /// Get the range of ledgers in the checkpoint identified by `checkpoint_ledger_seq`.
@@ -155,9 +169,9 @@ pub fn checkpoint_range(checkpoint_ledger_seq: u32) -> (u32, u32) {
         "not a checkpoint ledger: {}",
         checkpoint_ledger_seq
     );
-    // Handle first checkpoint (63) specially to avoid underflow
+    // Handle first checkpoint (63) — starts at ledger 1 per CATCHUP_SPEC §4.3
     let start = if checkpoint_ledger_seq < CHECKPOINT_FREQUENCY {
-        0
+        1
     } else {
         checkpoint_ledger_seq - CHECKPOINT_FREQUENCY + 1
     };
@@ -226,8 +240,10 @@ mod tests {
 
     #[test]
     fn test_checkpoint_start() {
-        assert_eq!(checkpoint_start(0), 0);
-        assert_eq!(checkpoint_start(63), 0);
+        // First checkpoint starts at ledger 1 (ledger 0 is not a real ledger).
+        // Spec: CATCHUP_SPEC §4.3 — firstInCheckpointContaining(L < freq) = 1.
+        assert_eq!(checkpoint_start(0), 1);
+        assert_eq!(checkpoint_start(63), 1);
         assert_eq!(checkpoint_start(64), 64);
         assert_eq!(checkpoint_start(127), 64);
         assert_eq!(checkpoint_start(128), 128);
@@ -254,7 +270,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_range() {
-        assert_eq!(checkpoint_range(63), (0, 63));
+        assert_eq!(checkpoint_range(63), (1, 63));
         assert_eq!(checkpoint_range(127), (64, 127));
         assert_eq!(checkpoint_range(191), (128, 191));
     }
@@ -277,7 +293,7 @@ mod tests {
 
     #[test]
     fn test_last_ledger_before_checkpoint_containing() {
-        // First checkpoint (0-63) has no ledger before it
+        // First checkpoint (1-63) has no real ledger before it.
         assert_eq!(last_ledger_before_checkpoint_containing(0), None);
         assert_eq!(last_ledger_before_checkpoint_containing(63), None);
         // Second checkpoint (64-127) is preceded by ledger 63
@@ -290,8 +306,10 @@ mod tests {
 
     #[test]
     fn test_size_of_checkpoint_containing() {
-        assert_eq!(size_of_checkpoint_containing(0), 64);
-        assert_eq!(size_of_checkpoint_containing(63), 64);
+        // First checkpoint has 63 ledgers (1-63), not 64.
+        // Spec: CATCHUP_SPEC §4.3 — sizeOfCheckpointContaining(L < freq) = freq - 1.
+        assert_eq!(size_of_checkpoint_containing(0), 63);
+        assert_eq!(size_of_checkpoint_containing(63), 63);
         assert_eq!(size_of_checkpoint_containing(64), 64);
         assert_eq!(size_of_checkpoint_containing(1000), 64);
     }
@@ -299,8 +317,8 @@ mod tests {
     #[test]
     fn test_first_ledger_in_checkpoint_containing() {
         // Alias for checkpoint_start
-        assert_eq!(first_ledger_in_checkpoint_containing(0), 0);
-        assert_eq!(first_ledger_in_checkpoint_containing(63), 0);
+        assert_eq!(first_ledger_in_checkpoint_containing(0), 1);
+        assert_eq!(first_ledger_in_checkpoint_containing(63), 1);
         assert_eq!(first_ledger_in_checkpoint_containing(64), 64);
         assert_eq!(first_ledger_in_checkpoint_containing(127), 64);
         assert_eq!(first_ledger_in_checkpoint_containing(128), 128);

@@ -104,7 +104,7 @@ use henyey_common::Hash256;
 use henyey_history::{
     archive::HistoryArchive,
     archive_state::HistoryArchiveState,
-    download::RETRY_A_FEW,
+    download::{RETRY_A_FEW, RETRY_A_LOT},
     paths::{bucket_path, checkpoint_path},
     verify, CheckpointData,
 };
@@ -1583,8 +1583,8 @@ impl HistoryWorkBuilder {
     ///
     /// Creates and registers all download work items (HAS, buckets, headers,
     /// transactions, results, SCP) with proper dependency ordering. Each work
-    /// item is configured with `RETRY_A_FEW` (5) retry attempts, matching
-    /// stellar-core.
+    /// item is configured with appropriate retry counts per CATCHUP_SPEC §9.1:
+    /// HAS downloads use `RETRY_A_FEW` (10), bulk downloads use `RETRY_A_LOT` (32).
     ///
     /// # Returns
     ///
@@ -1600,6 +1600,7 @@ impl HistoryWorkBuilder {
             RETRY_A_FEW,
         );
 
+        // Spec: CATCHUP_SPEC §9.1 — bucket downloads use RETRY_A_LOT (32).
         let buckets_id = scheduler.add_work(
             Box::new(DownloadBucketsWork::new(
                 Arc::clone(&self.archive),
@@ -1607,9 +1608,10 @@ impl HistoryWorkBuilder {
                 self.bucket_dir.clone(),
             )),
             vec![has_id],
-            RETRY_A_FEW,
+            RETRY_A_LOT,
         );
 
+        // Spec: CATCHUP_SPEC §9.1 — ledger header downloads use RETRY_A_LOT (32).
         let headers_id = scheduler.add_work(
             Box::new(DownloadLedgerHeadersWork::new(
                 Arc::clone(&self.archive),
@@ -1617,9 +1619,10 @@ impl HistoryWorkBuilder {
                 Arc::clone(&self.state),
             )),
             vec![has_id],
-            RETRY_A_FEW,
+            RETRY_A_LOT,
         );
 
+        // Spec: CATCHUP_SPEC §9.1 — transaction file downloads use RETRY_A_LOT (32).
         let tx_id = scheduler.add_work(
             Box::new(DownloadTransactionsWork::new(
                 Arc::clone(&self.archive),
@@ -1627,7 +1630,7 @@ impl HistoryWorkBuilder {
                 Arc::clone(&self.state),
             )),
             vec![headers_id],
-            RETRY_A_FEW,
+            RETRY_A_LOT,
         );
 
         let tx_results_id = scheduler.add_work(
@@ -1637,7 +1640,7 @@ impl HistoryWorkBuilder {
                 Arc::clone(&self.state),
             )),
             vec![headers_id, tx_id],
-            RETRY_A_FEW,
+            RETRY_A_LOT,
         );
 
         let scp_id = scheduler.add_work(
@@ -2194,8 +2197,8 @@ impl BatchDownloadWorkBuilder {
     /// - Results depend on headers and transactions (for verification)
     /// - SCP depends on headers (for context)
     ///
-    /// Each work item is configured with `RETRY_A_FEW` (5) retry attempts,
-    /// matching stellar-core.
+    /// Each work item is configured per CATCHUP_SPEC §9.1:
+    /// ledger/tx/result downloads use `RETRY_A_LOT` (32), SCP uses `RETRY_A_FEW` (10).
     ///
     /// # Returns
     ///
@@ -2209,7 +2212,7 @@ impl BatchDownloadWorkBuilder {
                 self.state.clone(),
             )),
             vec![],
-            RETRY_A_FEW,
+            RETRY_A_LOT,
         );
 
         let transactions_id = scheduler.add_work(
@@ -2220,7 +2223,7 @@ impl BatchDownloadWorkBuilder {
                 self.state.clone(),
             )),
             vec![headers_id],
-            RETRY_A_FEW,
+            RETRY_A_LOT,
         );
 
         let results_id = scheduler.add_work(
@@ -2231,7 +2234,7 @@ impl BatchDownloadWorkBuilder {
                 self.state.clone(),
             )),
             vec![headers_id, transactions_id],
-            RETRY_A_FEW,
+            RETRY_A_LOT,
         );
 
         let scp_id = scheduler.add_work(

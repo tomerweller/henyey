@@ -369,7 +369,8 @@ impl AccountState {
 const FEE_MULTIPLIER: u64 = 10;
 
 /// Default pending depth (number of ledgers before auto-ban).
-const DEFAULT_PENDING_DEPTH: u32 = 10;
+/// Spec: HERDER_SPEC §16 — TRANSACTION_QUEUE_TIMEOUT_LEDGERS = 4.
+const DEFAULT_PENDING_DEPTH: u32 = 4;
 
 pub(super) fn envelope_fee_per_op(envelope: &TransactionEnvelope) -> Option<(u64, u64, u32)> {
     QueuedTransaction::extract_fee_and_ops(envelope)
@@ -698,7 +699,7 @@ impl TransactionQueue {
     ) -> std::result::Result<(), henyey_tx::TxResultCode> {
         use henyey_tx::{
             validate_ledger_bounds, validate_signatures, validate_time_bounds, LedgerContext,
-            TxResultCode, TransactionFrame,
+            TransactionFrame, TxResultCode,
         };
 
         let frame = TransactionFrame::with_network(envelope.clone(), self.config.network_id);
@@ -761,8 +762,11 @@ impl TransactionQueue {
         // Validate preconditions (extra signers / min seq age+gap)
         if let Preconditions::V2(cond) = frame.preconditions() {
             if !cond.extra_signers.is_empty() {
-                match extra_signers_satisfied(envelope, &self.config.network_id, &cond.extra_signers)
-                {
+                match extra_signers_satisfied(
+                    envelope,
+                    &self.config.network_id,
+                    &cond.extra_signers,
+                ) {
                     Ok(true) => {}
                     _ => return Err(TxResultCode::TxBadAuth),
                 }
@@ -1204,10 +1208,11 @@ impl TransactionQueue {
         let is_fee_bump = is_fee_bump_envelope(&queued.envelope);
         let new_fee_source_key = fee_source_key(&queued.envelope);
 
-        let replaced_tx = match self.check_account_limit(&queued, &seq_source_key, new_seq, is_fee_bump) {
-            Ok(replaced) => replaced,
-            Err(result) => return result,
-        };
+        let replaced_tx =
+            match self.check_account_limit(&queued, &seq_source_key, new_seq, is_fee_bump) {
+                Ok(replaced) => replaced,
+                Err(result) => return result,
+            };
 
         let seed = if cfg!(test) {
             0
@@ -1298,7 +1303,9 @@ impl TransactionQueue {
             if let Some(available) = provider.get_available_balance(&fee_source_id) {
                 // available - net_new_fee < current_total_fees means insufficient
                 if available.saturating_sub(net_new_fee) < current_total_fees {
-                    return TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxInsufficientBalance));
+                    return TxQueueResult::Invalid(Some(
+                        henyey_tx::TxResultCode::TxInsufficientBalance,
+                    ));
                 }
             } else {
                 // Account doesn't exist
@@ -1532,10 +1539,8 @@ impl TransactionQueue {
         let mut accounts_to_cleanup: Vec<Vec<u8>> = Vec::new();
 
         for (envelope, applied_seq) in applied_txs {
-            let frame = henyey_tx::TransactionFrame::with_network(
-                envelope.clone(),
-                self.config.network_id,
-            );
+            let frame =
+                henyey_tx::TransactionFrame::with_network(envelope.clone(), self.config.network_id);
 
             // Get sequence-number-source (inner source for fee-bump)
             let seq_source_id = henyey_tx::muxed_to_account_id(&frame.inner_source_account());
@@ -1858,14 +1863,12 @@ fn precondition_hash_and_signatures<'a>(
 ) -> std::result::Result<(Hash256, &'a [DecoratedSignature]), &'static str> {
     match envelope {
         TransactionEnvelope::TxV0(env) => {
-            let frame =
-                henyey_tx::TransactionFrame::with_network(envelope.clone(), *network_id);
+            let frame = henyey_tx::TransactionFrame::with_network(envelope.clone(), *network_id);
             let hash = frame.hash(network_id).map_err(|_| "tx hash error")?;
             Ok((hash, env.signatures.as_slice()))
         }
         TransactionEnvelope::Tx(env) => {
-            let frame =
-                henyey_tx::TransactionFrame::with_network(envelope.clone(), *network_id);
+            let frame = henyey_tx::TransactionFrame::with_network(envelope.clone(), *network_id);
             let hash = frame.hash(network_id).map_err(|_| "tx hash error")?;
             Ok((hash, env.signatures.as_slice()))
         }
@@ -2845,8 +2848,7 @@ mod tests {
 
         let mut dex_count = 0;
         for tx in &set.transactions {
-            let frame =
-                henyey_tx::TransactionFrame::with_network(tx.clone(), NetworkId::testnet());
+            let frame = henyey_tx::TransactionFrame::with_network(tx.clone(), NetworkId::testnet());
             if frame.has_dex_operations() {
                 dex_count += 1;
             }
@@ -4374,11 +4376,10 @@ mod tests {
         let mut envelope = make_soroban_envelope(500);
         if let TransactionEnvelope::Tx(ref mut env) = envelope {
             let mut ops: Vec<Operation> = env.tx.operations.to_vec();
-            ops[0].source_account =
-                Some(MuxedAccount::MuxedEd25519(MuxedAccountMed25519 {
-                    id: 99,
-                    ed25519: Uint256([109u8; 32]),
-                }));
+            ops[0].source_account = Some(MuxedAccount::MuxedEd25519(MuxedAccountMed25519 {
+                id: 99,
+                ed25519: Uint256([109u8; 32]),
+            }));
             env.tx.operations = ops.try_into().unwrap();
         }
         set_source(&mut envelope, 110);
@@ -4430,9 +4431,7 @@ mod tests {
         let read_only: Vec<LedgerKey> = (0..read_only_entries)
             .map(|i| {
                 LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-                    account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
-                        [i as u8; 32],
-                    ))),
+                    account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([i as u8; 32]))),
                 })
             })
             .collect();

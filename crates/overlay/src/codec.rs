@@ -26,8 +26,13 @@ use bytes::{Buf, BufMut, BytesMut};
 use stellar_xdr::curr::{AuthenticatedMessage, Limits, ReadXdr, WriteXdr};
 use tokio_util::codec::{Decoder, Encoder};
 
-/// Maximum message size (32 MB) - prevents memory exhaustion.
-const MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024;
+/// Maximum message size (16 MB) - prevents memory exhaustion.
+/// Spec: OVERLAY_SPEC §3.1 — MAX_MESSAGE_SIZE = 16,777,216 bytes.
+const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
+/// Maximum message size before authentication completes.
+/// Spec: OVERLAY_SPEC §3.1 — unauthenticated messages (Hello/Auth) MUST NOT exceed 4,096 bytes.
+const MAX_UNAUTHENTICATED_MESSAGE_SIZE: usize = 4096;
 
 /// Minimum message size - must fit at least the authenticated message header.
 const MIN_MESSAGE_SIZE: usize = 12;
@@ -78,6 +83,9 @@ impl MessageFrame {
 pub struct MessageCodec {
     /// Current state of the decoder state machine.
     decode_state: DecodeState,
+    /// Whether authentication has completed. Before auth, messages are limited
+    /// to MAX_UNAUTHENTICATED_MESSAGE_SIZE (4096 bytes).
+    authenticated: bool,
 }
 
 /// Internal state machine for streaming message decoding.
@@ -100,7 +108,16 @@ impl MessageCodec {
     pub fn new() -> Self {
         Self {
             decode_state: DecodeState::ReadingLength,
+            authenticated: false,
         }
+    }
+
+    /// Mark the codec as authenticated, allowing full-size messages.
+    ///
+    /// Before this is called, incoming messages are limited to 4,096 bytes
+    /// per OVERLAY_SPEC §3.1.
+    pub fn set_authenticated(&mut self) {
+        self.authenticated = true;
     }
 
     /// Encodes a message to bytes with length prefix.
@@ -167,10 +184,17 @@ impl Decoder for MessageCodec {
                             len
                         )));
                     }
-                    if len > MAX_MESSAGE_SIZE {
+                    // Enforce size limit based on authentication state.
+                    // Spec: OVERLAY_SPEC §3.1 — before auth completes, limit to 4,096 bytes.
+                    let max_size = if self.authenticated {
+                        MAX_MESSAGE_SIZE
+                    } else {
+                        MAX_UNAUTHENTICATED_MESSAGE_SIZE
+                    };
+                    if len > max_size {
                         return Err(OverlayError::Message(format!(
-                            "message too large: {} bytes",
-                            len
+                            "message too large: {} bytes (limit: {})",
+                            len, max_size
                         )));
                     }
 

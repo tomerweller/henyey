@@ -40,14 +40,17 @@ use tracing::{debug, info, warn};
 /// Maximum phase duration for collecting (default: 30 minutes).
 const MAX_COLLECTING_PHASE_DURATION: Duration = Duration::from_secs(30 * 60);
 
-/// Maximum phase duration for reporting (default: 60 minutes).
-const MAX_REPORTING_PHASE_DURATION: Duration = Duration::from_secs(60 * 60);
+/// Maximum phase duration for reporting (default: 3 hours).
+/// Spec: OVERLAY_SPEC §8.3 — MAX_REPORTING_PHASE_DURATION = 3 hours.
+const MAX_REPORTING_PHASE_DURATION: Duration = Duration::from_secs(3 * 60 * 60);
 
 /// Number of ledgers before survey messages are ignored.
-const NUM_LEDGERS_BEFORE_IGNORE: u32 = 10;
+/// Spec: OVERLAY_SPEC §8.3 — NUM_LEDGERS_BEFORE_IGNORE = 6.
+const NUM_LEDGERS_BEFORE_IGNORE: u32 = 6;
 
 /// Maximum requests per ledger from a single surveyor.
-const MAX_REQUEST_LIMIT_PER_LEDGER: u32 = 100;
+/// Spec: OVERLAY_SPEC §8.3 — MAX_REQUEST_LIMIT_PER_LEDGER = 10.
+const MAX_REQUEST_LIMIT_PER_LEDGER: u32 = 10;
 
 /// Throttle timeout multiplier for survey requests.
 pub const SURVEY_THROTTLE_TIMEOUT_MULT: u32 = 3;

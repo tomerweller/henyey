@@ -452,7 +452,8 @@ pub fn validate_ledger_bounds(
         }
 
         // Check max ledger (0 means no limit)
-        if lb.max_ledger > 0 && current > lb.max_ledger {
+        // Spec: TX_SPEC §4.2.3 — ledger sequence MUST be strictly less than maxLedger.
+        if lb.max_ledger > 0 && current >= lb.max_ledger {
             return Err(ValidationError::BadLedgerBounds {
                 min: lb.min_ledger,
                 max: lb.max_ledger,
@@ -480,6 +481,13 @@ fn validate_soroban_resources(
     context: &LedgerContext,
 ) -> std::result::Result<(), ValidationError> {
     if !frame.is_soroban() {
+        // Spec: TX_SPEC §4.2.6 — a non-Soroban transaction MUST NOT carry
+        // SorobanTransactionData. Result: txMALFORMED.
+        if frame.soroban_data().is_some() {
+            return Err(ValidationError::InvalidStructure(
+                "non-Soroban transaction must not carry SorobanTransactionData".to_string(),
+            ));
+        }
         return Ok(());
     }
 
@@ -1475,9 +1483,9 @@ mod tests {
         let custom = LedgerContext::new(
             300,
             7000,
-            100,  // base_fee
+            100,     // base_fee
             5000000, // base_reserve
-            25,   // protocol_version
+            25,      // protocol_version
             NetworkId::testnet(),
         );
         assert_eq!(custom.sequence, 300);

@@ -72,7 +72,7 @@ impl Default for FlowControlConfig {
             flow_control_send_more_batch_size: 40,
             outbound_tx_queue_byte_limit: 3 * 1024 * 1024, // 3 MB (match stellar-core)
             max_tx_set_size_ops: 10000,
-            flow_control_bytes_batch_size: 300 * 1024, // 300 KB
+            flow_control_bytes_batch_size: 100_000, // 100 KB (spec: OVERLAY_SPEC §5.1)
         }
     }
 }
@@ -376,8 +376,12 @@ impl FlowControl {
         config: FlowControlConfig,
         scp_callback: Option<Arc<dyn ScpQueueCallback>>,
     ) -> Self {
-        let initial_bytes_capacity =
-            config.peer_flood_reading_capacity * config.flow_control_bytes_batch_size;
+        // Spec: OVERLAY_SPEC §5.2 — initial byte capacity is
+        // FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES (the byte batch size itself),
+        // NOT peer_flood_reading_capacity * byte_batch_size.
+        // stellar-core: FlowControlCapacity.cpp initializes mCapacity.mTotalCapacity
+        // as getConfig().FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES.
+        let initial_bytes_capacity = config.flow_control_bytes_batch_size;
 
         Self {
             state: Mutex::new(FlowControlState {

@@ -33,10 +33,10 @@ use crate::error::HistoryError;
 /// Default timeout for HTTP requests.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Retry count for operations that should retry a few times.
+/// Retry count for operations that should retry a few times (e.g. HAS downloads).
 ///
-/// Matches stellar-core's `RETRY_A_FEW = 5`.
-pub const RETRY_A_FEW: u32 = 5;
+/// Spec: CATCHUP_SPEC §9.1 — HAS download: up to 10 retries with archive rotation.
+pub const RETRY_A_FEW: u32 = 10;
 
 /// Retry count for operations that should retry many times.
 ///

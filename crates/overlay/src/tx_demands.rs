@@ -40,10 +40,12 @@ const MAX_DELAY_DEMAND: Duration = Duration::from_secs(2);
 pub const TX_DEMAND_VECTOR_MAX_SIZE: usize = 1000;
 
 /// Default demand period (milliseconds).
-const DEFAULT_DEMAND_PERIOD_MS: u64 = 500;
+/// Spec: OVERLAY_SPEC §6.3.2 — DEMAND_PERIOD = 200ms.
+const DEFAULT_DEMAND_PERIOD_MS: u64 = 200;
 
 /// Default backoff delay per attempt (milliseconds).
-const DEFAULT_BACKOFF_DELAY_MS: u64 = 50;
+/// Spec: OVERLAY_SPEC §6.3.2 — BACKOFF_DELAY = 500ms.
+const DEFAULT_BACKOFF_DELAY_MS: u64 = 500;
 
 /// Configuration for transaction demands.
 #[derive(Debug, Clone)]

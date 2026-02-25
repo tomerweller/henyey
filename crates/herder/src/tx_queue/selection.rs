@@ -77,10 +77,8 @@ impl TransactionQueue {
             let mut lane_for_tx = Vec::with_capacity(classic_txs.len());
 
             for tx in &classic_txs {
-                let frame = henyey_tx::TransactionFrame::with_network(
-                    tx.clone(),
-                    self.config.network_id,
-                );
+                let frame =
+                    henyey_tx::TransactionFrame::with_network(tx.clone(), self.config.network_id);
                 let lane = if has_dex_lane && frame.has_dex_operations() {
                     crate::surge_pricing::DEX_LANE
                 } else {
@@ -489,5 +487,4 @@ impl TransactionQueue {
             classic_limited,
         }
     }
-
 }
