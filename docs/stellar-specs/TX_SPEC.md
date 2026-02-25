@@ -242,7 +242,7 @@ are:
 | 9 | `INFLATION` | <12 | Distribute inflation (disabled from protocol 12). |
 | 10 | `MANAGE_DATA` | ≥2 | Create, update, or delete a data entry. |
 | 11 | `BUMP_SEQUENCE` | ≥10 | Bump source account sequence number. |
-| 12 | `MANAGE_BUY_OFFER` | ≥12 | Create, update, or delete a buy offer. |
+| 12 | `MANAGE_BUY_OFFER` | ≥11 | Create, update, or delete a buy offer. |
 | 13 | `PATH_PAYMENT_STRICT_SEND` | ≥12 | Payment through DEX path; exact source amount. |
 | 14 | `CREATE_CLAIMABLE_BALANCE` | ≥14 | Create a claimable balance with claim predicates. |
 | 15 | `CLAIM_CLAIMABLE_BALANCE` | ≥14 | Claim a claimable balance. |
@@ -321,6 +321,15 @@ Signers are identified by `SignerKey`, a union with four types:
 | `KEY_TYPE_PRE_AUTH_TX` | SHA-256 hash of a transaction envelope; consumed on use. |
 | `KEY_TYPE_HASH_X` | SHA-256 preimage; the signature is the preimage itself. |
 | `KEY_TYPE_ED25519_SIGNED_PAYLOAD` | Ed25519 key plus a payload that must match the signed data. `@version(≥19)` |
+
+**Signature hints**: Each `DecoratedSignature` includes a 4-byte hint
+to speed up signer lookup:
+- `ED25519`: last 4 bytes of the ed25519 public key.
+- `PRE_AUTH_TX`: last 4 bytes of the pre-auth transaction hash.
+- `HASH_X`: last 4 bytes of the hashX value.
+- `ED25519_SIGNED_PAYLOAD`: `last4bytes(ed25519_key) XOR last4bytes(payload)`.
+  If the payload is shorter than 4 bytes, it is right-padded with
+  zero bytes to 4 bytes before XOR. See CAP-0040.
 
 ---
 
@@ -481,10 +490,11 @@ function checkSignature(signers, neededWeight, contentHash, signatures):
                         break
 
                 case HASH_X:
-                    if sha256(sig.signature) == signer.hashX:
-                        usedSignatures.add(index)
-                        totalWeight += signer.weight
-                        break
+                    if sig.hint == last4bytes(signer.hashX):
+                        if sha256(sig.signature) == signer.hashX:
+                            usedSignatures.add(index)
+                            totalWeight += signer.weight
+                            break
 
                 case ED25519:
                     if sig.hint == last4bytes(signer.ed25519):
@@ -494,12 +504,16 @@ function checkSignature(signers, neededWeight, contentHash, signatures):
                             break
 
                 case ED25519_SIGNED_PAYLOAD:
-                    if sig.hint == last4bytes(signer.ed25519):
-                        if signer.payload == contentHash.payload:
-                            if ed25519Verify(signer.ed25519, contentHash, sig.signature):
-                                usedSignatures.add(index)
-                                totalWeight += signer.weight
-                                break
+                    // Hint is XOR of last 4 bytes of ed25519 key
+                    // and last 4 bytes of payload (zero-padded if
+                    // payload < 4 bytes). See CAP-0040.
+                    if sig.hint == xorHint(signer.ed25519SignedPayload):
+                        // Verify signature against the signer's
+                        // payload (NOT the transaction hash).
+                        if ed25519Verify(signer.ed25519, signer.payload, sig.signature):
+                            usedSignatures.add(index)
+                            totalWeight += signer.weight
+                            break
 
             // @version(≥10): cap accumulated weight
             totalWeight = min(totalWeight, UINT8_MAX)
@@ -950,7 +964,8 @@ operation types. For each operation, the specification defines:
 Creates a new account with a starting XLM balance.
 
 **Validation**:
-- `startingBalance` MUST be > 0. Result: `CREATE_ACCOUNT_MALFORMED`.
+- `@version(<14)`: `startingBalance` MUST be > 0. `@version(≥14)`:
+  `startingBalance` MUST be ≥ 0. Result: `CREATE_ACCOUNT_MALFORMED`.
 - `destination` MUST NOT equal the source account. Result:
   `CREATE_ACCOUNT_MALFORMED`.
 
@@ -1097,7 +1112,7 @@ a common base):
 
 ### 7.6 ManageBuyOffer
 
-Creates, updates, or deletes a buy offer on the DEX. `@version(≥12)`.
+Creates, updates, or deletes a buy offer on the DEX. `@version(≥11)`.
 
 The algorithm is identical to ManageSellOffer with the following
 differences:
@@ -1114,6 +1129,46 @@ differences:
 Creates a passive sell offer. Equivalent to ManageSellOffer with
 `offerID = 0` and `passive = true`. A passive offer does not cross
 offers at the same price — it only crosses at strictly better prices.
+
+### 7.7.1 Liabilities Model
+
+`@version(≥10)` (CAP-0003): Accounts and trustlines track aggregate
+**buying** and **selling liabilities** from outstanding offers.
+Liabilities are stored in `AccountEntry.ext.v1().liabilities` and
+`TrustLineEntry.ext.v1().liabilities`.
+
+**Available balance** (how much can be sold/sent):
+```
+availableBalance(account, native) =
+    account.balance - minBalance(account) - account.sellingLiabilities
+availableBalance(trustline) =
+    trustline.balance - trustline.sellingLiabilities
+```
+
+**Available limit** (how much can be received):
+```
+availableLimit(account, native) =
+    INT64_MAX - account.balance - account.buyingLiabilities
+availableLimit(trustline) =
+    trustline.limit - trustline.balance - trustline.buyingLiabilities
+```
+
+**Offer liabilities**: When an offer with `(price, amount)` is
+placed, the liabilities it reserves are computed via the exchange
+function (Section 7.29.1):
+- `offerSellingLiabilities` = amount of selling asset committed
+- `offerBuyingLiabilities` = amount of buying asset expected
+
+**Validation invariant** `@version(≥10)`:
+- `availableBalance >= offerSellingLiabilities`, else
+  `MANAGE_SELL_OFFER_UNDERFUNDED`.
+- `availableLimit >= offerBuyingLiabilities`, else
+  `MANAGE_SELL_OFFER_LINE_FULL`.
+
+**Lifecycle**: Liabilities are incremented when offers are created or
+updated, and decremented when offers are deleted, fully consumed, or
+partially filled. On each crossing, both parties' liabilities are
+adjusted to reflect the exchanged amounts.
 
 ### 7.8 SetOptions
 
@@ -1215,25 +1270,35 @@ remaining native balance.
 **Threshold level**: HIGH.
 
 **Validation**:
-- `@version(≥19)`: If the source has a `MAX_SEQ_NUM_TO_APPLY` entry,
-  it MUST NOT be merged (prevents replay after recreation).
-  Result: `ACCOUNT_MERGE_SEQNUM_TOO_FAR`.
+- Source MUST NOT equal destination. Result: `ACCOUNT_MERGE_MALFORMED`.
 
-**Execution**:
-1. Source MUST NOT have any sub-entries (trustlines, offers, data,
-   signers). Result: `ACCOUNT_MERGE_HAS_SUB_ENTRIES`.
-2. Source MUST NOT be an active sponsor (numSponsoring > 0).
-   Result: `ACCOUNT_MERGE_HAS_SUB_ENTRIES` `@version(≥14)`.
-3. Source MUST NOT be actively sponsored (numSponsored > 0, with
-   exceptions for self-sponsoring).
-4. `@version(≥10)`: Source MUST NOT have any selling liabilities.
-   Result: `ACCOUNT_MERGE_HAS_SUB_ENTRIES`.
-5. Source MUST NOT be `AUTH_IMMUTABLE`. Result:
+**Execution** (two code paths exist — `doApplyBeforeV16` and
+`doApplyFromV16` — but the observable check ordering from
+`@version(≥16)` onward is described here; the pre-v16 path has minor
+differences for stale-account handling in `@version(5..8)`):
+
+1. Destination MUST exist. Result: `ACCOUNT_MERGE_NO_ACCOUNT`.
+2. Source MUST NOT be `AUTH_IMMUTABLE`. Result:
    `ACCOUNT_MERGE_IMMUTABLE_SET`.
-6. Destination MUST exist. Result: `ACCOUNT_MERGE_NO_ACCOUNT`.
+3. Source MUST NOT have non-signer sub-entries (i.e.,
+   `numSubEntries != signers.size()`). Result:
+   `ACCOUNT_MERGE_HAS_SUB_ENTRIES`.
+4. `@version(≥10)`: Source sequence number MUST be less than the
+   starting sequence number for the current ledger
+   (`currentLedgerSeq << 32`). This prevents the account from
+   "jumping backwards" if recreated. `@version(≥19)`: Additionally,
+   if a `MAX_SEQ_NUM_TO_APPLY` entry exists and its value is ≥ the
+   starting sequence number, the merge is also rejected.
+   Result: `ACCOUNT_MERGE_SEQNUM_TOO_FAR`.
+5. `@version(≥14)`: Source MUST NOT be an active sponsor — both the
+   sponsorship counter (external sponsorships) and `numSponsoring`
+   (on the account entry itself) must be zero.
+   Result: `ACCOUNT_MERGE_IS_SPONSOR`.
+6. `@version(≥14)`: Remove all signers from the source account
+   (with sponsorship cleanup).
 7. Transfer: `destination.balance += source.balance`. Check for
    overflow. Result: `ACCOUNT_MERGE_DEST_FULL`.
-8. Remove source account.
+8. Remove source account (with sponsorship cleanup).
 9. Return `source.balance` as the merge result value.
 
 ### 7.12 Inflation
@@ -1580,6 +1645,52 @@ liquidity pools `@version(≥18)`:
 from the same account. If detected, the operation fails with
 `OFFER_CROSS_SELF`.
 
+#### 7.29.1 Exchange Algorithm (exchangeV10)
+
+`@version(≥10)` (CAP-0004): The exchange function computes the
+amounts exchanged when two offers cross. Terminology:
+- **wheat**: the aggressor offer (from the operation).
+- **sheep**: the passive offer (from the order book).
+- `price = { n, d }`: the sheep offer's price (sheep per wheat).
+
+**Sizing**:
+```
+wheatValue = min(maxWheatSend * price.n, maxSheepReceive * price.d)
+sheepValue = min(maxWheatReceive * price.n, maxSheepSend * price.d)
+wheatStays = (wheatValue > sheepValue)
+```
+
+**Rounding guarantees**:
+1. The smaller offer is always fully consumed (removed from book).
+2. Rounding error favors the offer that stays in the book.
+3. In `NORMAL` mode: if the rounding would cause > 1% price error
+   for either party, no trade occurs and the smaller offer is
+   removed with zero exchange amounts.
+4. In `PATH_PAYMENT_STRICT_RECEIVE` mode: the rounding may favor the
+   wheat side (book) by an arbitrary amount (the path payment's
+   `sendMax` provides protection).
+5. In `PATH_PAYMENT_STRICT_SEND` mode: `sheepSend > 0` is always
+   guaranteed when a trade occurs.
+
+**Computation branches** (determined by `wheatStays` and `price.n`
+vs `price.d`):
+- When `wheatStays` and (`price.n > price.d` or `STRICT_RECEIVE`):
+  `wheatReceive = floor(sheepValue / price.n)`,
+  `sheepSend = ceil(wheatReceive * price.n / price.d)`.
+- When `wheatStays` and `price.n <= price.d` (NORMAL):
+  `sheepSend = floor(sheepValue / price.d)`,
+  `wheatReceive = floor(sheepSend * price.d / price.n)`.
+- When `!wheatStays` and `price.n > price.d`:
+  `wheatReceive = floor(wheatValue / price.n)`,
+  `sheepSend = floor(wheatReceive * price.n / price.d)`.
+- When `!wheatStays` and `price.n <= price.d`:
+  `sheepSend = floor(wheatValue / price.d)`,
+  `wheatReceive = ceil(sheepSend * price.d / price.n)`.
+
+After computation, a 1% price error threshold is applied in `NORMAL`
+mode: if `sheepSend * price.d < wheatReceive * price.n` (sheep
+seller underpaid) beyond the threshold, the exchange is zeroed out.
+
 ---
 
 ## 8. Soroban Execution
@@ -1695,7 +1806,33 @@ function doApply(op, ltx):
 - `HOST_FUNCTION_TYPE_CREATE_CONTRACT`: Create a new contract instance.
 - `HOST_FUNCTION_TYPE_UPLOAD_WASM`: Upload a Wasm module.
 - `HOST_FUNCTION_TYPE_CREATE_CONTRACT_V2` `@version(≥22)`: Create a
-  contract with constructor arguments.
+  contract with constructor arguments. Uses `CreateContractArgsV2`
+  which includes `contractIDPreimage`, `executable`, and
+  `constructorArgs<>` (vector of `SCVal`).
+
+  **Constructor semantics** (CAP-0058):
+  - A Wasm exporting `__constructor` is considered to have a
+    constructor, but only if the Wasm's Soroban environment version
+    is ≥22.  Pre-v22 environment Wasms never have constructor
+    semantics even if they export `__constructor`.
+  - When creating a contract from constructor-enabled Wasm, the host
+    calls `__constructor` with the provided `constructorArgs`
+    immediately after creating the contract instance entry. If
+    `__constructor` fails (trap, error, or returns a non-Void value),
+    creation fails and all changes are rolled back.
+  - If a contract without a constructor is given ≥1 constructor
+    arguments, creation fails.
+  - Contracts without a constructor may be treated as having a
+    "default" 0-argument constructor. Passing 0 arguments succeeds.
+  - The legacy `HOST_FUNCTION_TYPE_CREATE_CONTRACT` is preserved for
+    backward compatibility: it works for contracts with no constructor
+    or an explicitly defined 0-argument constructor.
+  - Constructors are NOT called on Wasm updates, only on initial
+    creation.
+  - **Authorization**: `SOROBAN_AUTHORIZED_FUNCTION_TYPE_CREATE_CONTRACT_V2_HOST_FN`
+    authorizes `CreateContractArgsV2` payloads. The legacy
+    `SOROBAN_AUTHORIZED_FUNCTION_TYPE_CREATE_CONTRACT_HOST_FN` may
+    still be used for contracts with 0 constructor arguments.
 
 **Entry liveness**: An entry is **live** at ledger `L` if its TTL entry
 has `liveUntilLedgerSeq ≥ L`. Archived entries (not live) MUST NOT be
@@ -1822,7 +1959,7 @@ Transaction metadata version depends on the protocol:
 |----------|-------------|---------------|
 | <20 | v2 | Classic operations only. |
 | 20–22 | v3 | Adds `SorobanTransactionMeta` with events, return value, diagnostics. |
-| ≥23 | v4 | Per-operation events, transaction-level events, `SorobanTransactionMetaV2`. |
+| ≥23 | v4 | Per-operation events, transaction-level events, `SorobanTransactionMetaV2`. See CAP-0067. |
 
 ### 10.2 Meta Structure
 
@@ -1835,19 +1972,65 @@ Each transaction's metadata contains:
 2. **`operations`**: An array of `OperationMeta` (v2/v3) or
    `OperationMetaV2` (v4), one per operation. Each records:
    - The ledger entry changes made by that operation.
-   - `@version(≥23)` (v4): Contract events emitted by that operation.
+   - `@version(≥23)` (v4): Contract events emitted by that operation
+     (`ContractEvent events<>`).
 
 3. **`txChangesAfter`**: Ledger entry changes from post-apply
    processing (Soroban fee refunds). Empty for classic transactions.
 
 4. **`sorobanMeta`** (v3/v4): Present for Soroban transactions:
-   - Contract events (v3: all events here; v4: per-operation).
+   - Contract events (v3: all events here; v4: events moved to
+     per-operation `OperationMetaV2.events`).
    - Return value from host function invocation.
-   - Diagnostic events.
-   - `@version(≥23)` (v4): `nonRefundableResourceFeeCharged`,
+   - Diagnostic events (v3 only; v4 uses `diagnosticEvents` at
+     transaction level).
+   - `@version(≥23)` (v4): `SorobanTransactionMetaV2` with extended
+     fields: `nonRefundableResourceFeeCharged`,
      `rentFeeCharged`, `totalRefundableResourceFeeCharged`.
 
-### 10.3 Ledger Entry Change Types
+5. **`events`** (v4 only): Transaction-level `TransactionEvent`
+   entries. Used for fee charge/refund events (Section 11.4).
+
+6. **`diagnosticEvents`** (v4 only): Transaction-level diagnostic
+   events (`DiagnosticEvent` entries).
+
+### 10.3 XDR Structures (v4)
+
+`@version(≥23)`:
+
+```
+TransactionMetaV4 {
+    ext:              ExtensionPoint,
+    txChangesBefore:  LedgerEntryChanges,
+    operations:       OperationMetaV2[],
+    txChangesAfter:   LedgerEntryChanges,
+    sorobanMeta:      SorobanTransactionMetaV2*,  // optional
+    events:           TransactionEvent[],
+    diagnosticEvents: DiagnosticEvent[],
+}
+
+OperationMetaV2 {
+    ext:     ExtensionPoint,
+    changes: LedgerEntryChanges,
+    events:  ContractEvent[],
+}
+
+TransactionEvent {
+    stage: TransactionEventStage,  // BEFORE_ALL_TXS or AFTER_ALL_TXS
+    event: ContractEvent,
+}
+
+SorobanTransactionMetaV2 {
+    ext:         SorobanTransactionMetaExt,
+    returnValue: SCVal*,  // optional
+}
+```
+
+`SorobanTransactionMetaExt` may contain (v1 extension):
+`nonRefundableResourceFeeCharged`, `rentFeeCharged`,
+`totalRefundableResourceFeeCharged`.
+
+### 10.4 Ledger Entry Change Types
 
 | Change Type | Meaning |
 |-------------|---------|
@@ -1865,7 +2048,7 @@ Changes are recorded as pairs:
   for hot archive restores, or replaces STATE for live BucketList
   restores). `@version(≥23)`.
 
-### 10.4 Change Recording
+### 10.5 Change Recording
 
 Changes are computed by comparing the entry map of the committed ltx
 against the parent's state:
@@ -1881,7 +2064,191 @@ against the parent's state:
 
 ## 11. Event Emission
 
-### 11.1 Soroban Contract Events
+`@version(≥23)`: Classic operations emit **Stellar Asset Contract
+(SAC) events** for all asset movements. These are placed in
+per-operation `OperationMetaV2.events` for operation-level events
+and `TransactionMetaV4.events` for transaction-level events (fees).
+See CAP-0067.
+
+Classic SAC events are NOT hashed into the ledger (unlike Soroban
+contract events which are hashed via `InvokeHostFunctionResult`).
+
+### 11.1 Event Structure
+
+All SAC events use the following `ContractEvent` structure:
+
+```
+ContractEvent {
+    type:       CONTRACT,
+    contractID: getAssetContractID(networkID, asset),
+    body: V0 {
+        topics: [eventName, ...addresses..., sep0011AssetString],
+        data:   <event-type-specific>,
+    },
+}
+```
+
+**Contract ID derivation**: The contract ID is the SHA-256 hash of
+`HashIDPreimage::ENVELOPE_TYPE_CONTRACT_ID` with `networkID` and
+`CONTRACT_ID_PREIMAGE_FROM_ASSET(asset)`. This is computed
+deterministically — the SAC does not need to be deployed.
+
+**SEP-0011 asset string**: The last topic is always an `SCV_STRING`:
+- Native: `"native"`
+- Credit alphanum4/12: `"<CODE>:<ISSUER_STRKEY>"`
+
+**Address stripping**: All `SCAddress` values in topics have muxed
+info dropped: `SC_ADDRESS_TYPE_MUXED_ACCOUNT` is converted to
+`SC_ADDRESS_TYPE_ACCOUNT` using only the `ed25519` key.
+
+### 11.2 Event Types
+
+#### 11.2.1 `transfer`
+
+```
+topics: [Symbol("transfer"), Address(from), Address(to), String(sep0011Asset)]
+data:   i128(amount)  OR  Map{Symbol("amount"): i128, Symbol("to_muxed_id"): <mux>}
+```
+
+#### 11.2.2 `mint`
+
+```
+topics: [Symbol("mint"), Address(to), String(sep0011Asset)]
+data:   i128(amount)  OR  Map{Symbol("amount"): i128, Symbol("to_muxed_id"): <mux>}
+```
+
+#### 11.2.3 `burn`
+
+```
+topics: [Symbol("burn"), Address(from), String(sep0011Asset)]
+data:   i128(amount)
+```
+
+#### 11.2.4 `clawback`
+
+```
+topics: [Symbol("clawback"), Address(from), String(sep0011Asset)]
+data:   i128(amount)
+```
+
+#### 11.2.5 `set_authorized`
+
+```
+topics: [Symbol("set_authorized"), Address(id), String(sep0011Asset)]
+data:   Bool(authorized)
+```
+
+#### 11.2.6 `fee` (transaction-level only)
+
+```
+topics: [Symbol("fee"), Address(feeSource)]
+data:   i128(amount)
+```
+
+Fee events are wrapped in `TransactionEvent { stage, event }`.
+The `fee` event has no `sep0011Asset` topic — it is always native
+XLM, identified by the contract ID. Zero-amount fee events are
+suppressed.
+
+### 11.3 Muxed Data (`to_muxed_id`)
+
+The `data` field for `transfer` and `mint` events may be either a
+plain `i128(amount)` or an `SCV_MAP` containing both the amount and
+a muxed identifier. The map format is used when **all** of the
+following hold:
+
+1. The event's `allowMuxedIdOrMemo` flag is `true` (see per-operation
+   table below).
+2. The `to` address is either:
+   - `SC_ADDRESS_TYPE_MUXED_ACCOUNT` — `to_muxed_id` is
+     `U64(muxedAccount.id)`, OR
+   - `SC_ADDRESS_TYPE_ACCOUNT` with a non-`MEMO_NONE` transaction
+     memo — `to_muxed_id` is the memo value:
+     - `MEMO_TEXT` → `SCV_STRING`
+     - `MEMO_ID` → `SCV_U64`
+     - `MEMO_HASH` → `SCV_BYTES`
+     - `MEMO_RETURN` → `SCV_BYTES`
+
+`burn` and `clawback` events always use plain `i128(amount)`.
+
+### 11.4 Issuer Detection
+
+When an operation transfers assets using `transferWithIssuerCheck`,
+the event type is determined by whether `from` or `to` is the asset
+issuer:
+
+| `from` is issuer | `to` is issuer | Event emitted |
+|------------------|----------------|---------------|
+| No | No | `transfer` |
+| Yes | No | `mint` (issuer is source = minting) |
+| No | Yes | `burn` (sending to issuer = burning) |
+| Yes | Yes | `transfer` (issuer-to-issuer) |
+
+An address is the issuer only for credit assets (alphanum4/12),
+never for native or pool-share assets. For muxed accounts, only the
+underlying `ed25519` key is compared.
+
+### 11.5 Per-Operation Event Semantics
+
+| Operation | Events | `allowMuxedIdOrMemo` | Notes |
+|-----------|--------|---------------------|-------|
+| Payment | `transferWithIssuerCheck` | Yes | Single event; may be mint/burn for issuer. |
+| PathPaymentStrictReceive | claim-atom events + final `transferWithIssuerCheck` | No (claims), Yes (final) | One pair of events per claim atom; final event to destination. |
+| PathPaymentStrictSend | claim-atom events + final `transferWithIssuerCheck` | No (claims), Yes (final) | Same as strict-receive. |
+| CreateAccount | `transfer` (XLM) | Yes | Source → new account. |
+| AccountMerge | `transfer` (XLM) | Yes | Source → destination. |
+| Clawback | `clawback` | No | From the clawed-back account. |
+| ClawbackClaimableBalance | `clawback` | No | From the claimable balance address. |
+| AllowTrust | `set_authorized` | No | Sets authorization flag. May trigger pool withdrawal events (see below). |
+| SetTrustLineFlags | `set_authorized` | No | Same as AllowTrust. |
+| CreateClaimableBalance | `transferWithIssuerCheck` | No | Source → claimable-balance address (`SC_ADDRESS_TYPE_CLAIMABLE_BALANCE`). |
+| ClaimClaimableBalance | `transferWithIssuerCheck` | No | Claimable-balance address → claimer. |
+| LiquidityPoolDeposit | `transfer` × 2 | No | One per deposited asset (source → pool address). |
+| LiquidityPoolWithdraw | `transfer` × 2 | No | One per withdrawn asset (pool address → source). |
+| ManageSellOffer | claim-atom events | No | Two events per traded claim atom (one per side). |
+| ManageBuyOffer | claim-atom events | No | Same as ManageSellOffer. |
+| CreatePassiveSellOffer | claim-atom events | No | Same as ManageSellOffer. |
+| Inflation | `mint` (XLM) | No | One per inflation winner. |
+
+**Claim-atom events**: For each `ClaimAtom` in an offer trade, two
+`transferWithIssuerCheck` events are emitted: one for the asset sold
+by the offer owner, one for the asset bought. The `allowMuxedIdOrMemo`
+flag is always `false` for claim-atom events.
+
+**Deauthorization side effects**: When AllowTrust or SetTrustLineFlags
+deauthorizes a trustline that participates in a liquidity pool, the
+automatic pool withdrawal emits additional `transfer` and/or `burn`
+events for the withdrawn assets and pool shares.
+
+### 11.6 Extended Address Types
+
+`@version(≥23)`: The following `SCAddressType` variants are used in
+events to reference non-account/non-contract addresses:
+
+- `SC_ADDRESS_TYPE_CLAIMABLE_BALANCE`: Used as `from`/`to` in
+  CreateClaimableBalance and ClaimClaimableBalance events.
+- `SC_ADDRESS_TYPE_LIQUIDITY_POOL`: Used as `from`/`to` in
+  LiquidityPoolDeposit and LiquidityPoolWithdraw events.
+- `SC_ADDRESS_TYPE_MUXED_ACCOUNT`: Used for muxed account
+  destinations. Stripped from topics (converted to
+  `SC_ADDRESS_TYPE_ACCOUNT`); the muxed ID is conveyed via
+  `to_muxed_id` in the data field.
+
+These address types MUST NOT be used in Soroban storage keys.
+
+### 11.7 Fee Events
+
+Fee charge and refund events are emitted at the transaction level
+(in `TransactionMetaV4.events`) with a `TransactionEventStage`:
+
+| Stage | Event | When |
+|-------|-------|------|
+| `BEFORE_ALL_TXS` | `fee` (positive amount) | Fee charged from fee source before any transactions execute. |
+| `AFTER_ALL_TXS` | `fee` (negative amount) | Fee refund to fee source after all transactions complete. |
+
+Zero-amount refund events are suppressed.
+
+### 11.8 Soroban Contract Events
 
 Soroban operations emit contract events during execution. These are
 collected by the host runtime and included in the transaction metadata:
@@ -1889,48 +2256,25 @@ collected by the host runtime and included in the transaction metadata:
 - `@version(20–22)` (meta v3): All events are placed in
   `sorobanMeta.events`.
 - `@version(≥23)` (meta v4): Events are placed per-operation in
-  `operations[i].events` and also aggregated in transaction-level
-  `events`.
+  `operations[i].events`.
 
-### 11.2 Classic SAC Events
+### 11.9 XLM Balance Reconciliation
 
-`@version(≥23)`: Classic operations that transfer, mint, burn, or
-authorize assets emit **Stellar Asset Contract (SAC) events**. These
-mirror what the equivalent Soroban token contract would emit:
+`@version(<8)` only: For pre-protocol-8 transactions that could
+create or destroy XLM due to historical bugs, a reconciliation pass
+emits corrective **mint** or **burn** events for the native asset.
 
-Event types:
-- `transfer(from, to, amount)`: Asset transferred between accounts.
-- `mint(admin, to, amount)`: Asset issued by the issuer.
-- `burn(from, amount)`: Asset burned (sent to issuer, clawback, or
-  merge).
-- `clawback(admin, from, amount)`: Asset clawed back by issuer.
-- `set_authorized(admin, id, flag)`: Authorization flags changed.
+The reconciler:
+1. Computes the net XLM balance delta across all modified accounts
+   in the operation's ledger changes.
+2. If `delta > 0`: emits `mint(native, opSource, delta)`, inserted
+   at the beginning of the operation's event list.
+3. If `delta < 0`: emits `burn(native, opSource, |delta|)`.
+4. If `delta == 0`: no event emitted.
 
-Events are emitted by the following operations:
-- **Payment/PathPayment**: `transfer` or `mint`/`burn` for issuer
-  interactions.
-- **CreateAccount**: `transfer` (XLM from source to destination).
-- **AccountMerge**: `transfer` (XLM from source to destination).
-- **Clawback**: `clawback`.
-- **AllowTrust/SetTrustLineFlags**: `set_authorized`.
-- **CreateClaimableBalance**: `transfer` (from source to claimable
-  balance).
-- **ClaimClaimableBalance**: `transfer` (from claimable balance to
-  claimer).
-- **ChangeTrust** (pool shares): `transfer`/`mint`/`burn` for pool
-  deposit/withdraw side effects.
-- **LiquidityPoolDeposit**: `transfer` for each deposited asset.
-- **LiquidityPoolWithdraw**: `transfer` for each withdrawn asset.
-- **Inflation**: `mint` for each inflation payout.
-
-### 11.3 XLM Balance Reconciliation
-
-`@version(≥23)`: For transactions that modify XLM balances across
-multiple accounts, a reconciliation pass ensures that the net XLM
-transfer events sum to zero (conservation of XLM). The reconciler
-tracks all XLM balance deltas from the pre-apply state to the
-post-apply state and emits `transfer` events for any unaccounted
-movements (such as fee deductions and reserve changes).
+The reconciler does NOT run for Inflation operations (which have
+their own explicit mint events). It only emits `mint`/`burn`, never
+`transfer`.
 
 ---
 

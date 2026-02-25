@@ -420,13 +420,26 @@ oldestLedgerInSnap(L, seq):
 
 ### 4.6 BucketList Hash
 
-The BucketList hash is computed as:
+The BucketList hash is computed differently depending on the
+protocol version:
 
+**Before protocol 23:**
 ```
 bucketListHash = SHA256(level_0_hash || level_1_hash || ... || level_10_hash)
 ```
 
-where each level hash is:
+**Protocol 23 and later** (CAP-0062):
+```
+liveHash       = SHA256(level_0_hash || level_1_hash || ... || level_10_hash)
+hotArchiveHash = SHA256(level_0_hash || level_1_hash || ... || level_10_hash)
+bucketListHash = SHA256(liveHash || hotArchiveHash)
+```
+
+The `liveHash` is computed over the Live BucketList levels and the
+`hotArchiveHash` is computed over the Hot Archive BucketList levels.
+Each BucketList has its own independent set of 11 levels.
+
+In both cases, each level hash is:
 
 ```
 level_hash(L) = SHA256(curr_hash(L) || snap_hash(L))

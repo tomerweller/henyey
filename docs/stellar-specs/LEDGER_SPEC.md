@@ -1012,6 +1012,9 @@ indicated protocol version):
 | 11 | `CONTRACT_EXECUTION_LANES` | 20 | Number of execution lanes for parallel processing. |
 | 12 | `BUCKETLIST_SIZE_WINDOW` | 20 | Sliding window of BucketList sizes for rent fee computation. |
 | 13 | `EVICTION_ITERATOR` | 20 | Current position of the eviction scan iterator. |
+| 14 | `CONTRACT_PARALLEL_COMPUTE` | 23 | Parallel Soroban execution settings (`ledgerMaxDependentTxClusters`). Upper bound: 128. See CAP-0063. |
+| 15 | `CONTRACT_LEDGER_COST_EXT` | 23 | Extended ledger cost parameters: `txMaxFootprintEntries` (max total read+write footprint entries per tx) and `feeWrite1KB` (flat-rate write fee per KB). |
+| 16 | `SCP_TIMING` | 23 | On-chain SCP consensus timing: `ledgerTargetCloseTimeMilliseconds`, `nominationTimeoutInitialMilliseconds`, `nominationTimeoutIncrementMilliseconds`, `ballotTimeoutInitialMilliseconds`, `ballotTimeoutIncrementMilliseconds`. See CAP-0070. |
 
 ### 9.3 Configuration Loading
 
@@ -1052,6 +1055,19 @@ Each host function has its own `constTerm` and `linearTerm` for both
 CPU and memory. The cost model parameters are stored in
 `CONTRACT_COST_PARAMS_CPU` and `CONTRACT_COST_PARAMS_MEMORY` and are
 updated during protocol version upgrades.
+
+The parameter arrays are sized per protocol version:
+
+| Protocol | Entry Count | Additions |
+|----------|------------|-----------|
+| 20 | 23 | Base cost types (IDs 0–22): Wasm execution, memory, hashing, Ed25519, ECDSA, integer ops, ChaCha20. |
+| 21 | 45 | Granular Wasm parse/instantiate types (IDs 23–42), secp256r1 verification (IDs 43–44). See CAP-0051/0054. |
+| 22–24 | 70 | BLS12-381 operations (IDs 45–69). See CAP-0059/0074. |
+| 25+ | 85 | BN254 operations (IDs 70–84), Poseidon/Poseidon2 hashes. See CAP-0074/0075. |
+
+During protocol upgrades, the arrays are resized and new entries are
+populated with calibrated default values. All `constTerm` and
+`linearTerm` values MUST be non-negative.
 
 ### 9.6 Rent Fee Computation
 
@@ -1131,19 +1147,25 @@ computation.
 
 ### 10.5 Module Cache
 
-For protocol 25+, a contract module cache is maintained to avoid
+For protocol 23+, a contract module cache is maintained to avoid
 recompiling smart contract bytecode on every invocation:
 
 1. **Compilation**: All `CONTRACT_CODE` entries are compiled for all
    supported protocol versions at startup and cached.
 2. **Incremental updates**: After each ledger close, newly added
    contracts are compiled and added to the cache; evicted contracts
-   are removed.
-3. **Rebuild heuristic**: If the cache memory arena has grown beyond
+   are removed. Evictions are processed before additions, so if the
+   same entry is both evicted and re-uploaded in a single ledger, the
+   cache will contain the entry after close.
+3. **Same-ledger upload**: A contract uploaded and invoked in the
+   same ledger incurs the full parse/validate/translate CPU cost.
+   The low-cost cached instantiation only applies starting in the
+   ledger after the contract is uploaded.
+4. **Rebuild heuristic**: If the cache memory arena has grown beyond
    twice the last compiled size (adjusted by a memory cost model
    multiplier), the entire cache is rebuilt to reclaim fragmented
    memory.
-4. **Background compilation**: Compilation MAY occur on a background
+5. **Background compilation**: Compilation MAY occur on a background
    thread. The pipeline MUST block at the start of the next ledger
    close to await completion.
 
@@ -1223,7 +1245,7 @@ Via the `unsealHeader` callback:
 
 #### Step 3: Conditional Module Cache Rebuild
 
-For protocol 25+, if the module cache arena has grown beyond the
+For protocol 23+, if the module cache arena has grown beyond the
 rebuild threshold, rebuild the entire module cache from the new
 BucketList snapshot.
 
@@ -1499,7 +1521,7 @@ order book and path finding.
 | `CHECKPOINT_FREQUENCY` | 64 | Ledger interval between history checkpoints. |
 | `CURRENT_LEDGER_PROTOCOL_VERSION` | 25 | Maximum supported protocol version. |
 | `TARGET_LEDGER_CLOSE_TIME_BEFORE_P23_MS` | 5000 | Expected ledger close time before protocol 23 (5 seconds). |
-| `REUSABLE_CONTRACT_MODULE_CACHE_PROTOCOL_VERSION` | 25 | Protocol version at which the reusable contract module cache is activated. |
+| `REUSABLE_CONTRACT_MODULE_CACHE_PROTOCOL_VERSION` | 23 | Protocol version at which the reusable contract module cache is activated. |
 
 ---
 

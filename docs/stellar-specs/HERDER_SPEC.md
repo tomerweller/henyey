@@ -693,7 +693,9 @@ checks MUST pass:
    - No component MAY be empty (zero transactions).
 
 5. **Parallel phase structure** (for phases with `v=1`):
-   - There MUST be at least one stage.
+   - The phase MAY contain zero or more stages.  A phase with
+     zero stages represents a transaction set with no Soroban
+     transactions (see CAP-0063).
    - No stage MAY be empty (zero clusters).
    - No cluster MAY be empty (zero transactions).
 
@@ -1688,20 +1690,35 @@ RECOMMENDED defaults derived from stellar-core v25.x:
 
 ### 17.3 SCP Timeout Parameters
 
-SCP timeout computation varies by protocol version:
+SCP timeout computation varies by protocol version (see CAP-0070):
 
 **Before protocol 23:**
 ```
 timeout(round) = 1000ms + (round - 1) * 1000ms
 ```
+Both nomination and ballot timeouts use the same formula.  The
+ledger target close time is hardcoded at 5000 ms.
 
 **Protocol 23 and later:**
-```
-timeout(round) = initialTimeout + (round - 1) * incrementPerRound
-```
 
-Where `initialTimeout` and `incrementPerRound` are configurable
-via Soroban network configuration.
+The following five parameters are stored on-chain via
+`CONFIG_SETTING_SCP_TIMING` (setting ID 16) and are upgradeable
+through the standard config-upgrade mechanism:
+
+| Parameter | Initial | Min | Max | Purpose |
+|-----------|---------|-----|-----|---------|
+| `ledgerTargetCloseTimeMilliseconds` | 5000 | 4000 | 5000 | Delay before triggering nomination of the next ledger. |
+| `nominationTimeoutInitialMilliseconds` | 1000 | 750 | 2500 | Initial timeout for SCP nomination rounds. |
+| `nominationTimeoutIncrementMilliseconds` | 1000 | 750 | 2000 | Per-round increment for nomination timeouts. |
+| `ballotTimeoutInitialMilliseconds` | 1000 | 750 | 2500 | Initial timeout for SCP ballot rounds. |
+| `ballotTimeoutIncrementMilliseconds` | 1000 | 750 | 2000 | Per-round increment for ballot timeouts. |
+
+The timeout formula for round `i`:
+```
+timeout(i) = initialTimeout + (i - 1) * incrementPerRound
+```
+where `initialTimeout` and `incrementPerRound` are chosen
+based on whether the timeout is for nomination or ballot.
 
 In all cases, the timeout is capped at `MAX_TIMEOUT_MS`
 (30 minutes = 1,800,000 ms).
