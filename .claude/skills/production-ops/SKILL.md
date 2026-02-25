@@ -58,7 +58,9 @@ Run a mainnet validator that tracks the live network. Operates in the
 ```
 
 **Monitor:** Continuously tail the tracker log for errors, hash
-mismatches, panics, or crashes. When an issue is found:
+mismatches, panics, crashes, or any other irregular logs (unexpected
+warnings, assertion failures, stuck ledger progression, unusual resource
+usage patterns, etc.). When an issue is found:
 1. Follow the Bug Fix Workflow below.
 2. Rebuild the binary.
 3. Restart the validator.
