@@ -268,92 +268,32 @@ impl Peer {
     }
 
     /// Perform the authentication handshake.
+    /// Perform the authenticated handshake with a peer.
+    ///
+    /// OVERLAY_SPEC §4.2: The handshake ordering depends on direction:
+    ///
+    /// **Initiator (outbound)**: Send HELLO -> Receive HELLO -> Send AUTH -> Receive AUTH
+    /// **Responder (inbound)**:  Receive HELLO -> Send HELLO -> Receive AUTH -> Send AUTH
+    ///
+    /// After authentication, both sides exchange SEND_MORE_EXTENDED for flow
+    /// control and GET_SCP_STATE to synchronize consensus state.
     async fn handshake(&mut self, timeout_secs: u64) -> Result<()> {
         self.state = PeerState::Handshaking;
         let handshake_start = std::time::Instant::now();
         debug!("Starting handshake with {}", self.connection.remote_addr());
 
-        // Send Hello
-        let hello = self.auth.create_hello();
-        debug!(
-            "Sending Hello: overlay_version={}, ledger_version={}, version_str={}, listening_port={}",
-            hello.overlay_version,
-            hello.ledger_version,
-            hello.version_str.to_string(),
-            hello.listening_port
-        );
-        let hello_msg = StellarMessage::Hello(hello);
-        self.send_raw(hello_msg).await?;
-        self.auth.hello_sent();
-        debug!("Hello sent, waiting for peer Hello...");
-
-        // Receive Hello
-        let frame = self
-            .connection
-            .recv_timeout(timeout_secs)
-            .await?
-            .ok_or_else(|| OverlayError::PeerDisconnected("no Hello received".to_string()))?;
-        debug!("Received frame with {} bytes", frame.raw_len);
-
-        let message = self
-            .auth
-            .unwrap_message(frame.message, frame.is_authenticated)?;
-
-        match message {
-            StellarMessage::Hello(peer_hello) => {
-                self.process_hello(peer_hello)?;
-            }
-            other => {
-                return Err(OverlayError::InvalidMessage(format!(
-                    "expected Hello, got {}",
-                    helpers::message_type_name(&other)
-                )));
-            }
-        }
-
-        // Send Auth - with MAC (we have keys now from processing Hello)
-        // Set AUTH_MSG_FLAG_FLOW_CONTROL_BYTES_REQUESTED = 200 to enable flow control
-        let auth_msg = StellarMessage::Auth(Auth { flags: 200 });
-        self.send_auth(auth_msg).await?;
-        self.auth.auth_sent();
-
-        // Receive Auth
-        let frame = self
-            .connection
-            .recv_timeout(timeout_secs)
-            .await?
-            .ok_or_else(|| OverlayError::PeerDisconnected("no Auth received".to_string()))?;
-
-        let message = self
-            .auth
-            .unwrap_message(frame.message, frame.is_authenticated)?;
-
-        match message {
-            StellarMessage::Auth(ref auth) => {
-                // Validate AUTH_MSG_FLAG_FLOW_CONTROL_BYTES_REQUESTED (200)
-                // Peers must set this flag to enable byte-based flow control
-                if auth.flags != 200 {
-                    return Err(OverlayError::InvalidMessage(format!(
-                        "Auth message missing flow control flag, got flags={}",
-                        auth.flags
-                    )));
-                }
-                self.auth.process_auth()?;
-            }
-            StellarMessage::ErrorMsg(err) => {
-                let err_msg: String = err.msg.to_string();
-                warn!("Peer sent error: code={:?}, msg={}", err.code, err_msg);
-                return Err(OverlayError::InvalidMessage(format!(
-                    "peer sent ERROR: code={:?}, msg={}",
-                    err.code, err_msg
-                )));
-            }
-            other => {
-                return Err(OverlayError::InvalidMessage(format!(
-                    "expected Auth, got {}",
-                    helpers::message_type_name(&other)
-                )));
-            }
+        if self.connection.we_called_remote() {
+            // --- Initiator (outbound): Send HELLO first, then receive ---
+            self.send_hello().await?;
+            self.recv_hello(timeout_secs).await?;
+            self.send_auth_msg().await?;
+            self.recv_auth(timeout_secs).await?;
+        } else {
+            // --- Responder (inbound): Receive HELLO first, then reply ---
+            self.recv_hello(timeout_secs).await?;
+            self.send_hello().await?;
+            self.recv_auth(timeout_secs).await?;
+            self.send_auth_msg().await?;
         }
 
         self.state = PeerState::Authenticated;
@@ -378,6 +318,101 @@ impl Peer {
         self.send(get_scp_state).await?;
         debug!("Sent GET_SCP_STATE to {}", self.info.peer_id);
 
+        Ok(())
+    }
+
+    /// Send our HELLO message (unauthenticated).
+    async fn send_hello(&mut self) -> Result<()> {
+        let hello = self.auth.create_hello();
+        debug!(
+            "Sending Hello: overlay_version={}, ledger_version={}, version_str={}, listening_port={}",
+            hello.overlay_version,
+            hello.ledger_version,
+            hello.version_str.to_string(),
+            hello.listening_port
+        );
+        let hello_msg = StellarMessage::Hello(hello);
+        self.send_raw(hello_msg).await?;
+        self.auth.hello_sent();
+        debug!("Hello sent to {}", self.connection.remote_addr());
+        Ok(())
+    }
+
+    /// Receive and process the peer's HELLO message.
+    async fn recv_hello(&mut self, timeout_secs: u64) -> Result<()> {
+        let frame = self
+            .connection
+            .recv_timeout(timeout_secs)
+            .await?
+            .ok_or_else(|| OverlayError::PeerDisconnected("no Hello received".to_string()))?;
+        debug!("Received frame with {} bytes", frame.raw_len);
+
+        let message = self
+            .auth
+            .unwrap_message(frame.message, frame.is_authenticated)?;
+
+        match message {
+            StellarMessage::Hello(peer_hello) => {
+                self.process_hello(peer_hello)?;
+            }
+            other => {
+                return Err(OverlayError::InvalidMessage(format!(
+                    "expected Hello, got {}",
+                    helpers::message_type_name(&other)
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Send AUTH message (authenticated with MAC, sequence 0).
+    async fn send_auth_msg(&mut self) -> Result<()> {
+        // AUTH_MSG_FLAG_FLOW_CONTROL_BYTES_REQUESTED = 200 to enable flow control
+        let auth_msg = StellarMessage::Auth(Auth { flags: 200 });
+        self.send_auth(auth_msg).await?;
+        self.auth.auth_sent();
+        debug!("Auth sent to {}", self.connection.remote_addr());
+        Ok(())
+    }
+
+    /// Receive and process the peer's AUTH message.
+    async fn recv_auth(&mut self, timeout_secs: u64) -> Result<()> {
+        let frame = self
+            .connection
+            .recv_timeout(timeout_secs)
+            .await?
+            .ok_or_else(|| OverlayError::PeerDisconnected("no Auth received".to_string()))?;
+
+        let message = self
+            .auth
+            .unwrap_message(frame.message, frame.is_authenticated)?;
+
+        match message {
+            StellarMessage::Auth(ref auth) => {
+                // Validate AUTH_MSG_FLAG_FLOW_CONTROL_BYTES_REQUESTED (200)
+                if auth.flags != 200 {
+                    return Err(OverlayError::InvalidMessage(format!(
+                        "Auth message missing flow control flag, got flags={}",
+                        auth.flags
+                    )));
+                }
+                self.auth.process_auth()?;
+            }
+            StellarMessage::ErrorMsg(err) => {
+                let err_msg: String = err.msg.to_string();
+                warn!("Peer sent error: code={:?}, msg={}", err.code, err_msg);
+                return Err(OverlayError::InvalidMessage(format!(
+                    "peer sent ERROR: code={:?}, msg={}",
+                    err.code, err_msg
+                )));
+            }
+            other => {
+                return Err(OverlayError::InvalidMessage(format!(
+                    "expected Auth, got {}",
+                    helpers::message_type_name(&other)
+                )));
+            }
+        }
         Ok(())
     }
 

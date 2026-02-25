@@ -1108,6 +1108,10 @@ impl OverlayManager {
         let mut periodic_interval = tokio::time::interval(Duration::from_secs(1));
         let mut ticks_since_ping: u32 = 0;
 
+        // OVERLAY_SPEC §7.2: Track whether we've received a PEERS message
+        // from this peer. At most one is allowed; duplicates cause a drop.
+        let mut received_peers = false;
+
         // Ping/RTT tracking (G4/G17): store the hash and send time of the
         // outstanding ping so we can compute round-trip time when the peer
         // responds with DontHave (or a matching ScpQuorumset).
@@ -1242,9 +1246,39 @@ impl OverlayManager {
 
                             // Route message — the CapacityGuard ensures
                             // end_message_processing runs even on early exit.
+                            // OVERLAY_SPEC §7.2: PEERS message validation.
+                            // - Only the responder sends PEERS, so if we ARE the
+                            //   responder (Inbound direction) and receive PEERS from
+                            //   the initiator, drop the connection.
+                            // - At most one PEERS message per connection.
+                            if matches!(message, StellarMessage::Peers(_)) {
+                                if peer.direction() == ConnectionDirection::Inbound {
+                                    warn!(
+                                        "Peer {} sent PEERS but we are the responder — dropping (OVERLAY_SPEC §7.2)",
+                                        peer_id
+                                    );
+                                    break;
+                                }
+                                if received_peers {
+                                    warn!(
+                                        "Peer {} sent duplicate PEERS — dropping (OVERLAY_SPEC §7.2)",
+                                        peer_id
+                                    );
+                                    break;
+                                }
+                                received_peers = true;
+                                // PEERS messages are consumed here for peer discovery.
+                                // TODO: store peer addresses from the PEERS payload
+                            }
+
                             'route: {
                                 if helpers::is_handshake_message(&message) {
                                     debug!("Ignoring handshake message from authenticated peer {}", peer_id);
+                                    break 'route;
+                                }
+
+                                // PEERS messages are consumed above, not routed
+                                if matches!(message, StellarMessage::Peers(_)) {
                                     break 'route;
                                 }
 

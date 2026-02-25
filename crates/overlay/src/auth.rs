@@ -544,6 +544,9 @@ impl AuthContext {
     ///
     /// Call this after successfully sending the Hello to update state tracking.
     pub fn hello_sent(&mut self) {
+        // For the initiator, this transitions Initial → HelloSent.
+        // For the responder (who receives Hello first), state is already
+        // HelloReceived so this is a no-op — that's correct per OVERLAY_SPEC §4.2.
         if self.state == AuthState::Initial {
             self.state = AuthState::HelloSent;
         }
@@ -552,6 +555,8 @@ impl AuthContext {
     /// Marks that we have sent our Auth message.
     ///
     /// Call this after successfully sending the Auth to update state tracking.
+    /// For the responder, Auth is sent after receiving the peer's Auth, so the
+    /// state may already be Authenticated — the no-op is intentional.
     pub fn auth_sent(&mut self) {
         if self.state == AuthState::HelloReceived {
             self.state = AuthState::AuthSent;
