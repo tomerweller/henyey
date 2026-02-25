@@ -230,12 +230,14 @@ that must be downloaded to convert state `other` into state `self`:
 
 1. Build an inhibit set containing the zero hash and all bucket hashes
    present in `other`.
-2. Walk levels from bottom to top in `self`.
-3. For each level, collect `curr`, `snap`, and any future output hash
-   that is not in the inhibit set.
-4. Add collected hashes to the inhibit set (to avoid duplicates).
-5. Return separate lists for live and hot archive buckets, sorted
-   largest to smallest, with snapshot buckets before current buckets.
+2. Walk levels from deepest to shallowest (highest index first).
+3. For each level, collect three items in order: `snap`, `next`
+   (FutureBucket output hash, or `snap` again if no output hash
+   exists), and `curr`. Skip any hash that is already in the inhibit
+   set.
+4. Add collected hashes to the inhibit set (to avoid duplicates across
+   levels).
+5. Return separate lists for live and hot archive buckets.
 
 ### 3.4 Catchup Configuration
 
@@ -572,7 +574,7 @@ Let `fullReplayCount = cfg.toLedger - lcl`.
 |------|-----------|--------|
 | 1 | `lcl > GENESIS` | Replay only: range = `[lcl+1, cfg.toLedger]` |
 | 2 | `lcl == GENESIS` AND `cfg.count ≥ fullReplayCount` | Full replay: range = `[GENESIS+1, cfg.toLedger]` |
-| 3 | `lcl == GENESIS` AND `cfg.count == 0` AND `cfg.toLedger` is at a checkpoint boundary | Buckets only at `cfg.toLedger`, no replay |
+| 3 | `lcl == GENESIS` AND `cfg.count == 0` AND `cfg.toLedger` is the last ledger of a checkpoint (`isLastLedgerInCheckpoint(toLedger)`) | Buckets only at `cfg.toLedger`, no replay |
 | 4 | `lcl == GENESIS` AND `firstInCheckpoint(cfg.toLedger - cfg.count + 1) == GENESIS` | Full replay: range = `[GENESIS+1, cfg.toLedger]` |
 | 5 | Otherwise | Apply buckets at `lastBeforeCheckpoint(cfg.toLedger - cfg.count + 1)`, then replay from `firstInCheckpoint(cfg.toLedger - cfg.count + 1)` to `cfg.toLedger` |
 
@@ -603,8 +605,8 @@ The buffer maintains these invariants:
 
 1. Only ledgers with sequence numbers greater than `lastQueuedToApply`
    are buffered.
-2. The buffer spans at most two checkpoints worth of ledgers (~128
-   ledgers).
+2. The buffer spans at most one checkpoint plus one boundary ledger
+   (~65 ledgers: 64 + 1).
 3. Old ledgers are trimmed when no longer needed.
 
 ### 7.3 Process Ledger Decision Tree
@@ -631,10 +633,14 @@ When a new externalized ledger arrives via `processLedger`:
 
 7. No catchup running, gap detected:
    → trim buffer
-   → If first buffered ledger is at a checkpoint boundary
+   → If modeDoesCatchupWithBucketList()
+     AND first buffered ledger is at a checkpoint boundary
      AND more than one ledger is buffered
      AND pipeline is not currently applying:
-       → startOnlineCatchup()
+       → If !catchupFatalFailure:
+           startOnlineCatchup()
+         Else:
+           log fatal error (incompatible core version or invalid state)
    → return WAIT_TO_APPLY_BUFFERED_OR_CATCHUP
 ```
 
@@ -646,9 +652,9 @@ ledgers:
 1. Iterate through the buffer starting from `lastQueuedToApply + 1`.
 2. For each contiguous ledger: apply it via the normal ledger close
    pipeline.
-3. Stop if a gap is encountered or if the apply drift exceeds
-   `MAX_EXTERNALIZE_LEDGER_APPLY_DRIFT` (12 ledgers). Exceeding this
-   threshold means the apply pipeline is falling too far behind SCP
+3. Stop if a gap is encountered or if the apply drift reaches
+   `MAX_EXTERNALIZE_LEDGER_APPLY_DRIFT` (12 ledgers; the check uses
+   `>=`, so exactly 12 triggers it). Reaching this threshold means the apply pipeline is falling too far behind SCP
    and catchup should be triggered instead.
 4. Remove applied ledgers from the buffer.
 
@@ -687,8 +693,9 @@ composed of work items arranged in a dependency graph.
 
 ### 8.2 Phase 1: Fetch History Archive State
 
-1. Download the HAS from a randomly selected readable archive for the
-   target checkpoint.
+1. Download the HAS from a provided archive, or from a randomly
+   selected readable archive if none is specified, for the target
+   checkpoint.
 2. Validate that the network passphrase matches.
 3. Validate that the HAS checkpoint ledger is greater than the current
    LCL.
@@ -861,7 +868,7 @@ After bucket application completes:
 
 1. Set the LCL to the verified ledger at the bucket checkpoint.
 2. Store the ledger header in persistent storage.
-3. If the protocol version supports it (p25+): compile all contract
+3. If the protocol version supports it (p23+): compile all contract
    modules and populate the in-memory Soroban state.
 4. Transition the apply state from `SETTING_UP_STATE` to
    `READY_TO_APPLY`.

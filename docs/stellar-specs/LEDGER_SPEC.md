@@ -86,7 +86,7 @@ document are to be interpreted as described in [RFC 2119][rfc2119].
 | **Meta** | Ledger close metadata recording all state changes for downstream consumers (archives, indexers, horizon). |
 | **Soroban** | The smart contract execution environment introduced in protocol 20. |
 | **TTL** | Time-to-live entry controlling the expiration of Soroban state entries. |
-| **Phase** | A subdivision of a transaction set. Classic transactions form the sequential phase; Soroban transactions form the parallel phase (protocol 22+). |
+| **Phase** | A subdivision of a transaction set. Classic transactions form the sequential phase; Soroban transactions form the parallel phase (protocol 23+). |
 
 ### 1.3 Notation
 
@@ -124,7 +124,7 @@ At a high level:
    the set.
 
 4. **Transactions are applied** — either sequentially (classic) or in
-   parallel stages (Soroban, protocol 22+).
+   parallel stages (Soroban, protocol 23+).
 
 5. **Protocol upgrades** embedded in the SCP value are applied.
 
@@ -344,18 +344,23 @@ The pipeline MUST:
    determines the meta format version.
 4. Increment `ledgerSeq` by 1.
 5. Set `previousLedgerHash` to the hash of the current LCL header.
-6. Set `scpValue` to the `StellarValue` from the `LedgerCloseData`.
 
-#### Step 4: Validate Transaction Set
+Note: `scpValue` is set AFTER validation (Step 4), not during this
+step.
+
+#### Step 4: Validate Transaction Set and Set SCP Value
 
 The pipeline MUST verify:
 
+- The transaction set's `previousLedgerHash` matches the current LCL
+  hash.
 - The `txSetHash` in the `StellarValue` matches the hash of the
   provided transaction set.
-- The `previousLedgerHash` in the SCP value matches the current LCL
-  hash.
 
 If validation fails, the pipeline MUST abort.
+
+After validation succeeds, the pipeline MUST set the ledger header's
+`scpValue` to the `StellarValue` from the `LedgerCloseData`.
 
 #### Step 5: Prepare Transaction Set for Application
 
@@ -373,8 +378,8 @@ determined by `initialLedgerVers` (not the post-upgrade version):
 | initialLedgerVers | Meta Version |
 |-------------------|-------------|
 | < 20 | v0 |
-| 20–21 | v1 |
-| ≥ 22 | v2 |
+| 20–22 | v1 |
+| ≥ 23 | v2 |
 
 #### Step 7: Process Fees and Sequence Numbers
 
@@ -482,7 +487,10 @@ The `processFeesSeqNums` procedure:
    a. Loads the source account.
    b. Deducts the fee from the source account balance.
    c. Adds the fee to the ledger header's `feePool`.
-   d. Increments the source account's `seqNum`.
+   d. For protocol versions < 10: increments the source account's
+      `seqNum`. For protocol versions ≥ 10: does NOT advance the
+      sequence number here — it is advanced later during transaction
+      application (`processSeqNum` in the apply step).
 4. For protocol 19+: If the transaction set contains account merge
    operations, the procedure SHALL create `MAX_SEQ_NUM_TO_APPLY`
    internal entries for each source account, recording the highest
@@ -508,12 +516,12 @@ to the current ledger state:
    - **Sequential phase**: Apply transactions one at a time
      (Section 5.3).
    - **Parallel phase**: Apply transactions in parallel stages
-     (Section 5.4, protocol 22+).
+     (Section 5.4, protocol 23+).
 
 ### 5.3 Sequential Phase Application
 
 In the sequential phase (used for all classic transactions and for
-Soroban transactions before protocol 22), each transaction is applied
+Soroban transactions before protocol 23), each transaction is applied
 individually:
 
 1. For each transaction in the phase:
@@ -531,7 +539,7 @@ individually:
 
 ### 5.4 Parallel Phase Application
 
-In the parallel phase (protocol 22+, used for Soroban transactions),
+In the parallel phase (protocol 23+, used for Soroban transactions),
 transactions are organized into stages and clusters as defined in
 **HERDER_SPEC §7** ("Parallel Soroban Transaction Sets"). The
 execution mechanics are specified in **TX_SPEC §8.7**.
@@ -571,7 +579,7 @@ order), and transactions within a cluster are applied in order.
 The overall phase ordering is:
 
 1. **Phase 0**: Classic transactions (sequential).
-2. **Phase 1**: Soroban transactions (parallel in protocol 22+,
+2. **Phase 1**: Soroban transactions (parallel in protocol 23+,
    sequential before that).
 
 ---
@@ -843,7 +851,9 @@ combined by taking the highest proposed value for each parameter type.
 For protocol version upgrades, the maximum of all proposed versions is
 taken (clamped to `currentVersion + 1`). For config upgrades, if
 multiple validators propose different config sets, the one with the
-highest hash wins.
+lexicographically highest `(contractID, contentHash)` pair wins —
+`contractID` is compared first, and `contentHash` is used as a
+tiebreaker when `contractID` values are equal.
 
 #### 7.3.4 Application
 
@@ -859,6 +869,11 @@ During ledger close, upgrades are applied in the order they appear in
    - Set `header.ledgerVersion` to the new version.
    - If upgrading to p10: run `prepareLiabilities` to adjust all
      offers and trust lines for the new reserve calculation rules.
+   - If upgrading from p15 to p16 exactly **on the production
+     (mainnet) network only** (`gIsProductionNetwork`): remove an
+     invalid sponsorship from offer `289733046`. This is a
+     one-time data repair for a specific problematic ledger entry;
+     the fix is a no-op on non-production networks.
    - If upgrading to p20: create all initial Soroban `CONFIG_SETTING`
      entries with their default values.
    - If upgrading to p21, p22, p23, or p25: update cost model
@@ -877,8 +892,9 @@ During ledger close, upgrades are applied in the order they appear in
      `finalizeLedgerTxnChanges` (Section 11.1, Step 1c).
      Note: These fixes are mainnet-specific; testnet and
      private networks MUST NOT apply them.
-   - If upgrading to p25: promote the eviction state size to a window
-     and enable stale entry purging.
+   - If upgrading to p25: enable Rust Dalek signature verification
+     (`enableRustDalekVerify`) and create new Soroban cost types for
+     BN254 operations (`createCostTypesForV25`).
 
    **Base fee upgrade** (`LEDGER_UPGRADE_BASE_FEE`):
    - Set `header.baseFee` to the new value.
@@ -896,7 +912,10 @@ During ledger close, upgrades are applied in the order they appear in
    - Load the `ConfigUpgradeSet` from ledger state.
    - For each entry in the set, update the corresponding
      `CONFIG_SETTING` entry.
-   - Delete the `ConfigUpgradeSet` entry after application.
+   - The `ConfigUpgradeSet` entry is stored as `TEMPORARY` contract
+     data and is NOT explicitly deleted after application — it
+     remains in ledger state and expires naturally when its TTL
+     runs out.
 
    **Max Soroban tx set size upgrade** (`LEDGER_UPGRADE_MAX_SOROBAN_TX_SET_SIZE`):
    - Update the corresponding Soroban config setting.
@@ -939,28 +958,44 @@ The `skipList` array in the ledger header provides a geometric skip
 structure for efficient historical lookups. The skip list is an array
 of 4 `Hash` values, updated as follows:
 
-For a ledger with sequence number `N`:
+For a ledger with sequence number `N`, the skip list constants are:
 
 ```
-if (N mod 256) == 0:
-    skipList[2] = skipList[3]  (copy old [2] to [3])
-    skipList[1] = skipList[2]  (copy old [1] to [2])
-    skipList[0] = skipList[1]  (copy old [0] to [1])
-    skipList[3] = SHA256(previousLedgerHeader)
-else if (N mod 64) == 0:
-    skipList[1] = skipList[2]
-    skipList[0] = skipList[1]
-    skipList[2] = SHA256(previousLedgerHeader)
-else if (N mod 16) == 0:
-    skipList[0] = skipList[1]
-    skipList[1] = SHA256(previousLedgerHeader)
-else if (N mod 4) == 0:
-    skipList[0] = SHA256(previousLedgerHeader)
+SKIP_1 = 50
+SKIP_2 = 5000
+SKIP_3 = 50000
+SKIP_4 = 500000
 ```
+
+The update algorithm uses **nested** conditions (not mutually exclusive
+else-if). Multiple slots may shift in a single call:
+
+```
+if (N mod SKIP_1) == 0:
+    v = N - SKIP_1
+    if v > 0 and (v mod SKIP_2) == 0:
+        v2 = N - SKIP_2 - SKIP_1
+        if v2 > 0 and (v2 mod SKIP_3) == 0:
+            v3 = N - SKIP_3 - SKIP_2 - SKIP_1
+            if v3 > 0 and (v3 mod SKIP_4) == 0:
+                skipList[3] = skipList[2]
+            skipList[2] = skipList[1]
+        skipList[1] = skipList[0]
+    skipList[0] = currentHeader.bucketListHash
+```
+
+Key details:
+- The value stored in `skipList[0]` is `currentHeader.bucketListHash`
+  (the BucketList hash of the current ledger being closed), NOT a hash
+  of the previous ledger header.
+- Values cascade upward: `[0]→[1]`, `[1]→[2]`, `[2]→[3]` — the
+  oldest value is pushed to higher indices.
+- The conditions are nested, meaning that at certain ledger numbers
+  (e.g., when all conditions are met), multiple shifts happen in a
+  single invocation.
 
 Note: The skip list is updated during the `unsealHeader` callback,
-not during the initial header setup. The exact update rule references
-the LCL hash, not the current header hash (which is not yet known).
+not during the initial header setup.
 
 ### 8.3 Ledger Hash Computation
 
@@ -1074,7 +1109,7 @@ The parameter arrays are sized per protocol version:
 | 20 | 23 | Base cost types (IDs 0–22): Wasm execution, memory, hashing, Ed25519, ECDSA, integer ops, ChaCha20. |
 | 21 | 45 | Granular Wasm parse/instantiate types (IDs 23–42), secp256r1 verification (IDs 43–44). See CAP-0051/0054. |
 | 22–24 | 70 | BLS12-381 operations (IDs 45–69). See CAP-0059/0074. |
-| 25+ | 85 | BN254 operations (IDs 70–84), Poseidon/Poseidon2 hashes. See CAP-0074/0075. |
+| 25+ | 85 | BN254 operations (IDs 70–84): field encode/decode, G1/G2 point checks, G1 add/mul, pairing, Fr arithmetic. See CAP-0074/0075. |
 
 During protocol upgrades, the arrays are resized and new entries are
 populated with calibrated default values. All `constTerm` and
@@ -1082,21 +1117,51 @@ populated with calibrated default values. All `constTerm` and
 
 ### 9.6 Rent Fee Computation
 
-The rent fee for Soroban state entries is computed using the BucketList
-size window:
+The rent fee for Soroban state entries is computed using a two-phase
+piecewise-linear model based on the average Soroban state size.
 
-1. The window is a sliding window of `LIVE_SOROBAN_STATE_SIZE_WINDOW`
-   recent BucketList sizes.
-2. The average BucketList size over the window is computed.
-3. The rent fee is computed as a function of the average size, the
-   entry size, the rental period, and the fee rate configuration.
+#### Step 1: Compute per-1KB rent write fee
 
-The exact formula is:
+The average Soroban state size `S` is computed as the arithmetic mean
+of the sliding window of state size snapshots (the
+`BUCKETLIST_SIZE_WINDOW` configuration setting).
+
+Let:
+- `T` = `state_target_size_bytes`
+- `F_low` = `rent_fee_1kb_state_size_low`
+- `F_high` = `rent_fee_1kb_state_size_high`
+- `G` = `state_size_rent_fee_growth_factor`
+- `M` = `F_high - F_low` (fee rate multiplier)
+
+**Phase 1 (S < T):** Linear interpolation from `F_low` to `F_high`:
 ```
-rentFee = (entrySize × feeRatePerByte × rentPeriod) / (averageBucketListSize + 1)
+feePerKB = F_low + ceil(M × S / T)
 ```
 
-with appropriate scaling and minimum fee logic.
+**Phase 2 (S ≥ T):** Accelerated linear growth beyond the target:
+```
+feePerKB = F_high + ceil(M × (S - T) × G / T)
+```
+
+The result is clamped to a minimum of 1,000 stroops per 1KB.
+
+Note: `F_low` may be negative (protocol 23 sets it to −17,000),
+meaning the fee can be at the minimum floor for small state sizes.
+
+#### Step 2: Compute per-entry rent fee
+
+For each entry, the rent fee is:
+```
+rentFee = ceil(entrySize × feePerKB × rentLedgers / (1024 × rentRateDenominator))
+```
+
+where `rentRateDenominator` differs for persistent vs temporary
+entries. For `CONTRACT_CODE` entries, the result is further divided
+by a code entry rent discount factor of 3.
+
+The rent fee computation is implemented in the Soroban host (Rust),
+not in the C++ layer. The C++ side calls into the Rust bridge with
+the configuration parameters and average state size.
 
 ### 9.7 Resource Limits
 
@@ -1201,17 +1266,22 @@ The `finalizeLedgerTxnChanges` procedure:
    c. For protocol 24+ (persistent eviction):
       - Collect restored hot archive keys.
       - Run consistency invariant checks.
-      - If upgrading from p23 to p24 **on mainnet only**
-        (CAP-0076): apply the hot archive entry fix. For each
-        of 478 hardcoded (corrupted, correct) entry pairs:
-        (1) entry MUST exist in the Hot Archive,
-        (2) entry state MUST match the known corrupted state,
-        (3) entry MUST NOT exist in live state,
-        (4) entry MUST NOT be in the current eviction batch.
-        If all checks pass, append the correct entry to the
-        hot archive batch (overwriting the corrupted version).
-        These amendments are NOT reflected in `LedgerCloseMeta`
-        but are observable via the `bucketListHash` change.
+       - If upgrading from p23 to p24 **on mainnet only**
+         (CAP-0076): apply the hot archive entry fix. For each
+         of 478 hardcoded (corrupted, correct) entry pairs:
+         (1) If the entry does NOT exist in the Hot Archive,
+         log a warning and **skip** this entry (soft check —
+         the entry may have been restored before the upgrade).
+         (2) Entry state MUST match the known corrupted state
+         (`releaseAssert` — hard abort).
+         (3) Entry MUST NOT exist in live state
+         (`releaseAssert` — hard abort).
+         (4) Entry MUST NOT be in the current eviction batch
+         (`releaseAssert` — hard abort).
+         If all checks pass, append the correct entry to the
+         hot archive batch (overwriting the corrupted version).
+         These amendments are NOT reflected in `LedgerCloseMeta`
+         but are observable via the `bucketListHash` change.
       - Otherwise, add hot archive entries via `addHotArchiveBatch`.
       - Note: From protocol 24+, the eviction scan itself is
         fixed — for persistent entries, a BucketList point
@@ -1323,8 +1393,8 @@ The meta frame version is determined by the `initialLedgerVers`
 | initialLedgerVers | Meta Version | Description |
 |-------------------|-------------|-------------|
 | < 20 | v0 | Pre-Soroban format. |
-| 20–21 | v1 | Includes Soroban metadata, eviction info. |
-| ≥ 22 | v2 | Adds parallel Soroban transaction metadata. |
+| 20–22 | v1 | Includes Soroban metadata, eviction info. |
+| ≥ 23 | v2 | Adds parallel Soroban transaction metadata. |
 
 ### 12.3 Meta Contents
 
@@ -1385,10 +1455,10 @@ The `startNewLedger` procedure creates the genesis state:
    - **Sequence number**: 0.
    - **Thresholds**: `[1, 0, 0, 0]` (master weight 1, all thresholds
      0).
-4. Commit the `LedgerTxn`, which adds the root account to the
-   BucketList.
-5. Seal and persist the genesis ledger, computing the genesis
+4. Seal and persist the genesis ledger, computing the genesis
    `bucketListHash`.
+5. Commit the `LedgerTxn`, which flushes accumulated offer changes
+   (if any) to persistent storage.
 6. Advance the LCL to the genesis state.
 
 ---
@@ -1404,7 +1474,7 @@ The ledger close pipeline uses two primary thread contexts:
 | **Main thread** | Handles all LCL state queries, LCL state publishing, herder notification, and state machine transitions that require main-thread context. |
 | **Apply thread** | Executes the `applyLedger` pipeline (may be the main thread in single-threaded mode). |
 
-Additionally, for parallel Soroban execution (protocol 22+):
+Additionally, for parallel Soroban execution (protocol 23+):
 
 | Thread | Responsibilities |
 |--------|-----------------|
@@ -1666,8 +1736,8 @@ flowchart TD
     B -->|Yes| C[Phase 0: Classic Sequential]
     B -->|No| D{Has Soroban Phase?}
     C --> D
-    D -->|Yes, p22+| E[Phase 1: Soroban Parallel]
-    D -->|Yes, pre-p22| F[Phase 1: Soroban Sequential]
+    D -->|Yes, p23+| E[Phase 1: Soroban Parallel]
+    D -->|Yes, pre-p23| F[Phase 1: Soroban Sequential]
     D -->|No| G[Done]
     E --> G
     F --> G

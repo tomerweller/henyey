@@ -174,9 +174,10 @@ BucketList Hash     BucketListDB
 At each ledger close, changed entries are added to level 0 via
 `addBatch`. Periodically, entries "spill" from level L to level L+1
 through a merge process. Each bucket is an immutable, sorted,
-content-addressed file. The BucketList hash is the XOR of all level
-hashes, which are themselves derived from the hashes of each level's
-`curr` and `snap` buckets.
+content-addressed file. The BucketList hash is a SHA-256 digest of
+the concatenation of all level hashes, which are themselves derived
+from the hashes of each level's `curr` and `snap` buckets (see
+Section 4.6 for the precise computation).
 
 ### 2.3 Entry Flow
 
@@ -678,26 +679,31 @@ at the deepest level without risking entry revival.
 
 | New \ Old | INIT | LIVE | DEAD |
 |-----------|------|------|------|
-| **INIT**  | error (invalid) | error (invalid) | annihilate (emit nothing) |
+| **INIT**  | error (invalid) | error (invalid) | emit LIVE (new data) |
 | **LIVE**  | emit INIT (new data, INIT type) | emit LIVE (new) | emit LIVE (new) |
 | **DEAD**  | annihilate (emit nothing) | emit DEAD (new) | emit DEAD (new) |
 
 Key rules:
 
-- **INIT + DEAD = nothing**: An entry that was created and then deleted
-  within the same merge window annihilates — neither record is emitted.
-  This is the critical optimization that enables tombstone elimination
-  at the deepest level.
+- **Old=INIT, New=DEAD → nothing**: An entry that was created (INIT)
+  and then deleted (DEAD) within the same merge window annihilates —
+  neither record is emitted. This is the critical optimization that
+  enables tombstone elimination at the deepest level.
 
-- **DEAD + INIT = nothing**: The reverse case also annihilates — a
-  deletion followed by re-creation cancels out.
+- **Old=DEAD, New=INIT=x → LIVE=x**: A deletion followed by
+  re-creation merges to a LIVE entry with the new data. The INIT is
+  converted to LIVE because the explicit DEAD predecessor already
+  serves as the deletion boundary — the entry does not need the INIT
+  marker to protect against revival of a stale version below.
 
-- **LIVE + INIT = INIT**: An update to an entry that was originally
-  created preserves the INIT marker with the new data. This ensures
-  future merges know the entry has no older version below.
+- **Old=INIT=x, New=LIVE=y → INIT=y**: An update to an entry that was
+  originally created preserves the INIT marker with the new data. This
+  ensures future merges know the entry has no older version below.
 
-- **INIT + INIT** and **INIT + LIVE**: These combinations are invalid
-  and indicate a bug. An implementation MUST signal an error.
+- **Old=INIT, New=INIT** and **Old=LIVE, New=INIT**: These
+  combinations violate the lifecycle invariant (an INIT must be
+  preceded by DEAD or absence) and indicate a bug. An implementation
+  MUST signal an error.
 
 ### 6.6 Tombstone Elision at Deepest Level
 
@@ -1017,17 +1023,23 @@ use in-memory indexes while deeper levels use disk indexes.
 
 ### 9.3 In-Memory Index
 
-The in-memory index stores either:
-- A sorted set of `LedgerKey` values (for non-cached mode), or
-- A sorted map of `LedgerKey` to `BucketEntry` (for cached mode,
-  when the bucket is small enough to fit entries in memory).
+The in-memory index stores all bucket entries in a hash set
+(`unordered_set`) keyed by `LedgerKey`. Each element wraps a
+`shared_ptr<BucketEntry const>`, so lookups return the full entry
+directly from memory without any disk I/O. This makes the in-memory
+index inherently a **cached mode** — it is never persisted to disk and
+is always recreated on startup.
 
-**Lookup**: Binary search for the key. Returns the entry directly (if
-cached) or the file offset (computed from the sorted position) for disk
-read.
+**Lookup**: O(1) hash-based lookup for the key. Returns the entry
+directly (cache hit), avoiding disk reads.
 
-**Bulk scan**: Supports iteration from a lower-bound position, enabling
-efficient multi-key lookups with a single pass.
+**Bulk scan**: Supports iteration for multi-key lookups by performing
+individual lookups per key.
+
+The in-memory index also maintains auxiliary data:
+- An asset-to-pool-ID mapping for liquidity pool queries.
+- Entry counters and type-range offsets for compatibility with
+  disk-based operations.
 
 ### 9.4 Disk Index
 
@@ -1115,7 +1127,20 @@ rebuilt. Index persistence is controlled by the
 ### 10.1 Overview
 
 The snapshot and query layer provides thread-safe, read-only access to
-the BucketList state. It is organized as:
+the BucketList state.
+
+**OFFER exclusion**: OFFER entries are the only `LedgerEntryType` NOT
+supported by BucketListDB queries. OFFER entries exist in the BucketList
+(they participate in merges and hash computation) but are NOT looked up
+via the BucketList index. Instead, OFFER entries are stored in and
+queried from SQL (SQLite), which supports the complex order book queries
+(e.g., best offers by trading pair) that BucketListDB's key-value
+lookup model cannot efficiently provide. During ledger close, only
+OFFER changes are written to SQL; all other entry types are served
+exclusively by BucketListDB. During catchup, the `BucketApplicator`
+applies only OFFER entries from buckets to SQL.
+
+The snapshot and query layer is organized as:
 
 ```
 BucketSnapshotManager
@@ -1312,18 +1337,20 @@ differs in:
 
 ### 11.4 Merge Rules
 
-The Hot Archive merge follows "newest wins" semantics:
+The Hot Archive merge follows strict "newest wins" semantics with no
+annihilation cases. When two entries with the same key meet during a
+merge, the newer entry is always emitted regardless of the entry types:
 
 | New \ Old | ARCHIVED | LIVE | DELETED |
 |-----------|----------|------|---------|
 | **ARCHIVED** | emit ARCHIVED (new) | emit ARCHIVED (new) | emit ARCHIVED (new) |
-| **LIVE** | annihilate (emit nothing) | emit LIVE (new) | emit LIVE (new) |
+| **LIVE** | emit LIVE (new) | emit LIVE (new) | emit LIVE (new) |
 | **DELETED** | emit DELETED (new) | emit DELETED (new) | emit DELETED (new) |
 
-The key rule is **LIVE + ARCHIVED = nothing**: when a "restored" marker
-(LIVE) meets an archived entry, they annihilate. This is analogous to
-the INIT + DEAD annihilation in the Live BucketList — the restoration
-cancels out the archival.
+There is no pairwise annihilation in the Hot Archive merge (unlike the
+Live BucketList's INIT/DEAD annihilation). The only filtering occurs at
+the output stage: at level 10 (the deepest level), HOT_ARCHIVE_LIVE
+tombstone entries are elided by the output iterator (Section 11.5).
 
 ### 11.5 Tombstone Semantics
 
@@ -1424,14 +1451,16 @@ Within each bucket, the scan:
 
 ### 12.5 Eviction Entry Types
 
-| Entry Durability | Protocol < 23 | Protocol >= 23 |
-|-----------------|----------------|----------------|
-| Temporary | Evicted (deleted) | Evicted (deleted) |
-| Persistent | Not evicted | Evicted (archived to Hot Archive) |
+| Entry Durability | Protocol < 23 | Protocol 23 | Protocol >= 24 |
+|-----------------|----------------|-------------|----------------|
+| Temporary | Evicted (deleted) | Evicted (deleted) | Evicted (deleted) |
+| Persistent | Not evicted | Evicted (archived), any version | Evicted (archived), newest version only |
 
-For persistent entries at protocol >= 24, the scan ensures it evicts
-the **newest version** of the entry (not a stale version from a deeper
-bucket) by performing an additional point lookup.
+Persistent entry eviction was introduced in protocol 23. In protocol 23,
+the eviction scan may archive a stale version of a persistent entry
+(whatever version happens to be scanned). Starting with protocol 24, the
+scan ensures it evicts the **newest version** of the entry (not a stale
+version from a deeper bucket) by performing an additional point lookup.
 
 ### 12.6 Scan Validity
 
@@ -1471,27 +1500,32 @@ implementation details of bucket application.
 
 During catchup, bucket files downloaded from history archives are
 applied to reconstruct ledger state. The `BucketApplicator` reads
-through a bucket file and inserts entries into the ledger database:
+through a bucket file and inserts entries into the SQL database.
+Only OFFER entries are applied via the BucketApplicator — all other
+entry types are served directly from the BucketList index
+(BucketListDB) and do not need SQL application.
 
 ```
 applyBucket(bucket, database):
-    iter = BucketInputIterator(bucket)
-    while iter is valid:
+    // Seek to the OFFER range within the bucket
+    offsetRange = bucket.getRangeForType(OFFER)
+    iter = BucketInputIterator(bucket, offset=offsetRange.start)
+    while iter is valid AND within offsetRange:
         entry = *iter
         if entry is LIVEENTRY or INITENTRY:
-            if entry is offer:
-                upsert into database with offer-specific handling
-            else:
-                upsert into database
+            if entry.key not in seenKeys:
+                upsert entry into database (offer-specific handling)
+                seenKeys.add(entry.key)
         else if entry is DEADENTRY:
-            // Skip — dead entries indicate deletions, but during
-            // catchup from a minimal state, we only insert live entries
+            // Record key as seen so deeper buckets don't revive it
+            seenKeys.add(entry.key)
         advance(iter)
 ```
 
-Bucket application is **chunked**: the applicator processes a
-configurable number of entries per batch, yielding between batches to
-allow interleaving with other work (such as downloading more files).
+Bucket application is **chunked**: the applicator processes entries in
+batches of `LEDGER_ENTRY_BATCH_COMMIT_SIZE` (4095), yielding between
+batches to allow interleaving with other work (such as downloading
+more files).
 
 ### 13.2 Application Order
 
@@ -1646,11 +1680,13 @@ at deeper levels to become visible.
 
 ### 15.7 INIT/DEAD Annihilation Correctness
 
-**Invariant 7**: In the post-protocol-11 merge, INIT + DEAD annihilation
-MUST produce no output entry. This is the critical property that makes
-tombstone elimination at the deepest level safe: an entry that was
-created (INIT) and then deleted (DEAD) leaves no trace, so there is
-nothing for a deeper stale entry to shadow.
+**Invariant 7**: In the post-protocol-11 merge, when old=INIT and
+new=DEAD for the same key, annihilation MUST produce no output entry.
+This is the critical property that makes tombstone elimination at the
+deepest level safe: an entry that was created (INIT) and then deleted
+(DEAD) leaves no trace, so there is nothing for a deeper stale entry
+to shadow. Note that the reverse case (old=DEAD, new=INIT) does NOT
+annihilate — it produces a LIVE entry (see Section 6.5).
 
 ### 15.8 Shadow Consistency
 
@@ -1668,7 +1704,9 @@ in the Hot Archive are a fatal error.
 **Invariant 10**: For protocol >= 24, persistent entry eviction MUST
 evict the newest version of the entry (as determined by a BucketListDB
 point lookup), not a stale version that happened to be scanned. This
-prevents archiving an outdated version of a persistent entry.
+invariant was introduced in protocol 24 to fix a bug present in
+protocol 23, where persistent entry eviction could archive a stale
+version from a deeper bucket.
 
 ### 15.11 Query Consistency
 
@@ -1745,13 +1783,14 @@ Ledger 8:  L0 spills → L0.snap = old_L0.curr
                         Old Entry
                  INIT    LIVE    DEAD
           +------+-------+-------+-------+
-    New   | INIT | ERROR | ERROR | ANNHI |
+    New   | INIT | ERROR | ERROR | LIVE* |
     Entry | LIVE | INIT* | LIVE  | LIVE  |
           | DEAD | ANNHI | DEAD  | DEAD  |
           +------+-------+-------+-------+
 
     ANNHI = Annihilate (no output)
     INIT* = INIT with new entry's data
+    LIVE* = LIVE with new entry's data (INIT converted to LIVE)
     ERROR = Invalid state, implementation MUST signal error
 ```
 
@@ -1762,14 +1801,17 @@ Ledger 8:  L0 spills → L0.snap = old_L0.curr
                  ARCHIVED  LIVE   DELETED
           +---------+---------+------+---------+
     New   | ARCHIVED| ARCHIVED| ARCH | ARCHIVED|
-    Entry | LIVE    | ANNHI   | LIVE | LIVE    |
+    Entry | LIVE    | LIVE    | LIVE | LIVE    |
           | DELETED | DELETED | DEL  | DELETED |
           +---------+---------+------+---------+
 
-    ANNHI = Annihilate (no output)
+    All cells: newest entry always wins. No annihilation.
     ARCH  = Emit ARCHIVED (new)
     LIVE  = Emit LIVE (new)
     DEL   = Emit DELETED (new)
+
+    Note: HOT_ARCHIVE_LIVE tombstones are elided only at level 10
+    by the output iterator, not during the merge itself.
 ```
 
 ### Appendix D: BucketList Level Update Flow

@@ -383,13 +383,13 @@ The following checks MUST be performed on every transaction envelope:
 
 7. **Soroban memo restriction** `@version(≥25)`: If the transaction is
    a Soroban InvokeHostFunction transaction, the memo MUST be
-   `MEMO_NONE`. Result: `txMALFORMED`.
+   `MEMO_NONE`. Result: `txSOROBAN_INVALID`.
 
 8. **Soroban muxed account restriction** `@version(≥25)`: If the
    transaction is a Soroban InvokeHostFunction transaction, the
    transaction source account MUST NOT be a muxed account
    (`KEY_TYPE_MUXED_ED25519`). The operation source (if present)
-   MUST NOT be muxed either. Result: `txMALFORMED`.
+   MUST NOT be muxed either. Result: `txSOROBAN_INVALID`.
 
 ### 4.3 Precondition Validation
 
@@ -418,20 +418,19 @@ Preconditions are checked against the current ledger header:
 
 2. **Sequence number**: The transaction's `seqNum` MUST satisfy:
    - If `minSeqNum` precondition is present `@version(≥19)`:
-     `seqNum` MUST be > `minSeqNum` AND `seqNum` MUST be
-     > the source account's current sequence number AND `seqNum`
-     MUST be ≤ the source account's current sequence number +
-     `MAX_SEQ_NUM_INCREASE` (2^31).
+     `seqNum` MUST be ≥ `minSeqNum` AND `seqNum` MUST be
+     > the source account's current sequence number.
    - Otherwise: `seqNum` MUST equal the source account's current
      sequence number + 1.
    - Result: `txBAD_SEQ`.
 
 3. **Minimum sequence age** `@version(≥19)`: If `minSeqAge > 0`, the
    time elapsed since the source account's sequence number was last
-   changed MUST be ≥ `minSeqAge`. The elapsed time is computed as
-   `closeTime - max(seqTime, EXPECTED_CLOSE_TIME_MULT *
-   seqLedger)` where `seqTime` and `seqLedger` record when the
-   sequence was last updated. Result: `txBAD_MIN_SEQ_AGE_OR_GAP`.
+   changed MUST be ≥ `minSeqAge`. At apply time: checks
+   `closeTime - accSeqTime >= minSeqAge`, where `accSeqTime` is the
+   ledger close time at which the account's sequence number was last
+   consumed (`AccountEntryExtensionV3.seqTime`, or 0 if absent).
+   Result: `txBAD_MIN_SEQ_AGE_OR_GAP`.
 
 4. **Minimum sequence ledger gap** `@version(≥19)`: If
    `minSeqLedgerGap > 0`, the number of ledgers elapsed since the
@@ -476,50 +475,54 @@ function checkSignature(signers, neededWeight, contentHash, signatures):
     usedSignatures = empty set
     totalWeight = 0
 
-    for each signer in signers:
+    // Partition signers by type
+    preAuthSigners  = signers.filter(type == PRE_AUTH_TX)
+    hashXSigners    = signers.filter(type == HASH_X)
+    ed25519Signers  = signers.filter(type == ED25519)
+    payloadSigners  = signers.filter(type == ED25519_SIGNED_PAYLOAD)
+
+    // Phase 1: PRE_AUTH_TX — outer=signers, no inner loop over signatures
+    for each signer in preAuthSigners:
+        if signer.preAuthTxHash == contentHash:
+            mark signer as used (consume from account)
+            w = signer.weight
+            // @version(≥10): cap individual signer weight
+            if w > UINT8_MAX: w = UINT8_MAX
+            totalWeight += w
+            if totalWeight >= neededWeight: return true
+
+    // Phase 2-4: HASH_X, ED25519, ED25519_SIGNED_PAYLOAD
+    // All use the same loop: outer=signatures, inner=signers
+    for each signerType in [hashXSigners, ed25519Signers, payloadSigners]:
         for each (index, sig) in signatures:
-            if index in usedSignatures:
-                continue
+            if index in usedSignatures: continue
+            for each signer in signerType:
+                matched = false
+                match signer.type:
+                    case HASH_X:
+                        if sig.hint == last4bytes(signer.hashX):
+                            if sha256(sig.signature) == signer.hashX:
+                                matched = true
 
-            match signer.type:
-                case PRE_AUTH_TX:
-                    if signer.preAuthTxHash == contentHash:
-                        mark signer as used (consume from account)
-                        usedSignatures.add(index)
-                        totalWeight += signer.weight
-                        break
+                    case ED25519:
+                        if sig.hint == last4bytes(signer.ed25519):
+                            if ed25519Verify(signer.ed25519, contentHash, sig.signature):
+                                matched = true
 
-                case HASH_X:
-                    if sig.hint == last4bytes(signer.hashX):
-                        if sha256(sig.signature) == signer.hashX:
-                            usedSignatures.add(index)
-                            totalWeight += signer.weight
-                            break
+                    case ED25519_SIGNED_PAYLOAD:
+                        if sig.hint == xorHint(signer.ed25519SignedPayload):
+                            if ed25519Verify(signer.ed25519, signer.payload, sig.signature):
+                                matched = true
 
-                case ED25519:
-                    if sig.hint == last4bytes(signer.ed25519):
-                        if ed25519Verify(signer.ed25519, contentHash, sig.signature):
-                            usedSignatures.add(index)
-                            totalWeight += signer.weight
-                            break
-
-                case ED25519_SIGNED_PAYLOAD:
-                    // Hint is XOR of last 4 bytes of ed25519 key
-                    // and last 4 bytes of payload (zero-padded if
-                    // payload < 4 bytes). See CAP-0040.
-                    if sig.hint == xorHint(signer.ed25519SignedPayload):
-                        // Verify signature against the signer's
-                        // payload (NOT the transaction hash).
-                        if ed25519Verify(signer.ed25519, signer.payload, sig.signature):
-                            usedSignatures.add(index)
-                            totalWeight += signer.weight
-                            break
-
-            // @version(≥10): cap accumulated weight
-            totalWeight = min(totalWeight, UINT8_MAX)
-
-            if totalWeight >= neededWeight:
-                return true
+                if matched:
+                    usedSignatures.add(index)
+                    w = signer.weight
+                    // @version(≥10): cap individual signer weight
+                    if w > UINT8_MAX: w = UINT8_MAX
+                    totalWeight += w
+                    signerType.remove(signer)  // prevent reuse
+                    if totalWeight >= neededWeight: return true
+                    break  // next signature
 
     return totalWeight >= neededWeight
 ```
@@ -688,23 +691,30 @@ function processFeeSeqNum(tx, ltx):
     feeSource.balance -= actualDeduction
     ledgerHeader.feePool += actualDeduction
 
-    // @version(≥10): advance sequence number here
-    if protocolVersion >= 10:
+    // @version(<10): advance sequence number during fee processing
+    if protocolVersion < 10:
         sourceAccount = loadAccount(tx.sourceAccount, ltx)
         sourceAccount.seqNum = tx.seqNum
 
-    // @version(≥19): create MAX_SEQ_NUM_TO_APPLY entry if needed
-    if protocolVersion >= 19 and tx.hasAccountMergeOp():
-        createMaxSeqNumToApplyEntry(tx.sourceAccount, tx.seqNum, ltx)
+    // @version(≥10): sequence number is NOT advanced here;
+    // it is advanced later during apply in processSeqNum()
+    // (called from commonPreApply, see Section 6.1).
 
     commit(ltx)
 ```
 
 The `MAX_SEQ_NUM_TO_APPLY` internal entry `@version(≥19)` prevents an
-account merge from allowing a replayed transaction: if a transaction
-contains an `ACCOUNT_MERGE` operation, the maximum sequence number is
-recorded so that if the account is recreated, sequence-number-based
-replay protection is preserved.
+account merge from allowing a replayed transaction. It is created in
+the **ledger-level** fee processing loop (`processFeesSeqNums`), not in
+the per-transaction `processFeeSeqNum`. The algorithm:
+1. For every transaction in the set, record `(sourceAccountID →
+   max(seqNum))` in a map.
+2. Separately, check if **any** transaction in the set contains an
+   `ACCOUNT_MERGE` operation (set `mergeSeen = true`).
+3. If `mergeSeen`, create a `MAX_SEQ_NUM_TO_APPLY` entry for **every**
+   source account in the map — not just accounts whose transactions
+   contain merges. This blanket protection ensures that if the account
+   is recreated, sequence-number-based replay protection is preserved.
 
 ### 5.5 Soroban Fee Refunds
 
@@ -896,49 +906,48 @@ function applyOperations(tx, sigChecker, ltx, metaBuilder):
     for i in 0..tx.numOperations:
         op = tx.operations[i]
         ltxOp = createChild(ltx)
-        opMetaBuilder = metaBuilder.beginOperation()
 
-        // Resolve operation source account
-        opSource = op.sourceAccount ?? tx.sourceAccount
+        // op.apply() handles source resolution, signature check,
+        // validation, and execution internally.
+        txRes = op.apply(sigChecker, ltxOp, ...)
 
-        // Check operation-level signature
-        threshold = op.getThresholdLevel()
-        if not checkAccountSignatures(opSource, sigChecker, threshold):
-            op.setResult(opBAD_AUTH)
+        if not txRes:
             success = false
-            rollback(ltxOp)
-            break  // @version(≥14): stop on first failure
 
-        // Validate operation
-        if not op.checkValid(ltxOp):
-            success = false
-            rollback(ltxOp)
-            // @version(≥14): stop on first failure
-            break
+        // Record meta only while all ops are succeeding
+        if success:
+            opMetaBuilder.recordChanges(ltxOp)
 
-        // Execute operation
-        if not op.doApply(ltxOp):
-            success = false
-            // @version(≥14): rollback this op and stop
-            rollback(ltxOp)
-            break
-        else:
-            opMetaBuilder.recordChanges(ltxOp.getChanges())
+        // @version(≥14): only commit the per-op LedgerTxn if the
+        // op succeeded. Failed ops are rolled back (ltxOp drops
+        // without commit).
+        // @version(<14): always commit, even on failure.
+        if txRes or protocolVersion < 14:
             commit(ltxOp)
+        // else: ltxOp is rolled back (not committed)
 
-    if not success:
+    // All-or-nothing: commit the parent LedgerTxn only if every
+    // op succeeded. If any failed, the entire transaction's
+    // changes are discarded.
+    if success:
+        commit(ltx)
+    else:
         tx.setError(txFAILED)
 ```
 
-**Failure semantics**: `@version(≥14)`: When an operation fails, its
-state changes are rolled back and no subsequent operations are
-executed. The transaction result is `txFAILED` and the results array
-contains the failing operation's result at its index with all
-subsequent slots empty.
+**Failure semantics**: `@version(≥14)`: The loop does NOT break on
+first failure — all operations are still applied. However, a failed
+operation's per-op `LedgerTxn` is not committed (its changes are
+rolled back immediately). Subsequent operations continue executing in
+their own `LedgerTxn` scopes, but since the overall `success` flag is
+false, no metadata is recorded for them. After the loop, the parent
+`LedgerTxn` is never committed, so the entire transaction's state
+changes (including any individually-committed successful ops) are
+discarded. The result is `txFAILED`.
 
 `@version(<14)`: All operations are attempted regardless of earlier
-failures. Each failing operation's changes are individually rolled back.
-The transaction fails if any operation failed.
+failures. Each operation's `LedgerTxn` is always committed (even on
+failure). The transaction fails if any operation failed.
 
 ### 6.5 Operation Threshold Levels
 
@@ -985,10 +994,10 @@ Creates a new account with a starting XLM balance.
 
 **Execution**:
 1. Load source account.
-2. Verify source has sufficient native balance (startingBalance ≤
-   available balance). Result: `CREATE_ACCOUNT_UNDERFUNDED`.
-3. Verify destination account does not already exist.
+2. Verify destination account does not already exist.
    Result: `CREATE_ACCOUNT_ALREADY_EXIST`.
+3. Verify source has sufficient native balance (startingBalance ≤
+   available balance). Result: `CREATE_ACCOUNT_UNDERFUNDED`.
 4. Debit `startingBalance` from source.
 5. Create new `ACCOUNT` entry for destination with:
    - `balance = startingBalance`
@@ -1037,7 +1046,7 @@ destination amount.
    asset through each intermediate asset to source asset.
 5. At each hop, call the DEX conversion engine with
    `ROUND_TYPE_STRICT_RECEIVE` to exchange the needed amount.
-6. `@version(≥20)`: Enforce `MAX_OFFERS_TO_CROSS` (1000) limit across
+6. `@version(≥11)`: Enforce `MAX_OFFERS_TO_CROSS` (1000) limit across
    all hops. Result:
    `PATH_PAYMENT_STRICT_RECEIVE_EXCEEDED_WORK_LIMIT`.
 7. If total source amount exceeds `sendMax`:
@@ -1066,7 +1075,7 @@ minimum destination amount. `@version(≥12)`.
    strict receive).
 4. Walk conversion path forward from source asset to destination asset
    using `ROUND_TYPE_STRICT_SEND`.
-5. Enforce `MAX_OFFERS_TO_CROSS` limit `@version(≥20)`.
+5. Enforce `MAX_OFFERS_TO_CROSS` limit `@version(≥11)`.
 6. If destination amount received < `destMin`:
    Result: `PATH_PAYMENT_STRICT_SEND_UNDER_DESTMIN`.
 7. Credit destination.
@@ -1107,9 +1116,7 @@ a common base):
    - If the crossed offer is fully consumed, remove it.
    - Self-crossing check: MUST NOT cross own offers.
      Result: `MANAGE_SELL_OFFER_CROSS_SELF`.
-   - Also crosses liquidity pools `@version(≥18)` when the pool
-     offers a better price.
-   - Enforce `MAX_OFFERS_TO_CROSS` limit `@version(≥20)`.
+   - Enforce `MAX_OFFERS_TO_CROSS` limit `@version(≥11)`.
 
 6. If residual amount remains and this is not a delete:
    - If this is a new offer (`offerID == 0`): create a new OFFER
@@ -1647,13 +1654,23 @@ liquidity pools `@version(≥18)`:
    - `@version(≥10)`: Adjust buying/selling liabilities.
    - If offer is fully consumed, remove it.
 4. For liquidity pools `@version(≥18)`:
-   - Compute the constant-product exchange:
-     `amountOut = reserveOut * amountIn / (reserveIn + amountIn)`.
-   - Apply the 30 bps fee (rounded up).
+   - The 30 bps fee is integrated into the constant-product formula
+     (applied to the input amount before computing output), not
+     applied as a separate deduction.
+   - Strict-send: `fromPool = floor((maxBps - feeBps) *
+     reservesFromPool * toPool / (maxBps * reservesToPool +
+     (maxBps - feeBps) * toPool))` where `maxBps = 10000`,
+     `feeBps = 30`.
+   - Strict-receive: `toPool = ceil(maxBps * reservesToPool *
+     fromPool / ((reservesFromPool - fromPool) *
+     (maxBps - feeBps)))`.
+   - Note: `NORMAL` rounding mode (ManageSellOffer/ManageBuyOffer)
+     does NOT cross liquidity pools — only path payments do.
    - Update pool reserves.
 5. Repeat until the requested amount is fulfilled or no more
    offers/pools are available.
-6. Enforce `MAX_OFFERS_TO_CROSS` (1000) across all crossings.
+6. Enforce `MAX_OFFERS_TO_CROSS` (1000) across all crossings
+   `@version(≥11)`.
 
 **Self-crossing prevention**: An offer MUST NOT cross another offer
 from the same account. If detected, the operation fails with
@@ -1686,12 +1703,15 @@ wheatStays = (wheatValue > sheepValue)
 5. In `PATH_PAYMENT_STRICT_SEND` mode: `sheepSend > 0` is always
    guaranteed when a trade occurs.
 
-**Computation branches** (determined by `wheatStays` and `price.n`
-vs `price.d`):
+**Computation branches** (determined by `wheatStays`, `price.n`
+vs `price.d`, and rounding mode):
+- When `wheatStays` and `STRICT_SEND`:
+  `wheatReceive = floor(sheepValue / price.n)`,
+  `sheepSend = min(maxSheepSend, maxSheepReceive)`.
 - When `wheatStays` and (`price.n > price.d` or `STRICT_RECEIVE`):
   `wheatReceive = floor(sheepValue / price.n)`,
   `sheepSend = ceil(wheatReceive * price.n / price.d)`.
-- When `wheatStays` and `price.n <= price.d` (NORMAL):
+- When `wheatStays` and `price.n <= price.d` (NORMAL only):
   `sheepSend = floor(sheepValue / price.d)`,
   `wheatReceive = floor(sheepSend * price.d / price.n)`.
 - When `!wheatStays` and `price.n > price.d`:
@@ -1701,9 +1721,17 @@ vs `price.d`):
   `sheepSend = floor(wheatValue / price.d)`,
   `wheatReceive = ceil(sheepSend * price.d / price.n)`.
 
-After computation, a 1% price error threshold is applied in `NORMAL`
-mode: if `sheepSend * price.d < wheatReceive * price.n` (sheep
-seller underpaid) beyond the threshold, the exchange is zeroed out.
+After computation, a 1% price error threshold is applied:
+- In `NORMAL` mode: the check is **symmetric** — if the relative
+  error between the nominal price and the effective price exceeds 1%
+  in **either** direction, the exchange is zeroed out (both
+  `sheepSend` and `wheatReceive` set to 0, and the smaller offer is
+  removed).
+- In path payment modes (`STRICT_SEND`, `STRICT_RECEIVE`): the check
+  is **one-directional** — error favoring the wheat seller (book
+  offer) is unbounded (the path payment's `sendMax`/`destMin`
+  provides protection), while error favoring the sheep seller must
+  not exceed 1%.
 
 ---
 

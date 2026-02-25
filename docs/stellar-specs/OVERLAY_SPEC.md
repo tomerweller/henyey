@@ -261,8 +261,12 @@ The `HELLO` message carries the following fields:
 | `cert` | `AuthCert` | Ephemeral authentication certificate |
 | `nonce` | `uint256` | 32-byte random nonce for this connection |
 
-Upon receiving a HELLO, the receiver MUST perform the following validation
-checks in order:
+Upon receiving a HELLO, the receiver MUST perform the following steps
+in order. Note that the responder sends its own HELLO back **before**
+the overlay version, self-connection, and network ID checks. This is
+deliberate: subsequent `ERROR_MSG` messages are authenticated
+(HMAC-protected), so the remote peer needs the HELLO exchange to have
+completed in order to decode them.
 
 1. **State check**: The receiver MUST NOT have already received a HELLO
    from this peer. If the receiver is already in state `GOT_HELLO` or
@@ -272,22 +276,41 @@ checks in order:
    be dropped.
 3. **Ban check**: If the remote `peerID` is banned, the connection MUST
    be dropped.
-4. **Overlay version compatibility**: The receiver MUST check:
+4. **Store remote info and derive keys**: The receiver stores the
+   remote peer's overlay version range, version string, peerID, and
+   nonce. It then derives the per-connection HMAC keys
+   (Section 4.4.4). The connection transitions to state `GOT_HELLO`.
+5. **Address validation**: Validate that the remote IP is non-empty.
+   Update the peer address with the remote's `listeningPort`.
+6. **Responder sends HELLO**: If the receiver is the **responder**
+   (`REMOTE_CALLED_US`), it MUST send its own HELLO message back to
+   the initiator at this point — before performing the remaining
+   validation checks below.
+7. **Overlay version compatibility**: The receiver MUST check:
    - `remoteOverlayMinVersion <= remoteOverlayVersion` (coherent range)
    - `remoteOverlayVersion >= localOverlayMinVersion` (not too old)
    - `remoteOverlayMinVersion <= localOverlayVersion` (not too new)
    - If any check fails: send `ERROR_MSG(ERR_CONF, "wrong protocol version")`
      and drop.
-5. **Self-connection detection**: If `remotePeerID == localNodeID`, send
+8. **Self-connection detection**: If `remotePeerID == localNodeID`, send
    `ERROR_MSG(ERR_CONF, "connecting to self")` and drop.
-6. **Network ID check**: If `remoteNetworkID != localNetworkID`, send
+9. **Network ID check**: If `remoteNetworkID != localNetworkID`, send
    `ERROR_MSG(ERR_CONF, "wrong network passphrase")` and drop.
-7. **Port validation**: If `listeningPort <= 0` or `> 65535` or the
-   remote IP cannot be determined, send
-   `ERROR_MSG(ERR_CONF, "bad address")` and drop.
-8. **Duplicate peer check**: If the remote `peerID` already appears among
-   authenticated or pending peers (excluding this connection), send
-   `ERROR_MSG(ERR_CONF, "already-connected peer")` and drop.
+10. **Port validation**: If `listeningPort <= 0` or `> 65535` or the
+    remote IP cannot be determined, send
+    `ERROR_MSG(ERR_CONF, "bad address")` and drop.
+11. **Update peer record**: Record the successful HELLO echo in the
+    peer database.
+12. **Duplicate authenticated peer check**: If the remote `peerID`
+    already appears among authenticated peers (excluding this
+    connection), send `ERROR_MSG(ERR_CONF, "already-connected peer")`
+    and drop.
+13. **Duplicate pending peer check**: If the remote `peerID` already
+    appears among pending peers (excluding this connection), send
+    `ERROR_MSG(ERR_CONF, "already-connected peer")` and drop.
+14. **Initiator sends AUTH**: If the receiver is the **initiator**
+    (`WE_CALLED_REMOTE`), it sends the `AUTH` message at this point
+    to complete the handshake.
 
 #### 4.4.3 AuthCert Verification
 
@@ -1047,10 +1070,18 @@ Implementations MUST enforce the following constraints on configuration:
 
 - `FLOW_CONTROL_SEND_MORE_BATCH_SIZE <= PEER_FLOOD_READING_CAPACITY`
 - `PEER_READING_CAPACITY > PEER_FLOOD_READING_CAPACITY`
-- `PEER_FLOOD_READING_CAPACITY_BYTES - FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES >= MAX_CLASSIC_TX_SIZE_BYTES`
+- `PEER_FLOOD_READING_CAPACITY_BYTES - FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES >= maxTxSize`
 
-The last constraint ensures the sender can always send at least one
-maximum-size transaction before needing an acknowledgment.
+Where `maxTxSize` is the dynamic maximum of:
+- `MAX_CLASSIC_TX_SIZE_BYTES` (102,400 bytes, the compile-time classic
+  transaction size limit), and
+- `sorobanNetworkConfig.txMaxSizeBytes() + FLOW_CONTROL_BYTES_EXTRA_BUFFER`
+  (the Soroban maximum transaction size from the network configuration plus
+  a 2,000-byte buffer), when protocol >= 20.
+
+This value is recomputed at startup and on network configuration
+upgrades. The constraint ensures the sender can always send at least
+one maximum-size transaction before needing an acknowledgment.
 
 ---
 
@@ -1135,6 +1166,26 @@ popping hashes for demand scheduling.
 
 The demand scheduler runs every **200 ms** (`FLOOD_DEMAND_PERIOD_MS`)
 and constructs `FLOOD_DEMAND` messages for peers.
+
+**Max demand size**: The maximum number of hashes per `FLOOD_DEMAND`
+message is dynamically computed. Unlike the advert formula (which uses
+ledger limits from the ledger header and Soroban network config), the
+demand formula uses **queue sizes** from the transaction queue limiter:
+
+```
+queueSizeInOps = FLOOD_OP_RATE_PER_LEDGER * maxQueueSizeOps
+               + FLOOD_SOROBAN_RATE_PER_LEDGER * maxQueueSizeSorobanOps
+
+maxDemandSize = clamp(
+    ceil(queueSizeInOps * FLOOD_DEMAND_PERIOD_MS / expectedLedgerCloseTime),
+    1,
+    TX_DEMAND_VECTOR_MAX_SIZE    // 1000
+)
+```
+
+Where `maxQueueSizeOps` and `maxQueueSizeSorobanOps` come from the
+herder's `TxQueueLimiter` (scaled multiples of ledger limits), making
+the demand budget typically larger than the advert budget.
 
 **Demand status decision** for each transaction hash:
 
@@ -1905,6 +1956,7 @@ its connections, are mitigated by:
 | `FLOW_CONTROL_SEND_MORE_BATCH_SIZE` | 40 | Message batch for SEND_MORE | [8.4](#84-inbound-flow-control-and-capacity-release) |
 | `FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES` | 100,000 | Byte batch for SEND_MORE | [8.4](#84-inbound-flow-control-and-capacity-release) |
 | `OUTBOUND_TX_QUEUE_BYTE_LIMIT` | 3,145,728 (3 MiB) | Max outbound tx queue | [8.7](#87-load-shedding) |
+| `FLOW_CONTROL_BYTES_EXTRA_BUFFER` | 2,000 | Extra buffer added to Soroban maxTxSize for capacity constraint | [8.9](#89-capacity-constraints) |
 
 ### 14.4 Peer Management Constants
 

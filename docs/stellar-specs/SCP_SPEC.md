@@ -828,10 +828,10 @@ updateRoundLeaders():
 
     while |mRoundLeaders| < maxLeaderCount:
         newRoundLeaders = { localNodeID }
-        topPriority = getNodePriority(localNodeID, localQSet)
+        topPriority = getNodePriority(localNodeID, normalizedQSet)
 
         for each node cur in normalizedQSet:
-            w = getNodePriority(cur, localQSet)
+            w = getNodePriority(cur, normalizedQSet)
             if w > topPriority:
                 topPriority = w
                 newRoundLeaders = { }     // clear — new winner
@@ -935,8 +935,11 @@ highest-hash-value that it does not already have in `mVotes`:
 
 1. First, consider only `accepted` values from the leader. Validate
    each and compute `hashValue` for valid ones not in `mVotes`.
-2. Only if NO valid accepted value was found, fall through to `votes`.
+2. Only if NO valid accepted value was found (even if all valid ones
+   were already in `mVotes`), fall through to `votes`.
 3. Among qualifying values, select the one with the highest `hashValue`.
+   On ties (`curHash == newHash`), the later value in iteration order
+   wins (`>=` comparison).
 
 Accepted values take absolute priority over voted values. The
 `hashValue` function provides a deterministic, round-dependent ranking.
@@ -1202,8 +1205,12 @@ federated accept.
    peers' latest statements (see Section 9.5.1).
 2. Iterate candidates from **highest to lowest**.
 3. For each candidate ballot:
-   - In `CONFIRM` phase: only consider if the ballot is strictly
-     higher than `mPrepared` AND compatible with `mCommit`.
+   - In `CONFIRM` phase: only consider if `mPrepared` is
+      less-and-compatible with the ballot (i.e., `mPrepared < ballot`
+      AND `mPrepared ~ ballot`). An assertion verifies that any
+      candidate passing this filter is also compatible with `mCommit`
+      (this is guaranteed by the invariant `p ~ c` in CONFIRM phase,
+      not checked as a separate filter).
    - Skip if already covered: if `ballot <= mPreparedPrime`, or if
      `ballot` is less-and-compatible with `mPrepared`.
    - Call `federatedAccept(votedPrepared, acceptedPrepared)`:
@@ -1281,7 +1288,9 @@ optionally establish a commit range.
    - Only if neither `p` nor `p'` is higher-and-incompatible with
      `newH`.
    - Continue iterating downward from `newH`:
-     - Skip if `ballot < mCurrentBallot` or incompatible with `newH`.
+     - If `ballot < mCurrentBallot`: break (stop searching).
+     - If ballot is NOT less-and-compatible with `newH`: skip (continue
+       to next candidate).
      - Call `federatedRatify(hasPreparedBallot(...))`.
      - If ratified: `newC = ballot`, continue searching lower.
      - If not ratified: break (contiguous range ended).
@@ -1441,10 +1450,17 @@ Where `ballotCounter(st)` returns:
 1. Get latest composite candidate value from nomination protocol.
 2. If empty, fall back to `mCurrentBallot.value`.
 3. If still empty, return false.
-4. If `n == 0`: compute `n = mCurrentBallot ? mCurrentBallot.counter + 1 : 1`.
-5. Call `bumpState(value, n)`.
+4. If `n == 0`: call `bumpState(value, force=true)`.
+5. If `n > 0`: call `bumpState(value, n)` (direct counter overload).
 
-**`bumpState(value, n)`**:
+**`bumpState(value, force)`** — boolean force overload:
+
+1. If `!force AND mCurrentBallot` exists: return false (can't bump
+   unless forced or no ballot yet).
+2. Compute `n = mCurrentBallot ? mCurrentBallot.counter + 1 : 1`.
+3. Call `bumpState(value, n)`.
+
+**`bumpState(value, n)`** — explicit counter overload:
 
 1. Gate: only `PREPARE` or `CONFIRM`.
 2. Construct `newBallot = (n, value)`.

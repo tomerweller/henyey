@@ -138,13 +138,23 @@ The following transitions are **forbidden**:
 
 ### 3.3 Transition Rules
 
-**BOOTING → TRACKING:** Occurs when the node receives its first
-externalized SCP value and the ledger apply manager confirms the
-ledger can be applied sequentially (no catchup needed).
+**BOOTING → TRACKING:** Occurs at startup in `start()` when the
+node has existing ledger state (i.e., the last closed ledger is
+beyond genesis). The node calls `setTrackingSCPState` with
+`isTrackingNetwork = true`, transitions to TRACKING, and restores
+persisted SCP state. This is the normal restart path.
 
-**BOOTING → SYNCING:** Occurs when the node receives an externalized
-SCP value but the ledger apply manager determines catchup is required
-(the externalized ledger is too far ahead of the last closed ledger).
+**BOOTING → SYNCING:** Occurs at startup in `start()` when the node
+is on the genesis ledger (and `FORCE_SCP` is not set). In this case
+there is no meaningful consensus state to track, so the node calls
+`setTrackingSCPState` with `isTrackingNetwork = false`, transitioning
+to SYNCING. It then waits for SCP messages from the network.
+
+> **Note:** The node is never in the BOOTING state when SCP messages
+> are being processed, because `start()` unconditionally transitions
+> out of BOOTING before SCP processing begins. The
+> `trackingConsensusLedgerIndex()` method asserts that the state is
+> not BOOTING.
 
 **TRACKING → SYNCING:** Occurs when the **consensus stuck timer**
 fires without a new ledger being closed. This indicates the node has
@@ -155,9 +165,14 @@ fallen behind the network. On this transition, the herder:
 3. Starts the **out-of-sync recovery timer**.
 4. Processes any queued SCP envelopes to attempt re-synchronization.
 
-**SYNCING → TRACKING:** Occurs when a new ledger is successfully
-closed (either via catchup completion or sequential application of
-a buffered externalized value), re-establishing synchronization.
+**SYNCING → TRACKING:** Occurs when SCP externalizes a value for
+the latest slot (via the `valueExternalized` callback in
+`HerderSCPDriver`). The transition happens **before** the ledger
+is applied — `setTrackingSCPState` is called with
+`isTrackingNetwork = true` before `mHerder.valueExternalized()`
+delivers the `LedgerCloseData` to the ledger manager. This means
+the node transitions to TRACKING based on SCP consensus, not
+based on successful ledger application.
 
 ### 3.4 Tracking Timer
 
@@ -269,9 +284,14 @@ hold:
 
 - The node is in the **TRACKING** state.
 - The node is configured as a **validator** (not a watcher).
-- No nomination or ballot protocol is currently in progress for the
-  target slot.
-- The ledger manager is not currently applying a ledger close.
+- The ledger manager reports **synced** (`isSynced()` returns true).
+- The ledger manager is not currently applying a ledger close
+  (checked only when parallel ledger close is enabled).
+
+> **Note:** There is no explicit check for "no nomination or ballot
+> in progress" — the guard against double-nomination is handled
+> implicitly by timer scheduling and slot management rather than by
+> an explicit precondition check.
 
 If any precondition is not met, nomination is deferred. The herder
 SHOULD set a retry timer to re-evaluate nomination preconditions
@@ -297,8 +317,11 @@ When SCP calls `valueExternalized(slotIndex, value)`:
 5. **Deliver**: Pass the LedgerCloseData to the ledger apply manager.
 
 6. **Slot management**: Purge SCP state for old slots, retaining
-   state for the current slot and a small lookback window
-   (RECOMMENDED: `SCP_EXTRA_LOOKBACK_LEDGERS` = 3 additional slots).
+   state for the current slot and a lookback window of
+   `MAX_SLOTS_TO_REMEMBER` (12 by default, configurable) slots.
+   Note: `SCP_EXTRA_LOOKBACK_LEDGERS` (3) is a separate constant
+   used for requesting SCP state from peers, not for slot
+   retention.
 
 7. **Purge envelope state**: Remove cached envelopes, transaction
    sets, and quorum sets for slots older than the lookback window.
@@ -325,7 +348,7 @@ contain:
 | Field | Type | Description |
 |-------|------|-------------|
 | `nodeID` | `NodeID` | The Ed25519 public key of the proposing validator. |
-| `signature` | `Signature` | Ed25519 signature over `(networkID, ENVELOPE_TYPE_SCP_VALUE, closeTime, txSetHash)`. |
+| `signature` | `Signature` | Ed25519 signature over `(networkID, ENVELOPE_TYPE_SCPVALUE, txSetHash, closeTime)`. Note: `txSetHash` precedes `closeTime` in the signed payload. |
 
 ### 5.2 Close Time Computation
 
@@ -351,10 +374,11 @@ proposedCloseTime = max(previousLedgerCloseTime + 1,
 **Close time drift detection**: The herder SHOULD track the
 difference between observed close times and its local wall clock
 over a sliding window of `CLOSE_TIME_DRIFT_LEDGER_WINDOW_SIZE`
-(120) ledgers. If the median drift exceeds
+(120) ledgers. If the 75th-percentile drift exceeds
 `CLOSE_TIME_DRIFT_SECONDS_THRESHOLD` (10 seconds), the herder
-SHOULD apply a corrective offset to subsequent proposed close
-times to converge with the network.
+logs a warning indicating a possibly bad local clock. Note: the
+herder does NOT apply a corrective offset to subsequent proposed
+close times — drift detection is informational only.
 
 ### 5.3 StellarValue Validation
 
@@ -367,7 +391,7 @@ following checks:
 
 2. **Signature verification**: The signature in the extension
    MUST be a valid Ed25519 signature over
-   `(networkID, ENVELOPE_TYPE_SCP_VALUE, closeTime, txSetHash)`,
+   `(networkID, ENVELOPE_TYPE_SCPVALUE, txSetHash, closeTime)`,
    verifiable with the `nodeID` public key. Invalid signatures
    MUST be rejected.
 
@@ -376,7 +400,7 @@ following checks:
    MUST be rejected.
 
 4. **Close time upper bound**: `closeTime <= currentWallClock +
-   MAX_TIME_SLIP_SECONDS + CLOSE_TIME_DRIFT_SECONDS_THRESHOLD`.
+   MAX_TIME_SLIP_SECONDS`.
    Values with close times too far in the future MUST be rejected.
 
 5. **Slot validity**: The slot index MUST be within a
@@ -406,12 +430,16 @@ before ballot voting).
 ### 5.4 Extracting a Valid Value
 
 When SCP calls `extractValidValue`, the herder MUST return a
-value that passes all validation checks. If the input value has
-an invalid close time (too old or too far in the future), the
-herder SHOULD attempt to adjust the close time to the nearest
-valid value while preserving the transaction set hash and
-upgrades. If adjustment is not possible, the herder MUST return
-no value.
+value that passes all validation checks. The herder validates
+the input value against the local state; if validation fails,
+the herder MUST return no value. If the value passes validation,
+the herder removes any invalid upgrade steps (pruning upgrades
+that fail `isValid` checks) and returns the resulting value.
+
+> **Note:** The herder does NOT adjust the close time during
+> `extractValidValue`. If the close time is invalid (too old or
+> too far in the future), the value is rejected entirely rather
+> than adjusted. Only upgrade steps are filtered.
 
 ---
 
@@ -528,13 +556,15 @@ base fee for each lane is computed as follows:
 
 1. If the **generic lane** is full (at least one transaction
    was excluded due to the generic lane's resource limit), the
-   base fee for all lanes is at least the minimum fee among
-   all excluded transactions across all lanes.
+   base fee for all lanes is at least the minimum per-operation
+   inclusion fee among all **included** transactions across all
+   lanes. This is the fee of the marginal included transaction
+   — the lowest-fee transaction that made it into the set.
 
 2. If a **limited lane** (e.g., DEX lane) is additionally full,
-   the base fee for that lane is the minimum fee among
-   transactions excluded specifically from that lane. This may
-   be higher than the generic lane's base fee.
+   the base fee for that lane is the minimum per-operation
+   inclusion fee among **included** transactions in that specific
+   lane. This may be higher than the generic lane's base fee.
 
 3. If a lane had no excluded transactions (all submitted
    transactions fit), the base fee for that lane defaults to
@@ -857,32 +887,28 @@ Given a set of candidate StellarValues, the herder selects the
 "best" transaction set using the following ordered criteria.
 Each criterion is a tiebreaker for the previous one:
 
-1. **Largest phase count**: Prefer the transaction set with
-   more phases (i.e., prefer sets that include a Soroban phase
-   over those that do not).
-
-2. **Most operations**: Among sets with equal phase count,
-   prefer the set containing the most total operations
-   (sum of `getNumOperations()` across all transactions in
-   all phases). Before protocol 11, transaction count was
+1. **Most operations**: Prefer the set containing the most total
+   operations (sum of `getNumOperations()` across all transactions
+   in all phases). Before protocol 11, transaction count was
    used instead of operation count; from protocol 11+
    (CAP-0005), operation count is used.
 
-3. **Highest total inclusion fees**: Among sets with equal
+2. **Highest total inclusion fees**: Among sets with equal
    operation count, prefer the set with the highest sum
-   of inclusion fees.
+   of inclusion fees. (Protocol 21+, Soroban-era only.)
 
-4. **Highest total full fees**: Among sets with equal total
+3. **Highest total full fees**: Among sets with equal total
    inclusion fees, prefer the set with the highest sum of
-   full (pre-discount) fees.
+   full (pre-discount) fees. (Protocol 11+.)
 
-5. **Smallest encoded size**: Among sets with equal total
+4. **Smallest encoded size**: Among sets with equal total
    fees, prefer the set with the smallest XDR-encoded byte
-   size.
+   size. (Protocol 21+, Soroban-era only.)
 
-6. **Hash tiebreak**: If all above criteria are equal, prefer
-   the set whose contents hash, XORed with the SCP slot
-   hash, is lexicographically smallest.
+5. **Hash tiebreak**: If all above criteria are equal, prefer
+   the set whose contents hash, XORed with the `candidatesHash`
+   (the XOR of SHA-256 hashes of all candidate values), is
+   lexicographically smallest.
 
 ### 10.3 Close Time Selection
 
@@ -932,19 +958,22 @@ transaction per source account** at any time.
 ### 11.2 Queue Capacity
 
 Each queue holds up to `pendingDepth` ledgers worth of
-transactions, where capacity is measured in the queue's resource
-units (operations for classic, multi-dimensional resources for
-Soroban). A RECOMMENDED value for `pendingDepth` is 4 ledgers
-(`TRANSACTION_QUEUE_TIMEOUT_LEDGERS`).
-
-The maximum capacity of each queue is:
+transactions for aging purposes, where `pendingDepth` is
+`TRANSACTION_QUEUE_TIMEOUT_LEDGERS` (RECOMMENDED: 4).
+However, the queue's **resource capacity** uses a separate
+multiplier, `TRANSACTION_QUEUE_SIZE_MULTIPLIER` (default: 2,
+configurable):
 
 ```
-maxQueueResources = maxLedgerResources * pendingDepth
+maxQueueResources = maxLedgerResources * TRANSACTION_QUEUE_SIZE_MULTIPLIER
 ```
 
 Where `maxLedgerResources` is the per-ledger resource limit for
-the queue's transaction type.
+the queue's transaction type. Note that `pendingDepth` (4) and
+the capacity multiplier (2) are distinct parameters:
+`pendingDepth` controls how many ledger closes before a queued
+transaction is aged out, while the capacity multiplier controls
+the total resource capacity of the queue.
 
 ### 11.3 Transaction Reception
 
@@ -1006,14 +1035,22 @@ is rejected with `txSOROBAN_INVALID`.
 
 If the source account already has a queued transaction:
 
-- If the new transaction is a **fee-bump** wrapping the same
-  inner transaction and has the same sequence number, it MAY
-  replace the existing transaction if its per-operation
-  inclusion fee is at least `FEE_MULTIPLIER` (10) times the
-  existing transaction's per-operation inclusion fee. If the
-  fee is insufficient, the transaction is rejected with
-  `txINSUFFICIENT_FEE` and the minimum required fee is
-  reported.
+- If the new transaction is a **fee-bump** (envelope type
+  `ENVELOPE_TYPE_TX_FEE_BUMP`) with the same sequence number as
+  the existing queued transaction, it MAY replace the existing
+  transaction if its per-operation inclusion fee is at least
+  `FEE_MULTIPLIER` (10) times the existing transaction's
+  per-operation inclusion fee. If the fee is insufficient, the
+  transaction is rejected with `txINSUFFICIENT_FEE` and the
+  minimum required fee is reported.
+
+  > **Note:** The replace-by-fee check does NOT verify that the
+  > fee-bump wraps the same inner transaction as the existing
+  > queued transaction. It only checks: (1) the new transaction
+  > is a fee-bump envelope, (2) the sequence numbers match, and
+  > (3) the fee meets the 10x threshold. A fee-bump wrapping a
+  > completely different inner transaction with the same sequence
+  > number will pass the replace-by-fee check.
 
 - If the new transaction is not a qualifying fee-bump
   replacement, it is rejected with `TRY_AGAIN_LATER` (only
@@ -1179,9 +1216,19 @@ the lane configuration:
 | **Soroban** | Multi-dimensional resource limit (ops, instructions, read bytes, write bytes, tx size) | None (single-lane) |
 
 A classic transaction is assigned to the DEX lane if it contains
-any DEX-related operations (manage buy/sell offer, create passive
-sell offer, path payment strict send/receive) and the DEX lane is
-configured. Otherwise, it is assigned to the generic lane.
+any DEX-related operations and the DEX lane is configured.
+Otherwise, it is assigned to the generic lane.
+
+An operation is classified as **DEX** based on its type, with
+conditional exclusions:
+
+| Operation Type | DEX? | Exclusion |
+|---------------|------|-----------|
+| `MANAGE_SELL_OFFER` | Yes | **Except** when `amount == 0` (delete offer) |
+| `MANAGE_BUY_OFFER` | Yes | **Except** when `buyAmount == 0` (delete offer) |
+| `CREATE_PASSIVE_SELL_OFFER` | Yes | None |
+| `PATH_PAYMENT_STRICT_SEND` | Yes | **Except** when path is empty AND source asset == destination asset |
+| `PATH_PAYMENT_STRICT_RECEIVE` | Yes | **Except** when path is empty AND source asset == destination asset |
 
 ### 12.4 Transaction Set Selection
 
@@ -1537,8 +1584,10 @@ The tracker is rebuilt lazily:
 
 When SCP is ready to process envelopes, the herder pops
 ready envelopes in **slot order** (lowest slot first). Within
-a slot, envelopes are processed in the order they became ready
-(FIFO).
+a slot, envelopes are processed in **LIFO order** (last-in,
+first-out): the most recently readied envelope is popped first
+(using `v.back()` / `v.pop_back()` on the ready envelope
+vector).
 
 ---
 
@@ -1598,9 +1647,11 @@ each upgrade step MUST satisfy:
    types are forbidden.
 
 3. **Version upgrades**: The proposed version MUST NOT exceed
-   the maximum version supported by this node plus one.
-   This ensures nodes do not vote for versions they cannot
-   execute.
+   the maximum version supported by this node
+   (`config.LEDGER_PROTOCOL_VERSION`). This ensures nodes do
+   not vote for versions they cannot execute. Additionally,
+   the proposed version MUST be strictly greater than the
+   current ledger protocol version (monotonicity).
 
 4. **Config upgrades**: The referenced `ConfigUpgradeSet` MUST
    be available in the ledger state (as a contract data entry).
@@ -1638,12 +1689,17 @@ The herder MUST persist SCP state to durable storage so that
 consensus can be recovered after a restart. The following data
 is persisted for each slot:
 
-- All SCP envelopes that have been processed.
+- The SCP envelopes that the **local node has sent** (via
+  `getSCP().getLatestMessagesSend(slot)`), not all processed
+  envelopes.
 - All quorum sets referenced by those envelopes.
 - All transaction set hashes referenced by those envelopes.
 
-Persistence occurs after each externalization event. Only slots
-newer than the previously persisted slot are saved.
+Persistence occurs on **every SCP message emission** (in the
+`emitEnvelope` callback), not only on externalization. This
+means persistence is triggered whenever the local node sends
+any SCP message (nominate, prepare, confirm, or externalize).
+Only slots newer than the previously persisted slot are saved.
 
 ### 16.2 SCP State Restoration
 
@@ -1699,8 +1755,10 @@ RECOMMENDED defaults derived from stellar-core v25.x:
 | `TRANSACTION_QUEUE_TIMEOUT_LEDGERS` | 4 | Number of ledger closes before a queued transaction is aged out (`pendingDepth`). |
 | `TRANSACTION_QUEUE_BAN_LEDGERS` | 10 | Number of ledger closes a banned transaction hash remains banned (`banDepth`). |
 | `CLOSE_TIME_DRIFT_LEDGER_WINDOW_SIZE` | 120 | Number of ledgers in the close time drift detection sliding window. |
-| `CLOSE_TIME_DRIFT_SECONDS_THRESHOLD` | 10 | Drift threshold (seconds) that triggers corrective offset. |
-| `SCP_EXTRA_LOOKBACK_LEDGERS` | 3 | Number of additional old slots retained beyond the current slot. |
+| `CLOSE_TIME_DRIFT_SECONDS_THRESHOLD` | 10 | Drift threshold (seconds) that triggers a warning log. |
+| `SCP_EXTRA_LOOKBACK_LEDGERS` | 3 | Number of additional old slots requested from peers for SCP state recovery. |
+| `MAX_SLOTS_TO_REMEMBER` | 12 | Number of old SCP slots retained beyond the current slot (configurable). |
+| `TRANSACTION_QUEUE_SIZE_MULTIPLIER` | 2 | Multiplier for queue resource capacity (configurable; `maxQueueResources = maxLedgerResources * multiplier`). |
 | `QSET_CACHE_SIZE` | 10,000 | LRU cache capacity for quorum sets. |
 | `TXSET_CACHE_SIZE` | 10,000 | LRU cache capacity for transaction sets. |
 | `TX_SET_GC_DELAY` | 60 seconds | Interval for garbage-collecting unreferenced persisted transaction sets. |
