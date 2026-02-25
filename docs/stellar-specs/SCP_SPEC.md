@@ -1,6 +1,6 @@
 # Stellar Consensus Protocol (SCP) Specification
 
-**Version:** 25 (stellar-core v25.x / Protocol 25)
+**Version:** 25 (stellar-core v25.1.1 / Protocol 25)
 **Status:** Informational
 **Date:** 2026-02-20
 
@@ -127,8 +127,9 @@ The protocol achieves consensus through two primitives:
 - **Federated accept**: A statement transitions from "voted" to
   "accepted" when either a v-blocking set accepts it or a quorum
   votes/accepts it.
-- **Federated ratify**: A statement transitions from "accepted" to
-  "confirmed" when a quorum accepts it.
+- **Federated ratify**: A statement is confirmed by a node when a
+  quorum has accepted the statement (i.e., all members of a quorum
+  report having accepted it).
 
 ### 2.3 Library Isolation
 
@@ -557,6 +558,9 @@ The following methods MUST be implemented:
 | `setupTimer(slotIndex, timerID, timeout, callback)` | Schedule a callback after `timeout` milliseconds. A null callback cancels the timer. |
 | `stopTimer(slotIndex, timerID)` | Cancel a previously scheduled timer. |
 | `computeTimeout(roundNumber, isNomination) → milliseconds` | Compute the timeout duration for a given round. SHOULD grow with `roundNumber` and SHOULD allow at least 4 message exchanges. |
+| `hasUpgrades(value) → bool` | Returns true if the value contains protocol upgrades. Used by the upgrade stripping timeout mechanism. |
+| `stripAllUpgrades(value) → ValueWrapperPtr` | Returns a new value with all upgrades removed. Returns nullptr if no valid value exists without upgrades. |
+| `getUpgradeNominationTimeoutLimit() → uint32` | Returns the maximum number of nomination timer expirations before upgrade stripping activates. |
 
 ### 6.3 Virtual Methods with Defaults
 
@@ -619,11 +623,15 @@ big-endian `uint64`:
 | `hashNode(priority)` | 2 (`hash_P`) | `NodeID` | Priority assignment — determines ranking among leader candidates |
 | `hashValue` | 3 (`hash_K`) | `Value` | Value ranking — determines which candidate value to prefer from a leader |
 
+> **Note**: Both `computeHashNode` and `computeValueHash` are virtual methods on `SCPDriver` with default implementations. Drivers MAY override them to customize the hash computation (e.g., for testing purposes).
+
 ### 6.7 Node Weight
 
 The weight of a node within a quorum set determines its probability of
 passing the neighborhood check during leader selection. Weight is
 computed recursively:
+
+> **Note**: `getNodeWeight` is a virtual method on `SCPDriver` with the default implementation described below. Drivers MAY override it.
 
 ```
 getNodeWeight(nodeID, Q):
@@ -913,11 +921,26 @@ nominate(value, previousValue, timedout):
                 updated = true
                 nominatingValue(slotIndex, newValue)
 
-    // 7. Self-nomination (only if leader AND no values adopted)
-    if localNodeID ∈ mRoundLeaders AND mVotes is empty:
-        mVotes.add(value)
-        updated = true
-        nominatingValue(slotIndex, value)
+    // 7. Self-nomination (if leader)
+    if localNodeID ∈ mRoundLeaders:
+        shouldVoteForValue = false
+
+        // 7a. Vote if no votes yet
+        if mVotes is empty:
+            shouldVoteForValue = true
+
+        // 7b. Upgrade stripping after timeout (v25.1.1+)
+        // If nomination has timed out enough times and all current votes
+        // contain upgrades, strip upgrades from the value to improve liveness.
+        if mTimerExpCount >= getUpgradeNominationTimeoutLimit():
+            if ALL values in mVotes have upgrades (via hasUpgrades()):
+                value = stripAllUpgrades(value)
+                shouldVoteForValue = true
+
+        if shouldVoteForValue:
+            if mVotes.add(value):   // only if actually new
+                updated = true
+                nominatingValue(slotIndex, value)
 
     // 8. Schedule next round
     setupTimer(slotIndex, NOMINATION_TIMER, timeout,
@@ -1468,6 +1491,7 @@ Where `ballotCounter(st)` returns:
    `mValueOverride`. Once a value is locked (confirmed-prepared or
    accepted-committed), all subsequent ballots MUST use that value.
 4. Call `updateCurrentValue(newBallot)`.
+5. If updated: call `emitCurrentStateStatement()` followed by `checkHeardFromQuorum()`.
 
 **`updateCurrentValue(ballot)`**:
 
@@ -1529,6 +1553,8 @@ updateCurrentIfNeeded(h):
   c=(nCommit, value). Phase = CONFIRM.
 - EXTERNALIZE: b=(UINT32_MAX, value), p=(UINT32_MAX, value),
   h=(nH, value), c=commit. Phase = EXTERNALIZE.
+
+State recovery also sets `mLastEnvelopeEmit = mLastEnvelope`, preventing the recovered statement from being re-emitted to the network via `sendLatestEnvelope`.
 
 ---
 
@@ -1603,6 +1629,8 @@ See Section 8.6 for the complete nomination processing algorithm.
 | 2 | `nH >= commit.counter` |
 
 All statement types also require a valid (sane) quorum set hash.
+
+The quorum set sanity check is performed **without** extra checks (Rule 6 from Section 4.2 is not enforced for incoming messages), using `isQuorumSetSane(qSet, extraChecks=false)`.
 
 ---
 

@@ -32,7 +32,7 @@
 ### 1.1 Purpose and Scope
 
 This document specifies the Stellar Overlay Protocol as implemented in
-stellar-core v25.x. The overlay protocol governs how Stellar network nodes
+stellar-core v25.1.1. The overlay protocol governs how Stellar network nodes
 discover peers, establish authenticated connections, propagate transactions
 and consensus messages, manage flow control, and conduct network topology
 surveys.
@@ -234,16 +234,16 @@ sequenceDiagram
     B->>A: HELLO(CertB, NonceB)
     note over A: Verify CertB, derive keys<br/>State → GOT_HELLO
     A->>B: AUTH(seq=0, MAC_AB)
-    note over B: Verify MAC<br/>State → GOT_AUTH
+    note over B: Verify MAC, State → GOT_AUTH<br/>then accept peer & check flags
     B->>A: AUTH(seq=0, MAC_BA)
     B->>A: PEERS
-    note over A: Verify MAC<br/>State → GOT_AUTH
+    note over A: Verify MAC, State → GOT_AUTH<br/>then accept peer & check flags
     note over A,B: Authenticated: all messages MACed with increasing sequence numbers
 ```
 
 The initiator sends HELLO first, then AUTH. The responder sends HELLO in
-response to receiving the initiator's HELLO, then AUTH in response to
-receiving the initiator's AUTH.
+response to receiving the initiator's HELLO, then AUTH (followed by
+PEERS) in response to receiving the initiator's AUTH.
 
 #### 4.4.2 HELLO Exchange
 
@@ -264,9 +264,11 @@ The `HELLO` message carries the following fields:
 Upon receiving a HELLO, the receiver MUST perform the following steps
 in order. Note that the responder sends its own HELLO back **before**
 the overlay version, self-connection, and network ID checks. This is
-deliberate: subsequent `ERROR_MSG` messages are authenticated
-(HMAC-protected), so the remote peer needs the HELLO exchange to have
-completed in order to decode them.
+deliberate: although `ERROR_MSG` is exempt from MAC verification
+(Section 5.2), it is still wrapped in the `AuthenticatedMessage`
+envelope. The remote peer needs the HELLO exchange to have completed
+so that its connection state machine can properly process subsequent
+messages.
 
 1. **State check**: The receiver MUST NOT have already received a HELLO
    from this peer. If the receiver is already in state `GOT_HELLO` or
@@ -303,11 +305,11 @@ completed in order to decode them.
     peer database.
 12. **Duplicate authenticated peer check**: If the remote `peerID`
     already appears among authenticated peers (excluding this
-    connection), send `ERROR_MSG(ERR_CONF, "already-connected peer")`
+    connection), send `ERROR_MSG(ERR_CONF, "already-connected peer: <peerID>")`
     and drop.
 13. **Duplicate pending peer check**: If the remote `peerID` already
     appears among pending peers (excluding this connection), send
-    `ERROR_MSG(ERR_CONF, "already-connected peer")` and drop.
+    `ERROR_MSG(ERR_CONF, "already-connected peer: <peerID>")` and drop.
 14. **Initiator sends AUTH**: If the receiver is the **initiator**
     (`WE_CALLED_REMOTE`), it sends the `AUTH` message at this point
     to complete the handshake.
@@ -426,26 +428,38 @@ After the HELLO exchange and key derivation, the initiator sends an
 The AUTH message is the first message protected by the connection's HMAC
 keys (sequence number 0).
 
-Upon receiving AUTH, the receiver MUST verify:
+Upon receiving AUTH, the receiver MUST perform the following steps
+in order:
 
 1. **State check**: The receiver MUST be in state `GOT_HELLO`. If not,
    send `ERROR_MSG(ERR_MISC, "out-of-order AUTH message")` and drop.
-2. **Acceptance check**: The overlay manager MUST accept the peer
+2. **State transition**: The receiver transitions to state `GOT_AUTH`.
+3. **Responder reply**: If the receiver is the **responder**
+   (`REMOTE_CALLED_US`), it sends its own AUTH message back, followed
+   by a `PEERS` message.
+4. **Update peer record**: Record the successful authentication in the
+   peer database (reset backoff for outbound connections).
+5. **Acceptance check**: The overlay manager MUST accept the peer
    (Section 10.2). If rejected, send
    `ERROR_MSG(ERR_LOAD, "peer rejected")` and drop.
-3. **Flow control flag**: `auth.flags` MUST equal
+6. **Flow control flag**: `auth.flags` MUST equal
    `AUTH_MSG_FLAG_FLOW_CONTROL_BYTES_REQUESTED` (200). If not, send
    `ERROR_MSG(ERR_CONF, "flow control bytes disabled")` and drop.
 
 After successful AUTH:
 
-- The receiver transitions to state `GOT_AUTH`.
-- If the receiver is the responder, it sends its own AUTH message back,
-  followed by a `PEERS` message.
 - Both sides send an initial `SEND_MORE_EXTENDED` message to grant flow
   control capacity (Section 8.3).
 - Both sides send `GET_SCP_STATE` to request the peer's current consensus
   state.
+
+Note that the state transition to `GOT_AUTH` and the responder's reply
+(AUTH + PEERS) happen **before** the acceptance and flow control flag
+checks. This means a rejected peer will already be in `GOT_AUTH` state
+and the responder will have already sent its AUTH and PEERS messages
+before the rejection is detected. This is by design: the acceptance
+check may evict another peer, and the flow control flag check requires
+the AUTH to have been processed.
 
 ### 4.5 Peer State Machine
 
@@ -724,16 +738,19 @@ struct PeerAddress {
 ```
 
 **Behavioral requirements**:
-- Only the responder (`REMOTE_CALLED_US`) sends PEERS. If the initiator
-  receives PEERS, it is an error; the responder receiving PEERS from an
-  inbound peer MUST drop the connection.
+- Only the responder (`REMOTE_CALLED_US`) sends PEERS to the initiator
+  after successful authentication. The responder MUST drop the
+  connection if it receives a PEERS message (since only the responder
+  is allowed to send PEERS, receiving one means the remote initiator
+  sent it in violation of the protocol).
 - At most one PEERS message is allowed per connection. A second PEERS
   message MUST cause the connection to be dropped.
 - At most **50** peer addresses are included.
 - IPv6 addresses, private addresses, localhost addresses, the recipient's
   own address, and addresses with invalid ports (0 or > 65535) MUST be
   excluded.
-- Only peers with fewer than **10** failures are included.
+- Only peers with **10 or fewer** failures are included
+  (`numfailures <= MAX_FAILURES`).
 
 ### 7.3 SCP Messages
 
@@ -980,10 +997,14 @@ When a flood message is received:
 When the accumulated count reaches either threshold, a
 `SEND_MORE_EXTENDED` MUST be sent back to the peer:
 
-- **Message threshold**: `FLOW_CONTROL_SEND_MORE_BATCH_SIZE` (default: 40)
-  messages processed.
-- **Byte threshold**: `FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES` (default:
-  100,000) bytes processed.
+- **Message threshold**: accumulated messages `==`
+  `FLOW_CONTROL_SEND_MORE_BATCH_SIZE` (default: 40). The message
+  counter is guaranteed to never exceed the batch size (an invariant
+  enforced by assertion), so exact equality is used.
+- **Byte threshold**: accumulated bytes `>=`
+  `FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES` (default: 100,000). A
+  single message may push the byte counter past the threshold, so
+  greater-than-or-equal is used.
 
 The thresholds are evaluated with OR logic: reaching **either** threshold
 triggers the `SEND_MORE_EXTENDED`. Both accumulated counters are then
@@ -1772,7 +1793,7 @@ specified, an `ERROR_MSG` is sent before dropping:
 | Self-connection | `ERR_CONF` | "connecting to self" |
 | Wrong network | `ERR_CONF` | "wrong network passphrase" |
 | Bad address | `ERR_CONF` | "bad address" |
-| Duplicate peer | `ERR_CONF` | "already-connected peer" |
+| Duplicate peer | `ERR_CONF` | "already-connected peer: \<peerID\>" |
 | Flow control disabled | `ERR_CONF` | "flow control bytes disabled" |
 | Peer rejected (no slots) | `ERR_LOAD` | "peer rejected" |
 | Preferred peer eviction | `ERR_LOAD` | "preferred peer selected instead" |
@@ -1788,9 +1809,10 @@ The following conditions cause a silent drop (no ERROR_MSG):
 | No outbound capacity timeout | "idle timeout (no new flood requests)" |
 | Straggler timeout | "straggling (cannot keep up)" |
 | Failed AuthCert verification | "failed to verify auth cert" |
+| Failed address determination | "failed to determine remote address" |
 | Banned node | "node is banned" |
 | Message before handshake | "received {type} before completed handshake" |
-| PEERS from inbound peer | "received PEERS" |
+| PEERS received by responder | "received PEERS" |
 | Duplicate PEERS message | "too many msgs PEERS" |
 | Unexpected HELLO | "received unexpected HELLO" |
 | Flood message at capacity | "unexpected flood message, peer at capacity" |
@@ -1968,7 +1990,7 @@ its connections, are mitigated by:
 | `MAX_PENDING_CONNECTIONS` | 500 | Total pending budget | [10.2](#102-peer-selection-and-connection-limits) |
 | `LISTEN_QUEUE_LIMIT` | 100 | TCP listen backlog | [4.3](#43-connection-establishment) |
 | `MIN_INBOUND_FACTOR` | 3 | Adjusted outbound when no inbound | [10.2](#102-peer-selection-and-connection-limits) |
-| `POSSIBLY_PREFERRED_EXTRA` | 2 | Extra inbound slots for preferred | [10.4](#104-preferred-peers-and-eviction) |
+| `POSSIBLY_PREFERRED_EXTRA` | 2 | Extra inbound slots for preferred | [10.2](#102-peer-selection-and-connection-limits) |
 | `REALLY_DEAD_NUM_FAILURES_CUTOFF` | 120 | Delete peers after N failures | [10.1](#101-peer-database-and-persistence) |
 | `SECONDS_PER_BACKOFF` | 10 | Backoff time unit | [10.3](#103-connection-attempt-backoff) |
 | `MAX_BACKOFF_EXPONENT` | 10 | Max backoff exponent (caps at 10,240 s) | [10.3](#103-connection-attempt-backoff) |
@@ -2004,7 +2026,8 @@ its connections, are mitigated by:
 | Read buffer | 262,144 (256 KiB) | Buffered read stream size | [3.2](#32-record-marking-framing) |
 | `MAX_BATCH_WRITE_COUNT` | 1,024 | Max messages per scatter-gather write | [3.2](#32-record-marking-framing) |
 | `MAX_BATCH_WRITE_BYTES` | 1,048,576 (1 MiB) | Max bytes per scatter-gather write | [3.2](#32-record-marking-framing) |
-| Message dedup cache | 65,535 entries | BLAKE2 hash dedup cache | [9.2](#92-broadcast-deduplication) |
+| Message metrics cache | 65,535 entries | ShortHash (SipHash) message dedup for unique/duplicate metrics | [9.2](#92-broadcast-deduplication) |
+| Scheduled messages cache | 100,000 entries | LRU cache to deduplicate messages already scheduled for processing | [8.1](#81-overview-and-motivation) |
 
 ---
 
@@ -2024,7 +2047,7 @@ its connections, are mitigated by:
 
 | Reference | Title |
 |-----------|-------|
-| [stellar-core][stellar-core] | Stellar Core reference implementation (v25.0.1) |
+| [stellar-core][stellar-core] | Stellar Core reference implementation (v25.1.1) |
 | [RFC 7748][rfc7748] | Elliptic Curves for Security (X25519) |
 | [RFC 8032][rfc8032] | Edwards-Curve Digital Signature Algorithm (Ed25519) |
 | [RFC 5869][rfc5869] | HMAC-based Extract-and-Expand Key Derivation Function (HKDF) |

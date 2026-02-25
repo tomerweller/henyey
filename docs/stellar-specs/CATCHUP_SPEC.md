@@ -1,6 +1,6 @@
 # Stellar Catchup, Replay, and History Publishing Specification
 
-**Version:** 25 (stellar-core v25.x / Protocol 25)
+**Version:** 25 (stellar-core v25.1.1 / Protocol 25)
 **Status:** Informational
 **Date:** 2026-02-20
 
@@ -72,7 +72,7 @@ This specification covers:
 - Error handling, crash recovery, and retry semantics.
 
 This specification is **implementation agnostic**. It is derived
-exclusively from the vetted stellar-core C++ implementation (v25.x) and
+exclusively from the vetted stellar-core C++ implementation (v25.1.1) and
 its pseudocode companion (stellar-core-pc). Any conforming
 implementation that produces identical ledger state for all valid inputs
 is considered correct. Internal details such as work scheduling
@@ -228,8 +228,7 @@ Else:
 The `differingBuckets(other)` operation computes the set of buckets
 that must be downloaded to convert state `other` into state `self`:
 
-1. Build an inhibit set containing the zero hash and all bucket hashes
-   present in `other`.
+1. Build an inhibit set containing the zero hash. Then walk all levels of `other` (in order from lowest to highest), resolving any live FutureBucket merges, and adding each level's `curr`, `snap`, and FutureBucket output hash to the inhibit set.
 2. Walk levels from deepest to shallowest (highest index first).
 3. For each level, collect three items in order: `snap`, `next`
    (FutureBucket output hash, or `snap` again if no output hash
@@ -379,12 +378,13 @@ Key arithmetic functions:
 
 | Function | Formula | Example (freq=64) |
 |----------|---------|-------------------|
-| `checkpointContaining(L)` | `⌊L / freq + 1⌋ × freq - 1` | L=100 → 127 |
+| `checkpointContaining(L)` | `(⌊L / freq⌋ + 1) × freq - 1` (where ⌊⌋ denotes integer division / floor) | L=100 → 127 |
 | `isFirstInCheckpoint(L)` | `L == checkpointContaining(L) - freq + 1` or `L == 1` | L=64 → true |
 | `isLastInCheckpoint(L)` | `L == checkpointContaining(L)` | L=127 → true |
 | `firstInCheckpointContaining(L)` | `checkpointContaining(L) - sizeOf(L) + 1` | L=100 → 64 |
 | `lastBeforeCheckpointContaining(L)` | `firstInCheckpointContaining(L) - 1` | L=100 → 63 |
 | `sizeOfCheckpointContaining(L)` | `L < freq ? freq - 1 : freq` | L=50 → 63 |
+| `firstLedgerAfterCheckpointContaining(L)` | `firstInCheckpointContaining(L) + sizeOfCheckpointContaining(L)` | L=100 → 128 |
 
 ### 4.4 Checkpoint File Contents
 
@@ -487,14 +487,14 @@ At each checkpoint boundary:
 3. The queue file is created before the ledger commit and finalized
    after.
 
+Note: The HAS queue files stored locally use binary (cereal) serialization for efficiency and durability, NOT the JSON format used for archive-uploaded HAS files. The queue files are written with fsync for crash safety.
+
 ### 5.5 Archive Upload
 
 The upload process, triggered after checkpoint finalization:
 
 1. **Resolve**: Ensure all BucketList merges referenced in the HAS are
-   resolved. Wait until at least one ledger past the checkpoint
-   (conservative delay to avoid publishing data from a potentially
-   diverged node).
+   resolved. Wait for the configured `PUBLISH_TO_ARCHIVE_DELAY` duration (a time-based delay, not ledger-count-based) to avoid publishing data from a potentially diverged node.
 
 2. **Write SCP messages**: If the node records SCP messages, write
    them to the SCP checkpoint file.
@@ -628,8 +628,8 @@ When a new externalized ledger arrives via `processLedger`:
    → return PROCESSED_ALL_LEDGERS_SEQUENTIALLY
 
 6. If catchup is running:
-   → trim buffer
-   → return WAIT_TO_APPLY_BUFFERED_OR_CATCHUP
+   → If ledger.seq ≤ catchup's configured `toLedger` → skip trim, return WAIT_TO_APPLY_BUFFERED_OR_CATCHUP immediately
+   → Otherwise: trim buffer, return WAIT_TO_APPLY_BUFFERED_OR_CATCHUP
 
 7. No catchup running, gap detected:
    → trim buffer
@@ -641,6 +641,7 @@ When a new externalized ledger arrives via `processLedger`:
            startOnlineCatchup()
          Else:
            log fatal error (incompatible core version or invalid state)
+     When the first buffered ledger is NOT at a checkpoint boundary, the system computes a `ledgerToTriggerCatchup` as `firstLedgerInBufferedCheckpoint + 1` — meaning the node waits until it has one ledger past the first checkpoint boundary in its buffer before triggering catchup.
    → return WAIT_TO_APPLY_BUFFERED_OR_CATCHUP
 ```
 
@@ -654,7 +655,7 @@ ledgers:
    pipeline.
 3. Stop if a gap is encountered or if the apply drift reaches
    `MAX_EXTERNALIZE_LEDGER_APPLY_DRIFT` (12 ledgers; the check uses
-   `>=`, so exactly 12 triggers it). Reaching this threshold means the apply pipeline is falling too far behind SCP
+   `>=`, so exactly 12 triggers it). The drift is measured as `nextToApply - actualLCL` (where actualLCL is the last closed ledger from LedgerManager, which may lag behind `lastQueuedToApply` in parallel close mode). Reaching this threshold means the apply pipeline is falling too far behind SCP
    and catchup should be triggered instead.
 4. Remove applied ledgers from the buffer.
 
@@ -677,9 +678,8 @@ The buffer is trimmed to maintain its size invariant:
 
 1. Remove all ledgers with sequence numbers below
    `lastQueuedToApply + 1`.
-2. If the last buffered ledger is at a checkpoint boundary, keep
-   that checkpoint plus the previous checkpoint.
-3. Otherwise, keep only the current checkpoint.
+2. If the last buffered ledger is the **first ledger** in a checkpoint, keep that ledger plus the entire previous checkpoint (since the checkpoint containing the last buffered ledger may not have been published yet).
+3. Otherwise, keep only ledgers from the first ledger of the checkpoint containing the last buffered ledger onward.
 
 ---
 
@@ -985,7 +985,7 @@ Once all buffered ledgers are drained:
 | Component | Retry Policy |
 |-----------|-------------|
 | Catchup pipeline (top-level) | No retry — single attempt. |
-| HAS download | Up to `RETRY_A_FEW` (5) retries with archive rotation. |
+| HAS download | Up to 10 retries with archive rotation (CatchupWork overrides the default RETRY_A_FEW for reliability). |
 | Ledger header download | Up to `RETRY_A_LOT` (32) retries with archive rotation. |
 | Bucket download | Up to `RETRY_A_LOT` (32) retries with archive rotation. |
 | Transaction file download | Up to `RETRY_A_LOT` (32) retries with archive rotation. |
@@ -1140,7 +1140,7 @@ each checkpoint.
 |-----------|-------------|
 | [rfc2119] | Bradner, S., "Key words for use in RFCs to Indicate Requirement Levels", BCP 14, RFC 2119, March 1997. |
 | [rfc5785] | Nottingham, M., Hammer-Lahav, E., "Defining Well-Known Uniform Resource Identifiers (URIs)", RFC 5785, April 2010. |
-| [stellar-core] | stellar-core v25.x source code, `src/catchup/`, `src/history/`. |
+| [stellar-core] | stellar-core v25.1.1 source code, `src/catchup/`, `src/history/`. |
 | [stellar-core-pc] | stellar-core pseudocode companion, `src/catchup/`, `src/history/`. |
 | [BucketListDB Spec] | Stellar BucketList and BucketListDB Specification (companion document). |
 | [Ledger Spec] | Stellar Ledger Close Pipeline Specification (companion document). |

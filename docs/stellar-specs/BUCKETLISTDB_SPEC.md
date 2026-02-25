@@ -1,6 +1,6 @@
 # Stellar BucketList and BucketListDB Specification
 
-**Version:** 25 (stellar-core v25.x / Protocol 25)
+**Version:** 25 (stellar-core v25.1.1 / Protocol 25)
 **Status:** Informational
 **Date:** 2026-02-20
 
@@ -34,7 +34,7 @@
 ### 1.1 Purpose and Scope
 
 This document specifies the BucketList and BucketListDB subsystem as
-implemented in stellar-core v25.x. The BucketList is a hierarchical,
+implemented in stellar-core v25.1.1. The BucketList is a hierarchical,
 append-structured data store that maintains a cumulative, hash-verified
 snapshot of all ledger state. BucketListDB is the query layer built on
 top of the BucketList that supports point lookups and bulk key loads
@@ -65,7 +65,7 @@ This specification covers:
   persistence.
 
 This specification is **implementation agnostic**. It is derived
-exclusively from the vetted stellar-core C++ implementation (v25.x) and
+exclusively from the vetted stellar-core C++ implementation (v25.1.1) and
 its pseudocode companion (stellar-core-pc). Any conforming
 implementation that produces identical bucket hashes, BucketList hashes,
 and query results for all valid inputs is considered correct. Internal
@@ -250,7 +250,9 @@ enum BucketListType {
 };
 ```
 
-For the Live BucketList, `ext.v()` is 0. For the Hot Archive BucketList,
+For the Live BucketList, `ext.v()` is 0 for protocol versions before 23.
+For protocol 23 and later, `ext.v()` MUST be 1 and
+`ext.bucketListType()` MUST be `LIVE`. For the Hot Archive BucketList,
 `ext.v()` MUST be 1 and `ext.bucketListType()` MUST be `HOT_ARCHIVE`.
 
 ### 3.3 HotArchiveBucketEntry
@@ -261,24 +263,23 @@ For the Hot Archive BucketList (protocol 23+):
 enum HotArchiveBucketEntryType {
     HOT_ARCHIVE_METAENTRY = -1,
     HOT_ARCHIVE_ARCHIVED  =  0,
-    HOT_ARCHIVE_LIVE      =  1,
-    HOT_ARCHIVE_DELETED   =  2
+    HOT_ARCHIVE_LIVE      =  1
 };
 
 union HotArchiveBucketEntry switch (HotArchiveBucketEntryType type) {
 case HOT_ARCHIVE_ARCHIVED:
     LedgerEntry archivedEntry;
 case HOT_ARCHIVE_LIVE:
-case HOT_ARCHIVE_DELETED:
     LedgerKey key;
 case HOT_ARCHIVE_METAENTRY:
     BucketMetadata metaEntry;
 };
 ```
 
-Only Soroban entries (CONTRACT_DATA, CONTRACT_CODE, TTL) MAY appear in
-Hot Archive buckets. Attempting to store non-Soroban entries SHALL cause
-an error.
+Only persistent Soroban entries (persistent CONTRACT_DATA,
+CONTRACT_CODE) MAY appear in Hot Archive buckets. TTL entries MUST NOT
+appear in Hot Archive buckets. Attempting to store non-Soroban entries
+or TTL entries SHALL cause an error.
 
 ### 3.4 Entry Sort Order
 
@@ -368,13 +369,18 @@ The `bucketUpdatePeriod` for level L determines how often (in ledger
 closes) new entries are added to that level:
 
 ```
-bucketUpdatePeriod(L):
-    if L == 0: return 1           // every ledger
-    return levelHalf(L - 1)      // every levelHalf(L-1) ledgers
+bucketUpdatePeriod(L, isCurr):
+    if not isCurr:
+        return bucketUpdatePeriod(L + 1, true)
+    if L == 0: return 1
+    return 1 << (2 * L - 1)    // equivalently: levelHalf(L - 1)
 ```
 
-Level 0 is updated every ledger. Level 1 is updated every 2 ledgers.
-Level 2 every 8 ledgers, and so on.
+The `isCurr` parameter distinguishes between curr and snap buckets. Snap
+buckets update at the rate of the next level's curr bucket.
+
+Level 0 curr is updated every ledger. Level 1 curr is updated every 2
+ledgers. Level 2 curr every 8 ledgers, and so on.
 
 ### 4.4 Spill Condition
 
@@ -383,6 +389,7 @@ when:
 
 ```
 levelShouldSpill(seq, L):
+    if L == kNumLevels - 1: return false    // deepest level never spills
     return (seq & (levelHalf(L) - 1)) == 0
     // equivalently: seq mod levelHalf(L) == 0
 ```
@@ -512,17 +519,22 @@ ledger. The process for each level is:
 
 ```
 addBatchInternal(seq, initEntries, liveEntries, deadEntries):
-    for L = 0 to kNumLevels - 1:
-        if L == 0:
-            // Level 0: create fresh bucket from sorted entries
-            prepareFirstLevel(entries, seq)
-        else:
-            if bucketUpdatePeriod(L) does not divide seq:
-                break    // this level and deeper are not updated this ledger
+    // Process levels from deepest to shallowest (reverse order).
+    // This is critical: it ensures curr is snapped before anything
+    // is added to it from above.
+    for L = kNumLevels - 1 downto 1:
+        if bucketUpdatePeriod(L, true) does not divide seq:
+            continue   // this level is not updated this ledger
 
         if levelShouldSpill(seq, L):
             level[L].snap()       // move curr → snap
             level[L].prepare(...)  // start merge with next level
+
+    // Level 0: create fresh bucket from sorted entries
+    prepareFirstLevel(entries, seq)
+    if levelShouldSpill(seq, 0):
+        level[0].snap()
+        level[0].prepare(...)
 ```
 
 For level 0 specifically, an **in-memory merge** optimization MAY be
@@ -563,6 +575,13 @@ commit():
         mCurr = mNext.resolve()
         mNext.clear()
 ```
+
+**Implementation note**: In stellar-core, `mNextCurr` is a
+`std::variant` that can hold either a `FutureBucket` (for async merges
+at levels 1+) OR a direct `shared_ptr<BucketT>` (for in-memory merges
+at level 0). At level 0, the merge result is computed synchronously and
+stored directly as a bucket pointer, bypassing the FutureBucket state
+machine.
 
 ---
 
@@ -1093,14 +1112,15 @@ via metrics.
 ### 9.6 Entry Cache (Live BucketList Only)
 
 For disk-indexed live buckets, a **random-eviction cache** MAY be
-maintained that stores frequently-accessed entries in memory:
+maintained that stores recently-accessed entries in memory:
 
 - The cache stores shared references to immutable `BucketEntry` values,
   keyed by `LedgerKey`.
 - When a point lookup or scan finds an entry via disk I/O, the entry
   is added to the cache.
-- Cache size per bucket is proportional to the bucket's fraction of
-  total ACCOUNT entries in the BucketList.
+- Only **ACCOUNT** entries are cached in the index. Cache size per
+  bucket is proportional to the bucket's fraction of total ACCOUNT
+  entries in the BucketList.
 - The total cache memory budget is configurable
   (`BUCKETLIST_DB_MEMORY_FOR_CACHING`).
 
@@ -1281,12 +1301,16 @@ loadInflationWinners(maxWinners, minBalance):
             if entry is LIVEENTRY/INITENTRY for ACCOUNT type:
                 if entry.accountID not in seen:
                     seen.add(entry.accountID)
-                    if entry has inflationDest and balance >= minBalance:
+                    if entry has inflationDest and balance >= 1,000,000,000 stroops (100 XLM):
                         voteCount[inflationDest] += balance
 
     sort voteCount by balance descending
     return top maxWinners
 ```
+
+The minimum balance for vote counting is hardcoded at 100 XLM
+(1,000,000,000 stroops), independent of the `minBalance` parameter. The
+`minBalance` parameter is used only to filter the final winners list.
 
 This is a full-scan query and is only used during catchup for legacy
 protocol support.
@@ -1343,7 +1367,6 @@ differs in:
 |------|---------|
 | `HOT_ARCHIVE_ARCHIVED` | A persistent Soroban entry that was evicted and archived. Contains the full `LedgerEntry`. |
 | `HOT_ARCHIVE_LIVE` | A marker indicating an entry was restored from archive back to the live state. Contains only the `LedgerKey`. Acts as a tombstone. |
-| `HOT_ARCHIVE_DELETED` | A marker indicating a temporary entry was deleted during eviction. Contains only the `LedgerKey`. |
 | `HOT_ARCHIVE_METAENTRY` | Metadata record (same as Live BucketList METAENTRY). |
 
 ### 11.4 Merge Rules
@@ -1352,11 +1375,10 @@ The Hot Archive merge follows strict "newest wins" semantics with no
 annihilation cases. When two entries with the same key meet during a
 merge, the newer entry is always emitted regardless of the entry types:
 
-| New \ Old | ARCHIVED | LIVE | DELETED |
-|-----------|----------|------|---------|
-| **ARCHIVED** | emit ARCHIVED (new) | emit ARCHIVED (new) | emit ARCHIVED (new) |
-| **LIVE** | emit LIVE (new) | emit LIVE (new) | emit LIVE (new) |
-| **DELETED** | emit DELETED (new) | emit DELETED (new) | emit DELETED (new) |
+| New \ Old | ARCHIVED | LIVE |
+|-----------|----------|------|
+| **ARCHIVED** | emit ARCHIVED (new) | emit ARCHIVED (new) |
+| **LIVE** | emit LIVE (new) | emit LIVE (new) |
 
 There is no pairwise annihilation in the Hot Archive merge (unlike the
 Live BucketList's INIT/DEAD annihilation). The only filtering occurs at
@@ -1373,8 +1395,9 @@ Live BucketList).
 
 Hot Archive bucket entries MUST NOT appear in buckets with protocol
 version before `FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION` (23).
-Only Soroban entry types (CONTRACT_DATA, CONTRACT_CODE, TTL) are
-permitted in Hot Archive buckets.
+Only persistent Soroban entry types (persistent CONTRACT_DATA,
+CONTRACT_CODE) are permitted in Hot Archive buckets. TTL entries MUST
+NOT appear in Hot Archive buckets.
 
 ### 11.7 Indexing
 
@@ -1464,8 +1487,12 @@ Within each bucket, the scan:
 
 | Entry Durability | Protocol < 23 | Protocol 23 | Protocol >= 24 |
 |-----------------|----------------|-------------|----------------|
-| Temporary | Evicted (deleted) | Evicted (deleted) | Evicted (deleted) |
-| Persistent | Not evicted | Evicted (archived), any version | Evicted (archived), newest version only |
+| Temporary | Not evicted | Evicted (DEADENTRY in live BucketList) | Evicted (DEADENTRY in live BucketList) |
+| Persistent | Not evicted | Evicted (archived to Hot Archive), any version | Evicted (archived to Hot Archive), newest version only |
+
+Temporary entries that expire are simply deleted from the Live BucketList
+via a DEADENTRY tombstone. They are **never** added to the Hot Archive
+BucketList — only persistent entries are archived.
 
 Persistent entry eviction was introduced in protocol 23. In protocol 23,
 the eviction scan may archive a stale version of a persistent entry
@@ -1706,9 +1733,10 @@ be empty. The INIT/DEAD lifecycle replaces shadow-based elision entirely.
 
 ### 15.9 Hot Archive Soroban-Only
 
-**Invariant 9**: The Hot Archive BucketList MUST contain only Soroban
-entry types (CONTRACT_DATA, CONTRACT_CODE, TTL). Non-Soroban entries
-in the Hot Archive are a fatal error.
+**Invariant 9**: The Hot Archive BucketList MUST contain only persistent
+Soroban entry types (persistent CONTRACT_DATA, CONTRACT_CODE). TTL
+entries MUST NOT appear in Hot Archive buckets. Non-Soroban entries in
+the Hot Archive are a fatal error.
 
 ### 15.10 Eviction Version Safety
 
@@ -1756,7 +1784,7 @@ states from different ledgers.
 | [CAP-0035] | Stellar CAP-0035, "Asset Clawback", adds clawback-related entries. |
 | [CAP-0046] | Stellar CAP-0046, "Soroban Smart Contracts", introduces CONTRACT_DATA, CONTRACT_CODE, TTL entries. |
 | [CAP-0057] | Stellar CAP-0057, "Hot Archive BucketList", introduces the Hot Archive for persistent entry eviction. |
-| [stellar-core] | stellar-core v25.x source code, `src/bucket/` directory. |
+| [stellar-core] | stellar-core v25.1.1 source code, `src/bucket/` directory. |
 | [stellar-core-pc] | stellar-core pseudocode companion, `src/bucket/` directory. |
 
 ---
@@ -1809,17 +1837,15 @@ Ledger 8:  L0 spills → L0.snap = old_L0.curr
 
 ```
                         Old Entry
-                 ARCHIVED  LIVE   DELETED
-          +---------+---------+------+---------+
-    New   | ARCHIVED| ARCHIVED| ARCH | ARCHIVED|
-    Entry | LIVE    | LIVE    | LIVE | LIVE    |
-          | DELETED | DELETED | DEL  | DELETED |
-          +---------+---------+------+---------+
+                 ARCHIVED    LIVE
+          +---------+---------+------+
+    New   | ARCHIVED| ARCHIVED| ARCH |
+    Entry | LIVE    | LIVE    | LIVE |
+          +---------+---------+------+
 
     All cells: newest entry always wins. No annihilation.
     ARCH  = Emit ARCHIVED (new)
     LIVE  = Emit LIVE (new)
-    DEL   = Emit DELETED (new)
 
     Note: HOT_ARCHIVE_LIVE tombstones are elided only at level 10
     by the output iterator, not during the merge itself.

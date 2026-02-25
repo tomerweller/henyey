@@ -1,6 +1,6 @@
 # Stellar Transaction Processing Specification
 
-**Version:** 25 (stellar-core v25.x / Protocol 25)
+**Version:** 25 (stellar-core v25.1.1 / Protocol 25)
 **Status:** Informational
 **Date:** 2026-02-20
 
@@ -32,7 +32,7 @@
 ### 1.1 Purpose and Scope
 
 This document specifies the Stellar transaction processing subsystem as
-implemented in stellar-core v25.x. The transaction subsystem governs how
+implemented in stellar-core v25.1.1. The transaction subsystem governs how
 transactions are validated, how fees are computed and charged, how
 operations mutate ledger state, how results and metadata are constructed,
 and how Soroban smart contract transactions are executed.
@@ -48,7 +48,7 @@ out of scope except where they directly affect determinism or
 correctness.
 
 This specification is **implementation agnostic**. It is derived
-exclusively from the vetted stellar-core C++ implementation (v25.x)
+exclusively from the vetted stellar-core C++ implementation (v25.1.1)
 and its pseudocode companion (stellar-core-pc). Any conforming
 implementation that produces identical observable behavior (transaction
 results, metadata, ledger state changes) for all valid inputs is
@@ -404,7 +404,7 @@ Preconditions are checked against the current ledger header:
 2. **Ledger bounds** `@version(≥19)`: If `ledgerBounds` is present:
    - If `minLedger > 0`: the ledger sequence MUST be ≥ `minLedger`.
      Result: `txTOO_EARLY`.
-   - If `maxLedger > 0`: the ledger sequence MUST be ≤ `maxLedger`.
+   - If `maxLedger > 0`: the ledger sequence MUST be < `maxLedger` (strictly less-than).
      Result: `txTOO_LATE`.
 
 3. **Minimum fee**: The declared fee MUST be ≥ `baseFee * numOps`,
@@ -416,15 +416,26 @@ Preconditions are checked against the current ledger header:
 1. **Source account existence**: The source account MUST exist in the
    ledger. Result: `txNO_ACCOUNT`.
 
-2. **Sequence number**: The transaction's `seqNum` MUST satisfy:
+2. **Starting sequence number guard**: The transaction's `seqNum`
+   MUST NOT equal the starting sequence number for the current ledger
+   (`currentLedgerSeq << 32`). This prevents freshly-created accounts
+   from being used in the same ledger they were created.
+   Result: `txBAD_SEQ`.
+
+3. **INT64_MAX overflow guard**: If the source account's current
+   sequence number is `INT64_MAX`, the sequence check always fails
+   to prevent overflow. Result: `txBAD_SEQ`.
+
+4. **Sequence number**: The transaction's `seqNum` MUST satisfy:
    - If `minSeqNum` precondition is present `@version(≥19)`:
-     `seqNum` MUST be ≥ `minSeqNum` AND `seqNum` MUST be
+     the **source account's current sequence number** MUST be
+     ≥ `minSeqNum`, AND the **transaction's** `seqNum` MUST be
      > the source account's current sequence number.
    - Otherwise: `seqNum` MUST equal the source account's current
      sequence number + 1.
    - Result: `txBAD_SEQ`.
 
-3. **Minimum sequence age** `@version(≥19)`: If `minSeqAge > 0`, the
+5. **Minimum sequence age** `@version(≥19)`: If `minSeqAge > 0`, the
    time elapsed since the source account's sequence number was last
    changed MUST be ≥ `minSeqAge`. At apply time: checks
    `closeTime - accSeqTime >= minSeqAge`, where `accSeqTime` is the
@@ -432,7 +443,7 @@ Preconditions are checked against the current ledger header:
    consumed (`AccountEntryExtensionV3.seqTime`, or 0 if absent).
    Result: `txBAD_MIN_SEQ_AGE_OR_GAP`.
 
-4. **Minimum sequence ledger gap** `@version(≥19)`: If
+6. **Minimum sequence ledger gap** `@version(≥19)`: If
    `minSeqLedgerGap > 0`, the number of ledgers elapsed since the
    source account's sequence number was last changed MUST be ≥
    `minSeqLedgerGap`. Result: `txBAD_MIN_SEQ_AGE_OR_GAP`.
@@ -633,11 +644,16 @@ For Soroban transactions, the declared resources in
    `maxContractDataKeySizeBytes`.
 8. The serialized transaction size MUST be ≤ `txMaxSizeBytes`.
 9. Footprint keys MUST be of type `ACCOUNT`, `TRUSTLINE`,
-   `CONTRACT_DATA`, or `CONTRACT_CODE` only.
+   `CONTRACT_DATA`, or `CONTRACT_CODE` only. For `TRUSTLINE`
+   footprint keys, the asset MUST also be valid, non-native,
+   and not self-issued.
 10. There MUST be no duplicate keys across the read-only and read-write
     footprints combined.
 11. `@version(≥23)`: If `archivedSorobanEntries` is present, each
-    index MUST be valid (within the footprint).
+    index MUST be valid (within the footprint). The
+    `archivedSorobanEntries` indexes MUST be sorted in ascending
+    order, within bounds of the readWrite footprint, and MUST point
+    to persistent entries only.
 12. The `resourceFee` MUST be ≤ the total fee declared in the
     envelope.
 13. The `resourceFee` MUST be ≤ `MAX_RESOURCE_FEE` (2^50).
@@ -704,11 +720,13 @@ feeCharged = min(inclusionFee, baseFee * numOps)
 
 For a **Soroban transaction**:
 ```
-feeCharged = resourceFee + min(inclusionFee, baseFee * numOps)
+feeCharged = declaredResourceFee + min(inclusionFee, baseFee * numOps)
 ```
 
-where `resourceFee` is the computed (not declared) resource fee, and
-`baseFee` is the surge-priced base fee for this transaction's phase.
+where `declaredResourceFee` is `sorobanData.resourceFee` from the
+transaction envelope. Unused refundable portions are later refunded
+(see Section 5.5). `baseFee` is the surge-priced base fee for this
+transaction's phase.
 
 **During validation** (not application), the fee is computed as:
 ```
@@ -823,9 +841,8 @@ source and higher fee:
    reflect Soroban refunds. Prior versions did not propagate refunds
    to the inner result.
 
-7. `@version(≥25)`: The inner result's `feeCharged` adjustment
-   (subtracting from inner to add to outer) is removed. The inner
-   `feeCharged` is simply the charged fee of the inner transaction.
+7. `@version(≥25)`: The inner `feeCharged` is set to 0. The outer
+   `feeCharged` carries the full fee amount.
 
 8. **Apply-time inner signature re-validation**: When a fee-bump
    transaction is applied, the outer fee has already been charged and
@@ -911,13 +928,10 @@ function commonPreApply(tx, ltx, metaBuilder):
     if protocolVersion < 10:
         processSeqNum(tx, ltxPreApply)
 
-    // Verify transaction-level signatures
-    if not checkAccountSignatures(tx.sourceAccount, sigChecker, LOW):
-        txResult.setError(txBAD_AUTH)
-        validity = kInvalid
-
     // Process per-operation signatures, one-time signer removal,
-    // and unused-signature check
+    // and unused-signature check.
+    // NOTE: The transaction-level signature check already happens
+    // inside commonValid (see Section 6.3), so it is not repeated here.
     signaturesValid = processSignatures(
         validity, sigChecker, ltxPreApply, txResult)
 
@@ -1014,11 +1028,13 @@ function commonValid(tx, sigChecker, ltx, applying):
         tx.setError(txBAD_MIN_SEQ_AGE_OR_GAP)
         return kInvalid
 
-    // 4. Transaction-level signature check (during validation only)
-    if not applying:
-        if not checkAccountSignatures(tx.sourceAccount, sigChecker, LOW):
-            tx.setError(txBAD_AUTH)
-            return kInvalidPostAuth
+    // 4. Transaction-level signature check (both validation and apply)
+    //    checkAllTransactionSignatures includes both the LOW-threshold
+    //    signature check AND the extra signers check (@version(≥19)).
+    //    Failure produces txBAD_AUTH.
+    if not checkAccountSignatures(tx.sourceAccount, sigChecker, LOW):
+        tx.setError(txBAD_AUTH)
+        return kInvalidPostAuth
 
     // 5. Balance sufficiency
     if not checkFeeBalance(tx, sourceAccount):
@@ -3014,7 +3030,7 @@ may be updated via network upgrades:
 |-----------|-------------|
 | [rfc2119] | Bradner, S., "Key words for use in RFCs to Indicate Requirement Levels", BCP 14, RFC 2119, March 1997. |
 | [stellar-xdr] | Stellar XDR definitions: `Stellar-transaction.x`, `Stellar-ledger-entries.x`, `Stellar-ledger.x`, `Stellar-types.x`. https://github.com/stellar/stellar-xdr/tree/curr/ |
-| [stellar-core] | stellar-core v25.x source code (tag v25.0.1). https://github.com/stellar/stellar-core |
+| [stellar-core] | stellar-core v25.1.1 source code (tag v25.1.1). https://github.com/stellar/stellar-core |
 | [CAP-0021] | Stellar CAP-0021, "Preconditions V2". https://stellar.org/protocol/cap-21 |
 | [CAP-0046] | Stellar CAP-0046, "Soroban Smart Contracts". https://stellar.org/protocol/cap-46 |
 | [SCP whitepaper] | Stellar Consensus Protocol whitepaper. https://www.stellar.org/papers/stellar-consensus-protocol |

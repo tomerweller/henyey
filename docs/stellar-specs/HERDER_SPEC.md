@@ -1,6 +1,6 @@
 # Herder Specification
 
-**Version:** 25 (stellar-core v25.x / Protocol 25)
+**Version:** 25 (stellar-core v25.1.1 / Protocol 25)
 **Status:** Informational
 **Date:** 2026-02-20
 
@@ -34,7 +34,7 @@
 ### 1.1 Purpose and Scope
 
 This document specifies the Herder subsystem of the Stellar network as
-derived from stellar-core v25.x. The herder is the **orchestration
+derived from stellar-core v25.1.1. The herder is the **orchestration
 layer** that drives consensus rounds by bridging the SCP consensus
 library, the transaction pool, the overlay network, and the ledger
 close pipeline.
@@ -138,17 +138,21 @@ The following transitions are **forbidden**:
 
 ### 3.3 Transition Rules
 
-**BOOTING → TRACKING:** Occurs at startup in `start()` when the
-node has existing ledger state (i.e., the last closed ledger is
-beyond genesis). The node calls `setTrackingSCPState` with
+**BOOTING → TRACKING:** Occurs at startup in `start()` when
+`FORCE_SCP` is not set AND the last closed ledger is beyond
+genesis (i.e., `lcl.ledgerSeq != GENESIS_LEDGER_SEQ`), or when
+`FORCE_SCP` is set (regardless of the ledger sequence). In both
+cases, the node calls `setTrackingSCPState` with
 `isTrackingNetwork = true`, transitions to TRACKING, and restores
 persisted SCP state. This is the normal restart path.
 
-**BOOTING → SYNCING:** Occurs at startup in `start()` when the node
-is on the genesis ledger (and `FORCE_SCP` is not set). In this case
-there is no meaningful consensus state to track, so the node calls
-`setTrackingSCPState` with `isTrackingNetwork = false`, transitioning
-to SYNCING. It then waits for SCP messages from the network.
+**BOOTING → SYNCING:** Occurs at startup in `start()` when
+`FORCE_SCP` is not set AND the node is on the genesis ledger
+(`lcl.ledgerSeq == GENESIS_LEDGER_SEQ`). In this case there is
+no meaningful consensus state to track, so the node calls
+`setTrackingSCPState` with `isTrackingNetwork = false`,
+transitioning to SYNCING. It then waits for SCP messages from
+the network.
 
 > **Note:** The node is never in the BOOTING state when SCP messages
 > are being processed, because `start()` unconditionally transitions
@@ -221,8 +225,8 @@ the round through the following sequence:
 4. **Ledger close execution**: The ledger close pipeline executes
    the full close sequence (see LEDGER_SPEC §4).
 5. **Completion callback**: The ledger manager signals completion
-   via `ledgerCloseComplete`, returning the latest closed ledger
-   header to the herder.
+   via `lastClosedLedgerIncreased`, returning the latest closed
+   ledger header to the herder.
 6. **Transaction queue update**: The herder removes applied
    transactions from the queue, ages remaining transactions,
    and re-broadcasts the queue.
@@ -236,8 +240,8 @@ the round through the following sequence:
 
 ### 4.2 Triggering the Next Ledger
 
-When `ledgerCloseComplete` is called, the herder performs the
-following steps to initiate the next consensus round:
+When `lastClosedLedgerIncreased` is called, the herder performs
+the following steps to initiate the next consensus round:
 
 1. **Update tracking state**: Record the latest closed ledger
    sequence number and close time. Reset the tracking timer.
@@ -248,8 +252,9 @@ following steps to initiate the next consensus round:
       ledger (`removeApplied`).
    b. Age remaining transactions and evict those that have
       exceeded the pending depth (`shift`).
-   c. If a protocol upgrade occurred that changes resource
-      limits, rebuild the Soroban queue with the new limits.
+   c. If any protocol upgrade was applied in the just-closed
+      ledger (regardless of whether it changes resource limits),
+      rebuild the Soroban queue with the current limits.
    d. Re-validate remaining transactions against the new ledger
       state; ban any that are now invalid.
    e. Re-broadcast the queue to peers.
@@ -367,14 +372,12 @@ following constraints:
 When computing a proposed close time, the herder SHOULD use:
 
 ```
-proposedCloseTime = min(
-    currentWallClock + MAX_TIME_SLIP_SECONDS,
-    max(previousLedgerCloseTime + 1,
-        currentWallClock + closeTimeDriftOffset))
+proposedCloseTime = max(previousLedgerCloseTime + 1, currentWallClock)
 ```
 
-The `min` clamp ensures the proposed close time never exceeds the
-upper bound, even when the drift offset is positive.
+That is, the proposed close time is simply the current wall clock
+time, clamped to be at least one second after the previous ledger's
+close time. No drift offset is applied.
 
 **Close time drift detection**: The herder SHOULD track the
 difference between observed close times and its local wall clock
@@ -383,7 +386,8 @@ over a sliding window of `CLOSE_TIME_DRIFT_LEDGER_WINDOW_SIZE`
 `CLOSE_TIME_DRIFT_SECONDS_THRESHOLD` (10 seconds), the herder
 logs a warning indicating a possibly bad local clock. Note: the
 herder does NOT apply a corrective offset to subsequent proposed
-close times — drift detection is informational only.
+close times — drift detection is purely informational and does not
+influence the close time computation.
 
 ### 5.3 StellarValue Validation
 
@@ -408,10 +412,16 @@ following checks:
    MAX_TIME_SLIP_SECONDS`.
    Values with close times too far in the future MUST be rejected.
 
-5. **Slot validity**: The slot index MUST be within a
-   `LEDGER_VALIDITY_BRACKET` (100) of the node's current last
-   closed ledger sequence number. Values for slots that are
-   too old or too far ahead MUST be rejected.
+5. **Slot validity**: The slot index MUST satisfy both a lower
+   and upper bound relative to the node's current last closed
+   ledger sequence number:
+   - **Lower bound**: The slot index MUST be at least
+     `getMinLedgerSeqToRemember()`, which is based on
+     `MAX_SLOTS_TO_REMEMBER` (configurable, default 12).
+     Values for slots older than this are rejected.
+   - **Upper bound**: The slot index MUST be at most
+     `lastClosedLedgerSeq + LEDGER_VALIDITY_BRACKET` (100).
+     Values for slots too far ahead are rejected.
 
 6. **Transaction set availability**: The transaction set
    referenced by `txSetHash` MUST be available (either cached
@@ -436,10 +446,13 @@ before ballot voting).
 
 When SCP calls `extractValidValue`, the herder MUST return a
 value that passes all validation checks. The herder validates
-the input value against the local state; if validation fails,
-the herder MUST return no value. If the value passes validation,
-the herder removes any invalid upgrade steps (pruning upgrades
-that fail `isValid` checks) and returns the resulting value.
+the input value against the local state; if validation returns
+`kFullyValidatedValue`, the herder removes any invalid upgrade
+steps (pruning upgrades that fail `isValid` checks) and returns
+the resulting value. If validation returns any other result —
+including `kMaybeValidValue` (e.g., the transaction set is not
+yet available) — the herder MUST return no value. Only fully
+validated values are eligible for extraction.
 
 > **Note:** The herder does NOT adjust the close time during
 > `extractValidValue`. If the close time is invalid (too old or
@@ -900,7 +913,7 @@ Each criterion is a tiebreaker for the previous one:
 
 2. **Highest total inclusion fees**: Among sets with equal
    operation count, prefer the set with the highest sum
-   of inclusion fees. (Protocol 21+, Soroban-era only.)
+   of inclusion fees. (Protocol 20+ / `SOROBAN_PROTOCOL_VERSION`.)
 
 3. **Highest total full fees**: Among sets with equal total
    inclusion fees, prefer the set with the highest sum of
@@ -908,7 +921,7 @@ Each criterion is a tiebreaker for the previous one:
 
 4. **Smallest encoded size**: Among sets with equal total
    fees, prefer the set with the smallest XDR-encoded byte
-   size. (Protocol 21+, Soroban-era only.)
+   size. (Protocol 20+ / `SOROBAN_PROTOCOL_VERSION`.)
 
 5. **Hash tiebreak**: If all above criteria are equal, prefer
    the set whose contents hash, XORed with the `candidatesHash`
@@ -1478,6 +1491,15 @@ Fetching).
 
 When an SCP envelope arrives, the herder processes it as follows:
 
+> **Note:** In stellar-core, the actual ordering of checks differs
+> from the logical ordering presented here. The `recvSCPEnvelope`
+> method in `HerderImpl` performs close time range checks, slot
+> range checks, and StellarValue signature verification BEFORE
+> the envelope reaches `PendingEnvelopes`, where the quorum
+> membership check occurs. The ordering below groups checks by
+> concern for clarity, but implementors should be aware that the
+> pre-filtering in HerderImpl runs first in practice.
+
 1. **Quorum membership check**: The sender MUST be a member of
    the node's transitive quorum (the set of nodes reachable
    by following quorum set declarations from the local node).
@@ -1751,7 +1773,7 @@ by implementations:
 ### 17.2 Recommended Parameters
 
 These values are operational parameters. The values listed are
-RECOMMENDED defaults derived from stellar-core v25.x:
+RECOMMENDED defaults derived from stellar-core v25.1.1:
 
 | Parameter | Recommended Value | Description |
 |-----------|-------------------|-------------|
@@ -1763,7 +1785,8 @@ RECOMMENDED defaults derived from stellar-core v25.x:
 | `CLOSE_TIME_DRIFT_SECONDS_THRESHOLD` | 10 | Drift threshold (seconds) that triggers a warning log. |
 | `SCP_EXTRA_LOOKBACK_LEDGERS` | 3 | Number of additional old slots requested from peers for SCP state recovery. |
 | `MAX_SLOTS_TO_REMEMBER` | 12 | Number of old SCP slots retained beyond the current slot (configurable). |
-| `TRANSACTION_QUEUE_SIZE_MULTIPLIER` | 2 | Multiplier for queue resource capacity (configurable; `maxQueueResources = maxLedgerResources * multiplier`). |
+| `TRANSACTION_QUEUE_SIZE_MULTIPLIER` | 2 | Multiplier for classic queue resource capacity (configurable; `maxQueueResources = maxLedgerResources * multiplier`). |
+| `SOROBAN_TRANSACTION_QUEUE_SIZE_MULTIPLIER` | 2 | Multiplier for Soroban queue resource capacity (configurable; separate from the classic multiplier). |
 | `QSET_CACHE_SIZE` | 10,000 | LRU cache capacity for quorum sets. |
 | `TXSET_CACHE_SIZE` | 10,000 | LRU cache capacity for transaction sets. |
 | `TX_SET_GC_DELAY` | 60 seconds | Interval for garbage-collecting unreferenced persisted transaction sets. |
@@ -1825,7 +1848,7 @@ sequenceDiagram
     Herder->>Herder: Construct LedgerCloseData
     Herder->>LedgerMgr: valueExternalized(ledgerCloseData)
     LedgerMgr->>LedgerMgr: Execute ledger close pipeline
-    LedgerMgr->>Herder: ledgerCloseComplete(latestLCL)
+    LedgerMgr->>Herder: lastClosedLedgerIncreased(latestLCL)
 
     Herder->>TxQueue: removeApplied(appliedTxs)
     Herder->>TxQueue: shift() [age + evict old]

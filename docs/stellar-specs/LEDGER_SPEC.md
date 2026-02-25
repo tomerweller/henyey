@@ -1,6 +1,6 @@
 # Stellar Ledger Close Pipeline Specification
 
-**Version:** 25 (stellar-core v25.x / Protocol 25)
+**Version:** 25 (stellar-core v25.1.1 / Protocol 25)
 **Status:** Informational
 **Date:** 2026-02-20
 
@@ -34,7 +34,7 @@
 ### 1.1 Purpose and Scope
 
 This document specifies the ledger close pipeline as implemented in
-stellar-core v25.x. The ledger close pipeline is the deterministic
+stellar-core v25.1.1. The ledger close pipeline is the deterministic
 process by which the network transforms an agreed-upon transaction set
 (from SCP consensus) and the current ledger state into a new committed
 ledger state. It encompasses:
@@ -54,7 +54,7 @@ ledger state. It encompasses:
 - The genesis ledger bootstrap procedure.
 
 This specification is **implementation agnostic**. It is derived
-exclusively from the vetted stellar-core C++ implementation (v25.x) and
+exclusively from the vetted stellar-core C++ implementation (v25.1.1) and
 its pseudocode companion (stellar-core-pc). Any conforming
 implementation that produces identical ledger hashes, transaction result
 hashes, BucketList hashes, and ledger close metadata for all valid
@@ -450,22 +450,27 @@ The pipeline MUST execute the following 8-step commit sequence in
 exact order:
 
 1. **Queue history checkpoint**: If this ledger is at a checkpoint
-   boundary, queue the checkpoint for publishing.
+   boundary, queue the checkpoint for publishing (within current DB
+   transaction).
 2. **Commit LedgerTxn**: Commit the top-level `LedgerTxn`, flushing
-   all accumulated changes to persistent storage.
-3. **Finalize checkpoint**: If a checkpoint was queued, finalize the
-   checkpoint files.
+   offers to DB and committing the SQL transaction.
+3. **Finalize checkpoint files**: If a checkpoint was queued, finalize
+   the checkpoint files.
 4. **Start background eviction scan**: Begin the eviction scan for
    the next ledger (`ledgerSeq + 1`).
 5. **Exit COMMITTING phase**: Transition from `COMMITTING` to
    `READY_TO_APPLY`.
-6. **Snapshot for invariant**: Optionally capture a snapshot of
-   Soroban state for invariant checking.
-7. **Advance LCL and publish**: Swap in the new `CompleteConstLedgerState`
-   as the current LCL, publish queued history, and run bucket garbage
-   collection. This step MUST execute on the main thread.
-8. **Notify herder**: Signal that the ledger close is complete so the
-   herder can trigger the next consensus round.
+6. **Copy Soroban state for invariant check**: If invariant checking
+   is enabled, capture a snapshot of Soroban state.
+7. **Advance LCL, publish queued history, and GC buckets**: This step
+   MUST execute on the main thread:
+   a. Swap in the new `CompleteConstLedgerState` as the current LCL.
+   b. Publish Soroban metrics.
+   c. Kick off queued history publishing.
+   d. GC unreferenced buckets (under ledger state mutex).
+8. **Notify herder and run invariant snapshot check**: Signal that the
+   ledger close is complete so the herder can trigger the next
+   consensus round, and run the invariant snapshot check.
 
 ---
 
@@ -878,7 +883,10 @@ upgrade MUST be validated:
 2. The upgrade MUST be valid for the current protocol version
    (via `isValidForApply`).
 3. For `LEDGER_UPGRADE_VERSION`: the new version MUST be ≤
-   `CURRENT_LEDGER_PROTOCOL_VERSION` and MUST be `currentVersion + 1`.
+   `CURRENT_LEDGER_PROTOCOL_VERSION` and MUST be > `currentVersion`
+   (strictly greater). Note: the `currentVersion + 1` constraint
+   applies only during nomination, not during apply validation.
+   Multi-version jumps are valid during apply.
 4. For `LEDGER_UPGRADE_CONFIG`: the `ConfigUpgradeSet` MUST exist in
    the ledger state, entries MUST be sorted by `configSettingID` with
    no duplicates, and each setting MUST pass its specific validation
@@ -919,8 +927,30 @@ During ledger close, upgrades are applied in the order they appear in
      the fix is a no-op on non-production networks.
    - If upgrading to p20: create all initial Soroban `CONFIG_SETTING`
      entries with their default values.
-   - If upgrading to p21, p22, p23, or p25: update cost model
-     parameters for the new protocol.
+   - If upgrading to p21: create new cost types for protocol 21
+     (`createCostTypesForV21`).
+   - If upgrading to p22: create new cost types for protocol 22
+     (`createCostTypesForV22`).
+   - If upgrading to p23: create new ledger entries for protocol 23
+     (`createAndUpdateLedgerEntriesForV23`): create
+     `CONTRACT_PARALLEL_COMPUTE`, `SCP_TIMING`, and
+     `CONTRACT_LEDGER_COST_EXT` config settings, and update rent cost
+     parameters.
+   - If upgrading to p25: enable Rust Dalek signature verification
+     and create new cost types for protocol 25
+     (`createCostTypesForV25`).
+   - If the new version is ≥ 23: recompute the in-memory Soroban
+     state size and update the state size window if applicable
+     (`handleUpgradeAffectingSorobanInMemoryStateSize`).
+   - Note: Upgrade actions trigger when crossing through a target
+     version (using `needUpgradeToVersion(target, prev, new)` which
+     returns true when `prev < target && new >= target`). Upgrading
+     from v19 to v25 triggers ALL of v20, v21, v22, v23, and v25
+     upgrade actions.
+   - Note: Protocol version 24 has no version-specific upgrade actions
+     (no `createCostTypesForV24` or similar). The only v24-specific
+     behavior is the mainnet hot archive bug fix during the p23→p24
+     transition.
    - If upgrading from p23 to p24 **on the production (mainnet)
      network only** (`gIsProductionNetwork`): apply the CAP-0076
      P23 hot archive bug remediation. In protocol 23, the
@@ -934,10 +964,7 @@ During ledger close, upgrades are applied in the order they appear in
      (b) The hot archive entry fix is applied during
      `finalizeLedgerTxnChanges` (Section 11.1, Step 1c).
      Note: These fixes are mainnet-specific; testnet and
-     private networks MUST NOT apply them.
-   - If upgrading to p25: enable Rust Dalek signature verification
-     (`enableRustDalekVerify`) and create new Soroban cost types for
-     BN254 operations (`createCostTypesForV25`).
+           private networks MUST NOT apply them.
 
    **Base fee upgrade** (`LEDGER_UPGRADE_BASE_FEE`):
    - Set `header.baseFee` to the new value.
@@ -947,8 +974,10 @@ During ledger close, upgrades are applied in the order they appear in
 
    **Base reserve upgrade** (`LEDGER_UPGRADE_BASE_RESERVE`):
    - Set `header.baseReserve` to the new value.
-   - `@version(≥10)`: Run `prepareLiabilities` to reconcile all offers
-     against the new minimum balance. The algorithm:
+   - `@version(≥10)`: If the new base reserve is strictly greater than
+     the previous value, run `prepareLiabilities` to reconcile all offers
+     against the new minimum balance. Reserve decreases do NOT trigger
+     liability adjustment. The algorithm:
      1. Iterate all offers grouped by `accountID`, then by `offerID`.
      2. For each account's offers, compute the new minimum balance
         given the updated `baseReserve`.
@@ -1543,6 +1572,9 @@ Additionally, for parallel Soroban execution (protocol 23+):
 |--------|-----------------|
 | **Execution threads** | Short-lived threads spawned per cluster for parallel Soroban transaction execution. Read-only access to the apply state. |
 
+In v25.1.1, parallel Soroban apply is enabled by default for protocol
+23+. The previous experimental flag has been removed.
+
 ### 14.2 Thread Safety
 
 1. The `CompleteConstLedgerState` (LCL) is immutable and can be read
@@ -1680,7 +1712,7 @@ order book and path finding.
 | `CHECKPOINT_FREQUENCY` | 64 | Ledger interval between history checkpoints. |
 | `CURRENT_LEDGER_PROTOCOL_VERSION` | 25 | Maximum supported protocol version. |
 | `TARGET_LEDGER_CLOSE_TIME_BEFORE_P23_MS` | 5000 | Expected ledger close time before protocol 23 (5 seconds). |
-| `REUSABLE_CONTRACT_MODULE_CACHE_PROTOCOL_VERSION` | 23 | Protocol version at which the reusable contract module cache is activated. |
+| `REUSABLE_SOROBAN_MODULE_CACHE_PROTOCOL_VERSION` | 23 | Protocol version at which the reusable contract module cache is activated. |
 
 ---
 
@@ -1689,7 +1721,7 @@ order book and path finding.
 | Reference | Description |
 |-----------|-------------|
 | [rfc2119] | Bradner, S., "Key words for use in RFCs to Indicate Requirement Levels", BCP 14, RFC 2119, March 1997. |
-| [stellar-core] | stellar-core v25.x source code, `src/ledger/`, `src/herder/`. |
+| [stellar-core] | stellar-core v25.1.1 source code, `src/ledger/`, `src/herder/`. |
 | [stellar-core-pc] | stellar-core pseudocode companion, `src/ledger/`, `src/herder/`. |
 | [BucketListDB Spec] | Stellar BucketList and BucketListDB Specification (companion document). |
 | [SCP Spec] | Stellar Consensus Protocol (SCP) Specification (companion document). |
@@ -1823,14 +1855,18 @@ flowchart TD
 The 8-step commit sequence from Section 4.2, Step 17:
 
 ```
-Step 1: Queue history checkpoint if this ledger closes a checkpoint interval
-Step 2: Commit the LedgerTxn to persistent storage     ← offer flush + commit
-Step 3: Finalize checkpoint if queued and now complete
-Step 4: Begin background eviction scan for the next ledger
-Step 5: Transition pipeline state: COMMITTING → READY_TO_APPLY
-Step 6: Snapshot Soroban state for invariant verification (if enabled)
-Step 7: Publish the new LCL and notify subscribers     ← MUST run on main thread
-Step 8: Notify herder that ledger close is complete
+Step 1: Queue history checkpoint (within current DB transaction)
+Step 2: Commit LedgerTxn (flush offers to DB, commit SQL transaction)
+Step 3: Finalize checkpoint files
+Step 4: Start background eviction scan for the next ledger
+Step 5: Exit COMMITTING phase: COMMITTING → READY_TO_APPLY
+Step 6: Copy Soroban state for invariant check (if enabled)
+Step 7: Advance LCL, publish queued history, GC buckets  ← MUST run on main thread
+        7a. Swap in new CompleteConstLedgerState as LCL
+        7b. Publish Soroban metrics
+        7c. Kick off queued history publishing
+        7d. GC unreferenced buckets (under ledger state mutex)
+Step 8: Notify herder and run invariant snapshot check
 ```
 
 [rfc2119]: https://www.rfc-editor.org/rfc/rfc2119
