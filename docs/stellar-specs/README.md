@@ -211,6 +211,61 @@ affect consensus or ledger state.
 
 ---
 
+## Appendix A: Spec Implementation Notes
+
+This appendix consolidates cross-cutting constants and formulas used
+across multiple specs. It is non-normative but reflects stellar-core
+behavior for protocol 25.
+
+### A.1 Timing and Consensus
+
+- **SCP timeout computation** (SCP_SPEC §12.5, LEDGER_SPEC §9.2):
+  - `MAX_TIMEOUT_MS = 30 * 60 * 1000`.
+  - Pre‑p23: `initial = 1000`, `increment = 1000`.
+  - p23+: pull `initial`/`increment` from `SCP_TIMING` config setting
+    (`nominationTimeout*` or `ballotTimeout*` depending on phase).
+  - `timeout = min(initial + (round - 1) * increment, MAX_TIMEOUT_MS)`.
+- **Expected ledger close time** (LEDGER_SPEC §9.3):
+  - Pre‑p23: `5000 ms`.
+  - p23+: `SCP_TIMING.ledgerTargetCloseTimeMilliseconds`.
+
+### A.2 Overlay and Flooding
+
+- **Flood de‑duplication hash** (OVERLAY_SPEC §3.3):
+  - `BLAKE2b‑256(XDR(StellarMessage))`.
+- **Max tx size (`maxTxSize`)** (OVERLAY_SPEC §5.4):
+  - `maxClassic = 102400` bytes.
+  - `extraBuffer = 2000` bytes.
+  - Pre‑p20: `maxTxSize = maxClassic`.
+  - p20+: `maxTxSize = max(maxClassic, txMaxSizeBytes + extraBuffer)`.
+- **Flow control auto defaults** (OVERLAY_SPEC §8.3):
+  - `INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES = 300000`.
+  - `INITIAL_FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES = 100000`.
+  - Use `300000` unless it cannot accommodate `maxTxSize`, in which
+    case use `maxTxSize + 100000`.
+
+### A.3 Transaction Set Ordering
+
+- **Contents hash** (HERDER_SPEC §9.1):
+  - Legacy `TransactionSet`: `SHA256(previousLedgerHash || XDR(tx1) || ...)`.
+  - Generalized tx set v1: `SHA256(XDR(generalizedTxSet))`.
+- **Apply ordering comparator** (HERDER_SPEC §9):
+  - `lessThanXored(l, r, x) = (l XOR x) < (r XOR x)` (lexicographic).
+
+### A.4 Fees
+
+- **Per‑op fee rounding** (TX_SPEC §5.2):
+  - Pre‑p20: ceiling division.
+  - p20+: floor division.
+
+### A.5 Network Identity
+
+- **Production network detection** (LEDGER_SPEC §7.3.4):
+  - Network passphrase equals
+    `"Public Global Stellar Network ; September 2015"`.
+
+---
+
 ## References
 
 | Reference | Description |
