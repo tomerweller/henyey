@@ -169,7 +169,12 @@ The overlay protocol uses the following cryptographic primitives:
 | Key derivation | HKDF (HMAC-SHA-256) | 256-bit | Derive MAC keys from ECDH output |
 | Message authentication | HMAC-SHA-256 | 256-bit | Per-message integrity |
 | Hashing | SHA-256 | 256-bit | AuthCert signing, general hashing |
-| Message deduplication | BLAKE2 | 256-bit | Flood message deduplication |
+| Message deduplication | BLAKE2b | 256-bit | Flood message deduplication |
+
+**BLAKE2 variant**: stellar-core uses libsodium `crypto_generichash`
+with a 32-byte output, equivalent to **BLAKE2b-256** over the message
+bytes. The input is the XDR serialization of the **entire
+`StellarMessage`**, and the 32-byte digest is used as the flood-map key.
 
 ---
 
@@ -204,6 +209,9 @@ DNS resolution for configured peers is performed periodically:
 - **Retry on failure**: Every `retryCount * 10` seconds, up to a maximum
   of 600 seconds (after 60 retries, retries are disabled and the normal
   interval is used).
+
+The retry delay uses a fixed 10-second step (no exponential backoff) and
+caps at 600 seconds.
 
 ### 4.3 Connection Establishment
 
@@ -621,6 +629,22 @@ The receiver MUST validate the Record Marking header length:
 - If peer is unauthenticated and `length > 4,096`: drop the connection.
 - If `length > 16,777,216`: drop the connection.
 
+**Maximum transaction size (`maxTxSize`)**: The overlay uses the
+transaction size limit from the herder. It is computed as:
+
+```
+maxClassic = 102400  // MAX_CLASSIC_TX_SIZE_BYTES
+extraBuffer = 2000   // FLOW_CONTROL_BYTES_EXTRA_BUFFER
+
+if protocolVersion < 20:
+    maxTxSize = maxClassic
+else:
+    // txMaxSizeBytes is from Soroban network config
+    maxTxSize = max(maxClassic, txMaxSizeBytes + extraBuffer)
+```
+
+`maxTxSize` is recomputed at startup and after Soroban config upgrades.
+
 ---
 
 ## 6. Message Type Registry
@@ -981,6 +1005,10 @@ The byte capacity default is auto-calculated:
 - If `300,000 - 100,000 >= maxTxSize`: use **300,000** bytes.
 - Otherwise: use `maxTxSize + 100,000` bytes.
 
+`maxTxSize` is the value defined above. The constants are:
+`INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES = 300000` and
+`INITIAL_FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES = 100000`.
+
 ### 8.4 Inbound Flow Control and Capacity Release
 
 When a flood message is received:
@@ -1103,6 +1131,9 @@ Where `maxTxSize` is the dynamic maximum of:
 This value is recomputed at startup and on network configuration
 upgrades. The constraint ensures the sender can always send at least
 one maximum-size transaction before needing an acknowledgment.
+
+If flow-control byte parameters are provided explicitly, they MUST also
+obey `FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES <= PEER_FLOOD_READING_CAPACITY_BYTES`.
 
 ---
 
@@ -1313,6 +1344,11 @@ database (`REALLY_DEAD_NUM_FAILURES_CUTOFF`).
 
 The pending connection budget is split between inbound and outbound
 based on the ratio of configured target connections.
+
+Defaults (stellar-core): `TARGET_PEER_CONNECTIONS = 8`,
+`MAX_PENDING_CONNECTIONS = 500`,
+`PEER_AUTHENTICATION_TIMEOUT = 2s`, `PEER_TIMEOUT = 30s`,
+`PEER_STRAGGLER_TIMEOUT = 120s`.
 
 **Adjusted outbound target**: If there are zero inbound authenticated
 peers, the outbound target is temporarily reduced to **3**

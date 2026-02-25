@@ -709,6 +709,17 @@ eviction, and per-lane base fee computation — is defined in
 computation uses floor division. Prior versions use ceiling
 division.
 
+**Exact per-op fee calculation** (stellar-core):
+
+```
+if protocolVersion >= 20:
+    perOpFee = floor(inclusionFee / numOps)
+else:
+    perOpFee = ceil(inclusionFee / numOps)
+```
+
+The comparison uses 128-bit arithmetic to avoid overflow.
+
 ### 5.3 Effective Fee Computation
 
 When a transaction is applied, the actual fee charged is:

@@ -920,11 +920,13 @@ During ledger close, upgrades are applied in the order they appear in
    - Set `header.ledgerVersion` to the new version.
    - If upgrading to p10: run `prepareLiabilities` to adjust all
      offers and trust lines for the new reserve calculation rules.
-   - If upgrading from p15 to p16 exactly **on the production
-     (mainnet) network only** (`gIsProductionNetwork`): remove an
-     invalid sponsorship from offer `289733046`. This is a
-     one-time data repair for a specific problematic ledger entry;
-     the fix is a no-op on non-production networks.
+    - If upgrading from p15 to p16 exactly **on the production
+      (mainnet) network only** (`gIsProductionNetwork`): remove an
+      invalid sponsorship from offer `289733046`. This is a
+      one-time data repair for a specific problematic ledger entry;
+      the fix is a no-op on non-production networks. The production
+      network is identified by the network passphrase
+      `"Public Global Stellar Network ; September 2015"`.
    - If upgrading to p20: create all initial Soroban `CONFIG_SETTING`
      entries with their default values.
    - If upgrading to p21: create new cost types for protocol 21
@@ -951,20 +953,22 @@ During ledger close, upgrades are applied in the order they appear in
      (no `createCostTypesForV24` or similar). The only v24-specific
      behavior is the mainnet hot archive bug fix during the p23→p24
      transition.
-   - If upgrading from p23 to p24 **on the production (mainnet)
-     network only** (`gIsProductionNetwork`): apply the CAP-0076
-     P23 hot archive bug remediation. In protocol 23, the
-     persistent entry eviction scan could archive a stale
-     version of an entry from a deeper bucket level instead of
-     the newest version, because no point lookup was performed.
-     This corrupted 478 entries on mainnet. The remediation:
-     (a) Add `31,879,035` stroops to `feePool` to account for
-     unintentional XLM burns from restored corrupted SAC
-     balance entries.
-     (b) The hot archive entry fix is applied during
-     `finalizeLedgerTxnChanges` (Section 11.1, Step 1c).
-     Note: These fixes are mainnet-specific; testnet and
+    - If upgrading from p23 to p24 **on the production (mainnet)
+      network only** (`gIsProductionNetwork`): apply the CAP-0076
+      P23 hot archive bug remediation. In protocol 23, the
+      persistent entry eviction scan could archive a stale
+      version of an entry from a deeper bucket level instead of
+      the newest version, because no point lookup was performed.
+      This corrupted 478 entries on mainnet. The remediation:
+      (a) Add `31,879,035` stroops to `feePool` to account for
+      unintentional XLM burns from restored corrupted SAC
+      balance entries.
+      (b) The hot archive entry fix is applied during
+      `finalizeLedgerTxnChanges` (Section 11.1, Step 1c).
+      Note: These fixes are mainnet-specific; testnet and
            private networks MUST NOT apply them.
+      The production network is identified by the network
+      passphrase `"Public Global Stellar Network ; September 2015"`.
 
    **Base fee upgrade** (`LEDGER_UPGRADE_BASE_FEE`):
    - Set `header.baseFee` to the new value.
@@ -1164,6 +1168,19 @@ specific points during the ledger close pipeline:
 Configuration loading reads all `CONFIG_SETTING` entries from the
 current `LedgerTxn` and assembles them into a cached configuration
 object. This object is immutable for the duration of its use.
+
+**Expected ledger close time**: The overlay and herder derive
+`expectedLedgerCloseTime` from configuration as follows:
+
+```
+if protocolVersion < 23:
+    expectedLedgerCloseTime = 5000 ms
+else:
+    expectedLedgerCloseTime =
+        SCP_TIMING.ledgerTargetCloseTimeMilliseconds
+```
+
+The constant 5000 ms is `TARGET_LEDGER_CLOSE_TIME_BEFORE_PROTOCOL_VERSION_23_MS`.
 
 ### 9.4 Non-Upgradeable Settings
 

@@ -389,6 +389,12 @@ herder does NOT apply a corrective offset to subsequent proposed
 close times — drift detection is purely informational and does not
 influence the close time computation.
 
+**Implementation detail**: The 75th percentile is computed using
+`medida::Histogram` with `kSliding` sampling. The herder collects
+`externalizedCloseTime - localProposedCloseTime` samples for the
+window and computes `get75thPercentile()`; if `abs(drift) > 10`, it
+logs `POSSIBLY_BAD_LOCAL_CLOCK` and clears the window.
+
 ### 5.3 StellarValue Validation
 
 When receiving a StellarValue proposed by another validator (via
@@ -870,6 +876,24 @@ execution), transactions are ordered for application using an
 
 5. **Concatenate**: The final apply order is batch 0 followed
    by batch 1, and so on.
+
+**Implementation detail**: `txSetContentsHash` is the transaction-set
+contents hash computed as:
+
+```
+if legacy TransactionSet:
+    contentsHash = SHA256(previousLedgerHash || XDR(tx1) || XDR(tx2) || ...)
+else (GeneralizedTransactionSet v1):
+    contentsHash = SHA256(XDR(generalizedTxSet))
+```
+
+`transactionFullHash` is the full transaction hash (including
+signatures). The ordering comparator is:
+
+```
+lessThanXored(l, r, x):
+    return (l XOR x) < (r XOR x)   // lexicographic byte order
+```
 
 ### 9.2 Parallel Apply Ordering
 

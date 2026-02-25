@@ -1642,13 +1642,19 @@ Statement types are ordered: `PREPARE < CONFIRM < EXTERNALIZE`. A
 statement of a higher type always supersedes one of a lower type from
 the same node.
 
+Nomination and ballot statements are **not** comparable. If one
+statement is `SCP_ST_NOMINATE` and the other is a ballot statement
+(`PREPARE`, `CONFIRM`, `EXTERNALIZE`), `isNewerStatement` MUST return
+false; neither supersedes the other.
+
 ### 11.2 Ballot Statement Ordering
 
 Within the same statement type, ordering is lexicographic:
 
 **PREPARE**: Compare `(ballot, prepared, preparedPrime, nH)`.
 
-**CONFIRM**: Compare `(ballot, nPrepared, nH)`.
+**CONFIRM**: Compare `(ballot, nPrepared, nH)`. The `nCommit` field is
+NOT part of statement ordering.
 
 **EXTERNALIZE**: No duplicates — once a node externalizes, its
 statement is final. `isNewerStatement` always returns false for two
@@ -1737,6 +1743,29 @@ the driver. It SHOULD:
 - Grow with `roundNumber` to allow convergence under network delays.
 - Allow at least 4 message exchanges (2 round trips) within the
   timeout period.
+
+The stellar-core driver uses the following **exact** computation:
+
+```
+MAX_TIMEOUT_MS = 30 * 60 * 1000  // 30 minutes
+
+if protocolVersion < 23:
+    initialTimeoutMS = 1000
+    incrementMS = 1000
+else:
+    if isNomination:
+        initialTimeoutMS = networkConfig.nominationTimeoutInitialMilliseconds
+        incrementMS = networkConfig.nominationTimeoutIncrementMilliseconds
+    else:
+        initialTimeoutMS = networkConfig.ballotTimeoutInitialMilliseconds
+        incrementMS = networkConfig.ballotTimeoutIncrementMilliseconds
+
+timeoutMS = initialTimeoutMS + (roundNumber - 1) * incrementMS
+timeoutMS = min(timeoutMS, MAX_TIMEOUT_MS)
+```
+
+`roundNumber` MUST be > 0. The network config values come from the
+`SCP_TIMING` configuration setting (LEDGER_SPEC §9.2).
 
 ---
 
