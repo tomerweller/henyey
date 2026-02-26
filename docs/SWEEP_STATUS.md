@@ -1,6 +1,6 @@
 # Verify-Execution Sweep Status
 
-> **Updated**: 2026-02-26 05:37 UTC
+> **Updated**: 2026-02-26 07:40 UTC
 > **Session**: b5e87aee (fresh start)
 > **CDP data lake range**: L59501248–L61366079 (latest available as of 2026-02-23)
 > **Supported protocol**: P24+ (L59501312 is first P24 ledger; L59501248–L59501311 are P23 and unverifiable)
@@ -58,6 +58,12 @@ Ledgers L59501248–L59501311 (P23) cannot be verified by Henyey (min supported:
   - **Root cause**: The `!frame.is_soroban()` guard on the apply-time signature check skipped checking for all Soroban transactions. For fee-bump Soroban TXs, a prior TX in the same ledger modified the inner source's signer set, invalidating the inner signatures. stellar-core's `processSignatures()` calls `checkOperationSignatures()` for all transaction types.
   - **Fix**: Remove the `!frame.is_soroban()` guard so signature checking runs for all transaction types, matching stellar-core's behavior.
 
+- **VE-09**: LedgerDelta merge rejects parallel cluster double-delete — fixed in `9e901ca`
+  - **Ledger**: L61403915 (tracker catchup)
+  - **Symptom**: Tracker crashed during catchup with "invalid merge: delete on deleted entry" in `LedgerDelta::merge`.
+  - **Root cause**: Parallel Soroban clusters can independently delete the same entry (e.g. a TTL key present in multiple footprints). The merge logic rejected this as invalid, despite within-delta double-deletes already being handled as no-ops.
+  - **Fix**: Make delete-on-deleted idempotent in the merge path, matching the within-delta behavior at line 383.
+
 ## Running sweeps
 
 | Sweep | Range | Status | Started |
@@ -69,4 +75,4 @@ Ledgers L59501248–L59501311 (P23) cannot be verified by Henyey (min supported:
 
 | Status | PID | Started |
 |--------|-----|---------|
-| Synced | 514092 | 2026-02-25 19:46 UTC (restarted with codec auth fix 1a872a5) |
+| Syncing | 981416 | 2026-02-26 07:40 UTC (restarted with VE-09 delta merge fix 9e901ca) |
