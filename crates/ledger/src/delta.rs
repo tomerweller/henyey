@@ -716,9 +716,11 @@ impl LedgerDelta {
                                     );
                                 }
                                 EntryChange::Deleted { .. } => {
-                                    return Err(LedgerError::Internal(
-                                        "invalid merge: delete on deleted entry".to_string(),
-                                    ));
+                                    // Idempotent: both deltas deleted the same entry.
+                                    // This is valid when parallel clusters independently
+                                    // delete an entry that appears in multiple footprints
+                                    // (e.g. TTL keys during Soroban execution).  Keep
+                                    // the existing deletion.
                                 }
                             }
                         } else {
@@ -1173,9 +1175,12 @@ mod tests {
         assert!(delta1.merge(delta2).is_err());
     }
 
-    /// Merge error: delete on already-deleted entry.
+    /// Merge: delete on already-deleted entry is idempotent.
+    ///
+    /// This occurs when parallel Soroban clusters independently delete the
+    /// same entry (e.g. a TTL key present in multiple footprints).
     #[test]
-    fn test_merge_delete_on_deleted_fails() {
+    fn test_merge_delete_on_deleted_is_idempotent() {
         let mut delta1 = LedgerDelta::new(1);
         let mut delta2 = LedgerDelta::new(1);
 
@@ -1183,7 +1188,14 @@ mod tests {
         delta1.record_delete(entry.clone()).unwrap();
         delta2.record_delete(entry).unwrap();
 
-        assert!(delta1.merge(delta2).is_err());
+        delta1.merge(delta2).unwrap();
+
+        // Exactly one deletion should remain.
+        assert_eq!(delta1.changes.len(), 1);
+        assert!(matches!(
+            delta1.changes.values().next().unwrap(),
+            EntryChange::Deleted { .. }
+        ));
     }
 
     // =========================================================================
