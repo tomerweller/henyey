@@ -203,6 +203,15 @@ pub fn run_transactions_on_executor(
             Some(tx_prng_seed),
             false,
         )?;
+
+        // When fees were pre-charged (parallel path), the executor runs with
+        // deduct_fee=false so early validation failures (e.g. TxNoAccount)
+        // report fee_charged=0. Override with the actual pre-charged amount
+        // so the result matches the fee already deducted on the delta.
+        if has_pre_charged {
+            result.fee_charged = pre_fee_results[tx_index].charged_fee;
+        }
+
         let frame = TransactionFrame::with_network(tx.clone(), executor.network_id);
 
         let tx_result = build_tx_result_pair(
