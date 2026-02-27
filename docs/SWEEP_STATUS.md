@@ -39,6 +39,8 @@ Ledgers L59501248–L59501311 (P23) cannot be verified by Henyey (min supported:
 | L60341312–L60441311 | **CLEAN** | s22 completed — 100,000 ledgers, 0 mismatches |
 | L60441312–L60541311 | **CLEAN** | s23 completed — 100,000 ledgers, 0 mismatches |
 | L60541312–L60641311 | **CLEAN** | s24 completed — 100,000 ledgers, 0 mismatches |
+| L60641312–L60741311 | **CLEAN** | s25 completed — 100,000 ledgers, 0 mismatches (VE-10 fix applied) |
+| L60741312–L60841311 | **CLEAN** | s26 completed — 100,000 ledgers, 0 mismatches |
 
 ## Previously confirmed bug fixes (from prior sessions)
 
@@ -80,11 +82,11 @@ Ledgers L59501248–L59501311 (P23) cannot be verified by Henyey (min supported:
 
 | Sweep | Range | Status | Started |
 |-------|-------|--------|---------|
-| s25 | L60641312–L60741311 | running (100k chunk, VE-10 fix applied) | 2026-02-27 09:25 UTC |
-| s26 | L60741312–L60841311 | running (100k chunk) | 2026-02-27 12:05 UTC |
+| s27 | L60841312–L60941311 | running (100k chunk) | 2026-02-27 21:02 UTC |
+| s28 | L60941312–L61041311 | starting (100k chunk) | 2026-02-27 22:00 UTC |
 
 ## Tracker
 
 | Status | PID | Started |
 |--------|-----|---------|
-| Catching up | 2440604 | 2026-02-27 19:06 UTC (restarted with VE-10 fix; previous crashed at L61426044 hash mismatch) |
+| Synced | 2563315 | 2026-02-27 21:02 UTC (restarted after s26 completed; caught up and tracking live at ~L61427925) |
