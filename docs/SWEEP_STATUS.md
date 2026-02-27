@@ -1,6 +1,6 @@
 # Verify-Execution Sweep Status
 
-> **Updated**: 2026-02-27 07:02 UTC
+> **Updated**: 2026-02-27 09:25 UTC
 > **Session**: b5e87aee (fresh start)
 > **CDP data lake range**: L59501248–L61366079 (latest available as of 2026-02-23)
 > **Supported protocol**: P24+ (L59501312 is first P24 ledger; L59501248–L59501311 are P23 and unverifiable)
@@ -68,12 +68,19 @@ Ledgers L59501248–L59501311 (P23) cannot be verified by Henyey (min supported:
   - **Root cause**: Parallel Soroban clusters can independently delete the same entry (e.g. a TTL key present in multiple footprints). The merge logic rejected this as invalid, despite within-delta double-deletes already being handled as no-ops.
   - **Fix**: Make delete-on-deleted idempotent in the merge path, matching the within-delta behavior at line 383.
 
+- **VE-10**: Deleted account reloaded from snapshot in parallel fee path — fixed in `07fbf59` + `0782a40`
+  - **Ledger**: L60645316, TX 68 (hash `050055a3...`, account GBPHB57...)
+  - **Symptom**: txSuccess (ours) vs TxNoAccount (CDP). Also fee=0 vs fee=100.
+  - **Root cause**: In the parallel fee-deduction path, accounts are bulk-loaded into executor state via `state.load_entry()` (bypassing `load_account()`), so the `loaded_accounts` guard is never populated. When a prior TX in the ledger deletes the account via account_merge, a subsequent TX's `load_account` fell through to the bucket-list snapshot and returned the stale LIVE entry.
+  - **Fix 1** (`07fbf59`): Add `delta().deleted_keys()` check to `load_account()` and `load_account_without_record()`, matching the existing pattern in `load_trustline` and `load_claimable_balance`.
+  - **Fix 2** (`0782a40`): Override `result.fee_charged` with the pre-charged fee for validation failures in the parallel path, since the executor runs with `deduct_fee=false`.
+
 ## Running sweeps
 
 | Sweep | Range | Status | Started |
 |-------|-------|--------|---------|
 | s24 | L60541312–L60641311 | running (100k chunk) | 2026-02-26 22:46 UTC |
-| s25 | L60641312–L60741311 | running (100k chunk) | 2026-02-27 07:02 UTC |
+| s25 | L60641312–L60741311 | restarting after VE-10 fix | 2026-02-27 09:25 UTC |
 
 ## Tracker
 
