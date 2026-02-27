@@ -1,6 +1,6 @@
 # Henyey TX Crate — Specification Adherence Evaluation
 
-**Evaluated against:** `docs/stellar-specs/TX_SPEC.md` (stellar-core v25.x / Protocol 25)
+**Evaluated against:** `stellar-specs/TX_SPEC.md` (stellar-core v25.x / Protocol 25)
 **Crate:** `crates/tx/` (henyey-tx)
 **Self-reported parity:** 97% (195/202 functions, per `PARITY_STATUS.md`)
 **Date:** 2026-02-20
@@ -58,7 +58,7 @@ The henyey-tx crate implements the Stellar transaction processing subsystem with
 
 ## 2. Evaluation Methodology
 
-This evaluation compares the henyey-tx implementation against every section of `docs/stellar-specs/TX_SPEC.md`. The evaluation uses:
+This evaluation compares the henyey-tx implementation against every section of `stellar-specs/TX_SPEC.md`. The evaluation uses:
 
 1. **Spec requirements**: Each MUST/SHALL/REQUIRED statement in TX_SPEC is treated as a requirement.
 2. **Source code inspection**: Key Rust source files (`frame.rs`, `validation.rs`, `live_execution.rs`, `fee_bump.rs`, `signature_checker.rs`, `result.rs`, `meta_builder.rs`, `events.rs`, `lumen_reconciler.rs`, `operations/execute/*.rs`, `soroban/*.rs`, `state/*.rs`) were read and cross-referenced.

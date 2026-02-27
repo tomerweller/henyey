@@ -4,3 +4,6 @@
 [submodule "stellar-core-pc"]
 	path = stellar-core-pc
 	url = git@github.com:tomerweller/stellar-core-pc.git
+[submodule "stellar-specs"]
+	path = stellar-specs
+	url = git@github.com:tomerweller/stellar-spec.git

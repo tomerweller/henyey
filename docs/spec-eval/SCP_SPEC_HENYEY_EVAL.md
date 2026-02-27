@@ -1,6 +1,6 @@
 # Henyey SCP Crate — Specification Adherence Evaluation
 
-**Evaluated against:** `docs/stellar-specs/SCP_SPEC.md` (Stellar Consensus Protocol Specification v25)
+**Evaluated against:** `stellar-specs/SCP_SPEC.md` (Stellar Consensus Protocol Specification v25)
 **Crate:** `crates/scp/` (henyey-scp)
 **Function-level parity:** 100% (164/164 functions per `PARITY_STATUS.md`)
 **Date:** 2026-02-20
@@ -59,7 +59,7 @@ The evaluation finds that the Rust implementation adheres to the specification w
 
 ## 2. Evaluation Methodology
 
-This evaluation compares the henyey SCP implementation against `docs/stellar-specs/SCP_SPEC.md` (Sections 1-16, 1889 lines), cross-referenced with the C++ implementation via the crate's `PARITY_STATUS.md`.
+This evaluation compares the henyey SCP implementation against `stellar-specs/SCP_SPEC.md` (Sections 1-16, 1889 lines), cross-referenced with the C++ implementation via the crate's `PARITY_STATUS.md`.
 
 Every section of the specification was checked against the corresponding Rust module. Each requirement was assessed on:
 

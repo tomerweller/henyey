@@ -1,6 +1,6 @@
 # Henyey Catchup/History Crates — Specification Adherence Evaluation
 
-**Evaluated against:** `docs/stellar-specs/CATCHUP_SPEC.md` (stellar-core v25.x / Protocol 25)
+**Evaluated against:** `stellar-specs/CATCHUP_SPEC.md` (stellar-core v25.x / Protocol 25)
 **Crates:** `crates/history/` (henyey-history, 76% parity) and `crates/historywork/` (henyey-historywork, 56% parity)
 **Date:** 2026-02-20
 

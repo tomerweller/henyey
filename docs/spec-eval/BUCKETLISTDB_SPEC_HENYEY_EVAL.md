@@ -1,6 +1,6 @@
 # Henyey Bucket Crate — Specification Adherence Evaluation
 
-**Evaluated against:** `docs/stellar-specs/BUCKETLISTDB_SPEC.md` (stellar-core v25.0.1 BucketListDB reference)
+**Evaluated against:** `stellar-specs/BUCKETLISTDB_SPEC.md` (stellar-core v25.0.1 BucketListDB reference)
 **Crate:** `crates/bucket/` (henyey-bucket)
 **Date:** 2026-02-20
 

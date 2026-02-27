@@ -1,6 +1,6 @@
 # LEDGER_SPEC.md — Henyey Spec Adherence Evaluation
 
-**Spec**: `docs/stellar-specs/LEDGER_SPEC.md`
+**Spec**: `stellar-specs/LEDGER_SPEC.md`
 **Crate**: `crates/ledger/`
 **Date**: 2026-02-20
 **Evaluator**: AI-assisted review
