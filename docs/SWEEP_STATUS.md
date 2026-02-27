@@ -1,6 +1,6 @@
 # Verify-Execution Sweep Status
 
-> **Updated**: 2026-02-27 12:05 UTC
+> **Updated**: 2026-02-27 19:10 UTC
 > **Session**: b5e87aee (fresh start)
 > **CDP data lake range**: L59501248–L61366079 (latest available as of 2026-02-23)
 > **Supported protocol**: P24+ (L59501312 is first P24 ledger; L59501248–L59501311 are P23 and unverifiable)
@@ -87,4 +87,4 @@ Ledgers L59501248–L59501311 (P23) cannot be verified by Henyey (min supported:
 
 | Status | PID | Started |
 |--------|-----|---------|
-| Synced | 1015951 | 2026-02-26 08:20 UTC (restarted with VE-09 delta merge fix 9e901ca) |
+| Catching up | 2440604 | 2026-02-27 19:06 UTC (restarted with VE-10 fix; previous crashed at L61426044 hash mismatch) |
