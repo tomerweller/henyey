@@ -674,6 +674,17 @@ impl TransactionExecutor {
             account_id: account_id.clone(),
         });
 
+        // VE-10: In the parallel fee-deduction path, accounts are bulk-loaded
+        // into state via state.load_entry() (bypassing load_account), so
+        // loaded_accounts is never populated for them.  If a prior TX in this
+        // ledger deletes the account (account_merge), the loaded_accounts
+        // guard above won't fire, and without this check we'd reload the stale
+        // LIVE entry from the bucket-list snapshot.
+        if self.state.delta().deleted_keys().contains(&key) {
+            tracing::trace!(account = %account_id_to_strkey(account_id), "load_account: deleted by previous TX in this ledger (delta)");
+            return Ok(false);
+        }
+
         if let Some(entry) = snapshot.get_entry(&key)? {
             // Log signer info for debugging
             if let stellar_xdr::curr::LedgerEntryData::Account(ref acct) = entry.data {
@@ -723,6 +734,12 @@ impl TransactionExecutor {
         let key = stellar_xdr::curr::LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
             account_id: account_id.clone(),
         });
+
+        // Check if deleted by a previous TX in this ledger (delta persists across TXs).
+        if self.state.delta().deleted_keys().contains(&key) {
+            tracing::trace!(account = %account_id_to_strkey(account_id), "load_account_without_record: deleted by previous TX in this ledger");
+            return Ok(false);
+        }
 
         if let Some(entry) = snapshot.get_entry(&key)? {
             tracing::trace!(
@@ -4368,5 +4385,92 @@ mod tests {
         assert_eq!(all_restored.len(), 2);
         assert_eq!(all_restored[0], key0);
         assert_eq!(all_restored[1], key1);
+    }
+
+    /// Regression test for VE-10: account deleted by account_merge within a ledger
+    /// must not be re-loadable from the bucket list snapshot.
+    ///
+    /// In the parallel fee-deduction path, accounts are loaded into the executor
+    /// state directly via `state.load_entry()` (not through `load_account`), so
+    /// `loaded_accounts` is never populated.  When a prior TX in the ledger
+    /// deletes the account (account_merge), a subsequent TX's `load_account`
+    /// must detect the deletion via `delta().deleted_keys()` instead of relying
+    /// on `loaded_accounts`.
+    ///
+    /// Before the fix, `load_account` fell through to the bucket-list snapshot
+    /// and returned the stale LIVE entry, producing txSuccess instead of the
+    /// correct TxNoAccount.
+    ///
+    /// Observed at mainnet ledger 60645316 TX 68 (account GBPHB57...).
+    #[test]
+    fn test_deleted_account_not_reloaded_from_snapshot() {
+        use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
+        use stellar_xdr::curr::*;
+        use std::sync::Arc;
+
+        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0xAA; 32])));
+        let account_entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: account_id.clone(),
+                balance: 100_000_000,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        // Create a snapshot that returns the account from the "bucket list"
+        let account_entry_clone = account_entry.clone();
+        let account_id_for_lookup = account_id.clone();
+        let lookup_fn: crate::snapshot::EntryLookupFn = Arc::new(move |key: &LedgerKey| {
+            if let LedgerKey::Account(k) = key {
+                if k.account_id == account_id_for_lookup {
+                    return Ok(Some(account_entry_clone.clone()));
+                }
+            }
+            Ok(None)
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup_fn);
+
+        // Create executor
+        let context = LedgerContext::new(101, 1234567890, 100, 5_000_000, 25, NetworkId::testnet());
+        let mut executor = TransactionExecutor::new(
+            &context,
+            0,
+            SorobanConfig::default(),
+            ClassicEventConfig::default(),
+        );
+
+        // Mimic the parallel fee-deduction path: load the account directly into
+        // state via state.load_entry(), NOT through load_account().  This means
+        // loaded_accounts is NOT populated for this key.
+        executor.state.load_entry(account_entry.clone());
+        assert!(
+            executor.state.get_account(&account_id).is_some(),
+            "Account should be in state after direct load"
+        );
+
+        // Simulate a prior TX deleting the account (account_merge).
+        executor.state.delete_account(&account_id);
+        assert!(
+            executor.state.get_account(&account_id).is_none(),
+            "Account should be gone from state after delete"
+        );
+
+        // A subsequent TX tries to load the account.  loaded_accounts is empty,
+        // so without the delta().deleted_keys() check, this would fall through
+        // to the bucket-list snapshot and return true (the stale LIVE entry).
+        let reloaded = executor.load_account(&snapshot, &account_id).unwrap();
+        assert!(
+            !reloaded,
+            "Account deleted in this ledger must NOT be re-loaded from snapshot"
+        );
     }
 }
