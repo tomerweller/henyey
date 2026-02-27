@@ -3661,3 +3661,119 @@ fn test_should_apply_false_skips_operation_body() {
         "sequence number must be bumped to 2 (the TX's seq_num) even though body was skipped"
     );
 }
+
+/// Regression test for the second part of VE-10: in the parallel fee-deduction
+/// path, validation failures (e.g. TxNoAccount) must report the pre-charged fee
+/// as fee_charged, not 0.
+///
+/// When fees are pre-deducted on the delta, `run_transactions_on_executor` calls
+/// the executor with `deduct_fee=false`. Early validation failures like
+/// TxNoAccount construct a `failed_result` with `fee_charged=0`. The fix
+/// overrides fee_charged with the pre-charged amount when `has_pre_charged` is
+/// true, so the result hash matches the fee already deducted on the delta.
+///
+/// Observed at mainnet L60645316 TX 68 (account deleted by account_merge,
+/// subsequent TX got TxNoAccount with wrong fee_charged).
+#[test]
+fn test_pre_charged_fee_override_on_validation_failure() {
+    use henyey_ledger::execution::{run_transactions_on_executor, PreChargedFee};
+    use henyey_ledger::LedgerDelta;
+
+    // Source account that DOES exist (needed for fee pre-charging to make sense).
+    let secret = SecretKey::from_seed(&[99u8; 32]);
+    let source_id: AccountId = (&secret.public_key()).into();
+    let (source_key, source_entry) = create_account_entry(source_id.clone(), 100, 100_000_000);
+
+    // Account that does NOT exist in the snapshot — simulates a deleted account.
+    let missing_secret = SecretKey::from_seed(&[98u8; 32]);
+    let _missing_id: AccountId = (&missing_secret.public_key()).into();
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .expect("add source")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let network_id = NetworkId::testnet();
+    let base_fee: u32 = 100;
+    let base_reserve: u32 = 5_000_000;
+
+    // Build TX from the missing account — this will trigger TxNoAccount.
+    let payment_op = Operation {
+        source_account: None,
+        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+            destination: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+            asset: Asset::Native,
+            amount: 1,
+        }),
+    };
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*missing_secret.public_key().as_bytes())),
+        fee: base_fee,
+        seq_num: SequenceNumber(1),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![payment_op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    let sig = sign_envelope(&envelope, &missing_secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![sig].try_into().unwrap();
+    }
+
+    let context = henyey_tx::LedgerContext::new(2, 1_000, base_fee, base_reserve, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+    executor.load_orderbook_offers(&snapshot).expect("load offers");
+
+    let pre_charged_fee: i64 = 100;
+    let pre_charged = vec![PreChargedFee {
+        charged_fee: pre_charged_fee,
+        should_apply: true,
+        fee_changes: LedgerEntryChanges(vec![].try_into().unwrap()),
+    }];
+
+    let transactions = vec![(envelope, None)];
+    let mut delta = LedgerDelta::new(2);
+
+    let result = run_transactions_on_executor(
+        &mut executor,
+        &snapshot,
+        &transactions,
+        base_fee,
+        [0u8; 32],
+        false,
+        &mut delta,
+        Some(&pre_charged),
+    )
+    .expect("run_transactions_on_executor");
+
+    // TX must fail with NoAccount.
+    assert!(!result.results[0].success, "TX should fail");
+    assert_eq!(
+        result.results[0].failure,
+        Some(ExecutionFailure::NoAccount),
+        "Failure must be NoAccount"
+    );
+
+    // fee_charged must be the pre-charged amount, not 0.
+    assert_eq!(
+        result.results[0].fee_charged, pre_charged_fee,
+        "fee_charged must equal the pre-charged fee ({}), not 0",
+        pre_charged_fee
+    );
+
+    // Verify the XDR result also has the correct fee_charged.
+    assert_eq!(
+        result.tx_results[0].result.fee_charged, pre_charged_fee,
+        "XDR fee_charged must equal the pre-charged fee"
+    );
+}
