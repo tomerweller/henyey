@@ -1268,6 +1268,12 @@ impl TransactionExecutor {
         if self.state.get_entry(key).is_some() {
             return Ok(true);
         }
+        // Check if deleted by a previous TX in this ledger (delta persists across TXs).
+        // Without this check, entries deleted by prior TXs would be reloaded from the
+        // snapshot, producing stale state (same class of bug as VE-10).
+        if self.state.delta().deleted_keys().contains(key) {
+            return Ok(false);
+        }
         // Try to load from snapshot (bucket list + hot archive)
         if let Some(entry) = snapshot.get_entry(key)? {
             self.state.load_entry(entry);
@@ -4471,6 +4477,78 @@ mod tests {
         assert!(
             !reloaded,
             "Account deleted in this ledger must NOT be re-loaded from snapshot"
+        );
+    }
+
+    /// Regression test: generic `load_entry` must not reload entries deleted by
+    /// a prior TX in the same ledger from the bucket-list snapshot.
+    ///
+    /// Same class of bug as VE-10 (load_account variant). The generic
+    /// `load_entry` is used by `RevokeSponsorship(LedgerEntry(...))` and must
+    /// honour the delta's deleted_keys set.
+    #[test]
+    fn test_load_entry_respects_delta_deleted_keys() {
+        use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
+        use stellar_xdr::curr::*;
+        use std::sync::Arc;
+
+        // Create an account that exists in the "bucket list" snapshot.
+        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0xBB; 32])));
+        let account_key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: account_id.clone(),
+        });
+        let account_entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: account_id.clone(),
+                balance: 50_000_000,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let account_entry_clone = account_entry.clone();
+        let account_key_for_lookup = account_key.clone();
+        let lookup_fn: crate::snapshot::EntryLookupFn = Arc::new(move |key: &LedgerKey| {
+            if *key == account_key_for_lookup {
+                return Ok(Some(account_entry_clone.clone()));
+            }
+            Ok(None)
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup_fn);
+
+        let context = LedgerContext::new(101, 1234567890, 100, 5_000_000, 25, NetworkId::testnet());
+        let mut executor = TransactionExecutor::new(
+            &context,
+            0,
+            SorobanConfig::default(),
+            ClassicEventConfig::default(),
+        );
+
+        // Load the entry into state, then delete it (simulating account_merge
+        // by a prior TX).
+        executor.state.load_entry(account_entry.clone());
+        assert!(executor.state.get_account(&account_id).is_some());
+        executor.state.delete_account(&account_id);
+        assert!(executor.state.get_account(&account_id).is_none());
+
+        // Generic load_entry must not reload the stale entry from the snapshot.
+        let reloaded = executor.load_entry(&snapshot, &account_key).unwrap();
+        assert!(
+            !reloaded,
+            "load_entry must not reload an entry deleted in this ledger"
+        );
+        // Verify the account is still absent from state.
+        assert!(
+            executor.state.get_account(&account_id).is_none(),
+            "Account must remain absent after load_entry returns false"
         );
     }
 }
