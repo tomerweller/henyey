@@ -1,6 +1,6 @@
 # Verify-Execution Sweep Status
 
-> **Updated**: 2026-02-27 19:10 UTC
+> **Updated**: 2026-02-28 06:05 UTC
 > **Session**: b5e87aee (fresh start)
 > **CDP data lake range**: L59501248–L61366079 (latest available as of 2026-02-23)
 > **Supported protocol**: P24+ (L59501312 is first P24 ledger; L59501248–L59501311 are P23 and unverifiable)
@@ -78,15 +78,20 @@ Ledgers L59501248–L59501311 (P23) cannot be verified by Henyey (min supported:
   - **Fix 1** (`07fbf59`): Add `delta().deleted_keys()` check to `load_account()` and `load_account_without_record()`, matching the existing pattern in `load_trustline` and `load_claimable_balance`.
   - **Fix 2** (`0782a40`): Override `result.fee_charged` with the pre-charged fee for validation failures in the parallel path, since the executor runs with `deduct_fee=false`.
 
+- **VE-11**: Deleted entries not propagated across parallel Soroban stages — fixed in `4ca973c`
+  - **Ledger**: L61430400, TX 331 (InvokeHostFunction)
+  - **Symptom**: txSuccess (ours) vs Trapped (CDP) for an InvokeHostFunction in stage 1. Hash mismatch on ledger close.
+  - **Root cause**: In parallel Soroban execution, entries deleted within stage 0 (via apply_soroban_storage_changes when host doesn't return a new value for an RW footprint entry) were not propagated to stage 1. `delta.current_entries()` only returns Created+Updated entries, omitting deletions. A fresh executor in stage 1 would reload the deleted entry from the bucket list via `load_soroban_footprint`, causing the host to succeed where it should have trapped.
+  - **Fix**: Propagate `delta.dead_entries()` as `prior_stage_deleted_keys` to subsequent stage clusters, and call `mark_entry_deleted()` to populate the deleted sets in the fresh executor. This matches stellar-core's `cleanEmpty` propagation via `collectClusterFootprintEntriesFromGlobal`.
+
 ## Running sweeps
 
 | Sweep | Range | Status | Started |
 |-------|-------|--------|---------|
-| s27 | L60841312–L60941311 | running (100k chunk) | 2026-02-27 21:02 UTC |
-| s28 | L60941312–L61041311 | starting (100k chunk) | 2026-02-27 22:00 UTC |
+| — | — | resuming after VE-11 fix | 2026-02-28 06:05 UTC |
 
 ## Tracker
 
 | Status | PID | Started |
 |--------|-----|---------|
-| Synced | 2563315 | 2026-02-27 21:02 UTC (restarted after s26 completed; caught up and tracking live at ~L61427925) |
+| Down | — | Crashed at L61430401 (VE-11). Restarting after fix. |
