@@ -3869,6 +3869,7 @@ pub struct SorobanContext<'a> {
 pub struct ClusterParams<'a> {
     pub id_pool: u64,
     pub prior_stage_entries: &'a [LedgerEntry],
+    pub prior_stage_deleted_keys: &'a [LedgerKey],
     pub pre_charged_fees: &'a [PreChargedFee],
 }
 

@@ -2050,6 +2050,30 @@ impl LedgerStateManager {
         }
     }
 
+    /// Mark an entry as deleted without requiring it to be in the state.
+    ///
+    /// Used to propagate deletion information from prior stages in parallel
+    /// Soroban execution. In stellar-core, deleted entries are stored in the
+    /// global entry map as `cleanEmpty` and loaded by
+    /// `collectClusterFootprintEntriesFromGlobal`, which blocks BL fallthrough.
+    /// This method provides the same blocking behavior for our code.
+    pub fn mark_entry_deleted(&mut self, key: &LedgerKey) {
+        match key {
+            LedgerKey::ContractData(k) => {
+                let lookup_key =
+                    ContractDataKey::new(k.contract.clone(), k.key.clone(), k.durability);
+                self.deleted_contract_data.insert(lookup_key);
+            }
+            LedgerKey::ContractCode(k) => {
+                self.deleted_contract_code.insert(k.hash.0);
+            }
+            LedgerKey::Ttl(k) => {
+                self.deleted_ttl.insert(k.key_hash.0);
+            }
+            _ => {}
+        }
+    }
+
     /// Convert an account entry into a ledger entry using current metadata.
     pub fn ledger_entry_for_account(&self, entry: &AccountEntry) -> LedgerEntry {
         self.account_to_ledger_entry(entry)

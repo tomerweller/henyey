@@ -3438,6 +3438,56 @@ mod tests {
         // from reloading the entry from bucket list
     }
 
+    /// Regression test for VE-11: deleted entries must block BL reload across stages.
+    ///
+    /// When a Soroban TX in stage 0 deletes an entry from its RW footprint
+    /// (host doesn't return a new value), subsequent stages must know not to
+    /// reload the entry from the bucket list. Without mark_entry_deleted(),
+    /// stage 1 would reload the orphaned entry from BL and the host would
+    /// incorrectly succeed where it should trap.
+    ///
+    /// This matches stellar-core's cleanEmpty propagation via
+    /// collectClusterFootprintEntriesFromGlobal.
+    #[test]
+    fn test_mark_entry_deleted_blocks_bl_reload_ve11() {
+        // Simulate stage 1 executor: fresh state, no prior knowledge of deletions.
+        let mut manager = LedgerStateManager::new(5_000_000, 61430400);
+
+        let cd = create_test_contract_data_entry(42);
+        let cd_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: cd.contract.clone(),
+            key: cd.key.clone(),
+            durability: cd.durability,
+        });
+        let ttl_key = LedgerKey::Ttl(LedgerKeyTtl {
+            key_hash: Hash([42; 32]),
+        });
+
+        // Before marking: entry is not in state and not deleted.
+        // load_soroban_footprint would fall through to BL.
+        assert!(manager.get_entry(&cd_key).is_none());
+        assert!(!manager.is_entry_deleted(&cd_key));
+        assert!(!manager.is_entry_deleted(&ttl_key));
+
+        // Mark as deleted (propagated from stage 0 delta.dead_entries()).
+        manager.mark_entry_deleted(&cd_key);
+        manager.mark_entry_deleted(&ttl_key);
+
+        // After marking: entry is still not in state, but IS marked deleted.
+        // load_soroban_footprint will skip BL load.
+        assert!(manager.get_entry(&cd_key).is_none());
+        assert!(manager.is_entry_deleted(&cd_key));
+        assert!(manager.is_entry_deleted(&ttl_key));
+
+        // Verify ContractCode works too.
+        let cc_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: Hash([99; 32]),
+        });
+        assert!(!manager.is_entry_deleted(&cc_key));
+        manager.mark_entry_deleted(&cc_key);
+        assert!(manager.is_entry_deleted(&cc_key));
+    }
+
     /// Regression test for clear_cached_entries_preserving_offers.
     ///
     /// Verifies that clearing cached entries with preserve_offers=true retains

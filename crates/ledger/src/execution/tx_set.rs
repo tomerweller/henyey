@@ -418,6 +418,9 @@ pub fn execute_soroban_parallel_phase(
         // pass delta.current_entries() to match this behavior.
         // NOTE: After pre-deduction, these entries include the post-fee balances.
         let prior_stage_entries = delta.current_entries();
+        // Collect keys deleted in prior stages so clusters know not to reload
+        // them from the bucket list. Matches stellar-core cleanEmpty propagation.
+        let prior_stage_deleted_keys = delta.dead_entries();
 
         // Slice pre_charged_fees for this stage's clusters.
         let stage_tx_count: usize = stage.iter().map(|c| c.len()).sum();
@@ -443,6 +446,7 @@ pub fn execute_soroban_parallel_phase(
             &ClusterParams {
                 id_pool,
                 prior_stage_entries: &prior_stage_entries,
+                prior_stage_deleted_keys: &prior_stage_deleted_keys,
                 pre_charged_fees: stage_pre_charged,
             },
         )?;
@@ -643,6 +647,14 @@ pub(super) fn execute_single_cluster(
         executor.state.load_entry(entry.clone());
     }
 
+    // Mark entries deleted in prior stages so load_soroban_footprint won't
+    // reload them from the bucket list. In stellar-core, deleted entries are
+    // stored in the global entry map as cleanEmpty and loaded by
+    // collectClusterFootprintEntriesFromGlobal, blocking BL fallthrough.
+    for key in params.prior_stage_deleted_keys {
+        executor.state.mark_entry_deleted(key);
+    }
+
     let mut results = Vec::with_capacity(cluster.len());
     let mut tx_results = Vec::with_capacity(cluster.len());
     let mut tx_result_metas = Vec::with_capacity(cluster.len());
@@ -818,6 +830,7 @@ pub(super) fn execute_stage_clusters(
                 &ClusterParams {
                     id_pool: params.id_pool,
                     prior_stage_entries: params.prior_stage_entries,
+                    prior_stage_deleted_keys: params.prior_stage_deleted_keys,
                     pre_charged_fees: cluster_pc,
                 },
             )?;
@@ -845,6 +858,8 @@ pub(super) fn execute_stage_clusters(
         std::sync::Arc::new(clusters.to_vec());
     let prior_entries: std::sync::Arc<Vec<LedgerEntry>> =
         std::sync::Arc::new(params.prior_stage_entries.to_vec());
+    let prior_deleted_keys: std::sync::Arc<Vec<LedgerKey>> =
+        std::sync::Arc::new(params.prior_stage_deleted_keys.to_vec());
     // For multi-cluster parallel execution, we need to split pre_charged_fees per cluster.
     // Each cluster gets its own Vec since the spawn_blocking closure needs 'static data.
     let per_cluster_fees: Vec<std::sync::Arc<Vec<PreChargedFee>>> = {
@@ -876,6 +891,7 @@ pub(super) fn execute_stage_clusters(
             let ha = hot_archive.clone();
             let clusters = clusters.clone();
             let prior_entries = prior_entries.clone();
+            let prior_deleted_keys = prior_deleted_keys.clone();
             let cluster_offset = offsets[idx];
             let cluster_fees = per_cluster_fees[idx].clone();
 
@@ -897,6 +913,7 @@ pub(super) fn execute_stage_clusters(
                     &ClusterParams {
                         id_pool,
                         prior_stage_entries: &prior_entries,
+                        prior_stage_deleted_keys: &prior_deleted_keys,
                         pre_charged_fees: &cluster_fees,
                     },
                 )
