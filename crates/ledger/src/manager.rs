@@ -467,23 +467,27 @@ fn merge_level_results(
     }
 }
 
-/// Parallel scan: spawn one OS thread per bucket level via `std::thread::scope`,
-/// then merge results in level order.
-fn scan_parallel(
+/// Bounded-parallel scan-and-merge: up to `scan_thread_count` threads scan levels
+/// concurrently while the main thread merges completed results in level order (0 → 10).
+///
+/// Memory is bounded to N concurrent raw `LevelScanResult`s plus accumulated final state,
+/// because the main thread merges and drops each raw HashMap before the window slides forward.
+/// With N=1 this is equivalent to the previous sequential loop.
+fn scan_and_merge(
     bucket_list: &BucketList,
     protocol_version: u32,
     soroban_enabled: bool,
     rent_config: &Option<crate::soroban_state::SorobanRentConfig>,
     module_cache: Option<PersistentModuleCache>,
+    scan_thread_count: usize,
 ) -> CacheInitResult {
-    // Scan and merge incrementally: scan one level at a time and immediately
-    // fold each LevelScanResult into the accumulator before scanning the next.
-    // This bounds peak RSS to (one level's raw data) + (accumulated final data)
-    // instead of (all 11 levels' raw data) + (accumulated final data).
-    //
-    // All 11 levels in parallel also OOM-killed when two sweeper processes were
-    // already resident (~28 GB).  Sequential incremental scan avoids the spike.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+
     let module_cache_arc = module_cache.map(Arc::new);
+    let levels = bucket_list.levels();
+    let num_levels = levels.len();
+    let num_workers = scan_thread_count.min(num_levels).max(1);
 
     let mut soroban_state = crate::soroban_state::InMemorySorobanState::new();
     let mut mem_offers: HashMap<i64, LedgerEntry> = HashMap::new();
@@ -497,91 +501,125 @@ fn scan_parallel(
     let mut ttl_count = 0u64;
     let mut config_count = 0u64;
 
-    for (level_idx, level) in bucket_list.levels().iter().enumerate() {
-        let level_start = std::time::Instant::now();
-        let result = scan_single_level(
-            &level.curr,
-            &level.snap,
-            soroban_enabled,
-            &module_cache_arc,
-            protocol_version,
-        );
-        info!(
-            level = level_idx,
-            entries = result.entries.len(),
-            ttls = result.ttl_entries.len(),
-            elapsed_ms = level_start.elapsed().as_millis() as u64,
-            "scan_bucket_list_for_caches: level scan complete"
-        );
+    // Workers atomically claim level indices; results are sent back via channel.
+    let next_level = AtomicUsize::new(0);
+    let next_level_ref = &next_level;
+    let (tx, rx) = mpsc::channel::<(usize, LevelScanResult)>();
 
-        // --- merge this level into accumulators, then drop raw result ---
-        for dead_key in result.dead_keys {
-            global_seen.insert(dead_key);
-        }
-        for dead_ttl_hash in result.dead_ttl_keys {
-            global_ttl_seen.insert(dead_ttl_hash);
-        }
-        for (key, entry) in result.entries {
-            if !global_seen.insert(key) {
-                continue;
-            }
-            match &entry.data {
-                LedgerEntryData::Offer(ref offer) => {
-                    mem_offers.insert(offer.offer_id, entry.clone());
-                    offer_count += 1;
-                }
-                LedgerEntryData::Trustline(ref tl) => {
-                    if let stellar_xdr::curr::TrustLineAsset::PoolShare(ref pool_id) = tl.asset {
-                        pool_share_tl_account_index
-                            .entry(account_id_bytes(&tl.account_id))
-                            .or_default()
-                            .insert(pool_id.0 .0);
+    std::thread::scope(|s| {
+        for _ in 0..num_workers {
+            let worker_tx = tx.clone();
+            let mc_clone = module_cache_arc.clone();
+            s.spawn(move || {
+                loop {
+                    let idx = next_level_ref.fetch_add(1, Ordering::Relaxed);
+                    if idx >= num_levels {
+                        break;
                     }
-                }
-                LedgerEntryData::ContractCode(_) => {
-                    if let Err(e) = soroban_state.create_contract_code(
-                        entry,
+                    let level = &levels[idx];
+                    let level_start = std::time::Instant::now();
+                    let result = scan_single_level(
+                        &level.curr,
+                        &level.snap,
+                        soroban_enabled,
+                        &mc_clone,
                         protocol_version,
-                        rent_config.as_ref(),
-                    ) {
-                        tracing::warn!(error = %e, "Failed to add contract code to soroban state");
-                    } else {
-                        code_count += 1;
+                    );
+                    info!(
+                        level = idx,
+                        entries = result.entries.len(),
+                        ttls = result.ttl_entries.len(),
+                        elapsed_ms = level_start.elapsed().as_millis() as u64,
+                        "scan_bucket_list_for_caches: level scan complete"
+                    );
+                    if worker_tx.send((idx, result)).is_err() {
+                        break; // receiver dropped (shouldn't happen)
                     }
                 }
-                LedgerEntryData::ContractData(_) => {
-                    if let Err(e) = soroban_state.create_contract_data(entry) {
-                        tracing::warn!(error = %e, "Failed to add contract data to soroban state");
-                    } else {
-                        data_count += 1;
+            });
+        }
+
+        // Receive exactly `num_levels` results (one per level) and merge in order.
+        // Buffer out-of-order completions; drain consecutive completed levels as
+        // their turn arrives so raw HashMaps are freed as early as possible.
+        let mut pending: HashMap<usize, LevelScanResult> = HashMap::new();
+        let mut next_merge_idx = 0usize;
+
+        for _ in 0..num_levels {
+            let (idx, result) = rx.recv().expect("worker thread panicked");
+            pending.insert(idx, result);
+            while let Some(result) = pending.remove(&next_merge_idx) {
+                // --- merge this level into accumulators, then drop raw result ---
+                for dead_key in result.dead_keys {
+                    global_seen.insert(dead_key);
+                }
+                for dead_ttl_hash in result.dead_ttl_keys {
+                    global_ttl_seen.insert(dead_ttl_hash);
+                }
+                for (key, entry) in result.entries {
+                    if !global_seen.insert(key) {
+                        continue;
+                    }
+                    match &entry.data {
+                        LedgerEntryData::Offer(ref offer) => {
+                            mem_offers.insert(offer.offer_id, entry.clone());
+                            offer_count += 1;
+                        }
+                        LedgerEntryData::Trustline(ref tl) => {
+                            if let stellar_xdr::curr::TrustLineAsset::PoolShare(ref pool_id) = tl.asset {
+                                pool_share_tl_account_index
+                                    .entry(account_id_bytes(&tl.account_id))
+                                    .or_default()
+                                    .insert(pool_id.0 .0);
+                            }
+                        }
+                        LedgerEntryData::ContractCode(_) => {
+                            if let Err(e) = soroban_state.create_contract_code(
+                                entry,
+                                protocol_version,
+                                rent_config.as_ref(),
+                            ) {
+                                tracing::warn!(error = %e, "Failed to add contract code to soroban state");
+                            } else {
+                                code_count += 1;
+                            }
+                        }
+                        LedgerEntryData::ContractData(_) => {
+                            if let Err(e) = soroban_state.create_contract_data(entry) {
+                                tracing::warn!(error = %e, "Failed to add contract data to soroban state");
+                            } else {
+                                data_count += 1;
+                            }
+                        }
+                        LedgerEntryData::ConfigSetting(_) => {
+                            if let Err(e) = soroban_state.process_entry_create(
+                                &entry,
+                                protocol_version,
+                                rent_config.as_ref(),
+                            ) {
+                                tracing::warn!(error = %e, "Failed to add config setting to soroban state");
+                            } else {
+                                config_count += 1;
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                LedgerEntryData::ConfigSetting(_) => {
-                    if let Err(e) = soroban_state.process_entry_create(
-                        &entry,
-                        protocol_version,
-                        rent_config.as_ref(),
-                    ) {
-                        tracing::warn!(error = %e, "Failed to add config setting to soroban state");
+                for (key_hash, (ttl_key, ttl_data)) in result.ttl_entries {
+                    if !global_ttl_seen.insert(key_hash) {
+                        continue;
+                    }
+                    if let Err(e) = soroban_state.create_ttl(&ttl_key, ttl_data) {
+                        tracing::trace!(error = %e, "Failed to add TTL to soroban state (may be pending)");
                     } else {
-                        config_count += 1;
+                        ttl_count += 1;
                     }
                 }
-                _ => {}
+                // LevelScanResult dropped here — raw HashMaps freed before next level.
+                next_merge_idx += 1;
             }
         }
-        for (key_hash, (ttl_key, ttl_data)) in result.ttl_entries {
-            if !global_ttl_seen.insert(key_hash) {
-                continue;
-            }
-            if let Err(e) = soroban_state.create_ttl(&ttl_key, ttl_data) {
-                tracing::trace!(error = %e, "Failed to add TTL to soroban state (may be pending)");
-            } else {
-                ttl_count += 1;
-            }
-        }
-        // LevelScanResult dropped here — raw HashMaps freed before next level.
-    }
+    });
 
     info!(
         offer_count,
@@ -618,12 +656,13 @@ fn scan_parallel(
 /// returns results instead of installing them. It can run on a background thread
 /// because it only needs `&BucketList` (immutable, `Send + Sync`).
 ///
-/// When a tokio runtime is available, each of the 11 bucket levels is scanned in
-/// parallel via `spawn_blocking`, with results merged in level order (level 0 wins).
-/// Otherwise falls back to sequential single-pass scan.
+/// Up to `scan_thread_count` levels are scanned concurrently; results are merged
+/// in level order (level 0 wins) to preserve correct shadowing semantics while
+/// bounding peak memory to N concurrent raw scan results.
 fn scan_bucket_list_for_caches(
     bucket_list: &BucketList,
     protocol_version: u32,
+    scan_thread_count: usize,
 ) -> CacheInitResult {
     use henyey_common::MIN_SOROBAN_PROTOCOL_VERSION;
 
@@ -642,15 +681,17 @@ fn scan_bucket_list_for_caches(
 
     info!(
         soroban_enabled,
-        "scan_bucket_list_for_caches: starting parallel scan (11 levels)..."
+        scan_thread_count,
+        "scan_bucket_list_for_caches: starting scan..."
     );
 
-    let result = scan_parallel(
+    let result = scan_and_merge(
         bucket_list,
         protocol_version,
         soroban_enabled,
         &rent_config,
         module_cache,
+        scan_thread_count,
     );
 
     let scan_elapsed = cache_init_start.elapsed();
@@ -1315,7 +1356,7 @@ impl LedgerManager {
         let rss_before = get_rss_bytes();
 
         let bucket_list = self.bucket_list.read();
-        let cache_data = scan_bucket_list_for_caches(&bucket_list, protocol_version);
+        let cache_data = scan_bucket_list_for_caches(&bucket_list, protocol_version, 2);
         let rss_after_scan = get_rss_bytes();
 
         // Initialize per-bucket caches for all DiskIndex buckets.
@@ -4733,7 +4774,7 @@ mod tests {
     #[test]
     fn test_scan_empty_bucket_list() {
         let bl = BucketList::new();
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
         assert!(result.offers.is_empty());
         assert!(result.offer_index.is_empty());
         assert!(result.soroban_state.is_empty());
@@ -4747,7 +4788,7 @@ mod tests {
         bl.add_batch(1, TEST_PROTOCOL, BucketListType::Live, vec![offer1, offer2], vec![], vec![])
             .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
         assert_eq!(result.offers.len(), 2);
         assert!(result.offers.contains_key(&1));
         assert!(result.offers.contains_key(&2));
@@ -4763,7 +4804,7 @@ mod tests {
         bl.add_batch(1, TEST_PROTOCOL, BucketListType::Live, vec![cd1, cd2], vec![], vec![])
             .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
         assert_eq!(result.soroban_state.contract_data_count(), 2);
     }
 
@@ -4774,7 +4815,7 @@ mod tests {
         bl.add_batch(1, TEST_PROTOCOL, BucketListType::Live, vec![ttl], vec![], vec![])
             .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
         // TTL may or may not be added depending on whether it has a matching contract entry;
         // the important thing is no panic during parallel scan.
         assert!(result.soroban_state.contract_data_count() == 0);
@@ -4793,7 +4834,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
         assert_eq!(result.offers.len(), 1);
         assert!(result.offers.contains_key(&42));
         assert_eq!(result.soroban_state.contract_data_count(), 1);
@@ -4815,7 +4856,7 @@ mod tests {
         bl.add_batch(2, TEST_PROTOCOL, BucketListType::Live, vec![], vec![], vec![dead_key])
             .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
         assert!(result.offers.is_empty(), "dead entry should shadow the live offer");
     }
 
@@ -4838,7 +4879,7 @@ mod tests {
         bl.add_batch(2, TEST_PROTOCOL, BucketListType::Live, vec![], vec![new_offer.clone()], vec![])
             .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
         assert_eq!(result.offers.len(), 1);
         // The newer version (amount=9999) should win
         if let LedgerEntryData::Offer(ref o) = result.offers[&1].data {
@@ -4867,7 +4908,7 @@ mod tests {
             .unwrap();
         }
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
         assert_eq!(result.offers.len(), num_offers, "all offers should be found");
     }
 
@@ -4885,7 +4926,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, pre_soroban_protocol);
+        let result = scan_bucket_list_for_caches(&bl, pre_soroban_protocol, 2);
         assert_eq!(result.offers.len(), 1);
         assert_eq!(result.soroban_state.contract_data_count(), 0);
         assert!(result.module_cache.is_none());
@@ -5057,12 +5098,64 @@ mod tests {
         bl.add_batch(1, TEST_PROTOCOL, BucketListType::Live, vec![offer], vec![], vec![])
             .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
         assert_eq!(result.offers.len(), 1);
 
         // The secondary index should have entries for this seller+asset
         let has_seller_entry = result.offer_index.keys().any(|(acct, _)| *acct == seller);
         assert!(has_seller_entry, "secondary index should include seller");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_scan_thread_count_1_matches_thread_count_2() {
+        // Verify that scan_thread_count=1 (sequential) and scan_thread_count=2 (parallel)
+        // produce identical results for a bucket list with entries across multiple levels.
+        let mut bl = BucketList::new();
+        let num_offers = 20;
+        for i in 0..num_offers {
+            let offer = make_offer_entry(i as i64, {
+                let mut b = [0u8; 32];
+                b[0] = (i & 0xff) as u8;
+                b
+            });
+            bl.add_batch(
+                (i + 1) as u32, TEST_PROTOCOL, BucketListType::Live,
+                vec![offer], vec![], vec![],
+            )
+            .unwrap();
+        }
+
+        let result1 = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        let result2 = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
+
+        assert_eq!(result1.offers.len(), result2.offers.len());
+        for (id, entry) in &result1.offers {
+            assert!(result2.offers.contains_key(id), "parallel result missing offer {id}");
+            if let (LedgerEntryData::Offer(ref o1), LedgerEntryData::Offer(ref o2)) =
+                (&entry.data, &result2.offers[id].data)
+            {
+                assert_eq!(o1.amount, o2.amount, "offer {id} amount mismatch");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_scan_dead_entries_shadow_with_thread_count_1() {
+        // Dead-key shadowing test with scan_thread_count=1 (exercises the sequential path).
+        let mut bl = BucketList::new();
+        let offer = make_offer_entry(77, [7u8; 32]);
+        bl.add_batch(1, TEST_PROTOCOL, BucketListType::Live, vec![offer], vec![], vec![])
+            .unwrap();
+
+        let dead_key = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+            seller_id: make_account_id([7u8; 32]),
+            offer_id: 77,
+        });
+        bl.add_batch(2, TEST_PROTOCOL, BucketListType::Live, vec![], vec![], vec![dead_key])
+            .unwrap();
+
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        assert!(result.offers.is_empty(), "dead entry should shadow live offer (thread_count=1)");
     }
 
     #[test]
