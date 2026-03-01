@@ -1,6 +1,6 @@
 # Verify-Execution Sweep Status
 
-> **Updated**: 2026-03-01 14:56 UTC
+> **Updated**: 2026-03-01 17:45 UTC
 > **Session**: b5e87aee (fresh start)
 > **CDP data lake range**: L59501248–L61366079 (latest available as of 2026-02-23)
 > **Supported protocol**: P24+ (L59501312 is first P24 ledger; L59501248–L59501311 are P23 and unverifiable)
@@ -98,4 +98,32 @@ Ledgers L59501248–L59501311 (P23) cannot be verified by Henyey (min supported:
 
 | Status | PID | Started |
 |--------|-----|---------|
-| Live | 579467 | 2026-03-01 14:42 UTC (new build b7c0f61+0fe2744; 0 hash mismatches since restart) |
+| Live | 717200 | 2026-03-01 17:37 UTC (build b2f6c87; scan_thread_count=1; 0 hash mismatches since restart) |
+
+## Cache scan benchmark (2026-03-01)
+
+Measured on 63 GB machine with two resident sweepers (~32 GB RSS total).
+
+| N | Wall time | Peak RSS (tracker) | Result |
+|---|-----------|-------------------|--------|
+| 2 | ~95 s (est) | 23.2 GB | OOM-killed (55 GB total; 8 GB short of limit) |
+| 1 | 172 s | 18.8 GB | Stable |
+
+Per-level scan times (N=1, sequential):
+
+| Level | Entries | TTLs | Scan time |
+|-------|---------|------|-----------|
+| 0 | 1,600 | 1,221 | 5 ms |
+| 1 | 4,543 | 2,450 | 17 ms |
+| 2 | 12,671 | 7,929 | 65 ms |
+| 3 | 29,142 | 24,757 | 201 ms |
+| 4 | 90,355 | 81,630 | 405 ms |
+| 5 | 301,687 | 287,640 | 1.4 s |
+| 6 | 1,389,033 | 1,366,166 | 11.2 s |
+| 7 | 2,369,305 | 2,332,710 | 27.3 s |
+| 8 | 2,580,343 | 2,507,783 | 41.0 s |
+| 9 | 3,370,899 | 3,274,207 | 37.0 s |
+| 10 | 1,956,994 | 969,184 | 43.6 s |
+
+N=2 is safe when machine has >20 GB headroom above current sweeper RSS.
+Default is N=1 (b2f6c87); scan_thread_count parameter is configurable.
