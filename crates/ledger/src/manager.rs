@@ -346,6 +346,7 @@ fn scan_single_level(
 ///
 /// Processes levels in order (0 → 10) so that lower-numbered levels (newer data)
 /// shadow higher-numbered levels. A global seen set tracks cross-level dedup.
+#[cfg(test)]
 fn merge_level_results(
     level_results: Vec<LevelScanResult>,
     module_cache: Option<PersistentModuleCache>,
@@ -475,46 +476,140 @@ fn scan_parallel(
     rent_config: &Option<crate::soroban_state::SorobanRentConfig>,
     module_cache: Option<PersistentModuleCache>,
 ) -> CacheInitResult {
-    let module_cache = module_cache.map(Arc::new);
+    // Scan and merge incrementally: scan one level at a time and immediately
+    // fold each LevelScanResult into the accumulator before scanning the next.
+    // This bounds peak RSS to (one level's raw data) + (accumulated final data)
+    // instead of (all 11 levels' raw data) + (accumulated final data).
+    //
+    // All 11 levels in parallel also OOM-killed when two sweeper processes were
+    // already resident (~28 GB).  Sequential incremental scan avoids the spike.
+    let module_cache_arc = module_cache.map(Arc::new);
 
-    // Scan levels sequentially to bound peak memory usage.  All 11 levels in
-    // parallel caused OOM when two sweeper processes were already resident.
-    // The total wall-clock time is dominated by the largest levels regardless,
-    // so sequential ordering has negligible throughput impact.
-    let level_results: Vec<LevelScanResult> = bucket_list
-        .levels()
-        .iter()
-        .enumerate()
-        .map(|(level_idx, level)| {
-            let level_start = std::time::Instant::now();
-            let result = scan_single_level(
-                &level.curr,
-                &level.snap,
-                soroban_enabled,
-                &module_cache,
-                protocol_version,
-            );
-            info!(
-                level = level_idx,
-                entries = result.entries.len(),
-                ttls = result.ttl_entries.len(),
-                elapsed_ms = level_start.elapsed().as_millis() as u64,
-                "scan_bucket_list_for_caches: level scan complete"
-            );
-            result
-        })
-        .collect();
+    let mut soroban_state = crate::soroban_state::InMemorySorobanState::new();
+    let mut mem_offers: HashMap<i64, LedgerEntry> = HashMap::new();
+    let mut pool_share_tl_account_index: HashMap<[u8; 32], HashSet<[u8; 32]>> = HashMap::new();
+    let mut global_seen: HashSet<LedgerKey> = HashSet::new();
+    let mut global_ttl_seen: HashSet<[u8; 32]> = HashSet::new();
 
-    // Unwrap Arc to recover owned PersistentModuleCache
-    let module_cache = module_cache.map(|arc| {
-        Arc::try_unwrap(arc).unwrap_or_else(|arc| {
-            // All tasks are done, so this should always succeed.
-            // If not, clone as fallback (PersistentModuleCache internal state is Arc-shared).
-            PersistentModuleCache::clone(&arc)
-        })
+    let mut offer_count = 0u64;
+    let mut code_count = 0u64;
+    let mut data_count = 0u64;
+    let mut ttl_count = 0u64;
+    let mut config_count = 0u64;
+
+    for (level_idx, level) in bucket_list.levels().iter().enumerate() {
+        let level_start = std::time::Instant::now();
+        let result = scan_single_level(
+            &level.curr,
+            &level.snap,
+            soroban_enabled,
+            &module_cache_arc,
+            protocol_version,
+        );
+        info!(
+            level = level_idx,
+            entries = result.entries.len(),
+            ttls = result.ttl_entries.len(),
+            elapsed_ms = level_start.elapsed().as_millis() as u64,
+            "scan_bucket_list_for_caches: level scan complete"
+        );
+
+        // --- merge this level into accumulators, then drop raw result ---
+        for dead_key in result.dead_keys {
+            global_seen.insert(dead_key);
+        }
+        for dead_ttl_hash in result.dead_ttl_keys {
+            global_ttl_seen.insert(dead_ttl_hash);
+        }
+        for (key, entry) in result.entries {
+            if !global_seen.insert(key) {
+                continue;
+            }
+            match &entry.data {
+                LedgerEntryData::Offer(ref offer) => {
+                    mem_offers.insert(offer.offer_id, entry.clone());
+                    offer_count += 1;
+                }
+                LedgerEntryData::Trustline(ref tl) => {
+                    if let stellar_xdr::curr::TrustLineAsset::PoolShare(ref pool_id) = tl.asset {
+                        pool_share_tl_account_index
+                            .entry(account_id_bytes(&tl.account_id))
+                            .or_default()
+                            .insert(pool_id.0 .0);
+                    }
+                }
+                LedgerEntryData::ContractCode(_) => {
+                    if let Err(e) = soroban_state.create_contract_code(
+                        entry,
+                        protocol_version,
+                        rent_config.as_ref(),
+                    ) {
+                        tracing::warn!(error = %e, "Failed to add contract code to soroban state");
+                    } else {
+                        code_count += 1;
+                    }
+                }
+                LedgerEntryData::ContractData(_) => {
+                    if let Err(e) = soroban_state.create_contract_data(entry) {
+                        tracing::warn!(error = %e, "Failed to add contract data to soroban state");
+                    } else {
+                        data_count += 1;
+                    }
+                }
+                LedgerEntryData::ConfigSetting(_) => {
+                    if let Err(e) = soroban_state.process_entry_create(
+                        &entry,
+                        protocol_version,
+                        rent_config.as_ref(),
+                    ) {
+                        tracing::warn!(error = %e, "Failed to add config setting to soroban state");
+                    } else {
+                        config_count += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (key_hash, (ttl_key, ttl_data)) in result.ttl_entries {
+            if !global_ttl_seen.insert(key_hash) {
+                continue;
+            }
+            if let Err(e) = soroban_state.create_ttl(&ttl_key, ttl_data) {
+                tracing::trace!(error = %e, "Failed to add TTL to soroban state (may be pending)");
+            } else {
+                ttl_count += 1;
+            }
+        }
+        // LevelScanResult dropped here — raw HashMaps freed before next level.
+    }
+
+    info!(
+        offer_count,
+        code_count,
+        data_count,
+        ttl_count,
+        config_count,
+        "scan_bucket_list_for_caches: merge complete"
+    );
+
+    let module_cache = module_cache_arc.map(|arc| {
+        Arc::try_unwrap(arc).unwrap_or_else(|arc| PersistentModuleCache::clone(&arc))
     });
 
-    merge_level_results(level_results, module_cache, protocol_version, rent_config)
+    let mut offer_index: OfferAccountAssetIndex = HashMap::new();
+    for entry in mem_offers.values() {
+        if let LedgerEntryData::Offer(ref offer) = entry.data {
+            index_offer_insert(&mut offer_index, offer);
+        }
+    }
+
+    CacheInitResult {
+        offers: mem_offers,
+        offer_index,
+        pool_share_tl_account_index,
+        module_cache,
+        soroban_state,
+    }
 }
 
 /// Scan a bucket list and extract all cache data.
