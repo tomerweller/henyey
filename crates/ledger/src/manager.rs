@@ -1356,7 +1356,7 @@ impl LedgerManager {
         let rss_before = get_rss_bytes();
 
         let bucket_list = self.bucket_list.read();
-        let cache_data = scan_bucket_list_for_caches(&bucket_list, protocol_version, 2);
+        let cache_data = scan_bucket_list_for_caches(&bucket_list, protocol_version, 1);
         let rss_after_scan = get_rss_bytes();
 
         // Initialize per-bucket caches for all DiskIndex buckets.
