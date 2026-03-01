@@ -477,33 +477,33 @@ fn scan_parallel(
 ) -> CacheInitResult {
     let module_cache = module_cache.map(Arc::new);
 
-    let level_results: Vec<LevelScanResult> = std::thread::scope(|s| {
-        let handles: Vec<_> = bucket_list
-            .levels()
-            .iter()
-            .enumerate()
-            .map(|(level_idx, level)| {
-                let mc = &module_cache;
-                s.spawn(move || {
-                    let level_start = std::time::Instant::now();
-                    let result = scan_single_level(&level.curr, &level.snap, soroban_enabled, mc, protocol_version);
-                    info!(
-                        level = level_idx,
-                        entries = result.entries.len(),
-                        ttls = result.ttl_entries.len(),
-                        elapsed_ms = level_start.elapsed().as_millis() as u64,
-                        "scan_bucket_list_for_caches: level scan complete"
-                    );
-                    result
-                })
-            })
-            .collect();
-
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("level scan thread panicked"))
-            .collect()
-    });
+    // Scan levels sequentially to bound peak memory usage.  All 11 levels in
+    // parallel caused OOM when two sweeper processes were already resident.
+    // The total wall-clock time is dominated by the largest levels regardless,
+    // so sequential ordering has negligible throughput impact.
+    let level_results: Vec<LevelScanResult> = bucket_list
+        .levels()
+        .iter()
+        .enumerate()
+        .map(|(level_idx, level)| {
+            let level_start = std::time::Instant::now();
+            let result = scan_single_level(
+                &level.curr,
+                &level.snap,
+                soroban_enabled,
+                &module_cache,
+                protocol_version,
+            );
+            info!(
+                level = level_idx,
+                entries = result.entries.len(),
+                ttls = result.ttl_entries.len(),
+                elapsed_ms = level_start.elapsed().as_millis() as u64,
+                "scan_bucket_list_for_caches: level scan complete"
+            );
+            result
+        })
+        .collect();
 
     // Unwrap Arc to recover owned PersistentModuleCache
     let module_cache = module_cache.map(|arc| {
