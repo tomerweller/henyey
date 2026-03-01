@@ -410,17 +410,14 @@ pub fn execute_soroban_parallel_phase(
             continue;
         }
 
-        // Collect current entries from the delta so clusters in this stage can
-        // see changes from prior stages AND classic TX changes.  In stellar-core,
-        // GlobalParallelApplyLedgerState wraps the main LedgerTxn which already
-        // has classic TX changes committed, so even stage 0 clusters see classic
-        // modifications (e.g., fee deductions on shared accounts).  We always
-        // pass delta.current_entries() to match this behavior.
-        // NOTE: After pre-deduction, these entries include the post-fee balances.
-        let prior_stage_entries = delta.current_entries();
-        // Collect keys deleted in prior stages so clusters know not to reload
-        // them from the bucket list. Matches stellar-core cleanEmpty propagation.
-        let prior_stage_deleted_keys = delta.dead_entries();
+        // Capture live entries and deletions from the delta so clusters in
+        // this stage can see changes from prior stages AND classic TX changes.
+        // In stellar-core, GlobalParallelApplyLedgerState wraps the main
+        // LedgerTxn which already has classic TX changes committed, so even
+        // stage 0 clusters see classic modifications (e.g., fee deductions on
+        // shared accounts).  PriorStageState::from_delta bundles both
+        // current_entries() and dead_entries() to match this behavior.
+        let prior_stage = PriorStageState::from_delta(delta);
 
         // Slice pre_charged_fees for this stage's clusters.
         let stage_tx_count: usize = stage.iter().map(|c| c.len()).sum();
@@ -445,8 +442,7 @@ pub fn execute_soroban_parallel_phase(
             delta,
             &ClusterParams {
                 id_pool,
-                prior_stage_entries: &prior_stage_entries,
-                prior_stage_deleted_keys: &prior_stage_deleted_keys,
+                prior_stage: &prior_stage,
                 pre_charged_fees: stage_pre_charged,
             },
         )?;
@@ -641,17 +637,14 @@ pub(super) fn execute_single_cluster(
     }
 
     // Pre-load entries from prior stages so this cluster's executor sees
-    // restorations and modifications made by earlier stages.  This matches
-    // stellar-core `collectClusterFootprintEntriesFromGlobal`.
-    for entry in params.prior_stage_entries {
+    // Pre-load entries and deletions from prior stages so this cluster's
+    // executor sees restorations, modifications, and deletions made by
+    // earlier stages.  This matches stellar-core
+    // `collectClusterFootprintEntriesFromGlobal`.
+    for entry in &params.prior_stage.entries {
         executor.state.load_entry(entry.clone());
     }
-
-    // Mark entries deleted in prior stages so load_soroban_footprint won't
-    // reload them from the bucket list. In stellar-core, deleted entries are
-    // stored in the global entry map as cleanEmpty and loaded by
-    // collectClusterFootprintEntriesFromGlobal, blocking BL fallthrough.
-    for key in params.prior_stage_deleted_keys {
+    for key in &params.prior_stage.deleted_keys {
         executor.state.mark_entry_deleted(key);
     }
 
@@ -812,7 +805,7 @@ pub(super) fn execute_stage_clusters(
     tracing::debug!(
         ledger_seq = context.sequence,
         num_clusters = clusters.len(),
-        prior_entries = params.prior_stage_entries.len(),
+        prior_entries = params.prior_stage.entries.len(),
         "execute_stage_clusters: starting"
     );
 
@@ -829,8 +822,7 @@ pub(super) fn execute_stage_clusters(
                 soroban,
                 &ClusterParams {
                     id_pool: params.id_pool,
-                    prior_stage_entries: params.prior_stage_entries,
-                    prior_stage_deleted_keys: params.prior_stage_deleted_keys,
+                    prior_stage: params.prior_stage,
                     pre_charged_fees: cluster_pc,
                 },
             )?;
@@ -856,10 +848,11 @@ pub(super) fn execute_stage_clusters(
     let id_pool = params.id_pool;
     let clusters: std::sync::Arc<Vec<Vec<TxWithFee>>> =
         std::sync::Arc::new(clusters.to_vec());
-    let prior_entries: std::sync::Arc<Vec<LedgerEntry>> =
-        std::sync::Arc::new(params.prior_stage_entries.to_vec());
-    let prior_deleted_keys: std::sync::Arc<Vec<LedgerKey>> =
-        std::sync::Arc::new(params.prior_stage_deleted_keys.to_vec());
+    let prior_stage: std::sync::Arc<PriorStageState> =
+        std::sync::Arc::new(PriorStageState {
+            entries: params.prior_stage.entries.clone(),
+            deleted_keys: params.prior_stage.deleted_keys.clone(),
+        });
     // For multi-cluster parallel execution, we need to split pre_charged_fees per cluster.
     // Each cluster gets its own Vec since the spawn_blocking closure needs 'static data.
     let per_cluster_fees: Vec<std::sync::Arc<Vec<PreChargedFee>>> = {
@@ -890,8 +883,7 @@ pub(super) fn execute_stage_clusters(
             let cache = module_cache.clone();
             let ha = hot_archive.clone();
             let clusters = clusters.clone();
-            let prior_entries = prior_entries.clone();
-            let prior_deleted_keys = prior_deleted_keys.clone();
+            let prior_stage = prior_stage.clone();
             let cluster_offset = offsets[idx];
             let cluster_fees = per_cluster_fees[idx].clone();
 
@@ -912,8 +904,7 @@ pub(super) fn execute_stage_clusters(
                     &soroban,
                     &ClusterParams {
                         id_pool,
-                        prior_stage_entries: &prior_entries,
-                        prior_stage_deleted_keys: &prior_deleted_keys,
+                        prior_stage: &prior_stage,
                         pre_charged_fees: &cluster_fees,
                     },
                 )

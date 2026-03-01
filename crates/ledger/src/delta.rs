@@ -333,8 +333,13 @@ impl LedgerDelta {
             }
         } else {
             self.change_order.push(key_bytes.clone());
-            self.changes
-                .insert(key_bytes, EntryChange::Updated { previous, current: Box::new(current) });
+            self.changes.insert(
+                key_bytes,
+                EntryChange::Updated {
+                    previous,
+                    current: Box::new(current),
+                },
+            );
         }
 
         Ok(())
@@ -354,7 +359,10 @@ impl LedgerDelta {
     /// Parity: LedgerTxnTests.cpp:853 "fails for configuration"
     pub fn record_delete(&mut self, entry: LedgerEntry) -> Result<()> {
         // ConfigSetting entries cannot be erased (parity: stellar-core LedgerTxn::erase)
-        if matches!(entry.data, stellar_xdr::curr::LedgerEntryData::ConfigSetting(_)) {
+        if matches!(
+            entry.data,
+            stellar_xdr::curr::LedgerEntryData::ConfigSetting(_)
+        ) {
             return Err(LedgerError::InvalidEntry(
                 "cannot delete ConfigSetting entries".to_string(),
             ));
@@ -433,9 +441,10 @@ impl LedgerDelta {
                 // Entry was deleted — shouldn't happen for fee accounts, but handle gracefully.
                 return Ok((0, LedgerEntryChanges(VecM::default())));
             }
-        } else if let Some(entry) = snapshot.get_entry(&key).map_err(|e| {
-            LedgerError::Internal(format!("snapshot lookup failed: {}", e))
-        })? {
+        } else if let Some(entry) = snapshot
+            .get_entry(&key)
+            .map_err(|e| LedgerError::Internal(format!("snapshot lookup failed: {}", e)))?
+        {
             (entry, true)
         } else {
             // Account not found at all — no fee to deduct.
@@ -645,10 +654,8 @@ impl LedgerDelta {
                                     // Created + Created: a later stage re-creates the
                                     // same entry that an earlier stage already restored
                                     // from the hot archive.  Keep the later value.
-                                    self.changes.insert(
-                                        key_bytes,
-                                        EntryChange::Created(entry.clone()),
-                                    );
+                                    self.changes
+                                        .insert(key_bytes, EntryChange::Created(entry.clone()));
                                 }
                                 EntryChange::Updated { .. } => {
                                     return Err(LedgerError::Internal(
@@ -666,8 +673,10 @@ impl LedgerDelta {
                         if let Some(existing) = self.changes.get(&key_bytes) {
                             match existing {
                                 EntryChange::Created(_) => {
-                                    self.changes
-                                        .insert(key_bytes, EntryChange::Created(current.as_ref().clone()));
+                                    self.changes.insert(
+                                        key_bytes,
+                                        EntryChange::Created(current.as_ref().clone()),
+                                    );
                                 }
                                 EntryChange::Updated { previous: orig, .. } => {
                                     self.changes.insert(
@@ -715,12 +724,21 @@ impl LedgerDelta {
                                         },
                                     );
                                 }
-                                EntryChange::Deleted { .. } => {
+                                EntryChange::Deleted {
+                                    previous: existing_prev,
+                                } => {
                                     // Idempotent: both deltas deleted the same entry.
                                     // This is valid when parallel clusters independently
                                     // delete an entry that appears in multiple footprints
                                     // (e.g. TTL keys during Soroban execution).  Keep
                                     // the existing deletion.
+                                    //
+                                    // Both previous values should be identical since both
+                                    // clusters loaded from the same snapshot.
+                                    debug_assert!(
+                                        existing_prev == previous,
+                                        "merge: Deleted+Deleted previous values differ for same key"
+                                    );
                                 }
                             }
                         } else {
@@ -1198,6 +1216,67 @@ mod tests {
         ));
     }
 
+    /// Merge: Created + Updated = Created with the updated value.
+    ///
+    /// This occurs when one parallel cluster creates an entry and another
+    /// cluster (or a later stage) updates it.  The merge should produce a
+    /// single Created change with the final (updated) value, since the entry
+    /// did not exist before the first delta.
+    #[test]
+    fn test_merge_created_then_updated_becomes_created_with_final_value() {
+        let mut delta1 = LedgerDelta::new(1);
+        let mut delta2 = LedgerDelta::new(1);
+
+        let v0 = create_test_account(1);
+        let v1 = create_test_account_with_balance(1, 2_000);
+        let v2 = create_test_account_with_balance(1, 3_000);
+
+        delta1.record_create(v0.clone()).unwrap();
+        // delta2 sees v1 as the "previous" and updates to v2.
+        delta2.record_update(v1.clone(), v2.clone()).unwrap();
+
+        delta1.merge(delta2).unwrap();
+        assert_eq!(delta1.num_changes(), 1);
+        let changes: Vec<_> = delta1.changes().collect();
+        // Should remain Created (not Updated) since the entry was new.
+        assert!(changes[0].is_created());
+        // Value should be v2 (final from the Update).
+        if let LedgerEntryData::Account(ref acc) = changes[0].current_entry().unwrap().data {
+            assert_eq!(acc.balance, 3_000);
+        } else {
+            panic!("expected Account entry");
+        }
+    }
+
+    /// Merge: Updated + Deleted = Deleted with the original previous.
+    ///
+    /// This occurs when one delta updates an entry and a second delta deletes
+    /// it. The merge should produce a Deleted change that preserves the
+    /// original previous value (from before the first update).
+    #[test]
+    fn test_merge_updated_then_deleted_becomes_deleted_with_original_previous() {
+        let mut delta1 = LedgerDelta::new(1);
+        let mut delta2 = LedgerDelta::new(1);
+
+        let v0 = create_test_account(1);
+        let v1 = create_test_account_with_balance(1, 2_000);
+
+        delta1.record_update(v0.clone(), v1.clone()).unwrap();
+        delta2.record_delete(v1.clone()).unwrap();
+
+        delta1.merge(delta2).unwrap();
+        assert_eq!(delta1.num_changes(), 1);
+        let changes: Vec<_> = delta1.changes().collect();
+        // Should be Deleted.
+        assert!(changes[0].is_deleted());
+        // Previous should be v0 (the original value before the update).
+        if let LedgerEntryData::Account(ref acc) = changes[0].previous_entry().unwrap().data {
+            assert_eq!(acc.balance, 1_000_000_000); // v0 default balance
+        } else {
+            panic!("expected Account entry");
+        }
+    }
+
     // =========================================================================
     // Delta ordering test
     // =========================================================================
@@ -1266,7 +1345,9 @@ mod tests {
         let original = create_test_account(1);
         let updated = create_test_account_with_balance(1, 5_000);
 
-        delta.record_update(original.clone(), updated.clone()).unwrap();
+        delta
+            .record_update(original.clone(), updated.clone())
+            .unwrap();
         delta.record_delete(updated).unwrap();
 
         assert_eq!(delta.num_changes(), 1);
@@ -1290,7 +1371,9 @@ mod tests {
         }
 
         delta.record_delete(original.clone()).unwrap();
-        delta.record_update(original.clone(), updated_entry.clone()).unwrap();
+        delta
+            .record_update(original.clone(), updated_entry.clone())
+            .unwrap();
 
         assert_eq!(delta.num_changes(), 1);
         let changes: Vec<_> = delta.changes().collect();
@@ -1408,7 +1491,10 @@ mod tests {
 
         // Entry should not be findable
         let change = delta.get_change(&key).unwrap();
-        assert!(change.is_none(), "entry should have been removed from delta");
+        assert!(
+            change.is_none(),
+            "entry should have been removed from delta"
+        );
 
         // No entries in any category
         assert!(delta.init_entries().is_empty());
@@ -1464,7 +1550,9 @@ mod tests {
         } else {
             panic!("expected account");
         };
-        delta.apply_refund_to_account(&account_id, 50_000_000).unwrap();
+        delta
+            .apply_refund_to_account(&account_id, 50_000_000)
+            .unwrap();
 
         let changes: Vec<_> = delta.changes().collect();
         assert_eq!(changes.len(), 1);
@@ -1492,7 +1580,9 @@ mod tests {
         } else {
             panic!("expected account");
         };
-        delta.apply_refund_to_account(&account_id, 25_000_000).unwrap();
+        delta
+            .apply_refund_to_account(&account_id, 25_000_000)
+            .unwrap();
 
         let changes: Vec<_> = delta.changes().collect();
         if let LedgerEntryData::Account(ref acc) = changes[0].current_entry().unwrap().data {

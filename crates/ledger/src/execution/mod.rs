@@ -584,6 +584,25 @@ impl TransactionExecutor {
         self.loaded_accounts.clear();
     }
 
+    /// Look up an entry from the snapshot, respecting delta deletions.
+    ///
+    /// This is the single entry-point for all snapshot/bucket-list reads.
+    /// It checks `delta().deleted_keys()` *before* hitting the snapshot so
+    /// that entries deleted by a prior TX in this ledger are never reloaded.
+    ///
+    /// All `load_*` methods should call this instead of
+    /// `snapshot.get_entry()` directly.
+    fn get_entry_from_snapshot(
+        &self,
+        snapshot: &SnapshotHandle,
+        key: &LedgerKey,
+    ) -> Result<Option<LedgerEntry>> {
+        if self.state.delta().deleted_keys().contains(key) {
+            return Ok(None);
+        }
+        snapshot.get_entry(key)
+    }
+
     /// Batch-load multiple entries from the bucket list in a single pass.
     ///
     /// Filters out entries already in state or already attempted, then loads
@@ -594,7 +613,9 @@ impl TransactionExecutor {
         let mut needed = Vec::new();
 
         for key in keys {
-            // Skip if the entry was deleted in this ledger (don't reload it from snapshot)
+            // Skip if the entry was deleted in this ledger (don't reload from snapshot).
+            // Note: batch path uses load_entries(), so we filter here rather than
+            // going through get_entry_from_snapshot().
             if self.state.delta().deleted_keys().contains(key) {
                 continue;
             }
@@ -674,18 +695,7 @@ impl TransactionExecutor {
             account_id: account_id.clone(),
         });
 
-        // VE-10: In the parallel fee-deduction path, accounts are bulk-loaded
-        // into state via state.load_entry() (bypassing load_account), so
-        // loaded_accounts is never populated for them.  If a prior TX in this
-        // ledger deletes the account (account_merge), the loaded_accounts
-        // guard above won't fire, and without this check we'd reload the stale
-        // LIVE entry from the bucket-list snapshot.
-        if self.state.delta().deleted_keys().contains(&key) {
-            tracing::trace!(account = %account_id_to_strkey(account_id), "load_account: deleted by previous TX in this ledger (delta)");
-            return Ok(false);
-        }
-
-        if let Some(entry) = snapshot.get_entry(&key)? {
+        if let Some(entry) = self.get_entry_from_snapshot(snapshot, &key)? {
             // Log signer info for debugging
             if let stellar_xdr::curr::LedgerEntryData::Account(ref acct) = entry.data {
                 tracing::trace!(
@@ -735,13 +745,7 @@ impl TransactionExecutor {
             account_id: account_id.clone(),
         });
 
-        // Check if deleted by a previous TX in this ledger (delta persists across TXs).
-        if self.state.delta().deleted_keys().contains(&key) {
-            tracing::trace!(account = %account_id_to_strkey(account_id), "load_account_without_record: deleted by previous TX in this ledger");
-            return Ok(false);
-        }
-
-        if let Some(entry) = snapshot.get_entry(&key)? {
+        if let Some(entry) = self.get_entry_from_snapshot(snapshot, &key)? {
             tracing::trace!(
                 account = ?account_id,
                 "load_account_without_record: found in bucket list"
@@ -797,15 +801,7 @@ impl TransactionExecutor {
             asset: asset.clone(),
         });
 
-        // Check if deleted by a previous TX in this ledger. The delta persists across
-        // TXs, but is_trustline_tracked() only covers within-TX deletions (snapshots
-        // are cleared on commit). Without this check, entries deleted by prior TXs
-        // would be reloaded from the snapshot/bucket list.
-        if self.state.delta().deleted_keys().contains(&key) {
-            return Ok(false);
-        }
-
-        if let Some(entry) = snapshot.get_entry(&key)? {
+        if let Some(entry) = self.get_entry_from_snapshot(snapshot, &key)? {
             if let stellar_xdr::curr::LedgerEntryData::Trustline(ref tl) = entry.data {
                 tracing::debug!(
                     account = %account_id_to_strkey(account_id),
@@ -848,12 +844,7 @@ impl TransactionExecutor {
             balance_id: balance_id.clone(),
         });
 
-        // Check if deleted by a previous TX in this ledger (delta persists across TXs).
-        if self.state.delta().deleted_keys().contains(&key) {
-            return Ok(false);
-        }
-
-        if let Some(entry) = snapshot.get_entry(&key)? {
+        if let Some(entry) = self.get_entry_from_snapshot(snapshot, &key)? {
             self.state.load_entry(entry);
             return Ok(true);
         }
@@ -884,12 +875,7 @@ impl TransactionExecutor {
             data_name: name_bytes,
         });
 
-        // Check if deleted by a previous TX in this ledger (delta persists across TXs).
-        if self.state.delta().deleted_keys().contains(&key) {
-            return Ok(false);
-        }
-
-        if let Some(entry) = snapshot.get_entry(&key)? {
+        if let Some(entry) = self.get_entry_from_snapshot(snapshot, &key)? {
             self.state.load_entry(entry);
             return Ok(true);
         }
@@ -922,12 +908,7 @@ impl TransactionExecutor {
             data_name: data_name.clone(),
         });
 
-        // Check if deleted by a previous TX in this ledger (delta persists across TXs).
-        if self.state.delta().deleted_keys().contains(&key) {
-            return Ok(false);
-        }
-
-        if let Some(entry) = snapshot.get_entry(&key)? {
+        if let Some(entry) = self.get_entry_from_snapshot(snapshot, &key)? {
             self.state.load_entry(entry);
             return Ok(true);
         }
@@ -955,12 +936,7 @@ impl TransactionExecutor {
             offer_id,
         });
 
-        // Check if deleted by a previous TX in this ledger (delta persists across TXs).
-        if self.state.delta().deleted_keys().contains(&key) {
-            return Ok(false);
-        }
-
-        if let Some(entry) = snapshot.get_entry(&key)? {
+        if let Some(entry) = self.get_entry_from_snapshot(snapshot, &key)? {
             self.state.load_entry(entry);
             return Ok(true);
         }
@@ -1023,12 +999,7 @@ impl TransactionExecutor {
             liquidity_pool_id: pool_id.clone(),
         });
 
-        // Check if deleted by a previous TX in this ledger (delta persists across TXs).
-        if self.state.delta().deleted_keys().contains(&key) {
-            return Ok(None);
-        }
-
-        if let Some(entry) = snapshot.get_entry(&key)? {
+        if let Some(entry) = self.get_entry_from_snapshot(snapshot, &key)? {
             let pool = match &entry.data {
                 LedgerEntryData::LiquidityPool(pool) => pool.clone(),
                 _ => return Ok(None),
@@ -1268,14 +1239,8 @@ impl TransactionExecutor {
         if self.state.get_entry(key).is_some() {
             return Ok(true);
         }
-        // Check if deleted by a previous TX in this ledger (delta persists across TXs).
-        // Without this check, entries deleted by prior TXs would be reloaded from the
-        // snapshot, producing stale state (same class of bug as VE-10).
-        if self.state.delta().deleted_keys().contains(key) {
-            return Ok(false);
-        }
         // Try to load from snapshot (bucket list + hot archive)
-        if let Some(entry) = snapshot.get_entry(key)? {
+        if let Some(entry) = self.get_entry_from_snapshot(snapshot, key)? {
             self.state.load_entry(entry);
             return Ok(true);
         }
@@ -3865,11 +3830,30 @@ pub struct SorobanContext<'a> {
     pub runtime_handle: Option<tokio::runtime::Handle>,
 }
 
+/// Snapshot of prior-stage state for parallel Soroban execution.
+///
+/// Bundles live entries and deleted keys together so they always travel as a
+/// pair.  Constructed once per stage from the current `LedgerDelta` and shared
+/// by all clusters in that stage.
+pub struct PriorStageState {
+    pub entries: Vec<LedgerEntry>,
+    pub deleted_keys: Vec<LedgerKey>,
+}
+
+impl PriorStageState {
+    /// Build from a delta, capturing both live entries and deletions.
+    pub fn from_delta(delta: &crate::LedgerDelta) -> Self {
+        Self {
+            entries: delta.current_entries(),
+            deleted_keys: delta.dead_entries(),
+        }
+    }
+}
+
 /// Parameters specific to a single cluster or stage within the parallel phase.
 pub struct ClusterParams<'a> {
     pub id_pool: u64,
-    pub prior_stage_entries: &'a [LedgerEntry],
-    pub prior_stage_deleted_keys: &'a [LedgerKey],
+    pub prior_stage: &'a PriorStageState,
     pub pre_charged_fees: &'a [PreChargedFee],
 }
 
@@ -4392,6 +4376,138 @@ mod tests {
         assert_eq!(all_restored.len(), 2);
         assert_eq!(all_restored[0], key0);
         assert_eq!(all_restored[1], key1);
+    }
+
+    /// Integration-level regression test for VE-11: entries deleted in stage 0
+    /// must be invisible to stage 1 after PriorStageState propagation.
+    ///
+    /// Simulates the cross-stage flow:
+    ///   1. Stage 0 executor loads a ContractCode entry from the snapshot and
+    ///      deletes it (host doesn't return a new value).
+    ///   2. PriorStageState is built from the delta (captures entries + deletions).
+    ///   3. A fresh stage 1 executor receives the PriorStageState and applies it
+    ///      (same logic as execute_single_cluster).
+    ///   4. load_soroban_footprint on the stage 1 executor must NOT reload the
+    ///      deleted entry from the bucket list.
+    ///
+    /// Without mark_entry_deleted(), the fresh executor in step 3 would fall
+    /// through to the bucket list and reload the stale entry.
+    #[test]
+    fn test_cross_stage_deleted_entry_not_reloaded_ve11() {
+        use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
+        use crate::LedgerDelta;
+        use stellar_xdr::curr::*;
+        use std::sync::Arc;
+
+        // --- Build a ContractCode entry and its TTL in the snapshot ---
+        let code_hash = Hash([0xCC; 32]);
+        let contract_code = ContractCodeEntry {
+            ext: ContractCodeEntryExt::V0,
+            hash: code_hash.clone(),
+            code: BytesM::try_from(vec![1u8, 2u8]).unwrap(),
+        };
+        let code_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: code_hash.clone(),
+        });
+        let code_entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::ContractCode(contract_code),
+            ext: LedgerEntryExt::V0,
+        };
+
+        // Compute TTL key hash (SHA-256 of LedgerKey XDR)
+        let ttl_key_hash = {
+            use sha2::{Digest, Sha256};
+            let bytes = code_key.to_xdr(Limits::none()).unwrap();
+            Hash(Sha256::digest(&bytes).into())
+        };
+        let ttl_key = LedgerKey::Ttl(LedgerKeyTtl {
+            key_hash: ttl_key_hash.clone(),
+        });
+        let ttl_entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::Ttl(TtlEntry {
+                key_hash: ttl_key_hash,
+                live_until_ledger_seq: 200,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        // Snapshot lookup returns both entries from "bucket list".
+        let code_entry_bl = code_entry.clone();
+        let ttl_entry_bl = ttl_entry.clone();
+        let code_key_bl = code_key.clone();
+        let ttl_key_bl = ttl_key.clone();
+        let lookup_fn: crate::snapshot::EntryLookupFn = Arc::new(move |key: &LedgerKey| {
+            if *key == code_key_bl {
+                return Ok(Some(code_entry_bl.clone()));
+            }
+            if *key == ttl_key_bl {
+                return Ok(Some(ttl_entry_bl.clone()));
+            }
+            Ok(None)
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup_fn);
+
+        let context =
+            LedgerContext::new(101, 1234567890, 100, 5_000_000, 25, NetworkId::testnet());
+
+        // --- Build PriorStageState as if stage 0 deleted the entries ---
+        // Simulate: stage 0 loaded the entries and a TX deleted them.
+        // The delta after stage 0 contains the deletions.
+        let mut delta = LedgerDelta::new(101);
+        delta.record_delete(code_entry.clone()).unwrap();
+        delta.record_delete(ttl_entry.clone()).unwrap();
+
+        let prior_stage = PriorStageState::from_delta(&delta);
+        // Verify the deleted keys are captured.
+        assert!(
+            prior_stage.deleted_keys.contains(&code_key),
+            "PriorStageState must capture deleted ContractCode key"
+        );
+        assert!(
+            prior_stage.deleted_keys.contains(&ttl_key),
+            "PriorStageState must capture deleted TTL key"
+        );
+
+        // --- Stage 1: fresh executor, apply PriorStageState ---
+        let mut stage1_executor = TransactionExecutor::new(
+            &context,
+            0,
+            SorobanConfig::default(),
+            ClassicEventConfig::default(),
+        );
+
+        // Apply prior-stage entries (same as execute_single_cluster does).
+        for entry in &prior_stage.entries {
+            stage1_executor.state.load_entry(entry.clone());
+        }
+        // Apply prior-stage deletions.
+        for key in &prior_stage.deleted_keys {
+            stage1_executor.state.mark_entry_deleted(key);
+        }
+
+        // Verify the entry is marked as deleted in the fresh executor.
+        assert!(
+            stage1_executor.state.is_entry_deleted(&code_key),
+            "Stage 1 executor must know the entry is deleted"
+        );
+
+        // --- load_soroban_footprint must NOT reload the deleted entry ---
+        let footprint = LedgerFootprint {
+            read_only: vec![code_key.clone()].try_into().unwrap(),
+            read_write: VecM::default(),
+        };
+        stage1_executor
+            .load_soroban_footprint(&snapshot, &footprint)
+            .unwrap();
+
+        // The entry must remain absent — load_soroban_footprint skipped it because
+        // is_entry_deleted returned true.
+        assert!(
+            stage1_executor.state.get_entry(&code_key).is_none(),
+            "Deleted entry must NOT be reloaded from bucket list in stage 1"
+        );
     }
 
     /// Regression test for VE-10: account deleted by account_merge within a ledger
