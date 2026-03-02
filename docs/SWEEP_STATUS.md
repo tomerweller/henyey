@@ -1,6 +1,6 @@
 # Verify-Execution Sweep Status
 
-> **Updated**: 2026-03-01 17:45 UTC
+> **Updated**: 2026-03-02 13:55 UTC
 > **Session**: b5e87aee (fresh start)
 > **CDP data lake range**: L59501248–L61366079 (latest available as of 2026-02-23)
 > **Supported protocol**: P24+ (L59501312 is first P24 ledger; L59501248–L59501311 are P23 and unverifiable)
@@ -44,6 +44,8 @@ Ledgers L59501248–L59501311 (P23) cannot be verified by Henyey (min supported:
 | L60841312–L60941311 | **CLEAN** | s27-rerun completed — 100,000 ledgers, 0 mismatches (VE-11 fix applied) |
 | L60941312–L61041311 | **CLEAN** | s28 completed — 100,000 ledgers, 0 mismatches |
 | L61041312–L61141311 | **CLEAN** | s29 completed — 100,000 ledgers, 0 mismatches |
+| L61141312–L61241311 | **CLEAN** | s30 completed — 100,000 ledgers, 0 mismatches |
+| L61241312–L61341311 | **CLEAN** | s31 completed — 100,000 ledgers, 0 mismatches |
 
 ## Previously confirmed bug fixes (from prior sessions)
 
@@ -91,8 +93,7 @@ Ledgers L59501248–L59501311 (P23) cannot be verified by Henyey (min supported:
 
 | Sweep | Range | Status | Started |
 |-------|-------|--------|---------|
-| s30 | L61141312–L61241311 | running | 2026-03-01 09:34 UTC |
-| s31 | L61241312–L61341311 | running | 2026-03-01 10:39 UTC |
+| s32 | L61341312–L61366079 | running | 2026-03-02 13:55 UTC |
 
 ## Tracker
 
