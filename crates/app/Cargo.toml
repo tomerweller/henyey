@@ -37,6 +37,8 @@ rand.workspace = true
 
 # HTTP server
 axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
 
 # Configuration
 serde.workspace = true

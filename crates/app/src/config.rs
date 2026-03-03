@@ -131,6 +131,12 @@ pub struct AppConfig {
     #[serde(default)]
     pub catchup: CatchupConfig,
 
+    /// stellar-core compatibility HTTP server configuration.
+    /// When enabled, runs a second HTTP server that matches stellar-core's exact
+    /// wire format for drop-in compatibility with stellar-rpc.
+    #[serde(default)]
+    pub compat_http: CompatHttpConfig,
+
     /// HTTP query server configuration (for `/getledgerentryraw`, `/getledgerentry`).
     #[serde(default)]
     pub query: QueryConfig,
@@ -807,6 +813,38 @@ impl Default for HttpConfig {
     }
 }
 
+/// Configuration for the stellar-core compatibility HTTP server.
+///
+/// This server mirrors stellar-core's exact wire format (camelCase JSON fields,
+/// GET-based endpoints, plain-text responses for admin commands, etc.) so that
+/// stellar-rpc can connect to henyey without any changes.
+///
+/// When `enabled = false` (default), only the native henyey HTTP server runs.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CompatHttpConfig {
+    /// Whether to enable the stellar-core compatibility HTTP server.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Port for the compatibility HTTP server.
+    /// Default 11626 matches stellar-core's `HTTP_PORT`.
+    #[serde(default = "default_compat_http_port")]
+    pub port: u16,
+}
+
+impl Default for CompatHttpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: default_compat_http_port(),
+        }
+    }
+}
+
+fn default_compat_http_port() -> u16 {
+    11626
+}
+
 fn default_http_port() -> u16 {
     11626
 }
@@ -977,6 +1015,7 @@ impl AppConfig {
             },
             logging: LoggingConfig::default(),
             http: HttpConfig::default(),
+            compat_http: CompatHttpConfig::default(),
             surge_pricing: SurgePricingConfig::default(),
             events: EventsConfig::default(),
             metadata: MetadataConfig::default(),
@@ -1044,6 +1083,7 @@ impl AppConfig {
             },
             logging: LoggingConfig::default(),
             http: HttpConfig::default(),
+            compat_http: CompatHttpConfig::default(),
             surge_pricing: SurgePricingConfig::default(),
             events: EventsConfig::default(),
             metadata: MetadataConfig::default(),

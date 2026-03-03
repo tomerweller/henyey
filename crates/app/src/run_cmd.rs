@@ -43,6 +43,7 @@ use tokio::sync::broadcast;
 
 use crate::app::{App, AppState, CatchupTarget};
 use crate::config::AppConfig;
+use crate::compat_http::CompatServer;
 use crate::http::{QueryServer, StatusServer};
 
 /// Node running mode determining behavior and consensus participation.
@@ -150,6 +151,8 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
     let http_enabled = config.http.enabled;
     let http_port = config.http.port;
     let query_port = config.query.port;
+    let compat_http_enabled = config.compat_http.enabled;
+    let compat_http_port = config.compat_http.port;
 
     // Create the application
     let app = Arc::new(App::new(config).await?);
@@ -189,6 +192,18 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
         None
     };
 
+    // Start the stellar-core compatibility HTTP server if enabled
+    let compat_handle = if compat_http_enabled {
+        let compat_server = CompatServer::new(compat_http_port, app.clone());
+        Some(tokio::spawn(async move {
+            if let Err(e) = compat_server.start().await {
+                tracing::error!(error = %e, "stellar-core compat HTTP server error");
+            }
+        }))
+    } else {
+        None
+    };
+
     // Print startup info
     print_startup_info(&app, &options);
 
@@ -201,6 +216,9 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
         handle.abort();
     }
     if let Some(handle) = query_handle {
+        handle.abort();
+    }
+    if let Some(handle) = compat_handle {
         handle.abort();
     }
 

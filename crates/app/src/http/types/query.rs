@@ -34,7 +34,6 @@ pub struct GetLedgerEntryRawResponse {
 #[derive(Debug, Serialize)]
 pub struct RawEntryResult {
     /// Base64-encoded XDR `LedgerEntry`.
-    #[serde(rename = "e")]
     pub entry: String,
 }
 
@@ -83,7 +82,7 @@ pub struct LedgerEntryResult {
     pub state: LedgerEntryState,
 
     /// Base64-encoded XDR `LedgerEntry` (present for `live` and `archived`).
-    #[serde(skip_serializing_if = "Option::is_none", rename = "e")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub entry: Option<String>,
 
     /// For Soroban entries: the `live_until_ledger_seq` from the TTL entry.

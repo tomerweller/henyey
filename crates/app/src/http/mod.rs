@@ -211,7 +211,7 @@ impl StatusServer {
 }
 
 /// Format the current UTC time as ISO 8601 (e.g. "2026-01-15T12:34:56Z").
-fn format_utc_now() -> String {
+pub(crate) fn format_utc_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)

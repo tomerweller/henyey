@@ -1566,7 +1566,7 @@ impl App {
     /// blocking other tasks from accessing it.
     ///
     /// Returns `None` if the overlay hasn't been started yet.
-    pub(super) async fn overlay(&self) -> Option<Arc<OverlayManager>> {
+    pub(crate) async fn overlay(&self) -> Option<Arc<OverlayManager>> {
         self.overlay.read().await.clone()
     }
 
