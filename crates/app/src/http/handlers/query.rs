@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -21,8 +22,8 @@ use stellar_xdr::curr::{
 };
 
 use crate::http::types::query::{
-    GetLedgerEntryRawRequest, GetLedgerEntryRawResponse, GetLedgerEntryRequest,
-    GetLedgerEntryResponse, LedgerEntryResult, LedgerEntryState, RawEntryResult,
+    GetLedgerEntryRawResponse, GetLedgerEntryResponse, LedgerEntryResult, LedgerEntryState,
+    RawEntryResult,
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -32,16 +33,99 @@ pub(crate) struct QueryState {
     pub snapshot_manager: Arc<BucketSnapshotManager>,
 }
 
+/// Parsed form-encoded query request (supports repeated `key=` params).
+struct FormQueryParams {
+    keys: Vec<String>,
+    ledger_seq: Option<u32>,
+}
+
+/// Parse `key=<b64>&key=<b64>&ledgerSeq=N` from a URL-encoded form body.
+///
+/// stellar-core's QueryServer accepts `application/x-www-form-urlencoded`
+/// POST bodies with repeated `key` parameters and an optional `ledgerSeq`.
+fn parse_form_query_params(body: &[u8]) -> Result<FormQueryParams, String> {
+    let body_str = std::str::from_utf8(body).map_err(|e| format!("Invalid UTF-8 body: {}", e))?;
+    let mut keys = Vec::new();
+    let mut ledger_seq = None;
+
+    for pair in body_str.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = pair.split_once('=') {
+            let key = url_decode(k);
+            let value = url_decode(v);
+            match key.as_str() {
+                "key" => keys.push(value),
+                "ledgerSeq" => {
+                    ledger_seq = value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|&seq| seq >= 2);
+                }
+                _ => {} // ignore unknown params
+            }
+        }
+    }
+
+    Ok(FormQueryParams { keys, ledger_seq })
+}
+
+/// Minimal URL percent-decoding (handles `%XX` and `+` as space).
+fn url_decode(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.bytes();
+    while let Some(b) = chars.next() {
+        match b {
+            b'+' => result.push(' '),
+            b'%' => {
+                let hi = chars.next().and_then(|c| hex_digit(c));
+                let lo = chars.next().and_then(|c| hex_digit(c));
+                if let (Some(h), Some(l)) = (hi, lo) {
+                    result.push((h << 4 | l) as char);
+                } else {
+                    result.push('%');
+                }
+            }
+            _ => result.push(b as char),
+        }
+    }
+    result
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// POST /getledgerentryraw
 ///
 /// Returns raw ledger entries from the live bucket list without TTL/state
 /// classification. Matches stellar-core's `getledgerentryraw` endpoint.
+///
+/// Accepts `application/x-www-form-urlencoded` body with repeated `key=`
+/// params and optional `ledgerSeq=`.
 pub(crate) async fn getledgerentryraw_handler(
     State(state): State<Arc<QueryState>>,
-    Json(req): Json<GetLedgerEntryRawRequest>,
+    body: Bytes,
 ) -> impl IntoResponse {
+    let params = match parse_form_query_params(&body) {
+        Ok(p) => p,
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": msg})),
+            )
+                .into_response();
+        }
+    };
+
     // Decode all keys from base64 XDR.
-    let keys = match decode_keys(&req.key) {
+    let keys = match decode_keys(&params.keys) {
         Ok(keys) => keys,
         Err(msg) => {
             return (
@@ -73,7 +157,7 @@ pub(crate) async fn getledgerentryraw_handler(
     };
 
     // Load entries.
-    let (ledger_seq, entries) = match req.ledger_seq {
+    let (ledger_seq, entries) = match params.ledger_seq {
         Some(seq) => match live_bl.load_keys_from_ledger(&keys, seq) {
             Some(entries) => (seq, entries),
             None => {
@@ -120,12 +204,26 @@ pub(crate) async fn getledgerentryraw_handler(
 /// 3. Load TTL entries for live Soroban entries
 ///
 /// Results preserve request order.
+///
+/// Accepts `application/x-www-form-urlencoded` body with repeated `key=`
+/// params and optional `ledgerSeq=`.
 pub(crate) async fn getledgerentry_handler(
     State(state): State<Arc<QueryState>>,
-    Json(req): Json<GetLedgerEntryRequest>,
+    body: Bytes,
 ) -> impl IntoResponse {
+    let params = match parse_form_query_params(&body) {
+        Ok(p) => p,
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": msg})),
+            )
+                .into_response();
+        }
+    };
+
     // Decode all keys from base64 XDR.
-    let keys = match decode_keys(&req.key) {
+    let keys = match decode_keys(&params.keys) {
         Ok(keys) => keys,
         Err(msg) => {
             return (
@@ -186,10 +284,10 @@ pub(crate) async fn getledgerentry_handler(
             }
         };
 
-    let ledger_seq = req.ledger_seq.unwrap_or_else(|| live_bl.ledger_seq());
+    let ledger_seq = params.ledger_seq.unwrap_or_else(|| live_bl.ledger_seq());
 
     // ── Pass 1: Load all keys from live bucket list ──────────────────
-    let live_entries = match load_from_live(&live_bl, &keys, ledger_seq, req.ledger_seq.is_some()) {
+    let live_entries = match load_from_live(&live_bl, &keys, ledger_seq, params.ledger_seq.is_some()) {
         Ok(entries) => entries,
         Err(resp) => return resp.into_response(),
     };
@@ -224,7 +322,7 @@ pub(crate) async fn getledgerentry_handler(
         .collect();
 
     let archived_entries = if !hot_archive_keys.is_empty() {
-        load_from_hot_archive(&hot_archive_bl, &hot_archive_keys, ledger_seq, req.ledger_seq.is_some())
+        load_from_hot_archive(&hot_archive_bl, &hot_archive_keys, ledger_seq, params.ledger_seq.is_some())
     } else {
         Vec::new()
     };
@@ -252,7 +350,7 @@ pub(crate) async fn getledgerentry_handler(
         .collect();
 
     let ttl_entries = if !ttl_keys.is_empty() {
-        match load_from_live(&live_bl, &ttl_keys, ledger_seq, req.ledger_seq.is_some()) {
+        match load_from_live(&live_bl, &ttl_keys, ledger_seq, params.ledger_seq.is_some()) {
             Ok(entries) => entries,
             Err(resp) => return resp.into_response(),
         }

@@ -2,6 +2,9 @@
 //!
 //! Accepts `GET /tx?blob=<base64 TransactionEnvelope XDR>` and returns
 //! stellar-core's exact response format with status strings.
+//!
+//! The `error` field contains a base64-encoded XDR `TransactionResult`
+//! (matching stellar-core's wire format), not a human-readable string.
 
 use std::sync::Arc;
 
@@ -11,7 +14,10 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use stellar_xdr::curr::{Limits, ReadXdr, TransactionEnvelope};
+use stellar_xdr::curr::{
+    Limits, ReadXdr, TransactionEnvelope, TransactionResult, TransactionResultExt,
+    TransactionResultResult, WriteXdr,
+};
 
 use crate::compat_http::CompatServerState;
 
@@ -24,7 +30,7 @@ pub(crate) struct TxQueryParams {
 /// GET /tx?blob=<base64>
 ///
 /// Submits a transaction in stellar-core's exact wire format.
-/// Returns `{"status": "PENDING"}` or `{"status": "ERROR", "error": "..."}`.
+/// Returns `{"status": "PENDING"}` or `{"status": "ERROR", "error": "<base64 XDR TransactionResult>"}`.
 pub(crate) async fn compat_tx_handler(
     State(state): State<Arc<CompatServerState>>,
     Query(params): Query<TxQueryParams>,
@@ -69,47 +75,80 @@ pub(crate) async fn compat_tx_handler(
         TxQueueResult::Added => CompatTxResponse {
             status: "PENDING".to_string(),
             error: None,
+            diagnostic_events: None,
         },
         TxQueueResult::Duplicate => CompatTxResponse {
             status: "DUPLICATE".to_string(),
             error: None,
+            diagnostic_events: None,
         },
         TxQueueResult::TryAgainLater | TxQueueResult::QueueFull => CompatTxResponse {
             status: "TRY_AGAIN_LATER".to_string(),
             error: None,
+            diagnostic_events: None,
         },
         TxQueueResult::Filtered => CompatTxResponse {
             status: "FILTERED".to_string(),
             error: None,
+            diagnostic_events: None,
         },
         TxQueueResult::Invalid(code) => {
-            // stellar-core puts the base64-encoded TransactionResult XDR
-            // in the "error" field. We use the result code name as a fallback
-            // since the full XDR result is not always available in our current
-            // TxQueueResult.
-            let error_str = code.map_or("txInternalError".to_string(), |c| c.name().to_string());
+            // stellar-core puts the base64-encoded TransactionResult XDR in
+            // the "error" field. We synthesize a minimal TransactionResult from
+            // the result code.
+            let xdr_result_result = code
+                .map(|c| c.to_xdr_result())
+                .unwrap_or(TransactionResultResult::TxInternalError);
+            let error_b64 = encode_tx_result(xdr_result_result, 0);
             CompatTxResponse {
                 status: "ERROR".to_string(),
-                error: Some(error_str),
+                error: Some(error_b64),
+                diagnostic_events: None,
             }
         }
-        TxQueueResult::Banned => CompatTxResponse {
-            status: "ERROR".to_string(),
-            error: Some("Transaction is banned".to_string()),
-        },
-        TxQueueResult::FeeTooLow => CompatTxResponse {
-            status: "ERROR".to_string(),
-            error: Some("txINSUFFICIENT_FEE".to_string()),
+        TxQueueResult::Banned => {
+            let error_b64 = encode_tx_result(TransactionResultResult::TxBadAuth, 0);
+            CompatTxResponse {
+                status: "ERROR".to_string(),
+                error: Some(error_b64),
+                diagnostic_events: None,
+            }
+        }
+        TxQueueResult::FeeTooLow => {
+            let error_b64 = encode_tx_result(TransactionResultResult::TxInsufficientFee, 0);
+            CompatTxResponse {
+                status: "ERROR".to_string(),
+                error: Some(error_b64),
+                diagnostic_events: None,
+            }
         }
     };
 
     Json(response).into_response()
 }
 
+/// Encode a `TransactionResultResult` into a base64-encoded `TransactionResult` XDR.
+fn encode_tx_result(result: TransactionResultResult, fee_charged: i64) -> String {
+    let tx_result = TransactionResult {
+        fee_charged,
+        result,
+        ext: TransactionResultExt::V0,
+    };
+    let bytes = tx_result.to_xdr(Limits::none()).unwrap_or_default();
+    BASE64.encode(&bytes)
+}
+
 /// stellar-core compatible tx submission response.
+///
+/// Matches the Go SDK's `proto.TXResponse` exactly:
+/// - `status`: one of "PENDING", "DUPLICATE", "ERROR", "TRY_AGAIN_LATER", "FILTERED"
+/// - `error`: base64-encoded XDR `TransactionResult` (only on ERROR)
+/// - `diagnostic_events`: base64-encoded XDR `Vec<DiagnosticEvent>` (only on ERROR for Soroban txs)
 #[derive(Serialize)]
 struct CompatTxResponse {
     status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic_events: Option<String>,
 }

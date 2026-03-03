@@ -277,6 +277,43 @@ impl TxResultCode {
         )
     }
 
+    /// Convert to the XDR `TransactionResultResult` discriminant.
+    ///
+    /// For error codes (unit variants), this produces a zero-payload result.
+    /// For success/failure codes that carry operation results, this produces
+    /// an empty operation result vector.
+    pub fn to_xdr_result(&self) -> TransactionResultResult {
+        match self {
+            TxResultCode::TxFeeBumpInnerSuccess | TxResultCode::TxFeeBumpInnerFailed => {
+                // Fee bump inner results require an InnerTransactionResultPair
+                // which we cannot synthesize without the inner tx. Fall back to
+                // TxInternalError as a safe default.
+                TransactionResultResult::TxInternalError
+            }
+            TxResultCode::TxSuccess => {
+                TransactionResultResult::TxSuccess(Vec::new().try_into().unwrap())
+            }
+            TxResultCode::TxFailed => {
+                TransactionResultResult::TxFailed(Vec::new().try_into().unwrap())
+            }
+            TxResultCode::TxTooEarly => TransactionResultResult::TxTooEarly,
+            TxResultCode::TxTooLate => TransactionResultResult::TxTooLate,
+            TxResultCode::TxMissingOperation => TransactionResultResult::TxMissingOperation,
+            TxResultCode::TxBadSeq => TransactionResultResult::TxBadSeq,
+            TxResultCode::TxBadAuth => TransactionResultResult::TxBadAuth,
+            TxResultCode::TxInsufficientBalance => TransactionResultResult::TxInsufficientBalance,
+            TxResultCode::TxNoAccount => TransactionResultResult::TxNoAccount,
+            TxResultCode::TxInsufficientFee => TransactionResultResult::TxInsufficientFee,
+            TxResultCode::TxBadAuthExtra => TransactionResultResult::TxBadAuthExtra,
+            TxResultCode::TxInternalError => TransactionResultResult::TxInternalError,
+            TxResultCode::TxNotSupported => TransactionResultResult::TxNotSupported,
+            TxResultCode::TxBadSponsorship => TransactionResultResult::TxBadSponsorship,
+            TxResultCode::TxBadMinSeqAgeOrGap => TransactionResultResult::TxBadMinSeqAgeOrGap,
+            TxResultCode::TxMalformed => TransactionResultResult::TxMalformed,
+            TxResultCode::TxSorobanInvalid => TransactionResultResult::TxSorobanInvalid,
+        }
+    }
+
     /// Get a human-readable name.
     pub fn name(&self) -> &'static str {
         match self {
@@ -1304,9 +1341,7 @@ mod tests {
                     transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
                     result: stellar_xdr::curr::InnerTransactionResult {
                         fee_charged: 50,
-                        result: InnerTransactionResultResult::TxSuccess(
-                            vec![].try_into().unwrap(),
-                        ),
+                        result: InnerTransactionResultResult::TxSuccess(vec![].try_into().unwrap()),
                         ext: stellar_xdr::curr::InnerTransactionResultExt::V0,
                     },
                 },

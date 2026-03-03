@@ -8,9 +8,11 @@ use serde::{Deserialize, Serialize};
 
 /// Request body for `/getledgerentryraw`.
 ///
-/// Accepts an array of base64-encoded XDR `LedgerKey` values and an
-/// optional historical `ledger_seq`.
+/// Documents the expected schema. The actual request is parsed from
+/// `application/x-www-form-urlencoded` format with repeated `key=` params
+/// to match stellar-core's QueryServer.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct GetLedgerEntryRawRequest {
     /// Base64-encoded XDR `LedgerKey` values to look up.
     pub key: Vec<String>,
@@ -39,9 +41,11 @@ pub struct RawEntryResult {
 
 /// Request body for `/getledgerentry`.
 ///
-/// Accepts an array of base64-encoded XDR `LedgerKey` values and an
-/// optional historical `ledger_seq`. TTL keys are rejected.
+/// Documents the expected schema. The actual request is parsed from
+/// `application/x-www-form-urlencoded` format with repeated `key=` params
+/// to match stellar-core's QueryServer.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct GetLedgerEntryRequest {
     /// Base64-encoded XDR `LedgerKey` values to look up.
     pub key: Vec<String>,
