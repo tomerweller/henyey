@@ -298,10 +298,59 @@ impl AsyncMergeHandle {
                                     }
                                 }
                             } else {
-                                // Permanent file already exists (e.g. from catchup);
-                                // remove temp and load from the permanent path.
-                                let _ = std::fs::remove_file(&temp_path);
-                                Bucket::from_xdr_file_disk_backed(&permanent_path)
+                                // Permanent file already exists (e.g. from catchup).
+                                // Verify the file is valid before trusting it: a
+                                // previous write failure can leave a zero-byte or
+                                // truncated file at this path.  If the stored hash
+                                // does not match the expected hash, replace the file
+                                // with the freshly-computed temp file.
+                                match Bucket::from_xdr_file_disk_backed(&permanent_path) {
+                                    Ok(existing) if existing.hash() == hash => {
+                                        let _ = std::fs::remove_file(&temp_path);
+                                        Ok(existing)
+                                    }
+                                    Ok(existing) => {
+                                        tracing::warn!(
+                                            level,
+                                            expected_hash = %hash.to_hex(),
+                                            actual_hash = %existing.hash().to_hex(),
+                                            path = %permanent_path.display(),
+                                            "Permanent bucket file has wrong hash (corrupt), replacing with fresh merge output"
+                                        );
+                                        match durable_rename(&temp_path, &permanent_path) {
+                                            Ok(()) => Bucket::from_xdr_file_disk_backed(&permanent_path),
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    temp = %temp_path.display(),
+                                                    dest = %permanent_path.display(),
+                                                    "Failed to replace corrupt permanent file, using temp path"
+                                                );
+                                                Bucket::from_xdr_file_disk_backed(&temp_path)
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            level,
+                                            error = %e,
+                                            path = %permanent_path.display(),
+                                            "Failed to load existing permanent bucket file, replacing with fresh merge output"
+                                        );
+                                        match durable_rename(&temp_path, &permanent_path) {
+                                            Ok(()) => Bucket::from_xdr_file_disk_backed(&permanent_path),
+                                            Err(rename_err) => {
+                                                tracing::warn!(
+                                                    error = %rename_err,
+                                                    temp = %temp_path.display(),
+                                                    dest = %permanent_path.display(),
+                                                    "Failed to replace unreadable permanent file, using temp path"
+                                                );
+                                                Bucket::from_xdr_file_disk_backed(&temp_path)
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -3789,6 +3838,130 @@ mod tests {
         assert!(
             completed2.is_empty(),
             "drain should clear the completed merges"
+        );
+    }
+
+    /// Regression test for VE-12: when an async merge produces an output whose
+    /// canonical permanent file already exists but is corrupt (e.g. zero-byte
+    /// due to a previous disk-full write failure), `start_merge` must detect the
+    /// mismatch and replace the corrupt file with the freshly-computed output.
+    ///
+    /// Scenario that triggers the bug (without the fix):
+    ///
+    /// 1. An in-memory bucket with real entries and hash H is created.
+    /// 2. `save_to_xdr_file` partially writes then fails, leaving a zero-byte
+    ///    file at `{H}.bucket.xdr`.
+    /// 3. A subsequent async merge whose result would also hash to H (e.g.
+    ///    `merge(empty, bucket_H)`) checks the bucket dir, finds the existing
+    ///    permanent file, loads it — getting hash = SHA-256("") — and uses that
+    ///    corrupt bucket as the merge output.
+    /// 4. The bucket list hash then includes SHA-256("") as L1.curr, diverging
+    ///    from the expected value.
+    ///
+    /// After the fix, `start_merge` verifies the loaded bucket hash matches the
+    /// expected value and replaces the file if it does not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_start_merge_replaces_corrupt_permanent_file() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let bucket_dir = tmp.path().to_path_buf();
+
+        // Step 1: Run an actual disk-backed merge to discover what hash
+        // `merge(empty, snap_bucket)` produces, then corrupt that permanent file.
+        let snap_entries = vec![
+            BucketListEntry::Live(make_account_entry([1u8; 32], 100)),
+            BucketListEntry::Live(make_account_entry([2u8; 32], 200)),
+        ];
+        let snap_bucket = Arc::new(Bucket::from_entries(snap_entries).unwrap());
+        assert!(!snap_bucket.is_empty());
+
+        // Run a first merge to learn the real output hash.
+        let mut level_probe = BucketLevel::new(1);
+        level_probe
+            .prepare_with_normalization(
+                10,
+                TEST_PROTOCOL,
+                snap_bucket.clone(),
+                true,
+                &[],
+                false,
+                true,  // use_empty_curr → merge(empty, snap_bucket)
+                Some(&bucket_dir),
+                None,
+                None,
+            )
+            .unwrap();
+        let _ = level_probe.commit();
+        let expected_hash = level_probe.curr.hash();
+        assert!(
+            !expected_hash.is_zero(),
+            "first merge must produce a non-zero hash"
+        );
+        let empty_hash_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert_ne!(
+            expected_hash.to_hex(),
+            empty_hash_hex,
+            "first merge must not produce SHA-256(empty)"
+        );
+
+        // Step 2: Corrupt the permanent file that was just created.
+        let permanent_path = bucket_dir.join(canonical_bucket_filename(&expected_hash));
+        assert!(permanent_path.exists(), "permanent file must exist after first merge");
+        std::fs::write(&permanent_path, b"").unwrap(); // truncate to zero bytes
+        assert_eq!(
+            std::fs::metadata(&permanent_path).unwrap().len(),
+            0,
+            "file must be zero bytes after corruption"
+        );
+
+        // Verify that loading the corrupt file gives the wrong hash.
+        let corrupt_bucket = Bucket::from_xdr_file_disk_backed(&permanent_path).unwrap();
+        assert_eq!(
+            corrupt_bucket.hash().to_hex(),
+            empty_hash_hex,
+            "corrupt zero-byte file must hash to SHA-256(empty)"
+        );
+
+        // Step 3: Run the same merge again.  The permanent file at the expected
+        // output path now exists but is corrupt.  The fix must detect this,
+        // replace the file, and return the correct result.
+        let mut level_fixed = BucketLevel::new(1);
+        level_fixed
+            .prepare_with_normalization(
+                10,
+                TEST_PROTOCOL,
+                snap_bucket.clone(),
+                true,
+                &[],
+                false,
+                true,
+                Some(&bucket_dir),
+                None,
+                None,
+            )
+            .unwrap();
+        let _ = level_fixed.commit();
+        let result_hash = level_fixed.curr.hash();
+
+        // The result must be the correct hash, not SHA-256("").
+        assert_ne!(
+            result_hash.to_hex(),
+            empty_hash_hex,
+            "merge must not return SHA-256(empty) when permanent file is corrupt"
+        );
+        assert_eq!(
+            result_hash,
+            expected_hash,
+            "merge must return the same hash as the first (uncorrupted) run"
+        );
+
+        // The permanent file must have been replaced with valid content.
+        let reloaded = Bucket::from_xdr_file_disk_backed(&permanent_path).unwrap();
+        assert_eq!(
+            reloaded.hash(),
+            expected_hash,
+            "permanent file must contain valid bucket content after fix"
         );
     }
 }
