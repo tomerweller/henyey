@@ -537,11 +537,14 @@ fn all_archives(config: &AppConfig) -> anyhow::Result<Vec<henyey_history::Histor
 }
 
 /// Load configuration from file or use defaults.
+///
+/// Auto-detects stellar-core format configs (flat `SCREAMING_CASE` TOML)
+/// and translates them to henyey's nested format using the compat layer.
 fn load_config(cli: &Cli) -> anyhow::Result<AppConfig> {
     let mut config = match (&cli.config, cli.mainnet) {
         (Some(config_path), _) => {
             tracing::info!(path = ?config_path, "Loading configuration from file");
-            AppConfig::from_file_with_env(config_path)?
+            load_config_file(config_path)?
         }
         (None, true) => {
             tracing::info!("Using mainnet configuration");
@@ -563,6 +566,25 @@ fn load_config(cli: &Cli) -> anyhow::Result<AppConfig> {
     }
 
     Ok(config)
+}
+
+/// Load a config file, auto-detecting stellar-core vs henyey format.
+fn load_config_file(path: &std::path::Path) -> anyhow::Result<AppConfig> {
+    use henyey_app::compat_config;
+
+    let content = std::fs::read_to_string(path)?;
+    let raw: toml::Value = toml::from_str(&content)?;
+
+    if compat_config::is_stellar_core_format(&raw) {
+        tracing::info!("Detected stellar-core config format, translating");
+        let mut config = compat_config::translate_stellar_core_config(&raw)?;
+        config.apply_env_overrides();
+        Ok(config)
+    } else {
+        let mut config: AppConfig = toml::from_str(&content)?;
+        config.apply_env_overrides();
+        Ok(config)
+    }
 }
 
 /// Run command handler.

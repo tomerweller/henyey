@@ -55,6 +55,7 @@
 
 pub mod app;
 pub mod catchup_cmd;
+pub mod compat_config;
 pub mod compat_http;
 pub mod config;
 pub mod http;
