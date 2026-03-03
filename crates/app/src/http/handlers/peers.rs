@@ -10,31 +10,52 @@ use axum::{
 
 use super::super::helpers::{parse_connect_params, parse_peer_id_params, peer_id_to_strkey};
 use super::super::types::{
-    BansResponse, ConnectParams, DropPeerParams, PeerInfo, PeersResponse, SurveyCommandResponse,
-    UnbanParams,
+    BansResponse, ConnectParams, DropPeerParams, PeerInfo, PeersByDirection, PeersResponse,
+    SurveyCommandResponse, UnbanParams,
 };
 use super::super::ServerState;
 
 pub(crate) async fn peers_handler(State(state): State<Arc<ServerState>>) -> Json<PeersResponse> {
-    let mut peers = state
-        .app
-        .peer_snapshots()
-        .await
-        .into_iter()
-        .map(|snapshot| PeerInfo {
+    let snapshots = state.app.peer_snapshots().await;
+    let (pending_count, _authenticated_count) = state.app.peer_counts().await;
+
+    let mut inbound = Vec::new();
+    let mut outbound = Vec::new();
+
+    for snapshot in &snapshots {
+        let direction_str = match snapshot.info.direction {
+            henyey_overlay::ConnectionDirection::Inbound => "inbound",
+            henyey_overlay::ConnectionDirection::Outbound => "outbound",
+        };
+        let peer_info = PeerInfo {
             id: snapshot.info.peer_id.to_hex(),
             address: snapshot.info.address.to_string(),
-            direction: match snapshot.info.direction {
-                henyey_overlay::ConnectionDirection::Inbound => "inbound",
-                henyey_overlay::ConnectionDirection::Outbound => "outbound",
-            }
-            .to_string(),
-        })
-        .collect::<Vec<_>>();
-    peers.sort_by(|a, b| a.id.cmp(&b.id));
+            direction: direction_str.to_string(),
+            version: snapshot.info.version_string.clone(),
+            overlay_version: snapshot.info.overlay_version,
+            ledger_version: snapshot.info.ledger_version,
+            messages_sent: snapshot.stats.messages_sent,
+            messages_received: snapshot.stats.messages_received,
+            bytes_sent: snapshot.stats.bytes_sent,
+            bytes_received: snapshot.stats.bytes_received,
+            elapsed_secs: snapshot.info.connected_at.elapsed().as_secs(),
+        };
+        match snapshot.info.direction {
+            henyey_overlay::ConnectionDirection::Inbound => inbound.push(peer_info),
+            henyey_overlay::ConnectionDirection::Outbound => outbound.push(peer_info),
+        }
+    }
+
+    // Sort each group by peer ID for stable ordering
+    inbound.sort_by(|a, b| a.id.cmp(&b.id));
+    outbound.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let authenticated_count = inbound.len() + outbound.len();
+
     Json(PeersResponse {
-        count: peers.len(),
-        peers,
+        authenticated: PeersByDirection { inbound, outbound },
+        authenticated_count,
+        pending_count,
     })
 }
 
