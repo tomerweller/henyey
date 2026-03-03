@@ -1,0 +1,245 @@
+//! Handlers for /info, /status, /health, /ledger, /upgrades, /self-check,
+//! /quorum, and /dumpproposedsettings.
+
+use std::sync::Arc;
+
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::{IntoResponse, Json},
+};
+
+use crate::app::AppState;
+use crate::run_cmd::NodeStatus;
+
+use super::super::helpers::{map_upgrade_item, node_id_to_strkey};
+use super::super::types::{
+    DumpProposedSettingsParams, HealthResponse, InfoResponse, LedgerResponse, QuorumResponse,
+    QuorumSetResponse, RootResponse, SelfCheckResponse, UpgradeState, UpgradesResponse,
+};
+use super::super::ServerState;
+
+pub(crate) async fn root_handler() -> Json<RootResponse> {
+    Json(RootResponse {
+        name: "henyey".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        endpoints: vec![
+            "/info".to_string(),
+            "/status".to_string(),
+            "/metrics".to_string(),
+            "/peers".to_string(),
+            "/connect".to_string(),
+            "/droppeer".to_string(),
+            "/bans".to_string(),
+            "/unban".to_string(),
+            "/ledger".to_string(),
+            "/upgrades".to_string(),
+            "/self-check".to_string(),
+            "/quorum".to_string(),
+            "/survey".to_string(),
+            "/scp".to_string(),
+            "/survey/start".to_string(),
+            "/survey/stop".to_string(),
+            "/survey/topology".to_string(),
+            "/survey/reporting/stop".to_string(),
+            "/tx".to_string(),
+            "/shutdown".to_string(),
+            "/health".to_string(),
+            "/ll".to_string(),
+            "/manualclose".to_string(),
+            "/sorobaninfo".to_string(),
+            "/clearmetrics".to_string(),
+            "/logrotate".to_string(),
+            "/maintenance".to_string(),
+            "/dumpproposedsettings".to_string(),
+        ],
+    })
+}
+
+pub(crate) async fn info_handler(State(state): State<Arc<ServerState>>) -> Json<InfoResponse> {
+    let info = state.app.info();
+    let app_state = state.app.state().await;
+    let uptime = state.start_time.elapsed().as_secs();
+
+    Json(InfoResponse {
+        version: info.version,
+        node_name: info.node_name,
+        public_key: info.public_key,
+        network_passphrase: info.network_passphrase,
+        is_validator: info.is_validator,
+        state: format!("{}", app_state),
+        uptime_secs: uptime,
+    })
+}
+
+pub(crate) async fn status_handler(State(state): State<Arc<ServerState>>) -> Json<NodeStatus> {
+    let (ledger_seq, ledger_hash, _close_time, _protocol_version) = state.app.ledger_info();
+    let stats = state.app.herder_stats();
+    let peer_count = state.app.peer_snapshots().await.len();
+    Json(NodeStatus {
+        ledger_seq,
+        ledger_hash: Some(ledger_hash.to_hex()),
+        peer_count,
+        consensus_state: stats.state.to_string(),
+        pending_tx_count: stats.pending_transactions,
+        uptime_secs: state.start_time.elapsed().as_secs(),
+        state: format!("{}", state.app.state().await),
+    })
+}
+
+pub(crate) async fn health_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
+    let app_state = state.app.state().await;
+    let is_healthy = matches!(app_state, AppState::Synced | AppState::Validating);
+    let (ledger_seq, _hash, _close_time, _protocol_version) = state.app.ledger_info();
+    let peer_count = state.app.peer_snapshots().await.len();
+
+    let response = HealthResponse {
+        status: if is_healthy { "healthy" } else { "unhealthy" }.to_string(),
+        state: format!("{}", app_state),
+        ledger_seq,
+        peer_count,
+    };
+
+    let status = if is_healthy {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (status, Json(response))
+}
+
+pub(crate) async fn ledger_handler(State(state): State<Arc<ServerState>>) -> Json<LedgerResponse> {
+    let (sequence, hash, close_time, protocol_version) = state.app.ledger_info();
+    Json(LedgerResponse {
+        sequence,
+        hash: hash.to_hex(),
+        close_time,
+        protocol_version,
+    })
+}
+
+pub(crate) async fn upgrades_handler(State(state): State<Arc<ServerState>>) -> Json<UpgradesResponse> {
+    let (protocol_version, base_fee, base_reserve, max_tx_set_size) =
+        state.app.current_upgrade_state();
+    let proposed = state
+        .app
+        .proposed_upgrades()
+        .into_iter()
+        .filter_map(map_upgrade_item)
+        .collect::<Vec<_>>();
+
+    Json(UpgradesResponse {
+        current: UpgradeState {
+            protocol_version,
+            base_fee,
+            base_reserve,
+            max_tx_set_size,
+        },
+        proposed,
+    })
+}
+
+pub(crate) async fn self_check_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
+    match state.app.self_check(32) {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(SelfCheckResponse {
+                ok: result.ok,
+                checked_ledgers: result.checked_ledgers,
+                last_checked_ledger: result.last_checked_ledger,
+                message: None,
+            }),
+        ),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(SelfCheckResponse {
+                ok: false,
+                checked_ledgers: 0,
+                last_checked_ledger: None,
+                message: Some(err.to_string()),
+            }),
+        ),
+    }
+}
+
+pub(crate) async fn quorum_handler(State(state): State<Arc<ServerState>>) -> Json<QuorumResponse> {
+    let local = state
+        .app
+        .local_quorum_set()
+        .map(|qs| quorum_set_response(&qs));
+    Json(QuorumResponse { local })
+}
+
+pub(crate) fn quorum_set_response(quorum_set: &stellar_xdr::curr::ScpQuorumSet) -> QuorumSetResponse {
+    use henyey_scp::hash_quorum_set;
+
+    let hash = hash_quorum_set(quorum_set).to_hex();
+    let validators = quorum_set
+        .validators
+        .iter()
+        .filter_map(node_id_to_strkey)
+        .collect::<Vec<_>>();
+    let inner_sets = quorum_set
+        .inner_sets
+        .iter()
+        .map(quorum_set_response)
+        .collect::<Vec<_>>();
+    QuorumSetResponse {
+        hash,
+        threshold: quorum_set.threshold,
+        validators,
+        inner_sets,
+    }
+}
+
+pub(crate) async fn dumpproposedsettings_handler(
+    State(state): State<Arc<ServerState>>,
+    Query(params): Query<DumpProposedSettingsParams>,
+) -> impl IntoResponse {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use stellar_xdr::curr::{ConfigUpgradeSetKey, Limits, ReadXdr};
+
+    let Some(blob) = params.blob else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Must specify a ConfigUpgradeSetKey blob: dumpproposedsettings?blob=<ConfigUpgradeSetKey in xdr format>"
+            })),
+        );
+    };
+
+    let bytes = match STANDARD.decode(&blob) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("Invalid base64: {}", e)
+                })),
+            );
+        }
+    };
+
+    let key: ConfigUpgradeSetKey = match ConfigUpgradeSetKey::from_xdr(&bytes, Limits::none()) {
+        Ok(k) => k,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("Invalid XDR: {}", e)
+                })),
+            );
+        }
+    };
+
+    match state.app.get_config_upgrade_set(&key) {
+        Some(settings) => (StatusCode::OK, Json(serde_json::json!(settings))),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "configUpgradeSet is missing or invalid"
+            })),
+        ),
+    }
+}
