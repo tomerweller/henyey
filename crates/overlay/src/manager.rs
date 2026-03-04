@@ -1315,7 +1315,17 @@ impl OverlayManager {
                                     let lcl = last_closed_ledger.load(Ordering::Relaxed);
                                     let unique = flood_gate.record_seen(hash, Some(peer_id.clone()), lcl);
                                     peer.record_flood_stats(unique, message_size);
-                                    if !unique {
+                                    // SCP messages bypass flood gate dedup on the
+                                    // receiving side.  SCP dedup is handled by the
+                                    // herder (pending_envelopes), matching stellar-core
+                                    // where SCP messages from GetScpState responses are
+                                    // processed without flood gate checks.  Without
+                                    // this, re-requested SCP state after a gap is
+                                    // silently dropped because the original EXTERNALIZE
+                                    // was already seen (even though the herder may not
+                                    // have recorded it due to a missing tx_set).
+                                    let is_scp = matches!(message, StellarMessage::ScpMessage(_));
+                                    if !unique && !is_scp {
                                         break 'route;
                                     }
                                 } else if is_fetch_message(&message) {

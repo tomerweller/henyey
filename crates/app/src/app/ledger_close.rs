@@ -913,11 +913,15 @@ impl App {
 
     /// Drain all sequential buffered ledgers synchronously.
     ///
-    /// Called at the end of catchup to match stellar-core's
-    /// `ApplyBufferedLedgersWork`: CatchupWork does not return success
-    /// until all sequential buffered ledgers have been applied.
+    /// WARNING: This blocks the event loop for the entire duration. During the
+    /// drain, overlay messages (tx_sets, SCP) queue up but aren't processed,
+    /// causing the node to fall behind. Prefer letting the main select loop's
+    /// pending_close chaining handle buffered ledgers instead.
+    ///
+    /// Currently unused — kept for potential offline/testing use cases.
     ///
     /// Returns the number of ledgers drained.
+    #[allow(dead_code)]
     pub(super) async fn drain_buffered_ledgers_sync(&self) -> u32 {
         let mut drained = 0u32;
         loop {

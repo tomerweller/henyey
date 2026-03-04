@@ -282,7 +282,7 @@ impl Herder {
 
         let scp_driver_config = ScpDriverConfig {
             node_id: config.node_public_key,
-            max_tx_set_cache: 100,
+            max_tx_set_cache: 256,
             max_time_drift: MAX_TIME_SLIP_SECONDS,
             local_quorum_set: config.local_quorum_set.clone(),
         };

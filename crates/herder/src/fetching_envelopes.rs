@@ -8,13 +8,13 @@
 //! This is the Rust equivalent of stellar-core's `PendingEnvelopes` fetching logic.
 
 use dashmap::DashMap;
+use henyey_common::Hash256;
+use henyey_overlay::{ItemFetcher, ItemFetcherConfig, ItemType, PeerId};
+use henyey_scp::{is_quorum_set_sane, SlotIndex};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
-use henyey_common::Hash256;
-use henyey_overlay::{ItemFetcher, ItemFetcherConfig, ItemType, PeerId};
-use henyey_scp::{is_quorum_set_sane, SlotIndex};
 use stellar_xdr::curr::{Hash, Limits, ReadXdr, ScpEnvelope, ScpQuorumSet};
 use tracing::{debug, trace};
 
@@ -71,7 +71,7 @@ impl Default for FetchingConfig {
             tx_set_fetcher_config: ItemFetcherConfig::default(),
             quorum_set_fetcher_config: ItemFetcherConfig::default(),
             max_slots: 12,
-            max_tx_set_cache: 100,
+            max_tx_set_cache: 256,
             max_quorum_set_cache: 100,
         }
     }
@@ -1051,18 +1051,13 @@ mod tests {
             upgrades: VecM::default(),
             ext: StellarValueExt::Signed(LedgerCloseValueSignature {
                 node_id: XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
-                signature: stellar_xdr::curr::Signature(
-                    vec![0u8; 64].try_into().unwrap(),
-                ),
+                signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
             }),
         };
         sv.to_xdr(Limits::none()).unwrap()
     }
 
-    fn make_envelope_with_nomination_values(
-        slot: SlotIndex,
-        values: Vec<Vec<u8>>,
-    ) -> ScpEnvelope {
+    fn make_envelope_with_nomination_values(slot: SlotIndex, values: Vec<Vec<u8>>) -> ScpEnvelope {
         use stellar_xdr::curr::Value;
         let node_id = XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
         let votes: Vec<Value> = values
@@ -1089,8 +1084,7 @@ mod tests {
         cache_test_quorum_set(&fetching);
 
         // Envelope with a nomination containing a Basic StellarValue
-        let envelope =
-            make_envelope_with_nomination_values(100, vec![make_basic_stellar_value()]);
+        let envelope = make_envelope_with_nomination_values(100, vec![make_basic_stellar_value()]);
         let result = fetching.recv_envelope(envelope);
         assert_eq!(
             result,
@@ -1105,10 +1099,8 @@ mod tests {
         cache_test_quorum_set(&fetching);
 
         // Envelope with a nomination containing a Signed StellarValue
-        let envelope = make_envelope_with_nomination_values(
-            100,
-            vec![make_signed_stellar_value_bytes()],
-        );
+        let envelope =
+            make_envelope_with_nomination_values(100, vec![make_signed_stellar_value_bytes()]);
         let result = fetching.recv_envelope(envelope);
         assert_eq!(
             result,
@@ -1123,8 +1115,7 @@ mod tests {
         cache_test_quorum_set(&fetching);
 
         // Envelope with garbage bytes that can't be decoded as StellarValue
-        let envelope =
-            make_envelope_with_nomination_values(100, vec![vec![0xFF, 0xFE, 0xFD]]);
+        let envelope = make_envelope_with_nomination_values(100, vec![vec![0xFF, 0xFE, 0xFD]]);
         let result = fetching.recv_envelope(envelope);
         assert_eq!(
             result,

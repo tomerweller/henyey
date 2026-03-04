@@ -72,7 +72,7 @@ impl Default for ScpDriverConfig {
     fn default() -> Self {
         Self {
             node_id: PublicKey::from_bytes(&[0u8; 32]).unwrap(),
-            max_tx_set_cache: 100,
+            max_tx_set_cache: 256,
             max_time_drift: 60,
             local_quorum_set: None,
         }
@@ -3157,9 +3157,7 @@ mod compare_tx_sets_tests {
         };
         let source = MuxedAccount::Ed25519(Uint256([seed; 32]));
         let dest = stellar_xdr::curr::AccountId(
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
-                [seed.wrapping_add(1); 32],
-            )),
+            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256([seed.wrapping_add(1); 32])),
         );
         let operations: Vec<Operation> = (0..ops)
             .map(|_| Operation {
@@ -3259,7 +3257,6 @@ mod compare_tx_sets_tests {
         let driver = make_driver();
         let candidates_hash = [0u8; 32];
 
-
         // To test criterion 4 (encoded size), we need sets with same
         // ops and fees but genuinely different sizes.
         // 1 tx with 2 ops, fee 200 -> total_ops=2, total_fee=200 (small XDR)
@@ -3267,8 +3264,10 @@ mod compare_tx_sets_tests {
         let tx_set_small = TransactionSet::new(Hash256::ZERO, vec![make_tx(10, 200, 2)]);
         let hash_small = cache_tx_set(&driver, tx_set_small);
 
-        let tx_set_big =
-            TransactionSet::new(Hash256::ZERO, vec![make_tx(11, 100, 1), make_tx(12, 100, 1)]);
+        let tx_set_big = TransactionSet::new(
+            Hash256::ZERO,
+            vec![make_tx(11, 100, 1), make_tx(12, 100, 1)],
+        );
         let hash_big = cache_tx_set(&driver, tx_set_big);
 
         // Both have ops=2, total_fee=200, inclusion_fee=200.

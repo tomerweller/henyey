@@ -135,8 +135,8 @@ const TX_SET_UNAVAILABLE_TIMEOUT_SECS: u64 = 5;
 const RECOVERY_ESCALATION_SCP_REQUEST: u64 = 6;
 
 /// Number of consecutive recovery attempts without progress before
-/// triggering a full catchup.  At the 5s interval this equals ~60s.
-const RECOVERY_ESCALATION_CATCHUP: u64 = 12;
+/// triggering a full catchup.  At the 5s interval this equals ~30s.
+const RECOVERY_ESCALATION_CATCHUP: u64 = 6;
 
 /// Timeout for pending tx_set requests with no response from any peer.
 /// If we've been requesting a tx_set for this long with zero responses

@@ -174,17 +174,25 @@ impl App {
             return;
         }
 
-        // When the node is essentially caught up (small or zero gap), normally
-        // do NOT request SCP state from peers. Requesting SCP state brings stale
-        // EXTERNALIZE messages for slots whose tx_sets are already evicted from
-        // peers' caches (~60-72s window). These create pending tx_set requests
-        // that can never be fulfilled, causing infinite timeout → DontHave →
-        // recovery loops.
+        // When the node is essentially caught up (small or zero gap), the
+        // recovery strategy depends on whether we have the EXTERNALIZE for the
+        // very next slot (current_ledger + 1).
         //
-        // HOWEVER, after RECOVERY_ESCALATION_SCP_REQUEST failed attempts we
-        // escalate and request SCP state anyway — the node clearly isn't
-        // receiving fresh EXTERNALIZE messages on its own.
+        // Case 1: Next slot's EXTERNALIZE IS available — we're just waiting for
+        //   its tx_set. Don't request SCP state because peers would respond with
+        //   EXTERNALIZE for older slots whose tx_sets are already evicted from
+        //   their caches (~60-72s window), creating unfulfillable requests.
+        //
+        // Case 2: Next slot's EXTERNALIZE is MISSING — we need to ask peers for
+        //   it immediately. Every 5 seconds the gap grows by 1 slot, and peers
+        //   only cache ~12 slots (~60s). Waiting 60s to escalate guarantees the
+        //   EXTERNALIZE is evicted from peers by the time we ask.
         if gap <= TX_SET_REQUEST_WINDOW {
+            // Check if the next slot's EXTERNALIZE is missing
+            let next_slot = current_ledger as u64 + 1;
+            let next_slot_missing = latest_externalized > next_slot
+                && self.herder.get_externalized(next_slot).is_none();
+
             // Also clear syncing_ledgers entries with no tx_set — these are
             // unfulfillable entries from stale EXTERNALIZE and will block
             // try_start_ledger_close().
@@ -207,7 +215,19 @@ impl App {
             // Clear any remaining pending tx_sets from the herder
             self.herder.clear_pending_tx_sets();
 
-            if attempts < RECOVERY_ESCALATION_SCP_REQUEST {
+            if next_slot_missing {
+                // The next slot's EXTERNALIZE was missed (network blip, peer
+                // disconnection, etc.). Request SCP state immediately — peers
+                // should still have it cached if we act quickly.
+                tracing::warn!(
+                    current_ledger,
+                    latest_externalized,
+                    gap,
+                    attempts,
+                    "Next slot EXTERNALIZE missing — requesting SCP state immediately"
+                );
+                // Fall through to the SCP state request below
+            } else if attempts < RECOVERY_ESCALATION_SCP_REQUEST {
                 tracing::info!(
                     current_ledger,
                     latest_externalized,
@@ -216,17 +236,17 @@ impl App {
                     "Essentially caught up — waiting for fresh EXTERNALIZE"
                 );
                 return;
+            } else {
+                // Escalation: request SCP state despite small gap
+                tracing::warn!(
+                    current_ledger,
+                    latest_externalized,
+                    gap,
+                    attempts,
+                    "Essentially caught up but no progress — requesting SCP state from peers"
+                );
+                // Fall through to the SCP state request below
             }
-
-            // Escalation: request SCP state despite small gap
-            tracing::warn!(
-                current_ledger,
-                latest_externalized,
-                gap,
-                attempts,
-                "Essentially caught up but no progress — requesting SCP state from peers"
-            );
-            // Fall through to the SCP state request below
         }
 
         // Detect gaps in externalized slots to help diagnose sync issues.
@@ -298,14 +318,41 @@ impl App {
                     }
                 }
             } else {
-                // No gaps in externalized, but we can't apply - likely missing tx_sets
-                let externalized_slots = self.herder.get_externalized_slots_in_range(next_slot, latest_externalized);
-                tracing::info!(
+                // No gaps in externalized, but we can't apply - missing tx_sets.
+                // Peers won't have tx_sets for old slots (they cache ~60-72s).
+                // Check if any syncing_ledgers entries actually have tx_sets;
+                // if none do, catchup is the only recovery path.
+                let buffer = self.syncing_ledgers.read().await;
+                let total = buffer.range((current_ledger + 1)..).count();
+                let with_tx_set = buffer
+                    .range((current_ledger + 1)..)
+                    .filter(|(_, info)| info.tx_set.is_some())
+                    .count();
+                drop(buffer);
+
+                tracing::warn!(
                     current_ledger,
                     latest_externalized,
-                    externalized_count = externalized_slots.len(),
-                    "All slots externalized but cannot apply - likely missing tx_sets"
+                    total_buffered = total,
+                    with_tx_set,
+                    without_tx_set = total - with_tx_set,
+                    "All slots externalized but cannot apply - missing tx_sets"
                 );
+
+                // If no buffered entries have tx_sets, requesting SCP state is
+                // futile — force immediate catchup escalation.
+                if with_tx_set == 0 && total > 0 {
+                    tracing::warn!(
+                        current_ledger,
+                        latest_externalized,
+                        "No tx_sets available for any buffered slot — forcing catchup"
+                    );
+                    self.recovery_attempts_without_progress
+                        .store(RECOVERY_ESCALATION_CATCHUP, Ordering::SeqCst);
+                    // Recurse with the escalated counter — this will trigger catchup
+                    // on the next recovery tick (within 5s).
+                    return;
+                }
             }
         }
 
