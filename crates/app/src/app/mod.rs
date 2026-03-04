@@ -909,7 +909,7 @@ impl App {
             ledger_close_time: 5,
             node_public_key: keypair.public_key(),
             network_id: config.network_id(),
-            max_externalized_slots: TX_SET_REQUEST_WINDOW as usize,
+            max_externalized_slots: CHECKPOINT_FREQUENCY as usize * 2,
             max_tx_set_size: 1000,
             pending_config: Default::default(),
             tx_queue_config: TxQueueConfig {

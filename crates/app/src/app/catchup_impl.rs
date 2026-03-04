@@ -1786,17 +1786,30 @@ impl App {
         if target_checkpoint > latest_externalized as u32 {
             let first_replay = current_ledger as u64 + 1;
             let have_next_externalize = self.herder.get_externalized(first_replay).is_some();
-            tracing::info!(
-                current_ledger,
-                target,
-                target_checkpoint,
-                latest_externalized,
-                have_next_externalize,
-                "Skipping archive catchup: target checkpoint not yet published"
-            );
             self.catchup_in_progress.store(false, Ordering::SeqCst);
-            // Set cooldown to avoid rapid re-evaluation.
-            *self.last_catchup_completed_at.write().await = Some(Instant::now());
+            if have_next_externalize {
+                // We have the EXTERNALIZE for the next ledger, so the
+                // sequential close path in process_externalized_slots can
+                // handle this gap without archive downloads.  Don't set a
+                // cooldown — let it proceed immediately.
+                tracing::debug!(
+                    current_ledger,
+                    target,
+                    target_checkpoint,
+                    latest_externalized,
+                    "Skipping archive catchup: will close sequentially from cached EXTERNALIZE"
+                );
+            } else {
+                tracing::info!(
+                    current_ledger,
+                    target,
+                    target_checkpoint,
+                    latest_externalized,
+                    "Skipping archive catchup: target checkpoint not yet published and no cached EXTERNALIZE for next ledger"
+                );
+                // Set cooldown to avoid rapid re-evaluation.
+                *self.last_catchup_completed_at.write().await = Some(Instant::now());
+            }
             return;
         }
 
