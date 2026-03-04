@@ -368,6 +368,41 @@ impl App {
             *cache = Some((output.result.ledger_seq, Instant::now()));
         }
 
+        // Populate syncing_ledgers from externalized cache before draining.
+        // During catchup, the message caching task records EXTERNALIZE +
+        // tx_sets in the scp_driver caches.  But syncing_ledgers (which
+        // drain_buffered_ledgers_sync reads) is only populated by
+        // process_externalized_slots, which runs in the main event loop.
+        // Bridge the gap: for each externalized slot > new_lcl, call
+        // check_ledger_close and insert into syncing_ledgers so the drain
+        // can close them.
+        {
+            let current_ledger = self.get_current_ledger().await.unwrap_or(new_lcl);
+            let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
+            let mut buffer = self.syncing_ledgers.write().await;
+            let mut populated = 0u32;
+            for slot in (current_ledger as u64 + 1)..=latest_ext {
+                let seq = slot as u32;
+                if buffer.contains_key(&seq) {
+                    continue;
+                }
+                if let Some(info) = self.herder.check_ledger_close(slot) {
+                    if info.tx_set.is_some() {
+                        populated += 1;
+                    }
+                    buffer.insert(seq, info);
+                }
+            }
+            if populated > 0 {
+                tracing::info!(
+                    populated,
+                    current_ledger,
+                    latest_ext,
+                    "Populated syncing_ledgers from externalized cache before drain"
+                );
+            }
+        }
+
         // Drain all sequential buffered ledgers before returning.
         // This matches stellar-core's behavior: CatchupWork creates
         // ApplyBufferedLedgersWork which applies all sequential buffered
@@ -383,6 +418,58 @@ impl App {
                 new_ledger,
                 "Drained buffered ledgers as part of catchup completion"
             );
+        }
+
+        // After draining, if there's still a gap with externalized slots
+        // whose tx_sets haven't arrived yet, wait briefly for them.
+        // This helps close the remaining gap when the catchup message caching
+        // captured the EXTERNALIZE but the tx_set response is still in flight.
+        {
+            let current_ledger = self.get_current_ledger().await.unwrap_or(new_lcl);
+            let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
+            if latest_ext > current_ledger as u64 {
+                // Request pending tx_sets aggressively
+                self.request_pending_tx_sets().await;
+
+                // Wait up to 2 seconds for tx_sets to arrive, retrying drain
+                for attempt in 0..4u32 {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+                    // Re-populate syncing_ledgers from externalized cache
+                    let cur = self.get_current_ledger().await.unwrap_or(current_ledger);
+                    let ext = self.herder.latest_externalized_slot().unwrap_or(0);
+                    {
+                        let mut buffer = self.syncing_ledgers.write().await;
+                        for slot in (cur as u64 + 1)..=ext {
+                            let seq = slot as u32;
+                            if buffer.get(&seq).is_some_and(|e| e.tx_set.is_some()) {
+                                continue;
+                            }
+                            if let Some(info) = self.herder.check_ledger_close(slot) {
+                                buffer.insert(seq, info);
+                            }
+                        }
+                    }
+
+                    let extra = self.drain_buffered_ledgers_sync().await;
+                    if extra > 0 {
+                        let new_cur = self.get_current_ledger().await.unwrap_or(cur);
+                        tracing::info!(
+                            attempt,
+                            extra_drained = extra,
+                            new_ledger = new_cur,
+                            "Drained additional buffered ledgers after tx_set wait"
+                        );
+                    }
+
+                    // Check if we've caught up
+                    let cur_now = self.get_current_ledger().await.unwrap_or(cur) as u64;
+                    let ext_now = self.herder.latest_externalized_slot().unwrap_or(0);
+                    if ext_now.saturating_sub(cur_now) <= TX_SET_REQUEST_WINDOW {
+                        break;
+                    }
+                }
+            }
         }
 
         // Record catchup completion time for cooldown AFTER draining buffered
@@ -1814,6 +1901,36 @@ impl App {
                     latest_externalized,
                     "Skipping archive catchup: target checkpoint not yet published and no cached EXTERNALIZE for next ledger"
                 );
+                // Request SCP state from peers using first_replay as the
+                // starting slot.  Peers respond with EXTERNALIZE envelopes
+                // which go through the gap-slot handler (herder line 990),
+                // populating the externalized cache.  Without this, the
+                // node never learns about gap slots because peers don't
+                // spontaneously re-send old EXTERNALIZE messages and their
+                // SCP state only keeps the last ~4 slots.
+                //
+                // The gap slot handler also requests tx_sets, so this
+                // single request triggers both EXTERNALIZE + tx_set
+                // fetching for the missing slots.
+                if let Some(overlay) = self.overlay().await {
+                    let request_slot = current_ledger as u32;
+                    match overlay.request_scp_state(request_slot).await {
+                        Ok(count) => {
+                            tracing::info!(
+                                request_slot,
+                                peers_sent = count,
+                                "Requested SCP state for gap slots from peers"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                request_slot,
+                                error = %e,
+                                "Failed to request SCP state for gap slots"
+                            );
+                        }
+                    }
+                }
                 // Set cooldown to avoid rapid re-evaluation.
                 *self.last_catchup_completed_at.write().await = Some(Instant::now());
             }

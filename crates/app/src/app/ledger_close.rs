@@ -666,17 +666,24 @@ impl App {
                 // will trigger catchup for larger gaps.
                 //
                 // Exception: when the first replay ledger falls in an
-                // unpublished checkpoint AND we have its EXTERNALIZE,
-                // archive-based catchup would fail (the checkpoint file
-                // doesn't exist yet).  In that case, process ALL slots so
-                // the node can close ledgers from cached SCP messages +
-                // peer-fetched tx_sets instead of waiting for the checkpoint.
+                // unpublished checkpoint, archive-based catchup would fail
+                // (the checkpoint file doesn't exist yet).  In that case,
+                // process ALL slots so the node can close ledgers from
+                // cached SCP messages + peer-fetched tx_sets instead of
+                // waiting for the checkpoint.
+                //
+                // This is critical after catchup + rapid close: the gap
+                // re-opens (e.g., 10-15 slots), the EXTERNALIZE for
+                // current_ledger+1 may not be in the cache (peers evicted
+                // SCP state for old slots), but we still need to create
+                // syncing_ledgers entries and request tx_sets for all gap
+                // slots.  When EXTERNALIZE messages arrive from the gap
+                // slot handler, they match with already-fetched tx_sets.
                 let first_replay = current_ledger as u64 + 1;
                 let replay_checkpoint = checkpoint_containing(first_replay as u32);
                 let checkpoint_unpublished = replay_checkpoint > latest_externalized as u32;
-                let have_next_externalize = self.herder.get_externalized(first_replay).is_some();
 
-                let iter_start = if checkpoint_unpublished && have_next_externalize {
+                let iter_start = if checkpoint_unpublished {
                     // Process all slots — archive catchup would fail
                     last_processed + 1
                 } else if latest_externalized.saturating_sub(last_processed) > TX_SET_REQUEST_WINDOW {
