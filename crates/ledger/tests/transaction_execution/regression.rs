@@ -539,6 +539,8 @@ fn test_execute_transaction_set_accepts_hot_archive_parameter() {
             module_cache: None,
             hot_archive: Some(hot_archive_arc), // the key parameter being tested
             runtime_handle: None,
+            emit_soroban_tx_meta_ext_v1: false,
+            enable_soroban_diagnostic_events: false,
         },
     );
 
@@ -966,6 +968,8 @@ async fn test_parallel_soroban_multi_cluster_execution() {
                 module_cache: None,
                 hot_archive: None,
                 runtime_handle: None,
+            emit_soroban_tx_meta_ext_v1: false,
+            enable_soroban_diagnostic_events: false,
             },
             None,
         )
@@ -1044,6 +1048,8 @@ async fn test_parallel_soroban_matches_sequential() {
                 module_cache: None,
                 hot_archive: None,
                 runtime_handle: None,
+            emit_soroban_tx_meta_ext_v1: false,
+            enable_soroban_diagnostic_events: false,
             },
             None,
         )
@@ -1071,6 +1077,8 @@ async fn test_parallel_soroban_matches_sequential() {
                 module_cache: None,
                 hot_archive: None,
                 runtime_handle: None,
+            emit_soroban_tx_meta_ext_v1: false,
+            enable_soroban_diagnostic_events: false,
             },
             None,
         )
@@ -1155,6 +1163,8 @@ async fn test_parallel_soroban_deterministic() {
                     module_cache: None,
                     hot_archive: None,
                     runtime_handle: None,
+            emit_soroban_tx_meta_ext_v1: false,
+            enable_soroban_diagnostic_events: false,
                 },
                 None,
             )
@@ -1238,6 +1248,8 @@ async fn test_parallel_soroban_from_spawn_blocking() {
                     module_cache: None,
                     hot_archive: None,
                     runtime_handle: Some(handle),
+                    emit_soroban_tx_meta_ext_v1: false,
+                    enable_soroban_diagnostic_events: false,
                 },
                 None,
             )
@@ -1308,6 +1320,8 @@ async fn test_parallel_soroban_spawn_blocking_matches_worker() {
             module_cache: None,
             hot_archive: None,
             runtime_handle: None,
+            emit_soroban_tx_meta_ext_v1: false,
+            enable_soroban_diagnostic_events: false,
         },
         None,
     )
@@ -1350,6 +1364,8 @@ async fn test_parallel_soroban_spawn_blocking_matches_worker() {
                     module_cache: None,
                     hot_archive: None,
                     runtime_handle: Some(handle),
+                    emit_soroban_tx_meta_ext_v1: false,
+                    enable_soroban_diagnostic_events: false,
                 },
                 None,
             )
@@ -2391,6 +2407,8 @@ fn test_classic_fees_deducted_upfront_before_tx_execution() {
         module_cache: None,
         hot_archive: None,
         runtime_handle: None,
+            emit_soroban_tx_meta_ext_v1: false,
+            enable_soroban_diagnostic_events: false,
     };
 
     let result = execute_transaction_set_with_fee_mode(
@@ -3258,6 +3276,8 @@ fn test_pre_auth_tx_signer_checked_before_removal() {
         module_cache: None,
         hot_archive: None,
         runtime_handle: None,
+            emit_soroban_tx_meta_ext_v1: false,
+            enable_soroban_diagnostic_events: false,
     };
 
     let result = execute_transaction_set_with_fee_mode(

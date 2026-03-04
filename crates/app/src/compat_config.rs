@@ -122,12 +122,15 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
 
     // --- HTTP ---
     if let Some(port) = get_u16(table, "HTTP_PORT") {
+        // When stellar-core format is used, enable the compat HTTP server
+        // on this port, since stellar-rpc expects stellar-core's wire format.
+        // Disable the native HTTP server to avoid port conflict (both default
+        // to the same port).
         config.http = HttpConfig {
+            enabled: false,
             port,
             ..HttpConfig::default()
         };
-        // When stellar-core format is used, also enable the compat HTTP server
-        // on the same port, since stellar-rpc expects stellar-core's wire format.
         config.compat_http = CompatHttpConfig {
             enabled: true,
             port,
@@ -407,6 +410,9 @@ mod tests {
         // Compat HTTP should be auto-enabled on HTTP_PORT
         assert!(config.compat_http.enabled);
         assert_eq!(config.compat_http.port, 11626);
+
+        // Native HTTP should be disabled to avoid port conflict
+        assert!(!config.http.enabled);
     }
 
     #[test]

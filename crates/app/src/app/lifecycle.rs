@@ -1139,6 +1139,20 @@ impl App {
         self.set_state(AppState::ShuttingDown).await;
         self.stop_survey_reporting().await;
 
+        // Explicitly flush and close the meta stream before shutting down
+        // overlay connections. This ensures all streamed LedgerCloseMeta frames
+        // are written to the pipe/file before the process exits. The stream
+        // uses per-write flush, so this is mostly defensive — but it also
+        // ensures the underlying fd is closed promptly (important for pipe
+        // consumers like stellar-rpc that detect EOF to know core has stopped).
+        {
+            let mut guard = self.meta_stream.lock().unwrap();
+            if let Some(stream) = guard.take() {
+                tracing::info!("Closing metadata output stream");
+                drop(stream);
+            }
+        }
+
         let mut overlay = self.overlay.write().await;
         if let Some(overlay_arc) = overlay.take() {
             match Arc::try_unwrap(overlay_arc) {

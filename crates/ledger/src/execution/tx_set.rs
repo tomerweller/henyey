@@ -43,6 +43,10 @@ pub fn execute_transaction_set_with_fee_mode(
         soroban.config,
         soroban.classic_events,
     );
+    executor.set_meta_flags(
+        soroban.emit_soroban_tx_meta_ext_v1,
+        soroban.enable_soroban_diagnostic_events,
+    );
     // Set the module cache if provided for better Soroban performance
     if let Some(cache) = soroban.module_cache {
         executor.set_module_cache(cache.clone());
@@ -438,6 +442,8 @@ pub fn execute_soroban_parallel_phase(
                 module_cache: soroban.module_cache,
                 hot_archive: soroban.hot_archive.clone(),
                 runtime_handle: soroban.runtime_handle.clone(),
+                emit_soroban_tx_meta_ext_v1: soroban.emit_soroban_tx_meta_ext_v1,
+                enable_soroban_diagnostic_events: soroban.enable_soroban_diagnostic_events,
             },
             delta,
             &ClusterParams {
@@ -628,6 +634,10 @@ pub(super) fn execute_single_cluster(
         params.id_pool,
         soroban.config.clone(),
         soroban.classic_events,
+    );
+    executor.set_meta_flags(
+        soroban.emit_soroban_tx_meta_ext_v1,
+        soroban.enable_soroban_diagnostic_events,
     );
     if let Some(cache) = soroban.module_cache {
         executor.set_module_cache(cache.clone());
@@ -845,6 +855,8 @@ pub(super) fn execute_stage_clusters(
     let module_cache = soroban.module_cache.cloned();
     let hot_archive = soroban.hot_archive.clone();
     let runtime_handle = soroban.runtime_handle.clone();
+    let emit_soroban_tx_meta_ext_v1 = soroban.emit_soroban_tx_meta_ext_v1;
+    let enable_soroban_diagnostic_events = soroban.enable_soroban_diagnostic_events;
     let id_pool = params.id_pool;
     let clusters: std::sync::Arc<Vec<Vec<TxWithFee>>> =
         std::sync::Arc::new(clusters.to_vec());
@@ -895,6 +907,8 @@ pub(super) fn execute_stage_clusters(
                     module_cache: cache.as_ref(),
                     hot_archive: ha,
                     runtime_handle: None,
+                    emit_soroban_tx_meta_ext_v1,
+                    enable_soroban_diagnostic_events,
                 };
                 execute_single_cluster(
                     &snapshot,

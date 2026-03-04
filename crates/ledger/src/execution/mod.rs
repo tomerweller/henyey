@@ -456,6 +456,10 @@ pub struct TransactionExecutor {
     /// This enables looking up entries that have been evicted from the live bucket list
     /// and are waiting to be restored.
     hot_archive: Option<std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
+    /// Whether to emit `SorobanTransactionMetaExtV1` in transaction meta.
+    emit_soroban_tx_meta_ext_v1: bool,
+    /// Whether to include diagnostic events in transaction meta.
+    enable_soroban_diagnostic_events: bool,
 }
 
 impl TransactionExecutor {
@@ -481,6 +485,8 @@ impl TransactionExecutor {
             classic_events,
             module_cache: None,
             hot_archive: None,
+            emit_soroban_tx_meta_ext_v1: false,
+            enable_soroban_diagnostic_events: false,
         }
     }
 
@@ -507,6 +513,20 @@ impl TransactionExecutor {
     /// Get a reference to the module cache, if set.
     pub fn module_cache(&self) -> Option<&PersistentModuleCache> {
         self.module_cache.as_ref()
+    }
+
+    /// Configure meta extension flags for the executor.
+    ///
+    /// These control which optional fields appear in `TransactionMeta`:
+    /// - `emit_soroban_tx_meta_ext_v1`: Include `SorobanTransactionMetaExtV1` fee breakdown
+    /// - `enable_soroban_diagnostic_events`: Include diagnostic events in meta
+    pub fn set_meta_flags(
+        &mut self,
+        emit_soroban_tx_meta_ext_v1: bool,
+        enable_soroban_diagnostic_events: bool,
+    ) {
+        self.emit_soroban_tx_meta_ext_v1 = emit_soroban_tx_meta_ext_v1;
+        self.enable_soroban_diagnostic_events = enable_soroban_diagnostic_events;
     }
 
     /// Add contract code to the module cache.
@@ -2273,7 +2293,11 @@ impl TransactionExecutor {
     ///
     /// This matches stellar-core's `parallelApply` returning `{false, {}}` when
     /// `!txResult.isSuccess()` after `preParallelApply`.
-    fn build_skipped_result(pre: PreApplyResult) -> TransactionExecutionResult {
+    fn build_skipped_result(
+        pre: PreApplyResult,
+        emit_soroban_tx_meta_ext_v1: bool,
+        enable_soroban_diagnostic_events: bool,
+    ) -> TransactionExecutionResult {
         let soroban_fee_info = pre.refundable_fee_tracker.as_ref().map(|t| {
             (t.non_refundable_fee, t.consumed_refundable_fee, t.consumed_rent_fee)
         });
@@ -2290,6 +2314,8 @@ impl TransactionExecutor {
             None,    // no soroban return value
             vec![],  // no diagnostic events
             soroban_fee_info,
+            emit_soroban_tx_meta_ext_v1,
+            enable_soroban_diagnostic_events,
         );
 
         let total_us = pre.tx_timing_start.elapsed().as_micros() as u64;
@@ -2349,7 +2375,11 @@ impl TransactionExecutor {
 
         // Phase 2: Skip operation body when caller determined TX should not apply
         if !should_apply {
-            return Ok(Self::build_skipped_result(pre));
+            return Ok(Self::build_skipped_result(
+                pre,
+                self.emit_soroban_tx_meta_ext_v1,
+                self.enable_soroban_diagnostic_events,
+            ));
         }
 
         // Phase 3: Execute operation body
@@ -3008,6 +3038,8 @@ impl TransactionExecutor {
             soroban_return_value,
             diagnostic_events,
             soroban_fee_info,
+            self.emit_soroban_tx_meta_ext_v1,
+            self.enable_soroban_diagnostic_events,
         );
 
         let total_us = tx_timing_start.elapsed().as_micros() as u64;
@@ -3828,6 +3860,10 @@ pub struct SorobanContext<'a> {
     pub module_cache: Option<&'a PersistentModuleCache>,
     pub hot_archive: Option<std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
     pub runtime_handle: Option<tokio::runtime::Handle>,
+    /// Whether to emit `SorobanTransactionMetaExtV1` in transaction meta.
+    pub emit_soroban_tx_meta_ext_v1: bool,
+    /// Whether to include diagnostic events in transaction meta.
+    pub enable_soroban_diagnostic_events: bool,
 }
 
 /// Snapshot of prior-stage state for parallel Soroban execution.

@@ -53,12 +53,12 @@ use henyey_tx::state::AssetKey;
 use henyey_tx::{ClassicEventConfig, LedgerContext, TransactionFrame, TxEventManager};
 use stellar_xdr::curr::{
     AccountId, BucketListType, ConfigSettingEntry, ConfigSettingId,
-    EvictionIterator as XdrEvictionIterator, GeneralizedTransactionSet, Hash, LedgerCloseMeta,
-    LedgerCloseMetaExt, LedgerCloseMetaV2, LedgerEntry, LedgerEntryData, LedgerEntryExt,
-    LedgerHeader, LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt, LedgerKey,
-    LedgerKeyConfigSetting, TransactionEventStage, TransactionMeta, TransactionPhase,
-    TransactionResultMetaV1, TransactionSetV1, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
-    UpgradeEntryMeta, VecM,
+    EvictionIterator as XdrEvictionIterator, ExtensionPoint, GeneralizedTransactionSet, Hash,
+    LedgerCloseMeta, LedgerCloseMetaExt, LedgerCloseMetaExtV1, LedgerCloseMetaV2, LedgerEntry,
+    LedgerEntryData, LedgerEntryExt, LedgerHeader, LedgerHeaderHistoryEntry,
+    LedgerHeaderHistoryEntryExt, LedgerKey, LedgerKeyConfigSetting, TransactionEventStage,
+    TransactionMeta, TransactionPhase, TransactionResultMetaV1, TransactionSetV1, TxSetComponent,
+    TxSetComponentTxsMaybeDiscountedFee, UpgradeEntryMeta, VecM,
 };
 use tracing::{debug, info};
 
@@ -826,6 +826,21 @@ pub struct LedgerManagerConfig {
     /// Controls per-bucket caching and index page sizes. Applied to the
     /// bucket list during initialization.
     pub bucket_list_db: BucketListDbConfig,
+
+    /// When true, include `LedgerCloseMetaExtV1` (with `sorobanFeeWrite1KB`)
+    /// in `LedgerCloseMeta.ext`. Maps to stellar-core `EMIT_LEDGER_CLOSE_META_EXT_V1`.
+    pub emit_ledger_close_meta_ext_v1: bool,
+
+    /// When true, include `SorobanTransactionMetaExtV1` (with fee breakdown)
+    /// in Soroban transaction meta. Maps to stellar-core `EMIT_SOROBAN_TRANSACTION_META_EXT_V1`.
+    pub emit_soroban_tx_meta_ext_v1: bool,
+
+    /// When true, include diagnostic events in `TransactionMetaV4.diagnostic_events`.
+    /// Maps to stellar-core `ENABLE_SOROBAN_DIAGNOSTIC_EVENTS`.
+    ///
+    /// Note: The Soroban host always captures diagnostic events (`enable_diagnostics: true`).
+    /// This flag controls whether they are included in the metadata stream output.
+    pub enable_soroban_diagnostic_events: bool,
 }
 
 impl Default for LedgerManagerConfig {
@@ -835,6 +850,9 @@ impl Default for LedgerManagerConfig {
             emit_classic_events: false,
             backfill_stellar_asset_events: false,
             bucket_list_db: BucketListDbConfig::default(),
+            emit_ledger_close_meta_ext_v1: false,
+            emit_soroban_tx_meta_ext_v1: false,
+            enable_soroban_diagnostic_events: false,
         }
     }
 }
@@ -1623,6 +1641,7 @@ impl LedgerManager {
             timing_classic_exec_us: 0,
             timing_soroban_exec_us: 0,
             tx_perf: Vec::new(),
+            soroban_fee_write_1kb: 0,
         })
     }
 
@@ -2071,6 +2090,9 @@ struct LedgerCloseContext<'a> {
     timing_soroban_exec_us: u64,
     /// Per-transaction execution timing and metadata for perf reporting.
     tx_perf: Vec<crate::close::TxPerf>,
+    /// Soroban fee per 1KB write (rent fee), cached from SorobanConfig for meta ext V1.
+    /// Set during close_ledger() when SorobanConfig is loaded.
+    soroban_fee_write_1kb: i64,
 }
 
 impl<'a> LedgerCloseContext<'a> {
@@ -3052,6 +3074,9 @@ impl<'a> LedgerCloseContext<'a> {
         // Load SorobanConfig from ledger ConfigSettingEntry for accurate Soroban execution
         let soroban_config =
             crate::execution::load_soroban_config(&self.snapshot, self.prev_header.ledger_version);
+        // Cache fee_write_1kb for LedgerCloseMetaExtV1 (set during commit phase).
+        // This is stellar-core's feeRent1KB() / sorobanFeeWrite1KB.
+        self.soroban_fee_write_1kb = soroban_config.rent_fee_config.fee_per_write_1kb;
         // Use transaction set hash as base PRNG seed for Soroban execution
         let soroban_base_prng_seed = self.close_data.tx_set_hash();
         let classic_events = ClassicEventConfig {
@@ -3130,6 +3155,12 @@ impl<'a> LedgerCloseContext<'a> {
                 executor_ref.set_hot_archive(ha.clone());
             }
         }
+
+        // Configure meta extension flags from LedgerManagerConfig.
+        executor_ref.set_meta_flags(
+            self.manager.config.emit_soroban_tx_meta_ext_v1,
+            self.manager.config.enable_soroban_diagnostic_events,
+        );
 
         let mut tx_set_result =
             if has_parallel
@@ -3213,6 +3244,8 @@ impl<'a> LedgerCloseContext<'a> {
                         module_cache,
                         hot_archive,
                         runtime_handle: self.runtime_handle.clone(),
+                        emit_soroban_tx_meta_ext_v1: self.manager.config.emit_soroban_tx_meta_ext_v1,
+                        enable_soroban_diagnostic_events: self.manager.config.enable_soroban_diagnostic_events,
                     },
                     Some(soroban_pre_charged),
                 )?;
@@ -4563,6 +4596,8 @@ impl<'a> LedgerCloseContext<'a> {
             evicted_meta_keys,
             avg_soroban_state_size,
             upgrades_meta,
+            self.manager.config.emit_ledger_close_meta_ext_v1,
+            self.soroban_fee_write_1kb,
         );
         let meta_us = meta_start.elapsed().as_micros() as u64;
 
@@ -4642,6 +4677,7 @@ fn build_generalized_tx_set(tx_set: &TransactionSetVariant) -> GeneralizedTransa
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_ledger_close_meta(
     close_data: &LedgerCloseData,
     header: &LedgerHeader,
@@ -4650,6 +4686,8 @@ fn build_ledger_close_meta(
     evicted_keys: Vec<LedgerKey>,
     total_byte_size_of_live_soroban_state: u64,
     upgrades_processing: Vec<UpgradeEntryMeta>,
+    emit_ext_v1: bool,
+    soroban_fee_write_1kb: i64,
 ) -> LedgerCloseMeta {
     let ledger_header = LedgerHeaderHistoryEntry {
         hash: Hash::from(header_hash),
@@ -4659,11 +4697,24 @@ fn build_ledger_close_meta(
 
     let tx_set = build_generalized_tx_set(&close_data.tx_set);
 
+    // Build the meta extension. When EMIT_LEDGER_CLOSE_META_EXT_V1 is enabled,
+    // include sorobanFeeWrite1KB (the flat-rate write fee per 1KB, i.e.
+    // stellar-core's feeRent1KB()). This matches stellar-core's
+    // LedgerCloseMetaFrame::setNetworkConfiguration().
+    let ext = if emit_ext_v1 {
+        LedgerCloseMetaExt::V1(LedgerCloseMetaExtV1 {
+            ext: ExtensionPoint::V0,
+            soroban_fee_write1_kb: soroban_fee_write_1kb,
+        })
+    } else {
+        LedgerCloseMetaExt::V0
+    };
+
     // NOTE: The spec (LEDGER_SPEC §8.1) branches on `initialLedgerVers` to
     // select V0/V1/V2 meta format. Henyey supports protocol 24+ only, which
     // always uses V2, so we unconditionally produce V2 meta here.
     LedgerCloseMeta::V2(LedgerCloseMetaV2 {
-        ext: LedgerCloseMetaExt::V0,
+        ext,
         ledger_header,
         tx_set,
         tx_processing: tx_result_metas.to_vec().try_into().unwrap_or_default(),
@@ -5440,7 +5491,7 @@ mod tests {
         .with_scp_history(vec![scp_entry.clone()]);
 
         let header = create_genesis_header();
-        let meta = build_ledger_close_meta(&close_data, &header, Hash256::ZERO, &[], Vec::new(), 0, Vec::new());
+        let meta = build_ledger_close_meta(&close_data, &header, Hash256::ZERO, &[], Vec::new(), 0, Vec::new(), false, 0);
         let scp_info_len = match meta {
             LedgerCloseMeta::V0(_) => 0,
             LedgerCloseMeta::V1(v1) => v1.scp_info.len(),
@@ -5609,6 +5660,7 @@ mod tests {
             timing_classic_exec_us: 0,
             timing_soroban_exec_us: 0,
             tx_perf: Vec::new(),
+            soroban_fee_write_1kb: 0,
         }
     }
 

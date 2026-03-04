@@ -1107,6 +1107,7 @@ pub(super) fn empty_entry_changes() -> LedgerEntryChanges {
     LedgerEntryChanges(VecM::default())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_transaction_meta(
     tx_changes_before: LedgerEntryChanges,
     op_changes: Vec<LedgerEntryChanges>,
@@ -1115,6 +1116,8 @@ pub(super) fn build_transaction_meta(
     soroban_return_value: Option<stellar_xdr::curr::ScVal>,
     diagnostic_events: Vec<DiagnosticEvent>,
     soroban_fee_info: Option<(i64, i64, i64)>, // (non_refundable, refundable_consumed, rent_consumed)
+    emit_soroban_tx_meta_ext_v1: bool,
+    enable_soroban_diagnostic_events: bool,
 ) -> TransactionMeta {
     // Debug: log tx_changes_before and op_changes counts
     let tx_before_count = tx_changes_before.len();
@@ -1135,11 +1138,22 @@ pub(super) fn build_transaction_meta(
         })
         .collect();
 
+    // Filter diagnostic events based on config flag.
+    // The Soroban host always captures diagnostic events (enable_diagnostics: true),
+    // but we only include them in the meta stream when the config flag is set.
+    let filtered_diagnostics = if enable_soroban_diagnostic_events {
+        diagnostic_events
+    } else {
+        Vec::new()
+    };
+
     let has_soroban = soroban_return_value.is_some()
-        || !diagnostic_events.is_empty()
+        || !filtered_diagnostics.is_empty()
         || soroban_fee_info.is_some();
     let soroban_meta = if has_soroban {
-        let ext =
+        // Only emit SorobanTransactionMetaExtV1 (fee breakdown) when the flag is set.
+        // This matches stellar-core's EMIT_SOROBAN_TRANSACTION_META_EXT_V1 behavior.
+        let ext = if emit_soroban_tx_meta_ext_v1 {
             if let Some((non_refundable, refundable_consumed, rent_consumed)) = soroban_fee_info {
                 SorobanTransactionMetaExt::V1(SorobanTransactionMetaExtV1 {
                     ext: ExtensionPoint::V0,
@@ -1149,7 +1163,10 @@ pub(super) fn build_transaction_meta(
                 })
             } else {
                 SorobanTransactionMetaExt::V0
-            };
+            }
+        } else {
+            SorobanTransactionMetaExt::V0
+        };
         Some(SorobanTransactionMetaV2 {
             ext,
             return_value: soroban_return_value,
@@ -1165,7 +1182,7 @@ pub(super) fn build_transaction_meta(
         tx_changes_after: empty_entry_changes(),
         soroban_meta,
         events: tx_events.try_into().unwrap_or_default(),
-        diagnostic_events: diagnostic_events.try_into().unwrap_or_default(),
+        diagnostic_events: filtered_diagnostics.try_into().unwrap_or_default(),
     })
 }
 
@@ -1178,5 +1195,7 @@ pub(super) fn empty_transaction_meta() -> TransactionMeta {
         None,
         Vec::new(),
         None,
+        false,
+        false,
     )
 }

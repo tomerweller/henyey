@@ -1235,6 +1235,35 @@ impl AppConfig {
             );
         }
 
+        // Native HTTP and compat HTTP must not bind the same port
+        if self.http.enabled && self.compat_http.enabled && self.http.port == self.compat_http.port
+        {
+            anyhow::bail!(
+                "Native HTTP port ({}) and compat HTTP port ({}) must be different \
+                 (disable one or change the port)",
+                self.http.port,
+                self.compat_http.port
+            );
+        }
+
+        // Query server port must not conflict with other HTTP ports
+        if let Some(query_port) = self.query.port {
+            if self.http.enabled && query_port == self.http.port {
+                anyhow::bail!(
+                    "Query port ({}) and native HTTP port ({}) must be different",
+                    query_port,
+                    self.http.port
+                );
+            }
+            if self.compat_http.enabled && query_port == self.compat_http.port {
+                anyhow::bail!(
+                    "Query port ({}) and compat HTTP port ({}) must be different",
+                    query_port,
+                    self.compat_http.port
+                );
+            }
+        }
+
         // Bucket page size exponent must be in valid range (4-24)
         let exp = self.buckets.bucket_list_db.index_page_size_exponent;
         if exp < 4 || exp > 24 {
@@ -1700,5 +1729,28 @@ memory_for_caching_mb = 256
         // Defaults for unspecified fields
         assert_eq!(config.buckets.bucket_list_db.index_page_size_exponent, 14);
         assert!(config.buckets.bucket_list_db.persist_index);
+    }
+
+    #[test]
+    fn test_validation_compat_http_port_collision() {
+        let mut config = AppConfig::default();
+        config.http.enabled = true;
+        config.http.port = 11626;
+        config.compat_http.enabled = true;
+        config.compat_http.port = 11626;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("compat HTTP"));
+    }
+
+    #[test]
+    fn test_validation_query_port_collision_with_compat() {
+        let mut config = AppConfig::default();
+        config.compat_http.enabled = true;
+        config.compat_http.port = 11627;
+        config.query.port = Some(11627);
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Query port"));
     }
 }

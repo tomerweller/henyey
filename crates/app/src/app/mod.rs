@@ -884,6 +884,11 @@ impl App {
                 emit_classic_events: config.events.emit_classic_events,
                 backfill_stellar_asset_events: config.events.backfill_stellar_asset_events,
                 bucket_list_db: config.buckets.bucket_list_db.clone(),
+                emit_ledger_close_meta_ext_v1: config.metadata.emit_ledger_close_meta_ext_v1,
+                emit_soroban_tx_meta_ext_v1: config.metadata.emit_soroban_tx_meta_ext_v1,
+                enable_soroban_diagnostic_events: config
+                    .diagnostics
+                    .soroban_diagnostic_events,
             },
         );
 

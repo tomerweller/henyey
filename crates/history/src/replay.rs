@@ -614,6 +614,8 @@ pub fn replay_ledger_with_execution(
                 module_cache,
                 hot_archive: Some(hot_archive_ref.clone()),
                 runtime_handle: None,
+                emit_soroban_tx_meta_ext_v1: false,
+                enable_soroban_diagnostic_events: false,
             },
         )
         .map_err(|e| HistoryError::CatchupFailed(format!("replay execution failed: {}", e)))?;
