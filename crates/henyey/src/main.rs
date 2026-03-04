@@ -109,6 +109,14 @@ struct Cli {
     #[arg(long = "metadata-output-stream", value_name = "STREAM", global = true)]
     metadata_output_stream: Option<String>,
 
+    /// Set log level (stellar-core compatibility; use --verbose/--trace instead).
+    #[arg(long = "ll", value_name = "LEVEL", global = true, hide = true)]
+    log_level_compat: Option<String>,
+
+    /// Report metric on exit (stellar-core compatibility; accepted but ignored).
+    #[arg(long = "metric", value_name = "METRIC-NAME", global = true, hide = true)]
+    metric: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -146,6 +154,28 @@ enum Commands {
         /// Force catchup even if state exists
         #[arg(long)]
         force_catchup: bool,
+
+        /// Wait to hear from the network before voting (validators only).
+        /// Accepted for stellar-core compatibility.
+        #[arg(long, hide = true)]
+        wait_for_consensus: bool,
+
+        /// Deprecated: accepted for stellar-core compatibility, ignored.
+        #[arg(long, hide = true)]
+        in_memory: bool,
+
+        /// Deprecated: accepted for stellar-core compatibility, ignored.
+        #[arg(long, hide = true)]
+        start_at_ledger: Option<u32>,
+
+        /// Deprecated: accepted for stellar-core compatibility, ignored.
+        #[arg(long, hide = true)]
+        start_at_hash: Option<String>,
+
+        /// Keep all old buckets on disk (disable bucket GC).
+        /// Accepted for stellar-core compatibility.
+        #[arg(long, hide = true)]
+        disable_bucket_gc: bool,
     },
 
     /// Catch up from history archives
@@ -176,6 +206,10 @@ enum Commands {
         /// Force creation even if database exists
         #[arg(long)]
         force: bool,
+
+        /// Deprecated: accepted for stellar-core compatibility, ignored.
+        #[arg(long = "minimal-for-in-memory-mode", hide = true)]
+        minimal_for_in_memory_mode: bool,
     },
 
     /// Upgrade database schema
@@ -386,6 +420,11 @@ async fn main() -> anyhow::Result<()> {
             validator,
             watcher,
             force_catchup,
+            wait_for_consensus: _,
+            in_memory: _,
+            start_at_ledger: _,
+            start_at_hash: _,
+            disable_bucket_gc: _,
         } => cmd_run(config, validator, watcher, force_catchup).await,
 
         Commands::Catchup {
@@ -395,7 +434,11 @@ async fn main() -> anyhow::Result<()> {
             parallelism,
         } => cmd_catchup(config, target, mode, !no_verify, parallelism).await,
 
-        Commands::NewDb { path, force } => cmd_new_db(config, path, force).await,
+        Commands::NewDb {
+            path,
+            force,
+            minimal_for_in_memory_mode: _,
+        } => cmd_new_db(config, path, force).await,
 
         Commands::UpgradeDb => cmd_upgrade_db(config).await,
 
