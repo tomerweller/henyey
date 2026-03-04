@@ -1,6 +1,6 @@
 # Verify-Execution Sweep Status
 
-> **Updated**: 2026-03-02 13:55 UTC
+> **Updated**: 2026-03-03 22:45 UTC
 > **Session**: b5e87aee (fresh start)
 > **CDP data lake range**: L59501248–L61366079 (latest available as of 2026-02-23)
 > **Supported protocol**: P24+ (L59501312 is first P24 ledger; L59501248–L59501311 are P23 and unverifiable)
@@ -89,17 +89,37 @@ Ledgers L59501248–L59501311 (P23) cannot be verified by Henyey (min supported:
   - **Root cause**: In parallel Soroban execution, entries deleted within stage 0 (via apply_soroban_storage_changes when host doesn't return a new value for an RW footprint entry) were not propagated to stage 1. `delta.current_entries()` only returns Created+Updated entries, omitting deletions. A fresh executor in stage 1 would reload the deleted entry from the bucket list via `load_soroban_footprint`, causing the host to succeed where it should have trapped.
   - **Fix**: Propagate `delta.dead_entries()` as `prior_stage_deleted_keys` to subsequent stage clusters, and call `mark_entry_deleted()` to populate the deleted sets in the fresh executor. This matches stellar-core's `cleanEmpty` propagation via `collectClusterFootprintEntriesFromGlobal`.
 
+## Bug fixes (this session, continued)
+
+- **VE-12**: Corrupt permanent bucket file from disk-full partial write — fixed in `88743e3`
+  - **Ledger**: L61341704 (triggered by disk-full at L61341701)
+  - **Symptom**: `L1.curr.hash() = e3b0c44...` (SHA-256 of empty string) after ledger close
+  - **Root cause**: Two-step failure chain:
+    1. `save_to_xdr_file` for in-memory bucket (hash `2415f6ce...`) — `File::create` succeeded but `write_all` failed with `ENOSPC`, leaving a zero-byte permanent file.
+    2. At L61341702, `merge(empty_curr, bucket_2415f6ce...)` → output hash = `2415f6ce...` → `start_merge` finds the existing permanent file, skips the rename, loads zero-byte file → `from_xdr_file_disk_backed` produces SHA-256("") = `e3b0c44...`. At L61341704, `commit(L1)` resolves this corrupt merge → `L1.curr.hash() = e3b0c44...`.
+  - **Fix 1** (`88743e3`): `save_to_xdr_file` now deletes the partial file if `write_all` or `sync_all` fails.
+  - **Fix 2** (`88743e3`): `start_merge` verifies that an existing permanent file's hash matches the expected output; replaces it if corrupt.
+
+## Infrastructure incident (2026-03-02)
+
+The original s32 run (started 2026-03-02 13:55 UTC) hit **disk full** at L61341704:
+- Background merges at levels 8, 9, 10 failed with `No space left on device`
+- Merge failure left corrupted bucket state → hash mismatch at L61341704
+- This was NOT a code bug; disk was filled by accumulated sweep caches (cache/, cache-2/)
+- Resolution: deleted stale sweep caches (cache-2/ 1.2T, cache/ 194G), freeing 1.4T
+- s32 restarted clean from L61341312 on 2026-03-03
+
 ## Running sweeps
 
 | Sweep | Range | Status | Started |
 |-------|-------|--------|---------|
-| s32 | L61341312–L61366079 | running | 2026-03-02 13:55 UTC |
+| s32-rerun | L61341312–L61366079 | running | 2026-03-03 22:42 UTC |
 
 ## Tracker
 
 | Status | PID | Started |
 |--------|-----|---------|
-| Live | 717200 | 2026-03-01 17:37 UTC (build b2f6c87; scan_thread_count=1; 0 hash mismatches since restart) |
+| Live | 1818218 | 2026-03-04 00:35 UTC (restarted with VE-12-fixed binary + --force-catchup; 25 zero-byte mainnet bucket files deleted) |
 
 ## Cache scan benchmark (2026-03-01)
 
