@@ -248,13 +248,7 @@ impl App {
                         pending_close = self.try_start_ledger_close().await;
 
                         // If no more buffered ledgers to close, we just finished a rapid
-                        // close cycle.  Do NOT proactively request SCP state here.
-                        // Requesting SCP state brings in EXTERNALIZE messages for recent
-                        // slots whose tx_sets are already evicted from peers' caches,
-                        // causing a cascade of 10s timeouts → tx_set_all_peers_exhausted
-                        // → unnecessary catchup.  Instead, just wait: the dedicated SCP
-                        // channel guarantees the next natural EXTERNALIZE (with a fresh,
-                        // fetchable tx_set) arrives within ~6 seconds.
+                        // close cycle.
                         if pending_close.is_none() {
                             let current_ledger = *self.current_ledger.read().await;
 
@@ -276,10 +270,39 @@ impl App {
                             // closed ledgers — we're not stuck.
                             *self.consensus_stuck_state.write().await = None;
 
-                            tracing::info!(
-                                current_ledger,
-                                "Rapid close cycle ended; waiting for next natural EXTERNALIZE"
-                            );
+                            // Check if we still have a gap and are missing EXTERNALIZE for
+                            // the next ledger. This commonly happens after archive catchup:
+                            // the node closes a few buffered slots but doesn't have
+                            // EXTERNALIZE for the very next one because it was already
+                            // externalized on the network before the node connected.
+                            // Request SCP state from peers for that specific slot range —
+                            // peers with MAX_SLOTS_TO_REMEMBER=12 likely still have it
+                            // since it's only seconds old at this point.
+                            let next_slot = current_ledger as u64 + 1;
+                            let have_next = self.herder.get_externalized(next_slot).is_some();
+                            let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
+                            let gap = latest_ext.saturating_sub(current_ledger as u64);
+
+                            if !have_next && gap > 0 {
+                                tracing::info!(
+                                    current_ledger,
+                                    next_slot,
+                                    latest_ext,
+                                    gap,
+                                    "Rapid close cycle ended with gap; requesting SCP state for missing slots"
+                                );
+                                if let Some(overlay) = self.overlay().await {
+                                    // Request starting from current_ledger so peers send
+                                    // EXTERNALIZE for current_ledger+1 onward.
+                                    let _ = overlay.request_scp_state(current_ledger).await;
+                                }
+                                *self.last_scp_state_request_at.write().await = Instant::now();
+                            } else {
+                                tracing::info!(
+                                    current_ledger,
+                                    "Rapid close cycle ended; waiting for next natural EXTERNALIZE"
+                                );
+                            }
                         }
                     }
                 }
