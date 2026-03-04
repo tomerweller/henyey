@@ -181,6 +181,71 @@ HISTORY = "curl -sf http://history.stellar.org/prd/core-testnet/core_testnet_001
 
 stellar-rpc injects additional keys (`DATABASE`, `HTTP_PORT`, `NETWORK_PASSPHRASE`, etc.) into the config before passing it to henyey. Henyey handles all of these transparently.
 
+## Running with Docker Quickstart
+
+The [stellar/quickstart](https://github.com/stellar/docker-stellar-core-horizon) Docker image bundles stellar-core, Horizon, and stellar-rpc into a single container. Henyey can replace stellar-core inside this container with no changes to quickstart itself.
+
+The container runs three stellar-core instances simultaneously:
+
+| Instance | HTTP Port | Peer Port | Purpose |
+|----------|-----------|-----------|---------|
+| Node (standalone) | 11626 | 11625 | Full watcher |
+| Horizon captive core | 11726 | 11725 | Ingestion for Horizon |
+| RPC captive core | 11826 | 11825 | Ingestion for stellar-rpc |
+
+### Build the Image
+
+1. Build a release binary (requires a Linux x86_64 target):
+
+```bash
+cargo build --release
+```
+
+2. Create a `Dockerfile`:
+
+```dockerfile
+FROM stellar/quickstart:testing
+
+COPY henyey /usr/bin/henyey
+RUN chmod +x /usr/bin/henyey
+RUN mv /usr/bin/stellar-core /usr/bin/stellar-core.orig && \
+    ln -s /usr/bin/henyey /usr/bin/stellar-core
+```
+
+3. Build the image (from the directory containing the Dockerfile):
+
+```bash
+cp ./target/release/henyey .
+docker build -t henyey-quickstart .
+```
+
+### Run the Container
+
+```bash
+docker run -d --name henyey-quickstart \
+  -p 8000:8000 \
+  -p 8003:8003 \
+  henyey-quickstart --testnet
+```
+
+Port 8000 exposes Horizon and port 8003 exposes stellar-rpc.
+
+### Verify Health
+
+Wait a few minutes for catchup to complete, then check the services:
+
+```bash
+# Check stellar-rpc health
+curl -s -X POST http://localhost:8003/soroban/rpc \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | python3 -m json.tool
+
+# Check Horizon root
+curl -s http://localhost:8000/ | python3 -m json.tool
+```
+
+stellar-rpc should report `"status": "healthy"` and Horizon should return the network root with the current ledger sequence.
+
 ## Configuration
 
 Generate a sample config to customize:
