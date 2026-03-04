@@ -50,6 +50,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -107,7 +108,7 @@ impl Default for LogConfig {
         Self {
             level: Level::INFO,
             format: LogFormat::Text,
-            ansi_colors: true,
+            ansi_colors: std::io::stderr().is_terminal(),
             with_source_location: false,
             with_thread_ids: false,
         }
@@ -155,7 +156,7 @@ impl LogConfig {
 ///
 /// These map to Rust module targets for filtering purposes.
 pub const LOG_PARTITIONS: &[(&str, &str)] = &[
-    ("Fs", "stellar_core"),                   // Filesystem operations
+    ("Fs", "stellar_core"),             // Filesystem operations
     ("SCP", "henyey_scp"),              // SCP consensus
     ("Bucket", "henyey_bucket"),        // Bucket list
     ("Database", "henyey_db"),          // Database operations

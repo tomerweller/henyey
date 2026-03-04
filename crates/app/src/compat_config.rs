@@ -81,8 +81,16 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
 
     let mut config = AppConfig::default();
 
+    // Clear defaults that should come from the stellar-core config, not from
+    // henyey's testnet preset. These will be repopulated from the config below.
+    config.overlay.known_peers.clear();
+    config.history.archives.clear();
+    config.node.quorum_set.validators.clear();
+
     // --- Node ---
     if let Some(seed) = get_str(table, "NODE_SEED") {
+        // stellar-core allows "SEED name" format (e.g., "S... self") — strip the name suffix
+        let seed = seed.split_whitespace().next().unwrap_or(&seed).to_string();
         config.node.node_seed = Some(seed);
     }
     if let Some(v) = get_bool(table, "NODE_IS_VALIDATOR") {
@@ -239,10 +247,21 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     // stellar-rpc typically generates these for captive-core configs.
     if let Some(validators) = table.get("VALIDATORS").and_then(|v| v.as_array()) {
         let mut validator_keys = Vec::new();
+        let mut validator_addresses = Vec::new();
         for val in validators {
             if let Some(val_table) = val.as_table() {
                 if let Some(key) = val_table.get("PUBLIC_KEY").and_then(|v| v.as_str()) {
                     validator_keys.push(key.to_string());
+                }
+                // Extract ADDRESS for peer discovery (e.g., "core-testnet1.stellar.org")
+                if let Some(addr) = val_table.get("ADDRESS").and_then(|v| v.as_str()) {
+                    let peer_addr = if addr.contains(':') {
+                        addr.to_string()
+                    } else {
+                        // Default Stellar peer port
+                        format!("{addr}:11625")
+                    };
+                    validator_addresses.push(peer_addr);
                 }
                 // Also extract inline HISTORY from validators
                 if let Some(hist_cmd) = val_table.get("HISTORY").and_then(|v| v.as_str()) {
@@ -267,6 +286,37 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
         if !validator_keys.is_empty() {
             config.node.quorum_set.validators = validator_keys;
         }
+        // Use validator addresses as known peers if no explicit KNOWN_PEERS was set
+        if config.overlay.known_peers.is_empty() && !validator_addresses.is_empty() {
+            config.overlay.known_peers = validator_addresses;
+        }
+    }
+
+    // --- Old-style [QUORUM_SET] (used by quickstart local mode) ---
+    // stellar-core format:
+    //   [QUORUM_SET]
+    //   THRESHOLD_PERCENT=100
+    //   VALIDATORS=["$self"]
+    if let Some(qs_table) = table.get("QUORUM_SET").and_then(|v| v.as_table()) {
+        if let Some(validators) = qs_table.get("VALIDATORS").and_then(|v| v.as_array()) {
+            let mut keys: Vec<String> = Vec::new();
+            for v in validators {
+                if let Some(s) = v.as_str() {
+                    // "$self" is a reference to the node's own key — skip it, the node
+                    // adds itself automatically when NODE_IS_VALIDATOR is true.
+                    if s != "$self" {
+                        keys.push(s.to_string());
+                    }
+                }
+            }
+            // Only override if we found non-self validators and the [[VALIDATORS]]
+            // section didn't already set the quorum set
+            if !keys.is_empty() && config.node.quorum_set.validators.is_empty() {
+                config.node.quorum_set.validators = keys;
+            }
+        }
+        // THRESHOLD_PERCENT is accepted but not used — henyey computes
+        // threshold from the validator count automatically.
     }
 
     // --- Ignored keys (accepted silently for compatibility) ---
@@ -544,5 +594,104 @@ mod tests {
         let config = translate_stellar_core_config(&core_toml).unwrap();
         assert_eq!(config.overlay.known_peers.len(), 2);
         assert_eq!(config.overlay.known_peers[0], "core1.stellar.org:11625");
+    }
+
+    #[test]
+    fn test_validator_address_as_known_peers() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            [[VALIDATORS]]
+            NAME = "sdftest1"
+            PUBLIC_KEY = "GDKXE2OZMJIPOSLNA6N6F2BVCI3O777I2OOC4BV7VOYUEHYX7RTRYA7Y"
+            ADDRESS = "core-testnet1.stellar.org"
+            HISTORY = "curl -sf http://history.stellar.org/prd/core-testnet/core_testnet_001/{0} -o {1}"
+
+            [[VALIDATORS]]
+            NAME = "sdftest2"
+            PUBLIC_KEY = "GCUCJTIYXSOXKBSNFGNFWW5MUQ54HKRPGJUTQFJ5RQXZXNOLNXYDHRAP"
+            ADDRESS = "core-testnet2.stellar.org:11625"
+            HISTORY = "curl -sf http://history.stellar.org/prd/core-testnet/core_testnet_002/{0} -o {1}"
+            "#,
+        )
+        .unwrap();
+
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        // ADDRESS fields should be extracted as known_peers (with default port appended if missing)
+        assert_eq!(config.overlay.known_peers.len(), 2);
+        assert_eq!(
+            config.overlay.known_peers[0],
+            "core-testnet1.stellar.org:11625"
+        );
+        assert_eq!(
+            config.overlay.known_peers[1],
+            "core-testnet2.stellar.org:11625"
+        );
+    }
+
+    #[test]
+    fn test_known_peers_not_overridden_by_validator_address() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            KNOWN_PEERS = ["explicit-peer.stellar.org:11625"]
+            [[VALIDATORS]]
+            NAME = "sdftest1"
+            PUBLIC_KEY = "GDKXE2OZMJIPOSLNA6N6F2BVCI3O777I2OOC4BV7VOYUEHYX7RTRYA7Y"
+            ADDRESS = "core-testnet1.stellar.org"
+            "#,
+        )
+        .unwrap();
+
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        // Explicit KNOWN_PEERS should take precedence over validator ADDRESS
+        assert_eq!(config.overlay.known_peers.len(), 1);
+        assert_eq!(
+            config.overlay.known_peers[0],
+            "explicit-peer.stellar.org:11625"
+        );
+    }
+
+    #[test]
+    fn test_old_style_quorum_set() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Standalone Network ; February 2017"
+            NODE_SEED = "SDQVDISRYN2JXBS7ICL7QJAEKB3HWBJFP2QECXG7GZICAHBK4UNJCWK2 self"
+            NODE_IS_VALIDATOR = true
+            UNSAFE_QUORUM = true
+            FAILURE_SAFETY = 0
+            [QUORUM_SET]
+            THRESHOLD_PERCENT = 100
+            VALIDATORS = ["$self"]
+            "#,
+        )
+        .unwrap();
+
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        assert!(config.node.is_validator);
+        // "$self" should be skipped — the node adds itself automatically
+        assert!(config.node.quorum_set.validators.is_empty());
+    }
+
+    #[test]
+    fn test_unknown_config_keys_silently_ignored() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            HTTP_PORT = 11626
+            ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING = true
+            EXPERIMENTAL_BUCKETLIST_DB = true
+            PUBLIC_HTTP_PORT = true
+            COMMANDS = ["ll?level=debug"]
+            BACKFILL_STELLAR_ASSET_EVENTS = true
+            BUCKETLIST_DB_MEMORY_FOR_CACHING = 0
+            "#,
+        )
+        .unwrap();
+
+        // Should not error on unknown keys
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        assert_eq!(config.compat_http.port, 11626);
     }
 }

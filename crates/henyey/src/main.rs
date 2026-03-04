@@ -377,6 +377,37 @@ enum Commands {
     #[command(name = "version")]
     Version,
 
+    /// Convert an identifier between formats (stellar-core compatible)
+    ///
+    /// Takes a hex-encoded 32-byte value or a strkey (G.../S.../T.../X.../C...)
+    /// and prints all possible interpretations. Used by the quickstart container
+    /// to derive network root account keys from the network passphrase hash.
+    #[command(name = "convert-id")]
+    ConvertId {
+        /// The identifier to convert (hex or strkey)
+        id: String,
+    },
+
+    /// Force SCP to start (stellar-core compatible, no-op)
+    ///
+    /// In stellar-core, this forces SCP to start on a single-node network
+    /// without waiting for other validators. Henyey accepts this command
+    /// for compatibility but it is a no-op (SCP behavior is handled
+    /// automatically based on quorum configuration).
+    #[command(name = "force-scp")]
+    ForceScp,
+
+    /// Initialize a named history archive (stellar-core compatible, no-op)
+    ///
+    /// In stellar-core, this creates the directory structure for a local
+    /// history archive. Henyey accepts this command for compatibility
+    /// but history archive initialization is handled automatically.
+    #[command(name = "new-hist")]
+    NewHist {
+        /// Name of the history archive to initialize
+        name: String,
+    },
+
     /// Write verified checkpoint ledger hashes to a file
     ///
     /// Downloads checkpoint headers from history archives, verifies the header
@@ -403,9 +434,16 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Handle commands that must run before logging/config initialization
-    if matches!(cli.command, Commands::Version) {
-        cmd_version();
-        return Ok(());
+    match &cli.command {
+        Commands::Version => {
+            cmd_version();
+            return Ok(());
+        }
+        Commands::ConvertId { id } => {
+            cmd_convert_id(id);
+            return Ok(());
+        }
+        _ => {}
     }
 
     // Initialize logging
@@ -513,6 +551,21 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Version => {
             cmd_version();
+            Ok(())
+        }
+
+        Commands::ConvertId { id } => {
+            cmd_convert_id(&id);
+            Ok(())
+        }
+
+        Commands::ForceScp => {
+            tracing::info!("force-scp: accepted for compatibility (no-op)");
+            Ok(())
+        }
+
+        Commands::NewHist { name } => {
+            tracing::info!("new-hist: accepted for compatibility (no-op for archive '{name}')");
             Ok(())
         }
 
@@ -748,6 +801,86 @@ fn cmd_version() {
     use henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION;
     println!("henyey-v{}", env!("CARGO_PKG_VERSION"));
     println!("ledger protocol version: {CURRENT_LEDGER_PROTOCOL_VERSION}");
+}
+
+/// Convert an identifier between formats (stellar-core compatible).
+///
+/// Accepts a 64-character hex string or a strkey (G.../S.../T.../X.../C...) and
+/// prints all possible interpretations. The quickstart container uses this to
+/// derive the network root account from `SHA256(network_passphrase)`:
+///
+/// ```text
+/// NETWORK_ID=$(printf "$PASSPHRASE" | sha256sum | cut -f1 -d" ")
+/// stellar-core convert-id $NETWORK_ID
+/// ```
+///
+/// Output format matches stellar-core: multiple interpretations of the same
+/// 32-byte value as different strkey types.
+fn cmd_convert_id(id: &str) {
+    use henyey_crypto::stellar_strkey;
+    use henyey_crypto::{PublicKey, SecretKey};
+
+    // Try to decode the input in various formats
+    let raw_bytes: Option<[u8; 32]> = if id.len() == 64 {
+        // 64-char hex string → 32 bytes
+        let decoded = (0..32)
+            .map(|i| u8::from_str_radix(&id[i * 2..i * 2 + 2], 16))
+            .collect::<Result<Vec<u8>, _>>();
+        if let Ok(v) = decoded {
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&v);
+            Some(bytes)
+        } else {
+            None
+        }
+    } else if let Ok(pk) = PublicKey::from_strkey(id) {
+        Some(*pk.as_bytes())
+    } else if let Ok(sk) = SecretKey::from_strkey(id) {
+        // Input is already a strkey seed — print interpretation and derived public key
+        println!("Interpreted as Seed:");
+        println!("  strKey: {}", sk.to_strkey());
+        let pk = sk.public_key();
+        println!("PublicKey:");
+        println!("  strKey: {}", pk.to_strkey());
+        println!("  hex: {}", hex::encode(pk.as_bytes()));
+        return;
+    } else {
+        None
+    };
+
+    let Some(bytes) = raw_bytes else {
+        eprintln!("Error: cannot parse '{}' as hex or strkey", id);
+        std::process::exit(1);
+    };
+
+    // Interpret the 32 bytes as a public key (encode as strkey regardless of
+    // whether the bytes represent a valid Ed25519 point — matches stellar-core behavior)
+    println!("Interpreted as PublicKey:");
+    println!(
+        "  strKey: {}",
+        stellar_strkey::ed25519::PublicKey(bytes).to_string()
+    );
+    println!("  hex: {}", hex::encode(bytes));
+
+    // Interpret the 32 bytes as a seed → derive public key
+    let sk = SecretKey::from_seed(&bytes);
+    println!("Interpreted as Seed:");
+    println!("  strKey: {}", sk.to_strkey());
+    let derived_pk = sk.public_key();
+    println!("PublicKey:");
+    println!("  strKey: {}", derived_pk.to_strkey());
+    println!("  hex: {}", hex::encode(derived_pk.as_bytes()));
+
+    // Other strkey interpretations
+    println!("Other interpretations:");
+    println!(
+        "  STRKEY_PRE_AUTH_TX: {}",
+        stellar_strkey::PreAuthTx(bytes).to_string()
+    );
+    println!(
+        "  STRKEY_HASH_X: {}",
+        stellar_strkey::HashX(bytes).to_string()
+    );
 }
 
 /// Offline info command handler.
