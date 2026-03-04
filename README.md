@@ -111,6 +111,76 @@ A validator participates in consensus. Requires a secret key and quorum configur
 ./target/release/henyey --config configs/mainnet.toml run
 ```
 
+## Running with stellar-rpc
+
+Henyey can serve as a drop-in replacement for stellar-core when used as the backend for [stellar-rpc](https://github.com/stellar/stellar-rpc). No changes to stellar-rpc are required -- henyey automatically detects stellar-core format configuration and translates it internally.
+
+### Prerequisites
+
+- A built `henyey` binary (see [Build](#build) above)
+- A built `stellar-rpc` binary ([build instructions](https://github.com/stellar/stellar-rpc#building))
+
+### Quick Start (Testnet)
+
+```bash
+stellar-rpc \
+  --network-passphrase "Test SDF Network ; September 2015" \
+  --stellar-core-binary-path ./target/release/henyey \
+  --captive-core-config-path configs/captive-core-testnet.cfg \
+  --captive-core-storage-path /tmp/henyey-captive-core \
+  --db-path /tmp/soroban-rpc.sqlite \
+  --endpoint 127.0.0.1:8000 \
+  --history-archive-urls https://history.stellar.org/prd/core-testnet/core_testnet_001
+```
+
+Once running, verify it's healthy:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000 \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | python3 -m json.tool
+```
+
+Expected output:
+
+```json
+{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "result": {
+        "status": "healthy",
+        "latestLedger": 1329304,
+        "oldestLedger": 1329279,
+        "ledgerRetentionWindow": 120960
+    }
+}
+```
+
+### How It Works
+
+stellar-rpc launches henyey as a subprocess (in place of stellar-core) and communicates via three interfaces:
+
+1. **Meta pipe** (`fd:3`) -- henyey streams `LedgerCloseMeta` XDR frames to stellar-rpc for ingestion
+2. **HTTP commands** (port 11626) -- stellar-rpc polls `/info` for sync status and submits transactions via `/tx`
+3. **HTTP queries** (port 11628) -- stellar-rpc queries ledger entries via `/getledgerentry` for transaction preflight
+
+Henyey detects the stellar-core format config file (TOML with `[[VALIDATORS]]` sections), translates it to its native format, and starts the compatibility HTTP servers automatically. The CLI flags `--conf`, `--console`, `--metadata-output-stream fd:N`, and subcommands `new-db`, `catchup`, `run`, `offline-info`, and `version` are all supported with stellar-core compatible behavior.
+
+### Captive Core Config
+
+The config file passed to `--captive-core-config-path` uses stellar-core's format. See [`configs/captive-core-testnet.cfg`](configs/captive-core-testnet.cfg) for testnet. A minimal config only needs validator definitions:
+
+```toml
+[[VALIDATORS]]
+NAME = "sdf_testnet_1"
+HOME_DOMAIN = "testnet.stellar.org"
+PUBLIC_KEY = "GDKXE2OZMJIPOSLNA6N6F2BVCI3O777I2OOC4BV7VOYUEHYX7RTRYA7Y"
+ADDRESS = "core-testnet1.stellar.org"
+HISTORY = "curl -sf http://history.stellar.org/prd/core-testnet/core_testnet_001/{0} -o {1}"
+```
+
+stellar-rpc injects additional keys (`DATABASE`, `HTTP_PORT`, `NETWORK_PASSPHRASE`, etc.) into the config before passing it to henyey. Henyey handles all of these transparently.
+
 ## Configuration
 
 Generate a sample config to customize:
