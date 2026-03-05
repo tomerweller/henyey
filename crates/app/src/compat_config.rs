@@ -725,4 +725,33 @@ mod tests {
         // ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING should now be parsed
         assert!(config.testing.accelerate_time);
     }
+
+    #[test]
+    fn test_local_history_archive_with_cp_commands() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Standalone Network ; February 2017"
+            NODE_SEED = "SDQVDISRYN2JXBS7ICL7QJAEKB3HWBJFP2QECXG7GZICAHBK4UNJCWK2 self"
+            NODE_IS_VALIDATOR = true
+            [HISTORY.vs]
+            get = "cp /opt/stellar/history-archive/data/{0} {1}"
+            put = "cp {0} /opt/stellar/history-archive/data/{1}"
+            mkdir = "mkdir -p /opt/stellar/history-archive/data/{0}"
+            "#,
+        )
+        .unwrap();
+
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        assert_eq!(config.history.archives.len(), 1);
+        let archive = &config.history.archives[0];
+        assert_eq!(archive.name, "vs");
+        assert!(archive.get_enabled);
+        assert!(archive.put_enabled);
+        assert!(archive.put.is_some());
+        assert!(archive.mkdir.is_some());
+        assert_eq!(
+            archive.put.as_deref().unwrap(),
+            "cp {0} /opt/stellar/history-archive/data/{1}"
+        );
+    }
 }

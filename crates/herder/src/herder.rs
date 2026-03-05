@@ -1530,6 +1530,16 @@ impl Herder {
             );
         }
 
+        // For solo validators (1-of-1 quorum), the nomination→ballot→externalization
+        // happens synchronously within scp.nominate(). Check if the slot was
+        // externalized and advance tracking state accordingly.
+        if self.scp_driver.latest_externalized_slot() == Some(slot) {
+            if let Some(ext) = self.scp_driver.get_externalized(slot) {
+                *self.prev_value.write() = ext.value;
+            }
+            self.advance_tracking_slot(slot);
+        }
+
         Ok(())
     }
 

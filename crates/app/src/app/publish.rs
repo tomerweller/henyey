@@ -23,6 +23,10 @@ impl App {
             .collect();
 
         if command_archives.is_empty() {
+            tracing::debug!(
+                total_archives = self.config.history.archives.len(),
+                "publish: no writable command archives found"
+            );
             return;
         }
 
