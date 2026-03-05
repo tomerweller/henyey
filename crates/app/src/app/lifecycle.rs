@@ -219,6 +219,11 @@ impl App {
                     let success = self.handle_close_complete(pending, join_result).await;
                     // Chain next close if successful.
                     if success {
+                        // Publish queued history checkpoints (if any).
+                        // This runs synchronously to ensure archives are up to date
+                        // before captive core instances need them.
+                        self.maybe_publish_history().await;
+
                         // Trigger consensus immediately after a successful close, matching
                         // stellar-core's triggerNextLedger() call inside closeLedger().
                         if self.is_validator {
