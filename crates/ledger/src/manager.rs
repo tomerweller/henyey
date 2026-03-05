@@ -1445,11 +1445,13 @@ impl LedgerManager {
             return Err(LedgerError::NotInitialized);
         }
 
-        // Fatal: protocol version is unsupported
+        // Fatal: protocol version is unsupported.
+        // Version 0 is the genesis state before any protocol upgrade — it is
+        // always allowed because the upcoming ledger close will apply the upgrade.
         let version = state.header.ledger_version;
         let min = henyey_common::protocol::MIN_LEDGER_PROTOCOL_VERSION;
         let max = henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION;
-        if version < min || version > max {
+        if version != 0 && (version < min || version > max) {
             tracing::error!(
                 version,
                 min_supported = min,
