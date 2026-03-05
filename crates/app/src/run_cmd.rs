@@ -262,9 +262,18 @@ fn print_startup_info(app: &App, options: &RunOptions) {
 
 /// Run the main application loop.
 async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()> {
+    // Check for force-scp flag (standalone single-node bootstrap).
+    // When set, skip all catchup and restore the node directly from DB state.
+    let force_scp = app.check_force_scp();
+    if force_scp {
+        tracing::info!("force-scp flag detected, bootstrapping from DB state");
+        app.bootstrap_from_db().await?;
+        app.clear_force_scp();
+    }
+
     // Attempt to restore node state from persisted DB + on-disk bucket files.
     // This avoids a full catchup when the node restarts with intact state.
-    if !options.force_catchup {
+    if !force_scp && !options.force_catchup {
         match app.load_last_known_ledger().await {
             Ok(true) => {
                 let (seq, _hash, _close_time, _protocol) = app.ledger_info();
@@ -281,8 +290,12 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
         }
     }
 
-    // Check if we need to catch up
-    let needs_catchup = check_needs_catchup(&app, &options).await?;
+    // Check if we need to catch up (skip if force-scp already bootstrapped)
+    let needs_catchup = if force_scp {
+        false
+    } else {
+        check_needs_catchup(&app, &options).await?
+    };
 
     if needs_catchup {
         if options.mode == RunMode::Watcher {

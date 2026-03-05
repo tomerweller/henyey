@@ -388,12 +388,12 @@ enum Commands {
         id: String,
     },
 
-    /// Force SCP to start (stellar-core compatible, no-op)
+    /// Force SCP to start on next run.
     ///
-    /// In stellar-core, this forces SCP to start on a single-node network
-    /// without waiting for other validators. Henyey accepts this command
-    /// for compatibility but it is a no-op (SCP behavior is handled
-    /// automatically based on quorum configuration).
+    /// Sets a flag in the database so the next `run` will skip catchup and
+    /// bootstrap consensus from the current last closed ledger. This is
+    /// required for standalone single-node networks (e.g., quickstart local
+    /// mode) where there are no peers to catch up from.
     #[command(name = "force-scp")]
     ForceScp,
 
@@ -560,7 +560,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Commands::ForceScp => {
-            tracing::info!("force-scp: accepted for compatibility (no-op)");
+            cmd_force_scp(&config)?;
             Ok(())
         }
 
@@ -771,9 +771,179 @@ async fn cmd_new_db(
     }
 
     // Create the database
-    let _db = henyey_db::Database::open(db_path)?;
+    let db = henyey_db::Database::open(db_path)?;
+
+    // Initialize genesis ledger (ledger 1) with root account, matching stellar-core
+    let passphrase = &config.network.passphrase;
+    initialize_genesis_ledger(&db, passphrase)?;
 
     println!("Database created successfully at: {}", db_path.display());
+    Ok(())
+}
+
+/// Initialize the genesis ledger (ledger 1) in the database.
+///
+/// This mirrors stellar-core's `startNewLedger()`: creates a genesis header with
+/// protocol version 0, a root account holding 100 billion XLM, an empty bucket
+/// list with the root account entry, and persists everything to the database.
+///
+/// The root account's public key is derived from SHA-256(network_passphrase),
+/// matching stellar-core's `SecretKey::fromSeed(networkID).getPublicKey()`.
+fn initialize_genesis_ledger(
+    db: &henyey_db::Database,
+    network_passphrase: &str,
+) -> anyhow::Result<()> {
+    use henyey_bucket::BucketList;
+    use henyey_common::NetworkId;
+    use henyey_db::schema::state_keys;
+    use henyey_history::build_history_archive_state;
+    use henyey_ledger::{calculate_skip_values, compute_header_hash};
+    use stellar_xdr::curr::{
+        AccountEntry, AccountEntryExt, AccountId, BucketListType, Hash, LedgerEntry,
+        LedgerEntryData, LedgerEntryExt, LedgerHeader, LedgerHeaderExt, Limits, PublicKey,
+        SequenceNumber, StellarValue, StellarValueExt, Thresholds, TimePoint, Uint256, VecM,
+        WriteXdr,
+    };
+
+    // 1. Derive root account public key from network passphrase.
+    //    Matches stellar-core: SecretKey::fromSeed(networkID).getPublicKey()
+    //    The network ID (SHA256 of passphrase) is used as an Ed25519 seed,
+    //    and the public key of that keypair becomes the root account ID.
+    let network_id = NetworkId::from_passphrase(network_passphrase);
+    let root_secret = henyey_crypto::SecretKey::from_seed(network_id.as_bytes());
+    let root_public = root_secret.public_key();
+    let root_account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+        *root_public.as_bytes(),
+    )));
+
+    // 2. Create root account entry (balance = 100 billion XLM)
+    let total_coins: i64 = 1_000_000_000_000_000_000; // 100B XLM in stroops
+    let root_entry = LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::Account(AccountEntry {
+            account_id: root_account_id,
+            balance: total_coins,
+            seq_num: SequenceNumber(0),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: stellar_xdr::curr::String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]), // master weight = 1
+            signers: VecM::default(),
+            ext: AccountEntryExt::V0,
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+
+    // 3. Create bucket list and add root account
+    let mut bucket_list = BucketList::new();
+    bucket_list
+        .add_batch(
+            1, // ledger_seq
+            0, // protocol_version (genesis is v0)
+            BucketListType::Live,
+            vec![root_entry], // init_entries
+            vec![],           // live_entries
+            vec![],           // dead_entries
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to add genesis entry to bucket list: {}", e))?;
+
+    // 4. Compute bucket list hash (protocol 0 = just the live hash, no hot archive)
+    let bucket_list_hash = bucket_list.hash();
+
+    // 5. Build genesis header
+    let mut header = LedgerHeader {
+        ledger_version: 0,
+        previous_ledger_hash: Hash([0u8; 32]),
+        scp_value: StellarValue {
+            tx_set_hash: Hash([0u8; 32]),
+            close_time: TimePoint(0),
+            upgrades: VecM::default(),
+            ext: StellarValueExt::Basic,
+        },
+        tx_set_result_hash: Hash([0u8; 32]),
+        bucket_list_hash: Hash(*bucket_list_hash.as_bytes()),
+        ledger_seq: 1,
+        total_coins,
+        fee_pool: 0,
+        inflation_seq: 0,
+        id_pool: 0,
+        base_fee: 100,
+        base_reserve: 100_000_000, // 10 XLM
+        max_tx_set_size: 100,
+        skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
+        ext: LedgerHeaderExt::V0,
+    };
+
+    // 6. Calculate skip values (no-op for ledger 1, but call for correctness)
+    calculate_skip_values(&mut header);
+
+    // 7. Compute header hash and serialize
+    let header_hash = compute_header_hash(&header)?;
+    let header_xdr = header.to_xdr(Limits::none())?;
+
+    // 8. Build HAS (HistoryArchiveState) for genesis
+    let has = build_history_archive_state(
+        1,
+        &bucket_list,
+        None, // no hot archive at protocol 0
+        Some(network_passphrase.to_string()),
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to build HAS: {}", e))?;
+    let has_json = has.to_json()?;
+
+    // 9. Build bucket level hashes for DB storage
+    let bucket_levels: Vec<(henyey_common::Hash256, henyey_common::Hash256)> = bucket_list
+        .levels()
+        .iter()
+        .map(|level| (level.curr.hash(), level.snap.hash()))
+        .collect();
+
+    // 10. Persist everything to the database
+    db.with_connection(|conn| {
+        use henyey_db::queries::{BucketListQueries, LedgerQueries, StateQueries};
+
+        conn.store_ledger_header(&header, &header_xdr)?;
+        conn.store_bucket_list(1, &bucket_levels)?;
+        conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
+        conn.set_state(state_keys::NETWORK_PASSPHRASE, network_passphrase)?;
+        conn.set_last_closed_ledger(1)?;
+        Ok(())
+    })?;
+
+    tracing::info!(
+        ledger_seq = 1,
+        header_hash = %header_hash,
+        bucket_list_hash = %bucket_list_hash,
+        "Genesis ledger initialized with root account"
+    );
+
+    Ok(())
+}
+
+/// Force SCP command handler.
+///
+/// Sets a flag in the database so the next `run` will skip catchup and
+/// bootstrap consensus from the current LCL. This matches stellar-core's
+/// `force-scp` behavior for standalone single-node networks.
+fn cmd_force_scp(config: &AppConfig) -> anyhow::Result<()> {
+    let db_path = &config.database.path;
+    if !db_path.exists() {
+        anyhow::bail!(
+            "Database not found at {:?}. Run new-db first.",
+            db_path
+        );
+    }
+
+    let db = henyey_db::Database::open(db_path)?;
+    db.with_connection(|conn| {
+        use henyey_db::queries::StateQueries;
+        use henyey_db::schema::state_keys;
+        conn.set_state(state_keys::FORCE_SCP, "true")
+    })?;
+
+    tracing::info!("force-scp: flag set, SCP will bootstrap on next run");
+    println!("force-scp flag set successfully");
     Ok(())
 }
 
@@ -3938,5 +4108,71 @@ mod tests {
             }
             _ => panic!("Expected check-quorum-intersection command"),
         }
+    }
+
+    #[test]
+    fn test_genesis_ledger_creation() {
+        use henyey_db::queries::{LedgerQueries, StateQueries};
+        use henyey_db::schema::state_keys;
+
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        let passphrase = "Standalone Network ; February 2017";
+
+        initialize_genesis_ledger(&db, passphrase).unwrap();
+
+        // Verify LCL is set to 1
+        db.with_connection(|conn| {
+            let lcl = conn.get_last_closed_ledger().unwrap();
+            assert_eq!(lcl, Some(1));
+
+            // Verify network passphrase is stored
+            let stored_passphrase = conn.get_state(state_keys::NETWORK_PASSPHRASE).unwrap();
+            assert_eq!(stored_passphrase.as_deref(), Some(passphrase));
+
+            // Verify HAS is stored
+            let has_json = conn.get_state(state_keys::HISTORY_ARCHIVE_STATE).unwrap();
+            assert!(has_json.is_some());
+            let has_str = has_json.unwrap();
+            assert!(has_str.contains("\"currentLedger\": 1") || has_str.contains("\"currentLedger\":1"));
+
+            // Verify ledger header is stored
+            let header = conn.load_ledger_header(1).unwrap();
+            assert!(header.is_some());
+            let header = header.unwrap();
+            assert_eq!(header.ledger_seq, 1);
+            assert_eq!(header.ledger_version, 0);
+            assert_eq!(header.total_coins, 1_000_000_000_000_000_000);
+            assert_eq!(header.base_fee, 100);
+            assert_eq!(header.base_reserve, 100_000_000);
+
+            // Verify bucket_list_hash is non-zero (has root account entry)
+            assert_ne!(header.bucket_list_hash.0, [0u8; 32]);
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_genesis_ledger_root_account_key_derivation() {
+        // For "Standalone Network ; February 2017", the root account public key
+        // should be GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI
+        // The derivation is: SecretKey::from_seed(SHA256(passphrase)).public_key()
+        use henyey_common::NetworkId;
+
+        let network_id = NetworkId::from_passphrase("Standalone Network ; February 2017");
+        let root_secret = henyey_crypto::SecretKey::from_seed(network_id.as_bytes());
+        let root_public = root_secret.public_key();
+
+        assert_eq!(
+            root_public.to_strkey(),
+            "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI"
+        );
+
+        // Also verify the root secret key matches the known value
+        assert_eq!(
+            root_secret.to_strkey(),
+            "SC5O7VZUXDJ6JBDSZ74DSERXL7W3Y5LTOAMRF7RQRL3TAGAPS7LUVG3L"
+        );
     }
 }

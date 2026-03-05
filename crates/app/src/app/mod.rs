@@ -1205,6 +1205,116 @@ impl App {
         *self.current_ledger.write().await = seq;
     }
 
+    /// Check if the force-scp flag is set in the database.
+    ///
+    /// Returns `true` if the flag is set, `false` otherwise.
+    /// This does NOT clear the flag — call `clear_force_scp` after use.
+    pub fn check_force_scp(&self) -> bool {
+        use henyey_db::queries::StateQueries;
+        use henyey_db::schema::state_keys;
+        self.db
+            .with_connection(|conn| {
+                Ok(conn
+                    .get_state(state_keys::FORCE_SCP)?
+                    .as_deref()
+                    == Some("true"))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Clear the force-scp flag in the database.
+    pub fn clear_force_scp(&self) {
+        use henyey_db::queries::StateQueries;
+        use henyey_db::schema::state_keys;
+        let _ = self.db.with_connection(|conn| {
+            conn.delete_state(state_keys::FORCE_SCP)
+        });
+    }
+
+    /// Bootstrap the node from genesis state stored in the database.
+    ///
+    /// Used by the force-scp flow for standalone single-node networks.
+    /// Reads the genesis ledger header from the DB, recreates the bucket list
+    /// with the root account entry, and initializes the LedgerManager.
+    pub async fn bootstrap_from_db(&self) -> anyhow::Result<()> {
+        use henyey_bucket::BucketList;
+        use henyey_bucket::HotArchiveBucketList;
+        use henyey_common::NetworkId;
+        use henyey_db::queries::LedgerQueries;
+        use henyey_ledger::compute_header_hash;
+        use stellar_xdr::curr::{
+            AccountEntry, AccountEntryExt, AccountId, BucketListType, LedgerEntry,
+            LedgerEntryData, LedgerEntryExt, PublicKey, SequenceNumber, Thresholds, Uint256, VecM,
+        };
+
+        // Read LCL header from DB
+        let (lcl_seq, header) = self.db.with_connection(|conn| {
+            let lcl_seq = conn.get_last_closed_ledger()?
+                .ok_or_else(|| henyey_db::DbError::Integrity("No LCL in DB".to_string()))?;
+            let header = conn.load_ledger_header(lcl_seq)?
+                .ok_or_else(|| henyey_db::DbError::Integrity(format!("No header for LCL {}", lcl_seq)))?;
+            Ok((lcl_seq, header))
+        })?;
+
+        let header_hash = compute_header_hash(&header)
+            .map_err(|e| anyhow::anyhow!("Failed to compute header hash: {}", e))?;
+
+        // Recreate the bucket list with the root account entry.
+        // For genesis (protocol 0), this is a single entry in level 0.
+        let network_id = NetworkId::from_passphrase(&self.config.network.passphrase);
+        let root_secret = henyey_crypto::SecretKey::from_seed(network_id.as_bytes());
+        let root_public = root_secret.public_key();
+        let root_account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+            *root_public.as_bytes(),
+        )));
+
+        let root_entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: root_account_id,
+                balance: header.total_coins,
+                seq_num: SequenceNumber(0),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: stellar_xdr::curr::String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: VecM::default(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let mut bucket_list = BucketList::new();
+        bucket_list.add_batch(
+            1, 0, BucketListType::Live,
+            vec![root_entry], vec![], vec![],
+        ).map_err(|e| anyhow::anyhow!("Failed to create genesis bucket list: {}", e))?;
+
+        // Verify hash matches
+        let computed_hash = bucket_list.hash();
+        let expected_hash = henyey_common::Hash256::from_bytes(header.bucket_list_hash.0);
+        if computed_hash != expected_hash {
+            anyhow::bail!(
+                "Genesis bucket list hash mismatch: computed {} vs header {}",
+                computed_hash, expected_hash
+            );
+        }
+
+        // Initialize LedgerManager
+        let hot_archive = HotArchiveBucketList::new();
+        self.ledger_manager.initialize(bucket_list, hot_archive, header, header_hash)
+            .map_err(|e| anyhow::anyhow!("Failed to initialize LedgerManager: {}", e))?;
+
+        let (seq, _hash, _close_time, _protocol) = self.ledger_info();
+        tracing::info!(lcl_seq = seq, "Bootstrapped from genesis state via force-scp");
+
+        self.set_state(AppState::Synced).await;
+        self.set_current_ledger(lcl_seq).await;
+
+        Ok(())
+    }
+
     /// Get the database.
     pub fn database(&self) -> &henyey_db::Database {
         &self.db

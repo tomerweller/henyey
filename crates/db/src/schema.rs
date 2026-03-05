@@ -154,4 +154,11 @@ pub mod state_keys {
     ///
     /// Used for consensus state persistence.
     pub const SCP_STATE: &str = "scpstate";
+
+    /// Force SCP flag for standalone bootstrap.
+    ///
+    /// When set to "true", the node will skip catchup on next `run` and
+    /// bootstrap consensus from the current LCL. Used for single-node
+    /// networks (e.g., quickstart local mode). Cleared after first use.
+    pub const FORCE_SCP: &str = "forcescp";
 }
