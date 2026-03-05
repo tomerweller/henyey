@@ -185,11 +185,11 @@ stellar-rpc injects additional keys (`DATABASE`, `HTTP_PORT`, `NETWORK_PASSPHRAS
 
 The [stellar/quickstart](https://github.com/stellar/docker-stellar-core-horizon) Docker image bundles stellar-core, Horizon, and stellar-rpc into a single container. Henyey can replace stellar-core inside this container with no changes to quickstart itself.
 
-The container runs three stellar-core instances simultaneously:
+The container runs up to three stellar-core instances simultaneously (testnet mode uses all three; local mode uses the node + RPC captive core):
 
 | Instance | HTTP Port | Peer Port | Purpose |
 |----------|-----------|-----------|---------|
-| Node (standalone) | 11626 | 11625 | Full watcher |
+| Node (validator/watcher) | 11626 | 11625 | Consensus participant or full watcher |
 | Horizon captive core | 11726 | 11725 | Ingestion for Horizon |
 | RPC captive core | 11826 | 11825 | Ingestion for stellar-rpc |
 
@@ -245,6 +245,40 @@ curl -s http://localhost:8000/ | python3 -m json.tool
 ```
 
 stellar-rpc should report `"status": "healthy"` and Horizon should return the network root with the current ledger sequence.
+
+### Local Network Mode
+
+Run a standalone single-node network from genesis — no external peers, no catchup. This is the fastest way to develop and test against a Stellar network:
+
+```bash
+docker run -d --name henyey-local \
+  -p 8000:8000 \
+  henyey-quickstart --local --limits default
+```
+
+The container creates a standalone network with:
+
+- 1-second ledger closes
+- Protocol v25 from genesis
+- Friendbot for funding test accounts
+- Horizon (port 8000) and stellar-rpc (port 8000/soroban/rpc)
+
+Wait ~15 seconds for startup, then verify:
+
+```bash
+# RPC health
+curl -s -X POST http://localhost:8000/soroban/rpc \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | python3 -m json.tool
+
+# Fund a test account via friendbot
+curl -s "http://localhost:8000/friendbot?addr=GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H"
+
+# Check account on Horizon
+curl -s "http://localhost:8000/accounts/GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H" | python3 -m json.tool
+```
+
+The local network passphrase is `Standalone Network ; February 2017`.
 
 ## Configuration
 
