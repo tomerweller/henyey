@@ -307,15 +307,31 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
             let mut keys: Vec<String> = Vec::new();
             for v in validators {
                 if let Some(s) = v.as_str() {
-                    // "$self" is a reference to the node's own key — skip it, the node
-                    // adds itself automatically when NODE_IS_VALIDATOR is true.
-                    if s != "$self" {
+                    if s == "$self" {
+                        // "$self" refers to the node's own key — resolve it from NODE_SEED
+                        if let Some(ref seed_str) = config.node.node_seed {
+                            match henyey_crypto::SecretKey::from_strkey(seed_str) {
+                                Ok(secret) => {
+                                    keys.push(secret.public_key().to_strkey());
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "Cannot resolve $self in [QUORUM_SET]: invalid NODE_SEED"
+                                    );
+                                }
+                            }
+                        } else {
+                            tracing::warn!(
+                                "Cannot resolve $self in [QUORUM_SET]: NODE_SEED not set"
+                            );
+                        }
+                    } else {
                         keys.push(s.to_string());
                     }
                 }
             }
-            // Only override if we found non-self validators and the [[VALIDATORS]]
-            // section didn't already set the quorum set
+            // Only override if the [[VALIDATORS]] section didn't already set the quorum set
             if !keys.is_empty() && config.node.quorum_set.validators.is_empty() {
                 config.node.quorum_set.validators = keys;
             }
@@ -675,8 +691,15 @@ mod tests {
 
         let config = translate_stellar_core_config(&core_toml).unwrap();
         assert!(config.node.is_validator);
-        // "$self" should be skipped — the node adds itself automatically
-        assert!(config.node.quorum_set.validators.is_empty());
+        // "$self" should be resolved to the node's own public key from NODE_SEED
+        assert_eq!(config.node.quorum_set.validators.len(), 1);
+        let expected_pubkey = henyey_crypto::SecretKey::from_strkey(
+            "SDQVDISRYN2JXBS7ICL7QJAEKB3HWBJFP2QECXG7GZICAHBK4UNJCWK2",
+        )
+        .unwrap()
+        .public_key()
+        .to_strkey();
+        assert_eq!(config.node.quorum_set.validators[0], expected_pubkey);
     }
 
     #[test]
