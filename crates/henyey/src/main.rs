@@ -905,11 +905,33 @@ fn initialize_genesis_ledger(
         .map(|level| (level.curr.hash(), level.snap.hash()))
         .collect();
 
-    // 10. Persist everything to the database
+    // 10. Build empty tx history / tx result entries for genesis (needed by
+    //     history archive publishing — the first checkpoint includes ledger 1).
+    let empty_tx_set = stellar_xdr::curr::TransactionSet {
+        previous_ledger_hash: Hash(henyey_common::Hash256::ZERO.0),
+        txs: VecM::default(),
+    };
+    let genesis_tx_history = stellar_xdr::curr::TransactionHistoryEntry {
+        ledger_seq: 1,
+        tx_set: empty_tx_set,
+        ext: stellar_xdr::curr::TransactionHistoryEntryExt::V0,
+    };
+    let genesis_tx_result = stellar_xdr::curr::TransactionHistoryResultEntry {
+        ledger_seq: 1,
+        tx_result_set: stellar_xdr::curr::TransactionResultSet {
+            results: VecM::default(),
+        },
+        ext: stellar_xdr::curr::TransactionHistoryResultEntryExt::default(),
+    };
+
+    // 11. Persist everything to the database
     db.with_connection(|conn| {
         use henyey_db::queries::{BucketListQueries, LedgerQueries, StateQueries};
+        use henyey_db::queries::HistoryQueries;
 
         conn.store_ledger_header(&header, &header_xdr)?;
+        conn.store_tx_history_entry(1, &genesis_tx_history)?;
+        conn.store_tx_result_entry(1, &genesis_tx_result)?;
         conn.store_bucket_list(1, &bucket_levels)?;
         conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
         conn.set_state(state_keys::NETWORK_PASSPHRASE, network_passphrase)?;

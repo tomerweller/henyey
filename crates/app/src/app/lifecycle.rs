@@ -494,6 +494,13 @@ impl App {
                     // Request any pending tx sets we need
                     self.request_pending_tx_sets().await;
 
+                    // Publish queued history checkpoints.  This is normally done
+                    // from the pending_close arm, but for solo validators the
+                    // select may pick the tick arm repeatedly before pending_close.
+                    if self.is_validator {
+                        self.maybe_publish_history().await;
+                    }
+
                     // For validators, try to trigger next round
                     if self.is_validator {
                         self.try_trigger_consensus().await;
