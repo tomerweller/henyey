@@ -314,12 +314,13 @@ pub mod helpers {
     /// messages. Dropping these at the overlay layer reduces broadcast channel
     /// pressure by ~90% on mainnet, preventing SCP message loss.
     pub fn is_watcher_droppable(message: &StellarMessage) -> bool {
+        // Watchers must participate in the pull-mode flooding protocol
+        // (FloodAdvert, FloodDemand, Transaction) to forward transactions
+        // submitted via HTTP to validators.  Only survey messages are
+        // truly validator-only and can be dropped on watchers.
         matches!(
             message,
-            StellarMessage::Transaction(_)
-                | StellarMessage::FloodAdvert(_)
-                | StellarMessage::FloodDemand(_)
-                | StellarMessage::TimeSlicedSurveyRequest(_)
+            StellarMessage::TimeSlicedSurveyRequest(_)
                 | StellarMessage::TimeSlicedSurveyResponse(_)
                 | StellarMessage::TimeSlicedSurveyStartCollecting(_)
                 | StellarMessage::TimeSlicedSurveyStopCollecting(_)

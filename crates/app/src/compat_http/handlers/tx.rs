@@ -67,7 +67,9 @@ pub(crate) async fn compat_tx_handler(
     };
 
     // Submit to the herder.
-    let result = state.app.submit_transaction(tx_env);
+    tracing::info!("compat /tx: Received transaction submission");
+    let result = state.app.submit_transaction(tx_env).await;
+    tracing::info!(?result, "compat /tx: Transaction submission result");
 
     // Map to stellar-core status strings.
     use henyey_herder::TxQueueResult;

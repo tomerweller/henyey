@@ -53,7 +53,7 @@ pub(crate) async fn submit_tx_handler(
     let network_id = NetworkId::from_passphrase(&state.app.info().network_passphrase);
     let mut frame = TransactionFrame::with_network(tx_env.clone(), network_id);
     let hash = frame.compute_hash(&network_id).ok();
-    let result = state.app.submit_transaction(tx_env);
+    let result = state.app.submit_transaction(tx_env).await;
 
     let (status, error) = match result {
         henyey_herder::TxQueueResult::Added => (TxStatus::Pending, None),

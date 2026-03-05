@@ -36,6 +36,8 @@ impl App {
             std::mem::take(&mut *queue)
         };
 
+        tracing::debug!(count = hashes.len(), "Flushing tx adverts");
+
         self.tx_advert_set.write().await.clear();
 
         let Some(overlay) = self.overlay().await else {
@@ -380,7 +382,7 @@ impl App {
             if let Err(e) = overlay
                 .try_send_to(&peer_id, StellarMessage::FloodDemand(demand))
             {
-                tracing::debug!(peer = %peer_id, error = %e, "Failed to send flood demand");
+                tracing::warn!(peer = %peer_id, error = %e, "Failed to send flood demand");
             }
         }
     }
@@ -390,6 +392,11 @@ impl App {
         peer_id: &henyey_overlay::PeerId,
         advert: FloodAdvert,
     ) {
+        tracing::debug!(
+            peer = %peer_id,
+            count = advert.tx_hashes.0.len(),
+            "Received FloodAdvert"
+        );
         let ledger_seq = self.herder.tracking_slot().min(u32::MAX as u64) as u32;
         let max_ops = self.max_advert_queue_size();
         let mut adverts_by_peer = self.tx_adverts_by_peer.write().await;
@@ -404,6 +411,11 @@ impl App {
         peer_id: &henyey_overlay::PeerId,
         demand: FloodDemand,
     ) {
+        tracing::debug!(
+            peer = %peer_id,
+            count = demand.tx_hashes.0.len(),
+            "Received FloodDemand"
+        );
         let Some(overlay) = self.overlay().await else {
             return;
         };
