@@ -695,8 +695,25 @@ impl App {
         };
         local_node.listening_port = self.config.overlay.peer_port;
 
-        // Start with testnet or mainnet defaults
-        let mut overlay_config = if self.config.network.passphrase.contains("Test") {
+        // Start with testnet or mainnet defaults for seed peers, but only if
+        // the app config doesn't explicitly set known_peers (which includes the
+        // compat config case where known_peers is intentionally cleared).
+        let mut overlay_config = if !self.config.overlay.known_peers.is_empty() {
+            // Explicit peers configured — start from empty defaults
+            let mut cfg = OverlayManagerConfig::default();
+            cfg.known_peers = self
+                .config
+                .overlay
+                .known_peers
+                .iter()
+                .filter_map(|s| Self::parse_peer_address(s))
+                .collect();
+            cfg
+        } else if self.config.is_compat_config {
+            // Compat config with no known peers (e.g., local standalone mode) —
+            // do NOT inject testnet/mainnet seed peers.
+            OverlayManagerConfig::default()
+        } else if self.config.network.passphrase.contains("Test") {
             OverlayManagerConfig::testnet()
         } else {
             OverlayManagerConfig::mainnet()
@@ -710,17 +727,6 @@ impl App {
         overlay_config.listen_enabled = self.is_validator; // Validators listen for connections
         overlay_config.is_validator = self.is_validator; // Watchers filter non-essential messages
         overlay_config.network_passphrase = self.config.network.passphrase.clone();
-
-        // Convert known peers from strings to PeerAddress
-        if !self.config.overlay.known_peers.is_empty() {
-            overlay_config.known_peers = self
-                .config
-                .overlay
-                .known_peers
-                .iter()
-                .filter_map(|s| Self::parse_peer_address(s))
-                .collect();
-        }
 
         if let Ok(persisted) = self.load_persisted_peers() {
             for addr in persisted {

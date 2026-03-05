@@ -148,6 +148,12 @@ pub struct AppConfig {
     /// Testing overrides (e.g., `ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING`).
     #[serde(default)]
     pub testing: TestingConfig,
+
+    /// Whether this config was translated from stellar-core format.
+    /// When true, the overlay layer will not inject default seed peers
+    /// if no KNOWN_PEERS were specified in the original config.
+    #[serde(skip)]
+    pub is_compat_config: bool,
 }
 
 /// Node identity and behavior configuration.
@@ -1052,6 +1058,7 @@ impl AppConfig {
             query: QueryConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
             testing: TestingConfig::default(),
+            is_compat_config: false,
         }
     }
 
@@ -1121,6 +1128,7 @@ impl AppConfig {
             query: QueryConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
             testing: TestingConfig::default(),
+            is_compat_config: false,
         }
     }
 

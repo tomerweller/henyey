@@ -80,6 +80,7 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
         .ok_or_else(|| anyhow::anyhow!("Config must be a TOML table"))?;
 
     let mut config = AppConfig::default();
+    config.is_compat_config = true;
 
     // Clear defaults that should come from the stellar-core config, not from
     // henyey's testnet preset. These will be repopulated from the config below.
