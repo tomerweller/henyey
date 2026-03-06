@@ -59,6 +59,7 @@ use henyey_bucket::{
     HotArchiveBucketList, HotArchiveBucketListSnapshot,
 };
 use henyey_common::{Hash256, NetworkId};
+use henyey_clock::{Clock, RealClock};
 use henyey_db::{
     BucketListQueries, HistoryQueries, LedgerQueries, PublishQueueQueries, ScpQueries,
 };
@@ -323,6 +324,9 @@ struct PendingLedgerClose {
 pub struct App {
     /// Application configuration.
     config: AppConfig,
+
+    /// Clock abstraction for runtime behavior.
+    clock: Arc<dyn Clock>,
 
     /// Current application state.
     state: RwLock<AppState>,
@@ -697,7 +701,7 @@ enum SurveyReportingStart {
 }
 
 impl SurveyReportingState {
-    fn new() -> Self {
+    fn new(now: Instant) -> Self {
         Self {
             running: false,
             peers: HashSet::new(),
@@ -705,7 +709,7 @@ impl SurveyReportingState {
             inbound_indices: HashMap::new(),
             outbound_indices: HashMap::new(),
             bad_response_nodes: HashSet::new(),
-            next_topoff: Instant::now(),
+            next_topoff: now,
         }
     }
 }
@@ -713,12 +717,11 @@ impl SurveyReportingState {
 impl ScpLatencyTracker {
     const MAX_SAMPLES: usize = 256;
 
-    fn record_first_seen(&mut self, slot: u64) {
-        self.first_seen.entry(slot).or_insert_with(Instant::now);
+    fn record_first_seen(&mut self, slot: u64, now: Instant) {
+        self.first_seen.entry(slot).or_insert(now);
     }
 
-    fn record_self_sent(&mut self, slot: u64) -> Option<u64> {
-        let now = Instant::now();
+    fn record_self_sent(&mut self, slot: u64, now: Instant) -> Option<u64> {
         let mut sample = None;
         if let Some(first) = self.first_seen.get(&slot) {
             let delta = now.duration_since(*first).as_millis() as u64;
@@ -729,12 +732,12 @@ impl ScpLatencyTracker {
         sample
     }
 
-    fn record_other_after_self(&mut self, slot: u64) -> Option<u64> {
+    fn record_other_after_self(&mut self, slot: u64, now: Instant) -> Option<u64> {
         if self.self_to_other_recorded.contains(&slot) {
             return None;
         }
         if let Some(sent) = self.self_sent.get(&slot) {
-            let delta = sent.elapsed().as_millis() as u64;
+            let delta = now.duration_since(*sent).as_millis() as u64;
             Self::push_sample(&mut self.self_to_other_samples_ms, delta);
             self.self_to_other_recorded.insert(slot);
             return Some(delta);
@@ -768,10 +771,10 @@ struct SurveyScheduler {
 }
 
 impl SurveyScheduler {
-    fn new() -> Self {
+    fn new(now: Instant) -> Self {
         Self {
             phase: SurveySchedulerPhase::Idle,
-            next_action: Instant::now() + Duration::from_secs(60),
+            next_action: now + Duration::from_secs(60),
             peers: Vec::new(),
             nonce: 0,
             ledger_num: 0,
@@ -816,6 +819,15 @@ impl ScpQueueCallback for HerderScpCallback {
 impl App {
     /// Create a new application instance.
     pub async fn new(config: AppConfig) -> anyhow::Result<Self> {
+        Self::new_with_clock(config, Arc::new(RealClock))
+            .await
+    }
+
+    /// Create a new application instance with an injected clock.
+    pub async fn new_with_clock(
+        config: AppConfig,
+        clock: Arc<dyn Clock>,
+    ) -> anyhow::Result<Self> {
         // Apply testing overrides early, before any checkpoint math is used.
         if config.testing.accelerate_time {
             henyey_history::set_checkpoint_frequency(
@@ -985,6 +997,7 @@ impl App {
 
         // Create channel for outbound SCP envelopes
         let (scp_envelope_tx, scp_envelope_rx) = tokio::sync::mpsc::channel(100);
+        let now = clock.now();
 
         // Wire up envelope sender for validators
         if config.node.is_validator {
@@ -1000,6 +1013,7 @@ impl App {
         Ok(Self {
             is_validator,
             config,
+            clock,
             state: RwLock::new(AppState::Initializing),
             db,
             _db_lock: Some(db_lock),
@@ -1019,8 +1033,8 @@ impl App {
             catchup_fatal_failure: AtomicBool::new(false),
             syncing_ledgers: RwLock::new(BTreeMap::new()),
             last_externalized_slot: AtomicU64::new(0),
-            last_externalized_at: RwLock::new(Instant::now()),
-            last_scp_state_request_at: RwLock::new(Instant::now()),
+            last_externalized_at: RwLock::new(now),
+            last_scp_state_request_at: RwLock::new(now),
             survey_data: RwLock::new(SurveyDataManager::new(
                 is_validator,
                 max_inbound_peers,
@@ -1039,13 +1053,13 @@ impl App {
             last_catchup_completed_at: RwLock::new(None),
             cached_archive_checkpoint: RwLock::new(None),
             scp_latency: RwLock::new(ScpLatencyTracker::default()),
-            survey_scheduler: RwLock::new(SurveyScheduler::new()),
+            survey_scheduler: RwLock::new(SurveyScheduler::new(now)),
             survey_nonce: RwLock::new(1),
             survey_secrets: RwLock::new(HashMap::new()),
             survey_results: RwLock::new(HashMap::new()),
             survey_limiter: RwLock::new(SurveyMessageLimiter::new(6, 10)),
             survey_throttle,
-            survey_reporting: RwLock::new(SurveyReportingState::new()),
+            survey_reporting: RwLock::new(SurveyReportingState::new(now)),
             scp_timeouts: RwLock::new(ScpTimeoutState::new()),
             meta_stream: std::sync::Mutex::new(meta_stream),
             drift_tracker: std::sync::Mutex::new(CloseTimeDriftTracker::new()),
@@ -1410,7 +1424,7 @@ impl App {
         let header = self.ledger_manager.current_header();
         let hash = self.ledger_manager.current_header_hash();
         let close_time = ledger_close_time(&header);
-        let now = std::time::SystemTime::now()
+        let now = self.clock.system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();

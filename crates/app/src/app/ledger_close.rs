@@ -807,7 +807,7 @@ impl App {
                 .last_externalized_slot
                 .swap(latest_externalized, Ordering::Relaxed);
             if latest_externalized != prev_latest {
-                *self.last_externalized_at.write().await = Instant::now();
+                *self.last_externalized_at.write().await = self.clock.now();
             }
 
             let mut missing_tx_set = false;
@@ -1126,7 +1126,7 @@ impl App {
                 self.try_trigger_consensus().await;
             }
 
-            *self.last_externalized_at.write().await = Instant::now();
+            *self.last_externalized_at.write().await = self.clock.now();
             self.tx_set_all_peers_exhausted
                 .store(false, Ordering::SeqCst);
             self.tx_set_dont_have.write().await.clear();

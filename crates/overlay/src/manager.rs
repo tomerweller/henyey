@@ -34,7 +34,8 @@
 
 use crate::{
     codec::helpers,
-    connection::{ConnectionDirection, ConnectionPool, Listener},
+    connection::{ConnectionDirection, ConnectionPool},
+    connection_factory::{ConnectionFactory, TcpConnectionFactory},
     flood::{compute_message_hash, FloodGate, FloodGateStats},
     flow_control::{msg_body_size, FlowControl, FlowControlConfig, ScpQueueCallback},
     peer::{Peer, PeerInfo, PeerStats, PeerStatsSnapshot},
@@ -481,6 +482,8 @@ pub struct OverlayManager {
     /// Whether the node is tracking consensus (set by the herder/app layer).
     /// When false, the overlay may drop random peers to try new connections.
     is_tracking: Arc<AtomicBool>,
+    /// Connection factory used for transport establishment.
+    connection_factory: Arc<dyn ConnectionFactory>,
 }
 
 impl OverlayManager {
@@ -495,6 +498,15 @@ impl OverlayManager {
 
     /// Create a new overlay manager with the given configuration.
     pub fn new(config: OverlayConfig, local_node: LocalNode) -> Result<Self> {
+        Self::new_with_connection_factory(config, local_node, Arc::new(TcpConnectionFactory))
+    }
+
+    /// Create a new overlay manager with a custom connection factory.
+    pub fn new_with_connection_factory(
+        config: OverlayConfig,
+        local_node: LocalNode,
+        connection_factory: Arc<dyn ConnectionFactory>,
+    ) -> Result<Self> {
         // Broadcast channel for non-critical overlay messages (TX floods, etc.).
         // SCP and fetch-response messages bypass this channel via dedicated mpsc
         // channels, so the broadcast channel only carries remaining message types.
@@ -553,6 +565,7 @@ impl OverlayManager {
             scp_callback: None,
             peer_manager: config.peer_manager.clone(),
             is_tracking: Arc::new(AtomicBool::new(false)),
+            connection_factory,
         })
     }
 
@@ -685,7 +698,7 @@ impl OverlayManager {
 
     /// Start the connection listener.
     async fn start_listener(&mut self) -> Result<()> {
-        let listener = Listener::bind(self.config.listen_port).await?;
+        let listener = self.connection_factory.bind(self.config.listen_port).await?;
         info!("Listening on port {}", self.config.listen_port);
 
         let shared = self.shared_state();
@@ -856,6 +869,7 @@ impl OverlayManager {
         let max_outbound = self.config.max_outbound_peers;
         let connect_timeout = self.config.connect_timeout_secs;
         let auth_timeout = self.config.auth_timeout_secs;
+        let connection_factory = Arc::clone(&self.connection_factory);
         let config_known_peers = self.config.known_peers.clone();
         let mut shutdown_rx = self.shutdown_tx.as_ref().unwrap().subscribe();
 
@@ -1021,6 +1035,7 @@ impl OverlayManager {
                         timeout,
                         Arc::clone(&pool),
                         shared.clone(),
+                        Arc::clone(&connection_factory),
                     )
                     .await
                     {
@@ -1076,6 +1091,7 @@ impl OverlayManager {
                         timeout,
                         Arc::clone(&pool),
                         shared.clone(),
+                        Arc::clone(&connection_factory),
                     )
                     .await
                     {
@@ -1630,6 +1646,7 @@ impl OverlayManager {
             timeout,
             Arc::clone(&self.outbound_pool),
             self.shared_state(),
+            Arc::clone(&self.connection_factory),
         )
         .await
     }
@@ -1973,8 +1990,22 @@ impl OverlayManager {
         timeout_secs: u64,
         pool: Arc<ConnectionPool>,
         shared: SharedPeerState,
+        connection_factory: Arc<dyn ConnectionFactory>,
     ) -> Result<PeerId> {
-        let peer = match Peer::connect(addr, local_node, timeout_secs).await {
+        let connection = match connection_factory.connect(addr, timeout_secs).await {
+            Ok(connection) => connection,
+            Err(e) => {
+                pool.release_pending();
+                if let Some(tx) = shared.peer_event_tx.clone() {
+                    let _ = tx
+                        .send(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
+                        .await;
+                }
+                return Err(e);
+            }
+        };
+
+        let peer = match Peer::connect_with_connection(addr, connection, local_node, timeout_secs).await {
             Ok(peer) => peer,
             Err(e) => {
                 pool.release_pending();
@@ -2455,37 +2486,51 @@ impl OverlayManager {
             .config
             .connect_timeout_secs
             .max(self.config.auth_timeout_secs);
+        let connection_factory = Arc::clone(&self.connection_factory);
 
         let peer_handles = Arc::clone(&shared.peer_handles);
         let peer_handle = tokio::spawn(async move {
-            match Peer::connect(&addr, local_node, connect_timeout).await {
-                Ok(peer) => {
-                    let peer_id = peer.id().clone();
-                    info!("Connected to discovered peer: {} at {}", peer_id, addr);
+            match connection_factory.connect(&addr, connect_timeout).await {
+                Ok(connection) => {
+                    match Peer::connect_with_connection(&addr, connection, local_node, connect_timeout).await {
+                        Ok(peer) => {
+                            let peer_id = peer.id().clone();
+                            info!("Connected to discovered peer: {} at {}", peer_id, addr);
 
-                    // Handshake succeeded: promote from pending to authenticated
-                    pool.mark_authenticated();
+                            // Handshake succeeded: promote from pending to authenticated
+                            pool.mark_authenticated();
 
-                    if let Some(tx) = shared.peer_event_tx.clone() {
-                        let _ = tx
-                            .send(PeerEvent::Connected(addr.clone(), PeerType::Outbound))
-                            .await;
+                            if let Some(tx) = shared.peer_event_tx.clone() {
+                                let _ = tx
+                                    .send(PeerEvent::Connected(addr.clone(), PeerType::Outbound))
+                                    .await;
+                            }
+
+                            let peer_info = peer.info().clone();
+                            let (outbound_rx, flow_control) =
+                                Self::register_peer(&peer, &peer_id, peer_info, &shared);
+
+                            // NOTE: Do NOT send PEERS to outbound peers — see Peer.cpp:1225-1230.
+
+                            // Run peer loop (peer is moved, not locked)
+                            Self::run_peer_loop(peer_id.clone(), peer, outbound_rx, flow_control, shared.clone())
+                                .await;
+
+                            // Cleanup
+                            shared.peers.remove(&peer_id);
+                            shared.peer_info_cache.remove(&peer_id);
+                            pool.release_authenticated();
+                        }
+                        Err(e) => {
+                            debug!("Failed to connect to discovered peer {}: {}", addr, e);
+                            if let Some(tx) = shared.peer_event_tx.clone() {
+                                let _ = tx
+                                    .send(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
+                                    .await;
+                            }
+                            pool.release_pending();
+                        }
                     }
-
-                    let peer_info = peer.info().clone();
-                    let (outbound_rx, flow_control) =
-                        Self::register_peer(&peer, &peer_id, peer_info, &shared);
-
-                    // NOTE: Do NOT send PEERS to outbound peers — see Peer.cpp:1225-1230.
-
-                    // Run peer loop (peer is moved, not locked)
-                    Self::run_peer_loop(peer_id.clone(), peer, outbound_rx, flow_control, shared.clone())
-                        .await;
-
-                    // Cleanup
-                    shared.peers.remove(&peer_id);
-                    shared.peer_info_cache.remove(&peer_id);
-                    pool.release_authenticated();
                 }
                 Err(e) => {
                     debug!("Failed to connect to discovered peer {}: {}", addr, e);

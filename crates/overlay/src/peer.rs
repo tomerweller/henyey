@@ -233,6 +233,36 @@ impl Peer {
         Ok(peer)
     }
 
+    /// Create an outbound peer from a pre-established transport connection.
+    pub async fn connect_with_connection(
+        addr: &PeerAddress,
+        connection: Connection,
+        local_node: LocalNode,
+        timeout_secs: u64,
+    ) -> Result<Self> {
+        let auth = AuthContext::new(local_node, true);
+
+        let mut peer = Self {
+            info: PeerInfo {
+                peer_id: PeerId::from_bytes([0u8; 32]),
+                address: connection.remote_addr(),
+                direction: ConnectionDirection::Outbound,
+                version_string: String::new(),
+                overlay_version: 0,
+                ledger_version: 0,
+                connected_at: Instant::now(),
+                original_address: Some(addr.clone()),
+            },
+            state: PeerState::Connecting,
+            connection,
+            auth,
+            stats: Arc::new(PeerStats::default()),
+        };
+
+        peer.handshake(timeout_secs).await?;
+        Ok(peer)
+    }
+
     /// Create a peer from an accepted connection.
     pub async fn accept(
         connection: Connection,

@@ -157,7 +157,7 @@ impl App {
 
         if reconnected {
             // Give peers time to complete handshake
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            self.clock.sleep(Duration::from_millis(200)).await;
             self.request_scp_state_from_peers().await;
         }
     }
@@ -183,7 +183,7 @@ impl App {
         }
 
         // Phase 2: Build the to_ping list (no overlay lock needed).
-        let now = Instant::now();
+        let now = self.clock.now();
         let mut inflight = self.ping_inflight.write().await;
         let mut peer_inflight = self.peer_ping_inflight.write().await;
         inflight.retain(|hash, info| {
@@ -209,7 +209,7 @@ impl App {
                 hash,
                 PingInfo {
                     peer_id: snapshot.info.peer_id.clone(),
-                    sent_at: Instant::now(),
+                    sent_at: self.clock.now(),
                 },
             );
             to_ping.push((snapshot.info.peer_id, hash));

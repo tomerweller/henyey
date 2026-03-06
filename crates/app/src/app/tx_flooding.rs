@@ -159,14 +159,14 @@ impl App {
 
         // Clean up old tx demand history entries (older than 5 minutes)
         const MAX_TX_DEMAND_AGE_SECS: u64 = 300;
-        let cutoff = Instant::now() - std::time::Duration::from_secs(MAX_TX_DEMAND_AGE_SECS);
+        let cutoff = self.clock.now() - std::time::Duration::from_secs(MAX_TX_DEMAND_AGE_SECS);
         let mut history = self.tx_demand_history.write().await;
         history.retain(|_, entry| entry.last_demanded > cutoff);
 
         // Clean up old tx set dont have entries (older than 2 minutes)
         const MAX_TX_SET_DONT_HAVE_AGE_SECS: u64 = 120;
         let cutoff_short =
-            Instant::now() - std::time::Duration::from_secs(MAX_TX_SET_DONT_HAVE_AGE_SECS);
+            self.clock.now() - std::time::Duration::from_secs(MAX_TX_SET_DONT_HAVE_AGE_SECS);
         let mut dont_have = self.tx_set_dont_have.write().await;
         // Note: tx_set_dont_have doesn't have timestamps, so we clear it periodically
         // to prevent unbounded growth. Clear entries for any old tx set hashes.
@@ -181,7 +181,7 @@ impl App {
     }
 
     pub(super) async fn record_tx_pull_latency(&self, hash: Hash256, peer: &henyey_overlay::PeerId) {
-        let now = Instant::now();
+        let now = self.clock.now();
         let mut history = self.tx_demand_history.write().await;
         let Some(entry) = history.get_mut(&hash) else {
             return;
@@ -288,7 +288,7 @@ impl App {
 
         let max_demand_size = self.max_demand_size();
         let max_queue_size = self.max_advert_queue_size();
-        let now = Instant::now();
+        let now = self.clock.now();
         let mut to_send: Vec<(henyey_overlay::PeerId, Vec<Hash256>)> = Vec::new();
 
         {
@@ -848,7 +848,7 @@ impl App {
         }
         peers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
 
-        let now = Instant::now();
+        let now = self.clock.now();
         let (requests, newly_exhausted) = {
             let mut dont_have = self.tx_set_dont_have.write().await;
             let pending_set: HashSet<Hash256> = pending_hashes.iter().copied().collect();

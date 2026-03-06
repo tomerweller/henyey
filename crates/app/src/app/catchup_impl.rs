@@ -93,7 +93,7 @@ impl App {
             );
             // Record skip time for cooldown to prevent repeated catchup attempts.
             // We need to wait for the next checkpoint to become available.
-            *self.last_catchup_completed_at.write().await = Some(Instant::now());
+            *self.last_catchup_completed_at.write().await = Some(self.clock.now());
             return Ok(CatchupResult {
                 ledger_seq: current,
                 ledger_hash: Hash256::default(),
@@ -373,7 +373,7 @@ impl App {
         // Update cache with the ledger we caught up to (it's a checkpoint)
         {
             let mut cache = self.cached_archive_checkpoint.write().await;
-            *cache = Some((output.result.ledger_seq, Instant::now()));
+            *cache = Some((output.result.ledger_seq, self.clock.now()));
         }
 
         // Populate syncing_ledgers from externalized cache before returning.
@@ -447,7 +447,7 @@ impl App {
         // Record catchup completion time for cooldown. This prevents
         // maybe_start_buffered_catchup() from triggering a second catchup
         // while the main loop is still closing buffered ledgers.
-        *self.last_catchup_completed_at.write().await = Some(Instant::now());
+        *self.last_catchup_completed_at.write().await = Some(self.clock.now());
 
         let final_ledger = self.get_current_ledger().await.unwrap_or(output.result.ledger_seq);
         Ok(CatchupResult {
@@ -482,7 +482,7 @@ impl App {
         // Update cache
         {
             let mut cache = self.cached_archive_checkpoint.write().await;
-            *cache = Some((checkpoint, Instant::now()));
+            *cache = Some((checkpoint, self.clock.now()));
         }
 
         Ok(checkpoint)
@@ -1275,7 +1275,7 @@ impl App {
             } else {
                 // We're waiting for trigger - apply consensus stuck timeout
                 // This handles the case where we have a gap but can't reach the trigger
-                let now = Instant::now();
+                let now = self.clock.now();
                 let action = {
                     let mut stuck_state = self.consensus_stuck_state.write().await;
                     match stuck_state.as_mut() {
@@ -1530,7 +1530,7 @@ impl App {
                         // clear pending requests and prevent responses from being matched.
                         // Record skip time for cooldown to prevent repeated archive queries.
                         // This uses the same cooldown mechanism as catchup completion.
-                        *self.last_catchup_completed_at.write().await = Some(Instant::now());
+                        *self.last_catchup_completed_at.write().await = Some(self.clock.now());
                         self.catchup_in_progress.store(false, Ordering::SeqCst);
                         return;
                     }
@@ -1548,7 +1548,7 @@ impl App {
                         "Failed to query archive for latest checkpoint, skipping catchup"
                     );
                     // Record skip time for cooldown to prevent repeated archive queries.
-                    *self.last_catchup_completed_at.write().await = Some(Instant::now());
+                    *self.last_catchup_completed_at.write().await = Some(self.clock.now());
                     self.catchup_in_progress.store(false, Ordering::SeqCst);
                     return;
                 }
@@ -1722,7 +1722,7 @@ impl App {
 
                     // Reset tx_set tracking state (same as rapid close handler)
                     // so the main loop can make fresh requests.
-                    *self.last_externalized_at.write().await = Instant::now();
+                    *self.last_externalized_at.write().await = self.clock.now();
                     self.tx_set_all_peers_exhausted.store(false, Ordering::SeqCst);
                     self.tx_set_dont_have.write().await.clear();
                     self.tx_set_last_request.write().await.clear();
@@ -1759,7 +1759,7 @@ impl App {
                     // since catchup() unconditionally sets CatchingUp on entry.
                     self.restore_operational_state().await;
                 }
-                *self.last_catchup_completed_at.write().await = Some(Instant::now());
+                *self.last_catchup_completed_at.write().await = Some(self.clock.now());
             }
             Err(err) => {
                 // Check if this is a fatal catchup failure (verification/integrity
@@ -1791,7 +1791,7 @@ impl App {
                 // Without this, a failed catchup (e.g., archive checkpoint not yet
                 // published) would re-trigger immediately on the next tick because
                 // the stuck state's recovery_attempts are already exhausted.
-                *self.last_catchup_completed_at.write().await = Some(Instant::now());
+                *self.last_catchup_completed_at.write().await = Some(self.clock.now());
                 // Reset the stuck state so the recovery/timeout cycle re-arms.
                 // This provides natural backoff: 10s cooldown + 3 recovery attempts
                 // (30s) + catchup retry = ~40s per cycle while waiting for the
@@ -1800,7 +1800,7 @@ impl App {
                     if let Some(state) = self.consensus_stuck_state.write().await.as_mut() {
                         state.catchup_triggered = false;
                         state.recovery_attempts = 0;
-                        state.last_recovery_attempt = Instant::now();
+                        state.last_recovery_attempt = self.clock.now();
                     }
                 }
             }

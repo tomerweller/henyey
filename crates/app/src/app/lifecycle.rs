@@ -41,7 +41,7 @@ impl App {
         self.update_bucket_snapshot();
 
         // Wait a short time for initial peer connections, then request SCP state
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        self.clock.sleep(Duration::from_millis(500)).await;
         self.request_scp_state_from_peers().await;
 
         // Set state based on validator mode
@@ -179,7 +179,7 @@ impl App {
         // SCP message flow rate tracking
         let mut scp_messages_received: u64 = 0;
         let mut scp_messages_last_heartbeat: u64 = 0;
-        let mut last_scp_message_at = Instant::now();
+        let mut last_scp_message_at = self.clock.now();
 
         // In-progress background ledger close. Polled in the select loop.
         let mut pending_close: Option<PendingLedgerClose> = None;
@@ -255,7 +255,7 @@ impl App {
                             // Reset last_externalized_at so the heartbeat stall detector
                             // doesn't fire prematurely based on the timestamp of the
                             // EXTERNALIZE that was received 8-10s ago during rapid closes.
-                            *self.last_externalized_at.write().await = Instant::now();
+                            *self.last_externalized_at.write().await = self.clock.now();
 
                             // Reset tx_set tracking so fresh requests can be made for
                             // buffered entries that still need tx_sets. Don't evict
@@ -285,7 +285,7 @@ impl App {
                             if let Some(overlay) = self.overlay().await {
                                 let _ = overlay.request_scp_state(current_ledger).await;
                             }
-                            *self.last_scp_state_request_at.write().await = Instant::now();
+                            *self.last_scp_state_request_at.write().await = self.clock.now();
                         }
                     }
                 }
@@ -296,7 +296,7 @@ impl App {
                     self.set_phase(1); // 1 = scp_message
                     tracing::trace!(select_iteration, "BRANCH: scp_message_rx");
                     scp_messages_received += 1;
-                    last_scp_message_at = Instant::now();
+                    last_scp_message_at = self.clock.now();
                     let scp_slot = match &scp_msg.message {
                         StellarMessage::ScpMessage(env) => env.statement.slot_index,
                         _ => 0,
@@ -389,7 +389,7 @@ impl App {
                         let slot = envelope.statement.slot_index;
                         let sample = {
                             let mut latency = self.scp_latency.write().await;
-                            latency.record_self_sent(slot)
+                            latency.record_self_sent(slot, self.clock.now())
                         };
                         if let Some(ms) = sample {
                             let mut survey_data = self.survey_data.write().await;
@@ -480,7 +480,7 @@ impl App {
                                     if let Some(overlay) = self.overlay().await {
                                         let _ = overlay.request_scp_state(cl).await;
                                     }
-                                    *self.last_scp_state_request_at.write().await = Instant::now();
+                                    *self.last_scp_state_request_at.write().await = self.clock.now();
                                 }
                             }
                         }
@@ -617,7 +617,7 @@ impl App {
 
                     // If externalization stalls, ask peers for fresh SCP state.
                     if peers > 0 && self.herder.state().can_receive_scp() {
-                        let now = Instant::now();
+                        let now = self.clock.now();
                         let last_ext = *self.last_externalized_at.read().await;
                         let last_request = *self.last_scp_state_request_at.read().await;
                         if now.duration_since(last_ext) > Duration::from_secs(20)
@@ -815,8 +815,9 @@ impl App {
 
                 let sample = {
                     let mut latency = self.scp_latency.write().await;
-                    latency.record_first_seen(slot);
-                    latency.record_other_after_self(slot)
+                    let now = self.clock.now();
+                    latency.record_first_seen(slot, now);
+                    latency.record_other_after_self(slot, now)
                 };
                 if let Some(ms) = sample {
                     let mut survey_data = self.survey_data.write().await;

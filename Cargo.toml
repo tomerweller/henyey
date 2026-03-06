@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/clock",
     "crates/henyey",
     "crates/app",
     "crates/common",
@@ -10,6 +11,7 @@ members = [
     "crates/history",
     "crates/overlay",
     "crates/scp",
+    "crates/simulation",
     "crates/herder",
     "crates/ledger",
     "crates/tx",
@@ -44,6 +46,7 @@ soroban-env-common-p25 = { package = "soroban-env-common", git = "https://github
 
 # Workspace crates
 henyey-common = { path = "crates/common" }
+henyey-clock = { path = "crates/clock" }
 henyey-app = { path = "crates/app" }
 henyey-crypto = { path = "crates/crypto" }
 henyey-db = { path = "crates/db" }
@@ -51,6 +54,7 @@ henyey-bucket = { path = "crates/bucket" }
 henyey-history = { path = "crates/history" }
 henyey-overlay = { path = "crates/overlay" }
 henyey-scp = { path = "crates/scp" }
+henyey-simulation = { path = "crates/simulation" }
 henyey-herder = { path = "crates/herder" }
 henyey-ledger = { path = "crates/ledger" }
 henyey-tx = { path = "crates/tx" }
@@ -71,7 +75,7 @@ rand_chacha = "0.3"
 getrandom = { version = "0.2", default-features = false, features = ["std"] }
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 futures = "0.3"
 async-trait = "0.1"

@@ -197,6 +197,32 @@ For simulation stages, also run:
 cargo test -p henyey-simulation --tests
 ```
 
+## Execution Progress
+
+- [x] Stage 0 complete: baseline captured and deterministic gates documented.
+- [x] Stage 1 complete: `crates/clock/` added (`Clock`, `RealClock`, `VirtualClock`) and wired into workspace.
+- [x] Stage 1 complete: `App::new_with_clock(config, clock)` added and `App::new(config)` now delegates to `RealClock`.
+- [x] Stage 2 complete (initial scope): migrated core startup/consensus timing touchpoints to clock (`lifecycle.rs`, `consensus.rs`, `peers.rs`).
+- [x] Stage 2 expanded: migrated additional consensus-adjacent timing paths in `catchup_impl.rs`, `tx_flooding.rs`, `survey_impl.rs`, and `ledger_close.rs` to injected clock where behavior-sensitive.
+- [x] Stage 2 expanded further: migrated `App` construction-time time anchors (`last_externalized_at`, `last_scp_state_request_at`, survey scheduler/reporting initialization, and `/info` age calculation) to the injected clock.
+- [x] Stage 2 expanded further: migrated SCP latency tracker timing from direct wall clock calls to clock-provided instants (`record_first_seen`, `record_self_sent`, `record_other_after_self`).
+- [x] Stage 3 complete (TCP-preserving abstraction): added `ConnectionFactory` + `TcpConnectionFactory` and wired `OverlayManager` through factory-based connect/bind.
+- [x] Stage 4 complete (v1 harness): added `crates/simulation/` deterministic harness with `Simulation`, `SimNode`, `SimulationMode`, `Topologies::core3/pair`.
+- [x] Stage 4 refined: extracted `LoopbackNetwork` model (`partition`, `heal`, `drop_prob`, `link_active`) to separate simulation network module for clearer loopback semantics.
+- [x] Stage 4 refined: added additional deterministic topology support (`cycle`, `separate`) and connectivity helper (`is_fully_connected`) in simulation harness.
+- [x] Stage 5 complete (v1 tests): added simulation tests for 3-node close, partition/heal recovery, deterministic replay, and bounded message loss.
+- [x] Stage 5 expanded: added topology coverage tests for cycle convergence and separate-cluster non-connectivity behavior.
+- [x] Stage 6 complete (handoff update): this plan now reflects delivered execution status and command validation.
+
+### Current Validation Status
+
+- `cargo test -p henyey-clock` passes.
+- `cargo test -p henyey-app` passes.
+- `cargo test -p henyey-overlay` passes.
+- `cargo test -p henyey-simulation --tests` passes.
+- `cargo test -p henyey-simulation --tests` passes (including cycle/separate topology scenarios).
+- `cargo test --all` passes.
+
 ## Detailed Design Phases (Reference)
 
 ### Phase 1: Clock Abstraction (3-5 days)

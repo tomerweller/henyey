@@ -76,6 +76,7 @@ mod auth;
 mod ban_manager;
 mod codec;
 mod connection;
+mod connection_factory;
 mod error;
 mod flood;
 mod flow_control;
@@ -94,6 +95,7 @@ pub use auth::{AuthCert, AuthContext, AuthState};
 pub use ban_manager::BanManager;
 pub use codec::{helpers as message_helpers, MessageCodec, MessageFrame};
 pub use connection::{Connection, ConnectionDirection, ConnectionPool, Listener};
+pub use connection_factory::{ConnectionFactory, TcpConnectionFactory};
 pub use error::OverlayError;
 pub use flood::{compute_message_hash, FloodGate, FloodGateStats, FloodRecord};
 pub use flow_control::{

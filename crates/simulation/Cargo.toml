@@ -1,0 +1,18 @@
+[package]
+name = "henyey-simulation"
+description = "Deterministic multi-node simulation harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "henyey_simulation"
+path = "src/lib.rs"
+
+[dependencies]
+henyey-clock.workspace = true
+henyey-common.workspace = true
+henyey-crypto.workspace = true
+futures.workspace = true
+tokio.workspace = true

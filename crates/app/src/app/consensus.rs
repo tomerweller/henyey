@@ -32,7 +32,7 @@ impl App {
 
             // Record local close time for drift tracking before triggering consensus.
             // This captures when we started the consensus round.
-            let local_time = std::time::SystemTime::now()
+            let local_time = self.clock.system_now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
@@ -601,7 +601,7 @@ impl App {
             return;
         }
         let slot = self.herder.tracking_slot();
-        let now = Instant::now();
+        let now = self.clock.now();
         let mut timeouts = self.scp_timeouts.write().await;
         if timeouts.slot != slot {
             timeouts.slot = slot;

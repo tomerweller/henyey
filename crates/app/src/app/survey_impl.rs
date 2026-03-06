@@ -139,7 +139,7 @@ impl App {
         reporting.inbound_indices.clear();
         reporting.outbound_indices.clear();
         reporting.bad_response_nodes.clear();
-        reporting.next_topoff = Instant::now();
+        reporting.next_topoff = self.clock.now();
 
         self.survey_results.write().await.clear();
         self.ensure_survey_secret(nonce).await;
@@ -189,7 +189,7 @@ impl App {
         if !running {
             return;
         }
-        if Instant::now() < next_topoff {
+        if self.clock.now() < next_topoff {
             return;
         }
 
@@ -221,7 +221,7 @@ impl App {
                 to_send.push((peer_id, inbound_index, outbound_index));
                 requests_sent += 1;
             }
-            reporting.next_topoff = Instant::now() + self.survey_throttle;
+            reporting.next_topoff = self.clock.now() + self.survey_throttle;
         }
 
         for (peer_id, inbound_index, outbound_index) in to_send {
@@ -887,7 +887,7 @@ impl App {
         const SURVEY_RESPONSE_WAIT: Duration = Duration::from_secs(5);
         const SURVEY_MAX_PEERS: usize = 4;
 
-        let now = Instant::now();
+        let now = self.clock.now();
         let mut scheduler = self.survey_scheduler.write().await;
 
         if now < scheduler.next_action {
