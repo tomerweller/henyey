@@ -1183,12 +1183,19 @@ impl OverlayManager {
                             let msg_type = helpers::message_type_name(&message);
                             trace!("Processing {} from {}", msg_type, peer_id);
 
-                            // Log ERROR messages
+                            // Log ERROR messages (Load rejections are expected, log at debug)
                             if let StellarMessage::ErrorMsg(ref err) = message {
-                                warn!(
-                                    "Peer {} sent ERROR: code={:?}, msg={}",
-                                    peer_id, err.code, err.msg.to_string()
-                                );
+                                if err.code == ErrorCode::Load {
+                                    debug!(
+                                        "Peer {} sent ERROR: code={:?}, msg={}",
+                                        peer_id, err.code, err.msg.to_string()
+                                    );
+                                } else {
+                                    warn!(
+                                        "Peer {} sent ERROR: code={:?}, msg={}",
+                                        peer_id, err.code, err.msg.to_string()
+                                    );
+                                }
                             }
 
                             // Flow control: RAII guard locks capacity on creation,
