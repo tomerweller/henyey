@@ -456,7 +456,44 @@ impl BucketManager {
         if !final_path.exists() {
             durable_rename(&temp_path, &final_path)?;
         } else {
-            let _ = std::fs::remove_file(&temp_path);
+            // Canonical file already exists. Validate it before reuse: a prior
+            // partial write can leave a zero-byte/truncated file at this path.
+            match Bucket::from_xdr_file_disk_backed(&final_path) {
+                Ok(existing) if existing.hash() == hash => {
+                    let _ = std::fs::remove_file(&temp_path);
+                }
+                Ok(existing) => {
+                    tracing::warn!(
+                        expected_hash = %hash.to_hex(),
+                        actual_hash = %existing.hash().to_hex(),
+                        path = %final_path.display(),
+                        "merge: canonical bucket file has wrong hash, replacing"
+                    );
+                    if let Err(rename_err) = durable_rename(&temp_path, &final_path) {
+                        tracing::warn!(
+                            error = %rename_err,
+                            temp = %temp_path.display(),
+                            dest = %final_path.display(),
+                            "merge: failed to replace corrupt canonical file, using existing"
+                        );
+                    }
+                }
+                Err(load_err) => {
+                    tracing::warn!(
+                        error = %load_err,
+                        path = %final_path.display(),
+                        "merge: failed to load canonical bucket file, replacing"
+                    );
+                    if let Err(rename_err) = durable_rename(&temp_path, &final_path) {
+                        tracing::warn!(
+                            error = %rename_err,
+                            temp = %temp_path.display(),
+                            dest = %final_path.display(),
+                            "merge: failed to replace unreadable canonical file, using existing"
+                        );
+                    }
+                }
+            }
         }
 
         // Load as DiskBacked (builds index, O(index_size) memory)
@@ -2015,6 +2052,38 @@ mod tests {
         let reloaded = manager.load_bucket(&merged_hash).unwrap();
         assert_eq!(reloaded.hash(), merged_hash);
         assert_eq!(reloaded.len(), merged.len());
+    }
+
+    #[test]
+    fn test_merge_replaces_corrupt_existing_canonical_file() {
+        let (_temp_dir, manager) = create_manager();
+
+        let old = manager
+            .create_bucket(vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))])
+            .unwrap();
+        let new = manager
+            .create_bucket(vec![BucketEntry::Live(make_account_entry([2u8; 32], 200))])
+            .unwrap();
+
+        // First merge creates a valid canonical file.
+        let first = manager.merge(&old, &new, 25).unwrap();
+        let expected_hash = first.hash();
+        let canonical_path = manager.bucket_path(&expected_hash);
+        assert!(canonical_path.exists());
+
+        // Corrupt the canonical file to simulate prior partial write.
+        std::fs::write(&canonical_path, b"").unwrap();
+        assert_eq!(std::fs::metadata(&canonical_path).unwrap().len(), 0);
+
+        // A second merge with the same inputs should replace corrupt file.
+        manager.clear_cache();
+        let second = manager.merge(&old, &new, 25).unwrap();
+        assert_eq!(second.hash(), expected_hash);
+
+        manager.clear_cache();
+        let reloaded = manager.load_bucket(&expected_hash).unwrap();
+        assert_eq!(reloaded.hash(), expected_hash);
+        assert!(reloaded.len() > 0);
     }
 
     #[test]
