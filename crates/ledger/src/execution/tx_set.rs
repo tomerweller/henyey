@@ -126,6 +126,27 @@ pub fn run_transactions_on_executor(
         );
     }
 
+    // Prefetch seller deps for top-N best offers in DEX asset pairs from this TX set.
+    // Mirrors stellar-core's demand-driven populateEntryCacheFromBestOffers but is
+    // upfront and scoped to only the pairs referenced by this ledger's TXs.
+    // With N=10 and ~50-200 pairs per ledger → ~500-2000 offers → ~1500-6000 keys.
+    {
+        const TOP_N_OFFERS_PER_PAIR: usize = 10;
+        let dex_pairs = collect_dex_asset_pairs(transactions);
+        if !dex_pairs.is_empty() {
+            let seller_keys = executor.collect_seller_keys_for_pairs(&dex_pairs, TOP_N_OFFERS_PER_PAIR);
+            if !seller_keys.is_empty() {
+                let stats = snapshot.prefetch(&seller_keys)?;
+                tracing::debug!(
+                    pairs = dex_pairs.len(),
+                    requested = stats.requested,
+                    loaded = stats.loaded,
+                    "Prefetched offer seller deps"
+                );
+            }
+        }
+    }
+
     // Pre-deduct fees before executing any TX body.
     // When external_pre_charged is provided (parallel path), fees were already
     // deducted on the delta by pre_deduct_all_fees_on_delta. Otherwise, deduct
@@ -1108,4 +1129,155 @@ pub fn compute_state_size_window_entry(
         )),
         ext: LedgerEntryExt::V0,
     })
+}
+
+/// Extract (buying, selling) asset pairs from DEX operations in the TX set.
+///
+/// Scans all TX operations for offer management and path payment operations
+/// to determine which order books will be accessed during execution.
+fn collect_dex_asset_pairs(
+    transactions: &[(TransactionEnvelope, Option<u32>)],
+) -> HashSet<(Asset, Asset)> {
+    let mut pairs = HashSet::new();
+    for (tx, _) in transactions {
+        let frame = TransactionFrame::new(tx.clone());
+        for op in frame.operations() {
+            match &op.body {
+                OperationBody::ManageSellOffer(o) => {
+                    pairs.insert((o.buying.clone(), o.selling.clone()));
+                }
+                OperationBody::CreatePassiveSellOffer(o) => {
+                    pairs.insert((o.buying.clone(), o.selling.clone()));
+                }
+                OperationBody::ManageBuyOffer(o) => {
+                    pairs.insert((o.buying.clone(), o.selling.clone()));
+                }
+                OperationBody::PathPaymentStrictReceive(o) => {
+                    // Path: send_asset → path[0] → ... → dest_asset; crossed as (next, prev).
+                    let mut chain: Vec<&Asset> = vec![&o.send_asset];
+                    chain.extend(o.path.iter());
+                    chain.push(&o.dest_asset);
+                    for w in chain.windows(2) {
+                        pairs.insert((w[1].clone(), w[0].clone()));
+                    }
+                }
+                OperationBody::PathPaymentStrictSend(o) => {
+                    let mut chain: Vec<&Asset> = vec![&o.send_asset];
+                    chain.extend(o.path.iter());
+                    chain.push(&o.dest_asset);
+                    for w in chain.windows(2) {
+                        pairs.insert((w[1].clone(), w[0].clone()));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    pairs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::curr::{
+        AccountId, AlphaNum4, Asset, AssetCode4, ManageSellOfferOp, Memo, MuxedAccount,
+        PathPaymentStrictReceiveOp, Preconditions, PublicKey, SequenceNumber,
+        Transaction, TransactionExt, TransactionV1Envelope, Uint256, VecM,
+    };
+
+    fn make_account_id(seed: u8) -> AccountId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
+    }
+
+    fn credit(code: &[u8; 4], issuer_seed: u8) -> Asset {
+        Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*code),
+            issuer: make_account_id(issuer_seed),
+        })
+    }
+
+    fn make_tx_with_ops(ops: Vec<Operation>) -> (TransactionEnvelope, Option<u32>) {
+        let ops_vec: VecM<Operation, 100> = ops.try_into().unwrap();
+        let tx = Transaction {
+            source_account: MuxedAccount::Ed25519(Uint256([1u8; 32])),
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: ops_vec,
+            ext: TransactionExt::V0,
+        };
+        (TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        }), None)
+    }
+
+    fn op(body: OperationBody) -> Operation {
+        Operation { source_account: None, body }
+    }
+
+    /// collect_dex_asset_pairs extracts (buying, selling) from manage sell/buy offer ops.
+    #[test]
+    fn test_collect_dex_asset_pairs_manage_offers() {
+        let usd = credit(b"USD\0", 10);
+        let eur = credit(b"EUR\0", 11);
+
+        let tx = make_tx_with_ops(vec![
+            op(OperationBody::ManageSellOffer(ManageSellOfferOp {
+                selling: Asset::Native,
+                buying: usd.clone(),
+                amount: 100,
+                price: stellar_xdr::curr::Price { n: 1, d: 1 },
+                offer_id: 0,
+            })),
+        ]);
+
+        let pairs = collect_dex_asset_pairs(&[tx]);
+        assert_eq!(pairs.len(), 1);
+        assert!(pairs.contains(&(usd.clone(), Asset::Native)));
+
+        // ManageBuyOffer also captured
+        let tx2 = make_tx_with_ops(vec![
+            op(OperationBody::ManageBuyOffer(stellar_xdr::curr::ManageBuyOfferOp {
+                selling: eur.clone(),
+                buying: usd.clone(),
+                buy_amount: 100,
+                price: stellar_xdr::curr::Price { n: 2, d: 1 },
+                offer_id: 0,
+            })),
+        ]);
+        let pairs2 = collect_dex_asset_pairs(&[tx2]);
+        assert!(pairs2.contains(&(usd.clone(), eur.clone())));
+    }
+
+    /// collect_dex_asset_pairs extracts all hop pairs from path payments.
+    #[test]
+    fn test_collect_dex_asset_pairs_path_payment() {
+        let usd = credit(b"USD\0", 10);
+        let eur = credit(b"EUR\0", 11);
+        let btc = credit(b"BTC\0", 12);
+
+        // PathPaymentStrictReceive: native → EUR → USD → BTC
+        // Hops: (EUR, native), (USD, EUR), (BTC, USD)
+        let path: VecM<Asset, 5> = vec![eur.clone(), usd.clone()].try_into().unwrap();
+        let tx = make_tx_with_ops(vec![
+            op(OperationBody::PathPaymentStrictReceive(PathPaymentStrictReceiveOp {
+                send_asset: Asset::Native,
+                send_max: 1000,
+                destination: MuxedAccount::Ed25519(Uint256([2u8; 32])),
+                dest_asset: btc.clone(),
+                dest_amount: 500,
+                path,
+            })),
+        ]);
+
+        let pairs = collect_dex_asset_pairs(&[tx]);
+        assert_eq!(pairs.len(), 3, "expected 3 hop pairs, got {:?}", pairs);
+        assert!(pairs.contains(&(eur.clone(), Asset::Native)));
+        assert!(pairs.contains(&(usd.clone(), eur.clone())));
+        assert!(pairs.contains(&(btc.clone(), usd.clone())));
+    }
 }

@@ -206,6 +206,16 @@ impl OfferIndex {
             .flat_map(|book| book.values())
     }
 
+    /// Get the top-N offer keys (cheapest first) for an asset pair.
+    pub fn top_n_offer_keys(&self, buying: &Asset, selling: &Asset, n: usize) -> Vec<OfferKey> {
+        let pair = AssetPair::new(buying, selling);
+        self.order_books
+            .get(&pair)
+            .into_iter()
+            .flat_map(|book| book.values().take(n).copied())
+            .collect()
+    }
+
     /// Check if the index contains any offers for an asset pair.
     pub fn has_offers(&self, buying: &Asset, selling: &Asset) -> bool {
         let asset_pair = AssetPair::new(buying, selling);
@@ -233,5 +243,78 @@ impl OfferIndex {
     /// Get the number of asset pairs with offers.
     pub fn num_asset_pairs(&self) -> usize {
         self.order_books.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::curr::{
+        AccountId, AlphaNum4, Asset, AssetCode4, OfferEntry, OfferEntryExt, Price, PublicKey,
+        Uint256,
+    };
+
+    fn make_account_id(seed: u8) -> AccountId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
+    }
+
+    fn usd(issuer_seed: u8) -> Asset {
+        Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+            issuer: make_account_id(issuer_seed),
+        })
+    }
+
+    fn eur(issuer_seed: u8) -> Asset {
+        Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'E', b'U', b'R', 0]),
+            issuer: make_account_id(issuer_seed),
+        })
+    }
+
+    fn make_offer(seller_seed: u8, offer_id: i64, selling: Asset, buying: Asset, price_n: i32, price_d: i32) -> OfferEntry {
+        OfferEntry {
+            seller_id: make_account_id(seller_seed),
+            offer_id,
+            selling,
+            buying,
+            amount: 1000,
+            price: Price { n: price_n, d: price_d },
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        }
+    }
+
+    /// top_n_offer_keys returns top N offers by price (cheapest first), bounded by N.
+    #[test]
+    fn test_top_n_offer_keys() {
+        let issuer = 99u8;
+        let buying = usd(issuer);
+        let selling = Asset::Native;
+
+        let mut index = OfferIndex::new();
+        // Three offers at increasing prices: 1/1, 2/1, 3/1
+        let o1 = make_offer(1, 1, selling.clone(), buying.clone(), 1, 1);
+        let o2 = make_offer(2, 2, selling.clone(), buying.clone(), 2, 1);
+        let o3 = make_offer(3, 3, selling.clone(), buying.clone(), 3, 1);
+        index.add_offer(&o1);
+        index.add_offer(&o2);
+        index.add_offer(&o3);
+
+        // top-2 should return offers 1 and 2 (cheapest first)
+        let top2 = index.top_n_offer_keys(&buying, &selling, 2);
+        assert_eq!(top2.len(), 2);
+        assert_eq!(top2[0].offer_id, 1);
+        assert_eq!(top2[1].offer_id, 2);
+
+        // top-10 with only 3 offers should return all 3
+        let top10 = index.top_n_offer_keys(&buying, &selling, 10);
+        assert_eq!(top10.len(), 3);
+
+        // Unknown pair returns empty
+        let empty = index.top_n_offer_keys(&eur(issuer), &selling, 10);
+        assert!(empty.is_empty());
     }
 }

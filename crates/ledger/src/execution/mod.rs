@@ -1088,27 +1088,38 @@ impl TransactionExecutor {
         Ok(())
     }
 
-    /// Collect LedgerKeys for all offer seller accounts and their non-native trustlines.
+    /// Collect seller account + trustline keys for the top-N best offers in each asset pair.
     ///
-    /// Used to bulk-prefetch seller dependencies into the snapshot cache before
-    /// classic TX execution, mirroring stellar-core's `populateEntryCacheFromBestOffers`.
-    pub fn collect_offer_seller_keys(&self) -> Vec<LedgerKey> {
+    /// Only prefetches sellers for specific pairs (from the current TX set's DEX operations).
+    /// With N=10 and ~50-200 pairs per ledger, this produces ~500-2000 offers → 1500-6000 keys
+    /// instead of ~2M from scanning all 911K offers.
+    ///
+    /// Mirrors stellar-core's demand-driven `populateEntryCacheFromBestOffers`.
+    pub fn collect_seller_keys_for_pairs(
+        &self,
+        pairs: &HashSet<(Asset, Asset)>,
+        n: usize,
+    ) -> Vec<LedgerKey> {
         let mut keys: HashSet<LedgerKey> = HashSet::new();
-        for offer in self.state.iter_offers() {
-            keys.insert(LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-                account_id: offer.seller_id.clone(),
-            }));
-            if let Some(tl_asset) = asset_to_trustline_asset(&offer.selling) {
-                keys.insert(LedgerKey::Trustline(LedgerKeyTrustLine {
-                    account_id: offer.seller_id.clone(),
-                    asset: tl_asset,
-                }));
-            }
-            if let Some(tl_asset) = asset_to_trustline_asset(&offer.buying) {
-                keys.insert(LedgerKey::Trustline(LedgerKeyTrustLine {
-                    account_id: offer.seller_id.clone(),
-                    asset: tl_asset,
-                }));
+        for (buying, selling) in pairs {
+            for offer_key in self.state.top_n_offer_keys(buying, selling, n) {
+                if let Some(offer) = self.state.get_offer_by_key(&offer_key) {
+                    keys.insert(LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                        account_id: offer.seller_id.clone(),
+                    }));
+                    if let Some(tl_asset) = asset_to_trustline_asset(&offer.selling) {
+                        keys.insert(LedgerKey::Trustline(LedgerKeyTrustLine {
+                            account_id: offer.seller_id.clone(),
+                            asset: tl_asset,
+                        }));
+                    }
+                    if let Some(tl_asset) = asset_to_trustline_asset(&offer.buying) {
+                        keys.insert(LedgerKey::Trustline(LedgerKeyTrustLine {
+                            account_id: offer.seller_id.clone(),
+                            asset: tl_asset,
+                        }));
+                    }
+                }
             }
         }
         keys.into_iter().collect()
@@ -5098,20 +5109,22 @@ mod tests {
         );
     }
 
-    /// Verify `collect_offer_seller_keys()` returns the correct account and trustline keys
-    /// for all offer sellers, with native assets excluded and deduplication applied.
+    /// Verify `collect_seller_keys_for_pairs()` returns the correct account and trustline keys
+    /// for offer sellers in the given asset pairs, with native assets excluded and dedup applied.
     ///
-    /// Offers:
-    ///   seller 1: Native → USD  => account(1) + trustline(1, USD)
-    ///   seller 2: EUR → USD     => account(2) + trustline(2, EUR) + trustline(2, USD)
-    ///   seller 1: Native → Native (second offer, same seller) => account(1) [deduped]
+    /// Offers (all price 1/1, so offer_id determines order):
+    ///   seller 1: Native → USD  (offer_id 1)  => account(1) + trustline(1, USD)
+    ///   seller 2: EUR → USD     (offer_id 2)  => account(2) + trustline(2, EUR) + trustline(2, USD)
+    ///   seller 1: Native → Native (offer_id 3) => account(1) [deduped]
     ///
+    /// Query pairs: (buying=USD, selling=Native) and (buying=USD, selling=EUR)
     /// Expected 5 unique keys: 2 accounts + 3 trustlines.
     #[test]
-    fn test_collect_offer_seller_keys() {
+    fn test_collect_seller_keys_for_pairs() {
         use crate::snapshot::{EntriesLookupFn, LedgerSnapshot, SnapshotHandle};
         use stellar_xdr::curr::*;
         use std::sync::Arc;
+        use std::collections::HashSet;
 
         let make_account_id = |seed: u8| -> AccountId {
             let mut bytes = [0u8; 32];
@@ -5170,7 +5183,12 @@ mod tests {
         );
         executor.load_orderbook_offers(&snap).unwrap();
 
-        let keys = executor.collect_offer_seller_keys();
+        // Query pairs that cover the two non-native offers.
+        let mut pairs: HashSet<(Asset, Asset)> = HashSet::new();
+        pairs.insert((usd(issuer), Asset::Native));    // buying=USD, selling=Native
+        pairs.insert((usd(issuer), eur(issuer)));      // buying=USD, selling=EUR
+
+        let keys = executor.collect_seller_keys_for_pairs(&pairs, 10);
 
         // 2 account keys + 3 trustline keys = 5 unique keys
         assert_eq!(keys.len(), 5, "expected 5 unique keys, got {}: {:?}", keys.len(), keys);

@@ -906,9 +906,14 @@ impl LedgerStateManager {
         self.remove_last_modified_key(&ledger_key);
     }
 
-    /// Iterate over all offers currently in state.
-    pub fn iter_offers(&self) -> impl Iterator<Item = &OfferEntry> {
-        self.offers.values()
+    /// Get the top-N offer keys (cheapest first) for an asset pair.
+    pub fn top_n_offer_keys(&self, buying: &Asset, selling: &Asset, n: usize) -> Vec<OfferKey> {
+        self.offer_index.top_n_offer_keys(buying, selling, n)
+    }
+
+    /// Get an offer by its key (read-only).
+    pub fn get_offer_by_key(&self, key: &OfferKey) -> Option<&OfferEntry> {
+        self.offers.get(key)
     }
 
     /// Get an offer by seller and offer ID (read-only).
