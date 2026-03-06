@@ -453,6 +453,7 @@ pub fn execute_soroban_parallel_phase(
                 module_cache: soroban.module_cache,
                 hot_archive: soroban.hot_archive.clone(),
                 runtime_handle: soroban.runtime_handle.clone(),
+                soroban_state: soroban.soroban_state.clone(),
                 emit_soroban_tx_meta_ext_v1: soroban.emit_soroban_tx_meta_ext_v1,
                 enable_soroban_diagnostic_events: soroban.enable_soroban_diagnostic_events,
             },
@@ -542,6 +543,36 @@ pub fn pre_deduct_all_fees_on_delta(
     delta: &mut LedgerDelta,
     snapshot: &SnapshotHandle,
 ) -> Result<(Vec<PreChargedFee>, Vec<PreChargedFee>, i64)> {
+    // Batch-prefetch all fee source accounts before processing fees.
+    // Without this, each deduct_fee_from_account call falls through to an individual
+    // bucket list lookup. Prefetching once populates the snapshot cache so all
+    // subsequent lookups are O(1) cache hits.
+    {
+        let mut fee_keys: Vec<LedgerKey> = Vec::with_capacity(
+            classic_txs.len()
+                + soroban_phase
+                    .stages
+                    .iter()
+                    .map(|s| s.iter().map(|c| c.len()).sum::<usize>())
+                    .sum::<usize>(),
+        );
+        for (tx, _) in classic_txs {
+            fee_keys.push(LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                account_id: fee_source_account_id(tx),
+            }));
+        }
+        for stage in &soroban_phase.stages {
+            for cluster in stage {
+                for (tx, _) in cluster {
+                    fee_keys.push(LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                        account_id: fee_source_account_id(tx),
+                    }));
+                }
+            }
+        }
+        snapshot.prefetch(&fee_keys)?;
+    }
+
     let mut total_fee_pool = 0i64;
 
     // Phase 0: Classic fees (in apply order)
@@ -655,6 +686,9 @@ pub(super) fn execute_single_cluster(
     }
     if let Some(ref ha) = soroban.hot_archive {
         executor.set_hot_archive(ha.clone());
+    }
+    if let Some(ref ss) = soroban.soroban_state {
+        executor.set_soroban_state(ss.clone());
     }
 
     // Pre-load entries from prior stages so this cluster's executor sees
@@ -865,6 +899,7 @@ pub(super) fn execute_stage_clusters(
     let classic_events = soroban.classic_events;
     let module_cache = soroban.module_cache.cloned();
     let hot_archive = soroban.hot_archive.clone();
+    let soroban_state_arc = soroban.soroban_state.clone();
     let runtime_handle = soroban.runtime_handle.clone();
     let emit_soroban_tx_meta_ext_v1 = soroban.emit_soroban_tx_meta_ext_v1;
     let enable_soroban_diagnostic_events = soroban.enable_soroban_diagnostic_events;
@@ -905,6 +940,7 @@ pub(super) fn execute_stage_clusters(
             let config = soroban_config.clone();
             let cache = module_cache.clone();
             let ha = hot_archive.clone();
+            let ss = soroban_state_arc.clone();
             let clusters = clusters.clone();
             let prior_stage = prior_stage.clone();
             let cluster_offset = offsets[idx];
@@ -917,6 +953,7 @@ pub(super) fn execute_stage_clusters(
                     classic_events,
                     module_cache: cache.as_ref(),
                     hot_archive: ha,
+                    soroban_state: ss,
                     runtime_handle: None,
                     emit_soroban_tx_meta_ext_v1,
                     enable_soroban_diagnostic_events,

@@ -456,6 +456,12 @@ pub struct TransactionExecutor {
     /// This enables looking up entries that have been evicted from the live bucket list
     /// and are waiting to be restored.
     hot_archive: Option<std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
+    /// Optional shared in-memory Soroban state for O(1) contract entry lookups.
+    ///
+    /// When set, `load_soroban_footprint` checks this HashMap-backed cache before
+    /// falling through to the 22-bucket list scan. Set on every cluster executor
+    /// by `execute_single_cluster` for the parallel Soroban path.
+    soroban_state: Option<std::sync::Arc<crate::soroban_state::SharedSorobanState>>,
     /// Whether to emit `SorobanTransactionMetaExtV1` in transaction meta.
     emit_soroban_tx_meta_ext_v1: bool,
     /// Whether to include diagnostic events in transaction meta.
@@ -485,9 +491,22 @@ impl TransactionExecutor {
             classic_events,
             module_cache: None,
             hot_archive: None,
+            soroban_state: None,
             emit_soroban_tx_meta_ext_v1: false,
             enable_soroban_diagnostic_events: false,
         }
+    }
+
+    /// Set the in-memory Soroban state for O(1) contract entry lookups.
+    ///
+    /// When set, `load_soroban_footprint` uses this HashMap-backed cache as the
+    /// primary source for ContractData/ContractCode/TTL lookups, avoiding expensive
+    /// 22-bucket list scans.
+    pub fn set_soroban_state(
+        &mut self,
+        state: std::sync::Arc<crate::soroban_state::SharedSorobanState>,
+    ) {
+        self.soroban_state = Some(state);
     }
 
     /// Set the hot archive bucket list for Protocol 23+ entry restoration.
@@ -1229,8 +1248,15 @@ impl TransactionExecutor {
     ) -> Result<()> {
         use sha2::{Digest, Sha256};
 
-        // Collect all footprint keys + their TTL keys for batch loading
-        let mut all_keys = Vec::new();
+        // Acquire a read lock on InMemorySorobanState if available (O1 optimization).
+        // InMemorySorobanState is a HashMap mirror of all live ContractData/ContractCode/TTL
+        // entries built from the bucket list at startup and updated incrementally on each
+        // ledger close. Lookups are O(1) vs O(22 × bloom_filter) for bucket list scans.
+        let in_memory = self.soroban_state.as_ref().map(|s| s.read());
+
+        // Collect footprint keys not yet in state, routing Soroban keys to InMemorySorobanState
+        // and everything else to the bucket list.
+        let mut bucket_list_keys = Vec::new();
         for key in footprint
             .read_only
             .iter()
@@ -1240,10 +1266,46 @@ impl TransactionExecutor {
             // Also skip entries that were deleted by a previous TX in this ledger - they
             // should NOT be reloaded from the bucket list. In stellar-core, deleted
             // entries are tracked in mThreadEntryMap as nullopt, providing the same behavior.
-            if self.state.get_entry(key).is_none() && !self.state.is_entry_deleted(key) {
-                all_keys.push(key.clone());
+            if self.state.get_entry(key).is_some() || self.state.is_entry_deleted(key) {
+                continue;
             }
-            // Add TTL key for contract data/code entries
+
+            // For ContractData/ContractCode keys, use InMemorySorobanState as primary source.
+            if let Some(ref ims) = in_memory {
+                if matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)) {
+                    // Compute TTL key hash once (O3: reused for both entry and TTL lookup).
+                    let key_bytes = key
+                        .to_xdr(Limits::none())
+                        .map_err(|e| LedgerError::Serialization(e.to_string()))?;
+                    let key_hash = stellar_xdr::curr::Hash(Sha256::digest(&key_bytes).into());
+                    let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
+                        key_hash: key_hash.clone(),
+                    });
+
+                    if let Some(entry) = ims.get(key) {
+                        // Found in InMemorySorobanState — load directly, skipping bucket list.
+                        self.state.load_entry((*entry).clone());
+                        // Load the co-located TTL entry if not already present.
+                        if self.state.get_entry(&ttl_key).is_none()
+                            && !self.state.is_entry_deleted(&ttl_key)
+                        {
+                            if let Some(ttl_entry) = ims.get(&ttl_key) {
+                                self.state.load_entry((*ttl_entry).clone());
+                            }
+                        }
+                    }
+                    // Whether found or not, skip the bucket list for this Soroban key.
+                    // InMemorySorobanState is authoritative for ledger-start state; entries
+                    // absent from it are either newly created this ledger (already in state
+                    // from prior_stage.entries) or archived (caught by footprint_has_unrestored
+                    // before we get here).
+                    continue;
+                }
+            }
+
+            // Non-Soroban key (or no InMemorySorobanState): load from bucket list.
+            bucket_list_keys.push(key.clone());
+            // Add derived TTL key for contract data/code entries.
             if matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)) {
                 let key_bytes = key
                     .to_xdr(Limits::none())
@@ -1252,23 +1314,20 @@ impl TransactionExecutor {
                 let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
                     key_hash: key_hash.clone(),
                 });
-                // Also check if TTL was deleted (along with its parent entry)
                 if self.state.get_entry(&ttl_key).is_none()
                     && !self.state.is_entry_deleted(&ttl_key)
                 {
-                    all_keys.push(ttl_key);
+                    bucket_list_keys.push(ttl_key);
                 }
             }
         }
 
-        if all_keys.is_empty() {
-            return Ok(());
-        }
-
-        // Batch-load all entries + TTLs in a single bucket list pass
-        let entries = snapshot.load_entries(&all_keys)?;
-        for entry in entries {
-            self.state.load_entry(entry);
+        if !bucket_list_keys.is_empty() {
+            // Batch-load all remaining entries + TTLs in a single bucket list pass.
+            let entries = snapshot.load_entries(&bucket_list_keys)?;
+            for entry in entries {
+                self.state.load_entry(entry);
+            }
         }
 
         // NOTE: We do NOT auto-restore entries from the hot archive here.
@@ -3801,6 +3860,11 @@ pub struct SorobanContext<'a> {
     pub module_cache: Option<&'a PersistentModuleCache>,
     pub hot_archive: Option<std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>>,
     pub runtime_handle: Option<tokio::runtime::Handle>,
+    /// Shared in-memory Soroban state for O(1) contract entry lookups during execution.
+    ///
+    /// When provided, `load_soroban_footprint` uses this as the primary source for
+    /// ContractData/ContractCode/TTL lookups, bypassing the 22-bucket list scan.
+    pub soroban_state: Option<std::sync::Arc<crate::soroban_state::SharedSorobanState>>,
     /// Whether to emit `SorobanTransactionMetaExtV1` in transaction meta.
     pub emit_soroban_tx_meta_ext_v1: bool,
     /// Whether to include diagnostic events in transaction meta.
@@ -4643,6 +4707,238 @@ mod tests {
         assert!(
             executor.state.get_account(&account_id).is_none(),
             "Account must remain absent after load_entry returns false"
+        );
+    }
+
+    /// O1 optimization: load_soroban_footprint uses InMemorySorobanState when set.
+    ///
+    /// With soroban_state set on the executor, ContractData/ContractCode entries in the
+    /// footprint must be sourced from the in-memory HashMap (O(1)) rather than the bucket
+    /// list. The snapshot lookup function panics if called for Soroban keys, proving that
+    /// the bucket list is never consulted when IMS holds the entry.
+    #[test]
+    fn test_load_soroban_footprint_uses_in_memory_state() {
+        use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
+        use crate::soroban_state::SharedSorobanState;
+        use sha2::{Digest, Sha256};
+        use stellar_xdr::curr::*;
+        use std::sync::Arc;
+
+        // --- Build a ContractData entry ---
+        let contract_address = ScAddress::Contract(ContractId(Hash([0xAB; 32])));
+        let data_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract_address.clone(),
+            key: ScVal::U32(99),
+            durability: ContractDataDurability::Persistent,
+        });
+        let data_entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: contract_address.clone(),
+                key: ScVal::U32(99),
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::I32(42),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        // Compute TTL key hash
+        let ttl_key_hash_bytes: [u8; 32] = {
+            let bytes = data_key.to_xdr(Limits::none()).unwrap();
+            Sha256::digest(&bytes).into()
+        };
+        let ttl_key = LedgerKey::Ttl(LedgerKeyTtl {
+            key_hash: Hash(ttl_key_hash_bytes),
+        });
+
+        // --- Populate SharedSorobanState ---
+        let shared = Arc::new(SharedSorobanState::new());
+        {
+            let mut ims = shared.write();
+            // create_contract_data also registers any pending TTL
+            ims.create_ttl(
+                &LedgerKeyTtl { key_hash: Hash(ttl_key_hash_bytes) },
+                crate::soroban_state::TtlData::new(200, 100),
+            ).unwrap();
+            ims.create_contract_data(data_entry.clone()).unwrap();
+        }
+
+        // --- Snapshot that panics if Soroban keys reach the bucket list ---
+        let data_key_cl = data_key.clone();
+        let ttl_key_cl = ttl_key.clone();
+        let lookup_fn: crate::snapshot::EntryLookupFn = Arc::new(move |key: &LedgerKey| {
+            if *key == data_key_cl || *key == ttl_key_cl {
+                panic!("Bucket list must NOT be consulted when InMemorySorobanState is set");
+            }
+            Ok(None)
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup_fn);
+
+        // --- Executor with soroban_state wired in ---
+        let context = LedgerContext::new(101, 1234567890, 100, 5_000_000, 25, NetworkId::testnet());
+        let mut executor = TransactionExecutor::new(
+            &context,
+            0,
+            SorobanConfig::default(),
+            ClassicEventConfig::default(),
+        );
+        executor.set_soroban_state(shared);
+
+        // --- Footprint referencing the ContractData key ---
+        let footprint = LedgerFootprint {
+            read_only: vec![data_key.clone()].try_into().unwrap(),
+            read_write: VecM::default(),
+        };
+
+        // Must not panic (no bucket list access) and must succeed
+        executor.load_soroban_footprint(&snapshot, &footprint).unwrap();
+
+        // Entry and its TTL must now be in executor state
+        assert!(
+            executor.state.get_entry(&data_key).is_some(),
+            "ContractData entry must be loaded from InMemorySorobanState"
+        );
+        assert!(
+            executor.state.get_entry(&ttl_key).is_some(),
+            "TTL entry must be co-loaded from InMemorySorobanState"
+        );
+    }
+
+    /// O1 optimization: when InMemorySorobanState is set but does NOT contain a key,
+    /// the bucket list must still NOT be consulted for that Soroban key (IMS is
+    /// authoritative — absent entries are either new this ledger or archived).
+    #[test]
+    fn test_load_soroban_footprint_absent_key_skips_bucket_list() {
+        use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
+        use crate::soroban_state::SharedSorobanState;
+        use stellar_xdr::curr::*;
+        use std::sync::Arc;
+
+        let data_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(Hash([0xCD; 32]))),
+            key: ScVal::U32(1),
+            durability: ContractDataDurability::Persistent,
+        });
+
+        // Empty IMS — entry is absent
+        let shared = Arc::new(SharedSorobanState::new());
+
+        // Snapshot panics if the Soroban key is looked up
+        let data_key_cl = data_key.clone();
+        let lookup_fn: crate::snapshot::EntryLookupFn = Arc::new(move |key: &LedgerKey| {
+            if *key == data_key_cl {
+                panic!("Bucket list must NOT be consulted for absent Soroban key when IMS is set");
+            }
+            Ok(None)
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup_fn);
+
+        let context = LedgerContext::new(101, 1234567890, 100, 5_000_000, 25, NetworkId::testnet());
+        let mut executor = TransactionExecutor::new(
+            &context,
+            0,
+            SorobanConfig::default(),
+            ClassicEventConfig::default(),
+        );
+        executor.set_soroban_state(shared);
+
+        let footprint = LedgerFootprint {
+            read_only: vec![data_key.clone()].try_into().unwrap(),
+            read_write: VecM::default(),
+        };
+
+        // Must not panic (bucket list not accessed) and entry must remain absent
+        executor.load_soroban_footprint(&snapshot, &footprint).unwrap();
+        assert!(
+            executor.state.get_entry(&data_key).is_none(),
+            "Absent Soroban key must remain absent — not fetched from bucket list"
+        );
+    }
+
+    /// O1 optimization: without soroban_state set, bucket list is used as before.
+    #[test]
+    fn test_load_soroban_footprint_falls_back_to_bucket_list_without_ims() {
+        use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
+        use sha2::{Digest, Sha256};
+        use stellar_xdr::curr::*;
+        use std::sync::Arc;
+
+        let contract_address = ScAddress::Contract(ContractId(Hash([0xEF; 32])));
+        let data_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract_address.clone(),
+            key: ScVal::U32(7),
+            durability: ContractDataDurability::Persistent,
+        });
+        let data_entry = LedgerEntry {
+            last_modified_ledger_seq: 90,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: contract_address,
+                key: ScVal::U32(7),
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::I32(7),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let ttl_key_hash_bytes: [u8; 32] = {
+            let bytes = data_key.to_xdr(Limits::none()).unwrap();
+            Sha256::digest(&bytes).into()
+        };
+        let ttl_key = LedgerKey::Ttl(LedgerKeyTtl {
+            key_hash: Hash(ttl_key_hash_bytes),
+        });
+        let ttl_entry = LedgerEntry {
+            last_modified_ledger_seq: 90,
+            data: LedgerEntryData::Ttl(TtlEntry {
+                key_hash: Hash(ttl_key_hash_bytes),
+                live_until_ledger_seq: 500,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let data_entry_cl = data_entry.clone();
+        let ttl_entry_cl = ttl_entry.clone();
+        let data_key_cl = data_key.clone();
+        let ttl_key_cl = ttl_key.clone();
+        let bucket_list_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bucket_list_called_cl = bucket_list_called.clone();
+        let lookup_fn: crate::snapshot::EntryLookupFn = Arc::new(move |key: &LedgerKey| {
+            bucket_list_called_cl.store(true, std::sync::atomic::Ordering::Relaxed);
+            if *key == data_key_cl {
+                return Ok(Some(data_entry_cl.clone()));
+            }
+            if *key == ttl_key_cl {
+                return Ok(Some(ttl_entry_cl.clone()));
+            }
+            Ok(None)
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup_fn);
+
+        // No soroban_state set on executor
+        let context = LedgerContext::new(101, 1234567890, 100, 5_000_000, 25, NetworkId::testnet());
+        let mut executor = TransactionExecutor::new(
+            &context,
+            0,
+            SorobanConfig::default(),
+            ClassicEventConfig::default(),
+        );
+
+        let footprint = LedgerFootprint {
+            read_only: vec![data_key.clone()].try_into().unwrap(),
+            read_write: VecM::default(),
+        };
+
+        executor.load_soroban_footprint(&snapshot, &footprint).unwrap();
+
+        assert!(
+            bucket_list_called.load(std::sync::atomic::Ordering::Relaxed),
+            "Without IMS, bucket list must be used"
+        );
+        assert!(
+            executor.state.get_entry(&data_key).is_some(),
+            "ContractData entry must be loaded from bucket list when IMS is absent"
         );
     }
 }

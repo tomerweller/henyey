@@ -391,15 +391,13 @@ impl SnapshotHandle {
         for key in keys {
             if let Some(entry) = self.inner.get_entry(key)? {
                 result.push(entry.clone());
-            } else if !is_soroban_key(key) {
+            } else {
                 let key_bytes = key_to_bytes(key)?;
                 if let Some(entry) = prefetch.get(&key_bytes) {
                     result.push(entry.clone());
                 } else {
                     remaining.push(key.clone());
                 }
-            } else {
-                remaining.push(key.clone());
             }
         }
         drop(prefetch);
@@ -456,8 +454,8 @@ impl SnapshotHandle {
             return Ok(Some(entry.clone()));
         }
 
-        // 2. Check prefetch cache (skip for Soroban keys — they're never cached)
-        if !is_soroban_key(key) {
+        // 2. Check prefetch cache
+        {
             let key_bytes = key_to_bytes(key)?;
             if let Some(entry) = self.prefetch_cache.read().get(&key_bytes) {
                 return Ok(Some(entry.clone()));
@@ -490,16 +488,11 @@ impl SnapshotHandle {
     ///
     /// Uses batch_lookup_fn for a single bucket list traversal.
     /// Keys already in the snapshot cache or prefetch cache are skipped.
-    /// Soroban entry types are skipped (they're in-memory via InMemorySorobanState).
     pub fn prefetch(&self, keys: &[LedgerKey]) -> Result<PrefetchStats> {
         let mut needed = Vec::new();
         let cache = self.prefetch_cache.read();
 
         for key in keys {
-            // Skip soroban types (in-memory via InMemorySorobanState)
-            if is_soroban_key(key) {
-                continue;
-            }
             let key_bytes = key_to_bytes(key)?;
             if self.inner.get_entry(key)?.is_some() || cache.contains_key(&key_bytes) {
                 continue;
@@ -547,13 +540,6 @@ impl SnapshotHandle {
     }
 }
 
-/// Check if a LedgerKey is a Soroban type (ContractData, ContractCode, Ttl).
-fn is_soroban_key(key: &LedgerKey) -> bool {
-    matches!(
-        key,
-        LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) | LedgerKey::Ttl(_)
-    )
-}
 
 /// Fluent builder for constructing [`LedgerSnapshot`] instances.
 ///

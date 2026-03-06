@@ -3336,6 +3336,7 @@ impl<'a> LedgerCloseContext<'a> {
                         module_cache,
                         hot_archive,
                         runtime_handle: self.runtime_handle.clone(),
+                        soroban_state: Some(self.manager.soroban_state.clone()),
                         emit_soroban_tx_meta_ext_v1: self.manager.config.emit_soroban_tx_meta_ext_v1,
                         enable_soroban_diagnostic_events: self.manager.config.enable_soroban_diagnostic_events,
                     },
