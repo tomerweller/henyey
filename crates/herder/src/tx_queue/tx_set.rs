@@ -688,16 +688,14 @@ mod tests {
         GeneralizedTransactionSet, Memo, MuxedAccount, Operation, OperationBody,
         ParallelTxExecutionStage, ParallelTxsComponent, Preconditions, SequenceNumber,
         SignatureHint, Transaction, TransactionEnvelope, TransactionExt, TransactionPhase,
-        TransactionV1Envelope, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
-        TransactionSetV1, Uint256,
+        TransactionSetV1, TransactionV1Envelope, TxSetComponent,
+        TxSetComponentTxsMaybeDiscountedFee, Uint256,
     };
 
     fn make_tx_envelope(seed: u8, fee: u32) -> TransactionEnvelope {
         let source = MuxedAccount::Ed25519(Uint256([seed; 32]));
         let dest = stellar_xdr::curr::AccountId(
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
-                [seed.wrapping_add(1); 32],
-            )),
+            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256([seed.wrapping_add(1); 32])),
         );
         let tx = Transaction {
             source_account: source,
@@ -987,10 +985,7 @@ mod tests {
         let mut sorted_tx = vec![make_tx_envelope(1, 100)];
         sort_txs_by_hash(&mut sorted_tx);
         let gen = make_gen_tx_set(vec![
-            TransactionPhase::V1(make_parallel_component(
-                vec![vec![sorted_tx]],
-                Some(100),
-            )),
+            TransactionPhase::V1(make_parallel_component(vec![vec![sorted_tx]], Some(100))),
             TransactionPhase::V0(
                 vec![make_classic_component(vec![make_tx_envelope(2, 100)], None)]
                     .try_into()
@@ -1050,6 +1045,78 @@ mod tests {
             .unwrap(),
         };
         assert!(validate_parallel_component(&parallel).is_ok());
+    }
+
+    #[test]
+    fn test_validate_parallel_component_rejects_unsorted_clusters() {
+        let tx_a = make_tx_envelope(1, 100);
+        let tx_b = make_tx_envelope(2, 100);
+        let hash_a = Hash256::hash_xdr(&tx_a).unwrap_or_default();
+        let hash_b = Hash256::hash_xdr(&tx_b).unwrap_or_default();
+
+        let (first, second) = if hash_a.0 < hash_b.0 {
+            (tx_b, tx_a)
+        } else {
+            (tx_a, tx_b)
+        };
+
+        let parallel = ParallelTxsComponent {
+            base_fee: Some(100),
+            execution_stages: vec![ParallelTxExecutionStage(
+                vec![
+                    DependentTxCluster(vec![first].try_into().unwrap()),
+                    DependentTxCluster(vec![second].try_into().unwrap()),
+                ]
+                .try_into()
+                .unwrap(),
+            )]
+            .try_into()
+            .unwrap(),
+        };
+
+        let result = validate_parallel_component(&parallel);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Clusters within stage are not in canonical order"));
+    }
+
+    #[test]
+    fn test_validate_parallel_component_rejects_unsorted_stages() {
+        let tx_a = make_tx_envelope(1, 100);
+        let tx_b = make_tx_envelope(2, 100);
+        let hash_a = Hash256::hash_xdr(&tx_a).unwrap_or_default();
+        let hash_b = Hash256::hash_xdr(&tx_b).unwrap_or_default();
+
+        let (stage0_tx, stage1_tx) = if hash_a.0 < hash_b.0 {
+            (tx_b, tx_a)
+        } else {
+            (tx_a, tx_b)
+        };
+
+        let parallel = ParallelTxsComponent {
+            base_fee: Some(100),
+            execution_stages: vec![
+                ParallelTxExecutionStage(
+                    vec![DependentTxCluster(vec![stage0_tx].try_into().unwrap())]
+                        .try_into()
+                        .unwrap(),
+                ),
+                ParallelTxExecutionStage(
+                    vec![DependentTxCluster(vec![stage1_tx].try_into().unwrap())]
+                        .try_into()
+                        .unwrap(),
+                ),
+            ]
+            .try_into()
+            .unwrap(),
+        };
+
+        let result = validate_parallel_component(&parallel);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Stages are not in canonical order"));
     }
 
     // =========================================================================
