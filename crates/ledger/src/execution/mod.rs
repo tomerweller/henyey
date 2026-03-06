@@ -5097,4 +5097,116 @@ mod tests {
             "TTL must be loaded from IMS even when ContractData was already in state"
         );
     }
+
+    /// Verify `collect_offer_seller_keys()` returns the correct account and trustline keys
+    /// for all offer sellers, with native assets excluded and deduplication applied.
+    ///
+    /// Offers:
+    ///   seller 1: Native → USD  => account(1) + trustline(1, USD)
+    ///   seller 2: EUR → USD     => account(2) + trustline(2, EUR) + trustline(2, USD)
+    ///   seller 1: Native → Native (second offer, same seller) => account(1) [deduped]
+    ///
+    /// Expected 5 unique keys: 2 accounts + 3 trustlines.
+    #[test]
+    fn test_collect_offer_seller_keys() {
+        use crate::snapshot::{EntriesLookupFn, LedgerSnapshot, SnapshotHandle};
+        use stellar_xdr::curr::*;
+        use std::sync::Arc;
+
+        let make_account_id = |seed: u8| -> AccountId {
+            let mut bytes = [0u8; 32];
+            bytes[0] = seed;
+            AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
+        };
+
+        let usd = |issuer_seed: u8| -> Asset {
+            Asset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+                issuer: make_account_id(issuer_seed),
+            })
+        };
+
+        let eur = |issuer_seed: u8| -> Asset {
+            Asset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'E', b'U', b'R', 0]),
+                issuer: make_account_id(issuer_seed),
+            })
+        };
+
+        let make_offer = |seller_seed: u8, offer_id: i64, selling: Asset, buying: Asset| -> LedgerEntry {
+            LedgerEntry {
+                last_modified_ledger_seq: 1,
+                data: LedgerEntryData::Offer(OfferEntry {
+                    seller_id: make_account_id(seller_seed),
+                    offer_id,
+                    selling,
+                    buying,
+                    amount: 1000,
+                    price: Price { n: 1, d: 1 },
+                    flags: 0,
+                    ext: OfferEntryExt::V0,
+                }),
+                ext: LedgerEntryExt::V0,
+            }
+        };
+
+        let issuer = 99u8;
+        let offers = vec![
+            make_offer(1, 1, Asset::Native, usd(issuer)),       // seller 1: native→USD
+            make_offer(2, 2, eur(issuer), usd(issuer)),         // seller 2: EUR→USD
+            make_offer(1, 3, Asset::Native, Asset::Native),     // seller 1 again: native→native
+        ];
+
+        let entries_fn: EntriesLookupFn = Arc::new(move || Ok(offers.clone()));
+        let mut snap = SnapshotHandle::new(LedgerSnapshot::empty(1));
+        snap.set_entries_lookup(entries_fn);
+
+        let context = LedgerContext::new(100, 0, 100, 5_000_000, 25, NetworkId::testnet());
+        let mut executor = TransactionExecutor::new(
+            &context,
+            0,
+            SorobanConfig::default(),
+            ClassicEventConfig::default(),
+        );
+        executor.load_orderbook_offers(&snap).unwrap();
+
+        let keys = executor.collect_offer_seller_keys();
+
+        // 2 account keys + 3 trustline keys = 5 unique keys
+        assert_eq!(keys.len(), 5, "expected 5 unique keys, got {}: {:?}", keys.len(), keys);
+
+        let account1 = LedgerKey::Account(LedgerKeyAccount { account_id: make_account_id(1) });
+        let account2 = LedgerKey::Account(LedgerKeyAccount { account_id: make_account_id(2) });
+
+        let tl_usd_issuer = make_account_id(issuer);
+        let tl_eur_issuer = make_account_id(issuer);
+
+        let tl1_usd = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: make_account_id(1),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+                issuer: tl_usd_issuer.clone(),
+            }),
+        });
+        let tl2_usd = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: make_account_id(2),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+                issuer: tl_usd_issuer,
+            }),
+        });
+        let tl2_eur = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: make_account_id(2),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'E', b'U', b'R', 0]),
+                issuer: tl_eur_issuer,
+            }),
+        });
+
+        assert!(keys.contains(&account1), "missing account key for seller 1");
+        assert!(keys.contains(&account2), "missing account key for seller 2");
+        assert!(keys.contains(&tl1_usd), "missing USD trustline for seller 1");
+        assert!(keys.contains(&tl2_usd), "missing USD trustline for seller 2");
+        assert!(keys.contains(&tl2_eur), "missing EUR trustline for seller 2");
+    }
 }

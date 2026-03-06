@@ -838,6 +838,38 @@ mod tests {
         assert_eq!(h1.ledger_seq, 42);
     }
 
+    /// Verify that `load_entries()` caches loaded entries so a subsequent `get_entry()`
+    /// for the same key does NOT invoke the `lookup_fn` again.
+    #[test]
+    fn test_load_entries_caches_results() {
+        let (key, entry) = create_test_account(7);
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let snapshot = LedgerSnapshot::empty(1);
+        let mut handle = SnapshotHandle::new(snapshot);
+
+        let entry_clone = entry.clone();
+        let count = call_count.clone();
+        handle.set_lookup(Arc::new(move |_k| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(entry_clone.clone()))
+        }));
+
+        // load_entries fetches from lookup_fn (count goes to 1)
+        let loaded = handle.load_entries(&[key.clone()]).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // get_entry for the same key must be served from prefetch_cache, not lookup_fn
+        let result = handle.get_entry(&key).unwrap();
+        assert!(result.is_some());
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "lookup_fn invoked again after load_entries cached the result"
+        );
+    }
+
     /// Verify that `get_entry()` caches bucket list results so subsequent lookups
     /// do NOT re-invoke the `lookup_fn`.
     #[test]
