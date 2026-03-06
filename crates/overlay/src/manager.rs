@@ -1039,7 +1039,7 @@ impl OverlayManager {
                             remaining = remaining.saturating_sub(1);
                         }
                         Err(e) => {
-                            warn!("Failed to connect to peer {}: {}", addr, e);
+                            debug!("Failed to connect to peer {}: {}", addr, e);
                             retry_after.insert(addr.clone(), now + Duration::from_secs(10));
                         }
                     }

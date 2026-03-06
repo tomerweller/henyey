@@ -991,7 +991,7 @@ impl Herder {
                 }
 
                 // Fast-forward to this slot using the externalized value
-                info!(
+                debug!(
                     slot,
                     current_slot, "Fast-forwarding using EXTERNALIZE from network"
                 );

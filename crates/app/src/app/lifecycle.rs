@@ -1151,7 +1151,7 @@ impl App {
             }
         };
 
-        tracing::info!(
+        tracing::debug!(
             state = ?stats.state,
             tracking_slot = stats.tracking_slot,
             pending_txs = stats.pending_transactions,

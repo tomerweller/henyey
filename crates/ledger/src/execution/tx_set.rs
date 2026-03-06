@@ -118,7 +118,7 @@ pub fn run_transactions_on_executor(
         }
         let keys_vec: Vec<LedgerKey> = all_keys.into_iter().collect();
         let stats = snapshot.prefetch(&keys_vec)?;
-        tracing::info!(
+        tracing::debug!(
             requested = stats.requested,
             loaded = stats.loaded,
             elapsed_ms = prefetch_start.elapsed().as_millis() as u64,
@@ -405,7 +405,7 @@ pub fn execute_soroban_parallel_phase(
         }
         let keys_vec: Vec<LedgerKey> = all_keys.into_iter().collect();
         let stats = snapshot.prefetch(&keys_vec)?;
-        tracing::info!(
+        tracing::debug!(
             requested = stats.requested,
             loaded = stats.loaded,
             elapsed_ms = prefetch_start.elapsed().as_millis() as u64,
