@@ -484,6 +484,15 @@ pub struct OverlayManager {
 }
 
 impl OverlayManager {
+    fn initial_send_more_grant(config: &FlowControlConfig) -> (u32, u32) {
+        // Flow control bytes credit is granted in byte-batch units.
+        // This must match the local byte capacity tracked in FlowControl.
+        (
+            config.peer_flood_reading_capacity as u32,
+            config.flow_control_bytes_batch_size as u32,
+        )
+    }
+
     /// Create a new overlay manager with the given configuration.
     pub fn new(config: OverlayConfig, local_node: LocalNode) -> Result<Self> {
         // Broadcast channel for non-critical overlay messages (TX floods, etc.).
@@ -1114,9 +1123,8 @@ impl OverlayManager {
         // Matches stellar-core's Peer::recvAuth() → sendSendMore().
         {
             let config = FlowControlConfig::default();
-            let initial_flood_msgs = config.peer_flood_reading_capacity as u32;
-            let initial_flood_bytes =
-                (config.peer_flood_reading_capacity * config.flow_control_bytes_batch_size) as u32;
+            let (initial_flood_msgs, initial_flood_bytes) =
+                Self::initial_send_more_grant(&config);
             if let Err(e) = peer
                 .send_more_extended(initial_flood_msgs, initial_flood_bytes)
                 .await
@@ -3027,6 +3035,15 @@ mod tests {
         assert!(!should_skip_generic_routing(&StellarMessage::Peers(
             stellar_xdr::curr::VecM::default()
         )));
+    }
+
+    #[test]
+    fn test_initial_send_more_grant_uses_byte_batch_size() {
+        let config = FlowControlConfig::default();
+        let (msgs, bytes) = OverlayManager::initial_send_more_grant(&config);
+
+        assert_eq!(msgs, 200);
+        assert_eq!(bytes, 100_000);
     }
 
     // ---- G8 tests: maybe_drop_random_peer ----
