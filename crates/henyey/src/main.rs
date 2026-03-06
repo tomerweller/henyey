@@ -1932,6 +1932,8 @@ fn write_scp_history_file(
 
     for entry in entries {
         let xdr = entry.to_xdr(Limits::none())?;
+        let marked_len = (xdr.len() as u32) | 0x8000_0000;
+        encoder.write_all(&marked_len.to_be_bytes())?;
         encoder.write_all(&xdr)?;
     }
     encoder.finish()?;
@@ -4120,6 +4122,8 @@ async fn cmd_http_command(command: &str, port: u16) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+    use stellar_xdr::curr::ReadXdr;
 
     // =========================================================================
     // CLI Parsing Tests
@@ -4245,5 +4249,43 @@ mod tests {
             root_secret.to_strkey(),
             "SC5O7VZUXDJ6JBDSZ74DSERXL7W3Y5LTOAMRF7RQRL3TAGAPS7LUVG3L"
         );
+    }
+
+    #[test]
+    fn test_write_scp_history_file_uses_record_marks() {
+        use flate2::read::GzDecoder;
+        use henyey_history::paths::checkpoint_path;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let entry = stellar_xdr::curr::ScpHistoryEntry::V0(stellar_xdr::curr::ScpHistoryEntryV0 {
+            quorum_sets: stellar_xdr::curr::VecM::default(),
+            ledger_messages: stellar_xdr::curr::LedgerScpMessages {
+                ledger_seq: 63,
+                messages: stellar_xdr::curr::VecM::default(),
+            },
+        });
+
+        write_scp_history_file(tmp.path(), 63, &[entry.clone()]).unwrap();
+
+        let path = tmp.path().join(checkpoint_path("scp", 63, "xdr.gz"));
+        let file = std::fs::File::open(path).unwrap();
+        let mut decoder = GzDecoder::new(file);
+        let mut bytes = Vec::new();
+        decoder.read_to_end(&mut bytes).unwrap();
+
+        assert!(bytes.len() > 4);
+        let mark = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
+        assert_ne!(mark & 0x8000_0000, 0);
+
+        let payload_len = (mark & 0x7fff_ffff) as usize;
+        assert_eq!(payload_len, bytes.len() - 4);
+
+        let parsed = stellar_xdr::curr::ScpHistoryEntry::from_xdr(
+            &bytes[4..],
+            stellar_xdr::curr::Limits::none(),
+        )
+        .unwrap();
+        assert_eq!(parsed, entry);
     }
 }
