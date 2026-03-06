@@ -2082,6 +2082,154 @@ impl BucketList {
         Self::restore_from_has(&pairs, &next_states, load_bucket)
     }
 
+    /// Parallel variant of [`Self::restore_from_has`].
+    ///
+    /// Loads all levels concurrently via `std::thread::scope`. Requires `Fn + Send + Sync`
+    /// instead of `FnMut` so the closure can be shared across threads. On a machine with
+    /// fast disk I/O this reduces restore time from ~156s to ~56s (bounded by level 10).
+    ///
+    /// # Arguments
+    ///
+    /// * `hashes` - Vec of (curr_hash, snap_hash) pairs for each level
+    /// * `next_states` - Vec of HasNextState for each level
+    /// * `load_bucket` - Thread-safe function to load a bucket from its hash
+    pub fn restore_from_has_parallel<F>(
+        hashes: &[(Hash256, Hash256)],
+        next_states: &[HasNextState],
+        load_bucket: F,
+    ) -> Result<Self>
+    where
+        F: Fn(&Hash256) -> Result<Bucket> + Send + Sync,
+    {
+        if hashes.len() != BUCKET_LIST_LEVELS {
+            return Err(BucketError::Serialization(format!(
+                "Expected {} bucket level hashes, got {}",
+                BUCKET_LIST_LEVELS,
+                hashes.len()
+            )));
+        }
+
+        let load_bucket = &load_bucket;
+
+        // Collect (level_index, output_hash) for levels with completed merge outputs.
+        let output_hashes: Vec<(usize, Hash256)> = next_states
+            .iter()
+            .enumerate()
+            .filter_map(|(i, state)| {
+                if state.state == HAS_NEXT_STATE_OUTPUT {
+                    state
+                        .output
+                        .as_ref()
+                        .filter(|h| !h.is_zero())
+                        .map(|h| (i, *h))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let levels = std::thread::scope(|s| -> Result<Vec<BucketLevel>> {
+            // Spawn one thread per level to load curr + snap.
+            let level_handles: Vec<_> = hashes
+                .iter()
+                .zip(next_states.iter())
+                .enumerate()
+                .map(|(i, ((curr_hash, snap_hash), _state))| {
+                    s.spawn(move || -> Result<(usize, Bucket, Bucket)> {
+                        let level_start = std::time::Instant::now();
+
+                        let curr = if curr_hash.is_zero() {
+                            Bucket::empty()
+                        } else {
+                            load_bucket(curr_hash)?
+                        };
+
+                        let snap = if snap_hash.is_zero() {
+                            Bucket::empty()
+                        } else {
+                            load_bucket(snap_hash)?
+                        };
+
+                        tracing::info!(
+                            level = i,
+                            curr_entries = curr.len(),
+                            snap_entries = snap.len(),
+                            elapsed_ms = level_start.elapsed().as_millis() as u64,
+                            "restore_from_has_parallel: loaded level curr+snap"
+                        );
+
+                        Ok((i, curr, snap))
+                    })
+                })
+                .collect();
+
+            // Spawn separate threads for output buckets (completed merge outputs).
+            // These run fully in parallel with the level curr/snap threads so that
+            // a large output bucket (e.g., level 10's ~47M-entry merge result) does
+            // not extend the critical path beyond the largest curr/snap load.
+            let output_handles: Vec<(usize, _)> = output_hashes
+                .iter()
+                .map(|(level_idx, hash)| {
+                    let i = *level_idx;
+                    let hash = *hash;
+                    (
+                        i,
+                        s.spawn(move || -> Result<Bucket> {
+                            let t = std::time::Instant::now();
+                            let bucket = load_bucket(&hash)?;
+                            tracing::info!(
+                                level = i,
+                                entries = bucket.len(),
+                                elapsed_ms = t.elapsed().as_millis() as u64,
+                                "restore_from_has_parallel: loaded output bucket"
+                            );
+                            Ok(bucket)
+                        }),
+                    )
+                })
+                .collect();
+
+            // Collect level curr/snap results (order matches input since indexed by i).
+            let level_results: Vec<(usize, Bucket, Bucket)> = level_handles
+                .into_iter()
+                .map(|h| h.join().expect("level load thread panicked"))
+                .collect::<Result<_>>()?;
+
+            // Collect output bucket results into a map keyed by level index.
+            let mut output_map: std::collections::HashMap<usize, Bucket> = output_handles
+                .into_iter()
+                .map(|(level_idx, h)| {
+                    h.join()
+                        .expect("output bucket thread panicked")
+                        .map(|b| (level_idx, b))
+                })
+                .collect::<Result<_>>()?;
+
+            // Assemble BucketLevels, attaching output buckets where present.
+            // level_results is already in level order (spawned from enumerate).
+            let mut levels: Vec<BucketLevel> = Vec::with_capacity(BUCKET_LIST_LEVELS);
+            for (i, curr, snap) in level_results {
+                let next = output_map.remove(&i).map(PendingMerge::InMemory);
+                let mut level = BucketLevel::new(i);
+                level.curr = Arc::new(curr);
+                level.snap = Arc::new(snap);
+                level.next = next;
+                levels.push(level);
+            }
+            Ok(levels)
+        })?;
+
+        Ok(Self {
+            levels,
+            ledger_seq: 0,
+            bucket_dir: None,
+            bucket_list_db_config: None,
+            completed_merges: Vec::new(),
+            merge_map: None,
+            merge_counters: Arc::new(MergeCounters::new()),
+        })
+    }
+
     /// Restore a bucket list from History Archive State with full FutureBucket support.
     ///
     /// This is the primary restoration method. It restores pending merge results when

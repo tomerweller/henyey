@@ -309,20 +309,161 @@ impl App {
             }
         }
 
-        // Step 6: Reconstruct bucket lists from HAS using shared helper
+        // Step 6: Reconstruct bucket lists with overlapped cache scan.
+        //
+        // The scan runs concurrently with merge restart because it only reads
+        // level.curr and level.snap (via Arc clones) while restart_merges_from_has
+        // only writes level.next. The overall critical path is:
+        //   parallel_restore (~56s) → max(scan ~32s, merges ~60s) → ~116s total
+        // vs the old sequential path of ~297s.
         let reconstruct_start = std::time::Instant::now();
-        let (bucket_list, hot_archive) = self.reconstruct_bucket_lists(&has, &header, lcl_seq).await?;
+
+        let live_hash_pairs = has.bucket_hash_pairs();
+        let live_next_states: Vec<HasNextState> = has
+            .live_next_states()
+            .into_iter()
+            .map(|s| HasNextState {
+                state: s.state,
+                output: s.output,
+                input_curr: s.input_curr,
+                input_snap: s.input_snap,
+            })
+            .collect();
+        let bucket_dir = self.config.database.path
+            .parent()
+            .unwrap_or(&self.config.database.path)
+            .join("buckets");
+
+        // Step 6a: Parallel restore of live BucketList (all levels loaded concurrently).
+        let bucket_manager = self.bucket_manager.clone();
+        let load_bucket = |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::Bucket> {
+            let arc = bucket_manager.load_bucket(hash)?;
+            Ok(Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone()))
+        };
+        let mut bucket_list = BucketList::restore_from_has_parallel(
+            &live_hash_pairs,
+            &live_next_states,
+            load_bucket,
+        ).map_err(|e| anyhow::anyhow!("Failed to restore live bucket list: {}", e))?;
+        bucket_list.set_bucket_dir(bucket_dir.clone());
+        bucket_list.set_ledger_seq(lcl_seq);
+
+        // Step 6b: Extract Arc<Bucket> pairs before starting merges.
+        // The scan thread owns these Arc clones independently of bucket_list.
+        let level_pairs: Vec<(Arc<henyey_bucket::Bucket>, Arc<henyey_bucket::Bucket>)> = bucket_list
+            .levels()
+            .iter()
+            .map(|l| (l.curr.clone(), l.snap.clone()))
+            .collect();
+        let protocol_version = header.ledger_version;
+        let scan_thread_count = self.config.buckets.scan_thread_count;
+
+        // Step 6c: Spawn cache scan in background — runs concurrently with merges.
+        // Rent config point lookups happen inside the blocking thread (not the tokio thread).
+        let scan_handle = tokio::task::spawn_blocking(move || {
+            henyey_ledger::scan_level_pairs_for_caches(
+                level_pairs,
+                protocol_version,
+                scan_thread_count,
+            )
+        });
+
+        // Step 6d: Restart pending merges from HAS (async, ~60s).
+        // Safe to hold &mut bucket_list while scan thread has Arc clones.
+        {
+            let bucket_dir_for_merge = bucket_dir.clone();
+            let load_bucket_for_merge = |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::Bucket> {
+                if hash.is_zero() {
+                    return Ok(henyey_bucket::Bucket::empty());
+                }
+                let bucket_path = bucket_dir_for_merge.join(format!("{}.bucket.xdr", hash.to_hex()));
+                if bucket_path.exists() {
+                    henyey_bucket::Bucket::from_xdr_file_disk_backed(&bucket_path)
+                } else {
+                    Err(henyey_bucket::BucketError::NotFound(format!(
+                        "bucket {} not found on disk", hash.to_hex()
+                    )))
+                }
+            };
+            bucket_list
+                .restart_merges_from_has(
+                    lcl_seq,
+                    protocol_version,
+                    &live_next_states,
+                    load_bucket_for_merge,
+                    true,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to restart bucket merges: {}", e))?;
+            tracing::info!(
+                bucket_list_hash = %bucket_list.hash().to_hex(),
+                "Restarted pending merges from HAS"
+            );
+        }
+
+        // Step 6e: Restore hot archive (~1s, sequential).
+        let hot_archive = if let Some(hot_hash_pairs) = has.hot_archive_bucket_hash_pairs() {
+            let hot_next_states: Vec<HasNextState> = has
+                .hot_archive_next_states()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| HasNextState {
+                    state: s.state,
+                    output: s.output,
+                    input_curr: s.input_curr,
+                    input_snap: s.input_snap,
+                })
+                .collect();
+
+            let bucket_manager = self.bucket_manager.clone();
+            let load_hot = |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::HotArchiveBucket> {
+                bucket_manager.load_hot_archive_bucket(hash)
+            };
+            let mut hot_bl = HotArchiveBucketList::restore_from_has_parallel(
+                &hot_hash_pairs,
+                &hot_next_states,
+                load_hot,
+            ).map_err(|e| anyhow::anyhow!("Failed to restore hot archive: {}", e))?;
+
+            let bucket_manager = self.bucket_manager.clone();
+            let load_hot_for_merge = move |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::HotArchiveBucket> {
+                bucket_manager.load_hot_archive_bucket(hash)
+            };
+            let hot_next_states_ref = hot_next_states.clone();
+            hot_bl
+                .restart_merges_from_has(
+                    lcl_seq,
+                    protocol_version,
+                    &hot_next_states_ref,
+                    load_hot_for_merge,
+                    true,
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to restart hot archive merges: {}", e))?;
+            tracing::info!(
+                hot_archive_hash = %hot_bl.hash().to_hex(),
+                "Restarted hot archive pending merges from HAS"
+            );
+            hot_bl
+        } else {
+            HotArchiveBucketList::default()
+        };
+
+        // Step 6f: Join cache scan (should already be done since scan ~32s < merges ~60s).
+        let cache_data = scan_handle
+            .await
+            .map_err(|e| anyhow::anyhow!("Cache scan thread panicked: {:?}", e))?;
+
         tracing::info!(
             elapsed_ms = reconstruct_start.elapsed().as_millis() as u64,
-            "Bucket lists reconstructed from disk"
+            "Bucket lists reconstructed from disk (parallel restore + overlapped scan)"
         );
 
-        // Step 7: Initialize LedgerManager
+        // Step 7: Initialize LedgerManager with precomputed caches.
         if self.ledger_manager.is_initialized() {
             self.ledger_manager.reset();
         }
         self.ledger_manager
-            .initialize(bucket_list, hot_archive, header.clone(), header_hash)
+            .initialize_with_precomputed_caches(bucket_list, hot_archive, header.clone(), header_hash, cache_data)
             .map_err(|e| anyhow::anyhow!("Failed to initialize ledger manager from disk: {}", e))?;
 
         tracing::info!(
@@ -456,7 +597,7 @@ impl App {
             Ok(std::sync::Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone()))
         };
 
-        let mut bucket_list = BucketList::restore_from_has(
+        let mut bucket_list = BucketList::restore_from_has_parallel(
             &live_hash_pairs,
             &live_next_states,
             load_bucket,
@@ -522,7 +663,7 @@ impl App {
                 bucket_manager.load_hot_archive_bucket(hash)
             };
 
-            let mut hot_bl = HotArchiveBucketList::restore_from_has(
+            let mut hot_bl = HotArchiveBucketList::restore_from_has_parallel(
                 &hot_hash_pairs,
                 &hot_next_states,
                 load_hot,

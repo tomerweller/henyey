@@ -1243,6 +1243,92 @@ impl HotArchiveBucketList {
         Self::restore_from_has(&pairs, &next_states, load_bucket)
     }
 
+    /// Parallel variant of [`Self::restore_from_has`].
+    ///
+    /// Loads all levels concurrently via `std::thread::scope`. Requires `Fn + Send + Sync`
+    /// instead of `FnMut`.
+    ///
+    /// # Arguments
+    ///
+    /// * `hashes` - Vec of (curr_hash, snap_hash) pairs for each level
+    /// * `next_states` - Vec of HasNextState for each level
+    /// * `load_bucket` - Thread-safe function to load a HotArchiveBucket by hash
+    pub fn restore_from_has_parallel<F>(
+        hashes: &[(Hash256, Hash256)],
+        next_states: &[HasNextState],
+        load_bucket: F,
+    ) -> Result<Self>
+    where
+        F: Fn(&Hash256) -> Result<HotArchiveBucket> + Send + Sync,
+    {
+        if hashes.len() != HOT_ARCHIVE_BUCKET_LIST_LEVELS {
+            return Err(BucketError::Serialization(format!(
+                "Expected {} hot archive bucket level hashes, got {}",
+                HOT_ARCHIVE_BUCKET_LIST_LEVELS,
+                hashes.len()
+            )));
+        }
+
+        let load_bucket = &load_bucket;
+        let levels = std::thread::scope(|s| -> Result<Vec<HotArchiveBucketLevel>> {
+            let handles: Vec<_> = hashes
+                .iter()
+                .zip(next_states.iter())
+                .enumerate()
+                .map(|(i, ((curr_hash, snap_hash), state))| {
+                    s.spawn(move || -> Result<HotArchiveBucketLevel> {
+                        let curr = if curr_hash.is_zero() {
+                            HotArchiveBucket::empty()
+                        } else {
+                            load_bucket(curr_hash)?
+                        };
+
+                        let snap = if snap_hash.is_zero() {
+                            HotArchiveBucket::empty()
+                        } else {
+                            load_bucket(snap_hash)?
+                        };
+
+                        let next = if state.state == HAS_NEXT_STATE_OUTPUT {
+                            if let Some(ref output_hash) = state.output {
+                                if !output_hash.is_zero() {
+                                    tracing::debug!(
+                                        level = i,
+                                        output_hash = %output_hash.to_hex(),
+                                        "hot_archive restore_from_has_parallel: loading completed merge output"
+                                    );
+                                    Some(load_bucket(output_hash)?)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        let mut level = HotArchiveBucketLevel::new(i);
+                        level.curr = curr;
+                        level.snap = snap;
+                        level.next = next;
+                        Ok(level)
+                    })
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("level load thread panicked"))
+                .collect()
+        })?;
+
+        Ok(Self {
+            levels,
+            ledger_seq: 0,
+        })
+    }
+
     /// Restore a hot archive bucket list from History Archive State with full FutureBucket support.
     ///
     /// This is the primary restoration method. It restores pending merge results when

@@ -658,7 +658,7 @@ pub struct BucketConfig {
     pub scan_thread_count: usize,
 }
 
-fn default_scan_thread_count() -> usize { 2 }
+fn default_scan_thread_count() -> usize { 4 }
 
 impl Default for BucketConfig {
     fn default() -> Self {

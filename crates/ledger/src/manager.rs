@@ -187,10 +187,10 @@ struct PendingEvictionScan {
 ///
 /// This struct captures all the data that `initialize_all_caches` would compute,
 /// allowing the scan to run concurrently with other operations (e.g., merge restarts)
-/// during catchup. The scan runs on a `&BucketList` (read-only, `Send + Sync`)
-/// so it can execute on a background thread without interfering with bucket list
-/// mutations happening on other threads.
-struct CacheInitResult {
+/// during catchup. The scan runs on level Arc pairs (read-only, `Send + Sync`)
+/// so it can execute on a background thread concurrently with merge restarts
+/// that only modify `level.next`.
+pub struct CacheInitResult {
     /// All live offers indexed by offer_id.
     offers: HashMap<i64, LedgerEntry>,
     /// Secondary index: (account, asset) → set of offer_ids.
@@ -470,11 +470,14 @@ fn merge_level_results(
 /// Bounded-parallel scan-and-merge: up to `scan_thread_count` threads scan levels
 /// concurrently while the main thread merges completed results in level order (0 → 10).
 ///
+/// Levels are claimed in largest-first order so that the biggest (slowest) levels
+/// start immediately on all available workers, minimizing wall-clock time.
+///
 /// Memory is bounded to N concurrent raw `LevelScanResult`s plus accumulated final state,
 /// because the main thread merges and drops each raw HashMap before the window slides forward.
 /// With N=1 this is equivalent to the previous sequential loop.
 fn scan_and_merge(
-    bucket_list: &BucketList,
+    level_pairs: &[(Arc<henyey_bucket::Bucket>, Arc<henyey_bucket::Bucket>)],
     protocol_version: u32,
     soroban_enabled: bool,
     rent_config: &Option<crate::soroban_state::SorobanRentConfig>,
@@ -485,8 +488,7 @@ fn scan_and_merge(
     use std::sync::mpsc;
 
     let module_cache_arc = module_cache.map(Arc::new);
-    let levels = bucket_list.levels();
-    let num_levels = levels.len();
+    let num_levels = level_pairs.len();
     let num_workers = scan_thread_count.min(num_levels).max(1);
 
     let mut soroban_state = crate::soroban_state::InMemorySorobanState::new();
@@ -501,9 +503,17 @@ fn scan_and_merge(
     let mut ttl_count = 0u64;
     let mut config_count = 0u64;
 
-    // Workers atomically claim level indices; results are sent back via channel.
-    let next_level = AtomicUsize::new(0);
-    let next_level_ref = &next_level;
+    // Sort level indices by total bucket size descending for better load balancing:
+    // large levels (which take longest) start immediately, small levels fill gaps.
+    let mut sorted_indices: Vec<usize> = (0..num_levels).collect();
+    sorted_indices.sort_by_key(|&i| {
+        std::cmp::Reverse(level_pairs[i].0.len() + level_pairs[i].1.len())
+    });
+
+    // Workers atomically claim slots in the sorted array.
+    let next_claim = AtomicUsize::new(0);
+    let next_claim_ref = &next_claim;
+    let sorted_ref = &sorted_indices[..];
     let (tx, rx) = mpsc::channel::<(usize, LevelScanResult)>();
 
     std::thread::scope(|s| {
@@ -512,15 +522,16 @@ fn scan_and_merge(
             let mc_clone = module_cache_arc.clone();
             s.spawn(move || {
                 loop {
-                    let idx = next_level_ref.fetch_add(1, Ordering::Relaxed);
-                    if idx >= num_levels {
+                    let claim_idx = next_claim_ref.fetch_add(1, Ordering::Relaxed);
+                    if claim_idx >= num_levels {
                         break;
                     }
-                    let level = &levels[idx];
+                    let idx = sorted_ref[claim_idx];
+                    let (curr, snap) = &level_pairs[idx];
                     let level_start = std::time::Instant::now();
                     let result = scan_single_level(
-                        &level.curr,
-                        &level.snap,
+                        curr,
+                        snap,
                         soroban_enabled,
                         &mc_clone,
                         protocol_version,
@@ -652,67 +663,52 @@ fn scan_and_merge(
 
 /// Scan a bucket list and extract all cache data.
 ///
-/// This is the standalone version of `LedgerManager::initialize_all_caches` that
-/// returns results instead of installing them. It can run on a background thread
-/// because it only needs `&BucketList` (immutable, `Send + Sync`).
-///
-/// Up to `scan_thread_count` levels are scanned concurrently; results are merged
-/// in level order (level 0 wins) to preserve correct shadowing semantics while
-/// bounding peak memory to N concurrent raw scan results.
+/// Extracts level pairs from the BucketList, then delegates to
+/// `scan_level_pairs_for_caches` which computes the rent config internally.
 fn scan_bucket_list_for_caches(
     bucket_list: &BucketList,
     protocol_version: u32,
     scan_thread_count: usize,
 ) -> CacheInitResult {
-    use henyey_common::MIN_SOROBAN_PROTOCOL_VERSION;
-
-    let cache_init_start = std::time::Instant::now();
-
-    // Load rent config (uses point lookups, not full scan)
-    let rent_config = load_soroban_rent_config_from_bucket_list(bucket_list);
-
-    // Create module cache if Soroban is supported
-    let soroban_enabled = protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION;
-    let module_cache = if soroban_enabled {
-        PersistentModuleCache::new_for_protocol(protocol_version)
-    } else {
-        None
-    };
-
-    info!(
-        soroban_enabled,
-        scan_thread_count,
-        "scan_bucket_list_for_caches: starting scan..."
-    );
-
-    let result = scan_and_merge(
-        bucket_list,
-        protocol_version,
-        soroban_enabled,
-        &rent_config,
-        module_cache,
-        scan_thread_count,
-    );
-
-    let scan_elapsed = cache_init_start.elapsed();
-    info!(
-        elapsed_ms = scan_elapsed.as_millis() as u64,
-        "scan_bucket_list_for_caches: complete"
-    );
-
-    result
+    let level_pairs: Vec<(Arc<henyey_bucket::Bucket>, Arc<henyey_bucket::Bucket>)> = bucket_list
+        .levels()
+        .iter()
+        .map(|l| (l.curr.clone(), l.snap.clone()))
+        .collect();
+    scan_level_pairs_for_caches(level_pairs, protocol_version, scan_thread_count)
 }
 
-/// Load Soroban rent config from a bucket list (standalone version).
+/// Look up an entry from a slice of (curr, snap) bucket pairs, scanning level-order.
 ///
-/// This is used by `scan_bucket_list_for_caches` which runs outside of LedgerManager.
-fn load_soroban_rent_config_from_bucket_list(
-    bucket_list: &BucketList,
+/// Equivalent to `BucketList::get` but operates on pre-extracted pairs so it can
+/// be called without holding a `BucketList` reference.
+fn get_from_pairs(
+    level_pairs: &[(Arc<henyey_bucket::Bucket>, Arc<henyey_bucket::Bucket>)],
+    key: &LedgerKey,
+) -> henyey_bucket::Result<Option<LedgerEntry>> {
+    use henyey_bucket::BucketEntry;
+    'level: for (curr, snap) in level_pairs {
+        for bucket in [curr, snap] {
+            if let Some(entry) = bucket.get(key)? {
+                match entry {
+                    BucketEntry::Live(e) | BucketEntry::Init(e) => return Ok(Some(e)),
+                    BucketEntry::Dead(_) => return Ok(None),
+                    BucketEntry::Metadata(_) => continue 'level,
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Compute Soroban rent config from pre-extracted bucket level pairs via point lookups.
+fn compute_soroban_rent_config_from_pairs(
+    level_pairs: &[(Arc<henyey_bucket::Bucket>, Arc<henyey_bucket::Bucket>)],
 ) -> Option<crate::soroban_state::SorobanRentConfig> {
     let cpu_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
         config_setting_id: ConfigSettingId::ContractCostParamsCpuInstructions,
     });
-    let cpu_params = bucket_list.get(&cpu_key).ok()?.and_then(|e| {
+    let cpu_params = get_from_pairs(level_pairs, &cpu_key).ok()?.and_then(|e| {
         if let LedgerEntryData::ConfigSetting(
             ConfigSettingEntry::ContractCostParamsCpuInstructions(params),
         ) = e.data
@@ -726,7 +722,7 @@ fn load_soroban_rent_config_from_bucket_list(
     let mem_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
         config_setting_id: ConfigSettingId::ContractCostParamsMemoryBytes,
     });
-    let mem_params = bucket_list.get(&mem_key).ok()?.and_then(|e| {
+    let mem_params = get_from_pairs(level_pairs, &mem_key).ok()?.and_then(|e| {
         if let LedgerEntryData::ConfigSetting(
             ConfigSettingEntry::ContractCostParamsMemoryBytes(params),
         ) = e.data
@@ -741,10 +737,9 @@ fn load_soroban_rent_config_from_bucket_list(
         config_setting_id: ConfigSettingId::ContractComputeV0,
     });
     let (tx_max_instructions, tx_max_memory_bytes) =
-        bucket_list.get(&compute_key).ok()?.and_then(|e| {
-            if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractComputeV0(
-                compute,
-            )) = e.data
+        get_from_pairs(level_pairs, &compute_key).ok()?.and_then(|e| {
+            if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractComputeV0(compute)) =
+                e.data
             {
                 Some((
                     compute.tx_max_instructions as u64,
@@ -761,6 +756,67 @@ fn load_soroban_rent_config_from_bucket_list(
         tx_max_instructions,
         tx_max_memory_bytes,
     })
+}
+
+/// Scan a set of bucket level pairs and extract all cache data.
+///
+/// This is the primary scan entry point. It accepts pre-extracted `Arc<Bucket>` pairs
+/// (one per level) so it can run on a background thread concurrently with merge restarts,
+/// which only modify `level.next` and never touch `level.curr` or `level.snap`.
+///
+/// Rent config is computed from the pairs via point lookups at the start of this function,
+/// inside whatever thread context the caller provides (typically `spawn_blocking`).
+///
+/// Up to `scan_thread_count` levels are scanned concurrently in largest-first order;
+/// results are merged in level order (level 0 wins) to preserve correct shadowing
+/// semantics while bounding peak memory to N concurrent raw scan results.
+pub fn scan_level_pairs_for_caches(
+    level_pairs: Vec<(Arc<henyey_bucket::Bucket>, Arc<henyey_bucket::Bucket>)>,
+    protocol_version: u32,
+    scan_thread_count: usize,
+) -> CacheInitResult {
+    use henyey_common::MIN_SOROBAN_PROTOCOL_VERSION;
+
+    let cache_init_start = std::time::Instant::now();
+
+    let soroban_enabled = protocol_version >= MIN_SOROBAN_PROTOCOL_VERSION;
+    let module_cache = if soroban_enabled {
+        PersistentModuleCache::new_for_protocol(protocol_version)
+    } else {
+        None
+    };
+
+    // Compute rent config from the pairs (3 point lookups). This runs in the
+    // caller's thread context — for the startup path it runs inside spawn_blocking,
+    // keeping the tokio thread unblocked.
+    let rent_config = if soroban_enabled {
+        compute_soroban_rent_config_from_pairs(&level_pairs)
+    } else {
+        None
+    };
+
+    info!(
+        soroban_enabled,
+        scan_thread_count,
+        "scan_bucket_list_for_caches: starting scan..."
+    );
+
+    let result = scan_and_merge(
+        &level_pairs,
+        protocol_version,
+        soroban_enabled,
+        &rent_config,
+        module_cache,
+        scan_thread_count,
+    );
+
+    let scan_elapsed = cache_init_start.elapsed();
+    info!(
+        elapsed_ms = scan_elapsed.as_millis() as u64,
+        "scan_bucket_list_for_caches: complete"
+    );
+
+    result
 }
 
 /// Load the EvictionIterator from the bucket list's ConfigSettingEntry.
@@ -856,7 +912,7 @@ impl Default for LedgerManagerConfig {
             emit_ledger_close_meta_ext_v1: false,
             emit_soroban_tx_meta_ext_v1: false,
             enable_soroban_diagnostic_events: false,
-            scan_thread_count: 2,
+            scan_thread_count: 4,
         }
     }
 }
@@ -1164,6 +1220,52 @@ impl LedgerManager {
             ledger_seq = self.state.read().header.ledger_seq,
             header_hash = %self.state.read().header_hash.to_hex(),
             "Ledger initialized from buckets"
+        );
+
+        Ok(())
+    }
+
+    /// Initialize the ledger from bucket list state using a pre-computed cache scan.
+    ///
+    /// This is the optimized startup path. The caller pre-computes `cache_data` on a
+    /// background thread while merge restarts run concurrently, then calls this method
+    /// to install everything atomically.
+    ///
+    /// # Arguments
+    ///
+    /// * `bucket_list` - The live bucket list (merges already restarted)
+    /// * `hot_archive_bucket_list` - The hot archive bucket list
+    /// * `header` - The ledger header to initialize with
+    /// * `header_hash` - The authoritative hash of the header from the history archive
+    /// * `cache_data` - Pre-computed cache data from `scan_level_pairs_for_caches`
+    pub fn initialize_with_precomputed_caches(
+        &self,
+        bucket_list: BucketList,
+        hot_archive_bucket_list: HotArchiveBucketList,
+        header: LedgerHeader,
+        header_hash: Hash256,
+        cache_data: CacheInitResult,
+    ) -> Result<()> {
+        self.verify_and_install_bucket_lists(bucket_list, hot_archive_bucket_list, header, header_hash)?;
+
+        // Initialize per-bucket caches for all DiskIndex buckets.
+        {
+            let bucket_list = self.bucket_list.read();
+            bucket_list.maybe_initialize_caches();
+        }
+
+        // Install pre-computed cache data.
+        *self.offer_store.write() = cache_data.offers;
+        *self.offer_account_asset_index.write() = cache_data.offer_index;
+        *self.pool_share_tl_account_index.write() = cache_data.pool_share_tl_account_index;
+        *self.module_cache.write() = cache_data.module_cache;
+        *self.soroban_state.write() = cache_data.soroban_state;
+        *self.offers_initialized.write() = true;
+
+        info!(
+            ledger_seq = self.state.read().header.ledger_seq,
+            header_hash = %self.state.read().header_hash.to_hex(),
+            "Ledger initialized from buckets with precomputed caches"
         );
 
         Ok(())
