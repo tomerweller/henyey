@@ -1262,51 +1262,19 @@ impl TransactionExecutor {
             .iter()
             .chain(footprint.read_write.iter())
         {
-            // Skip entries already in state (e.g., created by previous TX in this ledger)
-            // Also skip entries that were deleted by a previous TX in this ledger - they
-            // should NOT be reloaded from the bucket list. In stellar-core, deleted
-            // entries are tracked in mThreadEntryMap as nullopt, providing the same behavior.
-            if self.state.get_entry(key).is_some() || self.state.is_entry_deleted(key) {
+            // Entries deleted by a previous TX in this ledger must not be reloaded.
+            // In stellar-core, deleted entries are tracked in mThreadEntryMap as nullopt.
+            if self.state.is_entry_deleted(key) {
                 continue;
             }
 
-            // For ContractData/ContractCode keys, use InMemorySorobanState as primary source.
-            if let Some(ref ims) = in_memory {
-                if matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)) {
-                    // Compute TTL key hash once (O3: reused for both entry and TTL lookup).
-                    let key_bytes = key
-                        .to_xdr(Limits::none())
-                        .map_err(|e| LedgerError::Serialization(e.to_string()))?;
-                    let key_hash = stellar_xdr::curr::Hash(Sha256::digest(&key_bytes).into());
-                    let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
-                        key_hash: key_hash.clone(),
-                    });
-
-                    if let Some(entry) = ims.get(key) {
-                        // Found in InMemorySorobanState — load directly, skipping bucket list.
-                        self.state.load_entry((*entry).clone());
-                        // Load the co-located TTL entry if not already present.
-                        if self.state.get_entry(&ttl_key).is_none()
-                            && !self.state.is_entry_deleted(&ttl_key)
-                        {
-                            if let Some(ttl_entry) = ims.get(&ttl_key) {
-                                self.state.load_entry((*ttl_entry).clone());
-                            }
-                        }
-                    }
-                    // Whether found or not, skip the bucket list for this Soroban key.
-                    // InMemorySorobanState is authoritative for ledger-start state; entries
-                    // absent from it are either newly created this ledger (already in state
-                    // from prior_stage.entries) or archived (caught by footprint_has_unrestored
-                    // before we get here).
-                    continue;
-                }
-            }
-
-            // Non-Soroban key (or no InMemorySorobanState): load from bucket list.
-            bucket_list_keys.push(key.clone());
-            // Add derived TTL key for contract data/code entries.
+            // For ContractData/ContractCode keys, we must ensure BOTH the entry AND its
+            // TTL are loaded into state. The entry may already be present (loaded by a
+            // prior stage TX via prior_stage.entries) but its TTL might be absent if the
+            // prior stage TX only modified the entry data (not the TTL). We always check
+            // whether the TTL needs loading, even when the entry is already in state.
             if matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)) {
+                // Compute TTL key hash once (O3: reused for both IMS and bucket-list paths).
                 let key_bytes = key
                     .to_xdr(Limits::none())
                     .map_err(|e| LedgerError::Serialization(e.to_string()))?;
@@ -1314,11 +1282,63 @@ impl TransactionExecutor {
                 let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
                     key_hash: key_hash.clone(),
                 });
-                if self.state.get_entry(&ttl_key).is_none()
-                    && !self.state.is_entry_deleted(&ttl_key)
-                {
+
+                let entry_in_state = self.state.get_entry(key).is_some();
+                let ttl_in_state = self.state.get_entry(&ttl_key).is_some()
+                    || self.state.is_entry_deleted(&ttl_key);
+
+                if entry_in_state && ttl_in_state {
+                    // Both entry and TTL already loaded — nothing to do.
+                    continue;
+                }
+
+                if let Some(ref ims) = in_memory {
+                    if !entry_in_state {
+                        if let Some(entry) = ims.get(key) {
+                            // Found in IMS — load the entry, skipping bucket list.
+                            self.state.load_entry((*entry).clone());
+                            // Load co-located TTL from IMS if not yet in state.
+                            if !ttl_in_state {
+                                if let Some(ttl_entry) = ims.get(&ttl_key) {
+                                    self.state.load_entry((*ttl_entry).clone());
+                                } else {
+                                    // TTL absent from IMS despite entry present — fall through
+                                    // to bucket list for TTL.
+                                    bucket_list_keys.push(ttl_key);
+                                }
+                            }
+                            continue;
+                        }
+                        // Entry not in IMS — load both entry and TTL from bucket list.
+                        bucket_list_keys.push(key.clone());
+                        if !ttl_in_state {
+                            bucket_list_keys.push(ttl_key);
+                        }
+                    } else {
+                        // Entry already in state but TTL missing — load TTL only.
+                        // Try IMS first (fast path).
+                        if let Some(ttl_entry) = ims.get(&ttl_key) {
+                            self.state.load_entry((*ttl_entry).clone());
+                        } else {
+                            bucket_list_keys.push(ttl_key);
+                        }
+                    }
+                    continue;
+                }
+
+                // No IMS — load from bucket list.
+                if !entry_in_state {
+                    bucket_list_keys.push(key.clone());
+                }
+                if !ttl_in_state {
                     bucket_list_keys.push(ttl_key);
                 }
+                continue;
+            }
+
+            // Non-Soroban key: only load if not already in state.
+            if self.state.get_entry(key).is_none() {
+                bucket_list_keys.push(key.clone());
             }
         }
 
@@ -4806,29 +4826,49 @@ mod tests {
     }
 
     /// O1 optimization: when InMemorySorobanState is set but does NOT contain a key,
-    /// the bucket list must still NOT be consulted for that Soroban key (IMS is
-    /// authoritative — absent entries are either new this ledger or archived).
+    /// the bucket list IS consulted as a fallback. IMS is a cache, not authoritative:
+    /// an entry may be live in the bucket list but temporarily absent from IMS.
     #[test]
-    fn test_load_soroban_footprint_absent_key_skips_bucket_list() {
+    fn test_load_soroban_footprint_absent_key_falls_back_to_bucket_list() {
+        // When IMS is set but doesn't have the entry, we must fall back to the bucket list.
+        // IMS is a cache (not authoritative): an entry may be live in the bucket list but
+        // temporarily absent from IMS (e.g. recently restored from hot archive). Skipping
+        // the bucket list in that case caused EntryArchived for valid live entries.
         use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
         use crate::soroban_state::SharedSorobanState;
         use stellar_xdr::curr::*;
-        use std::sync::Arc;
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
+        let contract_address = ScAddress::Contract(ContractId(Hash([0xCD; 32])));
         let data_key = LedgerKey::ContractData(LedgerKeyContractData {
-            contract: ScAddress::Contract(ContractId(Hash([0xCD; 32]))),
+            contract: contract_address.clone(),
             key: ScVal::U32(1),
             durability: ContractDataDurability::Persistent,
         });
+        let data_entry = LedgerEntry {
+            last_modified_ledger_seq: 90,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: contract_address,
+                key: ScVal::U32(1),
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::I32(42),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
 
-        // Empty IMS — entry is absent
+        // Empty IMS — entry is absent from IMS but present in bucket list
         let shared = Arc::new(SharedSorobanState::new());
 
-        // Snapshot panics if the Soroban key is looked up
+        // Snapshot returns the entry when consulted (bucket list has it)
         let data_key_cl = data_key.clone();
-        let lookup_fn: crate::snapshot::EntryLookupFn = Arc::new(move |key: &LedgerKey| {
-            if *key == data_key_cl {
-                panic!("Bucket list must NOT be consulted for absent Soroban key when IMS is set");
+        let data_entry_cl = data_entry.clone();
+        let consulted = Arc::new(AtomicBool::new(false));
+        let consulted_cl = consulted.clone();
+        let lookup_fn: crate::snapshot::EntryLookupFn = Arc::new(move |keys: &LedgerKey| {
+            if *keys == data_key_cl {
+                consulted_cl.store(true, Ordering::SeqCst);
+                return Ok(Some(data_entry_cl.clone()));
             }
             Ok(None)
         });
@@ -4848,11 +4888,14 @@ mod tests {
             read_write: VecM::default(),
         };
 
-        // Must not panic (bucket list not accessed) and entry must remain absent
         executor.load_soroban_footprint(&snapshot, &footprint).unwrap();
+
+        // Bucket list MUST have been consulted (IMS miss → bucket list fallback)
+        assert!(consulted.load(Ordering::SeqCst), "Bucket list must be consulted when IMS misses");
+        // Entry must be present in executor state (loaded from bucket list)
         assert!(
-            executor.state.get_entry(&data_key).is_none(),
-            "Absent Soroban key must remain absent — not fetched from bucket list"
+            executor.state.get_entry(&data_key).is_some(),
+            "Entry from bucket list must be loaded when IMS misses"
         );
     }
 
@@ -4939,6 +4982,93 @@ mod tests {
         assert!(
             executor.state.get_entry(&data_key).is_some(),
             "ContractData entry must be loaded from bucket list when IMS is absent"
+        );
+    }
+
+    /// Regression test for VE-13: when a ContractData entry is pre-loaded into state
+    /// (e.g., from prior_stage.entries in parallel Soroban execution) but its TTL is
+    /// absent (the prior stage TX only modified data, not the TTL), load_soroban_footprint
+    /// must still load the missing TTL from IMS.
+    ///
+    /// Before the fix, the early `continue` when `state.get_entry(key).is_some()` caused
+    /// the TTL loading code to be skipped entirely. This made is_archived_contract_entry
+    /// return true (no TTL → archived) even for fully live entries.
+    #[test]
+    fn test_load_soroban_footprint_loads_ttl_when_entry_already_in_state() {
+        use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
+        use crate::soroban_state::SharedSorobanState;
+        use sha2::{Digest, Sha256};
+        use stellar_xdr::curr::*;
+        use std::sync::Arc;
+
+        // --- Build a ContractData entry ---
+        let contract_address = ScAddress::Contract(ContractId(Hash([0x77; 32])));
+        let data_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract_address.clone(),
+            key: ScVal::U32(55),
+            durability: ContractDataDurability::Persistent,
+        });
+        let data_entry = LedgerEntry {
+            last_modified_ledger_seq: 90,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: contract_address.clone(),
+                key: ScVal::U32(55),
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::I32(77),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let ttl_key_hash_bytes: [u8; 32] = {
+            let bytes = data_key.to_xdr(Limits::none()).unwrap();
+            Sha256::digest(&bytes).into()
+        };
+        let ttl_key = LedgerKey::Ttl(LedgerKeyTtl {
+            key_hash: Hash(ttl_key_hash_bytes),
+        });
+
+        // --- Populate IMS with the entry AND its TTL ---
+        let shared = Arc::new(SharedSorobanState::new());
+        {
+            let mut ims = shared.write();
+            ims.create_ttl(
+                &LedgerKeyTtl { key_hash: Hash(ttl_key_hash_bytes) },
+                crate::soroban_state::TtlData::new(500, 90),
+            ).unwrap();
+            ims.create_contract_data(data_entry.clone()).unwrap();
+        }
+
+        // Snapshot panics if anything is looked up — we must serve from IMS.
+        let lookup_fn: crate::snapshot::EntryLookupFn =
+            Arc::new(|_key: &LedgerKey| panic!("Bucket list must not be consulted in this test"));
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup_fn);
+
+        let context = LedgerContext::new(101, 1234567890, 100, 5_000_000, 25, NetworkId::testnet());
+        let mut executor = TransactionExecutor::new(
+            &context,
+            0,
+            SorobanConfig::default(),
+            ClassicEventConfig::default(),
+        );
+        executor.set_soroban_state(shared);
+
+        // Simulate prior_stage loading: ContractData is already in state, TTL is NOT.
+        executor.state.load_entry(data_entry);
+        assert!(executor.state.get_entry(&data_key).is_some(), "setup: entry must be in state");
+        assert!(executor.state.get_entry(&ttl_key).is_none(), "setup: TTL must NOT be in state");
+
+        let footprint = LedgerFootprint {
+            read_only: vec![data_key.clone()].try_into().unwrap(),
+            read_write: VecM::default(),
+        };
+
+        // Must succeed (no panic, no bucket list access) and must load TTL from IMS.
+        executor.load_soroban_footprint(&snapshot, &footprint).unwrap();
+
+        assert!(
+            executor.state.get_entry(&ttl_key).is_some(),
+            "TTL must be loaded from IMS even when ContractData was already in state"
         );
     }
 }

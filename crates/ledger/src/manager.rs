@@ -4300,14 +4300,25 @@ impl<'a> LedgerCloseContext<'a> {
                 let rent_config = self.manager.load_soroban_rent_config(&bucket_list);
                 let mut soroban_state = self.manager.soroban_state.write();
 
-                // Process init entries (creates)
+                // Process init entries (creates).
+                // When a hot-archive-restored entry appears as INIT in the delta but
+                // still exists in IMS (with an expired TTL — pending eviction from the live
+                // bucket list), process_entry_create fails with "already exists".  In that
+                // case fall back to process_entry_update so the IMS entry and its TTL are
+                // refreshed to the restored values, preventing stale expired-TTL data from
+                // causing spurious EntryArchived errors on subsequent ledgers.
                 for entry in &init_entries {
-                    if let Err(e) = soroban_state.process_entry_create(
-                        entry,
-                        protocol_version,
-                        rent_config.as_ref(),
-                    ) {
-                        tracing::trace!(error = %e, "Failed to process init entry in soroban state");
+                    if soroban_state
+                        .process_entry_create(entry, protocol_version, rent_config.as_ref())
+                        .is_err()
+                    {
+                        if let Err(e) = soroban_state.process_entry_update(
+                            entry,
+                            protocol_version,
+                            rent_config.as_ref(),
+                        ) {
+                            tracing::trace!(error = %e, "Failed to process init entry in soroban state");
+                        }
                     }
                 }
 
