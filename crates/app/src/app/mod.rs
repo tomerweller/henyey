@@ -131,11 +131,12 @@ const TX_SET_UNAVAILABLE_TIMEOUT_SECS: u64 = 5;
 
 /// Number of consecutive recovery attempts without ledger progress before
 /// escalating from passive waiting to actively requesting SCP state from
-/// peers.  At the 5s SyncRecoveryManager interval this equals ~30s.
+/// peers. At the 1s consensus recovery interval this equals ~6s.
 const RECOVERY_ESCALATION_SCP_REQUEST: u64 = 6;
 
 /// Number of consecutive recovery attempts without progress before
-/// triggering a full catchup.  At the 5s interval this equals ~30s.
+/// triggering a full catchup. At the 1s consensus recovery interval this
+/// equals ~6s.
 const RECOVERY_ESCALATION_CATCHUP: u64 = 6;
 
 /// Timeout for pending tx_set requests with no response from any peer.

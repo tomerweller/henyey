@@ -59,10 +59,11 @@ impl App {
     /// giving the network a chance to provide the missing data before we
     /// fall back to catchup.
     ///
-    /// Tracks consecutive recovery attempts without ledger progress.  After
-    /// `RECOVERY_ESCALATION_SCP_REQUEST` attempts (~30s) we actively request
-    /// SCP state from peers even with a small gap.  After
-    /// `RECOVERY_ESCALATION_CATCHUP` attempts (~60s) we trigger a full catchup.
+    /// Tracks consecutive recovery attempts without ledger progress. After
+    /// `RECOVERY_ESCALATION_SCP_REQUEST` attempts (~6s at 1s interval) we
+    /// actively request SCP state from peers even with a small gap. After
+    /// `RECOVERY_ESCALATION_CATCHUP` attempts (~6s at 1s interval) we trigger
+    /// a full catchup.
     pub(super) async fn out_of_sync_recovery(&self, current_ledger: u32) {
         let latest_externalized = self.herder.latest_externalized_slot().unwrap_or(0);
         let last_processed = *self.last_processed_slot.read().await;
