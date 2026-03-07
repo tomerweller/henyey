@@ -3088,7 +3088,7 @@ impl TransactionExecutor {
 
         let tx_events = tx_event_manager.finalize();
         let tx_meta = build_transaction_meta(
-            tx_changes_before.clone(),
+            tx_changes_before,
             op_changes,
             op_events,
             tx_events,
