@@ -273,11 +273,43 @@ Classic execution (~112 TXs/ledger): ~230ms (61% of tx_exec)
 
 ---
 
-## What Was Already Optimized (O1–O6, Soroban-focused)
+## What Was Already Optimized (O1–O6 + O7 attempt)
 
-See `perf-analysis-soroban-tx-execution.md` for Soroban optimizations.
+See `perf-analysis-soroban-tx-execution.md` for Soroban optimizations O1–O6.
 Classic TX execution was not a focus of O1–O6. The offer cache (`OfferCache` that persists
 across ledgers) is the main existing optimization for classic DEX operations.
+
+### O7: Lazy LedgerEntryChanges serialization (INVESTIGATED, NOT VIABLE)
+
+**Attempt**: Defer `build_entry_changes_with_state_overrides` calls from `pre_apply` to
+`apply_body`, storing raw pre/post `LedgerEntry` data in `PreApplyResult` instead of the
+fully-built `LedgerEntryChanges`. Targeted: eliminating per-TX AccountEntry deep clones +
+XDR key serialization from the `fee_seq` hot path.
+
+**Result**: +43ms regression (330ms → 373ms mean on the 1000-ledger benchmark).
+
+**Root cause**: The work being deferred (AccountEntry clones, XDR serialization) accesses data
+that is **hot in CPU cache** during `pre_apply` — the AccountEntry was just loaded/modified by
+`flush_modified_entries`. Deferring to `apply_body` means the data is **cold** after op
+execution (Soroban WASM runs, contract data fetches, more account loads). Cache miss penalties
+dominate any theoretical allocation savings.
+
+**Lesson**: For short-lived allocations that access recently-hot data, eagerness beats laziness.
+"Do it now while the cache is warm" > "defer to avoid a clone."
+
+**Applied**: Only the trivial `.clone()` removal at the final `build_transaction_meta` call site
+(commit 85457b5). This avoids one redundant deep copy of the assembled `LedgerEntryChanges`
+since the value is not used after that call. Impact: below measurement noise (~3–5ms).
+
+### Deferred XDR serialization: NOT the gap
+
+The "deferred XDR serialization" gap listed in the cost table (~10–15ms) refers to
+stellar-core's `LedgerTxn` deferring all `LedgerEntryChanges` building to ledger commit time.
+In henyey, `build_entry_changes_with_state_overrides` runs per-TX in `pre_apply`. Moving this
+work to after `apply_body` does not save total work — it just changes cache behavior, and the
+cache behavior change is negative. This gap cannot be closed without an architectural shift to
+batch-build all entry changes at ledger close, which requires fundamentally different state
+tracking (accumulating all changes across TXs before materializing XDR).
 
 ---
 
