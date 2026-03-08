@@ -35,9 +35,9 @@
 //! }
 //! ```
 
-use std::collections::HashMap;
 use henyey_common::Hash256;
 use henyey_crypto::{verify_hash, PublicKey, Signature};
+use std::collections::HashMap;
 use stellar_xdr::curr::{DecoratedSignature, Signer, SignerKey, SignerKeyType};
 
 /// Signature checker that tracks which signatures have been used and
@@ -60,10 +60,7 @@ impl<'a> SignatureChecker<'a> {
     ///
     /// * `contents_hash` - Transaction hash that signatures are verified against
     /// * `signatures` - Slice of decorated signatures from the transaction
-    pub fn new(
-        contents_hash: Hash256,
-        signatures: &'a [DecoratedSignature],
-    ) -> Self {
+    pub fn new(contents_hash: Hash256, signatures: &'a [DecoratedSignature]) -> Self {
         Self {
             contents_hash,
             signatures,

@@ -274,14 +274,24 @@ mod tests {
         })
     }
 
-    fn make_offer(seller_seed: u8, offer_id: i64, selling: Asset, buying: Asset, price_n: i32, price_d: i32) -> OfferEntry {
+    fn make_offer(
+        seller_seed: u8,
+        offer_id: i64,
+        selling: Asset,
+        buying: Asset,
+        price_n: i32,
+        price_d: i32,
+    ) -> OfferEntry {
         OfferEntry {
             seller_id: make_account_id(seller_seed),
             offer_id,
             selling,
             buying,
             amount: 1000,
-            price: Price { n: price_n, d: price_d },
+            price: Price {
+                n: price_n,
+                d: price_d,
+            },
             flags: 0,
             ext: OfferEntryExt::V0,
         }

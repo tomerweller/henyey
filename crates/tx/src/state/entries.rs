@@ -1,3 +1,5 @@
+//! Ledger entry CRUD operations for [`LedgerStateManager`].
+
 use super::*;
 
 impl LedgerStateManager {

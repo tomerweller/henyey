@@ -894,48 +894,6 @@ pub fn compute_rent_fee_for_new_entry(
     }
 }
 
-/// Execute a Soroban host function using soroban-env-host's e2e_invoke API.
-///
-/// This uses the same high-level API that stellar-core uses, which handles
-/// all the internal setup correctly.
-///
-/// # Arguments
-///
-/// * `host_function` - The host function to execute
-/// * `auth_entries` - Authorization entries for the invocation
-/// * `source` - Source account for the transaction
-/// * `state` - Ledger state manager for reading entries
-/// * `context` - Ledger context with sequence, close time, etc.
-/// * `soroban_data` - Soroban transaction data with footprint and resources
-/// * `soroban_config` - Network configuration with cost parameters
-///
-/// # Returns
-///
-/// Returns the execution result including return value, storage changes, and events.
-/// Returns an error if the host function fails or budget is exceeded, along with
-/// the consumed resources which are needed to distinguish TRAPPED from RESOURCE_LIMIT_EXCEEDED.
-pub fn execute_host_function(
-    host_function: &HostFunction,
-    auth_entries: &[SorobanAuthorizationEntry],
-    source: &AccountId,
-    state: &LedgerStateManager,
-    context: &LedgerContext,
-    soroban_data: &SorobanTransactionData,
-    soroban_config: &SorobanConfig,
-) -> Result<SorobanExecutionResult, SorobanExecutionError> {
-    execute_host_function_with_cache(
-        host_function,
-        auth_entries,
-        source,
-        state,
-        context,
-        soroban_data,
-        soroban_config,
-        None,
-        None,
-    )
-}
-
 /// Execute a Soroban host function with an optional pre-populated module cache.
 ///
 /// This is the same as `execute_host_function` but accepts an optional persistent
@@ -1620,48 +1578,16 @@ fn execute_host_function_p25(
         hasher.finalize().to_vec()
     };
 
-    let encoded_host_fn = host_function.to_xdr(Limits::none()).map_err(|_e| {
-        make_setup_error(HostErrorP25::from(
-            soroban_env_host25::Error::from_type_and_code(
-                soroban_env_host25::xdr::ScErrorType::Context,
-                soroban_env_host25::xdr::ScErrorCode::InternalError,
-            ),
-        ))
-    })?;
+    let encoded_host_fn = xdr_encode_setup(host_function)?;
 
-    let encoded_resources = soroban_data
-        .resources
-        .to_xdr(Limits::none())
-        .map_err(|_e| {
-            make_setup_error(HostErrorP25::from(
-                soroban_env_host25::Error::from_type_and_code(
-                    soroban_env_host25::xdr::ScErrorType::Context,
-                    soroban_env_host25::xdr::ScErrorCode::InternalError,
-                ),
-            ))
-        })?;
+    let encoded_resources = xdr_encode_setup(&soroban_data.resources)?;
 
-    let encoded_source = source.to_xdr(Limits::none()).map_err(|_e| {
-        make_setup_error(HostErrorP25::from(
-            soroban_env_host25::Error::from_type_and_code(
-                soroban_env_host25::xdr::ScErrorType::Context,
-                soroban_env_host25::xdr::ScErrorCode::InternalError,
-            ),
-        ))
-    })?;
+    let encoded_source = xdr_encode_setup(source)?;
 
     let encoded_auth_entries: Vec<Vec<u8>> = auth_entries
         .iter()
-        .map(|e| e.to_xdr(Limits::none()))
-        .collect::<Result<_, _>>()
-        .map_err(|_| {
-            make_setup_error(HostErrorP25::from(
-                soroban_env_host25::Error::from_type_and_code(
-                    soroban_env_host25::xdr::ScErrorType::Context,
-                    soroban_env_host25::xdr::ScErrorCode::InternalError,
-                ),
-            ))
-        })?;
+        .map(|e| xdr_encode_setup(e))
+        .collect::<Result<_, _>>()?;
 
     // Extract archived entry indices from soroban_data.ext for TTL restoration FIRST
     // These are indices into the read_write footprint entries that need their TTL restored
@@ -1687,14 +1613,7 @@ fn execute_host_function_p25(
                             entry: &LedgerEntry,
                             live_until: Option<u32>|
      -> Result<(Vec<u8>, Vec<u8>), SorobanExecutionError> {
-        let entry_bytes = entry.to_xdr(Limits::none()).map_err(|_| {
-            make_setup_error(HostErrorP25::from(
-                soroban_env_host25::Error::from_type_and_code(
-                    soroban_env_host25::xdr::ScErrorType::Context,
-                    soroban_env_host25::xdr::ScErrorCode::InternalError,
-                ),
-            ))
-        })?;
+        let entry_bytes = xdr_encode_setup(entry)?;
 
         let needs_ttl = matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_));
         let ttl_bytes = if let Some(lu) = live_until {
@@ -1703,28 +1622,14 @@ fn execute_host_function_p25(
                 key_hash,
                 live_until_ledger_seq: lu,
             };
-            ttl_entry.to_xdr(Limits::none()).map_err(|_| {
-                make_setup_error(HostErrorP25::from(
-                    soroban_env_host25::Error::from_type_and_code(
-                        soroban_env_host25::xdr::ScErrorType::Context,
-                        soroban_env_host25::xdr::ScErrorCode::InternalError,
-                    ),
-                ))
-            })?
+            xdr_encode_setup(&ttl_entry)?
         } else if needs_ttl {
             let key_hash = compute_key_hash(key);
             let ttl_entry = stellar_xdr::curr::TtlEntry {
                 key_hash,
                 live_until_ledger_seq: current_ledger_p25,
             };
-            ttl_entry.to_xdr(Limits::none()).map_err(|_| {
-                make_setup_error(HostErrorP25::from(
-                    soroban_env_host25::Error::from_type_and_code(
-                        soroban_env_host25::xdr::ScErrorType::Context,
-                        soroban_env_host25::xdr::ScErrorCode::InternalError,
-                    ),
-                ))
-            })?
+            xdr_encode_setup(&ttl_entry)?
         } else {
             Vec::new()
         };

@@ -66,7 +66,7 @@
 //! - [`SorobanStorage`]: Provides the storage interface for contract state,
 //!   tracking reads and writes during execution.
 //!
-//! - [`execute_host_function`]: Main entry point for executing Soroban
+//! - [`execute_host_function_with_cache`]: Main entry point for executing Soroban
 //!   operations, handling protocol version dispatch.
 //!
 //! # Entry TTL and Archival
@@ -94,8 +94,8 @@ pub use budget::{
 };
 pub use events::{ContractEvent, ContractEvents, EventType};
 pub use host::{
-    compute_rent_fee_for_new_entry, execute_host_function, execute_host_function_with_cache,
-    PersistentModuleCache, SorobanExecutionError, SorobanExecutionResult, StorageChange,
+    compute_rent_fee_for_new_entry, execute_host_function_with_cache, PersistentModuleCache,
+    SorobanExecutionError, SorobanExecutionResult, StorageChange,
 };
 pub use storage::{SorobanStorage, StorageEntry, StorageKey};
 
@@ -206,7 +206,9 @@ mod tests {
 
         impl HotArchiveLookup for TestHotArchive {
             fn get(&self, key: &LedgerKey) -> Option<LedgerEntry> {
-                let key_bytes = stellar_xdr::curr::WriteXdr::to_xdr(key, stellar_xdr::curr::Limits::none()).ok()?;
+                let key_bytes =
+                    stellar_xdr::curr::WriteXdr::to_xdr(key, stellar_xdr::curr::Limits::none())
+                        .ok()?;
                 self.entries.get(&key_bytes).cloned()
             }
         }
@@ -214,7 +216,8 @@ mod tests {
         let mut entries = HashMap::new();
         let key = test_contract_data_key();
         let entry = test_contract_data_entry();
-        let key_bytes = stellar_xdr::curr::WriteXdr::to_xdr(&key, stellar_xdr::curr::Limits::none()).unwrap();
+        let key_bytes =
+            stellar_xdr::curr::WriteXdr::to_xdr(&key, stellar_xdr::curr::Limits::none()).unwrap();
         entries.insert(key_bytes, entry.clone());
 
         let archive = TestHotArchive { entries };

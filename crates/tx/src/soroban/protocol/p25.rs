@@ -50,22 +50,18 @@ mod tests {
         /// to match stellar-core behavior. In stellar-core, entries with expired TTL are not passed to
         /// the host during invoke_host_function - expired temporary entries are skipped entirely,
         /// and expired persistent entries are treated as archived (requiring restoration).
-        fn get_local(
-            &self,
-            key: &LedgerKey,
-        ) -> Result<Option<EntryWithTtl>, HostError> {
+        fn get_local(&self, key: &LedgerKey) -> Result<Option<EntryWithTtl>, HostError> {
             let live_until = get_entry_ttl(self.state, key, self.current_ledger);
 
             let entry = match key {
-                LedgerKey::Account(account_key) => {
-                    self.state
-                        .get_account(&account_key.account_id)
-                        .map(|acc| LedgerEntry {
-                            last_modified_ledger_seq: self.current_ledger,
-                            data: LedgerEntryData::Account(acc.clone()),
-                            ext: LedgerEntryExt::V0,
-                        })
-                }
+                LedgerKey::Account(account_key) => self
+                    .state
+                    .get_account(&account_key.account_id)
+                    .map(|acc| LedgerEntry {
+                        last_modified_ledger_seq: self.current_ledger,
+                        data: LedgerEntryData::Account(acc.clone()),
+                        ext: LedgerEntryExt::V0,
+                    }),
                 LedgerKey::Trustline(tl_key) => self
                     .state
                     .get_trustline_by_trustline_asset(&tl_key.account_id, &tl_key.asset)
@@ -180,15 +176,14 @@ mod tests {
             let live_until = get_entry_ttl(self.state, &local_key, self.current_ledger);
 
             let entry = match &local_key {
-                LedgerKey::Account(account_key) => {
-                    self.state
-                        .get_account(&account_key.account_id)
-                        .map(|acc| LedgerEntry {
-                            last_modified_ledger_seq: self.current_ledger,
-                            data: LedgerEntryData::Account(acc.clone()),
-                            ext: LedgerEntryExt::V0,
-                        })
-                }
+                LedgerKey::Account(account_key) => self
+                    .state
+                    .get_account(&account_key.account_id)
+                    .map(|acc| LedgerEntry {
+                        last_modified_ledger_seq: self.current_ledger,
+                        data: LedgerEntryData::Account(acc.clone()),
+                        ext: LedgerEntryExt::V0,
+                    }),
                 LedgerKey::Trustline(tl_key) => self
                     .state
                     .get_trustline_by_trustline_asset(&tl_key.account_id, &tl_key.asset)
@@ -304,7 +299,11 @@ mod tests {
     ///
     /// This ensures that if TX 4 creates a new entry with TTL, TX 5 (in a different
     /// cluster of the same stage) will NOT see that entry when loading its footprint.
-    fn get_entry_ttl(state: &LedgerStateManager, key: &LedgerKey, current_ledger: u32) -> Option<u32> {
+    fn get_entry_ttl(
+        state: &LedgerStateManager,
+        key: &LedgerKey,
+        current_ledger: u32,
+    ) -> Option<u32> {
         match key {
             LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
                 let key_hash = compute_key_hash(key);
@@ -365,9 +364,11 @@ mod tests {
 
     // P25 XDR conversion functions (soroban-env-host v25.0.0 uses stellar-xdr 25.0.0)
     fn convert_ledger_key_from_p25(key: &P25LedgerKey) -> Option<LedgerKey> {
-        let bytes =
-            soroban_env_host_p25::xdr::WriteXdr::to_xdr(key, soroban_env_host_p25::xdr::Limits::none())
-                .ok()?;
+        let bytes = soroban_env_host_p25::xdr::WriteXdr::to_xdr(
+            key,
+            soroban_env_host_p25::xdr::Limits::none(),
+        )
+        .ok()?;
         LedgerKey::from_xdr(&bytes, Limits::none()).ok()
     }
 
@@ -396,7 +397,11 @@ mod tests {
     }
 
     /// Helper to create a test contract data entry.
-    fn make_contract_data_entry(contract_hash: [u8; 32], key_val: i32, val: i32) -> ContractDataEntry {
+    fn make_contract_data_entry(
+        contract_hash: [u8; 32],
+        key_val: i32,
+        val: i32,
+    ) -> ContractDataEntry {
         ContractDataEntry {
             ext: stellar_xdr::curr::ExtensionPoint::V0,
             contract: ScAddress::Contract(ContractId(Hash(contract_hash))),
@@ -511,10 +516,7 @@ mod tests {
         let snapshot = LedgerSnapshotAdapter::new(&state, current_ledger);
         let result = snapshot.get_local(&key).expect("get_local should succeed");
 
-        assert!(
-            result.is_none(),
-            "Entry without TTL should not be returned"
-        );
+        assert!(result.is_none(), "Entry without TTL should not be returned");
     }
 
     /// Test that get_local returns entry when TTL equals current_ledger (boundary case).

@@ -115,14 +115,14 @@
 mod apply;
 mod error;
 mod events;
-pub mod fee_bump;
+pub(crate) mod fee_bump;
 mod frame;
-pub mod live_execution;
-pub mod lumen_reconciler;
-pub mod meta_builder;
+pub(crate) mod live_execution;
+pub(crate) mod lumen_reconciler;
+pub(crate) mod meta_builder;
 pub mod operations;
 mod result;
-pub mod signature_checker;
+pub(crate) mod signature_checker;
 pub mod soroban;
 pub mod state;
 #[cfg(test)]
@@ -166,20 +166,13 @@ pub use validation::{
 
 // Re-export operation types
 pub use operations::{
-    collect_prefetch_keys, get_needed_threshold, get_operation_source,
-    get_threshold_level, validate_operation, OperationType, OperationValidationError,
-    ThresholdLevel,
+    collect_prefetch_keys, get_needed_threshold, get_operation_source, get_threshold_level,
+    validate_operation, OperationType, OperationValidationError, ThresholdLevel,
 };
 
 // Re-export state types
 pub use state::{
     AssetPair, LedgerReader, LedgerStateManager, OfferDescriptor, OfferIndex, OfferKey,
-};
-
-// Re-export meta builder types
-pub use meta_builder::{
-    DiagnosticConfig, DiagnosticEventManager, ExecutionMetrics, OperationMetaBuilder,
-    TransactionMetaBuilder,
 };
 
 // Re-export fee bump types

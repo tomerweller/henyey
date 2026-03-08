@@ -1118,18 +1118,16 @@ mod tests {
         // balance=i64::MAX - 100, buying=200, refund=50
         // overflow check: i64::MAX - (i64::MAX-100) = 100 >= 50 -> ok
         // liability check: (i64::MAX-100+50) > i64::MAX - 200 -> (i64::MAX-50) > (i64::MAX-200) -> true -> skip
-        let mut account =
-            make_account_entry(account_id.clone(), i64::MAX - 100, 1);
+        let mut account = make_account_entry(account_id.clone(), i64::MAX - 100, 1);
         // Add buying liabilities via V1 extension
-        account.ext = stellar_xdr::curr::AccountEntryExt::V1(
-            stellar_xdr::curr::AccountEntryExtensionV1 {
+        account.ext =
+            stellar_xdr::curr::AccountEntryExt::V1(stellar_xdr::curr::AccountEntryExtensionV1 {
                 liabilities: stellar_xdr::curr::Liabilities {
                     buying: 200,
                     selling: 0,
                 },
                 ext: stellar_xdr::curr::AccountEntryExtensionV1Ext::V0,
-            },
-        );
+            });
 
         if let Some(state) = ctx.state_mut() {
             state.put_account(account);

@@ -366,9 +366,9 @@ mod tests {
         let account = create_test_account_with_sponsorship(
             create_test_account_id(0),
             100_000_000,
-            5,  // num_sub_entries
-            2,  // num_sponsored
-            3,  // num_sponsoring
+            5, // num_sub_entries
+            2, // num_sponsored
+            3, // num_sponsoring
         );
 
         assert_eq!(account.num_sub_entries, 5);

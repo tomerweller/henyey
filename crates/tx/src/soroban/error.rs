@@ -191,9 +191,9 @@ mod tests {
 
         // The converted error should be a valid P25 HostError
         // We can verify by extracting the ScError
-        let p25_sc_error: ScError25 = (&p25_host_error).try_into().unwrap_or_else(|_| {
-            ScError25::Context(ScErrorCode25::InternalError)
-        });
+        let p25_sc_error: ScError25 = (&p25_host_error)
+            .try_into()
+            .unwrap_or_else(|_| ScError25::Context(ScErrorCode25::InternalError));
         match p25_sc_error {
             ScError25::Context(code) => assert_eq!(code, ScErrorCode25::InternalError),
             _ => panic!("Expected Context error"),

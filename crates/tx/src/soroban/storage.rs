@@ -256,7 +256,6 @@ impl Footprint {
     pub fn is_writable(&self, key: &LedgerKey) -> bool {
         self.read_write.contains(key)
     }
-
 }
 
 #[cfg(test)]

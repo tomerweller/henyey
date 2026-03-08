@@ -920,8 +920,7 @@ fn get_asset_contract_id(network_id: &NetworkId, asset: &Asset) -> ContractId {
         network_id: Hash::from(network_id.0),
         contract_id_preimage: ContractIdPreimage::Asset(asset.clone()),
     });
-    let hash = henyey_common::Hash256::hash_xdr(&preimage)
-        .unwrap_or(henyey_common::Hash256::ZERO);
+    let hash = henyey_common::Hash256::hash_xdr(&preimage).unwrap_or(henyey_common::Hash256::ZERO);
     ContractId(Hash::from(hash))
 }
 
@@ -1111,14 +1110,8 @@ mod tests {
             emit_classic_events: true,
             backfill_stellar_asset_events: false,
         };
-        let mut manager = OpEventManager::new(
-            true,
-            false,
-            25,
-            NetworkId::testnet(),
-            Memo::None,
-            config,
-        );
+        let mut manager =
+            OpEventManager::new(true, false, 25, NetworkId::testnet(), Memo::None, config);
 
         assert!(!manager.is_finalized());
         let events = manager.finalize();
@@ -1136,14 +1129,8 @@ mod tests {
             emit_classic_events: true,
             backfill_stellar_asset_events: false,
         };
-        let manager = OpEventManager::new(
-            true,
-            false,
-            25,
-            NetworkId::testnet(),
-            Memo::None,
-            config,
-        );
+        let manager =
+            OpEventManager::new(true, false, 25, NetworkId::testnet(), Memo::None, config);
         let events = manager.into_events();
         assert!(events.is_empty());
     }
@@ -1154,14 +1141,8 @@ mod tests {
             emit_classic_events: true,
             backfill_stellar_asset_events: false,
         };
-        let mut manager = OpEventManager::new(
-            true,
-            false,
-            25,
-            NetworkId::testnet(),
-            Memo::None,
-            config,
-        );
+        let mut manager =
+            OpEventManager::new(true, false, 25, NetworkId::testnet(), Memo::None, config);
 
         let from = ScAddress::Account(test_account_id(1));
         let to = ScAddress::Account(test_account_id(2));
@@ -1183,14 +1164,8 @@ mod tests {
             emit_classic_events: true,
             backfill_stellar_asset_events: false,
         };
-        let mut manager = OpEventManager::new(
-            true,
-            false,
-            25,
-            NetworkId::testnet(),
-            Memo::None,
-            config,
-        );
+        let mut manager =
+            OpEventManager::new(true, false, 25, NetworkId::testnet(), Memo::None, config);
 
         let to = ScAddress::Account(test_account_id(1));
         manager.new_mint_event(&Asset::Native, &to, 5000, false);
@@ -1204,14 +1179,8 @@ mod tests {
             emit_classic_events: true,
             backfill_stellar_asset_events: false,
         };
-        let mut manager = OpEventManager::new(
-            true,
-            false,
-            25,
-            NetworkId::testnet(),
-            Memo::None,
-            config,
-        );
+        let mut manager =
+            OpEventManager::new(true, false, 25, NetworkId::testnet(), Memo::None, config);
 
         let to1 = ScAddress::Account(test_account_id(1));
         let to2 = ScAddress::Account(test_account_id(2));
@@ -1230,14 +1199,8 @@ mod tests {
             emit_classic_events: true,
             backfill_stellar_asset_events: false,
         };
-        let mut manager = OpEventManager::new(
-            true,
-            false,
-            25,
-            NetworkId::testnet(),
-            Memo::None,
-            config,
-        );
+        let mut manager =
+            OpEventManager::new(true, false, 25, NetworkId::testnet(), Memo::None, config);
 
         let from = ScAddress::Account(test_account_id(1));
         manager.new_burn_event(&Asset::Native, &from, 500);
@@ -1251,14 +1214,8 @@ mod tests {
             emit_classic_events: true,
             backfill_stellar_asset_events: false,
         };
-        let mut manager = OpEventManager::new(
-            true,
-            false,
-            25,
-            NetworkId::testnet(),
-            Memo::None,
-            config,
-        );
+        let mut manager =
+            OpEventManager::new(true, false, 25, NetworkId::testnet(), Memo::None, config);
 
         let from = ScAddress::Account(test_account_id(1));
         manager.new_clawback_event(&test_asset_alphanum4(10), &from, 100);
@@ -1272,14 +1229,8 @@ mod tests {
             emit_classic_events: true,
             backfill_stellar_asset_events: false,
         };
-        let mut manager = OpEventManager::new(
-            true,
-            false,
-            25,
-            NetworkId::testnet(),
-            Memo::None,
-            config,
-        );
+        let mut manager =
+            OpEventManager::new(true, false, 25, NetworkId::testnet(), Memo::None, config);
 
         let account = test_account_id(1);
         manager.new_set_authorized_event(&test_asset_alphanum4(10), &account, true);
@@ -1308,14 +1259,8 @@ mod tests {
             emit_classic_events: true,
             backfill_stellar_asset_events: false,
         };
-        let mut manager = OpEventManager::new(
-            true,
-            false,
-            25,
-            NetworkId::testnet(),
-            Memo::None,
-            config,
-        );
+        let mut manager =
+            OpEventManager::new(true, false, 25, NetworkId::testnet(), Memo::None, config);
 
         manager.finalize();
         assert!(manager.is_finalized());
@@ -1334,14 +1279,8 @@ mod tests {
             emit_classic_events: true,
             backfill_stellar_asset_events: false,
         };
-        let mut manager = OpEventManager::new(
-            true,
-            false,
-            25,
-            NetworkId::testnet(),
-            Memo::None,
-            config,
-        );
+        let mut manager =
+            OpEventManager::new(true, false, 25, NetworkId::testnet(), Memo::None, config);
 
         let issuer_id = test_account_id(10);
         let asset = test_asset_alphanum4(10); // uses issuer_id as issuer
@@ -1360,14 +1299,8 @@ mod tests {
             emit_classic_events: true,
             backfill_stellar_asset_events: false,
         };
-        let mut manager = OpEventManager::new(
-            true,
-            false,
-            25,
-            NetworkId::testnet(),
-            Memo::None,
-            config,
-        );
+        let mut manager =
+            OpEventManager::new(true, false, 25, NetworkId::testnet(), Memo::None, config);
 
         let issuer_id = test_account_id(10);
         let asset = test_asset_alphanum4(10);
@@ -1386,14 +1319,8 @@ mod tests {
             emit_classic_events: true,
             backfill_stellar_asset_events: false,
         };
-        let mut manager = OpEventManager::new(
-            true,
-            false,
-            25,
-            NetworkId::testnet(),
-            Memo::None,
-            config,
-        );
+        let mut manager =
+            OpEventManager::new(true, false, 25, NetworkId::testnet(), Memo::None, config);
 
         let asset = test_asset_alphanum4(10);
         let from = ScAddress::Account(test_account_id(1));
@@ -1605,9 +1532,11 @@ mod tests {
             .new_burn_event(&Asset::Native, &to, 500);
 
         // Add fee event
-        hierarchy
-            .tx_event_manager()
-            .charge_fee(&test_account_id(2), 100, TransactionEventStage::BeforeAllTxs);
+        hierarchy.tx_event_manager().charge_fee(
+            &test_account_id(2),
+            100,
+            TransactionEventStage::BeforeAllTxs,
+        );
 
         let (op_events, tx_events) = hierarchy.finalize();
 
