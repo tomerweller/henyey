@@ -81,6 +81,7 @@ mod error;
 mod flood;
 mod flow_control;
 mod item_fetcher;
+mod loopback;
 mod manager;
 mod message_handlers;
 mod metrics;
@@ -106,6 +107,7 @@ pub use item_fetcher::{
     ItemFetcher, ItemFetcherConfig, ItemFetcherStats, ItemType, NextPeerResult, PendingRequest,
     Tracker,
 };
+pub use loopback::LoopbackConnectionFactory;
 pub use manager::{OverlayManager, OverlayMessage, OverlayStats, PeerSnapshot};
 pub use message_handlers::{MessageDispatcher, MessageDispatcherStats, TxSetData};
 pub use metrics::{Counter, OverlayMetrics, OverlayMetricsSnapshot, Timer, TimerSnapshot};

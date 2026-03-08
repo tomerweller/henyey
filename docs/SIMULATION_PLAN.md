@@ -221,6 +221,7 @@ cargo test -p henyey-simulation --tests
 - `cargo test -p henyey-overlay` passes.
 - `cargo test -p henyey-simulation --tests` passes.
 - `cargo test -p henyey-simulation --tests` passes (including cycle/separate topology scenarios).
+- `cargo test -p henyey-simulation --test serious_simulation -- --nocapture` passes (core7 long-run staged fault schedule + deterministic replay).
 - `cargo test --all` passes.
 
 ## Detailed Design Phases (Reference)

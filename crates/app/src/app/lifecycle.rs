@@ -296,6 +296,7 @@ impl App {
                     self.set_phase(1); // 1 = scp_message
                     tracing::trace!(select_iteration, "BRANCH: scp_message_rx");
                     scp_messages_received += 1;
+                    self.scp_messages_received.fetch_add(1, Ordering::Relaxed);
                     last_scp_message_at = self.clock.now();
                     let scp_slot = match &scp_msg.message {
                         StellarMessage::ScpMessage(env) => env.statement.slot_index,
@@ -399,6 +400,7 @@ impl App {
                         if let Some(overlay) = self.overlay().await {
                             match overlay.broadcast(msg).await {
                                 Ok(count) => {
+                                    self.scp_messages_sent.fetch_add(1, Ordering::Relaxed);
                                     tracing::debug!(slot, peers = count, "Broadcast SCP envelope");
                                 }
                                 Err(e) => {
@@ -777,7 +779,11 @@ impl App {
             "Creating overlay with config"
         );
 
-        let mut overlay = OverlayManager::new(overlay_config, local_node)?;
+        let mut overlay = OverlayManager::new_with_connection_factory(
+            overlay_config,
+            local_node,
+            Arc::clone(&self.overlay_connection_factory),
+        )?;
         overlay.set_scp_callback(Arc::new(super::HerderScpCallback {
             herder: Arc::clone(&self.herder),
         }));
@@ -903,6 +909,11 @@ impl App {
                             self.process_externalized_slots().await;
                             // Then, immediately request any pending tx sets
                             self.request_pending_tx_sets().await;
+
+                            let current_ledger = *self.current_ledger.read().await as u64;
+                            if slot > current_ledger + 1 {
+                                self.sync_recovery_pending.store(true, Ordering::SeqCst);
+                            }
                         }
                     }
                     EnvelopeState::Pending => {

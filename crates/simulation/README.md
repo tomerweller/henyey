@@ -23,7 +23,16 @@ progress under bounded message loss.
 
 - Deterministic loopback simulation is implemented and tested.
 - Topology and fault scenarios are covered by integration tests.
-- TCP-backed simulation mode is reserved for follow-up wiring.
+- Initial app-backed TCP simulation support is implemented for node lifecycle,
+  genesis bootstrapping, single-node manual ledger-close execution,
+  multi-node startup/connectivity checks, and core3 multi-node ledger advancement.
+- Real app-backed loopback simulation now works through an in-memory overlay
+  connection factory alongside the TCP-backed path.
+- Initial deterministic load/transaction generation scaffolding is available
+  via `LoadGenerator` and `TxGenerator`, with pair-topology load execution
+  tests running over both TCP and loopback.
+- Full load execution parity and broader loopback scenario coverage remain
+  follow-up work.
 
 ## Run Tests
 

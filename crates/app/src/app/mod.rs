@@ -85,8 +85,9 @@ use henyey_ledger::{
     TransactionSetVariant,
 };
 use henyey_overlay::{
-    ConnectionDirection, LocalNode, OverlayConfig as OverlayManagerConfig, OverlayManager,
-    OverlayMessage, PeerAddress, PeerEvent, PeerId, PeerSnapshot, PeerType, ScpQueueCallback,
+    ConnectionDirection, ConnectionFactory, LocalNode, OverlayConfig as OverlayManagerConfig,
+    OverlayManager, OverlayMessage, PeerAddress, PeerEvent, PeerId, PeerSnapshot, PeerType,
+    ScpQueueCallback, TcpConnectionFactory,
 };
 use henyey_scp::hash_quorum_set;
 use henyey_tx::TransactionFrame;
@@ -279,6 +280,31 @@ pub struct SurveyReport {
     pub bad_response_nodes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SimulationDebugStats {
+    pub app_state: String,
+    pub herder_state: String,
+    pub current_ledger: u32,
+    pub tracking_slot: u64,
+    pub latest_externalized_slot: Option<u64>,
+    pub peer_count: usize,
+    pub pending_envelopes: usize,
+    pub cached_tx_sets: usize,
+    pub heard_from_quorum: bool,
+    pub is_v_blocking: bool,
+    pub slot_is_nominating: Option<bool>,
+    pub slot_is_externalized: Option<bool>,
+    pub slot_ballot_phase: Option<String>,
+    pub slot_ballot_round: Option<u32>,
+    pub nomination_timeout_fires: u64,
+    pub ballot_timeout_fires: u64,
+    pub scp_messages_sent: u64,
+    pub scp_messages_received: u64,
+    pub consensus_trigger_attempts: u64,
+    pub consensus_trigger_successes: u64,
+    pub consensus_trigger_failures: u64,
+}
+
 /// State for a ledger close running on a background thread.
 ///
 /// Created by [`App::try_start_ledger_close`] and consumed by
@@ -327,6 +353,9 @@ pub struct App {
 
     /// Clock abstraction for runtime behavior.
     clock: Arc<dyn Clock>,
+
+    /// Connection factory for overlay transport (TCP by default).
+    overlay_connection_factory: Arc<dyn ConnectionFactory>,
 
     /// Current application state.
     state: RwLock<AppState>,
@@ -392,6 +421,20 @@ pub struct App {
     syncing_ledgers: RwLock<BTreeMap<u32, henyey_herder::LedgerCloseInfo>>,
     /// Latest externalized slot we've observed (for liveness checks).
     last_externalized_slot: AtomicU64,
+    /// Count of SCP envelopes broadcast by this node.
+    scp_messages_sent: AtomicU64,
+    /// Count of SCP envelopes received by this node.
+    scp_messages_received: AtomicU64,
+    /// Number of attempts to trigger the next consensus round.
+    consensus_trigger_attempts: AtomicU64,
+    /// Number of successful trigger_next_ledger calls.
+    consensus_trigger_successes: AtomicU64,
+    /// Number of failed trigger_next_ledger calls.
+    consensus_trigger_failures: AtomicU64,
+    /// Number of nomination timeout firings.
+    nomination_timeout_fires: AtomicU64,
+    /// Number of ballot timeout firings.
+    ballot_timeout_fires: AtomicU64,
     /// Time when we last observed an externalized slot.
     last_externalized_at: RwLock<Instant>,
     /// Last time we requested SCP state due to stalled externalization.
@@ -819,7 +862,11 @@ impl ScpQueueCallback for HerderScpCallback {
 impl App {
     /// Create a new application instance.
     pub async fn new(config: AppConfig) -> anyhow::Result<Self> {
-        Self::new_with_clock(config, Arc::new(RealClock))
+        Self::new_with_clock_and_connection_factory(
+            config,
+            Arc::new(RealClock),
+            Arc::new(TcpConnectionFactory),
+        )
             .await
     }
 
@@ -827,6 +874,20 @@ impl App {
     pub async fn new_with_clock(
         config: AppConfig,
         clock: Arc<dyn Clock>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_clock_and_connection_factory(
+            config,
+            clock,
+            Arc::new(TcpConnectionFactory),
+        )
+        .await
+    }
+
+    /// Create a new application instance with injected clock and overlay factory.
+    pub async fn new_with_clock_and_connection_factory(
+        config: AppConfig,
+        clock: Arc<dyn Clock>,
+        overlay_connection_factory: Arc<dyn ConnectionFactory>,
     ) -> anyhow::Result<Self> {
         // Apply testing overrides early, before any checkpoint math is used.
         if config.testing.accelerate_time {
@@ -1014,6 +1075,7 @@ impl App {
             is_validator,
             config,
             clock,
+            overlay_connection_factory,
             state: RwLock::new(AppState::Initializing),
             db,
             _db_lock: Some(db_lock),
@@ -1033,6 +1095,13 @@ impl App {
             catchup_fatal_failure: AtomicBool::new(false),
             syncing_ledgers: RwLock::new(BTreeMap::new()),
             last_externalized_slot: AtomicU64::new(0),
+            scp_messages_sent: AtomicU64::new(0),
+            scp_messages_received: AtomicU64::new(0),
+            consensus_trigger_attempts: AtomicU64::new(0),
+            consensus_trigger_successes: AtomicU64::new(0),
+            consensus_trigger_failures: AtomicU64::new(0),
+            nomination_timeout_fires: AtomicU64::new(0),
+            ballot_timeout_fires: AtomicU64::new(0),
             last_externalized_at: RwLock::new(now),
             last_scp_state_request_at: RwLock::new(now),
             survey_data: RwLock::new(SurveyDataManager::new(
@@ -1455,6 +1524,29 @@ impl App {
         self.herder.ledger_close_time()
     }
 
+    pub async fn peer_count(&self) -> usize {
+        self.overlay.read().await.as_ref().map(|o| o.peer_count()).unwrap_or(0)
+    }
+
+    pub async fn add_peer(&self, addr: henyey_overlay::PeerAddress) -> anyhow::Result<bool> {
+        let overlay = self.overlay.read().await;
+        let Some(overlay) = overlay.as_ref() else {
+            anyhow::bail!("overlay not started")
+        };
+        overlay
+            .add_peer(addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to add peer: {}", e))
+    }
+
+    pub fn latest_externalized_slot(&self) -> Option<u64> {
+        self.herder.latest_externalized_slot()
+    }
+
+    pub fn request_out_of_sync_recovery(&self) {
+        self.sync_recovery_pending.store(true, Ordering::SeqCst);
+    }
+
     pub fn current_upgrade_state(&self) -> (u32, u32, u32, u32) {
         let header = self.ledger_manager.current_header();
         (
@@ -1589,6 +1681,41 @@ impl App {
 
     pub fn herder_stats(&self) -> HerderStats {
         self.herder.stats()
+    }
+
+    pub async fn simulation_debug_stats(&self) -> SimulationDebugStats {
+        let herder_stats = self.herder.stats();
+        let current_ledger = self.ledger_info().0;
+        let quorum_slot = herder_stats
+            .tracking_slot
+            .max(current_ledger as u64 + 1)
+            .max(1);
+        let slot_state = self.herder.get_slot_state(quorum_slot);
+        SimulationDebugStats {
+            app_state: self.state().await.to_string(),
+            herder_state: herder_stats.state.to_string(),
+            current_ledger,
+            tracking_slot: herder_stats.tracking_slot,
+            latest_externalized_slot: self.herder.latest_externalized_slot(),
+            peer_count: self.peer_count().await,
+            pending_envelopes: herder_stats.pending_envelopes,
+            cached_tx_sets: herder_stats.cached_tx_sets,
+            heard_from_quorum: self.herder.heard_from_quorum(quorum_slot),
+            is_v_blocking: self.herder.is_v_blocking(quorum_slot),
+            slot_is_nominating: slot_state.as_ref().map(|s| s.is_nominating),
+            slot_is_externalized: slot_state.as_ref().map(|s| s.is_externalized),
+            slot_ballot_phase: slot_state
+                .as_ref()
+                .map(|s| format!("{:?}", s.ballot_phase)),
+            slot_ballot_round: slot_state.as_ref().and_then(|s| s.ballot_round),
+            nomination_timeout_fires: self.nomination_timeout_fires.load(Ordering::Relaxed),
+            ballot_timeout_fires: self.ballot_timeout_fires.load(Ordering::Relaxed),
+            scp_messages_sent: self.scp_messages_sent.load(Ordering::Relaxed),
+            scp_messages_received: self.scp_messages_received.load(Ordering::Relaxed),
+            consensus_trigger_attempts: self.consensus_trigger_attempts.load(Ordering::Relaxed),
+            consensus_trigger_successes: self.consensus_trigger_successes.load(Ordering::Relaxed),
+            consensus_trigger_failures: self.consensus_trigger_failures.load(Ordering::Relaxed),
+        }
     }
 
     /// Clear metrics registry.

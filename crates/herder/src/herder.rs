@@ -666,9 +666,10 @@ impl Herder {
     /// Bootstrap the Herder after catchup.
     ///
     /// This transitions the Herder from Syncing to Tracking state,
-    /// setting the current ledger sequence as the tracking slot.
+    /// setting the next consensus ledger as the tracking slot.
     pub fn bootstrap(&self, ledger_seq: u32) {
-        let slot = ledger_seq as u64;
+        let lcl = ledger_seq as u64;
+        let slot = lcl + 1;
 
         info!("Bootstrapping Herder at ledger {}", ledger_seq);
 
@@ -709,7 +710,7 @@ impl Herder {
             }
         }
 
-        info!("Herder now tracking at slot {}", slot);
+        info!(lcl, tracking_slot = slot, "Herder now tracking next consensus slot");
     }
 
     /// Start syncing (called when catchup begins).
@@ -1872,6 +1873,10 @@ impl Herder {
         }
     }
 
+    pub fn get_slot_state(&self, slot: u64) -> Option<henyey_scp::SlotState> {
+        self.scp.as_ref().and_then(|scp| scp.get_slot_state(slot))
+    }
+
     /// Get the local quorum set if configured.
     pub fn local_quorum_set(&self) -> Option<ScpQuorumSet> {
         self.scp_driver.get_local_quorum_set()
@@ -2385,7 +2390,7 @@ mod tests {
 
         herder.bootstrap(100);
         assert_eq!(herder.state(), HerderState::Tracking);
-        assert_eq!(herder.tracking_slot(), 100);
+        assert_eq!(herder.tracking_slot(), 101);
         assert!(herder.is_tracking());
     }
 
@@ -2423,7 +2428,7 @@ mod tests {
 
         let stats = herder.stats();
         assert_eq!(stats.state, HerderState::Tracking);
-        assert_eq!(stats.tracking_slot, 50);
+        assert_eq!(stats.tracking_slot, 51);
         assert_eq!(stats.pending_transactions, 0);
         assert!(!stats.is_validator);
     }

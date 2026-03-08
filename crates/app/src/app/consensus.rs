@@ -8,6 +8,10 @@ impl App {
     /// (LCL == tracking slot). Without this, a node that is behind would
     /// propose stale transaction sets for slots it hasn't closed yet.
     pub(super) async fn try_trigger_consensus(&self) {
+        if self.config.node.manual_close {
+            return;
+        }
+
         let tracking_slot = self.herder.tracking_slot();
 
         // Check if we should start a new round
@@ -47,8 +51,12 @@ impl App {
             // 4. Start SCP nomination with that value
 
             // For now, trigger the herder
+            self.consensus_trigger_attempts.fetch_add(1, Ordering::Relaxed);
             if let Err(e) = self.herder.trigger_next_ledger(next_slot).await {
+                self.consensus_trigger_failures.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(error = %e, slot = next_slot, "Failed to trigger ledger");
+            } else {
+                self.consensus_trigger_successes.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -600,7 +608,8 @@ impl App {
         if !self.herder.state().can_receive_scp() {
             return;
         }
-        let slot = self.herder.tracking_slot();
+        let current_ledger = *self.current_ledger.read().await as u64;
+        let slot = self.herder.tracking_slot().max(current_ledger + 1);
         let now = self.clock.now();
         let mut timeouts = self.scp_timeouts.write().await;
         if timeouts.slot != slot {
@@ -611,6 +620,7 @@ impl App {
 
         if let Some(next) = timeouts.next_nomination {
             if now >= next {
+                self.nomination_timeout_fires.fetch_add(1, Ordering::Relaxed);
                 self.herder.handle_nomination_timeout(slot);
                 timeouts.next_nomination = None;
             }
@@ -623,6 +633,7 @@ impl App {
 
         if let Some(next) = timeouts.next_ballot {
             if now >= next {
+                self.ballot_timeout_fires.fetch_add(1, Ordering::Relaxed);
                 self.herder.handle_ballot_timeout(slot);
                 timeouts.next_ballot = None;
             }

@@ -96,3 +96,42 @@ async fn test_separate_topology_not_fully_connected() {
         .await;
     assert!(progressed);
 }
+
+#[tokio::test]
+async fn test_additional_topology_builders_exist() {
+    let cycle4 = Topologies::cycle4(SimulationMode::OverLoopback);
+    assert_eq!(cycle4.node_ids().len(), 4);
+
+    let branched = Topologies::branchedcycle(5, SimulationMode::OverLoopback);
+    assert_eq!(branched.node_ids().len(), 5);
+
+    let hierarchical = Topologies::hierarchical_quorum(2, SimulationMode::OverLoopback);
+    assert!(hierarchical.node_ids().len() >= 6);
+
+    let simplified =
+        Topologies::hierarchical_quorum_simplified(4, 3, SimulationMode::OverLoopback);
+    assert_eq!(simplified.node_ids().len(), 7);
+
+    let custom = Topologies::custom_a(SimulationMode::OverLoopback);
+    assert_eq!(custom.node_ids().len(), 7);
+
+    let asymmetric = Topologies::asymmetric(SimulationMode::OverLoopback);
+    assert_eq!(asymmetric.node_ids().len(), 7);
+}
+
+#[tokio::test]
+async fn test_populate_app_nodes_from_existing() {
+    let mut sim = Topologies::core3(SimulationMode::OverTcp);
+    sim.populate_app_nodes_from_existing_with_quorum_adjuster(67, |id, mut qset| {
+        if id == "node0" {
+            qset.threshold_percent = 100;
+        }
+        qset
+    });
+
+    assert_eq!(sim.app_node_ids(), vec!["node0", "node1", "node2"]);
+
+    let plan = sim.generate_load_plan_for_app_nodes(2, 3, 100, 10);
+    assert_eq!(plan.len(), 3);
+    assert_eq!(plan.iter().map(|s| s.transactions.len()).sum::<usize>(), 6);
+}

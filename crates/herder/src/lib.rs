@@ -292,6 +292,6 @@ mod tests {
 
         herder.bootstrap(100);
         assert_eq!(herder.state(), HerderState::Tracking);
-        assert_eq!(herder.tracking_slot(), 100);
+        assert_eq!(herder.tracking_slot(), 101);
     }
 }

@@ -10,9 +10,12 @@
 | Area | Status | Notes |
 |------|--------|-------|
 | Deterministic replay | Full | Repeated runs produce identical ledger hashes |
-| Topology modeling | Full | Core, pair, cycle, and separated clusters |
+| Topology modeling | Partial | Core, pair, cycle, cycle4, branched, hierarchical, custom-A, asymmetric |
 | Fault modeling | Partial | Partition/heal and drop probability supported |
-| App-level integration | Partial | Harness-level simulation complete; deeper app transport integration pending |
+| App-level integration | Partial | App-backed TCP nodes can bootstrap, run, and expose simulation state |
+| TCP mode | Partial | Single-node, pair, core3, and core4 app-backed closes pass |
+| Loopback mode | Partial | App-backed pair/core3 loopback closes pass via in-memory transport |
+| Load generation | Partial | Deterministic load plans execute on pair topology over TCP/loopback |
 
 ## Notes
 

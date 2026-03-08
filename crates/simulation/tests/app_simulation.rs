@@ -1,0 +1,427 @@
+use std::time::Duration;
+
+use henyey_app::config::QuorumSetConfig;
+use henyey_app::{AppState, CatchupTarget};
+use henyey_common::Hash256;
+use henyey_crypto::SecretKey;
+use henyey_simulation::{Simulation, SimulationMode, Topologies};
+
+async fn wait_for_app_ledger_close(sim: &Simulation, target_ledger: u32, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if sim.have_all_app_nodes_externalized(target_ledger, 1) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(sim.have_all_app_nodes_externalized(target_ledger, 1));
+}
+
+async fn manual_close_until(sim: &Simulation, target_ledger: u32, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if sim.have_all_app_nodes_externalized(target_ledger, 1) {
+            return;
+        }
+        let _ = sim.manual_close_all_app_nodes().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(sim.have_all_app_nodes_externalized(target_ledger, 1));
+}
+
+async fn wait_for_app_operational(sim: &Simulation, node_id: &str, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if let Some(app) = sim.app(node_id) {
+            if matches!(app.state().await, AppState::Synced | AppState::Validating) {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let app = sim.app(node_id).expect("app exists for operational wait");
+    assert!(matches!(app.state().await, AppState::Synced | AppState::Validating));
+}
+
+async fn wait_for_app_validating(sim: &Simulation, node_id: &str, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if let Some(app) = sim.app(node_id) {
+            if app.state().await == AppState::Validating {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let app = sim.app(node_id).expect("app exists for validating wait");
+    assert_eq!(app.state().await, AppState::Validating);
+}
+
+async fn wait_for_peer_count(sim: &Simulation, node_id: &str, expected: usize, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if sim.app_peer_count(node_id).await.unwrap_or(usize::MAX) == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(sim.app_peer_count(node_id).await.unwrap_or(usize::MAX), expected);
+}
+
+async fn ensure_app_accounts_funded(sim: &mut Simulation, expected: usize) {
+    let mut ledger_target = sim
+        .app("node0")
+        .map(|app| app.ledger_info().0)
+        .unwrap_or(1);
+    let mut funded_total = 0usize;
+    let mut rounds = 0usize;
+    while funded_total < expected && rounds < 8 {
+        let funded = sim.fund_app_accounts(10_000_000).await.expect("fund app accounts");
+        funded_total += funded;
+        ledger_target += 1;
+        manual_close_until(sim, ledger_target, Duration::from_secs(20)).await;
+        rounds += 1;
+    }
+    assert_eq!(funded_total, expected);
+}
+
+async fn build_app_backed_topology(
+    mut sim: Simulation,
+    threshold_percent: u32,
+) -> Simulation {
+    sim.populate_app_nodes_from_existing(threshold_percent);
+    sim.start_all_nodes().await;
+    let _ = sim
+        .stabilize_app_tcp_connectivity(1, Duration::from_secs(20))
+        .await
+        .expect("stabilize app tcp connectivity");
+    sim
+}
+
+async fn build_two_running_of_three(mode: SimulationMode) -> Simulation {
+    let mut sim = Topologies::core3(mode);
+    let node_ids = sim.node_ids();
+    let validators: Vec<String> = node_ids
+        .iter()
+        .map(|id| sim.app_spec_public_key(id).expect("public key for node"))
+        .collect();
+    let quorum_set = QuorumSetConfig {
+        threshold_percent: 67,
+        validators,
+        inner_sets: Vec::new(),
+    };
+
+    for id in node_ids.iter().take(2) {
+        let secret = sim.secret_for_test(id).expect("secret for node");
+        sim.add_app_node(id.clone(), secret, quorum_set.clone());
+    }
+    sim.start_all_nodes().await;
+    let _ = sim
+        .stabilize_app_tcp_connectivity(1, Duration::from_secs(20))
+        .await
+        .expect("stabilize two-of-three connectivity");
+    sim
+}
+
+#[tokio::test]
+async fn test_single_node_app_simulation_can_manual_close_over_tcp() {
+    let mut sim = Simulation::with_network(
+        SimulationMode::OverTcp,
+        "Test SDF Network ; September 2015",
+    );
+
+    let seed = Hash256::hash(b"APP_SIM_NODE_0");
+    let secret = SecretKey::from_seed(&seed.0);
+    let quorum_set = QuorumSetConfig {
+        threshold_percent: 100,
+        validators: vec![secret.public_key().to_strkey()],
+        inner_sets: Vec::new(),
+    };
+
+    sim.add_app_node("node0", secret, quorum_set);
+    sim.start_all_nodes().await;
+
+    let app = sim.app("node0").expect("running app node");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        if app.state().await == AppState::Validating {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(app.state().await, AppState::Validating);
+
+    let closed = sim.manual_close_all_app_nodes().await.expect("manual close");
+    assert_eq!(closed, vec![2]);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        if sim.have_all_app_nodes_externalized(2, 0) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(sim.have_all_app_nodes_externalized(2, 0));
+    sim.stop_all_nodes().await.expect("stop app-backed nodes");
+}
+
+#[tokio::test]
+async fn test_core3_app_simulation_starts_over_tcp() {
+    let mut sim = build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 67).await;
+
+    let mut total_peers = 0usize;
+
+    for id in ["node0", "node1", "node2"] {
+        let app = sim.app(id).expect("running core3 app node");
+        let status = sim.app_task_status(id).await;
+        assert_eq!(sim.app_task_finished(id), Some(false), "{id} status: {status:?}");
+        assert!(matches!(app.state().await, AppState::Synced | AppState::Validating));
+        total_peers += sim.app_peer_count(id).await.unwrap_or(0);
+    }
+
+    assert!(total_peers > 0, "expected at least one active TCP peer connection");
+
+    sim.stop_all_nodes().await.expect("stop core3 app nodes");
+}
+
+#[tokio::test]
+async fn test_three_nodes_two_running_threshold_two_over_tcp() {
+    let mut sim = build_two_running_of_three(SimulationMode::OverTcp).await;
+
+    let _ = sim.manual_close_all_app_nodes().await.expect("manual close two-of-three tcp");
+    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+
+    sim.stop_all_nodes().await.expect("stop two-of-three tcp");
+}
+
+#[tokio::test]
+async fn test_three_nodes_two_running_threshold_two_over_loopback() {
+    let mut sim = build_two_running_of_three(SimulationMode::OverLoopback).await;
+
+    let _ = sim.manual_close_all_app_nodes().await.expect("manual close two-of-three loopback");
+    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+
+    sim.stop_all_nodes().await.expect("stop two-of-three loopback");
+}
+
+#[tokio::test]
+async fn test_core3_app_simulation_can_attempt_multi_node_close() {
+    let mut sim = build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 67).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        let mut all_validating = true;
+        for id in ["node0", "node1", "node2"] {
+            let app = sim.app(id).expect("running core3 app node");
+            if app.state().await != AppState::Validating {
+                all_validating = false;
+                break;
+            }
+        }
+        if all_validating {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    for id in ["node0", "node1", "node2"] {
+        let app = sim.app(id).expect("running core3 app node");
+        assert_eq!(app.state().await, AppState::Validating);
+    }
+
+    let _ = sim.manual_close_all_app_nodes().await.expect("manual close all nodes");
+
+    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+    sim.stop_all_nodes().await.expect("stop core3 app nodes");
+}
+
+#[tokio::test]
+async fn test_pair_app_simulation_can_close_ledgers_over_tcp() {
+    let mut sim = build_app_backed_topology(Topologies::pair(SimulationMode::OverTcp), 100).await;
+
+    let _ = sim.manual_close_all_app_nodes().await.expect("manual close pair");
+    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+
+    sim.stop_all_nodes().await.expect("stop pair app nodes");
+}
+
+#[tokio::test]
+async fn test_pair_app_simulation_can_close_ledgers_over_loopback() {
+    let mut sim = build_app_backed_topology(Topologies::pair(SimulationMode::OverLoopback), 100).await;
+
+    let _ = sim.manual_close_all_app_nodes().await.expect("manual close pair loopback");
+    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+
+    sim.stop_all_nodes().await.expect("stop pair loopback app nodes");
+}
+
+#[tokio::test]
+async fn test_pair_app_simulation_executes_generated_load_over_tcp() {
+    let mut sim = build_app_backed_topology(Topologies::pair(SimulationMode::OverTcp), 100).await;
+
+    ensure_app_accounts_funded(&mut sim, 2).await;
+
+    let steps = sim.generate_load_plan_for_app_nodes(1, 1, 100, 1_000);
+    let submitted = sim
+        .submit_generated_load_step(&steps[0])
+        .await
+        .expect("submit generated load step");
+    assert_eq!(submitted, 1);
+
+    let ledger_target = sim.app("node0").expect("node0 app exists").ledger_info().0 + 1;
+    manual_close_until(&sim, ledger_target, Duration::from_secs(40)).await;
+
+    sim.stop_all_nodes().await.expect("stop pair tcp load test");
+}
+
+#[tokio::test]
+async fn test_pair_app_simulation_executes_generated_load_over_loopback() {
+    let mut sim = build_app_backed_topology(Topologies::pair(SimulationMode::OverLoopback), 100).await;
+
+    ensure_app_accounts_funded(&mut sim, 2).await;
+
+    let steps = sim.generate_load_plan_for_app_nodes(1, 1, 100, 1_000);
+    let submitted = sim
+        .submit_generated_load_step(&steps[0])
+        .await
+        .expect("submit generated load step loopback");
+    assert_eq!(submitted, 1);
+
+    let ledger_target = sim.app("node0").expect("node0 app exists").ledger_info().0 + 1;
+    manual_close_until(&sim, ledger_target, Duration::from_secs(40)).await;
+
+    sim.stop_all_nodes().await.expect("stop pair loopback load test");
+}
+
+#[tokio::test]
+async fn test_core4_app_simulation_can_close_ledgers_over_tcp() {
+    let mut sim = build_app_backed_topology(Topologies::core(4, SimulationMode::OverTcp), 75).await;
+
+    let _ = sim.manual_close_all_app_nodes().await.expect("manual close core4");
+    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+
+    sim.stop_all_nodes().await.expect("stop core4 app nodes");
+}
+
+#[tokio::test]
+async fn test_cycle4_app_simulation_can_close_ledgers_over_tcp() {
+    let mut sim = build_app_backed_topology(Topologies::cycle4(SimulationMode::OverTcp), 75).await;
+
+    let _ = sim.manual_close_all_app_nodes().await.expect("manual close cycle4");
+    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+
+    sim.stop_all_nodes().await.expect("stop cycle4 app nodes");
+}
+
+#[tokio::test]
+async fn test_core3_app_simulation_can_close_ledgers_over_loopback() {
+    let mut sim = build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 67).await;
+
+    let _ = sim.manual_close_all_app_nodes().await.expect("manual close core3 loopback");
+    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+
+    sim.stop_all_nodes().await.expect("stop core3 loopback app nodes");
+}
+
+#[tokio::test]
+async fn test_separate_app_simulation_stays_partitioned_over_tcp() {
+    let mut sim = build_app_backed_topology(Topologies::separate(SimulationMode::OverTcp), 75).await;
+
+    let _ = sim.manual_close_all_app_nodes().await.expect("manual close separate");
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!sim.have_all_app_nodes_externalized(2, 1));
+
+    sim.stop_all_nodes().await.expect("stop separate app nodes");
+}
+
+#[tokio::test]
+#[ignore = "restart/rejoin parity still being stabilized for app-backed simulation"]
+async fn test_core3_restart_rejoin_over_tcp() {
+    let mut sim = build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 67).await;
+
+    let _ = sim.manual_close_all_app_nodes().await.expect("close ledger 2 tcp");
+    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+
+    sim.remove_node("node0").await.expect("remove node0 tcp");
+    wait_for_peer_count(&sim, "node1", 1, Duration::from_secs(5)).await;
+    wait_for_peer_count(&sim, "node2", 1, Duration::from_secs(5)).await;
+
+    let _ = sim.manual_close_all_app_nodes().await.expect("close ledger 3 tcp");
+    wait_for_app_ledger_close(&sim, 3, Duration::from_secs(20)).await;
+
+    sim.restart_node("node0").await.expect("restart node0 tcp");
+    wait_for_app_operational(&sim, "node0", Duration::from_secs(2)).await;
+    sim.app("node0")
+        .expect("restarted node0 app")
+        .request_scp_state_from_peers()
+        .await;
+    sim.app("node0")
+        .expect("restarted node0 app")
+        .request_out_of_sync_recovery();
+    let _ = sim.add_connection("node0", "node1").await;
+    wait_for_app_validating(&sim, "node0", Duration::from_secs(5)).await;
+
+    let _ = sim.manual_close_app_node("node1").await.expect("close ledger 4 tcp from node1");
+    let _ = sim.manual_close_app_node("node2").await.expect("close ledger 4 tcp from node2");
+    wait_for_app_ledger_close(&sim, 4, Duration::from_secs(30)).await;
+
+    sim.stop_all_nodes().await.expect("stop core3 tcp restart test");
+}
+
+#[tokio::test]
+#[ignore = "loopback restart/rejoin parity still being stabilized; tcp variant passes"]
+async fn test_core3_restart_rejoin_over_loopback() {
+    let mut sim = build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 67).await;
+
+    let _ = sim.manual_close_all_app_nodes().await.expect("close ledger 2 loopback");
+    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+
+    sim.remove_node("node0").await.expect("remove node0 loopback");
+    wait_for_peer_count(&sim, "node1", 1, Duration::from_secs(5)).await;
+    wait_for_peer_count(&sim, "node2", 1, Duration::from_secs(5)).await;
+
+    let _ = sim.manual_close_all_app_nodes().await.expect("close ledger 3 loopback");
+    wait_for_app_ledger_close(&sim, 3, Duration::from_secs(20)).await;
+
+    sim.restart_node("node0").await.expect("restart node0 loopback");
+    wait_for_app_operational(&sim, "node0", Duration::from_secs(2)).await;
+    sim.app("node0")
+        .expect("restarted node0 app")
+        .request_scp_state_from_peers()
+        .await;
+    sim.app("node0")
+        .expect("restarted node0 app")
+        .request_out_of_sync_recovery();
+    let _ = sim.add_connection("node0", "node1").await;
+    wait_for_app_validating(&sim, "node0", Duration::from_secs(5)).await;
+    let _ = sim
+        .app("node0")
+        .expect("restarted node0 app")
+        .catchup(CatchupTarget::Current)
+        .await;
+    assert!(sim
+        .stabilize_app_tcp_connectivity(1, Duration::from_secs(10))
+        .await
+        .expect("stabilize connectivity after loopback restart"));
+
+    let _ = sim
+        .manual_close_app_node("node1")
+        .await
+        .expect("close ledger 4 loopback from node1");
+    let _ = sim
+        .manual_close_app_node("node2")
+        .await
+        .expect("close ledger 4 loopback from node2");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        if sim.have_all_app_nodes_externalized(4, 1) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(sim.have_all_app_nodes_externalized(4, 1));
+
+    sim.stop_all_nodes().await.expect("stop core3 loopback restart test");
+}

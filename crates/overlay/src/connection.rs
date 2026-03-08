@@ -22,13 +22,21 @@ use crate::{
 use futures::{SinkExt, StreamExt};
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use stellar_xdr::curr::AuthenticatedMessage;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
 use tracing::{debug, trace};
+
+trait AsyncIo: AsyncRead + AsyncWrite + Send + Unpin {}
+
+impl<T> AsyncIo for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
+
+type BoxedIo = Pin<Box<dyn AsyncIo>>;
 
 /// Direction of a peer connection.
 ///
@@ -66,7 +74,7 @@ impl ConnectionDirection {
 /// [`AuthenticatedMessage`]: stellar_xdr::curr::AuthenticatedMessage
 pub struct Connection {
     /// Framed stream for message encoding/decoding.
-    framed: Framed<TcpStream, MessageCodec>,
+    framed: Framed<BoxedIo, MessageCodec>,
     /// Remote peer's socket address.
     remote_addr: SocketAddr,
     /// Whether we initiated or accepted this connection.
@@ -89,6 +97,26 @@ impl Connection {
         #[allow(deprecated)]
         stream.set_linger(Some(Duration::from_secs(0)))?;
 
+        Self::from_boxed_io(Box::pin(stream), remote_addr, direction)
+    }
+
+    /// Creates a connection from an arbitrary async IO stream.
+    pub fn from_io<T>(
+        stream: T,
+        remote_addr: SocketAddr,
+        direction: ConnectionDirection,
+    ) -> Result<Self>
+    where
+        T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        Self::from_boxed_io(Box::pin(stream), remote_addr, direction)
+    }
+
+    fn from_boxed_io(
+        stream: BoxedIo,
+        remote_addr: SocketAddr,
+        direction: ConnectionDirection,
+    ) -> Result<Self> {
         let framed = Framed::new(stream, MessageCodec::new());
 
         Ok(Self {
@@ -269,7 +297,7 @@ impl Connection {
 /// Created by [`Connection::split`]. Allows sending messages without
 /// holding a lock on the full connection.
 pub struct ConnectionSender {
-    sink: futures::stream::SplitSink<Framed<TcpStream, MessageCodec>, AuthenticatedMessage>,
+    sink: futures::stream::SplitSink<Framed<BoxedIo, MessageCodec>, AuthenticatedMessage>,
     remote_addr: SocketAddr,
 }
 
@@ -307,7 +335,7 @@ impl ConnectionSender {
 /// Created by [`Connection::split`]. Allows receiving messages without
 /// holding a lock on the full connection.
 pub struct ConnectionReceiver {
-    stream: futures::stream::SplitStream<Framed<TcpStream, MessageCodec>>,
+    stream: futures::stream::SplitStream<Framed<BoxedIo, MessageCodec>>,
     remote_addr: SocketAddr,
 }
 
@@ -341,8 +369,13 @@ impl ConnectionReceiver {
 /// Binds to a port and accepts new connections, wrapping them as
 /// inbound [`Connection`]s.
 pub struct Listener {
-    listener: TcpListener,
+    listener: ListenerKind,
     local_addr: SocketAddr,
+}
+
+enum ListenerKind {
+    Tcp(TcpListener),
+    Loopback(tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Connection>>),
 }
 
 impl Listener {
@@ -359,9 +392,19 @@ impl Listener {
         debug!("Listening on {}", local_addr);
 
         Ok(Self {
-            listener,
+            listener: ListenerKind::Tcp(listener),
             local_addr,
         })
+    }
+
+    pub fn from_loopback(
+        local_addr: SocketAddr,
+        receiver: tokio::sync::mpsc::Receiver<Connection>,
+    ) -> Self {
+        Self {
+            listener: ListenerKind::Loopback(tokio::sync::Mutex::new(receiver)),
+            local_addr,
+        }
     }
 
     /// Returns the local address the listener is bound to.
@@ -374,10 +417,19 @@ impl Listener {
     /// Blocks until a new connection arrives, then returns it as an
     /// inbound [`Connection`].
     pub async fn accept(&self) -> Result<Connection> {
-        let (stream, remote_addr) = self.listener.accept().await?;
-        debug!("Accepted connection from {}", remote_addr);
-
-        Connection::new(stream, ConnectionDirection::Inbound)
+        match &self.listener {
+            ListenerKind::Tcp(listener) => {
+                let (stream, remote_addr) = listener.accept().await?;
+                debug!("Accepted connection from {}", remote_addr);
+                Connection::new(stream, ConnectionDirection::Inbound)
+            }
+            ListenerKind::Loopback(receiver) => receiver
+                .lock()
+                .await
+                .recv()
+                .await
+                .ok_or_else(|| OverlayError::PeerDisconnected("loopback listener closed".to_string())),
+        }
     }
 }
 
