@@ -214,15 +214,26 @@ impl CatchupRange {
         let count = mode.count();
         let full_replay_count = target - lcl;
 
-        // Case 1: LCL is past genesis AND mode is not Minimal — replay from LCL+1.
-        // For Minimal mode with a persisted LCL we fall through to the checkpoint-based
-        // logic so we download the latest checkpoint rather than replaying the full gap.
-        if lcl > GENESIS_LEDGER_SEQ && mode != CatchupMode::Minimal {
-            let replay = LedgerRange::new(lcl + 1, full_replay_count);
-            return Self::replay_only(replay);
+        // Case 1: LCL is past genesis — replay from LCL+1, unless the gap is large enough
+        // to justify a fresh checkpoint download.
+        //
+        // For Minimal mode with a LARGE gap (> MINIMAL_BUCKET_DOWNLOAD_THRESHOLD), fall
+        // through to the checkpoint-based logic. Downloading a fresh checkpoint is faster
+        // than replaying thousands of ledgers (e.g., 22k ledger startup gap).
+        //
+        // For small gaps, ALWAYS replay from LCL+1. A 4-minute bucket download for a
+        // 93-ledger gap would block the event loop and trigger an infinite catchup loop
+        // (the network advances faster than the bucket download completes).
+        const MINIMAL_BUCKET_DOWNLOAD_THRESHOLD: u32 = 10_000;
+        if lcl > GENESIS_LEDGER_SEQ {
+            if mode != CatchupMode::Minimal || full_replay_count <= MINIMAL_BUCKET_DOWNLOAD_THRESHOLD {
+                let replay = LedgerRange::new(lcl + 1, full_replay_count);
+                return Self::replay_only(replay);
+            }
+            // Fall through: Minimal mode + large gap → use checkpoint download below.
         }
 
-        // Remaining cases: lcl == genesis, OR lcl > genesis with Minimal mode.
+        // Remaining cases: lcl == genesis, OR lcl > genesis with Minimal mode + large gap.
         // full_replay covers from lcl+1 to target in both situations.
         let full_replay = LedgerRange::new(lcl + 1, full_replay_count);
 
@@ -383,19 +394,33 @@ mod tests {
     }
 
     #[test]
-    fn test_minimal_lcl_past_genesis_checkpoint_target() {
-        // Minimal mode with persisted LCL — should download checkpoint, not replay.
-        // target=127 is a checkpoint ledger.
+    fn test_minimal_lcl_past_genesis_small_gap_replays() {
+        // Minimal mode with persisted LCL and a SMALL gap (< 10_000) — must replay,
+        // not download buckets. A 4-minute bucket download for a 93-ledger gap would
+        // block the event loop and cause an infinite catchup loop.
+        // target=127 is a checkpoint ledger, but gap=27 < 10_000 → replay_only.
         let range = CatchupRange::calculate(100, 127, CatchupMode::Minimal);
-        assert!(range.apply_buckets());
-        assert!(!range.replay_ledgers());
-        assert_eq!(range.bucket_apply_ledger(), 127);
+        assert!(!range.apply_buckets());
+        assert!(range.replay_ledgers());
+        assert_eq!(range.replay_first(), 101);
+        assert_eq!(range.replay_count(), 27);
+    }
+
+    #[test]
+    fn test_minimal_lcl_past_genesis_buffered_catchup_gap() {
+        // Simulate the buffered-catchup scenario: LCL=61551871, gap=93.
+        // Must use replay_only, not bucket download.
+        let range = CatchupRange::calculate(61551871, 61551964, CatchupMode::Minimal);
+        assert!(!range.apply_buckets());
+        assert!(range.replay_ledgers());
+        assert_eq!(range.replay_first(), 61551872);
+        assert_eq!(range.replay_count(), 93);
     }
 
     #[test]
     fn test_minimal_mainnet_scenario() {
-        // Real-world scenario: persisted at L61529351, catchup target L61551615 (checkpoint).
-        // Should download checkpoint buckets, not replay 22k ledgers.
+        // Startup scenario: persisted at L61529351, target L61551615 (checkpoint).
+        // Gap=22264 > 10_000 → download checkpoint, not replay 22k ledgers.
         let range = CatchupRange::calculate(61529351, 61551615, CatchupMode::Minimal);
         assert!(range.apply_buckets());
         assert!(!range.replay_ledgers());
