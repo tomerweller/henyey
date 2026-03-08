@@ -724,33 +724,36 @@ impl App {
             }
         };
 
-        let ledger_version = self.ledger_manager.current_header().ledger_version;
-        if ledger_version >= 20 {
-            if let Some(gen_tx_set) = tx_set
-                .generalized_tx_set
-                .clone()
-                .or_else(|| build_generalized_tx_set(&tx_set))
-            {
-                let gen_hash = match gen_tx_set.to_xdr(stellar_xdr::curr::Limits::none()) {
-                    Ok(bytes) => henyey_common::Hash256::hash(&bytes),
-                    Err(e) => {
-                        tracing::warn!(hash = %hash256, error = %e, "Failed to encode GeneralizedTxSet");
-                        henyey_common::Hash256::ZERO
-                    }
-                };
-                if gen_hash == hash256 {
-                    let message = StellarMessage::GeneralizedTxSet(gen_tx_set);
-                    if let Some(overlay) = self.overlay().await {
-                        if let Err(e) = overlay.try_send_to(peer_id, message) {
-                            tracing::warn!(hash = %hash256, peer = %peer_id, error = %e, "Failed to send GeneralizedTxSet");
-                        } else {
-                            tracing::debug!(hash = %hash256, peer = %peer_id, "Sent GeneralizedTxSet");
-                        }
-                    }
-                    return;
+        // Try to send as GeneralizedTxSet first if the cached tx_set has one.
+        // The requesting node asked for a specific hash — if the cached entry was
+        // stored with a GeneralizedTxSet hash (protocol >= 20 consensus), we must
+        // send the GeneralizedTxSet back so the hash matches. Using ledger_version
+        // from the current header would be wrong for nodes that haven't yet closed
+        // the ledger at the newer protocol version.
+        if let Some(gen_tx_set) = tx_set
+            .generalized_tx_set
+            .clone()
+            .or_else(|| build_generalized_tx_set(&tx_set))
+        {
+            let gen_hash = match gen_tx_set.to_xdr(stellar_xdr::curr::Limits::none()) {
+                Ok(bytes) => henyey_common::Hash256::hash(&bytes),
+                Err(e) => {
+                    tracing::warn!(hash = %hash256, error = %e, "Failed to encode GeneralizedTxSet");
+                    henyey_common::Hash256::ZERO
                 }
-                tracing::warn!(hash = %hash256, computed = %gen_hash, "GeneralizedTxSet hash mismatch; falling back");
+            };
+            if gen_hash == hash256 {
+                let message = StellarMessage::GeneralizedTxSet(gen_tx_set);
+                if let Some(overlay) = self.overlay().await {
+                    if let Err(e) = overlay.try_send_to(peer_id, message) {
+                        tracing::warn!(hash = %hash256, peer = %peer_id, error = %e, "Failed to send GeneralizedTxSet");
+                    } else {
+                        tracing::debug!(hash = %hash256, peer = %peer_id, "Sent GeneralizedTxSet");
+                    }
+                }
+                return;
             }
+            tracing::warn!(hash = %hash256, computed = %gen_hash, "GeneralizedTxSet hash mismatch; falling back");
         }
 
         // Convert to legacy XDR TransactionSet

@@ -123,13 +123,6 @@ sim.set_drop_prob("node0", "node1", 0.0);
 
 See [PARITY_STATUS.md](PARITY_STATUS.md) for detailed stellar-core parity analysis.
 
-## Known Issues
-
-- App-backed restart/rejoin parity is incomplete. The ignored `core3`
-  restart/rejoin tests in `tests/app_simulation.rs` show that a restarted node
-  can reconnect and receive SCP traffic but fails to catch up and
-  re-externalize with the rest of the network.
-
 ## Run Tests
 
 ```bash

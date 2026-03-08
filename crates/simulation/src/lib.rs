@@ -252,6 +252,7 @@ impl Simulation {
                     &port_map,
                     data_dir.path().to_path_buf(),
                     Arc::clone(&overlay_connection_factory),
+                    true,
                 )
                 .await
                 .with_context(|| format!("build app node {}", spec.node_id))?;
@@ -332,10 +333,11 @@ impl Simulation {
                 &port_map,
                 data_dir.path().to_path_buf(),
                 Arc::clone(&overlay_connection_factory),
+                false,
             )
             .await?;
 
-        let running = Self::bootstrap_and_spawn(app, data_dir, peer_port).await?;
+        let running = Self::restore_and_spawn(app, data_dir, peer_port).await?;
         self.running_apps.insert(node_id.to_string(), running);
         Ok(())
     }
@@ -742,6 +744,7 @@ impl Simulation {
         Ok(submitted)
     }
 
+    /// Bootstrap a fresh node from genesis and spawn its run loop.
     async fn bootstrap_and_spawn(
         app: App,
         data_dir: Arc<TempDir>,
@@ -750,7 +753,47 @@ impl Simulation {
         let app = Arc::new(app);
         app.set_self_arc().await;
         app.bootstrap_from_db().await?;
+        Self::spawn_app_run_loop(app, data_dir, peer_port)
+    }
 
+    /// Restore a previously-running node from its persisted DB + bucket
+    /// state and spawn its run loop.  Used by `restart_node` so that the
+    /// node resumes at its last closed ledger instead of re-initializing
+    /// genesis.
+    async fn restore_and_spawn(
+        app: App,
+        data_dir: Arc<TempDir>,
+        peer_port: u16,
+    ) -> anyhow::Result<RunningAppNode> {
+        let app = Arc::new(app);
+        app.set_self_arc().await;
+
+        // Restore the LedgerManager from persisted DB + on-disk buckets.
+        // App::run() will read the restored ledger via get_current_ledger()
+        // and set state via restore_operational_state().
+        match app.load_last_known_ledger().await {
+            Ok(true) => {
+                let (seq, _hash, _close_time, _protocol) = app.ledger_info();
+                tracing::info!(lcl_seq = seq, "Restored restarted node from disk");
+            }
+            Ok(false) => {
+                tracing::warn!("No persisted state for restarted node, falling back to genesis bootstrap");
+                app.bootstrap_from_db().await?;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to restore restarted node from disk, falling back to genesis bootstrap");
+                app.bootstrap_from_db().await?;
+            }
+        }
+
+        Self::spawn_app_run_loop(app, data_dir, peer_port)
+    }
+
+    fn spawn_app_run_loop(
+        app: Arc<App>,
+        data_dir: Arc<TempDir>,
+        peer_port: u16,
+    ) -> anyhow::Result<RunningAppNode> {
         let app_clone = Arc::clone(&app);
         let status = Arc::new(tokio::sync::RwLock::new(None));
         let status_clone = Arc::clone(&status);
@@ -775,6 +818,7 @@ impl Simulation {
         port_map: &HashMap<String, u16>,
         data_dir: PathBuf,
         overlay_connection_factory: Arc<dyn ConnectionFactory>,
+        init_genesis: bool,
     ) -> anyhow::Result<App> {
         let peer_port = *port_map
             .get(&spec.node_id)
@@ -805,7 +849,9 @@ impl Simulation {
         }
         std::fs::create_dir_all(&config.buckets.directory)?;
 
-        initialize_genesis_ledger(&config, &self.network_passphrase)?;
+        if init_genesis {
+            initialize_genesis_ledger(&config, &self.network_passphrase)?;
+        }
         App::new_with_clock_and_connection_factory(
             config,
             Arc::new(RealClock),

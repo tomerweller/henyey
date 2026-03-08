@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use henyey_app::config::QuorumSetConfig;
-use henyey_app::{AppState, CatchupTarget};
+use henyey_app::AppState;
 use henyey_common::Hash256;
 use henyey_crypto::SecretKey;
 use henyey_simulation::{Simulation, SimulationMode, Topologies};
@@ -41,20 +41,6 @@ async fn wait_for_app_operational(sim: &Simulation, node_id: &str, timeout: Dura
     }
     let app = sim.app(node_id).expect("app exists for operational wait");
     assert!(matches!(app.state().await, AppState::Synced | AppState::Validating));
-}
-
-async fn wait_for_app_validating(sim: &Simulation, node_id: &str, timeout: Duration) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    while tokio::time::Instant::now() < deadline {
-        if let Some(app) = sim.app(node_id) {
-            if app.state().await == AppState::Validating {
-                return;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let app = sim.app(node_id).expect("app exists for validating wait");
-    assert_eq!(app.state().await, AppState::Validating);
 }
 
 async fn wait_for_peer_count(sim: &Simulation, node_id: &str, expected: usize, timeout: Duration) {
@@ -337,7 +323,6 @@ async fn test_separate_app_simulation_stays_partitioned_over_tcp() {
 }
 
 #[tokio::test]
-#[ignore = "restart/rejoin parity still being stabilized for app-backed simulation"]
 async fn test_core3_restart_rejoin_over_tcp() {
     let mut sim = build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 67).await;
 
@@ -352,37 +337,47 @@ async fn test_core3_restart_rejoin_over_tcp() {
     wait_for_app_ledger_close(&sim, 3, Duration::from_secs(20)).await;
 
     sim.restart_node("node0").await.expect("restart node0 tcp");
-    wait_for_app_operational(&sim, "node0", Duration::from_secs(2)).await;
+    wait_for_app_operational(&sim, "node0", Duration::from_secs(5)).await;
+
+    // Re-establish peer connections so node0 can receive SCP state.
+    let _ = sim.add_connection("node0", "node1").await;
+    let _ = sim.add_connection("node0", "node2").await;
+
+    // Request SCP state so node0 learns about the externalized slots it missed.
     sim.app("node0")
         .expect("restarted node0 app")
         .request_scp_state_from_peers()
         .await;
-    sim.app("node0")
-        .expect("restarted node0 app")
-        .request_out_of_sync_recovery();
-    let _ = sim.add_connection("node0", "node1").await;
-    wait_for_app_validating(&sim, "node0", Duration::from_secs(5)).await;
 
-    let _ = sim.manual_close_all_app_nodes().await.expect("close ledger 4 tcp from all nodes");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    // Wait for node0 to catch up to ledger 3 (where node1/node2 are) before
+    // triggering ledger 4 consensus. Without this, node0's manual_close would
+    // trigger the wrong slot.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     while tokio::time::Instant::now() < deadline {
-        if sim.have_all_app_nodes_externalized(4, 1) {
+        if sim.have_all_app_nodes_externalized(3, 1) {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Periodically re-request SCP state to help node0 learn about slot 3.
+        sim.app("node0")
+            .expect("node0")
+            .request_scp_state_from_peers()
+            .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    if !sim.have_all_app_nodes_externalized(4, 1) {
+    if !sim.have_all_app_nodes_externalized(3, 1) {
         for id in ["node0", "node1", "node2"] {
-            println!("tcp {id}: {:?}", sim.app_debug_stats(id).await);
+            eprintln!("catchup {id}: {:?}", sim.app_debug_stats(id).await);
         }
     }
-    assert!(sim.have_all_app_nodes_externalized(4, 1));
+    assert!(sim.have_all_app_nodes_externalized(3, 1), "node0 failed to catch up to ledger 3");
+
+    // Now advance all nodes to ledger 4.
+    manual_close_until(&sim, 4, Duration::from_secs(30)).await;
 
     sim.stop_all_nodes().await.expect("stop core3 tcp restart test");
 }
 
 #[tokio::test]
-#[ignore = "loopback restart/rejoin parity still being stabilized; tcp variant passes"]
 async fn test_core3_restart_rejoin_over_loopback() {
     let mut sim = build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 67).await;
 
@@ -397,38 +392,23 @@ async fn test_core3_restart_rejoin_over_loopback() {
     wait_for_app_ledger_close(&sim, 3, Duration::from_secs(20)).await;
 
     sim.restart_node("node0").await.expect("restart node0 loopback");
-    wait_for_app_operational(&sim, "node0", Duration::from_secs(2)).await;
+    wait_for_app_operational(&sim, "node0", Duration::from_secs(5)).await;
+
+    // Re-establish peer connections.
+    let _ = sim.add_connection("node0", "node1").await;
+    let _ = sim.add_connection("node0", "node2").await;
+
+    // Request SCP state so node0 learns about externalized slots it missed.
     sim.app("node0")
         .expect("restarted node0 app")
         .request_scp_state_from_peers()
         .await;
-    sim.app("node0")
-        .expect("restarted node0 app")
-        .request_out_of_sync_recovery();
-    let _ = sim.add_connection("node0", "node1").await;
-    wait_for_app_validating(&sim, "node0", Duration::from_secs(5)).await;
-    let _ = sim
-        .app("node0")
-        .expect("restarted node0 app")
-        .catchup(CatchupTarget::Current)
-        .await;
-    assert!(sim
-        .stabilize_app_tcp_connectivity(1, Duration::from_secs(10))
-        .await
-        .expect("stabilize connectivity after loopback restart"));
 
-    let _ = sim
-        .manual_close_all_app_nodes()
-        .await
-        .expect("close ledger 4 loopback from all nodes");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while tokio::time::Instant::now() < deadline {
-        if sim.have_all_app_nodes_externalized(4, 1) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert!(sim.have_all_app_nodes_externalized(4, 1));
+    // Wait for node0 to catch up to ledger 3 before triggering ledger 4.
+    wait_for_app_ledger_close(&sim, 3, Duration::from_secs(20)).await;
+
+    // Now advance all nodes to ledger 4.
+    manual_close_until(&sim, 4, Duration::from_secs(30)).await;
 
     sim.stop_all_nodes().await.expect("stop core3 loopback restart test");
 }

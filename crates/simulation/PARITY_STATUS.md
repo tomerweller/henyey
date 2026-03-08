@@ -175,7 +175,7 @@ Features not yet implemented. These ARE counted against parity %.
 | `TxGenerator` full API | Medium | Only payment_series; no Soroban upload, invoke, SAC, or batch transfer |
 | `LoadGenMode` enum | Medium | No mode-based dispatch (PAY, Soroban modes, MIXED, etc.) |
 | `ApplyLoad` | Medium | Benchmark infrastructure not implemented |
-| Node restart/rejoin | Medium | Partially works but not fully stable (ignored tests) |
+| Node restart/rejoin | Done | Restart + rejoin implemented and tested (both TCP and loopback) |
 
 ## Architectural Differences
 
@@ -213,13 +213,13 @@ Features not yet implemented. These ARE counted against parity %.
 - No Rust tests for Soroban load generation (stellar-core has extensive Soroban loadgen tests)
 - No Rust tests for `ApplyLoad` benchmarking
 - No Rust tests for resilience topologies (hierarchical, branched cycle, custom-A convergence)
-- Restart/rejoin tests exist but are `#[ignore]`d due to incomplete parity
+- Restart/rejoin tests pass for both TCP and loopback modes
 
 ## Parity Calculation
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 24 |
-| Gaps (None + Partial) | 51 |
+| Implemented (Full) | 25 |
+| Gaps (None + Partial) | 50 |
 | Intentional Omissions | 3 |
-| **Parity** | **24 / (24 + 51) = 32%** |
+| **Parity** | **25 / (25 + 50) = 33%** |
