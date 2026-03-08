@@ -341,21 +341,23 @@ backfill_stellar_asset_events = false
 ```
 henyey/
 ├── crates/
-│   ├── henyey/          # CLI binary
-│   ├── henyey-app/         # App orchestration
-│   ├── henyey-overlay/     # P2P networking
-│   ├── henyey-scp/         # Consensus protocol
-│   ├── henyey-herder/      # Consensus coordination
-│   ├── henyey-ledger/      # Ledger close pipeline
-│   ├── henyey-tx/          # Transaction execution
-│   ├── henyey-bucket/      # BucketList state
-│   ├── henyey-history/     # History archives
-│   ├── henyey-historywork/ # History work scheduling
-│   ├── henyey-db/          # SQLite persistence
-│   ├── henyey-crypto/      # Cryptographic primitives
-│   ├── henyey-common/      # Shared types
-│   └── henyey-work/        # Work scheduler
-└── configs/                      # Example configurations
+│   ├── app/            # App orchestration
+│   ├── bucket/         # BucketList state
+│   ├── clock/          # Clock abstractions
+│   ├── common/         # Shared types
+│   ├── crypto/         # Cryptographic primitives
+│   ├── db/             # SQLite persistence
+│   ├── henyey/         # CLI binary
+│   ├── herder/         # Consensus coordination
+│   ├── history/        # History archives
+│   ├── historywork/    # History work scheduling
+│   ├── ledger/         # Ledger close pipeline
+│   ├── overlay/        # P2P networking
+│   ├── scp/            # Consensus protocol
+│   ├── simulation/     # Multi-node simulation harness
+│   ├── tx/             # Transaction execution
+│   └── work/           # Work scheduler
+└── configs/            # Example configurations
 ```
 
 ## Crate Overview
@@ -399,7 +401,7 @@ henyey/
 | Crate | Purpose | Parity |
 |-------|---------|--------|
 | [`henyey-work`](crates/henyey-work/README.md) | Generic DAG-based work scheduler | [39%](crates/henyey-work/PARITY_STATUS.md) |
-| [`henyey-simulation`](crates/simulation/README.md) | Deterministic multi-node simulation harness and topology/fault scenarios | [N/A](crates/simulation/PARITY_STATUS.md) |
+| [`henyey-simulation`](crates/simulation/README.md) | Deterministic multi-node simulation harness and topology/fault scenarios | [37%](crates/simulation/PARITY_STATUS.md) |
 
 ## Design Constraints
 

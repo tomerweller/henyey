@@ -1,3 +1,5 @@
+//! Deterministic link model with partition and drop-probability controls.
+
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Default, Clone)]

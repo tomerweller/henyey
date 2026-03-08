@@ -1,38 +1,134 @@
 # henyey-simulation
 
-Deterministic multi-node simulation harness for henyey.
+Deterministic multi-node simulation harness for testing consensus, overlay,
+and ledger-close behavior across configurable network topologies.
 
 ## Overview
 
-`henyey-simulation` provides a lightweight simulation environment for
-multi-node behavior checks with deterministic replay. It is designed to support
-execution-plan validation for convergence, partition/recovery, and fault-tolerant
-progress under bounded message loss.
+`henyey-simulation` provides a lightweight simulation environment that can spin
+up multiple henyey `App` nodes (over TCP or in-memory loopback transport) and
+drive them through ledger close cycles, fault injection, and load generation.
+It corresponds to stellar-core's `src/simulation/` directory and is used
+exclusively for integration testing — it has no role in production.
 
-## Components
+## Architecture
 
-| Type | Purpose |
-|------|---------|
-| `Simulation` | Main harness managing nodes, topology, and progression |
-| `SimNode` | Simulated node state (id, key, ledger sequence/hash) |
-| `SimulationMode` | Execution mode selector (`OverLoopback`, `OverTcp`) |
-| `LoopbackNetwork` | Deterministic link model with partition/drop controls |
-| `Topologies` | Topology builders (`core`, `core3`, `pair`, `cycle`, `separate`) |
+```mermaid
+graph TD
+    T[Topologies] -->|builds| S[Simulation]
+    S -->|manages| AN[RunningAppNode]
+    S -->|models links| LN[LoopbackNetwork]
+    S -->|submits txs via| LG[LoadGenerator / TxGenerator]
+    AN -->|wraps| APP[henyey-app::App]
+    AN -->|runs on| TOK[tokio task]
+    LN -->|partition / drop| FAULT[Fault Injection]
+```
 
-## Current Status
+## Key Types
 
-- Deterministic loopback simulation is implemented and tested.
-- Topology and fault scenarios are covered by integration tests.
-- Initial app-backed TCP simulation support is implemented for node lifecycle,
-  genesis bootstrapping, single-node manual ledger-close execution,
-  multi-node startup/connectivity checks, and core3 multi-node ledger advancement.
-- Real app-backed loopback simulation now works through an in-memory overlay
-  connection factory alongside the TCP-backed path.
-- Initial deterministic load/transaction generation scaffolding is available
-  via `LoadGenerator` and `TxGenerator`, with pair-topology load execution
-  tests running over both TCP and loopback.
-- Full load execution parity and broader loopback scenario coverage remain
-  follow-up work.
+| Type | Description |
+|------|-------------|
+| `Simulation` | Main harness: manages nodes, topology, connections, and ledger progression |
+| `SimulationMode` | Selects transport: `OverLoopback` (in-memory) or `OverTcp` |
+| `SimNode` | Lightweight simulated node state (id, key, ledger sequence/hash) |
+| `Topologies` | Factory methods for standard network topologies (core, pair, cycle, etc.) |
+| `LoopbackNetwork` | Deterministic link model with partition and drop-probability controls |
+| `LoadGenerator` | Produces deterministic multi-step load plans from a `GeneratedLoadConfig` |
+| `TxGenerator` | Generates individual payment transaction series |
+| `GeneratedLoadConfig` | Configuration for load generation (accounts, rate, steps) |
+| `GeneratedTransaction` | A single generated transaction descriptor |
+| `LoadStep` | One step of a load plan containing a batch of transactions |
+| `LoadReport` | Summary statistics for a load plan |
+
+## Usage
+
+### Create a 3-node simulation and advance ledgers
+
+```rust
+use henyey_simulation::{SimulationMode, Topologies};
+use std::time::Duration;
+
+let mut sim = Topologies::core3(SimulationMode::OverLoopback);
+sim.start_all_nodes().await;
+
+let converged = sim
+    .crank_until(|s| s.have_all_externalized(11, 2), Duration::from_secs(30))
+    .await;
+assert!(converged);
+```
+
+### App-backed simulation with manual ledger close
+
+```rust
+use henyey_simulation::{Simulation, SimulationMode, Topologies};
+
+let mut sim = Topologies::core3(SimulationMode::OverTcp);
+sim.populate_app_nodes_from_existing(67);
+sim.start_all_nodes().await;
+sim.stabilize_app_tcp_connectivity(1, Duration::from_secs(20)).await?;
+
+let _ = sim.manual_close_all_app_nodes().await?;
+sim.stop_all_nodes().await?;
+```
+
+### Fault injection
+
+```rust
+let mut sim = Topologies::core(7, SimulationMode::OverLoopback);
+sim.start_all_nodes().await;
+
+// Partition a node
+sim.partition("node6");
+
+// Set probabilistic message drops
+sim.set_drop_prob("node0", "node1", 0.5);
+
+// Heal
+sim.heal_partition("node6");
+sim.set_drop_prob("node0", "node1", 0.0);
+```
+
+## Module Layout
+
+| Module | Description |
+|--------|-------------|
+| `lib.rs` | `Simulation`, `SimNode`, `SimulationMode`, `Topologies`, genesis bootstrapping |
+| `loopback.rs` | `LoopbackNetwork` — deterministic link graph with partition/drop controls |
+| `loadgen.rs` | `LoadGenerator`, `TxGenerator`, `GeneratedLoadConfig`, load plan types |
+
+## Design Notes
+
+- **Two simulation layers**: Lightweight `SimNode`-based simulation uses
+  `crank_all_nodes()` for fast deterministic ledger-sequence progression
+  without real App instances. App-backed simulation starts actual `App` nodes
+  with full consensus and overlay, driven via `manual_close_all_app_nodes()`.
+- **Determinism**: Repeated runs with the same topology and fault schedule
+  produce identical ledger hashes — verified by dedicated replay tests.
+- **Genesis bootstrapping**: `initialize_genesis_ledger()` sets up a self-
+  contained genesis ledger with a root account in each node's SQLite database,
+  enabling app-backed nodes to start without external history archives.
+
+## stellar-core Mapping
+
+| Rust | stellar-core |
+|------|--------------|
+| `lib.rs` (`Simulation`) | `src/simulation/Simulation.h` / `Simulation.cpp` |
+| `lib.rs` (`Topologies`) | `src/simulation/Topologies.h` / `Topologies.cpp` |
+| `loadgen.rs` (`LoadGenerator`) | `src/simulation/LoadGenerator.h` / `LoadGenerator.cpp` |
+| `loadgen.rs` (`TxGenerator`) | `src/simulation/TxGenerator.h` / `TxGenerator.cpp` |
+| — | `src/simulation/ApplyLoad.h` / `ApplyLoad.cpp` (not implemented) |
+| — | `src/simulation/CoreTests.cpp` (upstream test file) |
+
+## Parity Status
+
+See [PARITY_STATUS.md](PARITY_STATUS.md) for detailed stellar-core parity analysis.
+
+## Known Issues
+
+- App-backed restart/rejoin parity is incomplete. The ignored `core3`
+  restart/rejoin tests in `tests/app_simulation.rs` show that a restarted node
+  can reconnect and receive SCP traffic but fails to catch up and
+  re-externalize with the rest of the network.
 
 ## Run Tests
 

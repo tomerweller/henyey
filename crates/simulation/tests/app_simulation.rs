@@ -363,9 +363,20 @@ async fn test_core3_restart_rejoin_over_tcp() {
     let _ = sim.add_connection("node0", "node1").await;
     wait_for_app_validating(&sim, "node0", Duration::from_secs(5)).await;
 
-    let _ = sim.manual_close_app_node("node1").await.expect("close ledger 4 tcp from node1");
-    let _ = sim.manual_close_app_node("node2").await.expect("close ledger 4 tcp from node2");
-    wait_for_app_ledger_close(&sim, 4, Duration::from_secs(30)).await;
+    let _ = sim.manual_close_all_app_nodes().await.expect("close ledger 4 tcp from all nodes");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        if sim.have_all_app_nodes_externalized(4, 1) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if !sim.have_all_app_nodes_externalized(4, 1) {
+        for id in ["node0", "node1", "node2"] {
+            println!("tcp {id}: {:?}", sim.app_debug_stats(id).await);
+        }
+    }
+    assert!(sim.have_all_app_nodes_externalized(4, 1));
 
     sim.stop_all_nodes().await.expect("stop core3 tcp restart test");
 }
@@ -407,13 +418,9 @@ async fn test_core3_restart_rejoin_over_loopback() {
         .expect("stabilize connectivity after loopback restart"));
 
     let _ = sim
-        .manual_close_app_node("node1")
+        .manual_close_all_app_nodes()
         .await
-        .expect("close ledger 4 loopback from node1");
-    let _ = sim
-        .manual_close_app_node("node2")
-        .await
-        .expect("close ledger 4 loopback from node2");
+        .expect("close ledger 4 loopback from all nodes");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline {
         if sim.have_all_app_nodes_externalized(4, 1) {

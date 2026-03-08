@@ -1,3 +1,5 @@
+//! Deterministic load and transaction generation for simulation workloads.
+
 use henyey_common::Hash256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

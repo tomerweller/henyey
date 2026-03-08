@@ -1,3 +1,6 @@
+//! Deterministic multi-node simulation harness for validating consensus,
+//! overlay, and ledger-close behavior across configurable topologies.
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -22,7 +25,7 @@ use tokio::task::JoinHandle;
 
 mod loopback;
 mod loadgen;
-pub use loopback::LoopbackNetwork;
+use loopback::LoopbackNetwork;
 pub use loadgen::{GeneratedLoadConfig, GeneratedTransaction, LoadGenerator, LoadReport, LoadStep, TxGenerator};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,31 +256,11 @@ impl Simulation {
                 .await
                 .with_context(|| format!("build app node {}", spec.node_id))?;
 
-            let app = Arc::new(app);
-            app.set_self_arc().await;
-            app.bootstrap_from_db().await?;
-
-            let app_clone = Arc::clone(&app);
-            let status = Arc::new(tokio::sync::RwLock::new(None));
-            let status_clone = Arc::clone(&status);
-            let handle = tokio::spawn(async move {
-                let result = app_clone.run().await.map_err(|e| e.to_string());
-                *status_clone.write().await = Some(result.clone());
-                result.map_err(anyhow::Error::msg)
-            });
-
-            self.running_apps.insert(
-                id,
-                RunningAppNode {
-                    app,
-                    handle,
-                    status,
-                    _data_dir: data_dir,
-                    peer_port: *port_map
-                        .get(&spec.node_id)
-                        .expect("port assigned for app spec"),
-                },
-            );
+            let peer_port = *port_map
+                .get(&spec.node_id)
+                .expect("port assigned for app spec");
+            let running = Self::bootstrap_and_spawn(app, data_dir, peer_port).await?;
+            self.running_apps.insert(id, running);
         }
 
         Ok(())
@@ -352,28 +335,8 @@ impl Simulation {
             )
             .await?;
 
-        let app = Arc::new(app);
-        app.set_self_arc().await;
-        app.bootstrap_from_db().await?;
-        let status = Arc::new(tokio::sync::RwLock::new(None));
-        let status_clone = Arc::clone(&status);
-        let app_clone = Arc::clone(&app);
-        let handle = tokio::spawn(async move {
-            let result = app_clone.run().await.map_err(|e| e.to_string());
-            *status_clone.write().await = Some(result.clone());
-            result.map_err(anyhow::Error::msg)
-        });
-
-        self.running_apps.insert(
-            node_id.to_string(),
-            RunningAppNode {
-                app,
-                handle,
-                status,
-                _data_dir: data_dir,
-                peer_port,
-            },
-        );
+        let running = Self::bootstrap_and_spawn(app, data_dir, peer_port).await?;
+        self.running_apps.insert(node_id.to_string(), running);
         Ok(())
     }
 
@@ -577,38 +540,49 @@ impl Simulation {
             }
         }
 
+        if self.try_advance_non_partitioned(&ids, max_seq) {
+            did_work = true;
+        }
+
+        did_work
+    }
+
+    /// Attempt to advance all non-partitioned, fully-caught-up nodes by one
+    /// ledger if they are mutually connected.
+    fn try_advance_non_partitioned(&mut self, ids: &[String], max_seq: u32) -> bool {
         let non_partitioned: Vec<String> = ids
             .iter()
             .filter(|id| !self.loopback.is_partitioned(id))
             .cloned()
             .collect();
-        if non_partitioned.len() >= 2 {
-            let all_equal = non_partitioned
+        if non_partitioned.len() < 2 {
+            return false;
+        }
+        let all_equal = non_partitioned
+            .iter()
+            .filter_map(|id| self.nodes.get(id).map(|n| n.ledger_seq))
+            .all(|seq| seq == max_seq);
+        if !all_equal {
+            return false;
+        }
+        let connected = non_partitioned.iter().all(|id| {
+            non_partitioned
                 .iter()
-                .filter_map(|id| self.nodes.get(id).map(|n| n.ledger_seq))
-                .all(|seq| seq == max_seq);
-            if all_equal {
-                let connected = non_partitioned.iter().all(|id| {
-                    non_partitioned
-                        .iter()
-                        .filter(|other| *other != id)
-                        .any(|other| self.loopback.link_active(id, other))
-                });
-                if connected {
-                    for id in &non_partitioned {
-                        let next = max_seq + 1;
-                        let hash_input = format!("{}:{}", id, next);
-                        if let Some(node) = self.nodes.get_mut(id) {
-                            node.ledger_seq = next;
-                            node.ledger_hash = Hash256::hash(hash_input.as_bytes());
-                        }
-                    }
-                    did_work = true;
-                }
+                .filter(|other| *other != id)
+                .any(|other| self.loopback.link_active(id, other))
+        });
+        if !connected {
+            return false;
+        }
+        let next = max_seq + 1;
+        for id in &non_partitioned {
+            let hash_input = format!("{}:{}", id, next);
+            if let Some(node) = self.nodes.get_mut(id) {
+                node.ledger_seq = next;
+                node.ledger_hash = Hash256::hash(hash_input.as_bytes());
             }
         }
-
-        did_work
+        true
     }
 
     pub async fn crank_until<P>(&mut self, predicate: P, timeout: Duration) -> bool
@@ -766,6 +740,33 @@ impl Simulation {
             }
         }
         Ok(submitted)
+    }
+
+    async fn bootstrap_and_spawn(
+        app: App,
+        data_dir: Arc<TempDir>,
+        peer_port: u16,
+    ) -> anyhow::Result<RunningAppNode> {
+        let app = Arc::new(app);
+        app.set_self_arc().await;
+        app.bootstrap_from_db().await?;
+
+        let app_clone = Arc::clone(&app);
+        let status = Arc::new(tokio::sync::RwLock::new(None));
+        let status_clone = Arc::clone(&status);
+        let handle = tokio::spawn(async move {
+            let result = app_clone.run().await.map_err(|e| e.to_string());
+            *status_clone.write().await = Some(result.clone());
+            result.map_err(anyhow::Error::msg)
+        });
+
+        Ok(RunningAppNode {
+            app,
+            handle,
+            status,
+            _data_dir: data_dir,
+            peer_port,
+        })
     }
 
     async fn build_app_from_spec(
