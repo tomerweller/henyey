@@ -58,6 +58,308 @@ hot-key cache.
 
 ---
 
+## Caching Layer Deep-Dive: stellar-core vs henyey
+
+### Overview
+
+Both systems read ledger entries from an on-disk data structure (stellar-core: SQLite + bucket
+list; henyey: bucket list only). Both cache entries in RAM to amortize disk access across TXs
+in the same ledger. The difference is in how many layers of cache exist, what each layer covers,
+and which layers survive across ledger boundaries.
+
+---
+
+### stellar-core Caching Layers
+
+stellar-core's cache hierarchy is built around the `LedgerTxn` MVCC tree rooted at
+`LedgerTxnRoot`. For each ledger close, one outer `LedgerTxn` is opened; each TX gets a child
+`LedgerTxn`. Reads and writes flow through this tree.
+
+#### Layer 1 — `LedgerTxn::mEntry` (per-TX modified state)
+
+**Scope:** Per-`LedgerTxn` instance (per TX and per ledger).
+**Type:** `EntryMap` (unordered hash map of `InternalLedgerKey → InternalLedgerEntry`).
+**Lifetime:** Duration of the `LedgerTxn` instance; merged UP to parent on `commitChild()`.
+
+When TX N loads account X from root and modifies it, the modified entry goes into the child
+`LedgerTxn::mEntry`. When TX N commits, `mEntry` is merged into the parent `LedgerTxn`'s
+`mEntry`. TX N+1, reading account X through the parent, finds it in `mEntry` without any
+cache lookup or bucket list access — just a hash map probe.
+
+This is the MVCC chain: each layer checks its own `mEntry` first, then walks up to parent
+layers, only reaching `LedgerTxnRoot` (and thus `mEntryCache` / bucket list) for entries
+never touched by any ancestor TX.
+
+At ledger commit, the outer `LedgerTxn::mEntry` (which now contains all TX changes) commits
+to `LedgerTxnRoot`, persisting to SQL and clearing `mEntryCache`.
+
+#### Layer 2 — `LedgerTxnRoot::mEntryCache` (cross-TX read cache within a ledger)
+
+**Scope:** All TXs in a single ledger.
+**Type:** `RandomEvictionCache<LedgerKey, CacheEntry>` — an LRU-eviction cache with configurable
+capacity (`entryCacheSize` constructor parameter, set by `LedgerManagerImpl`).
+**Lifetime:** Created at node startup; **cleared on every `commitChild`** (end of each ledger).
+
+When `LedgerTxnRoot` loads an entry from SQL or bucket list, it goes into `mEntryCache` with
+`LoadType::IMMEDIATE`. Prefetch calls populate it with `LoadType::PREFETCH`. Subsequent reads
+for the same key within the ledger are `O(1)` hash map probes.
+
+`LoadType` distinguishes entries loaded eagerly (IMMEDIATE) from batch-prefetched ones
+(PREFETCH). If the entry cache throws (e.g., schema mismatch), it clears itself as a safety
+measure (`mEntryCache.clear()` in the catch block).
+
+**Critical detail:** `mEntryCache` is cleared per-ledger (on `commitChild`), not cross-ledger.
+Both stellar-core and henyey have per-ledger read caches. The structural advantage is
+`mEntryCache`'s size (configurable, can hold thousands of entries) and its automatic population
+via `prefetch()` from the upfront `processFeesSeqNums` TX key scan.
+
+#### Layer 3 — `LedgerTxnRoot::mBestOffers` (lazy offer book with seller prefetch)
+
+**Scope:** All TXs in a single ledger.
+**Type:** `UnorderedMap<AssetPair, BestOffersEntryPtr>` where each value is a
+`std::deque<LedgerEntry>` of offers sorted by price, loaded in batches.
+**Lifetime:** Cleared on `commitChild` (per-ledger).
+
+When `getBestOffer(buying, selling)` is called during TX execution, it looks up the asset pair
+in `mBestOffers`. If the deque is empty or exhausted, it loads the next batch of up to
+`BATCH_SIZE` offers from the bucket list via `loadBestOffers()`. After each batch load,
+`populateEntryCacheFromBestOffers()` is called, which scans the batch and inserts each seller's
+account key and trustline keys (buying/selling asset) into `mEntryCache` via `prefetch()` —
+provided they are not already cached. This is stellar-core's demand-driven seller prefetch.
+
+```cpp
+// LedgerTxn.cpp:3302 — called after each batch of offers is loaded
+void LedgerTxnRoot::Impl::populateEntryCacheFromBestOffers(iter, end) {
+    UnorderedSet<LedgerKey> toPrefetch;
+    for (; iter != end; ++iter) {
+        auto const& oe = iter->data.offer();
+        toPrefetch.emplace(accountKey(oe.sellerID));
+        if (oe.buying.type() != ASSET_TYPE_NATIVE)
+            toPrefetch.emplace(trustlineKey(oe.sellerID, oe.buying));
+        if (oe.selling.type() != ASSET_TYPE_NATIVE)
+            toPrefetch.emplace(trustlineKey(oe.sellerID, oe.selling));
+    }
+    prefetch(toPrefetch);
+}
+```
+
+In `allBucketsInMemory` mode (not the default), offers are not loaded via SQL; they go through
+the bucket list directly and `loadOffer()` bypasses `mEntryCache` to use the BucketList
+snapshot.
+
+#### Layer 4 — `LedgerTxnRoot::mInMemorySorobanState` (Soroban state, persistent)
+
+**Scope:** All TXs across all ledgers (node lifetime).
+**Type:** A dedicated `InMemorySorobanState` object — a hash map of all live
+`ContractData`, `ContractCode`, and `TTL` entries.
+**Lifetime:** Rebuilt on node startup from the bucket list; updated incrementally on each
+ledger commit. Never fully cleared during normal operation.
+
+This is the authoritative in-memory mirror of all Soroban state. Reads for Soroban entries
+bypass `mEntryCache` and the bucket list entirely — they are `O(1)` hash map lookups.
+
+#### Layer 5 — `LedgerTxn::mMultiOrderBook` (per-child-TX order book overlay)
+
+**Scope:** Per `LedgerTxn` child.
+**Type:** `MultiOrderBook` (`UnorderedMap<Asset, UnorderedMap<Asset, OrderBook>>`) — an in-memory
+sorted order book per asset pair, mirroring the parent's order book with child TX's modifications.
+
+Used during offer crossing within a single TX. When a TX creates/modifies/deletes an offer,
+`mMultiOrderBook` is updated. `getBestOffer()` checks `mMultiOrderBook` in the child before
+falling through to `mBestOffers` in the root, implementing TX-level order book isolation.
+
+---
+
+### henyey Caching Layers
+
+henyey's cache hierarchy is built around `SnapshotHandle` (a read-only point-in-time view of
+the bucket list) and `TransactionExecutor` (stateful, persistent across ledgers). Reads go
+through a stack of in-memory layers before hitting the bucket list.
+
+#### Layer 1 — `LedgerStateManager` per-type maps (cross-TX within ledger, partially cross-ledger)
+
+**Scope:** All TXs in a single ledger (most entry types); ALL ledgers for offers.
+**Types:**
+```
+accounts: HashMap<[u8;32], AccountEntry>          // cleared per-ledger
+trustlines: HashMap<TrustlineKey, TrustLineEntry>  // cleared per-ledger
+offers: HashMap<OfferKey, OfferEntry>              // PRESERVED cross-ledger
+offer_index: OfferIndex                            // PRESERVED cross-ledger
+claimable_balances, liquidity_pools, ...           // cleared per-ledger
+contract_data, contract_code, ttl                  // cleared per-ledger
+```
+**Lifetime:** `accounts`/`trustlines`/etc. are cleared by `clear_cached_entries_preserving_offers()`
+between ledgers. `offers` and `offer_index` survive across ledgers (set by
+`advance_to_ledger_preserving_offers`).
+
+This is the primary in-flight state store. When TX1 loads account X from the bucket list into
+`LedgerStateManager::accounts`, TX2 finds it there directly via `get_account()`. No bucket list
+scan needed. This mirrors stellar-core's `LedgerTxn::mEntry` chain for within-ledger cross-TX
+sharing, but with a flatter structure (one map per entry type rather than an MVCC tree).
+
+Rollback is handled via `*_snapshots` maps (`account_snapshots`, `trustline_snapshots`, etc.)
+that capture pre-TX state and are restored on rollback, without clearing the primary maps.
+
+#### Layer 2 — `TransactionExecutor::loaded_accounts` (deduplication guard)
+
+**Scope:** All TXs in a single ledger.
+**Type:** `HashMap<[u8;32], bool>` — tracks which account IDs have been "attempted" from the
+bucket list (whether found or not).
+**Lifetime:** Cleared by `advance_to_ledger_preserving_offers` between ledgers.
+
+This prevents redundant bucket list scans. If `load_account(account_id)` is called for an
+account that was already attempted (even if not found), it short-circuits without hitting the
+bucket list or prefetch_cache. Equivalent to stellar-core's `mEntryCache` existence check.
+
+**Gap vs stellar-core:** `loaded_accounts` only guards `AccountEntry` loads. Trustlines,
+claimable balances, liquidity pools, and other non-account entry types have no equivalent
+deduplication guard outside of `LedgerStateManager`'s maps. If a trustline is not in state
+(e.g., never modified), each attempted load goes through `get_entry_from_snapshot()` which
+checks `SnapshotHandle::prefetch_cache` before the bucket list — so the cache-through mechanism
+covers them, but only after the first miss.
+
+#### Layer 3 — `SnapshotHandle::prefetch_cache` (bucket list hit cache)
+
+**Scope:** All TXs in a single ledger (via shared `Arc<RwLock<...>>`).
+**Type:** `Arc<parking_lot::RwLock<HashMap<Vec<u8>, LedgerEntry>>>` — a flat HashMap keyed by
+XDR-serialized `LedgerKey` bytes.
+**Lifetime:** Allocated fresh in each `SnapshotHandle` constructor → per-ledger.
+
+Populated two ways:
+1. **Static prefetch** (`snapshot.prefetch()` at ledger start in `run_transactions_on_executor`):
+   bulk loads all statically-determinable keys for all TXs in one bucket list pass.
+2. **Cache-through** (commit 8104131): every `get_entry()` and `load_entries()` bucket list
+   miss writes the loaded entry back into `prefetch_cache`, so subsequent accesses within the
+   same ledger are `O(1)` HashMap lookups.
+
+The lookup chain in `get_entry()` is:
+```
+SnapshotHandle::inner (in-memory snapshot entries)
+  → prefetch_cache (HashMap lookup by XDR key bytes)
+    → bucket list (via lookup_fn / batch_lookup_fn)
+      → write back to prefetch_cache on hit
+```
+
+No eviction — entries accumulate until the snapshot is discarded at ledger end. The HashMap is
+sized by actual usage (~750–1050 entries/ledger on mainnet), not a fixed capacity.
+
+**Gap vs stellar-core's `mEntryCache`:** Both are per-ledger read caches. The difference is
+that stellar-core's `mEntryCache` is also populated by `populateEntryCacheFromBestOffers`
+(automatic offer-seller prefetch after each batch) whereas henyey requires explicit prefetch
+calls. The `prefetch_cache` also lacks `RandomEvictionCache`'s ability to bound memory usage,
+though in practice the entry count is small enough this doesn't matter.
+
+#### Layer 4 — `SnapshotHandle::inner` (ledger snapshot)
+
+**Scope:** Entire ledger.
+**Type:** `LedgerSnapshot` — an in-memory set of entries that were part of the ledger header
+or explicitly included in the snapshot at construction time.
+**Lifetime:** Per-ledger.
+
+In the verify-execution flow, this holds entries from the CDP metadata. In the live-node flow,
+it is typically empty (the bucket list is the source of truth). Checked before `prefetch_cache`
+in the lookup chain.
+
+#### Layer 5 — `SharedSorobanState` / `InMemorySorobanState` (Soroban state, persistent)
+
+**Scope:** All TXs across all ledgers.
+**Type:** HashMap of all live `ContractData`, `ContractCode`, and `TTL` entries with co-located
+TTL data.
+**Lifetime:** Persistent; rebuilt on startup, updated incrementally on each ledger commit.
+
+henyey's direct equivalent of stellar-core's `InMemorySorobanState`. When `soroban_state` is
+set on a `TransactionExecutor`, `load_soroban_footprint` reads from it instead of the bucket
+list — `O(1)` lookups. Set by `execute_single_cluster` for the parallel Soroban path.
+
+#### Layer 6 — `OfferIndex` in `LedgerStateManager` (offer book, persistent cross-ledger)
+
+**Scope:** All TXs across all ledgers.
+**Type:** `OfferIndex` — `HashMap<AssetPair, BTreeMap<OfferDescriptor, OfferKey>>` + reverse
+index `HashMap<OfferKey, (AssetPair, OfferDescriptor)>`.
+**Lifetime:** Loaded once at startup via `load_orderbook_offers()` (~911K offers, ~2.7s);
+updated incrementally as TXs create/modify/delete offers; preserved across ledgers by
+`advance_to_ledger_preserving_offers`.
+
+This is henyey's equivalent of stellar-core's SQL offer table + `mBestOffers` combined.
+`best_offer_key(buying, selling)` is `O(log n)` (BTreeMap `first_key_value()`).
+`top_n_offer_keys(buying, selling, n)` is `O(n log m)` (BTreeMap iteration).
+
+The key difference from stellar-core's `mBestOffers`: `OfferIndex` is always fully loaded
+upfront; stellar-core's `mBestOffers` loads lazily in batches with automatic seller prefetch.
+henyey must explicitly prefetch offer seller accounts/trustlines (P2).
+
+---
+
+### Layer-by-Layer Comparison
+
+| Layer | stellar-core | henyey | Cross-ledger? |
+|-------|-------------|--------|---------------|
+| Per-TX modified state | `LedgerTxn::mEntry` (MVCC chain) | `LedgerStateManager` per-type maps | No (both per-ledger) |
+| Cross-TX read cache | `LedgerTxnRoot::mEntryCache` (LRU, bounded) | `SnapshotHandle::prefetch_cache` (HashMap, unbounded) | No (both per-ledger) |
+| Offer book | SQL table + `mBestOffers` (lazy batches) | `OfferIndex` (fully preloaded, in-memory BTreeMap) | stellar-core: no; henyey: YES |
+| Offer seller prefetch | Automatic via `populateEntryCacheFromBestOffers` | Manual / P2 (not yet wired) | No |
+| Account dedup guard | Implicit (mEntry + mEntryCache) | `loaded_accounts` (accounts only) | No |
+| Non-account entry dedup | Implicit (mEntry + mEntryCache) | Cache-through (one miss then cached) | No |
+| Soroban state | `InMemorySorobanState` (persistent HashMap) | `SharedSorobanState` (persistent HashMap) | Both yes |
+| Cross-TX order book | `LedgerTxn::mMultiOrderBook` | `OfferIndex` (shared, no per-TX isolation layer) | N/A |
+
+---
+
+### Key Structural Differences
+
+**1. Offer book strategy (henyey has the advantage here)**
+
+stellar-core loads offers lazily in batches from SQL on `getBestOffer` calls; the batch size
+starts at `min(max(prefetchBatchSize, 5), getMaxOffersToCross())`. Between ledgers, the SQL
+table is the authoritative store — `mBestOffers` is cleared per-ledger and rebuilt lazily.
+
+henyey loads all ~911K offers once at startup into `OfferIndex`, then maintains it incrementally.
+No per-ledger reload. `best_offer_key()` is `O(log n)` with no I/O. This is henyey's biggest
+structural advantage over stellar-core for offer-heavy traffic.
+
+**2. Offer seller account caching (stellar-core has the advantage)**
+
+stellar-core automatically prefetches seller accounts and trustlines for each batch of offers
+loaded via `populateEntryCacheFromBestOffers`. henyey does not yet do this (P2). When a path
+payment crosses an offer in stellar-core, the seller account is already in `mEntryCache`
+(loaded with the preceding `getBestOffer` batch). In henyey, the seller account requires a
+bucket list scan on first touch within a ledger.
+
+**3. MVCC chain vs flat state maps**
+
+stellar-core's `LedgerTxn::mEntry` chain provides automatic cross-TX visibility: TX N+1 sees
+TX N's committed changes by walking parent layers. henyey's `LedgerStateManager` provides the
+same within-ledger cross-TX sharing but with a flat structure (one map per entry type). The
+semantic result is identical; the implementation differs in that stellar-core's chain also
+tracks the original (pre-modification) value at the root level, enabling precise
+`LedgerEntryChanges` construction without separate snapshot maps. henyey uses explicit
+`*_snapshots` maps for rollback.
+
+**4. Cross-ledger account caching (neither has it; see P1)**
+
+Both `LedgerTxnRoot::mEntryCache` and henyey's `prefetch_cache` are cleared per-ledger.
+Neither system caches non-offer, non-Soroban entries across ledger boundaries. The DEX offer
+seller accounts that were loaded in ledger N must be re-fetched in ledger N+1 in both systems.
+
+stellar-core's per-ledger cost is lower because its bucket list reads go through SQLite (with
+OS page cache warmth) and because `populateEntryCacheFromBestOffers` front-loads seller lookups
+before offer crossing begins. henyey's per-ledger cost is higher because seller accounts are
+loaded scattered across TXs via cache-through (random access pattern, bucket list scan each).
+
+P1 (cross-ledger hot-key prefetch) closes this specific gap by converting scattered per-TX
+bucket list misses into a single upfront batch scan.
+
+**5. `loaded_accounts` scope gap**
+
+henyey's `loaded_accounts` only deduplicates `AccountEntry` lookups. If the same trustline is
+looked up by two different path payment operations in the same ledger (and wasn't loaded via
+static prefetch), the second lookup goes through `prefetch_cache` (cache hit after first
+cache-through) rather than going to the bucket list again. So the deduplication still works
+via `prefetch_cache`, but it's one level slower than the `loaded_accounts` short-circuit.
+For accounts specifically, `loaded_accounts` avoids even the `prefetch_cache` lock acquisition.
+
+---
+
 ## P1: Cross-Ledger Hot-Key Prefetch (HIGH PRIORITY, ~10–20ms)
 
 ### Idea
