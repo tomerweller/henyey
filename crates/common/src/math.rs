@@ -124,7 +124,12 @@ pub fn big_divide(a: i64, b: i64, c: i64, rounding: Rounding) -> Result<i64, Mat
 ///
 /// Returns `Ok(result)` if the calculation fits in `u64`.
 /// Returns `Err(MathError::Overflow)` if result is too large.
-pub fn big_divide_unsigned(a: u64, b: u64, c: u64, rounding: Rounding) -> Result<u64, MathError> {
+pub(crate) fn big_divide_unsigned(
+    a: u64,
+    b: u64,
+    c: u64,
+    rounding: Rounding,
+) -> Result<u64, MathError> {
     if c == 0 {
         return Err(MathError::DivisionByZero);
     }
@@ -269,7 +274,7 @@ pub fn saturating_multiply(a: i64, b: i64) -> i64 {
 ///
 /// Returns true if the double value can be represented as an i64 without
 /// undefined behavior.
-pub fn is_representable_as_i64(d: f64) -> bool {
+pub(crate) fn is_representable_as_i64(d: f64) -> bool {
     d >= (i64::MIN as f64) && d < (i64::MAX as f64)
 }
 

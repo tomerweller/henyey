@@ -429,42 +429,6 @@ pub fn ledger_entry_key(entry: &LedgerEntry) -> LedgerKey {
 }
 
 // ============================================================================
-// Price Comparison
-// ============================================================================
-
-use stellar_xdr::curr::Price;
-
-/// Compare two prices for greater-than-or-equal using cross-multiplication.
-///
-/// Uses 128-bit arithmetic to avoid overflow.
-///
-/// # Panics
-///
-/// Panics if any component is negative.
-pub fn price_ge(a: &Price, b: &Price) -> bool {
-    assert!(a.n >= 0 && a.d >= 0 && b.n >= 0 && b.d >= 0);
-
-    let l = (a.n as u128) * (b.d as u128);
-    let r = (a.d as u128) * (b.n as u128);
-    l >= r
-}
-
-/// Compare two prices for greater-than using cross-multiplication.
-///
-/// Uses 128-bit arithmetic to avoid overflow.
-///
-/// # Panics
-///
-/// Panics if any component is negative.
-pub fn price_gt(a: &Price, b: &Price) -> bool {
-    assert!(a.n >= 0 && a.d >= 0 && b.n >= 0 && b.d >= 0);
-
-    let l = (a.n as u128) * (b.d as u128);
-    let r = (a.d as u128) * (b.n as u128);
-    l > r
-}
-
-// ============================================================================
 // Hash XOR Operations
 // ============================================================================
 
@@ -486,13 +450,6 @@ impl std::ops::BitXor for Hash256 {
         self ^= rhs;
         self
     }
-}
-
-/// Compare two hashes with XOR distance to a third hash.
-///
-/// Returns true if `(l ^ x) < (r ^ x)` in lexicographic order.
-pub fn less_than_xored(l: &Hash256, r: &Hash256, x: &Hash256) -> bool {
-    (*l ^ *x).0 < (*r ^ *x).0
 }
 
 #[cfg(test)]
@@ -639,21 +596,6 @@ mod tests {
     }
 
     #[test]
-    fn test_price_comparison() {
-        let p1 = Price { n: 1, d: 2 }; // 0.5
-        let p2 = Price { n: 2, d: 3 }; // 0.667
-        let p3 = Price { n: 1, d: 2 }; // 0.5
-
-        assert!(price_gt(&p2, &p1));
-        assert!(!price_gt(&p1, &p2));
-        assert!(!price_gt(&p1, &p3));
-
-        assert!(price_ge(&p2, &p1));
-        assert!(!price_ge(&p1, &p2));
-        assert!(price_ge(&p1, &p3));
-    }
-
-    #[test]
     fn test_hash_xor() {
         let mut h1 = Hash256::from_bytes([0xff; 32]);
         let h2 = Hash256::from_bytes([0xff; 32]);
@@ -664,15 +606,5 @@ mod tests {
         let h4 = Hash256::from_bytes([0xf0; 32]);
         let result = h3 ^ h4;
         assert_eq!(result.0, [0xff; 32]);
-    }
-
-    #[test]
-    fn test_less_than_xored() {
-        let x = Hash256::from_bytes([0x80; 32]);
-        let l = Hash256::from_bytes([0x00; 32]); // l ^ x = 0x80
-        let r = Hash256::from_bytes([0x01; 32]); // r ^ x = 0x81
-
-        assert!(less_than_xored(&l, &r, &x)); // 0x80 < 0x81
-        assert!(!less_than_xored(&r, &l, &x)); // 0x81 > 0x80
     }
 }

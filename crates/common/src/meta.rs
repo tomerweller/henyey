@@ -24,18 +24,17 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use henyey_common::meta::normalize_ledger_close_meta;
+//! use henyey_common::meta::normalize_transaction_meta;
 //!
-//! let mut meta = fetch_ledger_close_meta();
-//! normalize_ledger_close_meta(&mut meta)?;
+//! let mut meta = fetch_transaction_meta();
+//! normalize_transaction_meta(&mut meta).unwrap();
 //! // meta is now in canonical sorted order
 //! ```
 
 use crate::asset::ledger_entry_key;
 use crate::Hash256;
 use stellar_xdr::curr::{
-    LedgerCloseMeta, LedgerEntryChange, LedgerEntryChanges, LedgerKey, Limits, TransactionMeta,
-    WriteXdr,
+    LedgerEntryChange, LedgerEntryChanges, LedgerKey, Limits, TransactionMeta, WriteXdr,
 };
 
 /// Extracts the ledger key from a ledger entry change.
@@ -137,51 +136,6 @@ pub fn normalize_transaction_meta(
             sort_changes(&mut v4.tx_changes_before)?;
             sort_changes(&mut v4.tx_changes_after)?;
             normalize_ops_v2(&mut v4.operations);
-        }
-    }
-    Ok(())
-}
-
-/// Normalizes ledger close metadata for deterministic hashing.
-///
-/// This normalizes all transaction metadata and upgrade metadata within
-/// a ledger close, ensuring consistent ordering across all validators.
-/// After normalization, the metadata can be hashed to produce a consistent
-/// result regardless of the original ordering.
-///
-/// # Errors
-///
-/// Returns an error if XDR serialization fails during sorting.
-pub fn normalize_ledger_close_meta(
-    meta: &mut LedgerCloseMeta,
-) -> Result<(), stellar_xdr::curr::Error> {
-    match meta {
-        LedgerCloseMeta::V0(v0) => {
-            for upgrade in v0.upgrades_processing.iter_mut() {
-                sort_changes(&mut upgrade.changes)?;
-            }
-            for tx in v0.tx_processing.iter_mut() {
-                sort_changes(&mut tx.fee_processing)?;
-                normalize_transaction_meta(&mut tx.tx_apply_processing)?;
-            }
-        }
-        LedgerCloseMeta::V1(v1) => {
-            for upgrade in v1.upgrades_processing.iter_mut() {
-                sort_changes(&mut upgrade.changes)?;
-            }
-            for tx in v1.tx_processing.iter_mut() {
-                sort_changes(&mut tx.fee_processing)?;
-                normalize_transaction_meta(&mut tx.tx_apply_processing)?;
-            }
-        }
-        LedgerCloseMeta::V2(v2) => {
-            for upgrade in v2.upgrades_processing.iter_mut() {
-                sort_changes(&mut upgrade.changes)?;
-            }
-            for tx in v2.tx_processing.iter_mut() {
-                sort_changes(&mut tx.fee_processing)?;
-                normalize_transaction_meta(&mut tx.tx_apply_processing)?;
-            }
         }
     }
     Ok(())

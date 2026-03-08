@@ -247,13 +247,6 @@ impl PartialOrd for Resource {
     }
 }
 
-/// Returns `true` if any dimension of `lhs` is less than the corresponding dimension of `rhs`.
-///
-/// This is useful for detecting when a resource vector has any dimension below a threshold.
-pub fn any_less_than(lhs: &Resource, rhs: &Resource) -> bool {
-    lhs.values.iter().zip(rhs.values.iter()).any(|(a, b)| a < b)
-}
-
 /// Returns `true` if any dimension of `lhs` is greater than the corresponding dimension of `rhs`.
 ///
 /// This is useful for detecting when a resource vector exceeds a limit in any dimension.
@@ -270,20 +263,6 @@ pub fn subtract_non_negative(lhs: &Resource, rhs: &Resource) -> Resource {
             .iter()
             .zip(rhs.values.iter())
             .map(|(a, b)| (a - b).max(0))
-            .collect(),
-    )
-}
-
-/// Clamps each dimension of `current` to the corresponding dimension of `limit`.
-///
-/// Returns a new resource where each value is `min(current[i], limit[i])`.
-pub fn limit_to(current: &Resource, limit: &Resource) -> Resource {
-    Resource::new(
-        current
-            .values
-            .iter()
-            .zip(limit.values.iter())
-            .map(|(a, b)| (*a).min(*b))
             .collect(),
     )
 }
