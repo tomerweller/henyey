@@ -118,11 +118,7 @@ impl App {
                 "Cleared stale pending tx_set requests for already-closed slots"
             );
             // Also clear the local tx_set tracking state for these stale requests
-            self.tx_set_dont_have.write().await.clear();
-            self.tx_set_last_request.write().await.clear();
-            self.tx_set_exhausted_warned.write().await.clear();
-            self.tx_set_all_peers_exhausted
-                .store(false, Ordering::SeqCst);
+            self.reset_tx_set_tracking().await;
         }
 
         // --- Escalation: after many failed attempts, force catchup ---
@@ -150,11 +146,7 @@ impl App {
                 buffer.clear();
             }
             self.herder.clear_pending_tx_sets();
-            self.tx_set_dont_have.write().await.clear();
-            self.tx_set_last_request.write().await.clear();
-            self.tx_set_exhausted_warned.write().await.clear();
-            self.tx_set_all_peers_exhausted
-                .store(false, Ordering::SeqCst);
+            self.reset_tx_set_tracking().await;
             // Reset the counter so we don't immediately re-escalate after catchup
             self.recovery_attempts_without_progress
                 .store(0, Ordering::SeqCst);

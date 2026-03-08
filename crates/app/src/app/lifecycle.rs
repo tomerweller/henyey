@@ -161,11 +161,7 @@ impl App {
                 );
             }
             // Reset all tx_set tracking state
-            self.tx_set_dont_have.write().await.clear();
-            self.tx_set_last_request.write().await.clear();
-            self.tx_set_exhausted_warned.write().await.clear();
-            self.tx_set_all_peers_exhausted
-                .store(false, Ordering::SeqCst);
+            self.reset_tx_set_tracking().await;
         }
 
         tracing::info!("Entering main event loop");
@@ -261,10 +257,7 @@ impl App {
                             // buffered entries that still need tx_sets. Don't evict
                             // the entries themselves — they may be closeable once
                             // their tx_sets arrive from peers.
-                            self.tx_set_all_peers_exhausted.store(false, Ordering::SeqCst);
-                            self.tx_set_dont_have.write().await.clear();
-                            self.tx_set_last_request.write().await.clear();
-                            self.tx_set_exhausted_warned.write().await.clear();
+                            self.reset_tx_set_tracking().await;
 
                             // Also reset consensus stuck state since we just successfully
                             // closed ledgers — we're not stuck.

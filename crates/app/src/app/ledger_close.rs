@@ -123,31 +123,7 @@ impl App {
             // Hot archive merges are all in-memory, so after each close the curr/snap
             // buckets may have no backing file.
             if let Some(habl) = hot_archive_ref {
-                let bucket_dir = self.config.database.path
-                    .parent()
-                    .unwrap_or(&self.config.database.path)
-                    .join("buckets");
-                for level in habl.levels() {
-                    let mut buckets_to_check: Vec<&henyey_bucket::HotArchiveBucket> =
-                        vec![&level.curr, &level.snap];
-                    if let Some(next) = level.next() {
-                        buckets_to_check.push(next);
-                    }
-                    for bucket in buckets_to_check {
-                        if bucket.backing_file_path().is_none() && !bucket.hash().is_zero() {
-                            let permanent = bucket_dir.join(format!("{}.bucket.xdr", bucket.hash().to_hex()));
-                            if !permanent.exists() {
-                                if let Err(e) = bucket.save_to_xdr_file(&permanent) {
-                                    tracing::warn!(
-                                        error = %e,
-                                        hash = %bucket.hash().to_hex(),
-                                        "Failed to persist in-memory hot archive bucket to disk"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
+                self.persist_hot_archive_buckets(habl);
             }
 
             let has = build_history_archive_state(
@@ -350,10 +326,7 @@ impl App {
                 input_snap: s.input_snap,
             })
             .collect();
-        let bucket_dir = self.config.database.path
-            .parent()
-            .unwrap_or(&self.config.database.path)
-            .join("buckets");
+        let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
 
         // Step 6a: Parallel restore of live BucketList (all levels loaded concurrently).
         let bucket_manager = self.bucket_manager.clone();
@@ -624,10 +597,7 @@ impl App {
             load_bucket,
         ).map_err(|e| anyhow::anyhow!("Failed to restore live bucket list: {}", e))?;
 
-        let bucket_dir = self.config.database.path
-            .parent()
-            .unwrap_or(&self.config.database.path)
-            .join("buckets");
+        let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
         bucket_list.set_bucket_dir(bucket_dir.clone());
         bucket_list.set_ledger_seq(lcl_seq);
 
@@ -1065,34 +1035,6 @@ impl App {
         true
     }
 
-    /// Drain all sequential buffered ledgers synchronously.
-    ///
-    /// WARNING: This blocks the event loop for the entire duration. During the
-    /// drain, overlay messages (tx_sets, SCP) queue up but aren't processed,
-    /// causing the node to fall behind. Prefer letting the main select loop's
-    /// pending_close chaining handle buffered ledgers instead.
-    ///
-    /// Currently unused — kept for potential offline/testing use cases.
-    ///
-    /// Returns the number of ledgers drained.
-    #[allow(dead_code)]
-    pub(super) async fn drain_buffered_ledgers_sync(&self) -> u32 {
-        let mut drained = 0u32;
-        loop {
-            let mut pending = match self.try_start_ledger_close().await {
-                Some(p) => p,
-                None => break,
-            };
-            let join_result = (&mut pending.handle).await;
-            let success = self.handle_close_complete(pending, join_result).await;
-            if !success {
-                break;
-            }
-            drained += 1;
-        }
-        drained
-    }
-
     /// Apply a single buffered ledger (yields to tokio via `spawn_blocking`).
     ///
     /// Used by callers outside the main select loop (catchup completion, tx set
@@ -1127,11 +1069,7 @@ impl App {
             }
 
             *self.last_externalized_at.write().await = self.clock.now();
-            self.tx_set_all_peers_exhausted
-                .store(false, Ordering::SeqCst);
-            self.tx_set_dont_have.write().await.clear();
-            self.tx_set_last_request.write().await.clear();
-            self.tx_set_exhausted_warned.write().await.clear();
+            self.reset_tx_set_tracking().await;
             *self.consensus_stuck_state.write().await = None;
         }
     }

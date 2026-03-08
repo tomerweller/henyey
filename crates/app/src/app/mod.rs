@@ -188,6 +188,44 @@ fn build_generalized_tx_set(
     }))
     }
 
+/// Extract the previous ledger hash and transactions from a `GeneralizedTransactionSet`.
+///
+/// This avoids duplicating the phase/component traversal in every call site
+/// that receives a `GeneralizedTransactionSet` from the network.
+fn extract_txs_from_generalized(
+    gen_tx_set: &stellar_xdr::curr::GeneralizedTransactionSet,
+) -> (henyey_common::Hash256, Vec<TransactionEnvelope>) {
+    use stellar_xdr::curr::{GeneralizedTransactionSet, TransactionPhase, TxSetComponent};
+
+    let prev_hash = match gen_tx_set {
+        GeneralizedTransactionSet::V1(v1) => {
+            henyey_common::Hash256::from_bytes(v1.previous_ledger_hash.0)
+        }
+    };
+    let transactions = match gen_tx_set {
+        GeneralizedTransactionSet::V1(v1) => v1
+            .phases
+            .iter()
+            .flat_map(|phase| match phase {
+                TransactionPhase::V0(components) => components
+                    .iter()
+                    .flat_map(|component| match component {
+                        TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) => {
+                            comp.txs.to_vec()
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+                TransactionPhase::V1(parallel) => parallel
+                    .execution_stages
+                    .iter()
+                    .flat_map(|stage| stage.0.iter().flat_map(|cluster| cluster.0.to_vec()))
+                    .collect(),
+            })
+            .collect(),
+    };
+    (prev_hash, transactions)
+}
+
 fn decode_upgrades(upgrades: Vec<UpgradeType>) -> Vec<LedgerUpgrade> {
     upgrades
         .into_iter()
@@ -1302,13 +1340,44 @@ impl App {
     /// Clears the exhausted flag, don't-have map, last-request timestamps, and
     /// exhaustion warnings. Callers that also need to clear `consensus_stuck_state`
     /// should do so separately.
-    #[allow(dead_code)]
     pub(crate) async fn reset_tx_set_tracking(&self) {
         self.tx_set_all_peers_exhausted
             .store(false, Ordering::SeqCst);
         self.tx_set_dont_have.write().await.clear();
         self.tx_set_last_request.write().await.clear();
         self.tx_set_exhausted_warned.write().await.clear();
+    }
+
+    /// Persist in-memory hot archive buckets to disk.
+    ///
+    /// Hot archive merges are performed entirely in memory, so after catchup
+    /// or ledger close the curr/snap/next buckets may have no backing file.
+    /// This writes each non-zero bucket that lacks a file to the bucket
+    /// directory so that a subsequent restart can restore from the persisted HAS.
+    pub(crate) fn persist_hot_archive_buckets(&self, habl: &HotArchiveBucketList) {
+        let bucket_dir = self.bucket_manager.bucket_dir();
+        for level in habl.levels() {
+            let mut buckets_to_check: Vec<&henyey_bucket::HotArchiveBucket> =
+                vec![&level.curr, &level.snap];
+            if let Some(next) = level.next() {
+                buckets_to_check.push(next);
+            }
+            for bucket in buckets_to_check {
+                if bucket.backing_file_path().is_none() && !bucket.hash().is_zero() {
+                    let permanent =
+                        bucket_dir.join(format!("{}.bucket.xdr", bucket.hash().to_hex()));
+                    if !permanent.exists() {
+                        if let Err(e) = bucket.save_to_xdr_file(&permanent) {
+                            tracing::warn!(
+                                error = %e,
+                                hash = %bucket.hash().to_hex(),
+                                "Failed to persist in-memory hot archive bucket to disk"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Set the tracked current ledger sequence.
@@ -1396,10 +1465,7 @@ impl App {
             ext: LedgerEntryExt::V0,
         };
 
-        let bucket_dir = self.config.database.path
-            .parent()
-            .unwrap_or(&self.config.database.path)
-            .join("buckets");
+        let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
         std::fs::create_dir_all(&bucket_dir)?;
 
         let mut bucket_list = BucketList::new();
@@ -2004,26 +2070,32 @@ impl App {
     }
 }
 
+/// Map a `PeerType` to a DB peer-type integer, preserving any existing
+/// preferred or outbound classification.
+fn map_peer_type(peer_type: PeerType, existing_type: i32) -> i32 {
+    match peer_type {
+        PeerType::Inbound => match existing_type {
+            PEER_TYPE_PREFERRED => PEER_TYPE_PREFERRED,
+            PEER_TYPE_OUTBOUND => PEER_TYPE_OUTBOUND,
+            _ => PEER_TYPE_INBOUND,
+        },
+        PeerType::Outbound => {
+            if existing_type == PEER_TYPE_PREFERRED {
+                PEER_TYPE_PREFERRED
+            } else {
+                PEER_TYPE_OUTBOUND
+            }
+        }
+    }
+}
+
 fn update_peer_record(db: &henyey_db::Database, event: PeerEvent) {
     let now = current_epoch_seconds();
     match event {
         PeerEvent::Connected(addr, peer_type) => {
             let existing = db.load_peer(&addr.host, addr.port).ok().flatten();
             let existing_type = existing.map(|r| r.peer_type).unwrap_or(PEER_TYPE_INBOUND);
-            let mapped = match peer_type {
-                PeerType::Inbound => match existing_type {
-                    PEER_TYPE_PREFERRED => PEER_TYPE_PREFERRED,
-                    PEER_TYPE_OUTBOUND => PEER_TYPE_OUTBOUND,
-                    _ => PEER_TYPE_INBOUND,
-                },
-                PeerType::Outbound => {
-                    if existing_type == PEER_TYPE_PREFERRED {
-                        PEER_TYPE_PREFERRED
-                    } else {
-                        PEER_TYPE_OUTBOUND
-                    }
-                }
-            };
+            let mapped = map_peer_type(peer_type, existing_type);
             let record = henyey_db::queries::PeerRecord::new(now, 0, mapped);
             let _ = db.store_peer(&addr.host, addr.port, record);
         }
@@ -2034,20 +2106,7 @@ fn update_peer_record(db: &henyey_db::Database, event: PeerEvent) {
             let backoff = compute_peer_backoff_secs(failures);
             let next_attempt = now.saturating_add(backoff);
             let existing_type = existing.map(|r| r.peer_type).unwrap_or(PEER_TYPE_INBOUND);
-            let mapped = match peer_type {
-                PeerType::Inbound => match existing_type {
-                    PEER_TYPE_PREFERRED => PEER_TYPE_PREFERRED,
-                    PEER_TYPE_OUTBOUND => PEER_TYPE_OUTBOUND,
-                    _ => PEER_TYPE_INBOUND,
-                },
-                PeerType::Outbound => {
-                    if existing_type == PEER_TYPE_PREFERRED {
-                        PEER_TYPE_PREFERRED
-                    } else {
-                        PEER_TYPE_OUTBOUND
-                    }
-                }
-            };
+            let mapped = map_peer_type(peer_type, existing_type);
             let record = henyey_db::queries::PeerRecord::new(next_attempt, failures, mapped);
             let _ = db.store_peer(&addr.host, addr.port, record);
         }
@@ -3505,10 +3564,7 @@ mod tests {
         // buffer entries or pending tx_set requests. This allows the
         // normal process_externalized_slots → maybe_start_buffered_catchup
         // flow to handle stale entries properly.
-        app.tx_set_all_peers_exhausted.store(false, Ordering::SeqCst);
-        app.tx_set_dont_have.write().await.clear();
-        app.tx_set_last_request.write().await.clear();
-        app.tx_set_exhausted_warned.write().await.clear();
+        app.reset_tx_set_tracking().await;
         *app.consensus_stuck_state.write().await = None;
 
         // Verify everything is cleaned up
@@ -3834,11 +3890,7 @@ mod tests {
         // Directly exercise the reset block (same code as in try_apply_buffered_ledgers
         // when closed_any=true).
         *app.last_externalized_at.write().await = Instant::now();
-        app.tx_set_all_peers_exhausted
-            .store(false, Ordering::SeqCst);
-        app.tx_set_dont_have.write().await.clear();
-        app.tx_set_last_request.write().await.clear();
-        app.tx_set_exhausted_warned.write().await.clear();
+        app.reset_tx_set_tracking().await;
         *app.consensus_stuck_state.write().await = None;
 
         // Verify all tracking state is cleared.

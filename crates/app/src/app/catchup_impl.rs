@@ -201,33 +201,7 @@ impl App {
             // backing file. Without this, a subsequent `run` command will fail to
             // restore from the persisted HAS because the referenced bucket files
             // don't exist on disk.
-            {
-                let bucket_dir = self.config.database.path
-                    .parent()
-                    .unwrap_or(&self.config.database.path)
-                    .join("buckets");
-                for level in hot_archive_ref.levels() {
-                    let mut buckets_to_check: Vec<&henyey_bucket::HotArchiveBucket> =
-                        vec![&level.curr, &level.snap];
-                    if let Some(next) = level.next() {
-                        buckets_to_check.push(next);
-                    }
-                    for bucket in buckets_to_check {
-                        if bucket.backing_file_path().is_none() && !bucket.hash().is_zero() {
-                            let permanent = bucket_dir.join(format!("{}.bucket.xdr", bucket.hash().to_hex()));
-                            if !permanent.exists() {
-                                if let Err(e) = bucket.save_to_xdr_file(&permanent) {
-                                    tracing::warn!(
-                                        error = %e,
-                                        hash = %bucket.hash().to_hex(),
-                                        "Failed to persist in-memory hot archive bucket to disk after catchup"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            self.persist_hot_archive_buckets(hot_archive_ref);
 
             let has = build_history_archive_state(
                 final_header.ledger_seq,
@@ -861,8 +835,7 @@ impl App {
         mut message_rx: tokio::sync::mpsc::UnboundedReceiver<OverlayMessage>,
     ) {
         use stellar_xdr::curr::{
-            GeneralizedTransactionSet, Limits, ScpStatementPledges, TransactionPhase,
-            TxSetComponent, WriteXdr,
+            Limits, ScpStatementPledges, WriteXdr,
         };
         use std::collections::HashSet;
 
@@ -888,41 +861,8 @@ impl App {
                     let hash = henyey_common::Hash256::hash(&xdr_bytes);
 
                     // Extract transactions from the GeneralizedTxSet
-                    let prev_hash = match &gen_tx_set {
-                        GeneralizedTransactionSet::V1(v1) => {
-                            henyey_common::Hash256::from_bytes(
-                                v1.previous_ledger_hash.0,
-                            )
-                        }
-                    };
-
-                    let transactions: Vec<stellar_xdr::curr::TransactionEnvelope> =
-                        match &gen_tx_set {
-                            GeneralizedTransactionSet::V1(v1) => v1
-                                .phases
-                                .iter()
-                                .flat_map(|phase| match phase {
-                                    TransactionPhase::V0(components) => components
-                                        .iter()
-                                        .flat_map(|component| match component {
-                                            TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
-                                                comp,
-                                            ) => comp.txs.to_vec(),
-                                        })
-                                        .collect::<Vec<_>>(),
-                                    TransactionPhase::V1(parallel) => parallel
-                                        .execution_stages
-                                        .iter()
-                                        .flat_map(|stage| {
-                                            stage
-                                                .0
-                                                .iter()
-                                                .flat_map(|cluster| cluster.0.to_vec())
-                                        })
-                                        .collect(),
-                                })
-                                .collect(),
-                        };
+                    let (prev_hash, transactions) =
+                        super::extract_txs_from_generalized(&gen_tx_set);
 
                     let tx_set = henyey_herder::TransactionSet::with_generalized(
                         prev_hash,
@@ -1124,11 +1064,7 @@ impl App {
                     "maybe_start_buffered_catchup: essentially caught up, \
                      clearing tx_set_all_peers_exhausted and stale state"
                 );
-                self.tx_set_all_peers_exhausted
-                    .store(false, Ordering::SeqCst);
-                self.tx_set_dont_have.write().await.clear();
-                self.tx_set_last_request.write().await.clear();
-                self.tx_set_exhausted_warned.write().await.clear();
+                self.reset_tx_set_tracking().await;
                 self.herder.clear_pending_tx_sets();
             }
             return;
@@ -1723,10 +1659,7 @@ impl App {
                     // Reset tx_set tracking state (same as rapid close handler)
                     // so the main loop can make fresh requests.
                     *self.last_externalized_at.write().await = self.clock.now();
-                    self.tx_set_all_peers_exhausted.store(false, Ordering::SeqCst);
-                    self.tx_set_dont_have.write().await.clear();
-                    self.tx_set_last_request.write().await.clear();
-                    self.tx_set_exhausted_warned.write().await.clear();
+                    self.reset_tx_set_tracking().await;
                     *self.consensus_stuck_state.write().await = None;
 
                     // Request SCP state from peers for the slots immediately

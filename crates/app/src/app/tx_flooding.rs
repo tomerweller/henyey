@@ -525,42 +525,19 @@ impl App {
         };
         let hash = henyey_common::Hash256::hash(&xdr_bytes);
 
+        // Validate phase count before extracting
+        let GeneralizedTransactionSet::V1(v1) = &gen_tx_set;
+        if v1.phases.len() != 2 {
+            tracing::warn!(
+                hash = %hash,
+                phases = v1.phases.len(),
+                "Invalid GeneralizedTxSet phase count"
+            );
+            return;
+        }
+
         // Extract transactions from GeneralizedTransactionSet
-        let prev_hash = match &gen_tx_set {
-            GeneralizedTransactionSet::V1(v1) => {
-                henyey_common::Hash256::from_bytes(v1.previous_ledger_hash.0)
-            }
-        };
-        let transactions: Vec<stellar_xdr::curr::TransactionEnvelope> = match &gen_tx_set {
-            GeneralizedTransactionSet::V1(v1) => {
-                if v1.phases.len() != 2 {
-                    tracing::warn!(
-                        hash = %hash,
-                        phases = v1.phases.len(),
-                        "Invalid GeneralizedTxSet phase count"
-                    );
-                    return;
-                }
-                v1.phases
-                    .iter()
-                    .flat_map(|phase| match phase {
-                        TransactionPhase::V0(components) => components
-                            .iter()
-                            .flat_map(|component| match component {
-                                TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) => {
-                                    comp.txs.to_vec()
-                                }
-                            })
-                            .collect::<Vec<_>>(),
-                        TransactionPhase::V1(parallel) => parallel
-                            .execution_stages
-                            .iter()
-                            .flat_map(|stage| stage.0.iter().flat_map(|cluster| cluster.0.to_vec()))
-                            .collect(),
-                    })
-                    .collect()
-            }
-        };
+        let (prev_hash, transactions) = super::extract_txs_from_generalized(&gen_tx_set);
 
         tracing::debug!(
             hash = %hash,
