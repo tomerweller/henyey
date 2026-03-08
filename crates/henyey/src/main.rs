@@ -2192,6 +2192,415 @@ struct VerifyExecutionOptions {
     quiet: bool,
 }
 
+/// Returns a human-readable name for a `TransactionResultResult` variant.
+fn tx_result_code_name(r: &stellar_xdr::curr::TransactionResultResult) -> String {
+    use stellar_xdr::curr::TransactionResultResult;
+    match r {
+        TransactionResultResult::TxSuccess(_) => "txSuccess".to_string(),
+        TransactionResultResult::TxFailed(_) => "txFailed".to_string(),
+        TransactionResultResult::TxFeeBumpInnerSuccess(_) => "txFeeBumpInnerSuccess".to_string(),
+        TransactionResultResult::TxFeeBumpInnerFailed(_) => "txFeeBumpInnerFailed".to_string(),
+        other => format!("{:?}", other),
+    }
+}
+
+/// Prints pairwise differences between two operation result slices.
+fn print_op_diffs(
+    our_ops: &[stellar_xdr::curr::OperationResult],
+    cdp_ops: &[stellar_xdr::curr::OperationResult],
+) {
+    use stellar_xdr::curr::WriteXdr;
+    for (j, (our_op, cdp_op)) in our_ops.iter().zip(cdp_ops.iter()).enumerate() {
+        let our_op_xdr = our_op
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .unwrap_or_default();
+        let cdp_op_xdr = cdp_op
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .unwrap_or_default();
+        if our_op_xdr != cdp_op_xdr {
+            println!("          Op {} differs:", j);
+            println!("            Ours: {:?}", our_op);
+            println!("            CDP:  {:?}", cdp_op);
+        }
+    }
+}
+
+/// Prints all operations from a result slice with a label.
+fn print_all_ops(label: &str, ops: &[stellar_xdr::curr::OperationResult]) {
+    println!("        {} ops ({}):", label, ops.len());
+    for (j, op) in ops.iter().enumerate() {
+        println!("          Op {}: {:?}", j, op);
+    }
+}
+
+/// Prints an exhaustive field-by-field comparison of two ledger headers.
+fn print_header_field_diffs(
+    h: &stellar_xdr::curr::LedgerHeader,
+    c: &stellar_xdr::curr::LedgerHeader,
+    bucket_levels: &[(henyey_common::Hash256, henyey_common::Hash256)],
+) {
+    use henyey_common::Hash256;
+    if h.ledger_version != c.ledger_version {
+        println!(
+            "    DIFF ledger_version: ours={} expected={}",
+            h.ledger_version, c.ledger_version
+        );
+    }
+    if h.previous_ledger_hash != c.previous_ledger_hash {
+        println!(
+            "    DIFF previous_ledger_hash: ours={} expected={}",
+            hex::encode(&h.previous_ledger_hash.0),
+            hex::encode(&c.previous_ledger_hash.0)
+        );
+    }
+    if h.scp_value != c.scp_value {
+        println!("    DIFF scp_value");
+        if h.scp_value.tx_set_hash != c.scp_value.tx_set_hash {
+            println!(
+                "      tx_set_hash: ours={} expected={}",
+                hex::encode(&h.scp_value.tx_set_hash.0),
+                hex::encode(&c.scp_value.tx_set_hash.0)
+            );
+        }
+        if h.scp_value.close_time != c.scp_value.close_time {
+            println!(
+                "      close_time: ours={} expected={}",
+                h.scp_value.close_time.0, c.scp_value.close_time.0
+            );
+        }
+        if h.scp_value.upgrades != c.scp_value.upgrades {
+            println!(
+                "      upgrades: ours={:?} expected={:?}",
+                h.scp_value.upgrades, c.scp_value.upgrades
+            );
+        }
+        if h.scp_value.ext != c.scp_value.ext {
+            println!("      ext: differs");
+        }
+    }
+    let our_bl_hash = Hash256::from(h.bucket_list_hash.0);
+    let expected_bl_hash = Hash256::from(c.bucket_list_hash.0);
+    if our_bl_hash != expected_bl_hash {
+        println!(
+            "    DIFF bucket_list_hash: ours={} expected={}",
+            our_bl_hash.to_hex(),
+            expected_bl_hash.to_hex()
+        );
+        for (i, (curr_hash, snap_hash)) in bucket_levels.iter().enumerate() {
+            println!(
+                "      Level {}: curr={} snap={}",
+                i,
+                curr_hash.to_hex(),
+                snap_hash.to_hex()
+            );
+        }
+    }
+    if h.tx_set_result_hash != c.tx_set_result_hash {
+        println!(
+            "    DIFF tx_set_result_hash: ours={} expected={}",
+            hex::encode(&h.tx_set_result_hash.0),
+            hex::encode(&c.tx_set_result_hash.0)
+        );
+    }
+    if h.ledger_seq != c.ledger_seq {
+        println!(
+            "    DIFF ledger_seq: ours={} expected={}",
+            h.ledger_seq, c.ledger_seq
+        );
+    }
+    if h.total_coins != c.total_coins {
+        println!(
+            "    DIFF total_coins: ours={} expected={}",
+            h.total_coins, c.total_coins
+        );
+    }
+    if h.fee_pool != c.fee_pool {
+        println!(
+            "    DIFF fee_pool: ours={} expected={}",
+            h.fee_pool, c.fee_pool
+        );
+    }
+    if h.inflation_seq != c.inflation_seq {
+        println!(
+            "    DIFF inflation_seq: ours={} expected={}",
+            h.inflation_seq, c.inflation_seq
+        );
+    }
+    if h.id_pool != c.id_pool {
+        println!(
+            "    DIFF id_pool: ours={} expected={}",
+            h.id_pool, c.id_pool
+        );
+    }
+    if h.base_fee != c.base_fee {
+        println!(
+            "    DIFF base_fee: ours={} expected={}",
+            h.base_fee, c.base_fee
+        );
+    }
+    if h.base_reserve != c.base_reserve {
+        println!(
+            "    DIFF base_reserve: ours={} expected={}",
+            h.base_reserve, c.base_reserve
+        );
+    }
+    if h.max_tx_set_size != c.max_tx_set_size {
+        println!(
+            "    DIFF max_tx_set_size: ours={} expected={}",
+            h.max_tx_set_size, c.max_tx_set_size
+        );
+    }
+    if h.skip_list != c.skip_list {
+        println!("    DIFF skip_list:");
+        for (i, (ours, exp)) in h.skip_list.iter().zip(c.skip_list.iter()).enumerate() {
+            if ours != exp {
+                println!(
+                    "      [{}]: ours={} expected={}",
+                    i,
+                    hex::encode(&ours.0),
+                    hex::encode(&exp.0)
+                );
+            }
+        }
+    }
+    if h.ext != c.ext {
+        println!("    DIFF ext: ours={:?} expected={:?}", h.ext, c.ext);
+    }
+}
+
+/// Prints detailed per-TX result diffs between our results and CDP results.
+///
+/// Shows ordering differences, then does a TX-by-TX XDR comparison with
+/// detailed operation-level diffs for all result variant combinations.
+fn print_tx_result_diffs(
+    our_results: &[stellar_xdr::curr::TransactionResultPair],
+    cdp_results: &[stellar_xdr::curr::TransactionResultPair],
+) {
+    use stellar_xdr::curr::{
+        InnerTransactionResultResult, TransactionResultResult, WriteXdr,
+    };
+    println!(
+        "    TX count: ours={} CDP={}",
+        our_results.len(),
+        cdp_results.len()
+    );
+
+    // Check if TX ordering differs
+    let mut order_diffs = 0;
+    for (i, (our_tx, cdp_tx)) in our_results.iter().zip(cdp_results.iter()).enumerate() {
+        if our_tx.transaction_hash != cdp_tx.transaction_hash {
+            if order_diffs < 10 {
+                println!(
+                    "    ORDER DIFF at position {}: ours={} CDP={}",
+                    i,
+                    hex::encode(&our_tx.transaction_hash.0),
+                    hex::encode(&cdp_tx.transaction_hash.0)
+                );
+            }
+            order_diffs += 1;
+        }
+    }
+    if order_diffs > 0 {
+        println!("    Total TX ordering differences: {}", order_diffs);
+    } else {
+        println!("    TX ordering is IDENTICAL (same content hashes at every position)");
+    }
+
+    // Detailed TX-by-TX comparison using full XDR
+    let mut diff_count = 0;
+    for (i, (our_tx, cdp_tx)) in our_results.iter().zip(cdp_results.iter()).enumerate() {
+        let our_xdr = our_tx
+            .result
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .unwrap_or_default();
+        let cdp_xdr = cdp_tx
+            .result
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .unwrap_or_default();
+
+        if our_xdr != cdp_xdr {
+            diff_count += 1;
+            let our_result = &our_tx.result.result;
+            let cdp_result = &cdp_tx.result.result;
+
+            println!("      TX {}: MISMATCH (XDR differs)", i);
+            println!(
+                "        Result: ours={} CDP={}",
+                tx_result_code_name(our_result),
+                tx_result_code_name(cdp_result)
+            );
+            println!(
+                "        Fee: ours={} CDP={}",
+                our_tx.result.fee_charged, cdp_tx.result.fee_charged
+            );
+            println!(
+                "        TX hash: {}",
+                hex::encode(&our_tx.transaction_hash.0)
+            );
+
+            // Compare operations for same-variant pairs
+            match (our_result, cdp_result) {
+                (
+                    TransactionResultResult::TxFailed(our_ops),
+                    TransactionResultResult::TxFailed(cdp_ops),
+                )
+                | (
+                    TransactionResultResult::TxSuccess(our_ops),
+                    TransactionResultResult::TxSuccess(cdp_ops),
+                ) => {
+                    print_op_diffs(our_ops, cdp_ops);
+                }
+                // One succeeds, other fails — show all ops from both sides
+                (
+                    TransactionResultResult::TxSuccess(our_ops),
+                    TransactionResultResult::TxFailed(cdp_ops),
+                )
+                | (
+                    TransactionResultResult::TxFailed(our_ops),
+                    TransactionResultResult::TxSuccess(cdp_ops),
+                ) => {
+                    print_all_ops("Ours", our_ops);
+                    print_all_ops("CDP", cdp_ops);
+                }
+                _ => {}
+            }
+
+            // Fee bump inner result details
+            match (our_result, cdp_result) {
+                (
+                    TransactionResultResult::TxFeeBumpInnerFailed(our_inner),
+                    TransactionResultResult::TxFeeBumpInnerFailed(cdp_inner),
+                ) => {
+                    println!(
+                        "        Inner fee: ours={} CDP={}",
+                        our_inner.result.fee_charged, cdp_inner.result.fee_charged
+                    );
+                    let our_inner_code =
+                        format!("{:?}", std::mem::discriminant(&our_inner.result.result));
+                    let cdp_inner_code =
+                        format!("{:?}", std::mem::discriminant(&cdp_inner.result.result));
+                    println!(
+                        "        Inner result type: ours={} CDP={}",
+                        our_inner_code, cdp_inner_code
+                    );
+                    if let (
+                        InnerTransactionResultResult::TxFailed(our_ops),
+                        InnerTransactionResultResult::TxFailed(cdp_ops),
+                    ) = (&our_inner.result.result, &cdp_inner.result.result)
+                    {
+                        print_op_diffs(our_ops, cdp_ops);
+                        if our_ops.len() != cdp_ops.len() {
+                            println!(
+                                "          Inner op count: ours={} CDP={}",
+                                our_ops.len(),
+                                cdp_ops.len()
+                            );
+                        }
+                    } else {
+                        println!(
+                            "        Inner result ours: {:?}",
+                            our_inner.result.result
+                        );
+                        println!(
+                            "        Inner result CDP:  {:?}",
+                            cdp_inner.result.result
+                        );
+                    }
+                }
+                (
+                    TransactionResultResult::TxFeeBumpInnerSuccess(our_inner),
+                    TransactionResultResult::TxFeeBumpInnerSuccess(cdp_inner),
+                ) => {
+                    println!(
+                        "        Inner fee: ours={} CDP={}",
+                        our_inner.result.fee_charged, cdp_inner.result.fee_charged
+                    );
+                    if let (
+                        InnerTransactionResultResult::TxSuccess(our_ops),
+                        InnerTransactionResultResult::TxSuccess(cdp_ops),
+                    ) = (&our_inner.result.result, &cdp_inner.result.result)
+                    {
+                        print_op_diffs(our_ops, cdp_ops);
+                    }
+                }
+                // Cross-case fee bump inner results
+                (
+                    TransactionResultResult::TxFeeBumpInnerSuccess(our_inner),
+                    TransactionResultResult::TxFeeBumpInnerFailed(cdp_inner),
+                ) => {
+                    println!(
+                        "        Inner fee: ours={} CDP={}",
+                        our_inner.result.fee_charged, cdp_inner.result.fee_charged
+                    );
+                    if let InnerTransactionResultResult::TxSuccess(our_ops) =
+                        &our_inner.result.result
+                    {
+                        print_all_ops("Ours inner", our_ops);
+                    }
+                    if let InnerTransactionResultResult::TxFailed(cdp_ops) =
+                        &cdp_inner.result.result
+                    {
+                        print_all_ops("CDP inner", cdp_ops);
+                    } else {
+                        println!(
+                            "        CDP inner result: {:?}",
+                            cdp_inner.result.result
+                        );
+                    }
+                }
+                (
+                    TransactionResultResult::TxFeeBumpInnerFailed(our_inner),
+                    TransactionResultResult::TxFeeBumpInnerSuccess(cdp_inner),
+                ) => {
+                    println!(
+                        "        Inner fee: ours={} CDP={}",
+                        our_inner.result.fee_charged, cdp_inner.result.fee_charged
+                    );
+                    println!(
+                        "        Ours inner result: {:?}",
+                        our_inner.result.result
+                    );
+                    if let InnerTransactionResultResult::TxSuccess(cdp_ops) =
+                        &cdp_inner.result.result
+                    {
+                        print_all_ops("CDP inner", cdp_ops);
+                    }
+                }
+                _ => {}
+            }
+
+            // Show CDP ops when ours is TxNotSupported or other non-standard result
+            if !matches!(
+                our_result,
+                TransactionResultResult::TxSuccess(_)
+                    | TransactionResultResult::TxFailed(_)
+                    | TransactionResultResult::TxFeeBumpInnerSuccess(_)
+                    | TransactionResultResult::TxFeeBumpInnerFailed(_)
+            ) {
+                if let TransactionResultResult::TxFailed(cdp_ops) = cdp_result {
+                    println!("        CDP txFailed ops ({}):", cdp_ops.len());
+                    for (j, op) in cdp_ops.iter().enumerate() {
+                        println!("          Op {}: {:?}", j, op);
+                    }
+                }
+            }
+
+            // Limit output to first 10 diffs
+            if diff_count >= 10 {
+                println!("      ... (showing first 10 of potentially more diffs)");
+                break;
+            }
+        }
+    }
+    if diff_count > 0 {
+        println!(
+            "    Total TX diffs: {} out of {}",
+            diff_count,
+            our_results.len().min(cdp_results.len())
+        );
+    }
+}
+
 /// Verifies transaction execution by comparing results against CDP metadata.
 ///
 /// This test re-executes transactions using `close_ledger` and compares the
@@ -2638,82 +3047,8 @@ async fn cmd_verify_execution(
                     if !header_matches {
                         println!("    Header hash: ours={} expected={}",
                             result.header_hash.to_hex(), expected_header_hash.to_hex());
-                        // Exhaustive header field comparison
-                        let h = &result.header;
-                        let c = &cdp_header;
-                        if h.ledger_version != c.ledger_version {
-                            println!("    DIFF ledger_version: ours={} expected={}", h.ledger_version, c.ledger_version);
-                        }
-                        if h.previous_ledger_hash != c.previous_ledger_hash {
-                            println!("    DIFF previous_ledger_hash: ours={} expected={}",
-                                hex::encode(&h.previous_ledger_hash.0), hex::encode(&c.previous_ledger_hash.0));
-                        }
-                        if h.scp_value != c.scp_value {
-                            println!("    DIFF scp_value");
-                            if h.scp_value.tx_set_hash != c.scp_value.tx_set_hash {
-                                println!("      tx_set_hash: ours={} expected={}",
-                                    hex::encode(&h.scp_value.tx_set_hash.0), hex::encode(&c.scp_value.tx_set_hash.0));
-                            }
-                            if h.scp_value.close_time != c.scp_value.close_time {
-                                println!("      close_time: ours={} expected={}", h.scp_value.close_time.0, c.scp_value.close_time.0);
-                            }
-                            if h.scp_value.upgrades != c.scp_value.upgrades {
-                                println!("      upgrades: ours={:?} expected={:?}", h.scp_value.upgrades, c.scp_value.upgrades);
-                            }
-                            if h.scp_value.ext != c.scp_value.ext {
-                                println!("      ext: differs");
-                            }
-                        }
-                        let our_bl_hash = Hash256::from(h.bucket_list_hash.0);
-                        let expected_bl_hash = Hash256::from(c.bucket_list_hash.0);
-                        if our_bl_hash != expected_bl_hash {
-                            println!("    DIFF bucket_list_hash: ours={} expected={}",
-                                our_bl_hash.to_hex(), expected_bl_hash.to_hex());
-                            let level_info = ledger_manager.bucket_list_levels();
-                            for (i, (curr_hash, snap_hash)) in level_info.iter().enumerate() {
-                                println!("      Level {}: curr={} snap={}",
-                                    i, curr_hash.to_hex(), snap_hash.to_hex());
-                            }
-                        }
-                        if h.tx_set_result_hash != c.tx_set_result_hash {
-                            println!("    DIFF tx_set_result_hash: ours={} expected={}",
-                                hex::encode(&h.tx_set_result_hash.0), hex::encode(&c.tx_set_result_hash.0));
-                        }
-                        if h.ledger_seq != c.ledger_seq {
-                            println!("    DIFF ledger_seq: ours={} expected={}", h.ledger_seq, c.ledger_seq);
-                        }
-                        if h.total_coins != c.total_coins {
-                            println!("    DIFF total_coins: ours={} expected={}", h.total_coins, c.total_coins);
-                        }
-                        if h.fee_pool != c.fee_pool {
-                            println!("    DIFF fee_pool: ours={} expected={}", h.fee_pool, c.fee_pool);
-                        }
-                        if h.inflation_seq != c.inflation_seq {
-                            println!("    DIFF inflation_seq: ours={} expected={}", h.inflation_seq, c.inflation_seq);
-                        }
-                        if h.id_pool != c.id_pool {
-                            println!("    DIFF id_pool: ours={} expected={}", h.id_pool, c.id_pool);
-                        }
-                        if h.base_fee != c.base_fee {
-                            println!("    DIFF base_fee: ours={} expected={}", h.base_fee, c.base_fee);
-                        }
-                        if h.base_reserve != c.base_reserve {
-                            println!("    DIFF base_reserve: ours={} expected={}", h.base_reserve, c.base_reserve);
-                        }
-                        if h.max_tx_set_size != c.max_tx_set_size {
-                            println!("    DIFF max_tx_set_size: ours={} expected={}", h.max_tx_set_size, c.max_tx_set_size);
-                        }
-                        if h.skip_list != c.skip_list {
-                            println!("    DIFF skip_list:");
-                            for (i, (ours, exp)) in h.skip_list.iter().zip(c.skip_list.iter()).enumerate() {
-                                if ours != exp {
-                                    println!("      [{}]: ours={} expected={}", i, hex::encode(&ours.0), hex::encode(&exp.0));
-                                }
-                            }
-                        }
-                        if h.ext != c.ext {
-                            println!("    DIFF ext: ours={:?} expected={:?}", h.ext, c.ext);
-                        }
+                        let bucket_levels = ledger_manager.bucket_list_levels();
+                        print_header_field_diffs(&result.header, &cdp_header, &bucket_levels);
                     }
                     if !tx_result_matches {
                         println!("    TX result hash: ours={} expected={}",
@@ -2721,196 +3056,7 @@ async fn cmd_verify_execution(
                     }
 
                     if show_diff && !tx_result_matches {
-                        println!("    TX count: ours={} CDP={}",
-                            result.tx_results.len(), cdp_tx_results.len());
-
-                        // First: check if TX ordering differs (compare content hashes at each position)
-                        let mut order_diffs = 0;
-                        for (i, (our_tx, cdp_tx)) in result.tx_results.iter().zip(cdp_tx_results.iter()).enumerate() {
-                            if our_tx.transaction_hash != cdp_tx.transaction_hash {
-                                if order_diffs < 10 {
-                                    println!("    ORDER DIFF at position {}: ours={} CDP={}",
-                                        i,
-                                        hex::encode(&our_tx.transaction_hash.0),
-                                        hex::encode(&cdp_tx.transaction_hash.0));
-                                }
-                                order_diffs += 1;
-                            }
-                        }
-                        if order_diffs > 0 {
-                            println!("    Total TX ordering differences: {}", order_diffs);
-                        } else {
-                            println!("    TX ordering is IDENTICAL (same content hashes at every position)");
-                        }
-
-                        // Detailed TX-by-TX comparison using full XDR
-                        let mut diff_count = 0;
-                        for (i, (our_tx, cdp_tx)) in result.tx_results.iter().zip(cdp_tx_results.iter()).enumerate() {
-                            let our_xdr = our_tx.result.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
-                            let cdp_xdr = cdp_tx.result.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
-
-                            if our_xdr != cdp_xdr {
-                                diff_count += 1;
-                                use stellar_xdr::curr::TransactionResultResult;
-                                let our_result = &our_tx.result.result;
-                                let cdp_result = &cdp_tx.result.result;
-
-                                let our_result_code = match our_result {
-                                    TransactionResultResult::TxSuccess(_) => "txSuccess".to_string(),
-                                    TransactionResultResult::TxFailed(_) => "txFailed".to_string(),
-                                    TransactionResultResult::TxFeeBumpInnerSuccess(_) => "txFeeBumpInnerSuccess".to_string(),
-                                    TransactionResultResult::TxFeeBumpInnerFailed(_) => "txFeeBumpInnerFailed".to_string(),
-                                    _ => format!("{:?}", our_result),
-                                };
-                                let cdp_result_code = match cdp_result {
-                                    TransactionResultResult::TxSuccess(_) => "txSuccess".to_string(),
-                                    TransactionResultResult::TxFailed(_) => "txFailed".to_string(),
-                                    TransactionResultResult::TxFeeBumpInnerSuccess(_) => "txFeeBumpInnerSuccess".to_string(),
-                                    TransactionResultResult::TxFeeBumpInnerFailed(_) => "txFeeBumpInnerFailed".to_string(),
-                                    _ => format!("{:?}", cdp_result),
-                                };
-
-                                println!("      TX {}: MISMATCH (XDR differs)", i);
-                                println!("        Result: ours={} CDP={}", our_result_code, cdp_result_code);
-                                println!("        Fee: ours={} CDP={}", our_tx.result.fee_charged, cdp_tx.result.fee_charged);
-                                println!("        TX hash: {}", hex::encode(&our_tx.transaction_hash.0));
-
-                                // If both failed but with different op results, show details
-                                if let (TransactionResultResult::TxFailed(our_ops), TransactionResultResult::TxFailed(cdp_ops)) = (our_result, cdp_result) {
-                                    for (j, (our_op, cdp_op)) in our_ops.iter().zip(cdp_ops.iter()).enumerate() {
-                                        let our_op_xdr = our_op.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
-                                        let cdp_op_xdr = cdp_op.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
-                                        if our_op_xdr != cdp_op_xdr {
-                                            println!("          Op {} differs:", j);
-                                            println!("            Ours: {:?}", our_op);
-                                            println!("            CDP:  {:?}", cdp_op);
-                                        }
-                                    }
-                                }
-                                // Show inner operation results for txSuccess too if they differ
-                                if let (TransactionResultResult::TxSuccess(our_ops), TransactionResultResult::TxSuccess(cdp_ops)) = (our_result, cdp_result) {
-                                    for (j, (our_op, cdp_op)) in our_ops.iter().zip(cdp_ops.iter()).enumerate() {
-                                        let our_op_xdr = our_op.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
-                                        let cdp_op_xdr = cdp_op.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
-                                        if our_op_xdr != cdp_op_xdr {
-                                            println!("          Op {} differs:", j);
-                                            println!("            Ours: {:?}", our_op);
-                                            println!("            CDP:  {:?}", cdp_op);
-                                        }
-                                    }
-                                }
-
-                                // Show ops when one succeeds and other fails
-                                if let (TransactionResultResult::TxSuccess(our_ops), TransactionResultResult::TxFailed(cdp_ops)) = (our_result, cdp_result) {
-                                    println!("        Ours ops ({}):", our_ops.len());
-                                    for (j, op) in our_ops.iter().enumerate() {
-                                        println!("          Op {}: {:?}", j, op);
-                                    }
-                                    println!("        CDP ops ({}):", cdp_ops.len());
-                                    for (j, op) in cdp_ops.iter().enumerate() {
-                                        println!("          Op {}: {:?}", j, op);
-                                    }
-                                }
-                                if let (TransactionResultResult::TxFailed(our_ops), TransactionResultResult::TxSuccess(cdp_ops)) = (our_result, cdp_result) {
-                                    println!("        Ours ops ({}):", our_ops.len());
-                                    for (j, op) in our_ops.iter().enumerate() {
-                                        println!("          Op {}: {:?}", j, op);
-                                    }
-                                    println!("        CDP ops ({}):", cdp_ops.len());
-                                    for (j, op) in cdp_ops.iter().enumerate() {
-                                        println!("          Op {}: {:?}", j, op);
-                                    }
-                                }
-
-                                // Show fee bump inner result details
-                                if let (TransactionResultResult::TxFeeBumpInnerFailed(our_inner), TransactionResultResult::TxFeeBumpInnerFailed(cdp_inner)) = (our_result, cdp_result) {
-                                    println!("        Inner fee: ours={} CDP={}", our_inner.result.fee_charged, cdp_inner.result.fee_charged);
-                                    let our_inner_code = format!("{:?}", std::mem::discriminant(&our_inner.result.result));
-                                    let cdp_inner_code = format!("{:?}", std::mem::discriminant(&cdp_inner.result.result));
-                                    println!("        Inner result type: ours={} CDP={}", our_inner_code, cdp_inner_code);
-                                    if let (stellar_xdr::curr::InnerTransactionResultResult::TxFailed(our_ops), stellar_xdr::curr::InnerTransactionResultResult::TxFailed(cdp_ops)) = (&our_inner.result.result, &cdp_inner.result.result) {
-                                        for (j, (our_op, cdp_op)) in our_ops.iter().zip(cdp_ops.iter()).enumerate() {
-                                            let our_op_xdr = our_op.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
-                                            let cdp_op_xdr = cdp_op.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
-                                            if our_op_xdr != cdp_op_xdr {
-                                                println!("          Inner Op {} differs:", j);
-                                                println!("            Ours: {:?}", our_op);
-                                                println!("            CDP:  {:?}", cdp_op);
-                                            }
-                                        }
-                                        if our_ops.len() != cdp_ops.len() {
-                                            println!("          Inner op count: ours={} CDP={}", our_ops.len(), cdp_ops.len());
-                                        }
-                                    } else {
-                                        println!("        Inner result ours: {:?}", our_inner.result.result);
-                                        println!("        Inner result CDP:  {:?}", cdp_inner.result.result);
-                                    }
-                                }
-                                if let (TransactionResultResult::TxFeeBumpInnerSuccess(our_inner), TransactionResultResult::TxFeeBumpInnerSuccess(cdp_inner)) = (our_result, cdp_result) {
-                                    println!("        Inner fee: ours={} CDP={}", our_inner.result.fee_charged, cdp_inner.result.fee_charged);
-                                    if let (stellar_xdr::curr::InnerTransactionResultResult::TxSuccess(our_ops), stellar_xdr::curr::InnerTransactionResultResult::TxSuccess(cdp_ops)) = (&our_inner.result.result, &cdp_inner.result.result) {
-                                        for (j, (our_op, cdp_op)) in our_ops.iter().zip(cdp_ops.iter()).enumerate() {
-                                            let our_op_xdr = our_op.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
-                                            let cdp_op_xdr = cdp_op.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
-                                            if our_op_xdr != cdp_op_xdr {
-                                                println!("          Inner Op {} differs:", j);
-                                                println!("            Ours: {:?}", our_op);
-                                                println!("            CDP:  {:?}", cdp_op);
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Show cross-case fee bump inner results
-                                if let (TransactionResultResult::TxFeeBumpInnerSuccess(our_inner), TransactionResultResult::TxFeeBumpInnerFailed(cdp_inner)) = (our_result, cdp_result) {
-                                    println!("        Inner fee: ours={} CDP={}", our_inner.result.fee_charged, cdp_inner.result.fee_charged);
-                                    if let stellar_xdr::curr::InnerTransactionResultResult::TxSuccess(our_ops) = &our_inner.result.result {
-                                        println!("        Ours inner ops ({}):", our_ops.len());
-                                        for (j, op) in our_ops.iter().enumerate() {
-                                            println!("          Op {}: {:?}", j, op);
-                                        }
-                                    }
-                                    if let stellar_xdr::curr::InnerTransactionResultResult::TxFailed(cdp_ops) = &cdp_inner.result.result {
-                                        println!("        CDP inner ops ({}):", cdp_ops.len());
-                                        for (j, op) in cdp_ops.iter().enumerate() {
-                                            println!("          Op {}: {:?}", j, op);
-                                        }
-                                    } else {
-                                        println!("        CDP inner result: {:?}", cdp_inner.result.result);
-                                    }
-                                }
-                                if let (TransactionResultResult::TxFeeBumpInnerFailed(our_inner), TransactionResultResult::TxFeeBumpInnerSuccess(cdp_inner)) = (our_result, cdp_result) {
-                                    println!("        Inner fee: ours={} CDP={}", our_inner.result.fee_charged, cdp_inner.result.fee_charged);
-                                    println!("        Ours inner result: {:?}", our_inner.result.result);
-                                    if let stellar_xdr::curr::InnerTransactionResultResult::TxSuccess(cdp_ops) = &cdp_inner.result.result {
-                                        println!("        CDP inner ops ({}):", cdp_ops.len());
-                                        for (j, op) in cdp_ops.iter().enumerate() {
-                                            println!("          Op {}: {:?}", j, op);
-                                        }
-                                    }
-                                }
-
-                                // Show CDP ops when ours is TxNotSupported or other non-standard result
-                                if !matches!(our_result, TransactionResultResult::TxSuccess(_) | TransactionResultResult::TxFailed(_)
-                                    | TransactionResultResult::TxFeeBumpInnerSuccess(_) | TransactionResultResult::TxFeeBumpInnerFailed(_)) {
-                                    if let TransactionResultResult::TxFailed(cdp_ops) = cdp_result {
-                                        println!("        CDP txFailed ops ({}):", cdp_ops.len());
-                                        for (j, op) in cdp_ops.iter().enumerate() {
-                                            println!("          Op {}: {:?}", j, op);
-                                        }
-                                    }
-                                }
-
-                                // Limit output to first 10 diffs
-                                if diff_count >= 10 {
-                                    println!("      ... (showing first 10 of potentially more diffs)");
-                                    break;
-                                }
-                            }
-                        }
-                        if diff_count > 0 {
-                            println!("    Total TX diffs: {} out of {}", diff_count, result.tx_results.len().min(cdp_tx_results.len()));
-                        }
+                        print_tx_result_diffs(&result.tx_results, &cdp_tx_results);
                     }
 
                     // Compare eviction data when header mismatches but TX results match
@@ -3552,7 +3698,6 @@ fn cmd_sample_config() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Offline commands handler.
 /// Prints information about bucket files.
 ///
 /// If given a directory, lists all bucket files with their sizes.
