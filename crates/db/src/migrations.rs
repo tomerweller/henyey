@@ -34,7 +34,7 @@ use tracing::info;
 /// This should be incremented whenever a new migration is added.
 /// The database initialization and migration system uses this to
 /// determine if upgrades are needed.
-pub const CURRENT_VERSION: i32 = 5;
+pub(crate) const CURRENT_VERSION: i32 = 5;
 
 /// Represents a single database migration.
 ///
@@ -127,7 +127,7 @@ const MIGRATIONS: &[Migration] = &[
 /// # Errors
 ///
 /// Returns an error if the stored version string cannot be parsed as an integer.
-pub fn get_schema_version(conn: &Connection) -> Result<i32> {
+pub(crate) fn get_schema_version(conn: &Connection) -> Result<i32> {
     let result: std::result::Result<String, _> = conn.query_row(
         "SELECT state FROM storestate WHERE statename = 'databaseschema'",
         [],
@@ -149,7 +149,7 @@ pub fn get_schema_version(conn: &Connection) -> Result<i32> {
 /// Records the schema version in the database.
 ///
 /// This is called after each successful migration to update the version tracker.
-pub fn set_schema_version(conn: &Connection, version: i32) -> Result<()> {
+pub(crate) fn set_schema_version(conn: &Connection, version: i32) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO storestate (statename, state) VALUES ('databaseschema', ?)",
         [version.to_string()],
@@ -160,7 +160,7 @@ pub fn set_schema_version(conn: &Connection, version: i32) -> Result<()> {
 /// Checks if the database requires migration.
 ///
 /// Returns `true` if the database schema version is older than [`CURRENT_VERSION`].
-pub fn needs_migration(conn: &Connection) -> Result<bool> {
+pub(crate) fn needs_migration(conn: &Connection) -> Result<bool> {
     let current = get_schema_version(conn)?;
     Ok(current < CURRENT_VERSION)
 }
@@ -176,7 +176,7 @@ pub fn needs_migration(conn: &Connection) -> Result<bool> {
 /// - The database version is newer than [`CURRENT_VERSION`]
 /// - A required migration is not found
 /// - Any migration SQL fails to execute
-pub fn run_migrations(conn: &Connection) -> Result<()> {
+pub(crate) fn run_migrations(conn: &Connection) -> Result<()> {
     let mut current_version = get_schema_version(conn)?;
 
     if current_version == CURRENT_VERSION {
@@ -238,7 +238,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
 /// Returns an error if the schema version is:
 /// - Older than [`CURRENT_VERSION`] (migrations should be run first)
 /// - Newer than [`CURRENT_VERSION`] (software upgrade required)
-pub fn verify_schema(conn: &Connection) -> Result<()> {
+pub(crate) fn verify_schema(conn: &Connection) -> Result<()> {
     let version = get_schema_version(conn)?;
 
     if version < CURRENT_VERSION {
@@ -265,7 +265,7 @@ pub fn verify_schema(conn: &Connection) -> Result<()> {
 ///
 /// Should only be called on empty databases. For existing databases,
 /// use [`run_migrations`] instead.
-pub fn initialize_schema(conn: &Connection) -> Result<()> {
+pub(crate) fn initialize_schema(conn: &Connection) -> Result<()> {
     // Create the schema
     conn.execute_batch(crate::schema::CREATE_SCHEMA)?;
 

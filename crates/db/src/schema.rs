@@ -25,7 +25,7 @@
 ///
 /// This creates all tables and indexes needed for stellar-core operation.
 /// For existing databases, use the migration system instead of re-running this.
-pub const CREATE_SCHEMA: &str = r#"
+pub(crate) const CREATE_SCHEMA: &str = r#"
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS storestate (
     statename TEXT PRIMARY KEY,

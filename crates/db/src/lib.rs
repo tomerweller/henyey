@@ -59,15 +59,15 @@
 //! ```
 
 pub mod error;
-pub mod migrations;
-pub mod pool;
+pub(crate) mod migrations;
+pub(crate) mod pool;
 pub mod queries;
 pub mod schema;
 pub mod scp_persistence;
 
 pub use error::DbError;
-pub use migrations::{needs_migration, run_migrations, verify_schema, CURRENT_VERSION};
-pub use pool::{Database, PooledConnection};
+
+pub use pool::Database;
 pub use queries::*;
 pub use scp_persistence::SqliteScpPersistence;
 
@@ -193,23 +193,6 @@ impl Database {
         }
 
         Ok(())
-    }
-
-    /// Upgrades the database schema to the latest version.
-    ///
-    /// This is typically called by the "upgrade-db" CLI command. Normal database
-    /// initialization already handles migrations automatically.
-    pub fn upgrade(&self) -> Result<()> {
-        let conn = self.connection()?;
-        migrations::run_migrations(&conn)
-    }
-
-    /// Returns the current database schema version.
-    ///
-    /// This can be used to check compatibility or diagnose migration issues.
-    pub fn schema_version(&self) -> Result<i32> {
-        let conn = self.connection()?;
-        migrations::get_schema_version(&conn)
     }
 
     // =========================================================================

@@ -24,7 +24,7 @@ use rusqlite::Connection;
 ///
 /// This is a wrapper around an r2d2 pooled connection that automatically
 /// returns the connection to the pool when dropped.
-pub type PooledConnection = r2d2::PooledConnection<SqliteConnectionManager>;
+pub(crate) type PooledConnection = r2d2::PooledConnection<SqliteConnectionManager>;
 
 /// Database handle with connection pooling.
 ///
@@ -68,7 +68,7 @@ impl Database {
     ///
     /// Returns an error if the pool is exhausted or a connection cannot
     /// be established.
-    pub fn connection(&self) -> Result<PooledConnection, DbError> {
+    pub(crate) fn connection(&self) -> Result<PooledConnection, DbError> {
         self.pool.get().map_err(DbError::from)
     }
 
