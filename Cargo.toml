@@ -31,7 +31,7 @@ rust-version = "1.76"
 # Stellar official crates
 # We support multiple protocol versions by including multiple soroban-env-host versions.
 # Each host version is labeled with the MAXIMUM protocol it supports.
-stellar-xdr = { git = "https://github.com/stellar/rs-stellar-xdr", rev = "89cc1cbadf1b9a16843826954dede7fec514d8e7", default-features = false, features = ["std", "curr", "serde", "serde_json"] }
+stellar-xdr = { version = "=25.0.0", default-features = false, features = ["std", "curr", "serde", "serde_json"] }
 stellar-strkey = "0.0.11"
 
 # Soroban host for Protocol 24 (supports protocols 20-24)
@@ -156,5 +156,3 @@ debug = true
 [profile.test]
 opt-level = 1
 
-[patch.crates-io]
-stellar-xdr = { git = "https://github.com/stellar/rs-stellar-xdr", rev = "89cc1cbadf1b9a16843826954dede7fec514d8e7" }

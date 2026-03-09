@@ -49,8 +49,8 @@ use henyey_common::Hash256;
 use henyey_tx::operations::execute::entry_size_for_rent_by_protocol_with_cost_params;
 use soroban_env_host_p25::budget::Budget;
 use soroban_env_host_p25::e2e_invoke::entry_size_for_rent as entry_size_for_rent_p25;
-use soroban_env_host_p25::xdr as soroban_xdr_p25;
-use soroban_xdr_p25::ReadXdr;
+// After XDR alignment: soroban_env_host_p25::xdr is the same as stellar_xdr::curr.
+// No separate XDR alias or ReadXdr import needed for P25 conversions.
 use stellar_xdr::curr::{
     ConfigSettingId, ContractCostParams, LedgerEntry, LedgerEntryData, LedgerKey,
     LedgerKeyConfigSetting, LedgerKeyContractCode, LedgerKeyContractData, LedgerKeyTtl, Limits,
@@ -102,14 +102,9 @@ fn config_setting_entry_id(entry: &stellar_xdr::curr::ConfigSettingEntry) -> i32
     }
 }
 
-/// Convert a LedgerEntry to soroban-env-host P25's XDR type.
-/// This is needed because soroban-env-host v25.0.0 uses stellar-xdr 25.0.0 from crates.io,
-/// while our workspace uses a git revision of stellar-xdr.
-fn convert_ledger_entry_to_p25(entry: &LedgerEntry) -> Option<soroban_xdr_p25::LedgerEntry> {
-    use soroban_xdr_p25::ReadXdr as _;
-    let bytes = entry.to_xdr(Limits::none()).ok()?;
-    soroban_xdr_p25::LedgerEntry::from_xdr(&bytes, soroban_xdr_p25::Limits::none()).ok()
-}
+// convert_ledger_entry_to_p25 has been removed after XDR alignment.
+// The workspace stellar-xdr 25.0.0 and soroban-env-host P25's stellar-xdr 25.0.0
+// are the same crate, so LedgerEntry types are identical.
 
 /// TTL data co-located with contract entries.
 ///
@@ -170,12 +165,8 @@ impl Default for SorobanRentConfig {
     }
 }
 
-fn convert_contract_cost_params_to_p25(
-    params: &stellar_xdr::curr::ContractCostParams,
-) -> Option<soroban_xdr_p25::ContractCostParams> {
-    let bytes = params.to_xdr(Limits::none()).ok()?;
-    soroban_xdr_p25::ContractCostParams::from_xdr(&bytes, soroban_xdr_p25::Limits::none()).ok()
-}
+// convert_contract_cost_params_to_p25 has been removed after XDR alignment.
+// ContractCostParams is now the same type between workspace and soroban-env-host P25.
 
 fn build_rent_budget(rent_config: Option<&SorobanRentConfig>) -> Budget {
     let Some(config) = rent_config else {
@@ -185,19 +176,14 @@ fn build_rent_budget(rent_config: Option<&SorobanRentConfig>) -> Budget {
         return Budget::default();
     }
 
-    let cpu_cost_params = convert_contract_cost_params_to_p25(&config.cpu_cost_params);
-    let mem_cost_params = convert_contract_cost_params_to_p25(&config.mem_cost_params);
-    let (Some(cpu_cost_params), Some(mem_cost_params)) = (cpu_cost_params, mem_cost_params) else {
-        return Budget::default();
-    };
-
+    // After XDR alignment: ContractCostParams is the same type — no conversion needed.
     let instruction_limit = config.tx_max_instructions.saturating_mul(2);
     let memory_limit = config.tx_max_memory_bytes.saturating_mul(2);
     Budget::try_from_configs(
         instruction_limit,
         memory_limit,
-        cpu_cost_params,
-        mem_cost_params,
+        config.cpu_cost_params.clone(),
+        config.mem_cost_params.clone(),
     )
     .unwrap_or_else(|_| Budget::default())
 }
@@ -816,10 +802,8 @@ impl InMemorySorobanState {
             );
         }
         let budget = build_rent_budget(rent_config);
-        // Convert to P25 XDR type (soroban-env-host v25.0.0 uses stellar-xdr 25.0.0)
-        convert_ledger_entry_to_p25(entry)
-            .and_then(|p25_entry| entry_size_for_rent_p25(&budget, &p25_entry, xdr_size).ok())
-            .unwrap_or(xdr_size)
+        // After XDR alignment: LedgerEntry is the same type — pass directly.
+        entry_size_for_rent_p25(&budget, entry, xdr_size).unwrap_or(xdr_size)
     }
 
     /// Update state with new entries from a ledger close.
@@ -990,11 +974,8 @@ impl InMemorySorobanState {
 
             // Use the same logic as calculate_code_size
             let new_size = if protocol_version >= 25 {
-                convert_ledger_entry_to_p25(&entry.ledger_entry)
-                    .and_then(|p25_entry| {
-                        entry_size_for_rent_p25(&budget, &p25_entry, xdr_size).ok()
-                    })
-                    .unwrap_or(xdr_size)
+                // After XDR alignment: LedgerEntry is the same type — pass directly.
+                entry_size_for_rent_p25(&budget, &entry.ledger_entry, xdr_size).unwrap_or(xdr_size)
             } else {
                 let cost_params = rent_config.map(|rc| (&rc.cpu_cost_params, &rc.mem_cost_params));
                 entry_size_for_rent_by_protocol_with_cost_params(

@@ -4,9 +4,9 @@
 //! It uses soroban-env-host-p25 which is pinned to the exact git revision
 //! used by stellar-core for protocol 25.
 //!
-//! Note: soroban-env-host v25.0.0 uses stellar-xdr 25.0.0 from crates.io,
-//! while our workspace uses a git revision of stellar-xdr. We convert between
-//! the two via XDR serialization when crossing the boundary.
+//! After XDR alignment: the workspace stellar-xdr 25.0.0 and soroban-env-host
+//! P25's stellar-xdr 25.0.0 are the same crate, so all types are identical
+//! and no XDR conversion is needed for the P25 path.
 
 #[cfg(test)]
 mod tests {
@@ -15,16 +15,11 @@ mod tests {
     use soroban_env_host_p25::{storage::SnapshotSource, HostError};
 
     use stellar_xdr::curr::{
-        AccountId, Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerKey, Limits, ReadXdr,
-        WriteXdr,
+        AccountId, Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerKey,
     };
 
     use crate::soroban::host::EntryWithTtl;
     use crate::state::LedgerStateManager;
-
-    // Type aliases for soroban-env-host P25's XDR types (from stellar-xdr 25.0.0)
-    type P25LedgerKey = soroban_env_host_p25::xdr::LedgerKey;
-    type P25LedgerEntry = soroban_env_host_p25::xdr::LedgerEntry;
 
     /// Adapter that provides snapshot access to our ledger state for Soroban.
     struct LedgerSnapshotAdapter<'a> {
@@ -159,21 +154,13 @@ mod tests {
     impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
         fn get(
             &self,
-            key: &Rc<P25LedgerKey>,
+            key: &Rc<LedgerKey>,
         ) -> Result<Option<soroban_env_host_p25::storage::EntryWithLiveUntil>, HostError> {
-            // Convert P25 key to our workspace XDR type
-            let Some(local_key) = convert_ledger_key_from_p25(key.as_ref()) else {
-                return Ok(None);
-            };
+            // After XDR alignment: workspace LedgerKey === soroban-env-host P25 LedgerKey,
+            // so no conversion is needed. We can use the key directly.
+            let live_until = get_entry_ttl(self.state, key.as_ref(), self.current_ledger);
 
-            // For ContractData and ContractCode, check TTL first.
-            // If TTL has expired, the entry is considered to be in the hot archive
-            // and not accessible (unless being explicitly restored).
-            // This mimics stellar-core behavior where archived entries are not
-            // in the live bucket list.
-            let live_until = get_entry_ttl(self.state, &local_key, self.current_ledger);
-
-            let entry = match &local_key {
+            let entry = match key.as_ref() {
                 LedgerKey::Account(account_key) => self
                     .state
                     .get_account(&account_key.account_id)
@@ -190,72 +177,56 @@ mod tests {
                         data: LedgerEntryData::Trustline(tl.clone()),
                         ext: LedgerEntryExt::V0,
                     }),
-                LedgerKey::ContractData(cd_key) => {
-                    // Check TTL: In stellar-core, ContractData entries are only accessible
-                    // if they have a valid (non-expired) TTL entry. Entries without a TTL entry
-                    // or with expired TTL are treated as archived and not accessible.
-                    match live_until {
-                        Some(lu) if lu >= self.current_ledger => {
-                            // TTL exists and is live - return the entry
-                            self.state
-                                .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
-                                .map(|cd| LedgerEntry {
-                                    last_modified_ledger_seq: self.current_ledger,
-                                    data: LedgerEntryData::ContractData(cd.clone()),
-                                    ext: LedgerEntryExt::V0,
-                                })
-                        }
-                        Some(lu) => {
-                            // TTL exists but is expired
-                            tracing::debug!(
-                                current_ledger = self.current_ledger,
-                                live_until = lu,
-                                "ContractData entry has expired TTL, treating as archived"
-                            );
-                            return Ok(None);
-                        }
-                        None => {
-                            // No TTL entry found - entry is not properly initialized
-                            tracing::debug!(
-                                current_ledger = self.current_ledger,
-                                "ContractData entry has no TTL, treating as not live"
-                            );
-                            return Ok(None);
-                        }
+                LedgerKey::ContractData(cd_key) => match live_until {
+                    Some(lu) if lu >= self.current_ledger => self
+                        .state
+                        .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
+                        .map(|cd| LedgerEntry {
+                            last_modified_ledger_seq: self.current_ledger,
+                            data: LedgerEntryData::ContractData(cd.clone()),
+                            ext: LedgerEntryExt::V0,
+                        }),
+                    Some(lu) => {
+                        tracing::debug!(
+                            current_ledger = self.current_ledger,
+                            live_until = lu,
+                            "ContractData entry has expired TTL, treating as archived"
+                        );
+                        return Ok(None);
                     }
-                }
-                LedgerKey::ContractCode(cc_key) => {
-                    // Same as ContractData - require valid TTL
-                    match live_until {
-                        Some(lu) if lu >= self.current_ledger => {
-                            // TTL exists and is live - return the entry
-                            self.state
-                                .get_contract_code(&cc_key.hash)
-                                .map(|code| LedgerEntry {
-                                    last_modified_ledger_seq: self.current_ledger,
-                                    data: LedgerEntryData::ContractCode(code.clone()),
-                                    ext: LedgerEntryExt::V0,
-                                })
-                        }
-                        Some(lu) => {
-                            // TTL exists but is expired
-                            tracing::debug!(
-                                current_ledger = self.current_ledger,
-                                live_until = lu,
-                                "ContractCode entry has expired TTL, treating as archived"
-                            );
-                            return Ok(None);
-                        }
-                        None => {
-                            // No TTL entry found
-                            tracing::debug!(
-                                current_ledger = self.current_ledger,
-                                "ContractCode entry has no TTL, treating as not live"
-                            );
-                            return Ok(None);
-                        }
+                    None => {
+                        tracing::debug!(
+                            current_ledger = self.current_ledger,
+                            "ContractData entry has no TTL, treating as not live"
+                        );
+                        return Ok(None);
                     }
-                }
+                },
+                LedgerKey::ContractCode(cc_key) => match live_until {
+                    Some(lu) if lu >= self.current_ledger => self
+                        .state
+                        .get_contract_code(&cc_key.hash)
+                        .map(|code| LedgerEntry {
+                            last_modified_ledger_seq: self.current_ledger,
+                            data: LedgerEntryData::ContractCode(code.clone()),
+                            ext: LedgerEntryExt::V0,
+                        }),
+                    Some(lu) => {
+                        tracing::debug!(
+                            current_ledger = self.current_ledger,
+                            live_until = lu,
+                            "ContractCode entry has expired TTL, treating as archived"
+                        );
+                        return Ok(None);
+                    }
+                    None => {
+                        tracing::debug!(
+                            current_ledger = self.current_ledger,
+                            "ContractCode entry has no TTL, treating as not live"
+                        );
+                        return Ok(None);
+                    }
+                },
                 LedgerKey::Ttl(ttl_key) => {
                     self.state
                         .get_ttl(&ttl_key.key_hash)
@@ -268,17 +239,9 @@ mod tests {
                 _ => None,
             };
 
-            // Convert the entry to P25 XDR type
+            // No conversion needed — types are identical after XDR alignment.
             match entry {
-                Some(e) => {
-                    let p25_entry = convert_ledger_entry_to_p25(&e).ok_or_else(|| {
-                        HostError::from(soroban_env_host_p25::Error::from_type_and_code(
-                            soroban_env_host_p25::xdr::ScErrorType::Context,
-                            soroban_env_host_p25::xdr::ScErrorCode::InternalError,
-                        ))
-                    })?;
-                    Ok(Some((Rc::new(p25_entry), live_until)))
-                }
+                Some(e) => Ok(Some((Rc::new(e), live_until))),
                 None => Ok(None),
             }
         }
@@ -351,25 +314,9 @@ mod tests {
         }
     }
 
-    // P25 XDR conversion functions (soroban-env-host v25.0.0 uses stellar-xdr 25.0.0)
-    fn convert_ledger_key_from_p25(key: &P25LedgerKey) -> Option<LedgerKey> {
-        let bytes = soroban_env_host_p25::xdr::WriteXdr::to_xdr(
-            key,
-            soroban_env_host_p25::xdr::Limits::none(),
-        )
-        .ok()?;
-        LedgerKey::from_xdr(&bytes, Limits::none()).ok()
-    }
-
-    fn convert_ledger_entry_to_p25(entry: &LedgerEntry) -> Option<P25LedgerEntry> {
-        use soroban_env_host_p25::xdr::ReadXdr as _;
-        let bytes = entry.to_xdr(Limits::none()).ok()?;
-        soroban_env_host_p25::xdr::LedgerEntry::from_xdr(
-            &bytes,
-            soroban_env_host_p25::xdr::Limits::none(),
-        )
-        .ok()
-    }
+    // P25 XDR conversion functions have been removed after XDR alignment.
+    // The workspace stellar-xdr 25.0.0 and soroban-env-host P25's stellar-xdr 25.0.0
+    // are the same crate, so all types are identical.
 
     use stellar_xdr::curr::{
         ContractDataDurability, ContractDataEntry, ContractId, LedgerKeyContractData, ScAddress,
