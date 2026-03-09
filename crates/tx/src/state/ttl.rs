@@ -1,5 +1,4 @@
 use super::*;
-use stellar_xdr::curr::WriteXdr;
 
 impl LedgerStateManager {
     /// Get a TTL entry by key hash (read-only).
@@ -325,15 +324,7 @@ impl LedgerStateManager {
             }
 
             // Compute the TTL key hash (SHA-256 of the XDR-encoded entry key)
-            let key_hash = {
-                use sha2::{Digest, Sha256};
-                let mut hasher = Sha256::new();
-                if let Ok(bytes) = key.to_xdr(stellar_xdr::curr::Limits::none()) {
-                    hasher.update(&bytes);
-                }
-                let result: [u8; 32] = hasher.finalize().into();
-                result
-            };
+            let key_hash = crate::soroban::compute_key_hash(key).0;
 
             // Check if there's a pending RO TTL bump for this key
             if let Some(bumped_live_until) = self.deferred_ro_ttl_bumps.remove(&key_hash) {

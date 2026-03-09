@@ -4,7 +4,7 @@
 //! which extends the time-to-live for Soroban contract data entries.
 
 use stellar_xdr::curr::{
-    AccountId, ExtendFootprintTtlOp, ExtendFootprintTtlResult, ExtendFootprintTtlResultCode, Hash,
+    AccountId, ExtendFootprintTtlOp, ExtendFootprintTtlResult, ExtendFootprintTtlResultCode,
     LedgerKey, OperationResult, OperationResultTr, SorobanTransactionData, WriteXdr,
 };
 
@@ -32,6 +32,7 @@ pub fn execute_extend_footprint_ttl(
     state: &mut LedgerStateManager,
     context: &LedgerContext,
     soroban_data: Option<&SorobanTransactionData>,
+    ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
 ) -> Result<OperationResult> {
     // Validate extend_to is positive
     if op.extend_to == 0 {
@@ -74,7 +75,7 @@ pub fn execute_extend_footprint_ttl(
     // - Skip entries whose TTL already meets target
     // - Check read bytes resource limit
     for key in footprint.read_only.iter() {
-        let key_hash = compute_ledger_key_hash(key);
+        let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
 
         // Look up the TTL entry for this key
         let ttl_entry = state.get_ttl(&key_hash).cloned();
@@ -129,19 +130,6 @@ fn is_ttl_entry(key: &LedgerKey) -> bool {
     matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_))
 }
 
-/// Compute the hash of a ledger key for TTL lookup.
-fn compute_ledger_key_hash(key: &LedgerKey) -> Hash {
-    use sha2::{Digest, Sha256};
-    use stellar_xdr::curr::WriteXdr;
-
-    let mut hasher = Sha256::new();
-    if let Ok(bytes) = key.to_xdr(stellar_xdr::curr::Limits::none()) {
-        hasher.update(&bytes);
-    }
-    let result = hasher.finalize();
-    Hash(result.into())
-}
-
 /// Create an OperationResult from an ExtendFootprintTtlResultCode.
 fn make_result(code: ExtendFootprintTtlResultCode) -> OperationResult {
     let result = match code {
@@ -182,7 +170,7 @@ mod tests {
             extend_to: 0, // Invalid - must be positive
         };
 
-        let result = execute_extend_footprint_ttl(&op, &source, &mut state, &context, None);
+        let result = execute_extend_footprint_ttl(&op, &source, &mut state, &context, None, None);
         assert!(result.is_ok());
 
         match result.unwrap() {
@@ -205,7 +193,7 @@ mod tests {
         };
 
         // No Soroban data provided
-        let result = execute_extend_footprint_ttl(&op, &source, &mut state, &context, None);
+        let result = execute_extend_footprint_ttl(&op, &source, &mut state, &context, None, None);
         assert!(result.is_ok());
 
         match result.unwrap() {
@@ -245,8 +233,14 @@ mod tests {
             resource_fee: 0,
         };
 
-        let result =
-            execute_extend_footprint_ttl(&op, &source, &mut state, &context, Some(&soroban_data));
+        let result = execute_extend_footprint_ttl(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            None,
+        );
         assert!(result.is_ok());
 
         match result.unwrap() {
@@ -286,8 +280,14 @@ mod tests {
             resource_fee: 0,
         };
 
-        let result =
-            execute_extend_footprint_ttl(&op, &source, &mut state, &context, Some(&soroban_data));
+        let result = execute_extend_footprint_ttl(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            None,
+        );
         assert!(result.is_ok());
 
         match result.unwrap() {
@@ -323,8 +323,14 @@ mod tests {
             resource_fee: 0,
         };
 
-        let result =
-            execute_extend_footprint_ttl(&op, &source, &mut state, &context, Some(&soroban_data));
+        let result = execute_extend_footprint_ttl(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            None,
+        );
         assert!(result.is_ok());
 
         match result.unwrap() {
@@ -364,8 +370,14 @@ mod tests {
             resource_fee: 0,
         };
 
-        let result =
-            execute_extend_footprint_ttl(&op, &source, &mut state, &context, Some(&soroban_data));
+        let result = execute_extend_footprint_ttl(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            None,
+        );
         assert!(result.is_ok());
 
         match result.unwrap() {
@@ -409,8 +421,14 @@ mod tests {
             resource_fee: 0,
         };
 
-        let result =
-            execute_extend_footprint_ttl(&op, &source, &mut state, &context, Some(&soroban_data));
+        let result = execute_extend_footprint_ttl(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            None,
+        );
         assert!(result.is_ok());
 
         match result.unwrap() {
@@ -460,8 +478,14 @@ mod tests {
             resource_fee: 0,
         };
 
-        let result =
-            execute_extend_footprint_ttl(&op, &source, &mut state, &context, Some(&soroban_data));
+        let result = execute_extend_footprint_ttl(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            None,
+        );
         assert!(result.is_ok());
 
         match result.unwrap() {
@@ -512,8 +536,14 @@ mod tests {
             resource_fee: 0,
         };
 
-        let result =
-            execute_extend_footprint_ttl(&op, &source, &mut state, &context, Some(&soroban_data));
+        let result = execute_extend_footprint_ttl(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            None,
+        );
         assert!(result.is_ok());
 
         match result.unwrap() {

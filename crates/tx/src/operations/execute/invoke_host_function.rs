@@ -336,19 +336,6 @@ fn execute_contract_invocation(
     }
 }
 
-/// Compute the hash of a ledger key for TTL lookup.
-/// Delegates to the shared implementation in the soroban module.
-/// Used by tests; production code uses `get_or_compute_key_hash` with cache.
-#[cfg(test)]
-fn compute_key_hash(key: &LedgerKey) -> Hash {
-    crate::soroban::compute_key_hash(key)
-}
-
-/// Get or compute the TTL key hash, using the cache when available.
-fn get_or_compute_key_hash(cache: Option<&crate::soroban::TtlKeyCache>, key: &LedgerKey) -> Hash {
-    crate::soroban::get_or_compute_key_hash(cache, key)
-}
-
 /// Result of validating storage changes.
 enum StorageChangeValidation {
     /// All changes are valid and within limits.
@@ -501,7 +488,7 @@ fn disk_read_bytes_exceeded(
                     // actually still archived. If a previous TX in this ledger
                     // restored the entry, its TTL is now live, and stellar-core treats
                     // it as an in-memory soroban entry (no disk read metering).
-                    let key_hash = get_or_compute_key_hash(ttl_key_cache, key);
+                    let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
                     let is_still_archived = match state.get_ttl(&key_hash) {
                         Some(ttl) => ttl.live_until_ledger_seq < current_ledger,
                         None => true, // No TTL = not in live state = archived
@@ -689,7 +676,7 @@ fn apply_soroban_storage_changes(
                 {
                     state.delete_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability);
                     // Also delete the associated TTL entry
-                    let key_hash = get_or_compute_key_hash(ttl_key_cache, key);
+                    let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
                     state.delete_ttl(&key_hash);
                 }
             }
@@ -697,7 +684,7 @@ fn apply_soroban_storage_changes(
                 if state.get_contract_code(&cc_key.hash).is_some() {
                     state.delete_contract_code(&cc_key.hash);
                     // Also delete the associated TTL entry
-                    let key_hash = get_or_compute_key_hash(ttl_key_cache, key);
+                    let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
                     state.delete_ttl(&key_hash);
                 }
             }
@@ -822,7 +809,7 @@ fn apply_soroban_storage_change(
                 if live_until == 0 {
                     return;
                 }
-                let key_hash = get_or_compute_key_hash(ttl_key_cache, &change.key);
+                let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, &change.key);
                 let existing_ttl = state.get_ttl(&key_hash);
                 let ttl = TtlEntry {
                     key_hash: key_hash.clone(),
@@ -896,7 +883,7 @@ fn apply_soroban_storage_change(
         // This happens when a contract reads an entry and its TTL gets auto-extended.
         // Only emit when TTL was actually extended (new > old).
         if change.ttl_extended {
-            let key_hash = get_or_compute_key_hash(ttl_key_cache, &change.key);
+            let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, &change.key);
             let existing_ttl = state.get_ttl(&key_hash);
             let ttl = TtlEntry {
                 key_hash: key_hash.clone(),
@@ -937,12 +924,12 @@ fn apply_soroban_storage_change(
         match &change.key {
             LedgerKey::ContractData(key) => {
                 state.delete_contract_data(&key.contract, &key.key, key.durability);
-                let key_hash = get_or_compute_key_hash(ttl_key_cache, &change.key);
+                let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, &change.key);
                 state.delete_ttl(&key_hash);
             }
             LedgerKey::ContractCode(key) => {
                 state.delete_contract_code(&key.hash);
-                let key_hash = get_or_compute_key_hash(ttl_key_cache, &change.key);
+                let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, &change.key);
                 state.delete_ttl(&key_hash);
             }
             LedgerKey::Ttl(key) => {
@@ -983,11 +970,9 @@ fn footprint_has_unrestored_archived_entries(
         }
     }
 
-    if footprint
-        .read_only
-        .iter()
-        .any(|key| is_archived_contract_entry(state, key, current_ledger, hot_archive, ttl_key_cache))
-    {
+    if footprint.read_only.iter().any(|key| {
+        is_archived_contract_entry(state, key, current_ledger, hot_archive, ttl_key_cache)
+    }) {
         return true;
     }
 
@@ -1042,7 +1027,7 @@ fn is_archived_contract_entry(
 
     if entry_in_live {
         // Entry is in live state — check its TTL
-        let key_hash = get_or_compute_key_hash(ttl_key_cache, key);
+        let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
         return match state.get_ttl(&key_hash) {
             Some(ttl) => ttl.live_until_ledger_seq < current_ledger,
             None => true, // No TTL → treat as archived
@@ -1262,7 +1247,7 @@ mod tests {
             key: contract_key.clone(),
             durability,
         });
-        let key_hash = compute_key_hash(&key);
+        let key_hash = crate::soroban::compute_key_hash(&key);
         state.create_ttl(TtlEntry {
             key_hash,
             live_until_ledger_seq: context.sequence - 1,
@@ -1340,7 +1325,7 @@ mod tests {
             key: contract_key.clone(),
             durability,
         });
-        let key_hash = compute_key_hash(&key);
+        let key_hash = crate::soroban::compute_key_hash(&key);
         state.create_ttl(TtlEntry {
             key_hash,
             live_until_ledger_seq: context.sequence - 1,
@@ -1488,7 +1473,7 @@ mod tests {
             key: contract_key.clone(),
             durability,
         });
-        let key_hash = compute_key_hash(&cd_key);
+        let key_hash = crate::soroban::compute_key_hash(&cd_key);
 
         // Set TTL to LIVE (simulating a prior TX that restored this entry)
         state.create_ttl(TtlEntry {
@@ -1538,11 +1523,12 @@ mod tests {
         );
 
         // Now verify that if the TTL is expired, the entry IS metered
-        let key_hash2 = compute_key_hash(&LedgerKey::ContractData(LedgerKeyContractData {
-            contract: contract_id,
-            key: contract_key,
-            durability: ContractDataDurability::Persistent,
-        }));
+        let key_hash2 =
+            crate::soroban::compute_key_hash(&LedgerKey::ContractData(LedgerKeyContractData {
+                contract: contract_id,
+                key: contract_key,
+                durability: ContractDataDurability::Persistent,
+            }));
         state.get_ttl_mut(&key_hash2).unwrap().live_until_ledger_seq = context.sequence - 1; // Expired
 
         let exceeded = disk_read_bytes_exceeded(
@@ -1722,7 +1708,7 @@ mod tests {
             .get_contract_data(&contract_id, &contract_key, durability.clone())
             .is_some());
 
-        let ttl_key = compute_key_hash(&key);
+        let ttl_key = crate::soroban::compute_key_hash(&key);
         assert!(state.get_ttl(&ttl_key).is_some());
 
         let delete_change = StorageChange {
@@ -1765,7 +1751,7 @@ mod tests {
             durability: durability.clone(),
         });
 
-        let ttl_key_hash = compute_key_hash(&key);
+        let ttl_key_hash = crate::soroban::compute_key_hash(&key);
 
         // Pre-populate the TTL entry with value 226129 (simulates existing entry from bucket list)
         let existing_ttl = TtlEntry {
@@ -2278,7 +2264,7 @@ mod tests {
             key: contract_key.clone(),
             durability,
         });
-        let key_hash = compute_key_hash(&key);
+        let key_hash = crate::soroban::compute_key_hash(&key);
 
         // Simulate the storage change produced for a hot archive entry that the host
         // only read (no data returned).  The "is_deletion" and "ttl_extended" flags are
@@ -2355,7 +2341,7 @@ mod tests {
             key: contract_key.clone(),
             durability,
         });
-        let key_hash = compute_key_hash(&key);
+        let key_hash = crate::soroban::compute_key_hash(&key);
 
         // Storage change for a hot archive entry the host only read (no data returned).
         let restored_live_until: u32 = 62_014_364;
@@ -2489,7 +2475,13 @@ mod tests {
         assert_eq!(state.delta().deleted_keys().len(), 0);
 
         // Call apply_soroban_storage_changes — this runs the erase-RW loop.
-        apply_soroban_storage_changes(&mut state, &changes, &footprint, &hot_archive_restored_keys, None);
+        apply_soroban_storage_changes(
+            &mut state,
+            &changes,
+            &footprint,
+            &hot_archive_restored_keys,
+            None,
+        );
 
         // KEY ASSERTION: no DEAD entry should be created.
         // Before the VE-06 fix (hot archive skip at line 667), the erase-RW loop

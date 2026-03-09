@@ -4,7 +4,7 @@
 //! which restores archived Soroban contract data entries.
 
 use stellar_xdr::curr::{
-    AccountId, Hash, LedgerEntry, LedgerEntryData, LedgerKey, OperationResult, OperationResultTr,
+    AccountId, LedgerEntry, LedgerEntryData, LedgerKey, OperationResult, OperationResultTr,
     RestoreFootprintOp, RestoreFootprintResult, RestoreFootprintResultCode, SorobanTransactionData,
     TtlEntry,
 };
@@ -39,6 +39,7 @@ pub struct HotArchiveRestoreEntry {
 /// # Returns
 ///
 /// Returns the operation result indicating success or a specific failure reason.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_restore_footprint(
     _op: &RestoreFootprintOp,
     _source: &AccountId,
@@ -47,6 +48,7 @@ pub fn execute_restore_footprint(
     soroban_data: Option<&SorobanTransactionData>,
     min_persistent_entry_ttl: u32,
     hot_archive_restores: &[HotArchiveRestoreEntry],
+    ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
 ) -> Result<OperationResult> {
     // Get the footprint from Soroban transaction data
     let footprint = match soroban_data {
@@ -100,7 +102,7 @@ pub fn execute_restore_footprint(
         }
 
         // Create the TTL entry for the restored entry
-        let key_hash = compute_ledger_key_hash(&restore.key);
+        let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, &restore.key);
         let ttl_entry = TtlEntry {
             key_hash,
             live_until_ledger_seq: new_ttl,
@@ -116,7 +118,7 @@ pub fn execute_restore_footprint(
             continue;
         }
 
-        if restore_entry(key, new_ttl, state, current_ledger).is_err() {
+        if restore_entry(key, new_ttl, state, current_ledger, ttl_key_cache).is_err() {
             return Ok(make_result(
                 RestoreFootprintResultCode::ResourceLimitExceeded,
             ));
@@ -143,6 +145,7 @@ fn restore_entry(
     new_ttl: u32,
     state: &mut LedgerStateManager,
     current_ledger: u32,
+    ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
 ) -> std::result::Result<(), &'static str> {
     // Only contract data and contract code can be restored
     match key {
@@ -151,7 +154,7 @@ fn restore_entry(
     }
 
     // Compute the key hash for TTL lookup
-    let key_hash = compute_ledger_key_hash(key);
+    let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
 
     // Check the current TTL status
     let current_ttl = state.get_ttl(&key_hash).map(|t| t.live_until_ledger_seq);
@@ -184,19 +187,6 @@ fn restore_entry(
             Ok(())
         }
     }
-}
-
-/// Compute the hash of a ledger key for TTL lookup.
-fn compute_ledger_key_hash(key: &LedgerKey) -> Hash {
-    use sha2::{Digest, Sha256};
-    use stellar_xdr::curr::WriteXdr;
-
-    let mut hasher = Sha256::new();
-    if let Ok(bytes) = key.to_xdr(stellar_xdr::curr::Limits::none()) {
-        hasher.update(&bytes);
-    }
-    let result = hasher.finalize();
-    Hash(result.into())
 }
 
 /// Create an OperationResult from a RestoreFootprintResultCode.
@@ -249,6 +239,7 @@ mod tests {
             None,
             TEST_MIN_PERSISTENT_TTL,
             &[], // No hot archive restores
+            None,
         );
         assert!(result.is_ok());
 
@@ -292,6 +283,7 @@ mod tests {
             Some(&soroban_data),
             TEST_MIN_PERSISTENT_TTL,
             &[], // No hot archive restores
+            None,
         );
         assert!(result.is_ok());
 
@@ -339,6 +331,7 @@ mod tests {
             Some(&soroban_data),
             TEST_MIN_PERSISTENT_TTL,
             &[], // No hot archive restores
+            None,
         );
         assert!(result.is_ok());
 
@@ -388,6 +381,7 @@ mod tests {
             Some(&soroban_data),
             TEST_MIN_PERSISTENT_TTL,
             &[], // No hot archive restores
+            None,
         );
         assert!(result.is_ok());
 
@@ -438,6 +432,7 @@ mod tests {
             Some(&soroban_data),
             TEST_MIN_PERSISTENT_TTL,
             &[],
+            None,
         );
         assert!(result.is_ok());
 
@@ -495,6 +490,7 @@ mod tests {
             Some(&soroban_data),
             TEST_MIN_PERSISTENT_TTL,
             &[],
+            None,
         );
         assert!(result.is_ok());
 
@@ -552,6 +548,7 @@ mod tests {
             Some(&soroban_data),
             TEST_MIN_PERSISTENT_TTL,
             &[],
+            None,
         );
         assert!(result.is_ok());
 
@@ -610,6 +607,7 @@ mod tests {
             Some(&soroban_data),
             TEST_MIN_PERSISTENT_TTL,
             &[],
+            None,
         );
         assert!(result.is_ok());
 

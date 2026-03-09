@@ -12,8 +12,6 @@
 mod tests {
     use std::rc::Rc;
 
-    use sha2::{Digest, Sha256};
-
     use soroban_env_host_p25::{storage::SnapshotSource, HostError};
 
     use stellar_xdr::curr::{
@@ -306,7 +304,7 @@ mod tests {
     ) -> Option<u32> {
         match key {
             LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
-                let key_hash = compute_key_hash(key);
+                let key_hash = crate::soroban::compute_key_hash(key);
                 // Use get_ttl_at_ledger_start() to match stellar-core behavior for parallel Soroban.
                 // This returns the TTL from the bucket list snapshot at ledger start,
                 // NOT the current TTL (which might include entries created by earlier TXs).
@@ -351,15 +349,6 @@ mod tests {
             }
             _ => None,
         }
-    }
-
-    /// Compute the hash of a ledger key for TTL lookup.
-    fn compute_key_hash(key: &LedgerKey) -> Hash {
-        let mut hasher = Sha256::new();
-        if let Ok(bytes) = key.to_xdr(Limits::none()) {
-            hasher.update(&bytes);
-        }
-        Hash(hasher.finalize().into())
     }
 
     // P25 XDR conversion functions (soroban-env-host v25.0.0 uses stellar-xdr 25.0.0)
@@ -433,7 +422,7 @@ mod tests {
         state.create_contract_data(entry);
 
         // Create TTL entry with live_until >= current_ledger (valid)
-        let key_hash = compute_key_hash(&key);
+        let key_hash = crate::soroban::compute_key_hash(&key);
         let ttl = TtlEntry {
             key_hash: key_hash.clone(),
             live_until_ledger_seq: current_ledger + 100, // Valid: 1100 >= 1000
@@ -476,7 +465,7 @@ mod tests {
         state.create_contract_data(entry);
 
         // Create TTL entry with live_until < current_ledger (expired)
-        let key_hash = compute_key_hash(&key);
+        let key_hash = crate::soroban::compute_key_hash(&key);
         let ttl = TtlEntry {
             key_hash: key_hash.clone(),
             live_until_ledger_seq: current_ledger - 1, // Expired: 999 < 1000
@@ -540,7 +529,7 @@ mod tests {
         state.create_contract_data(entry);
 
         // Create TTL entry with live_until == current_ledger (boundary - still live)
-        let key_hash = compute_key_hash(&key);
+        let key_hash = crate::soroban::compute_key_hash(&key);
         let ttl = TtlEntry {
             key_hash: key_hash.clone(),
             live_until_ledger_seq: current_ledger, // Boundary: 1000 >= 1000
@@ -633,7 +622,7 @@ mod tests {
         let entry = make_contract_data_entry(contract_hash, 42, 100);
         state.create_contract_data(entry);
 
-        let key_hash = compute_key_hash(&key);
+        let key_hash = crate::soroban::compute_key_hash(&key);
         let ttl = TtlEntry {
             key_hash: key_hash.clone(),
             live_until_ledger_seq: current_ledger + 100, // Valid TTL

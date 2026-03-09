@@ -489,17 +489,6 @@ struct RentChange {
     new_live_until_ledger: u32,
 }
 
-fn ledger_key_hash(key: &stellar_xdr::curr::LedgerKey) -> stellar_xdr::curr::Hash {
-    use sha2::{Digest, Sha256};
-    use stellar_xdr::curr::WriteXdr;
-
-    let mut hasher = Sha256::new();
-    if let Ok(bytes) = key.to_xdr(stellar_xdr::curr::Limits::none()) {
-        hasher.update(&bytes);
-    }
-    stellar_xdr::curr::Hash(hasher.finalize().into())
-}
-
 pub fn entry_size_for_rent_by_protocol(
     protocol_version: u32,
     entry: &stellar_xdr::curr::LedgerEntry,
@@ -632,6 +621,7 @@ fn rent_snapshot_for_keys(
         &stellar_xdr::curr::ContractCostParams,
         &stellar_xdr::curr::ContractCostParams,
     )>,
+    ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
 ) -> Vec<RentSnapshot> {
     let mut snapshots = Vec::new();
     for key in keys {
@@ -647,7 +637,7 @@ fn rent_snapshot_for_keys(
             entry_xdr.len() as u32,
             cost_params,
         );
-        let key_hash = ledger_key_hash(key);
+        let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
         let old_live_until = state
             .get_ttl(&key_hash)
             .map(|ttl| ttl.live_until_ledger_seq)
@@ -672,6 +662,7 @@ fn rent_changes_from_snapshots(
         &stellar_xdr::curr::ContractCostParams,
         &stellar_xdr::curr::ContractCostParams,
     )>,
+    ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
 ) -> Vec<RentChange> {
     let mut changes = Vec::new();
     for snapshot in snapshots {
@@ -688,7 +679,7 @@ fn rent_changes_from_snapshots(
             entry_xdr.len() as u32,
             cost_params,
         );
-        let key_hash = ledger_key_hash(&snapshot.key);
+        let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, &snapshot.key);
         let new_live_until = state
             .get_ttl(&key_hash)
             .map(|ttl| ttl.live_until_ledger_seq)
@@ -905,6 +896,7 @@ pub fn execute_operation_with_soroban(
                         state,
                         context.protocol_version,
                         soroban_config.map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
+                        ttl_key_cache,
                     )
                 })
                 .unwrap_or_default();
@@ -914,6 +906,7 @@ pub fn execute_operation_with_soroban(
                 state,
                 context,
                 soroban_data,
+                ttl_key_cache,
             )?;
             let mut exec = OperationExecutionResult::new(result);
             if matches!(
@@ -927,6 +920,7 @@ pub fn execute_operation_with_soroban(
                     state,
                     context.protocol_version,
                     soroban_config.map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
+                    ttl_key_cache,
                 );
                 let rent_fee = compute_rent_fee_by_protocol(
                     context.protocol_version,
@@ -964,7 +958,7 @@ pub fn execute_operation_with_soroban(
             if let Some(data) = soroban_data {
                 for key in data.resources.footprint.read_write.iter() {
                     // Only compute rent for entries that need restoration
-                    let key_hash = ledger_key_hash(key);
+                    let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
                     let current_ttl = state.get_ttl(&key_hash).map(|t| t.live_until_ledger_seq);
 
                     // Case 1: TTL exists and entry is live -> skip
@@ -1036,6 +1030,7 @@ pub fn execute_operation_with_soroban(
                 soroban_data,
                 config.min_persistent_entry_ttl,
                 &ha_restore_entries,
+                ttl_key_cache,
             )?;
             let mut exec = OperationExecutionResult::new(result);
             if matches!(
@@ -1049,6 +1044,7 @@ pub fn execute_operation_with_soroban(
                     state,
                     context.protocol_version,
                     soroban_config.map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
+                    ttl_key_cache,
                 );
                 let rent_fee = compute_rent_fee_by_protocol(
                     context.protocol_version,
@@ -1334,11 +1330,11 @@ mod tests {
             account_id: create_test_account_id(),
         });
 
-        let hash = ledger_key_hash(&key);
+        let hash = crate::soroban::compute_key_hash(&key);
         // Hash should be 32 bytes (256 bits)
         assert_eq!(hash.0.len(), 32);
         // Same key should produce same hash
-        let hash2 = ledger_key_hash(&key);
+        let hash2 = crate::soroban::compute_key_hash(&key);
         assert_eq!(hash.0, hash2.0);
     }
 
@@ -1351,8 +1347,8 @@ mod tests {
             account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
         });
 
-        let hash1 = ledger_key_hash(&key1);
-        let hash2 = ledger_key_hash(&key2);
+        let hash1 = crate::soroban::compute_key_hash(&key1);
+        let hash2 = crate::soroban::compute_key_hash(&key2);
 
         // Different keys should produce different hashes
         assert_ne!(hash1.0, hash2.0);
