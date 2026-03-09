@@ -316,12 +316,18 @@ pub struct LedgerStateManager {
     claimable_balances: HashMap<[u8; 32], ClaimableBalanceEntry>,
     /// Liquidity pool entries by pool ID.
     liquidity_pools: HashMap<[u8; 32], LiquidityPoolEntry>,
-    /// Sponsoring account IDs for ledger entries (only when sponsored).
+    /// Sponsoring account IDs for non-offer ledger entries (only when sponsored).
     entry_sponsorships: HashMap<LedgerKey, AccountId>,
-    /// Ledger entries that have a sponsorship extension (even if not currently sponsored).
+    /// Sponsoring account IDs for offer entries (preserved across ledger closes).
+    offer_sponsorships: HashMap<LedgerKey, AccountId>,
+    /// Non-offer entries that have a sponsorship extension (even if not currently sponsored).
     entry_sponsorship_ext: HashSet<LedgerKey>,
-    /// Last modified ledger sequence for each entry.
+    /// Offer entries that have a sponsorship extension (preserved across ledger closes).
+    offer_sponsorship_ext: HashSet<LedgerKey>,
+    /// Last modified ledger sequence for non-offer entries.
     entry_last_modified: HashMap<LedgerKey, u32>,
+    /// Last modified ledger sequence for offer entries (preserved across ledger closes).
+    offer_last_modified: HashMap<LedgerKey, u32>,
     /// Per-operation snapshot of entries before mutation.
     op_entry_snapshots: HashMap<LedgerKey, LedgerEntry>,
     /// Whether op-level snapshots are active.
@@ -483,8 +489,11 @@ impl LedgerStateManager {
             claimable_balances: HashMap::new(),
             liquidity_pools: HashMap::new(),
             entry_sponsorships: HashMap::new(),
+            offer_sponsorships: HashMap::new(),
             entry_sponsorship_ext: HashSet::new(),
+            offer_sponsorship_ext: HashSet::new(),
             entry_last_modified: HashMap::new(),
+            offer_last_modified: HashMap::new(),
             op_entry_snapshots: HashMap::new(),
             op_snapshots_active: false,
             multi_op_mode: false,
@@ -534,6 +543,86 @@ impl LedgerStateManager {
             offers_by_account_asset_loader: None,
             pool_share_tls_by_account_loader: None,
             max_seq_num_to_apply: HashMap::new(),
+        }
+    }
+
+    // ========================================================================
+    // Offer/non-offer routed metadata accessors
+    // ========================================================================
+
+    fn is_offer_key(key: &LedgerKey) -> bool {
+        matches!(key, LedgerKey::Offer(_))
+    }
+
+    fn get_entry_sponsorship(&self, key: &LedgerKey) -> Option<&AccountId> {
+        if Self::is_offer_key(key) {
+            self.offer_sponsorships.get(key)
+        } else {
+            self.entry_sponsorships.get(key)
+        }
+    }
+
+    fn insert_entry_sponsorship(&mut self, key: LedgerKey, sponsor: AccountId) {
+        if Self::is_offer_key(&key) {
+            self.offer_sponsorships.insert(key, sponsor);
+        } else {
+            self.entry_sponsorships.insert(key, sponsor);
+        }
+    }
+
+    fn remove_entry_sponsorship(&mut self, key: &LedgerKey) -> Option<AccountId> {
+        if Self::is_offer_key(key) {
+            self.offer_sponsorships.remove(key)
+        } else {
+            self.entry_sponsorships.remove(key)
+        }
+    }
+
+    fn contains_sponsorship_ext(&self, key: &LedgerKey) -> bool {
+        if Self::is_offer_key(key) {
+            self.offer_sponsorship_ext.contains(key)
+        } else {
+            self.entry_sponsorship_ext.contains(key)
+        }
+    }
+
+    fn insert_sponsorship_ext(&mut self, key: LedgerKey) {
+        if Self::is_offer_key(&key) {
+            self.offer_sponsorship_ext.insert(key);
+        } else {
+            self.entry_sponsorship_ext.insert(key);
+        }
+    }
+
+    fn remove_sponsorship_ext(&mut self, key: &LedgerKey) -> bool {
+        if Self::is_offer_key(key) {
+            self.offer_sponsorship_ext.remove(key)
+        } else {
+            self.entry_sponsorship_ext.remove(key)
+        }
+    }
+
+    fn get_last_modified(&self, key: &LedgerKey) -> Option<u32> {
+        if Self::is_offer_key(key) {
+            self.offer_last_modified.get(key).copied()
+        } else {
+            self.entry_last_modified.get(key).copied()
+        }
+    }
+
+    fn insert_last_modified(&mut self, key: LedgerKey, seq: u32) {
+        if Self::is_offer_key(&key) {
+            self.offer_last_modified.insert(key, seq);
+        } else {
+            self.entry_last_modified.insert(key, seq);
+        }
+    }
+
+    fn remove_last_modified(&mut self, key: &LedgerKey) {
+        if Self::is_offer_key(key) {
+            self.offer_last_modified.remove(key);
+        } else {
+            self.entry_last_modified.remove(key);
         }
     }
 
@@ -915,18 +1004,15 @@ impl LedgerStateManager {
         self.ttl_bucket_list_snapshot.clear();
         self.claimable_balances.clear();
         self.liquidity_pools.clear();
-        if preserve_offers {
-            // Retain sponsorship/last_modified entries for Offer keys only
-            self.entry_sponsorships
-                .retain(|k, _| matches!(k, LedgerKey::Offer(_)));
-            self.entry_sponsorship_ext
-                .retain(|k| matches!(k, LedgerKey::Offer(_)));
-            self.entry_last_modified
-                .retain(|k, _| matches!(k, LedgerKey::Offer(_)));
-        } else {
-            self.entry_sponsorships.clear();
-            self.entry_sponsorship_ext.clear();
-            self.entry_last_modified.clear();
+        // Non-offer metadata maps are always cleared.
+        // Offer metadata maps are preserved when preserve_offers=true.
+        self.entry_sponsorships.clear();
+        self.entry_sponsorship_ext.clear();
+        self.entry_last_modified.clear();
+        if !preserve_offers {
+            self.offer_sponsorships.clear();
+            self.offer_sponsorship_ext.clear();
+            self.offer_last_modified.clear();
         }
         self.entry_loader = None;
         self.offers_by_account_asset_loader = None;
@@ -1258,19 +1344,19 @@ impl LedgerStateManager {
             entry_last_modified_pre_values: self
                 .entry_last_modified_snapshots
                 .keys()
-                .map(|k| (k.clone(), self.entry_last_modified.get(k).cloned()))
+                .map(|k| (k.clone(), self.get_last_modified(k)))
                 .collect(),
             entry_sponsorship_snapshots: self.entry_sponsorship_snapshots.clone(),
             entry_sponsorship_ext_snapshots: self.entry_sponsorship_ext_snapshots.clone(),
             entry_sponsorship_pre_values: self
                 .entry_sponsorship_snapshots
                 .keys()
-                .map(|k| (k.clone(), self.entry_sponsorships.get(k).cloned()))
+                .map(|k| (k.clone(), self.get_entry_sponsorship(k).cloned()))
                 .collect(),
             entry_sponsorship_ext_pre_values: self
                 .entry_sponsorship_ext_snapshots
                 .keys()
-                .map(|k| (k.clone(), self.entry_sponsorship_ext.contains(k)))
+                .map(|k| (k.clone(), self.contains_sponsorship_ext(k)))
                 .collect(),
 
             op_entry_snapshot_keys: self.op_entry_snapshots.keys().cloned().collect(),
@@ -1387,27 +1473,85 @@ impl LedgerStateManager {
         self.modified_liquidity_pools
             .truncate(sp.modified_liquidity_pools_len);
 
-        // Phase 6: Restore entry metadata
-        rollback_new_snapshots(
-            &mut self.entry_last_modified,
-            &self.entry_last_modified_snapshots,
-            &sp.entry_last_modified_snapshots,
-        );
-        apply_pre_values(
-            &mut self.entry_last_modified,
-            sp.entry_last_modified_pre_values,
-        );
+        // Phase 6: Restore entry metadata (routed to offer/non-offer maps)
+        for (key, snapshot) in &self.entry_last_modified_snapshots {
+            if !sp.entry_last_modified_snapshots.contains_key(key) {
+                match snapshot {
+                    Some(val) => {
+                        if Self::is_offer_key(key) {
+                            self.offer_last_modified.insert(key.clone(), *val);
+                        } else {
+                            self.entry_last_modified.insert(key.clone(), *val);
+                        }
+                    }
+                    None => {
+                        if Self::is_offer_key(key) {
+                            self.offer_last_modified.remove(key);
+                        } else {
+                            self.entry_last_modified.remove(key);
+                        }
+                    }
+                }
+            }
+        }
+        for (key, value) in sp.entry_last_modified_pre_values {
+            match value {
+                Some(val) => {
+                    if Self::is_offer_key(&key) {
+                        self.offer_last_modified.insert(key, val);
+                    } else {
+                        self.entry_last_modified.insert(key, val);
+                    }
+                }
+                None => {
+                    if Self::is_offer_key(&key) {
+                        self.offer_last_modified.remove(&key);
+                    } else {
+                        self.entry_last_modified.remove(&key);
+                    }
+                }
+            }
+        }
         self.entry_last_modified_snapshots = sp.entry_last_modified_snapshots;
 
-        rollback_new_snapshots(
-            &mut self.entry_sponsorships,
-            &self.entry_sponsorship_snapshots,
-            &sp.entry_sponsorship_snapshots,
-        );
-        apply_pre_values(
-            &mut self.entry_sponsorships,
-            sp.entry_sponsorship_pre_values,
-        );
+        for (key, snapshot) in &self.entry_sponsorship_snapshots {
+            if !sp.entry_sponsorship_snapshots.contains_key(key) {
+                match snapshot {
+                    Some(entry) => {
+                        if Self::is_offer_key(key) {
+                            self.offer_sponsorships.insert(key.clone(), entry.clone());
+                        } else {
+                            self.entry_sponsorships.insert(key.clone(), entry.clone());
+                        }
+                    }
+                    None => {
+                        if Self::is_offer_key(key) {
+                            self.offer_sponsorships.remove(key);
+                        } else {
+                            self.entry_sponsorships.remove(key);
+                        }
+                    }
+                }
+            }
+        }
+        for (key, value) in sp.entry_sponsorship_pre_values {
+            match value {
+                Some(entry) => {
+                    if Self::is_offer_key(&key) {
+                        self.offer_sponsorships.insert(key, entry);
+                    } else {
+                        self.entry_sponsorships.insert(key, entry);
+                    }
+                }
+                None => {
+                    if Self::is_offer_key(&key) {
+                        self.offer_sponsorships.remove(&key);
+                    } else {
+                        self.entry_sponsorships.remove(&key);
+                    }
+                }
+            }
+        }
         self.entry_sponsorship_snapshots = sp.entry_sponsorship_snapshots;
 
         // entry_sponsorship_ext uses HashSet + bool (not Option<V>), handle inline
@@ -1420,17 +1564,33 @@ impl LedgerStateManager {
         for key in new_ext_keys {
             if let Some(&was_present) = self.entry_sponsorship_ext_snapshots.get(&key) {
                 if was_present {
-                    self.entry_sponsorship_ext.insert(key);
+                    if Self::is_offer_key(&key) {
+                        self.offer_sponsorship_ext.insert(key);
+                    } else {
+                        self.entry_sponsorship_ext.insert(key);
+                    }
                 } else {
-                    self.entry_sponsorship_ext.remove(&key);
+                    if Self::is_offer_key(&key) {
+                        self.offer_sponsorship_ext.remove(&key);
+                    } else {
+                        self.entry_sponsorship_ext.remove(&key);
+                    }
                 }
             }
         }
         for (key, was_present) in sp.entry_sponsorship_ext_pre_values {
             if was_present {
-                self.entry_sponsorship_ext.insert(key);
+                if Self::is_offer_key(&key) {
+                    self.offer_sponsorship_ext.insert(key);
+                } else {
+                    self.entry_sponsorship_ext.insert(key);
+                }
             } else {
-                self.entry_sponsorship_ext.remove(&key);
+                if Self::is_offer_key(&key) {
+                    self.offer_sponsorship_ext.remove(&key);
+                } else {
+                    self.entry_sponsorship_ext.remove(&key);
+                }
             }
         }
         self.entry_sponsorship_ext_snapshots = sp.entry_sponsorship_ext_snapshots;
@@ -1585,34 +1745,37 @@ impl LedgerStateManager {
         );
 
         // Restore entry sponsorship snapshots
-        for (key, snapshot) in self.entry_sponsorship_snapshots.drain() {
+        let sponsorship_snaps: Vec<_> = self.entry_sponsorship_snapshots.drain().collect();
+        for (key, snapshot) in sponsorship_snaps {
             match snapshot {
                 Some(entry) => {
-                    self.entry_sponsorships.insert(key, entry);
+                    self.insert_entry_sponsorship(key, entry);
                 }
                 None => {
-                    self.entry_sponsorships.remove(&key);
+                    self.remove_entry_sponsorship(&key);
                 }
             }
         }
 
         // Restore sponsorship extension snapshots
-        for (key, snapshot) in self.entry_sponsorship_ext_snapshots.drain() {
+        let ext_snaps: Vec<_> = self.entry_sponsorship_ext_snapshots.drain().collect();
+        for (key, snapshot) in ext_snaps {
             if snapshot {
-                self.entry_sponsorship_ext.insert(key);
+                self.insert_sponsorship_ext(key);
             } else {
-                self.entry_sponsorship_ext.remove(&key);
+                self.remove_sponsorship_ext(&key);
             }
         }
 
         // Restore last modified snapshots
-        for (key, snapshot) in self.entry_last_modified_snapshots.drain() {
+        let lm_snaps: Vec<_> = self.entry_last_modified_snapshots.drain().collect();
+        for (key, snapshot) in lm_snaps {
             match snapshot {
                 Some(seq) => {
-                    self.entry_last_modified.insert(key, seq);
+                    self.insert_last_modified(key, seq);
                 }
                 None => {
-                    self.entry_last_modified.remove(&key);
+                    self.remove_last_modified(&key);
                 }
             }
         }

@@ -61,44 +61,44 @@ impl LedgerStateManager {
 
     /// Return the sponsor for a ledger entry, if any.
     pub fn entry_sponsor(&self, key: &LedgerKey) -> Option<&AccountId> {
-        self.entry_sponsorships.get(key)
+        self.get_entry_sponsorship(key)
     }
 
     fn snapshot_entry_sponsorship_ext(&mut self, key: &LedgerKey) {
         if !self.entry_sponsorship_ext_snapshots.contains_key(key) {
             self.entry_sponsorship_ext_snapshots
-                .insert(key.clone(), self.entry_sponsorship_ext.contains(key));
+                .insert(key.clone(), self.contains_sponsorship_ext(key));
         }
     }
 
     fn snapshot_entry_sponsorship_metadata(&mut self, key: &LedgerKey) {
         if !self.entry_sponsorship_snapshots.contains_key(key) {
             self.entry_sponsorship_snapshots
-                .insert(key.clone(), self.entry_sponsorships.get(key).cloned());
+                .insert(key.clone(), self.get_entry_sponsorship(key).cloned());
         }
         self.snapshot_entry_sponsorship_ext(key);
     }
 
     pub(super) fn clear_entry_sponsorship_metadata(&mut self, key: &LedgerKey) {
         self.snapshot_entry_sponsorship_metadata(key);
-        self.entry_sponsorships.remove(key);
-        self.entry_sponsorship_ext.remove(key);
+        self.remove_entry_sponsorship(key);
+        self.remove_sponsorship_ext(key);
     }
 
     /// Set the sponsor for a ledger entry.
     pub fn set_entry_sponsor(&mut self, key: LedgerKey, sponsor: AccountId) {
         self.snapshot_entry_sponsorship_metadata(&key);
         self.capture_op_snapshot_for_key(&key);
-        self.entry_sponsorships.insert(key.clone(), sponsor);
-        self.entry_sponsorship_ext.insert(key);
+        self.insert_entry_sponsorship(key.clone(), sponsor);
+        self.insert_sponsorship_ext(key);
     }
 
     /// Remove and return the sponsor for a ledger entry, if any.
     pub fn remove_entry_sponsor(&mut self, key: &LedgerKey) -> Option<AccountId> {
         self.snapshot_entry_sponsorship_metadata(key);
         self.capture_op_snapshot_for_key(key);
-        self.entry_sponsorship_ext.insert(key.clone());
-        self.entry_sponsorships.remove(key)
+        self.insert_sponsorship_ext(key.clone());
+        self.remove_entry_sponsorship(key)
     }
 
     /// Apply sponsorship to a newly created ledger entry owned by `sponsored`.

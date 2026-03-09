@@ -32,10 +32,7 @@ impl LedgerStateManager {
     }
 
     pub(super) fn last_modified_for_key(&self, key: &LedgerKey) -> u32 {
-        self.entry_last_modified
-            .get(key)
-            .copied()
-            .unwrap_or(self.ledger_seq)
+        self.get_last_modified(key).unwrap_or(self.ledger_seq)
     }
 
     pub(super) fn last_modified_snapshot_for_key(&self, key: &LedgerKey) -> Option<u32> {
@@ -47,18 +44,18 @@ impl LedgerStateManager {
 
     pub(super) fn snapshot_last_modified_key(&mut self, key: &LedgerKey) {
         if !self.entry_last_modified_snapshots.contains_key(key) {
-            let snapshot = self.entry_last_modified.get(key).copied();
+            let snapshot = self.get_last_modified(key);
             self.entry_last_modified_snapshots
                 .insert(key.clone(), snapshot);
         }
     }
 
     pub(super) fn set_last_modified_key(&mut self, key: LedgerKey, seq: u32) {
-        self.entry_last_modified.insert(key, seq);
+        self.insert_last_modified(key, seq);
     }
 
     pub(super) fn remove_last_modified_key(&mut self, key: &LedgerKey) {
-        self.entry_last_modified.remove(key);
+        self.remove_last_modified(key);
     }
 
     pub(super) fn ledger_entry_ext_for_snapshot(&self, key: &LedgerKey) -> LedgerEntryExt {
@@ -66,11 +63,11 @@ impl LedgerStateManager {
             .entry_sponsorship_ext_snapshots
             .get(key)
             .copied()
-            .unwrap_or_else(|| self.entry_sponsorship_ext.contains(key));
+            .unwrap_or_else(|| self.contains_sponsorship_ext(key));
         let sponsor_snapshot = if let Some(snapshot) = self.entry_sponsorship_snapshots.get(key) {
             snapshot.clone()
         } else {
-            self.entry_sponsorships.get(key).cloned()
+            self.get_entry_sponsorship(key).cloned()
         };
 
         if ext_present || sponsor_snapshot.is_some() {
@@ -93,8 +90,8 @@ impl LedgerStateManager {
     }
 
     pub(super) fn ledger_entry_ext_for(&self, key: &LedgerKey) -> LedgerEntryExt {
-        let sponsor = self.entry_sponsorships.get(key).cloned();
-        if self.entry_sponsorship_ext.contains(key) || sponsor.is_some() {
+        let sponsor = self.get_entry_sponsorship(key).cloned();
+        if self.contains_sponsorship_ext(key) || sponsor.is_some() {
             LedgerEntryExt::V1(LedgerEntryExtensionV1 {
                 sponsoring_id: SponsorshipDescriptor(sponsor),
                 ext: LedgerEntryExtensionV1Ext::V0,
@@ -124,13 +121,12 @@ impl LedgerStateManager {
         has_sponsorship_ext: bool,
         sponsor: Option<AccountId>,
     ) {
-        self.entry_last_modified
-            .insert(ledger_key.clone(), last_modified);
+        self.insert_last_modified(ledger_key.clone(), last_modified);
         if has_sponsorship_ext {
-            self.entry_sponsorship_ext.insert(ledger_key.clone());
+            self.insert_sponsorship_ext(ledger_key.clone());
         }
         if let Some(sponsor) = sponsor {
-            self.entry_sponsorships.insert(ledger_key, sponsor);
+            self.insert_entry_sponsorship(ledger_key, sponsor);
         }
     }
 
@@ -544,9 +540,9 @@ impl LedgerStateManager {
             }
         }
 
-        self.entry_sponsorships.remove(key);
-        self.entry_sponsorship_ext.remove(key);
-        self.entry_last_modified.remove(key);
+        self.remove_entry_sponsorship(key);
+        self.remove_sponsorship_ext(key);
+        self.remove_last_modified(key);
     }
 
     /// Delete an account entry.
