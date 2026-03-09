@@ -39,5 +39,6 @@ stellar-strkey.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
 siphasher = "0.3"
+once_cell.workspace = true
 
 [dev-dependencies]

@@ -11,9 +11,68 @@
 //! of the public key. When verifying, the hint can quickly filter candidate
 //! keys before performing the expensive signature verification.
 
+use std::collections::{HashMap, VecDeque};
+use std::sync::Mutex;
+
+use once_cell::sync::Lazy;
+use sha2::{Digest, Sha256};
+
 use crate::error::CryptoError;
 use crate::keys::{PublicKey, SecretKey, Signature};
 use henyey_common::Hash256;
+
+/// Default capacity for the signature verification cache, matching stellar-core's
+/// `gVerifySigCache` (250K entries) in `SecretKey.cpp`.
+const SIG_CACHE_CAPACITY: usize = 250_000;
+
+/// Global ed25519 signature verification cache.
+///
+/// Keyed by SHA-256(pubkey || signature || message_hash). Matches stellar-core's
+/// global `gVerifySigCache` which persists across the validator lifetime so that
+/// signatures verified during flood/nomination get cache hits during apply.
+static SIG_VERIFY_CACHE: Lazy<Mutex<SigVerifyCache>> =
+    Lazy::new(|| Mutex::new(SigVerifyCache::new(SIG_CACHE_CAPACITY)));
+
+struct SigVerifyCache {
+    map: HashMap<[u8; 32], bool>,
+    order: VecDeque<[u8; 32]>,
+    capacity: usize,
+}
+
+impl SigVerifyCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            map: HashMap::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn get(&self, key: &[u8; 32]) -> Option<bool> {
+        self.map.get(key).copied()
+    }
+
+    fn insert(&mut self, key: [u8; 32], value: bool) {
+        if self.map.contains_key(&key) {
+            return;
+        }
+        if self.map.len() >= self.capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+        self.map.insert(key, value);
+        self.order.push_back(key);
+    }
+}
+
+fn compute_cache_key(pubkey: &[u8; 32], sig: &[u8; 64], hash: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(pubkey);
+    hasher.update(sig);
+    hasher.update(hash);
+    hasher.finalize().into()
+}
 
 /// Signs arbitrary data with a secret key.
 ///
@@ -121,7 +180,13 @@ pub fn sign_hash(secret_key: &SecretKey, hash: &Hash256) -> Signature {
     secret_key.sign(hash.as_bytes())
 }
 
-/// Verifies a signature over a hash value.
+/// Verifies a signature over a hash value, using a global cache to avoid
+/// redundant ed25519 verification.
+///
+/// The cache matches stellar-core's `gVerifySigCache` in `SecretKey.cpp`.
+/// Within a TX, the same signature is verified 2+N times (N = num ops);
+/// across flood→apply, each TX signature is verified twice. The cache
+/// reduces all repeated verifications to a HashMap lookup.
 ///
 /// # Errors
 ///
@@ -131,7 +196,30 @@ pub fn verify_hash(
     hash: &Hash256,
     signature: &Signature,
 ) -> Result<(), CryptoError> {
-    public_key.verify(hash.as_bytes(), signature)
+    let cache_key = compute_cache_key(public_key.as_bytes(), signature.as_bytes(), hash.as_bytes());
+
+    // Check cache (lock held only for HashMap lookup, not during crypto)
+    {
+        let cache = SIG_VERIFY_CACHE.lock().unwrap();
+        if let Some(result) = cache.get(&cache_key) {
+            return if result {
+                Ok(())
+            } else {
+                Err(CryptoError::InvalidSignature)
+            };
+        }
+    }
+
+    // Cache miss — perform actual ed25519 verification
+    let result = public_key.verify(hash.as_bytes(), signature);
+
+    // Store result in cache
+    {
+        let mut cache = SIG_VERIFY_CACHE.lock().unwrap();
+        cache.insert(cache_key, result.is_ok());
+    }
+
+    result
 }
 
 #[cfg(test)]
