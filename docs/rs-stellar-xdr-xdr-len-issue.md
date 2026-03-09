@@ -19,6 +19,30 @@ This pattern appears ~4 times per footprint entry in `get_ledger_changes()` / `g
 
 In the context of the Stellar network, this matters: every microsecond in the ledger close path affects validator performance. The henyey validator project measured ~303ms mean ledger close time and is working to reduce it toward stellar-core's ~168ms. Eliminating unnecessary allocations and serialization in the hot path contributes to that goal.
 
+### Prior art: C++ `xdrpp` already has this
+
+The C++ XDR library used by stellar-core (`lib/xdrpp`) has provided zero-allocation size computation since its inception via `xdr::xdr_size()`:
+
+```cpp
+// lib/xdrpp/xdrpp/types.h:222
+template<typename T> std::size_t
+xdr_size(const T&t) {
+  return xdr_traits<T>::serial_size(t);
+}
+```
+
+Each XDR type has a `serial_size()` specialization that recursively sums field sizes without allocating or serializing. stellar-core uses this extensively in its C++ code paths — `ExtendFootprintTTLOpFrame`, `RestoreFootprintOpFrame`, and `InMemorySorobanState` all compute entry sizes this way.
+
+The Rust `rs-stellar-xdr` library is simply missing this counterpart. The proposed `xdr_len()` brings the Rust library to parity with what the C++ library has always had.
+
+### Impact on stellar-core
+
+This benefits stellar-core's own Rust code (soroban-env-host), not just external consumers:
+
+- **Old entry sizes in `get_ledger_changes()`**: The "before" snapshot entries are serialized purely to measure their byte length, then the buffer is dropped. An `xdr_len()` method eliminates this allocation entirely.
+- **New/modified entry sizes**: These serializations serve double duty (the bytes are returned as `encoded_new_value`), so `xdr_len()` doesn't help here in the bytes-based API. However, the new typed API (`invoke_host_function_typed` / `get_ledger_changes_typed`) doesn't produce encoded bytes at all, so ALL size computations there would benefit.
+- **Simulation code** (`soroban-simulation/src/resources.rs`): Calls `entry.to_xdr(limits)?.len()` for size computation — would benefit directly.
+
 ## Proposed Change
 
 Add a method to the `WriteXdr` trait:
