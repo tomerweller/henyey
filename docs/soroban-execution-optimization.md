@@ -53,7 +53,7 @@ this bookkeeping is redundant — the "operation changes" ARE the "transaction c
 
 | Component | Time | Optimizable? |
 |-----------|------|-------------|
-| executor_setup (HashMap retain for offers) | 10.5ms | **Yes** — offer/non-offer map split |
+| executor_setup (HashMap retain for offers) | 10.5ms | ✅ Fixed (Step 3 — offer/non-offer map split) |
 | post_exec (fee event generation) | 7.9ms | ✅ Fixed (Step 4 — reuses prepared TX data) |
 | tx_parse (XDR deserialization) | 7.4ms | ✅ Fixed (Step 4 — single prepare() call) |
 | fee_deduct + preload | 5.0ms | Minor |
@@ -202,29 +202,29 @@ building meta lazily/on-demand).
 
 ---
 
-### Step 3: Executor Setup — Offer/Non-Offer Map Split (Expected: −8 to −10ms)
+### Step 3: Executor Setup — Offer/Non-Offer Map Split ✅ DONE
 
-**Status**: Not started
+**Commit**: `0edb0d4` | **Result**: −8.83ms (A/B on 1000 ledgers)
 
-**Problem**: `clear_cached_entries_preserving_offers()` calls `.retain()` on three
-maps (`entry_sponsorships`, `entry_sponsorship_ext`, `entry_last_modified`), iterating
-all entries to keep only Offer keys. These maps accumulate entries of all types
-(accounts, trustlines, contracts, etc.) during a ledger. The `.retain()` cost is
-O(total entries) regardless of how many are offers. Measured at 10.5ms per ledger.
+Split `entry_sponsorships`, `entry_sponsorship_ext`, and `entry_last_modified` into
+offer-specific and non-offer maps. On `clear_cached_entries_preserving_offers()`,
+non-offer maps call `.clear()` (O(1)) instead of `.retain()` (O(n) scan).
 
-**How stellar-core solves it**: No equivalent cost. State is ephemeral per-ledger
-via scope-based `LedgerTxn`.
+Added `is_offer_key()` routing and helper methods (`get_entry_sponsorship`,
+`insert_entry_sponsorship`, etc.) to abstract the split. Updated all access points
+in `entries.rs`, `sponsorship.rs`, and rollback/savepoint logic in `mod.rs`.
 
-**Solution**: Split each map into offer-specific and non-offer maps:
-- On insert, route based on `LedgerKey::Offer(_)` match
-- On lookup, check both maps
-- On `clear_cached_entries_preserving_offers()`, call `.clear()` on non-offer maps
-  (O(1) amortized) and leave offer maps untouched
+**A/B benchmark** (1000 ledgers, 61349000–61350000):
 
-**Files to modify**:
-- `crates/tx/src/state/mod.rs` — split the three maps, update insert/get/remove
+| | Step 4 only | Step 4 + Step 3 | Delta |
+|--|-------------|-----------------|-------|
+| Average per ledger | 337.05ms | 328.22ms | −8.83ms (−2.6%) |
+| tx_exec | 302.08ms | 294.70ms | −7.38ms |
 
-**Benchmark gate**: Expected: mean ≤ 294ms. If improvement < 4ms, investigate.
+**Files modified**:
+- `crates/tx/src/state/mod.rs` — split maps, helpers, updated clear/rollback/savepoint
+- `crates/tx/src/state/entries.rs` — routed via helpers
+- `crates/tx/src/state/sponsorship.rs` — routed via helpers
 
 ---
 
@@ -321,7 +321,7 @@ For each step:
 | 1: TTL key hash caching | `a1db12f` | 307.1ms | −10.4ms | −10.4ms | SHA-256 was <1μs/call |
 | 2: Incremental mutation tracking | `b74e111` | 303.6ms | −3.5ms | −13.9ms | Savepoint ~2μs for Soroban (not 100-150μs) |
 | 2b: Meta construction cleanup | `3b48532` | ~303.6ms | ~0ms | −13.9ms | Code cleanup only, no perf gain |
-| 3: Offer/non-offer maps | | | | | |
+| 3: Offer/non-offer maps | `0edb0d4` | 328.2ms* | −8.83ms* | — | A/B on 1000 ledgers |
 | 4: Unified TX set parsing | `3f8a47f` | 346.1ms* | −240.8ms* | — | A/B on 1000 ledgers; *delta inflated by system conditions |
 | 5: Streamline fee_seq | | | | | |
 
@@ -335,7 +335,7 @@ For each step:
 | 1: TTL key hash caching | −10ms | 307ms | 1.82x |
 | 2: Incremental mutation tracking | −3.5ms | 303.6ms | 1.80x |
 | 2b: Meta construction cleanup | 0ms | 303.6ms | 1.80x |
-| 3: Offer/non-offer maps | −8 to −10ms | 294–296ms | 1.74–1.76x |
+| 3: Offer/non-offer maps | −8.83ms | ~295ms | ~1.75x |
 | 4: Unified TX set parsing | ~−10ms (est.) | ~294ms | ~1.74x |
 | 5: Streamline fee_seq | −5 to −10ms | 269–281ms | 1.60–1.67x |
 
@@ -371,23 +371,9 @@ steps alone. Closing the gap further would require structural changes — see
 
 ## Remaining Optimization Targets
 
-Ranked by expected impact and confidence. Steps 1, 2, 2b, and 4 are done.
+Ranked by expected impact and confidence. Steps 1, 2, 2b, 3, and 4 are done.
 
-### 1. Offer/Non-Offer Map Split (Step 3) — Recommended next
-
-**Expected gain**: −8 to −10ms | **Confidence**: High | **Complexity**: Low
-
-**Problem**: `clear_cached_entries_preserving_offers()` calls `.retain()` on three
-maps, scanning all entries (accounts, trustlines, contracts, etc.) to keep only
-Offer keys. Cost is O(total entries) = 10.5ms per ledger.
-
-**Solution**: Split each map into offer-specific and non-offer maps. On clear,
-`.clear()` the non-offer maps (O(1)) and leave offer maps untouched.
-
-**Why recommended**: Simplest remaining change. Purely mechanical. Low risk.
-Measured with `Instant` instrumentation (not sampled), so the estimate is reliable.
-
-### 2. Meta Construction — Arc<LedgerEntry> (new)
+### 1. Meta Construction — Arc<LedgerEntry>
 
 **Expected gain**: −15 to −25ms | **Confidence**: Medium | **Complexity**: High
 
@@ -408,7 +394,7 @@ clones would cut the gap to stellar-core significantly.
 Requires auditing all mutation patterns. Large blast radius but the change is
 conceptually simple (replace `LedgerEntry` with `Arc<LedgerEntry>` everywhere).
 
-### 3. Streamline fee_seq Processing (Step 5)
+### 2. Streamline fee_seq Processing (Step 5)
 
 **Expected gain**: −5 to −10ms | **Confidence**: Medium | **Complexity**: Medium
 
@@ -419,7 +405,7 @@ conceptually simple (replace `LedgerEntry` with `Arc<LedgerEntry>` everywhere).
 **Solution**: Combine the three delta-tracking phases for Soroban TXs (single op,
 no PreAuthTx signers). Skip signer removal iteration when unnecessary.
 
-### 4. Executor Setup Optimization (minor)
+### 3. Executor Setup Optimization (minor)
 
 **Expected gain**: −2 to −5ms | **Confidence**: Medium | **Complexity**: Low
 
@@ -429,10 +415,10 @@ config across ledgers when it hasn't changed.
 
 ---
 
-**Recommendation**: Do Step 3 (offer maps, −8-10ms) first — it's mechanical and
-reliable. Then re-profile with fresh instrumentation to validate whether
+**Recommendation**: Re-profile with fresh instrumentation to validate whether
 Arc<LedgerEntry> or fee_seq streamlining has the higher actual impact before
-committing to the larger refactor.
+committing to the larger refactor. Arc<LedgerEntry> has the highest potential
+gain but also the highest risk and complexity.
 
 ---
 
