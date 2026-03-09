@@ -1624,13 +1624,13 @@ impl TransactionExecutor {
         self.state.flush_modified_entries();
 
         let delta_after_fee = delta_snapshot(&self.state);
-        let delta_changes =
-            delta_changes_between(self.state.delta(), delta_before_fee, delta_after_fee);
+        let delta_slice =
+            delta_slice_between(self.state.delta(), delta_before_fee, delta_after_fee);
         let fee_changes = build_entry_changes_with_state_overrides(
             &self.state,
-            &delta_changes.created,
-            &delta_changes.updated,
-            &delta_changes.deleted,
+            delta_slice.created(),
+            delta_slice.updated(),
+            delta_slice.deleted(),
             &state_overrides,
         );
 
@@ -2121,11 +2121,11 @@ impl TransactionExecutor {
 
             self.state.flush_modified_entries();
             let delta_after_fee = delta_snapshot(&self.state);
-            let delta_changes =
-                delta_changes_between(self.state.delta(), delta_before_fee, delta_after_fee);
-            fee_created = delta_changes.created;
-            fee_updated = delta_changes.updated;
-            fee_deleted = delta_changes.deleted;
+            let delta_slice =
+                delta_slice_between(self.state.delta(), delta_before_fee, delta_after_fee);
+            fee_created = delta_slice.created().to_vec();
+            fee_updated = delta_slice.updated().to_vec();
+            fee_deleted = delta_slice.deleted().to_vec();
             let fee_changes = build_entry_changes_with_state(
                 &self.state,
                 &fee_created,
@@ -2242,14 +2242,14 @@ impl TransactionExecutor {
             );
             self.state.flush_modified_entries();
             let delta_after_signers = delta_snapshot(&self.state);
-            let delta_changes = delta_changes_between(
+            let delta_slice = delta_slice_between(
                 self.state.delta(),
                 delta_before_signers,
                 delta_after_signers,
             );
-            signer_created = delta_changes.created;
-            signer_updated = delta_changes.updated;
-            signer_deleted = delta_changes.deleted;
+            signer_created = delta_slice.created().to_vec();
+            signer_updated = delta_slice.updated().to_vec();
+            signer_deleted = delta_slice.deleted().to_vec();
             signer_changes = build_entry_changes_with_state_overrides(
                 &self.state,
                 &signer_created,
@@ -2278,8 +2278,8 @@ impl TransactionExecutor {
         }
         self.state.flush_modified_entries();
         let delta_after_seq = delta_snapshot(&self.state);
-        let delta_changes =
-            delta_changes_between(self.state.delta(), delta_before_seq, delta_after_seq);
+        let delta_slice =
+            delta_slice_between(self.state.delta(), delta_before_seq, delta_after_seq);
         // Use the pre-modification snapshot for STATE entry via state_overrides.
         let mut seq_state_overrides = HashMap::new();
         if let Some(entry) = seq_state_override {
@@ -2287,14 +2287,14 @@ impl TransactionExecutor {
         }
         let seq_changes = build_entry_changes_with_state_overrides(
             &self.state,
-            &delta_changes.created,
-            &delta_changes.updated,
-            &delta_changes.deleted,
+            delta_slice.created(),
+            delta_slice.updated(),
+            delta_slice.deleted(),
             &seq_state_overrides,
         );
-        seq_created = delta_changes.created;
-        seq_updated = delta_changes.updated;
-        seq_deleted = delta_changes.deleted;
+        seq_created = delta_slice.created().to_vec();
+        seq_updated = delta_slice.updated().to_vec();
+        seq_deleted = delta_slice.deleted().to_vec();
 
         // Merge all changes into tx_changes_before.
         // Order: fee_bump_wrapper_changes (fee source), seq_changes (inner source seq bump).
@@ -2680,8 +2680,13 @@ impl TransactionExecutor {
                 // Execute the operation with a per-operation savepoint.
                 // If the operation fails, we roll back its state changes so
                 // subsequent operations see clean state (matching stellar-core LedgerTxn).
+                // For single-op TXs, skip savepoint creation — TX-level rollback handles failures.
                 let op_index = u32::try_from(op_index).unwrap_or(u32::MAX);
-                let op_savepoint = self.state.create_savepoint();
+                let op_savepoint = if num_ops == 1 {
+                    None
+                } else {
+                    Some(self.state.create_savepoint())
+                };
                 let result = self.execute_single_operation(
                     op,
                     &op_source,
@@ -2756,17 +2761,19 @@ impl TransactionExecutor {
                             }
                             // Roll back failed operation's state changes so subsequent
                             // operations see clean state (matches stellar-core nested LedgerTxn).
-                            self.state.rollback_to_savepoint(op_savepoint);
+                            if let Some(sp) = op_savepoint {
+                                self.state.rollback_to_savepoint(sp);
+                            }
                         }
                         operation_results.push(op_result.clone());
 
                         let op_delta_after = delta_snapshot(&self.state);
-                        let delta_changes = delta_changes_between(
+                        let op_snapshots = self.state.end_op_snapshot();
+                        let delta_slice = delta_slice_between(
                             self.state.delta(),
                             op_delta_before,
                             op_delta_after,
                         );
-                        let op_snapshots = self.state.end_op_snapshot();
 
                         // For Soroban operations, extract restored entries (hot archive and live BL)
                         let (restored_entries, footprint) = if op_type.is_soroban() {
@@ -2829,8 +2836,8 @@ impl TransactionExecutor {
                             // go into `updated` (not `created`) because they already exist in state.
                             // We only want RESTORED emission for entries actually being created/restored
                             // in THIS transaction.
-                            let created_keys: HashSet<LedgerKey> = delta_changes
-                                .created
+                            let created_keys: HashSet<LedgerKey> = delta_slice
+                                .created()
                                 .iter()
                                 .filter_map(|entry| crate::delta::entry_to_key(entry).ok())
                                 .collect();
@@ -2918,13 +2925,14 @@ impl TransactionExecutor {
                             (RestoredEntries::default(), None)
                         };
 
+                        let change_order = delta_slice.change_order();
                         let ledger_changes = LedgerChanges {
-                            created: &delta_changes.created,
-                            updated: &delta_changes.updated,
-                            update_states: &delta_changes.update_states,
-                            deleted: &delta_changes.deleted,
-                            delete_states: &delta_changes.delete_states,
-                            change_order: &delta_changes.change_order,
+                            created: delta_slice.created(),
+                            updated: delta_slice.updated(),
+                            update_states: delta_slice.update_states(),
+                            deleted: delta_slice.deleted(),
+                            delete_states: delta_slice.delete_states(),
+                            change_order: &change_order,
                             state_overrides: &op_snapshots,
                             restored: &restored_entries,
                         };
@@ -2970,7 +2978,9 @@ impl TransactionExecutor {
                         }
                     }
                     Err(e) => {
-                        self.state.rollback_to_savepoint(op_savepoint);
+                        if let Some(sp) = op_savepoint {
+                            self.state.rollback_to_savepoint(sp);
+                        }
                         self.state.end_op_snapshot();
                         all_success = false;
                         tracing::debug!(
@@ -3659,14 +3669,65 @@ pub struct DeltaSnapshot {
     change_order: usize,
 }
 
-/// Result of extracting delta changes between two snapshots.
-pub struct DeltaChanges {
-    created: Vec<LedgerEntry>,
-    updated: Vec<LedgerEntry>,
-    update_states: Vec<LedgerEntry>,
-    deleted: Vec<LedgerKey>,
-    delete_states: Vec<LedgerEntry>,
-    change_order: Vec<henyey_tx::ChangeRef>,
+/// Zero-copy view into a range of delta changes between two snapshots.
+/// Avoids cloning vectors by referencing the parent `LedgerDelta` directly.
+pub struct DeltaSlice<'a> {
+    delta: &'a henyey_tx::LedgerDelta,
+    start: DeltaSnapshot,
+    end: DeltaSnapshot,
+}
+
+impl<'a> DeltaSlice<'a> {
+    pub fn created(&self) -> &[LedgerEntry] {
+        &self.delta.created_entries()[self.start.created..self.end.created]
+    }
+
+    pub fn updated(&self) -> &[LedgerEntry] {
+        &self.delta.updated_entries()[self.start.updated..self.end.updated]
+    }
+
+    pub fn update_states(&self) -> &[LedgerEntry] {
+        &self.delta.update_states()[self.start.updated..self.end.updated]
+    }
+
+    pub fn deleted(&self) -> &[LedgerKey] {
+        &self.delta.deleted_keys()[self.start.deleted..self.end.deleted]
+    }
+
+    pub fn delete_states(&self) -> &[LedgerEntry] {
+        &self.delta.delete_states()[self.start.deleted..self.end.deleted]
+    }
+
+    pub fn change_order(&self) -> Vec<henyey_tx::ChangeRef> {
+        self.delta.change_order()[self.start.change_order..self.end.change_order]
+            .iter()
+            .filter_map(|change_ref| {
+                match change_ref {
+                    henyey_tx::ChangeRef::Created(idx) => {
+                        if *idx >= self.start.created && *idx < self.end.created {
+                            Some(henyey_tx::ChangeRef::Created(*idx - self.start.created))
+                        } else {
+                            None
+                        }
+                    }
+                    henyey_tx::ChangeRef::Updated(idx) => {
+                        if *idx >= self.start.updated && *idx < self.end.updated {
+                            Some(henyey_tx::ChangeRef::Updated(*idx - self.start.updated))
+                        } else {
+                            None
+                        }
+                    }
+                    henyey_tx::ChangeRef::Deleted(idx) => {
+                        if *idx >= self.start.deleted && *idx < self.end.deleted {
+                            Some(henyey_tx::ChangeRef::Deleted(*idx - self.start.deleted))
+                        } else {
+                            None
+                        }
+                    }
+                }
+            })
+            .collect()
+    }
 }
 
 const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;

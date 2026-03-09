@@ -54,58 +54,12 @@ pub(super) fn delta_snapshot(state: &LedgerStateManager) -> DeltaSnapshot {
     }
 }
 
-pub(super) fn delta_changes_between(
-    delta: &henyey_tx::LedgerDelta,
+pub(super) fn delta_slice_between<'a>(
+    delta: &'a henyey_tx::LedgerDelta,
     start: DeltaSnapshot,
     end: DeltaSnapshot,
-) -> DeltaChanges {
-    let created = delta.created_entries()[start.created..end.created].to_vec();
-    let updated = delta.updated_entries()[start.updated..end.updated].to_vec();
-    let update_states = delta.update_states()[start.updated..end.updated].to_vec();
-    let deleted = delta.deleted_keys()[start.deleted..end.deleted].to_vec();
-    let delete_states = delta.delete_states()[start.deleted..end.deleted].to_vec();
-
-    // Adjust change_order indices to be relative to the sliced vectors
-    // Global indices need to be converted to local (sliced) indices
-    let change_order: Vec<henyey_tx::ChangeRef> = delta.change_order()
-        [start.change_order..end.change_order]
-        .iter()
-        .filter_map(|change_ref| {
-            match change_ref {
-                henyey_tx::ChangeRef::Created(idx) => {
-                    // Convert global index to local: subtract start offset
-                    if *idx >= start.created && *idx < end.created {
-                        Some(henyey_tx::ChangeRef::Created(*idx - start.created))
-                    } else {
-                        None // Index out of range for this slice
-                    }
-                }
-                henyey_tx::ChangeRef::Updated(idx) => {
-                    if *idx >= start.updated && *idx < end.updated {
-                        Some(henyey_tx::ChangeRef::Updated(*idx - start.updated))
-                    } else {
-                        None
-                    }
-                }
-                henyey_tx::ChangeRef::Deleted(idx) => {
-                    if *idx >= start.deleted && *idx < end.deleted {
-                        Some(henyey_tx::ChangeRef::Deleted(*idx - start.deleted))
-                    } else {
-                        None
-                    }
-                }
-            }
-        })
-        .collect();
-
-    DeltaChanges {
-        created,
-        updated,
-        update_states,
-        deleted,
-        delete_states,
-        change_order,
-    }
+) -> DeltaSlice<'a> {
+    DeltaSlice { delta, start, end }
 }
 
 pub(super) fn allow_trust_asset(op: &AllowTrustOp, issuer: &AccountId) -> Asset {
