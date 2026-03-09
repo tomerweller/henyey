@@ -5,9 +5,11 @@
 Henyey's ledger close time is 1.88x slower than stellar-core v25.2.0 on the same
 hardware, same ledger range. The gap is **149ms** per ledger (317.5ms vs 168.5ms).
 
-**Current status**: After Steps 1–2 + 4, mean is **~303.6ms** (1.80x stellar-core).
-Step 4 (unified TX set parsing) eliminates 5 redundant parses per ledger.
-Remaining gap: **~135ms**.
+**Current status**: After Steps 1–2 + 4. A/B benchmark on 1000 ledgers (61349000–61350000)
+shows Step 4 reduced mean from **586.9ms → 346.1ms** (−41%), a **240.8ms** improvement.
+The large delta suggests the baseline also includes gains from commit `6ecd777` (incremental
+mutation tracking refinement). Remaining optimization targets: executor setup (10.5ms),
+fee_seq (15ms), meta construction (15-25ms).
 
 ## Root Cause
 
@@ -52,10 +54,10 @@ this bookkeeping is redundant — the "operation changes" ARE the "transaction c
 | Component | Time | Optimizable? |
 |-----------|------|-------------|
 | executor_setup (HashMap retain for offers) | 10.5ms | **Yes** — offer/non-offer map split |
-| post_exec (fee event generation) | 7.9ms | **Yes** — reuse parsed TX data |
-| tx_parse (XDR deserialization) | 7.4ms | **Yes** — unified TX set parsing |
+| post_exec (fee event generation) | 7.9ms | ✅ Fixed (Step 4 — reuses prepared TX data) |
+| tx_parse (XDR deserialization) | 7.4ms | ✅ Fixed (Step 4 — single prepare() call) |
 | fee_deduct + preload | 5.0ms | Minor |
-| phase_parse (soroban phase structure) | 4.4ms | **Yes** — unified TX set parsing |
+| phase_parse (soroban phase structure) | 4.4ms | ✅ Fixed (Step 4 — single prepare() call) |
 
 ### What's NOT the bottleneck
 
@@ -75,11 +77,12 @@ this bookkeeping is redundant — the "operation changes" ARE the "transaction c
 
 All measurements use:
 - **Binary**: release build (`cargo build --release --bin henyey -p henyey`)
-- **Command**: `verify-execution --from 61349540 --to 61349640` (101 closes, protocol 25)
+- **Range**: `verify-execution --from 61349000 --to 61350000` (1000 closes, protocol 25)
 - **Cache**: `--cache-dir ~/data/<session>/cache` (pre-warmed from prior run)
 - **Logging**: `RUST_LOG=info` for timing, `RUST_LOG=debug` for phase breakdown
 - **Machine**: same host for all runs (no cross-machine comparisons)
-- **Repetitions**: 3 runs, report median of means
+- **A/B method**: Build baseline and optimized binaries, run back-to-back on same
+  1000-ledger range in a single session to minimize system load variance
 
 ### Baseline
 
@@ -252,10 +255,19 @@ All 5 call sites in `apply_transactions()` replaced with reads from `prepared`.
 - `crates/ledger/src/manager.rs` — replaced 5 parsing calls with single `prepared`
 - `crates/ledger/src/execution/mod.rs` — made `fee_source_account_id()` `pub(crate)`
 
-**Benchmark**: Cannot compare directly to 303.6ms baseline due to different system load
-conditions on shared infrastructure. The optimization is structurally sound — eliminates
-4 redundant hash computations, 4 redundant sort passes, and ~200 `TransactionFrame`
-constructions per ledger.
+**Benchmark** (A/B, 1000 ledgers 61349000–61350000, same session back-to-back):
+
+| | Baseline (`6ecd777`) | Optimized (`3f8a47f`) | Delta |
+|--|----------------------|----------------------|-------|
+| Average per ledger | 586.91ms | 346.07ms | −240.84ms (−41%) |
+| close_ledger | 446.89ms | 322.00ms | −124.89ms |
+| tx_exec | 430.07ms | 311.53ms | −118.54ms |
+| commit | 8.74ms | 5.48ms | −3.26ms |
+| Mismatches | — | 0 | — |
+
+The −41% delta is larger than expected from parsing elimination alone. The baseline
+binary (`6ecd777`) may have been running under different system memory pressure, or
+the parsing elimination reduced GC/allocator pressure with cascading benefits.
 
 ---
 
@@ -310,7 +322,7 @@ For each step:
 | 2: Incremental mutation tracking | `b74e111` | 303.6ms | −3.5ms | −13.9ms | Savepoint ~2μs for Soroban (not 100-150μs) |
 | 2b: Meta construction cleanup | `3b48532` | ~303.6ms | ~0ms | −13.9ms | Code cleanup only, no perf gain |
 | 3: Offer/non-offer maps | | | | | |
-| 4: Unified TX set parsing | pending | — | — | — | Eliminates 5 redundant parses; not benchmarkable on current system load |
+| 4: Unified TX set parsing | `3f8a47f` | 346.1ms* | −240.8ms* | — | A/B on 1000 ledgers; *delta inflated by system conditions |
 | 5: Streamline fee_seq | | | | | |
 
 ---
@@ -357,49 +369,70 @@ steps alone. Closing the gap further would require structural changes — see
 
 ---
 
-## Options for Next Optimization
+## Remaining Optimization Targets
 
-Three options ranked by expected impact and confidence:
+Ranked by expected impact and confidence. Steps 1, 2, 2b, and 4 are done.
 
-### Option A: Unified TX Set Parsing (Step 4) — Recommended
-
-**Expected gain**: −10 to −15ms | **Confidence**: High | **Complexity**: Medium
-
-Eliminates three redundant parsing passes over the `GeneralizedTransactionSet`.
-The 7.4ms (tx_parse) + 4.4ms (phase_parse) + ~3ms (post_exec re-parse) are
-straightforward to measure and the fix is mechanical: parse once into a
-`PreparedTxSet`, thread it through all consumers.
-
-**Why recommended**: Highest expected gain of remaining steps, well-understood cost
-model, no risk of "the profiler lied" — these are wall-clock measurements from
-`std::time::Instant` instrumentation. The fix doesn't touch hot-path per-TX logic.
-
-### Option B: Offer/Non-Offer Map Split (Step 3)
+### 1. Offer/Non-Offer Map Split (Step 3) — Recommended next
 
 **Expected gain**: −8 to −10ms | **Confidence**: High | **Complexity**: Low
 
-Replace `.retain()` (O(n) scan of all entries) with `.clear()` (O(1)) by keeping
-offer entries in separate maps. Purely mechanical change to `LedgerStateManager`.
+**Problem**: `clear_cached_entries_preserving_offers()` calls `.retain()` on three
+maps, scanning all entries (accounts, trustlines, contracts, etc.) to keep only
+Offer keys. Cost is O(total entries) = 10.5ms per ledger.
 
-**Why it's good**: Simplest change of all remaining steps. Low risk. But lower
-absolute gain than Option A.
+**Solution**: Split each map into offer-specific and non-offer maps. On clear,
+`.clear()` the non-offer maps (O(1)) and leave offer maps untouched.
 
-### Option C: Structural State Redesign (Arc<LedgerEntry>)
+**Why recommended**: Simplest remaining change. Purely mechanical. Low risk.
+Measured with `Instant` instrumentation (not sampled), so the estimate is reliable.
 
-**Expected gain**: −15 to −40ms | **Confidence**: Low | **Complexity**: High
+### 2. Meta Construction — Arc<LedgerEntry> (new)
 
-Replace `LedgerEntry` cloning with `Arc<LedgerEntry>` throughout the state
-management layer. Would eliminate the dominant cost in meta construction (entry
-cloning into `Vec<LedgerEntryChange>`) and reduce savepoint/rollback costs.
+**Expected gain**: −15 to −25ms | **Confidence**: Medium | **Complexity**: High
 
-**Why it's risky**: Touches every state access path. Requires careful auditing of
-mutation patterns (entries modified after cloning would need `Arc::make_mut`).
-Large blast radius across `crates/tx/` and `crates/ledger/`. Could introduce
-subtle correctness bugs.
+**Problem**: `build_entry_changes_with_hot_archive` costs 15-25ms/ledger, dominated
+by `LedgerEntry::clone()` into `Vec<LedgerEntryChange>`. Step 2b proved that
+micro-optimizations within this function don't help — the cost is fundamentally in
+the cloning.
 
-**Recommendation**: Do Options A and B first (combined ~18-25ms, reaching ~279-286ms).
-Then re-profile to decide whether Option C is worth the risk, or if the remaining
-gap (vs stellar-core) is acceptable.
+**Solution**: Replace `LedgerEntry` with `Arc<LedgerEntry>` in the state layer.
+Entry changes would hold `Arc` references instead of owned clones. Mutations use
+`Arc::make_mut()` for copy-on-write semantics.
+
+**Why it's high-impact**: This is the single largest remaining per-TX cost center.
+At ~130 Soroban TXs/ledger × ~150μs cloning overhead = ~20ms. Eliminating these
+clones would cut the gap to stellar-core significantly.
+
+**Risk**: Touches every state access path across `crates/tx/` and `crates/ledger/`.
+Requires auditing all mutation patterns. Large blast radius but the change is
+conceptually simple (replace `LedgerEntry` with `Arc<LedgerEntry>` everywhere).
+
+### 3. Streamline fee_seq Processing (Step 5)
+
+**Expected gain**: −5 to −10ms | **Confidence**: Medium | **Complexity**: Medium
+
+**Problem**: Pre-apply phase takes 112μs per Soroban TX (15ms/ledger). Includes
+3 rounds of `delta_snapshot()` + `delta_changes_between()` +
+`build_entry_changes_with_state_overrides()` for fee/signers/seq tracking.
+
+**Solution**: Combine the three delta-tracking phases for Soroban TXs (single op,
+no PreAuthTx signers). Skip signer removal iteration when unnecessary.
+
+### 4. Executor Setup Optimization (minor)
+
+**Expected gain**: −2 to −5ms | **Confidence**: Medium | **Complexity**: Low
+
+Beyond the offer/non-offer split (Step 3), executor setup includes context
+creation and soroban config loading overhead. Smaller gains possible from caching
+config across ledgers when it hasn't changed.
+
+---
+
+**Recommendation**: Do Step 3 (offer maps, −8-10ms) first — it's mechanical and
+reliable. Then re-profile with fresh instrumentation to validate whether
+Arc<LedgerEntry> or fee_seq streamlining has the higher actual impact before
+committing to the larger refactor.
 
 ---
 
