@@ -45,7 +45,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use henyey_bucket::{
     BucketEntry, BucketList, BucketListSnapshot, BucketMergeMap, EvictionIterator, EvictionResult,
-    HotArchiveBucketList, StateArchivalSettings,
+    HotArchiveBucketList, StateArchivalSettings, WarmCache,
 };
 use henyey_common::{BucketListDbConfig, Hash256, NetworkId};
 use henyey_tx::soroban::PersistentModuleCache;
@@ -900,6 +900,18 @@ pub struct LedgerManagerConfig {
 
     /// Number of parallel threads for the startup bucket list cache scan.
     pub scan_thread_count: usize,
+
+    /// Maximum number of entries in the cross-ledger WarmCache.
+    ///
+    /// The WarmCache holds Account and Trustline entries between ledger closes,
+    /// converting repeated bucket list scans to O(1) lookups.  Set to 0 to
+    /// disable.  Default: 200 000 entries.
+    pub warm_cache_max_entries: usize,
+
+    /// Maximum memory for the cross-ledger WarmCache, in bytes.
+    ///
+    /// Default: 100 MiB.
+    pub warm_cache_max_bytes: usize,
 }
 
 impl Default for LedgerManagerConfig {
@@ -913,6 +925,8 @@ impl Default for LedgerManagerConfig {
             emit_soroban_tx_meta_ext_v1: false,
             enable_soroban_diagnostic_events: false,
             scan_thread_count: 4,
+            warm_cache_max_entries: WarmCache::DEFAULT_MAX_ENTRIES,
+            warm_cache_max_bytes: WarmCache::DEFAULT_MAX_BYTES,
         }
     }
 }
@@ -1053,6 +1067,14 @@ pub struct LedgerManager {
     /// and `prepare_with_normalization` checks it before starting new merges.
     /// This avoids redundant merge computations across restarts and catchup.
     finished_merges: Option<Arc<std::sync::RwLock<BucketMergeMap>>>,
+
+    /// Cross-ledger warm cache for Account and Trustline entries.
+    ///
+    /// Converts repeated bucket list scans for hot classic entries (offer
+    /// seller accounts, trustlines) into O(1) RAM lookups.  Read during
+    /// transaction execution; updated from the committed ledger delta at
+    /// the end of each close.
+    warm_cache: Arc<WarmCache>,
 }
 
 // Compile-time assertion: LedgerManager must be Send + Sync for spawn_blocking.
@@ -1071,6 +1093,10 @@ impl LedgerManager {
     /// `initialize` before ledger close operations can begin.
     pub fn new(network_passphrase: String, config: LedgerManagerConfig) -> Self {
         let network_id = NetworkId::from_passphrase(&network_passphrase);
+        let warm_cache = Arc::new(WarmCache::with_limits(
+            config.warm_cache_max_bytes,
+            config.warm_cache_max_entries,
+        ));
 
         Self {
             bucket_list: Arc::new(RwLock::new(BucketList::default())),
@@ -1091,6 +1117,7 @@ impl LedgerManager {
             executor: Mutex::new(None),
             pending_eviction_scan: Mutex::new(None),
             finished_merges: None,
+            warm_cache,
         }
     }
 
@@ -1797,6 +1824,7 @@ impl LedgerManager {
             henyey_bucket::BucketListSnapshot::new(&bl, state.header.clone())
         });
         let bls_for_lookup = bucket_list_snapshot.clone();
+        let warm_cache_lookup = self.warm_cache.clone();
         let lookup_fn: crate::snapshot::EntryLookupFn = Arc::new(move |key: &LedgerKey| {
             // For Soroban entry types, check in-memory state first (O(1)),
             // then fall back to bucket list if not found.
@@ -1806,8 +1834,19 @@ impl LedgerManager {
                 }
                 // Fall through to bucket list for entries not in in-memory state
             }
-            // Non-Soroban types or Soroban cache miss: use bucket list snapshot
-            Ok(bls_for_lookup.get(key))
+            // For classic Account/Trustline types, check WarmCache first (O(1))
+            if WarmCache::is_warm_type(key) {
+                if let Some(entry) = warm_cache_lookup.get(key) {
+                    return Ok(Some((*entry).clone()));
+                }
+            }
+            // Non-Soroban types or WarmCache miss: use bucket list snapshot
+            let result = bls_for_lookup.get(key);
+            // Populate WarmCache from authoritative bucket list reads (natural warmup)
+            if let Some(ref entry) = result {
+                warm_cache_lookup.insert(key.clone(), entry.clone());
+            }
+            Ok(result)
         });
 
         // Batch lookup function for loading multiple entries in a single pass.
@@ -1817,12 +1856,14 @@ impl LedgerManager {
         // remaining non-Soroban keys from the bucket list in a single traversal.
         let soroban_state_batch = self.soroban_state.clone();
         let bls_for_batch = bucket_list_snapshot.clone();
+        let warm_cache_batch = self.warm_cache.clone();
         let batch_lookup_fn: crate::snapshot::BatchEntryLookupFn =
             Arc::new(move |keys: &[LedgerKey]| {
                 let mut result = Vec::new();
                 let mut bucket_list_keys = Vec::new();
 
-                // Check soroban state cache for soroban types first (O(1))
+                // Check soroban state cache for soroban types first (O(1)),
+                // then WarmCache for Account/Trustline types, then bucket list for the rest.
                 {
                     let soroban = soroban_state_batch.read();
                     for key in keys {
@@ -1837,6 +1878,13 @@ impl LedgerManager {
                             }
                             continue;
                         }
+                        // Check WarmCache for Account/Trustline before bucket list
+                        if WarmCache::is_warm_type(key) {
+                            if let Some(entry) = warm_cache_batch.get(key) {
+                                result.push((*entry).clone());
+                                continue;
+                            }
+                        }
                         bucket_list_keys.push(key.clone());
                     }
                 }
@@ -1846,6 +1894,12 @@ impl LedgerManager {
                     let bucket_entries = bls_for_batch
                         .load_keys_result(&bucket_list_keys)
                         .map_err(LedgerError::Bucket)?;
+                    // Populate WarmCache from authoritative bucket list reads
+                    for entry in &bucket_entries {
+                        if let Ok(key) = crate::delta::entry_to_key(entry) {
+                            warm_cache_batch.insert(key, entry.clone());
+                        }
+                    }
                     result.extend(bucket_entries);
                 }
 
@@ -2067,6 +2121,32 @@ impl LedgerManager {
                     }
                 }
                 _ => {} // Updated pool share trustlines: no index change needed
+            }
+        }
+
+        // Update WarmCache from committed delta: insert created/updated Account and
+        // Trustline entries; remove deleted ones.  This is the authoritative update
+        // that keeps the cross-ledger cache consistent with the bucket list.
+        if self.config.warm_cache_max_entries > 0 {
+            for change in delta.changes() {
+                if let Some(entry) = change.current_entry() {
+                    if let Ok(key) = crate::delta::entry_to_key(entry) {
+                        if WarmCache::is_warm_type(&key) {
+                            self.warm_cache.insert(key, entry.clone());
+                        }
+                    }
+                } else if let Some(prev) = change.previous_entry() {
+                    // Deleted entry — remove from cache
+                    if let Ok(key) = crate::delta::entry_to_key(prev) {
+                        if WarmCache::is_warm_type(&key) {
+                            self.warm_cache.remove(&key);
+                        }
+                    }
+                }
+            }
+            // Activate after first close so subsequent ledgers benefit.
+            if !self.warm_cache.is_active() {
+                self.warm_cache.activate();
             }
         }
 
@@ -4690,6 +4770,23 @@ impl<'a> LedgerCloseContext<'a> {
                 hit_rate: stats.hit_rate,
             }
         };
+
+        // Log WarmCache stats and reset per-ledger counters
+        {
+            let wc = self.manager.warm_cache.stats();
+            if wc.active {
+                tracing::debug!(
+                    ledger_seq = new_header.ledger_seq,
+                    warm_entries = wc.entry_count,
+                    warm_bytes = wc.size_bytes,
+                    warm_hits = wc.hits,
+                    warm_misses = wc.misses,
+                    warm_hit_rate = format!("{:.1}%", wc.hit_rate * 100.0),
+                    "WarmCache stats"
+                );
+            }
+            self.manager.warm_cache.reset_counters();
+        }
 
         // Compute average Soroban state size from the LiveSorobanStateSizeWindow.
         // Parity: NetworkConfig.cpp:1812 — average of all window entries.
