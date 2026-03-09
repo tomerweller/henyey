@@ -4036,7 +4036,7 @@ pub struct ClusterParams<'a> {
 /// Extract the fee-paying source AccountId from a raw TransactionEnvelope.
 /// For fee bump transactions, this is the outer fee source.
 /// For regular transactions, this is the transaction source account.
-fn fee_source_account_id(env: &TransactionEnvelope) -> AccountId {
+pub(crate) fn fee_source_account_id(env: &TransactionEnvelope) -> AccountId {
     let muxed = match env {
         TransactionEnvelope::TxV0(e) => MuxedAccount::Ed25519(e.tx.source_account_ed25519.clone()),
         TransactionEnvelope::Tx(e) => e.tx.source_account.clone(),

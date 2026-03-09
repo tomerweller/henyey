@@ -23,10 +23,10 @@ use henyey_crypto::Sha256Hasher;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use stellar_xdr::curr::{
-    ConfigUpgradeSetKey, GeneralizedTransactionSet, LedgerCloseMeta, LedgerHeader, LedgerHeaderExt,
-    LedgerHeaderExtensionV1, LedgerHeaderExtensionV1Ext, LedgerUpgrade, Limits, ScpHistoryEntry,
-    StellarValueExt, TransactionEnvelope, TransactionResultPair, TransactionResultSet,
-    TransactionSet, WriteXdr,
+    AccountId, ConfigUpgradeSetKey, GeneralizedTransactionSet, LedgerCloseMeta, LedgerHeader,
+    LedgerHeaderExt, LedgerHeaderExtensionV1, LedgerHeaderExtensionV1Ext, LedgerUpgrade, Limits,
+    OperationBody, ScpHistoryEntry, StellarValueExt, TransactionEnvelope, TransactionResultPair,
+    TransactionResultSet, TransactionSet, WriteXdr,
 };
 
 use crate::config_upgrade::{ConfigUpgradeSetFrame, ConfigUpgradeValidity};
@@ -597,6 +597,128 @@ pub struct SorobanPhaseStructure {
     /// Stages of clusters of sorted transactions with base fee.
     /// stages[i][j] = cluster j of stage i, containing sorted (tx, base_fee) pairs.
     pub stages: Vec<Vec<Vec<TxWithFee>>>,
+}
+
+/// Pre-extracted per-transaction metadata.
+pub struct TxMeta {
+    pub fee_source: AccountId,
+    pub is_soroban: bool,
+}
+
+/// Pre-parsed transaction set with all views computed once.
+pub struct PreparedTxSet {
+    /// Cached hash (XDR serialize + SHA-256, computed once).
+    pub hash: Hash256,
+    /// Classic phase transactions, sorted for sequential apply.
+    pub classic_txs: Vec<TxWithFee>,
+    /// Soroban parallel phase structure, if present.
+    pub soroban_phase: Option<SorobanPhaseStructure>,
+    /// Flat ordered list of ALL transactions (classic first, then soroban flattened).
+    /// Same ordering as `transactions_with_base_fee()`.
+    pub all_txs: Vec<TxWithFee>,
+    /// Per-TX metadata, indexed same order as `all_txs`.
+    pub tx_meta: Vec<TxMeta>,
+}
+
+/// Check if a raw transaction envelope contains Soroban operations.
+fn envelope_is_soroban(env: &TransactionEnvelope) -> bool {
+    let ops = match env {
+        TransactionEnvelope::TxV0(e) => &e.tx.operations,
+        TransactionEnvelope::Tx(e) => &e.tx.operations,
+        TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => &inner.tx.operations,
+        },
+    };
+    ops.iter().any(|op| {
+        matches!(
+            op.body,
+            OperationBody::InvokeHostFunction(_)
+                | OperationBody::ExtendFootprintTtl(_)
+                | OperationBody::RestoreFootprint(_)
+        )
+    })
+}
+
+impl TransactionSetVariant {
+    /// Parse the transaction set once, producing all views needed by `apply_transactions()`.
+    pub fn prepare(&self) -> PreparedTxSet {
+        let hash = self.hash();
+
+        let (classic_txs, soroban_phase, all_txs) = match self {
+            TransactionSetVariant::Classic(set) => {
+                let txs: Vec<TxWithFee> =
+                    set.txs.iter().cloned().map(|tx| (tx, None)).collect();
+                let sorted = sorted_for_apply_sequential(txs, hash);
+                (sorted.clone(), None, sorted)
+            }
+            TransactionSetVariant::Generalized(set) => {
+                let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = set;
+                let mut classic_txs = Vec::new();
+                let mut soroban_phase = None;
+                let mut all_txs = Vec::new();
+
+                for phase in set_v1.phases.iter() {
+                    match phase {
+                        stellar_xdr::curr::TransactionPhase::V0(components) => {
+                            let mut phase_txs = Vec::new();
+                            for comp in components.iter() {
+                                match comp {
+                                    stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) => {
+                                        let base_fee =
+                                            c.base_fee.and_then(|fee| u32::try_from(fee).ok());
+                                        phase_txs.extend(
+                                            c.txs.iter().cloned().map(|tx| (tx, base_fee)),
+                                        );
+                                    }
+                                }
+                            }
+                            let sorted = sorted_for_apply_sequential(phase_txs, hash);
+                            classic_txs = sorted.clone();
+                            all_txs.extend(sorted);
+                        }
+                        stellar_xdr::curr::TransactionPhase::V1(parallel) => {
+                            let base_fee =
+                                parallel.base_fee.and_then(|fee| u32::try_from(fee).ok());
+                            let stages = sorted_stages_for_parallel(
+                                parallel.execution_stages.as_slice(),
+                                hash,
+                                base_fee,
+                            );
+
+                            // Flatten stages into all_txs
+                            for stage in &stages {
+                                for cluster in stage {
+                                    all_txs.extend(cluster.iter().cloned());
+                                }
+                            }
+
+                            if !stages.is_empty() {
+                                soroban_phase = Some(SorobanPhaseStructure { base_fee, stages });
+                            }
+                        }
+                    }
+                }
+
+                (classic_txs, soroban_phase, all_txs)
+            }
+        };
+
+        let tx_meta = all_txs
+            .iter()
+            .map(|(env, _)| TxMeta {
+                fee_source: crate::execution::fee_source_account_id(env),
+                is_soroban: envelope_is_soroban(env),
+            })
+            .collect();
+
+        PreparedTxSet {
+            hash,
+            classic_txs,
+            soroban_phase,
+            all_txs,
+            tx_meta,
+        }
+    }
 }
 
 /// Result of successfully closing a ledger.

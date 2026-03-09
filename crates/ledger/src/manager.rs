@@ -50,7 +50,7 @@ use henyey_bucket::{
 use henyey_common::{BucketListDbConfig, Hash256, NetworkId};
 use henyey_tx::soroban::PersistentModuleCache;
 use henyey_tx::state::AssetKey;
-use henyey_tx::{ClassicEventConfig, LedgerContext, TransactionFrame, TxEventManager};
+use henyey_tx::{ClassicEventConfig, LedgerContext, TxEventManager};
 use stellar_xdr::curr::{
     AccountId, BucketListType, ConfigSettingEntry, ConfigSettingId,
     EvictionIterator as XdrEvictionIterator, ExtensionPoint, GeneralizedTransactionSet, Hash,
@@ -3148,9 +3148,9 @@ impl<'a> LedgerCloseContext<'a> {
             protocol_version_starts_from, PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION,
         };
 
-        let transactions = self.close_data.tx_set.transactions_with_base_fee();
+        let prepared = self.close_data.tx_set.prepare();
 
-        if transactions.is_empty() {
+        if prepared.all_txs.is_empty() {
             self.tx_results.clear();
             return Ok(vec![]);
         }
@@ -3162,7 +3162,7 @@ impl<'a> LedgerCloseContext<'a> {
         // This is stellar-core's feeRent1KB() / sorobanFeeWrite1KB.
         self.soroban_fee_write_1kb = soroban_config.rent_fee_config.fee_per_write_1kb;
         // Use transaction set hash as base PRNG seed for Soroban execution
-        let soroban_base_prng_seed = self.close_data.tx_set_hash();
+        let soroban_base_prng_seed = prepared.hash;
         let classic_events = ClassicEventConfig {
             emit_classic_events: self.manager.config.emit_classic_events,
             backfill_stellar_asset_events: self.manager.config.backfill_stellar_asset_events,
@@ -3185,8 +3185,7 @@ impl<'a> LedgerCloseContext<'a> {
         // The sequential path (applySequentialPhase) does NOT apply refunds
         // for P23+. So we must always use the parallel path when a Soroban
         // phase structure exists, even for single-stage single-cluster sets.
-        let phase_structure = self.close_data.tx_set.soroban_phase_structure();
-        let has_parallel = phase_structure.is_some();
+        let has_parallel = prepared.soroban_phase.is_some();
 
         // Take the persistent executor from the manager, or create a new one.
         // The executor's offer cache is preserved across ledger closes to avoid
@@ -3253,8 +3252,8 @@ impl<'a> LedgerCloseContext<'a> {
                     PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION,
                 )
             {
-                let phase = phase_structure.unwrap();
-                let classic_txs = self.close_data.tx_set.classic_phase_transactions();
+                let phase = prepared.soroban_phase.as_ref().unwrap();
+                let classic_txs = &prepared.classic_txs;
 
                 // Pre-deduct ALL fees (classic + Soroban) in a single pass before
                 // any transaction body executes. This matches stellar-core's
@@ -3262,8 +3261,8 @@ impl<'a> LedgerCloseContext<'a> {
                 // before any transaction applies.
                 let (classic_pre_charged, soroban_pre_charged, total_fee_pool) =
                     pre_deduct_all_fees_on_delta(
-                        &classic_txs,
-                        &phase,
+                        classic_txs,
+                        phase,
                         self.prev_header.base_fee,
                         self.manager.network_id,
                         self.close_data.ledger_seq,
@@ -3295,7 +3294,7 @@ impl<'a> LedgerCloseContext<'a> {
                     run_transactions_on_executor(
                         executor_ref,
                         &self.snapshot,
-                        &classic_txs,
+                        classic_txs,
                         self.prev_header.base_fee,
                         soroban_base_prng_seed.0,
                         false,
@@ -3317,7 +3316,7 @@ impl<'a> LedgerCloseContext<'a> {
                 );
                 let soroban_result = execute_soroban_parallel_phase(
                     &self.snapshot,
-                    &phase,
+                    phase,
                     classic_txs.len(),
                     &ledger_context,
                     &mut self.delta,
@@ -3357,7 +3356,7 @@ impl<'a> LedgerCloseContext<'a> {
                 run_transactions_on_executor(
                     executor_ref,
                     &self.snapshot,
-                    &transactions,
+                    &prepared.all_txs,
                     self.prev_header.base_fee,
                     soroban_base_prng_seed.0,
                     true,
@@ -3371,21 +3370,15 @@ impl<'a> LedgerCloseContext<'a> {
 
         // Prepend fee events for classic event emission.
         if classic_events.events_enabled(self.prev_header.ledger_version) {
-            // Reconstruct the full transaction list for fee event correlation.
-            let all_txs = self.close_data.tx_set.transactions_with_base_fee();
-            for (idx, ((envelope, _), meta)) in
-                all_txs.iter().zip(tx_set_result.tx_result_metas.iter_mut()).enumerate()
-            {
-                if idx >= tx_set_result.tx_results.len() {
+            for (idx, meta) in tx_set_result.tx_result_metas.iter_mut().enumerate() {
+                if idx >= tx_set_result.tx_results.len() || idx >= prepared.tx_meta.len() {
                     break;
                 }
                 let fee_charged = tx_set_result.tx_results[idx].result.fee_charged;
-                let frame =
-                    TransactionFrame::with_network(envelope.clone(), self.manager.network_id);
-                let fee_source = henyey_tx::muxed_to_account_id(&frame.fee_source_account());
+                let fee_source = &prepared.tx_meta[idx].fee_source;
                 prepend_fee_event(
                     &mut meta.tx_apply_processing,
-                    &fee_source,
+                    fee_source,
                     fee_charged,
                     self.prev_header.ledger_version,
                     &self.manager.network_id,
@@ -3410,16 +3403,13 @@ impl<'a> LedgerCloseContext<'a> {
         self.stats.record_fees(fees_collected);
 
         // Collect per-transaction perf data
-        let all_txs = self.close_data.tx_set.transactions_with_base_fee();
         for (i, result) in tx_set_result.results.iter().enumerate() {
             let hash_hex = if i < self.tx_results.len() {
                 Hash256::from(self.tx_results[i].transaction_hash.clone()).to_hex()[..16].to_string()
             } else {
                 String::new()
             };
-            let is_soroban = all_txs.get(i).map_or(false, |(env, _)| {
-                TransactionFrame::with_network(env.clone(), self.manager.network_id).is_soroban()
-            });
+            let is_soroban = prepared.tx_meta.get(i).map_or(false, |m| m.is_soroban);
             self.tx_perf.push(crate::close::TxPerf {
                 index: i,
                 hash_hex,
