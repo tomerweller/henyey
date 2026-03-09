@@ -144,6 +144,7 @@ pub fn execute_invoke_host_function(
     soroban_config: &SorobanConfig,
     module_cache: Option<&PersistentModuleCache>,
     hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
+    ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
 ) -> Result<OperationExecutionResult> {
     // Validate we have Soroban data for footprint
     let soroban_data = match soroban_data {
@@ -167,6 +168,7 @@ pub fn execute_invoke_host_function(
         soroban_config,
         module_cache,
         hot_archive,
+        ttl_key_cache,
     )
 }
 
@@ -181,6 +183,7 @@ fn execute_contract_invocation(
     soroban_config: &SorobanConfig,
     module_cache: Option<&PersistentModuleCache>,
     hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
+    ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
 ) -> Result<OperationExecutionResult> {
     use crate::soroban::execute_host_function_with_cache;
 
@@ -193,6 +196,7 @@ fn execute_contract_invocation(
         &soroban_data.ext,
         context.sequence,
         hot_archive,
+        ttl_key_cache,
     ) {
         return Ok(OperationExecutionResult::new(make_result(
             InvokeHostFunctionResultCode::EntryArchived,
@@ -205,6 +209,7 @@ fn execute_contract_invocation(
         soroban_data,
         context.protocol_version,
         context.sequence,
+        ttl_key_cache,
     ) {
         return Ok(OperationExecutionResult::new(make_result(
             InvokeHostFunctionResultCode::ResourceLimitExceeded,
@@ -223,6 +228,7 @@ fn execute_contract_invocation(
         soroban_config,
         module_cache,
         hot_archive,
+        ttl_key_cache,
     ) {
         Ok(result) => {
             // stellar-core check: event size (done first in collectEvents before
@@ -284,6 +290,7 @@ fn execute_contract_invocation(
                 &result.storage_changes,
                 &soroban_data.resources.footprint,
                 &hot_archive_restored_keys,
+                ttl_key_cache,
             );
 
             // Compute result hash from success preimage (return value + events)
@@ -330,14 +337,16 @@ fn execute_contract_invocation(
 }
 
 /// Compute the hash of a ledger key for TTL lookup.
+/// Delegates to the shared implementation in the soroban module.
+/// Used by tests; production code uses `get_or_compute_key_hash` with cache.
+#[cfg(test)]
 fn compute_key_hash(key: &LedgerKey) -> Hash {
-    use sha2::{Digest, Sha256};
+    crate::soroban::compute_key_hash(key)
+}
 
-    let mut hasher = Sha256::new();
-    if let Ok(bytes) = key.to_xdr(Limits::none()) {
-        hasher.update(&bytes);
-    }
-    Hash(hasher.finalize().into())
+/// Get or compute the TTL key hash, using the cache when available.
+fn get_or_compute_key_hash(cache: Option<&crate::soroban::TtlKeyCache>, key: &LedgerKey) -> Hash {
+    crate::soroban::get_or_compute_key_hash(cache, key)
 }
 
 /// Result of validating storage changes.
@@ -396,6 +405,7 @@ fn disk_read_bytes_exceeded(
     soroban_data: &SorobanTransactionData,
     protocol_version: u32,
     current_ledger: u32,
+    ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
 ) -> bool {
     let mut total_read_bytes = 0u32;
     let limit = soroban_data.resources.disk_read_bytes;
@@ -491,7 +501,7 @@ fn disk_read_bytes_exceeded(
                     // actually still archived. If a previous TX in this ledger
                     // restored the entry, its TTL is now live, and stellar-core treats
                     // it as an in-memory soroban entry (no disk read metering).
-                    let key_hash = compute_key_hash(key);
+                    let key_hash = get_or_compute_key_hash(ttl_key_cache, key);
                     let is_still_archived = match state.get_ttl(&key_hash) {
                         Some(ttl) => ttl.live_until_ledger_seq < current_ledger,
                         None => true, // No TTL = not in live state = archived
@@ -623,6 +633,7 @@ fn apply_soroban_storage_changes(
     changes: &[crate::soroban::StorageChange],
     footprint: &stellar_xdr::curr::LedgerFootprint,
     hot_archive_restored_keys: &std::collections::HashSet<LedgerKey>,
+    ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
 ) {
     use std::collections::HashSet;
 
@@ -645,7 +656,7 @@ fn apply_soroban_storage_changes(
             is_rent_related = change.is_rent_related,
             "Applying storage change"
         );
-        apply_soroban_storage_change(state, change, hot_archive_restored_keys);
+        apply_soroban_storage_change(state, change, hot_archive_restored_keys, ttl_key_cache);
     }
 
     // stellar-core behavior: delete any read-write footprint entries that weren't
@@ -678,7 +689,7 @@ fn apply_soroban_storage_changes(
                 {
                     state.delete_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability);
                     // Also delete the associated TTL entry
-                    let key_hash = compute_key_hash(key);
+                    let key_hash = get_or_compute_key_hash(ttl_key_cache, key);
                     state.delete_ttl(&key_hash);
                 }
             }
@@ -686,7 +697,7 @@ fn apply_soroban_storage_changes(
                 if state.get_contract_code(&cc_key.hash).is_some() {
                     state.delete_contract_code(&cc_key.hash);
                     // Also delete the associated TTL entry
-                    let key_hash = compute_key_hash(key);
+                    let key_hash = get_or_compute_key_hash(ttl_key_cache, key);
                     state.delete_ttl(&key_hash);
                 }
             }
@@ -702,6 +713,7 @@ fn apply_soroban_storage_change(
     state: &mut LedgerStateManager,
     change: &crate::soroban::StorageChange,
     hot_archive_restored_keys: &std::collections::HashSet<LedgerKey>,
+    ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
 ) {
     // Check if this entry is being restored from the hot archive.
     // Hot archive restored entries must be recorded as INIT (created) in the bucket list delta,
@@ -810,7 +822,7 @@ fn apply_soroban_storage_change(
                 if live_until == 0 {
                     return;
                 }
-                let key_hash = compute_key_hash(&change.key);
+                let key_hash = get_or_compute_key_hash(ttl_key_cache, &change.key);
                 let existing_ttl = state.get_ttl(&key_hash);
                 let ttl = TtlEntry {
                     key_hash: key_hash.clone(),
@@ -884,7 +896,7 @@ fn apply_soroban_storage_change(
         // This happens when a contract reads an entry and its TTL gets auto-extended.
         // Only emit when TTL was actually extended (new > old).
         if change.ttl_extended {
-            let key_hash = compute_key_hash(&change.key);
+            let key_hash = get_or_compute_key_hash(ttl_key_cache, &change.key);
             let existing_ttl = state.get_ttl(&key_hash);
             let ttl = TtlEntry {
                 key_hash: key_hash.clone(),
@@ -925,12 +937,12 @@ fn apply_soroban_storage_change(
         match &change.key {
             LedgerKey::ContractData(key) => {
                 state.delete_contract_data(&key.contract, &key.key, key.durability);
-                let key_hash = compute_key_hash(&change.key);
+                let key_hash = get_or_compute_key_hash(ttl_key_cache, &change.key);
                 state.delete_ttl(&key_hash);
             }
             LedgerKey::ContractCode(key) => {
                 state.delete_contract_code(&key.hash);
-                let key_hash = compute_key_hash(&change.key);
+                let key_hash = get_or_compute_key_hash(ttl_key_cache, &change.key);
                 state.delete_ttl(&key_hash);
             }
             LedgerKey::Ttl(key) => {
@@ -962,6 +974,7 @@ fn footprint_has_unrestored_archived_entries(
     ext: &stellar_xdr::curr::SorobanTransactionDataExt,
     current_ledger: u32,
     hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
+    ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
 ) -> bool {
     let mut archived_rw = std::collections::HashSet::new();
     if let stellar_xdr::curr::SorobanTransactionDataExt::V1(resources_ext) = ext {
@@ -973,13 +986,13 @@ fn footprint_has_unrestored_archived_entries(
     if footprint
         .read_only
         .iter()
-        .any(|key| is_archived_contract_entry(state, key, current_ledger, hot_archive))
+        .any(|key| is_archived_contract_entry(state, key, current_ledger, hot_archive, ttl_key_cache))
     {
         return true;
     }
 
     for (index, key) in footprint.read_write.iter().enumerate() {
-        if !is_archived_contract_entry(state, key, current_ledger, hot_archive) {
+        if !is_archived_contract_entry(state, key, current_ledger, hot_archive, ttl_key_cache) {
             continue;
         }
         if !archived_rw.contains(&index) {
@@ -1003,6 +1016,7 @@ fn is_archived_contract_entry(
     key: &LedgerKey,
     current_ledger: u32,
     hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
+    ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
 ) -> bool {
     // Only persistent Soroban entries can be "archived".
     // Temporary entries just disappear when expired.
@@ -1028,7 +1042,7 @@ fn is_archived_contract_entry(
 
     if entry_in_live {
         // Entry is in live state — check its TTL
-        let key_hash = compute_key_hash(key);
+        let key_hash = get_or_compute_key_hash(ttl_key_cache, key);
         return match state.get_ttl(&key_hash) {
             Some(ttl) => ttl.live_until_ledger_seq < current_ledger,
             None => true, // No TTL → treat as archived
@@ -1153,7 +1167,7 @@ mod tests {
         };
 
         let result = execute_invoke_host_function(
-            &op, &source, &mut state, &context, None, &config, None, None,
+            &op, &source, &mut state, &context, None, &config, None, None, None,
         )
         .expect("invoke host function");
 
@@ -1205,6 +1219,7 @@ mod tests {
             &context,
             Some(&soroban_data),
             &config,
+            None,
             None,
             None,
         )
@@ -1286,6 +1301,7 @@ mod tests {
             &context,
             Some(&soroban_data),
             &config,
+            None,
             None,
             None,
         )
@@ -1370,6 +1386,7 @@ mod tests {
             &config,
             Some(&module_cache),
             None,
+            None,
         )
         .expect("invoke host function");
 
@@ -1424,6 +1441,7 @@ mod tests {
             &context,
             Some(&soroban_data),
             &config,
+            None,
             None,
             None,
         )
@@ -1512,6 +1530,7 @@ mod tests {
             &soroban_data,
             context.protocol_version,
             context.sequence,
+            None,
         );
         assert!(
             !exceeded,
@@ -1531,6 +1550,7 @@ mod tests {
             &soroban_data,
             context.protocol_version,
             context.sequence,
+            None,
         );
         assert!(
             exceeded,
@@ -1697,7 +1717,7 @@ mod tests {
         };
 
         let no_restored_keys = std::collections::HashSet::new();
-        apply_soroban_storage_change(&mut state, &change, &no_restored_keys);
+        apply_soroban_storage_change(&mut state, &change, &no_restored_keys, None);
         assert!(state
             .get_contract_data(&contract_id, &contract_key, durability.clone())
             .is_some());
@@ -1714,7 +1734,7 @@ mod tests {
             is_read_only_ttl_bump: false,
         };
 
-        apply_soroban_storage_change(&mut state, &delete_change, &no_restored_keys);
+        apply_soroban_storage_change(&mut state, &delete_change, &no_restored_keys, None);
         assert!(state
             .get_contract_data(&contract_id, &contract_key, durability)
             .is_none());
@@ -1812,7 +1832,7 @@ mod tests {
         };
 
         let no_restored_keys = std::collections::HashSet::new();
-        apply_soroban_storage_change(&mut state2, &modify_change, &no_restored_keys);
+        apply_soroban_storage_change(&mut state2, &modify_change, &no_restored_keys, None);
 
         // Verify data was updated
         let cd = state2
@@ -2130,7 +2150,7 @@ mod tests {
             let mut hot_archive_keys = std::collections::HashSet::new();
             hot_archive_keys.insert(key.clone());
 
-            apply_soroban_storage_change(&mut state, &change, &hot_archive_keys);
+            apply_soroban_storage_change(&mut state, &change, &hot_archive_keys, None);
 
             // With hot_archive_keys and entry NOT in delta.created,
             // apply_soroban_storage_change should use create_contract_data.
@@ -2188,7 +2208,7 @@ mod tests {
             // Now apply WITHOUT hot_archive_keys
             let no_restored_keys: std::collections::HashSet<LedgerKey> =
                 std::collections::HashSet::new();
-            apply_soroban_storage_change(&mut state, &change, &no_restored_keys);
+            apply_soroban_storage_change(&mut state, &change, &no_restored_keys, None);
 
             // Without hot_archive_keys, entry exists, so should call update_contract_data
             let created_count = state
@@ -2292,7 +2312,7 @@ mod tests {
             "Delta should be empty before the call"
         );
 
-        apply_soroban_storage_change(&mut state, &change, &hot_archive_restored_keys);
+        apply_soroban_storage_change(&mut state, &change, &hot_archive_restored_keys, None);
 
         // KEY ASSERTION: no TTL INIT should have been created.
         // Before the fix, create_ttl() was called, producing a spurious TTL INIT that
@@ -2372,6 +2392,7 @@ mod tests {
             &[change],
             &footprint,
             &hot_archive_restored_keys,
+            None,
         );
 
         // No TTL INIT should have been created (VE-05 fix).
@@ -2468,7 +2489,7 @@ mod tests {
         assert_eq!(state.delta().deleted_keys().len(), 0);
 
         // Call apply_soroban_storage_changes — this runs the erase-RW loop.
-        apply_soroban_storage_changes(&mut state, &changes, &footprint, &hot_archive_restored_keys);
+        apply_soroban_storage_changes(&mut state, &changes, &footprint, &hot_archive_restored_keys, None);
 
         // KEY ASSERTION: no DEAD entry should be created.
         // Before the VE-06 fix (hot archive skip at line 667), the erase-RW loop

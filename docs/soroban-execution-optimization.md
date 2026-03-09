@@ -131,6 +131,13 @@ all call sites.
 **Benchmark gate**: Run benchmark protocol. Expected: −60 to −80ms (mean ≤ 258ms).
 If improvement < 30ms, investigate before proceeding. If not fixable, stop and alert.
 
+**Actual result**: −10.4ms (median close_ledger 307.1ms, 3 runs: 304.5/307.1/316.3).
+SHA-256 of small LedgerKey XDR (~100-200 bytes) takes <1μs each; even 15K redundant
+computations save only ~15ms. Original estimate was 4-5x too optimistic. Per-TX debug
+breakdown shows the real bottleneck is `ops_us` (host invocation): 700-1100μs/TX vs
+stellar-core's ~240μs — entry encoding and host setup, not hash computation.
+Proceeding to Step 2 which targets entry serialization redundancy.
+
 ---
 
 ### Step 2: Serialize Entries Once, Reuse for Metering and Host (Expected: −20 to −30ms)
