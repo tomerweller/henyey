@@ -977,7 +977,6 @@ impl App {
                     .diagnostics
                     .soroban_diagnostic_events,
                 scan_thread_count: config.buckets.scan_thread_count,
-                ..Default::default()
             },
         );
 
