@@ -328,6 +328,7 @@ impl<'a> LedgerSnapshotAdapter<'a> {
         &self,
         key: &Rc<soroban_env_host24::xdr::LedgerKey>,
         current_key: &LedgerKey,
+        ttl_key_cache: Option<&super::TtlKeyCache>,
     ) -> Result<ArchivedWithRestoreInfoP24, HostErrorP24> {
         let result = self.get_archived(key)?;
 
@@ -341,7 +342,7 @@ impl<'a> LedgerSnapshotAdapter<'a> {
 
                         if let Some(e) = current_entry {
                             // Get the TTL entry for the restore info
-                            let key_hash = compute_key_hash(current_key);
+                            let key_hash = get_or_compute_key_hash(ttl_key_cache, current_key);
                             let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
                                 key_hash: key_hash.clone(),
                             });
@@ -521,6 +522,7 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
     pub fn get_archived_with_restore_info(
         &self,
         key: &Rc<LedgerKey>,
+        ttl_key_cache: Option<&super::TtlKeyCache>,
     ) -> Result<ArchivedWithRestoreInfoP25, HostErrorP25> {
         let result = self.get_archived(key)?;
 
@@ -530,7 +532,7 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
                 let live_bl_restore = if let Some(lu) = live_until {
                     if lu < self.current_ledger {
                         // Get the TTL entry for the restore info
-                        let key_hash = compute_key_hash(key.as_ref());
+                        let key_hash = get_or_compute_key_hash(ttl_key_cache, key.as_ref());
                         let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
                             key_hash: key_hash.clone(),
                         });
@@ -617,9 +619,13 @@ impl<'a> soroban_env_host25::storage::SnapshotSource for LedgerSnapshotAdapterP2
 /// needs to compare against ledger-start TTL, which is handled separately in
 /// the storage_changes filter.
 fn get_entry_ttl(state: &LedgerStateManager, key: &LedgerKey, current_ledger: u32) -> Option<u32> {
+    get_entry_ttl_with_cache(state, key, current_ledger, None)
+}
+
+fn get_entry_ttl_with_cache(state: &LedgerStateManager, key: &LedgerKey, current_ledger: u32, ttl_key_cache: Option<&super::TtlKeyCache>) -> Option<u32> {
     match key {
         LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
-            let key_hash = compute_key_hash(key);
+            let key_hash = get_or_compute_key_hash(ttl_key_cache, key);
             // Use current state TTL which includes updates from earlier TXs in this ledger.
             // This matches stellar-core sequential execution where LedgerTxn reflects all prior
             // changes, including TTL bumps from earlier transactions.
@@ -647,12 +653,16 @@ fn get_entry_ttl(state: &LedgerStateManager, key: &LedgerKey, current_ledger: u3
 }
 
 /// Compute the hash of a ledger key for TTL lookup.
+/// Delegates to the shared implementation in the parent module.
+/// Used by tests; production code uses `get_or_compute_key_hash` with cache.
+#[cfg(test)]
 fn compute_key_hash(key: &LedgerKey) -> Hash {
-    let mut hasher = Sha256::new();
-    if let Ok(bytes) = key.to_xdr(Limits::none()) {
-        hasher.update(&bytes);
-    }
-    Hash(hasher.finalize().into())
+    super::compute_key_hash(key)
+}
+
+/// Get or compute the TTL key hash, using the cache when available.
+fn get_or_compute_key_hash(cache: Option<&super::TtlKeyCache>, key: &LedgerKey) -> Hash {
+    super::get_or_compute_key_hash(cache, key)
 }
 
 fn convert_ledger_key_to_p24(key: &LedgerKey) -> Option<soroban_env_host24::xdr::LedgerKey> {
@@ -922,6 +932,7 @@ pub fn execute_host_function_with_cache(
     soroban_config: &SorobanConfig,
     module_cache: Option<&PersistentModuleCache>,
     hot_archive: Option<&dyn super::HotArchiveLookup>,
+    ttl_key_cache: Option<&super::TtlKeyCache>,
 ) -> Result<SorobanExecutionResult, SorobanExecutionError> {
     if context.protocol_version >= 25 {
         let cache = module_cache
@@ -942,6 +953,7 @@ pub fn execute_host_function_with_cache(
             soroban_config,
             Some(p25_cache),
             hot_archive,
+            ttl_key_cache,
         );
     }
     let cache = module_cache
@@ -963,6 +975,7 @@ pub fn execute_host_function_with_cache(
         soroban_config,
         Some(p24_cache),
         hot_archive,
+        ttl_key_cache,
     )
 }
 
@@ -1012,6 +1025,7 @@ fn encode_footprint_entries(
     snapshot: &LedgerSnapshotAdapter<'_>,
     context: &LedgerContext,
     soroban_config: &SorobanConfig,
+    ttl_key_cache: Option<&super::TtlKeyCache>,
 ) -> Result<EncodedFootprint, SorobanExecutionError> {
     let make_setup_error = make_xdr_setup_error;
     let current_ledger = context.sequence;
@@ -1038,13 +1052,13 @@ fn encode_footprint_entries(
 
         let needs_ttl = matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_));
         let ttl_bytes = if let Some(lu) = live_until {
-            let key_hash = compute_key_hash(key);
+            let key_hash = get_or_compute_key_hash(ttl_key_cache, key);
             xdr_encode_p24_setup(&soroban_env_host24::xdr::TtlEntry {
                 key_hash: soroban_env_host24::xdr::Hash(key_hash.0),
                 live_until_ledger_seq: lu,
             })?
         } else if needs_ttl {
-            let key_hash = compute_key_hash(key);
+            let key_hash = get_or_compute_key_hash(ttl_key_cache, key);
             xdr_encode_p24_setup(&soroban_env_host24::xdr::TtlEntry {
                 key_hash: soroban_env_host24::xdr::Hash(key_hash.0),
                 live_until_ledger_seq: current_ledger,
@@ -1100,7 +1114,7 @@ fn encode_footprint_entries(
         let is_being_restored = restored_indices_set.contains(&(idx as u32));
         if is_being_restored {
             let result = snapshot
-                .get_archived_with_restore_info(&Rc::new(key_p24), key)
+                .get_archived_with_restore_info(&Rc::new(key_p24), key, ttl_key_cache)
                 .map_err(|e| SorobanExecutionError {
                     host_error: convert_host_error_p24_to_p25(e),
                     cpu_insns_consumed: 0,
@@ -1183,6 +1197,7 @@ fn execute_host_function_p24(
     soroban_config: &SorobanConfig,
     existing_cache: Option<&ModuleCache>,
     hot_archive: Option<&dyn super::HotArchiveLookup>,
+    ttl_key_cache: Option<&super::TtlKeyCache>,
 ) -> Result<SorobanExecutionResult, SorobanExecutionError> {
     // Create budget with network cost parameters.
     // stellar-core passes the per-transaction specified instruction limit directly
@@ -1266,7 +1281,7 @@ fn execute_host_function_p24(
         ttl_entries: encoded_ttl_entries,
         actual_restored_indices,
         live_bl_restores,
-    } = encode_footprint_entries(soroban_data, &snapshot, context, soroban_config)?;
+    } = encode_footprint_entries(soroban_data, &snapshot, context, soroban_config, ttl_key_cache)?;
 
     // Use existing module cache — it must always be provided.
     let cache_start = std::time::Instant::now();
@@ -1412,7 +1427,7 @@ fn execute_host_function_p24(
                     // Compare new TTL against ledger-start TTL, not host's old_live_until
                     let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none()).ok();
                     if let Some(ref key) = key {
-                        let key_hash = compute_key_hash(key);
+                        let key_hash = get_or_compute_key_hash(ttl_key_cache, key);
                         let ledger_start_ttl = state.get_ttl_at_ledger_start(&key_hash).unwrap_or(0);
                         ttl.new_live_until_ledger > ledger_start_ttl
                     } else {
@@ -1504,6 +1519,7 @@ fn execute_host_function_p25(
     soroban_config: &SorobanConfig,
     existing_cache: Option<&ModuleCacheP25>,
     hot_archive: Option<&dyn super::HotArchiveLookup>,
+    ttl_key_cache: Option<&super::TtlKeyCache>,
 ) -> Result<SorobanExecutionResult, SorobanExecutionError> {
     use soroban_env_host25::{budget::Budget, e2e_invoke, fees::compute_rent_fee};
 
@@ -1617,14 +1633,14 @@ fn execute_host_function_p25(
 
         let needs_ttl = matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_));
         let ttl_bytes = if let Some(lu) = live_until {
-            let key_hash = compute_key_hash(key);
+            let key_hash = get_or_compute_key_hash(ttl_key_cache, key);
             let ttl_entry = stellar_xdr::curr::TtlEntry {
                 key_hash,
                 live_until_ledger_seq: lu,
             };
             xdr_encode_setup(&ttl_entry)?
         } else if needs_ttl {
-            let key_hash = compute_key_hash(key);
+            let key_hash = get_or_compute_key_hash(ttl_key_cache, key);
             let ttl_entry = stellar_xdr::curr::TtlEntry {
                 key_hash,
                 live_until_ledger_seq: current_ledger_p25,
@@ -1676,7 +1692,7 @@ fn execute_host_function_p25(
         let is_being_restored = restored_indices_set.contains(&(idx as u32));
         if is_being_restored {
             let result = snapshot
-                .get_archived_with_restore_info(&Rc::new(key.clone()))
+                .get_archived_with_restore_info(&Rc::new(key.clone()), ttl_key_cache)
                 .map_err(make_setup_error)?;
             if let Some((entry, live_until, live_bl_restore)) = result {
                 // Check if this entry is ACTUALLY archived (needs restoration).
@@ -1862,7 +1878,7 @@ fn execute_host_function_p25(
                     // Compare new TTL against ledger-start TTL, not host's old_live_until
                     let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none()).ok();
                     if let Some(ref key) = key {
-                        let key_hash = compute_key_hash(key);
+                        let key_hash = get_or_compute_key_hash(ttl_key_cache, key);
                         let ledger_start_ttl =
                             state.get_ttl_at_ledger_start(&key_hash).unwrap_or(0);
                         ttl.new_live_until_ledger > ledger_start_ttl

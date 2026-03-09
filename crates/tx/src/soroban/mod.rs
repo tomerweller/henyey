@@ -99,7 +99,33 @@ pub use host::{
 };
 pub use storage::{SorobanStorage, StorageEntry, StorageKey};
 
-use stellar_xdr::curr::{LedgerEntry, LedgerKey};
+use sha2::{Digest, Sha256};
+use stellar_xdr::curr::{Hash, LedgerEntry, LedgerKey, Limits, WriteXdr};
+
+/// Cache of pre-computed TTL key hashes. Built during footprint loading,
+/// passed through to all Soroban validation and execution functions.
+/// Each entry maps a ContractData/ContractCode LedgerKey to its SHA-256 hash.
+pub type TtlKeyCache = std::collections::HashMap<LedgerKey, Hash>;
+
+/// Get or compute the TTL key hash for a ContractData/ContractCode key.
+/// Uses the cache if available, falls back to computing on the spot.
+pub fn get_or_compute_key_hash(cache: Option<&TtlKeyCache>, key: &LedgerKey) -> Hash {
+    if let Some(cache) = cache {
+        if let Some(hash) = cache.get(key) {
+            return hash.clone();
+        }
+    }
+    compute_key_hash(key)
+}
+
+/// Compute the hash of a ledger key for TTL lookup.
+pub fn compute_key_hash(key: &LedgerKey) -> Hash {
+    let mut hasher = Sha256::new();
+    if let Ok(bytes) = key.to_xdr(Limits::none()) {
+        hasher.update(&bytes);
+    }
+    Hash(hasher.finalize().into())
+}
 
 /// Trait for looking up archived entries from the hot archive.
 ///

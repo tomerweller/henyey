@@ -805,6 +805,7 @@ pub fn execute_operation(
         None,
         None, // No module cache for simple execution
         None, // No hot archive for simple execution
+        None, // No TTL key cache for simple execution
     )
 }
 
@@ -834,6 +835,7 @@ pub fn execute_operation_with_soroban(
     soroban_config: Option<&SorobanConfig>,
     module_cache: Option<&PersistentModuleCache>,
     hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
+    ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
 ) -> Result<OperationExecutionResult> {
     // Get the actual source for this operation
     // If the operation has an explicit source, use it; otherwise use the transaction source
@@ -887,6 +889,7 @@ pub fn execute_operation_with_soroban(
                 config,
                 module_cache,
                 hot_archive,
+                ttl_key_cache,
             )
         }
         OperationBody::ExtendFootprintTtl(op_data) => {

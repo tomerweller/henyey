@@ -466,6 +466,10 @@ pub struct TransactionExecutor {
     emit_soroban_tx_meta_ext_v1: bool,
     /// Whether to include diagnostic events in transaction meta.
     enable_soroban_diagnostic_events: bool,
+    /// Pre-computed TTL key hashes from the most recent `load_soroban_footprint` call.
+    /// Reused across all Soroban validation and execution functions to avoid
+    /// redundant SHA-256 computations.
+    ttl_key_cache: Option<henyey_tx::soroban::TtlKeyCache>,
 }
 
 impl TransactionExecutor {
@@ -494,6 +498,7 @@ impl TransactionExecutor {
             soroban_state: None,
             emit_soroban_tx_meta_ext_v1: false,
             enable_soroban_diagnostic_events: false,
+            ttl_key_cache: None,
         }
     }
 
@@ -1273,6 +1278,9 @@ impl TransactionExecutor {
     ) -> Result<()> {
         use sha2::{Digest, Sha256};
 
+        // Build TTL key cache: pre-compute SHA-256 hashes for all ContractData/ContractCode keys.
+        let mut ttl_key_cache = henyey_tx::soroban::TtlKeyCache::new();
+
         // Acquire a read lock on InMemorySorobanState if available (O1 optimization).
         // InMemorySorobanState is a HashMap mirror of all live ContractData/ContractCode/TTL
         // entries built from the bucket list at startup and updated incrementally on each
@@ -1304,6 +1312,8 @@ impl TransactionExecutor {
                     .to_xdr(Limits::none())
                     .map_err(|e| LedgerError::Serialization(e.to_string()))?;
                 let key_hash = stellar_xdr::curr::Hash(Sha256::digest(&key_bytes).into());
+                // Cache the computed hash for reuse in validation/execution.
+                ttl_key_cache.insert(key.clone(), key_hash.clone());
                 let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
                     key_hash: key_hash.clone(),
                 });
@@ -1382,6 +1392,13 @@ impl TransactionExecutor {
         // - RW entries marked in archivedSorobanEntries → restored in encode_footprint_entries
         //   (via get_archived_with_restore_info / get_entry_for_restoration)
         // Auto-restoring entries here would mask the ENTRY_ARCHIVED check.
+
+        // Store the TTL key cache for use during Soroban execution.
+        self.ttl_key_cache = if ttl_key_cache.is_empty() {
+            None
+        } else {
+            Some(ttl_key_cache)
+        };
 
         Ok(())
     }
@@ -3574,6 +3591,7 @@ impl TransactionExecutor {
             Some(&self.soroban_config),
             self.module_cache.as_ref(),
             hot_archive_ref,
+            self.ttl_key_cache.as_ref(),
         )
     }
 
