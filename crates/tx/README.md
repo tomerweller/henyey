@@ -47,9 +47,10 @@ Re-executing historical transactions is problematic for several reasons:
                                                             v
                             +--------------------------------------+
                             |       LedgerStateManager             |
-                            |       (state.rs)                     |
+                            |       (state/)                       |
                             |                                      |
                             |  In-memory entries + snapshots       |
+                            |  EntryStore<K,V> for 5 entry types   |
                             |  Per-operation Savepoint rollback    |
                             +------------------+-------------------+
                                                |
@@ -80,15 +81,25 @@ henyey-tx/
 │   ├── validation.rs       # Transaction validation logic
 │   ├── result.rs           # Result type wrappers (TxApplyResult, etc.)
 │   ├── error.rs            # Error types (TxError, etc.)
-│   ├── state.rs            # LedgerStateManager - in-memory state
 │   ├── events.rs           # Classic SAC event emission
 │   ├── lumen_reconciler.rs # XLM balance reconciliation for events
 │   ├── meta_builder.rs     # Transaction metadata construction
 │   ├── fee_bump.rs         # Fee bump transaction handling
+│   ├── scval_utils.rs      # Soroban ScVal conversion utilities
 │   ├── signature_checker.rs # Multi-sig threshold checking
+│   ├── state/
+│   │   ├── mod.rs          # LedgerStateManager, Savepoint, SorobanState, rollback
+│   │   ├── entries.rs      # Per-type CRUD (load/create/update/delete) methods
+│   │   ├── entry_store.rs  # Generic EntryStore<K,V> with snapshot/rollback lifecycle
+│   │   ├── offer_index.rs  # BTreeMap-based orderbook for O(log n) best-offer lookups
+│   │   ├── sponsorship.rs  # Sponsorship stack management
+│   │   └── ttl.rs          # TTL entry management and deferred read-only bumps
 │   ├── operations/
 │   │   ├── mod.rs          # Operation types and validation
-│   │   └── execute/        # Per-operation execution implementations
+│   │   └── execute/
+│   │       ├── mod.rs      # Operation dispatch and shared context types
+│   │       ├── offer_utils.rs # Shared DEX offer helpers (cross_offer, liabilities)
+│   │       └── ...         # Per-operation execution implementations
 │   └── soroban/
 │       ├── mod.rs          # Soroban module entry point
 │       ├── host.rs         # Host function execution via e2e_invoke
@@ -215,6 +226,8 @@ if let Some(account) = state.get_account(&account_id) {
 
 Features:
 - **Savepoint-based rollback**: Lightweight state checkpoints (`Savepoint`) that can undo all entry types on failure (see [Savepoint Architecture](#savepoint-architecture) below)
+- **`EntryStore<K,V>`**: Generic store that bundles live entries, snapshots, created/modified/deleted tracking, and savepoint/rollback for 5 entry types (Data, ContractData, ContractCode, ClaimableBalance, LiquidityPool). 4 complex types (Account, Trustline, Offer, TTL) remain hand-written due to unique behaviors.
+- **O(1) delta rollback**: `DeltaSnapshot` captures vector lengths instead of cloning the entire `LedgerDelta`, yielding ~43% speedup on `apply_txs`
 - Per-operation savepoints for automatic rollback of failed operations
 - Speculative orderbook exchange savepoints (path payments)
 - Multi-operation transaction tracking
@@ -318,17 +331,18 @@ Transaction with InvokeHostFunction
            |
            v
 +---------------------+
-| Build Storage Map    |  <- Load entries from bucket list
+| Build Storage Map    |  <- Load typed entries from state manager
 +---------------------+
            |
            v
-+---------------------+
-| Execute via e2e_invoke |  <- soroban-env-host execution
-+---------------------+
++---------------------------+
+| invoke_host_function_typed |  <- Typed API (no XDR ser/de for P25)
+| via PersistentModuleCache  |  <- Reuses compiled WASM across TXs
++---------------------------+
            |
            v
 +---------------------+
-| Collect Changes      |  <- Storage changes, events, fees
+| Collect Changes      |  <- Typed storage changes, events, fees
 +---------------------+
            |
            v
@@ -337,17 +351,19 @@ Apply to LedgerDelta
 
 ### Protocol Versioning
 
-The crate uses protocol-versioned `soroban-env-host` implementations to ensure deterministic replay:
+The crate uses two vendored copies of `soroban-env-host` (under `vendor/soroban-env-p24/` and `vendor/soroban-env-p25/`) to ensure deterministic replay across protocol versions:
 
-| Protocol | soroban-env-host Version | Notes |
-|----------|-------------------------|-------|
-| 24       | `soroban-env-host-p24`  | Initial Soroban support |
-| 25+      | `soroban-env-host-p25`  | Current version |
+| Protocol | soroban-env-host | XDR crate | Boundary cost |
+|----------|-----------------|-----------|---------------|
+| 24       | `soroban-env-host-p24` | `stellar-xdr 24.0.0` | XDR roundtrip per type (P25 workspace types differ from P24) |
+| 25+      | `soroban-env-host-p25` | `stellar-xdr 25.0.0` | Zero-copy (same XDR crate as workspace) |
 
 This versioning is critical because:
 - Host function semantics may change between versions
 - Cost model parameters differ per protocol
 - PRNG behavior must match exactly for determinism
+
+Both paths use the **typed invoke API** (`invoke_host_function_typed()`) which passes `Rc<LedgerEntry>` and `Rc<TtlEntry>` directly instead of serialized XDR bytes. For P25, this eliminates all XDR conversion at the boundary. For P24, type bridge functions convert between the P25 workspace types and P24 host types (an irreducible cost of dual-protocol support).
 
 ### Key Components
 
@@ -357,7 +373,11 @@ This versioning is critical because:
 
 - **`SorobanStorage`**: Provides the storage interface for contract state, tracking reads and writes during execution.
 
-- **`execute_host_function`**: Main entry point that dispatches to the correct protocol-versioned host.
+- **`execute_host_function_with_cache`**: Main entry point that dispatches to the correct protocol-versioned host. Accepts a `PersistentModuleCache` for WASM module reuse.
+
+- **`PersistentModuleCache`**: Enum wrapping P24/P25 compiled WASM module caches. Created once per ledger close and reused across all transactions, avoiding redundant WASM compilation.
+
+- **`SorobanContext`**: Bundle struct threading optional Soroban parameters (`SorobanTransactionData`, `SorobanConfig`, `PersistentModuleCache`, `HotArchiveLookup`, `TtlKeyCache`) through operation execution. Non-Soroban transactions use `SorobanContext::none()`.
 
 ### Entry TTL and Archival
 
@@ -532,26 +552,26 @@ commit/rollback pattern.
   +-----------------------+
   | LedgerStateManager    |
   |                       |       create_savepoint()
-  |  accounts             | ─────────────────────────────> +------------------+
-  |  trustlines           |                                |    Savepoint     |
-  |  offers               |                                |                  |
-  |  data_entries         |       rollback_to_savepoint()  | - snapshot maps  |
-  |  contract_data        | <───────────────────────────── | - pre-values     |
-  |  contract_code        |                                | - created sets   |
-  |  ttl_entries          |         (on failure)           | - delta lengths  |
-  |  claimable_balances   |                                | - modified lens  |
-  |  liquidity_pools      |                                | - metadata state |
+  |  accounts (manual)    | ─────────────────────────────> +------------------+
+  |  trustlines (manual)  |                                |    Savepoint     |
+  |  offers (manual)      |                                |                  |
+  |  ttl_entries (manual) |       rollback_to_savepoint()  | - snapshot maps  |
+  |  data (EntryStore)    | <───────────────────────────── | - pre-values     |
+  |  contract_data (ES)   |                                | - created sets   |
+  |  contract_code (ES)   |         (on failure)           | - delta lengths  |
+  |  claimable_bal (ES)   |                                | - modified lens  |
+  |  liquidity_pool (ES)  |                                | - metadata state |
   |  ...                  |                                | - id_pool        |
   +-----------+-----------+                                +------------------+
-              |
-              | flush_modified_entries()
+              |                                     EntryStore types delegate to
+              | flush_modified_entries()             EntryStoreSavepoint internally
               v
   +-----------------------+
   |     LedgerDelta       |  (output change log)
   |                       |
-  |  - created entries    |  Savepoint rollback also
-  |  - updated entries    |  truncates the delta back
-  |  - deleted entries    |  to its pre-savepoint lengths.
+  |  - created entries    |  Savepoint rollback truncates
+  |  - updated entries    |  delta vectors via O(1)
+  |  - deleted entries    |  DeltaSnapshot (length-only).
   |  - restored entries   |
   +-----------------------+
               |
@@ -563,10 +583,12 @@ commit/rollback pattern.
 **Key concepts:**
 
 - **Savepoint**: A lightweight state checkpoint that captures the current values of all
-  entry types (accounts, trustlines, offers, data, contract_data, contract_code, TTL,
-  claimable_balances, liquidity_pools), along with metadata tracking, delta vector lengths,
-  modified tracking vec lengths, created entry sets, and the id_pool. Creating a savepoint
-  is O(k) where k is the number of entries modified so far in the current transaction.
+  entry types. Four complex types (accounts, trustlines, offers, TTL) use manual
+  snapshot maps; five types (data, contract_data, contract_code, claimable_balances,
+  liquidity_pools) delegate to `EntryStoreSavepoint`. The savepoint also captures
+  metadata tracking, delta vector lengths (via `DeltaSnapshot`), modified tracking
+  vec lengths, created entry sets, and the id_pool. Creating a savepoint is O(k)
+  where k is the number of entries modified so far in the current transaction.
 
 - **Per-operation rollback**: Each operation in a multi-operation transaction gets a
   savepoint before execution (in the `henyey-ledger` execution loop). If the
@@ -585,7 +607,9 @@ commit/rollback pattern.
   creates, updates, and deletes for transaction metadata and bucket list updates.
   `Savepoint` is the internal undo mechanism. They interact because savepoint rollback
   also truncates the delta's vectors back to their pre-savepoint lengths, ensuring no
-  stale entries from failed operations appear in the final output.
+  stale entries from failed operations appear in the final output. Delta rollback uses
+  `DeltaSnapshot`, which captures only the vector lengths (not a full clone), making
+  it O(1) instead of O(N) where N is the accumulated delta size.
 
 - **Three-phase rollback** (`rollback_to_savepoint`):
   1. **Phase 1 -- Restore newly snapshot'd entries**: Entries that were first touched
@@ -597,6 +621,10 @@ commit/rollback pattern.
   3. **Phase 3 -- Restore tracking state**: Snapshot maps, created entry sets,
      modified vec lengths, entry metadata (last_modified, sponsorships), delta vector
      lengths, op_entry_snapshots, and id_pool are all restored to their savepoint values.
+
+  For `EntryStore`-based types, all three phases are handled internally by
+  `EntryStore::rollback_to_savepoint()`. Note that the `deleted` set (used by
+  Soroban types for cross-TX deletion tracking) is intentionally *not* rolled back.
 
 - **No manual rollback in operations**: Individual operation implementations (e.g.,
   `claimable_balance.rs`, `payment.rs`, `change_trust.rs`) do not contain manual
@@ -638,13 +666,19 @@ This crate corresponds to the following stellar-core components:
 | `live_execution.rs` | `src/transactions/TransactionFrame.cpp` (processFeeSeqNum, processPostApply, etc.) |
 | `validation.rs` | `src/transactions/TransactionUtils.cpp` |
 | `apply.rs` | `src/ledger/LedgerTxn.cpp` |
-| `state.rs` | `src/ledger/LedgerStateSnapshot.cpp`, `src/ledger/LedgerTxn.cpp` (nested commit/rollback via Savepoint) |
+| `state/mod.rs` | `src/ledger/LedgerStateSnapshot.cpp`, `src/ledger/LedgerTxn.cpp` (nested commit/rollback via Savepoint) |
+| `state/entries.rs` | `src/ledger/LedgerTxn.cpp` (per-type load/create/update/delete) |
+| `state/entry_store.rs` | No direct upstream equivalent (generic deduplication of per-type bookkeeping) |
+| `state/offer_index.rs` | `src/ledger/LedgerTxn.cpp` (offer ordering by price/id) |
+| `state/sponsorship.rs` | `src/ledger/LedgerTxn.cpp` (sponsorship tracking) |
+| `state/ttl.rs` | `src/ledger/LedgerTxn.cpp` (TTL entry management) |
 | `meta_builder.rs` | `src/transactions/TransactionMetaBuilder.cpp` |
 | `fee_bump.rs` | `src/transactions/FeeBumpTransactionFrame.cpp` |
 | `signature_checker.rs` | `src/transactions/SignatureChecker.cpp` |
 | `events.rs` | `src/transactions/EventManager.cpp` |
 | `lumen_reconciler.rs` | `src/transactions/LumenEventReconciler.cpp` |
 | `operations/` | `src/transactions/OperationFrame.cpp`, `src/transactions/*OpFrame.cpp` |
+| `operations/execute/offer_utils.rs` | `src/transactions/OfferExchange.cpp` (shared DEX helpers) |
 | `soroban/` | `src/transactions/InvokeHostFunctionOpFrame.cpp` |
 
 ## Testing
