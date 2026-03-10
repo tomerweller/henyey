@@ -17,7 +17,7 @@ use std::hash::Hash;
 /// rollback, commit, and flush lifecycle management.
 #[derive(Clone)]
 #[allow(dead_code)]
-pub struct EntryStore<K: Eq + Hash + Clone, V: Clone + PartialEq> {
+pub struct EntryStore<K: Eq + Hash + Clone, V: Clone> {
     /// Live entries.
     entries: HashMap<K, V>,
     /// Snapshot of each entry's value at the start of the current transaction.
@@ -50,7 +50,7 @@ pub struct EntryStoreSavepoint<K: Eq + Hash + Clone, V: Clone> {
 impl<K, V> EntryStore<K, V>
 where
     K: Eq + Hash + Clone,
-    V: Clone + PartialEq,
+    V: Clone,
 {
     /// Create a new empty entry store without deleted-entry tracking.
     pub fn new() -> Self {
@@ -204,6 +204,10 @@ where
     pub fn remove_deleted(&mut self, key: &K, track_deleted: bool, track_modified: bool) {
         self.entries.remove(key);
         if track_deleted {
+            debug_assert!(
+                self.deleted.is_some(),
+                "track_deleted=true on store without deleted tracking"
+            );
             if let Some(ref mut deleted) = self.deleted {
                 deleted.insert(key.clone());
             }
@@ -775,6 +779,24 @@ mod tests {
         store.commit();
         // Deleted set is NOT cleared by commit (persistent across TXs in same ledger)
         assert!(store.is_deleted(&1));
+    }
+
+    #[test]
+    fn test_deleted_survives_savepoint_rollback() {
+        let mut store = new_store_with_deleted();
+        store.entries_mut().insert(1, "hello".to_string());
+        store.ensure_snapshot_on_first(&1);
+        let sp = store.create_savepoint();
+        // Delete after savepoint
+        store.remove_deleted(&1, true, false);
+        assert!(store.is_deleted(&1));
+        // Rollback should restore the entry but NOT undo the deleted marker
+        store.rollback_to_savepoint(sp);
+        assert!(store.contains(&1));
+        assert!(
+            store.is_deleted(&1),
+            "deleted set must survive savepoint rollback (cross-TX deletion tracking)"
+        );
     }
 
     #[test]
