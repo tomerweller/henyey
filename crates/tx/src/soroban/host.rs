@@ -11,7 +11,6 @@ use sha2::{Digest, Sha256};
 use soroban_env_host24::xdr::ReadXdr as ReadXdrP24;
 use soroban_env_host24::{
     budget::{AsBudget, Budget},
-    e2e_invoke::{self},
     fees::{compute_rent_fee, LedgerEntryRentChange},
     storage::{EntryWithLiveUntil, SnapshotSource},
     vm::VersionedContractCodeCostInputs,
@@ -61,6 +60,53 @@ type ArchivedWithRestoreInfoP25 = Option<(
 
 /// A ledger entry paired with its optional TTL (live_until ledger sequence).
 pub type EntryWithTtl = (Rc<LedgerEntry>, Option<u32>);
+
+/// Extracts the rent-related changes from typed ledger changes.
+///
+/// This is the typed counterpart to `e2e_invoke::extract_rent_changes()` that
+/// operates on `TypedLedgerEntryChange` instead of `LedgerEntryChange`.
+/// Only meaningful changes are returned (i.e. no-op changes are skipped).
+fn extract_rent_changes_from_typed(
+    ledger_changes: &[soroban_env_host25::e2e_invoke::TypedLedgerEntryChange],
+) -> Vec<soroban_env_host25::fees::LedgerEntryRentChange> {
+    use soroban_env_host25::e2e_invoke::TypedLedgerEntryChange;
+    use soroban_env_host25::fees::LedgerEntryRentChange;
+    use stellar_xdr::curr::{ContractDataDurability, LedgerEntryType};
+
+    ledger_changes
+        .iter()
+        .filter_map(|entry_change: &TypedLedgerEntryChange| {
+            // Rent changes are only relevant to non-removed entries with a ttl.
+            if let Some(ttl_change) = &entry_change.ttl_change {
+                let new_size_bytes_for_rent = if entry_change.new_entry.is_some() {
+                    entry_change.new_entry_size_bytes_for_rent
+                } else {
+                    entry_change.old_entry_size_bytes_for_rent
+                };
+
+                // Skip the entry if 1. it is not extended and 2. the entry size has not increased
+                if ttl_change.old_live_until_ledger >= ttl_change.new_live_until_ledger
+                    && entry_change.old_entry_size_bytes_for_rent >= new_size_bytes_for_rent
+                {
+                    return None;
+                }
+                Some(LedgerEntryRentChange {
+                    is_persistent: matches!(
+                        ttl_change.durability,
+                        ContractDataDurability::Persistent
+                    ),
+                    is_code_entry: matches!(ttl_change.entry_type, LedgerEntryType::ContractCode),
+                    old_size_bytes: entry_change.old_entry_size_bytes_for_rent,
+                    new_size_bytes: new_size_bytes_for_rent,
+                    old_live_until_ledger: ttl_change.old_live_until_ledger,
+                    new_live_until_ledger: ttl_change.new_live_until_ledger,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
 
 /// Result of Soroban host function execution.
 pub struct SorobanExecutionResult {
@@ -700,6 +746,132 @@ fn convert_contract_cost_params_to_p24(
 // are the same crate, so all types are identical and no conversion is needed.
 // P24 conversion functions above are still required because P24 uses stellar-xdr 24.0.0.
 
+// ── P25→P24 conversion functions for typed API inputs ──
+// These convert workspace (P25) types to P24 types via XDR roundtrip.
+// This is the irreducible cost of supporting the P24 host with P25 workspace types.
+
+fn convert_host_function_to_p24(
+    hf: &HostFunction,
+) -> Option<soroban_env_host24::xdr::HostFunction> {
+    let bytes = hf.to_xdr(Limits::none()).ok()?;
+    soroban_env_host24::xdr::HostFunction::from_xdr(&bytes, soroban_env_host24::xdr::Limits::none())
+        .ok()
+}
+
+fn convert_soroban_resources_to_p24(
+    resources: &stellar_xdr::curr::SorobanResources,
+) -> Option<soroban_env_host24::xdr::SorobanResources> {
+    let bytes = resources.to_xdr(Limits::none()).ok()?;
+    soroban_env_host24::xdr::SorobanResources::from_xdr(
+        &bytes,
+        soroban_env_host24::xdr::Limits::none(),
+    )
+    .ok()
+}
+
+fn convert_account_id_to_p24(account: &AccountId) -> Option<soroban_env_host24::xdr::AccountId> {
+    let bytes = account.to_xdr(Limits::none()).ok()?;
+    soroban_env_host24::xdr::AccountId::from_xdr(&bytes, soroban_env_host24::xdr::Limits::none())
+        .ok()
+}
+
+fn convert_auth_entry_to_p24(
+    entry: &SorobanAuthorizationEntry,
+) -> Option<soroban_env_host24::xdr::SorobanAuthorizationEntry> {
+    let bytes = entry.to_xdr(Limits::none()).ok()?;
+    soroban_env_host24::xdr::SorobanAuthorizationEntry::from_xdr(
+        &bytes,
+        soroban_env_host24::xdr::Limits::none(),
+    )
+    .ok()
+}
+
+fn convert_ttl_entry_to_p24(
+    ttl: &stellar_xdr::curr::TtlEntry,
+) -> Option<soroban_env_host24::xdr::TtlEntry> {
+    let bytes = ttl.to_xdr(Limits::none()).ok()?;
+    soroban_env_host24::xdr::TtlEntry::from_xdr(&bytes, soroban_env_host24::xdr::Limits::none())
+        .ok()
+}
+
+// ── P24→P25 conversion functions for typed API outputs ──
+
+fn convert_sc_val_from_p24(val: &soroban_env_host24::xdr::ScVal) -> Option<ScVal> {
+    let bytes =
+        soroban_env_host24::xdr::WriteXdr::to_xdr(val, soroban_env_host24::xdr::Limits::none())
+            .ok()?;
+    ScVal::from_xdr(&bytes, Limits::none()).ok()
+}
+
+fn convert_contract_event_from_p24(
+    event: &soroban_env_host24::xdr::ContractEvent,
+) -> Option<stellar_xdr::curr::ContractEvent> {
+    let bytes =
+        soroban_env_host24::xdr::WriteXdr::to_xdr(event, soroban_env_host24::xdr::Limits::none())
+            .ok()?;
+    stellar_xdr::curr::ContractEvent::from_xdr(&bytes, Limits::none()).ok()
+}
+
+fn convert_ledger_entry_from_p24(
+    entry: &soroban_env_host24::xdr::LedgerEntry,
+) -> Option<LedgerEntry> {
+    let bytes =
+        soroban_env_host24::xdr::WriteXdr::to_xdr(entry, soroban_env_host24::xdr::Limits::none())
+            .ok()?;
+    LedgerEntry::from_xdr(&bytes, Limits::none()).ok()
+}
+
+fn convert_ledger_key_from_p24_to_p25(
+    key: &soroban_env_host24::xdr::LedgerKey,
+) -> Option<LedgerKey> {
+    let bytes =
+        soroban_env_host24::xdr::WriteXdr::to_xdr(key, soroban_env_host24::xdr::Limits::none())
+            .ok()?;
+    LedgerKey::from_xdr(&bytes, Limits::none()).ok()
+}
+
+/// Extracts rent changes from P24 typed ledger changes.
+/// Same logic as `extract_rent_changes_from_typed` but for P24 types.
+fn extract_rent_changes_from_typed_p24(
+    ledger_changes: &[soroban_env_host24::e2e_invoke::TypedLedgerEntryChange],
+) -> Vec<soroban_env_host24::fees::LedgerEntryRentChange> {
+    use soroban_env_host24::e2e_invoke::TypedLedgerEntryChange;
+    use soroban_env_host24::fees::LedgerEntryRentChange;
+    use soroban_env_host24::xdr::{ContractDataDurability, LedgerEntryType};
+
+    ledger_changes
+        .iter()
+        .filter_map(|entry_change: &TypedLedgerEntryChange| {
+            if let Some(ttl_change) = &entry_change.ttl_change {
+                let new_size_bytes_for_rent = if entry_change.new_entry.is_some() {
+                    entry_change.new_entry_size_bytes_for_rent
+                } else {
+                    entry_change.old_entry_size_bytes_for_rent
+                };
+
+                if ttl_change.old_live_until_ledger >= ttl_change.new_live_until_ledger
+                    && entry_change.old_entry_size_bytes_for_rent >= new_size_bytes_for_rent
+                {
+                    return None;
+                }
+                Some(LedgerEntryRentChange {
+                    is_persistent: matches!(
+                        ttl_change.durability,
+                        ContractDataDurability::Persistent
+                    ),
+                    is_code_entry: matches!(ttl_change.entry_type, LedgerEntryType::ContractCode),
+                    old_size_bytes: entry_change.old_entry_size_bytes_for_rent,
+                    new_size_bytes: new_size_bytes_for_rent,
+                    old_live_until_ledger: ttl_change.old_live_until_ledger,
+                    new_live_until_ledger: ttl_change.new_live_until_ledger,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Context for pre-compiling WASM modules outside of transaction execution.
 /// This mimics how stellar-core pre-compiles all contracts with an unlimited budget.
 /// We use very high budget limits (10B CPU, 1GB memory) to ensure compilation never fails
@@ -967,201 +1139,6 @@ fn make_xdr_setup_error() -> SorobanExecutionError {
     }
 }
 
-/// Encode a value to XDR, mapping errors to a setup error.
-fn xdr_encode_setup<T: stellar_xdr::curr::WriteXdr>(
-    val: &T,
-) -> Result<Vec<u8>, SorobanExecutionError> {
-    val.to_xdr(Limits::none())
-        .map_err(|_| make_xdr_setup_error())
-}
-
-/// Encode a p24 XDR value, mapping errors to a setup error.
-fn xdr_encode_p24_setup<T: soroban_env_host24::xdr::WriteXdr>(
-    val: &T,
-) -> Result<Vec<u8>, SorobanExecutionError> {
-    val.to_xdr(soroban_env_host24::xdr::Limits::none())
-        .map_err(|_| make_xdr_setup_error())
-}
-
-/// Result of collecting and encoding footprint entries for the Soroban host.
-struct EncodedFootprint {
-    ledger_entries: Vec<Vec<u8>>,
-    ttl_entries: Vec<Vec<u8>>,
-    actual_restored_indices: Vec<u32>,
-    live_bl_restores: Vec<super::protocol::LiveBucketListRestore>,
-}
-
-/// Collect and encode ledger entries from the transaction footprint.
-///
-/// Encodes each entry and its TTL for consumption by `e2e_invoke`. Handles
-/// archived entry restoration for Protocol 23+ by checking hot archive state
-/// and tracking which entries are actually being restored.
-fn encode_footprint_entries(
-    soroban_data: &SorobanTransactionData,
-    snapshot: &LedgerSnapshotAdapter<'_>,
-    context: &LedgerContext,
-    soroban_config: &SorobanConfig,
-    ttl_key_cache: Option<&super::TtlKeyCache>,
-) -> Result<EncodedFootprint, SorobanExecutionError> {
-    let make_setup_error = make_xdr_setup_error;
-    let current_ledger = context.sequence;
-
-    // Extract archived entry indices from soroban_data.ext for TTL restoration
-    let restored_rw_entry_indices: Vec<u32> = match &soroban_data.ext {
-        SorobanTransactionDataExt::V1(ext) => {
-            ext.archived_soroban_entries.iter().copied().collect()
-        }
-        SorobanTransactionDataExt::V0 => Vec::new(),
-    };
-    let restored_indices_set: std::collections::HashSet<u32> =
-        restored_rw_entry_indices.iter().copied().collect();
-
-    let mut encoded_ledger_entries = Vec::new();
-    let mut encoded_ttl_entries = Vec::new();
-
-    // Helper to encode an entry and its TTL, returning the encoded bytes.
-    let encode_entry = |key: &LedgerKey,
-                        entry: &soroban_env_host24::xdr::LedgerEntry,
-                        live_until: Option<u32>|
-     -> Result<(Vec<u8>, Vec<u8>), SorobanExecutionError> {
-        let entry_bytes = xdr_encode_p24_setup(entry)?;
-
-        let needs_ttl = matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_));
-        let ttl_bytes = if let Some(lu) = live_until {
-            let key_hash = super::get_or_compute_key_hash(ttl_key_cache, key);
-            xdr_encode_p24_setup(&soroban_env_host24::xdr::TtlEntry {
-                key_hash: soroban_env_host24::xdr::Hash(key_hash.0),
-                live_until_ledger_seq: lu,
-            })?
-        } else if needs_ttl {
-            let key_hash = super::get_or_compute_key_hash(ttl_key_cache, key);
-            xdr_encode_p24_setup(&soroban_env_host24::xdr::TtlEntry {
-                key_hash: soroban_env_host24::xdr::Hash(key_hash.0),
-                live_until_ledger_seq: current_ledger,
-            })?
-        } else {
-            Vec::new()
-        };
-
-        Ok((entry_bytes, ttl_bytes))
-    };
-
-    // Read-only footprint entries
-    for key in soroban_data.resources.footprint.read_only.iter() {
-        let key_p24 = convert_ledger_key_to_p24(key).ok_or_else(make_setup_error)?;
-        if let Some((entry, live_until)) =
-            snapshot
-                .get(&Rc::new(key_p24))
-                .map_err(|e| SorobanExecutionError {
-                    host_error: convert_host_error_p24_to_p25(e),
-                    cpu_insns_consumed: 0,
-                    mem_bytes_consumed: 0,
-                })?
-        {
-            let (le, ttl) = encode_entry(key, &entry, live_until)?;
-            encoded_ledger_entries.push(le);
-            encoded_ttl_entries.push(ttl);
-        }
-        // If entry not found, skip it — e2e_invoke's footprint loop will
-        // add it to the storage map as None (entry doesn't exist yet).
-    }
-
-    if !restored_indices_set.is_empty() {
-        tracing::debug!(
-            restored_count = restored_rw_entry_indices.len(),
-            restored_indices = ?restored_rw_entry_indices,
-            "P24: Transaction has archived entries to restore"
-        );
-    }
-
-    let mut live_bl_restores: Vec<super::protocol::LiveBucketListRestore> = Vec::new();
-    let mut actual_restored_indices: Vec<u32> = Vec::new();
-
-    // Read-write footprint entries (with archived entry restoration)
-    for (idx, key) in soroban_data
-        .resources
-        .footprint
-        .read_write
-        .iter()
-        .enumerate()
-    {
-        let key_p24 = convert_ledger_key_to_p24(key).ok_or_else(make_setup_error)?;
-
-        let is_being_restored = restored_indices_set.contains(&(idx as u32));
-        if is_being_restored {
-            let result = snapshot
-                .get_archived_with_restore_info(&Rc::new(key_p24), key)
-                .map_err(|e| SorobanExecutionError {
-                    host_error: convert_host_error_p24_to_p25(e),
-                    cpu_insns_consumed: 0,
-                    mem_bytes_consumed: 0,
-                })?;
-            if let Some((entry, live_until, live_bl_restore)) = result {
-                let is_actually_archived = match live_until {
-                    None => true,
-                    Some(lu) => lu < context.sequence,
-                };
-
-                if is_actually_archived {
-                    let restored_live_until =
-                        Some(context.sequence + soroban_config.min_persistent_entry_ttl - 1);
-                    tracing::info!(
-                        idx = idx,
-                        key_type = ?std::mem::discriminant(key),
-                        old_live_until = ?live_until,
-                        restored_live_until = ?restored_live_until,
-                        current_ledger = context.sequence,
-                        is_live_bl_restore = live_bl_restore.is_some(),
-                        "P24: Archived entry found for restoration"
-                    );
-                    let (le, ttl) = encode_entry(key, &entry, restored_live_until)?;
-                    encoded_ledger_entries.push(le);
-                    encoded_ttl_entries.push(ttl);
-                    actual_restored_indices.push(idx as u32);
-                    if let Some(restore) = live_bl_restore {
-                        live_bl_restores.push(restore);
-                    }
-                } else {
-                    tracing::debug!(
-                        idx = idx,
-                        key_type = ?std::mem::discriminant(key),
-                        live_until = ?live_until,
-                        "P24: Entry marked for restore but already live (restored by earlier TX)"
-                    );
-                    let (le, ttl) = encode_entry(key, &entry, live_until)?;
-                    encoded_ledger_entries.push(le);
-                    encoded_ttl_entries.push(ttl);
-                }
-            }
-            // If archived entry not found, skip it — e2e_invoke's footprint
-            // loop will add it to the storage map as None.
-        } else {
-            if let Some((entry, live_until)) =
-                snapshot
-                    .get(&Rc::new(key_p24))
-                    .map_err(|e| SorobanExecutionError {
-                        host_error: convert_host_error_p24_to_p25(e),
-                        cpu_insns_consumed: 0,
-                        mem_bytes_consumed: 0,
-                    })?
-            {
-                let (le, ttl) = encode_entry(key, &entry, live_until)?;
-                encoded_ledger_entries.push(le);
-                encoded_ttl_entries.push(ttl);
-            }
-            // If entry not found, skip it — e2e_invoke's footprint loop will
-            // add it to the storage map as None (entry doesn't exist yet).
-        }
-    }
-
-    Ok(EncodedFootprint {
-        ledger_entries: encoded_ledger_entries,
-        ttl_entries: encoded_ttl_entries,
-        actual_restored_indices,
-        live_bl_restores,
-    })
-}
-
 #[allow(clippy::too_many_arguments)]
 fn execute_host_function_p24(
     host_function: &HostFunction,
@@ -1176,9 +1153,6 @@ fn execute_host_function_p24(
     ttl_key_cache: Option<&super::TtlKeyCache>,
 ) -> Result<SorobanExecutionResult, SorobanExecutionError> {
     // Create budget with network cost parameters.
-    // stellar-core passes the per-transaction specified instruction limit directly
-    // to the host (mResources.instructions in InvokeHostFunctionOpFrame.cpp line 547).
-    // The memory limit comes from the network config (ledger_info.memory_limit).
     let instruction_limit = soroban_data.resources.instructions as u64;
     let memory_limit = soroban_config.tx_max_memory_bytes;
 
@@ -1221,34 +1195,43 @@ fn execute_host_function_p24(
         instruction_limit,
         memory_limit,
         has_cost_params = soroban_config.has_valid_cost_params(),
-        "Soroban host ledger info configured"
+        "P24: Soroban host ledger info configured"
     );
 
-    // Use PRNG seed from context if provided (computed as subSha256(txSetHash, txIndex)),
-    // otherwise fall back to a deterministic but incorrect seed based on ledger info.
-    let seed: Vec<u8> = if let Some(prng_seed) = context.soroban_prng_seed {
-        prng_seed.to_vec()
+    // PRNG seed: [u8; 32] for the typed API.
+    let base_prng_seed: [u8; 32] = if let Some(prng_seed) = context.soroban_prng_seed {
+        prng_seed
     } else {
-        // Fallback: use ledger info to generate a deterministic but incorrect seed.
-        // This will cause Soroban contract results to differ from stellar-core.
-        tracing::warn!("Using fallback PRNG seed - results may differ from stellar-core");
+        tracing::warn!("P24: Using fallback PRNG seed - results may differ from stellar-core");
         let mut hasher = Sha256::new();
         hasher.update(context.network_id.0 .0);
         hasher.update(context.sequence.to_le_bytes());
         hasher.update(context.close_time.to_le_bytes());
-        hasher.finalize().to_vec()
+        hasher.finalize().into()
     };
 
-    // Encode all data to XDR bytes for e2e_invoke
-    let encoded_host_fn = xdr_encode_setup(host_function)?;
-    let encoded_resources = xdr_encode_setup(&soroban_data.resources)?;
-    let encoded_source = xdr_encode_setup(source)?;
-    let encoded_auth_entries: Vec<Vec<u8>> = auth_entries
+    // ── Convert P25 (workspace) types to P24 types for the typed API ──
+    let host_function_p24 =
+        convert_host_function_to_p24(host_function).ok_or_else(make_xdr_setup_error)?;
+    let resources_p24 = convert_soroban_resources_to_p24(&soroban_data.resources)
+        .ok_or_else(make_xdr_setup_error)?;
+    let source_p24 = convert_account_id_to_p24(source).ok_or_else(make_xdr_setup_error)?;
+    let auth_entries_p24: Vec<soroban_env_host24::xdr::SorobanAuthorizationEntry> = auth_entries
         .iter()
-        .map(|e| xdr_encode_setup(e))
+        .map(|e| convert_auth_entry_to_p24(e).ok_or_else(make_xdr_setup_error))
         .collect::<Result<_, _>>()?;
 
-    // Create snapshot adapter with hot archive access for Protocol 23+ entry restoration
+    // Extract archived entry indices from soroban_data.ext
+    let restored_rw_entry_indices: Vec<u32> = match &soroban_data.ext {
+        SorobanTransactionDataExt::V1(ext) => {
+            ext.archived_soroban_entries.iter().copied().collect()
+        }
+        SorobanTransactionDataExt::V0 => Vec::new(),
+    };
+    let restored_indices_set: std::collections::HashSet<u32> =
+        restored_rw_entry_indices.iter().copied().collect();
+
+    // Create snapshot adapter with hot archive access
     let snapshot = LedgerSnapshotAdapter::with_hot_archive(
         state,
         context.sequence,
@@ -1256,22 +1239,135 @@ fn execute_host_function_p24(
         ttl_key_cache,
     );
 
-    // Collect and encode ledger entries from the footprint
-    let EncodedFootprint {
-        ledger_entries: encoded_ledger_entries,
-        ttl_entries: encoded_ttl_entries,
-        actual_restored_indices,
-        live_bl_restores,
-    } = encode_footprint_entries(
-        soroban_data,
-        &snapshot,
-        context,
-        soroban_config,
-        ttl_key_cache,
-    )?;
+    // ── Build typed ledger entries for P24 ──
+    // Build (Rc<P24::LedgerEntry>, Option<Rc<P24::TtlEntry>>) pairs.
+    let mut typed_ledger_entries: Vec<(
+        Rc<soroban_env_host24::xdr::LedgerEntry>,
+        Option<Rc<soroban_env_host24::xdr::TtlEntry>>,
+    )> = Vec::new();
+    let current_ledger = context.sequence;
+
+    // Helper to build an Rc<P24::TtlEntry> for a given workspace key and live_until.
+    let build_ttl_entry_p24 = |key: &LedgerKey,
+                               live_until: Option<u32>|
+     -> Option<Rc<soroban_env_host24::xdr::TtlEntry>> {
+        let needs_ttl = matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_));
+        if let Some(lu) = live_until {
+            let key_hash = super::get_or_compute_key_hash(ttl_key_cache, key);
+            let ttl_entry = stellar_xdr::curr::TtlEntry {
+                key_hash,
+                live_until_ledger_seq: lu,
+            };
+            convert_ttl_entry_to_p24(&ttl_entry).map(Rc::new)
+        } else if needs_ttl {
+            let key_hash = super::get_or_compute_key_hash(ttl_key_cache, key);
+            let ttl_entry = stellar_xdr::curr::TtlEntry {
+                key_hash,
+                live_until_ledger_seq: current_ledger,
+            };
+            convert_ttl_entry_to_p24(&ttl_entry).map(Rc::new)
+        } else {
+            None
+        }
+    };
+
+    // Read-only footprint entries
+    for key in soroban_data.resources.footprint.read_only.iter() {
+        let key_p24 = convert_ledger_key_to_p24(key).ok_or_else(make_xdr_setup_error)?;
+        if let Some((entry, live_until)) =
+            snapshot
+                .get(&Rc::new(key_p24))
+                .map_err(|e| SorobanExecutionError {
+                    host_error: convert_host_error_p24_to_p25(e),
+                    cpu_insns_consumed: 0,
+                    mem_bytes_consumed: 0,
+                })?
+        {
+            let ttl = build_ttl_entry_p24(key, live_until);
+            typed_ledger_entries.push((entry, ttl));
+        }
+    }
+
+    if !restored_indices_set.is_empty() {
+        tracing::debug!(
+            restored_count = restored_rw_entry_indices.len(),
+            restored_indices = ?restored_rw_entry_indices,
+            "P24: Transaction has archived entries to restore"
+        );
+    }
+
+    let mut live_bl_restores: Vec<super::protocol::LiveBucketListRestore> = Vec::new();
+    let mut actual_restored_indices: Vec<u32> = Vec::new();
+
+    // Read-write footprint entries (with archived entry restoration)
+    for (idx, key) in soroban_data
+        .resources
+        .footprint
+        .read_write
+        .iter()
+        .enumerate()
+    {
+        let key_p24 = convert_ledger_key_to_p24(key).ok_or_else(make_xdr_setup_error)?;
+        let is_being_restored = restored_indices_set.contains(&(idx as u32));
+        if is_being_restored {
+            let result = snapshot
+                .get_archived_with_restore_info(&Rc::new(key_p24), key)
+                .map_err(|e| SorobanExecutionError {
+                    host_error: convert_host_error_p24_to_p25(e),
+                    cpu_insns_consumed: 0,
+                    mem_bytes_consumed: 0,
+                })?;
+            if let Some((entry, live_until, live_bl_restore)) = result {
+                let is_actually_archived = match live_until {
+                    None => true,
+                    Some(lu) => lu < context.sequence,
+                };
+
+                if is_actually_archived {
+                    let restored_live_until =
+                        Some(context.sequence + soroban_config.min_persistent_entry_ttl - 1);
+                    tracing::info!(
+                        idx = idx,
+                        key_type = ?std::mem::discriminant(key),
+                        old_live_until = ?live_until,
+                        restored_live_until = ?restored_live_until,
+                        is_live_bl_restore = live_bl_restore.is_some(),
+                        "P24: Archived entry found for restoration"
+                    );
+                    let ttl = build_ttl_entry_p24(key, restored_live_until);
+                    typed_ledger_entries.push((entry, ttl));
+                    actual_restored_indices.push(idx as u32);
+                    if let Some(restore) = live_bl_restore {
+                        live_bl_restores.push(restore);
+                    }
+                } else {
+                    tracing::debug!(
+                        idx = idx,
+                        key_type = ?std::mem::discriminant(key),
+                        live_until = ?live_until,
+                        "P24: Entry marked for restore but already live (restored by earlier TX)"
+                    );
+                    let ttl = build_ttl_entry_p24(key, live_until);
+                    typed_ledger_entries.push((entry, ttl));
+                }
+            }
+        } else {
+            if let Some((entry, live_until)) =
+                snapshot
+                    .get(&Rc::new(key_p24))
+                    .map_err(|e| SorobanExecutionError {
+                        host_error: convert_host_error_p24_to_p25(e),
+                        cpu_insns_consumed: 0,
+                        mem_bytes_consumed: 0,
+                    })?
+            {
+                let ttl = build_ttl_entry_p24(key, live_until);
+                typed_ledger_entries.push((entry, ttl));
+            }
+        }
+    }
 
     // Use existing module cache — it must always be provided.
-    let cache_start = std::time::Instant::now();
     let module_cache = existing_cache.unwrap_or_else(|| {
         panic!(
             "P24: Module cache is not available — this is a bug. \
@@ -1279,45 +1375,29 @@ fn execute_host_function_p24(
         )
     });
     let module_cache = Some(module_cache.clone());
-    let cache_elapsed = cache_start.elapsed();
-    tracing::info!(
-        cache_ms = cache_elapsed.as_millis() as u64,
-        "P24: Module cache ready"
-    );
 
-    // Call e2e_invoke - iterator yields &Vec<u8> which implements AsRef<[u8]>
-    let invoke_start = std::time::Instant::now();
-    tracing::debug!(
-        instruction_limit,
-        memory_limit,
-        ledger_entries_count = encoded_ledger_entries.len(),
-        ttl_entries_count = encoded_ttl_entries.len(),
-        "P24: About to call e2e_invoke"
-    );
+    // ── Call invoke_host_function_typed() with P24 types ──
     let mut diagnostic_events: Vec<soroban_env_host24::xdr::DiagnosticEvent> = Vec::new();
-    let result = match e2e_invoke::invoke_host_function(
+    let result = match soroban_env_host24::e2e_invoke::invoke_host_function_typed(
         &budget,
         true, // enable_diagnostics
-        &encoded_host_fn,
-        &encoded_resources,
+        host_function_p24,
+        resources_p24,
         &actual_restored_indices,
-        &encoded_source,
-        encoded_auth_entries.iter(),
+        source_p24,
+        auth_entries_p24,
         ledger_info,
-        encoded_ledger_entries.iter(),
-        encoded_ttl_entries.iter(),
-        &seed,
+        typed_ledger_entries.into_iter(),
+        base_prng_seed,
         &mut diagnostic_events,
         None, // trace_hook
         module_cache,
     ) {
         Ok(r) => {
-            let invoke_elapsed = invoke_start.elapsed();
             tracing::info!(
-                invoke_ms = invoke_elapsed.as_millis() as u64,
                 cpu_consumed = budget.get_cpu_insns_consumed().unwrap_or(0),
                 mem_consumed = budget.get_mem_bytes_consumed().unwrap_or(0),
-                "P24: e2e_invoke completed successfully"
+                "P24: e2e_invoke_typed completed successfully"
             );
             r
         }
@@ -1326,7 +1406,7 @@ fn execute_host_function_p24(
                 error = %e,
                 cpu_consumed = budget.get_cpu_insns_consumed().unwrap_or(0),
                 mem_consumed = budget.get_mem_bytes_consumed().unwrap_or(0),
-                "P24: e2e_invoke returned error"
+                "P24: e2e_invoke_typed returned error"
             );
             return Err(SorobanExecutionError {
                 host_error: convert_host_error_p24_to_p25(e),
@@ -1336,16 +1416,22 @@ fn execute_host_function_p24(
         }
     };
 
-    // Parse the result
-    let (return_value, return_value_size) = match result.encoded_invoke_result {
-        Ok(ref bytes) => {
-            let val = ScVal::from_xdr(bytes, Limits::none()).unwrap_or(ScVal::Void);
-            (val, bytes.len() as u32)
+    // ── Process typed result ──
+    // Return value: P24 ScVal → P25 ScVal via XDR roundtrip.
+    let (return_value, return_value_size) = match result.invoke_result {
+        Ok(ref val) => {
+            let p25_val = convert_sc_val_from_p24(val).unwrap_or(ScVal::Void);
+            // Serialize once to get byte size.
+            let size = p25_val
+                .to_xdr(Limits::none())
+                .map(|b| b.len() as u32)
+                .unwrap_or(0);
+            (p25_val, size)
         }
         Err(ref e) => {
             tracing::debug!(
                 error = %e,
-                "P24: e2e_invoke result contained error"
+                "P24: e2e_invoke_typed result contained error"
             );
             return Err(SorobanExecutionError {
                 host_error: convert_host_error_p24_to_p25(e.clone()),
@@ -1355,100 +1441,73 @@ fn execute_host_function_p24(
         }
     };
 
+    // ── Contract events: P24 ContractEvent → P25 ContractEvent ──
     let mut contract_events = Vec::new();
     let mut contract_events_size = 0u32;
-    for buf in result.encoded_contract_events.iter() {
-        contract_events_size = contract_events_size.saturating_add(buf.len() as u32);
-        if let Ok(event) = stellar_xdr::curr::ContractEvent::from_xdr(buf, Limits::none()) {
-            contract_events.push(event);
+    for host_event in result.events.0.iter() {
+        if host_event.failed_call
+            || host_event.event.type_ == soroban_env_host24::xdr::ContractEventType::Diagnostic
+        {
+            continue;
+        }
+        if let Some(p25_event) = convert_contract_event_from_p24(&host_event.event) {
+            let event_size = p25_event
+                .to_xdr(Limits::none())
+                .map(|b| b.len() as u32)
+                .unwrap_or(0);
+            contract_events_size = contract_events_size.saturating_add(event_size);
+            contract_events.push(p25_event);
         }
     }
 
-    let rent_changes: Vec<LedgerEntryRentChange> =
-        e2e_invoke::extract_rent_changes(&result.ledger_changes);
+    // ── Rent: use get_ledger_changes_typed() + extract_rent_changes_from_typed_p24() ──
+    let min_live_until_ledger = context.sequence + soroban_config.min_persistent_entry_ttl - 1;
+    let typed_ledger_changes = soroban_env_host24::e2e_invoke::get_ledger_changes_typed(
+        &budget,
+        &result.storage,
+        &result.init_storage_map,
+        &result.ttl_map,
+        min_live_until_ledger,
+        &result.restored_keys,
+    )
+    .map_err(|e| SorobanExecutionError {
+        host_error: convert_host_error_p24_to_p25(e),
+        cpu_insns_consumed: budget.get_cpu_insns_consumed().unwrap_or(0),
+        mem_bytes_consumed: budget.get_mem_bytes_consumed().unwrap_or(0),
+    })?;
 
-    // Debug: print rent_changes for P24
-    if !rent_changes.is_empty() {
-        tracing::debug!(
-            rent_changes_count = rent_changes.len(),
-            "P24: Extracted rent changes"
-        );
-        for (i, rc) in rent_changes.iter().enumerate() {
-            tracing::debug!(
-                idx = i,
-                is_persistent = rc.is_persistent,
-                old_size = rc.old_size_bytes,
-                new_size = rc.new_size_bytes,
-                old_live_until = rc.old_live_until_ledger,
-                new_live_until = rc.new_live_until_ledger,
-                "P24: Rent change details"
-            );
-        }
-    }
+    let rent_changes_p24 = extract_rent_changes_from_typed_p24(&typed_ledger_changes);
 
-    // Convert ledger changes to our format
-    let storage_changes: Vec<crate::soroban::StorageChange> = result.ledger_changes
+    // ── Storage changes: map P24 TypedLedgerEntryChange to StorageChange ──
+    let storage_changes: Vec<crate::soroban::StorageChange> = typed_ledger_changes
         .into_iter()
         .filter_map(|change| {
-            // stellar-core behavior for transaction meta and state updates:
-            //
-            // 1. Transaction meta (setLedgerChangesFromSuccessfulOp): Uses raw res.getModifiedEntryMap()
-            //    which includes ALL entries, including RO TTL bumps. RO TTL bumps ARE in transaction meta.
-            // 2. State updates (commitChangesFromSuccessfulOp): Filters RO TTL bumps to mRoTTLBumps
-            //    (not the entry map) and flushes them at write barriers. This is for visibility ordering.
-            //
-            // We track read-only TTL bumps with is_read_only_ttl_bump flag so they can be:
-            // - Included in transaction meta (per stellar-core behavior)
-            // - Deferred for state visibility (so subsequent TXs don't see the bump)
-            
-            let is_deletion = !change.read_only && change.encoded_new_value.is_none();
-            let is_modification = change.encoded_new_value.is_some();
-            
-            // Determine if TTL was extended from the LEDGER-START perspective.
-            // We pass current TTL to the host for rent calculation, but for emission
-            // determination we need to compare against ledger-start TTL.
+            let is_deletion = !change.read_only && change.new_entry.is_none();
+            let is_modification = change.new_entry.is_some();
+            let is_rent_related = change.old_entry_size_bytes_for_rent > 0;
+
+            // Convert P24 key to P25 for TTL lookup.
+            let p25_key = convert_ledger_key_from_p24_to_p25(&change.key)?;
+
             let ttl_extended = change
                 .ttl_change
                 .as_ref()
                 .map(|ttl| {
-                    // Compare new TTL against ledger-start TTL, not host's old_live_until
-                    let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none()).ok();
-                    if let Some(ref key) = key {
-                        let key_hash = super::get_or_compute_key_hash(ttl_key_cache, key);
-                        let ledger_start_ttl = state.get_ttl_at_ledger_start(&key_hash).unwrap_or(0);
-                        ttl.new_live_until_ledger > ledger_start_ttl
-                    } else {
-                        // Fallback to host's comparison if we can't decode the key
-                        ttl.new_live_until_ledger > ttl.old_live_until_ledger
-                    }
+                    let key_hash = super::get_or_compute_key_hash(ttl_key_cache, &p25_key);
+                    let ledger_start_ttl = state.get_ttl_at_ledger_start(&key_hash).unwrap_or(0);
+                    ttl.new_live_until_ledger > ledger_start_ttl
                 })
                 .unwrap_or(false);
-            
-            // A read-only TTL bump is when:
-            // - Entry is read-only
-            // - Entry wasn't modified (no encoded_new_value)
-            // - TTL was extended
-            // These should be applied to state but NOT included in transaction meta.
-            let is_read_only_ttl_bump = change.read_only && !is_modification && ttl_extended;
-            
-            // Include entries that:
-            // 1. Have a new value (were created or modified), OR
-            // 2. Are NOT read-only and have no new value (were deleted), OR
-            // 3. Have a TTL that was extended (for bucket list updates)
-            // Note: read-only TTL bumps ARE included (for state/bucket list) but marked
-            // so they can be filtered from transaction meta.
-            let should_include = is_modification || is_deletion || ttl_extended;
 
-            if should_include {
-                let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none()).ok()?;
-                let new_entry = change.encoded_new_value.and_then(|bytes| {
-                    LedgerEntry::from_xdr(&bytes, Limits::none()).ok()
-                });
-                // Get TTL from ttl_change if present
+            let is_read_only_ttl_bump = change.read_only && !is_modification && ttl_extended;
+
+            if is_modification || is_deletion || ttl_extended {
+                let new_entry = change
+                    .new_entry
+                    .and_then(|rc| convert_ledger_entry_from_p24(&rc));
                 let live_until = change.ttl_change.map(|ttl| ttl.new_live_until_ledger);
-                let is_rent_related = change.old_entry_size_bytes_for_rent > 0;
                 Some(StorageChange {
-                    key,
+                    key: p25_key,
                     new_entry,
                     live_until,
                     ttl_extended,
@@ -1456,11 +1515,6 @@ fn execute_host_function_p24(
                     is_read_only_ttl_bump,
                 })
             } else {
-                tracing::info!(
-                    key_type = ?LedgerKey::from_xdr(&change.encoded_key, Limits::none()).ok().map(|k| std::mem::discriminant(&k)),
-                    read_only = change.read_only,
-                    "P24: Skipping ledger change (not modified/deleted/rent-related/ttl-extended)"
-                );
                 None
             }
         })
@@ -1472,10 +1526,10 @@ fn execute_host_function_p24(
     let contract_events_and_return_value_size =
         contract_events_size.saturating_add(return_value_size);
     let rent_fee_config = rent_fee_config_p25_to_p24(&soroban_config.rent_fee_config);
-    let rent_fee = compute_rent_fee(&rent_changes, &rent_fee_config, context.sequence);
+    let rent_fee = compute_rent_fee(&rent_changes_p24, &rent_fee_config, context.sequence);
     tracing::debug!(
         computed_rent_fee = rent_fee,
-        rent_changes_count = rent_changes.len(),
+        rent_changes_count = rent_changes_p24.len(),
         ledger_seq = context.sequence,
         "P24: Computed rent fee"
     );
@@ -1559,31 +1613,19 @@ fn execute_host_function_p25(
         "P25: Soroban host ledger info configured"
     );
 
-    let seed: Vec<u8> = if let Some(prng_seed) = context.soroban_prng_seed {
-        prng_seed.to_vec()
+    // PRNG seed: context.soroban_prng_seed is [u8; 32], matching the typed API's signature.
+    let base_prng_seed: [u8; 32] = if let Some(prng_seed) = context.soroban_prng_seed {
+        prng_seed
     } else {
         tracing::warn!("P25: Using fallback PRNG seed - results may differ from stellar-core");
         let mut hasher = Sha256::new();
         hasher.update(context.network_id.0 .0);
         hasher.update(context.sequence.to_le_bytes());
         hasher.update(context.close_time.to_le_bytes());
-        hasher.finalize().to_vec()
+        hasher.finalize().into()
     };
 
-    let encoded_host_fn = xdr_encode_setup(host_function)?;
-
-    let encoded_resources = xdr_encode_setup(&soroban_data.resources)?;
-
-    let encoded_source = xdr_encode_setup(source)?;
-
-    let encoded_auth_entries: Vec<Vec<u8>> = auth_entries
-        .iter()
-        .map(|e| xdr_encode_setup(e))
-        .collect::<Result<_, _>>()?;
-
-    // Extract archived entry indices from soroban_data.ext for TTL restoration FIRST
-    // These are indices into the read_write footprint entries that need their TTL restored
-    // We need this before building entries so we can include archived entries
+    // Extract archived entry indices from soroban_data.ext for TTL restoration
     let restored_rw_entry_indices: Vec<u32> = match &soroban_data.ext {
         SorobanTransactionDataExt::V1(ext) => {
             ext.archived_soroban_entries.iter().copied().collect()
@@ -1601,46 +1643,41 @@ fn execute_host_function_p25(
         ttl_key_cache,
     );
 
-    let mut encoded_ledger_entries = Vec::new();
-    let mut encoded_ttl_entries = Vec::new();
+    // ── Build typed ledger entries: Vec<(Rc<LedgerEntry>, Option<Rc<TtlEntry>>)> ──
+    // Instead of encoding to bytes, we build typed pairs that the typed API consumes directly.
+    let mut typed_ledger_entries: Vec<(Rc<LedgerEntry>, Option<Rc<stellar_xdr::curr::TtlEntry>>)> =
+        Vec::new();
     let current_ledger_p25 = context.sequence;
 
-    // Helper to encode an entry and its TTL, returning the encoded bytes.
-    let encode_entry_p25 = |key: &LedgerKey,
-                            entry: &LedgerEntry,
-                            live_until: Option<u32>|
-     -> Result<(Vec<u8>, Vec<u8>), SorobanExecutionError> {
-        let entry_bytes = xdr_encode_setup(entry)?;
-
-        let needs_ttl = matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_));
-        let ttl_bytes = if let Some(lu) = live_until {
-            let key_hash = super::get_or_compute_key_hash(ttl_key_cache, key);
-            let ttl_entry = stellar_xdr::curr::TtlEntry {
-                key_hash,
-                live_until_ledger_seq: lu,
-            };
-            xdr_encode_setup(&ttl_entry)?
-        } else if needs_ttl {
-            let key_hash = super::get_or_compute_key_hash(ttl_key_cache, key);
-            let ttl_entry = stellar_xdr::curr::TtlEntry {
-                key_hash,
-                live_until_ledger_seq: current_ledger_p25,
-            };
-            xdr_encode_setup(&ttl_entry)?
-        } else {
-            Vec::new()
+    // Helper to build an Rc<TtlEntry> for a given key and live_until.
+    let build_ttl_entry =
+        |key: &LedgerKey, live_until: Option<u32>| -> Option<Rc<stellar_xdr::curr::TtlEntry>> {
+            let needs_ttl = matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_));
+            if let Some(lu) = live_until {
+                let key_hash = super::get_or_compute_key_hash(ttl_key_cache, key);
+                Some(Rc::new(stellar_xdr::curr::TtlEntry {
+                    key_hash,
+                    live_until_ledger_seq: lu,
+                }))
+            } else if needs_ttl {
+                // Entry needs TTL but has none — use current ledger as placeholder.
+                let key_hash = super::get_or_compute_key_hash(ttl_key_cache, key);
+                Some(Rc::new(stellar_xdr::curr::TtlEntry {
+                    key_hash,
+                    live_until_ledger_seq: current_ledger_p25,
+                }))
+            } else {
+                None
+            }
         };
 
-        Ok((entry_bytes, ttl_bytes))
-    };
-
+    // Read-only footprint entries
     for key in soroban_data.resources.footprint.read_only.iter() {
         if let Some((entry, live_until)) = snapshot.get_local(key).map_err(make_setup_error)? {
-            let (le, ttl) = encode_entry_p25(key, entry.as_ref(), live_until)?;
-            encoded_ledger_entries.push(le);
-            encoded_ttl_entries.push(ttl);
+            let ttl = build_ttl_entry(key, live_until);
+            typed_ledger_entries.push((entry, ttl));
         }
-        // If entry not found, skip it — e2e_invoke's footprint loop will
+        // If entry not found, skip it — the typed API's footprint loop will
         // add it to the storage map as None (entry doesn't exist yet).
     }
 
@@ -1656,12 +1693,9 @@ fn execute_host_function_p25(
     let mut live_bl_restores: Vec<super::protocol::LiveBucketListRestore> = Vec::new();
 
     // Build the ACTUAL list of indices being restored in THIS transaction.
-    // The transaction envelope's archived_soroban_entries may list indices that were
-    // already restored by a previous transaction in the same ledger. We only want to
-    // tell the host about entries that are ACTUALLY being restored now.
-    // This matches stellar-core's previouslyRestoredFromHotArchive() check.
     let mut actual_restored_indices: Vec<u32> = Vec::new();
 
+    // Read-write footprint entries (with archived entry restoration)
     for (idx, key) in soroban_data
         .resources
         .footprint
@@ -1669,27 +1703,18 @@ fn execute_host_function_p25(
         .iter()
         .enumerate()
     {
-        // For archived entries being restored, use get_archived_with_restore_info
         let is_being_restored = restored_indices_set.contains(&(idx as u32));
         if is_being_restored {
             let result = snapshot
                 .get_archived_with_restore_info(&Rc::new(key.clone()))
                 .map_err(make_setup_error)?;
             if let Some((entry, live_until, live_bl_restore)) = result {
-                // Check if this entry is ACTUALLY archived (needs restoration).
-                // An entry is considered archived if:
-                // 1. It has no TTL (live_until is None) - from hot archive
-                // 2. Its TTL is expired (live_until < current_ledger) - live BL restore
-                //
-                // If the entry has a valid TTL >= current_ledger, it was already restored
-                // by a previous transaction in this ledger and should be treated as live.
                 let is_actually_archived = match live_until {
-                    None => true,                      // From hot archive
-                    Some(lu) => lu < context.sequence, // Live BL with expired TTL
+                    None => true,
+                    Some(lu) => lu < context.sequence,
                 };
 
                 if is_actually_archived {
-                    // Entry is actually being restored - use restored TTL
                     let restored_live_until =
                         Some(context.sequence + soroban_config.min_persistent_entry_ttl - 1);
                     tracing::info!(
@@ -1700,41 +1725,31 @@ fn execute_host_function_p25(
                         is_live_bl_restore = live_bl_restore.is_some(),
                         "P25: Archived entry found for restoration"
                     );
-                    let (le, ttl) = encode_entry_p25(key, entry.as_ref(), restored_live_until)?;
-                    encoded_ledger_entries.push(le);
-                    encoded_ttl_entries.push(ttl);
-
-                    // Track this index as actually being restored
+                    let ttl = build_ttl_entry(key, restored_live_until);
+                    typed_ledger_entries.push((entry, ttl));
                     actual_restored_indices.push(idx as u32);
-
-                    // Track live BL restorations
                     if let Some(restore) = live_bl_restore {
                         live_bl_restores.push(restore);
                     }
                 } else {
-                    // Entry is already live (restored by previous TX in this ledger).
-                    // Treat it as a normal live entry, don't add to restored indices.
                     tracing::debug!(
                         idx = idx,
                         key_type = ?std::mem::discriminant(key),
                         live_until = ?live_until,
                         "P25: Entry marked for restore but already live (restored by earlier TX)"
                     );
-                    let (le, ttl) = encode_entry_p25(key, entry.as_ref(), live_until)?;
-                    encoded_ledger_entries.push(le);
-                    encoded_ttl_entries.push(ttl);
+                    let ttl = build_ttl_entry(key, live_until);
+                    typed_ledger_entries.push((entry, ttl));
                 }
             }
-            // If archived entry not found, skip it — e2e_invoke's footprint
+            // If archived entry not found, skip it — the typed API's footprint
             // loop will add it to the storage map as None.
         } else {
-            // Normal entry - use standard TTL-filtered lookup
             if let Some((entry, live_until)) = snapshot.get_local(key).map_err(make_setup_error)? {
-                let (le, ttl) = encode_entry_p25(key, entry.as_ref(), live_until)?;
-                encoded_ledger_entries.push(le);
-                encoded_ttl_entries.push(ttl);
+                let ttl = build_ttl_entry(key, live_until);
+                typed_ledger_entries.push((entry, ttl));
             }
-            // If entry not found, skip it — e2e_invoke's footprint loop will
+            // If entry not found, skip it — the typed API's footprint loop will
             // add it to the storage map as None (entry doesn't exist yet).
         }
     }
@@ -1750,20 +1765,21 @@ fn execute_host_function_p25(
 
     let mut diagnostic_events: Vec<soroban_env_host25::xdr::DiagnosticEvent> = Vec::new();
 
-    let result = match e2e_invoke::invoke_host_function(
+    // ── Call invoke_host_function_typed() ──
+    // Pass typed values directly — no XDR serialization for inputs.
+    let result = match e2e_invoke::invoke_host_function_typed(
         &budget,
-        true,
-        &encoded_host_fn,
-        &encoded_resources,
+        true, // enable_diagnostics
+        host_function.clone(),
+        soroban_data.resources.clone(),
         &actual_restored_indices,
-        &encoded_source,
-        encoded_auth_entries.iter(),
+        source.clone(),
+        auth_entries.to_vec(),
         ledger_info,
-        encoded_ledger_entries.iter(),
-        encoded_ttl_entries.iter(),
-        &seed,
+        typed_ledger_entries.into_iter(),
+        base_prng_seed,
         &mut diagnostic_events,
-        None,
+        None, // trace_hook
         module_cache,
     ) {
         Ok(r) => r,
@@ -1774,7 +1790,7 @@ fn execute_host_function_p25(
                 cpu_consumed = cpu_insns_consumed,
                 mem_consumed = mem_bytes_consumed,
                 error = %e,
-                "P25: e2e_invoke failed"
+                "P25: e2e_invoke_typed failed"
             );
             for (i, event) in diagnostic_events.iter().enumerate() {
                 use soroban_env_host25::xdr::WriteXdr as _;
@@ -1794,10 +1810,17 @@ fn execute_host_function_p25(
         }
     };
 
-    let (return_value, return_value_size) = match result.encoded_invoke_result {
-        Ok(ref bytes) => {
-            let val = ScVal::from_xdr(bytes, Limits::none()).unwrap_or(ScVal::Void);
-            (val, bytes.len() as u32)
+    // ── Process typed result ──
+    // Return value: already a typed Result<ScVal, HostError>.
+    let (return_value, return_value_size) = match result.invoke_result {
+        Ok(ref val) => {
+            // Need to serialize once to get the byte size for contract_events_and_return_value_size.
+            // (This is the known xdr_len issue — acceptable for now.)
+            let size = val
+                .to_xdr(Limits::none())
+                .map(|b| b.len() as u32)
+                .unwrap_or(0);
+            (val.clone(), size)
         }
         Err(ref e) => {
             let cpu_insns_consumed = budget.get_cpu_insns_consumed().unwrap_or(0);
@@ -1809,7 +1832,6 @@ fn execute_host_function_p25(
                 error = %e,
                 "P25: Soroban invoke_result error"
             );
-            // Log diagnostic events for debugging crypto errors
             for (i, event) in diagnostic_events.iter().enumerate() {
                 use soroban_env_host25::xdr::WriteXdr as _;
                 if let Ok(encoded) = event.to_xdr(soroban_env_host25::xdr::Limits::none()) {
@@ -1828,57 +1850,71 @@ fn execute_host_function_p25(
         }
     };
 
+    // ── Contract events: extract from Events directly ──
+    // After XDR alignment, HostEvent.event is our workspace ContractEvent type.
     let mut contract_events = Vec::new();
     let mut contract_events_size = 0u32;
-    for buf in result.encoded_contract_events.iter() {
-        contract_events_size = contract_events_size.saturating_add(buf.len() as u32);
-        if let Ok(event) = stellar_xdr::curr::ContractEvent::from_xdr(buf, Limits::none()) {
-            contract_events.push(event);
+    for host_event in result.events.0.iter() {
+        if host_event.failed_call
+            || host_event.event.type_ == stellar_xdr::curr::ContractEventType::Diagnostic
+        {
+            continue;
         }
+        // Serialize event once to get its byte size.
+        let event_size = host_event
+            .event
+            .to_xdr(Limits::none())
+            .map(|b| b.len() as u32)
+            .unwrap_or(0);
+        contract_events_size = contract_events_size.saturating_add(event_size);
+        contract_events.push(host_event.event.clone());
     }
 
-    let rent_changes: Vec<soroban_env_host25::fees::LedgerEntryRentChange> =
-        e2e_invoke::extract_rent_changes(&result.ledger_changes);
+    // ── Rent: use get_ledger_changes_typed() + extract_rent_changes_from_typed() ──
+    let min_live_until_ledger = context.sequence + soroban_config.min_persistent_entry_ttl - 1;
+    let typed_ledger_changes = e2e_invoke::get_ledger_changes_typed(
+        &budget,
+        &result.storage,
+        &result.init_storage_map,
+        &result.ttl_map,
+        min_live_until_ledger,
+        &result.restored_keys,
+    )
+    .map_err(|e| SorobanExecutionError {
+        host_error: e,
+        cpu_insns_consumed: budget.get_cpu_insns_consumed().unwrap_or(0),
+        mem_bytes_consumed: budget.get_mem_bytes_consumed().unwrap_or(0),
+    })?;
 
-    let storage_changes: Vec<crate::soroban::StorageChange> = result
-        .ledger_changes
+    let rent_changes = extract_rent_changes_from_typed(&typed_ledger_changes);
+
+    // ── Storage changes: map TypedLedgerEntryChange to StorageChange ──
+    let storage_changes: Vec<crate::soroban::StorageChange> = typed_ledger_changes
         .into_iter()
         .filter_map(|change| {
-            // stellar-core behavior: RO TTL bumps ARE included in transaction meta.
-            // State updates defer them to mRoTTLBumps for visibility ordering, but that's
-            // separate from meta. See setLedgerChangesFromSuccessfulOp vs commitChangesFromSuccessfulOp.
-            let is_deletion = !change.read_only && change.encoded_new_value.is_none();
-            let is_modification = change.encoded_new_value.is_some();
+            let is_deletion = !change.read_only && change.new_entry.is_none();
+            let is_modification = change.new_entry.is_some();
             let is_rent_related = change.old_entry_size_bytes_for_rent > 0;
 
             // Determine if TTL was extended from the LEDGER-START perspective.
+            // Use typed key directly — no XDR deserialization needed.
             let ttl_extended = change
                 .ttl_change
                 .as_ref()
                 .map(|ttl| {
-                    // Compare new TTL against ledger-start TTL, not host's old_live_until
-                    let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none()).ok();
-                    if let Some(ref key) = key {
-                        let key_hash = super::get_or_compute_key_hash(ttl_key_cache, key);
-                        let ledger_start_ttl =
-                            state.get_ttl_at_ledger_start(&key_hash).unwrap_or(0);
-                        ttl.new_live_until_ledger > ledger_start_ttl
-                    } else {
-                        // Fallback to host's comparison if we can't decode the key
-                        ttl.new_live_until_ledger > ttl.old_live_until_ledger
-                    }
+                    let key_hash = super::get_or_compute_key_hash(ttl_key_cache, &change.key);
+                    let ledger_start_ttl = state.get_ttl_at_ledger_start(&key_hash).unwrap_or(0);
+                    ttl.new_live_until_ledger > ledger_start_ttl
                 })
                 .unwrap_or(false);
 
-            // A read-only TTL bump is when entry is read-only, wasn't modified, but TTL extended.
-            // These should be applied to state but NOT included in transaction meta.
+            // A read-only TTL bump: entry is read-only, wasn't modified, but TTL extended.
             let is_read_only_ttl_bump = change.read_only && !is_modification && ttl_extended;
 
             if is_modification || is_deletion || ttl_extended {
-                let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none()).ok()?;
-                let new_entry = change
-                    .encoded_new_value
-                    .and_then(|bytes| LedgerEntry::from_xdr(&bytes, Limits::none()).ok());
+                // Clone out of Rc — negligible cost vs the XDR serde that was here before.
+                let key = (*change.key).clone();
+                let new_entry = change.new_entry.map(|rc| (*rc).clone());
                 let live_until = change.ttl_change.map(|ttl| ttl.new_live_until_ledger);
                 Some(StorageChange {
                     key,
