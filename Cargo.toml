@@ -18,6 +18,11 @@ members = [
     "crates/work",
     "crates/historywork",
 ]
+# Vendored soroban-env crates are NOT workspace members (name collision between P24/P25).
+# They are referenced as path dependencies from workspace.dependencies below.
+exclude = [
+    "vendor",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -35,14 +40,14 @@ stellar-xdr = { version = "=25.0.0", default-features = false, features = ["std"
 stellar-strkey = "0.0.11"
 
 # Soroban host for Protocol 24 (supports protocols 20-24)
-# Using exact git revision from stellar-core for deterministic replay
-soroban-env-host-p24 = { package = "soroban-env-host", git = "https://github.com/stellar/rs-soroban-env", rev = "a37eeda815e626f416eff13f2eacb32a8b0c3729" }
-soroban-env-common-p24 = { package = "soroban-env-common", git = "https://github.com/stellar/rs-soroban-env", rev = "a37eeda815e626f416eff13f2eacb32a8b0c3729" }
+# Vendored from stellar/rs-soroban-env rev a37eeda8, with typed invoke API backported
+soroban-env-host-p24 = { package = "soroban-env-host", path = "vendor/soroban-env-p24/soroban-env-host" }
+soroban-env-common-p24 = { package = "soroban-env-common", path = "vendor/soroban-env-p24/soroban-env-common" }
 
 # Soroban host for Protocol 25 (supports protocol 25+)
-# Using v25.0.0 tag which includes the BN254 encoding fix (cf58d535)
-soroban-env-host-p25 = { package = "soroban-env-host", git = "https://github.com/stellar/rs-soroban-env", rev = "d2ff024b72f7f3f75737402ac74ca5d0093a4690" }
-soroban-env-common-p25 = { package = "soroban-env-common", git = "https://github.com/stellar/rs-soroban-env", rev = "d2ff024b72f7f3f75737402ac74ca5d0093a4690" }
+# Vendored from stellar/rs-soroban-env v25.0.0 (rev d2ff024b), with typed invoke API added
+soroban-env-host-p25 = { package = "soroban-env-host", path = "vendor/soroban-env-p25/soroban-env-host" }
+soroban-env-common-p25 = { package = "soroban-env-common", path = "vendor/soroban-env-p25/soroban-env-common" }
 
 # Workspace crates
 henyey-common = { path = "crates/common" }
