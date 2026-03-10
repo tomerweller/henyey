@@ -104,6 +104,35 @@ impl TransactionFrame {
         self.envelope
     }
 
+    /// Get the inner `Transaction` for V1 and FeeBump envelopes.
+    ///
+    /// For V1, returns `&env.tx`. For FeeBump, returns the inner transaction
+    /// inside the `FeeBumpTransactionInnerTx`. Returns `None` for V0 envelopes
+    /// (which use `TransactionV0`, a different type).
+    fn inner_tx(&self) -> Option<&Transaction> {
+        match &self.envelope {
+            TransactionEnvelope::TxV0(_) => None,
+            TransactionEnvelope::Tx(env) => Some(&env.tx),
+            TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
+                FeeBumpTransactionInnerTx::Tx(inner) => Some(&inner.tx),
+            },
+        }
+    }
+
+    /// Get the inner `TransactionV1Envelope` for V1 and FeeBump envelopes.
+    ///
+    /// For V1, returns the envelope itself. For FeeBump, returns the inner
+    /// envelope from `FeeBumpTransactionInnerTx`. Returns `None` for V0.
+    fn inner_envelope(&self) -> Option<&stellar_xdr::curr::TransactionV1Envelope> {
+        match &self.envelope {
+            TransactionEnvelope::TxV0(_) => None,
+            TransactionEnvelope::Tx(env) => Some(env),
+            TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
+                FeeBumpTransactionInnerTx::Tx(inner) => Some(inner),
+            },
+        }
+    }
+
     /// Compute the transaction hash for a given network.
     pub fn hash(&self, network_id: &NetworkId) -> Result<Hash256> {
         // Create the signature payload
@@ -201,10 +230,7 @@ impl TransactionFrame {
             TransactionEnvelope::TxV0(env) => {
                 MuxedAccount::Ed25519(env.tx.source_account_ed25519.clone())
             }
-            TransactionEnvelope::Tx(env) => env.tx.source_account.clone(),
-            TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-                FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.source_account.clone(),
-            },
+            _ => self.inner_tx().unwrap().source_account.clone(),
         }
     }
 
@@ -226,10 +252,7 @@ impl TransactionFrame {
     pub fn sequence_number(&self) -> i64 {
         match &self.envelope {
             TransactionEnvelope::TxV0(env) => env.tx.seq_num.0,
-            TransactionEnvelope::Tx(env) => env.tx.seq_num.0,
-            TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-                FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.seq_num.0,
-            },
+            _ => self.inner_tx().unwrap().seq_num.0,
         }
     }
 
@@ -307,10 +330,7 @@ impl TransactionFrame {
     pub fn inner_fee(&self) -> u32 {
         match &self.envelope {
             TransactionEnvelope::TxV0(env) => env.tx.fee,
-            TransactionEnvelope::Tx(env) => env.tx.fee,
-            TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-                FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.fee,
-            },
+            _ => self.inner_tx().unwrap().fee,
         }
     }
 
@@ -318,10 +338,7 @@ impl TransactionFrame {
     pub fn operations(&self) -> &[Operation] {
         match &self.envelope {
             TransactionEnvelope::TxV0(env) => env.tx.operations.as_slice(),
-            TransactionEnvelope::Tx(env) => env.tx.operations.as_slice(),
-            TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-                FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.operations.as_slice(),
-            },
+            _ => self.inner_tx().unwrap().operations.as_slice(),
         }
     }
 
@@ -376,10 +393,7 @@ impl TransactionFrame {
     pub fn memo(&self) -> &Memo {
         match &self.envelope {
             TransactionEnvelope::TxV0(env) => &env.tx.memo,
-            TransactionEnvelope::Tx(env) => &env.tx.memo,
-            TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-                FeeBumpTransactionInnerTx::Tx(inner) => &inner.tx.memo,
-            },
+            _ => &self.inner_tx().unwrap().memo,
         }
     }
 
@@ -394,10 +408,7 @@ impl TransactionFrame {
                     Preconditions::None
                 }
             }
-            TransactionEnvelope::Tx(env) => env.tx.cond.clone(),
-            TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-                FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.cond.clone(),
-            },
+            _ => self.inner_tx().unwrap().cond.clone(),
         }
     }
 
@@ -414,10 +425,7 @@ impl TransactionFrame {
     pub fn inner_signatures(&self) -> &[DecoratedSignature] {
         match &self.envelope {
             TransactionEnvelope::TxV0(env) => env.signatures.as_slice(),
-            TransactionEnvelope::Tx(env) => env.signatures.as_slice(),
-            TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-                FeeBumpTransactionInnerTx::Tx(inner) => inner.signatures.as_slice(),
-            },
+            _ => self.inner_envelope().unwrap().signatures.as_slice(),
         }
     }
 
@@ -454,18 +462,9 @@ impl TransactionFrame {
 
     /// Get the Soroban transaction data (if present).
     pub fn soroban_data(&self) -> Option<&SorobanTransactionData> {
-        match &self.envelope {
-            TransactionEnvelope::TxV0(_) => None,
-            TransactionEnvelope::Tx(env) => match &env.tx.ext {
-                TransactionExt::V0 => None,
-                TransactionExt::V1(data) => Some(data),
-            },
-            TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-                FeeBumpTransactionInnerTx::Tx(inner) => match &inner.tx.ext {
-                    TransactionExt::V0 => None,
-                    TransactionExt::V1(data) => Some(data),
-                },
-            },
+        match &self.inner_tx()?.ext {
+            TransactionExt::V0 => None,
+            TransactionExt::V1(data) => Some(data),
         }
     }
 
@@ -532,14 +531,9 @@ impl TransactionFrame {
     /// FeeBumpTransactionFrame::getResources() delegates to mInnerTx->getResources().
     pub fn inner_tx_size_bytes(&self) -> u32 {
         match &self.envelope {
-            TransactionEnvelope::TxFeeBump(fee_bump) => {
-                // Get the inner transaction envelope and compute its size
-                let inner_envelope = match &fee_bump.tx.inner_tx {
-                    stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
-                        TransactionEnvelope::Tx(inner.clone())
-                    }
-                };
-                inner_envelope
+            TransactionEnvelope::TxFeeBump(_) => {
+                let inner = self.inner_envelope().unwrap();
+                TransactionEnvelope::Tx(inner.clone())
                     .to_xdr(Limits::none())
                     .map(|bytes| bytes.len() as u32)
                     .unwrap_or(0)

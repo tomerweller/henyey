@@ -1,3 +1,5 @@
+//! TTL (time-to-live) entry management for Soroban contract state expiration.
+
 use super::*;
 
 impl LedgerStateManager {

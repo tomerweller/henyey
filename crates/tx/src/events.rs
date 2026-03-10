@@ -40,7 +40,7 @@ use stellar_xdr::curr::{
     AccountId, Asset, ClaimableBalanceId, ContractEvent, ContractEventBody, ContractEventType,
     ContractEventV0, ContractId, ContractIdPreimage, Hash, HashIdPreimage,
     HashIdPreimageContractId, Int128Parts, Memo, MuxedAccount, MuxedEd25519Account,
-    PublicKey as XdrPublicKey, ScAddress, ScMap, ScMapEntry, ScString, ScSymbol, ScVal, StringM,
+    PublicKey as XdrPublicKey, ScAddress, ScMap, ScMapEntry, ScString, ScVal, StringM,
     TransactionEvent, TransactionEventStage,
 };
 
@@ -835,14 +835,7 @@ fn asset_code_to_string(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
-fn make_symbol_scval(value: &str) -> ScVal {
-    let sym = ScSymbol(StringM::try_from(value).unwrap_or_default());
-    ScVal::Symbol(sym)
-}
-
-fn make_string_scval(value: &str) -> ScVal {
-    ScVal::String(ScString(StringM::try_from(value).unwrap_or_default()))
-}
+use crate::scval_utils::{make_string_scval, make_symbol_scval};
 
 fn make_i128_scval(amount: i64) -> ScVal {
     let value = amount as i128;

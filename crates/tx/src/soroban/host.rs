@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use soroban_env_host24::xdr::ReadXdr as ReadXdrP24;
 use soroban_env_host24::{
     budget::{AsBudget, Budget},
-    fees::{compute_rent_fee, LedgerEntryRentChange},
+    fees::compute_rent_fee,
     storage::{EntryWithLiveUntil, SnapshotSource},
     vm::VersionedContractCodeCostInputs,
     CompilationContext, ErrorHandler, HostError as HostErrorP24, LedgerInfo as LedgerInfoP24,
@@ -61,51 +61,74 @@ type ArchivedWithRestoreInfoP25 = Option<(
 /// A ledger entry paired with its optional TTL (live_until ledger sequence).
 pub type EntryWithTtl = (Rc<LedgerEntry>, Option<u32>);
 
-/// Extracts the rent-related changes from typed ledger changes.
-///
-/// This is the typed counterpart to `e2e_invoke::extract_rent_changes()` that
-/// operates on `TypedLedgerEntryChange` instead of `LedgerEntryChange`.
-/// Only meaningful changes are returned (i.e. no-op changes are skipped).
-fn extract_rent_changes_from_typed(
-    ledger_changes: &[soroban_env_host25::e2e_invoke::TypedLedgerEntryChange],
-) -> Vec<soroban_env_host25::fees::LedgerEntryRentChange> {
-    use soroban_env_host25::e2e_invoke::TypedLedgerEntryChange;
-    use soroban_env_host25::fees::LedgerEntryRentChange;
-    use stellar_xdr::curr::{ContractDataDurability, LedgerEntryType};
+/// Macro to generate `extract_rent_changes_from_typed` for both P24 and P25 host crates.
+/// The logic is identical — only the qualifying crate path differs.
+macro_rules! define_extract_rent_changes {
+    ($fn_name:ident, $host_crate:ident) => {
+        fn $fn_name(
+            ledger_changes: &[$host_crate::e2e_invoke::TypedLedgerEntryChange],
+        ) -> Vec<$host_crate::fees::LedgerEntryRentChange> {
+            use $host_crate::e2e_invoke::TypedLedgerEntryChange;
+            use $host_crate::fees::LedgerEntryRentChange;
 
-    ledger_changes
-        .iter()
-        .filter_map(|entry_change: &TypedLedgerEntryChange| {
-            // Rent changes are only relevant to non-removed entries with a ttl.
-            if let Some(ttl_change) = &entry_change.ttl_change {
-                let new_size_bytes_for_rent = if entry_change.new_entry.is_some() {
-                    entry_change.new_entry_size_bytes_for_rent
-                } else {
-                    entry_change.old_entry_size_bytes_for_rent
-                };
+            ledger_changes
+                .iter()
+                .filter_map(|entry_change: &TypedLedgerEntryChange| {
+                    if let Some(ttl_change) = &entry_change.ttl_change {
+                        let new_size_bytes_for_rent = if entry_change.new_entry.is_some() {
+                            entry_change.new_entry_size_bytes_for_rent
+                        } else {
+                            entry_change.old_entry_size_bytes_for_rent
+                        };
 
-                // Skip the entry if 1. it is not extended and 2. the entry size has not increased
-                if ttl_change.old_live_until_ledger >= ttl_change.new_live_until_ledger
-                    && entry_change.old_entry_size_bytes_for_rent >= new_size_bytes_for_rent
-                {
-                    return None;
-                }
-                Some(LedgerEntryRentChange {
-                    is_persistent: matches!(
-                        ttl_change.durability,
-                        ContractDataDurability::Persistent
-                    ),
-                    is_code_entry: matches!(ttl_change.entry_type, LedgerEntryType::ContractCode),
-                    old_size_bytes: entry_change.old_entry_size_bytes_for_rent,
-                    new_size_bytes: new_size_bytes_for_rent,
-                    old_live_until_ledger: ttl_change.old_live_until_ledger,
-                    new_live_until_ledger: ttl_change.new_live_until_ledger,
+                        if ttl_change.old_live_until_ledger >= ttl_change.new_live_until_ledger
+                            && entry_change.old_entry_size_bytes_for_rent >= new_size_bytes_for_rent
+                        {
+                            return None;
+                        }
+                        Some(LedgerEntryRentChange {
+                            is_persistent: ttl_change.durability
+                                == $host_crate::xdr::ContractDataDurability::Persistent,
+                            is_code_entry: ttl_change.entry_type
+                                == $host_crate::xdr::LedgerEntryType::ContractCode,
+                            old_size_bytes: entry_change.old_entry_size_bytes_for_rent,
+                            new_size_bytes: new_size_bytes_for_rent,
+                            old_live_until_ledger: ttl_change.old_live_until_ledger,
+                            new_live_until_ledger: ttl_change.new_live_until_ledger,
+                        })
+                    } else {
+                        None
+                    }
                 })
-            } else {
-                None
-            }
-        })
-        .collect()
+                .collect()
+        }
+    };
+}
+
+define_extract_rent_changes!(extract_rent_changes_from_typed, soroban_env_host25);
+define_extract_rent_changes!(extract_rent_changes_from_typed_p24, soroban_env_host24);
+
+/// Derive a fallback PRNG seed from ledger context when no explicit seed is provided.
+fn derive_fallback_prng_seed(context: &LedgerContext) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(context.network_id.0 .0);
+    hasher.update(context.sequence.to_le_bytes());
+    hasher.update(context.close_time.to_le_bytes());
+    hasher.finalize().into()
+}
+
+/// Extract archived entry restoration indices from SorobanTransactionData.
+fn extract_restored_indices(
+    soroban_data: &SorobanTransactionData,
+) -> (Vec<u32>, std::collections::HashSet<u32>) {
+    let indices: Vec<u32> = match &soroban_data.ext {
+        SorobanTransactionDataExt::V1(ext) => {
+            ext.archived_soroban_entries.iter().copied().collect()
+        }
+        SorobanTransactionDataExt::V0 => Vec::new(),
+    };
+    let set: std::collections::HashSet<u32> = indices.iter().copied().collect();
+    (indices, set)
 }
 
 /// Result of Soroban host function execution.
@@ -271,7 +294,7 @@ impl PersistentModuleCache {
 }
 
 /// Adapter that provides snapshot access to our ledger state for Soroban (P24).
-pub struct LedgerSnapshotAdapter<'a> {
+struct LedgerSnapshotAdapter<'a> {
     state: &'a LedgerStateManager,
     current_ledger: u32,
     hot_archive: Option<&'a dyn super::HotArchiveLookup>,
@@ -279,17 +302,6 @@ pub struct LedgerSnapshotAdapter<'a> {
 }
 
 impl<'a> LedgerSnapshotAdapter<'a> {
-    /// Create a new snapshot adapter without hot archive lookup.
-    #[allow(dead_code)]
-    pub fn new(state: &'a LedgerStateManager, current_ledger: u32) -> Self {
-        Self {
-            state,
-            current_ledger,
-            hot_archive: None,
-            ttl_key_cache: None,
-        }
-    }
-
     /// Create a new snapshot adapter with hot archive and TTL key cache.
     pub fn with_hot_archive(
         state: &'a LedgerStateManager,
@@ -485,7 +497,7 @@ impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
 }
 
 /// Adapter that provides snapshot access to our ledger state for Soroban (p25 host).
-pub struct LedgerSnapshotAdapterP25<'a> {
+struct LedgerSnapshotAdapterP25<'a> {
     state: &'a LedgerStateManager,
     current_ledger: u32,
     hot_archive: Option<&'a dyn super::HotArchiveLookup>,
@@ -830,227 +842,88 @@ fn convert_ledger_key_from_p24_to_p25(
     LedgerKey::from_xdr(&bytes, Limits::none()).ok()
 }
 
-/// Extracts rent changes from P24 typed ledger changes.
-/// Same logic as `extract_rent_changes_from_typed` but for P24 types.
-fn extract_rent_changes_from_typed_p24(
-    ledger_changes: &[soroban_env_host24::e2e_invoke::TypedLedgerEntryChange],
-) -> Vec<soroban_env_host24::fees::LedgerEntryRentChange> {
-    use soroban_env_host24::e2e_invoke::TypedLedgerEntryChange;
-    use soroban_env_host24::fees::LedgerEntryRentChange;
-    use soroban_env_host24::xdr::{ContractDataDurability, LedgerEntryType};
+// extract_rent_changes_from_typed_p24 is generated by the define_extract_rent_changes! macro above.
 
-    ledger_changes
-        .iter()
-        .filter_map(|entry_change: &TypedLedgerEntryChange| {
-            if let Some(ttl_change) = &entry_change.ttl_change {
-                let new_size_bytes_for_rent = if entry_change.new_entry.is_some() {
-                    entry_change.new_entry_size_bytes_for_rent
-                } else {
-                    entry_change.old_entry_size_bytes_for_rent
-                };
+/// Macro to define a `WasmCompilationContext` struct for a given protocol version.
+///
+/// Each version needs: the struct newtype wrapping its Budget, trait impls for
+/// `ErrorHandler`, `AsBudget`, and `CompilationContext`. The implementations are
+/// identical except for the host crate path and type aliases.
+macro_rules! define_wasm_compilation_context {
+    ($struct_name:ident, $host_crate:ident, $error_handler:path, $as_budget:path, $compilation_ctx:path, $host_error:ty) => {
+        #[derive(Clone)]
+        struct $struct_name($host_crate::budget::Budget);
 
-                if ttl_change.old_live_until_ledger >= ttl_change.new_live_until_ledger
-                    && entry_change.old_entry_size_bytes_for_rent >= new_size_bytes_for_rent
-                {
-                    return None;
-                }
-                Some(LedgerEntryRentChange {
-                    is_persistent: matches!(
-                        ttl_change.durability,
-                        ContractDataDurability::Persistent
-                    ),
-                    is_code_entry: matches!(ttl_change.entry_type, LedgerEntryType::ContractCode),
-                    old_size_bytes: entry_change.old_entry_size_bytes_for_rent,
-                    new_size_bytes: new_size_bytes_for_rent,
-                    old_live_until_ledger: ttl_change.old_live_until_ledger,
-                    new_live_until_ledger: ttl_change.new_live_until_ledger,
-                })
-            } else {
-                None
+        impl $struct_name {
+            /// Create a new compilation context with very high budget limits.
+            /// We use 10 billion CPU instructions and 1GB memory to ensure compilation
+            /// never fails due to budget constraints. The actual compilation cost is
+            /// typically much lower, but we want to match stellar-core behavior which doesn't
+            /// meter compilation at all.
+            fn new() -> Self {
+                let budget = $host_crate::budget::Budget::try_from_configs(
+                    10_000_000_000,     // 10 billion CPU instructions
+                    1_000_000_000,      // 1 GB memory
+                    Default::default(), // Default CPU cost params
+                    Default::default(), // Default memory cost params
+                )
+                .unwrap_or_else(|_| $host_crate::budget::Budget::default());
+                Self(budget)
             }
-        })
-        .collect()
+        }
+
+        impl $error_handler for $struct_name {
+            fn map_err<T, E>(&self, res: Result<T, E>) -> Result<T, $host_error>
+            where
+                $host_crate::Error: From<E>,
+                E: std::fmt::Debug,
+            {
+                res.map_err(<$host_error>::from)
+            }
+
+            fn error(
+                &self,
+                error: $host_crate::Error,
+                _msg: &str,
+                _args: &[$host_crate::Val],
+            ) -> $host_error {
+                <$host_error>::from(error)
+            }
+        }
+
+        impl $as_budget for $struct_name {
+            fn as_budget(&self) -> &$host_crate::budget::Budget {
+                &self.0
+            }
+        }
+
+        impl $compilation_ctx for $struct_name {}
+    };
 }
 
-/// Context for pre-compiling WASM modules outside of transaction execution.
-/// This mimics how stellar-core pre-compiles all contracts with an unlimited budget.
-/// We use very high budget limits (10B CPU, 1GB memory) to ensure compilation never fails
-/// due to budget constraints. stellar-core's SharedModuleCacheCompiler compiles
-/// without any budget metering.
-#[derive(Clone)]
-struct WasmCompilationContext(Budget);
+// Context for pre-compiling WASM modules outside of transaction execution.
+// This mimics how stellar-core pre-compiles all contracts with an unlimited budget.
+// We use very high budget limits (10B CPU, 1GB memory) to ensure compilation never fails
+// due to budget constraints. stellar-core's SharedModuleCacheCompiler compiles
+// without any budget metering.
+define_wasm_compilation_context!(
+    WasmCompilationContext,
+    soroban_env_host24,
+    ErrorHandler,
+    AsBudget,
+    CompilationContext,
+    HostErrorP24
+);
 
-impl WasmCompilationContext {
-    /// Create a new compilation context with very high budget limits.
-    /// We use 10 billion CPU instructions and 1GB memory to ensure compilation
-    /// never fails due to budget constraints. The actual compilation cost is
-    /// typically much lower, but we want to match stellar-core behavior which doesn't
-    /// meter compilation at all.
-    fn new() -> Self {
-        // Use a budget with very high limits to avoid ExceededLimit errors during pre-compilation.
-        // stellar-core compiles without metering, so we use 10B instructions / 1GB memory.
-        let budget = Budget::try_from_configs(
-            10_000_000_000,     // 10 billion CPU instructions
-            1_000_000_000,      // 1 GB memory
-            Default::default(), // Default CPU cost params
-            Default::default(), // Default memory cost params
-        )
-        .unwrap_or_else(|_| Budget::default());
-        Self(budget)
-    }
-}
-
-impl ErrorHandler for WasmCompilationContext {
-    fn map_err<T, E>(&self, res: Result<T, E>) -> Result<T, HostErrorP24>
-    where
-        soroban_env_host24::Error: From<E>,
-        E: std::fmt::Debug,
-    {
-        res.map_err(HostErrorP24::from)
-    }
-
-    fn error(
-        &self,
-        error: soroban_env_host24::Error,
-        _msg: &str,
-        _args: &[soroban_env_host24::Val],
-    ) -> HostErrorP24 {
-        HostErrorP24::from(error)
-    }
-}
-
-impl AsBudget for WasmCompilationContext {
-    fn as_budget(&self) -> &Budget {
-        &self.0
-    }
-}
-
-impl CompilationContext for WasmCompilationContext {}
-
-/// Context for pre-compiling WASM modules outside of transaction execution (P25 version).
-/// This mimics how stellar-core pre-compiles all contracts with an unlimited budget.
-/// We use very high budget limits (10B CPU, 1GB memory) to ensure compilation never fails
-/// due to budget constraints. stellar-core's SharedModuleCacheCompiler compiles
-/// without any budget metering.
-#[derive(Clone)]
-struct WasmCompilationContextP25(soroban_env_host25::budget::Budget);
-
-impl WasmCompilationContextP25 {
-    /// Create a new compilation context with very high budget limits.
-    /// We use 10 billion CPU instructions and 1GB memory to ensure compilation
-    /// never fails due to budget constraints. The actual compilation cost is
-    /// typically much lower, but we want to match stellar-core behavior which doesn't
-    /// meter compilation at all.
-    fn new() -> Self {
-        // Use a budget with very high limits to avoid ExceededLimit errors during pre-compilation.
-        // stellar-core compiles without metering, so we use 10B instructions / 1GB memory.
-        let budget = soroban_env_host25::budget::Budget::try_from_configs(
-            10_000_000_000,     // 10 billion CPU instructions
-            1_000_000_000,      // 1 GB memory
-            Default::default(), // Default CPU cost params
-            Default::default(), // Default memory cost params
-        )
-        .unwrap_or_else(|_| soroban_env_host25::budget::Budget::default());
-        Self(budget)
-    }
-}
-
-impl ErrorHandlerP25 for WasmCompilationContextP25 {
-    fn map_err<T, E>(&self, res: Result<T, E>) -> Result<T, HostErrorP25>
-    where
-        soroban_env_host25::Error: From<E>,
-        E: std::fmt::Debug,
-    {
-        res.map_err(HostErrorP25::from)
-    }
-
-    fn error(
-        &self,
-        error: soroban_env_host25::Error,
-        _msg: &str,
-        _args: &[soroban_env_host25::Val],
-    ) -> HostErrorP25 {
-        HostErrorP25::from(error)
-    }
-}
-
-impl AsBudgetP25 for WasmCompilationContextP25 {
-    fn as_budget(&self) -> &soroban_env_host25::budget::Budget {
-        &self.0
-    }
-}
-
-impl CompilationContextP25 for WasmCompilationContextP25 {}
-
-/// Compute rent_fee for a newly created Soroban entry.
-///
-/// This is used by `execute_upload_wasm` to compute the rent fee for the new
-/// ContractCode entry being created, matching how stellar-core computes
-/// rent fees via soroban-env-host.
-///
-/// # Arguments
-///
-/// * `entry_size_bytes` - The XDR size of the LedgerEntry being created
-/// * `live_until` - The live_until ledger sequence for the entry
-/// * `is_persistent` - Whether this is a persistent entry (true) or temporary (false)
-/// * `is_code_entry` - Whether this is a ContractCode entry (affects P25 rent calculation)
-/// * `current_ledger` - The current ledger sequence
-/// * `soroban_config` - Network configuration with rent fee parameters
-/// * `protocol_version` - The protocol version
-///
-/// # Returns
-///
-/// Returns the computed rent fee in stroops.
-pub fn compute_rent_fee_for_new_entry(
-    entry_size_bytes: u32,
-    live_until: u32,
-    is_persistent: bool,
-    is_code_entry: bool,
-    current_ledger: u32,
-    soroban_config: &SorobanConfig,
-    protocol_version: u32,
-) -> i64 {
-    // Create a rent change for a newly created entry:
-    // - old_size_bytes = 0 (new entry)
-    // - old_live_until_ledger = 0 (new entry)
-    // - new_size_bytes = entry XDR size
-    // - new_live_until_ledger = live_until
-
-    if protocol_version >= 25 {
-        use soroban_env_host25::fees::{
-            compute_rent_fee as compute_rent_fee_p25,
-            LedgerEntryRentChange as LedgerEntryRentChangeP25,
-        };
-
-        let rent_change = LedgerEntryRentChangeP25 {
-            is_persistent,
-            is_code_entry,
-            old_size_bytes: 0,
-            new_size_bytes: entry_size_bytes,
-            old_live_until_ledger: 0,
-            new_live_until_ledger: live_until,
-        };
-
-        // Use the P25 rent_fee_config directly from soroban_config
-        compute_rent_fee_p25(
-            &[rent_change],
-            &soroban_config.rent_fee_config,
-            current_ledger,
-        )
-    } else {
-        let rent_change = LedgerEntryRentChange {
-            is_persistent,
-            is_code_entry,
-            old_size_bytes: 0,
-            new_size_bytes: entry_size_bytes,
-            old_live_until_ledger: 0,
-            new_live_until_ledger: live_until,
-        };
-
-        let rent_fee_config = rent_fee_config_p25_to_p24(&soroban_config.rent_fee_config);
-        compute_rent_fee(&[rent_change], &rent_fee_config, current_ledger)
-    }
-}
+// P25 version of the compilation context.
+define_wasm_compilation_context!(
+    WasmCompilationContextP25,
+    soroban_env_host25,
+    ErrorHandlerP25,
+    AsBudgetP25,
+    CompilationContextP25,
+    HostErrorP25
+);
 
 /// Execute a Soroban host function with an optional pre-populated module cache.
 ///
@@ -1198,16 +1071,11 @@ fn execute_host_function_p24(
         "P24: Soroban host ledger info configured"
     );
 
-    // PRNG seed: [u8; 32] for the typed API.
     let base_prng_seed: [u8; 32] = if let Some(prng_seed) = context.soroban_prng_seed {
         prng_seed
     } else {
         tracing::warn!("P24: Using fallback PRNG seed - results may differ from stellar-core");
-        let mut hasher = Sha256::new();
-        hasher.update(context.network_id.0 .0);
-        hasher.update(context.sequence.to_le_bytes());
-        hasher.update(context.close_time.to_le_bytes());
-        hasher.finalize().into()
+        derive_fallback_prng_seed(context)
     };
 
     // ── Convert P25 (workspace) types to P24 types for the typed API ──
@@ -1221,15 +1089,7 @@ fn execute_host_function_p24(
         .map(|e| convert_auth_entry_to_p24(e).ok_or_else(make_xdr_setup_error))
         .collect::<Result<_, _>>()?;
 
-    // Extract archived entry indices from soroban_data.ext
-    let restored_rw_entry_indices: Vec<u32> = match &soroban_data.ext {
-        SorobanTransactionDataExt::V1(ext) => {
-            ext.archived_soroban_entries.iter().copied().collect()
-        }
-        SorobanTransactionDataExt::V0 => Vec::new(),
-    };
-    let restored_indices_set: std::collections::HashSet<u32> =
-        restored_rw_entry_indices.iter().copied().collect();
+    let (restored_rw_entry_indices, restored_indices_set) = extract_restored_indices(soroban_data);
 
     // Create snapshot adapter with hot archive access
     let snapshot = LedgerSnapshotAdapter::with_hot_archive(
@@ -1613,27 +1473,14 @@ fn execute_host_function_p25(
         "P25: Soroban host ledger info configured"
     );
 
-    // PRNG seed: context.soroban_prng_seed is [u8; 32], matching the typed API's signature.
     let base_prng_seed: [u8; 32] = if let Some(prng_seed) = context.soroban_prng_seed {
         prng_seed
     } else {
         tracing::warn!("P25: Using fallback PRNG seed - results may differ from stellar-core");
-        let mut hasher = Sha256::new();
-        hasher.update(context.network_id.0 .0);
-        hasher.update(context.sequence.to_le_bytes());
-        hasher.update(context.close_time.to_le_bytes());
-        hasher.finalize().into()
+        derive_fallback_prng_seed(context)
     };
 
-    // Extract archived entry indices from soroban_data.ext for TTL restoration
-    let restored_rw_entry_indices: Vec<u32> = match &soroban_data.ext {
-        SorobanTransactionDataExt::V1(ext) => {
-            ext.archived_soroban_entries.iter().copied().collect()
-        }
-        SorobanTransactionDataExt::V0 => Vec::new(),
-    };
-    let restored_indices_set: std::collections::HashSet<u32> =
-        restored_rw_entry_indices.iter().copied().collect();
+    let (restored_rw_entry_indices, restored_indices_set) = extract_restored_indices(soroban_data);
 
     // Create snapshot with hot archive access for Protocol 23+ entry restoration
     let snapshot = LedgerSnapshotAdapterP25::with_hot_archive(

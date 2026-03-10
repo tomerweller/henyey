@@ -107,7 +107,7 @@ fn validate_contract_ledger_entry(
 }
 
 use super::{OperationExecutionResult, SorobanOperationMeta};
-use crate::soroban::{PersistentModuleCache, SorobanConfig};
+use crate::soroban::{PersistentModuleCache, SorobanConfig, SorobanContext};
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::Result;
@@ -125,29 +125,21 @@ use crate::Result;
 /// * `source` - The source account ID
 /// * `state` - The ledger state manager
 /// * `context` - The ledger context
-/// * `soroban_data` - The Soroban transaction data
-/// * `soroban_config` - The Soroban network configuration with cost parameters
-/// * `module_cache` - Optional persistent module cache for reusing compiled WASM
-/// * `hot_archive` - Optional hot archive lookup for Protocol 23+ entry restoration
+/// * `soroban` - Soroban execution context
 ///
 /// # Returns
 ///
 /// Returns the operation result with the function's return value on success,
 /// or a specific failure reason.
-#[allow(clippy::too_many_arguments)]
 pub fn execute_invoke_host_function(
     op: &InvokeHostFunctionOp,
     source: &AccountId,
     state: &mut LedgerStateManager,
     context: &LedgerContext,
-    soroban_data: Option<&SorobanTransactionData>,
-    soroban_config: &SorobanConfig,
-    module_cache: Option<&PersistentModuleCache>,
-    hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
-    ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
+    soroban: &SorobanContext<'_>,
 ) -> Result<OperationExecutionResult> {
     // Validate we have Soroban data for footprint
-    let soroban_data = match soroban_data {
+    let soroban_data = match soroban.soroban_data {
         Some(data) => data,
         None => {
             return Ok(OperationExecutionResult::new(make_result(
@@ -156,6 +148,9 @@ pub fn execute_invoke_host_function(
             )));
         }
     };
+
+    let default_config = SorobanConfig::default();
+    let soroban_config = soroban.config.unwrap_or(&default_config);
 
     // All host functions go through soroban-env-host, matching stellar-core behavior.
     // This ensures rent calculation and other host-computed values are consistent.
@@ -166,9 +161,9 @@ pub fn execute_invoke_host_function(
         context,
         soroban_data,
         soroban_config,
-        module_cache,
-        hot_archive,
-        ttl_key_cache,
+        soroban.module_cache,
+        soroban.hot_archive,
+        soroban.ttl_key_cache,
     )
 }
 
@@ -696,6 +691,34 @@ fn apply_soroban_storage_changes(
     }
 }
 
+/// Create or update a TTL entry depending on whether it already exists in state.
+fn create_or_update_ttl(state: &mut LedgerStateManager, ttl: TtlEntry, exists: bool) {
+    if exists {
+        state.update_ttl(ttl);
+    } else {
+        state.create_ttl(ttl);
+    }
+}
+
+/// Determine whether a Soroban contract entry should be created or updated.
+///
+/// Handles the hot-archive restore logic: if the entry is being restored from the hot
+/// archive for the first time, it should be created (INIT). If it was already restored by a
+/// previous TX in this ledger, or it exists in live state, it should be updated.
+fn should_create_contract_entry(
+    entry_exists_in_state: bool,
+    is_hot_archive_restore: bool,
+    already_created_in_delta: bool,
+) -> bool {
+    if is_hot_archive_restore && !already_created_in_delta {
+        true // First restoration from hot archive - create to record as INIT
+    } else if entry_exists_in_state || already_created_in_delta {
+        false // Entry exists (either in live BL or already restored) - update
+    } else {
+        true // New entry (not a restore, not existing) - create
+    }
+}
+
 fn apply_soroban_storage_change(
     state: &mut LedgerStateManager,
     change: &crate::soroban::StorageChange,
@@ -711,57 +734,36 @@ fn apply_soroban_storage_change(
         // Handle contract data and code entries.
         match &entry.data {
             stellar_xdr::curr::LedgerEntryData::ContractData(cd) => {
-                // For hot archive restores, check if the entry was already created in the delta
-                // (by a previous TX in this ledger). We can't use state.get_*().is_some() because
-                // archived entries are pre-loaded into state from InMemorySorobanState.
-                let entry_exists_in_state = state
+                let exists = state
                     .get_contract_data(&cd.contract, &cd.key, cd.durability)
                     .is_some();
-                let already_restored = is_hot_archive_restore
+                let already_in_delta = is_hot_archive_restore
                     && key_already_created_in_delta(state.delta(), &change.key);
-
-                if is_hot_archive_restore && !already_restored {
-                    // First restoration from hot archive - use create to record as INIT
+                if should_create_contract_entry(exists, is_hot_archive_restore, already_in_delta) {
                     state.create_contract_data(cd.clone());
-                } else if entry_exists_in_state || already_restored {
-                    // Entry exists (either in live BL or already restored) - update
-                    state.update_contract_data(cd.clone());
                 } else {
-                    // New entry (not a restore, not existing) - create
-                    state.create_contract_data(cd.clone());
+                    state.update_contract_data(cd.clone());
                 }
             }
             stellar_xdr::curr::LedgerEntryData::ContractCode(cc) => {
-                // For hot archive restores, check if the entry was already created in the delta
-                // (by a previous TX in this ledger). We can't use state.get_*().is_some() because
-                // archived entries are pre-loaded into state from InMemorySorobanState.
-                let entry_exists_in_state = state.get_contract_code(&cc.hash).is_some();
-                let already_restored = is_hot_archive_restore
+                let exists = state.get_contract_code(&cc.hash).is_some();
+                let already_in_delta = is_hot_archive_restore
                     && key_already_created_in_delta(state.delta(), &change.key);
-
-                if is_hot_archive_restore && !already_restored {
-                    // First restoration from hot archive - use create to record as INIT
+                if should_create_contract_entry(exists, is_hot_archive_restore, already_in_delta) {
                     state.create_contract_code(cc.clone());
-                } else if entry_exists_in_state || already_restored {
-                    // Entry exists (either in live BL or already restored) - update
-                    state.update_contract_code(cc.clone());
                 } else {
-                    // New entry (not a restore, not existing) - create
-                    state.create_contract_code(cc.clone());
+                    state.update_contract_code(cc.clone());
                 }
             }
             stellar_xdr::curr::LedgerEntryData::Ttl(ttl) => {
+                let exists = state.get_ttl(&ttl.key_hash).is_some();
                 tracing::debug!(
                     key_hash = ?ttl.key_hash,
                     live_until = ttl.live_until_ledger_seq,
-                    existing = state.get_ttl(&ttl.key_hash).is_some(),
+                    existing = exists,
                     "TTL emit: direct TTL entry"
                 );
-                if state.get_ttl(&ttl.key_hash).is_some() {
-                    state.update_ttl(ttl.clone());
-                } else {
-                    state.create_ttl(ttl.clone());
-                }
+                create_or_update_ttl(state, ttl.clone(), exists);
             }
             // SAC (Stellar Asset Contract) can modify Account and Trustline entries
             stellar_xdr::curr::LedgerEntryData::Account(acc) => {
@@ -838,22 +840,15 @@ fn apply_soroban_storage_change(
                     // TTL was extended from the host's perspective (based on ledger-start state).
                     // We must emit this update even if our current state already has this value
                     // (e.g., from an earlier tx in the same ledger).
-                    if existing_ttl.is_some() {
-                        tracing::debug!(
-                            ?key_hash,
-                            live_until,
-                            ttl_extended = change.ttl_extended,
-                            "TTL emit: data modified, TTL extended"
-                        );
-                        state.update_ttl(ttl);
-                    } else {
-                        tracing::debug!(
-                            ?key_hash,
-                            live_until,
-                            "TTL emit: new TTL entry (extended)"
-                        );
-                        state.create_ttl(ttl);
-                    }
+                    let exists = existing_ttl.is_some();
+                    tracing::debug!(
+                        ?key_hash,
+                        live_until,
+                        ttl_extended = change.ttl_extended,
+                        exists,
+                        "TTL emit: data modified, TTL extended or new"
+                    );
+                    create_or_update_ttl(state, ttl, exists);
                 } else if existing_ttl.is_none() {
                     // New entry being created - emit TTL
                     tracing::debug!(?key_hash, live_until, "TTL emit: new TTL entry");
@@ -905,18 +900,15 @@ fn apply_soroban_storage_change(
                 // so subsequent TXs in this ledger don't see the bumped value
                 state.record_ro_ttl_bump_for_meta(&key_hash, live_until);
             } else {
+                let exists = existing_ttl.is_some();
                 tracing::debug!(
                     ?key_hash,
                     live_until,
-                    existing = existing_ttl.is_some(),
+                    existing = exists,
                     key_type = ?std::mem::discriminant(&change.key),
                     "TTL emit: ttl-only extended"
                 );
-                if existing_ttl.is_some() {
-                    state.update_ttl(ttl);
-                } else {
-                    state.create_ttl(ttl);
-                }
+                create_or_update_ttl(state, ttl, exists);
             }
         }
     } else {
@@ -1151,10 +1143,15 @@ mod tests {
             auth: vec![].try_into().unwrap(),
         };
 
-        let result = execute_invoke_host_function(
-            &op, &source, &mut state, &context, None, &config, None, None, None,
-        )
-        .expect("invoke host function");
+        let soroban = SorobanContext {
+            soroban_data: None,
+            config: Some(&config),
+            module_cache: None,
+            hot_archive: None,
+            ttl_key_cache: None,
+        };
+        let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
+            .expect("invoke host function");
 
         match result.result {
             OperationResult::OpInner(OperationResultTr::InvokeHostFunction(r)) => {
@@ -1197,18 +1194,15 @@ mod tests {
             resource_fee: 0,
         };
 
-        let result = execute_invoke_host_function(
-            &op,
-            &source,
-            &mut state,
-            &context,
-            Some(&soroban_data),
-            &config,
-            None,
-            None,
-            None,
-        )
-        .expect("invoke host function");
+        let soroban = SorobanContext {
+            soroban_data: Some(&soroban_data),
+            config: Some(&config),
+            module_cache: None,
+            hot_archive: None,
+            ttl_key_cache: None,
+        };
+        let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
+            .expect("invoke host function");
 
         match result.result {
             OperationResult::OpInner(OperationResultTr::InvokeHostFunction(r)) => {
@@ -1279,18 +1273,15 @@ mod tests {
             resource_fee: 0,
         };
 
-        let result = execute_invoke_host_function(
-            &op,
-            &source,
-            &mut state,
-            &context,
-            Some(&soroban_data),
-            &config,
-            None,
-            None,
-            None,
-        )
-        .expect("invoke host function");
+        let soroban = SorobanContext {
+            soroban_data: Some(&soroban_data),
+            config: Some(&config),
+            module_cache: None,
+            hot_archive: None,
+            ttl_key_cache: None,
+        };
+        let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
+            .expect("invoke host function");
 
         match result.result {
             OperationResult::OpInner(OperationResultTr::InvokeHostFunction(r)) => {
@@ -1362,18 +1353,15 @@ mod tests {
         let module_cache = PersistentModuleCache::new_for_protocol(context.protocol_version)
             .expect("create module cache");
 
-        let result = execute_invoke_host_function(
-            &op,
-            &source,
-            &mut state,
-            &context,
-            Some(&soroban_data),
-            &config,
-            Some(&module_cache),
-            None,
-            None,
-        )
-        .expect("invoke host function");
+        let soroban = SorobanContext {
+            soroban_data: Some(&soroban_data),
+            config: Some(&config),
+            module_cache: Some(&module_cache),
+            hot_archive: None,
+            ttl_key_cache: None,
+        };
+        let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
+            .expect("invoke host function");
 
         match result.result {
             OperationResult::OpInner(OperationResultTr::InvokeHostFunction(r)) => {
@@ -1419,18 +1407,15 @@ mod tests {
             resource_fee: 0,
         };
 
-        let result = execute_invoke_host_function(
-            &op,
-            &source,
-            &mut state,
-            &context,
-            Some(&soroban_data),
-            &config,
-            None,
-            None,
-            None,
-        )
-        .expect("invoke host function");
+        let soroban = SorobanContext {
+            soroban_data: Some(&soroban_data),
+            config: Some(&config),
+            module_cache: None,
+            hot_archive: None,
+            ttl_key_cache: None,
+        };
+        let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
+            .expect("invoke host function");
 
         match result.result {
             OperationResult::OpInner(OperationResultTr::InvokeHostFunction(r)) => {

@@ -1,3 +1,5 @@
+//! Sponsorship tracking and management for ledger entry reserves.
+
 use super::*;
 
 impl LedgerStateManager {

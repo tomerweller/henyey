@@ -94,13 +94,42 @@ pub use budget::{
 };
 pub use events::{ContractEvent, ContractEvents, EventType};
 pub use host::{
-    compute_rent_fee_for_new_entry, execute_host_function_with_cache, PersistentModuleCache,
-    SorobanExecutionError, SorobanExecutionResult, StorageChange,
+    execute_host_function_with_cache, PersistentModuleCache, SorobanExecutionError,
+    SorobanExecutionResult, StorageChange,
 };
 pub use storage::{SorobanStorage, StorageEntry, StorageKey};
 
 use sha2::{Digest, Sha256};
-use stellar_xdr::curr::{Hash, LedgerEntry, LedgerKey, Limits, WriteXdr};
+use stellar_xdr::curr::{Hash, LedgerEntry, LedgerKey, Limits, SorobanTransactionData, WriteXdr};
+
+/// Bundles the optional Soroban parameters that thread through operation execution.
+///
+/// Many operation-execution functions need access to these five optional fields
+/// for Soroban-enabled transactions. This struct eliminates the need to pass
+/// them as five separate parameters (and the associated `clippy::too_many_arguments`
+/// suppressions).
+///
+/// For non-Soroban transactions, create with [`SorobanContext::none()`].
+pub struct SorobanContext<'a> {
+    pub soroban_data: Option<&'a SorobanTransactionData>,
+    pub config: Option<&'a SorobanConfig>,
+    pub module_cache: Option<&'a PersistentModuleCache>,
+    pub hot_archive: Option<&'a dyn HotArchiveLookup>,
+    pub ttl_key_cache: Option<&'a TtlKeyCache>,
+}
+
+impl<'a> SorobanContext<'a> {
+    /// Create a context with no Soroban data (for non-Soroban transactions).
+    pub fn none() -> Self {
+        Self {
+            soroban_data: None,
+            config: None,
+            module_cache: None,
+            hot_archive: None,
+            ttl_key_cache: None,
+        }
+    }
+}
 
 /// Cache of pre-computed TTL key hashes. Built during footprint loading,
 /// passed through to all Soroban validation and execution functions.

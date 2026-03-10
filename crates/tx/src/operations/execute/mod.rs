@@ -10,18 +10,25 @@ use soroban_env_host_p25 as soroban_env_host25;
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, AccountId,
     Asset, ContractEvent, DiagnosticEvent, ExtendFootprintTtlResult, Liabilities, Operation,
-    OperationBody, OperationResult, OperationResultTr, RestoreFootprintResult,
-    SorobanTransactionData, TrustLineEntry, TrustLineEntryExt, TrustLineEntryV1,
-    TrustLineEntryV1Ext, TrustLineFlags, WriteXdr,
+    OperationBody, OperationResult, OperationResultTr, RestoreFootprintResult, TrustLineEntry,
+    TrustLineEntryExt, TrustLineEntryV1, TrustLineEntryV1Ext, TrustLineFlags, WriteXdr,
 };
 
 use crate::frame::muxed_to_account_id;
-use crate::soroban::{PersistentModuleCache, SorobanConfig};
+use crate::soroban::{SorobanConfig, SorobanContext};
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
 
 // Shared helpers used by multiple operation submodules.
+
+/// Transaction identity used to generate deterministic IDs for claimable balances
+/// and trust-flag revocations. Bundles the three fields that always travel together.
+pub struct TxIdentity<'a> {
+    pub source_id: &'a AccountId,
+    pub seq: i64,
+    pub op_index: u32,
+}
 
 const ACCOUNT_SUBENTRY_LIMIT: u32 = 1000;
 const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
@@ -366,6 +373,7 @@ mod liquidity_pool;
 mod manage_data;
 mod manage_offer;
 mod offer_exchange;
+pub(crate) mod offer_utils;
 mod path_payment;
 mod payment;
 pub mod prefetch;
@@ -763,19 +771,18 @@ pub fn execute_operation(
     state: &mut LedgerStateManager,
     context: &LedgerContext,
 ) -> Result<OperationExecutionResult> {
+    let tx_id = TxIdentity {
+        source_id: source_account_id,
+        seq: 0,
+        op_index: 0,
+    };
     execute_operation_with_soroban(
         op,
         source_account_id,
-        source_account_id,
-        0,
-        0,
+        &tx_id,
         state,
         context,
-        None,
-        None,
-        None, // No module cache for simple execution
-        None, // No hot archive for simple execution
-        None, // No TTL key cache for simple execution
+        &SorobanContext::none(),
     )
 }
 
@@ -786,26 +793,18 @@ pub fn execute_operation(
 ///
 /// # Arguments
 ///
-/// * `soroban_config` - Optional Soroban config with cost parameters. Required for
-///   accurate Soroban transaction execution. If None, uses default config which may
-///   produce incorrect results.
-/// * `module_cache` - Optional persistent module cache for reusing compiled WASM
-///   across transactions. Significantly improves performance for contracts.
-/// * `hot_archive` - Optional hot archive lookup for Protocol 23+ entry restoration
-#[allow(clippy::too_many_arguments)]
+/// * `tx_id` - Transaction identity for generating deterministic claimable balance
+///   and revocation IDs.
+/// * `soroban` - Soroban execution context with optional config, module cache,
+///   hot archive lookup, and TTL key cache. Use `SorobanContext::none()` for
+///   non-Soroban transactions.
 pub fn execute_operation_with_soroban(
     op: &Operation,
     source_account_id: &AccountId,
-    tx_source_id: &AccountId,
-    tx_seq: i64,
-    op_index: u32,
+    tx_id: &TxIdentity<'_>,
     state: &mut LedgerStateManager,
     context: &LedgerContext,
-    soroban_data: Option<&SorobanTransactionData>,
-    soroban_config: Option<&SorobanConfig>,
-    module_cache: Option<&PersistentModuleCache>,
-    hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
-    ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
+    soroban: &SorobanContext<'_>,
 ) -> Result<OperationExecutionResult> {
     // Get the actual source for this operation
     // If the operation has an explicit source, use it; otherwise use the transaction source
@@ -847,25 +846,15 @@ pub fn execute_operation_with_soroban(
         )),
         // Soroban operations
         OperationBody::InvokeHostFunction(op_data) => {
-            // Use provided config or default for Soroban execution
-            let default_config = SorobanConfig::default();
-            let config = soroban_config.unwrap_or(&default_config);
             invoke_host_function::execute_invoke_host_function(
-                op_data,
-                &op_source,
-                state,
-                context,
-                soroban_data,
-                config,
-                module_cache,
-                hot_archive,
-                ttl_key_cache,
+                op_data, &op_source, state, context, soroban,
             )
         }
         OperationBody::ExtendFootprintTtl(op_data) => {
             let default_config = SorobanConfig::default();
-            let config = soroban_config.unwrap_or(&default_config);
-            let snapshots = soroban_data
+            let config = soroban.config.unwrap_or(&default_config);
+            let snapshots = soroban
+                .soroban_data
                 .map(|data| {
                     let mut keys = Vec::new();
                     keys.extend(data.resources.footprint.read_only.iter().cloned());
@@ -874,8 +863,10 @@ pub fn execute_operation_with_soroban(
                         &keys,
                         state,
                         context.protocol_version,
-                        soroban_config.map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
-                        ttl_key_cache,
+                        soroban
+                            .config
+                            .map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
+                        soroban.ttl_key_cache,
                     )
                 })
                 .unwrap_or_default();
@@ -884,8 +875,8 @@ pub fn execute_operation_with_soroban(
                 &op_source,
                 state,
                 context,
-                soroban_data,
-                ttl_key_cache,
+                soroban.soroban_data,
+                soroban.ttl_key_cache,
             )?;
             let mut exec = OperationExecutionResult::new(result);
             if matches!(
@@ -898,8 +889,10 @@ pub fn execute_operation_with_soroban(
                     &snapshots,
                     state,
                     context.protocol_version,
-                    soroban_config.map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
-                    ttl_key_cache,
+                    soroban
+                        .config
+                        .map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
+                    soroban.ttl_key_cache,
                 );
                 let rent_fee = compute_rent_fee_by_protocol(
                     context.protocol_version,
@@ -922,7 +915,7 @@ pub fn execute_operation_with_soroban(
         }
         OperationBody::RestoreFootprint(op_data) => {
             let default_config = SorobanConfig::default();
-            let config = soroban_config.unwrap_or(&default_config);
+            let config = soroban.config.unwrap_or(&default_config);
             // For RestoreFootprint, we need to track which entries are ACTUALLY restored.
             // stellar-core only computes rent for entries that need restoration (not already live).
             //
@@ -934,10 +927,11 @@ pub fn execute_operation_with_soroban(
             // 3. If TTL exists but expired (TTL < current_ledger) -> include (restore from live BL)
             let mut snapshots = Vec::new();
             let mut hot_archive_restores = Vec::new();
-            if let Some(data) = soroban_data {
+            if let Some(data) = soroban.soroban_data {
                 for key in data.resources.footprint.read_write.iter() {
                     // Only compute rent for entries that need restoration
-                    let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
+                    let key_hash =
+                        crate::soroban::get_or_compute_key_hash(soroban.ttl_key_cache, key);
                     let current_ttl = state.get_ttl(&key_hash).map(|t| t.live_until_ledger_seq);
 
                     // Case 1: TTL exists and entry is live -> skip
@@ -954,7 +948,9 @@ pub fn execute_operation_with_soroban(
                                 context.protocol_version,
                                 &entry,
                                 entry_xdr.len() as u32,
-                                soroban_config.map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
+                                soroban
+                                    .config
+                                    .map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
                             );
                             let (is_persistent, is_code_entry) = rent_classification(key);
                             snapshots.push(RentSnapshot {
@@ -972,7 +968,7 @@ pub fn execute_operation_with_soroban(
                         //   - old_size_bytes = 0
                         //   - old_live_until_ledger = 0
                         // This is different from expired entries where we use the actual old size.
-                        if let Some(ha) = hot_archive {
+                        if let Some(ha) = soroban.hot_archive {
                             if let Some(entry) = ha.get(key) {
                                 let (is_persistent, is_code_entry) = rent_classification(key);
                                 snapshots.push(RentSnapshot {
@@ -1006,10 +1002,10 @@ pub fn execute_operation_with_soroban(
                 &op_source,
                 state,
                 context,
-                soroban_data,
+                soroban.soroban_data,
                 config.min_persistent_entry_ttl,
                 &ha_restore_entries,
-                ttl_key_cache,
+                soroban.ttl_key_cache,
             )?;
             let mut exec = OperationExecutionResult::new(result);
             if matches!(
@@ -1022,8 +1018,10 @@ pub fn execute_operation_with_soroban(
                     &snapshots,
                     state,
                     context.protocol_version,
-                    soroban_config.map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
-                    ttl_key_cache,
+                    soroban
+                        .config
+                        .map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
+                    soroban.ttl_key_cache,
                 );
                 let rent_fee = compute_rent_fee_by_protocol(
                     context.protocol_version,
@@ -1064,9 +1062,9 @@ pub fn execute_operation_with_soroban(
             trust_flags::execute_allow_trust(
                 op_data,
                 &op_source,
-                tx_source_id,
-                tx_seq,
-                op_index,
+                tx_id.source_id,
+                tx_id.seq,
+                tx_id.op_index,
                 state,
                 context,
             )?,
@@ -1078,9 +1076,9 @@ pub fn execute_operation_with_soroban(
             claimable_balance::execute_create_claimable_balance(
                 op_data,
                 &op_source,
-                tx_source_id,
-                tx_seq,
-                op_index,
+                tx_id.source_id,
+                tx_id.seq,
+                tx_id.op_index,
                 state,
                 context,
             )?,
@@ -1111,9 +1109,9 @@ pub fn execute_operation_with_soroban(
             trust_flags::execute_set_trust_line_flags(
                 op_data,
                 &op_source,
-                tx_source_id,
-                tx_seq,
-                op_index,
+                tx_id.source_id,
+                tx_id.seq,
+                tx_id.op_index,
                 state,
                 context,
             )?,

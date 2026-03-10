@@ -329,8 +329,8 @@ fn increment_pool_use_counts(
     params: &LiquidityPoolParameters,
 ) -> Result<()> {
     let LiquidityPoolParameters::LiquidityPoolConstantProduct(cp) = params;
-    increment_pool_use_count(state, source, &cp.asset_a)?;
-    increment_pool_use_count(state, source, &cp.asset_b)?;
+    adjust_pool_use_count(state, source, &cp.asset_a, 1)?;
+    adjust_pool_use_count(state, source, &cp.asset_b, 1)?;
     Ok(())
 }
 
@@ -340,15 +340,17 @@ fn decrement_pool_use_counts(
     params: &LiquidityPoolParameters,
 ) -> Result<()> {
     let LiquidityPoolParameters::LiquidityPoolConstantProduct(cp) = params;
-    decrement_pool_use_count(state, source, &cp.asset_a)?;
-    decrement_pool_use_count(state, source, &cp.asset_b)?;
+    adjust_pool_use_count(state, source, &cp.asset_a, -1)?;
+    adjust_pool_use_count(state, source, &cp.asset_b, -1)?;
     Ok(())
 }
 
-fn increment_pool_use_count(
+/// Adjust the liquidity pool use count on a trustline by `delta` (+1 or -1).
+fn adjust_pool_use_count(
     state: &mut LedgerStateManager,
     source: &AccountId,
     asset: &Asset,
+    delta: i32,
 ) -> Result<()> {
     if matches!(asset, Asset::Native) {
         return Ok(());
@@ -362,36 +364,20 @@ fn increment_pool_use_count(
         .get_trustline_mut(source, asset)
         .ok_or_else(|| TxError::Internal("missing trustline".into()))?;
     let v2 = ensure_trustline_ext_v2(trustline);
-    if v2.liquidity_pool_use_count == i32::MAX {
-        return Err(TxError::Internal(
-            "liquidity pool use count overflow".into(),
-        ));
-    }
-    v2.liquidity_pool_use_count += 1;
-    Ok(())
-}
-
-fn decrement_pool_use_count(
-    state: &mut LedgerStateManager,
-    source: &AccountId,
-    asset: &Asset,
-) -> Result<()> {
-    if matches!(asset, Asset::Native) {
-        return Ok(());
-    }
-    if let Some(issuer) = get_asset_issuer(asset) {
-        if account_id_to_key(&issuer) == account_id_to_key(source) {
-            return Ok(());
+    let new_count = v2.liquidity_pool_use_count.checked_add(delta);
+    match new_count {
+        Some(c) if c < 0 => {
+            return Err(TxError::Internal(
+                "liquidity pool use count underflow".into(),
+            ));
+        }
+        Some(c) => v2.liquidity_pool_use_count = c,
+        None => {
+            return Err(TxError::Internal(
+                "liquidity pool use count overflow".into(),
+            ));
         }
     }
-    let trustline = state
-        .get_trustline_mut(source, asset)
-        .ok_or_else(|| TxError::Internal("missing trustline".into()))?;
-    let v2 = ensure_trustline_ext_v2(trustline);
-    if v2.liquidity_pool_use_count == 0 {
-        return Ok(());
-    }
-    v2.liquidity_pool_use_count -= 1;
     Ok(())
 }
 

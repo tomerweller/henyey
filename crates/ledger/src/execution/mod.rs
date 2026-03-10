@@ -3596,20 +3596,22 @@ impl TransactionExecutor {
                 None
             };
 
+        let tx_id = henyey_tx::operations::execute::TxIdentity {
+            source_id: tx_source,
+            seq: tx_seq,
+            op_index,
+        };
+        let soroban = henyey_tx::soroban::SorobanContext {
+            soroban_data,
+            config: Some(&self.soroban_config),
+            module_cache: self.module_cache.as_ref(),
+            hot_archive: hot_archive_ref,
+            ttl_key_cache: self.ttl_key_cache.as_ref(),
+        };
+
         // Use the central operation dispatcher which handles all operation types
         henyey_tx::operations::execute::execute_operation_with_soroban(
-            op,
-            source,
-            tx_source,
-            tx_seq,
-            op_index,
-            &mut self.state,
-            context,
-            soroban_data,
-            Some(&self.soroban_config),
-            self.module_cache.as_ref(),
-            hot_archive_ref,
-            self.ttl_key_cache.as_ref(),
+            op, source, &tx_id, &mut self.state, context, &soroban,
         )
     }
 

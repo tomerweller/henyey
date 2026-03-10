@@ -70,7 +70,6 @@ use henyey_common::{Hash256, NetworkId};
 use stellar_xdr::curr::{AccountId, TransactionEventStage, TransactionResultCode};
 
 use crate::events::TxEventManager;
-use crate::fee_bump::FeeBumpFrame;
 use crate::frame::{muxed_to_account_id, TransactionFrame};
 use crate::meta_builder::TransactionMetaBuilder;
 use crate::result::MutableTransactionResult;
@@ -315,83 +314,6 @@ pub fn process_fee_seq_num(
     })
 }
 
-/// Process fee and sequence for a fee bump transaction.
-///
-/// Fee bump transactions charge the outer fee source account, not the inner
-/// transaction's source account.
-///
-/// # Parity
-///
-/// Matches `FeeBumpTransactionFrame::processFeeSeqNum()`.
-pub fn process_fee_seq_num_fee_bump(
-    fee_bump: &FeeBumpFrame,
-    ctx: &mut LiveExecutionContext,
-    base_fee: Option<i64>,
-) -> Result<FeeSeqNumResult> {
-    let fee_source_id = muxed_to_account_id(fee_bump.fee_source());
-    let base = base_fee.unwrap_or(ctx.base_fee() as i64);
-
-    // Calculate the fee for fee bump (outer fee)
-    let inner_frame = fee_bump.inner_frame();
-    let op_count = inner_frame.operation_count() as i64;
-
-    // Fee bump charges for (op_count + 1) operations
-    let fee = if inner_frame.is_soroban() {
-        // Soroban: use full fee from envelope
-        fee_bump.outer_fee()
-    } else {
-        // Classic: base_fee * (op_count + 1)
-        std::cmp::max(fee_bump.outer_fee(), base * (op_count + 1))
-    };
-
-    // Load fee source account and get balance
-    let available_balance = {
-        let state = ctx
-            .state()
-            .ok_or_else(|| TxError::Internal("state manager not available".into()))?;
-        let fee_source_account = state
-            .get_account(&fee_source_id)
-            .ok_or_else(|| TxError::AccountNotFound(format!("{:?}", fee_source_id)))?;
-        fee_source_account.balance
-    };
-
-    // Cap at available balance
-    let fee_charged = std::cmp::min(fee, available_balance);
-
-    // Create fee bump mutable result
-    let mut tx_result = MutableTransactionResult::new(fee_charged);
-
-    // Initialize refundable fee tracker if inner is Soroban
-    if inner_frame.is_soroban() {
-        if let Some(refundable_fee) = inner_frame.refundable_fee() {
-            tx_result.initialize_refundable_fee_tracker(refundable_fee);
-        }
-    }
-
-    // Check sufficient balance
-    let should_apply = fee_charged >= fee;
-    if !should_apply {
-        tx_result.set_error(TransactionResultCode::TxInsufficientBalance);
-    }
-
-    // Charge the fee
-    {
-        let state = ctx
-            .state_mut()
-            .ok_or_else(|| TxError::Internal("state manager not available".into()))?;
-        charge_fee_to_account(state, &fee_source_id, fee_charged)?;
-    }
-
-    // Add to fee pool after releasing state borrow
-    ctx.add_to_fee_pool(fee_charged);
-
-    Ok(FeeSeqNumResult {
-        fee_charged,
-        should_apply,
-        tx_result,
-    })
-}
-
 /// Calculate the fee to charge for a transaction.
 /// Calculate the fee to charge for a transaction.
 ///
@@ -509,35 +431,6 @@ pub fn process_post_apply(
     refund_soroban_fee(ctx, &fee_source_id, tx_result, None)
 }
 
-/// Post-apply processing for a fee bump transaction.
-///
-/// For fee bump transactions, refunds go to the fee source account
-/// (the account that submitted the fee bump), not the inner transaction source.
-///
-/// # Parity
-///
-/// Matches `FeeBumpTransactionFrame::processPostApply()`.
-pub fn process_post_apply_fee_bump(
-    fee_bump: &FeeBumpFrame,
-    ctx: &mut LiveExecutionContext,
-    tx_result: &mut MutableTransactionResult,
-    _meta_builder: Option<&mut TransactionMetaBuilder>,
-) -> Result<i64> {
-    // In protocol 23+, refunds are handled in process_post_tx_set_apply
-    if ctx.protocol_version() >= PROTOCOL_VERSION_23 {
-        return Ok(0);
-    }
-
-    // Only Soroban transactions have refunds
-    if !fee_bump.inner_frame().is_soroban() {
-        return Ok(0);
-    }
-
-    // Fee bump refunds go to the fee source, not the inner tx source
-    let fee_source_id = muxed_to_account_id(fee_bump.fee_source());
-    refund_soroban_fee(ctx, &fee_source_id, tx_result, None)
-}
-
 // ============================================================================
 // Transaction Set Post-Apply Processing
 // ============================================================================
@@ -578,27 +471,6 @@ pub fn process_post_tx_set_apply(
     }
 
     let fee_source_id = muxed_to_account_id(&frame.source_account());
-    refund_soroban_fee(ctx, &fee_source_id, tx_result, tx_event_manager)
-}
-
-/// Post-transaction-set processing for a fee bump transaction.
-///
-/// # Parity
-///
-/// Matches `FeeBumpTransactionFrame::processPostTxSetApply()`.
-pub fn process_post_tx_set_apply_fee_bump(
-    fee_bump: &FeeBumpFrame,
-    ctx: &mut LiveExecutionContext,
-    tx_result: &mut MutableTransactionResult,
-    tx_event_manager: Option<&mut TxEventManager>,
-) -> Result<i64> {
-    // Pre-P23, refunds were already applied in process_post_apply
-    if ctx.protocol_version() < PROTOCOL_VERSION_23 {
-        return Ok(0);
-    }
-
-    // Fee bump refunds go to the fee source
-    let fee_source_id = muxed_to_account_id(fee_bump.fee_source());
     refund_soroban_fee(ctx, &fee_source_id, tx_result, tx_event_manager)
 }
 

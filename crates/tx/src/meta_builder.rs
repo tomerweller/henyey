@@ -32,8 +32,8 @@ use henyey_common::NetworkId;
 use stellar_xdr::curr::{
     ContractEvent, ContractEventBody, ContractEventType, ContractEventV0, DiagnosticEvent,
     ExtensionPoint, LedgerEntry, LedgerEntryChange, LedgerEntryChanges, Memo, OperationMeta,
-    OperationMetaV2, ScError, ScMap, ScMapEntry, ScString, ScSymbol, ScVal, SorobanTransactionMeta,
-    SorobanTransactionMetaExt, SorobanTransactionMetaExtV1, SorobanTransactionMetaV2, StringM,
+    OperationMetaV2, ScError, ScMap, ScMapEntry, ScVal, SorobanTransactionMeta,
+    SorobanTransactionMetaExt, SorobanTransactionMetaExtV1, SorobanTransactionMetaV2,
     TransactionMeta, TransactionMetaV2, TransactionMetaV3, TransactionMetaV4,
 };
 
@@ -841,16 +841,7 @@ impl TransactionMetaBuilder {
     }
 }
 
-// Helper functions for ScVal construction
-
-fn make_symbol_scval(value: &str) -> ScVal {
-    let sym = ScSymbol(StringM::try_from(value).unwrap_or_default());
-    ScVal::Symbol(sym)
-}
-
-fn make_string_scval(value: &str) -> ScVal {
-    ScVal::String(ScString(StringM::try_from(value).unwrap_or_default()))
-}
+use crate::scval_utils::{make_string_scval, make_symbol_scval};
 
 #[cfg(test)]
 mod tests {

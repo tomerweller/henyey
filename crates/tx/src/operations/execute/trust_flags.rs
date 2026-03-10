@@ -13,7 +13,6 @@ use stellar_xdr::curr::{
     SetTrustLineFlagsResultCode, TrustLineAsset, TrustLineFlags,
 };
 
-use super::offer_exchange::{exchange_v10_without_price_error_thresholds, RoundingType};
 use super::{
     ensure_account_liabilities, ensure_trustline_liabilities,
     is_authorized_to_maintain_liabilities, issuer_for_asset, AUTHORIZED_FLAG,
@@ -115,15 +114,12 @@ pub fn execute_allow_trust(
         remove_offers_with_cleanup(state, &op.trustor, &asset);
 
         // Also redeem pool share trustlines (protocol >= 18)
-        let result = redeem_pool_share_trustlines(
-            state,
-            _context,
-            &op.trustor,
-            &asset,
-            tx_source_id,
-            tx_seq,
+        let tx_id = super::TxIdentity {
+            source_id: tx_source_id,
+            seq: tx_seq,
             op_index,
-        )?;
+        };
+        let result = redeem_pool_share_trustlines(state, _context, &op.trustor, &asset, &tx_id)?;
         match result {
             RemoveResult::Success => {}
             RemoveResult::LowReserve => {
@@ -253,15 +249,12 @@ pub fn execute_set_trust_line_flags(
         remove_offers_with_cleanup(state, &op.trustor, &op.asset);
 
         // Also redeem pool share trustlines (protocol >= 18)
-        let result = redeem_pool_share_trustlines(
-            state,
-            _context,
-            &op.trustor,
-            &op.asset,
-            tx_source_id,
-            tx_seq,
+        let tx_id = super::TxIdentity {
+            source_id: tx_source_id,
+            seq: tx_seq,
             op_index,
-        )?;
+        };
+        let result = redeem_pool_share_trustlines(state, _context, &op.trustor, &op.asset, &tx_id)?;
         match result {
             RemoveResult::Success => {}
             RemoveResult::LowReserve => {
@@ -357,13 +350,18 @@ fn remove_offers_with_cleanup(
 }
 
 /// Calculate and release liabilities for a deleted offer.
+///
+/// Uses `saturating_sub` instead of `apply_liabilities_delta` because this is
+/// called during bulk deauthorization where we need best-effort cleanup without
+/// propagating errors from individual offer liability releases.
 fn release_offer_liabilities(state: &mut LedgerStateManager, offer: &OfferEntry) {
     // Calculate liabilities: selling_liab is the offer amount,
     // buying_liab is what we'd receive at the offer price
-    let (selling_liab, buying_liab) = match offer_liabilities(&offer.amount, &offer.price) {
-        Ok((s, b)) => (s, b),
-        Err(_) => return, // Shouldn't happen for valid offers
-    };
+    let (selling_liab, buying_liab) =
+        match super::offer_utils::offer_liabilities_sell(offer.amount, &offer.price) {
+            Ok((s, b)) => (s, b),
+            Err(_) => return, // Shouldn't happen for valid offers
+        };
 
     // Release selling liability
     if matches!(offer.selling, Asset::Native) {
@@ -390,20 +388,6 @@ fn release_offer_liabilities(state: &mut LedgerStateManager, offer: &OfferEntry)
             liab.buying = liab.buying.saturating_sub(buying_liab);
         }
     }
-}
-
-/// Calculate the liabilities for a sell offer.
-fn offer_liabilities(amount: &i64, price: &stellar_xdr::curr::Price) -> Result<(i64, i64)> {
-    let res = exchange_v10_without_price_error_thresholds(
-        price.clone(),
-        *amount,
-        i64::MAX,
-        i64::MAX,
-        i64::MAX,
-        RoundingType::Normal,
-    )
-    .map_err(|_| crate::TxError::Internal("offer liability calculation failed".into()))?;
-    Ok((res.num_wheat_received, res.num_sheep_send))
 }
 
 /// Result of removing offers and pool share trustlines.
@@ -472,9 +456,7 @@ fn redeem_pool_share_trustlines(
     context: &LedgerContext,
     account_id: &AccountId,
     asset: &Asset,
-    tx_source_id: &AccountId,
-    tx_seq: i64,
-    op_index: u32,
+    tx_id: &super::TxIdentity<'_>,
 ) -> Result<RemoveResult> {
     if protocol_version_is_before(context.protocol_version, ProtocolVersion::V18) {
         return Ok(RemoveResult::Success);
@@ -545,9 +527,7 @@ fn redeem_pool_share_trustlines(
                 amount_a,
                 account_id,
                 &cb_sponsoring_acc_id,
-                tx_source_id,
-                tx_seq,
-                op_index,
+                tx_id,
                 &pool_id,
             )?;
             if res != RemoveResult::Success {
@@ -562,9 +542,7 @@ fn redeem_pool_share_trustlines(
                 amount_b,
                 account_id,
                 &cb_sponsoring_acc_id,
-                tx_source_id,
-                tx_seq,
-                op_index,
+                tx_id,
                 &pool_id,
             )?;
             if res != RemoveResult::Success {
@@ -592,16 +570,13 @@ fn redeem_pool_share_trustlines(
 }
 
 /// Create a claimable balance for a pool share redemption.
-#[allow(clippy::too_many_arguments)]
 fn redeem_into_claimable_balance(
     state: &mut LedgerStateManager,
     asset: &Asset,
     amount: i64,
     account_id: &AccountId,
     cb_sponsoring_acc_id: &AccountId,
-    tx_source_id: &AccountId,
-    tx_seq: i64,
-    op_index: u32,
+    tx_id: &super::TxIdentity<'_>,
     pool_id: &PoolId,
 ) -> Result<RemoveResult> {
     // If amount is 0, nothing to do
@@ -615,7 +590,7 @@ fn redeem_into_claimable_balance(
     }
 
     // Create the claimable balance entry
-    let balance_id = get_revoke_id(tx_source_id, tx_seq, op_index, pool_id, asset)?;
+    let balance_id = get_revoke_id(tx_id.source_id, tx_id.seq, tx_id.op_index, pool_id, asset)?;
 
     let claimant = Claimant::ClaimantTypeV0(ClaimantV0 {
         destination: account_id.clone(),

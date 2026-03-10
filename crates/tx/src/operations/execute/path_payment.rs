@@ -5,23 +5,18 @@
 
 use sha2::{Digest, Sha256};
 use stellar_xdr::curr::{
-    AccountId, Asset, ClaimAtom, ClaimLiquidityAtom, ClaimOfferAtom, Hash, LedgerKey,
-    LedgerKeyOffer, Limits, LiquidityPoolEntryBody, LiquidityPoolParameters, OperationResult,
-    OperationResultTr, PathPaymentStrictReceiveOp, PathPaymentStrictReceiveResult,
-    PathPaymentStrictReceiveResultCode, PathPaymentStrictReceiveResultSuccess,
-    PathPaymentStrictSendOp, PathPaymentStrictSendResult, PathPaymentStrictSendResultCode,
-    PathPaymentStrictSendResultSuccess, PoolId, Price, SimplePaymentResult, WriteXdr,
-    LIQUIDITY_POOL_FEE_V18,
+    AccountId, Asset, ClaimAtom, ClaimLiquidityAtom, Hash, Limits, LiquidityPoolEntryBody,
+    LiquidityPoolParameters, OperationResult, OperationResultTr, PathPaymentStrictReceiveOp,
+    PathPaymentStrictReceiveResult, PathPaymentStrictReceiveResultCode,
+    PathPaymentStrictReceiveResultSuccess, PathPaymentStrictSendOp, PathPaymentStrictSendResult,
+    PathPaymentStrictSendResultCode, PathPaymentStrictSendResultSuccess, PoolId,
+    SimplePaymentResult, WriteXdr, LIQUIDITY_POOL_FEE_V18,
 };
 
-use super::offer_exchange::{
-    adjust_offer_amount, exchange_v10, exchange_v10_without_price_error_thresholds,
-    ConversionParams, RoundingType,
-};
+use super::offer_exchange::{ConversionParams, RoundingType};
 use super::{
-    account_liabilities, add_account_balance, add_trustline_balance, apply_balance_delta,
-    apply_liabilities_delta, can_buy_at_most, is_authorized_to_maintain_liabilities,
-    is_trustline_authorized, issuer_for_asset, map_exchange_error, trustline_liabilities,
+    account_liabilities, add_account_balance, add_trustline_balance, is_trustline_authorized,
+    issuer_for_asset, trustline_liabilities,
 };
 use crate::frame::muxed_to_account_id;
 use crate::state::LedgerStateManager;
@@ -642,7 +637,7 @@ fn convert_with_offers(
         }
 
         let t1 = std::time::Instant::now();
-        let (recv, send, wheat_stays) = cross_offer_v10(
+        let (recv, send, wheat_stays) = super::offer_utils::cross_offer_v10(
             &offer,
             max_recv,
             max_send,
@@ -681,183 +676,6 @@ fn convert_with_offers(
     } else {
         ConvertResult::Ok
     })
-}
-
-fn cross_offer_v10(
-    offer: &stellar_xdr::curr::OfferEntry,
-    max_recv: i64,
-    max_send: i64,
-    round: RoundingType,
-    offer_trail: &mut Vec<ClaimAtom>,
-    state: &mut LedgerStateManager,
-    context: &LedgerContext,
-) -> Result<(i64, i64, bool)> {
-    let sheep = offer.buying.clone();
-    let wheat = offer.selling.clone();
-    let seller = offer.seller_id.clone();
-
-    // Batch-load seller's account and trustlines in a single bucket list pass.
-    // This is ~2-3x faster than separate ensure_*_loaded calls because it avoids
-    // re-traversing upper bucket list levels for each entry.
-    state.ensure_offer_entries_loaded(&seller, &wheat, &sheep)?;
-
-    // Step 1: Release liabilities FIRST (matches stellar-core exactly)
-    // This is critical - the available balance calculation depends on liabilities
-    // being released first.
-    let (selling_liab, buying_liab) = offer_liabilities_sell(offer.amount, &offer.price)?;
-    apply_liabilities_delta(
-        &seller,
-        &offer.selling,
-        &offer.buying,
-        -selling_liab,
-        -buying_liab,
-        state,
-    )?;
-
-    // Step 2: Calculate available amounts AFTER liabilities are released
-    let max_wheat_send = offer
-        .amount
-        .min(can_sell_at_most(&seller, &wheat, state, context)?);
-    let max_sheep_receive = can_buy_at_most(&seller, &sheep, state);
-
-    // Step 3: Adjust offer amount (stellar-core calls adjustOffer here as "preventative measure")
-    let adjusted_offer_amount =
-        adjust_offer_amount(offer.price.clone(), max_wheat_send, max_sheep_receive)
-            .map_err(map_exchange_error)?;
-
-    // Step 4: Perform the exchange calculation
-    let exchange = exchange_v10(
-        offer.price.clone(),
-        adjusted_offer_amount,
-        max_recv,
-        max_send,
-        max_sheep_receive,
-        round,
-    )
-    .map_err(map_exchange_error)?;
-
-    let num_wheat_received = exchange.num_wheat_received;
-    let num_sheep_send = exchange.num_sheep_send;
-    let wheat_stays = exchange.wheat_stays;
-
-    // Step 5: Apply balance changes (if any)
-    if num_sheep_send != 0 {
-        apply_balance_delta(&seller, &sheep, num_sheep_send, state)?;
-    }
-    if num_wheat_received != 0 {
-        apply_balance_delta(&seller, &wheat, -num_wheat_received, state)?;
-    }
-
-    // Step 6: Calculate new offer amount and handle offer update/deletion
-    let new_amount = if wheat_stays {
-        let tentative = adjusted_offer_amount.saturating_sub(num_wheat_received);
-        if tentative > 0 {
-            // Re-adjust after balance changes
-            let post_change_wheat_send =
-                tentative.min(can_sell_at_most(&seller, &wheat, state, context)?);
-            let post_change_sheep_receive = can_buy_at_most(&seller, &sheep, state);
-            adjust_offer_amount(
-                offer.price.clone(),
-                post_change_wheat_send,
-                post_change_sheep_receive,
-            )
-            .map_err(map_exchange_error)?
-        } else {
-            0
-        }
-    } else {
-        0
-    };
-
-    // Step 7: Delete or update offer
-    if new_amount == 0 {
-        let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
-            seller_id: seller.clone(),
-            offer_id: offer.offer_id,
-        });
-        let sponsor = state.entry_sponsor(&ledger_key).cloned();
-        state.delete_offer(&seller, offer.offer_id);
-        if let Some(sponsor) = sponsor {
-            state.update_num_sponsoring(&sponsor, -1)?;
-            state.update_num_sponsored(&seller, -1)?;
-        }
-        if let Some(account) = state.get_account_mut(&seller) {
-            if account.num_sub_entries > 0 {
-                account.num_sub_entries -= 1;
-            }
-        }
-    } else {
-        // Update offer and re-acquire liabilities
-        let updated = stellar_xdr::curr::OfferEntry {
-            amount: new_amount,
-            ..offer.clone()
-        };
-        state.update_offer(updated);
-        let (new_selling, new_buying) = offer_liabilities_sell(new_amount, &offer.price)?;
-        apply_liabilities_delta(
-            &seller,
-            &offer.selling,
-            &offer.buying,
-            new_selling,
-            new_buying,
-            state,
-        )?;
-    }
-
-    // Step 8: Add ClaimAtom (stellar-core always adds one, even for 0-0 exchanges)
-    offer_trail.push(ClaimAtom::OrderBook(ClaimOfferAtom {
-        seller_id: seller,
-        offer_id: offer.offer_id,
-        asset_sold: wheat,
-        amount_sold: num_wheat_received,
-        asset_bought: sheep,
-        amount_bought: num_sheep_send,
-    }));
-
-    Ok((num_wheat_received, num_sheep_send, wheat_stays))
-}
-
-fn can_sell_at_most(
-    source: &AccountId,
-    asset: &Asset,
-    state: &LedgerStateManager,
-    context: &LedgerContext,
-) -> Result<i64> {
-    if matches!(asset, Asset::Native) {
-        let Some(account) = state.get_account(source) else {
-            return Ok(0);
-        };
-        let min_balance =
-            state.minimum_balance_for_account(account, context.protocol_version, 0)?;
-        let available = account.balance - min_balance - account_liabilities(account).selling;
-        return Ok(available.max(0));
-    }
-
-    if issuer_for_asset(asset) == Some(source) {
-        return Ok(i64::MAX);
-    }
-
-    let Some(trustline) = state.get_trustline(source, asset) else {
-        return Ok(0);
-    };
-    if !is_authorized_to_maintain_liabilities(trustline.flags) {
-        return Ok(0);
-    }
-    let available = trustline.balance - trustline_liabilities(trustline).selling;
-    Ok(available.max(0))
-}
-
-fn offer_liabilities_sell(amount: i64, price: &Price) -> Result<(i64, i64)> {
-    let res = exchange_v10_without_price_error_thresholds(
-        price.clone(),
-        amount,
-        i64::MAX,
-        i64::MAX,
-        i64::MAX,
-        RoundingType::Normal,
-    )
-    .map_err(map_exchange_error)?;
-    Ok((res.num_wheat_received, res.num_sheep_send))
 }
 
 struct PoolExchange {

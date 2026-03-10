@@ -1,3 +1,5 @@
+//! Error conversion utilities between P24 and P25 Soroban host error types.
+
 use soroban_env_host_p24 as soroban_env_host24;
 use soroban_env_host_p25 as soroban_env_host25;
 

@@ -91,6 +91,98 @@ where
     }
 }
 
+/// Rollback metadata that is routed to separate offer/non-offer maps.
+///
+/// This handles the two-step rollback pattern for metadata maps that are split
+/// into offer and non-offer variants (e.g., `entry_last_modified` / `offer_last_modified`):
+/// 1. Restore snapshot values for entries snapshot'd *after* the savepoint
+/// 2. Apply pre-savepoint values for entries modified *before* the savepoint
+fn rollback_routed_metadata<V: Clone>(
+    current_snapshots: &HashMap<LedgerKey, Option<V>>,
+    sp_snapshots: &HashMap<LedgerKey, Option<V>>,
+    pre_values: Vec<(LedgerKey, Option<V>)>,
+    offer_map: &mut HashMap<LedgerKey, V>,
+    entry_map: &mut HashMap<LedgerKey, V>,
+) {
+    // Step 1: Restore entries snapshot'd after the savepoint
+    for (key, snapshot) in current_snapshots {
+        if !sp_snapshots.contains_key(key) {
+            let target = if matches!(key, LedgerKey::Offer(_)) {
+                &mut *offer_map
+            } else {
+                &mut *entry_map
+            };
+            match snapshot {
+                Some(val) => {
+                    target.insert(key.clone(), val.clone());
+                }
+                None => {
+                    target.remove(key);
+                }
+            }
+        }
+    }
+    // Step 2: Apply pre-savepoint values
+    for (key, value) in pre_values {
+        let target = if matches!(&key, LedgerKey::Offer(_)) {
+            &mut *offer_map
+        } else {
+            &mut *entry_map
+        };
+        match value {
+            Some(val) => {
+                target.insert(key, val);
+            }
+            None => {
+                target.remove(&key);
+            }
+        }
+    }
+}
+
+/// Rollback set-based metadata routed to separate offer/non-offer sets.
+///
+/// Same pattern as [`rollback_routed_metadata`] but for `HashSet`-backed maps
+/// where the snapshot is a `bool` (was-present) rather than `Option<V>`.
+fn rollback_routed_set_metadata(
+    current_snapshots: &HashMap<LedgerKey, bool>,
+    sp_snapshots: &HashMap<LedgerKey, bool>,
+    pre_values: Vec<(LedgerKey, bool)>,
+    offer_set: &mut HashSet<LedgerKey>,
+    entry_set: &mut HashSet<LedgerKey>,
+) {
+    // Step 1: Restore entries snapshot'd after the savepoint
+    for (key, &was_present) in current_snapshots {
+        if !sp_snapshots.contains_key(key) {
+            let (offer_s, entry_s) = (&mut *offer_set, &mut *entry_set);
+            let target = if matches!(key, LedgerKey::Offer(_)) {
+                offer_s
+            } else {
+                entry_s
+            };
+            if was_present {
+                target.insert(key.clone());
+            } else {
+                target.remove(key);
+            }
+        }
+    }
+    // Step 2: Apply pre-savepoint values
+    for (key, was_present) in pre_values {
+        let (offer_s, entry_s) = (&mut *offer_set, &mut *entry_set);
+        let target = if matches!(&key, LedgerKey::Offer(_)) {
+            offer_s
+        } else {
+            entry_s
+        };
+        if was_present {
+            target.insert(key);
+        } else {
+            target.remove(&key);
+        }
+    }
+}
+
 /// Rollback a set of entries from their snapshot map.
 ///
 /// For each snapshotted key: if the key is in `created`, remove the entry
@@ -1474,125 +1566,31 @@ impl LedgerStateManager {
             .truncate(sp.modified_liquidity_pools_len);
 
         // Phase 6: Restore entry metadata (routed to offer/non-offer maps)
-        for (key, snapshot) in &self.entry_last_modified_snapshots {
-            if !sp.entry_last_modified_snapshots.contains_key(key) {
-                match snapshot {
-                    Some(val) => {
-                        if Self::is_offer_key(key) {
-                            self.offer_last_modified.insert(key.clone(), *val);
-                        } else {
-                            self.entry_last_modified.insert(key.clone(), *val);
-                        }
-                    }
-                    None => {
-                        if Self::is_offer_key(key) {
-                            self.offer_last_modified.remove(key);
-                        } else {
-                            self.entry_last_modified.remove(key);
-                        }
-                    }
-                }
-            }
-        }
-        for (key, value) in sp.entry_last_modified_pre_values {
-            match value {
-                Some(val) => {
-                    if Self::is_offer_key(&key) {
-                        self.offer_last_modified.insert(key, val);
-                    } else {
-                        self.entry_last_modified.insert(key, val);
-                    }
-                }
-                None => {
-                    if Self::is_offer_key(&key) {
-                        self.offer_last_modified.remove(&key);
-                    } else {
-                        self.entry_last_modified.remove(&key);
-                    }
-                }
-            }
-        }
+        rollback_routed_metadata(
+            &self.entry_last_modified_snapshots,
+            &sp.entry_last_modified_snapshots,
+            sp.entry_last_modified_pre_values,
+            &mut self.offer_last_modified,
+            &mut self.entry_last_modified,
+        );
         self.entry_last_modified_snapshots = sp.entry_last_modified_snapshots;
 
-        for (key, snapshot) in &self.entry_sponsorship_snapshots {
-            if !sp.entry_sponsorship_snapshots.contains_key(key) {
-                match snapshot {
-                    Some(entry) => {
-                        if Self::is_offer_key(key) {
-                            self.offer_sponsorships.insert(key.clone(), entry.clone());
-                        } else {
-                            self.entry_sponsorships.insert(key.clone(), entry.clone());
-                        }
-                    }
-                    None => {
-                        if Self::is_offer_key(key) {
-                            self.offer_sponsorships.remove(key);
-                        } else {
-                            self.entry_sponsorships.remove(key);
-                        }
-                    }
-                }
-            }
-        }
-        for (key, value) in sp.entry_sponsorship_pre_values {
-            match value {
-                Some(entry) => {
-                    if Self::is_offer_key(&key) {
-                        self.offer_sponsorships.insert(key, entry);
-                    } else {
-                        self.entry_sponsorships.insert(key, entry);
-                    }
-                }
-                None => {
-                    if Self::is_offer_key(&key) {
-                        self.offer_sponsorships.remove(&key);
-                    } else {
-                        self.entry_sponsorships.remove(&key);
-                    }
-                }
-            }
-        }
+        rollback_routed_metadata(
+            &self.entry_sponsorship_snapshots,
+            &sp.entry_sponsorship_snapshots,
+            sp.entry_sponsorship_pre_values,
+            &mut self.offer_sponsorships,
+            &mut self.entry_sponsorships,
+        );
         self.entry_sponsorship_snapshots = sp.entry_sponsorship_snapshots;
 
-        // entry_sponsorship_ext uses HashSet + bool (not Option<V>), handle inline
-        let new_ext_keys: Vec<_> = self
-            .entry_sponsorship_ext_snapshots
-            .keys()
-            .filter(|k| !sp.entry_sponsorship_ext_snapshots.contains_key(k))
-            .cloned()
-            .collect();
-        for key in new_ext_keys {
-            if let Some(&was_present) = self.entry_sponsorship_ext_snapshots.get(&key) {
-                if was_present {
-                    if Self::is_offer_key(&key) {
-                        self.offer_sponsorship_ext.insert(key);
-                    } else {
-                        self.entry_sponsorship_ext.insert(key);
-                    }
-                } else {
-                    if Self::is_offer_key(&key) {
-                        self.offer_sponsorship_ext.remove(&key);
-                    } else {
-                        self.entry_sponsorship_ext.remove(&key);
-                    }
-                }
-            }
-        }
-        for (key, was_present) in sp.entry_sponsorship_ext_pre_values {
-            if was_present {
-                if Self::is_offer_key(&key) {
-                    self.offer_sponsorship_ext.insert(key);
-                } else {
-                    self.entry_sponsorship_ext.insert(key);
-                }
-            } else {
-                if Self::is_offer_key(&key) {
-                    self.offer_sponsorship_ext.remove(&key);
-                } else {
-                    self.entry_sponsorship_ext.remove(&key);
-                }
-            }
-        }
+        rollback_routed_set_metadata(
+            &self.entry_sponsorship_ext_snapshots,
+            &sp.entry_sponsorship_ext_snapshots,
+            sp.entry_sponsorship_ext_pre_values,
+            &mut self.offer_sponsorship_ext,
+            &mut self.entry_sponsorship_ext,
+        );
         self.entry_sponsorship_ext_snapshots = sp.entry_sponsorship_ext_snapshots;
 
         // Phase 7: Restore op entry snapshots and id_pool

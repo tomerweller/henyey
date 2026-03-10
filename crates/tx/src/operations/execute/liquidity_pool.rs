@@ -85,63 +85,14 @@ pub fn execute_liquidity_pool_deposit(
             }
         };
 
-    // Check source has trustlines for both assets (unless native or issuer).
-    // Issuers don't need trustlines for their own assets - they can always hold them.
-    let trustline_a = if matches!(&asset_a, Asset::Native) || is_issuer(source, &asset_a) {
-        None
-    } else {
-        match state.get_trustline(source, &asset_a) {
-            Some(tl) => Some(tl),
-            None => {
-                return Ok(make_deposit_result(LiquidityPoolDepositResultCode::NoTrust));
-            }
-        }
+    // Check source has trustlines, authorization, and available balance for both assets.
+    let available_a = match resolve_deposit_asset(source, &asset_a, state, context) {
+        Ok(v) => v,
+        Err(code) => return Ok(make_deposit_result(code)),
     };
-
-    let trustline_b = if matches!(&asset_b, Asset::Native) || is_issuer(source, &asset_b) {
-        None
-    } else {
-        match state.get_trustline(source, &asset_b) {
-            Some(tl) => Some(tl),
-            None => {
-                return Ok(make_deposit_result(LiquidityPoolDepositResultCode::NoTrust));
-            }
-        }
-    };
-
-    if is_auth_required(&asset_a, state)
-        && trustline_a
-            .map(|tl| !is_trustline_authorized(tl.flags))
-            .unwrap_or(false)
-    {
-        return Ok(make_deposit_result(
-            LiquidityPoolDepositResultCode::NotAuthorized,
-        ));
-    }
-
-    if is_auth_required(&asset_b, state)
-        && trustline_b
-            .map(|tl| !is_trustline_authorized(tl.flags))
-            .unwrap_or(false)
-    {
-        return Ok(make_deposit_result(
-            LiquidityPoolDepositResultCode::NotAuthorized,
-        ));
-    }
-
-    let available_a = match &asset_a {
-        Asset::Native => available_native_balance(source, state, context)?,
-        _ if is_issuer(source, &asset_a) => i64::MAX, // Issuers have unlimited capacity
-        _ => trustline_a
-            .map(|tl| trustline_balance_after_liabilities(tl))
-            .unwrap_or(0),
-    };
-    let available_b = match &asset_b {
-        Asset::Native => available_native_balance(source, state, context)?,
-        _ if is_issuer(source, &asset_b) => i64::MAX, // Issuers have unlimited capacity
-        _ => trustline_b
-            .map(|tl| trustline_balance_after_liabilities(tl))
-            .unwrap_or(0),
+    let available_b = match resolve_deposit_asset(source, &asset_b, state, context) {
+        Ok(v) => v,
+        Err(code) => return Ok(make_deposit_result(code)),
     };
     let available_pool_share_limit = pool_share_trustline
         .limit
@@ -231,44 +182,11 @@ pub fn execute_liquidity_pool_deposit(
 
     // Deduct assets from source
     // Note: issuers can deposit their own assets without a trustline (they create from nothing)
-    if matches!(&asset_a, Asset::Native) {
-        if let Some(account) = state.get_account_mut(source) {
-            if account.balance < deposit_a {
-                return Ok(make_deposit_result(
-                    LiquidityPoolDepositResultCode::Underfunded,
-                ));
-            }
-            account.balance -= deposit_a;
-        }
-    } else if is_issuer(source, &asset_a) {
-        // Issuer "creates" assets out of nothing, no balance to deduct
-    } else if let Some(tl) = state.get_trustline_mut(source, &asset_a) {
-        if tl.balance < deposit_a {
-            return Ok(make_deposit_result(
-                LiquidityPoolDepositResultCode::Underfunded,
-            ));
-        }
-        tl.balance -= deposit_a;
+    if let Err(code) = debit_asset(state, source, &asset_a, deposit_a) {
+        return Ok(make_deposit_result(code));
     }
-
-    if matches!(&asset_b, Asset::Native) {
-        if let Some(account) = state.get_account_mut(source) {
-            if account.balance < deposit_b {
-                return Ok(make_deposit_result(
-                    LiquidityPoolDepositResultCode::Underfunded,
-                ));
-            }
-            account.balance -= deposit_b;
-        }
-    } else if is_issuer(source, &asset_b) {
-        // Issuer "creates" assets out of nothing, no balance to deduct
-    } else if let Some(tl) = state.get_trustline_mut(source, &asset_b) {
-        if tl.balance < deposit_b {
-            return Ok(make_deposit_result(
-                LiquidityPoolDepositResultCode::Underfunded,
-            ));
-        }
-        tl.balance -= deposit_b;
+    if let Err(code) = debit_asset(state, source, &asset_b, deposit_b) {
+        return Ok(make_deposit_result(code));
     }
 
     // Credit pool shares to source
@@ -368,31 +286,19 @@ pub fn execute_liquidity_pool_withdraw(
         ));
     }
 
-    match can_credit_asset(state, source, &asset_a, withdraw_a) {
-        WithdrawAssetCheck::Ok => {}
-        WithdrawAssetCheck::NoTrust => {
-            return Ok(make_withdraw_result(
-                LiquidityPoolWithdrawResultCode::NoTrust,
-            ));
-        }
-        WithdrawAssetCheck::LineFull => {
-            return Ok(make_withdraw_result(
-                LiquidityPoolWithdrawResultCode::LineFull,
-            ));
-        }
-    }
-
-    match can_credit_asset(state, source, &asset_b, withdraw_b) {
-        WithdrawAssetCheck::Ok => {}
-        WithdrawAssetCheck::NoTrust => {
-            return Ok(make_withdraw_result(
-                LiquidityPoolWithdrawResultCode::NoTrust,
-            ));
-        }
-        WithdrawAssetCheck::LineFull => {
-            return Ok(make_withdraw_result(
-                LiquidityPoolWithdrawResultCode::LineFull,
-            ));
+    for (asset, amount) in [(&asset_a, withdraw_a), (&asset_b, withdraw_b)] {
+        match can_credit_asset(state, source, asset, amount) {
+            WithdrawAssetCheck::Ok => {}
+            WithdrawAssetCheck::NoTrust => {
+                return Ok(make_withdraw_result(
+                    LiquidityPoolWithdrawResultCode::NoTrust,
+                ));
+            }
+            WithdrawAssetCheck::LineFull => {
+                return Ok(make_withdraw_result(
+                    LiquidityPoolWithdrawResultCode::LineFull,
+                ));
+            }
         }
     }
 
@@ -418,6 +324,76 @@ pub fn execute_liquidity_pool_withdraw(
     Ok(make_withdraw_result(
         LiquidityPoolWithdrawResultCode::Success,
     ))
+}
+
+/// Resolve a single asset's trustline and available balance for a deposit.
+///
+/// Looks up the trustline (unless native or issuer), checks authorization,
+/// and computes available balance. Returns `Err(code)` for early-exit conditions.
+fn resolve_deposit_asset(
+    source: &AccountId,
+    asset: &Asset,
+    state: &LedgerStateManager,
+    context: &LedgerContext,
+) -> std::result::Result<i64, LiquidityPoolDepositResultCode> {
+    use stellar_xdr::curr::TrustLineEntry;
+
+    let trustline: Option<&TrustLineEntry> =
+        if matches!(asset, Asset::Native) || is_issuer(source, asset) {
+            None
+        } else {
+            match state.get_trustline(source, asset) {
+                Some(tl) => Some(tl),
+                None => return Err(LiquidityPoolDepositResultCode::NoTrust),
+            }
+        };
+
+    if is_auth_required(asset, state)
+        && trustline
+            .map(|tl| !is_trustline_authorized(tl.flags))
+            .unwrap_or(false)
+    {
+        return Err(LiquidityPoolDepositResultCode::NotAuthorized);
+    }
+
+    let available = match asset {
+        Asset::Native => available_native_balance(source, state, context)
+            .map_err(|_| LiquidityPoolDepositResultCode::Underfunded)?,
+        _ if is_issuer(source, asset) => i64::MAX,
+        _ => trustline
+            .map(|tl| trustline_balance_after_liabilities(tl))
+            .unwrap_or(0),
+    };
+
+    Ok(available)
+}
+
+/// Debit an asset from the source account for a liquidity pool deposit.
+///
+/// Handles native (account balance), issuer (no-op), and trustline cases.
+/// Returns `Err(Underfunded)` if the balance is insufficient.
+fn debit_asset(
+    state: &mut LedgerStateManager,
+    source: &AccountId,
+    asset: &Asset,
+    amount: i64,
+) -> std::result::Result<(), LiquidityPoolDepositResultCode> {
+    if matches!(asset, Asset::Native) {
+        if let Some(account) = state.get_account_mut(source) {
+            if account.balance < amount {
+                return Err(LiquidityPoolDepositResultCode::Underfunded);
+            }
+            account.balance -= amount;
+        }
+    } else if is_issuer(source, asset) {
+        // Issuer "creates" assets out of nothing, no balance to deduct
+    } else if let Some(tl) = state.get_trustline_mut(source, asset) {
+        if tl.balance < amount {
+            return Err(LiquidityPoolDepositResultCode::Underfunded);
+        }
+        tl.balance -= amount;
+    }
+    Ok(())
 }
 
 const AUTH_REQUIRED_FLAG: u32 = 0x1;

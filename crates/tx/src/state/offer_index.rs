@@ -1,3 +1,5 @@
+//! Order-book offer index for price-ordered offer traversal during DEX exchange.
+
 use super::*;
 
 /// Descriptor for an offer used in the order book index.

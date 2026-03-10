@@ -6,21 +6,23 @@
 use std::cmp::Ordering;
 
 use stellar_xdr::curr::{
-    AccountId, Asset, ClaimAtom, ClaimOfferAtom, CreatePassiveSellOfferOp, LedgerKey,
-    LedgerKeyOffer, ManageBuyOfferOp, ManageOfferSuccessResult, ManageOfferSuccessResultOffer,
-    ManageSellOfferOp, ManageSellOfferResult, ManageSellOfferResultCode, OfferEntry, OfferEntryExt,
-    OfferEntryFlags, OperationResult, OperationResultTr, Price,
+    AccountId, Asset, CreatePassiveSellOfferOp, LedgerKey, LedgerKeyOffer, ManageBuyOfferOp,
+    ManageOfferSuccessResult, ManageOfferSuccessResultOffer, ManageSellOfferOp,
+    ManageSellOfferResult, ManageSellOfferResultCode, OfferEntry, OfferEntryExt, OfferEntryFlags,
+    OperationResult, OperationResultTr, Price,
 };
 
 use super::offer_exchange::{
-    adjust_offer_amount, exchange_v10, exchange_v10_without_price_error_thresholds,
-    ConversionParams, RoundingType,
+    adjust_offer_amount, exchange_v10_without_price_error_thresholds, ConversionParams,
+    RoundingType,
+};
+use super::offer_utils::{
+    can_sell_at_most, cross_offer_v10, delete_offer_with_sponsorship, offer_liabilities_sell,
 };
 use super::{
     account_balance_after_liabilities, account_liabilities, apply_balance_delta,
-    apply_liabilities_delta, can_buy_at_most, is_authorized_to_maintain_liabilities,
-    is_trustline_authorized, issuer_for_asset, map_exchange_error, trustline_liabilities,
-    ACCOUNT_SUBENTRY_LIMIT,
+    apply_liabilities_delta, can_buy_at_most, is_trustline_authorized, issuer_for_asset,
+    map_exchange_error, trustline_liabilities, ACCOUNT_SUBENTRY_LIMIT,
 };
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
@@ -628,23 +630,7 @@ fn delete_offer(
         state,
     )?;
 
-    let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
-        seller_id: source.clone(),
-        offer_id,
-    });
-    let sponsor = state.entry_sponsor(&ledger_key).cloned();
-    state.delete_offer(source, offer_id);
-    if let Some(sponsor) = sponsor {
-        state.update_num_sponsoring(&sponsor, -1)?;
-        state.update_num_sponsored(source, -1)?;
-    }
-
-    // Decrement the source account's sub-entries
-    if let Some(account) = state.get_account_mut(source) {
-        if account.num_sub_entries > 0 {
-            account.num_sub_entries -= 1;
-        }
-    }
+    delete_offer_with_sponsorship(source, offer_id, state)?;
 
     let success = ManageOfferSuccessResult {
         offers_claimed: vec![].try_into().unwrap(),
@@ -667,19 +653,6 @@ fn invert_price(price: &Price) -> Price {
         n: price.d,
         d: price.n,
     }
-}
-
-fn offer_liabilities_sell(amount: i64, price: &Price) -> Result<(i64, i64)> {
-    let res = exchange_v10_without_price_error_thresholds(
-        price.clone(),
-        amount,
-        i64::MAX,
-        i64::MAX,
-        i64::MAX,
-        RoundingType::Normal,
-    )
-    .map_err(map_exchange_error)?;
-    Ok((res.num_wheat_received, res.num_sheep_send))
 }
 
 fn offer_liabilities_buy(buy_amount: i64, price: &Price) -> Result<(i64, i64)> {
@@ -760,41 +733,6 @@ fn has_buying_capacity(
     let effective_liab = current_liab.saturating_sub(old_buying_liab);
     let available = trustline.limit - trustline.balance - effective_liab;
     available >= buying_liab
-}
-
-fn can_sell_at_most(
-    source: &AccountId,
-    asset: &Asset,
-    state: &LedgerStateManager,
-    context: &LedgerContext,
-    reserve_subentry: bool,
-) -> Result<i64> {
-    if matches!(asset, Asset::Native) {
-        let Some(account) = state.get_account(source) else {
-            return Ok(0);
-        };
-        let additional_subentries = if reserve_subentry { 1 } else { 0 };
-        let min_balance = state.minimum_balance_for_account(
-            account,
-            context.protocol_version,
-            additional_subentries,
-        )?;
-        let available = account.balance - min_balance - account_liabilities(account).selling;
-        return Ok(available.max(0));
-    }
-
-    if issuer_for_asset(asset) == Some(source) {
-        return Ok(i64::MAX);
-    }
-
-    let Some(trustline) = state.get_trustline(source, asset) else {
-        return Ok(0);
-    };
-    if !is_authorized_to_maintain_liabilities(trustline.flags) {
-        return Ok(0);
-    }
-    let available = trustline.balance - trustline_liabilities(trustline).selling;
-    Ok(available.max(0))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -894,122 +832,6 @@ fn offer_filter(
     }
 
     OfferFilterResult::Keep
-}
-
-fn cross_offer_v10(
-    offer: &OfferEntry,
-    max_wheat_receive: i64,
-    max_sheep_send: i64,
-    round: RoundingType,
-    offer_trail: &mut Vec<ClaimAtom>,
-    state: &mut LedgerStateManager,
-    context: &LedgerContext,
-) -> Result<(i64, i64, bool)> {
-    let sheep = offer.buying.clone();
-    let wheat = offer.selling.clone();
-    let seller = offer.seller_id.clone();
-
-    // Batch-load seller's account and trustlines in a single bucket list pass.
-    state.ensure_offer_entries_loaded(&seller, &wheat, &sheep)?;
-
-    let (selling_liab, buying_liab) = offer_liabilities_sell(offer.amount, &offer.price)?;
-    apply_liabilities_delta(
-        &seller,
-        &offer.selling,
-        &offer.buying,
-        -selling_liab,
-        -buying_liab,
-        state,
-    )?;
-
-    let max_wheat_send = offer
-        .amount
-        .min(can_sell_at_most(&seller, &wheat, state, context, false)?);
-    let max_sheep_receive = can_buy_at_most(&seller, &sheep, state);
-    let adjusted_offer_amount =
-        adjust_offer_amount(offer.price.clone(), max_wheat_send, max_sheep_receive)
-            .map_err(map_exchange_error)?;
-    let max_wheat_send = adjusted_offer_amount;
-    let exchange = exchange_v10(
-        offer.price.clone(),
-        max_wheat_send,
-        max_wheat_receive,
-        max_sheep_send,
-        max_sheep_receive,
-        round,
-    )
-    .map_err(map_exchange_error)?;
-
-    let num_wheat_received = exchange.num_wheat_received;
-    let num_sheep_send = exchange.num_sheep_send;
-    let wheat_stays = exchange.wheat_stays;
-
-    if num_sheep_send != 0 {
-        apply_balance_delta(&seller, &sheep, num_sheep_send, state)?;
-    }
-
-    if num_wheat_received != 0 {
-        apply_balance_delta(&seller, &wheat, -num_wheat_received, state)?;
-    }
-
-    let mut new_amount = adjusted_offer_amount;
-    if wheat_stays {
-        new_amount = new_amount.saturating_sub(num_wheat_received);
-        if new_amount > 0 {
-            let max_wheat_send =
-                new_amount.min(can_sell_at_most(&seller, &wheat, state, context, false)?);
-            let max_sheep_receive = can_buy_at_most(&seller, &sheep, state);
-            new_amount =
-                adjust_offer_amount(offer.price.clone(), max_wheat_send, max_sheep_receive)
-                    .map_err(map_exchange_error)?;
-        }
-    } else {
-        new_amount = 0;
-    }
-
-    if new_amount == 0 {
-        let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
-            seller_id: seller.clone(),
-            offer_id: offer.offer_id,
-        });
-        let sponsor = state.entry_sponsor(&ledger_key).cloned();
-        state.delete_offer(&seller, offer.offer_id);
-        if let Some(sponsor) = sponsor {
-            state.update_num_sponsoring(&sponsor, -1)?;
-            state.update_num_sponsored(&seller, -1)?;
-        }
-        if let Some(account) = state.get_account_mut(&seller) {
-            if account.num_sub_entries > 0 {
-                account.num_sub_entries -= 1;
-            }
-        }
-    } else {
-        let updated = OfferEntry {
-            amount: new_amount,
-            ..offer.clone()
-        };
-        state.update_offer(updated);
-        let (new_selling, new_buying) = offer_liabilities_sell(new_amount, &offer.price)?;
-        apply_liabilities_delta(
-            &seller,
-            &offer.selling,
-            &offer.buying,
-            new_selling,
-            new_buying,
-            state,
-        )?;
-    }
-
-    offer_trail.push(ClaimAtom::OrderBook(ClaimOfferAtom {
-        seller_id: seller,
-        offer_id: offer.offer_id,
-        asset_sold: wheat,
-        amount_sold: num_wheat_received,
-        asset_bought: sheep,
-        amount_bought: num_sheep_send,
-    }));
-
-    Ok((num_wheat_received, num_sheep_send, wheat_stays))
 }
 
 fn compare_price(lhs: &Price, rhs: &Price) -> Ordering {

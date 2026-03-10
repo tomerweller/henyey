@@ -122,6 +122,7 @@ pub(crate) mod lumen_reconciler;
 pub(crate) mod meta_builder;
 pub mod operations;
 mod result;
+pub(crate) mod scval_utils;
 pub(crate) mod signature_checker;
 pub mod soroban;
 pub mod state;
@@ -161,8 +162,7 @@ pub use signature_checker::{collect_signers_for_account, SignatureChecker};
 pub use validation::{
     validate_basic, validate_fee, validate_full, validate_ledger_bounds, validate_sequence,
     validate_signatures, validate_structure, validate_time_bounds, verify_signature_with_key,
-    verify_signature_with_raw_key,
-    LedgerContext, ValidationError,
+    verify_signature_with_raw_key, LedgerContext, ValidationError,
 };
 
 // Re-export operation types
@@ -185,8 +185,7 @@ pub use fee_bump::{
 
 // Re-export live execution types
 pub use live_execution::{
-    apply_transaction, process_fee_seq_num, process_fee_seq_num_fee_bump, process_post_apply,
-    process_post_apply_fee_bump, process_post_tx_set_apply, process_post_tx_set_apply_fee_bump,
+    apply_transaction, process_fee_seq_num, process_post_apply, process_post_tx_set_apply,
     process_seq_num, refund_soroban_fee, remove_one_time_signers, FeeSeqNumResult,
     LiveExecutionContext,
 };

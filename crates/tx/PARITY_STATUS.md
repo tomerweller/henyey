@@ -193,12 +193,9 @@ Corresponds to: `TransactionFrame::processFeeSeqNum()`, `processPostApply()`, et
 | stellar-core | Rust | Status |
 |--------------|------|--------|
 | `processFeeSeqNum()` | `process_fee_seq_num()` | Full |
-| (FeeBump variant) | `process_fee_seq_num_fee_bump()` | Full |
 | `processSeqNum()` | `process_seq_num()` | Full |
 | `processPostApply()` | `process_post_apply()` | Full |
-| (FeeBump variant) | `process_post_apply_fee_bump()` | Full |
 | `processPostTxSetApply()` | `process_post_tx_set_apply()` | Full |
-| (FeeBump variant) | `process_post_tx_set_apply_fee_bump()` | Full |
 | `refundSorobanFee()` | `refund_soroban_fee()` | Full |
 | `removeOneTimeSignerKeyFromAllSourceAccounts()` | `remove_one_time_signers()` | Full |
 | `getFee()` (baseFee-aware) | `calculate_fee_to_charge()` | Full |

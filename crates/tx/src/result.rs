@@ -681,6 +681,37 @@ impl std::fmt::Display for RefundableFeeError {
 
 impl std::error::Error for RefundableFeeError {}
 
+/// Map a `TransactionResultCode` to the corresponding `TransactionResultResult`.
+///
+/// Fee-bump inner codes (`TxFeeBumpInnerSuccess`, `TxFeeBumpInnerFailed`) cannot
+/// be mapped without an inner transaction result pair, so they fall back to
+/// `TxInternalError`.
+fn code_to_result(code: stellar_xdr::curr::TransactionResultCode) -> TransactionResultResult {
+    use stellar_xdr::curr::TransactionResultCode::*;
+
+    match code {
+        TxSuccess => TransactionResultResult::TxSuccess(vec![].try_into().unwrap()),
+        TxFailed => TransactionResultResult::TxFailed(vec![].try_into().unwrap()),
+        TxTooEarly => TransactionResultResult::TxTooEarly,
+        TxTooLate => TransactionResultResult::TxTooLate,
+        TxMissingOperation => TransactionResultResult::TxMissingOperation,
+        TxBadSeq => TransactionResultResult::TxBadSeq,
+        TxBadAuth => TransactionResultResult::TxBadAuth,
+        TxInsufficientBalance => TransactionResultResult::TxInsufficientBalance,
+        TxNoAccount => TransactionResultResult::TxNoAccount,
+        TxInsufficientFee => TransactionResultResult::TxInsufficientFee,
+        TxBadAuthExtra => TransactionResultResult::TxBadAuthExtra,
+        TxInternalError => TransactionResultResult::TxInternalError,
+        TxNotSupported => TransactionResultResult::TxNotSupported,
+        TxBadSponsorship => TransactionResultResult::TxBadSponsorship,
+        TxBadMinSeqAgeOrGap => TransactionResultResult::TxBadMinSeqAgeOrGap,
+        TxMalformed => TransactionResultResult::TxMalformed,
+        TxSorobanInvalid => TransactionResultResult::TxSorobanInvalid,
+        // Fee-bump inner codes can't be mapped without an InnerTransactionResultPair
+        TxFeeBumpInnerSuccess | TxFeeBumpInnerFailed => TransactionResultResult::TxInternalError,
+    }
+}
+
 /// Mutable transaction result for use during transaction execution.
 ///
 /// This wrapper allows modifying the result as the transaction progresses,
@@ -730,6 +761,7 @@ impl MutableTransactionResult {
     pub fn create_error(code: stellar_xdr::curr::TransactionResultCode, fee_charged: i64) -> Self {
         use stellar_xdr::curr::TransactionResultCode::*;
 
+        // Fee-bump codes need special handling with InnerTransactionResultPair.
         let result = match code {
             TxFeeBumpInnerSuccess => TransactionResultResult::TxFeeBumpInnerSuccess(
                 stellar_xdr::curr::InnerTransactionResultPair {
@@ -755,23 +787,7 @@ impl MutableTransactionResult {
                     },
                 },
             ),
-            TxSuccess => TransactionResultResult::TxSuccess(vec![].try_into().unwrap()),
-            TxFailed => TransactionResultResult::TxFailed(vec![].try_into().unwrap()),
-            TxTooEarly => TransactionResultResult::TxTooEarly,
-            TxTooLate => TransactionResultResult::TxTooLate,
-            TxMissingOperation => TransactionResultResult::TxMissingOperation,
-            TxBadSeq => TransactionResultResult::TxBadSeq,
-            TxBadAuth => TransactionResultResult::TxBadAuth,
-            TxInsufficientBalance => TransactionResultResult::TxInsufficientBalance,
-            TxNoAccount => TransactionResultResult::TxNoAccount,
-            TxInsufficientFee => TransactionResultResult::TxInsufficientFee,
-            TxBadAuthExtra => TransactionResultResult::TxBadAuthExtra,
-            TxInternalError => TransactionResultResult::TxInternalError,
-            TxNotSupported => TransactionResultResult::TxNotSupported,
-            TxBadSponsorship => TransactionResultResult::TxBadSponsorship,
-            TxBadMinSeqAgeOrGap => TransactionResultResult::TxBadMinSeqAgeOrGap,
-            TxMalformed => TransactionResultResult::TxMalformed,
-            TxSorobanInvalid => TransactionResultResult::TxSorobanInvalid,
+            other => code_to_result(other),
         };
 
         Self {
@@ -808,28 +824,7 @@ impl MutableTransactionResult {
     /// This also resets any consumed refundable fees (for Soroban) so that
     /// the maximum refund is returned to the fee source.
     pub fn set_error(&mut self, code: stellar_xdr::curr::TransactionResultCode) {
-        use stellar_xdr::curr::TransactionResultCode::*;
-
-        self.inner.result = match code {
-            TxSuccess => TransactionResultResult::TxSuccess(vec![].try_into().unwrap()),
-            TxFailed => TransactionResultResult::TxFailed(vec![].try_into().unwrap()),
-            TxTooEarly => TransactionResultResult::TxTooEarly,
-            TxTooLate => TransactionResultResult::TxTooLate,
-            TxMissingOperation => TransactionResultResult::TxMissingOperation,
-            TxBadSeq => TransactionResultResult::TxBadSeq,
-            TxBadAuth => TransactionResultResult::TxBadAuth,
-            TxInsufficientBalance => TransactionResultResult::TxInsufficientBalance,
-            TxNoAccount => TransactionResultResult::TxNoAccount,
-            TxInsufficientFee => TransactionResultResult::TxInsufficientFee,
-            TxBadAuthExtra => TransactionResultResult::TxBadAuthExtra,
-            TxInternalError => TransactionResultResult::TxInternalError,
-            TxNotSupported => TransactionResultResult::TxNotSupported,
-            TxBadSponsorship => TransactionResultResult::TxBadSponsorship,
-            TxBadMinSeqAgeOrGap => TransactionResultResult::TxBadMinSeqAgeOrGap,
-            TxMalformed => TransactionResultResult::TxMalformed,
-            TxSorobanInvalid => TransactionResultResult::TxSorobanInvalid,
-            _ => TransactionResultResult::TxInternalError, // Fee bump handled separately
-        };
+        self.inner.result = code_to_result(code);
 
         // Reset refundable fees on error
         if let Some(ref mut tracker) = self.refundable_fee_tracker {
