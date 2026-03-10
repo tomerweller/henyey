@@ -222,7 +222,7 @@ struct DeltaSnapshot {
 }
 
 pub struct SorobanState {
-    pub contract_data: EntryStore<ContractDataKey, ContractDataEntry>,
+    pub contract_data: EntryStore<StorageKey, ContractDataEntry>,
     pub contract_code: EntryStore<[u8; 32], ContractCodeEntry>,
     pub ttl_entries: HashMap<[u8; 32], TtlEntry>,
     pub ttl_bucket_list_snapshot: HashMap<[u8; 32], u32>,
@@ -258,7 +258,7 @@ pub struct Savepoint {
     claimable_balances: EntryStoreSavepoint<[u8; 32], ClaimableBalanceEntry>,
     liquidity_pools: EntryStoreSavepoint<[u8; 32], LiquidityPoolEntry>,
     contract_code: EntryStoreSavepoint<[u8; 32], ContractCodeEntry>,
-    contract_data: EntryStoreSavepoint<ContractDataKey, ContractDataEntry>,
+    contract_data: EntryStoreSavepoint<StorageKey, ContractDataEntry>,
     data_entries: EntryStoreSavepoint<DataKey, DataEntry>,
 
     // Created entry sets
@@ -308,27 +308,14 @@ pub enum AssetKey {
     PoolShare([u8; 32]),
 }
 
-/// Key for contract data lookup.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct ContractDataKey {
-    /// Contract address.
-    pub contract: ScAddress,
-    /// Data key.
-    pub key: ScVal,
-    /// Durability (temporary or persistent).
-    pub durability: ContractDataDurability,
-}
+/// Re-export `StorageKey` from the soroban module as the canonical key type
+/// for contract data entries. Previously a separate `ContractDataKey` struct
+/// with identical fields existed here; it has been unified into `StorageKey`.
+pub use crate::soroban::StorageKey;
 
-impl ContractDataKey {
-    /// Create a new contract data key.
-    pub fn new(contract: ScAddress, key: ScVal, durability: ContractDataDurability) -> Self {
-        Self {
-            contract,
-            key,
-            durability,
-        }
-    }
-}
+/// Type alias for backwards compatibility. `ContractDataKey` was merged into
+/// `StorageKey` — they have identical fields (`contract`, `key`, `durability`).
+pub type ContractDataKey = StorageKey;
 
 impl AssetKey {
     /// Create an AssetKey from an XDR Asset.

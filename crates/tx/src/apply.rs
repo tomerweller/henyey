@@ -590,33 +590,7 @@ pub fn account_id_to_key(account_id: &stellar_xdr::curr::AccountId) -> [u8; 32] 
     }
 }
 
-/// Asset key for lookups
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub enum AssetKey {
-    Native,
-    CreditAlphanum4([u8; 4], [u8; 32]),
-    CreditAlphanum12([u8; 12], [u8; 32]),
-}
-
-impl AssetKey {
-    pub fn from_asset(asset: &stellar_xdr::curr::Asset) -> Self {
-        match asset {
-            stellar_xdr::curr::Asset::Native => AssetKey::Native,
-            stellar_xdr::curr::Asset::CreditAlphanum4(a) => {
-                let mut code = [0u8; 4];
-                code.copy_from_slice(&a.asset_code.0);
-                let issuer = account_id_to_key(&a.issuer);
-                AssetKey::CreditAlphanum4(code, issuer)
-            }
-            stellar_xdr::curr::Asset::CreditAlphanum12(a) => {
-                let mut code = [0u8; 12];
-                code.copy_from_slice(&a.asset_code.0);
-                let issuer = account_id_to_key(&a.issuer);
-                AssetKey::CreditAlphanum12(code, issuer)
-            }
-        }
-    }
-}
+// AssetKey is now defined in crate::state::AssetKey (the canonical definition).
 
 /// Batch apply multiple transactions from history.
 pub fn apply_transaction_set_from_history(
@@ -636,6 +610,7 @@ pub fn apply_transaction_set_from_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::AssetKey;
     use stellar_xdr::curr::*;
 
     #[test]

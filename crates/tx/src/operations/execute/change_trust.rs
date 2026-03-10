@@ -1,22 +1,22 @@
 //! ChangeTrust operation execution.
 
 use stellar_xdr::curr::{
-    AccountId, Asset, ChangeTrustAsset, ChangeTrustOp, ChangeTrustResult, ChangeTrustResultCode,
-    LedgerKey, LedgerKeyTrustLine, Liabilities, LiquidityPoolEntry, LiquidityPoolEntryBody,
-    LiquidityPoolEntryConstantProduct, LiquidityPoolParameters, OperationResult, OperationResultTr,
-    TrustLineAsset, TrustLineEntry, TrustLineEntryExt, TrustLineEntryExtensionV2,
-    TrustLineEntryExtensionV2Ext, TrustLineEntryV1, TrustLineEntryV1Ext, TrustLineFlags,
+    AccountFlags, AccountId, Asset, ChangeTrustAsset, ChangeTrustOp, ChangeTrustResult,
+    ChangeTrustResultCode, LedgerKey, LedgerKeyTrustLine, Liabilities, LiquidityPoolEntry,
+    LiquidityPoolEntryBody, LiquidityPoolEntryConstantProduct, LiquidityPoolParameters,
+    OperationResult, OperationResultTr, TrustLineAsset, TrustLineEntry, TrustLineEntryExt,
+    TrustLineEntryExtensionV2, TrustLineEntryExtensionV2Ext, TrustLineEntryV1, TrustLineEntryV1Ext,
 };
 
 use super::{
     account_balance_after_liabilities, is_authorized_to_maintain_liabilities,
     trustline_liabilities, ACCOUNT_SUBENTRY_LIMIT, AUTHORIZED_FLAG,
+    TRUSTLINE_CLAWBACK_ENABLED_FLAG,
 };
 use crate::apply::account_id_to_key;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
-
 /// Execute a ChangeTrust operation.
 pub fn execute_change_trust(
     op: &ChangeTrustOp,
@@ -265,10 +265,6 @@ fn get_asset_issuer(asset: &Asset) -> Option<AccountId> {
     }
 }
 
-const AUTH_REQUIRED_FLAG: u32 = 0x1;
-const AUTH_CLAWBACK_FLAG: u32 = 0x8;
-const TRUSTLINE_CLAWBACK_ENABLED_FLAG: u32 = TrustLineFlags::TrustlineClawbackEnabledFlag as u32;
-
 fn build_trustline_flags(asset: Option<&Asset>, state: &LedgerStateManager) -> u32 {
     let Some(asset) = asset else {
         return 0;
@@ -281,10 +277,10 @@ fn build_trustline_flags(asset: Option<&Asset>, state: &LedgerStateManager) -> u
         return 0;
     };
     let mut flags = 0;
-    if issuer_account.flags & AUTH_REQUIRED_FLAG == 0 {
+    if issuer_account.flags & (AccountFlags::RequiredFlag as u32) == 0 {
         flags |= AUTHORIZED_FLAG;
     }
-    if issuer_account.flags & AUTH_CLAWBACK_FLAG != 0 {
+    if issuer_account.flags & (AccountFlags::ClawbackEnabledFlag as u32) != 0 {
         flags |= TRUSTLINE_CLAWBACK_ENABLED_FLAG;
     }
     flags

@@ -34,6 +34,7 @@ const ACCOUNT_SUBENTRY_LIMIT: u32 = 1000;
 const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
 const AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG: u32 =
     TrustLineFlags::AuthorizedToMaintainLiabilitiesFlag as u32;
+const TRUSTLINE_CLAWBACK_ENABLED_FLAG: u32 = TrustLineFlags::TrustlineClawbackEnabledFlag as u32;
 
 fn is_trustline_authorized(flags: u32) -> bool {
     flags & AUTHORIZED_FLAG != 0

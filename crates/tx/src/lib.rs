@@ -146,7 +146,7 @@ pub use frame::{muxed_to_account_id, muxed_to_ed25519, TransactionFrame};
 // Re-export apply types and functions
 pub use apply::{
     account_id_to_key, apply_fee_only, apply_from_history, apply_transaction_set_from_history,
-    entry_to_key, ApplyContext, AssetKey, ChangeRef, LedgerDelta,
+    entry_to_key, ApplyContext, ChangeRef, LedgerDelta,
 };
 
 // Re-export result types
@@ -173,7 +173,7 @@ pub use operations::{
 
 // Re-export state types
 pub use state::{
-    AssetPair, LedgerReader, LedgerStateManager, OfferDescriptor, OfferIndex, OfferKey,
+    AssetKey, AssetPair, LedgerReader, LedgerStateManager, OfferDescriptor, OfferIndex, OfferKey,
 };
 
 // Re-export fee bump types

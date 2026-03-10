@@ -2,17 +2,25 @@
 
 use super::*;
 
-/// Descriptor for an offer used in the order book index.
-/// Offers are sorted by price (ascending) then offer ID (ascending).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A lightweight descriptor for an offer used in sorting and comparison.
+///
+/// This struct captures just the information needed to determine offer ordering:
+/// the price and the offer ID. Offers are sorted by price (ascending) then
+/// offer ID (ascending).
+#[derive(Debug, Clone)]
 pub struct OfferDescriptor {
-    /// Price as n/d ratio.
+    /// The price of the offer (n/d ratio).
     pub price: Price,
-    /// Unique offer identifier.
+    /// The unique identifier of the offer.
     pub offer_id: i64,
 }
 
 impl OfferDescriptor {
+    /// Create a new offer descriptor.
+    pub fn new(price: Price, offer_id: i64) -> Self {
+        Self { price, offer_id }
+    }
+
     /// Create a new offer descriptor from an offer entry.
     pub fn from_offer(offer: &OfferEntry) -> Self {
         Self {
@@ -20,15 +28,51 @@ impl OfferDescriptor {
             offer_id: offer.offer_id,
         }
     }
+
+    /// Create an offer descriptor from an offer entry (alias for `from_offer`).
+    pub fn from_offer_entry(offer: &OfferEntry) -> Self {
+        Self::from_offer(offer)
+    }
+
+    /// Create an offer descriptor from a ledger entry containing an offer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ledger entry does not contain an offer.
+    pub fn from_ledger_entry(entry: &LedgerEntry) -> Self {
+        match &entry.data {
+            LedgerEntryData::Offer(offer) => Self::from_offer(offer),
+            _ => panic!("Expected offer entry"),
+        }
+    }
+
+    /// Calculate the price as a floating point value.
+    ///
+    /// This is used for comparison purposes only - not for actual calculations
+    /// which should use the rational n/d form.
+    #[inline]
+    pub fn price_as_f64(&self) -> f64 {
+        self.price.n as f64 / self.price.d as f64
+    }
 }
+
+impl PartialEq for OfferDescriptor {
+    fn eq(&self, other: &Self) -> bool {
+        self.price.n == other.price.n
+            && self.price.d == other.price.d
+            && self.offer_id == other.offer_id
+    }
+}
+
+impl Eq for OfferDescriptor {}
 
 /// Comparator for offers: lower price is better, then lower offer ID.
 impl Ord for OfferDescriptor {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Use floating-point comparison to match stellar-core behavior.
         // The stellar-core code uses `double(price.n) / double(price.d)` for ordering.
-        let self_price = self.price.n as f64 / self.price.d as f64;
-        let other_price = other.price.n as f64 / other.price.d as f64;
+        let self_price = self.price_as_f64();
+        let other_price = other.price_as_f64();
 
         match self_price.partial_cmp(&other_price) {
             Some(std::cmp::Ordering::Equal) | None => self.offer_id.cmp(&other.offer_id),
@@ -40,6 +84,14 @@ impl Ord for OfferDescriptor {
 impl PartialOrd for OfferDescriptor {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+impl std::hash::Hash for OfferDescriptor {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.price.n.hash(state);
+        self.price.d.hash(state);
+        self.offer_id.hash(state);
     }
 }
 

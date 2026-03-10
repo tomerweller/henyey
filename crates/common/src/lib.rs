@@ -59,6 +59,7 @@ pub mod types;
 pub mod xdr_stream;
 
 // Re-export key types at crate root for convenience
+pub use asset::LIQUIDITY_POOL_FEE_V18;
 pub use config::{BucketListDbConfig, Config};
 pub use error::{Error, Result};
 pub use meta::*;

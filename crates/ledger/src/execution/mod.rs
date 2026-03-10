@@ -41,7 +41,7 @@ use soroban_env_host_p25::fees::{
     RentFeeConfiguration, RentWriteFeeConfiguration,
 };
 use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
-use henyey_common::{Hash256, NetworkId};
+use henyey_common::{Hash256, NetworkId, LIQUIDITY_POOL_FEE_V18};
 use henyey_crypto::account_id_to_strkey;
 
 use henyey_tx::{
@@ -1063,7 +1063,7 @@ impl TransactionExecutor {
                 LiquidityPoolConstantProductParameters {
                     asset_a: sorted_a,
                     asset_b: sorted_b,
-                    fee: 30, // LIQUIDITY_POOL_FEE_V18 = 30
+                    fee: LIQUIDITY_POOL_FEE_V18,
                 },
             );
 
@@ -3786,14 +3786,8 @@ pub struct RestoredEntries {
     live_bucket_list_entries: HashMap<LedgerKey, LedgerEntry>,
 }
 
-/// Threshold level for per-operation signature checking.
-/// Matches stellar-core's ThresholdLevel enum.
-#[derive(Debug, Clone, Copy)]
-pub enum ThresholdLevel {
-    Low,
-    Medium,
-    High,
-}
+// Re-export ThresholdLevel from henyey_common for use in this module and submodules.
+pub use henyey_common::ThresholdLevel;
 
 /// Signature checker that tracks which signatures have been used.
 ///

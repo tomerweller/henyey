@@ -162,6 +162,42 @@ impl AsRef<[u8]> for Hash256 {
     }
 }
 
+/// Authorization threshold level required for an operation.
+///
+/// Stellar accounts have three configurable threshold levels that determine
+/// how much signer weight is required to authorize different types of operations.
+/// The thresholds are stored in the account's \ field:
+///
+/// - \: Master key weight
+/// - \: Low threshold
+/// - \: Medium threshold
+/// - \: High threshold
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ThresholdLevel {
+    /// Low threshold - for less sensitive operations.
+    Low,
+
+    /// Medium threshold - for most standard operations.
+    Medium,
+
+    /// High threshold - for sensitive operations that modify account security.
+    High,
+}
+
+impl ThresholdLevel {
+    /// Get the threshold index in the account's thresholds array.
+    ///
+    /// Returns the index (1-3) into the account's \ field.
+    /// Note: index 0 is the master key weight, not a threshold.
+    pub fn index(&self) -> usize {
+        match self {
+            ThresholdLevel::Low => 1,
+            ThresholdLevel::Medium => 2,
+            ThresholdLevel::High => 3,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +228,12 @@ mod tests {
     fn test_hash256_zero() {
         assert!(Hash256::ZERO.is_zero());
         assert!(!Hash256::hash(b"test").is_zero());
+    }
+
+    #[test]
+    fn test_threshold_level_index() {
+        assert_eq!(ThresholdLevel::Low.index(), 1);
+        assert_eq!(ThresholdLevel::Medium.index(), 2);
+        assert_eq!(ThresholdLevel::High.index(), 3);
     }
 }

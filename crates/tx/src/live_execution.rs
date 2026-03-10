@@ -66,6 +66,9 @@
 //! }
 //! ```
 
+use henyey_common::protocol::{
+    protocol_version_is_before, protocol_version_starts_from, ProtocolVersion,
+};
 use henyey_common::{Hash256, NetworkId};
 use stellar_xdr::curr::{AccountId, TransactionEventStage, TransactionResultCode};
 
@@ -76,16 +79,6 @@ use crate::result::MutableTransactionResult;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
-
-// ============================================================================
-// Protocol Constants
-// ============================================================================
-
-/// Protocol version where sequence number processing moved to a separate step.
-const FIRST_PROTOCOL_SUPPORTING_OPERATION_VALIDITY: u32 = 10;
-
-/// Protocol version where refund timing changed to post-tx-set.
-const PROTOCOL_VERSION_23: u32 = 23;
 
 // ============================================================================
 // Live Execution Context
@@ -299,7 +292,7 @@ pub fn process_fee_seq_num(
         charge_fee_to_account(state, &source_account_id, fee_charged)?;
 
         // Update sequence number for pre-protocol 10 (only if applying)
-        if should_apply && protocol_version < FIRST_PROTOCOL_SUPPORTING_OPERATION_VALIDITY {
+        if should_apply && protocol_version_is_before(protocol_version, ProtocolVersion::V10) {
             update_sequence_number(state, &source_account_id, frame.sequence_number())?;
         }
     }
@@ -418,7 +411,7 @@ pub fn process_post_apply(
     _meta_builder: Option<&mut TransactionMetaBuilder>,
 ) -> Result<i64> {
     // In protocol 23+, refunds are handled in process_post_tx_set_apply
-    if ctx.protocol_version() >= PROTOCOL_VERSION_23 {
+    if protocol_version_starts_from(ctx.protocol_version(), ProtocolVersion::V23) {
         return Ok(0);
     }
 
@@ -466,7 +459,7 @@ pub fn process_post_tx_set_apply(
     tx_event_manager: Option<&mut TxEventManager>,
 ) -> Result<i64> {
     // Pre-P23, refunds were already applied in process_post_apply
-    if ctx.protocol_version() < PROTOCOL_VERSION_23 {
+    if protocol_version_is_before(ctx.protocol_version(), ProtocolVersion::V23) {
         return Ok(0);
     }
 
@@ -594,7 +587,7 @@ pub fn refund_soroban_fee(
 /// `Ok(())` on success, or an error if the account doesn't exist.
 pub fn process_seq_num(frame: &TransactionFrame, ctx: &mut LiveExecutionContext) -> Result<()> {
     // Only for protocol 10+
-    if ctx.protocol_version() < FIRST_PROTOCOL_SUPPORTING_OPERATION_VALIDITY {
+    if protocol_version_is_before(ctx.protocol_version(), ProtocolVersion::V10) {
         return Ok(()); // Sequence was already updated in process_fee_seq_num
     }
 
@@ -1277,9 +1270,11 @@ mod tests {
 
     #[test]
     fn test_protocol_constants() {
-        // These are critical protocol boundaries
-        assert_eq!(FIRST_PROTOCOL_SUPPORTING_OPERATION_VALIDITY, 10);
-        assert_eq!(PROTOCOL_VERSION_23, 23);
+        // These are critical protocol boundaries — verified through ProtocolVersion enum
+        assert!(protocol_version_is_before(9, ProtocolVersion::V10));
+        assert!(!protocol_version_is_before(10, ProtocolVersion::V10));
+        assert!(protocol_version_is_before(22, ProtocolVersion::V23));
+        assert!(!protocol_version_is_before(23, ProtocolVersion::V23));
     }
 
     // === Edge case tests ===

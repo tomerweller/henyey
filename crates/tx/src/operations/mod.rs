@@ -554,50 +554,9 @@ pub fn get_operation_source<'a>(
     op.source_account.as_ref().unwrap_or(tx_source)
 }
 
-/// Authorization threshold level required for an operation.
-///
-/// Stellar accounts have three configurable threshold levels that determine
-/// how much signer weight is required to authorize different types of operations.
-/// The thresholds are stored in the account's `thresholds` field:
-///
-/// - `thresholds[0]`: Master key weight
-/// - `thresholds[1]`: Low threshold
-/// - `thresholds[2]`: Medium threshold
-/// - `thresholds[3]`: High threshold
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ThresholdLevel {
-    /// Low threshold - for less sensitive operations.
-    ///
-    /// Operations: `AllowTrust`, `SetTrustLineFlags`, `BumpSequence`,
-    /// `ClaimClaimableBalance`, `Inflation`, `ExtendFootprintTtl`, `RestoreFootprint`
-    Low,
-
-    /// Medium threshold - for most standard operations.
-    ///
-    /// Operations: `CreateAccount`, `Payment`, `PathPayment*`, `ManageOffer*`,
-    /// `ChangeTrust`, `ManageData`, `CreateClaimableBalance`, sponsorship ops,
-    /// `Clawback*`, `LiquidityPool*`, `InvokeHostFunction`
-    Medium,
-
-    /// High threshold - for sensitive operations that modify account security.
-    ///
-    /// Operations: `AccountMerge`, `SetOptions` (when modifying thresholds/signers)
-    High,
-}
-
-impl ThresholdLevel {
-    /// Get the threshold index in the account's thresholds array.
-    ///
-    /// Returns the index (1-3) into the account's `thresholds` field.
-    /// Note: index 0 is the master key weight, not a threshold.
-    pub fn index(&self) -> usize {
-        match self {
-            ThresholdLevel::Low => 1,
-            ThresholdLevel::Medium => 2,
-            ThresholdLevel::High => 3,
-        }
-    }
-}
+// Re-export ThresholdLevel from henyey_common so downstream users can still
+// access it via `henyey_tx::ThresholdLevel`.
+pub use henyey_common::ThresholdLevel;
 
 /// Get the threshold level required for an operation.
 ///

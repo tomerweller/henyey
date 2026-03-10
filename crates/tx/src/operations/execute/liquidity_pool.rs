@@ -5,7 +5,7 @@
 //! - LiquidityPoolWithdraw
 
 use stellar_xdr::curr::{
-    AccountId, Asset, LiquidityPoolDepositOp, LiquidityPoolDepositResult,
+    AccountFlags, AccountId, Asset, LiquidityPoolDepositOp, LiquidityPoolDepositResult,
     LiquidityPoolDepositResultCode, LiquidityPoolWithdrawOp, LiquidityPoolWithdrawResult,
     LiquidityPoolWithdrawResultCode, OperationResult, OperationResultTr, Price, TrustLineAsset,
 };
@@ -396,8 +396,6 @@ fn debit_asset(
     Ok(())
 }
 
-const AUTH_REQUIRED_FLAG: u32 = 0x1;
-
 fn is_auth_required(asset: &Asset, state: &LedgerStateManager) -> bool {
     let issuer = match asset {
         Asset::Native => return false,
@@ -406,7 +404,7 @@ fn is_auth_required(asset: &Asset, state: &LedgerStateManager) -> bool {
     };
     state
         .get_account(issuer)
-        .map(|account| account.flags & AUTH_REQUIRED_FLAG != 0)
+        .map(|account| account.flags & (AccountFlags::RequiredFlag as u32) != 0)
         .unwrap_or(false)
 }
 
@@ -832,7 +830,7 @@ mod tests {
         state.create_account(create_test_account(
             issuer_a.clone(),
             100_000_000,
-            AUTH_REQUIRED_FLAG,
+            AccountFlags::RequiredFlag as u32,
         ));
         state.create_account(create_test_account(issuer_b.clone(), 100_000_000, 0));
 
