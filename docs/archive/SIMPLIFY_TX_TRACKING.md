@@ -8,13 +8,13 @@
 
 ---
 
-## 1. LARGE MODULE / DUPLICATION — `state/mod.rs`: Generic `TrackedEntryStore`
-- **Location**: `crates/tx/src/state/mod.rs` (2,338 non-test lines)
-- **Task**: Introduce a generic `TrackedEntryStore<K, V>` to replace the 9× repeated bookkeeping pattern
-- **Estimated savings**: ~1,000 lines
-- [ ] Design and implement `TrackedEntryStore<K, V>`
-- [ ] Replace 9 entry-type stores in `LedgerStateManager`
-- [ ] Verify with clippy + tests
+## 1. LARGE MODULE / DUPLICATION — `state/mod.rs`: Generic `EntryStore<K, V>`
+- **Location**: `crates/tx/src/state/mod.rs`, `crates/tx/src/state/entry_store.rs`, `crates/tx/src/state/entries.rs`
+- **Task**: Introduce a generic `EntryStore<K, V>` to replace per-type bookkeeping pattern
+- **Scope**: Converted 5 clean types (ClaimableBalance, LiquidityPool, ContractCode, ContractData, Data); 4 complex types (Account, Trustline, Offer, TTL) stay hand-written
+- [x] Design and implement `EntryStore<K, V>` with 44 unit tests
+- [x] Convert ClaimableBalance, LiquidityPool, ContractCode, ContractData, Data
+- [x] Verify with clippy + tests (888 tx + 52 ledger tests pass, 0 clippy warnings)
 
 ## 2. DUPLICATION — DEX helpers duplicated across 3 files
 - **Location**: `manage_offer.rs`, `path_payment.rs`, `trust_flags.rs`

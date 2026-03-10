@@ -44,9 +44,12 @@ pub type DataKey = ([u8; 32], String);
 /// extracting the large Soroban collections (which are never accessed during
 /// orderbook exchange), the clone becomes much cheaper.
 mod entries;
+pub(crate) mod entry_store;
 pub mod offer_index;
 mod sponsorship;
 mod ttl;
+
+use entry_store::{EntryStore, EntryStoreSavepoint};
 
 /// Restore entries from snapshots created after the savepoint.
 ///
@@ -219,8 +222,8 @@ struct DeltaSnapshot {
 }
 
 pub struct SorobanState {
-    pub contract_data: HashMap<ContractDataKey, ContractDataEntry>,
-    pub contract_code: HashMap<[u8; 32], ContractCodeEntry>,
+    pub contract_data: EntryStore<ContractDataKey, ContractDataEntry>,
+    pub contract_code: EntryStore<[u8; 32], ContractCodeEntry>,
     pub ttl_entries: HashMap<[u8; 32], TtlEntry>,
     pub ttl_bucket_list_snapshot: HashMap<[u8; 32], u32>,
 }
@@ -244,35 +247,25 @@ pub struct Savepoint {
     offer_snapshots: HashMap<OfferKey, Option<OfferEntry>>,
     account_snapshots: HashMap<[u8; 32], Option<AccountEntry>>,
     trustline_snapshots: HashMap<TrustlineKey, Option<TrustLineEntry>>,
-    data_snapshots: HashMap<DataKey, Option<DataEntry>>,
-    contract_data_snapshots: HashMap<ContractDataKey, Option<ContractDataEntry>>,
-    contract_code_snapshots: HashMap<[u8; 32], Option<ContractCodeEntry>>,
     ttl_snapshots: HashMap<[u8; 32], Option<TtlEntry>>,
-    claimable_balance_snapshots: HashMap<[u8; 32], Option<ClaimableBalanceEntry>>,
-    liquidity_pool_snapshots: HashMap<[u8; 32], Option<LiquidityPoolEntry>>,
-
     // Pre-savepoint values of entries in snapshot maps.
     offer_pre_values: Vec<(OfferKey, Option<OfferEntry>)>,
     account_pre_values: Vec<([u8; 32], Option<AccountEntry>)>,
     trustline_pre_values: Vec<(TrustlineKey, Option<TrustLineEntry>)>,
-    data_pre_values: Vec<(DataKey, Option<DataEntry>)>,
-    contract_data_pre_values: Vec<(ContractDataKey, Option<ContractDataEntry>)>,
-    contract_code_pre_values: Vec<([u8; 32], Option<ContractCodeEntry>)>,
     ttl_pre_values: Vec<([u8; 32], Option<TtlEntry>)>,
-    claimable_balance_pre_values: Vec<([u8; 32], Option<ClaimableBalanceEntry>)>,
-    liquidity_pool_pre_values: Vec<([u8; 32], Option<LiquidityPoolEntry>)>,
+
+    // EntryStore-based savepoints
+    claimable_balances: EntryStoreSavepoint<[u8; 32], ClaimableBalanceEntry>,
+    liquidity_pools: EntryStoreSavepoint<[u8; 32], LiquidityPoolEntry>,
+    contract_code: EntryStoreSavepoint<[u8; 32], ContractCodeEntry>,
+    contract_data: EntryStoreSavepoint<ContractDataKey, ContractDataEntry>,
+    data_entries: EntryStoreSavepoint<DataKey, DataEntry>,
 
     // Created entry sets
     created_offers: HashSet<OfferKey>,
     created_accounts: HashSet<[u8; 32]>,
     created_trustlines: HashSet<TrustlineKey>,
-    created_data: HashSet<DataKey>,
-    created_contract_data: HashSet<ContractDataKey>,
-    created_contract_code: HashSet<[u8; 32]>,
     created_ttl: HashSet<[u8; 32]>,
-    created_claimable_balances: HashSet<[u8; 32]>,
-    created_liquidity_pools: HashSet<[u8; 32]>,
-
     // Delta vector lengths for truncation
     delta_lengths: DeltaLengths,
 
@@ -280,13 +273,7 @@ pub struct Savepoint {
     modified_accounts_len: usize,
     modified_trustlines_len: usize,
     modified_offers_len: usize,
-    modified_data_len: usize,
-    modified_contract_data_len: usize,
-    modified_contract_code_len: usize,
     modified_ttl_len: usize,
-    modified_claimable_balances_len: usize,
-    modified_liquidity_pools_len: usize,
-
     // Entry metadata snapshots
     entry_last_modified_snapshots: HashMap<LedgerKey, Option<u32>>,
     entry_last_modified_pre_values: Vec<(LedgerKey, Option<u32>)>,
@@ -403,11 +390,11 @@ pub struct LedgerStateManager {
     /// Offer entries by (seller, offer_id).
     offers: HashMap<OfferKey, OfferEntry>,
     /// Data entries by (account, name).
-    data_entries: HashMap<DataKey, DataEntry>,
+    data_entries: EntryStore<DataKey, DataEntry>,
     /// Contract data entries by (contract, key, durability).
-    contract_data: HashMap<ContractDataKey, ContractDataEntry>,
+    contract_data: EntryStore<ContractDataKey, ContractDataEntry>,
     /// Contract code entries by hash.
-    contract_code: HashMap<[u8; 32], ContractCodeEntry>,
+    contract_code: EntryStore<[u8; 32], ContractCodeEntry>,
     /// TTL entries by key hash.
     ttl_entries: HashMap<[u8; 32], TtlEntry>,
     /// TTL values at ledger start (for Soroban execution).
@@ -416,9 +403,9 @@ pub struct LedgerStateManager {
     /// transactions see the bucket list state at ledger start, not changes from previous txs.
     ttl_bucket_list_snapshot: HashMap<[u8; 32], u32>,
     /// Claimable balance entries by balance ID.
-    claimable_balances: HashMap<[u8; 32], ClaimableBalanceEntry>,
+    claimable_balances: EntryStore<[u8; 32], ClaimableBalanceEntry>,
     /// Liquidity pool entries by pool ID.
-    liquidity_pools: HashMap<[u8; 32], LiquidityPoolEntry>,
+    liquidity_pools: EntryStore<[u8; 32], LiquidityPoolEntry>,
     /// Sponsoring account IDs for non-offer ledger entries (only when sponsored).
     entry_sponsorships: HashMap<LedgerKey, AccountId>,
     /// Sponsoring account IDs for offer entries (preserved across ledger closes).
@@ -449,12 +436,7 @@ pub struct LedgerStateManager {
     modified_trustlines: Vec<TrustlineKey>,
     /// Track which offers have been modified.
     modified_offers: Vec<OfferKey>,
-    /// Track which data entries have been modified.
-    modified_data: Vec<DataKey>,
-    /// Track which contract data entries have been modified.
-    modified_contract_data: Vec<ContractDataKey>,
-    /// Track which contract code entries have been modified.
-    modified_contract_code: Vec<[u8; 32]>,
+    // Data entries use EntryStore — modified tracking is internal.
     /// Track which TTL entries have been modified.
     modified_ttl: Vec<[u8; 32]>,
     /// Deferred read-only TTL bumps. These are TTL updates for read-only entries
@@ -465,28 +447,17 @@ pub struct LedgerStateManager {
     deferred_ro_ttl_bumps: HashMap<[u8; 32], u32>,
     /// Snapshot of deferred RO TTL bumps at TX start (for rollback).
     deferred_ro_ttl_bumps_snapshot: Option<HashMap<[u8; 32], u32>>,
-    /// Track which claimable balance entries have been modified.
-    modified_claimable_balances: Vec<[u8; 32]>,
-    /// Track which liquidity pool entries have been modified.
-    modified_liquidity_pools: Vec<[u8; 32]>,
+
     /// Snapshot of accounts for rollback.
     account_snapshots: HashMap<[u8; 32], Option<AccountEntry>>,
     /// Snapshot of trustlines for rollback.
     trustline_snapshots: HashMap<TrustlineKey, Option<TrustLineEntry>>,
     /// Snapshot of offers for rollback.
     offer_snapshots: HashMap<OfferKey, Option<OfferEntry>>,
-    /// Snapshot of data entries for rollback.
-    data_snapshots: HashMap<DataKey, Option<DataEntry>>,
-    /// Snapshot of contract data entries for rollback.
-    contract_data_snapshots: HashMap<ContractDataKey, Option<ContractDataEntry>>,
-    /// Snapshot of contract code entries for rollback.
-    contract_code_snapshots: HashMap<[u8; 32], Option<ContractCodeEntry>>,
+    // Data entries use EntryStore — snapshots are internal.
     /// Snapshot of TTL entries for rollback.
     ttl_snapshots: HashMap<[u8; 32], Option<TtlEntry>>,
-    /// Snapshot of claimable balance entries for rollback.
-    claimable_balance_snapshots: HashMap<[u8; 32], Option<ClaimableBalanceEntry>>,
-    /// Snapshot of liquidity pool entries for rollback.
-    liquidity_pool_snapshots: HashMap<[u8; 32], Option<LiquidityPoolEntry>>,
+
     /// Snapshot of entry sponsorships for rollback.
     entry_sponsorship_snapshots: HashMap<LedgerKey, Option<AccountId>>,
     /// Snapshot of sponsorship extension presence for rollback.
@@ -499,25 +470,10 @@ pub struct LedgerStateManager {
     created_trustlines: HashSet<TrustlineKey>,
     /// Track offers created in this transaction (for rollback).
     created_offers: HashSet<OfferKey>,
-    /// Track data entries created in this transaction (for rollback).
-    created_data: HashSet<DataKey>,
-    /// Track contract data entries created in this transaction (for rollback).
-    created_contract_data: HashSet<ContractDataKey>,
-    /// Track contract code entries created in this transaction (for rollback).
-    created_contract_code: HashSet<[u8; 32]>,
+    // Data entries use EntryStore — created tracking is internal.
     /// Track TTL entries created in this transaction (for rollback).
     created_ttl: HashSet<[u8; 32]>,
-    /// Track claimable balances created in this transaction (for rollback).
-    created_claimable_balances: HashSet<[u8; 32]>,
-    /// Track liquidity pools created in this transaction (for rollback).
-    created_liquidity_pools: HashSet<[u8; 32]>,
-    /// Track contract data entries deleted in this ledger.
-    /// Used to prevent reloading deleted entries from bucket list during footprint loading.
-    /// In stellar-core, deleted entries are tracked in mThreadEntryMap as nullopt,
-    /// which prevents subsequent transactions from seeing them.
-    deleted_contract_data: HashSet<ContractDataKey>,
-    /// Track contract code entries deleted in this ledger.
-    deleted_contract_code: HashSet<[u8; 32]>,
+
     /// Track TTL entries deleted in this ledger.
     deleted_ttl: HashSet<[u8; 32]>,
     /// Snapshot of id_pool for rollback. When an ID is generated during a transaction
@@ -586,13 +542,13 @@ impl LedgerStateManager {
             accounts: HashMap::new(),
             trustlines: HashMap::new(),
             offers: HashMap::new(),
-            data_entries: HashMap::new(),
-            contract_data: HashMap::new(),
-            contract_code: HashMap::new(),
+            data_entries: EntryStore::new(),
+            contract_data: EntryStore::new_with_deleted_tracking(),
+            contract_code: EntryStore::new_with_deleted_tracking(),
             ttl_entries: HashMap::new(),
             ttl_bucket_list_snapshot: HashMap::new(),
-            claimable_balances: HashMap::new(),
-            liquidity_pools: HashMap::new(),
+            claimable_balances: EntryStore::new(),
+            liquidity_pools: EntryStore::new(),
             entry_sponsorships: HashMap::new(),
             offer_sponsorships: HashMap::new(),
             entry_sponsorship_ext: HashSet::new(),
@@ -607,37 +563,26 @@ impl LedgerStateManager {
             modified_accounts: Vec::new(),
             modified_trustlines: Vec::new(),
             modified_offers: Vec::new(),
-            modified_data: Vec::new(),
-            modified_contract_data: Vec::new(),
-            modified_contract_code: Vec::new(),
+            // modified_data is internal to EntryStore
             modified_ttl: Vec::new(),
             deferred_ro_ttl_bumps: HashMap::new(),
             deferred_ro_ttl_bumps_snapshot: None,
-            modified_claimable_balances: Vec::new(),
-            modified_liquidity_pools: Vec::new(),
+
             account_snapshots: HashMap::new(),
             trustline_snapshots: HashMap::new(),
             offer_snapshots: HashMap::new(),
-            data_snapshots: HashMap::new(),
-            contract_data_snapshots: HashMap::new(),
-            contract_code_snapshots: HashMap::new(),
+            // data_snapshots is internal to EntryStore
             ttl_snapshots: HashMap::new(),
-            claimable_balance_snapshots: HashMap::new(),
-            liquidity_pool_snapshots: HashMap::new(),
+
             entry_sponsorship_snapshots: HashMap::new(),
             entry_sponsorship_ext_snapshots: HashMap::new(),
             entry_last_modified_snapshots: HashMap::new(),
             created_accounts: HashSet::new(),
             created_trustlines: HashSet::new(),
             created_offers: HashSet::new(),
-            created_data: HashSet::new(),
-            created_contract_data: HashSet::new(),
-            created_contract_code: HashSet::new(),
+            // created_data is internal to EntryStore
             created_ttl: HashSet::new(),
-            created_claimable_balances: HashSet::new(),
-            created_liquidity_pools: HashSet::new(),
-            deleted_contract_data: HashSet::new(),
-            deleted_contract_code: HashSet::new(),
+
             deleted_ttl: HashSet::new(),
             id_pool_snapshot: None,
             delta_snapshot: None,
@@ -1048,8 +993,14 @@ impl LedgerStateManager {
     /// and restoring after avoids copying millions of entries.
     pub fn take_soroban_state(&mut self) -> SorobanState {
         SorobanState {
-            contract_data: std::mem::take(&mut self.contract_data),
-            contract_code: std::mem::take(&mut self.contract_code),
+            contract_data: std::mem::replace(
+                &mut self.contract_data,
+                EntryStore::new_with_deleted_tracking(),
+            ),
+            contract_code: std::mem::replace(
+                &mut self.contract_code,
+                EntryStore::new_with_deleted_tracking(),
+            ),
             ttl_entries: std::mem::take(&mut self.ttl_entries),
             ttl_bucket_list_snapshot: std::mem::take(&mut self.ttl_bucket_list_snapshot),
         }
@@ -1105,7 +1056,7 @@ impl LedgerStateManager {
             self.offer_index.clear();
             self.account_asset_offers.clear();
         }
-        self.data_entries.clear();
+        self.data_entries.clear(); // EntryStore::clear()
         self.contract_data.clear();
         self.contract_code.clear();
         self.ttl_entries.clear();
@@ -1137,22 +1088,14 @@ impl LedgerStateManager {
         self.modified_accounts.clear();
         self.modified_trustlines.clear();
         self.modified_offers.clear();
-        self.modified_data.clear();
-        self.modified_contract_data.clear();
-        self.modified_contract_code.clear();
+        // modified_data is cleared by data_entries.clear() above
         self.modified_ttl.clear();
-        self.modified_claimable_balances.clear();
-        self.modified_liquidity_pools.clear();
 
         self.account_snapshots.clear();
         self.trustline_snapshots.clear();
         self.offer_snapshots.clear();
-        self.data_snapshots.clear();
-        self.contract_data_snapshots.clear();
-        self.contract_code_snapshots.clear();
+        // data_snapshots is cleared by data_entries.clear() above
         self.ttl_snapshots.clear();
-        self.claimable_balance_snapshots.clear();
-        self.liquidity_pool_snapshots.clear();
         self.entry_sponsorship_snapshots.clear();
         self.entry_sponsorship_ext_snapshots.clear();
         self.entry_last_modified_snapshots.clear();
@@ -1162,12 +1105,8 @@ impl LedgerStateManager {
         if !preserve_offers {
             self.created_offers.clear();
         }
-        self.created_data.clear();
-        self.created_contract_data.clear();
-        self.created_contract_code.clear();
+        // created_data is cleared by data_entries.clear() above
         self.created_ttl.clear();
-        self.created_claimable_balances.clear();
-        self.created_liquidity_pools.clear();
     }
 
     // ========================================================================
@@ -1242,8 +1181,8 @@ impl LedgerStateManager {
             LedgerKey::Data(k) => {
                 let account_key = account_id_to_bytes(&k.account_id);
                 let name = data_name_to_string(&k.data_name);
-                self.data_snapshots
-                    .get(&(account_key, name))
+                self.data_entries
+                    .snapshot_value(&(account_key, name))
                     .cloned()
                     .flatten()
                     .map(|entry| LedgerEntry {
@@ -1255,8 +1194,8 @@ impl LedgerStateManager {
             LedgerKey::ContractData(k) => {
                 let lookup_key =
                     ContractDataKey::new(k.contract.clone(), k.key.clone(), k.durability);
-                self.contract_data_snapshots
-                    .get(&lookup_key)
+                self.contract_data
+                    .snapshot_value(&lookup_key)
                     .cloned()
                     .flatten()
                     .map(|entry| LedgerEntry {
@@ -1266,8 +1205,8 @@ impl LedgerStateManager {
                     })
             }
             LedgerKey::ContractCode(k) => self
-                .contract_code_snapshots
-                .get(&k.hash.0)
+                .contract_code
+                .snapshot_value(&k.hash.0)
                 .cloned()
                 .flatten()
                 .map(|entry| LedgerEntry {
@@ -1287,8 +1226,8 @@ impl LedgerStateManager {
                 }),
             LedgerKey::ClaimableBalance(k) => {
                 let key_bytes = claimable_balance_id_to_bytes(&k.balance_id);
-                self.claimable_balance_snapshots
-                    .get(&key_bytes)
+                self.claimable_balances
+                    .snapshot_value(&key_bytes)
                     .cloned()
                     .flatten()
                     .map(|entry| LedgerEntry {
@@ -1299,8 +1238,8 @@ impl LedgerStateManager {
             }
             LedgerKey::LiquidityPool(k) => {
                 let key_bytes = pool_id_to_bytes(&k.liquidity_pool_id);
-                self.liquidity_pool_snapshots
-                    .get(&key_bytes)
+                self.liquidity_pools
+                    .snapshot_value(&key_bytes)
                     .cloned()
                     .flatten()
                     .map(|entry| LedgerEntry {
@@ -1370,12 +1309,7 @@ impl LedgerStateManager {
             offer_snapshots: self.offer_snapshots.clone(),
             account_snapshots: self.account_snapshots.clone(),
             trustline_snapshots: self.trustline_snapshots.clone(),
-            data_snapshots: self.data_snapshots.clone(),
-            contract_data_snapshots: self.contract_data_snapshots.clone(),
-            contract_code_snapshots: self.contract_code_snapshots.clone(),
             ttl_snapshots: self.ttl_snapshots.clone(),
-            claimable_balance_snapshots: self.claimable_balance_snapshots.clone(),
-            liquidity_pool_snapshots: self.liquidity_pool_snapshots.clone(),
 
             // Save current values of entries in snapshot maps (pre-savepoint values)
             offer_pre_values: self
@@ -1393,59 +1327,32 @@ impl LedgerStateManager {
                 .keys()
                 .map(|k| (k.clone(), self.trustlines.get(k).cloned()))
                 .collect(),
-            data_pre_values: self
-                .data_snapshots
-                .keys()
-                .map(|k| (k.clone(), self.data_entries.get(k).cloned()))
-                .collect(),
-            contract_data_pre_values: self
-                .contract_data_snapshots
-                .keys()
-                .map(|k| (k.clone(), self.contract_data.get(k).cloned()))
-                .collect(),
-            contract_code_pre_values: self
-                .contract_code_snapshots
-                .keys()
-                .map(|k| (*k, self.contract_code.get(k).cloned()))
-                .collect(),
             ttl_pre_values: self
                 .ttl_snapshots
                 .keys()
                 .map(|k| (*k, self.ttl_entries.get(k).cloned()))
                 .collect(),
-            claimable_balance_pre_values: self
-                .claimable_balance_snapshots
-                .keys()
-                .map(|k| (*k, self.claimable_balances.get(k).cloned()))
-                .collect(),
-            liquidity_pool_pre_values: self
-                .liquidity_pool_snapshots
-                .keys()
-                .map(|k| (*k, self.liquidity_pools.get(k).cloned()))
-                .collect(),
+
+            // EntryStore-based savepoints
+            claimable_balances: self.claimable_balances.create_savepoint(),
+            liquidity_pools: self.liquidity_pools.create_savepoint(),
+            contract_code: self.contract_code.create_savepoint(),
+            contract_data: self.contract_data.create_savepoint(),
+            data_entries: self.data_entries.create_savepoint(),
 
             // Created entry sets
             created_offers: self.created_offers.clone(),
             created_accounts: self.created_accounts.clone(),
             created_trustlines: self.created_trustlines.clone(),
-            created_data: self.created_data.clone(),
-            created_contract_data: self.created_contract_data.clone(),
-            created_contract_code: self.created_contract_code.clone(),
             created_ttl: self.created_ttl.clone(),
-            created_claimable_balances: self.created_claimable_balances.clone(),
-            created_liquidity_pools: self.created_liquidity_pools.clone(),
 
             // Delta and modified vec lengths
             delta_lengths: self.delta.snapshot_lengths(),
             modified_accounts_len: self.modified_accounts.len(),
             modified_trustlines_len: self.modified_trustlines.len(),
             modified_offers_len: self.modified_offers.len(),
-            modified_data_len: self.modified_data.len(),
-            modified_contract_data_len: self.modified_contract_data.len(),
-            modified_contract_code_len: self.modified_contract_code.len(),
+            // modified_data_len is handled internally by data_entries.create_savepoint()
             modified_ttl_len: self.modified_ttl.len(),
-            modified_claimable_balances_len: self.modified_claimable_balances.len(),
-            modified_liquidity_pools_len: self.modified_liquidity_pools.len(),
 
             // Entry metadata
             entry_last_modified_snapshots: self.entry_last_modified_snapshots.clone(),
@@ -1495,35 +1402,11 @@ impl LedgerStateManager {
             &self.trustline_snapshots,
             &sp.trustline_snapshots,
         );
-        rollback_new_snapshots(
-            &mut self.data_entries,
-            &self.data_snapshots,
-            &sp.data_snapshots,
-        );
-        rollback_new_snapshots(
-            &mut self.contract_data,
-            &self.contract_data_snapshots,
-            &sp.contract_data_snapshots,
-        );
-        rollback_new_snapshots(
-            &mut self.contract_code,
-            &self.contract_code_snapshots,
-            &sp.contract_code_snapshots,
-        );
+        // data_entries uses EntryStore — handled below
         rollback_new_snapshots(
             &mut self.ttl_entries,
             &self.ttl_snapshots,
             &sp.ttl_snapshots,
-        );
-        rollback_new_snapshots(
-            &mut self.claimable_balances,
-            &self.claimable_balance_snapshots,
-            &sp.claimable_balance_snapshots,
-        );
-        rollback_new_snapshots(
-            &mut self.liquidity_pools,
-            &self.liquidity_pool_snapshots,
-            &sp.liquidity_pool_snapshots,
         );
 
         // Phase 2: Restore pre-savepoint values for entries already in snapshot maps.
@@ -1531,36 +1414,28 @@ impl LedgerStateManager {
         self.apply_offer_pre_values(sp.offer_pre_values);
         apply_pre_values(&mut self.accounts, sp.account_pre_values);
         apply_pre_values(&mut self.trustlines, sp.trustline_pre_values);
-        apply_pre_values(&mut self.data_entries, sp.data_pre_values);
-        apply_pre_values(&mut self.contract_data, sp.contract_data_pre_values);
-        apply_pre_values(&mut self.contract_code, sp.contract_code_pre_values);
+        // data_entries pre_values handled by EntryStore rollback below
         apply_pre_values(&mut self.ttl_entries, sp.ttl_pre_values);
-        apply_pre_values(
-            &mut self.claimable_balances,
-            sp.claimable_balance_pre_values,
-        );
-        apply_pre_values(&mut self.liquidity_pools, sp.liquidity_pool_pre_values);
+
+        // EntryStore-based rollbacks (handles phases 1-3 + modified truncation internally)
+        self.claimable_balances
+            .rollback_to_savepoint(sp.claimable_balances);
+        self.liquidity_pools
+            .rollback_to_savepoint(sp.liquidity_pools);
+        self.contract_code.rollback_to_savepoint(sp.contract_code);
+        self.contract_data.rollback_to_savepoint(sp.contract_data);
+        self.data_entries.rollback_to_savepoint(sp.data_entries);
 
         // Phase 3: Restore snapshot maps and created sets
         self.offer_snapshots = sp.offer_snapshots;
         self.account_snapshots = sp.account_snapshots;
         self.trustline_snapshots = sp.trustline_snapshots;
-        self.data_snapshots = sp.data_snapshots;
-        self.contract_data_snapshots = sp.contract_data_snapshots;
-        self.contract_code_snapshots = sp.contract_code_snapshots;
         self.ttl_snapshots = sp.ttl_snapshots;
-        self.claimable_balance_snapshots = sp.claimable_balance_snapshots;
-        self.liquidity_pool_snapshots = sp.liquidity_pool_snapshots;
 
         self.created_offers = sp.created_offers;
         self.created_accounts = sp.created_accounts;
         self.created_trustlines = sp.created_trustlines;
-        self.created_data = sp.created_data;
-        self.created_contract_data = sp.created_contract_data;
-        self.created_contract_code = sp.created_contract_code;
         self.created_ttl = sp.created_ttl;
-        self.created_claimable_balances = sp.created_claimable_balances;
-        self.created_liquidity_pools = sp.created_liquidity_pools;
 
         // Phase 4: Truncate delta
         self.delta.truncate_to(&sp.delta_lengths);
@@ -1570,16 +1445,8 @@ impl LedgerStateManager {
         self.modified_trustlines
             .truncate(sp.modified_trustlines_len);
         self.modified_offers.truncate(sp.modified_offers_len);
-        self.modified_data.truncate(sp.modified_data_len);
-        self.modified_contract_data
-            .truncate(sp.modified_contract_data_len);
-        self.modified_contract_code
-            .truncate(sp.modified_contract_code_len);
+        // modified_data truncation handled by data_entries.rollback_to_savepoint() above
         self.modified_ttl.truncate(sp.modified_ttl_len);
-        self.modified_claimable_balances
-            .truncate(sp.modified_claimable_balances_len);
-        self.modified_liquidity_pools
-            .truncate(sp.modified_liquidity_pools_len);
 
         // Phase 6: Restore entry metadata (routed to offer/non-offer maps)
         rollback_routed_metadata(
@@ -1716,21 +1583,9 @@ impl LedgerStateManager {
         }
         self.created_offers.clear();
 
-        rollback_entries(
-            &mut self.data_entries,
-            &mut self.data_snapshots,
-            &mut self.created_data,
-        );
-        rollback_entries(
-            &mut self.contract_data,
-            &mut self.contract_data_snapshots,
-            &mut self.created_contract_data,
-        );
-        rollback_entries(
-            &mut self.contract_code,
-            &mut self.contract_code_snapshots,
-            &mut self.created_contract_code,
-        );
+        self.data_entries.rollback();
+        self.contract_data.rollback();
+        self.contract_code.rollback();
         rollback_entries(
             &mut self.ttl_entries,
             &mut self.ttl_snapshots,
@@ -1747,16 +1602,8 @@ impl LedgerStateManager {
             self.deferred_ro_ttl_bumps.clear();
         }
 
-        rollback_entries(
-            &mut self.claimable_balances,
-            &mut self.claimable_balance_snapshots,
-            &mut self.created_claimable_balances,
-        );
-        rollback_entries(
-            &mut self.liquidity_pools,
-            &mut self.liquidity_pool_snapshots,
-            &mut self.created_liquidity_pools,
-        );
+        self.claimable_balances.rollback();
+        self.liquidity_pools.rollback();
 
         // Restore entry sponsorship snapshots
         let sponsorship_snaps: Vec<_> = self.entry_sponsorship_snapshots.drain().collect();
@@ -1798,12 +1645,8 @@ impl LedgerStateManager {
         self.modified_accounts.clear();
         self.modified_trustlines.clear();
         self.modified_offers.clear();
-        self.modified_data.clear();
-        self.modified_contract_data.clear();
-        self.modified_contract_code.clear();
+        // modified_data is cleared by data_entries.rollback() above
         self.modified_ttl.clear();
-        self.modified_claimable_balances.clear();
-        self.modified_liquidity_pools.clear();
 
         // Restore delta from snapshot if available, otherwise reset it.
         // This preserves committed changes from previous transactions in this ledger.
@@ -1839,37 +1682,32 @@ impl LedgerStateManager {
         self.account_snapshots.clear();
         self.trustline_snapshots.clear();
         self.offer_snapshots.clear();
-        self.data_snapshots.clear();
-        self.contract_data_snapshots.clear();
-        self.contract_code_snapshots.clear();
+        // data_snapshots cleared by data_entries.commit() below
         self.ttl_snapshots.clear();
-        self.claimable_balance_snapshots.clear();
-        self.liquidity_pool_snapshots.clear();
         self.entry_sponsorship_snapshots.clear();
         self.entry_sponsorship_ext_snapshots.clear();
         self.entry_last_modified_snapshots.clear();
+
+        // Commit EntryStore-based types
+        self.claimable_balances.commit();
+        self.liquidity_pools.commit();
+        self.contract_code.commit();
+        self.contract_data.commit();
+        self.data_entries.commit();
 
         // Clear modification tracking
         self.modified_accounts.clear();
         self.modified_trustlines.clear();
         self.modified_offers.clear();
-        self.modified_data.clear();
-        self.modified_contract_data.clear();
-        self.modified_contract_code.clear();
+        // modified_data cleared by data_entries.commit() above
         self.modified_ttl.clear();
-        self.modified_claimable_balances.clear();
-        self.modified_liquidity_pools.clear();
 
         // Clear created entry tracking
         self.created_accounts.clear();
         self.created_trustlines.clear();
         self.created_offers.clear();
-        self.created_data.clear();
-        self.created_contract_data.clear();
-        self.created_contract_code.clear();
+        // created_data cleared by data_entries.commit() above
         self.created_ttl.clear();
-        self.created_claimable_balances.clear();
-        self.created_liquidity_pools.clear();
     }
 
     /// Flush all pending account changes to the delta, excluding a specific account.
@@ -2030,9 +1868,9 @@ impl LedgerStateManager {
             }
         }
 
-        let modified_data = std::mem::take(&mut self.modified_data);
+        let modified_data = self.data_entries.take_modified();
         for key in modified_data {
-            if let Some(Some(snapshot_entry)) = self.data_snapshots.get(&key) {
+            if let Some(Some(snapshot_entry)) = self.data_entries.snapshot_value(&key) {
                 if let Some(entry) = self.data_entries.get(&key).cloned() {
                     let ledger_key = LedgerKey::Data(LedgerKeyData {
                         account_id: entry.account_id.clone(),
@@ -2049,9 +1887,9 @@ impl LedgerStateManager {
             }
         }
 
-        let modified_contract_data = std::mem::take(&mut self.modified_contract_data);
+        let modified_contract_data = self.contract_data.take_modified();
         for key in modified_contract_data {
-            if let Some(Some(snapshot_entry)) = self.contract_data_snapshots.get(&key) {
+            if let Some(Some(snapshot_entry)) = self.contract_data.snapshot_value(&key) {
                 if let Some(entry) = self.contract_data.get(&key).cloned() {
                     if &entry != snapshot_entry {
                         let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
@@ -2067,9 +1905,9 @@ impl LedgerStateManager {
             }
         }
 
-        let modified_contract_code = std::mem::take(&mut self.modified_contract_code);
+        let modified_contract_code = self.contract_code.take_modified();
         for key in modified_contract_code {
-            if let Some(Some(snapshot_entry)) = self.contract_code_snapshots.get(&key) {
+            if let Some(Some(snapshot_entry)) = self.contract_code.snapshot_value(&key) {
                 if let Some(entry) = self.contract_code.get(&key).cloned() {
                     if &entry != snapshot_entry {
                         let ledger_key = LedgerKey::ContractCode(LedgerKeyContractCode {
@@ -2119,9 +1957,9 @@ impl LedgerStateManager {
             }
         }
 
-        let modified_claimable_balances = std::mem::take(&mut self.modified_claimable_balances);
+        let modified_claimable_balances = self.claimable_balances.take_modified();
         for key in modified_claimable_balances {
-            if let Some(Some(snapshot_entry)) = self.claimable_balance_snapshots.get(&key) {
+            if let Some(Some(snapshot_entry)) = self.claimable_balances.snapshot_value(&key) {
                 if let Some(entry) = self.claimable_balances.get(&key).cloned() {
                     let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
                         balance_id: entry.balance_id.clone(),
@@ -2136,9 +1974,9 @@ impl LedgerStateManager {
             }
         }
 
-        let modified_liquidity_pools = std::mem::take(&mut self.modified_liquidity_pools);
+        let modified_liquidity_pools = self.liquidity_pools.take_modified();
         for key in modified_liquidity_pools {
-            if let Some(Some(snapshot_entry)) = self.liquidity_pool_snapshots.get(&key) {
+            if let Some(Some(snapshot_entry)) = self.liquidity_pools.snapshot_value(&key) {
                 if let Some(entry) = self.liquidity_pools.get(&key).cloned() {
                     let ledger_key = LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
                         liquidity_pool_id: entry.liquidity_pool_id.clone(),
