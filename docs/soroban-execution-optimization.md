@@ -5,10 +5,10 @@
 Henyey's ledger close time is 1.88x slower than stellar-core v25.2.0 on the same
 hardware, same ledger range. The gap is **149ms** per ledger (317.5ms vs 168.5ms).
 
-**Current status**: Steps 1, 2, 2b, 3, and 4 are done. A/B benchmarks on 1000 ledgers
-confirm Step 4 (unified parsing) and Step 3 (offer map split) together save ~250ms.
-Remaining optimization targets: meta construction via Arc<LedgerEntry> (15-25ms),
-fee_seq streamlining (5-10ms), minor executor setup caching (2-5ms).
+**Current status**: Steps 1–5a done, plus Step 5b (raw-key decompression bypass).
+Combined sig cache + raw-key: 273.5ms mean (−30.7ms vs 304.2ms baseline, −10.1%).
+Next targets: reducing check_operation_signatures bookkeeping overhead (~15-20ms) and
+profiling the unprofiled ~217ms region.
 
 ## Root Cause
 
@@ -270,28 +270,120 @@ the parsing elimination reduced GC/allocator pressure with cascading benefits.
 
 ---
 
-### Step 5: Streamline fee_seq Processing (Expected: −5 to −10ms)
+### Step 5a: Global Ed25519 Signature Verification Cache ✅ DONE
+
+**Commit**: `87e7c2e` | **Result**: −33ms (A/B on 1000 ledgers)
+
+Added a global thread-safe `SigVerifyCache` (250K-entry FIFO) inside `verify_hash()`
+in `crates/crypto/src/signature.rs`, matching stellar-core's `gVerifySigCache` in
+`SecretKey.cpp`. Cache key: `SHA-256(pubkey || signature || message_hash)`.
+
+All 10 ed25519 verification call sites flow through `verify_hash()` and automatically
+benefit — zero call-site changes required. Within a TX, the same signature is verified
+2+N times (N = num ops); the cache eliminates all redundant ed25519 verifies.
+
+**A/B benchmark** (1000 ledgers, 61349000–61350000, back-to-back same session):
+
+| | Baseline | With sig cache | Delta |
+|--|----------|---------------|-------|
+| close_ledger (run 1) | 307.1ms | 277.7ms | −29.4ms (−9.6%) |
+| close_ledger (run 2) | 310.2ms | 282.0ms | −28.2ms (−9.1%) |
+| tx_exec (run 1) | 295.2ms | 263.9ms | −31.3ms |
+| Mismatches | 0 | 0 | — |
+| Peak RSS | ~12.6GB | ~12.6GB | negligible |
+
+**Why it outperformed estimates**: Original estimate was −5 to −15ms based on the
+profiled validation cost (27.8ms). But the cache captures savings across ALL phases —
+validation, fee_seq (signer verification), per-op signature checks, and
+`check_operation_signatures`. With ~297 TXs/ledger and ~297 ops/ledger, each signature
+is verified multiple times across these phases, and all redundant verifies become
+HashMap lookups (~50ns vs ~50μs for ed25519 verify).
+
+**Post-5a fee_seq re-profiling** (100 ledgers, RUST_LOG=debug, sig_check sub-phases):
+
+| Sub-phase | No cache | With cache | Delta |
+|-----------|----------|-----------|-------|
+| sig_verify (check_operation_signatures) | 58.6ms | 20.9ms | −37.7ms |
+| fee_deduct | 0.5ms | 0.5ms | 0ms |
+| fee_bump_hash | 0.9ms | 0.9ms | 0ms |
+| signer_remove | 1.4ms | 1.4ms | 0ms |
+| seq_bump | 1.8ms | 1.8ms | 0ms |
+| **fee_seq total** | **63.8ms** | **26.1ms** | **−37.7ms** |
+
+The 20.9ms residual in `check_operation_signatures` is:
+- Soroban: 11.2ms (50μs/TX × 224 TXs) — signer list building, type splitting, iteration
+- Classic: 9.6ms (41μs/TX × 236 TXs) — same overhead, often more ops per TX
+
+This overhead is from allocations (4 Vec splits, HashSet per type) and signer list
+construction on each call. The cache eliminates the ed25519 verify cost but not the
+surrounding bookkeeping. Potential optimization: cache the full `check_signature` result
+per (account, tx_hash) pair, or restructure to avoid per-call allocation.
+
+**Files modified**:
+- `crates/crypto/src/signature.rs` — `SigVerifyCache`, global static, cached `verify_hash()`
+- `crates/crypto/Cargo.toml` — added `once_cell` dependency
+
+---
+
+### Step 5b: Avoid Ed25519 Point Decompression on Cache Hits ✅ DONE
+
+**Commit**: `d95e7e2` | **Result**: Combined with 5a: −30.7ms (A/B, 1001 ledgers)
+
+**Problem**: Even with the sig cache (Step 5a), `check_operation_signatures` still took
+20.9ms/ledger. Investigation revealed hidden cost: `PublicKey::from_bytes()` calls
+`ed25519_dalek::VerifyingKey::from_bytes()` which performs ed25519 curve point
+decompression (~35μs per call). This ran on every signer check — even when the
+subsequent `verify_hash()` would hit the cache and skip verification entirely.
+
+stellar-core's `PubKeyUtils::verifySig` checks the signature cache using raw bytes
+**before** any decompression. On cache hits, no crypto work occurs at all.
+
+**Solution**: Added `verify_hash_from_raw_key(pubkey_bytes: &[u8; 32], ...)` which
+checks the cache with raw bytes first, and only decompresses on cache miss. Updated
+all 6 ed25519 verification call sites across 5 files to pass raw `&[u8; 32]` bytes
+instead of decompressing to `PublicKey` first.
+
+**A/B benchmark** (1001 ledgers, 61349000–61350000):
+
+| | Baseline (no cache) | Cache + raw-key | Delta |
+|--|---------------------|----------------|-------|
+| close_ledger | 304.15ms | 273.46ms | −30.7ms (−10.1%) |
+| tx_exec | 293.65ms | 261.15ms | −32.5ms |
+| Mismatches | 0 | 0 | — |
+| Peak RSS | 12813MB | 12946MB | +133MB (cache overhead) |
+
+**Files modified**:
+- `crates/crypto/src/signature.rs` — added `verify_hash_from_raw_key()`
+- `crates/tx/src/validation.rs` — added `verify_signature_with_raw_key()`
+- `crates/tx/src/lib.rs` — exported new function
+- `crates/tx/src/signature_checker.rs` — use raw key in `verify_ed25519()`
+- `crates/ledger/src/execution/mod.rs` — use raw key in `check_signature_from_signers`
+- `crates/ledger/src/execution/signatures.rs` — `has_ed25519_signature_raw()` with raw key
+- `crates/herder/src/tx_queue/mod.rs` — use raw key in tx queue signature check
+
+---
+
+### Step 5c: Reduce check_operation_signatures Bookkeeping (Expected: −5 to −10ms)
 
 **Status**: Not started
 
-**Problem**: The pre-apply phase (`fee_seq_us`) takes 112μs per Soroban TX (15ms/ledger).
-This includes fee deduction, sequence bump, one-time signer removal, and 3 rounds of
-`delta_snapshot()` + `delta_changes_between()` + `build_entry_changes_with_state_overrides()`
-to track metadata changes for each sub-phase (fee, signers, seq).
+**Problem**: With ed25519 verify cached and decompression bypassed on hits, the
+residual `check_operation_signatures` cost (~15-20ms/ledger) is per-call bookkeeping:
+- Build signer list from AccountEntry signers (Vec alloc + SignerKey clone)
+- Split into 4 type-specific Vecs (alloc × 4)
+- HashSet<usize> creation per type for consumed tracking
+- Called 2× per Soroban TX (TX-level + 1 op), 1+N per classic TX
 
-**How stellar-core handles it**: `LedgerTxn` sub-transactions are O(1) push/pop. Change
-tracking is implicit in the overlay stack. No explicit delta cloning.
-
-**Solution**: For Soroban TXs (which have no per-op source accounts and typically no
-PreAuthTx signers):
-- Combine the three delta-tracking phases into a single phase where possible
-- Skip signer removal iteration when the TX has no PreAuthTx signatures
-- Use direct state mutation tracking instead of before/after snapshot diffing
+**Solution options**:
+- (A) Skip per-op check for single-op same-source TXs (covers ~90% of Soroban)
+- (B) Cache check_signature result per (account_id, tx_hash) pair
+- (C) Pre-split signers by type once per account load
 
 **Files to modify**:
-- `crates/ledger/src/execution/mod.rs` — optimize `execute_single_transaction` pre-apply
+- `crates/ledger/src/execution/signatures.rs` — optimize `check_operation_signatures`
+- `crates/ledger/src/execution/mod.rs` — `check_signature_from_signers`
 
-**Benchmark gate**: Expected: mean ≤ 272ms. If improvement < 3ms, investigate.
+**Benchmark gate**: Expected: mean ≤ 265ms. If improvement < 3ms, investigate.
 
 ---
 
@@ -322,7 +414,9 @@ For each step:
 | 2b: Meta construction cleanup | `3b48532` | ~303.6ms | ~0ms | −13.9ms | Code cleanup only, no perf gain |
 | 3: Offer/non-offer maps | `0edb0d4` | 328.2ms* | −8.83ms* | — | A/B on 1000 ledgers |
 | 4: Unified TX set parsing | `3f8a47f` | 346.1ms* | −240.8ms* | — | A/B on 1000 ledgers; *delta inflated by system conditions |
-| 5: Streamline fee_seq | | | | | |
+| 5a: Sig verify cache | `87e7c2e` | ~280ms | −29ms | — | A/B on 1000 ledgers; 2 runs consistent |
+| **5b: Raw-key decompression bypass** | **`d95e7e2`** | **273.5ms** | **−30.7ms combined** | — | **A/B on 1001 ledgers; bypasses point decompression on cache hits** |
+| 5c: check_op_sigs bookkeeping | | | | | |
 
 ---
 
@@ -335,15 +429,18 @@ For each step:
 | 2: Incremental mutation tracking | −3.5ms | 303.6ms | 1.80x |
 | 2b: Meta construction cleanup | 0ms | 303.6ms | 1.80x |
 | 3: Offer/non-offer maps | −8.83ms | ~295ms | ~1.75x |
-| 4: Unified TX set parsing | ~−10ms (est.) | ~294ms | ~1.74x |
-| 5: Streamline fee_seq | −5 to −10ms | 269–281ms | 1.60–1.67x |
+| 4: Unified TX set parsing | ~−10ms (est.) | ~285ms | ~1.69x |
+| 5a: Sig verify cache | −29ms | ~280ms | ~1.66x |
+| **5b: Raw-key decompression bypass** | **−30.7ms combined** | **273.5ms** | **1.62x** |
+| 5c: check_op_sigs bookkeeping | −5 to −10ms | 263–268ms | 1.56–1.59x |
+| 6: Profile unprofiled ~217ms | TBD | TBD | TBD |
 
-**Projected best case: ~269ms (1.60x stellar-core)**
-**Projected worst case: ~281ms (1.67x stellar-core)**
+**Current: 273.5ms (1.62x stellar-core)**
 
-The 220ms acceptance target is not reachable with the remaining micro-optimization
-steps alone. Closing the gap further would require structural changes like
-Arc<LedgerEntry> — see "Remaining Optimization Targets" below.
+The 220ms acceptance target requires ~53ms more savings. Post-5b, the remaining profiled
+optimization targets are check_operation_signatures bookkeeping (~15-20ms), validation
+residual (~10-15ms), and prepare/hash (~5-9ms). To reach 220ms, we must find ~25-35ms
+in the unprofiled ~217ms region (op execution, commit, bucket list).
 
 ---
 
@@ -362,62 +459,127 @@ Arc<LedgerEntry> — see "Remaining Optimization Targets" below.
    everything else. Fixing this requires either `Arc<LedgerEntry>` shared ownership or
    lazy/streaming meta construction.
 
-3. **Setup/teardown is the reliable optimization target**: Per-ledger costs like
+3. **Cross-cutting caches outperform phase-specific optimizations**: The signature
+   verification cache (Step 5a) delivered −29ms despite being estimated at −5 to −15ms —
+   because signatures are verified across multiple phases (validation, fee_seq signer
+   checks, per-op checks). Re-profiling confirmed: `sig_verify` in fee_seq alone dropped
+   from 58.6ms → 20.9ms (−37.7ms internal saving). Optimizations at a low-level leaf
+   function have outsized impact when called from many hot paths.
+
+4. **Hidden costs in type conversions**: `PublicKey::from_bytes()` performs ed25519
+   curve point decompression (~35μs), not just a copy. This ran on every signer check
+   even when the signature cache would hit. stellar-core avoids this by checking the
+   cache with raw bytes first. The fix (Step 5b) passes raw `&[u8; 32]` through the
+   entire pipeline, deferring decompression to cache misses only.
+
+5. **Setup/teardown is the reliable optimization target**: Per-ledger costs like
    executor_setup (10.5ms), tx_parse (7.4ms), and post_exec (7.9ms) are large, fixed,
    and have clear solutions. These are more predictable wins than per-TX micro-opts.
 
 ---
 
-## Remaining Optimization Targets
+## Fresh Profiling Results (Post Steps 1-4)
 
-Ranked by expected impact and confidence. Steps 1, 2, 2b, 3, and 4 are done.
+Instrumented profiling on 1008 ledgers (61349000–61350000), mean close 303.2ms:
 
-### 1. Meta Construction — Arc<LedgerEntry>
+| Phase | ms/ledger | % of close | Notes |
+|-------|-----------|-----------|-------|
+| **fee_seq** | **40.8** | **13.5%** | Fee deduction + seq bump + signer removal |
+| **validation** | **27.8** | **9.2%** | TX validation (signatures, preconditions) |
+| prepare | 8.8 | 2.9% | TX set parse/hash (was ~15ms before Step 4) |
+| footprint | 6.1 | 2.0% | Soroban footprint loading from state/buckets |
+| meta_constr | 1.6 | 0.5% | `build_entry_changes_with_hot_archive` |
+| flush | 0.7 | 0.2% | `flush_modified_entries` |
+| executor_setup | 0.2 | 0.1% | Context creation (was ~10ms before Step 3) |
+| fee_events | 0.0 | 0.0% | Already optimized in Step 4 |
+| **Subtotal profiled** | **85.9** | **28.3%** | |
+| **Unprofiled** | **217.3** | **71.7%** | Op execution + commit + bucket list |
 
-**Expected gain**: −15 to −25ms | **Confidence**: Medium | **Complexity**: High
+**Key insight**: Meta construction (1.6ms) is far smaller than the 15-25ms estimated
+from sampled profiling. The Arc<LedgerEntry> refactor is no longer the highest
+priority. fee_seq (40.8ms) and validation (27.8ms) are the dominant profiled costs.
 
-**Problem**: `build_entry_changes_with_hot_archive` costs 15-25ms/ledger, dominated
-by `LedgerEntry::clone()` into `Vec<LedgerEntryChange>`. Step 2b proved that
-micro-optimizations within this function don't help — the cost is fundamentally in
-the cloning.
-
-**Solution**: Replace `LedgerEntry` with `Arc<LedgerEntry>` in the state layer.
-Entry changes would hold `Arc` references instead of owned clones. Mutations use
-`Arc::make_mut()` for copy-on-write semantics.
-
-**Why it's high-impact**: This is the single largest remaining per-TX cost center.
-At ~130 Soroban TXs/ledger × ~150μs cloning overhead = ~20ms. Eliminating these
-clones would cut the gap to stellar-core significantly.
-
-**Risk**: Touches every state access path across `crates/tx/` and `crates/ledger/`.
-Requires auditing all mutation patterns. Large blast radius but the change is
-conceptually simple (replace `LedgerEntry` with `Arc<LedgerEntry>` everywhere).
-
-### 2. Streamline fee_seq Processing (Step 5)
-
-**Expected gain**: −5 to −10ms | **Confidence**: Medium | **Complexity**: Medium
-
-**Problem**: Pre-apply phase takes 112μs per Soroban TX (15ms/ledger). Includes
-3 rounds of `delta_snapshot()` + `delta_changes_between()` +
-`build_entry_changes_with_state_overrides()` for fee/signers/seq tracking.
-
-**Solution**: Combine the three delta-tracking phases for Soroban TXs (single op,
-no PreAuthTx signers). Skip signer removal iteration when unnecessary.
-
-### 3. Executor Setup Optimization (minor)
-
-**Expected gain**: −2 to −5ms | **Confidence**: Medium | **Complexity**: Low
-
-Beyond the offer/non-offer split (Step 3), executor setup includes context
-creation and soroban config loading overhead. Smaller gains possible from caching
-config across ledgers when it hasn't changed.
+The unprofiled 217ms includes actual operation execution (WASM host, classic ops),
+ledger commit, and bucket list updates — these require separate profiling.
 
 ---
 
-**Recommendation**: Re-profile with fresh instrumentation to validate whether
-Arc<LedgerEntry> or fee_seq streamlining has the higher actual impact before
-committing to the larger refactor. Arc<LedgerEntry> has the highest potential
-gain but also the highest risk and complexity.
+## Remaining Optimization Targets
+
+Ranked by expected impact. Steps 1–5b done. Current mean: 273.5ms.
+
+### 1. Profile the Unprofiled 217ms (HIGHEST PRIORITY)
+
+**Measured cost**: ~217ms/ledger (71.7% of close time) | **Complexity**: Low (instrumentation)
+
+The majority of ledger close time is unmeasured. Before optimizing smaller profiled
+phases, we need to decompose this region:
+- **Operation execution**: WASM host invocation, classic op dispatch, state reads/writes
+- **Commit phase**: SQLite writes, bucket list adds, entry serialization
+- **Bucket list maintenance**: merge scheduling, eviction scans
+
+**Action**: Add `Instant`-based timing to `execute_single_transaction` (per-op dispatch),
+`commit_ledger` sub-phases, and bucket list operations. Run on the benchmark range with
+`RUST_LOG=debug` to get a breakdown. This will likely reveal the largest remaining
+optimization opportunity.
+
+### 2. Reduce `check_operation_signatures` Overhead (Step 5c)
+
+**Measured cost**: 20.9ms/ledger (post-5a) | **Expected gain**: −5 to −10ms | **Complexity**: Medium
+
+Re-profiling shows that even with cached ed25519 verify, `check_operation_signatures`
+still takes 20.9ms/ledger. The cost is now dominated by per-call bookkeeping in
+`check_signature_from_signers`:
+- Building `Vec<(SignerKey, u32)>` from account signers (allocation + clone)
+- Splitting into 4 type-specific Vecs (pre_auth, hash_x, ed25519, signed_payload)
+- Creating `HashSet<usize>` for consumed-signer tracking per type
+- Called 1 + N_ops times per TX (Soroban: 2×, classic: 1 + num_ops)
+
+**Solution options**:
+- (A) **Cache check_signature result per (account_id, tx_hash)**: If the same account
+  is checked multiple times with the same tx_hash (TX-level + per-op with same source),
+  return cached result. Covers ~90% of Soroban TXs (single op, same source).
+- (B) **Avoid per-call allocation**: Pre-split signers once when loading the account,
+  store type-split lists on the account or in the SignatureTracker.
+- (C) **Skip per-op check for single-op same-source TXs**: If the TX has 1 op and
+  no per-op source override, the per-op check is identical to the TX-level check.
+
+**Breakdown by TX type** (post-5a):
+- Soroban: 50μs/TX × 224/ledger = 11.2ms (signer build + 2 calls, mostly cache-hit verify)
+- Classic: 41μs/TX × 236/ledger = 9.6ms (same overhead, but typically 1 op)
+
+### 3. Validation Optimization (partially done by 5a)
+
+**Measured cost**: 27.8ms/ledger (pre-5a), ~10-15ms estimated post-5a | **Expected gain**: −3 to −8ms | **Complexity**: Medium
+
+Step 5a eliminated the ed25519 verification component. Remaining validation cost is
+likely precondition checks, account loading, and XDR decoding. Needs re-profiling to
+confirm residual cost.
+
+### 4. Prepare Optimization (TX set hash)
+
+**Measured cost**: 8.8ms/ledger | **Expected gain**: −3 to −5ms | **Complexity**: Low
+
+Pass the TX set hash from consensus into `prepare()` to skip recomputation (full XDR
+serialize + SHA-256 of the entire transaction set).
+
+### 5. Meta Construction — Arc<LedgerEntry> (deprioritized)
+
+**Measured cost**: 1.6ms/ledger | **Expected gain**: ~1ms | **Complexity**: High
+
+Not cost-effective given high complexity and small actual gain.
+
+---
+
+**Recommendation**: The path to 220ms requires ~53ms more savings. Post-5b:
+- `check_operation_signatures` bookkeeping: ~15-20ms — optimizable via skipping
+  redundant per-op checks for same-source TXs (Step 5c, expected −5 to −10ms)
+- Unprofiled region: ~217ms — must instrument to find the next big target
+
+Concrete next steps:
+1. **Step 5c**: Reduce `check_operation_signatures` overhead (~15ms → ~5-10ms)
+2. **Instrument** the unprofiled ~217ms (op execution, commit, bucket list)
+3. Based on (2), prioritize the next optimization
 
 ---
 
