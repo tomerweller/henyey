@@ -6,10 +6,10 @@
 
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext,
-    AccountEntryExtensionV2, AccountEntryExtensionV2Ext, AccountId, AlphaNum4, Asset, AssetCode4,
-    Liabilities, PublicKey, SequenceNumber, String32, Thresholds, TrustLineAsset, TrustLineEntry,
-    TrustLineEntryExt, TrustLineEntryExtensionV2, TrustLineEntryExtensionV2Ext, TrustLineEntryV1,
-    TrustLineEntryV1Ext, TrustLineFlags, Uint256,
+    AccountEntryExtensionV2, AccountEntryExtensionV2Ext, AccountFlags, AccountId, AlphaNum4, Asset,
+    AssetCode4, Liabilities, PublicKey, SequenceNumber, String32, Thresholds, TrustLineAsset,
+    TrustLineEntry, TrustLineEntryExt, TrustLineEntryExtensionV2, TrustLineEntryExtensionV2Ext,
+    TrustLineEntryV1, TrustLineEntryV1Ext, TrustLineFlags, Uint256,
 };
 
 use crate::validation::LedgerContext;
@@ -312,16 +312,16 @@ pub fn assert_too_many_sponsoring(result: &stellar_xdr::curr::OperationResult) {
 // ============================================================================
 
 /// AUTH_REQUIRED_FLAG - trustlines require authorization from issuer.
-pub const AUTH_REQUIRED_FLAG: u32 = 0x1;
+pub const AUTH_REQUIRED_FLAG: u32 = AccountFlags::RequiredFlag as u32;
 
 /// AUTH_REVOCABLE_FLAG - trustlines can be revoked by issuer.
-pub const AUTH_REVOCABLE_FLAG: u32 = 0x2;
+pub const AUTH_REVOCABLE_FLAG: u32 = AccountFlags::RevocableFlag as u32;
 
 /// AUTH_IMMUTABLE_FLAG - account flags cannot be changed.
-pub const AUTH_IMMUTABLE_FLAG: u32 = 0x4;
+pub const AUTH_IMMUTABLE_FLAG: u32 = AccountFlags::ImmutableFlag as u32;
 
 /// AUTH_CLAWBACK_ENABLED_FLAG - issuer can clawback assets.
-pub const AUTH_CLAWBACK_FLAG: u32 = 0x8;
+pub const AUTH_CLAWBACK_FLAG: u32 = AccountFlags::ClawbackEnabledFlag as u32;
 
 #[cfg(test)]
 mod tests {
@@ -445,7 +445,7 @@ mod tests {
     #[test]
     fn test_create_test_account_with_flags() {
         let id = create_test_account_id(6);
-        let auth_required = 0x1; // AUTH_REQUIRED_FLAG
+        let auth_required = AccountFlags::RequiredFlag as u32;
         let account = create_test_account_with_flags(id.clone(), 2_000_000, auth_required);
 
         assert_eq!(account.account_id, id);

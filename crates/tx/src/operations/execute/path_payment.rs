@@ -1030,8 +1030,6 @@ mod tests {
     use super::*;
     use stellar_xdr::curr::*;
 
-    const AUTH_REQUIRED_FLAG: u32 = 0x1;
-
     fn create_test_account_id(seed: u8) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
     }
@@ -1203,7 +1201,7 @@ mod tests {
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(dest_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AUTH_REQUIRED_FLAG;
+        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(
@@ -1260,7 +1258,7 @@ mod tests {
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(dest_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AUTH_REQUIRED_FLAG;
+        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(

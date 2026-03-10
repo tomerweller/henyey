@@ -22,6 +22,7 @@ use crate::delta::LedgerDelta;
 use crate::snapshot::SnapshotHandle;
 use crate::{reserves, trustlines, LedgerError, Result};
 use henyey_common::asset::{add_balance, is_issuer};
+use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 use henyey_tx::operations::execute::{
     adjust_offer_amount, exchange_v10_without_price_error_thresholds, RoundingType,
 };
@@ -754,7 +755,9 @@ pub fn prepare_liabilities(
                     }
 
                     // Parity: V11+ deltas should not be positive.
-                    if protocol_version >= 11 && (delta_selling > 0 || delta_buying > 0) {
+                    if protocol_version_starts_from(protocol_version, ProtocolVersion::V11)
+                        && (delta_selling > 0 || delta_buying > 0)
+                    {
                         return Err(LedgerError::Internal(
                             "invalid liabilities delta".to_string(),
                         ));

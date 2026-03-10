@@ -507,6 +507,7 @@ fn make_result(code: ChangeTrustResultCode) -> OperationResult {
 mod tests {
     use super::*;
     use crate::operations::execute::manage_offer::execute_manage_sell_offer;
+    use henyey_common::LIQUIDITY_POOL_FEE_V18;
     use sha2::{Digest, Sha256};
     use stellar_xdr::curr::*;
 
@@ -973,7 +974,7 @@ mod tests {
             LiquidityPoolConstantProductParameters {
                 asset_a: asset_a.clone(),
                 asset_b: asset_b.clone(),
-                fee: 30,
+                fee: LIQUIDITY_POOL_FEE_V18,
             },
         );
         let pool_id = pool_id_from_params(&params);
@@ -1082,7 +1083,7 @@ mod tests {
             LiquidityPoolConstantProductParameters {
                 asset_a: asset_a.clone(),
                 asset_b: asset_b.clone(),
-                fee: 30,
+                fee: LIQUIDITY_POOL_FEE_V18,
             },
         );
         let op = ChangeTrustOp {
@@ -1157,7 +1158,7 @@ mod tests {
             LiquidityPoolConstantProductParameters {
                 asset_a: asset_a.clone(),
                 asset_b: asset_b.clone(),
-                fee: 30,
+                fee: LIQUIDITY_POOL_FEE_V18,
             },
         );
         let pool_id = pool_id_from_params(&params);
@@ -1600,7 +1601,7 @@ mod tests {
             LiquidityPoolConstantProductParameters {
                 asset_a,
                 asset_b,
-                fee: 30,
+                fee: LIQUIDITY_POOL_FEE_V18,
             },
         );
 

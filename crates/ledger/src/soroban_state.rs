@@ -45,6 +45,9 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use henyey_common::protocol::{
+    protocol_version_is_before, protocol_version_starts_from, ProtocolVersion,
+};
 use henyey_common::Hash256;
 use henyey_tx::operations::execute::entry_size_for_rent_by_protocol_with_cost_params;
 use soroban_env_host_p25::budget::Budget;
@@ -792,7 +795,7 @@ impl InMemorySorobanState {
             .to_xdr(Limits::none())
             .map(|v| v.len() as u32)
             .unwrap_or(0);
-        if protocol_version < 25 {
+        if protocol_version_is_before(protocol_version, ProtocolVersion::V25) {
             let cost_params = rent_config.map(|rc| (&rc.cpu_cost_params, &rc.mem_cost_params));
             return entry_size_for_rent_by_protocol_with_cost_params(
                 protocol_version,
@@ -973,7 +976,7 @@ impl InMemorySorobanState {
                 .unwrap_or(0);
 
             // Use the same logic as calculate_code_size
-            let new_size = if protocol_version >= 25 {
+            let new_size = if protocol_version_starts_from(protocol_version, ProtocolVersion::V25) {
                 // After XDR alignment: LedgerEntry is the same type — pass directly.
                 entry_size_for_rent_p25(&budget, &entry.ledger_entry, xdr_size).unwrap_or(xdr_size)
             } else {

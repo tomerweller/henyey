@@ -2181,6 +2181,7 @@ fn ensure_signer_sponsoring_ids(v2: &mut AccountEntryExtensionV2, signer_count: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use henyey_common::LIQUIDITY_POOL_FEE_V18;
     use stellar_xdr::curr::*;
 
     fn create_test_account_id(seed: u8) -> AccountId {
@@ -2472,7 +2473,7 @@ mod tests {
                             asset_code: AssetCode4([b'U', b'S', b'D', 0]),
                             issuer: create_test_account_id(1),
                         }),
-                        fee: 30,
+                        fee: LIQUIDITY_POOL_FEE_V18,
                     },
                     reserve_a: 1000000,
                     reserve_b: 1000000,

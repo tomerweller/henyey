@@ -684,7 +684,7 @@ impl App {
                 tracing::debug!(hash = hex::encode(hash), peer = %peer_id, "TxSet not found in cache");
                 if let Some(overlay) = self.overlay().await {
                     let ledger_version = self.ledger_manager.current_header().ledger_version;
-                    let message_type = if ledger_version >= 20 {
+                    let message_type = if protocol_version_starts_from(ledger_version, ProtocolVersion::V20) {
                         stellar_xdr::curr::MessageType::GeneralizedTxSet
                     } else {
                         stellar_xdr::curr::MessageType::TxSet

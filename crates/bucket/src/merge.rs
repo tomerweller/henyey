@@ -52,11 +52,7 @@ use stellar_xdr::curr::{BucketMetadata, BucketMetadataExt, LedgerKey, Limits, Wr
 use crate::bucket::{Bucket, BucketIter};
 use crate::entry::{compare_keys, BucketEntry};
 use crate::metrics::{EntryCountType, MergeCounters};
-use crate::{
-    BucketError, Result, FIRST_PROTOCOL_SHADOWS_REMOVED,
-    FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY,
-    FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION,
-};
+use crate::{protocol_version_starts_from, BucketError, ProtocolVersion, Result};
 
 /// Record an entry type in the merge counters.
 fn record_entry_type(counters: Option<&MergeCounters>, entry: &BucketEntry) {
@@ -194,7 +190,7 @@ fn merge_with_shadows_impl(
     let mut merged = Vec::new();
 
     // Create shadow cursors for inline shadow checking.
-    // For protocol >= 12 (FIRST_PROTOCOL_SHADOWS_REMOVED), shadow_buckets is always
+    // For protocol >= 12 (V12, shadows removed), shadow_buckets is always
     // empty, so no cursors are created.
     let mut shadow_cursors: Vec<ShadowCursor<'_>> =
         shadow_buckets.iter().map(ShadowCursor::new).collect();
@@ -606,12 +602,12 @@ pub fn merge_in_memory(
     // Build output metadata using max_protocol_version directly.
     // This matches stellar-core mergeInMemory behavior where meta.ledgerVersion = maxProtocolVersion
     // without calling calculateMergeProtocolVersion.
-    let output_meta = if max_protocol_version >= FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY {
+    let output_meta = if protocol_version_starts_from(max_protocol_version, ProtocolVersion::V11) {
         let mut meta = BucketMetadata {
             ledger_version: max_protocol_version,
             ext: BucketMetadataExt::V0,
         };
-        if max_protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
+        if protocol_version_starts_from(max_protocol_version, ProtocolVersion::V23) {
             meta.ext = BucketMetadataExt::V1(stellar_xdr::curr::BucketListType::Live);
         }
         Some(BucketEntry::Metadata(meta))
@@ -890,9 +886,11 @@ pub fn merge_buckets_with_options_and_shadows_and_counters(
     shadow_buckets: &[Bucket],
     counters: Option<&MergeCounters>,
 ) -> Result<Bucket> {
-    // For protocol >= 12 (FIRST_PROTOCOL_SHADOWS_REMOVED), shadows are always
+    // For protocol >= 12 (shadows removed), shadows are always
     // empty in practice. Pass empty slice to skip shadow cursor creation.
-    if shadow_buckets.is_empty() || max_protocol_version >= FIRST_PROTOCOL_SHADOWS_REMOVED {
+    if shadow_buckets.is_empty()
+        || protocol_version_starts_from(max_protocol_version, ProtocolVersion::V12)
+    {
         return merge_with_shadows_impl(
             old_bucket,
             new_bucket,
@@ -906,7 +904,7 @@ pub fn merge_buckets_with_options_and_shadows_and_counters(
     }
 
     let keep_shadowed_lifecycle_entries =
-        max_protocol_version >= FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY;
+        protocol_version_starts_from(max_protocol_version, ProtocolVersion::V11);
     merge_with_shadows_impl(
         old_bucket,
         new_bucket,
@@ -1309,7 +1307,7 @@ fn build_output_metadata(
         )));
     }
 
-    let use_meta = protocol_version >= FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY;
+    let use_meta = protocol_version_starts_from(protocol_version, ProtocolVersion::V11);
     if !use_meta {
         return Ok((protocol_version, None));
     }
@@ -1321,7 +1319,7 @@ fn build_output_metadata(
 
     // For Protocol 23+, Live buckets must use V1 extension with BucketListType::LIVE.
     // merge_buckets_with_options is specifically for the Live bucket list.
-    if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
+    if protocol_version_starts_from(protocol_version, ProtocolVersion::V23) {
         output.ext = BucketMetadataExt::V1(stellar_xdr::curr::BucketListType::Live);
     }
 
@@ -2086,7 +2084,7 @@ mod tests {
             &old_bucket,
             &new_bucket,
             true, // keep_dead_entries
-            FIRST_PROTOCOL_SHADOWS_REMOVED - 1,
+            ProtocolVersion::V11.as_u32(),
             true, // normalize_init_entries
             &[shadow_bucket],
         )
@@ -2122,7 +2120,7 @@ mod tests {
             &old_bucket,
             &new_bucket,
             true,
-            FIRST_PROTOCOL_SHADOWS_REMOVED, // exactly protocol 12
+            ProtocolVersion::V12.as_u32(), // exactly protocol 12
             true,
             &[shadow_bucket],
         )
@@ -2151,7 +2149,7 @@ mod tests {
             &old_bucket,
             &new_bucket,
             true,
-            FIRST_PROTOCOL_SHADOWS_REMOVED - 1,
+            ProtocolVersion::V11.as_u32(),
             true,
             &[], // no shadows
         )
@@ -2185,8 +2183,8 @@ mod tests {
             &old_bucket,
             &new_bucket,
             true,
-            FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY, // protocol 11
-            false,                                             // don't normalize init entries
+            ProtocolVersion::V11.as_u32(), // protocol 11
+            false,                         // don't normalize init entries
             &[shadow_bucket],
         )
         .unwrap();
@@ -2224,7 +2222,7 @@ mod tests {
             &old_bucket,
             &new_bucket,
             true,
-            FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY,
+            ProtocolVersion::V11.as_u32(),
             false,
             &[shadow_bucket],
         )
@@ -2263,7 +2261,7 @@ mod tests {
             &old_bucket,
             &new_bucket,
             true,
-            FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY, // 11
+            ProtocolVersion::V11.as_u32(), // 11
             false,
             &[shadow_bucket],
         )
@@ -2315,7 +2313,7 @@ mod tests {
             &b5,
             &b4,
             true,
-            FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY,
+            ProtocolVersion::V11.as_u32(),
             false,
             &[shadow],
         )
@@ -2349,7 +2347,7 @@ mod tests {
             &b1,
             &b2,
             true,
-            FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY,
+            ProtocolVersion::V11.as_u32(),
             false,
             &[shadow],
         )
@@ -2379,7 +2377,7 @@ mod tests {
             &old_bucket,
             &new_bucket,
             true,
-            FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY - 1, // protocol 10
+            ProtocolVersion::V10.as_u32(), // protocol 10
             true,
         )
         .unwrap();
@@ -2449,7 +2447,7 @@ mod tests {
             &old_with_meta,
             &new_with_meta,
             true,
-            FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY,
+            ProtocolVersion::V11.as_u32(),
             false,
         )
         .unwrap();
@@ -2470,12 +2468,8 @@ mod tests {
         let old_bucket = Bucket::from_sorted_entries_with_in_memory(old_entries).unwrap();
         let new_bucket = Bucket::from_sorted_entries_with_in_memory(new_entries).unwrap();
 
-        let merged = merge_in_memory(
-            &old_bucket,
-            &new_bucket,
-            FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY - 1,
-        )
-        .unwrap();
+        let merged =
+            merge_in_memory(&old_bucket, &new_bucket, ProtocolVersion::V10.as_u32()).unwrap();
 
         let has_metadata = merged.iter().any(|e| e.is_metadata());
         assert!(
@@ -2555,7 +2549,7 @@ mod tests {
             &old,
             &new,
             true,
-            FIRST_PROTOCOL_SHADOWS_REMOVED - 1,
+            ProtocolVersion::V11.as_u32(),
             false,
             &[shadow_bucket],
             Some(&counters),

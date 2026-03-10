@@ -535,6 +535,7 @@ pub fn cleanup_orphaned_indexes(bucket_dir: &Path) -> Result<usize, BucketError>
 mod tests {
     use super::*;
     use crate::index::DEFAULT_PAGE_SIZE;
+    use henyey_common::LIQUIDITY_POOL_FEE_V18;
     use stellar_xdr::curr::*;
     use tempfile::tempdir;
 
@@ -907,7 +908,7 @@ mod tests {
                         params: LiquidityPoolConstantProductParameters {
                             asset_a: asset_a.clone(),
                             asset_b: asset_b.clone(),
-                            fee: 30,
+                            fee: LIQUIDITY_POOL_FEE_V18,
                         },
                         reserve_a: 1000,
                         reserve_b: 2000,

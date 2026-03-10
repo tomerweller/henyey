@@ -48,6 +48,7 @@
 use crate::{is_checkpoint_ledger, verify, HistoryError, Result};
 use sha2::{Digest, Sha256};
 use henyey_bucket::{EvictionIterator, StateArchivalSettings};
+use henyey_common::protocol::{protocol_version_is_before, protocol_version_starts_from, ProtocolVersion};
 use henyey_common::{Hash256, NetworkId};
 use henyey_ledger::{
     execution::{execute_transaction_set, load_soroban_config, SorobanContext},
@@ -115,7 +116,7 @@ fn run_eviction_scan(
     live_entries: &[LedgerEntry],
 ) -> Result<EvictionScanResult> {
     if !config.run_eviction
-        || header.ledger_version < FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION
+        || protocol_version_is_before(header.ledger_version, ProtocolVersion::V23)
     {
         return Ok(EvictionScanResult {
             evicted_keys: Vec::new(),
@@ -188,7 +189,7 @@ fn verify_bucket_list_hash(
     let is_checkpoint = header.ledger_seq % 64 == 63;
     let eviction_running = config.run_eviction && eviction_iterator.is_some();
     let can_verify = is_checkpoint
-        && (header.ledger_version < FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION
+        && (protocol_version_is_before(header.ledger_version, ProtocolVersion::V23)
             || eviction_running);
 
     if !can_verify {
@@ -647,15 +648,13 @@ impl Default for ReplayConfig {
     }
 }
 
-const FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION: u32 = 23;
-
 fn combined_bucket_list_hash(
     live_bucket_list: &henyey_bucket::BucketList,
     hot_archive_bucket_list: &henyey_bucket::HotArchiveBucketList,
     protocol_version: u32,
 ) -> Hash256 {
     let live_hash = live_bucket_list.hash();
-    if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
+    if protocol_version_starts_from(protocol_version, ProtocolVersion::V23) {
         let hot_hash = hot_archive_bucket_list.hash();
         tracing::info!(
             live_hash = %live_hash,

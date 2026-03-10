@@ -31,6 +31,7 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 use tracing::{debug, info, trace, warn};
 
+use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 use henyey_common::Hash256;
 use henyey_crypto::{PublicKey, SecretKey, Signature};
 use henyey_ledger::LedgerManager;
@@ -1033,7 +1034,8 @@ impl ScpDriver {
             LedgerUpgrade::Flags(flags) => {
                 // Must be protocol >= 18 and only valid flag bits
                 const MASK_LEDGER_HEADER_FLAGS: u32 = 0x7;
-                current_version >= 18 && (*flags & !MASK_LEDGER_HEADER_FLAGS) == 0
+                protocol_version_starts_from(current_version, ProtocolVersion::V18)
+                    && (*flags & !MASK_LEDGER_HEADER_FLAGS) == 0
             }
             LedgerUpgrade::Config(_) => {
                 // Config upgrades require Soroban protocol.
@@ -2152,7 +2154,7 @@ impl SCPDriver for HerderScpCallback {
         let mut increment_ms: u64 = 1000;
         if let Some(manager) = self.driver.ledger_manager.read().as_ref() {
             let header = manager.current_header();
-            if header.ledger_version >= 23 {
+            if protocol_version_starts_from(header.ledger_version, ProtocolVersion::V23) {
                 if let Some(info) = manager.soroban_network_info() {
                     if is_nomination {
                         initial_ms = info.nomination_timeout_initial_ms as u64;

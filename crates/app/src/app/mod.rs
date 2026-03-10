@@ -58,6 +58,7 @@ use henyey_bucket::{
     BucketList, BucketListSnapshot, BucketSnapshotManager, HasNextState,
     HotArchiveBucketList, HotArchiveBucketListSnapshot,
 };
+use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 use henyey_common::{Hash256, NetworkId};
 use henyey_clock::{Clock, RealClock};
 use henyey_db::{

@@ -27,6 +27,9 @@
 //! let hash = frame.hash(&NetworkId::testnet())?;
 //! ```
 
+use henyey_common::protocol::{
+    protocol_version_is_before, protocol_version_starts_from, ProtocolVersion,
+};
 use henyey_common::{Hash256, NetworkId, Resource};
 use henyey_crypto::sha256;
 use soroban_env_host_p25::fees::TransactionResources;
@@ -700,7 +703,7 @@ fn soroban_disk_read_entries(
         return resources.footprint.read_write.len() as i64;
     }
 
-    if ledger_version < 23 {
+    if protocol_version_is_before(ledger_version, ProtocolVersion::V23) {
         return (resources.footprint.read_only.len() + resources.footprint.read_write.len()) as i64;
     }
 
@@ -716,7 +719,7 @@ fn soroban_disk_read_entries(
         }
     }
 
-    if ledger_version >= 23 {
+    if protocol_version_starts_from(ledger_version, ProtocolVersion::V23) {
         if let Some(SorobanTransactionDataExt::V1(ext)) = ext {
             count += ext.archived_soroban_entries.len() as i64;
         }

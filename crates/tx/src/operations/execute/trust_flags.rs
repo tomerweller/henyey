@@ -5,28 +5,25 @@
 //! - SetTrustLineFlags
 
 use stellar_xdr::curr::{
-    AccountId, AllowTrustOp, AllowTrustResult, AllowTrustResultCode, Asset, ClaimPredicate,
-    ClaimableBalanceEntry, ClaimableBalanceId, Claimant, ClaimantV0, Hash, HashIdPreimage,
-    HashIdPreimageRevokeId, LedgerKey, LedgerKeyClaimableBalance, LedgerKeyOffer,
+    AccountFlags, AccountId, AllowTrustOp, AllowTrustResult, AllowTrustResultCode, Asset,
+    ClaimPredicate, ClaimableBalanceEntry, ClaimableBalanceId, Claimant, ClaimantV0, Hash,
+    HashIdPreimage, HashIdPreimageRevokeId, LedgerKey, LedgerKeyClaimableBalance, LedgerKeyOffer,
     LedgerKeyTrustLine, LiquidityPoolEntryBody, OfferEntry, OperationResult, OperationResultTr,
     PoolId, SequenceNumber, SetTrustLineFlagsOp, SetTrustLineFlagsResult,
-    SetTrustLineFlagsResultCode, TrustLineAsset, TrustLineFlags,
+    SetTrustLineFlagsResultCode, TrustLineAsset,
 };
 
 use super::{
     ensure_account_liabilities, ensure_trustline_liabilities,
     is_authorized_to_maintain_liabilities, issuer_for_asset, AUTHORIZED_FLAG,
-    AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG,
+    AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG, TRUSTLINE_CLAWBACK_ENABLED_FLAG,
 };
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::Result;
 use henyey_common::protocol::{protocol_version_is_before, ProtocolVersion};
 
-const AUTH_REVOCABLE_FLAG: u32 = 0x2;
 const TRUSTLINE_AUTH_FLAGS: u32 = AUTHORIZED_FLAG | AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG;
-const TRUSTLINE_CLAWBACK_ENABLED_FLAG: u32 = TrustLineFlags::TrustlineClawbackEnabledFlag as u32;
-
 /// Execute an AllowTrust operation (deprecated).
 ///
 /// This operation sets the authorized flag on a trustline. It has been
@@ -60,7 +57,7 @@ pub fn execute_allow_trust(
 
     // Check AUTH_REVOCABLE for revocation (first check - before loading trustline)
     // Cannot fully deauthorize (authorize == 0) without AUTH_REVOCABLE
-    let auth_revocable = issuer.flags & AUTH_REVOCABLE_FLAG != 0;
+    let auth_revocable = issuer.flags & (AccountFlags::RevocableFlag as u32) != 0;
     if !auth_revocable && op.authorize == 0 {
         return Ok(make_allow_trust_result(AllowTrustResultCode::CantRevoke));
     }
@@ -188,7 +185,7 @@ pub fn execute_set_trust_line_flags(
     // 2. AUTHORIZED_FLAG -> 0
     // 3. AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG -> 0
     // These are all cases where we're clearing auth flags without setting AUTHORIZED.
-    let auth_revocable = source_account.flags & AUTH_REVOCABLE_FLAG != 0;
+    let auth_revocable = source_account.flags & (AccountFlags::RevocableFlag as u32) != 0;
     if !auth_revocable {
         let clearing_any_auth = (op.clear_flags & TRUSTLINE_AUTH_FLAGS) != 0;
         let setting_authorized = (op.set_flags & AUTHORIZED_FLAG) != 0;
@@ -790,9 +787,8 @@ fn decrement_pool_shares_trust_line_count(state: &mut LedgerStateManager, pool_i
 #[cfg(test)]
 mod tests {
     use super::*;
+    use henyey_common::LIQUIDITY_POOL_FEE_V18;
     use stellar_xdr::curr::*;
-
-    const AUTH_REQUIRED_FLAG: u32 = 0x1;
 
     fn create_test_account_id(seed: u8) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
@@ -919,7 +915,7 @@ mod tests {
         state.create_account(create_test_account(
             issuer_id.clone(),
             100_000_000,
-            AUTH_REQUIRED_FLAG,
+            AccountFlags::RequiredFlag as u32,
         ));
         state.create_account(create_test_account(trustor_id.clone(), 100_000_000, 0));
 
@@ -968,7 +964,7 @@ mod tests {
         state.create_account(create_test_account(
             issuer_id.clone(),
             100_000_000,
-            AUTH_REQUIRED_FLAG,
+            AccountFlags::RequiredFlag as u32,
         ));
 
         let op = AllowTrustOp {
@@ -1107,7 +1103,7 @@ mod tests {
         state.create_account(create_test_account(
             issuer_id.clone(),
             100_000_000,
-            AUTH_REQUIRED_FLAG | AUTH_REVOCABLE_FLAG,
+            AccountFlags::RequiredFlag as u32 | AccountFlags::RevocableFlag as u32,
         ));
         state.create_account(create_test_account(trustor_id.clone(), 10_000_000, 0));
 
@@ -1189,7 +1185,7 @@ mod tests {
         state.create_account(create_test_account(
             issuer_id.clone(),
             100_000_000,
-            AUTH_REQUIRED_FLAG | AUTH_REVOCABLE_FLAG,
+            AccountFlags::RequiredFlag as u32 | AccountFlags::RevocableFlag as u32,
         ));
         state.create_account(create_test_account(trustor_id.clone(), 10_000_000, 0));
 
@@ -1273,7 +1269,7 @@ mod tests {
             }),
             1000,
             1_000_000,
-            AUTH_REQUIRED_FLAG,
+            AccountFlags::RequiredFlag as u32,
         ));
 
         // Non-issuer tries to set flags
@@ -1501,7 +1497,7 @@ mod tests {
                     params: LiquidityPoolConstantProductParameters {
                         asset_a,
                         asset_b,
-                        fee: 30,
+                        fee: LIQUIDITY_POOL_FEE_V18,
                     },
                     reserve_a,
                     reserve_b,
@@ -1556,7 +1552,7 @@ mod tests {
         state.create_account(create_test_account(
             issuer_id.clone(),
             100_000_000,
-            AUTH_REQUIRED_FLAG | AUTH_REVOCABLE_FLAG,
+            AccountFlags::RequiredFlag as u32 | AccountFlags::RevocableFlag as u32,
         ));
         state.create_account(create_test_account(trustor_id.clone(), 100_000_000, 0));
         state.create_account(create_test_account(other_issuer_id.clone(), 100_000_000, 0));
@@ -1713,7 +1709,7 @@ mod tests {
         state.create_account(create_test_account(
             issuer_id.clone(),
             100_000_000,
-            AUTH_REQUIRED_FLAG | AUTH_REVOCABLE_FLAG,
+            AccountFlags::RequiredFlag as u32 | AccountFlags::RevocableFlag as u32,
         ));
         state.create_account(create_test_account(trustor_id.clone(), 100_000_000, 0));
         state.create_account(create_test_account(other_issuer_id.clone(), 100_000_000, 0));
@@ -1836,7 +1832,7 @@ mod tests {
         state.create_account(create_test_account(
             issuer_id.clone(),
             100_000_000,
-            AUTH_REQUIRED_FLAG | AUTH_REVOCABLE_FLAG,
+            AccountFlags::RequiredFlag as u32 | AccountFlags::RevocableFlag as u32,
         ));
         state.create_account(create_test_account(trustor_id.clone(), 100_000_000, 0));
         state.create_account(create_test_account(other_issuer_id.clone(), 100_000_000, 0));
@@ -1953,7 +1949,7 @@ mod tests {
         state.create_account(create_test_account(
             issuer_id.clone(),
             100_000_000,
-            AUTH_REQUIRED_FLAG | AUTH_REVOCABLE_FLAG,
+            AccountFlags::RequiredFlag as u32 | AccountFlags::RevocableFlag as u32,
         ));
         state.create_account(create_test_account(trustor_id.clone(), 100_000_000, 0));
 

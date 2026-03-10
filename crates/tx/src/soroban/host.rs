@@ -5,6 +5,7 @@
 
 use std::rc::Rc;
 
+use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 use sha2::{Digest, Sha256};
 
 // Use soroban-env-host types for Host interaction
@@ -221,7 +222,7 @@ impl PersistentModuleCache {
 
     /// Create a new cache for the given protocol version.
     pub fn new_for_protocol(protocol_version: u32) -> Option<Self> {
-        if protocol_version >= 25 {
+        if protocol_version_starts_from(protocol_version, ProtocolVersion::V25) {
             Self::new_p25()
         } else {
             Self::new_p24()
@@ -955,7 +956,7 @@ pub fn execute_host_function_with_cache(
     hot_archive: Option<&dyn super::HotArchiveLookup>,
     ttl_key_cache: Option<&super::TtlKeyCache>,
 ) -> Result<SorobanExecutionResult, SorobanExecutionError> {
-    if context.protocol_version >= 25 {
+    if protocol_version_starts_from(context.protocol_version, ProtocolVersion::V25) {
         let cache = module_cache
             .unwrap_or_else(|| panic!("Module cache must be provided for Soroban TX execution"));
         let p25_cache = cache.as_p25().unwrap_or_else(|| {

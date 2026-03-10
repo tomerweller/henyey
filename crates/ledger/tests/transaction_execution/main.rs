@@ -1,4 +1,4 @@
-use henyey_common::NetworkId;
+use henyey_common::{NetworkId, LIQUIDITY_POOL_FEE_V18};
 use henyey_crypto::{sign_hash, SecretKey};
 use henyey_ledger::execution::build_tx_result_pair;
 use henyey_ledger::execution::{ExecutionFailure, TransactionExecutor};
@@ -224,7 +224,7 @@ fn create_liquidity_pool_entry(
                     params: LiquidityPoolConstantProductParameters {
                         asset_a,
                         asset_b,
-                        fee: 30,
+                        fee: LIQUIDITY_POOL_FEE_V18,
                     },
                     reserve_a,
                     reserve_b,

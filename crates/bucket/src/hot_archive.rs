@@ -43,9 +43,9 @@ use crate::bucket_list::{
 };
 use crate::entry::ledger_entry_to_key;
 use crate::{BucketError, Result};
-
-/// First protocol version supporting hot archive bucket list.
-pub const FIRST_PROTOCOL_SUPPORTING_HOT_ARCHIVE: u32 = 23;
+use henyey_common::protocol::{
+    protocol_version_is_before, protocol_version_starts_from, ProtocolVersion,
+};
 
 /// Number of levels in the HotArchiveBucketList (same as live bucket list).
 pub const HOT_ARCHIVE_BUCKET_LIST_LEVELS: usize = 11;
@@ -978,10 +978,10 @@ impl HotArchiveBucketList {
         archived_entries: Vec<LedgerEntry>,
         restored_keys: Vec<LedgerKey>,
     ) -> Result<()> {
-        if protocol_version < FIRST_PROTOCOL_SUPPORTING_HOT_ARCHIVE {
+        if protocol_version_is_before(protocol_version, ProtocolVersion::V23) {
             return Err(BucketError::Merge(format!(
                 "hot archive not supported before protocol {}",
-                FIRST_PROTOCOL_SUPPORTING_HOT_ARCHIVE
+                ProtocolVersion::V23.as_u32()
             )));
         }
 
@@ -2015,7 +2015,7 @@ pub fn merge_hot_archive_buckets(
         ledger_version: output_version,
         ext: BucketMetadataExt::V0,
     };
-    if output_version >= FIRST_PROTOCOL_SUPPORTING_HOT_ARCHIVE {
+    if protocol_version_starts_from(output_version, ProtocolVersion::V23) {
         meta.ext = BucketMetadataExt::V1(BucketListType::HotArchive);
     }
     result_entries.push(HotArchiveBucketEntry::Metaentry(meta));

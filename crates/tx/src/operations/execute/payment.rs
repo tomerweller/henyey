@@ -116,7 +116,6 @@ mod tests {
     use super::*;
     use stellar_xdr::curr::*;
 
-    const AUTH_REQUIRED_FLAG: u32 = 0x1;
     const AUTHORIZED_FLAG: u32 = 0x1; // TrustLineFlags::AuthorizedFlag
 
     fn create_test_account_id(seed: u8) -> AccountId {
@@ -406,7 +405,7 @@ mod tests {
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(dest_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AUTH_REQUIRED_FLAG;
+        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let asset = Asset::CreditAlphanum4(AlphaNum4 {
             asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
@@ -459,7 +458,7 @@ mod tests {
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(dest_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AUTH_REQUIRED_FLAG;
+        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let asset = Asset::CreditAlphanum4(AlphaNum4 {
             asset_code: AssetCode4([b'U', b'S', b'D', b'C']),

@@ -716,6 +716,7 @@ fn make_withdraw_result(code: LiquidityPoolWithdrawResultCode) -> OperationResul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use henyey_common::LIQUIDITY_POOL_FEE_V18;
     use stellar_xdr::curr::*;
 
     fn create_test_account_id(seed: u8) -> AccountId {
@@ -756,7 +757,7 @@ mod tests {
                     params: LiquidityPoolConstantProductParameters {
                         asset_a,
                         asset_b,
-                        fee: 30,
+                        fee: LIQUIDITY_POOL_FEE_V18,
                     },
                     reserve_a,
                     reserve_b,

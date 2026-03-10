@@ -590,9 +590,6 @@ fn validate_offer(
     Ok(())
 }
 
-#[cfg(test)]
-const AUTH_REQUIRED_FLAG: u32 = 0x1;
-
 /// Delete an existing offer.
 fn delete_offer(
     source: &AccountId,
@@ -1112,7 +1109,7 @@ mod tests {
         let issuer_id = create_test_account_id(1);
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AUTH_REQUIRED_FLAG;
+        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(
@@ -1153,7 +1150,7 @@ mod tests {
         let issuer_id = create_test_account_id(1);
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AUTH_REQUIRED_FLAG;
+        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(
@@ -1193,7 +1190,7 @@ mod tests {
         let issuer_id = create_test_account_id(1);
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AUTH_REQUIRED_FLAG;
+        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(
@@ -1234,7 +1231,7 @@ mod tests {
         let issuer_id = create_test_account_id(1);
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AUTH_REQUIRED_FLAG;
+        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(
@@ -1275,7 +1272,7 @@ mod tests {
         let issuer_id = create_test_account_id(1);
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AUTH_REQUIRED_FLAG;
+        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(
@@ -1345,7 +1342,7 @@ mod tests {
         let issuer_id = create_test_account_id(1);
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AUTH_REQUIRED_FLAG;
+        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(
@@ -1415,7 +1412,7 @@ mod tests {
         let issuer_id = create_test_account_id(1);
         state.create_account(create_test_account(source_id.clone(), 100_000_000));
         state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
-        state.get_account_mut(&issuer_id).unwrap().flags = AUTH_REQUIRED_FLAG;
+        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
 
         let asset = create_asset(&issuer_id);
         state.create_trustline(create_test_trustline(

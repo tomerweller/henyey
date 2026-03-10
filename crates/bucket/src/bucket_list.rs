@@ -75,9 +75,7 @@ use crate::merge::{
 use crate::merge_map::BucketMergeMap;
 use crate::metrics::MergeCounters;
 use crate::{
-    BucketError, Result, FIRST_PROTOCOL_SHADOWS_REMOVED,
-    FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY,
-    FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION,
+    protocol_version_is_before, protocol_version_starts_from, BucketError, ProtocolVersion, Result,
 };
 
 /// Number of levels in the BucketList (matches stellar-core's `kNumLevels`).
@@ -1577,7 +1575,7 @@ impl BucketList {
         live_entries: Vec<LedgerEntry>,
         dead_entries: Vec<LedgerKey>,
     ) -> Result<()> {
-        let use_init = protocol_version >= FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY;
+        let use_init = protocol_version_starts_from(protocol_version, ProtocolVersion::V11);
 
         let mut entries: Vec<BucketEntry> = Vec::new();
 
@@ -1586,7 +1584,7 @@ impl BucketList {
                 ledger_version: protocol_version,
                 ext: BucketMetadataExt::V0,
             };
-            if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
+            if protocol_version_starts_from(protocol_version, ProtocolVersion::V23) {
                 meta.ext = BucketMetadataExt::V1(bucket_list_type);
             }
             entries.push(BucketEntry::Metadata(meta));
@@ -1727,7 +1725,7 @@ impl BucketList {
                 let keep_dead = Self::keep_tombstone_entries(i);
                 let normalize_init = false; // Never normalize INIT to LIVE during merges
                 let use_empty_curr = Self::should_merge_with_empty_curr(ledger_seq, i);
-                let shadow_buckets = if protocol_version < FIRST_PROTOCOL_SHADOWS_REMOVED {
+                let shadow_buckets = if protocol_version_is_before(protocol_version, ProtocolVersion::V12) {
                     let mut shadows = Vec::new();
                     for level in self.levels.iter().take(i - 1) {
                         shadows.push((*level.curr).clone());

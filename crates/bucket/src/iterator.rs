@@ -37,8 +37,8 @@ use std::path::{Path, PathBuf};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use sha2::{Digest, Sha256};
 use henyey_common::Hash256;
+use sha2::{Digest, Sha256};
 use stellar_xdr::curr::BucketMetadata;
 
 use crate::entry::{compare_entries, BucketEntry};
@@ -336,9 +336,6 @@ pub struct BucketOutputIterator {
 }
 
 impl BucketOutputIterator {
-    /// First protocol version supporting INITENTRY and METAENTRY.
-    const FIRST_PROTOCOL_SUPPORTING_METADATA: u32 = 11;
-
     /// Creates a new bucket output iterator.
     ///
     /// # Arguments
@@ -391,7 +388,10 @@ impl BucketOutputIterator {
         }
         self.wrote_metadata = true;
 
-        if self.protocol_version >= Self::FIRST_PROTOCOL_SUPPORTING_METADATA {
+        if henyey_common::protocol::protocol_version_starts_from(
+            self.protocol_version,
+            henyey_common::protocol::ProtocolVersion::V11,
+        ) {
             let metadata = BucketMetadata {
                 ledger_version: self.protocol_version,
                 ext: stellar_xdr::curr::BucketMetadataExt::V0,

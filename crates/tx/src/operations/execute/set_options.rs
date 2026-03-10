@@ -5,8 +5,8 @@
 
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext,
-    AccountEntryExtensionV2, AccountId, OperationResult, OperationResultTr, PublicKey,
-    SetOptionsOp, SetOptionsResult, SetOptionsResultCode, Signer, SignerKey,
+    AccountEntryExtensionV2, AccountFlags, AccountId, OperationResult, OperationResultTr,
+    PublicKey, SetOptionsOp, SetOptionsResult, SetOptionsResultCode, Signer, SignerKey,
     SignerKeyEd25519SignedPayload, SignerKeyType, SponsorshipDescriptor, MASK_ACCOUNT_FLAGS_V17,
 };
 
@@ -94,17 +94,15 @@ pub fn execute_set_options(
     };
 
     // Check flag consistency
-    const AUTH_REQUIRED_FLAG: u32 = 0x1;
-    const AUTH_REVOCABLE_FLAG: u32 = 0x2;
-    const AUTH_IMMUTABLE_FLAG: u32 = 0x4;
-    const AUTH_CLAWBACK_FLAG: u32 = 0x8;
-    let auth_flags_mask =
-        AUTH_REQUIRED_FLAG | AUTH_REVOCABLE_FLAG | AUTH_IMMUTABLE_FLAG | AUTH_CLAWBACK_FLAG;
+    let auth_flags_mask = AccountFlags::RequiredFlag as u32
+        | AccountFlags::RevocableFlag as u32
+        | AccountFlags::ImmutableFlag as u32
+        | AccountFlags::ClawbackEnabledFlag as u32;
 
     let current_flags = source_account.flags;
 
     // If account is immutable, can only clear flags (not set new ones)
-    if current_flags & AUTH_IMMUTABLE_FLAG != 0 {
+    if current_flags & (AccountFlags::ImmutableFlag as u32) != 0 {
         let set_flags = op.set_flags.unwrap_or(0);
         let clear_flags = op.clear_flags.unwrap_or(0);
         if (set_flags | clear_flags) & auth_flags_mask != 0 {
@@ -119,7 +117,9 @@ pub fn execute_set_options(
     let set = op.set_flags.unwrap_or(0);
     if clear != 0 || set != 0 {
         let new_flags = (current_flags & !clear) | set;
-        if new_flags & AUTH_CLAWBACK_FLAG != 0 && new_flags & AUTH_REVOCABLE_FLAG == 0 {
+        if new_flags & (AccountFlags::ClawbackEnabledFlag as u32) != 0
+            && new_flags & (AccountFlags::RevocableFlag as u32) == 0
+        {
             return Ok(make_result(SetOptionsResultCode::AuthRevocableRequired));
         }
     }
@@ -435,10 +435,6 @@ fn make_result(code: SetOptionsResultCode) -> OperationResult {
 mod tests {
     use super::*;
     use stellar_xdr::curr::*;
-
-    const AUTH_REQUIRED_FLAG: u32 = 0x1;
-    const AUTH_REVOCABLE_FLAG: u32 = 0x2;
-    const AUTH_CLAWBACK_FLAG: u32 = 0x8;
 
     fn make_string32(s: &str) -> String32 {
         String32::try_from(s.as_bytes().to_vec()).unwrap()
@@ -1288,12 +1284,12 @@ mod tests {
 
         let source_id = create_test_account_id(36);
         let mut source = create_test_account(source_id.clone(), 100_000_000);
-        source.flags = AUTH_REQUIRED_FLAG | AUTH_REVOCABLE_FLAG;
+        source.flags = AccountFlags::RequiredFlag as u32 | AccountFlags::RevocableFlag as u32;
         state.create_account(source);
 
         let op = SetOptionsOp {
             inflation_dest: None,
-            clear_flags: Some(AUTH_REVOCABLE_FLAG),
+            clear_flags: Some(AccountFlags::RevocableFlag as u32),
             set_flags: None,
             master_weight: None,
             low_threshold: None,
@@ -1314,12 +1310,12 @@ mod tests {
         // Verify flag was cleared
         let account = state.get_account(&source_id).unwrap();
         assert_eq!(
-            account.flags & AUTH_REVOCABLE_FLAG,
+            account.flags & (AccountFlags::RevocableFlag as u32),
             0,
             "AUTH_REVOCABLE should be cleared"
         );
         assert_ne!(
-            account.flags & AUTH_REQUIRED_FLAG,
+            account.flags & (AccountFlags::RequiredFlag as u32),
             0,
             "AUTH_REQUIRED should remain"
         );
@@ -1340,13 +1336,17 @@ mod tests {
         let source_id = create_test_account_id(50);
         let mut source = create_test_account(source_id.clone(), 100_000_000);
         // Account has both AUTH_REVOCABLE and AUTH_CLAWBACK set
-        source.flags = AUTH_REQUIRED_FLAG | AUTH_REVOCABLE_FLAG | AUTH_CLAWBACK_FLAG;
+        source.flags = AccountFlags::RequiredFlag as u32
+            | AccountFlags::RevocableFlag as u32
+            | AccountFlags::ClawbackEnabledFlag as u32;
         state.create_account(source);
 
         // Clear both revocable and clawback at once
         let op = SetOptionsOp {
             inflation_dest: None,
-            clear_flags: Some(AUTH_REVOCABLE_FLAG | AUTH_CLAWBACK_FLAG),
+            clear_flags: Some(
+                AccountFlags::RevocableFlag as u32 | AccountFlags::ClawbackEnabledFlag as u32,
+            ),
             set_flags: None,
             master_weight: None,
             low_threshold: None,
@@ -1369,9 +1369,12 @@ mod tests {
         }
 
         let account = state.get_account(&source_id).unwrap();
-        assert_eq!(account.flags & AUTH_REVOCABLE_FLAG, 0);
-        assert_eq!(account.flags & AUTH_CLAWBACK_FLAG, 0);
-        assert_ne!(account.flags & AUTH_REQUIRED_FLAG, 0);
+        assert_eq!(account.flags & (AccountFlags::RevocableFlag as u32), 0);
+        assert_eq!(
+            account.flags & (AccountFlags::ClawbackEnabledFlag as u32),
+            0
+        );
+        assert_ne!(account.flags & (AccountFlags::RequiredFlag as u32), 0);
     }
 
     /// Test SetOptions set master weight to 0 (disable master key).

@@ -40,7 +40,7 @@ use soroban_env_host_p25::fees::{
     compute_rent_write_fee_per_1kb, compute_transaction_resource_fee, FeeConfiguration,
     RentFeeConfiguration, RentWriteFeeConfiguration,
 };
-use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
+use henyey_common::protocol::{protocol_version_is_before, protocol_version_starts_from, ProtocolVersion};
 use henyey_common::{Hash256, NetworkId, LIQUIDITY_POOL_FEE_V18};
 use henyey_crypto::account_id_to_strkey;
 
@@ -809,7 +809,7 @@ impl TransactionExecutor {
             .minimum_balance_for_account(account, self.protocol_version, 0)
             .map_err(|e| LedgerError::Internal(e.to_string()))?;
         let mut available = account.balance - min_balance;
-        if self.protocol_version >= 10 {
+        if protocol_version_starts_from(self.protocol_version, ProtocolVersion::V10) {
             let selling = match &account.ext {
                 AccountEntryExt::V1(v1) => v1.liabilities.selling,
                 AccountEntryExt::V0 => 0,
@@ -1619,7 +1619,7 @@ impl TransactionExecutor {
         }
 
         // For protocol < 10, sequence bump happens during fee processing
-        if self.protocol_version < 10 {
+        if protocol_version_is_before(self.protocol_version, ProtocolVersion::V10) {
             if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
                 // Set the account's seq_num to the transaction's seq_num
                 acc.seq_num = stellar_xdr::curr::SequenceNumber(frame.sequence_number());

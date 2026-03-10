@@ -8,22 +8,15 @@ use stellar_xdr::curr::{
     AccountId, Asset, ClaimableBalanceFlags, ClawbackClaimableBalanceOp,
     ClawbackClaimableBalanceResult, ClawbackClaimableBalanceResultCode, ClawbackOp, ClawbackResult,
     ClawbackResultCode, LedgerKey, LedgerKeyClaimableBalance, OperationResult, OperationResultTr,
-    TrustLineFlags,
 };
 
 use super::is_asset_valid;
 use super::trustline_liabilities;
+use super::TRUSTLINE_CLAWBACK_ENABLED_FLAG;
 use crate::frame::muxed_to_account_id;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::Result;
-
-/// Account flag for clawback enabled (used in tests)
-#[cfg(test)]
-const AUTH_CLAWBACK_ENABLED_FLAG: u32 = 0x8;
-
-/// Trustline flag for clawback enabled
-const TRUSTLINE_CLAWBACK_ENABLED_FLAG: u32 = TrustLineFlags::TrustlineClawbackEnabledFlag as u32;
 
 /// Execute a Clawback operation.
 ///
@@ -375,7 +368,7 @@ mod tests {
         state.create_account(create_test_account(
             issuer_id.clone(),
             100_000_000,
-            AUTH_CLAWBACK_ENABLED_FLAG,
+            AccountFlags::ClawbackEnabledFlag as u32,
         ));
 
         let op = ClawbackClaimableBalanceOp {
@@ -407,7 +400,7 @@ mod tests {
         state.create_account(create_test_account(
             issuer_id.clone(),
             100_000_000,
-            AUTH_CLAWBACK_ENABLED_FLAG,
+            AccountFlags::ClawbackEnabledFlag as u32,
         ));
         state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
 
@@ -455,7 +448,7 @@ mod tests {
         state.create_account(create_test_account(
             issuer_id.clone(),
             100_000_000,
-            AUTH_CLAWBACK_ENABLED_FLAG,
+            AccountFlags::ClawbackEnabledFlag as u32,
         ));
         state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
 
@@ -503,7 +496,7 @@ mod tests {
         state.create_account(create_test_account(
             issuer_id.clone(),
             100_000_000,
-            AUTH_CLAWBACK_ENABLED_FLAG,
+            AccountFlags::ClawbackEnabledFlag as u32,
         ));
         state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
 
@@ -543,13 +536,13 @@ mod tests {
         state.create_account(create_test_account(
             issuer_id.clone(),
             100_000_000,
-            AUTH_CLAWBACK_ENABLED_FLAG,
+            AccountFlags::ClawbackEnabledFlag as u32,
         ));
         state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
         state.create_account(create_test_account(
             non_issuer_id.clone(),
             100_000_000,
-            AUTH_CLAWBACK_ENABLED_FLAG,
+            AccountFlags::ClawbackEnabledFlag as u32,
         ));
 
         let asset = create_asset(&issuer_id);
@@ -597,7 +590,7 @@ mod tests {
         state.create_account(create_test_account(
             issuer_id.clone(),
             100_000_000,
-            AUTH_CLAWBACK_ENABLED_FLAG,
+            AccountFlags::ClawbackEnabledFlag as u32,
         ));
         state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
 
@@ -639,7 +632,7 @@ mod tests {
         state.create_account(create_test_account(
             issuer_id.clone(),
             100_000_000,
-            AUTH_CLAWBACK_ENABLED_FLAG,
+            AccountFlags::ClawbackEnabledFlag as u32,
         ));
         state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
 
@@ -687,7 +680,7 @@ mod tests {
         state.create_account(create_test_account(
             issuer_id.clone(),
             100_000_000,
-            AUTH_CLAWBACK_ENABLED_FLAG,
+            AccountFlags::ClawbackEnabledFlag as u32,
         ));
         state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
 
@@ -742,11 +735,11 @@ mod tests {
         let issuer_id = create_test_account_id(27);
         let holder_id = create_test_account_id(28);
 
-        // Issuer has AUTH_CLAWBACK_ENABLED_FLAG
+        // Issuer has AUTH_CLAWBACK_ENABLED flag
         state.create_account(create_test_account(
             issuer_id.clone(),
             100_000_000,
-            AUTH_CLAWBACK_ENABLED_FLAG,
+            AccountFlags::ClawbackEnabledFlag as u32,
         ));
         state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
 
@@ -797,7 +790,7 @@ mod tests {
         state.create_account(create_test_account(
             issuer_id.clone(),
             100_000_000,
-            AUTH_CLAWBACK_ENABLED_FLAG,
+            AccountFlags::ClawbackEnabledFlag as u32,
         ));
 
         let asset = create_asset(&issuer_id);
@@ -840,7 +833,7 @@ mod tests {
         state.create_account(create_test_account(
             issuer_id.clone(),
             100_000_000,
-            AUTH_CLAWBACK_ENABLED_FLAG,
+            AccountFlags::ClawbackEnabledFlag as u32,
         ));
         state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
 
@@ -883,7 +876,7 @@ mod tests {
         state.create_account(create_test_account(
             issuer_id.clone(),
             100_000_000,
-            AUTH_CLAWBACK_ENABLED_FLAG,
+            AccountFlags::ClawbackEnabledFlag as u32,
         ));
         state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
 
@@ -942,7 +935,7 @@ mod tests {
         state.create_account(create_test_account(
             issuer_id.clone(),
             100_000_000,
-            AUTH_CLAWBACK_ENABLED_FLAG,
+            AccountFlags::ClawbackEnabledFlag as u32,
         ));
         state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
 
@@ -1014,7 +1007,7 @@ mod tests {
         state.create_account(create_test_account(
             issuer_id.clone(),
             100_000_000,
-            AUTH_CLAWBACK_ENABLED_FLAG,
+            AccountFlags::ClawbackEnabledFlag as u32,
         ));
         state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
 

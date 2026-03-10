@@ -1,9 +1,9 @@
 //! AccountMerge operation execution.
 
 use stellar_xdr::curr::{
-    AccountEntry, AccountEntryExt, AccountEntryExtensionV1Ext, AccountId, AccountMergeResult,
-    AccountMergeResultCode, LedgerKey, LedgerKeyAccount, MuxedAccount, OperationResult,
-    OperationResultTr, PublicKey, SponsorshipDescriptor,
+    AccountEntry, AccountEntryExt, AccountEntryExtensionV1Ext, AccountFlags, AccountId,
+    AccountMergeResult, AccountMergeResultCode, LedgerKey, LedgerKeyAccount, MuxedAccount,
+    OperationResult, OperationResultTr, PublicKey, SponsorshipDescriptor,
 };
 
 use super::add_account_balance;
@@ -36,8 +36,7 @@ pub fn execute_account_merge(
     };
 
     // Check source is not immutable (checked first per stellar-core doApplyFromV16)
-    const AUTH_IMMUTABLE_FLAG: u32 = 0x4;
-    if source_account.flags & AUTH_IMMUTABLE_FLAG != 0 {
+    if source_account.flags & (AccountFlags::ImmutableFlag as u32) != 0 {
         return Ok(make_result(AccountMergeResultCode::ImmutableSet));
     }
 

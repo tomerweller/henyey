@@ -40,6 +40,7 @@
 //! let inner_hash = frame.inner_transaction_hash()?;
 //! ```
 
+use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 use henyey_common::{Hash256, NetworkId};
 use stellar_xdr::curr::{
     AccountId, DecoratedSignature, FeeBumpTransaction, FeeBumpTransactionEnvelope,
@@ -591,7 +592,7 @@ impl FeeBumpMutableTransactionResult {
         if let Some(ref tracker) = self.refundable_fee_tracker {
             let refund = tracker.get_fee_refund();
 
-            if protocol_version >= 25 {
+            if protocol_version_starts_from(protocol_version, ProtocolVersion::V25) {
                 // In P25+, all fees come from outer, so refund from outer
                 self.outer_fee_charged -= refund;
             } else {
@@ -691,7 +692,7 @@ impl FeeBumpMutableTransactionResult {
 ///
 /// This matches stellar-core `FeeBumpTransactionFrame::getInnerFullFee`.
 pub fn calculate_inner_fee_charged(inner_declared_fee: u32, protocol_version: u32) -> i64 {
-    if protocol_version >= 25 {
+    if protocol_version_starts_from(protocol_version, ProtocolVersion::V25) {
         // In protocol 25+, inner fee is always 0
         0
     } else {

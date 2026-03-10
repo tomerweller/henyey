@@ -18,6 +18,7 @@ use stellar_xdr::curr::{
 use super::{
     account_balance_after_liabilities, account_liabilities, add_account_balance,
     add_trustline_balance, is_trustline_authorized, trustline_balance_after_liabilities,
+    TRUSTLINE_CLAWBACK_ENABLED_FLAG,
 };
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
@@ -387,9 +388,6 @@ fn generate_claimable_balance_id(
         .map_err(|e| TxError::Internal(format!("claimable balance id hash error: {}", e)))?;
     Ok(ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash(hash.0)))
 }
-
-const TRUSTLINE_CLAWBACK_ENABLED_FLAG: u32 =
-    stellar_xdr::curr::TrustLineFlags::TrustlineClawbackEnabledFlag as u32;
 
 fn asset_issuer(asset: &Asset) -> Option<AccountId> {
     match asset {

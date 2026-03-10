@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 
 use henyey_bucket::{BucketList, BucketListSnapshot, SearchableBucketListSnapshot};
+use henyey_common::LIQUIDITY_POOL_FEE_V18;
 use stellar_xdr::curr::{
     AccountId, AlphaNum4, Asset, AssetCode4, Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt,
     LedgerHeader, LedgerHeaderExt, LiquidityPoolConstantProductParameters, LiquidityPoolEntry,
@@ -43,7 +44,7 @@ fn make_liquidity_pool(pool_id: PoolId, asset_a: Asset, asset_b: Asset) -> Ledge
                     params: LiquidityPoolConstantProductParameters {
                         asset_a,
                         asset_b,
-                        fee: 30,
+                        fee: LIQUIDITY_POOL_FEE_V18,
                     },
                     reserve_a: 1_000_000,
                     reserve_b: 1_000_000,

@@ -107,26 +107,27 @@ pub fn build_tx_result_pair(
         //   - For Soroban: resourceFee + min(inclusionFee, baseFee * numOps) - refund
         //     (stellar-core had a bug where refund was applied to inner fee; this was fixed in p25)
         //   - For classic: min(inner_fee, baseFee * numOps)
-        let inner_fee_charged = if protocol_version >= 25 {
-            0
-        } else {
-            let num_inner_ops = frame.operation_count() as i64;
-            let adjusted_fee = base_fee * std::cmp::max(1, num_inner_ops);
-            if frame.is_soroban() {
-                // For Soroban transactions, include the declared resource fee
-                let resource_fee = frame.declared_soroban_resource_fee();
-                let inner_fee = frame.inner_fee() as i64;
-                let inclusion_fee = inner_fee - resource_fee;
-                let computed_fee = resource_fee + std::cmp::min(inclusion_fee, adjusted_fee);
-                // Prior to protocol 25, stellar-core incorrectly applied the refund to the inner
-                // feeCharged field for fee bump transactions. We replicate this behavior
-                // for compatibility.
-                computed_fee.saturating_sub(exec.fee_refund)
+        let inner_fee_charged =
+            if protocol_version_starts_from(protocol_version, ProtocolVersion::V25) {
+                0
             } else {
-                // For classic transactions
-                std::cmp::min(frame.inner_fee() as i64, adjusted_fee)
-            }
-        };
+                let num_inner_ops = frame.operation_count() as i64;
+                let adjusted_fee = base_fee * std::cmp::max(1, num_inner_ops);
+                if frame.is_soroban() {
+                    // For Soroban transactions, include the declared resource fee
+                    let resource_fee = frame.declared_soroban_resource_fee();
+                    let inner_fee = frame.inner_fee() as i64;
+                    let inclusion_fee = inner_fee - resource_fee;
+                    let computed_fee = resource_fee + std::cmp::min(inclusion_fee, adjusted_fee);
+                    // Prior to protocol 25, stellar-core incorrectly applied the refund to the inner
+                    // feeCharged field for fee bump transactions. We replicate this behavior
+                    // for compatibility.
+                    computed_fee.saturating_sub(exec.fee_refund)
+                } else {
+                    // For classic transactions
+                    std::cmp::min(frame.inner_fee() as i64, adjusted_fee)
+                }
+            };
 
         let inner_pair = InnerTransactionResultPair {
             transaction_hash: stellar_xdr::curr::Hash(inner_hash.0),

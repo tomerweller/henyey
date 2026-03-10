@@ -57,6 +57,7 @@ use crate::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use henyey_bucket::{Bucket, BucketList, BucketManager, HasNextState, HotArchiveBucketList};
+use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 use henyey_common::{Hash256, NetworkId};
 use henyey_db::Database;
 
@@ -1673,7 +1674,7 @@ impl CatchupManager {
                 .unwrap_or_else(|| {
                     // For protocol 20+, use GeneralizedTransactionSet format
                     // For earlier protocols, use Classic TransactionSet
-                    if header.ledger_version >= 20 {
+                    if protocol_version_starts_from(header.ledger_version, ProtocolVersion::V20) {
                         // Create empty GeneralizedTransactionSet with proper phases
                         // Phase 0: empty classic phase (V0 with no components)
                         // Phase 1: empty soroban phase (V1 with no stages)

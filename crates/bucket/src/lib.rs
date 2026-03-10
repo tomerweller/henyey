@@ -188,7 +188,7 @@ pub use future_bucket::{FutureBucket, FutureBucketSnapshot, FutureBucketState, M
 
 pub use hot_archive::{
     is_hot_archive_tombstone, merge_hot_archive_buckets, HotArchiveBucket, HotArchiveBucketLevel,
-    HotArchiveBucketList, HotArchiveBucketListStats, FIRST_PROTOCOL_SUPPORTING_HOT_ARCHIVE,
+    HotArchiveBucketList, HotArchiveBucketListStats,
     HOT_ARCHIVE_BUCKET_LIST_LEVELS,
 };
 
@@ -262,16 +262,12 @@ pub use iterator::{
 pub use live_iterator::{LiveEntriesIterator, LiveEntriesStats};
 
 // ============================================================================
-// Protocol version constants
+// Protocol version re-exports (for bucket-level usage)
 // ============================================================================
 
-/// First protocol version supporting INITENTRY and METAENTRY (CAP-0020).
-pub const FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY: u32 = 11;
-/// First protocol version where bucket shadows are removed (CAP-0020 follow-up).
-pub const FIRST_PROTOCOL_SHADOWS_REMOVED: u32 = 12;
-
-/// First protocol version supporting persistent eviction (CAP-0046/Soroban).
-pub const FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION: u32 = 23;
+pub use henyey_common::protocol::{
+    protocol_version_is_before, protocol_version_starts_from, ProtocolVersion,
+};
 
 /// Result type for bucket operations.
 ///

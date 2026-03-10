@@ -48,6 +48,9 @@ use henyey_bucket::{
     HotArchiveBucketList, StateArchivalSettings,
 };
 use henyey_common::{BucketListDbConfig, Hash256, NetworkId};
+use henyey_common::protocol::{
+    needs_upgrade_to_version, protocol_version_starts_from, ProtocolVersion,
+};
 use henyey_tx::soroban::PersistentModuleCache;
 use henyey_tx::state::AssetKey;
 use henyey_tx::{ClassicEventConfig, LedgerContext, TxEventManager};
@@ -168,9 +171,6 @@ pub fn prepend_fee_event(
         v4.events = combined.try_into().unwrap_or_default();
     }
 }
-
-/// Protocol version that introduced persistent eviction/state archival.
-const FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION: u32 = 23;
 
 /// A background eviction scan that was started after committing a ledger.
 ///
@@ -1335,7 +1335,7 @@ impl LedgerManager {
         // For earlier protocols, the hash is just the live bucket list hash.
         let live_hash = bucket_list.hash();
         let computed_hash =
-            if header.ledger_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
+            if protocol_version_starts_from(header.ledger_version, ProtocolVersion::V23) {
                 use sha2::{Digest, Sha256};
                 let hot_hash = hot_archive_bucket_list.hash();
                 let mut hasher = Sha256::new();
@@ -1896,7 +1896,7 @@ impl LedgerManager {
             // For protocol >= 23, the hash is SHA256(live_hash || hot_archive_hash).
             // For earlier protocols, the hash is just the live bucket list hash.
             let computed =
-                if new_header.ledger_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
+                if protocol_version_starts_from(new_header.ledger_version, ProtocolVersion::V23) {
                     let hot_archive_guard = self.hot_archive_bucket_list.read();
                     if let Some(ref hot_archive) = *hot_archive_guard {
                         use sha2::{Digest, Sha256};
@@ -3144,9 +3144,7 @@ impl<'a> LedgerCloseContext<'a> {
     /// advanced via `advance_to_ledger_preserving_offers` which clears non-offer
     /// cached entries while keeping the offer index intact.
     fn apply_transactions(&mut self) -> Result<Vec<TransactionExecutionResult>> {
-        use henyey_common::protocol::{
-            protocol_version_starts_from, PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION,
-        };
+        use henyey_common::protocol::PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION;
 
         let prepare_start = std::time::Instant::now();
         let prepared = self.close_data.tx_set.prepare();
@@ -3504,35 +3502,35 @@ impl<'a> LedgerCloseContext<'a> {
             let delta_before = self.delta.num_changes();
             // Parity: Upgrades.cpp:1189-1212
             // needUpgradeToVersion(V_20, prev, new) → createLedgerEntriesForV20
-            if prev_version < 20 && protocol_version >= 20 {
+            if needs_upgrade_to_version(ProtocolVersion::V20, prev_version, protocol_version) {
                 self.create_ledger_entries_for_v20()?;
                 version_upgrade_memory_cost_changed = true;
             }
 
             // Parity: Upgrades.cpp:1213-1217
             // needUpgradeToVersion(V_21, prev, new) → createCostTypesForV21
-            if prev_version < 21 && protocol_version >= 21 {
+            if needs_upgrade_to_version(ProtocolVersion::V21, prev_version, protocol_version) {
                 self.create_cost_types_for_v21()?;
                 version_upgrade_memory_cost_changed = true;
             }
 
             // Parity: Upgrades.cpp:1219-1223
             // needUpgradeToVersion(V_22, prev, new) → createCostTypesForV22
-            if prev_version < 22 && protocol_version >= 22 {
+            if needs_upgrade_to_version(ProtocolVersion::V22, prev_version, protocol_version) {
                 self.create_cost_types_for_v22()?;
                 version_upgrade_memory_cost_changed = true;
             }
 
             // Parity: Upgrades.cpp:1225-1229
             // needUpgradeToVersion(V_23, prev, new) → createAndUpdateLedgerEntriesForV23
-            if prev_version < 23 && protocol_version >= 23 {
+            if needs_upgrade_to_version(ProtocolVersion::V23, prev_version, protocol_version) {
                 self.create_and_update_ledger_entries_for_v23()?;
                 version_upgrade_memory_cost_changed = true;
             }
 
             // Parity: Upgrades.cpp:1229-1233
             // needUpgradeToVersion(V_25, prev, new) → createCostTypesForV25
-            if prev_version < 25 && protocol_version >= 25 {
+            if needs_upgrade_to_version(ProtocolVersion::V25, prev_version, protocol_version) {
                 self.create_cost_types_for_v25()?;
                 version_upgrade_memory_cost_changed = true;
             }
@@ -3547,7 +3545,7 @@ impl<'a> LedgerCloseContext<'a> {
             // NOTE: Henyey supports protocol 24+ only, so prev_version < 10
             // should never be true in production. This is included for
             // completeness.
-            if prev_version < 10 && protocol_version >= 10 {
+            if needs_upgrade_to_version(ProtocolVersion::V10, prev_version, protocol_version) {
                 crate::prepare_liabilities::prepare_liabilities(
                     &self.snapshot,
                     &mut self.delta,
@@ -3610,7 +3608,7 @@ impl<'a> LedgerCloseContext<'a> {
         // this is not an issue in practice.
         let reserve_changes = if let Some(new_reserve) = self.upgrade_ctx.base_reserve_upgrade() {
             let did_reserve_increase = new_reserve > self.prev_header.base_reserve;
-            if protocol_version >= 10 && did_reserve_increase {
+            if protocol_version_starts_from(protocol_version, ProtocolVersion::V10) && did_reserve_increase {
                 let delta_before = self.delta.num_changes();
                 crate::prepare_liabilities::prepare_liabilities(
                     &self.snapshot,
@@ -3714,7 +3712,7 @@ impl<'a> LedgerCloseContext<'a> {
         // 2. After config upgrade that changes ContractCostParamsMemoryBytes
         // It recomputes contract code sizes in-memory and overwrites all window entries.
         let version_upgrade_triggers_state_size =
-            prev_version != protocol_version && protocol_version >= 23;
+            prev_version != protocol_version && protocol_version_starts_from(protocol_version, ProtocolVersion::V23);
         if (config_memory_cost_params_changed
             || version_upgrade_memory_cost_changed
             || version_upgrade_triggers_state_size)
@@ -3747,9 +3745,9 @@ impl<'a> LedgerCloseContext<'a> {
 
             // Update all window entries with the new total size
             // Parity: NetworkConfig.cpp:2165 updateRecomputedSorobanStateSize
-            if henyey_common::protocol::protocol_version_starts_from(
+            if protocol_version_starts_from(
                 protocol_version,
-                henyey_common::protocol::ProtocolVersion::V23,
+                ProtocolVersion::V23,
             ) {
                 let new_size = self.manager.soroban_state.read().total_size();
                 let window_key = stellar_xdr::curr::LedgerKey::ConfigSetting(
@@ -4004,7 +4002,7 @@ impl<'a> LedgerCloseContext<'a> {
         // Parity: In stellar-core, eviction runs after config upgrades (sealLedgerTxnAndStoreInBucketsAndDB),
         // so it reads the post-upgrade StateArchival settings. We use load_state_archival_settings()
         // which checks the delta first (containing any upgrade changes) before the snapshot.
-        let eviction_settings = if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION
+        let eviction_settings = if protocol_version_starts_from(protocol_version, ProtocolVersion::V23)
         {
             tracing::debug!(
                 ledger_seq = self.close_data.ledger_seq,
@@ -4113,7 +4111,7 @@ impl<'a> LedgerCloseContext<'a> {
             let mut eviction_us: u64 = 0;
             let mut evicted_meta_keys: Vec<LedgerKey> = Vec::new();
 
-            if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
+            if protocol_version_starts_from(protocol_version, ProtocolVersion::V23) {
                 let hot_archive_guard = self.manager.hot_archive_bucket_list.read();
                 if hot_archive_guard.is_some() {
                     drop(hot_archive_guard); // Release read lock before write operations
@@ -4520,7 +4518,7 @@ impl<'a> LedgerCloseContext<'a> {
 
             // For Protocol 23+, update hot archive and combine bucket list hashes
             let hot_archive_start = std::time::Instant::now();
-            let final_hash = if protocol_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION {
+            let final_hash = if protocol_version_starts_from(protocol_version, ProtocolVersion::V23) {
                 let mut hot_archive_guard = self.manager.hot_archive_bucket_list.write();
                 if let Some(ref mut hot_archive) = *hot_archive_guard {
                     // Advance hot archive through any skipped ledgers (same as live bucket list)
@@ -4574,9 +4572,10 @@ impl<'a> LedgerCloseContext<'a> {
             let hot_archive_us = hot_archive_start.elapsed().as_micros() as u64;
 
             // Prepare data for background eviction scan (snapshot while we hold the lock)
-            let bg_eviction_data = if protocol_version
-                >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION
-            {
+            let bg_eviction_data = if protocol_version_starts_from(
+                protocol_version,
+                ProtocolVersion::V23,
+            ) {
                 eviction_settings.map(|settings| {
                     let snapshot =
                         BucketListSnapshot::new(&bucket_list, self.prev_header.clone());
@@ -4633,7 +4632,7 @@ impl<'a> LedgerCloseContext<'a> {
         // If protocol upgraded to a new major version, rebuild the module cache.
         // Transactions in THIS ledger ran under prev_version; the NEXT ledger
         // needs a cache matching the new protocol version.
-        if prev_version < 25 && protocol_version >= 25 {
+        if needs_upgrade_to_version(ProtocolVersion::V25, prev_version, protocol_version) {
             self.manager.rebuild_module_cache(protocol_version);
         }
 

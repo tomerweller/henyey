@@ -37,6 +37,7 @@
 //! }
 //! ```
 
+use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -211,7 +212,6 @@ impl UpgradeParameters {
     pub fn from_json(s: &str) -> std::result::Result<Self, serde_json::Error> {
         serde_json::from_str(s)
     }
-
 }
 
 impl fmt::Display for UpgradeParameters {
@@ -533,15 +533,16 @@ pub fn is_valid_for_apply(
             // Flags upgrade requires protocol 18+
             // MASK_LEDGER_HEADER_FLAGS = 0x7 (bits 0-2)
             const MASK_LEDGER_HEADER_FLAGS: u32 = 0x7;
-            current_version >= 18 && (*flags & !MASK_LEDGER_HEADER_FLAGS) == 0
+            protocol_version_starts_from(current_version, ProtocolVersion::V18)
+                && (*flags & !MASK_LEDGER_HEADER_FLAGS) == 0
         }
         LedgerUpgrade::Config(_) => {
             // Config upgrade requires Soroban (protocol 20+)
-            current_version >= 20
+            protocol_version_starts_from(current_version, ProtocolVersion::V20)
         }
         LedgerUpgrade::MaxSorobanTxSetSize(_) => {
             // Soroban tx set size requires protocol 20+
-            current_version >= 20
+            protocol_version_starts_from(current_version, ProtocolVersion::V20)
         }
     };
 
@@ -663,26 +664,38 @@ mod tests {
 
         // Before upgrade time
         let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
-                close_time: 999, protocol_version: 23, base_fee: 100,
-                max_tx_set_size: 1000, base_reserve: 10000000, flags: 0,
-                max_soroban_tx_set_size: None,
-            });
+            close_time: 999,
+            protocol_version: 23,
+            base_fee: 100,
+            max_tx_set_size: 1000,
+            base_reserve: 10000000,
+            flags: 0,
+            max_soroban_tx_set_size: None,
+        });
         assert!(proposals.is_empty());
 
         // At upgrade time, with differences
         let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
-                close_time: 1000, protocol_version: 23, base_fee: 100,
-                max_tx_set_size: 1000, base_reserve: 10000000, flags: 0,
-                max_soroban_tx_set_size: None,
-            });
+            close_time: 1000,
+            protocol_version: 23,
+            base_fee: 100,
+            max_tx_set_size: 1000,
+            base_reserve: 10000000,
+            flags: 0,
+            max_soroban_tx_set_size: None,
+        });
         assert_eq!(proposals.len(), 3);
 
         // At upgrade time, with no differences
         let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
-                close_time: 1000, protocol_version: 24, base_fee: 200,
-                max_tx_set_size: 500, base_reserve: 10000000, flags: 0,
-                max_soroban_tx_set_size: None,
-            });
+            close_time: 1000,
+            protocol_version: 24,
+            base_fee: 200,
+            max_tx_set_size: 500,
+            base_reserve: 10000000,
+            flags: 0,
+            max_soroban_tx_set_size: None,
+        });
         assert!(proposals.is_empty());
     }
 
@@ -904,10 +917,14 @@ mod tests {
 
         // At upgrade time, should emit a Config upgrade
         let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
-                close_time: 1000, protocol_version: 24, base_fee: 100,
-                max_tx_set_size: 1000, base_reserve: 10000000, flags: 0,
-                max_soroban_tx_set_size: None,
-            });
+            close_time: 1000,
+            protocol_version: 24,
+            base_fee: 100,
+            max_tx_set_size: 1000,
+            base_reserve: 10000000,
+            flags: 0,
+            max_soroban_tx_set_size: None,
+        });
         assert_eq!(proposals.len(), 1);
         match &proposals[0] {
             LedgerUpgrade::Config(key) => {
@@ -933,10 +950,14 @@ mod tests {
         let upgrades = Upgrades::new(params);
 
         let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
-                close_time: 1000, protocol_version: 24, base_fee: 100,
-                max_tx_set_size: 1000, base_reserve: 10000000, flags: 0,
-                max_soroban_tx_set_size: None,
-            });
+            close_time: 1000,
+            protocol_version: 24,
+            base_fee: 100,
+            max_tx_set_size: 1000,
+            base_reserve: 10000000,
+            flags: 0,
+            max_soroban_tx_set_size: None,
+        });
         // Should have: Version, BaseFee, Config = 3 upgrades
         assert_eq!(proposals.len(), 3);
         assert!(matches!(proposals[0], LedgerUpgrade::Version(25)));
@@ -955,11 +976,18 @@ mod tests {
 
         let upgrades = Upgrades::new(params);
         let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
-                close_time: 1000, protocol_version: 24, base_fee: 100,
-                max_tx_set_size: 1000, base_reserve: 10000000, flags: 0,
-                max_soroban_tx_set_size: None,
-            });
-        assert!(proposals.is_empty(), "Bad config key should produce no upgrade");
+            close_time: 1000,
+            protocol_version: 24,
+            base_fee: 100,
+            max_tx_set_size: 1000,
+            base_reserve: 10000000,
+            flags: 0,
+            max_soroban_tx_set_size: None,
+        });
+        assert!(
+            proposals.is_empty(),
+            "Bad config key should produce no upgrade"
+        );
     }
 
     #[test]
@@ -976,10 +1004,14 @@ mod tests {
 
         // Before upgrade time, should emit nothing
         let proposals = upgrades.create_upgrades_for(&CurrentLedgerState {
-                close_time: 1000, protocol_version: 24, base_fee: 100,
-                max_tx_set_size: 1000, base_reserve: 10000000, flags: 0,
-                max_soroban_tx_set_size: None,
-            });
+            close_time: 1000,
+            protocol_version: 24,
+            base_fee: 100,
+            max_tx_set_size: 1000,
+            base_reserve: 10000000,
+            flags: 0,
+            max_soroban_tx_set_size: None,
+        });
         assert!(proposals.is_empty());
     }
 }
