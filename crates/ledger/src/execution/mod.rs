@@ -4876,12 +4876,9 @@ mod tests {
         };
 
         // Compute TTL key hash
-        let ttl_key_hash_bytes: [u8; 32] = {
-            let bytes = data_key.to_xdr(Limits::none()).unwrap();
-            Sha256::digest(&bytes).into()
-        };
+        let ttl_key_hash = Hash(Sha256::digest(&data_key.to_xdr(Limits::none()).unwrap()).into());
         let ttl_key = LedgerKey::Ttl(LedgerKeyTtl {
-            key_hash: Hash(ttl_key_hash_bytes),
+            key_hash: ttl_key_hash.clone(),
         });
 
         // --- Populate SharedSorobanState ---
@@ -4890,7 +4887,7 @@ mod tests {
             let mut ims = shared.write();
             // create_contract_data also registers any pending TTL
             ims.create_ttl(
-                &LedgerKeyTtl { key_hash: Hash(ttl_key_hash_bytes) },
+                &LedgerKeyTtl { key_hash: ttl_key_hash.clone() },
                 crate::soroban_state::TtlData::new(200, 100),
             ).unwrap();
             ims.create_contract_data(data_entry.clone()).unwrap();
@@ -5037,17 +5034,14 @@ mod tests {
             ext: LedgerEntryExt::V0,
         };
 
-        let ttl_key_hash_bytes: [u8; 32] = {
-            let bytes = data_key.to_xdr(Limits::none()).unwrap();
-            Sha256::digest(&bytes).into()
-        };
+        let ttl_key_hash = Hash(Sha256::digest(&data_key.to_xdr(Limits::none()).unwrap()).into());
         let ttl_key = LedgerKey::Ttl(LedgerKeyTtl {
-            key_hash: Hash(ttl_key_hash_bytes),
+            key_hash: ttl_key_hash.clone(),
         });
         let ttl_entry = LedgerEntry {
             last_modified_ledger_seq: 90,
             data: LedgerEntryData::Ttl(TtlEntry {
-                key_hash: Hash(ttl_key_hash_bytes),
+                key_hash: ttl_key_hash,
                 live_until_ledger_seq: 500,
             }),
             ext: LedgerEntryExt::V0,
@@ -5132,12 +5126,9 @@ mod tests {
             ext: LedgerEntryExt::V0,
         };
 
-        let ttl_key_hash_bytes: [u8; 32] = {
-            let bytes = data_key.to_xdr(Limits::none()).unwrap();
-            Sha256::digest(&bytes).into()
-        };
+        let ttl_key_hash = Hash(Sha256::digest(&data_key.to_xdr(Limits::none()).unwrap()).into());
         let ttl_key = LedgerKey::Ttl(LedgerKeyTtl {
-            key_hash: Hash(ttl_key_hash_bytes),
+            key_hash: ttl_key_hash.clone(),
         });
 
         // --- Populate IMS with the entry AND its TTL ---
@@ -5145,7 +5136,7 @@ mod tests {
         {
             let mut ims = shared.write();
             ims.create_ttl(
-                &LedgerKeyTtl { key_hash: Hash(ttl_key_hash_bytes) },
+                &LedgerKeyTtl { key_hash: ttl_key_hash },
                 crate::soroban_state::TtlData::new(500, 90),
             ).unwrap();
             ims.create_contract_data(data_entry.clone()).unwrap();

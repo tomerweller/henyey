@@ -55,55 +55,13 @@ use soroban_env_host_p25::e2e_invoke::entry_size_for_rent as entry_size_for_rent
 // After XDR alignment: soroban_env_host_p25::xdr is the same as stellar_xdr::curr.
 // No separate XDR alias or ReadXdr import needed for P25 conversions.
 use stellar_xdr::curr::{
-    ConfigSettingId, ContractCostParams, LedgerEntry, LedgerEntryData, LedgerKey,
+    ConfigSettingId, ContractCostParams, Hash, LedgerEntry, LedgerEntryData, LedgerKey,
     LedgerKeyConfigSetting, LedgerKeyContractCode, LedgerKeyContractData, LedgerKeyTtl, Limits,
     TtlEntry, WriteXdr,
 };
 use tracing::{debug, trace};
 
 use crate::{LedgerError, Result};
-
-/// Get the ConfigSettingId (as i32) from a ConfigSettingEntry.
-fn config_setting_entry_id(entry: &stellar_xdr::curr::ConfigSettingEntry) -> i32 {
-    use stellar_xdr::curr::ConfigSettingEntry;
-    match entry {
-        ConfigSettingEntry::ContractMaxSizeBytes(_) => ConfigSettingId::ContractMaxSizeBytes as i32,
-        ConfigSettingEntry::ContractComputeV0(_) => ConfigSettingId::ContractComputeV0 as i32,
-        ConfigSettingEntry::ContractLedgerCostV0(_) => ConfigSettingId::ContractLedgerCostV0 as i32,
-        ConfigSettingEntry::ContractHistoricalDataV0(_) => {
-            ConfigSettingId::ContractHistoricalDataV0 as i32
-        }
-        ConfigSettingEntry::ContractEventsV0(_) => ConfigSettingId::ContractEventsV0 as i32,
-        ConfigSettingEntry::ContractBandwidthV0(_) => ConfigSettingId::ContractBandwidthV0 as i32,
-        ConfigSettingEntry::ContractCostParamsCpuInstructions(_) => {
-            ConfigSettingId::ContractCostParamsCpuInstructions as i32
-        }
-        ConfigSettingEntry::ContractCostParamsMemoryBytes(_) => {
-            ConfigSettingId::ContractCostParamsMemoryBytes as i32
-        }
-        ConfigSettingEntry::ContractDataKeySizeBytes(_) => {
-            ConfigSettingId::ContractDataKeySizeBytes as i32
-        }
-        ConfigSettingEntry::ContractDataEntrySizeBytes(_) => {
-            ConfigSettingId::ContractDataEntrySizeBytes as i32
-        }
-        ConfigSettingEntry::StateArchival(_) => ConfigSettingId::StateArchival as i32,
-        ConfigSettingEntry::ContractExecutionLanes(_) => {
-            ConfigSettingId::ContractExecutionLanes as i32
-        }
-        ConfigSettingEntry::LiveSorobanStateSizeWindow(_) => {
-            ConfigSettingId::LiveSorobanStateSizeWindow as i32
-        }
-        ConfigSettingEntry::EvictionIterator(_) => ConfigSettingId::EvictionIterator as i32,
-        ConfigSettingEntry::ContractParallelComputeV0(_) => {
-            ConfigSettingId::ContractParallelComputeV0 as i32
-        }
-        ConfigSettingEntry::ContractLedgerCostExtV0(_) => {
-            ConfigSettingId::ContractLedgerCostExtV0 as i32
-        }
-        ConfigSettingEntry::ScpTiming(_) => ConfigSettingId::ScpTiming as i32,
-    }
-}
 
 // convert_ledger_entry_to_p25 has been removed after XDR alignment.
 // The workspace stellar-xdr 25.0.0 and soroban-env-host P25's stellar-xdr 25.0.0
@@ -250,22 +208,22 @@ pub struct InMemorySorobanState {
     ///
     /// Uses the TTL key hash as index to enable lookup by either
     /// CONTRACT_DATA key or TTL key without key duplication.
-    contract_data_entries: HashMap<[u8; 32], ContractDataMapEntry>,
+    contract_data_entries: HashMap<Hash, ContractDataMapEntry>,
 
     /// Contract code entries indexed by TTL key hash.
-    contract_code_entries: HashMap<[u8; 32], ContractCodeMapEntry>,
+    contract_code_entries: HashMap<Hash, ContractCodeMapEntry>,
 
     /// ConfigSetting entries indexed by ConfigSettingId.
     ///
     /// These are cached for fast access during ledger close, avoiding
     /// repeated bucket list lookups for Soroban config (cost params, limits, etc.).
-    config_settings: HashMap<i32, Arc<LedgerEntry>>,
+    config_settings: HashMap<ConfigSettingId, Arc<LedgerEntry>>,
 
     /// Pending TTLs waiting for their entries.
     ///
     /// During initialization, TTL entries may arrive before their corresponding
     /// data/code entries. They're stored here temporarily until adopted.
-    pending_ttls: HashMap<[u8; 32], TtlData>,
+    pending_ttls: HashMap<Hash, TtlData>,
 
     /// Last closed ledger sequence number.
     last_closed_ledger_seq: u32,
@@ -357,24 +315,28 @@ impl InMemorySorobanState {
     }
 
     /// Compute the TTL key hash for a CONTRACT_DATA key.
-    pub fn contract_data_key_hash(key: &LedgerKeyContractData) -> [u8; 32] {
+    pub fn contract_data_key_hash(key: &LedgerKeyContractData) -> Hash {
         // TTL key hash is the SHA-256 of the contract data key.
-        Hash256::hash_xdr(&LedgerKey::ContractData(key.clone()))
-            .map(|h| *h.as_bytes())
-            .unwrap_or([0u8; 32])
+        Hash(
+            Hash256::hash_xdr(&LedgerKey::ContractData(key.clone()))
+                .map(|h| *h.as_bytes())
+                .unwrap_or([0u8; 32]),
+        )
     }
 
     /// Compute the TTL key hash for a CONTRACT_CODE key.
-    pub fn contract_code_key_hash(key: &LedgerKeyContractCode) -> [u8; 32] {
+    pub fn contract_code_key_hash(key: &LedgerKeyContractCode) -> Hash {
         // TTL key hash is the SHA-256 of the contract code key.
-        Hash256::hash_xdr(&LedgerKey::ContractCode(key.clone()))
-            .map(|h| *h.as_bytes())
-            .unwrap_or([0u8; 32])
+        Hash(
+            Hash256::hash_xdr(&LedgerKey::ContractCode(key.clone()))
+                .map(|h| *h.as_bytes())
+                .unwrap_or([0u8; 32]),
+        )
     }
 
     /// Compute the map key from a TTL key.
-    pub fn ttl_key_to_map_key(key: &LedgerKeyTtl) -> [u8; 32] {
-        key.key_hash.0
+    pub fn ttl_key_to_map_key(key: &LedgerKeyTtl) -> Hash {
+        key.key_hash.clone()
     }
 
     /// Get a contract data entry by key.
@@ -408,8 +370,7 @@ impl InMemorySorobanState {
 
     /// Get a ConfigSetting entry by key.
     pub fn get_config_setting(&self, key: &LedgerKeyConfigSetting) -> Option<Arc<LedgerEntry>> {
-        let id = key.config_setting_id as i32;
-        self.config_settings.get(&id).cloned()
+        self.config_settings.get(&key.config_setting_id).cloned()
     }
 
     /// Get TTL data for a key.
@@ -417,17 +378,15 @@ impl InMemorySorobanState {
         match key {
             LedgerKey::ContractData(cd) => self.get_contract_data(cd).map(|e| e.ttl_data),
             LedgerKey::ContractCode(cc) => self.get_contract_code(cc).map(|e| e.ttl_data),
-            LedgerKey::Ttl(ttl) => {
-                let key_hash = ttl.key_hash.0;
-                self.contract_data_entries
-                    .get(&key_hash)
-                    .map(|e| e.ttl_data)
-                    .or_else(|| {
-                        self.contract_code_entries
-                            .get(&key_hash)
-                            .map(|e| e.ttl_data)
-                    })
-            }
+            LedgerKey::Ttl(ttl) => self
+                .contract_data_entries
+                .get(&ttl.key_hash)
+                .map(|e| e.ttl_data)
+                .or_else(|| {
+                    self.contract_code_entries
+                        .get(&ttl.key_hash)
+                        .map(|e| e.ttl_data)
+                }),
             _ => None,
         }
     }
@@ -435,15 +394,13 @@ impl InMemorySorobanState {
     /// Synthesize a TTL entry from stored TTL data.
     fn get_ttl_entry(&self, key: &LedgerKeyTtl) -> Option<Arc<LedgerEntry>> {
         // Look up in both maps
-        let key_hash = key.key_hash.0;
-
         let ttl_data = self
             .contract_data_entries
-            .get(&key_hash)
+            .get(&key.key_hash)
             .map(|e| e.ttl_data)
             .or_else(|| {
                 self.contract_code_entries
-                    .get(&key_hash)
+                    .get(&key.key_hash)
                     .map(|e| e.ttl_data)
             })?;
 
@@ -462,9 +419,8 @@ impl InMemorySorobanState {
 
     /// Check if a TTL exists for a key.
     pub fn has_ttl(&self, key: &LedgerKeyTtl) -> bool {
-        let key_hash = key.key_hash.0;
-        self.contract_data_entries.contains_key(&key_hash)
-            || self.contract_code_entries.contains_key(&key_hash)
+        self.contract_data_entries.contains_key(&key.key_hash)
+            || self.contract_code_entries.contains_key(&key.key_hash)
     }
 
     /// Create a new contract data entry.
@@ -697,10 +653,8 @@ impl InMemorySorobanState {
     /// If the corresponding data/code entry exists and has no TTL yet, stores
     /// the TTL inline. Otherwise, stores in pending_ttls to be adopted later.
     pub fn create_ttl(&mut self, key: &LedgerKeyTtl, ttl_data: TtlData) -> Result<()> {
-        let key_hash = key.key_hash.0;
-
         // Try to update inline in contract data
-        if let Some(entry) = self.contract_data_entries.get_mut(&key_hash) {
+        if let Some(entry) = self.contract_data_entries.get_mut(&key.key_hash) {
             if entry.ttl_data.is_initialized() {
                 return Err(LedgerError::InvalidEntry(
                     "contract data TTL already initialized".into(),
@@ -712,7 +666,7 @@ impl InMemorySorobanState {
         }
 
         // Try to update inline in contract code
-        if let Some(entry) = self.contract_code_entries.get_mut(&key_hash) {
+        if let Some(entry) = self.contract_code_entries.get_mut(&key.key_hash) {
             if entry.ttl_data.is_initialized() {
                 return Err(LedgerError::InvalidEntry(
                     "contract code TTL already initialized".into(),
@@ -724,12 +678,12 @@ impl InMemorySorobanState {
         }
 
         // No entry found, store as pending
-        if self.pending_ttls.contains_key(&key_hash) {
+        if self.pending_ttls.contains_key(&key.key_hash) {
             return Err(LedgerError::InvalidEntry(
                 "pending TTL already exists".into(),
             ));
         }
-        self.pending_ttls.insert(key_hash, ttl_data);
+        self.pending_ttls.insert(key.key_hash.clone(), ttl_data);
         trace!("Stored pending TTL");
         Ok(())
     }
@@ -738,15 +692,13 @@ impl InMemorySorobanState {
     ///
     /// Returns an error if the corresponding data/code entry does not exist.
     pub fn update_ttl(&mut self, key: &LedgerKeyTtl, ttl_data: TtlData) -> Result<()> {
-        let key_hash = key.key_hash.0;
-
-        if let Some(entry) = self.contract_data_entries.get_mut(&key_hash) {
+        if let Some(entry) = self.contract_data_entries.get_mut(&key.key_hash) {
             entry.ttl_data = ttl_data;
             trace!("Updated TTL inline for contract data");
             return Ok(());
         }
 
-        if let Some(entry) = self.contract_code_entries.get_mut(&key_hash) {
+        if let Some(entry) = self.contract_code_entries.get_mut(&key.key_hash) {
             entry.ttl_data = ttl_data;
             trace!("Updated TTL inline for contract code");
             return Ok(());
@@ -758,18 +710,17 @@ impl InMemorySorobanState {
     }
 
     fn ttl_from_entry(&self, entry: &LedgerEntry) -> Result<(LedgerKeyTtl, TtlData)> {
-        let (key_hash, ttl_data) = match &entry.data {
-            LedgerEntryData::Ttl(ttl) => (
-                ttl.key_hash.0,
-                TtlData::new(ttl.live_until_ledger_seq, entry.last_modified_ledger_seq),
-            ),
-            _ => return Err(LedgerError::InvalidEntry("not a TTL entry".into())),
-        };
-
-        let key = LedgerKeyTtl {
-            key_hash: stellar_xdr::curr::Hash(key_hash),
-        };
-        Ok((key, ttl_data))
+        match &entry.data {
+            LedgerEntryData::Ttl(ttl) => {
+                let key = LedgerKeyTtl {
+                    key_hash: ttl.key_hash.clone(),
+                };
+                let ttl_data =
+                    TtlData::new(ttl.live_until_ledger_seq, entry.last_modified_ledger_seq);
+                Ok((key, ttl_data))
+            }
+            _ => Err(LedgerError::InvalidEntry("not a TTL entry".into())),
+        }
     }
 
     /// Process a TTL entry for initialization (create semantics).
@@ -863,7 +814,7 @@ impl InMemorySorobanState {
             // Log which pending TTLs remain for debugging
             for (key_hash, ttl_data) in &self.pending_ttls {
                 tracing::error!(
-                    key_hash = %format!("{:02x?}", &key_hash[..8]),
+                    key_hash = %format!("{:02x?}", &key_hash.0[..8]),
                     live_until = ttl_data.live_until_ledger_seq,
                     "Remaining pending TTL"
                 );
@@ -898,8 +849,8 @@ impl InMemorySorobanState {
             }
             LedgerEntryData::Ttl(_) => self.process_ttl_entry_create(entry),
             LedgerEntryData::ConfigSetting(cs) => {
-                let id = config_setting_entry_id(cs);
-                self.config_settings.insert(id, Arc::new(entry.clone()));
+                self.config_settings
+                    .insert(cs.discriminant(), Arc::new(entry.clone()));
                 Ok(())
             }
             _ => Ok(()), // Ignore non-Soroban entries
@@ -925,8 +876,8 @@ impl InMemorySorobanState {
             }
             LedgerEntryData::Ttl(_) => self.process_ttl_entry_update(entry),
             LedgerEntryData::ConfigSetting(cs) => {
-                let id = config_setting_entry_id(cs);
-                self.config_settings.insert(id, Arc::new(entry.clone()));
+                self.config_settings
+                    .insert(cs.discriminant(), Arc::new(entry.clone()));
                 Ok(())
             }
             _ => Ok(()), // Ignore non-Soroban entries
@@ -944,8 +895,7 @@ impl InMemorySorobanState {
             LedgerKey::ContractCode(cc) => self.delete_contract_code(cc),
             LedgerKey::Ttl(ttl) => {
                 // TTL deletion is handled implicitly when data/code is deleted
-                let key_hash = ttl.key_hash.0;
-                self.pending_ttls.remove(&key_hash);
+                self.pending_ttls.remove(&ttl.key_hash);
                 Ok(())
             }
             _ => Ok(()), // Ignore non-Soroban entries
@@ -1239,9 +1189,7 @@ mod tests {
         let key_hash = InMemorySorobanState::contract_data_key_hash(&key);
 
         // Update TTL
-        let ttl_key = LedgerKeyTtl {
-            key_hash: Hash(key_hash),
-        };
+        let ttl_key = LedgerKeyTtl { key_hash };
         state.update_ttl(&ttl_key, TtlData::new(1000, 100)).unwrap();
 
         // Verify TTL is co-located
@@ -1263,9 +1211,7 @@ mod tests {
             durability: ContractDataDurability::Persistent,
         };
         let key_hash = InMemorySorobanState::contract_data_key_hash(&key);
-        let ttl_key = LedgerKeyTtl {
-            key_hash: Hash(key_hash),
-        };
+        let ttl_key = LedgerKeyTtl { key_hash };
 
         state.create_ttl(&ttl_key, TtlData::new(2000, 200)).unwrap();
         assert_eq!(state.pending_ttls.len(), 1);
@@ -1298,9 +1244,7 @@ mod tests {
             durability: ContractDataDurability::Persistent,
         };
         let key_hash = InMemorySorobanState::contract_data_key_hash(&key);
-        let ttl_key = LedgerKeyTtl {
-            key_hash: Hash(key_hash),
-        };
+        let ttl_key = LedgerKeyTtl { key_hash };
 
         state.update_ttl(&ttl_key, TtlData::new(3000, 300)).unwrap();
 
@@ -1378,7 +1322,7 @@ mod tests {
         let ttl_entry = LedgerEntry {
             last_modified_ledger_seq: 100,
             data: LedgerEntryData::Ttl(TtlEntry {
-                key_hash: Hash(key_hash),
+                key_hash,
                 live_until_ledger_seq: 500000, // Extended TTL
             }),
             ext: LedgerEntryExt::V0,

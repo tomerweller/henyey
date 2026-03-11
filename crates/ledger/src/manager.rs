@@ -2067,7 +2067,7 @@ impl LedgerManager {
 
         let bucket_list = self.bucket_list.read();
         let mut compiled = 0u32;
-        let mut seen_hashes = std::collections::HashSet::<[u8; 32]>::new();
+        let mut seen_hashes = std::collections::HashSet::<stellar_xdr::curr::Hash>::new();
 
         // Scan levels from 0 (newest) to 10 (oldest). Within each level,
         // curr shadows snap. Dead entries shadow live entries at higher levels.
@@ -2078,9 +2078,10 @@ impl LedgerManager {
                         henyey_bucket::BucketEntry::Liveentry(le)
                         | henyey_bucket::BucketEntry::Initentry(le) => {
                             if let LedgerEntryData::ContractCode(ref cc) = le.data {
-                                let hash: [u8; 32] =
+                                let hash = stellar_xdr::curr::Hash(
                                     <sha2::Sha256 as sha2::Digest>::digest(cc.code.as_slice())
-                                        .into();
+                                        .into(),
+                                );
                                 if seen_hashes.insert(hash) {
                                     if new_cache
                                         .add_contract(cc.code.as_slice(), protocol_version)
