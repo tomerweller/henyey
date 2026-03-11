@@ -84,12 +84,18 @@ pub fn execute_change_trust(
             decrement_pool_use_counts(state, source, params)?;
         }
 
-        let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
-            account_id: source.clone(),
-            asset: tl_asset.clone(),
-        });
-        if state.entry_sponsor(&ledger_key).is_some() {
-            state.remove_entry_sponsorship_and_update_counts(&ledger_key, source, multiplier)?;
+        {
+            let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+                account_id: source.clone(),
+                asset: tl_asset.clone(),
+            });
+            if state.entry_sponsor(&ledger_key).is_some() {
+                state.remove_entry_sponsorship_and_update_counts(
+                    &ledger_key,
+                    source,
+                    multiplier,
+                )?;
+            }
         }
 
         // Decrease sub-entries BEFORE deleting trustline.

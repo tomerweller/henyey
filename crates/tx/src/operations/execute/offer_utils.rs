@@ -131,30 +131,23 @@ pub fn cross_offer_v10(
     state: &mut LedgerStateManager,
     context: &LedgerContext,
 ) -> Result<(i64, i64, bool)> {
-    let sheep = offer.buying.clone();
-    let wheat = offer.selling.clone();
     let seller = offer.seller_id.clone();
+    let selling = &offer.selling;
+    let buying = &offer.buying;
 
     // Batch-load seller's account and trustlines in a single bucket list pass.
-    state.ensure_offer_entries_loaded(&seller, &wheat, &sheep)?;
+    state.ensure_offer_entries_loaded(&seller, selling, buying)?;
 
     // Release liabilities FIRST (matches stellar-core exactly).
     // The available balance calculation depends on liabilities being released first.
     let (selling_liab, buying_liab) = offer_liabilities_sell(offer.amount, &offer.price)?;
-    apply_liabilities_delta(
-        &seller,
-        &offer.selling,
-        &offer.buying,
-        -selling_liab,
-        -buying_liab,
-        state,
-    )?;
+    apply_liabilities_delta(&seller, selling, buying, -selling_liab, -buying_liab, state)?;
 
     // Calculate available amounts AFTER liabilities are released.
     let max_wheat_send = offer
         .amount
-        .min(can_sell_at_most(&seller, &wheat, state, context, false)?);
-    let max_sheep_receive = can_buy_at_most(&seller, &sheep, state);
+        .min(can_sell_at_most(&seller, selling, state, context, false)?);
+    let max_sheep_receive = can_buy_at_most(&seller, buying, state);
 
     // Adjust offer amount (stellar-core calls adjustOffer as "preventative measure").
     let adjusted_offer_amount =
@@ -178,10 +171,10 @@ pub fn cross_offer_v10(
 
     // Apply balance changes.
     if num_sheep_send != 0 {
-        apply_balance_delta(&seller, &sheep, num_sheep_send, state)?;
+        apply_balance_delta(&seller, buying, num_sheep_send, state)?;
     }
     if num_wheat_received != 0 {
-        apply_balance_delta(&seller, &wheat, -num_wheat_received, state)?;
+        apply_balance_delta(&seller, selling, -num_wheat_received, state)?;
     }
 
     // Calculate new offer amount and handle offer update/deletion.
@@ -190,8 +183,8 @@ pub fn cross_offer_v10(
         if tentative > 0 {
             // Re-adjust after balance changes.
             let post_wheat_send =
-                tentative.min(can_sell_at_most(&seller, &wheat, state, context, false)?);
-            let post_sheep_receive = can_buy_at_most(&seller, &sheep, state);
+                tentative.min(can_sell_at_most(&seller, selling, state, context, false)?);
+            let post_sheep_receive = can_buy_at_most(&seller, buying, state);
             adjust_offer_amount(offer.price.clone(), post_wheat_send, post_sheep_receive)
                 .map_err(map_exchange_error)?
         } else {
@@ -210,22 +203,15 @@ pub fn cross_offer_v10(
         };
         state.update_offer(updated);
         let (new_selling, new_buying) = offer_liabilities_sell(new_amount, &offer.price)?;
-        apply_liabilities_delta(
-            &seller,
-            &offer.selling,
-            &offer.buying,
-            new_selling,
-            new_buying,
-            state,
-        )?;
+        apply_liabilities_delta(&seller, selling, buying, new_selling, new_buying, state)?;
     }
 
     offer_trail.push(ClaimAtom::OrderBook(ClaimOfferAtom {
         seller_id: seller,
         offer_id: offer.offer_id,
-        asset_sold: wheat,
+        asset_sold: offer.selling.clone(),
         amount_sold: num_wheat_received,
-        asset_bought: sheep,
+        asset_bought: offer.buying.clone(),
         amount_bought: num_sheep_send,
     }));
 

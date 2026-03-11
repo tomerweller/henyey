@@ -793,26 +793,20 @@ impl LedgerStateManager {
             }));
         }
         if !matches!(selling, Asset::Native) {
-            let tl_asset = asset_to_trustline_asset(selling);
-            if !self
-                .trustlines
-                .contains_key(&(seller.clone(), tl_asset.clone()))
-            {
+            let tl_key = (seller.clone(), asset_to_trustline_asset(selling));
+            if !self.trustlines.contains_key(&tl_key) {
                 needed_keys.push(LedgerKey::Trustline(LedgerKeyTrustLine {
-                    account_id: seller.clone(),
-                    asset: tl_asset,
+                    account_id: tl_key.0,
+                    asset: tl_key.1,
                 }));
             }
         }
         if !matches!(buying, Asset::Native) {
-            let tl_asset = asset_to_trustline_asset(buying);
-            if !self
-                .trustlines
-                .contains_key(&(seller.clone(), tl_asset.clone()))
-            {
+            let tl_key = (seller.clone(), asset_to_trustline_asset(buying));
+            if !self.trustlines.contains_key(&tl_key) {
                 needed_keys.push(LedgerKey::Trustline(LedgerKeyTrustLine {
-                    account_id: seller.clone(),
-                    asset: tl_asset,
+                    account_id: tl_key.0,
+                    asset: tl_key.1,
                 }));
             }
         }
@@ -872,17 +866,14 @@ impl LedgerStateManager {
         account_id: &AccountId,
         asset: &Asset,
     ) -> Result<bool> {
-        let tl_asset = asset_to_trustline_asset(asset);
-        if self
-            .trustlines
-            .contains_key(&(account_id.clone(), tl_asset.clone()))
-        {
+        let tl_key = (account_id.clone(), asset_to_trustline_asset(asset));
+        if self.trustlines.contains_key(&tl_key) {
             return Ok(true);
         }
         if let Some(loader) = self.entry_loader.take() {
             let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
-                account_id: account_id.clone(),
-                asset: tl_asset,
+                account_id: tl_key.0,
+                asset: tl_key.1,
             });
             let result = loader(&ledger_key);
             self.entry_loader = Some(loader); // restore before handling result
@@ -1176,11 +1167,21 @@ impl LedgerStateManager {
         let ttl_entry_size = 16;
 
         // Core entry maps
-        let accounts = hashmap_heap_bytes(self.accounts.capacity(), account_id_size, account_entry_size);
-        let trustlines = hashmap_heap_bytes(self.trustlines.capacity(), trustline_key_size, trustline_entry_size);
+        let accounts = hashmap_heap_bytes(
+            self.accounts.capacity(),
+            account_id_size,
+            account_entry_size,
+        );
+        let trustlines = hashmap_heap_bytes(
+            self.trustlines.capacity(),
+            trustline_key_size,
+            trustline_entry_size,
+        );
         // Offers now live in the shared OfferStore; no local offer map.
-        let ttl_entries = hashmap_heap_bytes(self.ttl_entries.capacity(), hash_size, ttl_entry_size);
-        let ttl_snapshot = hashmap_heap_bytes(self.ttl_bucket_list_snapshot.capacity(), hash_size, 4);
+        let ttl_entries =
+            hashmap_heap_bytes(self.ttl_entries.capacity(), hash_size, ttl_entry_size);
+        let ttl_snapshot =
+            hashmap_heap_bytes(self.ttl_bucket_list_snapshot.capacity(), hash_size, 4);
 
         // EntryStore-based maps
         let data_entries = self.data_entries.estimate_heap_bytes(100, 200);
@@ -1190,19 +1191,51 @@ impl LedgerStateManager {
         let liquidity_pools = self.liquidity_pools.estimate_heap_bytes(hash_size, 300);
 
         // Sponsorship maps (non-offer only; offer metadata is in OfferStore)
-        let entry_sponsorships = hashmap_heap_bytes(self.entry_sponsorships.capacity(), ledger_key_size, account_id_size);
-        let entry_sponsorship_ext = hashset_heap_bytes(self.entry_sponsorship_ext.capacity(), ledger_key_size);
-        let entry_last_modified = hashmap_heap_bytes(self.entry_last_modified.capacity(), ledger_key_size, 4);
+        let entry_sponsorships = hashmap_heap_bytes(
+            self.entry_sponsorships.capacity(),
+            ledger_key_size,
+            account_id_size,
+        );
+        let entry_sponsorship_ext =
+            hashset_heap_bytes(self.entry_sponsorship_ext.capacity(), ledger_key_size);
+        let entry_last_modified =
+            hashmap_heap_bytes(self.entry_last_modified.capacity(), ledger_key_size, 4);
 
         // Snapshot maps (typically empty between TXs)
-        let op_entry_snapshots = hashmap_heap_bytes(self.op_entry_snapshots.capacity(), ledger_key_size, 200);
-        let account_snapshots = hashmap_heap_bytes(self.account_snapshots.capacity(), account_id_size, account_entry_size);
-        let trustline_snapshots = hashmap_heap_bytes(self.trustlines.capacity(), trustline_key_size, trustline_entry_size);
-        let offer_snapshots = hashmap_heap_bytes(self.offer_snapshots.capacity(), offer_key_size, offer_entry_size + 48);
-        let ttl_snapshots = hashmap_heap_bytes(self.ttl_snapshots.capacity(), hash_size, ttl_entry_size);
-        let sponsorship_snapshots = hashmap_heap_bytes(self.entry_sponsorship_snapshots.capacity(), ledger_key_size, account_id_size);
-        let ext_snapshots = hashmap_heap_bytes(self.entry_sponsorship_ext_snapshots.capacity(), ledger_key_size, 1);
-        let lm_snapshots = hashmap_heap_bytes(self.entry_last_modified_snapshots.capacity(), ledger_key_size, 4);
+        let op_entry_snapshots =
+            hashmap_heap_bytes(self.op_entry_snapshots.capacity(), ledger_key_size, 200);
+        let account_snapshots = hashmap_heap_bytes(
+            self.account_snapshots.capacity(),
+            account_id_size,
+            account_entry_size,
+        );
+        let trustline_snapshots = hashmap_heap_bytes(
+            self.trustlines.capacity(),
+            trustline_key_size,
+            trustline_entry_size,
+        );
+        let offer_snapshots = hashmap_heap_bytes(
+            self.offer_snapshots.capacity(),
+            offer_key_size,
+            offer_entry_size + 48,
+        );
+        let ttl_snapshots =
+            hashmap_heap_bytes(self.ttl_snapshots.capacity(), hash_size, ttl_entry_size);
+        let sponsorship_snapshots = hashmap_heap_bytes(
+            self.entry_sponsorship_snapshots.capacity(),
+            ledger_key_size,
+            account_id_size,
+        );
+        let ext_snapshots = hashmap_heap_bytes(
+            self.entry_sponsorship_ext_snapshots.capacity(),
+            ledger_key_size,
+            1,
+        );
+        let lm_snapshots = hashmap_heap_bytes(
+            self.entry_last_modified_snapshots.capacity(),
+            ledger_key_size,
+            4,
+        );
 
         // Tracking vecs and sets
         let modified_accounts = vec_heap_bytes(self.modified_accounts.capacity(), account_id_size);
@@ -1226,14 +1259,37 @@ impl LedgerStateManager {
         // Offer-related bytes are now in OfferStore (reported separately by LedgerManager)
         let offer_bytes = 0;
 
-        let total = accounts + trustlines + ttl_entries + ttl_snapshot
-            + data_entries + contract_data + contract_code + claimable_balances + liquidity_pools
-            + entry_sponsorships + entry_sponsorship_ext + entry_last_modified
-            + op_entry_snapshots + account_snapshots + trustline_snapshots + offer_snapshots
-            + ttl_snapshots + sponsorship_snapshots + ext_snapshots + lm_snapshots
-            + modified_accounts + modified_trustlines + modified_offers + modified_ttl
-            + created_accounts + created_trustlines + created_offers + created_ttl + deleted_ttl
-            + deferred + max_seq;
+        let total = accounts
+            + trustlines
+            + ttl_entries
+            + ttl_snapshot
+            + data_entries
+            + contract_data
+            + contract_code
+            + claimable_balances
+            + liquidity_pools
+            + entry_sponsorships
+            + entry_sponsorship_ext
+            + entry_last_modified
+            + op_entry_snapshots
+            + account_snapshots
+            + trustline_snapshots
+            + offer_snapshots
+            + ttl_snapshots
+            + sponsorship_snapshots
+            + ext_snapshots
+            + lm_snapshots
+            + modified_accounts
+            + modified_trustlines
+            + modified_offers
+            + modified_ttl
+            + created_accounts
+            + created_trustlines
+            + created_offers
+            + created_ttl
+            + deleted_ttl
+            + deferred
+            + max_seq;
 
         (total, offer_bytes)
     }
@@ -1485,19 +1541,11 @@ impl LedgerStateManager {
     /// Rollback offer snapshots created since the savepoint.
     /// Restores full OfferRecords (including metadata) to the shared OfferStore.
     fn rollback_offer_snapshots(&mut self, sp: &Savepoint) {
-        let new_offer_keys: Vec<_> = self
+        let new_offer_snapshots: Vec<_> = self
             .offer_snapshots
-            .keys()
-            .filter(|k| !sp.offer_snapshots.contains_key(k))
-            .cloned()
-            .collect();
-        let new_offer_snapshots: Vec<_> = new_offer_keys
-            .into_iter()
-            .filter_map(|key| {
-                self.offer_snapshots
-                    .get(&key)
-                    .map(|snap| (key, snap.clone()))
-            })
+            .iter()
+            .filter(|(k, _)| !sp.offer_snapshots.contains_key(k))
+            .map(|(key, snap)| (key.clone(), snap.clone()))
             .collect();
         let mut store = self.offer_store_lock();
         for (key, snapshot) in new_offer_snapshots {
@@ -1733,7 +1781,7 @@ impl LedgerStateManager {
                         } else {
                             self.account_to_ledger_entry(snapshot_entry)
                         };
-                        self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
+                        self.set_last_modified_key(ledger_key, self.ledger_seq);
                         let post_state = self.account_to_ledger_entry(&entry);
                         self.delta.record_update(pre_state, post_state);
                         // Do NOT update account_snapshots here. The original pre-tx

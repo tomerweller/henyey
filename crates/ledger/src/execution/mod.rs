@@ -1321,7 +1321,7 @@ impl TransactionExecutor {
                 // Cache the computed hash for reuse in validation/execution.
                 ttl_key_cache.insert(key.clone(), key_hash.clone());
                 let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
-                    key_hash: key_hash.clone(),
+                    key_hash,
                 });
 
                 let entry_in_state = self.state.get_entry(key).is_some();
@@ -2288,7 +2288,7 @@ impl TransactionExecutor {
         // Use the pre-modification snapshot for STATE entry via state_overrides.
         let mut seq_state_overrides = HashMap::new();
         if let Some(entry) = seq_state_override {
-            seq_state_overrides.insert(inner_source_key.clone(), entry);
+            seq_state_overrides.insert(inner_source_key, entry);
         }
         let seq_changes = build_entry_changes_with_state_overrides(
             &self.state,
@@ -3476,7 +3476,7 @@ impl TransactionExecutor {
                         let pool_id = PoolId(stellar_xdr::curr::Hash(Sha256::digest(&xdr).into()));
                         let stellar_xdr::curr::LiquidityPoolParameters::LiquidityPoolConstantProduct(cp) = params;
                         let mut keys = vec![LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
-                            liquidity_pool_id: pool_id.clone(),
+                            liquidity_pool_id: pool_id,
                         })];
                         if let Some(tl_asset) = asset_to_trustline_asset(&cp.asset_a) {
                             keys.push(make_trustline_key(&op_source, &tl_asset));

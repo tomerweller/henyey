@@ -349,7 +349,8 @@ fn merge_level_results(
             }
             match &entry.data {
                 LedgerEntryData::Offer(ref offer) => {
-                    mem_offers.insert(offer.offer_id, entry.clone());
+                    let offer_id = offer.offer_id;
+                    mem_offers.insert(offer_id, entry);
                     offer_count += 1;
                 }
                 LedgerEntryData::Trustline(ref tl) => {
@@ -530,7 +531,8 @@ fn scan_and_merge(
                     }
                     match &entry.data {
                         LedgerEntryData::Offer(ref offer) => {
-                            mem_offers.insert(offer.offer_id, entry.clone());
+                            let offer_id = offer.offer_id;
+                            mem_offers.insert(offer_id, entry);
                             offer_count += 1;
                         }
                         LedgerEntryData::Trustline(ref tl) => {
@@ -1520,10 +1522,10 @@ impl LedgerManager {
             );
 
             // Debug: Log header details to help diagnose hash mismatch
-            let skip_list_0 = Hash256::from(state.header.skip_list[0].clone()).to_hex();
-            let skip_list_1 = Hash256::from(state.header.skip_list[1].clone()).to_hex();
-            let skip_list_2 = Hash256::from(state.header.skip_list[2].clone()).to_hex();
-            let skip_list_3 = Hash256::from(state.header.skip_list[3].clone()).to_hex();
+            let skip_list_0 = Hash256::from_bytes(state.header.skip_list[0].0).to_hex();
+            let skip_list_1 = Hash256::from_bytes(state.header.skip_list[1].0).to_hex();
+            let skip_list_2 = Hash256::from_bytes(state.header.skip_list[2].0).to_hex();
+            let skip_list_3 = Hash256::from_bytes(state.header.skip_list[3].0).to_hex();
             tracing::error!(
                 current_seq = state.header.ledger_seq,
                 close_seq = close_data.ledger_seq,
@@ -3412,7 +3414,7 @@ impl<'a> LedgerCloseContext<'a> {
         let (mut agg_validation_us, mut agg_fee_seq_us, mut agg_footprint_us, mut agg_ops_us, mut agg_meta_build_us) = (0u64, 0u64, 0u64, 0u64, 0u64);
         for (i, result) in tx_set_result.results.iter().enumerate() {
             let hash_hex = if i < self.tx_results.len() {
-                Hash256::from(self.tx_results[i].transaction_hash.clone()).to_hex()[..16].to_string()
+                Hash256::from_bytes(self.tx_results[i].transaction_hash.0).to_hex()[..16].to_string()
             } else {
                 String::new()
             };
@@ -3680,8 +3682,8 @@ impl<'a> LedgerCloseContext<'a> {
         // Build UpgradeEntryMeta for each upgrade.
         // Parity: LedgerManagerImpl.cpp:1660-1673
         let mut upgrades_meta = Vec::new();
-        for upgrade in &self.close_data.upgrades {
-            let changes = match upgrade {
+        for upgrade in std::mem::take(&mut self.close_data.upgrades) {
+            let changes = match &upgrade {
                 LedgerUpgrade::Version(_) => version_changes.clone(),
                 LedgerUpgrade::Config(key) => {
                     let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
@@ -3694,7 +3696,7 @@ impl<'a> LedgerCloseContext<'a> {
                 _ => LedgerEntryChanges(VecM::default()),
             };
             upgrades_meta.push(UpgradeEntryMeta {
-                upgrade: upgrade.clone(),
+                upgrade,
                 changes,
             });
         }
@@ -3809,7 +3811,7 @@ impl<'a> LedgerCloseContext<'a> {
                         ),
                         ext: stellar_xdr::curr::LedgerEntryExt::V0,
                     };
-                    self.delta.record_update(prev.clone(), new_window_entry)?;
+                    self.delta.record_update(prev, new_window_entry)?;
                     tracing::info!(
                         ledger_seq = self.close_data.ledger_seq,
                         new_size = new_size,
@@ -4229,17 +4231,7 @@ impl<'a> LedgerCloseContext<'a> {
                     dead_entries.extend(resolved.evicted_keys);
                     archived_entries = resolved.archived_entries;
 
-                    // Add EvictionIterator update to live entries
-                    let eviction_iter_entry = LedgerEntry {
-                        last_modified_ledger_seq: self.close_data.ledger_seq,
-                        data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(
-                            resolved.end_iterator.clone(),
-                        )),
-                        ext: LedgerEntryExt::V0,
-                    };
-
-                    live_entries.push(eviction_iter_entry);
-
+                    // Log before moving end_iterator into the entry
                     tracing::debug!(
                         ledger_seq = self.close_data.ledger_seq,
                         bytes_scanned = bytes_scanned,
@@ -4248,6 +4240,17 @@ impl<'a> LedgerCloseContext<'a> {
                         offset = resolved.end_iterator.bucket_file_offset,
                         "Added EvictionIterator entry to live entries"
                     );
+
+                    // Add EvictionIterator update to live entries
+                    let eviction_iter_entry = LedgerEntry {
+                        last_modified_ledger_seq: self.close_data.ledger_seq,
+                        data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(
+                            resolved.end_iterator,
+                        )),
+                        ext: LedgerEntryExt::V0,
+                    };
+
+                    live_entries.push(eviction_iter_entry);
                 }
             }
 
@@ -4529,8 +4532,8 @@ impl<'a> LedgerCloseContext<'a> {
                     hot_archive.add_batch(
                         self.close_data.ledger_seq,
                         protocol_version,
-                        archived_entries.clone(),
-                        self.hot_archive_restored_keys.clone(),
+                        archived_entries,
+                        std::mem::take(&mut self.hot_archive_restored_keys),
                     )?;
 
                     use sha2::{Digest, Sha256};
@@ -4653,10 +4656,10 @@ impl<'a> LedgerCloseContext<'a> {
             upgrades_count = new_header.scp_value.upgrades.len(),
             stellar_value_ext = %stellar_value_ext_desc,
             prev_header_hash = %self.prev_header_hash.to_hex(),
-            skip_list_0 = %Hash256::from(new_header.skip_list[0].clone()).to_hex(),
-            skip_list_1 = %Hash256::from(new_header.skip_list[1].clone()).to_hex(),
-            skip_list_2 = %Hash256::from(new_header.skip_list[2].clone()).to_hex(),
-            skip_list_3 = %Hash256::from(new_header.skip_list[3].clone()).to_hex(),
+            skip_list_0 = %Hash256::from_bytes(new_header.skip_list[0].0).to_hex(),
+            skip_list_1 = %Hash256::from_bytes(new_header.skip_list[1].0).to_hex(),
+            skip_list_2 = %Hash256::from_bytes(new_header.skip_list[2].0).to_hex(),
+            skip_list_3 = %Hash256::from_bytes(new_header.skip_list[3].0).to_hex(),
             id_pool = new_header.id_pool,
             inflation_seq = new_header.inflation_seq,
             base_fee = new_header.base_fee,
