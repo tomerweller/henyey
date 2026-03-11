@@ -59,7 +59,7 @@ impl App {
         for envelope in &scp_envelopes {
             if let Some(hash) = Self::scp_quorum_set_hash(&envelope.statement) {
                 let hash256 = Hash256::from_bytes(hash.0);
-                if let Some(qset) = self.herder.get_quorum_set_by_hash(hash256.as_bytes()) {
+                if let Some(qset) = self.herder.get_quorum_set_by_hash(&hash256) {
                     scp_quorum_sets.push((hash256, qset));
                 } else {
                     tracing::debug!(hash = %hash256.to_hex(), "Missing quorum set for SCP history");

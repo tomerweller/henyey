@@ -562,7 +562,7 @@ impl Herder {
     }
 
     /// Get a quorum set by hash if available.
-    pub fn get_quorum_set_by_hash(&self, hash: &[u8; 32]) -> Option<ScpQuorumSet> {
+    pub fn get_quorum_set_by_hash(&self, hash: &Hash256) -> Option<ScpQuorumSet> {
         self.scp_driver.get_quorum_set_by_hash(hash)
     }
 

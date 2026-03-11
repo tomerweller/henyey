@@ -473,7 +473,7 @@ impl App {
             return;
         };
 
-        let req = requested_hash.0;
+        let req = henyey_common::Hash256::from_bytes(requested_hash.0);
         if let Some(qs) = self.herder.get_quorum_set_by_hash(&req) {
             if let Err(e) = overlay.try_send_to(peer_id, StellarMessage::ScpQuorumset(qs)) {
                 tracing::debug!(peer = %peer_id, error = %e, "Failed to send quorum set");
@@ -560,7 +560,7 @@ impl App {
 
         let mut qsets = Vec::new();
         for hash in hashes {
-            match self.herder.get_quorum_set_by_hash(hash.as_bytes()) {
+            match self.herder.get_quorum_set_by_hash(&hash) {
                 Some(qset) => qsets.push(qset),
                 None => {
                     tracing::debug!(hash = %hash.to_hex(), "Missing quorum set for SCP history entry");

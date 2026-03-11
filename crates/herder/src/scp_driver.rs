@@ -205,7 +205,7 @@ pub struct ScpDriver {
     /// Quorum sets by node ID (key is 32-byte public key).
     quorum_sets: DashMap<[u8; 32], ScpQuorumSet>,
     /// Quorum sets by quorum set hash.
-    quorum_sets_by_hash: DashMap<[u8; 32], ScpQuorumSet>,
+    quorum_sets_by_hash: DashMap<Hash256, ScpQuorumSet>,
     /// Our local quorum set.
     local_quorum_set: RwLock<Option<ScpQuorumSet>>,
     /// Ledger manager for network configuration lookups.
@@ -228,7 +228,7 @@ impl ScpDriver {
 
         if let Some(ref quorum_set) = local_quorum_set {
             let hash = hash_quorum_set(quorum_set);
-            quorum_sets_by_hash.insert(hash.0, quorum_set.clone());
+            quorum_sets_by_hash.insert(hash, quorum_set.clone());
             quorum_sets.insert(*config.node_id.as_bytes(), quorum_set.clone());
         }
         Self {
@@ -359,7 +359,7 @@ impl ScpDriver {
     pub fn request_quorum_set(&self, hash: Hash256, node_id: NodeId) -> bool {
         // If we already have this quorum set, store the association with this node_id
         // Clone the quorum set before dropping the lock to avoid deadlock
-        let existing_qs = self.quorum_sets_by_hash.get(&hash.0).map(|qs| qs.clone());
+        let existing_qs = self.quorum_sets_by_hash.get(&hash).map(|qs| qs.clone());
         if let Some(qs) = existing_qs {
             trace!(%hash, node_id = ?node_id, "Associating existing quorum set with node");
             self.store_quorum_set(&node_id, qs);
@@ -1680,11 +1680,10 @@ impl ScpDriver {
         *self.local_quorum_set.write() = Some(quorum_set);
         if let Some(local) = self.local_quorum_set.read().clone() {
             let hash = hash_quorum_set(&local);
-            self.quorum_sets_by_hash.insert(hash.0, local.clone());
+            self.quorum_sets_by_hash.insert(hash, local.clone());
             self.quorum_sets
                 .insert(*self.config.node_id.as_bytes(), local);
-            self.pending_quorum_sets
-                .remove(&Hash256::from_bytes(hash.0));
+            self.pending_quorum_sets.remove(&hash);
         }
     }
 
@@ -1695,9 +1694,8 @@ impl ScpDriver {
         };
         let hash = hash_quorum_set(&quorum_set);
         self.quorum_sets.insert(key, quorum_set.clone());
-        self.quorum_sets_by_hash.insert(hash.0, quorum_set);
-        self.pending_quorum_sets
-            .remove(&Hash256::from_bytes(hash.0));
+        self.quorum_sets_by_hash.insert(hash, quorum_set);
+        self.pending_quorum_sets.remove(&hash);
     }
 
     /// Get a quorum set for a node.
@@ -1716,13 +1714,13 @@ impl ScpDriver {
     }
 
     /// Get a quorum set by its hash.
-    pub fn get_quorum_set_by_hash(&self, hash: &[u8; 32]) -> Option<ScpQuorumSet> {
+    pub fn get_quorum_set_by_hash(&self, hash: &Hash256) -> Option<ScpQuorumSet> {
         self.quorum_sets_by_hash.get(hash).map(|v| v.clone())
     }
 
     /// Whether we already have a quorum set with the given hash.
     pub fn has_quorum_set_hash(&self, hash: &Hash256) -> bool {
-        self.quorum_sets_by_hash.contains_key(&hash.0)
+        self.quorum_sets_by_hash.contains_key(hash)
     }
 
     /// Get our node ID.
@@ -2096,7 +2094,7 @@ impl SCPDriver for HerderScpCallback {
     }
 
     fn get_quorum_set_by_hash(&self, hash: &henyey_common::Hash256) -> Option<ScpQuorumSet> {
-        self.driver.get_quorum_set_by_hash(hash.as_bytes())
+        self.driver.get_quorum_set_by_hash(hash)
     }
 
     fn nominating_value(&self, _slot_index: u64, _value: &Value) {
