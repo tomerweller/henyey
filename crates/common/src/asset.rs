@@ -16,7 +16,7 @@
 
 use stellar_xdr::curr::{
     AccountId, Asset, AssetCode12, AssetCode4, BucketEntry, ChangeTrustAsset,
-    HotArchiveBucketEntry, LedgerEntry, LedgerKey, TrustLineAsset,
+    HotArchiveBucketEntry, LedgerKey, TrustLineAsset,
 };
 
 use crate::protocol::{protocol_version_is_before, protocol_version_starts_from, ProtocolVersion};
@@ -374,7 +374,7 @@ pub fn add_balance(balance: i64, delta: i64, max_balance: i64) -> Option<i64> {
 /// Panics for METAENTRY entries.
 pub fn get_hot_archive_bucket_ledger_key(be: &HotArchiveBucketEntry) -> LedgerKey {
     match be {
-        HotArchiveBucketEntry::Archived(entry) => ledger_entry_key(entry),
+        HotArchiveBucketEntry::Archived(entry) => crate::entry_to_key(entry),
         HotArchiveBucketEntry::Live(key) => key.clone(),
         HotArchiveBucketEntry::Metaentry(_) => {
             panic!("Tried to get key for METAENTRY")
@@ -389,66 +389,11 @@ pub fn get_hot_archive_bucket_ledger_key(be: &HotArchiveBucketEntry) -> LedgerKe
 /// Panics for METAENTRY entries.
 pub fn get_bucket_ledger_key(be: &BucketEntry) -> LedgerKey {
     match be {
-        BucketEntry::Liveentry(entry) | BucketEntry::Initentry(entry) => ledger_entry_key(entry),
+        BucketEntry::Liveentry(entry) | BucketEntry::Initentry(entry) => crate::entry_to_key(entry),
         BucketEntry::Deadentry(key) => key.clone(),
         BucketEntry::Metaentry(_) => {
             panic!("Tried to get key for METAENTRY")
         }
-    }
-}
-
-/// Extract the ledger key from a ledger entry.
-pub fn ledger_entry_key(entry: &LedgerEntry) -> LedgerKey {
-    use stellar_xdr::curr::LedgerEntryData;
-
-    match &entry.data {
-        LedgerEntryData::Account(a) => LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-            account_id: a.account_id.clone(),
-        }),
-        LedgerEntryData::Trustline(t) => {
-            LedgerKey::Trustline(stellar_xdr::curr::LedgerKeyTrustLine {
-                account_id: t.account_id.clone(),
-                asset: t.asset.clone(),
-            })
-        }
-        LedgerEntryData::Offer(o) => LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
-            seller_id: o.seller_id.clone(),
-            offer_id: o.offer_id,
-        }),
-        LedgerEntryData::Data(d) => LedgerKey::Data(stellar_xdr::curr::LedgerKeyData {
-            account_id: d.account_id.clone(),
-            data_name: d.data_name.clone(),
-        }),
-        LedgerEntryData::ClaimableBalance(cb) => {
-            LedgerKey::ClaimableBalance(stellar_xdr::curr::LedgerKeyClaimableBalance {
-                balance_id: cb.balance_id.clone(),
-            })
-        }
-        LedgerEntryData::LiquidityPool(lp) => {
-            LedgerKey::LiquidityPool(stellar_xdr::curr::LedgerKeyLiquidityPool {
-                liquidity_pool_id: lp.liquidity_pool_id.clone(),
-            })
-        }
-        LedgerEntryData::ContractData(cd) => {
-            LedgerKey::ContractData(stellar_xdr::curr::LedgerKeyContractData {
-                contract: cd.contract.clone(),
-                key: cd.key.clone(),
-                durability: cd.durability,
-            })
-        }
-        LedgerEntryData::ContractCode(cc) => {
-            LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
-                hash: cc.hash.clone(),
-            })
-        }
-        LedgerEntryData::ConfigSetting(cs) => {
-            LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
-                config_setting_id: cs.discriminant(),
-            })
-        }
-        LedgerEntryData::Ttl(t) => LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
-            key_hash: t.key_hash.clone(),
-        }),
     }
 }
 

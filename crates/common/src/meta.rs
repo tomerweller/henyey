@@ -31,7 +31,7 @@
 //! // meta is now in canonical sorted order
 //! ```
 
-use crate::asset::ledger_entry_key;
+use crate::types::entry_to_key;
 use crate::Hash256;
 use stellar_xdr::curr::{
     LedgerEntryChange, LedgerEntryChanges, LedgerKey, Limits, TransactionMeta, WriteXdr,
@@ -43,7 +43,7 @@ fn change_key(change: &LedgerEntryChange) -> LedgerKey {
         LedgerEntryChange::State(entry)
         | LedgerEntryChange::Created(entry)
         | LedgerEntryChange::Updated(entry)
-        | LedgerEntryChange::Restored(entry) => ledger_entry_key(entry),
+        | LedgerEntryChange::Restored(entry) => entry_to_key(entry),
         LedgerEntryChange::Removed(key) => key.clone(),
     }
 }
