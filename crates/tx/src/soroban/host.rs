@@ -1811,7 +1811,8 @@ fn execute_host_function_p25(
                 .ttl_change
                 .as_ref()
                 .map(|ttl| {
-                    let key_hash_bytes: [u8; 32] = ttl.key_hash.as_slice().try_into().unwrap_or([0u8; 32]);
+                    debug_assert_eq!(ttl.key_hash.len(), 32, "host key_hash should always be SHA-256 (32 bytes)");
+                    let key_hash_bytes: [u8; 32] = ttl.key_hash.as_slice().try_into().expect("host key_hash must be 32 bytes (SHA-256)");
                     let key_hash = stellar_xdr::curr::Hash(key_hash_bytes);
                     let ledger_start_ttl = state.get_ttl_at_ledger_start(&key_hash).unwrap_or(0);
                     ttl.new_live_until_ledger > ledger_start_ttl
