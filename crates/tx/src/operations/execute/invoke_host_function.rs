@@ -124,13 +124,27 @@ fn validate_footprint_entry_sizes(
 
     // Check all read-only footprint entries
     for key in soroban_data.resources.footprint.read_only.iter() {
-        if !validate_footprint_entry(state, key, current_ledger, max_contract_size, max_data_entry_size, ttl_key_cache) {
+        if !validate_footprint_entry(
+            state,
+            key,
+            current_ledger,
+            max_contract_size,
+            max_data_entry_size,
+            ttl_key_cache,
+        ) {
             return false;
         }
     }
     // Check all read-write footprint entries
     for key in soroban_data.resources.footprint.read_write.iter() {
-        if !validate_footprint_entry(state, key, current_ledger, max_contract_size, max_data_entry_size, ttl_key_cache) {
+        if !validate_footprint_entry(
+            state,
+            key,
+            current_ledger,
+            max_contract_size,
+            max_data_entry_size,
+            ttl_key_cache,
+        ) {
             return false;
         }
     }
@@ -301,7 +315,13 @@ fn execute_contract_invocation(
         )));
     }
 
-    if disk_read_bytes_exceeded(state, soroban_data, context.protocol_version, context.sequence, ttl_key_cache) {
+    if disk_read_bytes_exceeded(
+        state,
+        soroban_data,
+        context.protocol_version,
+        context.sequence,
+        ttl_key_cache,
+    ) {
         return Ok(OperationExecutionResult::new(make_result(
             InvokeHostFunctionResultCode::ResourceLimitExceeded,
             Hash([0u8; 32]),
@@ -311,7 +331,13 @@ fn execute_contract_invocation(
     // Validate all footprint entries against network config size limits.
     // This matches stellar-core's addReads() which calls validateContractLedgerEntry()
     // for every footprint entry BEFORE running the host.
-    if !validate_footprint_entry_sizes(state, soroban_data, soroban_config, context.sequence, ttl_key_cache) {
+    if !validate_footprint_entry_sizes(
+        state,
+        soroban_data,
+        soroban_config,
+        context.sequence,
+        ttl_key_cache,
+    ) {
         return Ok(OperationExecutionResult::new(make_result(
             InvokeHostFunctionResultCode::ResourceLimitExceeded,
             Hash([0u8; 32]),

@@ -45,14 +45,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use henyey_bucket::{
     BucketEntry, BucketEntryExt, BucketList, BucketListSnapshot, BucketMergeMap, EvictionIterator,
-    EvictionIteratorExt, EvictionResult, HotArchiveBucketList, StateArchivalSettings,
+    EvictionIteratorExt, EvictionResult, HotArchiveBucketList,
 };
 use henyey_common::{BucketListDbConfig, Hash256, NetworkId};
 use henyey_common::protocol::{
     needs_upgrade_to_version, protocol_version_starts_from, ProtocolVersion,
 };
 use henyey_tx::soroban::PersistentModuleCache;
-use henyey_tx::state::asset_to_trustline_asset;
+use henyey_common::asset::asset_to_trustline_asset;
 use henyey_tx::{ClassicEventConfig, LedgerContext, TxEventManager};
 use stellar_xdr::curr::{
     AccountId, BucketListType, ConfigSettingEntry, ConfigSettingId,
@@ -60,9 +60,9 @@ use stellar_xdr::curr::{
     LedgerCloseMeta, LedgerCloseMetaExt, LedgerCloseMetaExtV1, LedgerCloseMetaV2, LedgerEntry,
     LedgerEntryData, LedgerEntryExt, LedgerHeader, LedgerHeaderHistoryEntry,
     LedgerHeaderHistoryEntryExt, LedgerKey, LedgerKeyConfigSetting, PoolId,
-    TransactionEventStage, TransactionMeta, TransactionPhase, TransactionResultMetaV1,
-    TransactionSetV1, TrustLineAsset, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
-    UpgradeEntryMeta, VecM,
+    StateArchivalSettings, TransactionEventStage, TransactionMeta, TransactionPhase,
+    TransactionResultMetaV1, TransactionSetV1, TrustLineAsset, TxSetComponent,
+    TxSetComponentTxsMaybeDiscountedFee, UpgradeEntryMeta, VecM,
 };
 use tracing::{debug, info};
 
@@ -1922,7 +1922,7 @@ impl LedgerManager {
             let mut offer_deletes: Vec<i64> = Vec::new();
 
             for change in delta.changes() {
-                let key = change.key()?;
+                let key = change.key();
                 // Only process offer entries
                 if !matches!(key, LedgerKey::Offer(_)) {
                     continue;
@@ -1976,10 +1976,7 @@ impl LedgerManager {
 
         // Update pool share trustline secondary index with changes from this ledger.
         for change in delta.changes() {
-            let key = match change.key() {
-                Ok(k) => k,
-                Err(_) => continue,
-            };
+            let key = change.key();
             let tl_key = match &key {
                 LedgerKey::Trustline(tl_key)
                     if matches!(
@@ -2336,11 +2333,7 @@ impl<'a> LedgerCloseContext<'a> {
         if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(settings)) =
             entry.data
         {
-            Some(StateArchivalSettings {
-                eviction_scan_size: settings.eviction_scan_size as u64,
-                starting_eviction_scan_level: settings.starting_eviction_scan_level,
-                max_entries_to_archive: settings.max_entries_to_archive,
-            })
+            Some(settings)
         } else {
             None
         }
@@ -3712,10 +3705,9 @@ impl<'a> LedgerCloseContext<'a> {
                             changes.push(LedgerEntryChange::Updated(current.as_ref().clone()));
                         }
                         crate::delta::EntryChange::Deleted { previous } => {
-                            if let Ok(key) = crate::delta::entry_to_key(previous) {
-                                changes.push(LedgerEntryChange::State(previous.clone()));
-                                changes.push(LedgerEntryChange::Removed(key));
-                            }
+                            let key = henyey_common::entry_to_key(previous);
+                            changes.push(LedgerEntryChange::State(previous.clone()));
+                            changes.push(LedgerEntryChange::Removed(key));
                         }
                     }
                 }
@@ -3762,10 +3754,9 @@ impl<'a> LedgerCloseContext<'a> {
                                 changes.push(LedgerEntryChange::Updated(current.as_ref().clone()));
                             }
                             crate::delta::EntryChange::Deleted { previous } => {
-                                if let Ok(key) = crate::delta::entry_to_key(previous) {
-                                    changes.push(LedgerEntryChange::State(previous.clone()));
-                                    changes.push(LedgerEntryChange::Removed(key));
-                                }
+                                let key = henyey_common::entry_to_key(previous);
+                                changes.push(LedgerEntryChange::State(previous.clone()));
+                                changes.push(LedgerEntryChange::Removed(key));
                             }
                         }
                     }
@@ -4200,7 +4191,7 @@ impl<'a> LedgerCloseContext<'a> {
 
             // Log first few entries for debugging
             for (i, entry) in init_entries.iter().take(5).enumerate() {
-                let key = crate::delta::entry_to_key(entry).ok();
+                let key = henyey_common::entry_to_key(entry);
                 tracing::debug!(
                     ledger_seq = self.close_data.ledger_seq,
                     index = i,
@@ -4210,7 +4201,7 @@ impl<'a> LedgerCloseContext<'a> {
                 );
             }
             for (i, entry) in live_entries.iter().take(5).enumerate() {
-                let key = crate::delta::entry_to_key(entry).ok();
+                let key = henyey_common::entry_to_key(entry);
                 tracing::debug!(
                     ledger_seq = self.close_data.ledger_seq,
                     index = i,
@@ -4248,7 +4239,7 @@ impl<'a> LedgerCloseContext<'a> {
                     drop(hot_archive_guard); // Release read lock before write operations
 
                     // Use pre-loaded eviction settings (loaded before bucket list lock)
-                    let eviction_settings = eviction_settings.unwrap_or_default();
+                    let eviction_settings = eviction_settings.clone().unwrap_or_default();
 
                     // Try to use background eviction scan from previous ledger
                     let eviction_start = std::time::Instant::now();
@@ -4568,7 +4559,7 @@ impl<'a> LedgerCloseContext<'a> {
 
             // Detailed entry logging for debugging
             for (i, entry) in init_entries.iter().enumerate() {
-                let key = henyey_bucket::ledger_entry_to_key(entry);
+                let key = henyey_common::entry_to_key(entry);
                 tracing::trace!(
                     ledger_seq = self.close_data.ledger_seq,
                     idx = i,
@@ -4579,7 +4570,7 @@ impl<'a> LedgerCloseContext<'a> {
                 );
             }
             for (i, entry) in live_entries.iter().enumerate() {
-                let key = henyey_bucket::ledger_entry_to_key(entry);
+                let key = henyey_common::entry_to_key(entry);
                 // For ConfigSetting entries, log the data for comparison
                 let config_data = match &entry.data {
                     LedgerEntryData::ConfigSetting(cs) => Some(format!("{:?}", cs)),
@@ -4724,8 +4715,9 @@ impl<'a> LedgerCloseContext<'a> {
         // lock was held), so it doesn't interfere with subsequent operations.
         if let Some((snapshot, iter, settings)) = bg_eviction_data {
             let target_ledger_seq = self.close_data.ledger_seq + 1;
+            let settings_clone = settings.clone();
             let handle = std::thread::spawn(move || {
-                snapshot.scan_for_eviction_incremental(iter, target_ledger_seq, &settings)
+                snapshot.scan_for_eviction_incremental(iter, target_ledger_seq, &settings_clone)
             });
             *self.manager.pending_eviction_scan.lock() = Some(PendingEvictionScan {
                 handle,
@@ -5855,8 +5847,9 @@ mod tests {
         );
         let settings = StateArchivalSettings::default();
         let iter = EvictionIterator::new(settings.starting_eviction_scan_level);
+        let settings_clone = settings.clone();
         let handle = std::thread::spawn(move || {
-            snapshot.scan_for_eviction_incremental(iter, 2, &settings)
+            snapshot.scan_for_eviction_incremental(iter, 2, &settings_clone)
         });
         *manager.pending_eviction_scan.lock() = Some(PendingEvictionScan {
             handle,
@@ -5931,6 +5924,7 @@ mod tests {
             starting_eviction_scan_level: 0,
             eviction_scan_size: 100_000,
             max_entries_to_archive: 1000,
+            ..Default::default()
         };
         let iter = EvictionIterator {
             bucket_list_level: 0,

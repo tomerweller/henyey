@@ -54,7 +54,7 @@ use std::collections::HashSet;
 use stellar_xdr::curr::{LedgerEntry, LedgerKey};
 
 use crate::bucket::{Bucket, BucketIter};
-use crate::entry::{ledger_entry_to_key, BucketEntry};
+use crate::entry::BucketEntry;
 use crate::{BucketLevel, BucketList, Result};
 
 /// Streaming iterator over live bucket list entries.
@@ -215,10 +215,7 @@ impl<'a> Iterator for LiveEntriesIterator<'a> {
                     match entry {
                         BucketEntry::Liveentry(ref e) | BucketEntry::Initentry(ref e) => {
                             // Get the key for this entry
-                            let key = match ledger_entry_to_key(e) {
-                                Some(k) => k,
-                                None => continue, // Skip entries without valid keys
-                            };
+                            let key = henyey_common::entry_to_key(e);
 
                             // stellar-core pattern: mSeenKeys.emplace(key).second
                             // insert() returns true if the key was newly inserted
@@ -531,11 +528,11 @@ mod tests {
         // Convert to sets of keys for comparison (order may differ slightly)
         let old_keys: HashSet<_> = old_entries
             .iter()
-            .filter_map(|e| ledger_entry_to_key(e))
+            .map(|e| henyey_common::entry_to_key(e))
             .collect();
         let new_keys: HashSet<_> = new_entries
             .iter()
-            .filter_map(|e| ledger_entry_to_key(e))
+            .map(|e| henyey_common::entry_to_key(e))
             .collect();
 
         assert_eq!(old_keys, new_keys, "Key sets differ");

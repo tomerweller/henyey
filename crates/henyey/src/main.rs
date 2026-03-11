@@ -3548,10 +3548,9 @@ async fn cmd_verify_execution(
                                         stellar_xdr::curr::LedgerEntryChange::Updated(entry)
                                         | stellar_xdr::curr::LedgerEntryChange::Created(entry)
                                         | stellar_xdr::curr::LedgerEntryChange::Restored(entry) => {
-                                            if let Ok(key) = henyey_ledger::entry_to_key(entry) {
-                                                if let Ok(kb) = key.to_xdr(stellar_xdr::curr::Limits::none()) {
-                                                    map.insert(kb, entry.clone());
-                                                }
+                                            let key = henyey_common::entry_to_key(entry);
+                                            if let Ok(kb) = key.to_xdr(stellar_xdr::curr::Limits::none()) {
+                                                map.insert(kb, entry.clone());
                                             }
                                         }
                                         stellar_xdr::curr::LedgerEntryChange::Removed(key) => {

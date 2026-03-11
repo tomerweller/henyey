@@ -140,7 +140,7 @@ pub use bloom_filter::{BucketBloomFilter, HashSeed, HASH_KEY_BYTES};
 pub use entry::{
     compare_entries, compare_keys, get_ttl_key, get_ttl_live_until, is_persistent_entry,
     is_persistent_key, is_soroban_entry, is_soroban_key, is_temporary_entry, is_ttl_expired,
-    ledger_entry_data_type, ledger_entry_to_key, ledger_key_type, BucketEntry, BucketEntryExt,
+    ledger_entry_data_type, ledger_key_type, BucketEntry, BucketEntryExt,
 };
 
 // ============================================================================
@@ -154,9 +154,9 @@ pub use error::BucketError;
 // ============================================================================
 
 pub use eviction::{
-    bucket_update_period, level_half, level_should_spill, level_size,
-    update_starting_eviction_iterator, EvictionCandidate, EvictionIterator, EvictionIteratorExt,
-    EvictionResult, ResolvedEviction, StateArchivalSettings,
+    bucket_update_period, default_state_archival_settings, level_half, level_should_spill,
+    level_size, update_starting_eviction_iterator, EvictionCandidate, EvictionIterator,
+    EvictionIteratorExt, EvictionResult, ResolvedEviction,
     DEFAULT_EVICTION_SCAN_SIZE, DEFAULT_MAX_ENTRIES_TO_ARCHIVE, DEFAULT_STARTING_EVICTION_SCAN_LEVEL,
 };
 

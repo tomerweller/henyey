@@ -41,7 +41,7 @@ use std::sync::Arc;
 use stellar_xdr::curr::{LedgerEntry, LedgerEntryType, LedgerKey};
 
 use crate::bucket::Bucket;
-use crate::entry::{ledger_entry_data_type, ledger_entry_to_key, ledger_key_type, BucketEntry};
+use crate::entry::{ledger_entry_data_type, ledger_key_type, BucketEntry};
 use crate::Result;
 
 /// Default number of entries to process in each chunk.
@@ -324,19 +324,18 @@ impl BucketApplicator {
 
             match entry {
                 BucketEntry::Liveentry(ledger_entry) | BucketEntry::Initentry(ledger_entry) => {
-                    if let Some(key) = ledger_entry_to_key(ledger_entry) {
-                        // Skip if already seen
-                        if self.seen_keys.contains(&key) {
-                            counters.record_skipped();
-                            continue;
-                        }
-
-                        self.seen_keys.insert(key.clone());
-
-                        let entry_type = ledger_entry_data_type(&ledger_entry.data);
-                        counters.record_upsert(entry_type);
-                        batch.push(EntryToApply::Upsert(key, Box::new(ledger_entry.clone())));
+                    let key = henyey_common::entry_to_key(ledger_entry);
+                    // Skip if already seen
+                    if self.seen_keys.contains(&key) {
+                        counters.record_skipped();
+                        continue;
                     }
+
+                    self.seen_keys.insert(key.clone());
+
+                    let entry_type = ledger_entry_data_type(&ledger_entry.data);
+                    counters.record_upsert(entry_type);
+                    batch.push(EntryToApply::Upsert(key, Box::new(ledger_entry.clone())));
                 }
                 BucketEntry::Deadentry(key) => {
                     if !self.apply_dead_entries {

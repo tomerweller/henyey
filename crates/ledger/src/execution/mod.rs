@@ -2841,7 +2841,7 @@ impl TransactionExecutor {
                             let created_keys: HashSet<LedgerKey> = delta_slice
                                 .created()
                                 .iter()
-                                .filter_map(|entry| crate::delta::entry_to_key(entry).ok())
+                                .map(|entry| henyey_common::entry_to_key(entry))
                                 .collect();
                             // For transaction meta emission: only emit RESTORED for keys in created
                             // Keep original set for bucket list operations

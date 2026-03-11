@@ -6,11 +6,7 @@
 
 use super::*;
 
-pub(super) fn asset_to_trustline_asset(
-    asset: &stellar_xdr::curr::Asset,
-) -> Option<stellar_xdr::curr::TrustLineAsset> {
-    henyey_common::asset::non_native_asset_to_trustline_asset(asset)
-}
+pub(super) use henyey_common::asset::non_native_asset_to_trustline_asset as asset_to_trustline_asset;
 
 pub(super) fn asset_issuer_id(asset: &stellar_xdr::curr::Asset) -> Option<AccountId> {
     henyey_common::asset::get_issuer(asset).ok().cloned()
@@ -591,11 +587,10 @@ pub(super) fn build_entry_changes_with_hot_archive(
                             stellar_xdr::curr::LedgerEntryData::ContractData(_)
                             | stellar_xdr::curr::LedgerEntryData::ContractCode(_) => {
                                 // Data/Code: associated_hash is SHA256 of key XDR, type_order=1 (second)
-                                if let Ok(key) = crate::delta::entry_to_key(entry) {
-                                    if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
-                                        let key_hash = Sha256::digest(&key_bytes);
-                                        return (key_hash.to_vec(), 1);
-                                    }
+                                let key = henyey_common::entry_to_key(entry);
+                                if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
+                                    let key_hash = Sha256::digest(&key_bytes);
+                                    return (key_hash.to_vec(), 1);
                                 }
                                 (Vec::new(), 1)
                             }
@@ -613,23 +608,7 @@ pub(super) fn build_entry_changes_with_hot_archive(
 
                     for (idx, _) in entries_with_sort {
                         let entry = &created[idx];
-                        if let Ok(key) = crate::delta::entry_to_key(entry) {
-                            if !created_keys.contains(&key) {
-                                created_keys.insert(key.clone());
-                                push_created_or_restored(
-                                    &mut changes,
-                                    entry,
-                                    &key,
-                                    restored,
-                                    &mut processed_keys,
-                                );
-                            }
-                        }
-                    }
-                }
-                ChangeGroup::ClassicCreate { idx } => {
-                    let entry = &created[idx];
-                    if let Ok(key) = crate::delta::entry_to_key(entry) {
+                        let key = henyey_common::entry_to_key(entry);
                         if !created_keys.contains(&key) {
                             created_keys.insert(key.clone());
                             push_created_or_restored(
@@ -642,35 +621,48 @@ pub(super) fn build_entry_changes_with_hot_archive(
                         }
                     }
                 }
+                ChangeGroup::ClassicCreate { idx } => {
+                    let entry = &created[idx];
+                    let key = henyey_common::entry_to_key(entry);
+                    if !created_keys.contains(&key) {
+                        created_keys.insert(key.clone());
+                        push_created_or_restored(
+                            &mut changes,
+                            entry,
+                            &key,
+                            restored,
+                            &mut processed_keys,
+                        );
+                    }
+                }
                 ChangeGroup::SingleUpdate { idx } => {
                     if idx < updated.len() {
                         let post_state = &updated[idx];
-                        if let Ok(key) = crate::delta::entry_to_key(post_state) {
-                            // NOTE: RO TTL bumps ARE included in transaction meta (per stellar-core
-                            // setLedgerChangesFromSuccessfulOp which uses raw res.getModifiedEntryMap()).
-                            // The filtering to mRoTTLBumps only affects STATE updates (commitChangesFromSuccessfulOp),
-                            // not transaction meta. Do NOT skip ro_ttl_keys here.
-                            if restored.hot_archive.contains(&key)
-                                || restored.live_bucket_list.contains(&key)
-                            {
-                                changes.push(LedgerEntryChange::Restored(post_state.clone()));
-                                processed_keys.insert(key);
+                        let key = henyey_common::entry_to_key(post_state);
+                        // NOTE: RO TTL bumps ARE included in transaction meta (per stellar-core
+                        // setLedgerChangesFromSuccessfulOp which uses raw res.getModifiedEntryMap()).
+                        // The filtering to mRoTTLBumps only affects STATE updates (commitChangesFromSuccessfulOp),
+                        // not transaction meta. Do NOT skip ro_ttl_keys here.
+                        if restored.hot_archive.contains(&key)
+                            || restored.live_bucket_list.contains(&key)
+                        {
+                            changes.push(LedgerEntryChange::Restored(post_state.clone()));
+                            processed_keys.insert(key);
+                        } else {
+                            // Get pre-state from update_states or snapshot
+                            let pre_state = if idx < update_states.len() {
+                                Some(update_states[idx].clone())
                             } else {
-                                // Get pre-state from update_states or snapshot
-                                let pre_state = if idx < update_states.len() {
-                                    Some(update_states[idx].clone())
-                                } else {
-                                    state_overrides
-                                        .get(&key)
-                                        .cloned()
-                                        .or_else(|| state.snapshot_entry(&key))
-                                };
-                                if let Some(state_entry) = pre_state {
-                                    changes.push(LedgerEntryChange::State(state_entry));
-                                }
-                                changes.push(LedgerEntryChange::Updated(post_state.clone()));
-                                processed_keys.insert(key);
+                                state_overrides
+                                    .get(&key)
+                                    .cloned()
+                                    .or_else(|| state.snapshot_entry(&key))
+                            };
+                            if let Some(state_entry) = pre_state {
+                                changes.push(LedgerEntryChange::State(state_entry));
                             }
+                            changes.push(LedgerEntryChange::Updated(post_state.clone()));
+                            processed_keys.insert(key);
                         }
                     }
                 }
@@ -725,50 +717,47 @@ pub(super) fn build_entry_changes_with_hot_archive(
                 henyey_tx::ChangeRef::Created(idx) => {
                     if *idx < created.len() {
                         let entry = &created[*idx];
-                        if let Ok(key) = crate::delta::entry_to_key(entry) {
-                            // Only emit create once per key
-                            if !created_keys.contains(&key) {
-                                created_keys.insert(key.clone());
-                                push_created_or_restored(
-                                    &mut changes,
-                                    entry,
-                                    &key,
-                                    restored,
-                                    &mut processed_keys,
-                                );
-                            }
+                        let key = henyey_common::entry_to_key(entry);
+                        // Only emit create once per key
+                        if !created_keys.contains(&key) {
+                            created_keys.insert(key.clone());
+                            push_created_or_restored(
+                                &mut changes,
+                                entry,
+                                &key,
+                                restored,
+                                &mut processed_keys,
+                            );
                         }
                     }
                 }
                 henyey_tx::ChangeRef::Updated(idx) => {
                     if *idx < updated.len() {
                         let post_state = &updated[*idx];
-
-                        if let Ok(key) = crate::delta::entry_to_key(post_state) {
-                            if restored.hot_archive.contains(&key)
-                                || restored.live_bucket_list.contains(&key)
-                            {
-                                // Use entry value for hot archive restored entries
-                                changes.push(LedgerEntryChange::Restored(post_state.clone()));
-                                processed_keys.insert(key);
+                        let key = henyey_common::entry_to_key(post_state);
+                        if restored.hot_archive.contains(&key)
+                            || restored.live_bucket_list.contains(&key)
+                        {
+                            // Use entry value for hot archive restored entries
+                            changes.push(LedgerEntryChange::Restored(post_state.clone()));
+                            processed_keys.insert(key);
+                        } else {
+                            // Normal update: STATE (pre-state) then UPDATED (post-state)
+                            // Use the pre-state stored in the delta at the same index
+                            let pre_state = if *idx < update_states.len() {
+                                Some(update_states[*idx].clone())
                             } else {
-                                // Normal update: STATE (pre-state) then UPDATED (post-state)
-                                // Use the pre-state stored in the delta at the same index
-                                let pre_state = if *idx < update_states.len() {
-                                    Some(update_states[*idx].clone())
-                                } else {
-                                    // Fallback to snapshot lookup if pre-state not available
-                                    state_overrides
-                                        .get(&key)
-                                        .cloned()
-                                        .or_else(|| state.snapshot_entry(&key))
-                                };
-                                if let Some(state_entry) = pre_state {
-                                    changes.push(LedgerEntryChange::State(state_entry));
-                                }
-                                changes.push(LedgerEntryChange::Updated(post_state.clone()));
-                                processed_keys.insert(key);
+                                // Fallback to snapshot lookup if pre-state not available
+                                state_overrides
+                                    .get(&key)
+                                    .cloned()
+                                    .or_else(|| state.snapshot_entry(&key))
+                            };
+                            if let Some(state_entry) = pre_state {
+                                changes.push(LedgerEntryChange::State(state_entry));
                             }
+                            changes.push(LedgerEntryChange::Updated(post_state.clone()));
+                            processed_keys.insert(key);
                         }
                     }
                 }
@@ -817,9 +806,8 @@ pub(super) fn build_entry_changes_with_hot_archive(
         // Build final values for each updated key (only needed in this branch)
         let mut final_updated: HashMap<LedgerKey, LedgerEntry> = HashMap::new();
         for entry in updated {
-            if let Ok(key) = crate::delta::entry_to_key(entry) {
-                final_updated.insert(key, entry.clone());
-            }
+            let key = henyey_common::entry_to_key(entry);
+            final_updated.insert(key, entry.clone());
         }
 
         // Use type-grouped order: deleted -> updated -> created
@@ -850,35 +838,33 @@ pub(super) fn build_entry_changes_with_hot_archive(
         // Deduplicate updated entries
         let mut seen_keys: HashSet<LedgerKey> = HashSet::new();
         for entry in updated {
-            if let Ok(key) = crate::delta::entry_to_key(entry) {
-                if !seen_keys.contains(&key) {
-                    seen_keys.insert(key.clone());
-                    if let Some(final_entry) = final_updated.get(&key) {
-                        if restored.hot_archive.contains(&key)
-                            || restored.live_bucket_list.contains(&key)
+            let key = henyey_common::entry_to_key(entry);
+            if !seen_keys.contains(&key) {
+                seen_keys.insert(key.clone());
+                if let Some(final_entry) = final_updated.get(&key) {
+                    if restored.hot_archive.contains(&key)
+                        || restored.live_bucket_list.contains(&key)
+                    {
+                        changes.push(LedgerEntryChange::Restored(final_entry.clone()));
+                        processed_keys.insert(key);
+                    } else {
+                        if let Some(state_entry) = state_overrides
+                            .get(&key)
+                            .cloned()
+                            .or_else(|| state.snapshot_entry(&key))
                         {
-                            changes.push(LedgerEntryChange::Restored(final_entry.clone()));
-                            processed_keys.insert(key);
-                        } else {
-                            if let Some(state_entry) = state_overrides
-                                .get(&key)
-                                .cloned()
-                                .or_else(|| state.snapshot_entry(&key))
-                            {
-                                changes.push(LedgerEntryChange::State(state_entry));
-                            }
-                            changes.push(LedgerEntryChange::Updated(final_entry.clone()));
-                            processed_keys.insert(key);
+                            changes.push(LedgerEntryChange::State(state_entry));
                         }
+                        changes.push(LedgerEntryChange::Updated(final_entry.clone()));
+                        processed_keys.insert(key);
                     }
                 }
             }
         }
 
         for entry in created {
-            if let Ok(key) = crate::delta::entry_to_key(entry) {
-                push_created_or_restored(&mut changes, entry, &key, restored, &mut processed_keys);
-            }
+            let key = henyey_common::entry_to_key(entry);
+            push_created_or_restored(&mut changes, entry, &key, restored, &mut processed_keys);
         }
     }
 

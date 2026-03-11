@@ -47,7 +47,7 @@
 
 use crate::{is_checkpoint_ledger, verify, HistoryError, Result};
 use sha2::{Digest, Sha256};
-use henyey_bucket::{EvictionIterator, EvictionIteratorExt, StateArchivalSettings};
+use henyey_bucket::{EvictionIterator, EvictionIteratorExt};
 use henyey_common::protocol::{protocol_version_is_before, protocol_version_starts_from, ProtocolVersion};
 use henyey_common::{Hash256, NetworkId};
 use henyey_ledger::{
@@ -60,7 +60,8 @@ use henyey_tx::{muxed_to_account_id, LedgerContext, TransactionFrame};
 use stellar_xdr::curr::{
     BucketListType, ConfigSettingEntry, ConfigSettingId,
     LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerHeader, LedgerKey, LedgerKeyConfigSetting,
-    TransactionEnvelope, TransactionMeta, TransactionResultPair, TransactionResultSet, WriteXdr,
+    StateArchivalSettings, TransactionEnvelope, TransactionMeta, TransactionResultPair,
+    TransactionResultSet, WriteXdr,
 };
 
 fn load_state_archival_settings(snapshot: &SnapshotHandle) -> Option<StateArchivalSettings> {
@@ -70,11 +71,7 @@ fn load_state_archival_settings(snapshot: &SnapshotHandle) -> Option<StateArchiv
     match snapshot.get_entry(&key) {
         Ok(Some(entry)) => match entry.data {
             LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(settings)) => {
-                Some(StateArchivalSettings {
-                    eviction_scan_size: settings.eviction_scan_size as u64,
-                    starting_eviction_scan_level: settings.starting_eviction_scan_level,
-                    max_entries_to_archive: settings.max_entries_to_archive,
-                })
+                Some(settings)
             }
             _ => None,
         },
@@ -271,13 +268,7 @@ fn classify_delta_entries(
     let mut init_entries: Vec<LedgerEntry> = Vec::new();
     let mut moved_to_live_count = 0u32;
     for entry in delta_init_entries {
-        let key = match henyey_ledger::entry_to_key(&entry) {
-            Ok(k) => k,
-            Err(_) => {
-                init_entries.push(entry);
-                continue;
-            }
-        };
+        let key = henyey_common::entry_to_key(&entry);
 
         let should_check = matches!(
             &entry.data,
@@ -316,7 +307,7 @@ fn classify_delta_entries(
     // Handle hot archive restored entries.
     let init_entry_keys: std::collections::HashSet<_> = init_entries
         .iter()
-        .filter_map(|e| henyey_ledger::entry_to_key(e).ok())
+        .map(|e| henyey_common::entry_to_key(e))
         .collect();
     for key in hot_archive_restored_keys {
         if init_entry_keys.contains(key) {
@@ -842,7 +833,7 @@ pub fn replay_ledger_with_execution(
     let cpu_cost_params = soroban_config.cpu_cost_params.clone();
     let mem_cost_params = soroban_config.mem_cost_params.clone();
     let eviction_settings =
-        load_state_archival_settings(&snapshot).unwrap_or(config.eviction_settings);
+        load_state_archival_settings(&snapshot).unwrap_or(config.eviction_settings.clone());
     // Use transaction set hash as base PRNG seed for Soroban execution
     let soroban_base_prng_seed = tx_set.hash();
     let classic_events = henyey_tx::ClassicEventConfig {

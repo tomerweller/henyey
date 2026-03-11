@@ -20,8 +20,8 @@
 //!
 //! # Result Codes
 //!
-//! The [`TxResultCode`] and [`OpResultCode`] enums provide typed access to result
-//! codes with human-readable names matching the Stellar documentation.
+//! The [`TxResultCode`] and [`OpResultCode`] type aliases provide typed access to
+//! XDR result codes with human-readable names.
 
 use stellar_xdr::curr::{
     InnerTransactionResultResult, OperationResult, OperationResultTr, TransactionResult,
@@ -418,50 +418,12 @@ impl OpResultWrapper {
 
     /// Get the result code.
     pub fn result_code(&self) -> OpResultCode {
-        match &self.inner {
-            OperationResult::OpInner(_) => OpResultCode::OpInner,
-            OperationResult::OpBadAuth => OpResultCode::OpBadAuth,
-            OperationResult::OpNoAccount => OpResultCode::OpNoAccount,
-            OperationResult::OpNotSupported => OpResultCode::OpNotSupported,
-            OperationResult::OpTooManySubentries => OpResultCode::OpTooManySubentries,
-            OperationResult::OpExceededWorkLimit => OpResultCode::OpExceededWorkLimit,
-            OperationResult::OpTooManySponsoring => OpResultCode::OpTooManySponsoring,
-        }
+        self.inner.discriminant()
     }
 }
 
-/// Operation result codes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum OpResultCode {
-    OpInner,
-    OpBadAuth,
-    OpNoAccount,
-    OpNotSupported,
-    OpTooManySubentries,
-    OpExceededWorkLimit,
-    OpTooManySponsoring,
-}
-
-impl OpResultCode {
-    /// Get a human-readable name.
-    pub fn name(&self) -> &'static str {
-        match self {
-            OpResultCode::OpInner => "opInner",
-            OpResultCode::OpBadAuth => "opBadAuth",
-            OpResultCode::OpNoAccount => "opNoAccount",
-            OpResultCode::OpNotSupported => "opNotSupported",
-            OpResultCode::OpTooManySubentries => "opTooManySubentries",
-            OpResultCode::OpExceededWorkLimit => "opExceededWorkLimit",
-            OpResultCode::OpTooManySponsoring => "opTooManySponsoring",
-        }
-    }
-}
-
-impl std::fmt::Display for OpResultCode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.name())
-    }
-}
+/// Operation result code — type alias for the XDR `OperationResultCode`.
+pub type OpResultCode = stellar_xdr::curr::OperationResultCode;
 
 // ============================================================================
 // Mutable Transaction Result Types (for live execution)
@@ -938,7 +900,7 @@ mod tests {
     fn test_result_code_names() {
         assert_eq!(TxResultCode::TxSuccess.name(), "TxSuccess");
         assert_eq!(TxResultCode::TxBadSeq.name(), "TxBadSeq");
-        assert_eq!(OpResultCode::OpBadAuth.name(), "opBadAuth");
+        assert_eq!(OpResultCode::OpBadAuth.name(), "OpBadAuth");
     }
 
     // RefundableFeeTracker tests

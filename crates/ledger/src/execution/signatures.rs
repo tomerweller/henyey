@@ -249,20 +249,21 @@ pub(super) fn get_threshold_for_op(op: &Operation) -> ThresholdLevel {
             {
                 ThresholdLevel::High
             } else {
-                ThresholdLevel::Medium
+                ThresholdLevel::Med
             }
         }
 
         // All other operations default to MEDIUM
-        _ => ThresholdLevel::Medium,
+        _ => ThresholdLevel::Med,
     }
 }
 
 /// Get the needed threshold weight for an operation based on its threshold level.
 pub(super) fn get_needed_threshold(account: &AccountEntry, level: ThresholdLevel) -> u32 {
     match level {
+        ThresholdLevel::MasterWeight => account.thresholds.0[0] as u32,
         ThresholdLevel::Low => threshold_low(account),
-        ThresholdLevel::Medium => threshold_medium(account),
+        ThresholdLevel::Med => threshold_medium(account),
         ThresholdLevel::High => threshold_high(account),
     }
 }

@@ -500,12 +500,12 @@ pub fn get_threshold_level(op: &Operation) -> ThresholdLevel {
             {
                 ThresholdLevel::High
             } else {
-                ThresholdLevel::Medium
+                ThresholdLevel::Med
             }
         }
 
         // All other operations use MEDIUM threshold
-        _ => ThresholdLevel::Medium,
+        _ => ThresholdLevel::Med,
     }
 }
 
@@ -526,7 +526,7 @@ pub fn get_needed_threshold(
     account: &stellar_xdr::curr::AccountEntry,
     level: ThresholdLevel,
 ) -> i32 {
-    account.thresholds.0[level.index()] as i32
+    account.thresholds.0[level as usize] as i32
 }
 
 #[cfg(test)]
@@ -699,9 +699,9 @@ mod tests {
 
     #[test]
     fn test_threshold_level_index() {
-        assert_eq!(ThresholdLevel::Low.index(), 1);
-        assert_eq!(ThresholdLevel::Medium.index(), 2);
-        assert_eq!(ThresholdLevel::High.index(), 3);
+        assert_eq!(ThresholdLevel::Low as usize, 1);
+        assert_eq!(ThresholdLevel::Med as usize, 2);
+        assert_eq!(ThresholdLevel::High as usize, 3);
     }
 
     #[test]
@@ -758,7 +758,7 @@ mod tests {
                 amount: 1000,
             }),
         };
-        assert_eq!(get_threshold_level(&payment_op), ThresholdLevel::Medium);
+        assert_eq!(get_threshold_level(&payment_op), ThresholdLevel::Med);
 
         // CreateAccount
         let create_account_op = Operation {
@@ -768,10 +768,7 @@ mod tests {
                 starting_balance: 10_000_000,
             }),
         };
-        assert_eq!(
-            get_threshold_level(&create_account_op),
-            ThresholdLevel::Medium
-        );
+        assert_eq!(get_threshold_level(&create_account_op), ThresholdLevel::Med);
 
         // ChangeTrust
         let change_trust_op = Operation {
@@ -781,10 +778,7 @@ mod tests {
                 limit: 1000,
             }),
         };
-        assert_eq!(
-            get_threshold_level(&change_trust_op),
-            ThresholdLevel::Medium
-        );
+        assert_eq!(get_threshold_level(&change_trust_op), ThresholdLevel::Med);
 
         // ManageData
         let manage_data_op = Operation {
@@ -794,7 +788,7 @@ mod tests {
                 data_value: Some(b"value".to_vec().try_into().unwrap()),
             }),
         };
-        assert_eq!(get_threshold_level(&manage_data_op), ThresholdLevel::Medium);
+        assert_eq!(get_threshold_level(&manage_data_op), ThresholdLevel::Med);
     }
 
     #[test]
@@ -891,7 +885,7 @@ mod tests {
         };
         assert_eq!(
             get_threshold_level(&set_options_basic_op),
-            ThresholdLevel::Medium
+            ThresholdLevel::Med
         );
 
         // SetOptions with only home domain change
@@ -913,7 +907,7 @@ mod tests {
         };
         assert_eq!(
             get_threshold_level(&set_options_domain_op),
-            ThresholdLevel::Medium
+            ThresholdLevel::Med
         );
     }
 
@@ -937,7 +931,7 @@ mod tests {
         };
 
         assert_eq!(get_needed_threshold(&account, ThresholdLevel::Low), 1);
-        assert_eq!(get_needed_threshold(&account, ThresholdLevel::Medium), 5);
+        assert_eq!(get_needed_threshold(&account, ThresholdLevel::Med), 5);
         assert_eq!(get_needed_threshold(&account, ThresholdLevel::High), 10);
     }
 

@@ -145,8 +145,7 @@ pub use frame::{muxed_to_account_id, muxed_to_ed25519, TransactionFrame};
 
 // Re-export apply types and functions
 pub use apply::{
-    apply_fee_only, apply_from_history, apply_transaction_set_from_history, entry_to_key,
-    ApplyContext, ChangeRef, LedgerDelta,
+    apply_fee_only, apply_from_history, apply_transaction_set_from_history, ChangeRef, LedgerDelta,
 };
 
 // Re-export result types
@@ -175,8 +174,7 @@ pub use stellar_xdr::curr::OperationType;
 
 // Re-export state types
 pub use state::{
-    asset_to_trustline_asset, AssetPair, LedgerReader, LedgerStateManager, OfferDescriptor,
-    OfferIndex, OfferKey,
+    AssetPair, LedgerReader, LedgerStateManager, OfferDescriptor, OfferIndex, OfferKey,
 };
 
 // Re-export fee bump types
@@ -352,61 +350,6 @@ impl TransactionValidator {
     pub fn check_signatures(&self, tx: &stellar_xdr::curr::TransactionEnvelope) -> bool {
         let frame = TransactionFrame::new(tx.clone());
         validate_signatures(&frame, &self.context).is_ok()
-    }
-}
-
-/// Transaction executor for applying transactions.
-///
-/// Provides methods for executing transactions in different modes:
-///
-/// - **Historical replay**: Use [`apply_historical`](Self::apply_historical) with
-///   known results and metadata from archives.
-///
-/// - **Live execution**: Use `execute_with_state` (when available) with a
-///   state reader for full transaction execution.
-///
-/// # Note
-///
-/// The basic [`execute`](Self::execute) method is not fully implemented for live
-/// execution. For catchup mode, use `apply_historical`. For live execution,
-/// use the operation execution functions directly.
-pub struct TransactionExecutor {
-    /// Execution context (ledger sequence, close time, etc.).
-    _context: ApplyContext,
-}
-
-impl TransactionExecutor {
-    /// Create a new executor with the given context.
-    pub fn new(context: ApplyContext) -> Self {
-        Self { _context: context }
-    }
-
-    /// Execute a transaction and return the result.
-    ///
-    /// Note: For full live execution, use `execute_with_state` which provides
-    /// a state reader. This method returns an error indicating state is required.
-    pub fn execute(
-        &self,
-        _tx: &stellar_xdr::curr::TransactionEnvelope,
-        _delta: &mut LedgerDelta,
-    ) -> Result<TxApplyResult> {
-        // Full execution requires a state reader - use execute_with_state for live execution
-        // or apply_from_history for catchup mode
-        Err(TxError::OperationFailed(
-            "use execute_with_state or apply_from_history".into(),
-        ))
-    }
-
-    /// Apply a transaction from history (for catchup).
-    pub fn apply_historical(
-        &self,
-        tx: &stellar_xdr::curr::TransactionEnvelope,
-        result: &stellar_xdr::curr::TransactionResult,
-        meta: &stellar_xdr::curr::TransactionMeta,
-        delta: &mut LedgerDelta,
-    ) -> Result<TxApplyResult> {
-        let frame = TransactionFrame::new(tx.clone());
-        apply_from_history(&frame, result, meta, delta)
     }
 }
 

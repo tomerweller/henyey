@@ -44,11 +44,11 @@ use crate::{
     bucket_list::BUCKET_LIST_LEVELS,
     entry::{
         get_ttl_key, is_soroban_entry, is_temporary_entry, is_ttl_expired,
-        ledger_entry_data_type, ledger_entry_to_key, ledger_key_type,
+        ledger_entry_data_type, ledger_key_type,
     },
     eviction::{
         update_starting_eviction_iterator, EvictionCandidate, EvictionIterator, EvictionIteratorExt,
-        EvictionResult, StateArchivalSettings,
+        EvictionResult,
     },
     index::LiveBucketIndex,
     Bucket, BucketEntry, BucketEntryExt, BucketLevel, BucketList, HotArchiveBucket,
@@ -60,7 +60,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use stellar_xdr::curr::{
     AccountId, Asset, HotArchiveBucketEntry, LedgerEntry, LedgerEntryData, LedgerEntryType,
-    LedgerHeader, LedgerKey, LedgerKeyTrustLine, Limits, PoolId, TrustLineAsset, WriteXdr,
+    LedgerHeader, LedgerKey, LedgerKeyTrustLine, Limits, PoolId, StateArchivalSettings,
+    TrustLineAsset, WriteXdr,
 };
 
 /// A read-only snapshot of a single bucket.
@@ -510,7 +511,7 @@ impl BucketListSnapshot {
         );
 
         let start_iter = iter.clone();
-        let mut bytes_remaining = settings.eviction_scan_size;
+        let mut bytes_remaining = settings.eviction_scan_size as u64;
 
         // Track keys we've seen to avoid duplicates (from shadowed entries)
         let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
@@ -627,13 +628,7 @@ impl BucketListSnapshot {
                 continue;
             }
 
-            let Some(key) = ledger_entry_to_key(live_entry) else {
-                if bytes_used >= max_bytes {
-                    iter.bucket_file_offset = start_offset + bytes_used;
-                    return Ok((entries_scanned, bytes_used, false));
-                }
-                continue;
-            };
+            let key = henyey_common::entry_to_key(live_entry);
 
             let key_bytes = match key.to_xdr(Limits::none()) {
                 Ok(bytes) => bytes,

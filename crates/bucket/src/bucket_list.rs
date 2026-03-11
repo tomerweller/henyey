@@ -47,7 +47,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use henyey_common::protocol::MIN_SOROBAN_PROTOCOL_VERSION;
 use stellar_xdr::curr::{
-    BucketListType, BucketMetadata, BucketMetadataExt, LedgerEntry, LedgerKey, Limits, WriteXdr,
+    BucketListType, BucketMetadata, BucketMetadataExt, LedgerEntry, LedgerKey, Limits,
+    StateArchivalSettings, WriteXdr,
 };
 use tokio::sync::oneshot;
 
@@ -56,14 +57,14 @@ use henyey_common::{BucketListDbConfig, Hash256};
 use crate::bucket::Bucket;
 use crate::entry::{
     get_ttl_key, is_persistent_entry, is_soroban_entry, is_temporary_entry, is_ttl_expired,
-    ledger_entry_to_key, BucketEntry, BucketEntryExt,
+    BucketEntry, BucketEntryExt,
 };
 use crate::cache::CacheStats;
 use crate::future_bucket::MergeKey;
 use crate::index::BucketEntryCounters;
 use crate::eviction::{
     update_starting_eviction_iterator, EvictionCandidate, EvictionIterator, EvictionIteratorExt,
-    EvictionResult, StateArchivalSettings,
+    EvictionResult,
 };
 use crate::live_iterator::LiveEntriesIterator;
 use crate::manager::{canonical_bucket_filename, promote_temp_to_canonical, temp_merge_path};
@@ -1022,10 +1023,9 @@ fn deduplicate_entries(entries: Vec<LedgerEntry>) -> Vec<LedgerEntry> {
 
     // First pass: record the position of each key (later entries overwrite earlier ones)
     for (idx, entry) in entries.iter().enumerate() {
-        if let Some(key) = ledger_entry_to_key(entry) {
-            if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
-                key_positions.insert(key_bytes, idx);
-            }
+        let key = henyey_common::entry_to_key(entry);
+        if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
+            key_positions.insert(key_bytes, idx);
         }
     }
 
@@ -1559,9 +1559,7 @@ impl BucketList {
                 for entry in bucket.iter() {
                     match entry {
                         BucketEntry::Liveentry(live) | BucketEntry::Initentry(live) => {
-                            let Some(key) = crate::entry::ledger_entry_to_key(&live) else {
-                                continue;
-                            };
+                            let key = henyey_common::entry_to_key(&live);
                             let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
                                 BucketError::Serialization(format!(
                                     "failed to serialize ledger key: {}",
@@ -2641,9 +2639,7 @@ impl BucketList {
                     }
 
                     // Get the key for this entry
-                    let Some(key) = ledger_entry_to_key(&live_entry) else {
-                        continue;
-                    };
+                    let key = henyey_common::entry_to_key(&live_entry);
 
                     // Check if we've already processed this key
                     let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
@@ -2730,7 +2726,7 @@ impl BucketList {
         );
 
         let start_iter = iter.clone();
-        let mut bytes_remaining = settings.eviction_scan_size;
+        let mut bytes_remaining = settings.eviction_scan_size as u64;
 
         // Track keys we've seen to avoid duplicates (from shadowed entries)
         let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
@@ -2872,13 +2868,7 @@ impl BucketList {
             }
 
             // Get the key for this entry
-            let Some(key) = ledger_entry_to_key(live_entry) else {
-                if bytes_used >= max_bytes {
-                    iter.bucket_file_offset = start_offset + bytes_used;
-                    return Ok((entries_scanned, bytes_used, false));
-                }
-                continue;
-            };
+            let key = henyey_common::entry_to_key(live_entry);
 
             // Check if we've already seen this key (from a newer bucket)
             let key_bytes = match key.to_xdr(Limits::none()) {

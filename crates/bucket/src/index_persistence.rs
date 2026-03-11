@@ -233,34 +233,11 @@ struct IndexData {
 // ============================================================================
 
 fn entry_type_to_u32(entry_type: LedgerEntryType) -> u32 {
-    match entry_type {
-        LedgerEntryType::Account => 0,
-        LedgerEntryType::Trustline => 1,
-        LedgerEntryType::Offer => 2,
-        LedgerEntryType::Data => 3,
-        LedgerEntryType::ClaimableBalance => 4,
-        LedgerEntryType::LiquidityPool => 5,
-        LedgerEntryType::ContractData => 6,
-        LedgerEntryType::ContractCode => 7,
-        LedgerEntryType::ConfigSetting => 8,
-        LedgerEntryType::Ttl => 9,
-    }
+    entry_type as u32
 }
 
 fn u32_to_entry_type(value: u32) -> Option<LedgerEntryType> {
-    match value {
-        0 => Some(LedgerEntryType::Account),
-        1 => Some(LedgerEntryType::Trustline),
-        2 => Some(LedgerEntryType::Offer),
-        3 => Some(LedgerEntryType::Data),
-        4 => Some(LedgerEntryType::ClaimableBalance),
-        5 => Some(LedgerEntryType::LiquidityPool),
-        6 => Some(LedgerEntryType::ContractData),
-        7 => Some(LedgerEntryType::ContractCode),
-        8 => Some(LedgerEntryType::ConfigSetting),
-        9 => Some(LedgerEntryType::Ttl),
-        _ => None,
-    }
+    LedgerEntryType::try_from(value as i32).ok()
 }
 
 // ============================================================================
@@ -643,7 +620,12 @@ mod tests {
 
         // Create a DiskIndex with entries
         let entries: Vec<(BucketEntry, u64)> = (0..100u8)
-            .map(|i| (BucketEntry::Liveentry(make_account_entry(i)), i as u64 * 100))
+            .map(|i| {
+                (
+                    BucketEntry::Liveentry(make_account_entry(i)),
+                    i as u64 * 100,
+                )
+            })
             .collect();
 
         let bloom_seed = [42u8; 16];
@@ -750,7 +732,12 @@ mod tests {
 
         // Create and save with page_size = 10
         let entries: Vec<(BucketEntry, u64)> = (0..50u8)
-            .map(|i| (BucketEntry::Liveentry(make_account_entry(i)), i as u64 * 100))
+            .map(|i| {
+                (
+                    BucketEntry::Liveentry(make_account_entry(i)),
+                    i as u64 * 100,
+                )
+            })
             .collect();
 
         let index = DiskIndex::from_entries(entries.into_iter(), [0u8; 16], 10);
@@ -839,7 +826,12 @@ mod tests {
         }
 
         let entries: Vec<(BucketEntry, u64)> = (0..num_entries)
-            .map(|i| (BucketEntry::Liveentry(make_account_entry_for(i)), i as u64 * 100))
+            .map(|i| {
+                (
+                    BucketEntry::Liveentry(make_account_entry_for(i)),
+                    i as u64 * 100,
+                )
+            })
             .collect();
 
         DiskIndex::from_entries(entries.into_iter(), bloom_seed, page_size)

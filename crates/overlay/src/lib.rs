@@ -92,7 +92,7 @@ mod tx_adverts;
 mod tx_demands;
 
 // Re-export public types
-pub use auth::{AuthCert, AuthContext, AuthState};
+pub use auth::{AuthCert, AuthCertExt, AuthContext, AuthState};
 pub use ban_manager::BanManager;
 pub use codec::{helpers as message_helpers, MessageCodec, MessageFrame};
 pub use connection::{Connection, ConnectionDirection, ConnectionPool, Listener};

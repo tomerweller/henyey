@@ -277,9 +277,9 @@ Corresponds to: `OperationFrame.h`
 | `OperationFrame::apply()` | `execute_operation()` | Full |
 | `OperationFrame::checkSignature()` | Inline in `validate_signatures()` | Full |
 | `OperationFrame::getThresholdLevel()` | `get_threshold_level()` | Full |
-| `ThresholdLevel::LOW` | `ThresholdLevel::Low` | Full |
-| `ThresholdLevel::MEDIUM` | `ThresholdLevel::Medium` | Full |
-| `ThresholdLevel::HIGH` | `ThresholdLevel::High` | Full |
+| `ThresholdLevel::LOW` | `ThresholdLevel::Low` (XDR `ThresholdIndexes`) | Full |
+| `ThresholdLevel::MEDIUM` | `ThresholdLevel::Med` (XDR `ThresholdIndexes`) | Full |
+| `ThresholdLevel::HIGH` | `ThresholdLevel::High` (XDR `ThresholdIndexes`) | Full |
 | `isDexOperation()` | Inline in `has_dex_operations()` | Full |
 | `isSoroban()` | `is_soroban()` | Full |
 | `isOpSupported()` | Protocol version checks inline | Full |

@@ -1,6 +1,6 @@
+use henyey_common::entry_to_key;
 use henyey_common::normalize_transaction_meta;
 use henyey_crypto::{seed, xdr_compute_hash};
-use henyey_ledger::entry_to_key;
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, ExtensionPoint, LedgerEntry, LedgerEntryChange,
     LedgerEntryChanges, LedgerEntryData, LedgerEntryExt, OperationMetaV2, PublicKey, String32,
@@ -77,7 +77,7 @@ fn tx_meta_hash_vectors() {
 
     let op_changes = vec![
         ledger_entry_changes(vec![
-            LedgerEntryChange::Removed(entry_to_key(&entry_a).expect("entry key")),
+            LedgerEntryChange::Removed(entry_to_key(&entry_a)),
             LedgerEntryChange::Updated(entry_b.clone()),
         ]),
         ledger_entry_changes(vec![LedgerEntryChange::Created(entry_b.clone())]),
@@ -111,7 +111,7 @@ fn dump_tx_meta_hash_vectors() {
 
     let op_changes = vec![
         ledger_entry_changes(vec![
-            LedgerEntryChange::Removed(entry_to_key(&entry_a).expect("entry key")),
+            LedgerEntryChange::Removed(entry_to_key(&entry_a)),
             LedgerEntryChange::Updated(entry_b.clone()),
         ]),
         ledger_entry_changes(vec![LedgerEntryChange::Created(entry_b.clone())]),

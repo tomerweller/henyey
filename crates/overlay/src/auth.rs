@@ -42,15 +42,19 @@ use henyey_crypto::PublicKey;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use stellar_xdr::curr::{
-    self as xdr, AuthCert as XdrAuthCert, AuthenticatedMessage, AuthenticatedMessageV0,
-    Curve25519Public, EnvelopeType, Hello, HmacSha256Key, HmacSha256Mac, StellarMessage, Uint256,
-    WriteXdr,
+    self as xdr, AuthenticatedMessage, AuthenticatedMessageV0, Curve25519Public, EnvelopeType,
+    Hello, HmacSha256Key, HmacSha256Mac, StellarMessage, Uint256, WriteXdr,
 };
+
+/// Type alias for the XDR `AuthCert` — the overlay authentication certificate.
+///
+/// See [`AuthCertExt`] for helper methods (construction, signing, verification).
+pub type AuthCert = xdr::AuthCert;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, SharedSecret};
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Authentication certificate for the overlay handshake.
+/// Extension trait for `AuthCert` providing construction, signing, and verification.
 ///
 /// An `AuthCert` binds an ephemeral X25519 public key to a node's Ed25519 identity.
 /// The signature proves that the owner of the Ed25519 key generated this ephemeral key,
@@ -66,18 +70,21 @@ type HmacSha256 = Hmac<Sha256>;
 /// network_id (32 bytes) || ENVELOPE_TYPE_AUTH (4 bytes, big-endian) ||
 /// expiration (8 bytes, big-endian) || ephemeral_pubkey (32 bytes)
 /// ```
-#[derive(Debug, Clone)]
-pub struct AuthCert {
-    /// Ephemeral X25519 public key for Diffie-Hellman key exchange.
-    pub pubkey: [u8; 32],
-
-    /// Expiration time as Unix timestamp (seconds since epoch).
+pub trait AuthCertExt {
+    /// Creates a new authentication certificate.
     ///
-    /// Certificates are rejected if current time exceeds this value.
-    pub expiration: u64,
+    /// Generates a signature binding the ephemeral X25519 key to the local node's
+    /// Ed25519 identity. The certificate expires 1 hour from creation.
+    fn new_cert(local_node: &LocalNode, ephemeral_secret: &EphemeralSecret) -> AuthCert;
 
-    /// Ed25519 signature (64 bytes) over the certificate data.
-    pub sig: [u8; 64],
+    /// Verifies this certificate was signed by the given peer.
+    ///
+    /// Checks that the certificate has not expired and the signature is valid.
+    fn verify(
+        &self,
+        network_id: &henyey_common::NetworkId,
+        peer_public_key: &PublicKey,
+    ) -> Result<()>;
 }
 
 /// Constant-time byte array comparison to prevent timing side-channel attacks.
@@ -95,17 +102,8 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-impl AuthCert {
-    /// Creates a new authentication certificate.
-    ///
-    /// Generates a signature binding the ephemeral X25519 key to the local node's
-    /// Ed25519 identity. The certificate expires 1 hour from creation.
-    ///
-    /// # Arguments
-    ///
-    /// * `local_node` - The local node's identity and network configuration
-    /// * `ephemeral_secret` - The ephemeral X25519 secret key (public key is derived)
-    pub fn new(local_node: &LocalNode, ephemeral_secret: &EphemeralSecret) -> Self {
+impl AuthCertExt for AuthCert {
+    fn new_cert(local_node: &LocalNode, ephemeral_secret: &EphemeralSecret) -> AuthCert {
         let ephemeral_public = X25519PublicKey::from(ephemeral_secret);
         let pubkey = *ephemeral_public.as_bytes();
 
@@ -117,43 +115,16 @@ impl AuthCert {
             + 3600;
 
         // Sign: network_id || ENVELOPE_TYPE_AUTH || expiration || pubkey
-        let sig = Self::sign_cert(local_node, expiration, &pubkey);
+        let sig = sign_cert(local_node, expiration, &pubkey);
 
-        Self {
-            pubkey,
+        AuthCert {
+            pubkey: Curve25519Public { key: pubkey },
             expiration,
-            sig,
+            sig: xdr::Signature(sig.to_vec().try_into().unwrap()),
         }
     }
 
-    /// Signs the certificate data using the local node's Ed25519 key.
-    ///
-    /// Following stellar-core's implementation, we sign the SHA-256 hash of
-    /// the concatenated certificate fields, not the raw data.
-    fn sign_cert(local_node: &LocalNode, expiration: u64, pubkey: &[u8; 32]) -> [u8; 64] {
-        let mut data = Vec::with_capacity(32 + 4 + 8 + 32);
-        data.extend_from_slice(local_node.network_id.as_bytes());
-        data.extend_from_slice(&(EnvelopeType::Auth as i32).to_be_bytes());
-        data.extend_from_slice(&expiration.to_be_bytes());
-        data.extend_from_slice(pubkey);
-
-        // stellar-core signs the SHA-256 hash of the data, not the raw data
-        let hash = Hash256::hash(&data);
-        let signature = local_node.secret_key.sign(hash.as_bytes());
-        *signature.as_bytes()
-    }
-
-    /// Verifies this certificate was signed by the given peer.
-    ///
-    /// Checks that:
-    /// 1. The certificate has not expired
-    /// 2. The signature is valid for the peer's public key and network ID
-    ///
-    /// # Errors
-    ///
-    /// Returns `AuthenticationFailed` if the certificate is expired or
-    /// the signature is invalid.
-    pub fn verify(
+    fn verify(
         &self,
         network_id: &henyey_common::NetworkId,
         peer_public_key: &PublicKey,
@@ -174,37 +145,35 @@ impl AuthCert {
         data.extend_from_slice(network_id.as_bytes());
         data.extend_from_slice(&(EnvelopeType::Auth as i32).to_be_bytes());
         data.extend_from_slice(&self.expiration.to_be_bytes());
-        data.extend_from_slice(&self.pubkey);
+        data.extend_from_slice(&self.pubkey.key);
 
         // Verify signature over the hash (matching stellar-core's approach)
         let hash = Hash256::hash(&data);
-        let sig = henyey_crypto::Signature::from_bytes(self.sig);
+        let sig_bytes: [u8; 64] = self.sig.0.as_slice().try_into().map_err(|_| {
+            OverlayError::AuthenticationFailed("invalid signature length".to_string())
+        })?;
+        let sig = henyey_crypto::Signature::from_bytes(sig_bytes);
         peer_public_key.verify(hash.as_bytes(), &sig).map_err(|_| {
             OverlayError::AuthenticationFailed("invalid auth cert signature".to_string())
         })
     }
+}
 
-    /// Converts this certificate to XDR format.
-    pub fn to_xdr(&self) -> XdrAuthCert {
-        XdrAuthCert {
-            pubkey: Curve25519Public { key: self.pubkey },
-            expiration: self.expiration,
-            sig: xdr::Signature(self.sig.to_vec().try_into().unwrap()),
-        }
-    }
+/// Signs the certificate data using the local node's Ed25519 key.
+///
+/// Following stellar-core's implementation, we sign the SHA-256 hash of
+/// the concatenated certificate fields, not the raw data.
+fn sign_cert(local_node: &LocalNode, expiration: u64, pubkey: &[u8; 32]) -> [u8; 64] {
+    let mut data = Vec::with_capacity(32 + 4 + 8 + 32);
+    data.extend_from_slice(local_node.network_id.as_bytes());
+    data.extend_from_slice(&(EnvelopeType::Auth as i32).to_be_bytes());
+    data.extend_from_slice(&expiration.to_be_bytes());
+    data.extend_from_slice(pubkey);
 
-    /// Parses a certificate from XDR format.
-    pub fn from_xdr(xdr: &XdrAuthCert) -> Self {
-        let mut sig = [0u8; 64];
-        let sig_len = xdr.sig.0.len().min(64);
-        sig[..sig_len].copy_from_slice(&xdr.sig.0[..sig_len]);
-
-        Self {
-            pubkey: xdr.pubkey.key,
-            expiration: xdr.expiration,
-            sig,
-        }
-    }
+    // stellar-core signs the SHA-256 hash of the data, not the raw data
+    let hash = Hash256::hash(&data);
+    let signature = local_node.secret_key.sign(hash.as_bytes());
+    *signature.as_bytes()
 }
 
 /// Current state of the authentication handshake.
@@ -309,7 +278,7 @@ impl AuthContext {
         // Generate ephemeral key pair
         let ephemeral_secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
         let ephemeral_public = X25519PublicKey::from(&ephemeral_secret);
-        let auth_cert = AuthCert::new(&local_node, &ephemeral_secret);
+        let auth_cert = AuthCert::new_cert(&local_node, &ephemeral_secret);
 
         // Generate our nonce for Hello message
         let our_nonce = rand::random::<[u8; 32]>();
@@ -374,7 +343,7 @@ impl AuthContext {
                 .unwrap_or_default(),
             listening_port: self.local_node.listening_port as i32,
             peer_id: xdr::NodeId(public_key),
-            cert: self.our_auth_cert.as_ref().unwrap().to_xdr(),
+            cert: self.our_auth_cert.as_ref().unwrap().clone(),
             nonce: Uint256(self.our_nonce),
         }
     }
@@ -418,8 +387,8 @@ impl AuthContext {
             OverlayError::AuthenticationFailed(format!("invalid peer public key: {}", e))
         })?;
 
-        // Verify auth cert
-        let peer_auth_cert = AuthCert::from_xdr(&hello.cert);
+        // Verify auth cert (hello.cert is already the XDR AuthCert type)
+        let peer_auth_cert = hello.cert.clone();
         peer_auth_cert.verify(&self.local_node.network_id, &peer_public_key)?;
 
         // Store peer's nonce
@@ -429,7 +398,7 @@ impl AuthContext {
         let our_secret = self.our_ephemeral_secret.take().ok_or_else(|| {
             OverlayError::AuthenticationFailed("ephemeral secret already used".to_string())
         })?;
-        let peer_ephemeral_public = X25519PublicKey::from(peer_auth_cert.pubkey);
+        let peer_ephemeral_public = X25519PublicKey::from(peer_auth_cert.pubkey.key);
         let shared_secret = our_secret.diffie_hellman(&peer_ephemeral_public);
 
         // Derive MAC keys using nonces from Hello messages
@@ -476,9 +445,9 @@ impl AuthContext {
         // Step 1: HKDF-Extract to create shared key K
         // IKM = ECDH_result || A_pub || B_pub (where A is initiator, B is acceptor)
         let (a_pub, b_pub) = if self.we_called_remote {
-            (our_public.as_bytes(), &peer_auth_cert.pubkey)
+            (our_public.as_bytes(), &peer_auth_cert.pubkey.key)
         } else {
-            (&peer_auth_cert.pubkey, our_public.as_bytes())
+            (&peer_auth_cert.pubkey.key, our_public.as_bytes())
         };
 
         let mut ikm = Vec::with_capacity(32 + 32 + 32);
@@ -749,7 +718,7 @@ mod tests {
         let secret = SecretKey::generate();
         let local_node = LocalNode::new_testnet(secret);
         let ephemeral = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
-        let cert = AuthCert::new(&local_node, &ephemeral);
+        let cert = AuthCert::new_cert(&local_node, &ephemeral);
 
         // Verify it with our own public key
         let result = cert.verify(&local_node.network_id, &local_node.public_key());
@@ -1094,13 +1063,16 @@ mod tests {
 
     #[test]
     fn test_auth_cert_xdr_roundtrip() {
+        use stellar_xdr::curr::ReadXdr;
+
         let secret = SecretKey::generate();
         let local_node = LocalNode::new_testnet(secret);
         let ephemeral = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
-        let cert = AuthCert::new(&local_node, &ephemeral);
+        let cert = AuthCert::new_cert(&local_node, &ephemeral);
 
-        let xdr = cert.to_xdr();
-        let restored = AuthCert::from_xdr(&xdr);
+        // Serialize to XDR bytes and deserialize back
+        let bytes = cert.to_xdr(xdr::Limits::none()).unwrap();
+        let restored = AuthCert::from_xdr(bytes.as_slice(), xdr::Limits::none()).unwrap();
         assert!(restored
             .verify(&local_node.network_id, &local_node.public_key())
             .is_ok());

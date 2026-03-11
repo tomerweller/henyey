@@ -275,7 +275,7 @@ pub(crate) async fn getledgerentry_handler(
     let live_entry_map: HashMap<Vec<u8>, &LedgerEntry> = live_entries
         .iter()
         .filter_map(|e| {
-            let key = henyey_bucket::ledger_entry_to_key(e)?;
+            let key = henyey_common::entry_to_key(e);
             key.to_xdr(Limits::none()).ok().map(|kb| (kb, e))
         })
         .collect();
@@ -311,7 +311,7 @@ pub(crate) async fn getledgerentry_handler(
         .iter()
         .filter_map(|hae| match hae {
             HotArchiveBucketEntry::Archived(e) => {
-                let key = henyey_bucket::ledger_entry_to_key(e)?;
+                let key = henyey_common::entry_to_key(e);
                 key.to_xdr(Limits::none()).ok().map(|kb| (kb, e))
             }
             _ => None,
@@ -323,7 +323,7 @@ pub(crate) async fn getledgerentry_handler(
         .iter()
         .filter(|e| henyey_bucket::is_soroban_entry(e))
         .filter_map(|e| {
-            let key = henyey_bucket::ledger_entry_to_key(e)?;
+            let key = henyey_common::entry_to_key(e);
             get_ttl_key(&key)
         })
         .collect();
@@ -341,7 +341,7 @@ pub(crate) async fn getledgerentry_handler(
     let ttl_map: HashMap<Vec<u8>, &LedgerEntry> = ttl_entries
         .iter()
         .filter_map(|e| {
-            let key = henyey_bucket::ledger_entry_to_key(e)?;
+            let key = henyey_common::entry_to_key(e);
             key.to_xdr(Limits::none()).ok().map(|kb| (kb, e))
         })
         .collect();

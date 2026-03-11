@@ -38,9 +38,6 @@
 //!   Tracks creates, updates, and deletes with their pre-states for proper
 //!   metadata generation.
 //!
-//! - [`ApplyContext`]: Provides ledger context (sequence, close time, protocol
-//!   version, network ID) needed for transaction application.
-//!
 //! - [`ChangeRef`]: References a change by type and index, preserving the exact
 //!   order of state modifications for correct metadata construction.
 //!
@@ -382,43 +379,6 @@ impl LedgerDelta {
     }
 }
 
-/// Context for applying transactions during catchup.
-pub struct ApplyContext {
-    /// Current ledger sequence.
-    pub ledger_seq: u32,
-    /// Ledger close time.
-    pub close_time: u64,
-    /// Protocol version.
-    pub protocol_version: u32,
-    /// Base fee.
-    pub base_fee: u32,
-    /// Base reserve.
-    pub base_reserve: u32,
-    /// Network ID bytes.
-    pub network_id: [u8; 32],
-}
-
-impl ApplyContext {
-    /// Create a new apply context.
-    pub fn new(
-        ledger_seq: u32,
-        close_time: u64,
-        protocol_version: u32,
-        base_fee: u32,
-        base_reserve: u32,
-        network_id: [u8; 32],
-    ) -> Self {
-        Self {
-            ledger_seq,
-            close_time,
-            protocol_version,
-            base_fee,
-            base_reserve,
-            network_id,
-        }
-    }
-}
-
 /// Apply a transaction from history.
 ///
 /// This is the main entry point for catchup mode. We trust the historical
@@ -534,11 +494,6 @@ pub fn apply_fee_only(
     let fee = frame.total_fee();
     delta.add_fee(fee);
     Ok(())
-}
-
-/// Extract the ledger key from a ledger entry.
-pub fn entry_to_key(entry: &LedgerEntry) -> LedgerKey {
-    henyey_common::entry_to_key(entry)
 }
 
 /// Batch apply multiple transactions from history.
@@ -657,7 +612,7 @@ mod tests {
             ext: LedgerEntryExt::V0,
         };
 
-        let key = entry_to_key(&entry);
+        let key = henyey_common::entry_to_key(&entry);
         match key {
             LedgerKey::Account(k) => {
                 assert_eq!(k.account_id, account_id);
@@ -1072,7 +1027,7 @@ mod tests {
             ext: LedgerEntryExt::V0,
         };
 
-        let key = entry_to_key(&entry);
+        let key = henyey_common::entry_to_key(&entry);
         match key {
             LedgerKey::Trustline(k) => {
                 assert_eq!(k.account_id, account_id);
@@ -1104,7 +1059,7 @@ mod tests {
             ext: LedgerEntryExt::V0,
         };
 
-        let key = entry_to_key(&entry);
+        let key = henyey_common::entry_to_key(&entry);
         match key {
             LedgerKey::Offer(k) => {
                 assert_eq!(k.seller_id, seller);
@@ -1129,7 +1084,7 @@ mod tests {
             ext: LedgerEntryExt::V0,
         };
 
-        let key = entry_to_key(&entry);
+        let key = henyey_common::entry_to_key(&entry);
         match key {
             LedgerKey::Data(k) => {
                 assert_eq!(k.account_id, account_id);

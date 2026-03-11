@@ -17,6 +17,7 @@ use stellar_xdr::curr::{
 
 use crate::apply::{DeltaLengths, LedgerDelta};
 use crate::{Result, TxError};
+pub(crate) use henyey_common::asset::asset_to_trustline_asset;
 
 /// Callback type for lazily loading ledger entries from the bucket list.
 type EntryLoaderFn = dyn Fn(&LedgerKey) -> Result<Option<LedgerEntry>> + Send + Sync;
@@ -1228,11 +1229,21 @@ impl LedgerStateManager {
         let ttl_entry_size = 16;
 
         // Core entry maps
-        let accounts = hashmap_heap_bytes(self.accounts.capacity(), account_id_size, account_entry_size);
-        let trustlines = hashmap_heap_bytes(self.trustlines.capacity(), trustline_key_size, trustline_entry_size);
+        let accounts = hashmap_heap_bytes(
+            self.accounts.capacity(),
+            account_id_size,
+            account_entry_size,
+        );
+        let trustlines = hashmap_heap_bytes(
+            self.trustlines.capacity(),
+            trustline_key_size,
+            trustline_entry_size,
+        );
         let offers = hashmap_heap_bytes(self.offers.capacity(), offer_key_size, offer_entry_size);
-        let ttl_entries = hashmap_heap_bytes(self.ttl_entries.capacity(), hash_size, ttl_entry_size);
-        let ttl_snapshot = hashmap_heap_bytes(self.ttl_bucket_list_snapshot.capacity(), hash_size, 4);
+        let ttl_entries =
+            hashmap_heap_bytes(self.ttl_entries.capacity(), hash_size, ttl_entry_size);
+        let ttl_snapshot =
+            hashmap_heap_bytes(self.ttl_bucket_list_snapshot.capacity(), hash_size, 4);
 
         // EntryStore-based maps
         let data_entries = self.data_entries.estimate_heap_bytes(100, 200);
@@ -1242,30 +1253,71 @@ impl LedgerStateManager {
         let liquidity_pools = self.liquidity_pools.estimate_heap_bytes(hash_size, 300);
 
         // Sponsorship maps
-        let entry_sponsorships = hashmap_heap_bytes(self.entry_sponsorships.capacity(), ledger_key_size, account_id_size);
-        let offer_sponsorships = hashmap_heap_bytes(self.offer_sponsorships.capacity(), ledger_key_size, account_id_size);
-        let entry_sponsorship_ext = hashset_heap_bytes(self.entry_sponsorship_ext.capacity(), ledger_key_size);
-        let offer_sponsorship_ext = hashset_heap_bytes(self.offer_sponsorship_ext.capacity(), ledger_key_size);
-        let entry_last_modified = hashmap_heap_bytes(self.entry_last_modified.capacity(), ledger_key_size, 4);
-        let offer_last_modified = hashmap_heap_bytes(self.offer_last_modified.capacity(), ledger_key_size, 4);
+        let entry_sponsorships = hashmap_heap_bytes(
+            self.entry_sponsorships.capacity(),
+            ledger_key_size,
+            account_id_size,
+        );
+        let offer_sponsorships = hashmap_heap_bytes(
+            self.offer_sponsorships.capacity(),
+            ledger_key_size,
+            account_id_size,
+        );
+        let entry_sponsorship_ext =
+            hashset_heap_bytes(self.entry_sponsorship_ext.capacity(), ledger_key_size);
+        let offer_sponsorship_ext =
+            hashset_heap_bytes(self.offer_sponsorship_ext.capacity(), ledger_key_size);
+        let entry_last_modified =
+            hashmap_heap_bytes(self.entry_last_modified.capacity(), ledger_key_size, 4);
+        let offer_last_modified =
+            hashmap_heap_bytes(self.offer_last_modified.capacity(), ledger_key_size, 4);
 
         // Snapshot maps (typically empty between TXs)
-        let op_entry_snapshots = hashmap_heap_bytes(self.op_entry_snapshots.capacity(), ledger_key_size, 200);
-        let account_snapshots = hashmap_heap_bytes(self.account_snapshots.capacity(), account_id_size, account_entry_size);
-        let trustline_snapshots = hashmap_heap_bytes(self.trustline_snapshots.capacity(), trustline_key_size, trustline_entry_size);
-        let offer_snapshots = hashmap_heap_bytes(self.offer_snapshots.capacity(), offer_key_size, offer_entry_size);
-        let ttl_snapshots = hashmap_heap_bytes(self.ttl_snapshots.capacity(), hash_size, ttl_entry_size);
-        let sponsorship_snapshots = hashmap_heap_bytes(self.entry_sponsorship_snapshots.capacity(), ledger_key_size, account_id_size);
-        let ext_snapshots = hashmap_heap_bytes(self.entry_sponsorship_ext_snapshots.capacity(), ledger_key_size, 1);
-        let lm_snapshots = hashmap_heap_bytes(self.entry_last_modified_snapshots.capacity(), ledger_key_size, 4);
+        let op_entry_snapshots =
+            hashmap_heap_bytes(self.op_entry_snapshots.capacity(), ledger_key_size, 200);
+        let account_snapshots = hashmap_heap_bytes(
+            self.account_snapshots.capacity(),
+            account_id_size,
+            account_entry_size,
+        );
+        let trustline_snapshots = hashmap_heap_bytes(
+            self.trustline_snapshots.capacity(),
+            trustline_key_size,
+            trustline_entry_size,
+        );
+        let offer_snapshots = hashmap_heap_bytes(
+            self.offer_snapshots.capacity(),
+            offer_key_size,
+            offer_entry_size,
+        );
+        let ttl_snapshots =
+            hashmap_heap_bytes(self.ttl_snapshots.capacity(), hash_size, ttl_entry_size);
+        let sponsorship_snapshots = hashmap_heap_bytes(
+            self.entry_sponsorship_snapshots.capacity(),
+            ledger_key_size,
+            account_id_size,
+        );
+        let ext_snapshots = hashmap_heap_bytes(
+            self.entry_sponsorship_ext_snapshots.capacity(),
+            ledger_key_size,
+            1,
+        );
+        let lm_snapshots = hashmap_heap_bytes(
+            self.entry_last_modified_snapshots.capacity(),
+            ledger_key_size,
+            4,
+        );
 
         // Tracking vecs and sets
         let modified_accounts = vec_heap_bytes(self.modified_accounts.capacity(), account_id_size);
-        let modified_trustlines = vec_heap_bytes(self.modified_trustlines.capacity(), trustline_key_size);
+        let modified_trustlines =
+            vec_heap_bytes(self.modified_trustlines.capacity(), trustline_key_size);
         let modified_offers = vec_heap_bytes(self.modified_offers.capacity(), offer_key_size);
         let modified_ttl = vec_heap_bytes(self.modified_ttl.capacity(), hash_size);
-        let created_accounts = hashset_heap_bytes(self.created_accounts.capacity(), account_id_size);
-        let created_trustlines = hashset_heap_bytes(self.created_trustlines.capacity(), trustline_key_size);
+        let created_accounts =
+            hashset_heap_bytes(self.created_accounts.capacity(), account_id_size);
+        let created_trustlines =
+            hashset_heap_bytes(self.created_trustlines.capacity(), trustline_key_size);
         let created_offers = hashset_heap_bytes(self.created_offers.capacity(), offer_key_size);
         let created_ttl = hashset_heap_bytes(self.created_ttl.capacity(), hash_size);
         let deleted_ttl = hashset_heap_bytes(self.deleted_ttl.capacity(), hash_size);
@@ -1274,9 +1326,15 @@ impl LedgerStateManager {
         let deferred = hashmap_heap_bytes(self.deferred_ro_ttl_bumps.capacity(), hash_size, 4);
 
         // Offer index
-        let offer_index_books = hashmap_heap_bytes(self.offer_index.order_book_capacity(), asset_pair_size, 200);
-        let offer_index_locs = hashmap_heap_bytes(self.offer_index.location_capacity(), offer_key_size, asset_pair_size + 24);
-        let account_asset_offers = hashmap_heap_bytes(self.account_asset_offers.capacity(), trustline_key_size, 64);
+        let offer_index_books =
+            hashmap_heap_bytes(self.offer_index.order_book_capacity(), asset_pair_size, 200);
+        let offer_index_locs = hashmap_heap_bytes(
+            self.offer_index.location_capacity(),
+            offer_key_size,
+            asset_pair_size + 24,
+        );
+        let account_asset_offers =
+            hashmap_heap_bytes(self.account_asset_offers.capacity(), trustline_key_size, 64);
         let max_seq = hashmap_heap_bytes(self.max_seq_num_to_apply.capacity(), account_id_size, 8);
 
         // Offer-related bytes (preserved across ledger closes)
@@ -1288,15 +1346,44 @@ impl LedgerStateManager {
             + offer_index_locs
             + account_asset_offers;
 
-        let total = accounts + trustlines + offers + ttl_entries + ttl_snapshot
-            + data_entries + contract_data + contract_code + claimable_balances + liquidity_pools
-            + entry_sponsorships + offer_sponsorships + entry_sponsorship_ext + offer_sponsorship_ext
-            + entry_last_modified + offer_last_modified
-            + op_entry_snapshots + account_snapshots + trustline_snapshots + offer_snapshots
-            + ttl_snapshots + sponsorship_snapshots + ext_snapshots + lm_snapshots
-            + modified_accounts + modified_trustlines + modified_offers + modified_ttl
-            + created_accounts + created_trustlines + created_offers + created_ttl + deleted_ttl
-            + deferred + offer_index_books + offer_index_locs + account_asset_offers + max_seq;
+        let total = accounts
+            + trustlines
+            + offers
+            + ttl_entries
+            + ttl_snapshot
+            + data_entries
+            + contract_data
+            + contract_code
+            + claimable_balances
+            + liquidity_pools
+            + entry_sponsorships
+            + offer_sponsorships
+            + entry_sponsorship_ext
+            + offer_sponsorship_ext
+            + entry_last_modified
+            + offer_last_modified
+            + op_entry_snapshots
+            + account_snapshots
+            + trustline_snapshots
+            + offer_snapshots
+            + ttl_snapshots
+            + sponsorship_snapshots
+            + ext_snapshots
+            + lm_snapshots
+            + modified_accounts
+            + modified_trustlines
+            + modified_offers
+            + modified_ttl
+            + created_accounts
+            + created_trustlines
+            + created_offers
+            + created_ttl
+            + deleted_ttl
+            + deferred
+            + offer_index_books
+            + offer_index_locs
+            + account_asset_offers
+            + max_seq;
 
         (total, offer_bytes)
     }
@@ -2060,11 +2147,6 @@ impl LedgerStateManager {
 /// Convert a String64 data name to a String.
 fn data_name_to_string(name: &stellar_xdr::curr::String64) -> String {
     String::from_utf8_lossy(name.as_vec()).to_string()
-}
-
-/// Convert an Asset to a TrustLineAsset.
-pub fn asset_to_trustline_asset(asset: &Asset) -> TrustLineAsset {
-    henyey_common::asset::asset_to_trustline_asset(asset)
 }
 
 fn sponsorship_counts(account: &AccountEntry) -> (i64, i64) {

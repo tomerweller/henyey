@@ -41,7 +41,7 @@ use crate::bucket_list::{
     bl_keep_tombstone_entries, bl_level_half, bl_level_should_spill, bl_round_down,
     bl_should_merge_with_empty_curr, HasNextState, HAS_NEXT_STATE_INPUTS, HAS_NEXT_STATE_OUTPUT,
 };
-use crate::entry::{compare_sc_address, compare_sc_val, ledger_entry_to_key};
+use crate::entry::{compare_sc_address, compare_sc_val};
 use crate::{BucketError, Result};
 use henyey_common::protocol::{
     protocol_version_is_before, protocol_version_starts_from, ProtocolVersion,
@@ -653,12 +653,17 @@ impl HotArchiveBucket {
     /// Estimate heap bytes used by this bucket.
     pub fn estimate_heap_bytes(&self) -> usize {
         match &self.storage {
-            HotArchiveStorage::InMemory { entries, ordered_entries } => {
+            HotArchiveStorage::InMemory {
+                entries,
+                ordered_entries,
+            } => {
                 // BTreeMap: key Vec<u8> heap + entry overhead
                 let key_data: usize = entries.keys().map(|k| k.len()).sum();
-                let entry_overhead = entries.len() * (std::mem::size_of::<HotArchiveBucketEntry>() + 64);
+                let entry_overhead =
+                    entries.len() * (std::mem::size_of::<HotArchiveBucketEntry>() + 64);
                 // ordered_entries Vec
-                let ordered = ordered_entries.capacity() * std::mem::size_of::<HotArchiveBucketEntry>();
+                let ordered =
+                    ordered_entries.capacity() * std::mem::size_of::<HotArchiveBucketEntry>();
                 key_data + entry_overhead + ordered
             }
             HotArchiveStorage::DiskBacked { index, .. } => {
@@ -677,9 +682,9 @@ impl HotArchiveBucket {
     pub fn mmap_bytes(&self) -> usize {
         match &self.storage {
             HotArchiveStorage::InMemory { .. } => 0,
-            HotArchiveStorage::DiskBacked { path, .. } => {
-                std::fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0)
-            }
+            HotArchiveStorage::DiskBacked { path, .. } => std::fs::metadata(path)
+                .map(|m| m.len() as usize)
+                .unwrap_or(0),
         }
     }
 }
@@ -1174,16 +1179,18 @@ impl HotArchiveBucketList {
 
     /// Estimate total heap bytes across all hot archive buckets.
     pub fn estimate_heap_bytes(&self) -> usize {
-        self.levels.iter().map(|l| {
-            l.curr.estimate_heap_bytes() + l.snap.estimate_heap_bytes()
-        }).sum()
+        self.levels
+            .iter()
+            .map(|l| l.curr.estimate_heap_bytes() + l.snap.estimate_heap_bytes())
+            .sum()
     }
 
     /// Total mmap'd / disk-backed bytes across all hot archive buckets.
     pub fn mmap_bytes(&self) -> usize {
-        self.levels.iter().map(|l| {
-            l.curr.mmap_bytes() + l.snap.mmap_bytes()
-        }).sum()
+        self.levels
+            .iter()
+            .map(|l| l.curr.mmap_bytes() + l.snap.mmap_bytes())
+            .sum()
     }
 
     /// Debug print level state.
@@ -1629,9 +1636,7 @@ pub struct HotArchiveBucketListStats {
 fn hot_archive_entry_to_key(entry: &HotArchiveBucketEntry) -> Result<Vec<u8>> {
     match entry {
         HotArchiveBucketEntry::Archived(e) => {
-            let key = ledger_entry_to_key(e).ok_or_else(|| {
-                BucketError::Serialization("failed to extract key from entry".to_string())
-            })?;
+            let key = henyey_common::entry_to_key(e);
             key.to_xdr(Limits::none())
                 .map_err(|e| BucketError::Serialization(format!("failed to serialize key: {}", e)))
         }
@@ -1673,13 +1678,13 @@ pub fn compare_hot_archive_entries(
 
     // Get LedgerKey from each entry
     let key_a = match a {
-        HotArchiveBucketEntry::Archived(e) => ledger_entry_to_key(e),
+        HotArchiveBucketEntry::Archived(e) => Some(henyey_common::entry_to_key(e)),
         HotArchiveBucketEntry::Live(k) => Some(k.clone()),
         HotArchiveBucketEntry::Metaentry(_) => unreachable!(),
     };
 
     let key_b = match b {
-        HotArchiveBucketEntry::Archived(e) => ledger_entry_to_key(e),
+        HotArchiveBucketEntry::Archived(e) => Some(henyey_common::entry_to_key(e)),
         HotArchiveBucketEntry::Live(k) => Some(k.clone()),
         HotArchiveBucketEntry::Metaentry(_) => unreachable!(),
     };

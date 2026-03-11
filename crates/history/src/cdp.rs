@@ -1005,17 +1005,16 @@ pub fn extract_restored_keys(
         restored_keys: &mut Vec<stellar_xdr::curr::LedgerKey>,
     ) {
         if let LedgerEntryChange::Restored(entry) = change {
-            if let Some(key) = henyey_bucket::ledger_entry_to_key(entry) {
-                // Only CONTRACT_DATA and CONTRACT_CODE keys go to hot archive.
-                // TTL keys are NOT recorded in the hot archive bucket list,
-                // matching stellar-core behavior in LedgerManagerImpl.cpp.
-                match &key {
-                    LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
-                        restored_keys.push(key);
-                    }
-                    _ => {
-                        // Skip TTL keys and any other key types
-                    }
+            let key = henyey_common::entry_to_key(entry);
+            // Only CONTRACT_DATA and CONTRACT_CODE keys go to hot archive.
+            // TTL keys are NOT recorded in the hot archive bucket list,
+            // matching stellar-core behavior in LedgerManagerImpl.cpp.
+            match &key {
+                LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
+                    restored_keys.push(key);
+                }
+                _ => {
+                    // Skip TTL keys and any other key types
                 }
             }
         }

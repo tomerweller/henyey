@@ -105,7 +105,7 @@ impl BucketEntryExt for BucketEntry {
     fn key(&self) -> Option<LedgerKey> {
         match self {
             BucketEntry::Liveentry(entry) | BucketEntry::Initentry(entry) => {
-                ledger_entry_to_key(entry)
+                Some(henyey_common::entry_to_key(entry))
             }
             BucketEntry::Deadentry(key) => Some(key.clone()),
             BucketEntry::Metaentry(_) => None,
@@ -138,11 +138,6 @@ impl BucketEntryExt for BucketEntry {
     fn entry_type(&self) -> BucketEntryType {
         self.discriminant()
     }
-}
-
-/// Extract a LedgerKey from a LedgerEntry.
-pub fn ledger_entry_to_key(entry: &LedgerEntry) -> Option<LedgerKey> {
-    Some(henyey_common::entry_to_key(entry))
 }
 
 /// Compare two LedgerKeys for ordering.

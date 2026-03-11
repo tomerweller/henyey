@@ -836,12 +836,11 @@ impl BucketManager {
                         }
 
                         // Check if already seen
-                        if let Some(key) = crate::entry::ledger_entry_to_key(ledger_entry) {
-                            if seen_keys.contains(&key) {
-                                continue;
-                            }
-                            seen_keys.insert(key);
+                        let key = henyey_common::entry_to_key(ledger_entry);
+                        if seen_keys.contains(&key) {
+                            continue;
                         }
+                        seen_keys.insert(key);
 
                         // Accept the entry
                         if !accept_entry(ledger_entry) {
@@ -925,15 +924,14 @@ impl BucketManager {
                 match entry {
                     crate::BucketEntry::Liveentry(ref ledger_entry)
                     | crate::BucketEntry::Initentry(ref ledger_entry) => {
-                        if let Some(key) = crate::entry::ledger_entry_to_key(ledger_entry) {
-                            let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
-                                BucketError::Serialization(format!(
-                                    "failed to serialize ledger key: {}",
-                                    e
-                                ))
-                            })?;
-                            state.insert(key_bytes, ledger_entry.clone());
-                        }
+                        let key = henyey_common::entry_to_key(ledger_entry);
+                        let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
+                            BucketError::Serialization(format!(
+                                "failed to serialize ledger key: {}",
+                                e
+                            ))
+                        })?;
+                        state.insert(key_bytes, ledger_entry.clone());
                     }
                     crate::BucketEntry::Deadentry(ref key) => {
                         let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
@@ -993,15 +991,14 @@ impl BucketManager {
             for entry in bucket.iter() {
                 match entry {
                     stellar_xdr::curr::HotArchiveBucketEntry::Archived(ref ledger_entry) => {
-                        if let Some(key) = crate::entry::ledger_entry_to_key(ledger_entry) {
-                            let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
-                                BucketError::Serialization(format!(
-                                    "failed to serialize ledger key: {}",
-                                    e
-                                ))
-                            })?;
-                            state.insert(key_bytes, ledger_entry.clone());
-                        }
+                        let key = henyey_common::entry_to_key(ledger_entry);
+                        let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
+                            BucketError::Serialization(format!(
+                                "failed to serialize ledger key: {}",
+                                e
+                            ))
+                        })?;
+                        state.insert(key_bytes, ledger_entry.clone());
                     }
                     stellar_xdr::curr::HotArchiveBucketEntry::Live(ref key) => {
                         // Live = restore marker (tombstone) — remove from archive

@@ -211,41 +211,9 @@ pub fn entry_to_key(entry: &stellar_xdr::curr::LedgerEntry) -> stellar_xdr::curr
     }
 }
 
-/// Authorization threshold level required for an operation.
-///
-/// Stellar accounts have three configurable threshold levels that determine
-/// how much signer weight is required to authorize different types of operations.
-/// The thresholds are stored in the account's \ field:
-///
-/// - \: Master key weight
-/// - \: Low threshold
-/// - \: Medium threshold
-/// - \: High threshold
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ThresholdLevel {
-    /// Low threshold - for less sensitive operations.
-    Low,
-
-    /// Medium threshold - for most standard operations.
-    Medium,
-
-    /// High threshold - for sensitive operations that modify account security.
-    High,
-}
-
-impl ThresholdLevel {
-    /// Get the threshold index in the account's thresholds array.
-    ///
-    /// Returns the index (1-3) into the account's \ field.
-    /// Note: index 0 is the master key weight, not a threshold.
-    pub fn index(&self) -> usize {
-        match self {
-            ThresholdLevel::Low => 1,
-            ThresholdLevel::Medium => 2,
-            ThresholdLevel::High => 3,
-        }
-    }
-}
+/// Type alias: `ThresholdLevel` is now `ThresholdIndexes` from the XDR crate.
+/// Variants: `MasterWeight = 0`, `Low = 1`, `Med = 2`, `High = 3`.
+pub type ThresholdLevel = stellar_xdr::curr::ThresholdIndexes;
 
 #[cfg(test)]
 mod tests {
@@ -281,8 +249,8 @@ mod tests {
 
     #[test]
     fn test_threshold_level_index() {
-        assert_eq!(ThresholdLevel::Low.index(), 1);
-        assert_eq!(ThresholdLevel::Medium.index(), 2);
-        assert_eq!(ThresholdLevel::High.index(), 3);
+        assert_eq!(ThresholdLevel::Low as usize, 1);
+        assert_eq!(ThresholdLevel::Med as usize, 2);
+        assert_eq!(ThresholdLevel::High as usize, 3);
     }
 }

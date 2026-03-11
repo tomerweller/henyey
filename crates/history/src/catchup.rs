@@ -2339,7 +2339,7 @@ impl CatchupManagerBuilder {
             emit_classic_events: false,
             backfill_stellar_asset_events: false,
             run_eviction: true,
-            eviction_settings: henyey_bucket::StateArchivalSettings::default(),
+            eviction_settings: stellar_xdr::curr::StateArchivalSettings::default(),
             wait_for_publish: false,
         };
 

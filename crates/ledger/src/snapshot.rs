@@ -23,9 +23,9 @@
 
 use crate::delta::key_to_bytes;
 use crate::{LedgerError, Result};
+use henyey_common::Hash256;
 use std::collections::HashMap;
 use std::sync::Arc;
-use henyey_common::Hash256;
 use stellar_xdr::curr::{
     AccountEntry, AccountId, LedgerEntry, LedgerEntryData, LedgerHeader, LedgerKey, PoolId,
 };
@@ -424,10 +424,9 @@ impl SnapshotHandle {
         if !loaded.is_empty() {
             let mut cache = self.prefetch_cache.write();
             for entry in &loaded {
-                if let Ok(key) = crate::delta::entry_to_key(entry) {
-                    if let Ok(key_bytes) = key_to_bytes(&key) {
-                        cache.insert(key_bytes, entry.clone());
-                    }
+                let key = henyey_common::entry_to_key(entry);
+                if let Ok(key_bytes) = key_to_bytes(&key) {
+                    cache.insert(key_bytes, entry.clone());
                 }
             }
         }
@@ -547,10 +546,9 @@ impl SnapshotHandle {
         let loaded = entries.len();
         let mut cache = self.prefetch_cache.write();
         for entry in entries {
-            if let Ok(key) = crate::delta::entry_to_key(&entry) {
-                if let Ok(key_bytes) = key_to_bytes(&key) {
-                    cache.insert(key_bytes, entry);
-                }
+            let key = henyey_common::entry_to_key(&entry);
+            if let Ok(key_bytes) = key_to_bytes(&key) {
+                cache.insert(key_bytes, entry);
             }
         }
 
@@ -560,7 +558,6 @@ impl SnapshotHandle {
         })
     }
 }
-
 
 /// Fluent builder for constructing [`LedgerSnapshot`] instances.
 ///

@@ -67,11 +67,11 @@ pub enum EntryChange {
 
 impl EntryChange {
     /// Get the ledger key for this change.
-    pub fn key(&self) -> Result<LedgerKey> {
+    pub fn key(&self) -> LedgerKey {
         match self {
-            EntryChange::Created(entry) => entry_to_key(entry),
-            EntryChange::Updated { current, .. } => entry_to_key(current),
-            EntryChange::Deleted { previous } => entry_to_key(previous),
+            EntryChange::Created(entry) => henyey_common::entry_to_key(entry),
+            EntryChange::Updated { current, .. } => henyey_common::entry_to_key(current),
+            EntryChange::Deleted { previous } => henyey_common::entry_to_key(previous),
         }
     }
 
@@ -107,21 +107,6 @@ impl EntryChange {
     pub fn is_deleted(&self) -> bool {
         matches!(self, EntryChange::Deleted { .. })
     }
-}
-
-/// Extract the ledger key from a ledger entry.
-///
-/// Each ledger entry type has a corresponding key type that uniquely
-/// identifies it. This function extracts the appropriate key fields
-/// from the entry data.
-///
-/// # Supported Entry Types
-///
-/// - Account, Trustline, Offer, Data
-/// - ClaimableBalance, LiquidityPool
-/// - ContractData, ContractCode, ConfigSetting, Ttl (Soroban)
-pub fn entry_to_key(entry: &LedgerEntry) -> Result<LedgerKey> {
-    Ok(henyey_common::entry_to_key(entry))
 }
 
 /// Serialize a ledger key to bytes for use as a hash map key.
@@ -204,7 +189,7 @@ impl LedgerDelta {
     /// - If it was updated, keep original previous and update current
     /// - If it was deleted, return error (can't create a deleted entry)
     pub fn record_create(&mut self, entry: LedgerEntry) -> Result<()> {
-        let key = entry_to_key(&entry)?;
+        let key = henyey_common::entry_to_key(&entry);
         let key_bytes = key_to_bytes(&key)?;
 
         if let Some(existing) = self.changes.get(&key_bytes) {
@@ -244,7 +229,7 @@ impl LedgerDelta {
 
     /// Record an update to an existing entry.
     pub fn record_update(&mut self, previous: LedgerEntry, current: LedgerEntry) -> Result<()> {
-        let key = entry_to_key(&current)?;
+        let key = henyey_common::entry_to_key(&current);
         let key_bytes = key_to_bytes(&key)?;
 
         // Check if we already have a change for this entry
@@ -314,7 +299,7 @@ impl LedgerDelta {
             ));
         }
 
-        let key = entry_to_key(&entry)?;
+        let key = henyey_common::entry_to_key(&entry);
         let key_bytes = key_to_bytes(&key)?;
 
         // Check if we already have a change for this entry
@@ -566,7 +551,7 @@ impl LedgerDelta {
     pub fn dead_entries(&self) -> Vec<LedgerKey> {
         self.changes()
             .filter(|change| change.is_deleted())
-            .filter_map(|change| change.key().ok())
+            .map(|change| change.key())
             .collect()
     }
 
@@ -1406,7 +1391,7 @@ mod tests {
     fn test_deleted_entry_shows_as_deleted_in_delta() {
         let mut delta = LedgerDelta::new(1);
         let entry = create_test_account(1);
-        let key = entry_to_key(&entry).unwrap();
+        let key = henyey_common::entry_to_key(&entry);
 
         delta.record_delete(entry.clone()).unwrap();
 
@@ -1427,7 +1412,7 @@ mod tests {
     fn test_created_then_deleted_vanishes() {
         let mut delta = LedgerDelta::new(1);
         let entry = create_test_account(1);
-        let key = entry_to_key(&entry).unwrap();
+        let key = henyey_common::entry_to_key(&entry);
 
         delta.record_create(entry.clone()).unwrap();
         assert_eq!(delta.num_changes(), 1);
@@ -1454,7 +1439,7 @@ mod tests {
     fn test_deleted_entry_previous_preserved() {
         let mut delta = LedgerDelta::new(1);
         let entry = create_test_account(1);
-        let key = entry_to_key(&entry).unwrap();
+        let key = henyey_common::entry_to_key(&entry);
 
         // Set a specific balance so we can verify previous is preserved
         let mut custom = entry.clone();

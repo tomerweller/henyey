@@ -883,7 +883,8 @@ async fn test_eviction_scan_shadowed_entries_not_evicted() {
 /// Test incremental eviction scan with settings
 #[tokio::test(flavor = "multi_thread")]
 async fn test_eviction_scan_incremental() {
-    use henyey_bucket::{EvictionIterator, StateArchivalSettings};
+    use henyey_bucket::EvictionIterator;
+    use stellar_xdr::curr::StateArchivalSettings;
 
     let mut bl = BucketList::new();
 
@@ -915,6 +916,7 @@ async fn test_eviction_scan_incremental() {
         starting_eviction_scan_level: 0,
         eviction_scan_size: 10_000, // Scan 10KB at a time
         max_entries_to_archive: 1000, // Default limit
+        ..Default::default()
     };
 
     // Create iterator starting at level 0
@@ -958,7 +960,7 @@ async fn test_eviction_scan_incremental() {
 /// background eviction optimization: the snapshot-based scan must be identical.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_snapshot_eviction_scan_matches_bucket_list() {
-    use henyey_bucket::{BucketListSnapshot, EvictionIterator, StateArchivalSettings};
+    use henyey_bucket::{BucketListSnapshot, EvictionIterator};
 
     let mut bl = BucketList::new();
 
@@ -989,6 +991,7 @@ async fn test_snapshot_eviction_scan_matches_bucket_list() {
         starting_eviction_scan_level: 0,
         eviction_scan_size: 100_000,
         max_entries_to_archive: 1000,
+        ..Default::default()
     };
 
     let iter = EvictionIterator {
@@ -1086,7 +1089,7 @@ async fn test_snapshot_eviction_scan_matches_bucket_list() {
 /// send it to another thread, run the scan there, and collect the result.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_snapshot_eviction_scan_on_background_thread() {
-    use henyey_bucket::{BucketListSnapshot, EvictionIterator, StateArchivalSettings};
+    use henyey_bucket::{BucketListSnapshot, EvictionIterator};
 
     let mut bl = BucketList::new();
 
@@ -1116,6 +1119,7 @@ async fn test_snapshot_eviction_scan_on_background_thread() {
         starting_eviction_scan_level: 0,
         eviction_scan_size: 100_000,
         max_entries_to_archive: 1000,
+        ..Default::default()
     };
 
     let iter = EvictionIterator {
@@ -1178,7 +1182,7 @@ async fn test_snapshot_eviction_scan_on_background_thread() {
 /// When a TTL is updated (extended), the snapshot must see the latest version.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_snapshot_eviction_scan_respects_extended_ttl() {
-    use henyey_bucket::{BucketListSnapshot, EvictionIterator, StateArchivalSettings};
+    use henyey_bucket::{BucketListSnapshot, EvictionIterator};
 
     let mut bl = BucketList::new();
 
@@ -1246,6 +1250,7 @@ async fn test_snapshot_eviction_scan_respects_extended_ttl() {
         starting_eviction_scan_level: 0,
         eviction_scan_size: 100_000,
         max_entries_to_archive: 1000,
+        ..Default::default()
     };
     let iter = EvictionIterator {
         bucket_list_level: 0,
@@ -1282,7 +1287,7 @@ async fn test_snapshot_eviction_scan_respects_extended_ttl() {
 /// (they should be marked as temporary, not persistent).
 #[tokio::test(flavor = "multi_thread")]
 async fn test_snapshot_eviction_scan_temporary_entries() {
-    use henyey_bucket::{BucketListSnapshot, EvictionIterator, StateArchivalSettings};
+    use henyey_bucket::{BucketListSnapshot, EvictionIterator};
 
     let mut bl = BucketList::new();
 
@@ -1347,6 +1352,7 @@ async fn test_snapshot_eviction_scan_temporary_entries() {
         starting_eviction_scan_level: 0,
         eviction_scan_size: 100_000,
         max_entries_to_archive: 1000,
+        ..Default::default()
     };
     let iter = EvictionIterator {
         bucket_list_level: 0,

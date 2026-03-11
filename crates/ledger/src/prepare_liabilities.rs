@@ -31,8 +31,7 @@ use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext,
     AccountEntryExtensionV2, AccountEntryExtensionV2Ext, AccountId, Asset, LedgerEntry,
     LedgerEntryData, LedgerEntryExt, LedgerKey, LedgerKeyAccount, LedgerKeyTrustLine, Liabilities,
-    OfferEntry, TrustLineAsset, TrustLineEntry, TrustLineEntryExt, TrustLineEntryV1,
-    TrustLineEntryV1Ext, VecM,
+    OfferEntry, TrustLineEntry, TrustLineEntryExt, TrustLineEntryV1, TrustLineEntryV1Ext, VecM,
 };
 
 /// Result of updating a single offer during liability preparation.
@@ -502,16 +501,11 @@ fn build_signer_sponsoring_ids(count: usize) -> VecM<stellar_xdr::curr::Sponsors
     ids.try_into().unwrap_or_default()
 }
 
-/// Convert an `Asset` to a `TrustLineAsset` for trustline key lookups.
-fn asset_to_trustline_asset(asset: &Asset) -> TrustLineAsset {
-    henyey_common::asset::asset_to_trustline_asset(asset)
-}
-
 /// Build a `LedgerKey::Trustline` for an account and asset.
 fn make_trustline_key(account_id: &AccountId, asset: &Asset) -> LedgerKey {
     LedgerKey::Trustline(LedgerKeyTrustLine {
         account_id: account_id.clone(),
-        asset: asset_to_trustline_asset(asset),
+        asset: henyey_common::asset::asset_to_trustline_asset(asset),
     })
 }
 

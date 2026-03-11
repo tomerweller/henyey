@@ -84,7 +84,6 @@
 
 mod budget;
 mod error;
-mod events;
 mod host;
 pub mod protocol;
 mod storage;
@@ -92,7 +91,6 @@ mod storage;
 pub use budget::{
     FeeConfiguration, RentFeeConfiguration, ResourceLimits, SorobanBudget, SorobanConfig,
 };
-pub use events::{ContractEvent, ContractEvents};
 pub use host::{
     execute_host_function_with_cache, PersistentModuleCache, SorobanExecutionError,
     SorobanExecutionResult, StorageChange,

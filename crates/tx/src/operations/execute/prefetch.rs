@@ -56,14 +56,9 @@ fn data_key(account: &AccountId, name: &stellar_xdr::curr::String64) -> LedgerKe
     })
 }
 
-/// Convert an Asset to a TrustLineAsset, returning None for native.
-fn asset_to_trustline_asset(asset: &Asset) -> Option<TrustLineAsset> {
-    henyey_common::asset::non_native_asset_to_trustline_asset(asset)
-}
-
 /// Insert trustline key for a non-native asset.
 fn insert_asset_trustline(keys: &mut HashSet<LedgerKey>, id: &AccountId, asset: &Asset) {
-    if let Some(tl_asset) = asset_to_trustline_asset(asset) {
+    if let Some(tl_asset) = henyey_common::asset::non_native_asset_to_trustline_asset(asset) {
         keys.insert(trustline_key(id, &tl_asset));
     }
 }

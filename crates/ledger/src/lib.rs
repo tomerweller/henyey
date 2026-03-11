@@ -88,7 +88,7 @@ pub use close::{
     TransactionSetVariant, TxWithFee, UpgradeContext,
 };
 pub use config_upgrade::{ConfigUpgradeSetFrame, ConfigUpgradeValidity};
-pub use delta::{entry_to_key, EntryChange, LedgerDelta};
+pub use delta::{EntryChange, LedgerDelta};
 pub use error::LedgerError;
 pub use execution::{
     compute_state_size_window_entry, execute_soroban_parallel_phase, SorobanContext,

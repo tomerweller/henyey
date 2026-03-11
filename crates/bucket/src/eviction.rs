@@ -55,7 +55,7 @@
 //! ## Example Usage
 //!
 //! ```ignore
-//! use henyey_bucket::{EvictionIterator, StateArchivalSettings, update_starting_eviction_iterator};
+//! use henyey_bucket::{EvictionIterator, update_starting_eviction_iterator};
 //!
 //! // Initialize iterator at default starting level (6)
 //! let mut iter = EvictionIterator::with_default_level();
@@ -77,12 +77,12 @@
 //! - Eviction iterator: `src/ledger/NetworkConfig.h` (EvictionIterator struct)
 //! - State archival CAP: CAP-0046 (Soroban State Archival)
 
-use stellar_xdr::curr::{LedgerEntry, LedgerKey};
+use stellar_xdr::curr::{LedgerEntry, LedgerKey, StateArchivalSettings};
 
 use crate::bucket_list::BUCKET_LIST_LEVELS;
 
 /// Default eviction scan size in bytes per ledger (100 KB).
-pub const DEFAULT_EVICTION_SCAN_SIZE: u64 = 100_000;
+pub const DEFAULT_EVICTION_SCAN_SIZE: u32 = 100_000;
 
 /// Default starting eviction scan level (level 6).
 /// Lower levels update too frequently, so we start from level 6.
@@ -299,42 +299,25 @@ impl EvictionResult {
     }
 }
 
-/// Configuration settings for Soroban state archival.
-///
-/// These settings control the eviction scan behavior and are typically
-/// sourced from network configuration (ConfigSetting entries).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct StateArchivalSettings {
-    /// Maximum bytes to scan per ledger (default: 100 KB).
-    ///
-    /// Larger values process more entries per ledger but increase
-    /// ledger close time. The scan stops when this limit is reached,
-    /// even if in the middle of a bucket.
-    pub eviction_scan_size: u64,
-    /// Minimum bucket list level to scan (default: 6).
-    ///
-    /// Lower levels update too frequently to be worth scanning.
-    /// Level 6 updates every 2048 ledgers, giving entries reasonable
-    /// lifetime before they're scanned.
-    pub starting_eviction_scan_level: u32,
-    /// Maximum number of data entries to evict per ledger (default: 1000).
-    ///
-    /// This caps the total number of data entries (not counting TTL entries)
-    /// that can be evicted in a single ledger. When this limit is reached,
-    /// the scan stops and remaining entries are left for subsequent ledgers.
-    pub max_entries_to_archive: u32,
-}
-
 /// Default maximum entries to archive per ledger.
 pub const DEFAULT_MAX_ENTRIES_TO_ARCHIVE: u32 = 1000;
 
-impl Default for StateArchivalSettings {
-    fn default() -> Self {
-        Self {
-            eviction_scan_size: DEFAULT_EVICTION_SCAN_SIZE,
-            starting_eviction_scan_level: DEFAULT_STARTING_EVICTION_SCAN_LEVEL,
-            max_entries_to_archive: DEFAULT_MAX_ENTRIES_TO_ARCHIVE,
-        }
+/// Create default `StateArchivalSettings` for eviction scanning.
+///
+/// Uses the XDR `StateArchivalSettings` type directly with default eviction
+/// parameters and zero values for unrelated fields (TTL, rent rates).
+pub fn default_state_archival_settings() -> StateArchivalSettings {
+    StateArchivalSettings {
+        max_entry_ttl: 0,
+        min_temporary_ttl: 0,
+        min_persistent_ttl: 0,
+        persistent_rent_rate_denominator: 0,
+        temp_rent_rate_denominator: 0,
+        max_entries_to_archive: DEFAULT_MAX_ENTRIES_TO_ARCHIVE,
+        live_soroban_state_size_window_sample_size: 0,
+        live_soroban_state_size_window_sample_period: 0,
+        eviction_scan_size: DEFAULT_EVICTION_SCAN_SIZE,
+        starting_eviction_scan_level: DEFAULT_STARTING_EVICTION_SCAN_LEVEL,
     }
 }
 
@@ -762,7 +745,7 @@ mod tests {
 
     #[test]
     fn test_default_settings() {
-        let settings = StateArchivalSettings::default();
+        let settings = default_state_archival_settings();
         assert_eq!(settings.eviction_scan_size, DEFAULT_EVICTION_SCAN_SIZE);
         assert_eq!(settings.eviction_scan_size, 100_000);
         assert_eq!(
