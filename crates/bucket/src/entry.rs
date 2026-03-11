@@ -177,42 +177,19 @@ pub fn compare_keys(a: &LedgerKey, b: &LedgerKey) -> Ordering {
 }
 
 /// Returns the ledger entry type for a given ledger key.
+///
+/// Delegates to the XDR crate's inherent `LedgerKey::discriminant()` method.
 pub fn ledger_key_type(key: &LedgerKey) -> stellar_xdr::curr::LedgerEntryType {
-    match key {
-        LedgerKey::Account(_) => stellar_xdr::curr::LedgerEntryType::Account,
-        LedgerKey::Trustline(_) => stellar_xdr::curr::LedgerEntryType::Trustline,
-        LedgerKey::Offer(_) => stellar_xdr::curr::LedgerEntryType::Offer,
-        LedgerKey::Data(_) => stellar_xdr::curr::LedgerEntryType::Data,
-        LedgerKey::ClaimableBalance(_) => stellar_xdr::curr::LedgerEntryType::ClaimableBalance,
-        LedgerKey::LiquidityPool(_) => stellar_xdr::curr::LedgerEntryType::LiquidityPool,
-        LedgerKey::ContractData(_) => stellar_xdr::curr::LedgerEntryType::ContractData,
-        LedgerKey::ContractCode(_) => stellar_xdr::curr::LedgerEntryType::ContractCode,
-        LedgerKey::ConfigSetting(_) => stellar_xdr::curr::LedgerEntryType::ConfigSetting,
-        LedgerKey::Ttl(_) => stellar_xdr::curr::LedgerEntryType::Ttl,
-    }
+    key.discriminant()
 }
 
 /// Returns the ledger entry type for a given entry data variant.
 ///
-/// This is the canonical implementation used across the bucket crate. It maps
-/// each `LedgerEntryData` variant to its corresponding `LedgerEntryType`
-/// discriminant.
+/// Delegates to the XDR crate's inherent `LedgerEntryData::discriminant()` method.
 pub fn ledger_entry_data_type(
     data: &stellar_xdr::curr::LedgerEntryData,
 ) -> stellar_xdr::curr::LedgerEntryType {
-    use stellar_xdr::curr::LedgerEntryType;
-    match data {
-        LedgerEntryData::Account(_) => LedgerEntryType::Account,
-        LedgerEntryData::Trustline(_) => LedgerEntryType::Trustline,
-        LedgerEntryData::Offer(_) => LedgerEntryType::Offer,
-        LedgerEntryData::Data(_) => LedgerEntryType::Data,
-        LedgerEntryData::ClaimableBalance(_) => LedgerEntryType::ClaimableBalance,
-        LedgerEntryData::LiquidityPool(_) => LedgerEntryType::LiquidityPool,
-        LedgerEntryData::ContractData(_) => LedgerEntryType::ContractData,
-        LedgerEntryData::ContractCode(_) => LedgerEntryType::ContractCode,
-        LedgerEntryData::ConfigSetting(_) => LedgerEntryType::ConfigSetting,
-        LedgerEntryData::Ttl(_) => LedgerEntryType::Ttl,
-    }
+    data.discriminant()
 }
 
 fn compare_keys_same_type(a: &LedgerKey, b: &LedgerKey) -> Ordering {
@@ -250,7 +227,7 @@ fn compare_keys_same_type(a: &LedgerKey, b: &LedgerKey) -> Ordering {
     }
 }
 
-fn compare_sc_address(
+pub(crate) fn compare_sc_address(
     a: &stellar_xdr::curr::ScAddress,
     b: &stellar_xdr::curr::ScAddress,
 ) -> Ordering {
@@ -267,12 +244,15 @@ fn compare_sc_address(
 /// This uses explicit type discriminant comparison followed by value comparison,
 /// matching the stellar-core xdrpp library's behavior. This is critical for bucket hash
 /// determinism across implementations.
-fn compare_sc_val(a: &stellar_xdr::curr::ScVal, b: &stellar_xdr::curr::ScVal) -> Ordering {
+pub(crate) fn compare_sc_val(
+    a: &stellar_xdr::curr::ScVal,
+    b: &stellar_xdr::curr::ScVal,
+) -> Ordering {
     use stellar_xdr::curr::{Limits, ScVal::*};
 
-    // Compare by type discriminant first
-    let type_a = sc_val_type_discriminant(a);
-    let type_b = sc_val_type_discriminant(b);
+    // Compare by type discriminant first (uses XDR-defined ScValType values)
+    let type_a = i32::from(a.discriminant());
+    let type_b = i32::from(b.discriminant());
     if type_a != type_b {
         return type_a.cmp(&type_b);
     }
@@ -370,38 +350,6 @@ fn compare_sc_val(a: &stellar_xdr::curr::ScVal, b: &stellar_xdr::curr::ScVal) ->
             let b_bytes = b.to_xdr(Limits::none()).unwrap_or_default();
             a_bytes.cmp(&b_bytes)
         }
-    }
-}
-
-/// Get the XDR type discriminant for an ScVal.
-///
-/// These values must match the XDR ScValType enum discriminants exactly
-/// for deterministic comparison across implementations.
-fn sc_val_type_discriminant(v: &stellar_xdr::curr::ScVal) -> i32 {
-    use stellar_xdr::curr::ScVal::*;
-    match v {
-        Bool(_) => 0,
-        Void => 1,
-        Error(_) => 2,
-        U32(_) => 3,
-        I32(_) => 4,
-        U64(_) => 5,
-        I64(_) => 6,
-        Timepoint(_) => 7,
-        Duration(_) => 8,
-        U128(_) => 9,
-        I128(_) => 10,
-        U256(_) => 11,
-        I256(_) => 12,
-        Bytes(_) => 13,
-        String(_) => 14,
-        Symbol(_) => 15,
-        Vec(_) => 16,
-        Map(_) => 17,
-        Address(_) => 18,
-        ContractInstance(_) => 19,
-        LedgerKeyContractInstance => 20,
-        LedgerKeyNonce(_) => 21,
     }
 }
 
