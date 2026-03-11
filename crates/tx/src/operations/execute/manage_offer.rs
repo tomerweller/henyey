@@ -152,7 +152,7 @@ fn execute_manage_offer(
 
     // NOW check if the offer exists (after trustline checks)
     let old_offer = if offer_id != 0 {
-        state.get_offer(source, offer_id).cloned()
+        state.get_offer(source, offer_id)
     } else {
         None
     };
@@ -597,7 +597,7 @@ fn delete_offer(
     state: &mut LedgerStateManager,
 ) -> Result<OperationResult> {
     // Check offer exists and belongs to source
-    let offer = match state.get_offer(source, offer_id).cloned() {
+    let offer = match state.get_offer(source, offer_id) {
         Some(offer) => offer,
         None => {
             return Ok(make_sell_offer_result(

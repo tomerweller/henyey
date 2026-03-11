@@ -144,14 +144,14 @@ pub fn execute_revoke_sponsorship(
                     let Some(sponsor) = state.entry_sponsor(ledger_key) else {
                         return Ok(make_revoke_result(RevokeSponsorshipResultCode::Malformed));
                     };
-                    (sponsor.clone(), cb.claimants.len() as i64)
+                    (sponsor, cb.claimants.len() as i64)
                 }
                 _ => {
                     return Ok(make_revoke_result(RevokeSponsorshipResultCode::Malformed));
                 }
             };
 
-            let current_sponsor = state.entry_sponsor(ledger_key).cloned();
+            let current_sponsor = state.entry_sponsor(ledger_key);
             let was_sponsored = current_sponsor.is_some();
 
             if was_sponsored {
@@ -792,7 +792,7 @@ mod tests {
             ))
         ));
 
-        let sponsor = state.entry_sponsor(&ledger_key).cloned();
+        let sponsor = state.entry_sponsor(&ledger_key);
         assert_eq!(sponsor, Some(new_sponsor));
     }
 

@@ -62,7 +62,7 @@ impl LedgerStateManager {
     }
 
     /// Return the sponsor for a ledger entry, if any.
-    pub fn entry_sponsor(&self, key: &LedgerKey) -> Option<&AccountId> {
+    pub fn entry_sponsor(&self, key: &LedgerKey) -> Option<AccountId> {
         self.get_entry_sponsorship(key)
     }
 
@@ -76,7 +76,7 @@ impl LedgerStateManager {
     fn snapshot_entry_sponsorship_metadata(&mut self, key: &LedgerKey) {
         if !self.entry_sponsorship_snapshots.contains_key(key) {
             self.entry_sponsorship_snapshots
-                .insert(key.clone(), self.get_entry_sponsorship(key).cloned());
+                .insert(key.clone(), self.get_entry_sponsorship(key));
         }
         self.snapshot_entry_sponsorship_ext(key);
     }

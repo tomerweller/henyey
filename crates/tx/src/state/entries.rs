@@ -3,37 +3,6 @@
 use super::*;
 
 impl LedgerStateManager {
-    /// Insert an offer into the (account, asset) secondary index.
-    pub(super) fn aa_index_insert(&mut self, offer: &OfferEntry) {
-        let seller = offer.seller_id.clone();
-        let selling_key = asset_to_trustline_asset(&offer.selling);
-        let buying_key = asset_to_trustline_asset(&offer.buying);
-        self.account_asset_offers
-            .entry((seller.clone(), selling_key))
-            .or_default()
-            .insert(offer.offer_id);
-        self.account_asset_offers
-            .entry((seller, buying_key))
-            .or_default()
-            .insert(offer.offer_id);
-    }
-
-    /// Remove an offer from the (account, asset) secondary index.
-    pub(super) fn aa_index_remove(&mut self, offer: &OfferEntry) {
-        let seller = offer.seller_id.clone();
-        let selling_key = asset_to_trustline_asset(&offer.selling);
-        let buying_key = asset_to_trustline_asset(&offer.buying);
-        if let Some(set) = self
-            .account_asset_offers
-            .get_mut(&(seller.clone(), selling_key))
-        {
-            set.remove(&offer.offer_id);
-        }
-        if let Some(set) = self.account_asset_offers.get_mut(&(seller, buying_key)) {
-            set.remove(&offer.offer_id);
-        }
-    }
-
     pub(super) fn last_modified_for_key(&self, key: &LedgerKey) -> u32 {
         self.get_last_modified(key).unwrap_or(self.ledger_seq)
     }
@@ -70,7 +39,7 @@ impl LedgerStateManager {
         let sponsor_snapshot = if let Some(snapshot) = self.entry_sponsorship_snapshots.get(key) {
             snapshot.clone()
         } else {
-            self.get_entry_sponsorship(key).cloned()
+            self.get_entry_sponsorship(key)
         };
 
         if ext_present || sponsor_snapshot.is_some() {
@@ -93,7 +62,7 @@ impl LedgerStateManager {
     }
 
     pub(super) fn ledger_entry_ext_for(&self, key: &LedgerKey) -> LedgerEntryExt {
-        let sponsor = self.get_entry_sponsorship(key).cloned();
+        let sponsor = self.get_entry_sponsorship(key);
         if self.contains_sponsorship_ext(key) || sponsor.is_some() {
             LedgerEntryExt::V1(LedgerEntryExtensionV1 {
                 sponsoring_id: SponsorshipDescriptor(sponsor),
@@ -135,6 +104,13 @@ impl LedgerStateManager {
 
     /// Load a single entry into the state manager.
     pub fn load_entry(&mut self, entry: LedgerEntry) {
+        // Offers go directly into the canonical OfferStore (includes metadata).
+        if matches!(entry.data, LedgerEntryData::Offer(_)) {
+            let mut store = self.offer_store_lock();
+            store.insert_from_ledger_entry(&entry);
+            return;
+        }
+
         let sponsor = sponsorship_from_entry_ext(&entry);
         let has_sponsorship_ext = matches!(entry.ext, LedgerEntryExt::V1(_));
         let last_modified = entry.last_modified_ledger_seq;
@@ -155,17 +131,7 @@ impl LedgerStateManager {
                 self.trustlines.insert(tl_key, trustline);
                 self.record_entry_metadata(ledger_key, last_modified, has_sponsorship_ext, sponsor);
             }
-            LedgerEntryData::Offer(offer) => {
-                let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
-                    seller_id: offer.seller_id.clone(),
-                    offer_id: offer.offer_id,
-                });
-                // Add to offer index for efficient best-offer lookups
-                self.offer_index.add_offer(&offer);
-                self.aa_index_insert(&offer);
-                self.offers.insert(OfferKey::from_offer(&offer), offer);
-                self.record_entry_metadata(ledger_key, last_modified, has_sponsorship_ext, sponsor);
-            }
+            LedgerEntryData::Offer(_) => unreachable!("handled above"),
             LedgerEntryData::Data(data) => {
                 let name = data_name_to_string(&data.data_name);
                 let ledger_key = LedgerKey::Data(LedgerKeyData {
@@ -442,9 +408,9 @@ impl LedgerStateManager {
                 let key = (tl.account_id.clone(), tl.asset.clone());
                 self.trustlines.insert(key, tl.clone());
             }
-            LedgerEntryData::Offer(offer) => {
-                let key = OfferKey::from_offer(&offer);
-                self.offers.insert(key, offer.clone());
+            LedgerEntryData::Offer(_) => {
+                let mut store = self.offer_store_lock();
+                store.insert_from_ledger_entry(entry);
             }
             LedgerEntryData::Data(data) => {
                 let name = data_name_to_string(&data.data_name);
@@ -501,7 +467,8 @@ impl LedgerStateManager {
             }
             LedgerKey::Offer(k) => {
                 let offer_key = OfferKey::new(k.seller_id.clone(), k.offer_id);
-                self.offers.remove(&offer_key);
+                let mut store = self.offer_store_lock();
+                store.remove(&offer_key);
             }
             LedgerKey::Data(k) => {
                 let name = data_name_to_string(&k.data_name);
@@ -881,17 +848,22 @@ impl LedgerStateManager {
 
     /// Get the top-N offer keys (cheapest first) for an asset pair.
     pub fn top_n_offer_keys(&self, buying: &Asset, selling: &Asset, n: usize) -> Vec<OfferKey> {
-        self.offer_index.top_n_offer_keys(buying, selling, n)
+        let store = self.offer_store_lock();
+        store.top_n_offer_keys(buying, selling, n)
     }
 
     /// Get an offer by its key (read-only).
-    pub fn get_offer_by_key(&self, key: &OfferKey) -> Option<&OfferEntry> {
-        self.offers.get(key)
+    pub fn get_offer_by_key(&self, key: &OfferKey) -> Option<OfferEntry> {
+        let store = self.offer_store_lock();
+        store.get_offer(key).cloned()
     }
 
     /// Get an offer by seller and offer ID (read-only).
-    pub fn get_offer(&self, seller_id: &AccountId, offer_id: i64) -> Option<&OfferEntry> {
-        self.offers.get(&OfferKey::new(seller_id.clone(), offer_id))
+    pub fn get_offer(&self, seller_id: &AccountId, offer_id: i64) -> Option<OfferEntry> {
+        let store = self.offer_store_lock();
+        store
+            .get_by_seller(seller_id, offer_id)
+            .map(|r| r.entry.clone())
     }
 
     /// Check if an offer was already loaded during this transaction.
@@ -902,60 +874,47 @@ impl LedgerStateManager {
 
     /// Get all offers for an account that buy or sell a specific asset.
     ///
-    /// Uses the state's own `account_asset_offers` secondary index, which is
-    /// maintained as offers are loaded, created, modified, and deleted. This is
-    /// more reliable than the manager's index (which may be stale across ledgers).
+    /// Reads from the canonical OfferStore which maintains its own secondary index.
     pub fn get_offers_by_account_and_asset(
         &self,
         account_id: &AccountId,
         asset: &Asset,
     ) -> Vec<OfferEntry> {
-        let asset_key = asset_to_trustline_asset(asset);
-        self.account_asset_offers
-            .get(&(account_id.clone(), asset_key))
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|&id| {
-                        self.offers
-                            .get(&OfferKey::new(account_id.clone(), id))
-                            .cloned()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        let store = self.offer_store_lock();
+        store.get_offers_by_account_and_asset(account_id, asset)
     }
 
-    /// Get a mutable reference to an offer.
+    /// Get a clone of an offer for mutation. Caller must call `update_offer()` to write back.
+    ///
+    /// This also snapshots the offer for rollback and tracks modification.
     pub fn get_offer_mut(
         &mut self,
         seller_id: &AccountId,
         offer_id: i64,
-    ) -> Option<&mut OfferEntry> {
+    ) -> Option<OfferEntry> {
         let key = OfferKey::new(seller_id.clone(), offer_id);
 
-        if self.offers.contains_key(&key) {
-            // Save snapshot if not already saved or if it's None (for newly created entries).
-            // For newly created entries, we update the snapshot to the current value so
-            // subsequent operations can track changes with STATE/UPDATED pairs.
-            // Rollback correctness is ensured by the created_offers set.
-            if !self.offer_snapshots.get(&key).is_some_and(|s| s.is_some()) {
-                let snapshot = self.offers.get(&key).cloned();
-                self.offer_snapshots.insert(key.clone(), snapshot);
-            }
-            let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
-                seller_id: seller_id.clone(),
-                offer_id,
-            });
-            self.capture_op_snapshot_for_key(&ledger_key);
-            self.snapshot_last_modified_key(&ledger_key);
-            // Track modification
-            if !self.modified_offers.contains(&key) {
-                self.modified_offers.push(key.clone());
-            }
-            self.offers.get_mut(&key)
-        } else {
-            None
+        let record = {
+            let store = self.offer_store_lock();
+            store.get(&key)?.clone()
+        };
+
+        // Save snapshot if not already saved or if it's None (for newly created entries).
+        if !self.offer_snapshots.get(&key).is_some_and(|s| s.is_some()) {
+            self.offer_snapshots.insert(key.clone(), Some(record.clone()));
         }
+        let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
+            seller_id: seller_id.clone(),
+            offer_id,
+        });
+        self.capture_op_snapshot_for_key(&ledger_key);
+        self.snapshot_last_modified_key(&ledger_key);
+        // Track modification
+        if !self.modified_offers.contains(&key) {
+            self.modified_offers.push(key);
+        }
+
+        Some(record.entry)
     }
 
     /// Create a new offer entry.
@@ -969,18 +928,28 @@ impl LedgerStateManager {
         // Save snapshot (None because it didn't exist)
         self.offer_snapshots.entry(key.clone()).or_insert(None);
         self.snapshot_last_modified_key(&ledger_key);
-        self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
 
-        // Record in delta
-        let ledger_entry = self.offer_to_ledger_entry(&entry);
+        // Pick up any pre-set sponsorship (set before create_offer via
+        // apply_entry_sponsorship_with_sponsor, which falls back to
+        // entry_sponsorships when the offer doesn't exist yet).
+        let sponsor = self.entry_sponsorships.remove(&ledger_key);
+        let has_ext = sponsor.is_some()
+            || self.entry_sponsorship_ext.remove(&ledger_key);
+
+        // Build record and insert into canonical offer store
+        let record = OfferRecord {
+            entry: entry.clone(),
+            last_modified: self.ledger_seq,
+            sponsor,
+            has_ext,
+        };
+        let ledger_entry = record.to_ledger_entry();
         self.delta.record_create(ledger_entry);
 
-        // Add to offer index for efficient best-offer lookups
-        self.offer_index.add_offer(&entry);
-        self.aa_index_insert(&entry);
-
-        // Insert into state
-        self.offers.insert(key.clone(), entry);
+        {
+            let mut store = self.offer_store_lock();
+            store.insert_record(record);
+        }
 
         // Track that this entry was created in this transaction (for rollback)
         self.created_offers.insert(key.clone());
@@ -1001,38 +970,39 @@ impl LedgerStateManager {
 
         // Save snapshot if not already saved (for rollback purposes)
         if !self.offer_snapshots.contains_key(&key) {
-            let snapshot = self.offers.get(&key).cloned();
+            let snapshot = self.offer_store_lock().get(&key).cloned();
             self.offer_snapshots.insert(key.clone(), snapshot);
         }
         self.capture_op_snapshot_for_key(&ledger_key);
         self.snapshot_last_modified_key(&ledger_key);
 
-        // Get pre-state from current state (value BEFORE this specific update)
-        let pre_state = self
-            .offers
-            .get(&key)
-            .map(|offer| self.offer_to_ledger_entry(offer));
+        // Get pre-state and existing metadata from canonical store
+        let (pre_state, mut new_record) = {
+            let store = self.offer_store_lock();
+            let pre = store.get(&key).map(|r| r.to_ledger_entry());
+            let rec = store.get(&key).cloned().unwrap_or(OfferRecord {
+                entry: entry.clone(),
+                last_modified: self.ledger_seq,
+                sponsor: None,
+                has_ext: false,
+            });
+            (pre, rec)
+        };
 
-        self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
+        new_record.entry = entry;
+        new_record.last_modified = self.ledger_seq;
+        let post_state = new_record.to_ledger_entry();
 
         // Record in delta - each update gets its own STATE/UPDATED pair
-        let post_state = self.offer_to_ledger_entry(&entry);
         if let Some(pre) = pre_state {
             self.delta.record_update(pre, post_state);
         }
 
-        // Update offer index (handles price/asset changes)
-        self.offer_index.update_offer(&entry);
-
-        // Update (account, asset) secondary index: remove old, insert new
-        let old_offer_clone = self.offers.get(&key).cloned();
-        if let Some(ref old_offer) = old_offer_clone {
-            self.aa_index_remove(old_offer);
+        // Update canonical store (handles index maintenance internally)
+        {
+            let mut store = self.offer_store_lock();
+            store.insert_record(new_record);
         }
-        self.aa_index_insert(&entry);
-
-        // Update state
-        self.offers.insert(key, entry.clone());
 
         // Do NOT track in modified_offers since we already recorded the update
         // This prevents flush_modified_entries from recording a duplicate
@@ -1048,95 +1018,79 @@ impl LedgerStateManager {
 
         // Save snapshot if not already saved
         if !self.offer_snapshots.contains_key(&key) {
-            let snapshot = self.offers.get(&key).cloned();
+            let snapshot = self.offer_store_lock().get(&key).cloned();
             self.offer_snapshots.insert(key.clone(), snapshot);
         }
         self.capture_op_snapshot_for_key(&ledger_key);
         self.snapshot_last_modified_key(&ledger_key);
 
-        // Get pre-state (current value BEFORE deletion)
-        let pre_state = self
-            .offers
-            .get(&key)
-            .map(|offer| self.offer_to_ledger_entry(offer));
+        // Get pre-state from canonical store (current value BEFORE deletion)
+        let pre_state = {
+            let store = self.offer_store_lock();
+            store.get(&key).map(|r| r.to_ledger_entry())
+        };
 
         // Record in delta with pre-state
         if let Some(pre) = pre_state {
             self.delta.record_delete(ledger_key.clone(), pre);
         }
 
-        // Remove from offer index
-        self.offer_index.remove_offer(seller_id, offer_id);
-
-        // Remove from (account, asset) secondary index
-        if let Some(offer) = self.offers.get(&key) {
-            let offer_clone = offer.clone();
-            self.aa_index_remove(&offer_clone);
+        // Remove from canonical store (handles index cleanup internally)
+        {
+            let mut store = self.offer_store_lock();
+            store.remove(&key);
         }
-
-        // Remove from state
-        self.clear_entry_sponsorship_metadata(&ledger_key);
-        self.offers.remove(&key);
-        self.remove_last_modified_key(&ledger_key);
+        // Note: metadata is inline in OfferRecord — removed with the offer.
     }
 
     /// Get the best offer for a buying/selling pair (lowest price, then offer ID).
     ///
-    /// Uses the offer index for O(log n) lookup instead of scanning all offers.
+    /// Uses the OfferStore's order book index for O(log n) lookup.
     pub fn best_offer(&self, buying: &Asset, selling: &Asset) -> Option<OfferEntry> {
-        // Use the offer index for efficient lookup
-        if let Some(key) = self.offer_index.best_offer_key(buying, selling) {
-            return self.offers.get(&key).cloned();
-        }
-        None
+        let store = self.offer_store_lock();
+        store.best_offer(buying, selling).cloned()
     }
 
     /// Get the best offer for a buying/selling pair with an additional filter.
     ///
-    /// Uses the offer index for efficient traversal in price order.
+    /// Uses the OfferStore's order book index for efficient traversal in price order.
     pub fn best_offer_filtered<F>(
         &self,
         buying: &Asset,
         selling: &Asset,
-        mut keep: F,
+        keep: F,
     ) -> Option<OfferEntry>
     where
         F: FnMut(&OfferEntry) -> bool,
     {
-        // Use the offer index to iterate in price order
-        for offer_key in self.offer_index.offers_for_pair(buying, selling) {
-            if let Some(offer) = self.offers.get(&offer_key) {
-                if keep(offer) {
-                    return Some(offer.clone());
-                }
-            }
-        }
-        None
+        let store = self.offer_store_lock();
+        store.best_offer_filtered(buying, selling, keep)
     }
 
     /// Check if offers exist for a specific asset pair.
     pub fn has_offers_for_pair(&self, buying: &Asset, selling: &Asset) -> bool {
-        self.offer_index.has_offers(buying, selling)
+        let store = self.offer_store_lock();
+        store.has_offers_for_pair(buying, selling)
     }
 
     /// Get all offers for a specific buying/selling asset pair.
     ///
     /// Returns cloned OfferEntry values for each offer in the pair's order book.
     pub fn offers_for_asset_pair(&self, buying: &Asset, selling: &Asset) -> Vec<OfferEntry> {
-        self.offer_index
-            .offers_for_pair(buying, selling)
-            .filter_map(|key| self.offers.get(&key).cloned())
-            .collect()
+        let store = self.offer_store_lock();
+        store.offers_for_asset_pair(buying, selling)
     }
 
     /// Get the number of offers in the index.
     pub fn offer_index_size(&self) -> usize {
-        self.offer_index.len()
+        let store = self.offer_store_lock();
+        store.offer_index_size()
     }
 
     /// Get the number of unique asset pairs with offers.
     pub fn offer_index_num_pairs(&self) -> usize {
-        self.offer_index.num_asset_pairs()
+        let store = self.offer_store_lock();
+        store.num_asset_pairs()
     }
 
     /// Remove all offers owned by an account that are buying or selling a specific asset.
@@ -1144,87 +1098,28 @@ impl LedgerStateManager {
     /// Returns the list of OfferEntry that were removed (before deletion) so callers can
     /// handle liability release, subentry updates, and sponsorship adjustments.
     ///
-    /// Mirrors stellar-core `removeOffersByAccountAndAsset` which calls
-    /// `loadOffersByAccountAndAsset` to query the SQL database for ALL
-    /// matching offers.  We first load all matching offers from the
-    /// authoritative offer store so the in-memory index is complete.
+    /// The canonical OfferStore contains ALL offers, so no authoritative loader is needed.
     pub fn remove_offers_by_account_and_asset(
         &mut self,
         account_id: &AccountId,
         asset: &Asset,
     ) -> Vec<OfferEntry> {
-        // Load all matching offers from the authoritative source so the
-        // in-memory index has every offer that exists, not just those that
-        // happened to be loaded during prior TX execution.
-        if let Some(loader) = self.offers_by_account_asset_loader.take() {
-            match loader(account_id, asset) {
-                Ok(entries) => {
-                    tracing::debug!(
-                        ledger_seq = self.ledger_seq,
-                        account = ?account_id,
-                        loader_entries = entries.len(),
-                        existing_offers = self.offers.len(),
-                        "remove_offers_by_account_and_asset: loader returned entries"
-                    );
-                    for entry in entries {
-                        if let LedgerEntryData::Offer(ref offer) = entry.data {
-                            let key = OfferKey::from_offer(offer);
-                            // Skip offers already deleted in this ledger (by a previous TX).
-                            // The loader returns offers from the bucket list snapshot which
-                            // doesn't reflect in-ledger deletions.
-                            let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
-                                seller_id: offer.seller_id.clone(),
-                                offer_id: offer.offer_id,
-                            });
-                            if self.delta.deleted_keys().contains(&ledger_key) {
-                                continue;
-                            }
-                            // Only load offers not already tracked in state.
-                            if !self.offers.contains_key(&key) {
-                                tracing::info!(
-                                    ledger_seq = self.ledger_seq,
-                                    offer_id = offer.offer_id,
-                                    "remove_offers_by_account_and_asset: loading NEW offer from authoritative store"
-                                );
-                                self.load_entry(entry);
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "remove_offers_by_account_and_asset: loader failed"
-                    );
-                }
-            }
-            self.offers_by_account_asset_loader = Some(loader);
-        } else {
-            tracing::debug!(
-                ledger_seq = self.ledger_seq,
-                "remove_offers_by_account_and_asset: NO loader available"
-            );
-        }
-
-        let asset_key = asset_to_trustline_asset(asset);
-
-        // Look up offer IDs from secondary index
-        let offer_ids: Vec<i64> = self
-            .account_asset_offers
-            .get(&(account_id.clone(), asset_key))
-            .map(|ids| ids.iter().copied().collect())
-            .unwrap_or_default();
-
-        // Collect matching offers (verify they still match before removing)
-        let offers_to_remove: Vec<OfferEntry> = offer_ids
-            .iter()
-            .filter_map(|&offer_id| {
-                self.offers
-                    .get(&OfferKey::new(account_id.clone(), offer_id))
-                    .cloned()
-                    .filter(|offer| offer.buying == *asset || offer.selling == *asset)
-            })
-            .collect();
+        // Get matching offers from the canonical store
+        let offers_to_remove: Vec<OfferEntry> = {
+            let store = self.offer_store_lock();
+            store
+                .get_offers_by_account_and_asset(account_id, asset)
+                .into_iter()
+                .filter(|offer| {
+                    // Skip offers already deleted in this ledger
+                    let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
+                        seller_id: offer.seller_id.clone(),
+                        offer_id: offer.offer_id,
+                    });
+                    !self.delta.deleted_keys().contains(&ledger_key)
+                })
+                .collect()
+        };
 
         // Remove each offer
         for offer in &offers_to_remove {
@@ -1677,7 +1572,7 @@ impl LedgerStateManager {
                 .map(|e| self.trustline_to_ledger_entry(e)),
             LedgerKey::Offer(k) => self
                 .get_offer(&k.seller_id, k.offer_id)
-                .map(|e| self.offer_to_ledger_entry(e)),
+                .map(|e| self.offer_to_ledger_entry(&e)),
             LedgerKey::Data(k) => {
                 let name = data_name_to_string(&k.data_name);
                 let result = self.get_data(&k.account_id, &name);

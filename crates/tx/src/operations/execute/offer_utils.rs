@@ -97,7 +97,7 @@ pub fn delete_offer_with_sponsorship(
         seller_id: seller.clone(),
         offer_id,
     });
-    let sponsor = state.entry_sponsor(&ledger_key).cloned();
+    let sponsor = state.entry_sponsor(&ledger_key);
     state.delete_offer(seller, offer_id);
     if let Some(sponsor) = sponsor {
         state.update_num_sponsoring(&sponsor, -1)?;

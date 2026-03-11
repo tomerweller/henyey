@@ -52,7 +52,7 @@ use henyey_common::protocol::{
     needs_upgrade_to_version, protocol_version_starts_from, ProtocolVersion,
 };
 use henyey_tx::soroban::PersistentModuleCache;
-use henyey_common::asset::asset_to_trustline_asset;
+use crate::offer_store::OfferStore;
 use henyey_tx::{ClassicEventConfig, LedgerContext, TxEventManager};
 use stellar_xdr::curr::{
     AccountId, BucketListType, ConfigSettingEntry, ConfigSettingId,
@@ -61,7 +61,7 @@ use stellar_xdr::curr::{
     LedgerEntryData, LedgerEntryExt, LedgerHeader, LedgerHeaderHistoryEntry,
     LedgerHeaderHistoryEntryExt, LedgerKey, LedgerKeyConfigSetting, PoolId,
     StateArchivalSettings, TransactionEventStage, TransactionMeta, TransactionPhase,
-    TransactionResultMetaV1, TransactionSetV1, TrustLineAsset, TxSetComponent,
+    TransactionResultMetaV1, TransactionSetV1, TxSetComponent,
     TxSetComponentTxsMaybeDiscountedFee, UpgradeEntryMeta, VecM,
 };
 use tracing::{debug, info};
@@ -88,41 +88,8 @@ fn get_rss_bytes() -> u64 {
     }
 }
 
-/// Secondary index type: (account, asset) → set of offer_ids.
-type OfferAccountAssetIndex = HashMap<(AccountId, TrustLineAsset), HashSet<i64>>;
-
 /// Secondary index type: account → set of pool_ids for pool share trustlines.
 type PoolShareTlAccountIndex = HashMap<AccountId, HashSet<PoolId>>;
-
-/// Insert an offer into the (account, asset) secondary index.
-///
-/// Each offer gets two entries: (seller, selling_asset) and (seller, buying_asset).
-fn index_offer_insert(index: &mut OfferAccountAssetIndex, offer: &stellar_xdr::curr::OfferEntry) {
-    let seller = offer.seller_id.clone();
-    let selling_key = asset_to_trustline_asset(&offer.selling);
-    let buying_key = asset_to_trustline_asset(&offer.buying);
-    index
-        .entry((seller.clone(), selling_key))
-        .or_default()
-        .insert(offer.offer_id);
-    index
-        .entry((seller, buying_key))
-        .or_default()
-        .insert(offer.offer_id);
-}
-
-/// Remove an offer from the (account, asset) secondary index.
-fn index_offer_remove(index: &mut OfferAccountAssetIndex, offer: &stellar_xdr::curr::OfferEntry) {
-    let seller = offer.seller_id.clone();
-    let selling_key = asset_to_trustline_asset(&offer.selling);
-    let buying_key = asset_to_trustline_asset(&offer.buying);
-    if let Some(set) = index.get_mut(&(seller.clone(), selling_key)) {
-        set.remove(&offer.offer_id);
-    }
-    if let Some(set) = index.get_mut(&(seller, buying_key)) {
-        set.remove(&offer.offer_id);
-    }
-}
 
 /// Prepend a fee event to transaction metadata.
 ///
@@ -187,8 +154,6 @@ struct PendingEvictionScan {
 pub struct CacheInitResult {
     /// All live offers indexed by offer_id.
     offers: HashMap<i64, LedgerEntry>,
-    /// Secondary index: (account, asset) → set of offer_ids.
-    offer_index: OfferAccountAssetIndex,
     /// Secondary index: account → set of pool_ids for pool share trustlines.
     pool_share_tl_account_index: HashMap<AccountId, HashSet<PoolId>>,
     /// Pre-compiled Soroban module cache (if Soroban is supported).
@@ -451,17 +416,8 @@ fn merge_level_results(
         "scan_bucket_list_for_caches: merge complete"
     );
 
-    // Build the (account, asset) secondary index
-    let mut offer_index: OfferAccountAssetIndex = HashMap::new();
-    for entry in mem_offers.values() {
-        if let LedgerEntryData::Offer(ref offer) = entry.data {
-            index_offer_insert(&mut offer_index, offer);
-        }
-    }
-
     CacheInitResult {
         offers: mem_offers,
-        offer_index,
         pool_share_tl_account_index,
         module_cache,
         soroban_state,
@@ -646,16 +602,8 @@ fn scan_and_merge(
         Arc::try_unwrap(arc).unwrap_or_else(|arc| PersistentModuleCache::clone(&arc))
     });
 
-    let mut offer_index: OfferAccountAssetIndex = HashMap::new();
-    for entry in mem_offers.values() {
-        if let LedgerEntryData::Offer(ref offer) = entry.data {
-            index_offer_insert(&mut offer_index, offer);
-        }
-    }
-
     CacheInitResult {
         offers: mem_offers,
-        offer_index,
         pool_share_tl_account_index,
         module_cache,
         soroban_state,
@@ -1006,16 +954,12 @@ pub struct LedgerManager {
     /// This avoids expensive full bucket list scans during orderbook operations.
     offers_initialized: Arc<RwLock<bool>>,
 
-    /// In-memory cache of all live offers, keyed by offer_id.
+    /// Unified in-memory offer store: canonical data + all indexes + metadata.
     /// Populated during initialize_all_caches() and updated on each ledger close.
-    /// Eliminates the need to query SQL for orderbook operations.
-    offer_store: Arc<RwLock<HashMap<i64, LedgerEntry>>>,
-
-    /// Secondary index: (account_bytes, asset) → set of offer_ids.
-    ///
-    /// Each offer is indexed under two keys: (seller, selling_asset) and (seller, buying_asset).
-    /// Used for O(k) lookups in `load_offers_by_account_and_asset` instead of O(n) full scans.
-    offer_account_asset_index: Arc<RwLock<OfferAccountAssetIndex>>,
+    /// Replaces both the old `offer_store` (HashMap<i64, LedgerEntry>) and
+    /// `offer_account_asset_index` (secondary index).
+    /// Wrapped in Arc for sharing with snapshot closures.
+    offer_store: Arc<Mutex<OfferStore>>,
 
     /// Secondary index: account_bytes → set of pool_id_bytes for pool share trustlines.
     ///
@@ -1090,8 +1034,7 @@ impl LedgerManager {
             config,
             module_cache: RwLock::new(None),
             offers_initialized: Arc::new(RwLock::new(false)),
-            offer_store: Arc::new(RwLock::new(HashMap::new())),
-            offer_account_asset_index: Arc::new(RwLock::new(HashMap::new())),
+            offer_store: Arc::new(Mutex::new(OfferStore::new())),
             pool_share_tl_account_index: Arc::new(RwLock::new(HashMap::new())),
             soroban_state: Arc::new(crate::soroban_state::SharedSorobanState::new()),
             executor: Mutex::new(None),
@@ -1194,9 +1137,9 @@ impl LedgerManager {
         self.bucket_list.write().resolve_all_pending_merges();
     }
 
-    /// Get a read lock on the offer store for direct access.
-    pub fn offer_store_read(&self) -> parking_lot::RwLockReadGuard<'_, HashMap<i64, LedgerEntry>> {
-        self.offer_store.read()
+    /// Get a lock on the unified offer store for direct access.
+    pub fn offer_store_lock(&self) -> parking_lot::MutexGuard<'_, OfferStore> {
+        self.offer_store.lock()
     }
 
     /// Get a read lock on the hot archive bucket list.
@@ -1291,8 +1234,7 @@ impl LedgerManager {
         }
 
         // Install pre-computed cache data.
-        *self.offer_store.write() = cache_data.offers;
-        *self.offer_account_asset_index.write() = cache_data.offer_index;
+        *self.offer_store.lock() = OfferStore::from_bucket_list_entries(cache_data.offers);
         *self.pool_share_tl_account_index.write() = cache_data.pool_share_tl_account_index;
         *self.module_cache.write() = cache_data.module_cache;
         *self.soroban_state.write() = cache_data.soroban_state;
@@ -1455,8 +1397,7 @@ impl LedgerManager {
         let rss_after_bucket_cache = get_rss_bytes();
         drop(bucket_list);
 
-        *self.offer_store.write() = cache_data.offers;
-        *self.offer_account_asset_index.write() = cache_data.offer_index;
+        *self.offer_store.lock() = OfferStore::from_bucket_list_entries(cache_data.offers);
         *self.pool_share_tl_account_index.write() = cache_data.pool_share_tl_account_index;
         *self.module_cache.write() = cache_data.module_cache;
         *self.soroban_state.write() = cache_data.soroban_state;
@@ -1810,31 +1751,16 @@ impl LedgerManager {
         // Offers are always initialized before the first ledger close, so no fallback is needed.
         let offer_store = self.offer_store.clone();
         let entries_fn: crate::snapshot::EntriesLookupFn = Arc::new(move || {
-            let store = offer_store.read();
-            Ok(store.values().cloned().collect())
+            let store = offer_store.lock();
+            Ok(store.all_ledger_entries())
         });
 
         // Create index-based lookup for offers by (account, asset).
         let offer_store_idx = self.offer_store.clone();
-        let offer_index = self.offer_account_asset_index.clone();
         let offers_by_account_asset_fn: crate::snapshot::OffersByAccountAssetFn = Arc::new(
             move |account_id: &AccountId, asset: &stellar_xdr::curr::Asset| {
-                let idx = offer_index.read();
-                let store = offer_store_idx.read();
-                let asset_key = asset_to_trustline_asset(asset);
-
-                let offer_ids = match idx.get(&(account_id.clone(), asset_key)) {
-                    Some(ids) => ids,
-                    None => return Ok(Vec::new()),
-                };
-
-                let mut result = Vec::with_capacity(offer_ids.len());
-                for &offer_id in offer_ids {
-                    if let Some(entry) = store.get(&offer_id) {
-                        result.push(entry.clone());
-                    }
-                }
-                Ok(result)
+                let store = offer_store_idx.lock();
+                Ok(store.offers_by_account_and_asset_as_entries(account_id, asset))
             },
         );
 
@@ -1916,60 +1842,27 @@ impl LedgerManager {
             }
         }
 
-        // Update in-memory offer store and secondary index with offer changes
+        // Update unified offer store with offer changes from this ledger.
+        // OfferStore handles all indexes (order book, account-asset, by-id) internally.
         if *self.offers_initialized.read() {
-            let mut offer_upserts: Vec<LedgerEntry> = Vec::new();
-            let mut offer_deletes: Vec<i64> = Vec::new();
-
+            let mut store = self.offer_store.lock();
             for change in delta.changes() {
                 let key = change.key();
-                // Only process offer entries
                 if !matches!(key, LedgerKey::Offer(_)) {
                     continue;
                 }
-
                 match change {
                     EntryChange::Created(entry) => {
-                        if matches!(entry.data, LedgerEntryData::Offer(_)) {
-                            offer_upserts.push(entry.clone());
-                        }
+                        store.insert_from_ledger_entry(&entry);
                     }
-                    EntryChange::Updated { current, previous } => {
-                        if matches!(current.data, LedgerEntryData::Offer(_)) {
-                            offer_upserts.push(current.as_ref().clone());
-                        }
-                        // For updates, remove old index entries (asset pair may have changed)
-                        if let LedgerEntryData::Offer(ref old_offer) = previous.data {
-                            let mut idx = self.offer_account_asset_index.write();
-                            index_offer_remove(&mut idx, old_offer);
-                        }
+                    EntryChange::Updated { current, .. } => {
+                        store.insert_from_ledger_entry(&current);
                     }
-                    EntryChange::Deleted { previous } => {
-                        // Collect offer ID for deletion
+                    EntryChange::Deleted { .. } => {
                         if let LedgerKey::Offer(offer_key) = &key {
-                            offer_deletes.push(offer_key.offer_id);
-                        }
-                        // Remove from secondary index
-                        if let LedgerEntryData::Offer(ref old_offer) = previous.data {
-                            let mut idx = self.offer_account_asset_index.write();
-                            index_offer_remove(&mut idx, old_offer);
+                            store.remove_by_seller(&offer_key.seller_id, offer_key.offer_id);
                         }
                     }
-                }
-            }
-
-            // Update in-memory offer store and secondary index
-            if !offer_upserts.is_empty() || !offer_deletes.is_empty() {
-                let mut store = self.offer_store.write();
-                let mut idx = self.offer_account_asset_index.write();
-                for entry in &offer_upserts {
-                    if let LedgerEntryData::Offer(ref offer) = entry.data {
-                        store.insert(offer.offer_id, entry.clone());
-                        index_offer_insert(&mut idx, offer);
-                    }
-                }
-                for offer_id in &offer_deletes {
-                    store.remove(offer_id);
                 }
             }
         }
@@ -2053,38 +1946,15 @@ impl LedgerManager {
             ));
         }
 
-        // Offer store
+        // Unified offer store (canonical data + all indexes)
         {
-            let store = self.offer_store.read();
+            let store = self.offer_store.lock();
+            let offer_bytes = store.estimate_heap_bytes();
             let offer_count = store.len();
-            // HashMap<i64, LedgerEntry>: i64 key + ~200 bytes avg entry
-            let offer_bytes = henyey_common::memory::hashmap_heap_bytes(
-                store.capacity(),
-                std::mem::size_of::<i64>(),
-                std::mem::size_of::<LedgerEntry>(),
-            );
             components.push(ComponentMemory::new(
                 "offers",
                 offer_bytes as u64,
                 offer_count as u64,
-            ));
-        }
-
-        // Offer secondary index
-        {
-            let idx = self.offer_account_asset_index.read();
-            // Rough estimate: capacity * (key_size + nested HashSet avg overhead)
-            // Key is (AccountId, TrustLineAsset) tuple; estimate 100 bytes
-            // Value is HashSet<i64>; average ~4 offers per (account, asset) pair
-            let idx_bytes = henyey_common::memory::hashmap_heap_bytes(
-                idx.capacity(),
-                100,
-                64, // HashSet overhead per entry
-            );
-            components.push(ComponentMemory::new(
-                "offer_index",
-                idx_bytes as u64,
-                idx.len() as u64,
             ));
         }
 
@@ -3340,14 +3210,14 @@ impl<'a> LedgerCloseContext<'a> {
         });
 
         if is_new_executor {
-            // First ledger after init/reset: load all offers from snapshot
+            // First ledger after init/reset: set up shared offer store
+            executor_ref.set_offer_store(self.manager.offer_store.clone());
             if let Some(cache) = module_cache {
                 executor_ref.set_module_cache(cache.clone());
             }
             if let Some(ref ha) = hot_archive {
                 executor_ref.set_hot_archive(ha.clone());
             }
-            executor_ref.load_orderbook_offers(&self.snapshot)?;
         } else {
             // Subsequent ledgers: advance the executor, preserving offers
             executor_ref.advance_to_ledger_preserving_offers(
@@ -3461,6 +3331,7 @@ impl<'a> LedgerCloseContext<'a> {
                         hot_archive,
                         runtime_handle: self.runtime_handle.clone(),
                         soroban_state: Some(self.manager.soroban_state.clone()),
+                        offer_store: Some(self.manager.offer_store.clone()),
                         emit_soroban_tx_meta_ext_v1: self.manager.config.emit_soroban_tx_meta_ext_v1,
                         enable_soroban_diagnostic_events: self.manager.config.enable_soroban_diagnostic_events,
                     },
@@ -5093,7 +4964,6 @@ mod tests {
         let bl = BucketList::new();
         let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
         assert!(result.offers.is_empty());
-        assert!(result.offer_index.is_empty());
         assert!(result.soroban_state.is_empty());
     }
 
@@ -5109,8 +4979,6 @@ mod tests {
         assert_eq!(result.offers.len(), 2);
         assert!(result.offers.contains_key(&1));
         assert!(result.offers.contains_key(&2));
-        // Each offer creates 2 index entries (selling + buying)
-        assert!(!result.offer_index.is_empty());
     }
 
     #[test]
@@ -5411,17 +5279,13 @@ mod tests {
     fn test_scan_offer_secondary_index() {
         let mut bl = BucketList::new();
         let seller_bytes = [7u8; 32];
-        let seller = make_account_id(seller_bytes);
         let offer = make_offer_entry(10, seller_bytes);
         bl.add_batch(1, TEST_PROTOCOL, BucketListType::Live, vec![offer], vec![], vec![])
             .unwrap();
 
         let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
         assert_eq!(result.offers.len(), 1);
-
-        // The secondary index should have entries for this seller+asset
-        let has_seller_entry = result.offer_index.keys().any(|(acct, _)| *acct == seller);
-        assert!(has_seller_entry, "secondary index should include seller");
+        assert!(result.offers.contains_key(&10));
     }
 
     #[tokio::test(flavor = "multi_thread")]

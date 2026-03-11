@@ -159,7 +159,7 @@ pub fn execute_clawback_claimable_balance(
     let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
         balance_id: entry.balance_id.clone(),
     });
-    let sponsor = state.entry_sponsor(&ledger_key).cloned();
+    let sponsor = state.entry_sponsor(&ledger_key);
     // Delete the claimable balance (clawed back entirely)
     state.delete_claimable_balance(&op.balance_id);
     if let Some(sponsor) = sponsor {

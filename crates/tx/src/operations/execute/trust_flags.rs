@@ -332,7 +332,7 @@ fn remove_offers_with_cleanup(
             seller_id: offer.seller_id.clone(),
             offer_id: offer.offer_id,
         });
-        if let Some(sponsor) = state.entry_sponsor(&ledger_key).cloned() {
+        if let Some(sponsor) = state.entry_sponsor(&ledger_key) {
             let _ = state.update_num_sponsoring(&sponsor, -1);
             let _ = state.update_num_sponsored(&offer.seller_id, -1);
         }
@@ -481,7 +481,6 @@ fn redeem_pool_share_trustlines(
         });
         let cb_sponsoring_acc_id = state
             .entry_sponsor(&tl_ledger_key)
-            .cloned()
             .unwrap_or_else(|| account_id.clone());
 
         // Delete the pool share trustline: release reserves and remove

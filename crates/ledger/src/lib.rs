@@ -77,6 +77,7 @@ pub mod execution;
 mod header;
 mod manager;
 pub mod offer;
+pub mod offer_store;
 pub mod memory_report;
 mod prepare_liabilities;
 mod snapshot;

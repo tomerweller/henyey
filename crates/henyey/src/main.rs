@@ -3691,8 +3691,8 @@ async fn cmd_verify_execution(
                                             // For offers, try the offer_store instead of bucket list snapshot
                                             // (offers are not indexed in bucket list snapshot)
                                             if let stellar_xdr::curr::LedgerEntryData::Offer(ref cdp_offer) = cdp_entry.data {
-                                                let offer_store = ledger_manager.offer_store_read();
-                                                if let Some(our_entry) = offer_store.get(&cdp_offer.offer_id) {
+                                                let offer_store = ledger_manager.offer_store_lock();
+                                                if let Some(our_entry) = offer_store.get_ledger_entry_by_id(cdp_offer.offer_id).as_ref() {
                                                     let our_xdr = our_entry.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
                                                     let our_hash = {
                                                         let mut h = Sha256::new();

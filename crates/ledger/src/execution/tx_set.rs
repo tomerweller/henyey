@@ -63,8 +63,10 @@ pub fn execute_transaction_set_with_fee_mode(
         executor.set_hot_archive(ha);
     }
 
-    // Load all orderbook offers before executing any transactions
-    executor.load_orderbook_offers(snapshot)?;
+    // Set shared offer store for classic phase execution
+    if let Some(ref offer_store) = soroban.offer_store {
+        executor.set_offer_store(offer_store.clone());
+    }
 
     run_transactions_on_executor(
         &mut executor,
@@ -460,6 +462,7 @@ pub fn execute_soroban_parallel_phase(
                 hot_archive: soroban.hot_archive.clone(),
                 runtime_handle: soroban.runtime_handle.clone(),
                 soroban_state: soroban.soroban_state.clone(),
+                offer_store: None, // Soroban clusters don't touch offers
                 emit_soroban_tx_meta_ext_v1: soroban.emit_soroban_tx_meta_ext_v1,
                 enable_soroban_diagnostic_events: soroban.enable_soroban_diagnostic_events,
             },
@@ -1019,6 +1022,7 @@ pub(super) fn execute_stage_clusters(
                     module_cache: cache.as_ref(),
                     hot_archive: ha,
                     soroban_state: ss,
+                    offer_store: None, // Soroban clusters don't touch offers
                     runtime_handle: None,
                     emit_soroban_tx_meta_ext_v1,
                     enable_soroban_diagnostic_events,

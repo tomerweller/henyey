@@ -500,6 +500,18 @@ impl TransactionExecutor {
         }
     }
 
+    /// Set the shared offer store reference on the state manager.
+    ///
+    /// Called once when the executor is created (for new executors) or when the
+    /// offer store is first available. The offer store is shared with LedgerManager
+    /// via `Arc<Mutex<OfferStore>>`.
+    pub fn set_offer_store(
+        &mut self,
+        store: std::sync::Arc<parking_lot::Mutex<henyey_tx::state::offer_store::OfferStore>>,
+    ) {
+        self.state.set_offer_store(store);
+    }
+
     /// Set the in-memory Soroban state for O(1) contract entry lookups.
     ///
     /// When set, `load_soroban_footprint` uses this HashMap-backed cache as the
@@ -923,7 +935,7 @@ impl TransactionExecutor {
             seller_id: seller_id.clone(),
             offer_id,
         });
-        if let Some(sponsor) = self.state.entry_sponsor(&key).cloned() {
+        if let Some(sponsor) = self.state.entry_sponsor(&key) {
             self.load_account(snapshot, &sponsor)?;
         }
         Ok(())
@@ -2563,21 +2575,6 @@ impl TransactionExecutor {
                     .map_err(|e| henyey_tx::TxError::Internal(e.to_string()))
             }));
 
-        // Set up authoritative offers-by-(account, asset) loader.
-        // stellar-core uses SQL `loadOffersByAccountAndAsset` which always
-        // returns every matching offer.  Without this loader, the in-memory
-        // index only contains offers that happened to be loaded during prior TX
-        // execution, causing non-deterministic offer removal in SetTrustLineFlags.
-        let snapshot_for_offers = snapshot.clone();
-        self.state
-            .set_offers_by_account_asset_loader(std::sync::Arc::new(
-                move |account_id, asset| {
-                    snapshot_for_offers
-                        .offers_by_account_and_asset(account_id, asset)
-                        .map_err(|e| henyey_tx::TxError::Internal(e.to_string()))
-                },
-            ));
-
         // Set up pool-share-trustlines-by-account loader (defense in depth).
         // This mirrors the offers loader pattern: `find_pool_share_trustlines_for_asset`
         // calls `ensure_pool_share_trustlines_loaded` which uses this loader to
@@ -3254,7 +3251,7 @@ impl TransactionExecutor {
                 let key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
                     balance_id: op_data.balance_id.clone(),
                 });
-                if let Some(sponsor) = self.state.entry_sponsor(&key).cloned() {
+                if let Some(sponsor) = self.state.entry_sponsor(&key) {
                     self.load_account(snapshot, &sponsor)?;
                 }
                 if let Some(entry) = self.state.get_claimable_balance(&op_data.balance_id) {
@@ -3270,7 +3267,7 @@ impl TransactionExecutor {
                 let key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
                     balance_id: op_data.balance_id.clone(),
                 });
-                if let Some(sponsor) = self.state.entry_sponsor(&key).cloned() {
+                if let Some(sponsor) = self.state.entry_sponsor(&key) {
                     self.load_account(snapshot, &sponsor)?;
                 }
             }
@@ -3443,7 +3440,7 @@ impl TransactionExecutor {
                             account_id: op_source.clone(),
                             asset: tl_asset.clone(),
                         });
-                        if let Some(sponsor) = self.state.entry_sponsor(&tl_key).cloned() {
+                        if let Some(sponsor) = self.state.entry_sponsor(&tl_key) {
                             self.load_account(snapshot, &sponsor)?;
                         }
                     }
@@ -3997,6 +3994,12 @@ pub struct SorobanContext<'a> {
     /// When provided, `load_soroban_footprint` uses this as the primary source for
     /// ContractData/ContractCode/TTL lookups, bypassing the 22-bucket list scan.
     pub soroban_state: Option<std::sync::Arc<crate::soroban_state::SharedSorobanState>>,
+    /// Shared canonical offer store for classic phase execution.
+    ///
+    /// When provided, the executor's state manager uses this instead of maintaining
+    /// a separate copy of all offers. Set for classic phase execution; `None` for
+    /// parallel Soroban cluster executors (which don't touch offers).
+    pub offer_store: Option<std::sync::Arc<parking_lot::Mutex<henyey_tx::state::offer_store::OfferStore>>>,
     /// Whether to emit `SorobanTransactionMetaExtV1` in transaction meta.
     pub emit_soroban_tx_meta_ext_v1: bool,
     /// Whether to include diagnostic events in transaction meta.

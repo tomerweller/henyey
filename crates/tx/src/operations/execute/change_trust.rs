@@ -1277,7 +1277,7 @@ mod tests {
         state.set_entry_sponsor(ledger_key.clone(), sponsor_id.clone());
 
         // Verify initial state
-        assert_eq!(state.entry_sponsor(&ledger_key), Some(&sponsor_id));
+        assert_eq!(state.entry_sponsor(&ledger_key).as_ref(), Some(&sponsor_id));
         let sponsor_before = state.get_account(&sponsor_id).unwrap();
         let sponsor_ext = match &sponsor_before.ext {
             AccountEntryExt::V1(v1) => match &v1.ext {

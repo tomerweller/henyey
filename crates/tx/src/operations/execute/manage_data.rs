@@ -543,7 +543,7 @@ mod tests {
             account_id: source_id.clone(),
             data_name: op.data_name.clone(),
         });
-        assert_eq!(state.entry_sponsor(&key), Some(&sponsor_id));
+        assert_eq!(state.entry_sponsor(&key).as_ref(), Some(&sponsor_id));
 
         let counts = state.sponsorship_counts_for_account(&sponsor_id).unwrap();
         assert_eq!(counts.0, 1);

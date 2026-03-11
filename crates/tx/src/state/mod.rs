@@ -1,8 +1,9 @@
 //! Ledger state management for transaction execution.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext,
     AccountEntryExtensionV2, AccountEntryExtensionV2Ext, AccountEntryExtensionV3, AccountId, Asset,
@@ -15,6 +16,8 @@ use stellar_xdr::curr::{
     TimePoint, TrustLineAsset, TrustLineEntry, TtlEntry, VecM,
 };
 
+use offer_store::{OfferRecord, OfferStore};
+
 use crate::apply::{DeltaLengths, LedgerDelta};
 use crate::{Result, TxError};
 pub(crate) use henyey_common::asset::asset_to_trustline_asset;
@@ -22,11 +25,6 @@ pub(crate) use henyey_common::asset::asset_to_trustline_asset;
 /// Callback type for lazily loading ledger entries from the bucket list.
 type EntryLoaderFn = dyn Fn(&LedgerKey) -> Result<Option<LedgerEntry>> + Send + Sync;
 type BatchEntryLoaderFn = dyn Fn(&[LedgerKey]) -> Result<Vec<LedgerEntry>> + Send + Sync;
-/// Callback type for loading all offers by (account, asset) from the
-/// authoritative offer store.  Used by `remove_offers_by_account_and_asset`
-/// to mirror stellar-core `loadOffersByAccountAndAsset` which queries the SQL database.
-type OffersByAccountAssetLoaderFn =
-    dyn Fn(&AccountId, &Asset) -> Result<Vec<LedgerEntry>> + Send + Sync;
 /// Callback type for loading pool share trustline pool IDs by account from the
 /// secondary index.  Used by `find_pool_share_trustlines_for_asset` to discover
 /// pool share trustlines that may only exist in the bucket list (not yet in memory).
@@ -47,6 +45,7 @@ pub type DataKey = (AccountId, String);
 mod entries;
 pub(crate) mod entry_store;
 pub mod offer_index;
+pub mod offer_store;
 mod sponsorship;
 mod ttl;
 
@@ -91,98 +90,6 @@ where
             None => {
                 live_map.remove(&key);
             }
-        }
-    }
-}
-
-/// Rollback metadata that is routed to separate offer/non-offer maps.
-///
-/// This handles the two-step rollback pattern for metadata maps that are split
-/// into offer and non-offer variants (e.g., `entry_last_modified` / `offer_last_modified`):
-/// 1. Restore snapshot values for entries snapshot'd *after* the savepoint
-/// 2. Apply pre-savepoint values for entries modified *before* the savepoint
-fn rollback_routed_metadata<V: Clone>(
-    current_snapshots: &HashMap<LedgerKey, Option<V>>,
-    sp_snapshots: &HashMap<LedgerKey, Option<V>>,
-    pre_values: Vec<(LedgerKey, Option<V>)>,
-    offer_map: &mut HashMap<LedgerKey, V>,
-    entry_map: &mut HashMap<LedgerKey, V>,
-) {
-    // Step 1: Restore entries snapshot'd after the savepoint
-    for (key, snapshot) in current_snapshots {
-        if !sp_snapshots.contains_key(key) {
-            let target = if matches!(key, LedgerKey::Offer(_)) {
-                &mut *offer_map
-            } else {
-                &mut *entry_map
-            };
-            match snapshot {
-                Some(val) => {
-                    target.insert(key.clone(), val.clone());
-                }
-                None => {
-                    target.remove(key);
-                }
-            }
-        }
-    }
-    // Step 2: Apply pre-savepoint values
-    for (key, value) in pre_values {
-        let target = if matches!(&key, LedgerKey::Offer(_)) {
-            &mut *offer_map
-        } else {
-            &mut *entry_map
-        };
-        match value {
-            Some(val) => {
-                target.insert(key, val);
-            }
-            None => {
-                target.remove(&key);
-            }
-        }
-    }
-}
-
-/// Rollback set-based metadata routed to separate offer/non-offer sets.
-///
-/// Same pattern as [`rollback_routed_metadata`] but for `HashSet`-backed maps
-/// where the snapshot is a `bool` (was-present) rather than `Option<V>`.
-fn rollback_routed_set_metadata(
-    current_snapshots: &HashMap<LedgerKey, bool>,
-    sp_snapshots: &HashMap<LedgerKey, bool>,
-    pre_values: Vec<(LedgerKey, bool)>,
-    offer_set: &mut HashSet<LedgerKey>,
-    entry_set: &mut HashSet<LedgerKey>,
-) {
-    // Step 1: Restore entries snapshot'd after the savepoint
-    for (key, &was_present) in current_snapshots {
-        if !sp_snapshots.contains_key(key) {
-            let (offer_s, entry_s) = (&mut *offer_set, &mut *entry_set);
-            let target = if matches!(key, LedgerKey::Offer(_)) {
-                offer_s
-            } else {
-                entry_s
-            };
-            if was_present {
-                target.insert(key.clone());
-            } else {
-                target.remove(key);
-            }
-        }
-    }
-    // Step 2: Apply pre-savepoint values
-    for (key, was_present) in pre_values {
-        let (offer_s, entry_s) = (&mut *offer_set, &mut *entry_set);
-        let target = if matches!(&key, LedgerKey::Offer(_)) {
-            offer_s
-        } else {
-            entry_s
-        };
-        if was_present {
-            target.insert(key);
-        } else {
-            target.remove(&key);
         }
     }
 }
@@ -245,12 +152,12 @@ pub struct SorobanState {
 /// - ID pool value
 pub struct Savepoint {
     // Snapshot maps clones (small: only entries modified earlier in TX)
-    offer_snapshots: HashMap<OfferKey, Option<OfferEntry>>,
+    offer_snapshots: HashMap<OfferKey, Option<OfferRecord>>,
     account_snapshots: HashMap<AccountId, Option<AccountEntry>>,
     trustline_snapshots: HashMap<TrustlineKey, Option<TrustLineEntry>>,
     ttl_snapshots: HashMap<Hash, Option<TtlEntry>>,
     // Pre-savepoint values of entries in snapshot maps.
-    offer_pre_values: Vec<(OfferKey, Option<OfferEntry>)>,
+    offer_pre_values: Vec<(OfferKey, Option<OfferRecord>)>,
     account_pre_values: Vec<(AccountId, Option<AccountEntry>)>,
     trustline_pre_values: Vec<(TrustlineKey, Option<TrustLineEntry>)>,
     ttl_pre_values: Vec<(Hash, Option<TtlEntry>)>,
@@ -311,8 +218,6 @@ pub type ContractDataKey = StorageKey;
 // similar to stellar-core's MultiOrderBook. This is critical for
 // performance when executing path payments and manage offer operations.
 
-use std::collections::BTreeMap;
-
 /// Ledger state manager for transaction execution.
 ///
 /// This provides read/write access to ledger entries during transaction
@@ -329,8 +234,9 @@ pub struct LedgerStateManager {
     accounts: HashMap<AccountId, AccountEntry>,
     /// Trustline entries by (account, asset).
     trustlines: HashMap<TrustlineKey, TrustLineEntry>,
-    /// Offer entries by (seller, offer_id).
-    offers: HashMap<OfferKey, OfferEntry>,
+    /// Shared reference to the canonical offer store. `None` for fresh/Soroban cluster
+    /// executors that don't touch offers.
+    offer_store: Option<Arc<Mutex<OfferStore>>>,
     /// Data entries by (account, name).
     data_entries: EntryStore<DataKey, DataEntry>,
     /// Contract data entries by (contract, key, durability).
@@ -350,16 +256,10 @@ pub struct LedgerStateManager {
     liquidity_pools: EntryStore<PoolId, LiquidityPoolEntry>,
     /// Sponsoring account IDs for non-offer ledger entries (only when sponsored).
     entry_sponsorships: HashMap<LedgerKey, AccountId>,
-    /// Sponsoring account IDs for offer entries (preserved across ledger closes).
-    offer_sponsorships: HashMap<LedgerKey, AccountId>,
     /// Non-offer entries that have a sponsorship extension (even if not currently sponsored).
     entry_sponsorship_ext: HashSet<LedgerKey>,
-    /// Offer entries that have a sponsorship extension (preserved across ledger closes).
-    offer_sponsorship_ext: HashSet<LedgerKey>,
     /// Last modified ledger sequence for non-offer entries.
     entry_last_modified: HashMap<LedgerKey, u32>,
-    /// Last modified ledger sequence for offer entries (preserved across ledger closes).
-    offer_last_modified: HashMap<LedgerKey, u32>,
     /// Per-operation snapshot of entries before mutation.
     op_entry_snapshots: HashMap<LedgerKey, LedgerEntry>,
     /// Whether op-level snapshots are active.
@@ -394,8 +294,8 @@ pub struct LedgerStateManager {
     account_snapshots: HashMap<AccountId, Option<AccountEntry>>,
     /// Snapshot of trustlines for rollback.
     trustline_snapshots: HashMap<TrustlineKey, Option<TrustLineEntry>>,
-    /// Snapshot of offers for rollback.
-    offer_snapshots: HashMap<OfferKey, Option<OfferEntry>>,
+    /// Snapshot of offers for rollback (captures full OfferRecord with metadata).
+    offer_snapshots: HashMap<OfferKey, Option<OfferRecord>>,
     // Data entries use EntryStore — snapshots are internal.
     /// Snapshot of TTL entries for rollback.
     ttl_snapshots: HashMap<Hash, Option<TtlEntry>>,
@@ -426,13 +326,6 @@ pub struct LedgerStateManager {
     /// On rollback, we truncate the delta vectors to these saved lengths.
     /// This reduces snapshot cost from O(N entries) to O(1).
     delta_snapshot: Option<DeltaSnapshot>,
-    /// Index of offers by asset pair for efficient best-offer lookups.
-    /// This mirrors stellar-core's MultiOrderBook structure.
-    offer_index: OfferIndex,
-    /// Secondary index: (account_bytes, asset) → set of offer_ids.
-    /// Each offer is indexed under both (seller, selling_asset) and (seller, buying_asset).
-    /// Used for O(k) lookups in `remove_offers_by_account_and_asset`.
-    account_asset_offers: HashMap<TrustlineKey, HashSet<i64>>,
     /// Optional callback to lazily load ledger entries from the bucket list.
     /// Used during offer crossing to load seller accounts and trustlines
     /// on demand instead of preloading all offer dependencies upfront.
@@ -441,13 +334,6 @@ pub struct LedgerStateManager {
     /// through the bucket list. Used by `ensure_offer_entries_loaded` to batch
     /// account + trustline lookups for offer sellers.
     batch_entry_loader: Option<Arc<BatchEntryLoaderFn>>,
-    /// Optional callback to load all offers for a given (account, asset) pair
-    /// from the authoritative offer store.  stellar-core uses SQL
-    /// `loadOffersByAccountAndAsset` which always returns every matching offer.
-    /// Without this loader the in-memory `account_asset_offers` index would
-    /// only contain offers that happened to be loaded during prior TX execution,
-    /// causing non-deterministic offer removal in `SetTrustLineFlags` / `AllowTrust`.
-    offers_by_account_asset_loader: Option<Arc<OffersByAccountAssetLoaderFn>>,
     /// Optional callback to load pool share trustline pool IDs for a given account
     /// from the secondary index.  Mirrors stellar-core
     /// `loadPoolShareTrustLinesByAccountAndAsset` which queries SQL for all pool
@@ -483,7 +369,7 @@ impl LedgerStateManager {
             id_pool: 0,
             accounts: HashMap::new(),
             trustlines: HashMap::new(),
-            offers: HashMap::new(),
+            offer_store: Some(Arc::new(Mutex::new(OfferStore::new()))),
             data_entries: EntryStore::new(),
             contract_data: EntryStore::new_with_deleted_tracking(),
             contract_code: EntryStore::new_with_deleted_tracking(),
@@ -492,11 +378,8 @@ impl LedgerStateManager {
             claimable_balances: EntryStore::new(),
             liquidity_pools: EntryStore::new(),
             entry_sponsorships: HashMap::new(),
-            offer_sponsorships: HashMap::new(),
             entry_sponsorship_ext: HashSet::new(),
-            offer_sponsorship_ext: HashSet::new(),
             entry_last_modified: HashMap::new(),
-            offer_last_modified: HashMap::new(),
             op_entry_snapshots: HashMap::new(),
             op_snapshots_active: false,
             multi_op_mode: false,
@@ -528,11 +411,8 @@ impl LedgerStateManager {
             deleted_ttl: HashSet::new(),
             id_pool_snapshot: None,
             delta_snapshot: None,
-            offer_index: OfferIndex::new(),
-            account_asset_offers: HashMap::new(),
             entry_loader: None,
             batch_entry_loader: None,
-            offers_by_account_asset_loader: None,
             pool_share_tls_by_account_loader: None,
             max_seq_num_to_apply: HashMap::new(),
         }
@@ -546,17 +426,56 @@ impl LedgerStateManager {
         matches!(key, LedgerKey::Offer(_))
     }
 
-    fn get_entry_sponsorship(&self, key: &LedgerKey) -> Option<&AccountId> {
+    /// Lock the shared offer store. Panics if no store is set.
+    fn offer_store_lock(&self) -> parking_lot::MutexGuard<'_, OfferStore> {
+        self.offer_store
+            .as_ref()
+            .expect("offer_store not set")
+            .lock()
+    }
+
+    /// Set the shared offer store reference.
+    pub fn set_offer_store(&mut self, store: Arc<Mutex<OfferStore>>) {
+        self.offer_store = Some(store);
+    }
+
+    /// Returns true if an offer store is set.
+    pub fn has_offer_store(&self) -> bool {
+        self.offer_store.is_some()
+    }
+
+    fn get_entry_sponsorship(&self, key: &LedgerKey) -> Option<AccountId> {
         if Self::is_offer_key(key) {
-            self.offer_sponsorships.get(key)
+            if let LedgerKey::Offer(ok) = key {
+                let store = self.offer_store_lock();
+                let from_store = store
+                    .get_by_seller(&ok.seller_id, ok.offer_id)
+                    .and_then(|r| r.sponsor.clone());
+                // Also check fallback map (sponsorship set before offer exists).
+                from_store.or_else(|| self.entry_sponsorships.get(key).cloned())
+            } else {
+                None
+            }
         } else {
-            self.entry_sponsorships.get(key)
+            self.entry_sponsorships.get(key).cloned()
         }
     }
 
     fn insert_entry_sponsorship(&mut self, key: LedgerKey, sponsor: AccountId) {
         if Self::is_offer_key(&key) {
-            self.offer_sponsorships.insert(key, sponsor);
+            if let LedgerKey::Offer(ok) = &key {
+                let offer_key = OfferKey::new(ok.seller_id.clone(), ok.offer_id);
+                let mut store = self.offer_store_lock();
+                if let Some(record) = store.get_mut(&offer_key) {
+                    record.sponsor = Some(sponsor);
+                    record.has_ext = true;
+                } else {
+                    // Offer doesn't exist yet (sponsorship set before create_offer).
+                    // Store in entry_sponsorships; create_offer will pick it up.
+                    drop(store);
+                    self.entry_sponsorships.insert(key, sponsor);
+                }
+            }
         } else {
             self.entry_sponsorships.insert(key, sponsor);
         }
@@ -564,7 +483,19 @@ impl LedgerStateManager {
 
     fn remove_entry_sponsorship(&mut self, key: &LedgerKey) -> Option<AccountId> {
         if Self::is_offer_key(key) {
-            self.offer_sponsorships.remove(key)
+            if let LedgerKey::Offer(ok) = key {
+                let offer_key = OfferKey::new(ok.seller_id.clone(), ok.offer_id);
+                let mut store = self.offer_store_lock();
+                if let Some(record) = store.get_mut(&offer_key) {
+                    record.sponsor.take()
+                } else {
+                    // Check fallback map (sponsorship set before offer existed).
+                    drop(store);
+                    self.entry_sponsorships.remove(key)
+                }
+            } else {
+                None
+            }
         } else {
             self.entry_sponsorships.remove(key)
         }
@@ -572,7 +503,17 @@ impl LedgerStateManager {
 
     fn contains_sponsorship_ext(&self, key: &LedgerKey) -> bool {
         if Self::is_offer_key(key) {
-            self.offer_sponsorship_ext.contains(key)
+            if let LedgerKey::Offer(ok) = key {
+                let store = self.offer_store_lock();
+                let in_store = store
+                    .get_by_seller(&ok.seller_id, ok.offer_id)
+                    .map(|r| r.has_ext)
+                    .unwrap_or(false);
+                // Also check fallback set (ext set before offer exists).
+                in_store || self.entry_sponsorship_ext.contains(key)
+            } else {
+                false
+            }
         } else {
             self.entry_sponsorship_ext.contains(key)
         }
@@ -580,7 +521,17 @@ impl LedgerStateManager {
 
     fn insert_sponsorship_ext(&mut self, key: LedgerKey) {
         if Self::is_offer_key(&key) {
-            self.offer_sponsorship_ext.insert(key);
+            if let LedgerKey::Offer(ok) = &key {
+                let offer_key = OfferKey::new(ok.seller_id.clone(), ok.offer_id);
+                let mut store = self.offer_store_lock();
+                if let Some(record) = store.get_mut(&offer_key) {
+                    record.has_ext = true;
+                } else {
+                    // Offer doesn't exist yet; store in ext set for create_offer to pick up.
+                    drop(store);
+                    self.entry_sponsorship_ext.insert(key);
+                }
+            }
         } else {
             self.entry_sponsorship_ext.insert(key);
         }
@@ -588,7 +539,21 @@ impl LedgerStateManager {
 
     fn remove_sponsorship_ext(&mut self, key: &LedgerKey) -> bool {
         if Self::is_offer_key(key) {
-            self.offer_sponsorship_ext.remove(key)
+            if let LedgerKey::Offer(ok) = key {
+                let offer_key = OfferKey::new(ok.seller_id.clone(), ok.offer_id);
+                let mut store = self.offer_store_lock();
+                if let Some(record) = store.get_mut(&offer_key) {
+                    let was = record.has_ext;
+                    record.has_ext = false;
+                    was
+                } else {
+                    // Check fallback set (ext set before offer existed).
+                    drop(store);
+                    self.entry_sponsorship_ext.remove(key)
+                }
+            } else {
+                false
+            }
         } else {
             self.entry_sponsorship_ext.remove(key)
         }
@@ -596,7 +561,14 @@ impl LedgerStateManager {
 
     fn get_last_modified(&self, key: &LedgerKey) -> Option<u32> {
         if Self::is_offer_key(key) {
-            self.offer_last_modified.get(key).copied()
+            if let LedgerKey::Offer(ok) = key {
+                let store = self.offer_store_lock();
+                store
+                    .get_by_seller(&ok.seller_id, ok.offer_id)
+                    .map(|r| r.last_modified)
+            } else {
+                None
+            }
         } else {
             self.entry_last_modified.get(key).copied()
         }
@@ -604,18 +576,23 @@ impl LedgerStateManager {
 
     fn insert_last_modified(&mut self, key: LedgerKey, seq: u32) {
         if Self::is_offer_key(&key) {
-            self.offer_last_modified.insert(key, seq);
+            if let LedgerKey::Offer(ok) = &key {
+                let offer_key = OfferKey::new(ok.seller_id.clone(), ok.offer_id);
+                let mut store = self.offer_store_lock();
+                if let Some(record) = store.get_mut(&offer_key) {
+                    record.last_modified = seq;
+                }
+            }
         } else {
             self.entry_last_modified.insert(key, seq);
         }
     }
 
     fn remove_last_modified(&mut self, key: &LedgerKey) {
-        if Self::is_offer_key(key) {
-            self.offer_last_modified.remove(key);
-        } else {
+        if !Self::is_offer_key(key) {
             self.entry_last_modified.remove(key);
         }
+        // For offers, metadata is inline in OfferRecord — removed when the offer is removed.
     }
 
     pub fn begin_op_snapshot(&mut self) {
@@ -782,19 +759,6 @@ impl LedgerStateManager {
     /// Set a batch entry loader for loading multiple entries in one bucket list pass.
     pub fn set_batch_entry_loader(&mut self, loader: Arc<BatchEntryLoaderFn>) {
         self.batch_entry_loader = Some(loader);
-    }
-
-    /// Set the loader that returns all offers for a given (account, asset) pair.
-    ///
-    /// This mirrors stellar-core `loadOffersByAccountAndAsset` and is used by
-    /// `remove_offers_by_account_and_asset` (called during authorization
-    /// revocation) to ensure ALL matching offers are found, not just those
-    /// that happened to be loaded during prior TX execution.
-    pub fn set_offers_by_account_asset_loader(
-        &mut self,
-        loader: Arc<OffersByAccountAssetLoaderFn>,
-    ) {
-        self.offers_by_account_asset_loader = Some(loader);
     }
 
     /// Set the loader that returns pool IDs for pool share trustlines owned by an account.
@@ -993,14 +957,11 @@ impl LedgerStateManager {
         self.clear_cached_entries_inner(true);
     }
 
-    fn clear_cached_entries_inner(&mut self, preserve_offers: bool) {
+    fn clear_cached_entries_inner(&mut self, _preserve_offers: bool) {
+        // Offers live in the shared OfferStore (always preserved).
+        // Only non-offer entries and transaction-level state are cleared here.
         self.accounts.clear();
         self.trustlines.clear();
-        if !preserve_offers {
-            self.offers.clear();
-            self.offer_index.clear();
-            self.account_asset_offers.clear();
-        }
         self.data_entries.clear(); // EntryStore::clear()
         self.contract_data.clear();
         self.contract_code.clear();
@@ -1008,18 +969,10 @@ impl LedgerStateManager {
         self.ttl_bucket_list_snapshot.clear();
         self.claimable_balances.clear();
         self.liquidity_pools.clear();
-        // Non-offer metadata maps are always cleared.
-        // Offer metadata maps are preserved when preserve_offers=true.
         self.entry_sponsorships.clear();
         self.entry_sponsorship_ext.clear();
         self.entry_last_modified.clear();
-        if !preserve_offers {
-            self.offer_sponsorships.clear();
-            self.offer_sponsorship_ext.clear();
-            self.offer_last_modified.clear();
-        }
         self.entry_loader = None;
-        self.offers_by_account_asset_loader = None;
         self.pool_share_tls_by_account_loader = None;
 
         // Clear all transaction-level state
@@ -1047,9 +1000,7 @@ impl LedgerStateManager {
 
         self.created_accounts.clear();
         self.created_trustlines.clear();
-        if !preserve_offers {
-            self.created_offers.clear();
-        }
+        self.created_offers.clear();
         // created_data is cleared by data_entries.clear() above
         self.created_ttl.clear();
     }
@@ -1111,11 +1062,7 @@ impl LedgerStateManager {
                 .get(&OfferKey::new(k.seller_id.clone(), k.offer_id))
                 .cloned()
                 .flatten()
-                .map(|entry| LedgerEntry {
-                    last_modified_ledger_seq: last_modified,
-                    data: LedgerEntryData::Offer(entry),
-                    ext,
-                }),
+                .map(|record| record.to_ledger_entry()),
             LedgerKey::Data(k) => {
                 let name = data_name_to_string(&k.data_name);
                 self.data_entries
@@ -1221,7 +1168,7 @@ impl LedgerStateManager {
         let offer_key_size = 44; // (AccountId, i64)
         let hash_size = 32;
         let ledger_key_size = 80; // enum with variants
-        let asset_pair_size = 120;
+        let _asset_pair_size = 120;
 
         let account_entry_size = 200;
         let trustline_entry_size = 150;
@@ -1229,21 +1176,11 @@ impl LedgerStateManager {
         let ttl_entry_size = 16;
 
         // Core entry maps
-        let accounts = hashmap_heap_bytes(
-            self.accounts.capacity(),
-            account_id_size,
-            account_entry_size,
-        );
-        let trustlines = hashmap_heap_bytes(
-            self.trustlines.capacity(),
-            trustline_key_size,
-            trustline_entry_size,
-        );
-        let offers = hashmap_heap_bytes(self.offers.capacity(), offer_key_size, offer_entry_size);
-        let ttl_entries =
-            hashmap_heap_bytes(self.ttl_entries.capacity(), hash_size, ttl_entry_size);
-        let ttl_snapshot =
-            hashmap_heap_bytes(self.ttl_bucket_list_snapshot.capacity(), hash_size, 4);
+        let accounts = hashmap_heap_bytes(self.accounts.capacity(), account_id_size, account_entry_size);
+        let trustlines = hashmap_heap_bytes(self.trustlines.capacity(), trustline_key_size, trustline_entry_size);
+        // Offers now live in the shared OfferStore; no local offer map.
+        let ttl_entries = hashmap_heap_bytes(self.ttl_entries.capacity(), hash_size, ttl_entry_size);
+        let ttl_snapshot = hashmap_heap_bytes(self.ttl_bucket_list_snapshot.capacity(), hash_size, 4);
 
         // EntryStore-based maps
         let data_entries = self.data_entries.estimate_heap_bytes(100, 200);
@@ -1252,61 +1189,20 @@ impl LedgerStateManager {
         let claimable_balances = self.claimable_balances.estimate_heap_bytes(hash_size, 300);
         let liquidity_pools = self.liquidity_pools.estimate_heap_bytes(hash_size, 300);
 
-        // Sponsorship maps
-        let entry_sponsorships = hashmap_heap_bytes(
-            self.entry_sponsorships.capacity(),
-            ledger_key_size,
-            account_id_size,
-        );
-        let offer_sponsorships = hashmap_heap_bytes(
-            self.offer_sponsorships.capacity(),
-            ledger_key_size,
-            account_id_size,
-        );
-        let entry_sponsorship_ext =
-            hashset_heap_bytes(self.entry_sponsorship_ext.capacity(), ledger_key_size);
-        let offer_sponsorship_ext =
-            hashset_heap_bytes(self.offer_sponsorship_ext.capacity(), ledger_key_size);
-        let entry_last_modified =
-            hashmap_heap_bytes(self.entry_last_modified.capacity(), ledger_key_size, 4);
-        let offer_last_modified =
-            hashmap_heap_bytes(self.offer_last_modified.capacity(), ledger_key_size, 4);
+        // Sponsorship maps (non-offer only; offer metadata is in OfferStore)
+        let entry_sponsorships = hashmap_heap_bytes(self.entry_sponsorships.capacity(), ledger_key_size, account_id_size);
+        let entry_sponsorship_ext = hashset_heap_bytes(self.entry_sponsorship_ext.capacity(), ledger_key_size);
+        let entry_last_modified = hashmap_heap_bytes(self.entry_last_modified.capacity(), ledger_key_size, 4);
 
         // Snapshot maps (typically empty between TXs)
-        let op_entry_snapshots =
-            hashmap_heap_bytes(self.op_entry_snapshots.capacity(), ledger_key_size, 200);
-        let account_snapshots = hashmap_heap_bytes(
-            self.account_snapshots.capacity(),
-            account_id_size,
-            account_entry_size,
-        );
-        let trustline_snapshots = hashmap_heap_bytes(
-            self.trustline_snapshots.capacity(),
-            trustline_key_size,
-            trustline_entry_size,
-        );
-        let offer_snapshots = hashmap_heap_bytes(
-            self.offer_snapshots.capacity(),
-            offer_key_size,
-            offer_entry_size,
-        );
-        let ttl_snapshots =
-            hashmap_heap_bytes(self.ttl_snapshots.capacity(), hash_size, ttl_entry_size);
-        let sponsorship_snapshots = hashmap_heap_bytes(
-            self.entry_sponsorship_snapshots.capacity(),
-            ledger_key_size,
-            account_id_size,
-        );
-        let ext_snapshots = hashmap_heap_bytes(
-            self.entry_sponsorship_ext_snapshots.capacity(),
-            ledger_key_size,
-            1,
-        );
-        let lm_snapshots = hashmap_heap_bytes(
-            self.entry_last_modified_snapshots.capacity(),
-            ledger_key_size,
-            4,
-        );
+        let op_entry_snapshots = hashmap_heap_bytes(self.op_entry_snapshots.capacity(), ledger_key_size, 200);
+        let account_snapshots = hashmap_heap_bytes(self.account_snapshots.capacity(), account_id_size, account_entry_size);
+        let trustline_snapshots = hashmap_heap_bytes(self.trustlines.capacity(), trustline_key_size, trustline_entry_size);
+        let offer_snapshots = hashmap_heap_bytes(self.offer_snapshots.capacity(), offer_key_size, offer_entry_size + 48);
+        let ttl_snapshots = hashmap_heap_bytes(self.ttl_snapshots.capacity(), hash_size, ttl_entry_size);
+        let sponsorship_snapshots = hashmap_heap_bytes(self.entry_sponsorship_snapshots.capacity(), ledger_key_size, account_id_size);
+        let ext_snapshots = hashmap_heap_bytes(self.entry_sponsorship_ext_snapshots.capacity(), ledger_key_size, 1);
+        let lm_snapshots = hashmap_heap_bytes(self.entry_last_modified_snapshots.capacity(), ledger_key_size, 4);
 
         // Tracking vecs and sets
         let modified_accounts = vec_heap_bytes(self.modified_accounts.capacity(), account_id_size);
@@ -1325,72 +1221,30 @@ impl LedgerStateManager {
         // Deferred TTL bumps
         let deferred = hashmap_heap_bytes(self.deferred_ro_ttl_bumps.capacity(), hash_size, 4);
 
-        // Offer index
-        let offer_index_books =
-            hashmap_heap_bytes(self.offer_index.order_book_capacity(), asset_pair_size, 200);
-        let offer_index_locs = hashmap_heap_bytes(
-            self.offer_index.location_capacity(),
-            offer_key_size,
-            asset_pair_size + 24,
-        );
-        let account_asset_offers =
-            hashmap_heap_bytes(self.account_asset_offers.capacity(), trustline_key_size, 64);
         let max_seq = hashmap_heap_bytes(self.max_seq_num_to_apply.capacity(), account_id_size, 8);
 
-        // Offer-related bytes (preserved across ledger closes)
-        let offer_bytes = offers
-            + offer_sponsorships
-            + offer_sponsorship_ext
-            + offer_last_modified
-            + offer_index_books
-            + offer_index_locs
-            + account_asset_offers;
+        // Offer-related bytes are now in OfferStore (reported separately by LedgerManager)
+        let offer_bytes = 0;
 
-        let total = accounts
-            + trustlines
-            + offers
-            + ttl_entries
-            + ttl_snapshot
-            + data_entries
-            + contract_data
-            + contract_code
-            + claimable_balances
-            + liquidity_pools
-            + entry_sponsorships
-            + offer_sponsorships
-            + entry_sponsorship_ext
-            + offer_sponsorship_ext
-            + entry_last_modified
-            + offer_last_modified
-            + op_entry_snapshots
-            + account_snapshots
-            + trustline_snapshots
-            + offer_snapshots
-            + ttl_snapshots
-            + sponsorship_snapshots
-            + ext_snapshots
-            + lm_snapshots
-            + modified_accounts
-            + modified_trustlines
-            + modified_offers
-            + modified_ttl
-            + created_accounts
-            + created_trustlines
-            + created_offers
-            + created_ttl
-            + deleted_ttl
-            + deferred
-            + offer_index_books
-            + offer_index_locs
-            + account_asset_offers
-            + max_seq;
+        let total = accounts + trustlines + ttl_entries + ttl_snapshot
+            + data_entries + contract_data + contract_code + claimable_balances + liquidity_pools
+            + entry_sponsorships + entry_sponsorship_ext + entry_last_modified
+            + op_entry_snapshots + account_snapshots + trustline_snapshots + offer_snapshots
+            + ttl_snapshots + sponsorship_snapshots + ext_snapshots + lm_snapshots
+            + modified_accounts + modified_trustlines + modified_offers + modified_ttl
+            + created_accounts + created_trustlines + created_offers + created_ttl + deleted_ttl
+            + deferred + max_seq;
 
         (total, offer_bytes)
     }
 
-    /// Number of offers currently loaded.
+    /// Number of offers in the shared offer store.
     pub fn offer_count(&self) -> usize {
-        self.offers.len()
+        if let Some(store) = &self.offer_store {
+            store.lock().len()
+        } else {
+            0
+        }
     }
 
     /// Apply a fee refund to the most recent account update in the delta.
@@ -1430,11 +1284,13 @@ impl LedgerStateManager {
             ttl_snapshots: self.ttl_snapshots.clone(),
 
             // Save current values of entries in snapshot maps (pre-savepoint values)
-            offer_pre_values: self
-                .offer_snapshots
-                .keys()
-                .map(|k| (k.clone(), self.offers.get(k).cloned()))
-                .collect(),
+            offer_pre_values: {
+                let store = self.offer_store_lock();
+                self.offer_snapshots
+                    .keys()
+                    .map(|k| (k.clone(), store.get(k).cloned()))
+                    .collect()
+            },
             account_pre_values: self
                 .account_snapshots
                 .keys()
@@ -1484,7 +1340,7 @@ impl LedgerStateManager {
             entry_sponsorship_pre_values: self
                 .entry_sponsorship_snapshots
                 .keys()
-                .map(|k| (k.clone(), self.get_entry_sponsorship(k).cloned()))
+                .map(|k| (k.clone(), self.get_entry_sponsorship(k)))
                 .collect(),
             entry_sponsorship_ext_pre_values: self
                 .entry_sponsorship_ext_snapshots
@@ -1566,32 +1422,58 @@ impl LedgerStateManager {
         // modified_data truncation handled by data_entries.rollback_to_savepoint() above
         self.modified_ttl.truncate(sp.modified_ttl_len);
 
-        // Phase 6: Restore entry metadata (routed to offer/non-offer maps)
-        rollback_routed_metadata(
+        // Phase 6: Restore entry metadata.
+        // For offer keys, metadata is restored via OfferRecord snapshots (in rollback_offer_snapshots).
+        // For non-offer keys, use the standard rollback helpers.
+        // Filter to only non-offer keys for the non-offer maps.
+        let non_offer_lm_pre: Vec<_> = sp
+            .entry_last_modified_pre_values
+            .into_iter()
+            .filter(|(k, _)| !Self::is_offer_key(k))
+            .collect();
+        rollback_new_snapshots(
+            &mut self.entry_last_modified,
             &self.entry_last_modified_snapshots,
             &sp.entry_last_modified_snapshots,
-            sp.entry_last_modified_pre_values,
-            &mut self.offer_last_modified,
-            &mut self.entry_last_modified,
         );
+        apply_pre_values(&mut self.entry_last_modified, non_offer_lm_pre);
         self.entry_last_modified_snapshots = sp.entry_last_modified_snapshots;
 
-        rollback_routed_metadata(
+        let non_offer_sp_pre: Vec<_> = sp
+            .entry_sponsorship_pre_values
+            .into_iter()
+            .filter(|(k, _)| !Self::is_offer_key(k))
+            .collect();
+        rollback_new_snapshots(
+            &mut self.entry_sponsorships,
             &self.entry_sponsorship_snapshots,
             &sp.entry_sponsorship_snapshots,
-            sp.entry_sponsorship_pre_values,
-            &mut self.offer_sponsorships,
-            &mut self.entry_sponsorships,
         );
+        apply_pre_values(&mut self.entry_sponsorships, non_offer_sp_pre);
         self.entry_sponsorship_snapshots = sp.entry_sponsorship_snapshots;
 
-        rollback_routed_set_metadata(
-            &self.entry_sponsorship_ext_snapshots,
-            &sp.entry_sponsorship_ext_snapshots,
-            sp.entry_sponsorship_ext_pre_values,
-            &mut self.offer_sponsorship_ext,
-            &mut self.entry_sponsorship_ext,
-        );
+        // For sponsorship ext (bool-based set)
+        for (key, &was_present) in &self.entry_sponsorship_ext_snapshots {
+            if !sp.entry_sponsorship_ext_snapshots.contains_key(key) && !Self::is_offer_key(key) {
+                if was_present {
+                    self.entry_sponsorship_ext.insert(key.clone());
+                } else {
+                    self.entry_sponsorship_ext.remove(key);
+                }
+            }
+        }
+        let non_offer_ext_pre: Vec<_> = sp
+            .entry_sponsorship_ext_pre_values
+            .into_iter()
+            .filter(|(k, _)| !Self::is_offer_key(k))
+            .collect();
+        for (key, was_present) in non_offer_ext_pre {
+            if was_present {
+                self.entry_sponsorship_ext.insert(key);
+            } else {
+                self.entry_sponsorship_ext.remove(&key);
+            }
+        }
         self.entry_sponsorship_ext_snapshots = sp.entry_sponsorship_ext_snapshots;
 
         // Phase 7: Restore op entry snapshots and id_pool
@@ -1601,7 +1483,7 @@ impl LedgerStateManager {
     }
 
     /// Rollback offer snapshots created since the savepoint.
-    /// Offers need special handling for the aa_index and offer_index.
+    /// Restores full OfferRecords (including metadata) to the shared OfferStore.
     fn rollback_offer_snapshots(&mut self, sp: &Savepoint) {
         let new_offer_keys: Vec<_> = self
             .offer_snapshots
@@ -1617,39 +1499,29 @@ impl LedgerStateManager {
                     .map(|snap| (key, snap.clone()))
             })
             .collect();
+        let mut store = self.offer_store_lock();
         for (key, snapshot) in new_offer_snapshots {
-            if let Some(current) = self.offers.get(&key).cloned() {
-                self.aa_index_remove(&current);
-            }
             match snapshot {
-                Some(entry) => {
-                    self.aa_index_insert(&entry);
-                    self.offer_index.update_offer(&entry);
-                    self.offers.insert(key, entry);
+                Some(record) => {
+                    store.insert_record(record);
                 }
                 None => {
-                    self.offer_index.remove_by_key(&key);
-                    self.offers.remove(&key);
+                    store.remove(&key);
                 }
             }
         }
     }
 
-    /// Apply offer pre-savepoint values, maintaining aa_index and offer_index.
-    fn apply_offer_pre_values(&mut self, pre_values: Vec<(OfferKey, Option<OfferEntry>)>) {
+    /// Apply offer pre-savepoint values, restoring full OfferRecords to the shared OfferStore.
+    fn apply_offer_pre_values(&mut self, pre_values: Vec<(OfferKey, Option<OfferRecord>)>) {
+        let mut store = self.offer_store_lock();
         for (key, value) in pre_values {
-            if let Some(current) = self.offers.get(&key).cloned() {
-                self.aa_index_remove(&current);
-            }
             match value {
-                Some(entry) => {
-                    self.aa_index_insert(&entry);
-                    self.offer_index.update_offer(&entry);
-                    self.offers.insert(key, entry);
+                Some(record) => {
+                    store.insert_record(record);
                 }
                 None => {
-                    self.offer_index.remove_by_key(&key);
-                    self.offers.remove(&key);
+                    store.remove(&key);
                 }
             }
         }
@@ -1678,25 +1550,18 @@ impl LedgerStateManager {
             &mut self.created_trustlines,
         );
 
-        // Restore offer snapshots and incrementally update the index.
-        // Offers need special handling for aa_index and offer_index.
+        // Restore offer snapshots to the shared OfferStore.
         let offer_snapshots: Vec<_> = self.offer_snapshots.drain().collect();
-        for (key, snapshot) in offer_snapshots {
-            if self.created_offers.contains(&key) {
-                // Offer was created in this transaction — remove from index and map.
-                if let Some(current) = self.offers.get(&key).cloned() {
-                    self.aa_index_remove(&current);
+        {
+            let mut store = self.offer_store_lock();
+            for (key, snapshot) in offer_snapshots {
+                if self.created_offers.contains(&key) {
+                    // Offer was created in this transaction — remove it.
+                    store.remove(&key);
+                } else if let Some(record) = snapshot {
+                    // Offer existed before — restore the full record (entry + metadata).
+                    store.insert_record(record);
                 }
-                self.offer_index.remove_by_key(&key);
-                self.offers.remove(&key);
-            } else if let Some(entry) = snapshot {
-                // Offer existed before — restore it and update index.
-                if let Some(current) = self.offers.get(&key).cloned() {
-                    self.aa_index_remove(&current);
-                }
-                self.aa_index_insert(&entry);
-                self.offer_index.update_offer(&entry);
-                self.offers.insert(key, entry);
             }
         }
         self.created_offers.clear();
@@ -1967,21 +1832,30 @@ impl LedgerStateManager {
         }
 
         let modified_offers = std::mem::take(&mut self.modified_offers);
-        for key in modified_offers {
-            if let Some(Some(snapshot_entry)) = self.offer_snapshots.get(&key) {
-                if let Some(entry) = self.offers.get(&key).cloned() {
+        let offer_updates: Vec<_> = {
+            let store = self.offer_store_lock();
+            modified_offers
+                .into_iter()
+                .filter_map(|key| {
+                    let snapshot_record = self.offer_snapshots.get(&key)?.as_ref()?;
+                    let record = store.get(&key)?;
                     let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
-                        seller_id: entry.seller_id.clone(),
-                        offer_id: entry.offer_id,
+                        seller_id: record.entry.seller_id.clone(),
+                        offer_id: record.entry.offer_id,
                     });
                     let accessed_in_op = self.op_entry_snapshots.contains_key(&ledger_key);
-                    if accessed_in_op || &entry != snapshot_entry {
-                        let fallback = self.offer_to_ledger_entry(snapshot_entry);
-                        let post = self.offer_to_ledger_entry(&entry);
-                        self.record_flush_update(ledger_key, fallback, post);
+                    if accessed_in_op || record.entry != snapshot_record.entry {
+                        let fallback = snapshot_record.to_ledger_entry();
+                        let post = record.to_ledger_entry();
+                        Some((ledger_key, fallback, post))
+                    } else {
+                        None
                     }
-                }
-            }
+                })
+                .collect()
+        };
+        for (ledger_key, fallback, post) in offer_updates {
+            self.record_flush_update(ledger_key, fallback, post);
         }
 
         let modified_data = self.data_entries.take_modified();
@@ -2285,6 +2159,13 @@ mod tests {
     use henyey_common::LIQUIDITY_POOL_FEE_V18;
     use stellar_xdr::curr::*;
 
+    /// Create a LedgerStateManager with a shared OfferStore pre-configured.
+    fn new_manager_with_offers(base_reserve: i64, ledger_seq: u32) -> LedgerStateManager {
+        let mut manager = LedgerStateManager::new(base_reserve, ledger_seq);
+        manager.set_offer_store(Arc::new(Mutex::new(OfferStore::new())));
+        manager
+    }
+
     fn create_test_account_entry(seed: u8) -> AccountEntry {
         AccountEntry {
             account_id: create_test_account_id(seed),
@@ -2302,7 +2183,7 @@ mod tests {
 
     #[test]
     fn test_state_manager_creation() {
-        let manager = LedgerStateManager::new(5_000_000, 100);
+        let manager = new_manager_with_offers(5_000_000, 100);
         assert_eq!(manager.ledger_seq(), 100);
         assert_eq!(manager.base_reserve(), 5_000_000);
         assert!(!manager.has_changes());
@@ -2310,7 +2191,7 @@ mod tests {
 
     #[test]
     fn test_minimum_balance() {
-        let manager = LedgerStateManager::new(5_000_000, 100);
+        let manager = new_manager_with_offers(5_000_000, 100);
         let account = create_test_account_entry(1);
         // 0 sub-entries: (2 + 0) * 5_000_000 = 10_000_000
         assert_eq!(
@@ -2332,7 +2213,7 @@ mod tests {
 
     #[test]
     fn test_account_operations() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
         let account = create_test_account_entry(1);
         let account_id = account.account_id.clone();
 
@@ -2356,7 +2237,7 @@ mod tests {
 
     #[test]
     fn test_rollback() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
         let account = create_test_account_entry(1);
         let account_id = account.account_id.clone();
 
@@ -2372,7 +2253,7 @@ mod tests {
 
     #[test]
     fn test_rollback_preserves_fee_charged() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         // Add fee from first transaction
         manager.delta_mut().add_fee(400);
@@ -2428,7 +2309,7 @@ mod tests {
 
     #[test]
     fn test_commit() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
         let account = create_test_account_entry(1);
         let account_id = account.account_id.clone();
 
@@ -2448,7 +2329,7 @@ mod tests {
 
     #[test]
     fn test_take_delta() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
         let account = create_test_account_entry(1);
 
         manager.create_account(account);
@@ -2477,7 +2358,7 @@ mod tests {
     /// sponsor of a ClaimableBalance entry but the modification was not recorded.
     #[test]
     fn test_claimable_balance_sponsorship_only_change_recorded_in_delta() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         // Create a claimable balance ID
         let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([1u8; 32]));
@@ -2554,7 +2435,7 @@ mod tests {
     /// Same fix as ClaimableBalance, applied for consistency.
     #[test]
     fn test_liquidity_pool_sponsorship_only_change_recorded_in_delta() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         // Create a liquidity pool ID
         let pool_id = PoolId(Hash([2u8; 32]));
@@ -2639,7 +2520,7 @@ mod tests {
     /// bucket list hash mismatch and a num_sponsoring underflow at ledger 80388.
     #[test]
     fn test_offer_sponsorship_only_change_recorded_in_delta() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         // Create an offer entry
         let seller_id = create_test_account_id(1);
@@ -2863,7 +2744,7 @@ mod tests {
 
     #[test]
     fn test_state_manager_best_offer_uses_index() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         // Create offers with different prices
         let offer1 = create_test_offer(1, 100, 3, 1); // price = 3.0
@@ -2884,7 +2765,7 @@ mod tests {
 
     #[test]
     fn test_state_manager_best_offer_filtered() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         let seller1 = create_test_account_id(1);
         let seller2 = create_test_account_id(2);
@@ -2908,7 +2789,7 @@ mod tests {
 
     #[test]
     fn test_state_manager_offer_index_rollback() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         let offer1 = create_test_offer(1, 100, 1, 1);
         manager.create_offer(offer1.clone());
@@ -2924,7 +2805,7 @@ mod tests {
 
     #[test]
     fn test_state_manager_offer_index_delete() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         let offer1 = create_test_offer(1, 100, 2, 1);
         let offer2 = create_test_offer(2, 200, 1, 1); // best
@@ -2976,20 +2857,19 @@ mod tests {
         }
     }
 
-    /// Helper to query the account_asset_offers index for a (seller, asset) pair.
+    /// Helper to query the OfferStore for offers matching a (seller, asset) pair.
     fn aa_index_get(manager: &LedgerStateManager, seller_seed: u8, asset: &Asset) -> HashSet<i64> {
         let seller = create_test_account_id(seller_seed);
-        let tl_asset = asset_to_trustline_asset(asset);
         manager
-            .account_asset_offers
-            .get(&(seller, tl_asset))
-            .cloned()
-            .unwrap_or_default()
+            .get_offers_by_account_and_asset(&seller, asset)
+            .into_iter()
+            .map(|e| e.offer_id)
+            .collect()
     }
 
     #[test]
     fn test_account_asset_index_create_offer() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         // 2 offers for seller_1 (Native→USD)
         let offer1 = create_test_offer_with_assets(1, 100, Asset::Native, usd_asset());
@@ -3016,13 +2896,13 @@ mod tests {
         let s2_usd = aa_index_get(&manager, 2, &usd_asset());
         assert_eq!(s2_usd, HashSet::from([300]));
 
-        // Total unique keys in the index: 4
-        assert_eq!(manager.account_asset_offers.len(), 4);
+        // Verify offers are in the store (4 unique (account, asset) pairs)
+        // The OfferStore maintains this internally; we verify via queries above.
     }
 
     #[test]
     fn test_account_asset_index_multi_asset() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         let offer1 = create_test_offer_with_assets(1, 100, Asset::Native, usd_asset());
         let offer2 = create_test_offer_with_assets(1, 200, Asset::Native, eur_asset());
@@ -3044,7 +2924,7 @@ mod tests {
 
     #[test]
     fn test_account_asset_index_delete_offer() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         let offer1 = create_test_offer_with_assets(1, 100, Asset::Native, usd_asset());
         let offer2 = create_test_offer_with_assets(1, 200, Asset::Native, usd_asset());
@@ -3066,7 +2946,7 @@ mod tests {
 
     #[test]
     fn test_account_asset_index_update_offer() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         let offer = create_test_offer_with_assets(1, 100, Asset::Native, usd_asset());
         manager.create_offer(offer);
@@ -3098,7 +2978,7 @@ mod tests {
 
     #[test]
     fn test_remove_offers_by_account_and_asset() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         // offer1: Native→USD, offer2: Native→EUR, offer3: EUR→USD
         let offer1 = create_test_offer_with_assets(1, 100, Asset::Native, usd_asset());
@@ -3131,7 +3011,7 @@ mod tests {
 
     #[test]
     fn test_remove_offers_by_account_and_asset_isolation() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         let offer1 = create_test_offer_with_assets(1, 100, Asset::Native, usd_asset());
         let offer2 = create_test_offer_with_assets(2, 200, Asset::Native, usd_asset());
@@ -3159,7 +3039,7 @@ mod tests {
 
     #[test]
     fn test_account_asset_index_rollback() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         let offer = create_test_offer_with_assets(1, 100, Asset::Native, usd_asset());
         manager.create_offer(offer);
@@ -3183,7 +3063,7 @@ mod tests {
 
     #[test]
     fn test_account_asset_index_rollback_restore() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         // Create and commit offer1
         let offer1 = create_test_offer_with_assets(1, 100, Asset::Native, usd_asset());
@@ -3215,7 +3095,7 @@ mod tests {
 
     #[test]
     fn test_account_asset_index_savepoint() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         // Create and commit offer1
         let offer1 = create_test_offer_with_assets(1, 100, Asset::Native, usd_asset());
@@ -3251,7 +3131,7 @@ mod tests {
 
     #[test]
     fn test_savepoint_rollback_accounts() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         // Create and commit an account
         let account = create_test_account_entry(1);
@@ -3283,7 +3163,7 @@ mod tests {
 
     #[test]
     fn test_savepoint_rollback_data_entries() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         // Create savepoint on empty state
         let sp = manager.create_savepoint();
@@ -3310,7 +3190,7 @@ mod tests {
 
     #[test]
     fn test_savepoint_rollback_claimable_balances() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         // Create savepoint
         let sp = manager.create_savepoint();
@@ -3335,7 +3215,7 @@ mod tests {
 
     #[test]
     fn test_savepoint_rollback_preserves_pre_savepoint_changes() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         // Create account and commit
         let account = create_test_account_entry(1);
@@ -3374,7 +3254,7 @@ mod tests {
 
     #[test]
     fn test_savepoint_rollback_restores_id_pool() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         let initial_id = manager.id_pool;
         let sp = manager.create_savepoint();
@@ -3424,7 +3304,7 @@ mod tests {
 
     #[test]
     fn test_deleted_contract_data_tracking() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
         let cd = create_test_contract_data_entry(1);
         let key = LedgerKey::ContractData(LedgerKeyContractData {
             contract: cd.contract.clone(),
@@ -3452,7 +3332,7 @@ mod tests {
 
     #[test]
     fn test_deleted_contract_code_tracking() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
         let cc = create_test_contract_code_entry(2);
         let key = LedgerKey::ContractCode(LedgerKeyContractCode {
             hash: cc.hash.clone(),
@@ -3474,7 +3354,7 @@ mod tests {
 
     #[test]
     fn test_deleted_ttl_tracking() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
         let ttl = create_test_ttl_entry(3);
         let key = LedgerKey::Ttl(LedgerKeyTtl {
             key_hash: ttl.key_hash.clone(),
@@ -3496,7 +3376,7 @@ mod tests {
 
     #[test]
     fn test_non_soroban_entries_not_tracked_as_deleted() {
-        let manager = LedgerStateManager::new(5_000_000, 100);
+        let manager = new_manager_with_offers(5_000_000, 100);
 
         // Non-Soroban entry types should always return false for is_entry_deleted
         let account_key = LedgerKey::Account(LedgerKeyAccount {
@@ -3516,7 +3396,7 @@ mod tests {
         // Regression test for ledger 842789 TX 5 mismatch.
         // When TX 4 deletes an entry, TX 5 should NOT reload it from bucket list.
         // This test verifies that deleted entries are properly tracked.
-        let mut manager = LedgerStateManager::new(5_000_000, 842789);
+        let mut manager = new_manager_with_offers(5_000_000, 842789);
 
         // Simulate TX 4 creating and then deleting a contract data entry
         let cd = create_test_contract_data_entry(4);
@@ -3554,7 +3434,7 @@ mod tests {
     #[test]
     fn test_mark_entry_deleted_blocks_bl_reload_ve11() {
         // Simulate stage 1 executor: fresh state, no prior knowledge of deletions.
-        let mut manager = LedgerStateManager::new(5_000_000, 61430400);
+        let mut manager = new_manager_with_offers(5_000_000, 61430400);
 
         let cd = create_test_contract_data_entry(42);
         let cd_key = LedgerKey::ContractData(LedgerKeyContractData {
@@ -3602,7 +3482,7 @@ mod tests {
     /// without reloading ~911K offers.
     #[test]
     fn test_clear_cached_entries_preserving_offers() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         // Add an account
         let account = create_test_account_entry(1);
@@ -3660,13 +3540,13 @@ mod tests {
         assert!(best.is_some(), "OfferIndex should be preserved");
     }
 
-    /// Regression test: clear_cached_entries (without preserving) clears everything.
+    /// Test: clear_cached_entries clears non-offer entries but preserves the shared OfferStore.
     ///
-    /// Contrast with test_clear_cached_entries_preserving_offers: when
-    /// preserve_offers=false, all entries including offers should be cleared.
+    /// With the shared OfferStore architecture, offers are always preserved across
+    /// clear_cached_entries calls because the store is shared with other components.
     #[test]
-    fn test_clear_cached_entries_clears_offers() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+    fn test_clear_cached_entries_preserves_shared_offer_store() {
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         let offer1 = create_test_offer(1, 100, 1, 1);
         manager.create_offer(offer1);
@@ -3676,57 +3556,49 @@ mod tests {
 
         manager.clear_cached_entries();
 
+        // Offers are preserved in the shared OfferStore
         assert!(
-            manager.get_offer(&create_test_account_id(1), 100).is_none(),
-            "Offers should be cleared when preserve_offers=false"
+            manager.get_offer(&create_test_account_id(1), 100).is_some(),
+            "Offers in the shared OfferStore should be preserved across clear_cached_entries"
         );
     }
 
-    /// Regression test: remove_offers_by_account_and_asset must use the
-    /// authoritative loader to discover offers not yet in the in-memory index.
+    /// Test: remove_offers_by_account_and_asset discovers all offers in the shared OfferStore.
     ///
-    /// Mirrors stellar-core `loadOffersByAccountAndAsset` which queries the SQL database
-    /// for ALL matching offers regardless of whether they were previously accessed.
-    /// Without the loader, offers that exist in the bucket list but were never
-    /// loaded into the state manager would be silently skipped, causing
-    /// non-deterministic authorization revocation.
+    /// With the shared OfferStore, all offers are always visible regardless of whether
+    /// they were explicitly loaded by this state manager. This replaces the old loader-based
+    /// test since the OfferStore is the single authoritative source.
     #[test]
-    fn test_remove_offers_by_account_and_asset_uses_loader() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+    fn test_remove_offers_by_account_and_asset_uses_store() {
+        let mut manager = new_manager_with_offers(5_000_000, 100);
         let seller1 = create_test_account_id(1);
 
-        // Create offer1 directly (simulating it being loaded from bucket list
-        // during a prior TX).
+        // Create offer1 via the state manager.
         let offer1 = create_test_offer_with_assets(1, 100, Asset::Native, usd_asset());
         manager.create_offer(offer1);
         manager.commit();
 
-        // offer2 exists in the "authoritative store" but has NOT been loaded
-        // into the state manager's in-memory index.
+        // Insert offer2 directly into the shared OfferStore (simulating it being
+        // present from a prior ledger close, not loaded via this state manager).
         let offer2 = create_test_offer_with_assets(1, 200, eur_asset(), usd_asset());
+        {
+            let mut store = manager.offer_store_lock();
+            store.insert_record(OfferRecord {
+                entry: offer2,
+                last_modified: 100,
+                sponsor: None,
+                has_ext: false,
+            });
+        }
 
-        // Set up the loader to return offer2 (simulating the manager's
-        // complete offer store returning all offers for this account+asset).
-        let offer2_entry = LedgerEntry {
-            last_modified_ledger_seq: 100,
-            data: LedgerEntryData::Offer(offer2),
-            ext: LedgerEntryExt::V0,
-        };
-        let offer2_clone = offer2_entry.clone();
-        manager.set_offers_by_account_asset_loader(Arc::new(move |_account_id, _asset| {
-            Ok(vec![offer2_clone.clone()])
-        }));
-
-        // Before the fix, this would only find offer1 (the one already loaded).
-        // With the fix, it uses the loader to discover offer2 as well.
+        // remove_offers_by_account_and_asset should find both offers via the OfferStore.
         let removed = manager.remove_offers_by_account_and_asset(&seller1, &usd_asset());
 
-        // Both offers should be removed: offer1 (Native→USD) and offer2 (EUR→USD)
         let removed_ids: HashSet<i64> = removed.iter().map(|o| o.offer_id).collect();
         assert_eq!(
             removed_ids,
             HashSet::from([100, 200]),
-            "Both the pre-loaded offer and the loader-discovered offer should be removed"
+            "Both offers should be removed from the shared OfferStore"
         );
     }
 
@@ -3741,7 +3613,7 @@ mod tests {
     /// account's num_sponsoring was not correctly rolled back.
     #[test]
     fn test_rollback_after_flush_all_accounts_restores_original() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         // Create an account that will be modified across multiple "operations"
         let account = create_test_account_entry(1);
@@ -3793,18 +3665,15 @@ mod tests {
     /// Regression test: remove_offers_by_account_and_asset must skip offers
     /// that were already deleted in a previous transaction within the same ledger.
     ///
-    /// The offers_by_account_asset_loader returns offers from the bucket list
-    /// snapshot, which does not reflect in-ledger deletions. Without the fix,
-    /// a deleted offer would be re-loaded from the snapshot and then deleted
-    /// again, causing double liability release and double sub_entries decrement.
+    /// With the shared OfferStore, deleted offers are immediately removed, so
+    /// they cannot be re-discovered. This test verifies correctness.
     ///
-    /// This bug caused a bucket_list_hash mismatch at mainnet L59517076 where
-    /// offer 1799030633 was deleted by TX 81 (offer crossing), then re-loaded
-    /// and re-deleted by TX 105 (AllowTrust authorization revocation), causing
-    /// selling_liabilities to go negative (-801) and sub_entries to be off by -1.
+    /// Originally caused by mainnet L59517076 where offer 1799030633 was deleted
+    /// by TX 81 (offer crossing), then re-loaded and re-deleted by TX 105
+    /// (AllowTrust authorization revocation).
     #[test]
     fn test_remove_offers_skips_already_deleted_offers() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
         let seller = create_test_account_id(1);
 
         // Create account with sub_entries tracking
@@ -3826,7 +3695,7 @@ mod tests {
         // TX1 succeeds
         manager.commit();
 
-        // Verify offer1 is deleted from state
+        // Verify offer1 is deleted from the shared OfferStore
         assert!(manager.get_offer(&seller, 100).is_none());
         // Verify offer1 deletion is in the delta
         let offer1_key = LedgerKey::Offer(LedgerKeyOffer {
@@ -3841,27 +3710,10 @@ mod tests {
         // --- TX2: AllowTrust revokes authorization, triggering remove_offers ---
         manager.snapshot_delta();
 
-        // The loader returns BOTH offers from the "bucket list" snapshot,
-        // which doesn't know about the in-ledger deletion of offer1.
-        let offer1_entry = LedgerEntry {
-            last_modified_ledger_seq: 100,
-            data: LedgerEntryData::Offer(offer1),
-            ext: LedgerEntryExt::V0,
-        };
-        let offer2_entry = LedgerEntry {
-            last_modified_ledger_seq: 100,
-            data: LedgerEntryData::Offer(offer2),
-            ext: LedgerEntryExt::V0,
-        };
-        let entries = vec![offer1_entry, offer2_entry];
-        manager.set_offers_by_account_asset_loader(Arc::new(move |_account_id, _asset| {
-            Ok(entries.clone())
-        }));
-
+        // With the shared OfferStore, offer1 is already gone.
         let removed = manager.remove_offers_by_account_and_asset(&seller, &usd_asset());
 
-        // Only offer2 should be removed. offer1 was already deleted in TX1
-        // and must NOT be re-loaded from the loader.
+        // Only offer2 should be removed. offer1 was already deleted in TX1.
         let removed_ids: HashSet<i64> = removed.iter().map(|o| o.offer_id).collect();
         assert_eq!(
             removed_ids,
@@ -3892,7 +3744,7 @@ mod tests {
     /// leaking extended TTLs into the next transaction's state.
     #[test]
     fn test_ttl_rollback_restores_original_value() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
         let key_hash = Hash([7; 32]);
         let original_ttl = TtlEntry {
             key_hash: key_hash.clone(),
@@ -3936,7 +3788,7 @@ mod tests {
     /// (simulating per-operation rollback within a transaction).
     #[test]
     fn test_extend_ttl_savepoint_rollback_restores_original_value() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
         let key_hash = Hash([8; 32]);
         let original_ttl = TtlEntry {
             key_hash: key_hash.clone(),
@@ -3974,7 +3826,7 @@ mod tests {
     /// cluster sees the original TTL value (not the extended one from TX 1).
     #[test]
     fn test_ttl_cross_tx_isolation_after_failed_tx() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
         let key_hash = Hash([9; 32]);
         let original_ttl = TtlEntry {
             key_hash: key_hash.clone(),
@@ -4017,7 +3869,7 @@ mod tests {
     /// `deferred_ro_ttl_bumps` on rollback.
     #[test]
     fn test_ro_ttl_bumps_rolled_back_on_tx_failure() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
         let key_hash = Hash([10; 32]);
         let original_ttl = TtlEntry {
             key_hash: key_hash.clone(),
@@ -4084,7 +3936,7 @@ mod tests {
             ContractDataDurability, LedgerKey, LedgerKeyContractData, ScAddress, ScVal,
         };
 
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
         let key_hash = Hash([20; 32]);
         let original_ttl = TtlEntry {
             key_hash: key_hash.clone(),
@@ -4184,7 +4036,7 @@ mod tests {
     /// Test that flush_ro_ttl_bumps_for_write_footprint skips non-Soroban keys.
     #[test]
     fn test_flush_ro_ttl_bumps_skips_non_soroban_keys() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         // Add a deferred bump
         let key_hash = Hash([30; 32]);
@@ -4238,7 +4090,7 @@ mod tests {
     #[test]
     fn test_flush_modified_entries_stamps_current_ledger_on_post_state() {
         let ledger_seq = 500;
-        let mut manager = LedgerStateManager::new(5_000_000, ledger_seq);
+        let mut manager = new_manager_with_offers(5_000_000, ledger_seq);
 
         // Create an account (committed at ledger_seq)
         let account = create_test_account_entry(1);
@@ -4340,7 +4192,7 @@ mod tests {
     #[test]
     fn test_rollback_to_savepoint_restores_contract_data_after_update() {
         let ledger_seq = 100u32;
-        let mut manager = LedgerStateManager::new(5_000_000, ledger_seq);
+        let mut manager = new_manager_with_offers(5_000_000, ledger_seq);
 
         let contract = ScAddress::Contract(ContractId(Hash([1u8; 32])));
         let key = ScVal::I32(42);
@@ -4397,7 +4249,7 @@ mod tests {
     /// the wrong (post-update) balance instead of the original.
     #[test]
     fn test_rollback_to_savepoint_restores_account_after_update() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         let mut account = create_test_account_entry(1);
         account.balance = 1_000_000;
@@ -4435,7 +4287,7 @@ mod tests {
     /// Regression test: update_data must not overwrite the snapshot.
     #[test]
     fn test_rollback_to_savepoint_restores_data_after_update() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         let account_id = create_test_account_id(1);
         let name = "my_key";
@@ -4484,7 +4336,7 @@ mod tests {
     /// Regression test: update_claimable_balance must not overwrite the snapshot.
     #[test]
     fn test_rollback_to_savepoint_restores_claimable_balance_after_update() {
-        let mut manager = LedgerStateManager::new(5_000_000, 100);
+        let mut manager = new_manager_with_offers(5_000_000, 100);
 
         let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([5u8; 32]));
         let original_entry = ClaimableBalanceEntry {
