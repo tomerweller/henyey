@@ -19,14 +19,7 @@ fn test_execute_transaction_missing_operation() {
 
     let snapshot = LedgerSnapshot::empty(1);
     let snapshot = SnapshotHandle::new(snapshot);
-    let context = henyey_tx::LedgerContext::new(
-        1,
-        1000,
-        100,
-        5_000_000,
-        25,
-        NetworkId::testnet(),
-    );
+    let context = henyey_tx::LedgerContext::new(1, 1000, 100, 5_000_000, 25, NetworkId::testnet());
     let mut executor = TransactionExecutor::new(
         &context,
         0,
@@ -89,20 +82,9 @@ fn test_execute_transaction_time_bounds_too_early() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
-    let context = henyey_tx::LedgerContext::new(
-        1,
-        1_000,
-        100,
-        5_000_000,
-        25,
-        network_id,
-    );
-    let mut executor = TransactionExecutor::new(
-        &context,
-        0,
-        SorobanConfig::default(),
-        classic_events,
-    );
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor =
+        TransactionExecutor::new(&context, 0, SorobanConfig::default(), classic_events);
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
         .expect("execute");
@@ -165,20 +147,9 @@ fn test_execute_transaction_min_seq_num_precondition() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
-    let context = henyey_tx::LedgerContext::new(
-        1,
-        1_000,
-        100,
-        5_000_000,
-        25,
-        network_id,
-    );
-    let mut executor = TransactionExecutor::new(
-        &context,
-        0,
-        SorobanConfig::default(),
-        classic_events,
-    );
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor =
+        TransactionExecutor::new(&context, 0, SorobanConfig::default(), classic_events);
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
         .expect("execute");
@@ -247,14 +218,7 @@ fn test_execute_transaction_min_seq_num_relaxed_sequence() {
         env.signatures = vec![decorated].try_into().unwrap();
     }
 
-    let context = henyey_tx::LedgerContext::new(
-        1,
-        1_000,
-        100,
-        5_000_000,
-        25,
-        network_id,
-    );
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
     let mut executor = TransactionExecutor::new(
         &context,
         0,
@@ -329,14 +293,7 @@ fn test_execute_transaction_strict_sequence_without_min_seq_num() {
         env.signatures = vec![decorated].try_into().unwrap();
     }
 
-    let context = henyey_tx::LedgerContext::new(
-        1,
-        1_000,
-        100,
-        5_000_000,
-        25,
-        network_id,
-    );
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
     let mut executor = TransactionExecutor::new(
         &context,
         0,
@@ -413,12 +370,8 @@ fn test_execute_transaction_min_seq_age_precondition() {
     }
 
     let context = henyey_tx::LedgerContext::new(
-        10,
-        1_000, // close_time
-        100,
-        5_000_000,
-        25,
-        network_id,
+        10, 1_000, // close_time
+        100, 5_000_000, 25, network_id,
     );
     let mut executor = TransactionExecutor::new(
         &context,
@@ -490,14 +443,7 @@ fn test_execute_transaction_min_seq_ledger_gap_precondition() {
         env.signatures = vec![decorated].try_into().unwrap();
     }
 
-    let context = henyey_tx::LedgerContext::new(
-        10,
-        1_000,
-        100,
-        5_000_000,
-        25,
-        network_id,
-    );
+    let context = henyey_tx::LedgerContext::new(10, 1_000, 100, 5_000_000, 25, network_id);
     let mut executor = TransactionExecutor::new(
         &context,
         0,
@@ -567,20 +513,9 @@ fn test_execute_transaction_extra_signers_missing() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
-    let context = henyey_tx::LedgerContext::new(
-        1,
-        1_000,
-        100,
-        5_000_000,
-        25,
-        network_id,
-    );
-    let mut executor = TransactionExecutor::new(
-        &context,
-        0,
-        SorobanConfig::default(),
-        classic_events,
-    );
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor =
+        TransactionExecutor::new(&context, 0, SorobanConfig::default(), classic_events);
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
         .expect("execute");
@@ -643,6 +578,11 @@ fn test_fee_bump_result_encoding() {
         hot_archive_restored_keys: vec![],
         op_type_timings: std::collections::HashMap::new(),
         exec_time_us: 0,
+        validation_us: 0,
+        fee_seq_us: 0,
+        footprint_us: 0,
+        ops_us: 0,
+        meta_build_us: 0,
     };
 
     let pair = build_tx_result_pair(
@@ -715,26 +655,18 @@ fn test_operation_failure_rolls_back_changes() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
-    let context = henyey_tx::LedgerContext::new(
-        1,
-        1_000,
-        100,
-        5_000_000,
-        25,
-        network_id,
-    );
-    let mut executor = TransactionExecutor::new(
-        &context,
-        0,
-        SorobanConfig::default(),
-        classic_events,
-    );
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor =
+        TransactionExecutor::new(&context, 0, SorobanConfig::default(), classic_events);
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
         .expect("execute");
 
     assert!(!result.success);
-    assert_eq!(result.failure, Some(ExecutionFailure::TxInsufficientBalance));
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::TxInsufficientBalance)
+    );
 
     let state = executor.state();
     assert!(state.get_account(&destination).is_none());
@@ -798,9 +730,7 @@ fn test_fee_bump_inner_signature_uses_low_threshold() {
     };
 
     let inner_tx = Transaction {
-        source_account: MuxedAccount::Ed25519(Uint256(
-            *inner_secret.public_key().as_bytes(),
-        )),
+        source_account: MuxedAccount::Ed25519(Uint256(*inner_secret.public_key().as_bytes())),
         fee: 100,
         seq_num: SequenceNumber(2),
         cond: Preconditions::None,
@@ -823,9 +753,7 @@ fn test_fee_bump_inner_signature_uses_low_threshold() {
     };
 
     let fee_bump = FeeBumpTransaction {
-        fee_source: MuxedAccount::Ed25519(Uint256(
-            *fee_secret.public_key().as_bytes(),
-        )),
+        fee_source: MuxedAccount::Ed25519(Uint256(*fee_secret.public_key().as_bytes())),
         fee: 200,
         inner_tx: FeeBumpTransactionInnerTx::Tx(inner_v1),
         ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
@@ -862,4 +790,3 @@ fn test_fee_bump_inner_signature_uses_low_threshold() {
         "fee-bump inner TX signature should use THRESHOLD_LOW, not THRESHOLD_MEDIUM"
     );
 }
-
