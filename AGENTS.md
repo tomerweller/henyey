@@ -1,5 +1,7 @@
 # Repository Guidelines
 
+This codebase is under heavy construction. Don't be afraid to make significant changes — refactors, redesigns, and large diffs are expected and welcome.
+
 ## Project Structure & Module Organization
 
 - `crates/` contains the Rust workspace crates. Each module is a crate (e.g., `crates/ledger`, `crates/tx`, `crates/history`).
@@ -22,6 +24,7 @@
 - Use descriptive error messages and map to XDR result codes where applicable.
 - Fix cargo compiler warnings before submitting changes; keep the workspace warning-free where practical.
 - Never fail silently. If assumptions are not met, error out — do not gracefully recover.
+- Prefer using types provided by `rs-stellar-xdr` over creating new ones and adding many conversions.
 
 ## Determinism & Parity
 
