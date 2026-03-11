@@ -142,55 +142,7 @@ impl BucketEntryExt for BucketEntry {
 
 /// Extract a LedgerKey from a LedgerEntry.
 pub fn ledger_entry_to_key(entry: &LedgerEntry) -> Option<LedgerKey> {
-    use stellar_xdr::curr::*;
-
-    let key = match &entry.data {
-        LedgerEntryData::Account(account) => LedgerKey::Account(LedgerKeyAccount {
-            account_id: account.account_id.clone(),
-        }),
-        LedgerEntryData::Trustline(trustline) => LedgerKey::Trustline(LedgerKeyTrustLine {
-            account_id: trustline.account_id.clone(),
-            asset: trustline.asset.clone(),
-        }),
-        LedgerEntryData::Offer(offer) => LedgerKey::Offer(LedgerKeyOffer {
-            seller_id: offer.seller_id.clone(),
-            offer_id: offer.offer_id,
-        }),
-        LedgerEntryData::Data(data) => LedgerKey::Data(LedgerKeyData {
-            account_id: data.account_id.clone(),
-            data_name: data.data_name.clone(),
-        }),
-        LedgerEntryData::ClaimableBalance(cb) => {
-            LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
-                balance_id: cb.balance_id.clone(),
-            })
-        }
-        LedgerEntryData::LiquidityPool(pool) => LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
-            liquidity_pool_id: pool.liquidity_pool_id.clone(),
-        }),
-        LedgerEntryData::ContractData(contract_data) => {
-            LedgerKey::ContractData(LedgerKeyContractData {
-                contract: contract_data.contract.clone(),
-                key: contract_data.key.clone(),
-                durability: contract_data.durability,
-            })
-        }
-        LedgerEntryData::ContractCode(contract_code) => {
-            LedgerKey::ContractCode(LedgerKeyContractCode {
-                hash: contract_code.hash.clone(),
-            })
-        }
-        LedgerEntryData::ConfigSetting(config) => {
-            LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-                config_setting_id: config.discriminant(),
-            })
-        }
-        LedgerEntryData::Ttl(ttl) => LedgerKey::Ttl(LedgerKeyTtl {
-            key_hash: ttl.key_hash.clone(),
-        }),
-    };
-
-    Some(key)
+    Some(henyey_common::entry_to_key(entry))
 }
 
 /// Compare two LedgerKeys for ordering.

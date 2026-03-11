@@ -265,14 +265,14 @@ impl PersistentModuleCache {
     /// prevent unbounded growth of the module cache.
     ///
     /// Returns true if the module was found and removed, false otherwise.
-    pub fn remove_contract(&self, hash: &[u8; 32]) -> bool {
+    pub fn remove_contract(&self, hash: &stellar_xdr::curr::Hash) -> bool {
         match self {
             PersistentModuleCache::P24(cache) => {
-                let contract_id = soroban_env_host24::xdr::Hash(*hash);
+                let contract_id = soroban_env_host24::xdr::Hash(hash.0);
                 cache.remove_module(&contract_id).ok().flatten().is_some()
             }
             PersistentModuleCache::P25(cache) => {
-                let contract_id = soroban_env_host25::xdr::Hash(*hash);
+                let contract_id = soroban_env_host25::xdr::Hash(hash.0);
                 cache.remove_module(&contract_id).ok().flatten().is_some()
             }
         }

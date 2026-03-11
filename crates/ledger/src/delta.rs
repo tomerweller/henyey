@@ -121,61 +121,7 @@ impl EntryChange {
 /// - ClaimableBalance, LiquidityPool
 /// - ContractData, ContractCode, ConfigSetting, Ttl (Soroban)
 pub fn entry_to_key(entry: &LedgerEntry) -> Result<LedgerKey> {
-    use stellar_xdr::curr::LedgerEntryData;
-
-    let key = match &entry.data {
-        LedgerEntryData::Account(account) => {
-            LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-                account_id: account.account_id.clone(),
-            })
-        }
-        LedgerEntryData::Trustline(trustline) => {
-            LedgerKey::Trustline(stellar_xdr::curr::LedgerKeyTrustLine {
-                account_id: trustline.account_id.clone(),
-                asset: trustline.asset.clone(),
-            })
-        }
-        LedgerEntryData::Offer(offer) => LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
-            seller_id: offer.seller_id.clone(),
-            offer_id: offer.offer_id,
-        }),
-        LedgerEntryData::Data(data) => LedgerKey::Data(stellar_xdr::curr::LedgerKeyData {
-            account_id: data.account_id.clone(),
-            data_name: data.data_name.clone(),
-        }),
-        LedgerEntryData::ClaimableBalance(cb) => {
-            LedgerKey::ClaimableBalance(stellar_xdr::curr::LedgerKeyClaimableBalance {
-                balance_id: cb.balance_id.clone(),
-            })
-        }
-        LedgerEntryData::LiquidityPool(pool) => {
-            LedgerKey::LiquidityPool(stellar_xdr::curr::LedgerKeyLiquidityPool {
-                liquidity_pool_id: pool.liquidity_pool_id.clone(),
-            })
-        }
-        LedgerEntryData::ContractData(data) => {
-            LedgerKey::ContractData(stellar_xdr::curr::LedgerKeyContractData {
-                contract: data.contract.clone(),
-                key: data.key.clone(),
-                durability: data.durability,
-            })
-        }
-        LedgerEntryData::ContractCode(code) => {
-            LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
-                hash: code.hash.clone(),
-            })
-        }
-        LedgerEntryData::ConfigSetting(setting) => {
-            LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
-                config_setting_id: setting.discriminant(),
-            })
-        }
-        LedgerEntryData::Ttl(ttl) => LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
-            key_hash: ttl.key_hash.clone(),
-        }),
-    };
-
-    Ok(key)
+    Ok(henyey_common::entry_to_key(entry))
 }
 
 /// Serialize a ledger key to bytes for use as a hash map key.

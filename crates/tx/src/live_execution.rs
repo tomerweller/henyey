@@ -727,15 +727,12 @@ pub fn apply_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::create_test_account_id;
     use stellar_xdr::curr::{
         AccountEntry, AccountEntryExt, AccountId, MuxedAccount, Operation, OperationBody,
         PaymentOp, Preconditions, PublicKey, SequenceNumber, Transaction, TransactionEnvelope,
         TransactionExt, TransactionV1Envelope, Uint256,
     };
-
-    fn make_account_id(seed: u8) -> AccountId {
-        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
-    }
 
     fn make_account_entry(id: AccountId, balance: i64, seq_num: i64) -> AccountEntry {
         AccountEntry {
@@ -836,7 +833,7 @@ mod tests {
     #[test]
     fn test_process_fee_seq_num_basic() {
         let mut ctx = make_test_context_with_state(21);
-        let account_id = make_account_id(1);
+        let account_id = create_test_account_id(1);
         let account = make_account_entry(account_id.clone(), 10_000_000, 1);
 
         // Add account to state
@@ -857,7 +854,7 @@ mod tests {
 
         // Check account balance was deducted
         if let Some(state) = ctx.state() {
-            let updated_account = state.get_account(&make_account_id(1)).unwrap();
+            let updated_account = state.get_account(&create_test_account_id(1)).unwrap();
             assert_eq!(updated_account.balance, 10_000_000 - 100);
         }
     }
@@ -865,7 +862,7 @@ mod tests {
     #[test]
     fn test_process_fee_seq_num_insufficient_balance() {
         let mut ctx = make_test_context_with_state(21);
-        let account_id = make_account_id(1);
+        let account_id = create_test_account_id(1);
         let account = make_account_entry(account_id.clone(), 50, 1); // Only 50 stroops
 
         if let Some(state) = ctx.state_mut() {
@@ -884,7 +881,7 @@ mod tests {
     #[test]
     fn test_process_post_apply_pre_p23() {
         let mut ctx = make_test_context_with_state(22);
-        let account_id = make_account_id(1);
+        let account_id = create_test_account_id(1);
         let account = make_account_entry(account_id.clone(), 10_000_000, 1);
 
         if let Some(state) = ctx.state_mut() {
@@ -902,7 +899,7 @@ mod tests {
     #[test]
     fn test_process_post_apply_p23_noop() {
         let mut ctx = make_test_context_with_state(23);
-        let account_id = make_account_id(1);
+        let account_id = create_test_account_id(1);
 
         let frame = make_test_frame(account_id, 200, 2);
         let mut tx_result = MutableTransactionResult::new(200);
@@ -915,7 +912,7 @@ mod tests {
     #[test]
     fn test_process_post_tx_set_apply_p23() {
         let mut ctx = make_test_context_with_state(23);
-        let account_id = make_account_id(1);
+        let account_id = create_test_account_id(1);
         let account = make_account_entry(account_id.clone(), 10_000_000, 1);
 
         if let Some(state) = ctx.state_mut() {
@@ -933,7 +930,7 @@ mod tests {
     #[test]
     fn test_refund_soroban_fee() {
         let mut ctx = make_test_context_with_state(23);
-        let account_id = make_account_id(1);
+        let account_id = create_test_account_id(1);
         let account = make_account_entry(account_id.clone(), 10_000_000, 1);
 
         if let Some(state) = ctx.state_mut() {
@@ -965,7 +962,7 @@ mod tests {
     #[test]
     fn test_refund_soroban_fee_skipped_when_liabilities_block() {
         let mut ctx = make_test_context_with_state(23);
-        let account_id = make_account_id(1);
+        let account_id = create_test_account_id(1);
 
         // Create account with high buying liabilities such that:
         // balance + refund + buying_liabilities > i64::MAX
@@ -1025,7 +1022,7 @@ mod tests {
     #[test]
     fn test_refund_soroban_fee_account_merged() {
         let mut ctx = make_test_context_with_state(23);
-        let account_id = make_account_id(1);
+        let account_id = create_test_account_id(1);
         // Don't add the account - simulating it was merged
 
         let mut tx_result = MutableTransactionResult::new(1000);
@@ -1039,7 +1036,7 @@ mod tests {
     #[test]
     fn test_process_seq_num_protocol_10_plus() {
         let mut ctx = make_test_context_with_state(21);
-        let account_id = make_account_id(1);
+        let account_id = create_test_account_id(1);
         let account = make_account_entry(account_id.clone(), 10_000_000, 5);
 
         if let Some(state) = ctx.state_mut() {
@@ -1060,7 +1057,7 @@ mod tests {
     #[test]
     fn test_process_seq_num_pre_protocol_10() {
         let mut ctx = make_test_context_with_state(9);
-        let account_id = make_account_id(1);
+        let account_id = create_test_account_id(1);
         let account = make_account_entry(account_id.clone(), 10_000_000, 5);
 
         if let Some(state) = ctx.state_mut() {
@@ -1091,7 +1088,7 @@ mod tests {
     #[test]
     fn test_process_seq_num_with_sequence_gap_cap_0021() {
         let mut ctx = make_test_context_with_state(21);
-        let account_id = make_account_id(1);
+        let account_id = create_test_account_id(1);
         // Account has seq 100, but tx uses seq 105 (gap allowed by minSeqNum)
         let account = make_account_entry(account_id.clone(), 10_000_000, 100);
 
@@ -1118,7 +1115,7 @@ mod tests {
     fn test_calculate_fee_to_charge_classic() {
         // Test 1: Declared fee (50) is less than base_fee * ops (100 * 1 = 100)
         // Fee charged should be min(50, 100) = 50
-        let account_id = make_account_id(1);
+        let account_id = create_test_account_id(1);
         let frame = make_test_frame(account_id, 50, 1);
         let fee = calculate_fee_to_charge(&frame, 21, Some(100));
         assert_eq!(
@@ -1128,7 +1125,7 @@ mod tests {
 
         // Test 2: Declared fee (200) is greater than base_fee * ops (100 * 1 = 100)
         // Fee charged should be min(200, 100) = 100
-        let frame2 = make_test_frame(make_account_id(1), 200, 1);
+        let frame2 = make_test_frame(create_test_account_id(1), 200, 1);
         let fee2 = calculate_fee_to_charge(&frame2, 21, Some(100));
         assert_eq!(
             fee2, 100,
@@ -1138,7 +1135,7 @@ mod tests {
         // Test 3: Declared fee (500) with 3 operations, base fee 100
         // required_fee = 100 * 3 = 300
         // Fee charged should be min(500, 300) = 300
-        let frame3 = make_test_frame(make_account_id(1), 500, 1);
+        let frame3 = make_test_frame(create_test_account_id(1), 500, 1);
         // Note: make_test_frame creates 1 op, so we use fee 500 for a single op tx
         let fee3 = calculate_fee_to_charge(&frame3, 21, Some(100));
         assert_eq!(
@@ -1147,7 +1144,7 @@ mod tests {
         );
 
         // Test 4: Declared fee exactly matches base_fee * ops
-        let frame4 = make_test_frame(make_account_id(1), 100, 1);
+        let frame4 = make_test_frame(create_test_account_id(1), 100, 1);
         let fee4 = calculate_fee_to_charge(&frame4, 21, Some(100));
         assert_eq!(
             fee4, 100,
@@ -1162,7 +1159,7 @@ mod tests {
         // A user declaring a fee of 1,000,000 stroops for a 1-op transaction
         // should only be charged base_fee * 1 = 100 stroops (assuming base_fee=100),
         // NOT the full 1,000,000 they declared.
-        let frame = make_test_frame(make_account_id(1), 1_000_000, 1);
+        let frame = make_test_frame(create_test_account_id(1), 1_000_000, 1);
         let fee = calculate_fee_to_charge(&frame, 21, Some(100));
         assert_eq!(
             fee, 100,
@@ -1282,7 +1279,7 @@ mod tests {
     #[test]
     fn test_process_fee_seq_num_exactly_zero_balance() {
         let mut ctx = make_test_context_with_state(21);
-        let account_id = make_account_id(1);
+        let account_id = create_test_account_id(1);
         let account = make_account_entry(account_id.clone(), 0, 1); // Zero balance
 
         if let Some(state) = ctx.state_mut() {
@@ -1300,7 +1297,7 @@ mod tests {
     #[test]
     fn test_process_fee_seq_num_exact_fee_match() {
         let mut ctx = make_test_context_with_state(21);
-        let account_id = make_account_id(1);
+        let account_id = create_test_account_id(1);
         // Account has exactly 100 stroops (the base fee)
         let account = make_account_entry(account_id.clone(), 100, 1);
 
@@ -1318,14 +1315,14 @@ mod tests {
 
         // Account should be at 0
         if let Some(state) = ctx.state() {
-            let updated_account = state.get_account(&make_account_id(1)).unwrap();
+            let updated_account = state.get_account(&create_test_account_id(1)).unwrap();
             assert_eq!(updated_account.balance, 0);
         }
     }
 
     #[test]
     fn test_calculate_fee_to_charge_with_zero_base_fee() {
-        let account_id = make_account_id(1);
+        let account_id = create_test_account_id(1);
         let frame = make_test_frame(account_id, 100, 1);
 
         // With base_fee=0, required_fee = 0 * 1 = 0

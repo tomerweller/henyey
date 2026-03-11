@@ -52,16 +52,17 @@ use henyey_common::protocol::{
     needs_upgrade_to_version, protocol_version_starts_from, ProtocolVersion,
 };
 use henyey_tx::soroban::PersistentModuleCache;
-use henyey_tx::state::AssetKey;
+use henyey_tx::state::asset_to_trustline_asset;
 use henyey_tx::{ClassicEventConfig, LedgerContext, TxEventManager};
 use stellar_xdr::curr::{
     AccountId, BucketListType, ConfigSettingEntry, ConfigSettingId,
     ExtensionPoint, GeneralizedTransactionSet, Hash,
     LedgerCloseMeta, LedgerCloseMetaExt, LedgerCloseMetaExtV1, LedgerCloseMetaV2, LedgerEntry,
     LedgerEntryData, LedgerEntryExt, LedgerHeader, LedgerHeaderHistoryEntry,
-    LedgerHeaderHistoryEntryExt, LedgerKey, LedgerKeyConfigSetting, TransactionEventStage,
-    TransactionMeta, TransactionPhase, TransactionResultMetaV1, TransactionSetV1, TxSetComponent,
-    TxSetComponentTxsMaybeDiscountedFee, UpgradeEntryMeta, VecM,
+    LedgerHeaderHistoryEntryExt, LedgerKey, LedgerKeyConfigSetting, PoolId,
+    TransactionEventStage, TransactionMeta, TransactionPhase, TransactionResultMetaV1,
+    TransactionSetV1, TrustLineAsset, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
+    UpgradeEntryMeta, VecM,
 };
 use tracing::{debug, info};
 
@@ -87,28 +88,21 @@ fn get_rss_bytes() -> u64 {
     }
 }
 
-/// Secondary index type: (account_bytes, asset) → set of offer_ids.
-type OfferAccountAssetIndex = HashMap<([u8; 32], AssetKey), HashSet<i64>>;
+/// Secondary index type: (account, asset) → set of offer_ids.
+type OfferAccountAssetIndex = HashMap<(AccountId, TrustLineAsset), HashSet<i64>>;
 
-/// Secondary index type: account_bytes → set of pool_id bytes for pool share trustlines.
-type PoolShareTlAccountIndex = HashMap<[u8; 32], HashSet<[u8; 32]>>;
-
-/// Extract the 32-byte public key from an AccountId.
-///
-/// Delegates to [`crate::execution::account_id_to_key`] to avoid duplication.
-fn account_id_bytes(account_id: &AccountId) -> [u8; 32] {
-    crate::execution::account_id_to_key(account_id)
-}
+/// Secondary index type: account → set of pool_ids for pool share trustlines.
+type PoolShareTlAccountIndex = HashMap<AccountId, HashSet<PoolId>>;
 
 /// Insert an offer into the (account, asset) secondary index.
 ///
 /// Each offer gets two entries: (seller, selling_asset) and (seller, buying_asset).
 fn index_offer_insert(index: &mut OfferAccountAssetIndex, offer: &stellar_xdr::curr::OfferEntry) {
-    let seller = account_id_bytes(&offer.seller_id);
-    let selling_key = AssetKey::from_asset(&offer.selling);
-    let buying_key = AssetKey::from_asset(&offer.buying);
+    let seller = offer.seller_id.clone();
+    let selling_key = asset_to_trustline_asset(&offer.selling);
+    let buying_key = asset_to_trustline_asset(&offer.buying);
     index
-        .entry((seller, selling_key))
+        .entry((seller.clone(), selling_key))
         .or_default()
         .insert(offer.offer_id);
     index
@@ -119,10 +113,10 @@ fn index_offer_insert(index: &mut OfferAccountAssetIndex, offer: &stellar_xdr::c
 
 /// Remove an offer from the (account, asset) secondary index.
 fn index_offer_remove(index: &mut OfferAccountAssetIndex, offer: &stellar_xdr::curr::OfferEntry) {
-    let seller = account_id_bytes(&offer.seller_id);
-    let selling_key = AssetKey::from_asset(&offer.selling);
-    let buying_key = AssetKey::from_asset(&offer.buying);
-    if let Some(set) = index.get_mut(&(seller, selling_key)) {
+    let seller = offer.seller_id.clone();
+    let selling_key = asset_to_trustline_asset(&offer.selling);
+    let buying_key = asset_to_trustline_asset(&offer.buying);
+    if let Some(set) = index.get_mut(&(seller.clone(), selling_key)) {
         set.remove(&offer.offer_id);
     }
     if let Some(set) = index.get_mut(&(seller, buying_key)) {
@@ -195,8 +189,8 @@ pub struct CacheInitResult {
     offers: HashMap<i64, LedgerEntry>,
     /// Secondary index: (account, asset) → set of offer_ids.
     offer_index: OfferAccountAssetIndex,
-    /// Secondary index: account_bytes → set of pool_id_bytes for pool share trustlines.
-    pool_share_tl_account_index: HashMap<[u8; 32], HashSet<[u8; 32]>>,
+    /// Secondary index: account → set of pool_ids for pool share trustlines.
+    pool_share_tl_account_index: HashMap<AccountId, HashSet<PoolId>>,
     /// Pre-compiled Soroban module cache (if Soroban is supported).
     module_cache: Option<PersistentModuleCache>,
     /// In-memory Soroban state (contract data, code, TTLs, config).
@@ -211,13 +205,13 @@ struct LevelScanResult {
     /// Live entries of interest, deduped within this level (curr shadows snap).
     entries: HashMap<LedgerKey, LedgerEntry>,
     /// TTL entries keyed by TTL key hash (separate because TTLs need special handling).
-    ttl_entries: HashMap<[u8; 32], (stellar_xdr::curr::LedgerKeyTtl, crate::soroban_state::TtlData)>,
+    ttl_entries: HashMap<Hash, (stellar_xdr::curr::LedgerKeyTtl, crate::soroban_state::TtlData)>,
     /// Keys that were DEAD at this level — used for cross-level shadowing.
     /// A dead entry at a lower level must prevent live entries at higher levels
     /// from being included in the final result.
     dead_keys: HashSet<LedgerKey>,
     /// TTL key hashes that were DEAD at this level.
-    dead_ttl_keys: HashSet<[u8; 32]>,
+    dead_ttl_keys: HashSet<Hash>,
 }
 
 /// Accumulator for scanning a single bucket level.
@@ -227,10 +221,10 @@ struct LevelScanResult {
 /// (pre-collected entries) and the fallback path (full bucket iteration).
 struct LevelScanner {
     entries: HashMap<LedgerKey, LedgerEntry>,
-    ttl_entries: HashMap<[u8; 32], (stellar_xdr::curr::LedgerKeyTtl, crate::soroban_state::TtlData)>,
+    ttl_entries: HashMap<Hash, (stellar_xdr::curr::LedgerKeyTtl, crate::soroban_state::TtlData)>,
     seen_keys: HashSet<LedgerKey>,
     dead_keys: HashSet<LedgerKey>,
-    dead_ttl_keys: HashSet<[u8; 32]>,
+    dead_ttl_keys: HashSet<Hash>,
 }
 
 impl LevelScanner {
@@ -290,7 +284,7 @@ impl LevelScanner {
                     ttl.live_until_ledger_seq,
                     le.last_modified_ledger_seq,
                 );
-                self.ttl_entries.insert(ttl.key_hash.0, (ttl_key, ttl_data));
+                self.ttl_entries.insert(ttl.key_hash.clone(), (ttl_key, ttl_data));
             } else {
                 self.entries.insert(key, le.clone());
             }
@@ -298,7 +292,7 @@ impl LevelScanner {
             // Track dead keys so they shadow live entries at higher (older) levels.
             // For TTL entries, also track in the TTL-specific dead set.
             if let LedgerKey::Ttl(ref ttl_key) = key {
-                self.dead_ttl_keys.insert(ttl_key.key_hash.0);
+                self.dead_ttl_keys.insert(ttl_key.key_hash.clone());
             }
             self.dead_keys.insert(key);
         }
@@ -362,9 +356,9 @@ fn merge_level_results(
 ) -> CacheInitResult {
     let mut soroban_state = crate::soroban_state::InMemorySorobanState::new();
     let mut mem_offers: HashMap<i64, LedgerEntry> = HashMap::new();
-    let mut pool_share_tl_account_index: HashMap<[u8; 32], HashSet<[u8; 32]>> = HashMap::new();
+    let mut pool_share_tl_account_index: HashMap<AccountId, HashSet<PoolId>> = HashMap::new();
     let mut global_seen: HashSet<LedgerKey> = HashSet::new();
-    let mut global_ttl_seen: HashSet<[u8; 32]> = HashSet::new();
+    let mut global_ttl_seen: HashSet<Hash> = HashSet::new();
 
     let mut offer_count = 0u64;
     let mut code_count = 0u64;
@@ -396,9 +390,9 @@ fn merge_level_results(
                 LedgerEntryData::Trustline(ref tl) => {
                     if let stellar_xdr::curr::TrustLineAsset::PoolShare(ref pool_id) = tl.asset {
                         pool_share_tl_account_index
-                            .entry(account_id_bytes(&tl.account_id))
+                            .entry(tl.account_id.clone())
                             .or_default()
-                            .insert(pool_id.0 .0);
+                            .insert(pool_id.clone());
                     }
                 }
                 LedgerEntryData::ContractCode(_) => {
@@ -500,9 +494,9 @@ fn scan_and_merge(
 
     let mut soroban_state = crate::soroban_state::InMemorySorobanState::new();
     let mut mem_offers: HashMap<i64, LedgerEntry> = HashMap::new();
-    let mut pool_share_tl_account_index: HashMap<[u8; 32], HashSet<[u8; 32]>> = HashMap::new();
+    let mut pool_share_tl_account_index: HashMap<AccountId, HashSet<PoolId>> = HashMap::new();
     let mut global_seen: HashSet<LedgerKey> = HashSet::new();
-    let mut global_ttl_seen: HashSet<[u8; 32]> = HashSet::new();
+    let mut global_ttl_seen: HashSet<Hash> = HashSet::new();
 
     let mut offer_count = 0u64;
     let mut code_count = 0u64;
@@ -586,9 +580,9 @@ fn scan_and_merge(
                         LedgerEntryData::Trustline(ref tl) => {
                             if let stellar_xdr::curr::TrustLineAsset::PoolShare(ref pool_id) = tl.asset {
                                 pool_share_tl_account_index
-                                    .entry(account_id_bytes(&tl.account_id))
+                                    .entry(tl.account_id.clone())
                                     .or_default()
-                                    .insert(pool_id.0 .0);
+                                    .insert(pool_id.clone());
                             }
                         }
                         LedgerEntryData::ContractCode(_) => {
@@ -1827,10 +1821,9 @@ impl LedgerManager {
             move |account_id: &AccountId, asset: &stellar_xdr::curr::Asset| {
                 let idx = offer_index.read();
                 let store = offer_store_idx.read();
-                let seller = account_id_bytes(account_id);
-                let asset_key = AssetKey::from_asset(asset);
+                let asset_key = asset_to_trustline_asset(asset);
 
-                let offer_ids = match idx.get(&(seller, asset_key)) {
+                let offer_ids = match idx.get(&(account_id.clone(), asset_key)) {
                     Some(ids) => ids,
                     None => return Ok(Vec::new()),
                 };
@@ -1854,13 +1847,12 @@ impl LedgerManager {
         let pool_share_tls_by_account_fn: crate::snapshot::PoolShareTrustlinesByAccountFn =
             Arc::new(move |account_id| {
                 let idx = pool_share_idx.read();
-                let account_bytes = account_id_bytes(account_id);
                 Ok(idx
-                    .get(&account_bytes)
+                    .get(account_id)
                     .map(|pool_ids| {
                         pool_ids
                             .iter()
-                            .map(|id| stellar_xdr::curr::PoolId(stellar_xdr::curr::Hash(*id)))
+                            .cloned()
                             .collect()
                     })
                     .unwrap_or_default())
@@ -1999,7 +1991,7 @@ impl LedgerManager {
                 }
                 _ => continue,
             };
-            let account_bytes = account_id_bytes(&tl_key.account_id);
+            let account_id = tl_key.account_id.clone();
             match change {
                 EntryChange::Created(entry) => {
                     if let LedgerEntryData::Trustline(ref tl) = entry.data {
@@ -2007,9 +1999,9 @@ impl LedgerManager {
                         {
                             self.pool_share_tl_account_index
                                 .write()
-                                .entry(account_bytes)
+                                .entry(account_id)
                                 .or_default()
-                                .insert(pool_id.0 .0);
+                                .insert(pool_id.clone());
                         }
                     }
                 }
@@ -2018,8 +2010,8 @@ impl LedgerManager {
                         if let stellar_xdr::curr::TrustLineAsset::PoolShare(ref pool_id) = tl.asset
                         {
                             let mut idx = self.pool_share_tl_account_index.write();
-                            if let Some(pools) = idx.get_mut(&account_bytes) {
-                                pools.remove(&pool_id.0 .0);
+                            if let Some(pools) = idx.get_mut(&account_id) {
+                                pools.remove(pool_id);
                             }
                         }
                     }
@@ -4373,7 +4365,7 @@ impl<'a> LedgerCloseContext<'a> {
                     if let LedgerKey::ContractCode(cc) = key {
                         let module_cache_guard = self.manager.module_cache.read();
                         if let Some(cache) = module_cache_guard.as_ref() {
-                            if cache.remove_contract(&cc.hash.0) {
+                            if cache.remove_contract(&cc.hash) {
                                 tracing::debug!(
                                     hash = ?cc.hash,
                                     "Removed evicted contract code from module cache"
@@ -5277,8 +5269,9 @@ mod tests {
     #[test]
     fn test_scan_offer_secondary_index() {
         let mut bl = BucketList::new();
-        let seller = [7u8; 32];
-        let offer = make_offer_entry(10, seller);
+        let seller_bytes = [7u8; 32];
+        let seller = make_account_id(seller_bytes);
+        let offer = make_offer_entry(10, seller_bytes);
         bl.add_batch(1, TEST_PROTOCOL, BucketListType::Live, vec![offer], vec![], vec![])
             .unwrap();
 

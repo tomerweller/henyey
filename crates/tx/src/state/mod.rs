@@ -11,8 +11,8 @@ use stellar_xdr::curr::{
     LedgerEntryExt, LedgerEntryExtensionV1, LedgerEntryExtensionV1Ext, LedgerKey, LedgerKeyAccount,
     LedgerKeyClaimableBalance, LedgerKeyContractCode, LedgerKeyContractData, LedgerKeyData,
     LedgerKeyLiquidityPool, LedgerKeyOffer, LedgerKeyTrustLine, LedgerKeyTtl, Liabilities,
-    LiquidityPoolEntry, OfferEntry, PoolId, Price, PublicKey, ScAddress, ScVal,
-    SponsorshipDescriptor, TimePoint, TrustLineAsset, TrustLineEntry, TtlEntry, VecM,
+    LiquidityPoolEntry, OfferEntry, PoolId, Price, ScAddress, ScVal, SponsorshipDescriptor,
+    TimePoint, TrustLineAsset, TrustLineEntry, TtlEntry, VecM,
 };
 
 use crate::apply::{DeltaLengths, LedgerDelta};
@@ -32,10 +32,10 @@ type OffersByAccountAssetLoaderFn =
 /// Mirrors stellar-core `loadPoolShareTrustLinesByAccountAndAsset` SQL query.
 type PoolShareTlsByAccountLoaderFn = dyn Fn(&AccountId) -> Result<Vec<PoolId>> + Send + Sync;
 
-/// Key for trustline entries: (account_id bytes, asset key).
-pub type TrustlineKey = ([u8; 32], AssetKey);
-/// Key for data entries: (account_id bytes, data name).
-pub type DataKey = ([u8; 32], String);
+/// Key for trustline entries: (account_id, trustline asset).
+pub type TrustlineKey = (AccountId, TrustLineAsset);
+/// Key for data entries: (account_id, data name).
+pub type DataKey = (AccountId, String);
 
 /// Soroban state extracted from LedgerStateManager for cheap cloning.
 ///
@@ -223,9 +223,9 @@ struct DeltaSnapshot {
 
 pub struct SorobanState {
     pub contract_data: EntryStore<StorageKey, ContractDataEntry>,
-    pub contract_code: EntryStore<[u8; 32], ContractCodeEntry>,
-    pub ttl_entries: HashMap<[u8; 32], TtlEntry>,
-    pub ttl_bucket_list_snapshot: HashMap<[u8; 32], u32>,
+    pub contract_code: EntryStore<Hash, ContractCodeEntry>,
+    pub ttl_entries: HashMap<Hash, TtlEntry>,
+    pub ttl_bucket_list_snapshot: HashMap<Hash, u32>,
 }
 
 /// Savepoint for rolling back state modifications within a transaction.
@@ -245,27 +245,27 @@ pub struct SorobanState {
 pub struct Savepoint {
     // Snapshot maps clones (small: only entries modified earlier in TX)
     offer_snapshots: HashMap<OfferKey, Option<OfferEntry>>,
-    account_snapshots: HashMap<[u8; 32], Option<AccountEntry>>,
+    account_snapshots: HashMap<AccountId, Option<AccountEntry>>,
     trustline_snapshots: HashMap<TrustlineKey, Option<TrustLineEntry>>,
-    ttl_snapshots: HashMap<[u8; 32], Option<TtlEntry>>,
+    ttl_snapshots: HashMap<Hash, Option<TtlEntry>>,
     // Pre-savepoint values of entries in snapshot maps.
     offer_pre_values: Vec<(OfferKey, Option<OfferEntry>)>,
-    account_pre_values: Vec<([u8; 32], Option<AccountEntry>)>,
+    account_pre_values: Vec<(AccountId, Option<AccountEntry>)>,
     trustline_pre_values: Vec<(TrustlineKey, Option<TrustLineEntry>)>,
-    ttl_pre_values: Vec<([u8; 32], Option<TtlEntry>)>,
+    ttl_pre_values: Vec<(Hash, Option<TtlEntry>)>,
 
     // EntryStore-based savepoints
-    claimable_balances: EntryStoreSavepoint<[u8; 32], ClaimableBalanceEntry>,
-    liquidity_pools: EntryStoreSavepoint<[u8; 32], LiquidityPoolEntry>,
-    contract_code: EntryStoreSavepoint<[u8; 32], ContractCodeEntry>,
+    claimable_balances: EntryStoreSavepoint<ClaimableBalanceId, ClaimableBalanceEntry>,
+    liquidity_pools: EntryStoreSavepoint<PoolId, LiquidityPoolEntry>,
+    contract_code: EntryStoreSavepoint<Hash, ContractCodeEntry>,
     contract_data: EntryStoreSavepoint<StorageKey, ContractDataEntry>,
     data_entries: EntryStoreSavepoint<DataKey, DataEntry>,
 
     // Created entry sets
     created_offers: HashSet<OfferKey>,
-    created_accounts: HashSet<[u8; 32]>,
+    created_accounts: HashSet<AccountId>,
     created_trustlines: HashSet<TrustlineKey>,
-    created_ttl: HashSet<[u8; 32]>,
+    created_ttl: HashSet<Hash>,
     // Delta vector lengths for truncation
     delta_lengths: DeltaLengths,
 
@@ -295,19 +295,6 @@ pub trait LedgerReader {
     fn get_entry(&self, key: &LedgerKey) -> Option<LedgerEntry>;
 }
 
-/// Asset key for trustline lookup.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub enum AssetKey {
-    /// Native XLM asset.
-    Native,
-    /// Credit alphanum4 asset (code, issuer).
-    CreditAlphanum4([u8; 4], [u8; 32]),
-    /// Credit alphanum12 asset (code, issuer).
-    CreditAlphanum12([u8; 12], [u8; 32]),
-    /// Pool share asset.
-    PoolShare([u8; 32]),
-}
-
 /// Re-export `StorageKey` from the soroban module as the canonical key type
 /// for contract data entries. Previously a separate `ContractDataKey` struct
 /// with identical fields existed here; it has been unified into `StorageKey`.
@@ -316,39 +303,6 @@ pub use crate::soroban::StorageKey;
 /// Type alias for backwards compatibility. `ContractDataKey` was merged into
 /// `StorageKey` — they have identical fields (`contract`, `key`, `durability`).
 pub type ContractDataKey = StorageKey;
-
-impl AssetKey {
-    /// Create an AssetKey from an XDR Asset.
-    pub fn from_asset(asset: &Asset) -> Self {
-        match asset {
-            Asset::Native => AssetKey::Native,
-            Asset::CreditAlphanum4(a) => {
-                let issuer = account_id_to_bytes(&a.issuer);
-                AssetKey::CreditAlphanum4(a.asset_code.0, issuer)
-            }
-            Asset::CreditAlphanum12(a) => {
-                let issuer = account_id_to_bytes(&a.issuer);
-                AssetKey::CreditAlphanum12(a.asset_code.0, issuer)
-            }
-        }
-    }
-
-    /// Create an AssetKey from a TrustLineAsset.
-    pub fn from_trustline_asset(asset: &TrustLineAsset) -> Self {
-        match asset {
-            TrustLineAsset::Native => AssetKey::Native,
-            TrustLineAsset::CreditAlphanum4(a) => {
-                let issuer = account_id_to_bytes(&a.issuer);
-                AssetKey::CreditAlphanum4(a.asset_code.0, issuer)
-            }
-            TrustLineAsset::CreditAlphanum12(a) => {
-                let issuer = account_id_to_bytes(&a.issuer);
-                AssetKey::CreditAlphanum12(a.asset_code.0, issuer)
-            }
-            TrustLineAsset::PoolShare(pool_id) => AssetKey::PoolShare(pool_id.0 .0),
-        }
-    }
-}
 
 // ==================== Offer Index ====================
 //
@@ -370,8 +324,8 @@ pub struct LedgerStateManager {
     base_reserve: i64,
     /// ID pool for generating offer IDs.
     id_pool: u64,
-    /// Account entries by account ID (32-byte public key).
-    accounts: HashMap<[u8; 32], AccountEntry>,
+    /// Account entries by account ID.
+    accounts: HashMap<AccountId, AccountEntry>,
     /// Trustline entries by (account, asset).
     trustlines: HashMap<TrustlineKey, TrustLineEntry>,
     /// Offer entries by (seller, offer_id).
@@ -381,18 +335,18 @@ pub struct LedgerStateManager {
     /// Contract data entries by (contract, key, durability).
     contract_data: EntryStore<ContractDataKey, ContractDataEntry>,
     /// Contract code entries by hash.
-    contract_code: EntryStore<[u8; 32], ContractCodeEntry>,
+    contract_code: EntryStore<Hash, ContractCodeEntry>,
     /// TTL entries by key hash.
-    ttl_entries: HashMap<[u8; 32], TtlEntry>,
+    ttl_entries: HashMap<Hash, TtlEntry>,
     /// TTL values at ledger start (for Soroban execution).
     /// This is captured at the start of each ledger and remains read-only during execution.
     /// Soroban uses these values instead of ttl_entries to match stellar-core behavior where
     /// transactions see the bucket list state at ledger start, not changes from previous txs.
-    ttl_bucket_list_snapshot: HashMap<[u8; 32], u32>,
+    ttl_bucket_list_snapshot: HashMap<Hash, u32>,
     /// Claimable balance entries by balance ID.
-    claimable_balances: EntryStore<[u8; 32], ClaimableBalanceEntry>,
+    claimable_balances: EntryStore<ClaimableBalanceId, ClaimableBalanceEntry>,
     /// Liquidity pool entries by pool ID.
-    liquidity_pools: EntryStore<[u8; 32], LiquidityPoolEntry>,
+    liquidity_pools: EntryStore<PoolId, LiquidityPoolEntry>,
     /// Sponsoring account IDs for non-offer ledger entries (only when sponsored).
     entry_sponsorships: HashMap<LedgerKey, AccountId>,
     /// Sponsoring account IDs for offer entries (preserved across ledger closes).
@@ -418,32 +372,32 @@ pub struct LedgerStateManager {
     /// Changes made during execution.
     delta: LedgerDelta,
     /// Track which entries have been modified for rollback.
-    modified_accounts: Vec<[u8; 32]>,
+    modified_accounts: Vec<AccountId>,
     /// Track which trustlines have been modified.
     modified_trustlines: Vec<TrustlineKey>,
     /// Track which offers have been modified.
     modified_offers: Vec<OfferKey>,
     // Data entries use EntryStore — modified tracking is internal.
     /// Track which TTL entries have been modified.
-    modified_ttl: Vec<[u8; 32]>,
+    modified_ttl: Vec<Hash>,
     /// Deferred read-only TTL bumps. These are TTL updates for read-only entries
     /// where only the TTL changed. Per stellar-core behavior:
     /// - They should NOT appear in transaction meta
     /// - They should be flushed to the delta at end of ledger (for bucket list)
     ///   Key is TTL key hash, value is the new live_until_ledger_seq.
-    deferred_ro_ttl_bumps: HashMap<[u8; 32], u32>,
+    deferred_ro_ttl_bumps: HashMap<Hash, u32>,
     /// Snapshot of deferred RO TTL bumps at TX start (for rollback).
-    deferred_ro_ttl_bumps_snapshot: Option<HashMap<[u8; 32], u32>>,
+    deferred_ro_ttl_bumps_snapshot: Option<HashMap<Hash, u32>>,
 
     /// Snapshot of accounts for rollback.
-    account_snapshots: HashMap<[u8; 32], Option<AccountEntry>>,
+    account_snapshots: HashMap<AccountId, Option<AccountEntry>>,
     /// Snapshot of trustlines for rollback.
     trustline_snapshots: HashMap<TrustlineKey, Option<TrustLineEntry>>,
     /// Snapshot of offers for rollback.
     offer_snapshots: HashMap<OfferKey, Option<OfferEntry>>,
     // Data entries use EntryStore — snapshots are internal.
     /// Snapshot of TTL entries for rollback.
-    ttl_snapshots: HashMap<[u8; 32], Option<TtlEntry>>,
+    ttl_snapshots: HashMap<Hash, Option<TtlEntry>>,
 
     /// Snapshot of entry sponsorships for rollback.
     entry_sponsorship_snapshots: HashMap<LedgerKey, Option<AccountId>>,
@@ -452,17 +406,17 @@ pub struct LedgerStateManager {
     /// Snapshot of last modified ledger sequence for rollback.
     entry_last_modified_snapshots: HashMap<LedgerKey, Option<u32>>,
     /// Track accounts created in this transaction (for rollback).
-    created_accounts: HashSet<[u8; 32]>,
+    created_accounts: HashSet<AccountId>,
     /// Track trustlines created in this transaction (for rollback).
     created_trustlines: HashSet<TrustlineKey>,
     /// Track offers created in this transaction (for rollback).
     created_offers: HashSet<OfferKey>,
     // Data entries use EntryStore — created tracking is internal.
     /// Track TTL entries created in this transaction (for rollback).
-    created_ttl: HashSet<[u8; 32]>,
+    created_ttl: HashSet<Hash>,
 
     /// Track TTL entries deleted in this ledger.
-    deleted_ttl: HashSet<[u8; 32]>,
+    deleted_ttl: HashSet<Hash>,
     /// Snapshot of id_pool for rollback. When an ID is generated during a transaction
     /// that later fails, the id_pool must be restored to its pre-transaction value.
     id_pool_snapshot: Option<u64>,
@@ -505,7 +459,7 @@ pub struct LedgerStateManager {
     /// transaction contains an AccountMerge operation.  `MergeOpFrame::isSeqnumTooFar`
     /// in stellar-core uses this to prevent merges that could allow sequence-number
     /// reuse after account re-creation.
-    max_seq_num_to_apply: HashMap<[u8; 32], i64>,
+    max_seq_num_to_apply: HashMap<AccountId, i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -694,13 +648,13 @@ impl LedgerStateManager {
     /// Set the per-account maximum sequence numbers for the current tx set.
     /// Called by the tx-set execution loop when any transaction contains an
     /// AccountMerge operation.
-    pub fn set_max_seq_num_to_apply(&mut self, map: HashMap<[u8; 32], i64>) {
+    pub fn set_max_seq_num_to_apply(&mut self, map: HashMap<AccountId, i64>) {
         self.max_seq_num_to_apply = map;
     }
 
     /// Look up the maximum sequence number that any transaction in the current
     /// tx set uses for the given source account.
-    pub fn get_max_seq_num_to_apply(&self, account_id: &[u8; 32]) -> Option<&i64> {
+    pub fn get_max_seq_num_to_apply(&self, account_id: &AccountId) -> Option<&i64> {
         self.max_seq_num_to_apply.get(account_id)
     }
 
@@ -866,18 +820,19 @@ impl LedgerStateManager {
         selling: &Asset,
         buying: &Asset,
     ) -> Result<()> {
-        let seller_bytes = account_id_to_bytes(seller);
         let mut needed_keys = Vec::new();
 
-        if !self.accounts.contains_key(&seller_bytes) {
+        if !self.accounts.contains_key(seller) {
             needed_keys.push(LedgerKey::Account(LedgerKeyAccount {
                 account_id: seller.clone(),
             }));
         }
         if !matches!(selling, Asset::Native) {
-            let asset_key = AssetKey::from_asset(selling);
-            if !self.trustlines.contains_key(&(seller_bytes, asset_key)) {
-                let tl_asset = asset_to_trustline_asset(selling);
+            let tl_asset = asset_to_trustline_asset(selling);
+            if !self
+                .trustlines
+                .contains_key(&(seller.clone(), tl_asset.clone()))
+            {
                 needed_keys.push(LedgerKey::Trustline(LedgerKeyTrustLine {
                     account_id: seller.clone(),
                     asset: tl_asset,
@@ -885,9 +840,11 @@ impl LedgerStateManager {
             }
         }
         if !matches!(buying, Asset::Native) {
-            let asset_key = AssetKey::from_asset(buying);
-            if !self.trustlines.contains_key(&(seller_bytes, asset_key)) {
-                let tl_asset = asset_to_trustline_asset(buying);
+            let tl_asset = asset_to_trustline_asset(buying);
+            if !self
+                .trustlines
+                .contains_key(&(seller.clone(), tl_asset.clone()))
+            {
                 needed_keys.push(LedgerKey::Trustline(LedgerKeyTrustLine {
                     account_id: seller.clone(),
                     asset: tl_asset,
@@ -924,8 +881,7 @@ impl LedgerStateManager {
     /// Returns `Ok(true)` if the account is available (already loaded or
     /// successfully fetched), `Ok(false)` if it doesn't exist.
     pub fn ensure_account_loaded(&mut self, account_id: &AccountId) -> Result<bool> {
-        let key_bytes = account_id_to_bytes(account_id);
-        if self.accounts.contains_key(&key_bytes) {
+        if self.accounts.contains_key(account_id) {
             return Ok(true);
         }
         if let Some(loader) = self.entry_loader.take() {
@@ -951,13 +907,14 @@ impl LedgerStateManager {
         account_id: &AccountId,
         asset: &Asset,
     ) -> Result<bool> {
-        let account_key = account_id_to_bytes(account_id);
-        let asset_key = AssetKey::from_asset(asset);
-        if self.trustlines.contains_key(&(account_key, asset_key)) {
+        let tl_asset = asset_to_trustline_asset(asset);
+        if self
+            .trustlines
+            .contains_key(&(account_id.clone(), tl_asset.clone()))
+        {
             return Ok(true);
         }
         if let Some(loader) = self.entry_loader.take() {
-            let tl_asset = asset_to_trustline_asset(asset);
             let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
                 account_id: account_id.clone(),
                 asset: tl_asset,
@@ -1128,48 +1085,40 @@ impl LedgerStateManager {
         let ext = self.ledger_entry_ext_for_snapshot(key);
 
         match key {
-            LedgerKey::Account(k) => {
-                let account_key = account_id_to_bytes(&k.account_id);
-                self.account_snapshots
-                    .get(&account_key)
-                    .cloned()
-                    .flatten()
-                    .map(|entry| LedgerEntry {
-                        last_modified_ledger_seq: last_modified,
-                        data: LedgerEntryData::Account(entry),
-                        ext,
-                    })
-            }
-            LedgerKey::Trustline(k) => {
-                let account_key = account_id_to_bytes(&k.account_id);
-                let asset_key = AssetKey::from_trustline_asset(&k.asset);
-                self.trustline_snapshots
-                    .get(&(account_key, asset_key))
-                    .cloned()
-                    .flatten()
-                    .map(|entry| LedgerEntry {
-                        last_modified_ledger_seq: last_modified,
-                        data: LedgerEntryData::Trustline(entry),
-                        ext,
-                    })
-            }
-            LedgerKey::Offer(k) => {
-                let seller_key = account_id_to_bytes(&k.seller_id);
-                self.offer_snapshots
-                    .get(&OfferKey::new(seller_key, k.offer_id))
-                    .cloned()
-                    .flatten()
-                    .map(|entry| LedgerEntry {
-                        last_modified_ledger_seq: last_modified,
-                        data: LedgerEntryData::Offer(entry),
-                        ext,
-                    })
-            }
+            LedgerKey::Account(k) => self
+                .account_snapshots
+                .get(&k.account_id)
+                .cloned()
+                .flatten()
+                .map(|entry| LedgerEntry {
+                    last_modified_ledger_seq: last_modified,
+                    data: LedgerEntryData::Account(entry),
+                    ext,
+                }),
+            LedgerKey::Trustline(k) => self
+                .trustline_snapshots
+                .get(&(k.account_id.clone(), k.asset.clone()))
+                .cloned()
+                .flatten()
+                .map(|entry| LedgerEntry {
+                    last_modified_ledger_seq: last_modified,
+                    data: LedgerEntryData::Trustline(entry),
+                    ext,
+                }),
+            LedgerKey::Offer(k) => self
+                .offer_snapshots
+                .get(&OfferKey::new(k.seller_id.clone(), k.offer_id))
+                .cloned()
+                .flatten()
+                .map(|entry| LedgerEntry {
+                    last_modified_ledger_seq: last_modified,
+                    data: LedgerEntryData::Offer(entry),
+                    ext,
+                }),
             LedgerKey::Data(k) => {
-                let account_key = account_id_to_bytes(&k.account_id);
                 let name = data_name_to_string(&k.data_name);
                 self.data_entries
-                    .snapshot_value(&(account_key, name))
+                    .snapshot_value(&(k.account_id.clone(), name))
                     .cloned()
                     .flatten()
                     .map(|entry| LedgerEntry {
@@ -1193,7 +1142,7 @@ impl LedgerStateManager {
             }
             LedgerKey::ContractCode(k) => self
                 .contract_code
-                .snapshot_value(&k.hash.0)
+                .snapshot_value(&k.hash)
                 .cloned()
                 .flatten()
                 .map(|entry| LedgerEntry {
@@ -1201,40 +1150,37 @@ impl LedgerStateManager {
                     data: LedgerEntryData::ContractCode(entry),
                     ext,
                 }),
-            LedgerKey::Ttl(k) => self
-                .ttl_snapshots
-                .get(&k.key_hash.0)
+            LedgerKey::Ttl(k) => {
+                self.ttl_snapshots
+                    .get(&k.key_hash)
+                    .cloned()
+                    .flatten()
+                    .map(|entry| LedgerEntry {
+                        last_modified_ledger_seq: last_modified,
+                        data: LedgerEntryData::Ttl(entry),
+                        ext,
+                    })
+            }
+            LedgerKey::ClaimableBalance(k) => self
+                .claimable_balances
+                .snapshot_value(&k.balance_id)
                 .cloned()
                 .flatten()
                 .map(|entry| LedgerEntry {
                     last_modified_ledger_seq: last_modified,
-                    data: LedgerEntryData::Ttl(entry),
+                    data: LedgerEntryData::ClaimableBalance(entry),
                     ext,
                 }),
-            LedgerKey::ClaimableBalance(k) => {
-                let key_bytes = claimable_balance_id_to_bytes(&k.balance_id);
-                self.claimable_balances
-                    .snapshot_value(&key_bytes)
-                    .cloned()
-                    .flatten()
-                    .map(|entry| LedgerEntry {
-                        last_modified_ledger_seq: last_modified,
-                        data: LedgerEntryData::ClaimableBalance(entry),
-                        ext,
-                    })
-            }
-            LedgerKey::LiquidityPool(k) => {
-                let key_bytes = pool_id_to_bytes(&k.liquidity_pool_id);
-                self.liquidity_pools
-                    .snapshot_value(&key_bytes)
-                    .cloned()
-                    .flatten()
-                    .map(|entry| LedgerEntry {
-                        last_modified_ledger_seq: last_modified,
-                        data: LedgerEntryData::LiquidityPool(entry),
-                        ext,
-                    })
-            }
+            LedgerKey::LiquidityPool(k) => self
+                .liquidity_pools
+                .snapshot_value(&k.liquidity_pool_id)
+                .cloned()
+                .flatten()
+                .map(|entry| LedgerEntry {
+                    last_modified_ledger_seq: last_modified,
+                    data: LedgerEntryData::LiquidityPool(entry),
+                    ext,
+                }),
             _ => None,
         }
     }
@@ -1270,8 +1216,7 @@ impl LedgerStateManager {
         // Find the most recent update to this account in the delta and add the refund
         self.delta.apply_refund_to_account(account_id, refund);
         // Also update the in-memory account state (without recording a new delta)
-        let key = account_id_to_bytes(account_id);
-        if let Some(acc) = self.accounts.get_mut(&key) {
+        if let Some(acc) = self.accounts.get_mut(account_id) {
             acc.balance += refund;
         }
     }
@@ -1302,12 +1247,12 @@ impl LedgerStateManager {
             offer_pre_values: self
                 .offer_snapshots
                 .keys()
-                .map(|k| (*k, self.offers.get(k).cloned()))
+                .map(|k| (k.clone(), self.offers.get(k).cloned()))
                 .collect(),
             account_pre_values: self
                 .account_snapshots
                 .keys()
-                .map(|k| (*k, self.accounts.get(k).cloned()))
+                .map(|k| (k.clone(), self.accounts.get(k).cloned()))
                 .collect(),
             trustline_pre_values: self
                 .trustline_snapshots
@@ -1317,7 +1262,7 @@ impl LedgerStateManager {
             ttl_pre_values: self
                 .ttl_snapshots
                 .keys()
-                .map(|k| (*k, self.ttl_entries.get(k).cloned()))
+                .map(|k| (k.clone(), self.ttl_entries.get(k).cloned()))
                 .collect(),
 
             // EntryStore-based savepoints
@@ -1706,11 +1651,10 @@ impl LedgerStateManager {
     /// The `exclude` parameter specifies an account to skip (e.g., an account
     /// that's about to be deleted). If None, all accounts are flushed.
     pub fn flush_all_accounts_except(&mut self, exclude: Option<&AccountId>) {
-        let exclude_key = exclude.map(crate::account_id_to_key);
         let modified_accounts = std::mem::take(&mut self.modified_accounts);
         let mut remaining = Vec::new();
         for key in modified_accounts {
-            if exclude_key == Some(key) {
+            if exclude == Some(&key) {
                 // Keep excluded account in modified list (will be handled by delete)
                 remaining.push(key);
                 continue;
@@ -1764,12 +1708,11 @@ impl LedgerStateManager {
     ///
     /// Returns true if the account was in the modified list and was flushed.
     pub fn flush_account(&mut self, account_id: &AccountId) -> bool {
-        let key = crate::account_id_to_key(account_id);
-        let pos = self.modified_accounts.iter().position(|k| k == &key);
+        let pos = self.modified_accounts.iter().position(|k| k == account_id);
         if let Some(pos) = pos {
             self.modified_accounts.remove(pos);
-            if let Some(Some(snapshot_entry)) = self.account_snapshots.get(&key) {
-                if let Some(entry) = self.accounts.get(&key).cloned() {
+            if let Some(Some(snapshot_entry)) = self.account_snapshots.get(account_id) {
+                if let Some(entry) = self.accounts.get(account_id).cloned() {
                     // For single-operation transactions, only record if entry actually changed.
                     // For multi-operation transactions, record for every access (even if no change)
                     // because stellar-core records per-operation entries for multi-op txs.
@@ -1915,11 +1858,10 @@ impl LedgerStateManager {
             if self.created_ttl.contains(&key) {
                 continue;
             }
-            let key_hash = Hash(key);
-            tracing::debug!(?key_hash, "flush_modified_entries: processing TTL");
+            tracing::debug!(?key, "flush_modified_entries: processing TTL");
             if let Some(snapshot) = self.ttl_snapshots.get(&key).cloned() {
                 tracing::debug!(
-                    ?key_hash,
+                    ?key,
                     has_snapshot_value = snapshot.is_some(),
                     "flush_modified_entries: TTL snapshot state"
                 );
@@ -1930,7 +1872,7 @@ impl LedgerStateManager {
                                 key_hash: entry.key_hash.clone(),
                             });
                             tracing::debug!(
-                                ?key_hash,
+                                ?key,
                                 pre_live_until = snapshot_entry.live_until_ledger_seq,
                                 post_live_until = entry.live_until_ledger_seq,
                                 "flush_modified_entries: TTL record_update"
@@ -2016,37 +1958,14 @@ impl LedgerStateManager {
 
 // ==================== Helper Functions ====================
 
-/// Convert an AccountId to its raw bytes.
-pub(crate) fn account_id_to_bytes(account_id: &AccountId) -> [u8; 32] {
-    match &account_id.0 {
-        PublicKey::PublicKeyTypeEd25519(key) => key.0,
-    }
-}
-
 /// Convert a String64 data name to a String.
 fn data_name_to_string(name: &stellar_xdr::curr::String64) -> String {
     String::from_utf8_lossy(name.as_vec()).to_string()
 }
 
 /// Convert an Asset to a TrustLineAsset.
-fn asset_to_trustline_asset(asset: &Asset) -> TrustLineAsset {
-    match asset {
-        Asset::Native => TrustLineAsset::Native,
-        Asset::CreditAlphanum4(a) => TrustLineAsset::CreditAlphanum4(a.clone()),
-        Asset::CreditAlphanum12(a) => TrustLineAsset::CreditAlphanum12(a.clone()),
-    }
-}
-
-/// Convert a ClaimableBalanceId to its raw bytes.
-fn claimable_balance_id_to_bytes(balance_id: &ClaimableBalanceId) -> [u8; 32] {
-    match balance_id {
-        ClaimableBalanceId::ClaimableBalanceIdTypeV0(hash) => hash.0,
-    }
-}
-
-/// Convert a PoolId to its raw bytes.
-fn pool_id_to_bytes(pool_id: &PoolId) -> [u8; 32] {
-    pool_id.0 .0
+pub fn asset_to_trustline_asset(asset: &Asset) -> TrustLineAsset {
+    henyey_common::asset::asset_to_trustline_asset(asset)
 }
 
 fn sponsorship_counts(account: &AccountEntry) -> (i64, i64) {
@@ -2181,12 +2100,9 @@ fn ensure_signer_sponsoring_ids(v2: &mut AccountEntryExtensionV2, signer_count: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::create_test_account_id;
     use henyey_common::LIQUIDITY_POOL_FEE_V18;
     use stellar_xdr::curr::*;
-
-    fn create_test_account_id(seed: u8) -> AccountId {
-        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
-    }
 
     fn create_test_account_entry(seed: u8) -> AccountEntry {
         AccountEntry {
@@ -2363,16 +2279,16 @@ mod tests {
     }
 
     #[test]
-    fn test_asset_key() {
-        let native_key = AssetKey::from_asset(&Asset::Native);
-        assert!(matches!(native_key, AssetKey::Native));
+    fn test_asset_to_trustline_asset() {
+        let native_key = asset_to_trustline_asset(&Asset::Native);
+        assert!(matches!(native_key, TrustLineAsset::Native));
 
         let alphanum4 = Asset::CreditAlphanum4(AlphaNum4 {
             asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
             issuer: create_test_account_id(1),
         });
-        let key4 = AssetKey::from_asset(&alphanum4);
-        assert!(matches!(key4, AssetKey::CreditAlphanum4(_, _)));
+        let key4 = asset_to_trustline_asset(&alphanum4);
+        assert!(matches!(key4, TrustLineAsset::CreditAlphanum4(_)));
     }
 
     /// Test that ClaimableBalance sponsorship-only changes are recorded in delta.
@@ -2881,11 +2797,11 @@ mod tests {
 
     /// Helper to query the account_asset_offers index for a (seller, asset) pair.
     fn aa_index_get(manager: &LedgerStateManager, seller_seed: u8, asset: &Asset) -> HashSet<i64> {
-        let seller = [seller_seed; 32];
-        let asset_key = AssetKey::from_asset(asset);
+        let seller = create_test_account_id(seller_seed);
+        let tl_asset = asset_to_trustline_asset(asset);
         manager
             .account_asset_offers
-            .get(&(seller, asset_key))
+            .get(&(seller, tl_asset))
             .cloned()
             .unwrap_or_default()
     }
@@ -3803,7 +3719,9 @@ mod tests {
         };
 
         // Load entry (simulating load_soroban_footprint)
-        manager.ttl_entries.insert(key_hash.0, original_ttl.clone());
+        manager
+            .ttl_entries
+            .insert(key_hash.clone(), original_ttl.clone());
 
         // Commit (simulating the commit before operations)
         manager.commit();
@@ -3845,7 +3763,9 @@ mod tests {
         };
 
         // Load and commit entry
-        manager.ttl_entries.insert(key_hash.0, original_ttl.clone());
+        manager
+            .ttl_entries
+            .insert(key_hash.clone(), original_ttl.clone());
         manager.commit();
 
         // Create savepoint (simulating per-operation savepoint)
@@ -3881,7 +3801,9 @@ mod tests {
         };
 
         // Load entry and commit
-        manager.ttl_entries.insert(key_hash.0, original_ttl.clone());
+        manager
+            .ttl_entries
+            .insert(key_hash.clone(), original_ttl.clone());
         manager.commit();
 
         // === TX 1 ===
@@ -3922,7 +3844,9 @@ mod tests {
         };
 
         // Load entry and commit
-        manager.ttl_entries.insert(key_hash.0, original_ttl.clone());
+        manager
+            .ttl_entries
+            .insert(key_hash.clone(), original_ttl.clone());
         manager.commit();
 
         // === TX 1 (will fail) ===
@@ -3933,7 +3857,7 @@ mod tests {
 
         // Verify the bump is stored in deferred_ro_ttl_bumps
         assert_eq!(
-            manager.deferred_ro_ttl_bumps.get(&key_hash.0),
+            manager.deferred_ro_ttl_bumps.get(&key_hash),
             Some(&500_000),
             "RO TTL bump must be stored in deferred_ro_ttl_bumps"
         );
@@ -3943,7 +3867,7 @@ mod tests {
 
         // RO TTL bumps are rolled back (matches stellar-core behavior)
         assert_eq!(
-            manager.deferred_ro_ttl_bumps.get(&key_hash.0),
+            manager.deferred_ro_ttl_bumps.get(&key_hash),
             None,
             "RO TTL bump must be rolled back on TX failure"
         );
@@ -3959,7 +3883,7 @@ mod tests {
 
         // Only TX 2's bump should be present
         assert_eq!(
-            manager.deferred_ro_ttl_bumps.get(&key_hash.0),
+            manager.deferred_ro_ttl_bumps.get(&key_hash),
             Some(&600_000),
             "Only successful TX's RO TTL bump should be present"
         );
@@ -3987,7 +3911,9 @@ mod tests {
         };
 
         // Load TTL entry
-        manager.ttl_entries.insert(key_hash.0, original_ttl.clone());
+        manager
+            .ttl_entries
+            .insert(key_hash.clone(), original_ttl.clone());
         manager.commit();
 
         // === TX 1 (succeeds): records an RO TTL bump ===
@@ -3999,14 +3925,14 @@ mod tests {
         assert_eq!(
             manager
                 .ttl_entries
-                .get(&key_hash.0)
+                .get(&key_hash)
                 .unwrap()
                 .live_until_ledger_seq,
             100_000,
             "TTL entry must not be updated yet (deferred)"
         );
         assert_eq!(
-            manager.deferred_ro_ttl_bumps.get(&key_hash.0),
+            manager.deferred_ro_ttl_bumps.get(&key_hash),
             Some(&500_000),
             "Deferred bump must be stored"
         );
@@ -4038,17 +3964,19 @@ mod tests {
                 .unwrap();
             hasher.update(&bytes);
             let result: [u8; 32] = hasher.finalize().into();
-            result
+            Hash(result)
         };
 
         // Set up the TTL entry and deferred bump using the ACTUAL hash
-        let real_key_hash = Hash(actual_hash);
+        let real_key_hash = actual_hash.clone();
         let real_ttl = TtlEntry {
             key_hash: real_key_hash.clone(),
             live_until_ledger_seq: 200_000,
         };
-        manager.ttl_entries.insert(actual_hash, real_ttl);
-        manager.deferred_ro_ttl_bumps.insert(actual_hash, 800_000);
+        manager.ttl_entries.insert(actual_hash.clone(), real_ttl);
+        manager
+            .deferred_ro_ttl_bumps
+            .insert(actual_hash.clone(), 800_000);
 
         // Flush for write footprint containing this key
         manager.flush_ro_ttl_bumps_for_write_footprint(&[contract_key]);
@@ -4078,13 +4006,15 @@ mod tests {
         let mut manager = LedgerStateManager::new(5_000_000, 100);
 
         // Add a deferred bump
-        let key_hash = [30; 32];
+        let key_hash = Hash([30; 32]);
         let ttl = TtlEntry {
-            key_hash: Hash(key_hash),
+            key_hash: key_hash.clone(),
             live_until_ledger_seq: 100_000,
         };
-        manager.ttl_entries.insert(key_hash, ttl);
-        manager.deferred_ro_ttl_bumps.insert(key_hash, 500_000);
+        manager.ttl_entries.insert(key_hash.clone(), ttl);
+        manager
+            .deferred_ro_ttl_bumps
+            .insert(key_hash.clone(), 500_000);
 
         // Flush with a non-Soroban key (Account)
         let account_key = LedgerKey::Account(LedgerKeyAccount {

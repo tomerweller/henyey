@@ -5,11 +5,11 @@ use super::*;
 impl LedgerStateManager {
     /// Insert an offer into the (account, asset) secondary index.
     pub(super) fn aa_index_insert(&mut self, offer: &OfferEntry) {
-        let seller = account_id_to_bytes(&offer.seller_id);
-        let selling_key = AssetKey::from_asset(&offer.selling);
-        let buying_key = AssetKey::from_asset(&offer.buying);
+        let seller = offer.seller_id.clone();
+        let selling_key = asset_to_trustline_asset(&offer.selling);
+        let buying_key = asset_to_trustline_asset(&offer.buying);
         self.account_asset_offers
-            .entry((seller, selling_key))
+            .entry((seller.clone(), selling_key))
             .or_default()
             .insert(offer.offer_id);
         self.account_asset_offers
@@ -20,10 +20,13 @@ impl LedgerStateManager {
 
     /// Remove an offer from the (account, asset) secondary index.
     pub(super) fn aa_index_remove(&mut self, offer: &OfferEntry) {
-        let seller = account_id_to_bytes(&offer.seller_id);
-        let selling_key = AssetKey::from_asset(&offer.selling);
-        let buying_key = AssetKey::from_asset(&offer.buying);
-        if let Some(set) = self.account_asset_offers.get_mut(&(seller, selling_key)) {
+        let seller = offer.seller_id.clone();
+        let selling_key = asset_to_trustline_asset(&offer.selling);
+        let buying_key = asset_to_trustline_asset(&offer.buying);
+        if let Some(set) = self
+            .account_asset_offers
+            .get_mut(&(seller.clone(), selling_key))
+        {
             set.remove(&offer.offer_id);
         }
         if let Some(set) = self.account_asset_offers.get_mut(&(seller, buying_key)) {
@@ -137,25 +140,22 @@ impl LedgerStateManager {
         let last_modified = entry.last_modified_ledger_seq;
         match entry.data {
             LedgerEntryData::Account(account) => {
-                let key = account_id_to_bytes(&account.account_id);
                 let ledger_key = LedgerKey::Account(LedgerKeyAccount {
                     account_id: account.account_id.clone(),
                 });
-                self.accounts.insert(key, account);
+                self.accounts.insert(account.account_id.clone(), account);
                 self.record_entry_metadata(ledger_key, last_modified, has_sponsorship_ext, sponsor);
             }
             LedgerEntryData::Trustline(trustline) => {
-                let account_key = account_id_to_bytes(&trustline.account_id);
-                let asset_key = AssetKey::from_trustline_asset(&trustline.asset);
+                let tl_key = (trustline.account_id.clone(), trustline.asset.clone());
                 let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
                     account_id: trustline.account_id.clone(),
                     asset: trustline.asset.clone(),
                 });
-                self.trustlines.insert((account_key, asset_key), trustline);
+                self.trustlines.insert(tl_key, trustline);
                 self.record_entry_metadata(ledger_key, last_modified, has_sponsorship_ext, sponsor);
             }
             LedgerEntryData::Offer(offer) => {
-                let seller_key = account_id_to_bytes(&offer.seller_id);
                 let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
                     seller_id: offer.seller_id.clone(),
                     offer_id: offer.offer_id,
@@ -163,12 +163,10 @@ impl LedgerStateManager {
                 // Add to offer index for efficient best-offer lookups
                 self.offer_index.add_offer(&offer);
                 self.aa_index_insert(&offer);
-                self.offers
-                    .insert(OfferKey::new(seller_key, offer.offer_id), offer);
+                self.offers.insert(OfferKey::from_offer(&offer), offer);
                 self.record_entry_metadata(ledger_key, last_modified, has_sponsorship_ext, sponsor);
             }
             LedgerEntryData::Data(data) => {
-                let account_key = account_id_to_bytes(&data.account_id);
                 let name = data_name_to_string(&data.data_name);
                 let ledger_key = LedgerKey::Data(LedgerKeyData {
                     account_id: data.account_id.clone(),
@@ -176,7 +174,7 @@ impl LedgerStateManager {
                 });
                 self.data_entries
                     .entries_mut()
-                    .insert((account_key, name), data);
+                    .insert((data.account_id.clone(), name), data);
                 self.record_entry_metadata(ledger_key, last_modified, has_sponsorship_ext, sponsor);
             }
             LedgerEntryData::ContractData(contract_data) => {
@@ -194,7 +192,7 @@ impl LedgerStateManager {
                 self.record_entry_metadata(ledger_key, last_modified, has_sponsorship_ext, sponsor);
             }
             LedgerEntryData::ContractCode(contract_code) => {
-                let key = contract_code.hash.0;
+                let key = contract_code.hash.clone();
                 let ledger_key = LedgerKey::ContractCode(LedgerKeyContractCode {
                     hash: contract_code.hash.clone(),
                 });
@@ -202,7 +200,7 @@ impl LedgerStateManager {
                 self.record_entry_metadata(ledger_key, last_modified, has_sponsorship_ext, sponsor);
             }
             LedgerEntryData::Ttl(ttl) => {
-                let key = ttl.key_hash.0;
+                let key = ttl.key_hash.clone();
                 let ledger_key = LedgerKey::Ttl(LedgerKeyTtl {
                     key_hash: ttl.key_hash.clone(),
                 });
@@ -210,13 +208,13 @@ impl LedgerStateManager {
                 // Only capture if not already present - this ensures we keep the original
                 // bucket list value even if the entry is reloaded later.
                 self.ttl_bucket_list_snapshot
-                    .entry(key)
+                    .entry(key.clone())
                     .or_insert(ttl.live_until_ledger_seq);
                 self.ttl_entries.insert(key, ttl);
                 self.record_entry_metadata(ledger_key, last_modified, has_sponsorship_ext, sponsor);
             }
             LedgerEntryData::ClaimableBalance(cb) => {
-                let key = claimable_balance_id_to_bytes(&cb.balance_id);
+                let key = cb.balance_id.clone();
                 let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
                     balance_id: cb.balance_id.clone(),
                 });
@@ -224,7 +222,7 @@ impl LedgerStateManager {
                 self.record_entry_metadata(ledger_key, last_modified, has_sponsorship_ext, sponsor);
             }
             LedgerEntryData::LiquidityPool(lp) => {
-                let key = pool_id_to_bytes(&lp.liquidity_pool_id);
+                let key = lp.liquidity_pool_id.clone();
                 let ledger_key = LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
                     liquidity_pool_id: lp.liquidity_pool_id.clone(),
                 });
@@ -247,12 +245,11 @@ impl LedgerStateManager {
         let last_modified = entry.last_modified_ledger_seq;
         match entry.data {
             LedgerEntryData::Account(account) => {
-                let key = account_id_to_bytes(&account.account_id);
                 let ledger_key = LedgerKey::Account(LedgerKeyAccount {
                     account_id: account.account_id.clone(),
                 });
                 // Insert account but do NOT save snapshot or mark as modified
-                self.accounts.insert(key, account);
+                self.accounts.insert(account.account_id.clone(), account);
                 self.record_entry_metadata(ledger_key, last_modified, has_sponsorship_ext, sponsor);
             }
             // For other entry types, delegate to regular load_entry since they don't
@@ -280,33 +277,30 @@ impl LedgerStateManager {
     /// This method is useful when you need to load an account from external storage
     /// and then access it.
     pub fn load_account(&mut self, account_id: &AccountId) -> Option<&AccountEntry> {
-        let key = account_id_to_bytes(account_id);
-        self.accounts.get(&key)
+        self.accounts.get(account_id)
     }
 
     /// Get an account by ID (read-only).
     pub fn get_account(&self, account_id: &AccountId) -> Option<&AccountEntry> {
-        let key = account_id_to_bytes(account_id);
-        self.accounts.get(&key)
+        self.accounts.get(account_id)
     }
 
     /// Get a mutable reference to an account by ID.
     ///
     /// This automatically tracks the modification for the delta.
     pub fn get_account_mut(&mut self, account_id: &AccountId) -> Option<&mut AccountEntry> {
-        let key = account_id_to_bytes(account_id);
-        if self.accounts.contains_key(&key) {
+        if self.accounts.contains_key(account_id) {
             // Save snapshot if not already saved or if it's None (for newly created entries).
             // For newly created entries, we update the snapshot to the current value so
             // subsequent operations can track changes with STATE/UPDATED pairs.
             // Rollback correctness is ensured by the created_accounts set.
             if !self
                 .account_snapshots
-                .get(&key)
+                .get(account_id)
                 .is_some_and(|s| s.is_some())
             {
-                let snapshot = self.accounts.get(&key).cloned();
-                self.account_snapshots.insert(key, snapshot);
+                let snapshot = self.accounts.get(account_id).cloned();
+                self.account_snapshots.insert(account_id.clone(), snapshot);
             }
             let ledger_key = LedgerKey::Account(LedgerKeyAccount {
                 account_id: account_id.clone(),
@@ -314,10 +308,10 @@ impl LedgerStateManager {
             self.capture_op_snapshot_for_key(&ledger_key);
             self.snapshot_last_modified_key(&ledger_key);
             // Track modification
-            if !self.modified_accounts.contains(&key) {
-                self.modified_accounts.push(key);
+            if !self.modified_accounts.contains(account_id) {
+                self.modified_accounts.push(account_id.clone());
             }
-            self.accounts.get_mut(&key)
+            self.accounts.get_mut(account_id)
         } else {
             None
         }
@@ -332,19 +326,18 @@ impl LedgerStateManager {
     /// Use this when an operation loads an account that must appear in the
     /// transaction meta (e.g., issuer account in AllowTrust/SetTrustLineFlags).
     pub fn record_account_access(&mut self, account_id: &AccountId) {
-        let key = account_id_to_bytes(account_id);
         // Only record if account exists in state
-        if !self.accounts.contains_key(&key) {
+        if !self.accounts.contains_key(account_id) {
             return;
         }
         // Save snapshot if not already saved (same as get_account_mut)
         if !self
             .account_snapshots
-            .get(&key)
+            .get(account_id)
             .is_some_and(|s| s.is_some())
         {
-            let snapshot = self.accounts.get(&key).cloned();
-            self.account_snapshots.insert(key, snapshot);
+            let snapshot = self.accounts.get(account_id).cloned();
+            self.account_snapshots.insert(account_id.clone(), snapshot);
         }
         let ledger_key = LedgerKey::Account(LedgerKeyAccount {
             account_id: account_id.clone(),
@@ -352,20 +345,22 @@ impl LedgerStateManager {
         self.capture_op_snapshot_for_key(&ledger_key);
         self.snapshot_last_modified_key(&ledger_key);
         // Track as "modified" so it gets flushed to delta
-        if !self.modified_accounts.contains(&key) {
-            self.modified_accounts.push(key);
+        if !self.modified_accounts.contains(account_id) {
+            self.modified_accounts.push(account_id.clone());
         }
     }
 
     /// Create a new account entry.
     pub fn create_account(&mut self, entry: AccountEntry) {
-        let key = account_id_to_bytes(&entry.account_id);
+        let account_id = entry.account_id.clone();
         let ledger_key = LedgerKey::Account(LedgerKeyAccount {
-            account_id: entry.account_id.clone(),
+            account_id: account_id.clone(),
         });
 
         // Save snapshot (None because it didn't exist)
-        self.account_snapshots.entry(key).or_insert(None);
+        self.account_snapshots
+            .entry(account_id.clone())
+            .or_insert(None);
         self.snapshot_last_modified_key(&ledger_key);
         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
 
@@ -374,28 +369,28 @@ impl LedgerStateManager {
         self.delta.record_create(ledger_entry);
 
         // Insert into state
-        self.accounts.insert(key, entry);
+        self.accounts.insert(account_id.clone(), entry);
 
         // Track that this entry was created in this transaction (for rollback)
-        self.created_accounts.insert(key);
+        self.created_accounts.insert(account_id.clone());
 
         // Track modification
-        if !self.modified_accounts.contains(&key) {
-            self.modified_accounts.push(key);
+        if !self.modified_accounts.contains(&account_id) {
+            self.modified_accounts.push(account_id);
         }
     }
 
     /// Update an existing account entry.
     pub fn update_account(&mut self, entry: AccountEntry) {
-        let key = account_id_to_bytes(&entry.account_id);
+        let account_id = entry.account_id.clone();
         let ledger_key = LedgerKey::Account(LedgerKeyAccount {
-            account_id: entry.account_id.clone(),
+            account_id: account_id.clone(),
         });
 
         // Save snapshot if not already saved (preserves original state from start of tx)
-        if !self.account_snapshots.contains_key(&key) {
-            let snapshot = self.accounts.get(&key).cloned();
-            self.account_snapshots.insert(key, snapshot);
+        if !self.account_snapshots.contains_key(&account_id) {
+            let snapshot = self.accounts.get(&account_id).cloned();
+            self.account_snapshots.insert(account_id.clone(), snapshot);
         }
         self.capture_op_snapshot_for_key(&ledger_key);
         self.snapshot_last_modified_key(&ledger_key);
@@ -403,7 +398,7 @@ impl LedgerStateManager {
         // Get pre-state (current value BEFORE this update)
         let pre_state = self
             .accounts
-            .get(&key)
+            .get(&account_id)
             .map(|acc| self.account_to_ledger_entry(acc));
 
         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
@@ -415,7 +410,7 @@ impl LedgerStateManager {
         }
 
         // Update state
-        self.accounts.insert(key, entry);
+        self.accounts.insert(account_id, entry);
     }
 
     /// Set an account entry directly without delta tracking.
@@ -423,8 +418,7 @@ impl LedgerStateManager {
     /// This is used during verification to sync state with CDP without
     /// affecting the delta computation for subsequent transactions.
     pub fn set_account_no_tracking(&mut self, entry: AccountEntry) {
-        let key = account_id_to_bytes(&entry.account_id);
-        self.accounts.insert(key, entry);
+        self.accounts.insert(entry.account_id.clone(), entry);
     }
 
     /// Add or update an account entry (convenience alias for set_account_no_tracking).
@@ -442,32 +436,29 @@ impl LedgerStateManager {
         use stellar_xdr::curr::LedgerEntryData;
         match &entry.data {
             LedgerEntryData::Account(acc) => {
-                let key = account_id_to_bytes(&acc.account_id);
-                self.accounts.insert(key, acc.clone());
+                self.accounts.insert(acc.account_id.clone(), acc.clone());
             }
             LedgerEntryData::Trustline(tl) => {
-                let account_key = account_id_to_bytes(&tl.account_id);
-                let asset_key = AssetKey::from_trustline_asset(&tl.asset);
-                let key = (account_key, asset_key);
+                let key = (tl.account_id.clone(), tl.asset.clone());
                 self.trustlines.insert(key, tl.clone());
             }
             LedgerEntryData::Offer(offer) => {
-                let key = OfferKey::new(account_id_to_bytes(&offer.seller_id), offer.offer_id);
+                let key = OfferKey::from_offer(&offer);
                 self.offers.insert(key, offer.clone());
             }
             LedgerEntryData::Data(data) => {
                 let name = data_name_to_string(&data.data_name);
-                let key = (account_id_to_bytes(&data.account_id), name);
+                let key = (data.account_id.clone(), name);
                 self.data_entries.entries_mut().insert(key, data.clone());
             }
             LedgerEntryData::ClaimableBalance(cb) => {
-                let key = claimable_balance_id_to_bytes(&cb.balance_id);
+                let key = cb.balance_id.clone();
                 self.claimable_balances
                     .entries_mut()
                     .insert(key, cb.clone());
             }
             LedgerEntryData::LiquidityPool(lp) => {
-                let key = pool_id_to_bytes(&lp.liquidity_pool_id);
+                let key = lp.liquidity_pool_id.clone();
                 self.liquidity_pools.entries_mut().insert(key, lp.clone());
             }
             LedgerEntryData::ContractData(cd) => {
@@ -475,16 +466,16 @@ impl LedgerStateManager {
                 self.contract_data.entries_mut().insert(key, cd.clone());
             }
             LedgerEntryData::ContractCode(cc) => {
-                let key = cc.hash.0;
+                let key = cc.hash.clone();
                 self.contract_code.entries_mut().insert(key, cc.clone());
             }
             LedgerEntryData::Ttl(ttl) => {
-                let key = ttl.key_hash.0;
+                let key = ttl.key_hash.clone();
                 // Capture the bucket list TTL value for Soroban.
                 // Only capture if not already present - this ensures we keep the original
                 // bucket list value even if the entry is reloaded later.
                 self.ttl_bucket_list_snapshot
-                    .entry(key)
+                    .entry(key.clone())
                     .or_insert(ttl.live_until_ledger_seq);
                 self.ttl_entries.insert(key, ttl.clone());
             }
@@ -502,42 +493,38 @@ impl LedgerStateManager {
         use stellar_xdr::curr::LedgerKey;
         match key {
             LedgerKey::Account(k) => {
-                let account_key = account_id_to_bytes(&k.account_id);
-                self.accounts.remove(&account_key);
+                self.accounts.remove(&k.account_id);
             }
             LedgerKey::Trustline(k) => {
-                let account_key = account_id_to_bytes(&k.account_id);
-                let asset_key = AssetKey::from_trustline_asset(&k.asset);
-                self.trustlines.remove(&(account_key, asset_key));
+                let key = (k.account_id.clone(), k.asset.clone());
+                self.trustlines.remove(&key);
             }
             LedgerKey::Offer(k) => {
-                let offer_key = OfferKey::new(account_id_to_bytes(&k.seller_id), k.offer_id);
+                let offer_key = OfferKey::new(k.seller_id.clone(), k.offer_id);
                 self.offers.remove(&offer_key);
             }
             LedgerKey::Data(k) => {
                 let name = data_name_to_string(&k.data_name);
-                let data_key = (account_id_to_bytes(&k.account_id), name);
+                let data_key = (k.account_id.clone(), name);
                 self.data_entries.entries_mut().remove(&data_key);
             }
             LedgerKey::ClaimableBalance(k) => {
-                let cb_key = claimable_balance_id_to_bytes(&k.balance_id);
-                self.claimable_balances.entries_mut().remove(&cb_key);
+                self.claimable_balances.entries_mut().remove(&k.balance_id);
             }
             LedgerKey::LiquidityPool(k) => {
-                let pool_key = pool_id_to_bytes(&k.liquidity_pool_id);
-                self.liquidity_pools.entries_mut().remove(&pool_key);
+                self.liquidity_pools
+                    .entries_mut()
+                    .remove(&k.liquidity_pool_id);
             }
             LedgerKey::ContractData(k) => {
                 let cd_key = ContractDataKey::new(k.contract.clone(), k.key.clone(), k.durability);
                 self.contract_data.entries_mut().remove(&cd_key);
             }
             LedgerKey::ContractCode(k) => {
-                let code_key = k.hash.0;
-                self.contract_code.entries_mut().remove(&code_key);
+                self.contract_code.entries_mut().remove(&k.hash);
             }
             LedgerKey::Ttl(k) => {
-                let ttl_key = k.key_hash.0;
-                self.ttl_entries.remove(&ttl_key);
+                self.ttl_entries.remove(&k.key_hash);
             }
             LedgerKey::ConfigSetting(_) => {
                 // Config settings not tracked
@@ -551,15 +538,14 @@ impl LedgerStateManager {
 
     /// Delete an account entry.
     pub fn delete_account(&mut self, account_id: &AccountId) {
-        let key = account_id_to_bytes(account_id);
         let ledger_key = LedgerKey::Account(LedgerKeyAccount {
             account_id: account_id.clone(),
         });
 
         // Save snapshot if not already saved
-        if !self.account_snapshots.contains_key(&key) {
-            let snapshot = self.accounts.get(&key).cloned();
-            self.account_snapshots.insert(key, snapshot);
+        if !self.account_snapshots.contains_key(account_id) {
+            let snapshot = self.accounts.get(account_id).cloned();
+            self.account_snapshots.insert(account_id.clone(), snapshot);
         }
         self.capture_op_snapshot_for_key(&ledger_key);
         self.snapshot_last_modified_key(&ledger_key);
@@ -567,7 +553,7 @@ impl LedgerStateManager {
         // Get pre-state (current value BEFORE deletion)
         let pre_state = self
             .accounts
-            .get(&key)
+            .get(account_id)
             .map(|acc| self.account_to_ledger_entry(acc));
 
         // Record in delta with pre-state
@@ -577,15 +563,14 @@ impl LedgerStateManager {
 
         // Remove from state
         self.clear_entry_sponsorship_metadata(&ledger_key);
-        self.accounts.remove(&key);
+        self.accounts.remove(account_id);
         self.remove_last_modified_key(&ledger_key);
     }
 
     /// Get a trustline by account and asset (read-only).
     pub fn get_trustline(&self, account_id: &AccountId, asset: &Asset) -> Option<&TrustLineEntry> {
-        let account_key = account_id_to_bytes(account_id);
-        let asset_key = AssetKey::from_asset(asset);
-        self.trustlines.get(&(account_key, asset_key))
+        let asset_key = asset_to_trustline_asset(asset);
+        self.trustlines.get(&(account_id.clone(), asset_key))
     }
 
     /// Get a trustline by account and trustline asset (read-only).
@@ -594,17 +579,13 @@ impl LedgerStateManager {
         account_id: &AccountId,
         asset: &TrustLineAsset,
     ) -> Option<&TrustLineEntry> {
-        let account_key = account_id_to_bytes(account_id);
-        let asset_key = AssetKey::from_trustline_asset(asset);
-        self.trustlines.get(&(account_key, asset_key))
+        self.trustlines.get(&(account_id.clone(), asset.clone()))
     }
 
     /// Check if a trustline was already loaded during this transaction.
     pub fn is_trustline_tracked(&self, account_id: &AccountId, asset: &TrustLineAsset) -> bool {
-        let account_key = account_id_to_bytes(account_id);
-        let asset_key = AssetKey::from_trustline_asset(asset);
         self.trustline_snapshots
-            .contains_key(&(account_key, asset_key))
+            .contains_key(&(account_id.clone(), asset.clone()))
     }
 
     /// Iterate over all trustlines as (key, entry) pairs.
@@ -640,16 +621,16 @@ impl LedgerStateManager {
             return Ok(());
         }
 
-        let account_bytes = account_id_to_bytes(account_id);
+        let account_bytes = account_id.clone();
 
         // Load each pool share trustline and its liquidity pool if not already in memory.
         for pool_id in &pool_ids {
-            let pool_share_asset_key = AssetKey::PoolShare(pool_id.0 .0);
+            let pool_share_asset_key = TrustLineAsset::PoolShare(pool_id.clone());
 
             // Load pool share trustline if not already tracked.
             if !self
                 .trustlines
-                .contains_key(&(account_bytes, pool_share_asset_key))
+                .contains_key(&(account_bytes.clone(), pool_share_asset_key))
             {
                 let tl_key = LedgerKey::Trustline(LedgerKeyTrustLine {
                     account_id: account_id.clone(),
@@ -665,8 +646,8 @@ impl LedgerStateManager {
             }
 
             // Load the liquidity pool if not already tracked.
-            let pool_id_bytes = pool_id.0 .0;
-            if !self.liquidity_pools.contains(&pool_id_bytes) {
+            let pool_id_key = pool_id.clone();
+            if !self.liquidity_pools.contains(&pool_id_key) {
                 let pool_key = LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
                     liquidity_pool_id: pool_id.clone(),
                 });
@@ -689,9 +670,7 @@ impl LedgerStateManager {
         account_id: &AccountId,
         asset: &TrustLineAsset,
     ) -> Option<&mut TrustLineEntry> {
-        let account_key = account_id_to_bytes(account_id);
-        let asset_key = AssetKey::from_trustline_asset(asset);
-        let key = (account_key, asset_key.clone());
+        let key = (account_id.clone(), asset.clone());
 
         if self.trustlines.contains_key(&key) {
             // Save snapshot if not already saved or if it's None (for newly created entries).
@@ -728,9 +707,8 @@ impl LedgerStateManager {
         account_id: &AccountId,
         asset: &Asset,
     ) -> Option<&mut TrustLineEntry> {
-        let account_key = account_id_to_bytes(account_id);
-        let asset_key = AssetKey::from_asset(asset);
-        let key = (account_key, asset_key.clone());
+        let asset_key = asset_to_trustline_asset(asset);
+        let key = (account_id.clone(), asset_key.clone());
 
         if self.trustlines.contains_key(&key) {
             // Save snapshot if not already saved or if it's None (for newly created entries).
@@ -763,9 +741,7 @@ impl LedgerStateManager {
 
     /// Create a new trustline entry.
     pub fn create_trustline(&mut self, entry: TrustLineEntry) {
-        let account_key = account_id_to_bytes(&entry.account_id);
-        let asset_key = AssetKey::from_trustline_asset(&entry.asset);
-        let key = (account_key, asset_key.clone());
+        let key = (entry.account_id.clone(), entry.asset.clone());
         let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
             account_id: entry.account_id.clone(),
             asset: entry.asset.clone(),
@@ -796,9 +772,7 @@ impl LedgerStateManager {
 
     /// Update an existing trustline entry.
     pub fn update_trustline(&mut self, entry: TrustLineEntry) {
-        let account_key = account_id_to_bytes(&entry.account_id);
-        let asset_key = AssetKey::from_trustline_asset(&entry.asset);
-        let key = (account_key, asset_key.clone());
+        let key = (entry.account_id.clone(), entry.asset.clone());
         let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
             account_id: entry.account_id.clone(),
             asset: entry.asset.clone(),
@@ -836,9 +810,8 @@ impl LedgerStateManager {
 
     /// Delete a trustline entry.
     pub fn delete_trustline(&mut self, account_id: &AccountId, asset: &Asset) {
-        let account_key = account_id_to_bytes(account_id);
-        let asset_key = AssetKey::from_asset(asset);
-        let key = (account_key, asset_key.clone());
+        let asset_key = asset_to_trustline_asset(asset);
+        let key = (account_id.clone(), asset_key.clone());
         let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
             account_id: account_id.clone(),
             asset: asset_to_trustline_asset(asset),
@@ -875,9 +848,7 @@ impl LedgerStateManager {
         account_id: &AccountId,
         asset: &TrustLineAsset,
     ) {
-        let account_key = account_id_to_bytes(account_id);
-        let asset_key = AssetKey::from_trustline_asset(asset);
-        let key = (account_key, asset_key.clone());
+        let key = (account_id.clone(), asset.clone());
         let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
             account_id: account_id.clone(),
             asset: asset.clone(),
@@ -920,15 +891,13 @@ impl LedgerStateManager {
 
     /// Get an offer by seller and offer ID (read-only).
     pub fn get_offer(&self, seller_id: &AccountId, offer_id: i64) -> Option<&OfferEntry> {
-        let seller_key = account_id_to_bytes(seller_id);
-        self.offers.get(&OfferKey::new(seller_key, offer_id))
+        self.offers.get(&OfferKey::new(seller_id.clone(), offer_id))
     }
 
     /// Check if an offer was already loaded during this transaction.
     pub fn is_offer_tracked(&self, seller_id: &AccountId, offer_id: i64) -> bool {
-        let seller_key = account_id_to_bytes(seller_id);
         self.offer_snapshots
-            .contains_key(&OfferKey::new(seller_key, offer_id))
+            .contains_key(&OfferKey::new(seller_id.clone(), offer_id))
     }
 
     /// Get all offers for an account that buy or sell a specific asset.
@@ -941,13 +910,16 @@ impl LedgerStateManager {
         account_id: &AccountId,
         asset: &Asset,
     ) -> Vec<OfferEntry> {
-        let account_key = account_id_to_bytes(account_id);
-        let asset_key = AssetKey::from_asset(asset);
+        let asset_key = asset_to_trustline_asset(asset);
         self.account_asset_offers
-            .get(&(account_key, asset_key))
+            .get(&(account_id.clone(), asset_key))
             .map(|ids| {
                 ids.iter()
-                    .filter_map(|&id| self.offers.get(&OfferKey::new(account_key, id)).cloned())
+                    .filter_map(|&id| {
+                        self.offers
+                            .get(&OfferKey::new(account_id.clone(), id))
+                            .cloned()
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -959,8 +931,7 @@ impl LedgerStateManager {
         seller_id: &AccountId,
         offer_id: i64,
     ) -> Option<&mut OfferEntry> {
-        let seller_key = account_id_to_bytes(seller_id);
-        let key = OfferKey::new(seller_key, offer_id);
+        let key = OfferKey::new(seller_id.clone(), offer_id);
 
         if self.offers.contains_key(&key) {
             // Save snapshot if not already saved or if it's None (for newly created entries).
@@ -969,7 +940,7 @@ impl LedgerStateManager {
             // Rollback correctness is ensured by the created_offers set.
             if !self.offer_snapshots.get(&key).is_some_and(|s| s.is_some()) {
                 let snapshot = self.offers.get(&key).cloned();
-                self.offer_snapshots.insert(key, snapshot);
+                self.offer_snapshots.insert(key.clone(), snapshot);
             }
             let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
                 seller_id: seller_id.clone(),
@@ -979,7 +950,7 @@ impl LedgerStateManager {
             self.snapshot_last_modified_key(&ledger_key);
             // Track modification
             if !self.modified_offers.contains(&key) {
-                self.modified_offers.push(key);
+                self.modified_offers.push(key.clone());
             }
             self.offers.get_mut(&key)
         } else {
@@ -989,15 +960,14 @@ impl LedgerStateManager {
 
     /// Create a new offer entry.
     pub fn create_offer(&mut self, entry: OfferEntry) {
-        let seller_key = account_id_to_bytes(&entry.seller_id);
-        let key = OfferKey::new(seller_key, entry.offer_id);
+        let key = OfferKey::from_offer(&entry);
         let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
             seller_id: entry.seller_id.clone(),
             offer_id: entry.offer_id,
         });
 
         // Save snapshot (None because it didn't exist)
-        self.offer_snapshots.entry(key).or_insert(None);
+        self.offer_snapshots.entry(key.clone()).or_insert(None);
         self.snapshot_last_modified_key(&ledger_key);
         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
 
@@ -1010,10 +980,10 @@ impl LedgerStateManager {
         self.aa_index_insert(&entry);
 
         // Insert into state
-        self.offers.insert(key, entry);
+        self.offers.insert(key.clone(), entry);
 
         // Track that this entry was created in this transaction (for rollback)
-        self.created_offers.insert(key);
+        self.created_offers.insert(key.clone());
 
         // Track modification
         if !self.modified_offers.contains(&key) {
@@ -1023,8 +993,7 @@ impl LedgerStateManager {
 
     /// Update an existing offer entry.
     pub fn update_offer(&mut self, entry: OfferEntry) {
-        let seller_key = account_id_to_bytes(&entry.seller_id);
-        let key = OfferKey::new(seller_key, entry.offer_id);
+        let key = OfferKey::from_offer(&entry);
         let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
             seller_id: entry.seller_id.clone(),
             offer_id: entry.offer_id,
@@ -1033,7 +1002,7 @@ impl LedgerStateManager {
         // Save snapshot if not already saved (for rollback purposes)
         if !self.offer_snapshots.contains_key(&key) {
             let snapshot = self.offers.get(&key).cloned();
-            self.offer_snapshots.insert(key, snapshot);
+            self.offer_snapshots.insert(key.clone(), snapshot);
         }
         self.capture_op_snapshot_for_key(&ledger_key);
         self.snapshot_last_modified_key(&ledger_key);
@@ -1071,8 +1040,7 @@ impl LedgerStateManager {
 
     /// Delete an offer entry.
     pub fn delete_offer(&mut self, seller_id: &AccountId, offer_id: i64) {
-        let seller_key = account_id_to_bytes(seller_id);
-        let key = OfferKey::new(seller_key, offer_id);
+        let key = OfferKey::new(seller_id.clone(), offer_id);
         let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
             seller_id: seller_id.clone(),
             offer_id,
@@ -1081,7 +1049,7 @@ impl LedgerStateManager {
         // Save snapshot if not already saved
         if !self.offer_snapshots.contains_key(&key) {
             let snapshot = self.offers.get(&key).cloned();
-            self.offer_snapshots.insert(key, snapshot);
+            self.offer_snapshots.insert(key.clone(), snapshot);
         }
         self.capture_op_snapshot_for_key(&ledger_key);
         self.snapshot_last_modified_key(&ledger_key);
@@ -1200,8 +1168,7 @@ impl LedgerStateManager {
                     );
                     for entry in entries {
                         if let LedgerEntryData::Offer(ref offer) = entry.data {
-                            let seller_key = account_id_to_bytes(&offer.seller_id);
-                            let key = OfferKey::new(seller_key, offer.offer_id);
+                            let key = OfferKey::from_offer(offer);
                             // Skip offers already deleted in this ledger (by a previous TX).
                             // The loader returns offers from the bucket list snapshot which
                             // doesn't reflect in-ledger deletions.
@@ -1239,13 +1206,12 @@ impl LedgerStateManager {
             );
         }
 
-        let account_key = account_id_to_bytes(account_id);
-        let asset_key = AssetKey::from_asset(asset);
+        let asset_key = asset_to_trustline_asset(asset);
 
         // Look up offer IDs from secondary index
         let offer_ids: Vec<i64> = self
             .account_asset_offers
-            .get(&(account_key, asset_key))
+            .get(&(account_id.clone(), asset_key))
             .map(|ids| ids.iter().copied().collect())
             .unwrap_or_default();
 
@@ -1254,7 +1220,7 @@ impl LedgerStateManager {
             .iter()
             .filter_map(|&offer_id| {
                 self.offers
-                    .get(&OfferKey::new(account_key, offer_id))
+                    .get(&OfferKey::new(account_id.clone(), offer_id))
                     .cloned()
                     .filter(|offer| offer.buying == *asset || offer.selling == *asset)
             })
@@ -1270,21 +1236,19 @@ impl LedgerStateManager {
 
     /// Get a data entry by account and name (read-only).
     pub fn get_data(&self, account_id: &AccountId, name: &str) -> Option<&DataEntry> {
-        let account_key = account_id_to_bytes(account_id);
-        self.data_entries.get(&(account_key, name.to_string()))
+        self.data_entries
+            .get(&(account_id.clone(), name.to_string()))
     }
 
     /// Check if a data entry was already loaded during this transaction.
     pub fn is_data_tracked(&self, account_id: &AccountId, name: &str) -> bool {
-        let account_key = account_id_to_bytes(account_id);
         self.data_entries
-            .is_tracked(&(account_key, name.to_string()))
+            .is_tracked(&(account_id.clone(), name.to_string()))
     }
 
     /// Get a mutable reference to a data entry.
     pub fn get_data_mut(&mut self, account_id: &AccountId, name: &str) -> Option<&mut DataEntry> {
-        let account_key = account_id_to_bytes(account_id);
-        let key = (account_key, name.to_string());
+        let key = (account_id.clone(), name.to_string());
         if !self.data_entries.contains(&key) {
             return None;
         }
@@ -1303,15 +1267,14 @@ impl LedgerStateManager {
 
     /// Create a new data entry.
     pub fn create_data(&mut self, entry: DataEntry) {
-        let account_key = account_id_to_bytes(&entry.account_id);
         let name = data_name_to_string(&entry.data_name);
         tracing::debug!(
-            "create_data: account_key={:02x?}, name={:?}, name_bytes={:?}",
-            &account_key[..4],
+            "create_data: account_id={:?}, name={:?}, name_bytes={:?}",
+            &entry.account_id,
             name,
             entry.data_name.as_vec()
         );
-        let key = (account_key, name.clone());
+        let key = (entry.account_id.clone(), name.clone());
         let ledger_key = LedgerKey::Data(LedgerKeyData {
             account_id: entry.account_id.clone(),
             data_name: entry.data_name.clone(),
@@ -1325,9 +1288,8 @@ impl LedgerStateManager {
 
     /// Update an existing data entry.
     pub fn update_data(&mut self, entry: DataEntry) {
-        let account_key = account_id_to_bytes(&entry.account_id);
         let name = data_name_to_string(&entry.data_name);
-        let key = (account_key, name.clone());
+        let key = (entry.account_id.clone(), name.clone());
         let ledger_key = LedgerKey::Data(LedgerKeyData {
             account_id: entry.account_id.clone(),
             data_name: entry.data_name.clone(),
@@ -1349,8 +1311,7 @@ impl LedgerStateManager {
 
     /// Delete a data entry.
     pub fn delete_data(&mut self, account_id: &AccountId, name: &str) {
-        let account_key = account_id_to_bytes(account_id);
-        let key = (account_key, name.to_string());
+        let key = (account_id.clone(), name.to_string());
         self.data_entries.ensure_snapshot_on_first(&key);
 
         // Build ledger key from stored entry (Data constructs LedgerKey from entry fields).
@@ -1471,12 +1432,12 @@ impl LedgerStateManager {
 
     /// Get a contract code entry by hash (read-only).
     pub fn get_contract_code(&self, hash: &Hash) -> Option<&ContractCodeEntry> {
-        self.contract_code.get(&hash.0)
+        self.contract_code.get(hash)
     }
 
     /// Get a mutable reference to a contract code entry.
     pub fn get_contract_code_mut(&mut self, hash: &Hash) -> Option<&mut ContractCodeEntry> {
-        let key = hash.0;
+        let key = hash.clone();
         if !self.contract_code.contains(&key) {
             return None;
         }
@@ -1489,7 +1450,7 @@ impl LedgerStateManager {
 
     /// Create a new contract code entry.
     pub fn create_contract_code(&mut self, entry: ContractCodeEntry) {
-        let key = entry.hash.0;
+        let key = entry.hash.clone();
         let ledger_key = LedgerKey::ContractCode(LedgerKeyContractCode {
             hash: entry.hash.clone(),
         });
@@ -1502,7 +1463,7 @@ impl LedgerStateManager {
 
     /// Update an existing contract code entry.
     pub fn update_contract_code(&mut self, entry: ContractCodeEntry) {
-        let key = entry.hash.0;
+        let key = entry.hash.clone();
         let ledger_key = LedgerKey::ContractCode(LedgerKeyContractCode {
             hash: entry.hash.clone(),
         });
@@ -1523,7 +1484,7 @@ impl LedgerStateManager {
 
     /// Delete a contract code entry.
     pub fn delete_contract_code(&mut self, hash: &Hash) {
-        let key = hash.0;
+        let key = hash.clone();
         let ledger_key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: hash.clone() });
         self.contract_code.ensure_snapshot_on_first(&key);
         self.capture_op_snapshot_for_key(&ledger_key);
@@ -1545,14 +1506,12 @@ impl LedgerStateManager {
         &self,
         balance_id: &ClaimableBalanceId,
     ) -> Option<&ClaimableBalanceEntry> {
-        let key = claimable_balance_id_to_bytes(balance_id);
-        self.claimable_balances.get(&key)
+        self.claimable_balances.get(balance_id)
     }
 
     /// Check if a claimable balance was already loaded during this transaction.
     pub fn is_claimable_balance_tracked(&self, balance_id: &ClaimableBalanceId) -> bool {
-        let key = claimable_balance_id_to_bytes(balance_id);
-        self.claimable_balances.is_tracked(&key)
+        self.claimable_balances.is_tracked(balance_id)
     }
 
     /// Get a mutable reference to a claimable balance entry.
@@ -1560,22 +1519,21 @@ impl LedgerStateManager {
         &mut self,
         balance_id: &ClaimableBalanceId,
     ) -> Option<&mut ClaimableBalanceEntry> {
-        let key = claimable_balance_id_to_bytes(balance_id);
-        if !self.claimable_balances.contains(&key) {
+        if !self.claimable_balances.contains(balance_id) {
             return None;
         }
-        self.claimable_balances.ensure_snapshot(&key);
+        self.claimable_balances.ensure_snapshot(balance_id);
         let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
             balance_id: balance_id.clone(),
         });
         self.capture_op_snapshot_for_key(&ledger_key);
         self.snapshot_last_modified_key(&ledger_key);
-        self.claimable_balances.get_mut_tracked(&key)
+        self.claimable_balances.get_mut_tracked(balance_id)
     }
 
     /// Create a new claimable balance entry.
     pub fn create_claimable_balance(&mut self, entry: ClaimableBalanceEntry) {
-        let key = claimable_balance_id_to_bytes(&entry.balance_id);
+        let key = entry.balance_id.clone();
         let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
             balance_id: entry.balance_id.clone(),
         });
@@ -1588,7 +1546,7 @@ impl LedgerStateManager {
 
     /// Delete a claimable balance entry (when claimed).
     pub fn delete_claimable_balance(&mut self, balance_id: &ClaimableBalanceId) {
-        let key = claimable_balance_id_to_bytes(balance_id);
+        let key = balance_id.clone();
         let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
             balance_id: balance_id.clone(),
         });
@@ -1609,7 +1567,7 @@ impl LedgerStateManager {
 
     /// Update an existing claimable balance entry.
     pub fn update_claimable_balance(&mut self, entry: ClaimableBalanceEntry) {
-        let key = claimable_balance_id_to_bytes(&entry.balance_id);
+        let key = entry.balance_id.clone();
         let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
             balance_id: entry.balance_id.clone(),
         });
@@ -1630,34 +1588,31 @@ impl LedgerStateManager {
 
     /// Get a liquidity pool by ID (read-only).
     pub fn get_liquidity_pool(&self, pool_id: &PoolId) -> Option<&LiquidityPoolEntry> {
-        let key = pool_id_to_bytes(pool_id);
-        self.liquidity_pools.get(&key)
+        self.liquidity_pools.get(pool_id)
     }
 
     /// Check if a liquidity pool was already loaded during this transaction.
     pub fn is_liquidity_pool_tracked(&self, pool_id: &PoolId) -> bool {
-        let key = pool_id_to_bytes(pool_id);
-        self.liquidity_pools.is_tracked(&key)
+        self.liquidity_pools.is_tracked(pool_id)
     }
 
     /// Get a mutable reference to a liquidity pool.
     pub fn get_liquidity_pool_mut(&mut self, pool_id: &PoolId) -> Option<&mut LiquidityPoolEntry> {
-        let key = pool_id_to_bytes(pool_id);
-        if !self.liquidity_pools.contains(&key) {
+        if !self.liquidity_pools.contains(pool_id) {
             return None;
         }
-        self.liquidity_pools.ensure_snapshot(&key);
+        self.liquidity_pools.ensure_snapshot(pool_id);
         let ledger_key = LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
             liquidity_pool_id: pool_id.clone(),
         });
         self.capture_op_snapshot_for_key(&ledger_key);
         self.snapshot_last_modified_key(&ledger_key);
-        self.liquidity_pools.get_mut_tracked(&key)
+        self.liquidity_pools.get_mut_tracked(pool_id)
     }
 
     /// Create a new liquidity pool entry.
     pub fn create_liquidity_pool(&mut self, entry: LiquidityPoolEntry) {
-        let key = pool_id_to_bytes(&entry.liquidity_pool_id);
+        let key = entry.liquidity_pool_id.clone();
         let ledger_key = LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
             liquidity_pool_id: entry.liquidity_pool_id.clone(),
         });
@@ -1670,7 +1625,7 @@ impl LedgerStateManager {
 
     /// Update an existing liquidity pool entry.
     pub fn update_liquidity_pool(&mut self, entry: LiquidityPoolEntry) {
-        let key = pool_id_to_bytes(&entry.liquidity_pool_id);
+        let key = entry.liquidity_pool_id.clone();
         let ledger_key = LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
             liquidity_pool_id: entry.liquidity_pool_id.clone(),
         });
@@ -1691,7 +1646,7 @@ impl LedgerStateManager {
 
     /// Delete a liquidity pool entry (when pool_shares_trust_line_count reaches 0).
     pub fn delete_liquidity_pool(&mut self, pool_id: &PoolId) {
-        let key = pool_id_to_bytes(pool_id);
+        let key = pool_id.clone();
         let ledger_key = LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
             liquidity_pool_id: pool_id.clone(),
         });
@@ -1716,23 +1671,19 @@ impl LedgerStateManager {
             LedgerKey::Account(k) => self
                 .get_account(&k.account_id)
                 .map(|e| self.account_to_ledger_entry(e)),
-            LedgerKey::Trustline(k) => {
-                let account_key = account_id_to_bytes(&k.account_id);
-                let asset_key = AssetKey::from_trustline_asset(&k.asset);
-                self.trustlines
-                    .get(&(account_key, asset_key))
-                    .map(|e| self.trustline_to_ledger_entry(e))
-            }
+            LedgerKey::Trustline(k) => self
+                .trustlines
+                .get(&(k.account_id.clone(), k.asset.clone()))
+                .map(|e| self.trustline_to_ledger_entry(e)),
             LedgerKey::Offer(k) => self
                 .get_offer(&k.seller_id, k.offer_id)
                 .map(|e| self.offer_to_ledger_entry(e)),
             LedgerKey::Data(k) => {
                 let name = data_name_to_string(&k.data_name);
-                let account_key = account_id_to_bytes(&k.account_id);
                 let result = self.get_data(&k.account_id, &name);
                 tracing::debug!(
-                    "get_entry for Data: account={:02x?}, name={:?}, name_bytes={:?}, found={}",
-                    &account_key[..4],
+                    "get_entry for Data: account={:?}, name={:?}, name_bytes={:?}, found={}",
+                    &k.account_id,
                     name,
                     k.data_name.as_vec(),
                     result.is_some()
@@ -1771,8 +1722,8 @@ impl LedgerStateManager {
                     ContractDataKey::new(k.contract.clone(), k.key.clone(), k.durability);
                 self.contract_data.is_deleted(&lookup_key)
             }
-            LedgerKey::ContractCode(k) => self.contract_code.is_deleted(&k.hash.0),
-            LedgerKey::Ttl(k) => self.deleted_ttl.contains(&k.key_hash.0),
+            LedgerKey::ContractCode(k) => self.contract_code.is_deleted(&k.hash),
+            LedgerKey::Ttl(k) => self.deleted_ttl.contains(&k.key_hash),
             _ => false,
         }
     }
@@ -1792,10 +1743,10 @@ impl LedgerStateManager {
                 self.contract_data.mark_deleted(lookup_key);
             }
             LedgerKey::ContractCode(k) => {
-                self.contract_code.mark_deleted(k.hash.0);
+                self.contract_code.mark_deleted(k.hash.clone());
             }
             LedgerKey::Ttl(k) => {
-                self.deleted_ttl.insert(k.key_hash.0);
+                self.deleted_ttl.insert(k.key_hash.clone());
             }
             _ => {}
         }

@@ -5,7 +5,7 @@ use super::*;
 impl LedgerStateManager {
     /// Get a TTL entry by key hash (read-only).
     pub fn get_ttl(&self, key_hash: &Hash) -> Option<&TtlEntry> {
-        self.ttl_entries.get(&key_hash.0)
+        self.ttl_entries.get(key_hash)
     }
 
     /// Get the TTL live_until_ledger_seq at ledger start.
@@ -15,7 +15,7 @@ impl LedgerStateManager {
     /// by Soroban execution to match stellar-core behavior where transactions
     /// see the bucket list state at ledger start, not changes from previous txs.
     pub fn get_ttl_at_ledger_start(&self, key_hash: &Hash) -> Option<u32> {
-        self.ttl_bucket_list_snapshot.get(&key_hash.0).copied()
+        self.ttl_bucket_list_snapshot.get(key_hash).copied()
     }
 
     /// Capture the current TTL values as the bucket list snapshot.
@@ -28,22 +28,24 @@ impl LedgerStateManager {
         self.ttl_bucket_list_snapshot.clear();
         for (key_hash, ttl) in &self.ttl_entries {
             self.ttl_bucket_list_snapshot
-                .insert(*key_hash, ttl.live_until_ledger_seq);
+                .insert(key_hash.clone(), ttl.live_until_ledger_seq);
         }
     }
 
     /// Get a mutable reference to a TTL entry.
     pub fn get_ttl_mut(&mut self, key_hash: &Hash) -> Option<&mut TtlEntry> {
-        let key = key_hash.0;
-
-        if self.ttl_entries.contains_key(&key) {
+        if self.ttl_entries.contains_key(key_hash) {
             // Save snapshot if not already saved or if it's None (for newly created entries).
             // For newly created entries, we update the snapshot to the current value so
             // subsequent operations can track changes with STATE/UPDATED pairs.
             // Rollback correctness is ensured by the created_ttl set.
-            if !self.ttl_snapshots.get(&key).is_some_and(|s| s.is_some()) {
-                let snapshot = self.ttl_entries.get(&key).cloned();
-                self.ttl_snapshots.insert(key, snapshot);
+            if !self
+                .ttl_snapshots
+                .get(key_hash)
+                .is_some_and(|s| s.is_some())
+            {
+                let snapshot = self.ttl_entries.get(key_hash).cloned();
+                self.ttl_snapshots.insert(key_hash.clone(), snapshot);
             }
             let ledger_key = LedgerKey::Ttl(LedgerKeyTtl {
                 key_hash: key_hash.clone(),
@@ -51,10 +53,10 @@ impl LedgerStateManager {
             self.capture_op_snapshot_for_key(&ledger_key);
             self.snapshot_last_modified_key(&ledger_key);
             // Track modification
-            if !self.modified_ttl.contains(&key) {
-                self.modified_ttl.push(key);
+            if !self.modified_ttl.contains(key_hash) {
+                self.modified_ttl.push(key_hash.clone());
             }
-            self.ttl_entries.get_mut(&key)
+            self.ttl_entries.get_mut(key_hash)
         } else {
             None
         }
@@ -62,9 +64,9 @@ impl LedgerStateManager {
 
     /// Create a new TTL entry.
     pub fn create_ttl(&mut self, entry: TtlEntry) {
-        let key = entry.key_hash.0;
+        let key_hash = entry.key_hash.clone();
         let ledger_key = LedgerKey::Ttl(LedgerKeyTtl {
-            key_hash: entry.key_hash.clone(),
+            key_hash: key_hash.clone(),
         });
 
         tracing::debug!(
@@ -74,8 +76,8 @@ impl LedgerStateManager {
         );
 
         // Save snapshot (None because it didn't exist)
-        let existing_snapshot = self.ttl_snapshots.get(&key).cloned();
-        self.ttl_snapshots.entry(key).or_insert(None);
+        let existing_snapshot = self.ttl_snapshots.get(&key_hash).cloned();
+        self.ttl_snapshots.entry(key_hash.clone()).or_insert(None);
         tracing::debug!(
             key_hash = ?entry.key_hash,
             ?existing_snapshot,
@@ -93,14 +95,14 @@ impl LedgerStateManager {
         self.delta.record_create(ledger_entry);
 
         // Insert into state
-        self.ttl_entries.insert(key, entry);
+        self.ttl_entries.insert(key_hash.clone(), entry);
 
         // Track that this entry was created in this transaction (for rollback)
-        self.created_ttl.insert(key);
+        self.created_ttl.insert(key_hash.clone());
 
         // Track modification
-        if !self.modified_ttl.contains(&key) {
-            self.modified_ttl.push(key);
+        if !self.modified_ttl.contains(&key_hash) {
+            self.modified_ttl.push(key_hash);
         }
     }
 
@@ -112,9 +114,9 @@ impl LedgerStateManager {
     /// with a value that earlier transactions already set. Recording a no-op update
     /// would cause bucket list divergence from stellar-core.
     pub fn update_ttl(&mut self, entry: TtlEntry) {
-        let key = entry.key_hash.0;
+        let key_hash = entry.key_hash.clone();
         let ledger_key = LedgerKey::Ttl(LedgerKeyTtl {
-            key_hash: entry.key_hash.clone(),
+            key_hash: key_hash.clone(),
         });
 
         tracing::debug!(
@@ -124,7 +126,7 @@ impl LedgerStateManager {
         );
 
         // Check if the TTL value is actually changing
-        if let Some(existing) = self.ttl_entries.get(&key) {
+        if let Some(existing) = self.ttl_entries.get(&key_hash) {
             if existing.live_until_ledger_seq == entry.live_until_ledger_seq {
                 // TTL value unchanged - skip recording any update.
                 // This can happen when multiple transactions in the same ledger
@@ -134,7 +136,7 @@ impl LedgerStateManager {
                 // value is already 700457 in our state. Recording this no-op
                 // would cause bucket list divergence.
                 tracing::debug!(
-                    ?key,
+                    ?key_hash,
                     live_until = entry.live_until_ledger_seq,
                     "TTL update skipped: value unchanged"
                 );
@@ -143,9 +145,9 @@ impl LedgerStateManager {
         }
 
         // Save snapshot if not already saved (preserves original value for rollback)
-        if !self.ttl_snapshots.contains_key(&key) {
-            let snapshot = self.ttl_entries.get(&key).cloned();
-            self.ttl_snapshots.insert(key, snapshot);
+        if !self.ttl_snapshots.contains_key(&key_hash) {
+            let snapshot = self.ttl_entries.get(&key_hash).cloned();
+            self.ttl_snapshots.insert(key_hash.clone(), snapshot);
         }
         self.capture_op_snapshot_for_key(&ledger_key);
         self.snapshot_last_modified_key(&ledger_key);
@@ -154,11 +156,11 @@ impl LedgerStateManager {
 
         // Update state — delta recording is deferred to flush_modified_entries()
         // which compares current state against the snapshot.
-        self.ttl_entries.insert(key, entry.clone());
+        self.ttl_entries.insert(key_hash.clone(), entry.clone());
 
         // Track modification
-        if !self.modified_ttl.contains(&key) {
-            self.modified_ttl.push(key);
+        if !self.modified_ttl.contains(&key_hash) {
+            self.modified_ttl.push(key_hash);
         }
     }
 
@@ -170,9 +172,9 @@ impl LedgerStateManager {
     ///
     /// The state update is still needed for correct bucket list computation.
     pub fn update_ttl_no_delta(&mut self, entry: TtlEntry) {
-        let key = entry.key_hash.0;
+        let key_hash = entry.key_hash.clone();
         let ledger_key = LedgerKey::Ttl(LedgerKeyTtl {
-            key_hash: entry.key_hash.clone(),
+            key_hash: key_hash.clone(),
         });
 
         tracing::debug!(
@@ -182,7 +184,7 @@ impl LedgerStateManager {
         );
 
         // Check if the TTL value is actually changing
-        if let Some(existing) = self.ttl_entries.get(&key) {
+        if let Some(existing) = self.ttl_entries.get(&key_hash) {
             if existing.live_until_ledger_seq == entry.live_until_ledger_seq {
                 // TTL value unchanged - nothing to do
                 return;
@@ -193,14 +195,14 @@ impl LedgerStateManager {
         self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
 
         // Update state only (no delta recording)
-        self.ttl_entries.insert(key, entry.clone());
+        self.ttl_entries.insert(key_hash.clone(), entry.clone());
 
         // Update snapshot to prevent flush_modified_entries from recording this
-        self.ttl_snapshots.insert(key, Some(entry));
+        self.ttl_snapshots.insert(key_hash.clone(), Some(entry));
 
         // Track modification (for bucket list, but not for delta/meta)
-        if !self.modified_ttl.contains(&key) {
-            self.modified_ttl.push(key);
+        if !self.modified_ttl.contains(&key_hash) {
+            self.modified_ttl.push(key_hash);
         }
     }
 
@@ -217,7 +219,6 @@ impl LedgerStateManager {
     /// 2. Does NOT update ttl_entries (so subsequent TX lookups return old value)
     /// 3. Stores the bump for later flushing to state
     pub fn record_ro_ttl_bump_for_meta(&mut self, key_hash: &Hash, live_until_ledger_seq: u32) {
-        let key = key_hash.0;
         let ledger_key = LedgerKey::Ttl(LedgerKeyTtl {
             key_hash: key_hash.clone(),
         });
@@ -225,7 +226,7 @@ impl LedgerStateManager {
         // Get pre-state (current value in ttl_entries, NOT including deferred bumps)
         let pre_state = self
             .ttl_entries
-            .get(&key)
+            .get(key_hash)
             .map(|ttl| self.ttl_to_ledger_entry(ttl));
 
         if pre_state.is_none() {
@@ -238,7 +239,7 @@ impl LedgerStateManager {
         }
 
         // Check if TTL is actually changing
-        if let Some(existing) = self.ttl_entries.get(&key) {
+        if let Some(existing) = self.ttl_entries.get(key_hash) {
             if existing.live_until_ledger_seq == live_until_ledger_seq {
                 // No change needed
                 tracing::debug!(
@@ -280,7 +281,10 @@ impl LedgerStateManager {
 
         // Also store for later flushing to state (for bucket list)
         // Only keep the highest TTL bump for each key
-        let entry = self.deferred_ro_ttl_bumps.entry(key).or_insert(0);
+        let entry = self
+            .deferred_ro_ttl_bumps
+            .entry(key_hash.clone())
+            .or_insert(0);
         if live_until_ledger_seq > *entry {
             *entry = live_until_ledger_seq;
         }
@@ -297,9 +301,11 @@ impl LedgerStateManager {
     /// these bumps to the delta (after transaction meta is built, before bucket list
     /// is updated).
     pub fn defer_ro_ttl_bump(&mut self, key_hash: &Hash, live_until_ledger_seq: u32) {
-        let key = key_hash.0;
         // Only keep the highest TTL bump for each key
-        let entry = self.deferred_ro_ttl_bumps.entry(key).or_insert(0);
+        let entry = self
+            .deferred_ro_ttl_bumps
+            .entry(key_hash.clone())
+            .or_insert(0);
         if live_until_ledger_seq > *entry {
             *entry = live_until_ledger_seq;
         }
@@ -326,7 +332,7 @@ impl LedgerStateManager {
             }
 
             // Compute the TTL key hash (SHA-256 of the XDR-encoded entry key)
-            let key_hash = crate::soroban::compute_key_hash(key).0;
+            let key_hash = crate::soroban::compute_key_hash(key);
 
             // Check if there's a pending RO TTL bump for this key
             if let Some(bumped_live_until) = self.deferred_ro_ttl_bumps.remove(&key_hash) {
@@ -339,7 +345,7 @@ impl LedgerStateManager {
                             "flush_ro_ttl_bumps_for_write_footprint: flushing bump for write key"
                         );
                         let ttl = TtlEntry {
-                            key_hash: Hash(key_hash),
+                            key_hash,
                             live_until_ledger_seq: bumped_live_until,
                         };
                         self.update_ttl_no_delta(ttl);
@@ -364,9 +370,8 @@ impl LedgerStateManager {
             count = bumps.len(),
             "flush_deferred_ro_ttl_bumps: starting flush"
         );
-        for (key, live_until) in bumps {
-            let key_hash = Hash(key);
-            if let Some(existing) = self.ttl_entries.get(&key) {
+        for (key_hash, live_until) in bumps {
+            if let Some(existing) = self.ttl_entries.get(&key_hash) {
                 // Only update if the deferred bump is higher than current value
                 if live_until > existing.live_until_ledger_seq {
                     let ttl = TtlEntry {
@@ -403,15 +408,13 @@ impl LedgerStateManager {
 
     /// Extend the TTL of an entry to the specified ledger sequence.
     pub fn extend_ttl(&mut self, key_hash: &Hash, live_until_ledger_seq: u32) {
-        let key = key_hash.0;
-
-        if let Some(ttl_entry) = self.ttl_entries.get(&key).cloned() {
+        if let Some(ttl_entry) = self.ttl_entries.get(key_hash).cloned() {
             // Only extend if the new TTL is greater
             if live_until_ledger_seq > ttl_entry.live_until_ledger_seq {
                 // If this entry was created in this transaction, we should NOT emit
                 // a STATE+UPDATED pair - the CREATED entry should reflect the final value.
                 // We update the delta's created entry directly instead.
-                if self.created_ttl.contains(&key) {
+                if self.created_ttl.contains(key_hash) {
                     // Create updated entry
                     let updated = TtlEntry {
                         key_hash: ttl_entry.key_hash,
@@ -420,11 +423,11 @@ impl LedgerStateManager {
                     // Update the created entry in delta to reflect final value
                     self.delta.update_created_ttl(key_hash, &updated);
                     // Update state
-                    self.ttl_entries.insert(key, updated);
+                    self.ttl_entries.insert(key_hash.clone(), updated);
                 } else {
                     // Save snapshot if not already saved (preserves original value for rollback)
                     self.ttl_snapshots
-                        .entry(key)
+                        .entry(key_hash.clone())
                         .or_insert_with(|| Some(ttl_entry.clone()));
                     let ledger_key = LedgerKey::Ttl(LedgerKeyTtl {
                         key_hash: key_hash.clone(),
@@ -441,11 +444,11 @@ impl LedgerStateManager {
                     };
 
                     // Update state — delta recording is deferred to flush_modified_entries()
-                    self.ttl_entries.insert(key, updated);
+                    self.ttl_entries.insert(key_hash.clone(), updated);
 
                     // Track modification
-                    if !self.modified_ttl.contains(&key) {
-                        self.modified_ttl.push(key);
+                    if !self.modified_ttl.contains(key_hash) {
+                        self.modified_ttl.push(key_hash.clone());
                     }
                 }
             }
@@ -454,15 +457,14 @@ impl LedgerStateManager {
 
     /// Delete a TTL entry.
     pub fn delete_ttl(&mut self, key_hash: &Hash) {
-        let key = key_hash.0;
         let ledger_key = LedgerKey::Ttl(LedgerKeyTtl {
             key_hash: key_hash.clone(),
         });
 
         // Save snapshot if not already saved
-        if !self.ttl_snapshots.contains_key(&key) {
-            let snapshot = self.ttl_entries.get(&key).cloned();
-            self.ttl_snapshots.insert(key, snapshot);
+        if !self.ttl_snapshots.contains_key(key_hash) {
+            let snapshot = self.ttl_entries.get(key_hash).cloned();
+            self.ttl_snapshots.insert(key_hash.clone(), snapshot);
         }
         self.capture_op_snapshot_for_key(&ledger_key);
         self.snapshot_last_modified_key(&ledger_key);
@@ -470,7 +472,7 @@ impl LedgerStateManager {
         // Get pre-state (current value BEFORE deletion)
         let pre_state = self
             .ttl_entries
-            .get(&key)
+            .get(key_hash)
             .map(|ttl| self.ttl_to_ledger_entry(ttl));
 
         // Record in delta with pre-state
@@ -480,10 +482,10 @@ impl LedgerStateManager {
 
         // Remove from state and track deletion
         self.clear_entry_sponsorship_metadata(&ledger_key);
-        self.ttl_entries.remove(&key);
+        self.ttl_entries.remove(key_hash);
         self.remove_last_modified_key(&ledger_key);
         // Track this deletion to prevent reloading from bucket list
-        self.deleted_ttl.insert(key);
+        self.deleted_ttl.insert(key_hash.clone());
     }
 
     /// Check if a TTL entry is live (not expired).

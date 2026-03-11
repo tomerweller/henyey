@@ -675,28 +675,23 @@ fn find_pool_share_trustlines_for_asset(
 
     let mut result = Vec::new();
 
-    let account_bytes = crate::state::account_id_to_bytes(account_id);
     for (key, _tl) in state.trustlines_iter() {
-        let (acct_bytes, asset_key) = key;
-        if *acct_bytes != account_bytes {
+        let (acct_id, asset_key) = key;
+        if acct_id != account_id {
             continue;
         }
-        let pool_id_bytes = match asset_key {
-            crate::state::AssetKey::PoolShare(bytes) => bytes,
+        let pool_id = match asset_key {
+            TrustLineAsset::PoolShare(pool_id) => pool_id,
             _ => continue,
         };
 
-        let pool_id = PoolId(Hash(*pool_id_bytes));
-        let Some(pool) = state.get_liquidity_pool(&pool_id) else {
+        let Some(pool) = state.get_liquidity_pool(pool_id) else {
             continue;
         };
 
         let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &pool.body;
         if &cp.params.asset_a == asset || &cp.params.asset_b == asset {
-            result.push((
-                pool_id,
-                TrustLineAsset::PoolShare(PoolId(Hash(*pool_id_bytes))),
-            ));
+            result.push((pool_id.clone(), TrustLineAsset::PoolShare(pool_id.clone())));
         }
     }
 
@@ -787,12 +782,9 @@ fn decrement_pool_shares_trust_line_count(state: &mut LedgerStateManager, pool_i
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::create_test_account_id;
     use henyey_common::LIQUIDITY_POOL_FEE_V18;
     use stellar_xdr::curr::*;
-
-    fn create_test_account_id(seed: u8) -> AccountId {
-        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
-    }
 
     fn create_test_account(account_id: AccountId, balance: i64, flags: u32) -> AccountEntry {
         AccountEntry {

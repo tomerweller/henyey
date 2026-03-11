@@ -162,6 +162,55 @@ impl AsRef<[u8]> for Hash256 {
     }
 }
 
+/// Extract the [`LedgerKey`] from a [`LedgerEntry`].
+///
+/// This is the canonical, infallible conversion from a ledger entry to its
+/// corresponding key. The match is exhaustive over all `LedgerEntryData`
+/// variants, so it always succeeds.
+pub fn entry_to_key(entry: &stellar_xdr::curr::LedgerEntry) -> stellar_xdr::curr::LedgerKey {
+    use stellar_xdr::curr::*;
+
+    match &entry.data {
+        LedgerEntryData::Account(a) => LedgerKey::Account(LedgerKeyAccount {
+            account_id: a.account_id.clone(),
+        }),
+        LedgerEntryData::Trustline(t) => LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: t.account_id.clone(),
+            asset: t.asset.clone(),
+        }),
+        LedgerEntryData::Offer(o) => LedgerKey::Offer(LedgerKeyOffer {
+            seller_id: o.seller_id.clone(),
+            offer_id: o.offer_id,
+        }),
+        LedgerEntryData::Data(d) => LedgerKey::Data(LedgerKeyData {
+            account_id: d.account_id.clone(),
+            data_name: d.data_name.clone(),
+        }),
+        LedgerEntryData::ClaimableBalance(c) => {
+            LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+                balance_id: c.balance_id.clone(),
+            })
+        }
+        LedgerEntryData::LiquidityPool(l) => LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
+            liquidity_pool_id: l.liquidity_pool_id.clone(),
+        }),
+        LedgerEntryData::ContractData(c) => LedgerKey::ContractData(LedgerKeyContractData {
+            contract: c.contract.clone(),
+            key: c.key.clone(),
+            durability: c.durability,
+        }),
+        LedgerEntryData::ContractCode(c) => LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: c.hash.clone(),
+        }),
+        LedgerEntryData::ConfigSetting(c) => LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: c.discriminant(),
+        }),
+        LedgerEntryData::Ttl(t) => LedgerKey::Ttl(LedgerKeyTtl {
+            key_hash: t.key_hash.clone(),
+        }),
+    }
+}
+
 /// Authorization threshold level required for an operation.
 ///
 /// Stellar accounts have three configurable threshold levels that determine

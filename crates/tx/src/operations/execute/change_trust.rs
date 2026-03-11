@@ -13,7 +13,6 @@ use super::{
     trustline_liabilities, ACCOUNT_SUBENTRY_LIMIT, AUTHORIZED_FLAG,
     TRUSTLINE_CLAWBACK_ENABLED_FLAG,
 };
-use crate::apply::account_id_to_key;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
@@ -45,9 +44,7 @@ pub fn execute_change_trust(
     if let Some(asset) = &maybe_asset {
         let issuer = get_asset_issuer(asset);
         if let Some(issuer_id) = issuer {
-            let source_key = account_id_to_key(source);
-            let issuer_key = account_id_to_key(&issuer_id);
-            if source_key == issuer_key {
+            if source == &issuer_id {
                 return Ok(make_result(ChangeTrustResultCode::Malformed));
             }
         }
@@ -306,7 +303,7 @@ fn validate_pool_asset_trustline(
         return Ok(());
     }
     if let Some(issuer) = get_asset_issuer(asset) {
-        if account_id_to_key(&issuer) == account_id_to_key(source) {
+        if &issuer == source {
             return Ok(());
         }
     }
@@ -352,7 +349,7 @@ fn adjust_pool_use_count(
         return Ok(());
     }
     if let Some(issuer) = get_asset_issuer(asset) {
-        if account_id_to_key(&issuer) == account_id_to_key(source) {
+        if &issuer == source {
             return Ok(());
         }
     }
@@ -507,13 +504,10 @@ fn make_result(code: ChangeTrustResultCode) -> OperationResult {
 mod tests {
     use super::*;
     use crate::operations::execute::manage_offer::execute_manage_sell_offer;
+    use crate::test_utils::create_test_account_id;
     use henyey_common::LIQUIDITY_POOL_FEE_V18;
     use sha2::{Digest, Sha256};
     use stellar_xdr::curr::*;
-
-    fn create_test_account_id(seed: u8) -> AccountId {
-        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
-    }
 
     fn create_test_account(account_id: AccountId, balance: i64) -> AccountEntry {
         AccountEntry {

@@ -298,15 +298,11 @@ impl Default for ReconcilerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::create_test_account_id;
     use stellar_xdr::curr::{
         AccountEntry, AccountEntryExt, AccountId, LedgerEntry, LedgerEntryData, LedgerEntryExt,
-        LedgerKey, LedgerKeyAccount, PublicKey, SequenceNumber, String32, Thresholds, Uint256,
-        VecM,
+        LedgerKey, LedgerKeyAccount, SequenceNumber, String32, Thresholds, Uint256, VecM,
     };
-
-    fn make_account_id(seed: u8) -> AccountId {
-        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
-    }
 
     fn make_account_entry(account_id: AccountId, balance: i64) -> LedgerEntry {
         LedgerEntry {
@@ -349,7 +345,7 @@ mod tests {
     #[test]
     fn test_reconciler_track_balance() {
         let mut reconciler = LumenEventReconciler::new();
-        let account_id = make_account_id(1);
+        let account_id = create_test_account_id(1);
 
         reconciler.track_balance(account_id.clone(), 1000);
 
@@ -359,7 +355,7 @@ mod tests {
     #[test]
     fn test_reconciler_track_balance_disabled() {
         let mut reconciler = LumenEventReconciler::disabled();
-        let account_id = make_account_id(1);
+        let account_id = create_test_account_id(1);
 
         reconciler.track_balance(account_id.clone(), 1000);
 
@@ -369,7 +365,7 @@ mod tests {
     #[test]
     fn test_reconciler_calculate_account_delta() {
         let mut reconciler = LumenEventReconciler::new();
-        let account_id = make_account_id(1);
+        let account_id = create_test_account_id(1);
 
         reconciler.track_balance(account_id.clone(), 1000);
 
@@ -389,8 +385,8 @@ mod tests {
     #[test]
     fn test_reconciler_calculate_total_delta() {
         let mut reconciler = LumenEventReconciler::new();
-        let account1 = make_account_id(1);
-        let account2 = make_account_id(2);
+        let account1 = create_test_account_id(1);
+        let account2 = create_test_account_id(2);
 
         reconciler.track_balance(account1.clone(), 1000);
         reconciler.track_balance(account2.clone(), 2000);
@@ -414,7 +410,7 @@ mod tests {
     #[test]
     fn test_reconciler_clear() {
         let mut reconciler = LumenEventReconciler::new();
-        let account_id = make_account_id(1);
+        let account_id = create_test_account_id(1);
 
         reconciler.track_balance(account_id.clone(), 1000);
         assert!(reconciler.get_tracked_balance(&account_id).is_some());
@@ -437,7 +433,7 @@ mod tests {
 
     #[test]
     fn test_get_account_balance() {
-        let account_id = make_account_id(1);
+        let account_id = create_test_account_id(1);
         let entry = make_account_entry(account_id.clone(), 5000);
 
         assert_eq!(get_account_balance(Some(&entry)), 5000);
@@ -453,7 +449,7 @@ mod tests {
 
     #[test]
     fn test_calculate_balance_delta_created() {
-        let account_id = make_account_id(1);
+        let account_id = create_test_account_id(1);
         let entry = make_account_entry(account_id.clone(), 1000);
 
         let mut delta = LedgerDelta::new(1);
@@ -465,7 +461,7 @@ mod tests {
 
     #[test]
     fn test_calculate_balance_delta_deleted() {
-        let account_id = make_account_id(1);
+        let account_id = create_test_account_id(1);
         let entry = make_account_entry(account_id.clone(), 1000);
 
         let mut delta = LedgerDelta::new(1);
@@ -477,7 +473,7 @@ mod tests {
 
     #[test]
     fn test_calculate_balance_delta_updated() {
-        let account_id = make_account_id(1);
+        let account_id = create_test_account_id(1);
         let prev_entry = make_account_entry(account_id.clone(), 1000);
         let curr_entry = make_account_entry(account_id.clone(), 1500);
 
@@ -490,9 +486,9 @@ mod tests {
 
     #[test]
     fn test_calculate_balance_delta_multiple() {
-        let account1 = make_account_id(1);
-        let account2 = make_account_id(2);
-        let account3 = make_account_id(3);
+        let account1 = create_test_account_id(1);
+        let account2 = create_test_account_id(2);
+        let account3 = create_test_account_id(3);
 
         let mut delta = LedgerDelta::new(1);
 
@@ -518,7 +514,7 @@ mod tests {
 
     #[test]
     fn test_calculate_balance_delta_zero() {
-        let account_id = make_account_id(1);
+        let account_id = create_test_account_id(1);
         let entry = make_account_entry(account_id.clone(), 1000);
 
         let mut delta = LedgerDelta::new(1);

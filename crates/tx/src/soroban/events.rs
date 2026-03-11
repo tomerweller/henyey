@@ -2,24 +2,16 @@
 //!
 //! Records events emitted during contract execution.
 
-use stellar_xdr::curr::{ContractId, Hash, ScVal, WriteXdr};
-
-/// Type of contract event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EventType {
-    /// Regular contract event.
-    Contract,
-    /// System event (created/deleted entries).
-    System,
-    /// Diagnostic event (debug info).
-    Diagnostic,
-}
+use stellar_xdr::curr::{
+    ContractEvent as XdrContractEvent, ContractEventBody, ContractEventType, ContractEventV0,
+    ContractId, ExtensionPoint, Hash, ScVal, WriteXdr,
+};
 
 /// A contract event emitted during execution.
 #[derive(Debug, Clone)]
 pub struct ContractEvent {
     /// The type of event.
-    pub event_type: EventType,
+    pub event_type: ContractEventType,
     /// The contract that emitted the event.
     pub contract_id: Option<ContractId>,
     /// Event topics (indexed fields).
@@ -31,7 +23,7 @@ pub struct ContractEvent {
 impl ContractEvent {
     /// Create a new contract event.
     pub fn new(
-        event_type: EventType,
+        event_type: ContractEventType,
         contract_id: Option<ContractId>,
         topics: Vec<ScVal>,
         data: ScVal,
@@ -47,7 +39,7 @@ impl ContractEvent {
     /// Create a system event for entry creation.
     pub fn entry_created(contract_id: &ContractId, key: &ScVal) -> Self {
         Self {
-            event_type: EventType::System,
+            event_type: ContractEventType::System,
             contract_id: Some(contract_id.clone()),
             topics: vec![ScVal::Symbol(
                 "entry_created".try_into().unwrap_or_default(),
@@ -59,7 +51,7 @@ impl ContractEvent {
     /// Create a system event for entry deletion.
     pub fn entry_deleted(contract_id: &ContractId, key: &ScVal) -> Self {
         Self {
-            event_type: EventType::System,
+            event_type: ContractEventType::System,
             contract_id: Some(contract_id.clone()),
             topics: vec![ScVal::Symbol(
                 "entry_deleted".try_into().unwrap_or_default(),
@@ -74,8 +66,8 @@ impl ContractEvent {
 
         let mut hasher = Sha256::new();
 
-        // Hash event type
-        hasher.update([self.event_type as u8]);
+        // Hash event type (as i32, matching the XDR #[repr(i32)] encoding)
+        hasher.update((self.event_type as i32).to_be_bytes());
 
         // Hash contract ID if present
         if let Some(ref id) = self.contract_id {
@@ -115,7 +107,7 @@ impl ContractEvents {
 
     /// Add an event.
     pub fn push(&mut self, event: ContractEvent) {
-        if event.event_type == EventType::Diagnostic {
+        if event.event_type == ContractEventType::Diagnostic {
             self.diagnostic_events.push(event);
         } else {
             self.events.push(event);
@@ -158,25 +150,14 @@ impl ContractEvents {
     }
 
     /// Convert to XDR events vector.
-    pub fn to_xdr(&self) -> Vec<stellar_xdr::curr::ContractEvent> {
+    pub fn to_xdr(&self) -> Vec<XdrContractEvent> {
         self.events
             .iter()
             .filter_map(|e| self.event_to_xdr(e))
             .collect()
     }
 
-    fn event_to_xdr(&self, event: &ContractEvent) -> Option<stellar_xdr::curr::ContractEvent> {
-        use stellar_xdr::curr::{
-            ContractEvent as XdrContractEvent, ContractEventBody, ContractEventType,
-            ContractEventV0, ExtensionPoint,
-        };
-
-        let event_type = match event.event_type {
-            EventType::Contract => ContractEventType::Contract,
-            EventType::System => ContractEventType::System,
-            EventType::Diagnostic => ContractEventType::Diagnostic,
-        };
-
+    fn event_to_xdr(&self, event: &ContractEvent) -> Option<XdrContractEvent> {
         let body = ContractEventBody::V0(ContractEventV0 {
             topics: event.topics.clone().try_into().ok()?,
             data: event.data.clone(),
@@ -185,7 +166,7 @@ impl ContractEvents {
         Some(XdrContractEvent {
             ext: ExtensionPoint::V0,
             contract_id: event.contract_id.clone(),
-            type_: event_type,
+            type_: event.event_type,
             body,
         })
     }
@@ -205,13 +186,13 @@ mod tests {
     fn test_event_creation() {
         let contract_id = ContractId(Hash([1u8; 32]));
         let event = ContractEvent::new(
-            EventType::Contract,
+            ContractEventType::Contract,
             Some(contract_id),
             vec![ScVal::Symbol("transfer".try_into().unwrap())],
             ScVal::I64(1000),
         );
 
-        assert_eq!(event.event_type, EventType::Contract);
+        assert_eq!(event.event_type, ContractEventType::Contract);
         assert!(event.contract_id.is_some());
     }
 
@@ -220,7 +201,7 @@ mod tests {
         let mut events = ContractEvents::new();
         assert!(events.is_empty());
 
-        let event = ContractEvent::new(EventType::Contract, None, vec![], ScVal::Void);
+        let event = ContractEvent::new(ContractEventType::Contract, None, vec![], ScVal::Void);
         events.push(event);
 
         assert_eq!(events.len(), 1);
@@ -232,13 +213,13 @@ mod tests {
         let mut events = ContractEvents::new();
 
         events.push(ContractEvent::new(
-            EventType::Contract,
+            ContractEventType::Contract,
             None,
             vec![],
             ScVal::Void,
         ));
         events.push(ContractEvent::new(
-            EventType::Diagnostic,
+            ContractEventType::Diagnostic,
             None,
             vec![],
             ScVal::Void,
@@ -255,7 +236,7 @@ mod tests {
         let key = ScVal::U32(42);
         let event = ContractEvent::entry_created(&contract_id, &key);
 
-        assert_eq!(event.event_type, EventType::System);
+        assert_eq!(event.event_type, ContractEventType::System);
         assert!(event.contract_id.is_some());
         assert_eq!(event.topics.len(), 1);
         assert!(matches!(event.data, ScVal::U32(42)));
@@ -268,7 +249,7 @@ mod tests {
         let key = ScVal::I64(100);
         let event = ContractEvent::entry_deleted(&contract_id, &key);
 
-        assert_eq!(event.event_type, EventType::System);
+        assert_eq!(event.event_type, ContractEventType::System);
         assert!(event.contract_id.is_some());
         assert_eq!(event.topics.len(), 1);
         assert!(matches!(event.data, ScVal::I64(100)));
@@ -278,13 +259,13 @@ mod tests {
     #[test]
     fn test_event_hash() {
         let event1 = ContractEvent::new(
-            EventType::Contract,
+            ContractEventType::Contract,
             Some(ContractId(Hash([1u8; 32]))),
             vec![ScVal::I32(1)],
             ScVal::I64(100),
         );
         let event2 = ContractEvent::new(
-            EventType::Contract,
+            ContractEventType::Contract,
             Some(ContractId(Hash([2u8; 32]))),
             vec![ScVal::I32(1)],
             ScVal::I64(100),
@@ -312,7 +293,7 @@ mod tests {
 
         // Add an event
         events.push(ContractEvent::new(
-            EventType::Contract,
+            ContractEventType::Contract,
             None,
             vec![],
             ScVal::I32(42),
@@ -328,13 +309,13 @@ mod tests {
         let mut events = ContractEvents::new();
 
         events.push(ContractEvent::new(
-            EventType::Contract,
+            ContractEventType::Contract,
             None,
             vec![],
             ScVal::Void,
         ));
         events.push(ContractEvent::new(
-            EventType::Diagnostic,
+            ContractEventType::Diagnostic,
             None,
             vec![],
             ScVal::Void,
@@ -355,13 +336,13 @@ mod tests {
         let mut events = ContractEvents::new();
 
         events.push(ContractEvent::new(
-            EventType::Contract,
+            ContractEventType::Contract,
             Some(ContractId(Hash([4u8; 32]))),
             vec![ScVal::Symbol("test".try_into().unwrap())],
             ScVal::U64(999),
         ));
         events.push(ContractEvent::new(
-            EventType::System,
+            ContractEventType::System,
             None,
             vec![],
             ScVal::Void,
@@ -375,7 +356,7 @@ mod tests {
     #[test]
     fn test_event_no_contract_id() {
         let event = ContractEvent::new(
-            EventType::Contract,
+            ContractEventType::Contract,
             None,
             vec![ScVal::Bool(true)],
             ScVal::I32(-1),
@@ -391,7 +372,7 @@ mod tests {
     #[test]
     fn test_event_multiple_topics() {
         let event = ContractEvent::new(
-            EventType::Contract,
+            ContractEventType::Contract,
             Some(ContractId(Hash([5u8; 32]))),
             vec![
                 ScVal::Symbol("transfer".try_into().unwrap()),

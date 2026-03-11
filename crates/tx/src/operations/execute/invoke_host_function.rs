@@ -1201,11 +1201,8 @@ fn map_host_error_to_result_code(
 mod tests {
     use super::*;
     use crate::soroban::StorageChange;
+    use crate::test_utils::create_test_account_id;
     use stellar_xdr::curr::*;
-
-    fn create_test_account_id(seed: u8) -> AccountId {
-        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
-    }
 
     fn create_test_context() -> LedgerContext {
         LedgerContext::testnet(1, 1000)

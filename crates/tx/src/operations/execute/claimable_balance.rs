@@ -390,11 +390,7 @@ fn generate_claimable_balance_id(
 }
 
 fn asset_issuer(asset: &Asset) -> Option<AccountId> {
-    match asset {
-        Asset::Native => None,
-        Asset::CreditAlphanum4(a) => Some(a.issuer.clone()),
-        Asset::CreditAlphanum12(a) => Some(a.issuer.clone()),
-    }
+    henyey_common::asset::get_issuer(asset).ok().cloned()
 }
 
 /// Check if a claim predicate is satisfied.
@@ -523,11 +519,8 @@ fn make_claim_result(code: ClaimClaimableBalanceResultCode) -> OperationResult {
 mod tests {
     use super::super::AUTHORIZED_FLAG;
     use super::*;
+    use crate::test_utils::create_test_account_id;
     use stellar_xdr::curr::*;
-
-    fn create_test_account_id(seed: u8) -> AccountId {
-        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
-    }
 
     fn create_test_account(account_id: AccountId, balance: i64) -> AccountEntry {
         AccountEntry {

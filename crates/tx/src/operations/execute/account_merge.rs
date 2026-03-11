@@ -3,7 +3,7 @@
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1Ext, AccountFlags, AccountId,
     AccountMergeResult, AccountMergeResultCode, LedgerKey, LedgerKeyAccount, MuxedAccount,
-    OperationResult, OperationResultTr, PublicKey, SponsorshipDescriptor,
+    OperationResult, OperationResultTr, SponsorshipDescriptor,
 };
 
 use super::add_account_balance;
@@ -45,11 +45,8 @@ pub fn execute_account_merge(
         return Ok(make_result(AccountMergeResultCode::HasSubEntries));
     }
 
-    let source_key = match &source.0 {
-        PublicKey::PublicKeyTypeEd25519(k) => k.0,
-    };
     let starting_seq = state.starting_sequence_number()?;
-    if let Some(&max_seq) = state.get_max_seq_num_to_apply(&source_key) {
+    if let Some(&max_seq) = state.get_max_seq_num_to_apply(source) {
         if max_seq >= starting_seq {
             return Ok(make_result(AccountMergeResultCode::SeqnumTooFar));
         }
@@ -145,11 +142,8 @@ fn signer_sponsoring_ids(account: &AccountEntry) -> Option<Vec<AccountId>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::create_test_account_id;
     use stellar_xdr::curr::*;
-
-    fn create_test_account_id(seed: u8) -> AccountId {
-        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
-    }
 
     fn create_test_muxed_account(seed: u8) -> MuxedAccount {
         MuxedAccount::Ed25519(Uint256([seed; 32]))
@@ -811,12 +805,9 @@ mod tests {
         state.create_account(create_test_account(dest_id.clone(), 50_000_000));
 
         // Set max_seq_num_to_apply for this source to >= starting_seq
-        let source_key_bytes = match &source_id.0 {
-            PublicKey::PublicKeyTypeEd25519(k) => k.0,
-        };
         let starting_seq = state.starting_sequence_number().unwrap();
         let mut map = std::collections::HashMap::new();
-        map.insert(source_key_bytes, starting_seq);
+        map.insert(source_id.clone(), starting_seq);
         state.set_max_seq_num_to_apply(map);
 
         let result = execute_account_merge(
@@ -854,12 +845,9 @@ mod tests {
         state.create_account(create_test_account(dest_id.clone(), 50_000_000));
 
         // Set max_seq_num_to_apply below starting_seq — merge should succeed
-        let source_key_bytes = match &source_id.0 {
-            PublicKey::PublicKeyTypeEd25519(k) => k.0,
-        };
         let starting_seq = state.starting_sequence_number().unwrap();
         let mut map = std::collections::HashMap::new();
-        map.insert(source_key_bytes, starting_seq - 1);
+        map.insert(source_id.clone(), starting_seq - 1);
         state.set_max_seq_num_to_apply(map);
 
         let result = execute_account_merge(

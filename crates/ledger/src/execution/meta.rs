@@ -9,23 +9,11 @@ use super::*;
 pub(super) fn asset_to_trustline_asset(
     asset: &stellar_xdr::curr::Asset,
 ) -> Option<stellar_xdr::curr::TrustLineAsset> {
-    match asset {
-        stellar_xdr::curr::Asset::Native => None,
-        stellar_xdr::curr::Asset::CreditAlphanum4(a) => Some(
-            stellar_xdr::curr::TrustLineAsset::CreditAlphanum4(a.clone()),
-        ),
-        stellar_xdr::curr::Asset::CreditAlphanum12(a) => Some(
-            stellar_xdr::curr::TrustLineAsset::CreditAlphanum12(a.clone()),
-        ),
-    }
+    henyey_common::asset::non_native_asset_to_trustline_asset(asset)
 }
 
 pub(super) fn asset_issuer_id(asset: &stellar_xdr::curr::Asset) -> Option<AccountId> {
-    match asset {
-        stellar_xdr::curr::Asset::Native => None,
-        stellar_xdr::curr::Asset::CreditAlphanum4(a) => Some(a.issuer.clone()),
-        stellar_xdr::curr::Asset::CreditAlphanum12(a) => Some(a.issuer.clone()),
-    }
+    henyey_common::asset::get_issuer(asset).ok().cloned()
 }
 
 pub(super) fn make_account_key(account_id: &AccountId) -> LedgerKey {
@@ -889,13 +877,7 @@ pub(super) fn build_entry_changes_with_hot_archive(
 
         for entry in created {
             if let Ok(key) = crate::delta::entry_to_key(entry) {
-                push_created_or_restored(
-                    &mut changes,
-                    entry,
-                    &key,
-                    restored,
-                    &mut processed_keys,
-                );
+                push_created_or_restored(&mut changes, entry, &key, restored, &mut processed_keys);
             }
         }
     }

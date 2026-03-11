@@ -208,14 +208,11 @@ fn make_result(code: RestoreFootprintResultCode) -> OperationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::create_test_account_id;
     use stellar_xdr::curr::*;
 
     /// Default min persistent TTL for tests (matches testnet config)
     const TEST_MIN_PERSISTENT_TTL: u32 = 120960;
-
-    fn create_test_account_id(seed: u8) -> AccountId {
-        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
-    }
 
     fn create_test_context() -> LedgerContext {
         LedgerContext::testnet(1, 1000)

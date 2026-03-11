@@ -6,13 +6,6 @@
 
 use super::*;
 
-/// Convert AccountId to key bytes.
-pub(crate) fn account_id_to_key(account_id: &AccountId) -> [u8; 32] {
-    match &account_id.0 {
-        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => key.0,
-    }
-}
-
 /// Check if an operation result indicates success.
 pub(super) fn is_operation_success(result: &OperationResult) -> bool {
     match result {
@@ -118,7 +111,8 @@ pub(super) fn has_sufficient_signer_weight(
     let mut counted: HashSet<Hash256> = HashSet::new();
 
     // Master key signer.
-    let master_key_bytes = account_id_to_key(&account.account_id);
+    let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref master_key) = account.account_id.0;
+    let master_key_bytes = &master_key.0;
     let master_weight = account.thresholds.0[0] as u32;
     tracing::trace!(
         master_weight = master_weight,
@@ -129,12 +123,10 @@ pub(super) fn has_sufficient_signer_weight(
         "Checking signature weight"
     );
     if master_weight > 0 {
-        let has_sig = has_ed25519_signature_raw(tx_hash, signatures, &master_key_bytes);
+        let has_sig = has_ed25519_signature_raw(tx_hash, signatures, master_key_bytes);
         tracing::trace!(has_master_sig = has_sig, "Master key signature check");
         if has_sig {
-            let id = signer_key_id(&SignerKey::Ed25519(stellar_xdr::curr::Uint256(
-                master_key_bytes,
-            )));
+            let id = signer_key_id(&SignerKey::Ed25519(master_key.clone()));
             if counted.insert(id) {
                 total = total.saturating_add(master_weight);
             }
@@ -190,9 +182,7 @@ pub(super) fn has_required_extra_signers(
     extra_signers: &[SignerKey],
 ) -> bool {
     extra_signers.iter().all(|signer| match signer {
-        SignerKey::Ed25519(key) => {
-            has_ed25519_signature_raw(tx_hash, signatures, &key.0)
-        }
+        SignerKey::Ed25519(key) => has_ed25519_signature_raw(tx_hash, signatures, &key.0),
         SignerKey::PreAuthTx(key) => key.0 == tx_hash.0,
         SignerKey::HashX(key) => has_hashx_signature(signatures, key),
         SignerKey::Ed25519SignedPayload(payload) => {

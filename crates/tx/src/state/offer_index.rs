@@ -96,24 +96,24 @@ impl std::hash::Hash for OfferDescriptor {
 }
 
 /// Key for an offer in the primary offers map.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OfferKey {
-    /// Seller account ID (32 bytes).
-    pub seller: [u8; 32],
+    /// Seller account ID.
+    pub seller: AccountId,
     /// Offer ID.
     pub offer_id: i64,
 }
 
 impl OfferKey {
     /// Create a new offer key.
-    pub fn new(seller: [u8; 32], offer_id: i64) -> Self {
+    pub fn new(seller: AccountId, offer_id: i64) -> Self {
         Self { seller, offer_id }
     }
 
     /// Create from an offer entry.
     pub fn from_offer(offer: &OfferEntry) -> Self {
         Self {
-            seller: account_id_to_bytes(&offer.seller_id),
+            seller: offer.seller_id.clone(),
             offer_id: offer.offer_id,
         }
     }
@@ -123,17 +123,17 @@ impl OfferKey {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AssetPair {
     /// Asset being bought.
-    pub buying: AssetKey,
+    pub buying: TrustLineAsset,
     /// Asset being sold.
-    pub selling: AssetKey,
+    pub selling: TrustLineAsset,
 }
 
 impl AssetPair {
     /// Create a new asset pair from XDR assets.
     pub fn new(buying: &Asset, selling: &Asset) -> Self {
         Self {
-            buying: AssetKey::from_asset(buying),
-            selling: AssetKey::from_asset(selling),
+            buying: asset_to_trustline_asset(buying),
+            selling: asset_to_trustline_asset(selling),
         }
     }
 }
@@ -178,7 +178,7 @@ impl OfferIndex {
 
         // Add to order book
         let order_book = self.order_books.entry(asset_pair.clone()).or_default();
-        order_book.insert(descriptor.clone(), key);
+        order_book.insert(descriptor.clone(), key.clone());
 
         // Add to reverse index
         self.offer_locations.insert(key, (asset_pair, descriptor));
@@ -186,7 +186,7 @@ impl OfferIndex {
 
     /// Remove an offer from the index.
     pub fn remove_offer(&mut self, seller: &AccountId, offer_id: i64) {
-        let key = OfferKey::new(account_id_to_bytes(seller), offer_id);
+        let key = OfferKey::new(seller.clone(), offer_id);
         self.remove_by_key(&key);
     }
 
@@ -223,7 +223,7 @@ impl OfferIndex {
         self.order_books
             .get(&asset_pair)
             .and_then(|book| book.first_key_value())
-            .map(|(_, key)| *key)
+            .map(|(_, key)| key.clone())
     }
 
     /// Get the best offer for an asset pair, excluding specific offers.
@@ -243,7 +243,7 @@ impl OfferIndex {
         self.order_books.get(&asset_pair).and_then(|book| {
             book.iter()
                 .find(|(_, key)| filter(key))
-                .map(|(_, key)| *key)
+                .map(|(_, key)| key.clone())
         })
     }
 
@@ -266,7 +266,7 @@ impl OfferIndex {
         self.order_books
             .get(&pair)
             .into_iter()
-            .flat_map(|book| book.values().take(n).copied())
+            .flat_map(|book| book.values().take(n).cloned())
             .collect()
     }
 

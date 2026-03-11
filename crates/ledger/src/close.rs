@@ -486,11 +486,14 @@ fn sorted_for_apply_sequential(
         return txs;
     }
 
-    let mut by_account: HashMap<[u8; 32], Vec<(TransactionEnvelope, Option<u32>)>> = HashMap::new();
+    let mut by_account: HashMap<AccountId, Vec<(TransactionEnvelope, Option<u32>)>> =
+        HashMap::new();
     for (tx, base_fee) in txs {
         let account_id = tx_source_id(&tx);
-        let key = henyey_tx::account_id_to_key(&account_id);
-        by_account.entry(key).or_default().push((tx, base_fee));
+        by_account
+            .entry(account_id)
+            .or_default()
+            .push((tx, base_fee));
     }
 
     let mut queues: Vec<std::collections::VecDeque<(TransactionEnvelope, Option<u32>)>> =
@@ -646,8 +649,7 @@ impl TransactionSetVariant {
 
         let (classic_txs, soroban_phase, all_txs) = match self {
             TransactionSetVariant::Classic(set) => {
-                let txs: Vec<TxWithFee> =
-                    set.txs.iter().cloned().map(|tx| (tx, None)).collect();
+                let txs: Vec<TxWithFee> = set.txs.iter().cloned().map(|tx| (tx, None)).collect();
                 let sorted = sorted_for_apply_sequential(txs, hash);
                 (sorted.clone(), None, sorted)
             }
@@ -1397,15 +1399,14 @@ mod tests {
         set_hash: Hash256,
         use_fee_source: bool,
     ) -> Vec<Hash256> {
-        let mut by_account: HashMap<[u8; 32], Vec<TransactionEnvelope>> = HashMap::new();
+        let mut by_account: HashMap<AccountId, Vec<TransactionEnvelope>> = HashMap::new();
         for tx in txs {
             let account_id = if use_fee_source {
                 fee_source_id(&tx)
             } else {
                 inner_source_id(&tx)
             };
-            let key = henyey_tx::account_id_to_key(&account_id);
-            by_account.entry(key).or_default().push(tx);
+            by_account.entry(account_id).or_default().push(tx);
         }
 
         let mut queues: Vec<std::collections::VecDeque<TransactionEnvelope>> = by_account

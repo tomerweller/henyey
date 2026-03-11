@@ -88,10 +88,8 @@
 //! ```
 
 use stellar_xdr::curr::{
-    AccountEntry, AccountId, LedgerEntry, LedgerEntryChange, LedgerEntryChanges, LedgerEntryData,
-    LedgerKey, LedgerKeyAccount, LedgerKeyClaimableBalance, LedgerKeyContractCode,
-    LedgerKeyContractData, LedgerKeyData, LedgerKeyLiquidityPool, LedgerKeyOffer,
-    LedgerKeyTrustLine, LedgerKeyTtl, TransactionMeta, TransactionResult,
+    AccountEntry, AccountId, LedgerEntry, LedgerEntryChange, LedgerEntryChanges, LedgerKey,
+    TransactionMeta, TransactionResult,
 };
 
 use crate::frame::TransactionFrame;
@@ -540,57 +538,8 @@ pub fn apply_fee_only(
 
 /// Extract the ledger key from a ledger entry.
 pub fn entry_to_key(entry: &LedgerEntry) -> LedgerKey {
-    match &entry.data {
-        LedgerEntryData::Account(a) => LedgerKey::Account(LedgerKeyAccount {
-            account_id: a.account_id.clone(),
-        }),
-        LedgerEntryData::Trustline(t) => LedgerKey::Trustline(LedgerKeyTrustLine {
-            account_id: t.account_id.clone(),
-            asset: t.asset.clone(),
-        }),
-        LedgerEntryData::Offer(o) => LedgerKey::Offer(LedgerKeyOffer {
-            seller_id: o.seller_id.clone(),
-            offer_id: o.offer_id,
-        }),
-        LedgerEntryData::Data(d) => LedgerKey::Data(LedgerKeyData {
-            account_id: d.account_id.clone(),
-            data_name: d.data_name.clone(),
-        }),
-        LedgerEntryData::ClaimableBalance(c) => {
-            LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
-                balance_id: c.balance_id.clone(),
-            })
-        }
-        LedgerEntryData::LiquidityPool(l) => LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
-            liquidity_pool_id: l.liquidity_pool_id.clone(),
-        }),
-        LedgerEntryData::ContractData(c) => LedgerKey::ContractData(LedgerKeyContractData {
-            contract: c.contract.clone(),
-            key: c.key.clone(),
-            durability: c.durability,
-        }),
-        LedgerEntryData::ContractCode(c) => LedgerKey::ContractCode(LedgerKeyContractCode {
-            hash: c.hash.clone(),
-        }),
-        LedgerEntryData::ConfigSetting(c) => {
-            LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
-                config_setting_id: c.discriminant(),
-            })
-        }
-        LedgerEntryData::Ttl(t) => LedgerKey::Ttl(LedgerKeyTtl {
-            key_hash: t.key_hash.clone(),
-        }),
-    }
+    henyey_common::entry_to_key(entry)
 }
-
-/// Convert AccountId to lookup key
-pub fn account_id_to_key(account_id: &stellar_xdr::curr::AccountId) -> [u8; 32] {
-    match &account_id.0 {
-        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => key.0,
-    }
-}
-
-// AssetKey is now defined in crate::state::AssetKey (the canonical definition).
 
 /// Batch apply multiple transactions from history.
 pub fn apply_transaction_set_from_history(
@@ -610,7 +559,7 @@ pub fn apply_transaction_set_from_history(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::AssetKey;
+    use crate::state::asset_to_trustline_asset;
     use stellar_xdr::curr::*;
 
     #[test]
@@ -854,13 +803,13 @@ mod tests {
         assert!(matches!(order[2], ChangeRef::Deleted(0)));
     }
 
-    /// Test AssetKey from different asset types.
+    /// Test asset_to_trustline_asset from different asset types.
     #[test]
-    fn test_asset_key_variants() {
+    fn test_asset_to_trustline_asset_variants() {
         // Native
         let native = stellar_xdr::curr::Asset::Native;
-        let key = AssetKey::from_asset(&native);
-        assert!(matches!(key, AssetKey::Native));
+        let key = asset_to_trustline_asset(&native);
+        assert!(matches!(key, TrustLineAsset::Native));
 
         // CreditAlphanum4
         let issuer = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([5u8; 32])));
@@ -868,10 +817,10 @@ mod tests {
             asset_code: AssetCode4(*b"USD\0"),
             issuer: issuer.clone(),
         });
-        let key = AssetKey::from_asset(&alpha4);
+        let key = asset_to_trustline_asset(&alpha4);
         match key {
-            AssetKey::CreditAlphanum4(code, _) => {
-                assert_eq!(&code, b"USD\0");
+            TrustLineAsset::CreditAlphanum4(a) => {
+                assert_eq!(&a.asset_code.0, b"USD\0");
             }
             _ => panic!("Expected CreditAlphanum4"),
         }
@@ -881,10 +830,10 @@ mod tests {
             asset_code: AssetCode12(*b"LONGASSET123"),
             issuer: issuer.clone(),
         });
-        let key = AssetKey::from_asset(&alpha12);
+        let key = asset_to_trustline_asset(&alpha12);
         match key {
-            AssetKey::CreditAlphanum12(code, _) => {
-                assert_eq!(&code, b"LONGASSET123");
+            TrustLineAsset::CreditAlphanum12(a) => {
+                assert_eq!(&a.asset_code.0, b"LONGASSET123");
             }
             _ => panic!("Expected CreditAlphanum12"),
         }

@@ -88,7 +88,6 @@ mod tx_set;
 
 pub use config::{load_config_setting, load_soroban_config, load_soroban_network_info, compute_soroban_resource_fee};
 pub use result_mapping::build_tx_result_pair;
-pub(crate) use signatures::account_id_to_key;
 pub use tx_set::{execute_transaction_set, execute_transaction_set_with_fee_mode, run_transactions_on_executor, execute_soroban_parallel_phase, pre_deduct_all_fees_on_delta, compute_state_size_window_entry};
 
 use meta::*;
@@ -443,7 +442,7 @@ pub struct TransactionExecutor {
     /// State manager for execution.
     state: LedgerStateManager,
     /// Accounts loaded from snapshot.
-    loaded_accounts: HashMap<[u8; 32], bool>,
+    loaded_accounts: HashMap<AccountId, bool>,
     /// Soroban network configuration for contract execution.
     soroban_config: SorobanConfig,
     /// Classic event configuration.
@@ -665,9 +664,8 @@ impl TransactionExecutor {
 
             let already_loaded = match key {
                 LedgerKey::Account(k) => {
-                    let key_bytes = account_id_to_key(&k.account_id);
                     self.state.get_account(&k.account_id).is_some()
-                        || self.loaded_accounts.contains_key(&key_bytes)
+                        || self.loaded_accounts.contains_key(&k.account_id)
                 }
                 LedgerKey::Trustline(k) => self
                     .state
@@ -696,8 +694,7 @@ impl TransactionExecutor {
         // Mark all account keys as attempted (whether found or not)
         for key in &needed {
             if let LedgerKey::Account(k) = key {
-                let key_bytes = account_id_to_key(&k.account_id);
-                self.loaded_accounts.insert(key_bytes, true);
+                self.loaded_accounts.insert(k.account_id.clone(), true);
             }
         }
 
@@ -749,16 +746,14 @@ impl TransactionExecutor {
             return Ok(true);
         }
 
-        let key_bytes = account_id_to_key(account_id);
-
         // Check if we've already tried to load from snapshot
-        if self.loaded_accounts.contains_key(&key_bytes) {
+        if self.loaded_accounts.contains_key(account_id) {
             tracing::trace!(account = %account_id_to_strkey(account_id), "{}: already tried, not found", label);
             return Ok(false);
         }
 
         // Mark as attempted
-        self.loaded_accounts.insert(key_bytes, true);
+        self.loaded_accounts.insert(account_id.clone(), true);
 
         // Try to load from snapshot
         let key = stellar_xdr::curr::LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
@@ -2107,9 +2102,8 @@ impl TransactionExecutor {
                 let charged_fee = std::cmp::min(acc.balance, fee);
                 acc.balance -= charged_fee;
                 fee = charged_fee;
-                let key_bytes = henyey_tx::account_id_to_key(&fee_source_id);
                 tracing::debug!(
-                    account_prefix = ?&key_bytes[0..4],
+                    account = %account_id_to_strkey(&fee_source_id),
                     old_balance = old_balance,
                     new_balance = acc.balance,
                     fee = charged_fee,
@@ -3815,8 +3809,8 @@ impl<'a> SignatureTracker<'a> {
         let mut signers: Vec<(SignerKey, u32)> = Vec::new();
         let master_weight = account.thresholds.0[0] as u32;
         if master_weight > 0 {
-            let key_bytes = account_id_to_key(&account.account_id);
-            let signer_key = SignerKey::Ed25519(stellar_xdr::curr::Uint256(key_bytes));
+            let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref key) = account.account_id.0;
+            let signer_key = SignerKey::Ed25519(key.clone());
             signers.push((signer_key, master_weight));
         }
         for signer in account.signers.iter() {
@@ -3834,8 +3828,8 @@ impl<'a> SignatureTracker<'a> {
         &mut self,
         account_id: &AccountId,
     ) -> bool {
-        let key_bytes = account_id_to_key(account_id);
-        let signer_key = SignerKey::Ed25519(stellar_xdr::curr::Uint256(key_bytes));
+        let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref key) = account_id.0;
+        let signer_key = SignerKey::Ed25519(key.clone());
         let signers = vec![(signer_key, 1u32)];
         self.check_signature_from_signers(&signers, 0)
     }

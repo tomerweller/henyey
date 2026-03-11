@@ -1028,11 +1028,8 @@ fn make_strict_send_result_with_asset(
 mod tests {
     use super::super::AUTHORIZED_FLAG;
     use super::*;
+    use crate::test_utils::create_test_account_id;
     use stellar_xdr::curr::*;
-
-    fn create_test_account_id(seed: u8) -> AccountId {
-        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
-    }
 
     fn create_test_muxed_account(seed: u8) -> MuxedAccount {
         MuxedAccount::Ed25519(Uint256([seed; 32]))

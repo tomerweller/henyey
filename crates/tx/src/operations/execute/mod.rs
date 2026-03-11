@@ -1129,11 +1129,8 @@ pub fn execute_operation_with_soroban(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::create_test_account_id;
     use stellar_xdr::curr::*;
-
-    fn create_test_account_id() -> AccountId {
-        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32])))
-    }
 
     fn create_test_account(account_id: AccountId, balance: i64) -> AccountEntry {
         AccountEntry {
@@ -1158,7 +1155,7 @@ mod tests {
     fn test_inflation_operation_dispatch() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
-        let source = create_test_account_id();
+        let source = create_test_account_id(0);
 
         // Add the source account to state
         state.create_account(create_test_account(source.clone(), 100_000_000));
@@ -1265,12 +1262,12 @@ mod tests {
     #[test]
     fn test_hot_archive_restore_struct() {
         let key = LedgerKey::Account(LedgerKeyAccount {
-            account_id: create_test_account_id(),
+            account_id: create_test_account_id(0),
         });
         let entry = LedgerEntry {
             last_modified_ledger_seq: 100,
             data: LedgerEntryData::Account(create_test_account(
-                create_test_account_id(),
+                create_test_account_id(0),
                 1_000_000,
             )),
             ext: LedgerEntryExt::V0,
@@ -1287,11 +1284,11 @@ mod tests {
     #[test]
     fn test_hot_archive_restore_debug() {
         let key = LedgerKey::Account(LedgerKeyAccount {
-            account_id: create_test_account_id(),
+            account_id: create_test_account_id(0),
         });
         let entry = LedgerEntry {
             last_modified_ledger_seq: 50,
-            data: LedgerEntryData::Account(create_test_account(create_test_account_id(), 500_000)),
+            data: LedgerEntryData::Account(create_test_account(create_test_account_id(0), 500_000)),
             ext: LedgerEntryExt::V0,
         };
 
@@ -1305,7 +1302,7 @@ mod tests {
     #[test]
     fn test_ledger_key_hash_account() {
         let key = LedgerKey::Account(LedgerKeyAccount {
-            account_id: create_test_account_id(),
+            account_id: create_test_account_id(0),
         });
 
         let hash = crate::soroban::compute_key_hash(&key);
@@ -1338,7 +1335,7 @@ mod tests {
     fn test_bump_sequence_operation_dispatch() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
-        let source = create_test_account_id();
+        let source = create_test_account_id(0);
 
         state.create_account(create_test_account(source.clone(), 100_000_000));
 
@@ -1365,7 +1362,7 @@ mod tests {
     fn test_create_account_operation_dispatch() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
-        let source = create_test_account_id();
+        let source = create_test_account_id(0);
 
         state.create_account(create_test_account(source.clone(), 100_000_000));
 
@@ -1395,7 +1392,7 @@ mod tests {
     fn test_payment_operation_dispatch_no_dest() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
-        let source = create_test_account_id();
+        let source = create_test_account_id(0);
 
         state.create_account(create_test_account(source.clone(), 100_000_000));
 
@@ -1425,7 +1422,7 @@ mod tests {
     fn test_manage_data_operation_dispatch() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
-        let source = create_test_account_id();
+        let source = create_test_account_id(0);
 
         state.create_account(create_test_account(source.clone(), 100_000_000));
 
@@ -1451,7 +1448,7 @@ mod tests {
     fn test_operation_with_explicit_source() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
-        let tx_source = create_test_account_id();
+        let tx_source = create_test_account_id(0);
         let op_source = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([9u8; 32])));
 
         // Create both accounts
@@ -1480,14 +1477,14 @@ mod tests {
 
     #[test]
     fn test_account_balance_after_liabilities_no_ext() {
-        let account = create_test_account(create_test_account_id(), 100_000_000);
+        let account = create_test_account(create_test_account_id(0), 100_000_000);
         // V0 ext means 0 selling liabilities
         assert_eq!(account_balance_after_liabilities(&account), 100_000_000);
     }
 
     #[test]
     fn test_account_balance_after_liabilities_with_liabilities() {
-        let mut account = create_test_account(create_test_account_id(), 100_000_000);
+        let mut account = create_test_account(create_test_account_id(0), 100_000_000);
         account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
             liabilities: Liabilities {
                 buying: 5_000_000,
@@ -1500,7 +1497,7 @@ mod tests {
 
     #[test]
     fn test_account_balance_after_liabilities_saturates_negative() {
-        let mut account = create_test_account(create_test_account_id(), 10_000_000);
+        let mut account = create_test_account(create_test_account_id(0), 10_000_000);
         account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
             liabilities: Liabilities {
                 buying: 0,
@@ -1516,7 +1513,7 @@ mod tests {
 
     #[test]
     fn test_account_balance_after_liabilities_zero_balance() {
-        let account = create_test_account(create_test_account_id(), 0);
+        let account = create_test_account(create_test_account_id(0), 0);
         assert_eq!(account_balance_after_liabilities(&account), 0);
     }
 
@@ -1535,7 +1532,7 @@ mod tests {
             TrustLineEntryExt::V0
         };
         TrustLineEntry {
-            account_id: create_test_account_id(),
+            account_id: create_test_account_id(0),
             asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
                 asset_code: AssetCode4([b'U', b'S', b'D', 0]),
                 issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
@@ -1646,14 +1643,14 @@ mod tests {
     #[test]
     fn test_can_buy_at_most_native_no_account() {
         let state = LedgerStateManager::new(5_000_000, 100);
-        let source = create_test_account_id();
+        let source = create_test_account_id(0);
         assert_eq!(can_buy_at_most(&source, &Asset::Native, &state), 0);
     }
 
     #[test]
     fn test_can_buy_at_most_native_no_liabilities() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
-        let source = create_test_account_id();
+        let source = create_test_account_id(0);
         state.create_account(create_test_account(source.clone(), 100_000_000));
         let capacity = can_buy_at_most(&source, &Asset::Native, &state);
         assert_eq!(capacity, i64::MAX - 100_000_000);
@@ -1662,7 +1659,7 @@ mod tests {
     #[test]
     fn test_can_buy_at_most_native_with_buying_liabilities() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
-        let source = create_test_account_id();
+        let source = create_test_account_id(0);
         let mut account = create_test_account(source.clone(), 100_000_000);
         account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
             liabilities: Liabilities {
@@ -1690,7 +1687,7 @@ mod tests {
     #[test]
     fn test_can_buy_at_most_non_native_no_trustline() {
         let state = LedgerStateManager::new(5_000_000, 100);
-        let source = create_test_account_id();
+        let source = create_test_account_id(0);
         let asset = Asset::CreditAlphanum4(AlphaNum4 {
             asset_code: AssetCode4([b'U', b'S', b'D', 0]),
             issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
@@ -1703,7 +1700,7 @@ mod tests {
     #[test]
     fn test_apply_liabilities_delta_native_selling() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
-        let source = create_test_account_id();
+        let source = create_test_account_id(0);
         state.create_account(create_test_account(source.clone(), 100_000_000));
 
         apply_liabilities_delta(
@@ -1726,7 +1723,7 @@ mod tests {
     #[test]
     fn test_apply_liabilities_delta_missing_account() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
-        let source = create_test_account_id();
+        let source = create_test_account_id(0);
         // No account created
 
         let result = apply_liabilities_delta(

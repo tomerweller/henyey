@@ -156,16 +156,13 @@ pub fn run_transactions_on_executor(
     // Matches stellar-core processFeesSeqNums (LedgerManagerImpl.cpp).
     if deduct_fee {
         let mut merge_seen = false;
-        let mut acc_to_max_seq: HashMap<[u8; 32], i64> = HashMap::new();
+        let mut acc_to_max_seq: HashMap<AccountId, i64> = HashMap::new();
         for (tx, _) in transactions.iter() {
             let frame = TransactionFrame::new(tx.clone());
             let source_id = frame.source_account_id();
-            let source_bytes = match source_id.0 {
-                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(k) => k.0,
-            };
             let seq = frame.sequence_number();
             acc_to_max_seq
-                .entry(source_bytes)
+                .entry(source_id)
                 .and_modify(|e| *e = (*e).max(seq))
                 .or_insert(seq);
             if !merge_seen {

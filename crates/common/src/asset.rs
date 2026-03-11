@@ -256,6 +256,30 @@ pub fn get_issuer(asset: &Asset) -> Result<&AccountId, NoIssuerError> {
     }
 }
 
+/// Convert an [`Asset`] to its [`TrustLineAsset`] equivalent.
+///
+/// The `Asset` enum has three variants (Native, CreditAlphanum4, CreditAlphanum12),
+/// while `TrustLineAsset` adds PoolShare. This conversion maps the three common
+/// variants directly.
+pub fn asset_to_trustline_asset(asset: &Asset) -> TrustLineAsset {
+    match asset {
+        Asset::Native => TrustLineAsset::Native,
+        Asset::CreditAlphanum4(a) => TrustLineAsset::CreditAlphanum4(a.clone()),
+        Asset::CreditAlphanum12(a) => TrustLineAsset::CreditAlphanum12(a.clone()),
+    }
+}
+
+/// Convert a non-native [`Asset`] to its [`TrustLineAsset`] equivalent.
+///
+/// Returns `None` for native assets, since native assets do not have trustlines.
+pub fn non_native_asset_to_trustline_asset(asset: &Asset) -> Option<TrustLineAsset> {
+    match asset {
+        Asset::Native => None,
+        Asset::CreditAlphanum4(a) => Some(TrustLineAsset::CreditAlphanum4(a.clone())),
+        Asset::CreditAlphanum12(a) => Some(TrustLineAsset::CreditAlphanum12(a.clone())),
+    }
+}
+
 /// Get the issuer of a TrustLineAsset.
 pub fn get_trustline_asset_issuer(asset: &TrustLineAsset) -> Result<&AccountId, NoIssuerError> {
     match asset {

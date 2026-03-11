@@ -504,11 +504,7 @@ fn build_signer_sponsoring_ids(count: usize) -> VecM<stellar_xdr::curr::Sponsors
 
 /// Convert an `Asset` to a `TrustLineAsset` for trustline key lookups.
 fn asset_to_trustline_asset(asset: &Asset) -> TrustLineAsset {
-    match asset {
-        Asset::Native => TrustLineAsset::Native,
-        Asset::CreditAlphanum4(a) => TrustLineAsset::CreditAlphanum4(a.clone()),
-        Asset::CreditAlphanum12(a) => TrustLineAsset::CreditAlphanum12(a.clone()),
-    }
+    henyey_common::asset::asset_to_trustline_asset(asset)
 }
 
 /// Build a `LedgerKey::Trustline` for an account and asset.

@@ -434,14 +434,11 @@ fn make_result(code: SetOptionsResultCode) -> OperationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::create_test_account_id;
     use stellar_xdr::curr::*;
 
     fn make_string32(s: &str) -> String32 {
         String32::try_from(s.as_bytes().to_vec()).unwrap()
-    }
-
-    fn create_test_account_id(seed: u8) -> AccountId {
-        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
     }
 
     fn create_test_account(account_id: AccountId, balance: i64) -> AccountEntry {
