@@ -106,8 +106,7 @@ macro_rules! define_extract_rent_changes {
     };
 }
 
-// P25 now uses `e2e_invoke::extract_rent_changes()` (non-typed API) for budget parity with
-// stellar-core (see VE-14 fix). Only P24 still uses the typed macro variant.
+define_extract_rent_changes!(extract_rent_changes_from_typed, soroban_env_host25);
 define_extract_rent_changes!(extract_rent_changes_from_typed_p24, soroban_env_host24);
 
 /// Derive a fallback PRNG seed from ledger context when no explicit seed is provided.
@@ -1492,54 +1491,44 @@ fn execute_host_function_p25(
         ttl_key_cache,
     );
 
-    // ── Build XDR-encoded ledger entries for the non-typed API ──
-    // We MUST use the non-typed API (invoke_host_function) rather than the typed API
-    // (invoke_host_function_typed) because the non-typed API meters XDR deserialization
-    // against the host budget. The typed API skips this metering, which means transactions
-    // that are budget-limited in stellar-core would incorrectly succeed in our code.
-    // See VE-14 (L61593050 TX 166) for the first instance of this bug.
-    let mut encoded_ledger_entries: Vec<Vec<u8>> = Vec::new();
-    let mut encoded_ttl_entries: Vec<Vec<u8>> = Vec::new();
+    // ── Build typed ledger entries: Vec<(Rc<LedgerEntry>, Option<Rc<TtlEntry>>)> ──
+    // Pass typed pairs directly to the typed API — no XDR serialization needed.
+    // Budget parity with stellar-core is maintained because the vendored
+    // invoke_host_function_typed() now charges ValDeser for each typed input
+    // (see charge_val_deser_for_typed in e2e_invoke.rs, fixing VE-14).
+    let mut typed_ledger_entries: Vec<(Rc<LedgerEntry>, Option<Rc<stellar_xdr::curr::TtlEntry>>)> =
+        Vec::new();
     let current_ledger_p25 = context.sequence;
 
-    // Helper to build a TtlEntry for a given key and live_until, then encode to XDR.
-    let build_ttl_bytes =
-        |key: &LedgerKey, live_until: Option<u32>| -> Vec<u8> {
+    // Helper to build an Rc<TtlEntry> for a given key and live_until.
+    let build_ttl_entry =
+        |key: &LedgerKey, live_until: Option<u32>| -> Option<Rc<stellar_xdr::curr::TtlEntry>> {
             let needs_ttl = matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_));
             if let Some(lu) = live_until {
                 let key_hash = super::get_or_compute_key_hash(ttl_key_cache, key);
-                let ttl = stellar_xdr::curr::TtlEntry {
+                Some(Rc::new(stellar_xdr::curr::TtlEntry {
                     key_hash,
                     live_until_ledger_seq: lu,
-                };
-                ttl.to_xdr(Limits::none()).unwrap_or_default()
+                }))
             } else if needs_ttl {
+                // Entry needs TTL but has none — use current ledger as placeholder.
                 let key_hash = super::get_or_compute_key_hash(ttl_key_cache, key);
-                let ttl = stellar_xdr::curr::TtlEntry {
+                Some(Rc::new(stellar_xdr::curr::TtlEntry {
                     key_hash,
                     live_until_ledger_seq: current_ledger_p25,
-                };
-                ttl.to_xdr(Limits::none()).unwrap_or_default()
+                }))
             } else {
-                // Non-soroban entry: empty buf signals no TTL to the host
-                Vec::new()
+                None
             }
         };
 
     // Read-only footprint entries
     for key in soroban_data.resources.footprint.read_only.iter() {
         if let Some((entry, live_until)) = snapshot.get_local(key).map_err(make_setup_error)? {
-            let ttl_bytes = build_ttl_bytes(key, live_until);
-            let entry_bytes = entry.to_xdr(Limits::none()).map_err(|_| make_setup_error(
-                soroban_env_host25::Error::from_type_and_code(
-                    soroban_env_host25::xdr::ScErrorType::Value,
-                    soroban_env_host25::xdr::ScErrorCode::InternalError,
-                ).into(),
-            ))?;
-            encoded_ledger_entries.push(entry_bytes);
-            encoded_ttl_entries.push(ttl_bytes);
+            let ttl = build_ttl_entry(key, live_until);
+            typed_ledger_entries.push((entry, ttl));
         }
-        // If entry not found, skip it — the host's footprint loop will
+        // If entry not found, skip it — the typed API's footprint loop will
         // add it to the storage map as None (entry doesn't exist yet).
     }
 
@@ -1587,15 +1576,8 @@ fn execute_host_function_p25(
                         is_live_bl_restore = live_bl_restore.is_some(),
                         "P25: Archived entry found for restoration"
                     );
-                    let ttl_bytes = build_ttl_bytes(key, restored_live_until);
-                    let entry_bytes = entry.to_xdr(Limits::none()).map_err(|_| make_setup_error(
-                        soroban_env_host25::Error::from_type_and_code(
-                            soroban_env_host25::xdr::ScErrorType::Value,
-                            soroban_env_host25::xdr::ScErrorCode::InternalError,
-                        ).into(),
-                    ))?;
-                    encoded_ledger_entries.push(entry_bytes);
-                    encoded_ttl_entries.push(ttl_bytes);
+                    let ttl = build_ttl_entry(key, restored_live_until);
+                    typed_ledger_entries.push((entry, ttl));
                     actual_restored_indices.push(idx as u32);
                     if let Some(restore) = live_bl_restore {
                         live_bl_restores.push(restore);
@@ -1607,32 +1589,18 @@ fn execute_host_function_p25(
                         live_until = ?live_until,
                         "P25: Entry marked for restore but already live (restored by earlier TX)"
                     );
-                    let ttl_bytes = build_ttl_bytes(key, live_until);
-                    let entry_bytes = entry.to_xdr(Limits::none()).map_err(|_| make_setup_error(
-                        soroban_env_host25::Error::from_type_and_code(
-                            soroban_env_host25::xdr::ScErrorType::Value,
-                            soroban_env_host25::xdr::ScErrorCode::InternalError,
-                        ).into(),
-                    ))?;
-                    encoded_ledger_entries.push(entry_bytes);
-                    encoded_ttl_entries.push(ttl_bytes);
+                    let ttl = build_ttl_entry(key, live_until);
+                    typed_ledger_entries.push((entry, ttl));
                 }
             }
-            // If archived entry not found, skip it — the host's footprint loop
-            // will add it to the storage map as None.
+            // If archived entry not found, skip it — the typed API's footprint
+            // loop will add it to the storage map as None.
         } else {
             if let Some((entry, live_until)) = snapshot.get_local(key).map_err(make_setup_error)? {
-                let ttl_bytes = build_ttl_bytes(key, live_until);
-                let entry_bytes = entry.to_xdr(Limits::none()).map_err(|_| make_setup_error(
-                    soroban_env_host25::Error::from_type_and_code(
-                        soroban_env_host25::xdr::ScErrorType::Value,
-                        soroban_env_host25::xdr::ScErrorCode::InternalError,
-                    ).into(),
-                ))?;
-                encoded_ledger_entries.push(entry_bytes);
-                encoded_ttl_entries.push(ttl_bytes);
+                let ttl = build_ttl_entry(key, live_until);
+                typed_ledger_entries.push((entry, ttl));
             }
-            // If entry not found, skip it — the host's footprint loop will
+            // If entry not found, skip it — the typed API's footprint loop will
             // add it to the storage map as None (entry doesn't exist yet).
         }
     }
@@ -1648,68 +1616,40 @@ fn execute_host_function_p25(
 
     let mut diagnostic_events: Vec<soroban_env_host25::xdr::DiagnosticEvent> = Vec::new();
 
-    // ── Serialize remaining inputs to XDR bytes ──
-    let encoded_host_fn = host_function.to_xdr(Limits::none()).map_err(|_| make_setup_error(
-        soroban_env_host25::Error::from_type_and_code(
-            soroban_env_host25::xdr::ScErrorType::Value,
-            soroban_env_host25::xdr::ScErrorCode::InternalError,
-        ).into(),
-    ))?;
-    let encoded_resources = soroban_data.resources.to_xdr(Limits::none()).map_err(|_| make_setup_error(
-        soroban_env_host25::Error::from_type_and_code(
-            soroban_env_host25::xdr::ScErrorType::Value,
-            soroban_env_host25::xdr::ScErrorCode::InternalError,
-        ).into(),
-    ))?;
-    let encoded_source_account = source.to_xdr(Limits::none()).map_err(|_| make_setup_error(
-        soroban_env_host25::Error::from_type_and_code(
-            soroban_env_host25::xdr::ScErrorType::Value,
-            soroban_env_host25::xdr::ScErrorCode::InternalError,
-        ).into(),
-    ))?;
-    let encoded_auth_entries: Vec<Vec<u8>> = auth_entries
-        .iter()
-        .map(|a| a.to_xdr(Limits::none()))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|_| make_setup_error(
-            soroban_env_host25::Error::from_type_and_code(
-                soroban_env_host25::xdr::ScErrorType::Value,
-                soroban_env_host25::xdr::ScErrorCode::InternalError,
-            ).into(),
-        ))?;
-
-    // ── Call invoke_host_function() (non-typed API) ──
-    // We use the non-typed API to ensure XDR deserialization is metered against the
-    // host budget, matching stellar-core's behavior exactly.
-    // Collect into Vec<&[u8]> so all iterator params share the same concrete type.
-    let auth_refs: Vec<&[u8]> = encoded_auth_entries.iter().map(|v| v.as_slice()).collect();
-    let entry_refs: Vec<&[u8]> = encoded_ledger_entries.iter().map(|v| v.as_slice()).collect();
-    let ttl_refs: Vec<&[u8]> = encoded_ttl_entries.iter().map(|v| v.as_slice()).collect();
-    let result = match e2e_invoke::invoke_host_function(
+    // ── Call invoke_host_function_typed() ──
+    // Pass typed values directly — no XDR serialization for inputs.
+    // ValDeser budget charges are now applied inside the typed API itself.
+    let result = match e2e_invoke::invoke_host_function_typed(
         &budget,
         true, // enable_diagnostics
-        encoded_host_fn.as_slice(),
-        encoded_resources.as_slice(),
+        host_function.clone(),
+        soroban_data.resources.clone(),
         &actual_restored_indices,
-        encoded_source_account.as_slice(),
-        auth_refs.into_iter(),
+        source.clone(),
+        auth_entries.to_vec(),
         ledger_info,
-        entry_refs.into_iter(),
-        ttl_refs.into_iter(),
-        &base_prng_seed[..],
+        typed_ledger_entries.into_iter(),
+        base_prng_seed,
         &mut diagnostic_events,
         None, // trace_hook
         module_cache,
     ) {
-        Ok(r) => r,
+        Ok(r) => {
+            tracing::info!(
+                cpu_consumed = budget.get_cpu_insns_consumed().unwrap_or(0),
+                mem_consumed = budget.get_mem_bytes_consumed().unwrap_or(0),
+                "P25: e2e_invoke_typed completed successfully"
+            );
+            r
+        }
         Err(e) => {
             let cpu_insns_consumed = budget.get_cpu_insns_consumed().unwrap_or(0);
             let mem_bytes_consumed = budget.get_mem_bytes_consumed().unwrap_or(0);
-            tracing::warn!(
+            tracing::debug!(
                 cpu_consumed = cpu_insns_consumed,
                 mem_consumed = mem_bytes_consumed,
                 error = %e,
-                "P25: e2e_invoke failed"
+                "P25: e2e_invoke_typed failed"
             );
             for (i, event) in diagnostic_events.iter().enumerate() {
                 use soroban_env_host25::xdr::WriteXdr as _;
@@ -1729,22 +1669,16 @@ fn execute_host_function_p25(
         }
     };
 
-    // ── Process non-typed result ──
-    // Return value: encoded ScVal XDR on success, or error.
-    let (return_value, return_value_size) = match result.encoded_invoke_result {
-        Ok(ref encoded_val) => {
-            let return_value_size = encoded_val.len() as u32;
-            let val = ScVal::from_xdr(encoded_val, Limits::none()).map_err(|_| {
-                SorobanExecutionError {
-                    host_error: soroban_env_host25::Error::from_type_and_code(
-                        soroban_env_host25::xdr::ScErrorType::Value,
-                        soroban_env_host25::xdr::ScErrorCode::InternalError,
-                    ).into(),
-                    cpu_insns_consumed: budget.get_cpu_insns_consumed().unwrap_or(0),
-                    mem_bytes_consumed: budget.get_mem_bytes_consumed().unwrap_or(0),
-                }
-            })?;
-            (val, return_value_size)
+    // ── Process typed result ──
+    // Return value: already a typed Result<ScVal, HostError>.
+    let (return_value, return_value_size) = match result.invoke_result {
+        Ok(ref val) => {
+            // Need to serialize once to get the byte size for contract_events_and_return_value_size.
+            let size = val
+                .to_xdr(Limits::none())
+                .map(|b| b.len() as u32)
+                .unwrap_or(0);
+            (val.clone(), size)
         }
         Err(ref e) => {
             let cpu_insns_consumed = budget.get_cpu_insns_consumed().unwrap_or(0);
@@ -1752,20 +1686,9 @@ fn execute_host_function_p25(
             tracing::debug!(
                 cpu_consumed = cpu_insns_consumed,
                 mem_consumed = mem_bytes_consumed,
-                diagnostic_events = diagnostic_events.len(),
                 error = %e,
-                "P25: Soroban invoke_result error"
+                "P25: e2e_invoke_typed result contained error"
             );
-            for (i, event) in diagnostic_events.iter().enumerate() {
-                use soroban_env_host25::xdr::WriteXdr as _;
-                if let Ok(encoded) = event.to_xdr(soroban_env_host25::xdr::Limits::none()) {
-                    tracing::debug!(
-                        event_idx = i,
-                        event_hex = hex::encode(&encoded),
-                        "P25: Diagnostic event from invoke_result error"
-                    );
-                }
-            }
             return Err(SorobanExecutionError {
                 host_error: e.clone(),
                 cpu_insns_consumed,
@@ -1774,46 +1697,59 @@ fn execute_host_function_p25(
         }
     };
 
-    // ── Contract events: decode from XDR bytes ──
-    let mut contract_events: Vec<stellar_xdr::curr::ContractEvent> = Vec::new();
+    // ── Contract events: extract from Events directly ──
+    // After XDR alignment, HostEvent.event is our workspace ContractEvent type.
+    let mut contract_events = Vec::new();
     let mut contract_events_size = 0u32;
-    for encoded_event in result.encoded_contract_events.iter() {
-        let event: stellar_xdr::curr::ContractEvent = match stellar_xdr::curr::ContractEvent::from_xdr(encoded_event, Limits::none()) {
-            Ok(e) => e,
-            Err(_) => {
-                tracing::warn!("Failed to decode contract event from XDR");
-                continue;
-            }
-        };
-        if event.type_ == stellar_xdr::curr::ContractEventType::Diagnostic {
+    for host_event in result.events.0.iter() {
+        if host_event.failed_call
+            || host_event.event.type_ == stellar_xdr::curr::ContractEventType::Diagnostic
+        {
             continue;
         }
-        let event_size = encoded_event.len() as u32;
+        // Serialize event once to get its byte size.
+        let event_size = host_event
+            .event
+            .to_xdr(Limits::none())
+            .map(|b| b.len() as u32)
+            .unwrap_or(0);
         contract_events_size = contract_events_size.saturating_add(event_size);
-        contract_events.push(event);
+        contract_events.push(host_event.event.clone());
     }
 
-    // ── Rent and storage changes from LedgerEntryChange ──
-    let rent_changes = e2e_invoke::extract_rent_changes(&result.ledger_changes);
+    // ── Rent: use get_ledger_changes_typed() + extract_rent_changes_from_typed() ──
+    let min_live_until_ledger = context.sequence + soroban_config.min_persistent_entry_ttl - 1;
+    let typed_ledger_changes = e2e_invoke::get_ledger_changes_typed(
+        &budget,
+        &result.storage,
+        &result.init_storage_map,
+        &result.ttl_map,
+        min_live_until_ledger,
+        &result.restored_keys,
+    )
+    .map_err(|e| SorobanExecutionError {
+        host_error: e,
+        cpu_insns_consumed: budget.get_cpu_insns_consumed().unwrap_or(0),
+        mem_bytes_consumed: budget.get_mem_bytes_consumed().unwrap_or(0),
+    })?;
 
-    // ── Storage changes: map LedgerEntryChange to StorageChange ──
-    let storage_changes: Vec<crate::soroban::StorageChange> = result
-        .ledger_changes
-        .iter()
+    let rent_changes = extract_rent_changes_from_typed(&typed_ledger_changes);
+
+    // ── Storage changes: map TypedLedgerEntryChange to StorageChange ──
+    let storage_changes: Vec<crate::soroban::StorageChange> = typed_ledger_changes
+        .into_iter()
         .filter_map(|change| {
-            let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none()).ok()?;
-            let is_deletion = !change.read_only && change.encoded_new_value.is_none();
-            let is_modification = change.encoded_new_value.is_some();
+            let is_deletion = !change.read_only && change.new_entry.is_none();
+            let is_modification = change.new_entry.is_some();
             let is_rent_related = change.old_entry_size_bytes_for_rent > 0;
 
             // Determine if TTL was extended from the LEDGER-START perspective.
+            // Use typed key directly — no XDR deserialization needed.
             let ttl_extended = change
                 .ttl_change
                 .as_ref()
                 .map(|ttl| {
-                    debug_assert_eq!(ttl.key_hash.len(), 32, "host key_hash should always be SHA-256 (32 bytes)");
-                    let key_hash_bytes: [u8; 32] = ttl.key_hash.as_slice().try_into().expect("host key_hash must be 32 bytes (SHA-256)");
-                    let key_hash = stellar_xdr::curr::Hash(key_hash_bytes);
+                    let key_hash = super::get_or_compute_key_hash(ttl_key_cache, &change.key);
                     let ledger_start_ttl = state.get_ttl_at_ledger_start(&key_hash).unwrap_or(0);
                     ttl.new_live_until_ledger > ledger_start_ttl
                 })
@@ -1823,10 +1759,10 @@ fn execute_host_function_p25(
             let is_read_only_ttl_bump = change.read_only && !is_modification && ttl_extended;
 
             if is_modification || is_deletion || ttl_extended {
-                let new_entry = change.encoded_new_value.as_ref().and_then(|bytes| {
-                    LedgerEntry::from_xdr(bytes, Limits::none()).ok()
-                });
-                let live_until = change.ttl_change.as_ref().map(|ttl| ttl.new_live_until_ledger);
+                // Clone out of Rc — negligible cost vs the XDR serde that was here before.
+                let key = (*change.key).clone();
+                let new_entry = change.new_entry.map(|rc| (*rc).clone());
+                let live_until = change.ttl_change.map(|ttl| ttl.new_live_until_ledger);
                 Some(StorageChange {
                     key,
                     new_entry,
@@ -2004,18 +1940,16 @@ mod tests {
 
     /// Regression test for VE-14 / L61593050: XDR deserialization metering.
     ///
-    /// The non-typed Soroban API (`invoke_host_function`) meters XDR deserialization
-    /// of ledger entries against the host budget via `metered_from_xdr_with_budget`,
-    /// which charges `ContractCostType::ValDeser` for each entry's byte length.
-    /// The typed API (`invoke_host_function_typed`) skips this metering entirely.
+    /// stellar-core deserializes ledger entries from XDR, charging
+    /// `ContractCostType::ValDeser` for each entry's byte length. The vendored
+    /// `invoke_host_function_typed()` now applies the same charge via
+    /// `charge_val_deser_for_typed()` (added in the VE-14 fix).
     ///
-    /// For a TX with 45 footprint entries, the metering difference is ~3M CPU instructions.
-    /// At L61593050 TX 166 (instruction_limit=20M, actual consumption 17.1M typed → 20.03M
-    /// non-typed), this caused the TX to incorrectly succeed when using the typed API.
+    /// For a TX with 45 footprint entries, the ValDeser cost is ~3M CPU instructions.
+    /// At L61593050 TX 166 (instruction_limit=20M, actual consumption ~20.03M),
+    /// the missing charge previously caused the TX to incorrectly succeed.
     ///
-    /// This test verifies that `ValDeser` charges consume non-zero CPU instructions,
-    /// confirming the budget impact that makes the typed vs non-typed API distinction
-    /// significant for parity with stellar-core.
+    /// This test verifies that `ValDeser` charges consume non-zero CPU instructions.
     #[test]
     fn test_xdr_deserialization_budget_charge_is_significant() {
         use soroban_env_host25::budget::Budget;
