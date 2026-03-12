@@ -1535,9 +1535,10 @@ impl App {
             match guard.as_ref() {
                 Some(ha) => HotArchiveBucketListSnapshot::new(ha, header),
                 None => {
-                    // No hot archive yet (pre-protocol 23); create empty placeholder.
-                    // The snapshot manager will simply have no hot archive data.
-                    return;
+                    // No hot archive yet; use an empty placeholder so that the
+                    // live snapshot still gets updated (query server needs it).
+                    let default = HotArchiveBucketList::default();
+                    HotArchiveBucketListSnapshot::new(&default, header)
                 }
             }
         };
