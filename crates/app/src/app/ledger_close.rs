@@ -1560,6 +1560,13 @@ impl App {
         *self.last_processed_slot.write().await = pending.ledger_seq as u64;
         self.clear_tx_advert_history(pending.ledger_seq).await;
 
+        // Re-bootstrap the herder so tracking_slot advances past the
+        // just-closed ledger.  For validators, SCP's externalize path
+        // handles this, but watchers close ledgers from buffered
+        // EXTERNALIZE messages without going through SCP — the
+        // tracking_slot stalls unless we update it here.
+        self.herder.bootstrap(pending.ledger_seq);
+
         // Update bucket snapshots for the query server.
         self.update_bucket_snapshot();
 
