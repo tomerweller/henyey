@@ -1,3 +1,5 @@
+//! Handler for the `getTransaction` JSON-RPC method.
+
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};

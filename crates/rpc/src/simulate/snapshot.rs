@@ -2,17 +2,19 @@ use std::rc::Rc;
 
 use henyey_bucket::SearchableBucketListSnapshot;
 use soroban_env_host_p25 as soroban_host;
-use stellar_xdr::curr::{LedgerKey, WriteXdr};
+use stellar_xdr::curr::LedgerKey;
 
 use soroban_host::storage::{EntryWithLiveUntil, SnapshotSource};
 use soroban_host::HostError;
+
+use crate::util::ttl_key_for_ledger_key;
 
 /// Adapter that provides snapshot access to the bucket list for Soroban simulation.
 ///
 /// Implements `SnapshotSource` from `soroban-env-host-p25` by wrapping a
 /// `SearchableBucketListSnapshot`. This is used for `simulateTransaction`
 /// where we need read-only access to the current ledger state.
-pub struct BucketListSnapshotSource {
+pub(crate) struct BucketListSnapshotSource {
     snapshot: SearchableBucketListSnapshot,
     current_ledger: u32,
 }
@@ -23,7 +25,7 @@ pub struct BucketListSnapshotSource {
 unsafe impl Send for BucketListSnapshotSource {}
 
 impl BucketListSnapshotSource {
-    pub fn new(snapshot: SearchableBucketListSnapshot, current_ledger: u32) -> Self {
+    pub(crate) fn new(snapshot: SearchableBucketListSnapshot, current_ledger: u32) -> Self {
         Self {
             snapshot,
             current_ledger,
@@ -57,25 +59,12 @@ impl SnapshotSource for BucketListSnapshotSource {
 
 /// Get the TTL (live_until_ledger) for a ledger entry from the bucket list.
 fn get_entry_ttl(snapshot: &SearchableBucketListSnapshot, key: &LedgerKey) -> Option<u32> {
-    // Only contract data and contract code entries have TTLs
-    let ttl_key = match key {
-        LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
-            // Compute the hash of the key to look up the TTL entry
-            let key_bytes = key.to_xdr(stellar_xdr::curr::Limits::none()).ok()?;
-            let key_hash = henyey_crypto::sha256(&key_bytes);
-            LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
-                key_hash: stellar_xdr::curr::Hash(*key_hash.as_bytes()),
-            })
-        }
-        _ => return None,
-    };
+    let ttl_key = ttl_key_for_ledger_key(key)?;
 
     // Look up the TTL entry
     let ttl_entry = snapshot.load(&ttl_key)?;
     match ttl_entry.data {
-        stellar_xdr::curr::LedgerEntryData::Ttl(ttl_data) => {
-            Some(ttl_data.live_until_ledger_seq)
-        }
+        stellar_xdr::curr::LedgerEntryData::Ttl(ttl_data) => Some(ttl_data.live_until_ledger_seq),
         _ => None,
     }
 }

@@ -1,9 +1,17 @@
+//! Handler for the `getEvents` JSON-RPC method.
+
 use std::sync::Arc;
 
 use serde_json::json;
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
+use crate::util::format_unix_timestamp_utc;
+
+/// Default number of events returned per query.
+const DEFAULT_EVENTS_LIMIT: u64 = 100;
+/// Maximum number of events that can be requested in a single query.
+const MAX_EVENTS_LIMIT: u64 = 10_000;
 
 pub async fn handle(
     ctx: &Arc<RpcContext>,
@@ -23,56 +31,16 @@ pub async fn handle(
         .map(|v| v as u32);
 
     // Parse filters
-    let filters = params.get("filters").and_then(|v| v.as_array());
-
-    let mut event_type: Option<&str> = None;
-    let mut contract_ids: Vec<String> = Vec::new();
-    let mut topic_filters: Vec<Vec<String>> = Vec::new();
-
-    if let Some(filter_array) = filters {
-        for filter in filter_array {
-            if let Some(t) = filter.get("type").and_then(|v| v.as_str()) {
-                event_type = Some(match t {
-                    "contract" => "contract",
-                    "system" => "system",
-                    "diagnostic" => "diagnostic",
-                    _ => "contract",
-                });
-            }
-
-            if let Some(cids) = filter.get("contractIds").and_then(|v| v.as_array()) {
-                for cid in cids {
-                    if let Some(s) = cid.as_str() {
-                        contract_ids.push(s.to_string());
-                    }
-                }
-            }
-
-            // Topics is an array of arrays: [["topic1_a", "topic1_b"], ["*"], ...]
-            // Each inner array is OR alternatives for that position
-            if let Some(topics_arr) = filter.get("topics").and_then(|v| v.as_array()) {
-                for topic_set in topics_arr {
-                    if let Some(alternatives) = topic_set.as_array() {
-                        let mut alt_strings: Vec<String> = Vec::new();
-                        for alt in alternatives {
-                            if let Some(s) = alt.as_str() {
-                                alt_strings.push(s.to_string());
-                            }
-                        }
-                        topic_filters.push(alt_strings);
-                    }
-                }
-            }
-        }
-    }
+    let (event_type, contract_ids, topic_filters) =
+        parse_event_filters(params.get("filters").and_then(|v| v.as_array()));
 
     // Parse pagination
     let pagination = params.get("pagination");
     let limit = pagination
         .and_then(|p| p.get("limit"))
         .and_then(|v| v.as_u64())
-        .unwrap_or(100)
-        .min(10000) as u32;
+        .unwrap_or(DEFAULT_EVENTS_LIMIT)
+        .min(MAX_EVENTS_LIMIT) as u32;
     let cursor = pagination
         .and_then(|p| p.get("cursor"))
         .and_then(|v| v.as_str());
@@ -146,6 +114,50 @@ pub async fn handle(
     }))
 }
 
+/// Parse event filter parameters from the JSON-RPC request.
+///
+/// Returns `(event_type, contract_ids, topic_filters)`.
+fn parse_event_filters(
+    filters: Option<&Vec<serde_json::Value>>,
+) -> (Option<&'static str>, Vec<String>, Vec<Vec<String>>) {
+    let mut event_type: Option<&'static str> = None;
+    let mut contract_ids = Vec::new();
+    let mut topic_filters = Vec::new();
+
+    let Some(filter_array) = filters else {
+        return (event_type, contract_ids, topic_filters);
+    };
+
+    for filter in filter_array {
+        if let Some(t) = filter.get("type").and_then(|v| v.as_str()) {
+            event_type = Some(match t {
+                "contract" => "contract",
+                "system" => "system",
+                "diagnostic" => "diagnostic",
+                _ => "contract",
+            });
+        }
+
+        if let Some(cids) = filter.get("contractIds").and_then(|v| v.as_array()) {
+            contract_ids.extend(cids.iter().filter_map(|v| v.as_str().map(String::from)));
+        }
+
+        // Topics is an array of arrays: [["topic1_a", "topic1_b"], ["*"], ...]
+        // Each inner array is OR alternatives for that position.
+        if let Some(topics_arr) = filter.get("topics").and_then(|v| v.as_array()) {
+            for topic_set in topics_arr {
+                if let Some(alternatives) = topic_set.as_array() {
+                    let alt_strings: Vec<String> =
+                        alternatives.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+                    topic_filters.push(alt_strings);
+                }
+            }
+        }
+    }
+
+    (event_type, contract_ids, topic_filters)
+}
+
 fn get_ledger_close_time(ctx: &RpcContext, ledger_seq: u32) -> String {
     ctx.app
         .database()
@@ -156,74 +168,10 @@ fn get_ledger_close_time(ctx: &RpcContext, ledger_seq: u32) -> String {
         .ok()
         .flatten()
         .map(|h| {
-            // Format as ISO 8601
             let ts = h.scp_value.close_time.0;
-            format_timestamp(ts)
+            format_unix_timestamp_utc(ts)
         })
         .unwrap_or_default()
-}
-
-fn format_timestamp(unix_ts: u64) -> String {
-    // Simple UTC timestamp formatting
-    let secs = unix_ts as i64;
-    let days_since_epoch = secs / 86400;
-    let time_of_day = secs % 86400;
-
-    let hours = time_of_day / 3600;
-    let minutes = (time_of_day % 3600) / 60;
-    let seconds = time_of_day % 60;
-
-    // Calculate year/month/day from days since 1970-01-01
-    let mut days = days_since_epoch;
-    let mut year = 1970i32;
-
-    loop {
-        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
-        if days < days_in_year {
-            break;
-        }
-        days -= days_in_year;
-        year += 1;
-    }
-
-    let leap = is_leap_year(year);
-    let month_days = [
-        31,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-
-    let mut month = 0usize;
-    for (i, &md) in month_days.iter().enumerate() {
-        if days < md {
-            month = i;
-            break;
-        }
-        days -= md;
-    }
-
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        year,
-        month + 1,
-        days + 1,
-        hours,
-        minutes,
-        seconds
-    )
-}
-
-fn is_leap_year(year: i32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
 /// Extract the value XDR (base64) from a ContractEvent's body.

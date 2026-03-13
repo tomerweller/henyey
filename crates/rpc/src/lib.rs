@@ -6,10 +6,10 @@
 mod context;
 mod dispatch;
 mod error;
-pub mod methods;
+mod methods;
 mod server;
-pub mod simulate;
-pub mod types;
+mod simulate;
+mod types;
+mod util;
 
-pub use context::RpcContext;
 pub use server::RpcServer;

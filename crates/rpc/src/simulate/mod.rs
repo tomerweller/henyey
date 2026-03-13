@@ -1,6 +1,8 @@
+//! Soroban transaction simulation for `simulateTransaction`.
+
 mod snapshot;
 
-pub use snapshot::BucketListSnapshotSource;
+pub(crate) use snapshot::BucketListSnapshotSource;
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -15,6 +17,15 @@ use stellar_xdr::curr::{
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
+
+/// Multiplicative adjustment factor for CPU instructions (soroban-simulation default).
+const INSTRUCTION_ADJUSTMENT_FACTOR: f64 = 1.04;
+/// Additive adjustment for CPU instructions (soroban-simulation default).
+const INSTRUCTION_ADJUSTMENT_ADDEND: u32 = 50_000;
+/// Multiplicative adjustment factor for refundable fees (soroban-simulation default).
+const REFUNDABLE_FEE_ADJUSTMENT_FACTOR: f64 = 1.15;
+/// Estimated transaction envelope size for fee computation.
+const DEFAULT_TX_SIZE_ESTIMATE: u32 = 300;
 
 pub async fn handle(
     ctx: &Arc<RpcContext>,
@@ -68,15 +79,11 @@ pub async fn handle(
     // Build the snapshot source from our bucket list snapshot
     let snapshot_source = BucketListSnapshotSource::new(bl_snapshot, ledger.num);
 
-    // Clone what we need before moving into the blocking task
-    let host_fn_clone = host_fn.clone();
-    let source_account_clone = source_account.clone();
-
     // Run simulation in a blocking task (soroban Host uses Rc, not Send)
     let result = tokio::task::spawn_blocking(move || {
         run_simulation(
-            host_fn_clone,
-            source_account_clone,
+            host_fn,
+            source_account,
             ledger_info,
             snapshot_source,
         )
@@ -127,16 +134,9 @@ fn extract_host_function(
     match &ops[0].body {
         OperationBody::InvokeHostFunction(op) => Ok((source_account, op.host_function.clone())),
         OperationBody::ExtendFootprintTtl(_) | OperationBody::RestoreFootprint(_) => {
-            // For extend/restore, we need the SorobanTransactionData from the tx
-            // These are simpler operations that don't need the full host invocation
-            match &ops[0].body {
-                OperationBody::InvokeHostFunction(op) => {
-                    Ok((source_account, op.host_function.clone()))
-                }
-                _ => Err(JsonRpcError::invalid_params(
-                    "ExtendFootprintTtl and RestoreFootprint simulation not yet supported",
-                )),
-            }
+            Err(JsonRpcError::invalid_params(
+                "ExtendFootprintTtl and RestoreFootprint simulation not yet supported",
+            ))
         }
         _ => Err(JsonRpcError::invalid_params(
             "operation must be InvokeHostFunction, ExtendFootprintTtl, or RestoreFootprint",
@@ -273,8 +273,9 @@ fn build_error_response(error: String, latest_ledger: u32) -> Result<serde_json:
 /// whose state may have advanced since the simulation snapshot.
 fn adjust_resources(resources: &mut stellar_xdr::curr::SorobanResources) {
     if resources.instructions > 0 {
-        let adjusted = ((resources.instructions as f64) * 1.04).floor() as u32;
-        resources.instructions = adjusted.saturating_add(50_000);
+        let adjusted =
+            ((resources.instructions as f64) * INSTRUCTION_ADJUSTMENT_FACTOR).floor() as u32;
+        resources.instructions = adjusted.saturating_add(INSTRUCTION_ADJUSTMENT_ADDEND);
     }
 }
 
@@ -292,7 +293,7 @@ fn compute_resource_fee(
         disk_read_bytes: resources.disk_read_bytes,
         write_bytes: resources.write_bytes,
         contract_events_size_bytes: 0,
-        transaction_size_bytes: 300,
+        transaction_size_bytes: DEFAULT_TX_SIZE_ESTIMATE,
     };
 
     let fee_config = FeeConfiguration {
@@ -309,9 +310,9 @@ fn compute_resource_fee(
     let (non_refundable, refundable) =
         compute_transaction_resource_fee(&tx_resources, &fee_config);
 
-    // Apply 15% adjustment to refundable fee (matches soroban-simulation default)
+    // Apply adjustment to refundable fee (matches soroban-simulation default)
     let adjusted_refundable = if refundable > 0 {
-        ((refundable as f64) * 1.15).floor() as i64
+        ((refundable as f64) * REFUNDABLE_FEE_ADJUSTMENT_FACTOR).floor() as i64
     } else {
         0
     };

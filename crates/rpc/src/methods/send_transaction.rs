@@ -1,3 +1,5 @@
+//! Handler for the `sendTransaction` JSON-RPC method.
+
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -37,54 +39,46 @@ pub async fn handle(
     // Submit to herder
     let result = ctx.app.submit_transaction(tx_env.clone()).await;
 
-    match result {
-        henyey_herder::TxQueueResult::Added => Ok(json!({
-            "status": "PENDING",
-            "hash": hash,
-            "latestLedger": ledger.num,
-            "latestLedgerCloseTime": ledger.close_time.to_string()
-        })),
-        henyey_herder::TxQueueResult::Duplicate => Ok(json!({
-            "status": "DUPLICATE",
-            "hash": hash,
-            "latestLedger": ledger.num,
-            "latestLedgerCloseTime": ledger.close_time.to_string()
-        })),
-        henyey_herder::TxQueueResult::QueueFull
-        | henyey_herder::TxQueueResult::TryAgainLater => Ok(json!({
-            "status": "TRY_AGAIN_LATER",
-            "hash": hash,
-            "latestLedger": ledger.num,
-            "latestLedgerCloseTime": ledger.close_time.to_string()
-        })),
-        henyey_herder::TxQueueResult::Invalid(code) => {
-            let error_result_xdr = build_error_result_xdr(code);
+    // Build base response with fields common to all outcomes
+    let close_time = ledger.close_time.to_string();
+    let mut resp = json!({
+        "hash": hash,
+        "latestLedger": ledger.num,
+        "latestLedgerCloseTime": close_time
+    });
+    let obj = resp.as_object_mut().unwrap();
 
-            Ok(json!({
-                "status": "ERROR",
-                "hash": hash,
-                "errorResultXdr": error_result_xdr,
-                "latestLedger": ledger.num,
-                "latestLedgerCloseTime": ledger.close_time.to_string(),
-                "diagnosticEventsXdr": []
-            }))
+    match result {
+        henyey_herder::TxQueueResult::Added => {
+            obj.insert("status".into(), json!("PENDING"));
+        }
+        henyey_herder::TxQueueResult::Duplicate => {
+            obj.insert("status".into(), json!("DUPLICATE"));
+        }
+        henyey_herder::TxQueueResult::QueueFull
+        | henyey_herder::TxQueueResult::TryAgainLater => {
+            obj.insert("status".into(), json!("TRY_AGAIN_LATER"));
+        }
+        henyey_herder::TxQueueResult::Invalid(_code) => {
+            obj.insert("status".into(), json!("ERROR"));
+            obj.insert("errorResultXdr".into(), json!(build_error_result_xdr()));
+            obj.insert("diagnosticEventsXdr".into(), json!([]));
         }
         henyey_herder::TxQueueResult::Banned
         | henyey_herder::TxQueueResult::FeeTooLow
         | henyey_herder::TxQueueResult::Filtered => {
-            Ok(json!({
-                "status": "ERROR",
-                "hash": hash,
-                "latestLedger": ledger.num,
-                "latestLedgerCloseTime": ledger.close_time.to_string()
-            }))
+            obj.insert("status".into(), json!("ERROR"));
         }
     }
+
+    Ok(resp)
 }
 
-fn build_error_result_xdr(
-    _code: Option<henyey_tx::TxResultCode>,
-) -> String {
+/// Build a minimal error TransactionResult XDR for the response.
+///
+/// Currently always returns a generic `TxFailed` result. A more complete
+/// implementation would map the actual error code.
+fn build_error_result_xdr() -> String {
     use stellar_xdr::curr::{
         TransactionResult, TransactionResultExt,
         TransactionResultResult,

@@ -1,6 +1,5 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -30,7 +29,6 @@ impl RpcServer {
     pub async fn start(self) -> anyhow::Result<()> {
         let ctx = Arc::new(RpcContext {
             app: self.app.clone(),
-            start_time: Instant::now(),
         });
 
         let mut shutdown_rx = self.app.subscribe_shutdown();

@@ -1,3 +1,5 @@
+//! Handler for the `getLedgerEntries` JSON-RPC method.
+
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -6,6 +8,7 @@ use stellar_xdr::curr::{LedgerEntry, LedgerKey, Limits, ReadXdr, WriteXdr};
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
+use crate::util::ttl_key_for_ledger_key;
 
 pub async fn handle(
     ctx: &Arc<RpcContext>,
@@ -94,38 +97,20 @@ pub async fn handle(
 
 /// For contract data and contract code entries, build the corresponding TTL key.
 fn ttl_key_for_entry(entry: &LedgerEntry) -> Option<LedgerKey> {
-    match &entry.data {
+    let entry_key = match &entry.data {
         stellar_xdr::curr::LedgerEntryData::ContractData(data) => {
-            Some(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
-                key_hash: hash_ledger_key(&LedgerKey::ContractData(
-                    stellar_xdr::curr::LedgerKeyContractData {
-                        contract: data.contract.clone(),
-                        key: data.key.clone(),
-                        durability: data.durability,
-                    },
-                )),
-            }))
+            LedgerKey::ContractData(stellar_xdr::curr::LedgerKeyContractData {
+                contract: data.contract.clone(),
+                key: data.key.clone(),
+                durability: data.durability,
+            })
         }
-        stellar_xdr::curr::LedgerEntryData::ContractCode(_) => {
-            let code_key = LedgerKey::ContractCode(
-                stellar_xdr::curr::LedgerKeyContractCode {
-                    hash: match &entry.data {
-                        stellar_xdr::curr::LedgerEntryData::ContractCode(c) => c.hash.clone(),
-                        _ => unreachable!(),
-                    },
-                },
-            );
-            Some(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
-                key_hash: hash_ledger_key(&code_key),
-            }))
+        stellar_xdr::curr::LedgerEntryData::ContractCode(code) => {
+            LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+                hash: code.hash.clone(),
+            })
         }
-        _ => None,
-    }
-}
-
-fn hash_ledger_key(key: &LedgerKey) -> stellar_xdr::curr::Hash {
-    use henyey_crypto::sha256;
-    let xdr_bytes = key.to_xdr(Limits::none()).expect("XDR encode");
-    let hash = sha256(&xdr_bytes);
-    stellar_xdr::curr::Hash(*hash.as_bytes())
+        _ => return None,
+    };
+    ttl_key_for_ledger_key(&entry_key)
 }

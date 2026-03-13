@@ -1,24 +1,27 @@
 use std::sync::Arc;
 
-use henyey_app::AppState;
 use serde_json::json;
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
 
+/// Default ledger retention window (number of ledgers kept).
+const DEFAULT_LEDGER_RETENTION_WINDOW: u32 = 2880;
+
 pub async fn handle(ctx: &Arc<RpcContext>) -> Result<serde_json::Value, JsonRpcError> {
-    let state = ctx.app.state().await;
     let ledger = ctx.app.ledger_summary();
 
-    let status = match state {
-        AppState::Synced | AppState::Validating => "healthy",
-        _ => "healthy", // stellar-rpc returns healthy if reachable
-    };
+    // stellar-rpc returns "healthy" whenever the server is reachable
+    let status = "healthy";
+    let oldest_ledger = ledger
+        .num
+        .saturating_sub(DEFAULT_LEDGER_RETENTION_WINDOW)
+        .max(1);
 
     Ok(json!({
         "status": status,
         "latestLedger": ledger.num,
-        "oldestLedger": 1, // TODO: compute from retention window
-        "ledgerRetentionWindow": 2880
+        "oldestLedger": oldest_ledger,
+        "ledgerRetentionWindow": DEFAULT_LEDGER_RETENTION_WINDOW
     }))
 }
