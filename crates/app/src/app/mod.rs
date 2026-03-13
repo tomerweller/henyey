@@ -2070,6 +2070,8 @@ impl App {
 
         AppInfo {
             version: env!("CARGO_PKG_VERSION").to_string(),
+            commit_hash: self.config.build.commit_hash.clone(),
+            build_timestamp: self.config.build.build_timestamp.clone(),
             node_name: self.config.node.name.clone(),
             public_key: self.keypair.public_key().to_strkey(),
             network_passphrase: self.config.network.passphrase.clone(),
@@ -2211,6 +2213,10 @@ pub struct LedgerSummary {
 pub struct AppInfo {
     /// Application version.
     pub version: String,
+    /// Git commit hash.
+    pub commit_hash: String,
+    /// Build timestamp (ISO 8601).
+    pub build_timestamp: String,
     /// Node name.
     pub node_name: String,
     /// Node public key.
@@ -2248,6 +2254,12 @@ pub struct SelfCheckResult {
 impl std::fmt::Display for AppInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "henyey {}", self.version)?;
+        if !self.commit_hash.is_empty() {
+            writeln!(f, "  Commit:     {}", self.commit_hash)?;
+        }
+        if !self.build_timestamp.is_empty() {
+            writeln!(f, "  Built:      {}", self.build_timestamp)?;
+        }
         writeln!(f)?;
         writeln!(f, "Node Information:")?;
         writeln!(f, "  Name:       {}", self.node_name)?;

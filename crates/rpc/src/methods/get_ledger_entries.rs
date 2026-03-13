@@ -25,6 +25,12 @@ pub async fn handle(
         return Err(JsonRpcError::invalid_params("'keys' must not be empty"));
     }
 
+    if keys_array.len() > 200 {
+        return Err(JsonRpcError::invalid_params(
+            "too many keys: max 200 allowed",
+        ));
+    }
+
     // Decode base64 XDR keys, keeping the original base64 strings
     let mut ledger_keys = Vec::with_capacity(keys_array.len());
     for (i, key_val) in keys_array.iter().enumerate() {

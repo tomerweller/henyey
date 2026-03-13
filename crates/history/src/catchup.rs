@@ -1911,6 +1911,19 @@ impl CatchupManager {
                         let tx_body = tx.to_xdr(stellar_xdr::curr::Limits::none())?;
                         let tx_result_xdr = tx_result.to_xdr(stellar_xdr::curr::Limits::none())?;
 
+                        // Compute status from result code
+                        let status = {
+                            use stellar_xdr::curr::TransactionResultCode;
+                            let code = tx_result.result.result.discriminant();
+                            if code == TransactionResultCode::TxSuccess
+                                || code == TransactionResultCode::TxFeeBumpInnerSuccess
+                            {
+                                henyey_db::TX_STATUS_SUCCESS
+                            } else {
+                                henyey_db::TX_STATUS_FAILED
+                            }
+                        };
+
                         conn.store_transaction(
                             data.header.ledger_seq,
                             idx as u32,
@@ -1918,6 +1931,7 @@ impl CatchupManager {
                             &tx_body,
                             &tx_result_xdr,
                             None,
+                            status,
                         )?;
                     }
                 }

@@ -11,9 +11,9 @@ pub async fn handle(ctx: &Arc<RpcContext>) -> Result<serde_json::Value, JsonRpcE
 
     Ok(json!({
         "version": info.version,
-        "commitHash": "",
-        "buildTimestamp": "",
-        "captiveCoreVersion": "",
+        "commitHash": info.commit_hash,
+        "buildTimestamp": info.build_timestamp,
+        "captiveCoreVersion": format!("henyey-v{}", info.version),
         "protocolVersion": ledger.version
     }))
 }

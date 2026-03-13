@@ -17,6 +17,10 @@ use stellar_xdr::curr::{
 
 use crate::error::DbError;
 
+/// Transaction status values stored in the `status` column.
+pub const TX_STATUS_SUCCESS: i32 = 0;
+pub const TX_STATUS_FAILED: i32 = 1;
+
 /// A stored transaction record.
 ///
 /// Contains all the data needed to reconstruct a transaction's execution,
@@ -37,6 +41,8 @@ pub struct TxRecord {
     ///
     /// Contains ledger entry changes and other execution details.
     pub meta: Option<Vec<u8>>,
+    /// Transaction status: 0 = success, 1 = failed.
+    pub status: i32,
 }
 
 /// Query trait for transaction history operations.
@@ -47,6 +53,7 @@ pub trait HistoryQueries {
     /// Stores a transaction in the history table.
     ///
     /// If a transaction with the same ID already exists, it is replaced.
+    /// `status` should be [`TX_STATUS_SUCCESS`] or [`TX_STATUS_FAILED`].
     fn store_transaction(
         &self,
         ledger_seq: u32,
@@ -55,6 +62,7 @@ pub trait HistoryQueries {
         body: &[u8],
         result: &[u8],
         meta: Option<&[u8]>,
+        status: i32,
     ) -> Result<(), DbError>;
 
     /// Loads a transaction by its ID (hash).
@@ -120,12 +128,14 @@ pub trait HistoryQueries {
     /// limited to `limit` rows.
     ///
     /// If `start_tx_index` is `None`, starts from the beginning of `start_ledger`.
+    /// If `status_filter` is `Some`, only returns transactions with that status.
     fn load_transactions_in_range(
         &self,
         start_ledger: u32,
         start_tx_index: Option<u32>,
         end_ledger: u32,
         limit: u32,
+        status_filter: Option<i32>,
     ) -> Result<Vec<TxRecord>, DbError>;
 
     /// Deletes old transaction history entries with `ledgerseq <= max_ledger`.
@@ -145,14 +155,15 @@ impl HistoryQueries for Connection {
         body: &[u8],
         result: &[u8],
         meta: Option<&[u8]>,
+        status: i32,
     ) -> Result<(), DbError> {
         self.execute(
             r#"
             INSERT OR REPLACE INTO txhistory
-            (txid, ledgerseq, txindex, txbody, txresult, txmeta)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            (txid, ledgerseq, txindex, txbody, txresult, txmeta, status)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             "#,
-            params![tx_id, ledger_seq, tx_index, body, result, meta,],
+            params![tx_id, ledger_seq, tx_index, body, result, meta, status,],
         )?;
         Ok(())
     }
@@ -161,7 +172,7 @@ impl HistoryQueries for Connection {
         let result = self
             .query_row(
                 r#"
-                SELECT ledgerseq, txindex, txbody, txresult, txmeta
+                SELECT ledgerseq, txindex, txbody, txresult, txmeta, status
                 FROM txhistory WHERE txid = ?1
                 "#,
                 params![tx_id],
@@ -173,6 +184,7 @@ impl HistoryQueries for Connection {
                         body: row.get(2)?,
                         result: row.get(3)?,
                         meta: row.get(4)?,
+                        status: row.get(5)?,
                     })
                 },
             )
@@ -297,54 +309,84 @@ impl HistoryQueries for Connection {
         start_tx_index: Option<u32>,
         end_ledger: u32,
         limit: u32,
+        status_filter: Option<i32>,
     ) -> Result<Vec<TxRecord>, DbError> {
+        let status_clause = match status_filter {
+            Some(_) => " AND status = ?",
+            None => "",
+        };
+
+        let map_row = |row: &rusqlite::Row<'_>| {
+            Ok(TxRecord {
+                tx_id: row.get(0)?,
+                ledger_seq: row.get(1)?,
+                tx_index: row.get(2)?,
+                body: row.get(3)?,
+                result: row.get(4)?,
+                meta: row.get(5)?,
+                status: row.get(6)?,
+            })
+        };
+
         let mut results = Vec::new();
 
         match start_tx_index {
             Some(tx_index) => {
                 // Cursor-based: start after (start_ledger, tx_index)
-                let mut stmt = self.prepare(
-                    "SELECT txid, ledgerseq, txindex, txbody, txresult, txmeta \
+                let sql = format!(
+                    "SELECT txid, ledgerseq, txindex, txbody, txresult, txmeta, status \
                      FROM txhistory \
                      WHERE (ledgerseq > ?1 OR (ledgerseq = ?1 AND txindex > ?2)) \
-                       AND ledgerseq < ?3 \
+                       AND ledgerseq < ?3{} \
                      ORDER BY ledgerseq ASC, txindex ASC \
                      LIMIT ?4",
-                )?;
-                let rows =
-                    stmt.query_map(params![start_ledger, tx_index, end_ledger, limit], |row| {
-                        Ok(TxRecord {
-                            tx_id: row.get(0)?,
-                            ledger_seq: row.get(1)?,
-                            tx_index: row.get(2)?,
-                            body: row.get(3)?,
-                            result: row.get(4)?,
-                            meta: row.get(5)?,
-                        })
-                    })?;
+                    status_clause,
+                );
+                let mut stmt = self.prepare(&sql)?;
+                let rows = if let Some(status) = status_filter {
+                    // With status filter, shift the LIMIT param index
+                    let sql_with_status = format!(
+                        "SELECT txid, ledgerseq, txindex, txbody, txresult, txmeta, status \
+                         FROM txhistory \
+                         WHERE (ledgerseq > ?1 OR (ledgerseq = ?1 AND txindex > ?2)) \
+                           AND ledgerseq < ?3 AND status = ?4 \
+                         ORDER BY ledgerseq ASC, txindex ASC \
+                         LIMIT ?5",
+                    );
+                    stmt = self.prepare(&sql_with_status)?;
+                    stmt.query_map(
+                        params![start_ledger, tx_index, end_ledger, status, limit],
+                        map_row,
+                    )?
+                } else {
+                    stmt.query_map(params![start_ledger, tx_index, end_ledger, limit], map_row)?
+                };
                 for row in rows {
                     results.push(row?);
                 }
             }
             None => {
                 // Start from beginning of start_ledger
-                let mut stmt = self.prepare(
-                    "SELECT txid, ledgerseq, txindex, txbody, txresult, txmeta \
-                     FROM txhistory \
-                     WHERE ledgerseq >= ?1 AND ledgerseq < ?2 \
-                     ORDER BY ledgerseq ASC, txindex ASC \
-                     LIMIT ?3",
-                )?;
-                let rows = stmt.query_map(params![start_ledger, end_ledger, limit], |row| {
-                    Ok(TxRecord {
-                        tx_id: row.get(0)?,
-                        ledger_seq: row.get(1)?,
-                        tx_index: row.get(2)?,
-                        body: row.get(3)?,
-                        result: row.get(4)?,
-                        meta: row.get(5)?,
-                    })
-                })?;
+                let mut stmt;
+                let rows = if let Some(status) = status_filter {
+                    stmt = self.prepare(
+                        "SELECT txid, ledgerseq, txindex, txbody, txresult, txmeta, status \
+                         FROM txhistory \
+                         WHERE ledgerseq >= ?1 AND ledgerseq < ?2 AND status = ?3 \
+                         ORDER BY ledgerseq ASC, txindex ASC \
+                         LIMIT ?4",
+                    )?;
+                    stmt.query_map(params![start_ledger, end_ledger, status, limit], map_row)?
+                } else {
+                    stmt = self.prepare(
+                        "SELECT txid, ledgerseq, txindex, txbody, txresult, txmeta, status \
+                         FROM txhistory \
+                         WHERE ledgerseq >= ?1 AND ledgerseq < ?2 \
+                         ORDER BY ledgerseq ASC, txindex ASC \
+                         LIMIT ?3",
+                    )?;
+                    stmt.query_map(params![start_ledger, end_ledger, limit], map_row)?
+                };
                 for row in rows {
                     results.push(row?);
                 }
@@ -410,7 +452,8 @@ mod tests {
                 txindex INTEGER NOT NULL,
                 txbody BLOB NOT NULL,
                 txresult BLOB NOT NULL,
-                txmeta BLOB
+                txmeta BLOB,
+                status INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX txhistory_ledger ON txhistory(ledgerseq);
             CREATE TABLE txsets (
@@ -435,7 +478,7 @@ mod tests {
         let result = b"transaction result";
         let meta = b"transaction meta";
 
-        conn.store_transaction(100, 0, tx_id, body, result, Some(meta))
+        conn.store_transaction(100, 0, tx_id, body, result, Some(meta), TX_STATUS_SUCCESS)
             .unwrap();
 
         let loaded = conn.load_transaction(tx_id).unwrap().unwrap();
@@ -445,6 +488,7 @@ mod tests {
         assert_eq!(loaded.body, body.to_vec());
         assert_eq!(loaded.result, result.to_vec());
         assert_eq!(loaded.meta, Some(meta.to_vec()));
+        assert_eq!(loaded.status, TX_STATUS_SUCCESS);
     }
 
     #[test]
@@ -454,13 +498,14 @@ mod tests {
         let body = b"body";
         let result = b"result";
 
-        conn.store_transaction(200, 5, tx_id, body, result, None)
+        conn.store_transaction(200, 5, tx_id, body, result, None, TX_STATUS_FAILED)
             .unwrap();
 
         let loaded = conn.load_transaction(tx_id).unwrap().unwrap();
         assert_eq!(loaded.ledger_seq, 200);
         assert_eq!(loaded.tx_index, 5);
         assert!(loaded.meta.is_none());
+        assert_eq!(loaded.status, TX_STATUS_FAILED);
     }
 
     #[test]
@@ -475,17 +520,34 @@ mod tests {
         let tx_id = "update_test";
 
         // Store initial version
-        conn.store_transaction(100, 0, tx_id, b"old_body", b"old_result", None)
-            .unwrap();
+        conn.store_transaction(
+            100,
+            0,
+            tx_id,
+            b"old_body",
+            b"old_result",
+            None,
+            TX_STATUS_SUCCESS,
+        )
+        .unwrap();
 
         // Update with new data
-        conn.store_transaction(100, 0, tx_id, b"new_body", b"new_result", Some(b"meta"))
-            .unwrap();
+        conn.store_transaction(
+            100,
+            0,
+            tx_id,
+            b"new_body",
+            b"new_result",
+            Some(b"meta"),
+            TX_STATUS_FAILED,
+        )
+        .unwrap();
 
         let loaded = conn.load_transaction(tx_id).unwrap().unwrap();
         assert_eq!(loaded.body, b"new_body".to_vec());
         assert_eq!(loaded.result, b"new_result".to_vec());
         assert_eq!(loaded.meta, Some(b"meta".to_vec()));
+        assert_eq!(loaded.status, TX_STATUS_FAILED);
     }
 
     // Item 14: copy_tx_history_to_streams tests

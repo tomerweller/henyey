@@ -36,7 +36,7 @@ pub async fn handle(
 
     // Parse filters
     let (event_type, contract_ids, topic_filters) =
-        parse_event_filters(params.get("filters").and_then(|v| v.as_array()));
+        parse_event_filters(params.get("filters").and_then(|v| v.as_array()))?;
 
     // Parse pagination
     let pagination = params.get("pagination");
@@ -119,48 +119,90 @@ pub async fn handle(
     }))
 }
 
+/// Maximum number of filters allowed per request.
+const MAX_FILTERS: usize = 5;
+/// Maximum number of contract IDs per filter.
+const MAX_CONTRACT_IDS_PER_FILTER: usize = 5;
+/// Maximum number of topic segments per filter.
+const MAX_TOPICS_PER_FILTER: usize = 5;
+/// Maximum number of alternatives per topic segment.
+const MAX_TOPIC_SEGMENTS: usize = 4;
+
 /// Parse event filter parameters from the JSON-RPC request.
 ///
 /// Returns `(event_type, contract_ids, topic_filters)`.
 fn parse_event_filters(
     filters: Option<&Vec<serde_json::Value>>,
-) -> (Option<&'static str>, Vec<String>, Vec<Vec<String>>) {
+) -> Result<(Option<&'static str>, Vec<String>, Vec<Vec<String>>), JsonRpcError> {
     let mut event_type: Option<&'static str> = None;
     let mut contract_ids = Vec::new();
     let mut topic_filters = Vec::new();
 
     let Some(filter_array) = filters else {
-        return (event_type, contract_ids, topic_filters);
+        return Ok((event_type, contract_ids, topic_filters));
     };
+
+    if filter_array.len() > MAX_FILTERS {
+        return Err(JsonRpcError::invalid_params(format!(
+            "too many filters: max {} allowed",
+            MAX_FILTERS
+        )));
+    }
 
     for filter in filter_array {
         if let Some(t) = filter.get("type").and_then(|v| v.as_str()) {
             event_type = Some(match t {
                 "contract" => "contract",
                 "system" => "system",
-                "diagnostic" => "diagnostic",
-                _ => "contract",
+                other => {
+                    return Err(JsonRpcError::invalid_params(format!(
+                        "unsupported event type: '{}' (allowed: contract, system)",
+                        other,
+                    )));
+                }
             });
         }
 
         if let Some(cids) = filter.get("contractIds").and_then(|v| v.as_array()) {
+            if cids.len() > MAX_CONTRACT_IDS_PER_FILTER {
+                return Err(JsonRpcError::invalid_params(format!(
+                    "too many contractIds per filter: max {} allowed",
+                    MAX_CONTRACT_IDS_PER_FILTER
+                )));
+            }
             contract_ids.extend(cids.iter().filter_map(|v| v.as_str().map(String::from)));
         }
 
         // Topics is an array of arrays: [["topic1_a", "topic1_b"], ["*"], ...]
         // Each inner array is OR alternatives for that position.
         if let Some(topics_arr) = filter.get("topics").and_then(|v| v.as_array()) {
+            if topics_arr.len() > MAX_TOPICS_PER_FILTER {
+                return Err(JsonRpcError::invalid_params(format!(
+                    "too many topics per filter: max {} allowed",
+                    MAX_TOPICS_PER_FILTER
+                )));
+            }
             for topic_set in topics_arr {
                 if let Some(alternatives) = topic_set.as_array() {
+                    if alternatives.len() > MAX_TOPIC_SEGMENTS {
+                        return Err(JsonRpcError::invalid_params(format!(
+                            "too many alternatives per topic segment: max {} allowed",
+                            MAX_TOPIC_SEGMENTS
+                        )));
+                    }
                     let alt_strings: Vec<String> =
                         alternatives.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+                    // ** means "match all remaining positions" — stop adding further filters
+                    if alt_strings.iter().any(|s| s == "**") {
+                        break;
+                    }
                     topic_filters.push(alt_strings);
                 }
             }
         }
     }
 
-    (event_type, contract_ids, topic_filters)
+    Ok((event_type, contract_ids, topic_filters))
 }
 
 fn get_ledger_close_time(ctx: &RpcContext, ledger_seq: u32) -> String {

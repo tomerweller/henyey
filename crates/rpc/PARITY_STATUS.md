@@ -2,28 +2,28 @@
 
 **Crate**: `henyey-rpc`
 **Upstream**: `stellar/stellar-rpc` (Go, GitHub)
-**Overall Parity**: 85%
+**Overall Parity**: 98%
 **Last Updated**: 2026-03-13
 
 ## Summary
 
 | Area | Status | Notes |
 |------|--------|-------|
-| JSON-RPC 2.0 envelope | Full | Request/response parsing, error codes |
+| JSON-RPC 2.0 envelope | Full | Request/response parsing, error codes, body size limit, batch rejection |
 | Method dispatch | Full | All 12 methods registered |
-| getHealth | Partial | No latency check; `oldestLedger` from DB |
+| getHealth | Full | Latency check via configurable `max_healthy_ledger_latency_secs` |
 | getNetwork | Full | Passphrase, friendbot URL, protocol version |
 | getLatestLedger | Full | All fields: `id`, `sequence`, `protocolVersion`, `closeTime`, `headerXdr`, `metadataXdr` |
-| getVersionInfo | Partial | `commitHash`, `buildTimestamp`, `captiveCoreVersion` empty |
+| getVersionInfo | Full | `commitHash`, `buildTimestamp` from build.rs; `captiveCoreVersion` = henyey version |
 | getFeeStats | Full | Sliding window, nearest-rank percentiles, classic + soroban fees |
-| getLedgerEntries | Partial | Core lookup + TTL works; `xdrFormat` support; no key limit |
+| getLedgerEntries | Full | Core lookup + TTL; `xdrFormat` support; max 200 keys limit |
 | getTransaction | Full | Full lookup, `xdrFormat` support, all fields |
-| getTransactions | Partial | Range query, TOID cursor, `xdrFormat` support; missing status filter |
+| getTransactions | Full | Range query, TOID cursor, `xdrFormat` support, DB-level status filter |
 | getLedgers | Full | Range query, cursor pagination, `xdrFormat` support |
-| getEvents | Partial | Core query works; `xdrFormat` support; missing filter limits, `**` wildcard |
-| sendTransaction | Partial | Submission works; `xdrFormat` support; generic error XDR |
-| simulateTransaction | Partial | InvokeHostFunction + ExtendTTL + Restore; `xdrFormat` support; no authMode/stateChanges |
-| Infrastructure | Partial | `xdrFormat` JSON output implemented; no body size limit, no batch rejection |
+| getEvents | Full | Core query; `xdrFormat` support; filter limits; `**` wildcard; diagnostic type rejected |
+| sendTransaction | Full | Submission; `xdrFormat` support; actual error codes from herder |
+| simulateTransaction | Full | InvokeHostFunction + ExtendTTL + Restore; `xdrFormat`; authMode; resourceConfig; stateChanges; memo validation |
+| Infrastructure | Full | `xdrFormat` JSON output; 512KB body size limit; batch request rejection |
 
 ## File Mapping
 
@@ -57,8 +57,8 @@ Corresponds to: `cmd/soroban-rpc/internal/jsonrpc.go`, `cmd/soroban-rpc/internal
 | JSON-RPC 2.0 response envelope | `JsonRpcResponse` | Full |
 | Error codes (-32600, -32601, -32602, -32603) | `JsonRpcError` | Full |
 | Method dispatch by name | `dispatch()` | Full |
-| HTTP body size limit (512KB) | — | None |
-| Batch request rejection | — | None |
+| HTTP body size limit (512KB) | `DefaultBodyLimit::max()` in `server.rs` | Full |
+| Batch request rejection (`[` prefix check) | `server.rs` handler | Full |
 | xdrFormat parameter support | `util::parse_format()`, `XdrFormat` enum | Full |
 
 ### getHealth (`methods/health.rs`)
@@ -71,7 +71,7 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/health.go`
 | `latestLedger` field | `handle()` | Full |
 | `oldestLedger` from DB retention | `util::oldest_ledger()` | Full |
 | `ledgerRetentionWindow` | `DEFAULT_LEDGER_RETENTION_WINDOW` | Full |
-| Ledger age check (`maxHealthyLedgerLatency`) | — | None |
+| Ledger age check (`maxHealthyLedgerLatency`) | `handle()` via `SystemTime` + `max_healthy_ledger_latency_secs` | Full |
 
 ### getNetwork (`methods/network.rs`)
 
@@ -104,9 +104,9 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/get_version_info.go`
 |-------------|------|--------|
 | `version` | `handle()` | Full |
 | `protocolVersion` | `handle()` | Full |
-| `commitHash` | Empty string | None |
-| `buildTimestamp` | Empty string | None |
-| `captiveCoreVersion` | Empty string | None |
+| `commitHash` | `handle()` via `AppInfo.commit_hash` (from `build.rs`) | Full |
+| `buildTimestamp` | `handle()` via `AppInfo.build_timestamp` (from `build.rs`) | Full |
+| `captiveCoreVersion` | `handle()` as `"henyey-v{version}"` | Full |
 
 ### getFeeStats (`methods/fee_stats.rs`, `fee_window.rs`)
 
@@ -133,7 +133,7 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/get_ledger_entries.go`
 | `liveUntilLedgerSeq` in response | `handle()` | Full |
 | `lastModifiedLedgerSeq` | `handle()` | Full |
 | `extXdr` field | `handle()` | Full |
-| Max 200 keys limit | — | None |
+| Max 200 keys limit | `handle()` | Full |
 | `xdrFormat` JSON output | `handle()` | Full |
 
 ### getTransaction (`methods/get_transaction.rs`)
@@ -167,7 +167,7 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/get_transactions.go`
 | `diagnosticEventsXdr` | `util::extract_diagnostic_events()` | Full |
 | `txHash`, `ledger`, `createdAt`, `applicationOrder` | `handle()` | Full |
 | `latestLedger`, `oldestLedger`, close times | `handle()` | Full |
-| Filter by status | — | None |
+| Filter by status (success/failed) | `handle()` + DB-level `status` column | Full |
 | `xdrFormat` support | `handle()` | Full |
 
 ### getLedgers (`methods/get_ledgers.rs`)
@@ -199,11 +199,11 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/get_events.go`
 | DB query for events | `handle()` | Full |
 | Ledger close time lookup | `get_ledger_close_time()` | Full |
 | Event value XDR extraction | `extract_event_value()` | Full |
-| Max 5 filters enforcement | — | None |
-| Max 5 contractIDs per filter | — | None |
-| Max 5 topics, 4 segments per topic | — | None |
-| `**` wildcard support | — | None |
-| `diagnostic` type rejected (Go only allows contract/system) | Accepted (divergence) | Partial |
+| Max 5 filters enforcement | `parse_event_filters()` | Full |
+| Max 5 contractIDs per filter | `parse_event_filters()` | Full |
+| Max 5 topics, 4 segments per topic | `parse_event_filters()` | Full |
+| `**` wildcard support (topic truncation) | `parse_event_filters()` + DB-side break | Full |
+| `diagnostic` type rejected | `parse_event_filters()` | Full |
 | `oldestLedger` from DB | `util::oldest_ledger()` | Full |
 | `xdrFormat` JSON output | `handle()` | Full |
 
@@ -217,8 +217,8 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/send_transaction.go`
 | Transaction hash computation | `handle()` | Full |
 | Herder submission | `handle()` | Full |
 | PENDING/DUPLICATE/TRY_AGAIN_LATER/ERROR status | `handle()` | Full |
-| `errorResultXdr` with actual error code | Generic `TxFailed` always | Partial |
-| `diagnosticEventsXdr` | Empty array for Invalid | Partial |
+| `errorResultXdr` with actual error code | `handle()` via `TxResultCode` from herder | Full |
+| `diagnosticEventsXdr` | Empty array for errors | Partial |
 | `xdrFormat` JSON output | `handle()` | Full |
 
 ### simulateTransaction (`simulate/mod.rs`, `simulate/snapshot.rs`)
@@ -231,7 +231,7 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/simulate_transaction.go`, `cmd
 | Recording mode invocation | `run_invoke_simulation()` | Full |
 | BucketList snapshot source | `BucketListSnapshotSource` | Full |
 | TTL-aware entry lookup | `get_entry_ttl()` | Full |
-| Resource adjustment (1.04x + 50k) | `adjust_resources()` | Full |
+| Resource adjustment (1.04x instructions, 1.0x read/write bytes) | `adjust_resources()` | Full |
 | Refundable fee adjustment (1.15x) | `compute_invoke_resource_fee()` | Full |
 | SorobanTransactionData construction | `build_invoke_response()` | Full |
 | Auth entries in response | `build_invoke_response()` | Full |
@@ -241,10 +241,10 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/simulate_transaction.go`, `cmd
 | RestoreFootprint simulation | `simulate_restore_op()` | Full |
 | Rent fee computation | `compute_resource_fee_with_rent()` | Full |
 | `xdrFormat` support | `handle()` | Full |
-| `authMode` parameter | — | None |
-| `stateChanges` in response | — | None |
-| `resourceConfig` parameter | — | None |
-| Memo validation | — | None |
+| `authMode` parameter (enforce/record/record_allow_nonroot) | `resolve_auth_mode()` | Full |
+| `stateChanges` in response (created/updated/deleted diffs) | `extract_modified_entries()`, `serialize_state_changes()` | Full |
+| `resourceConfig.instructionLeeway` parameter | `handle()` + `adjust_resources()` | Full |
+| Memo validation (MemoText ≤ 28 bytes) | `validate_memo()` | Full |
 
 ## Intentional Omissions
 
@@ -256,22 +256,11 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/simulate_transaction.go`, `cmd
 | Prometheus metrics endpoint | Out of scope for initial implementation |
 | CORS / HTTP middleware | Not required for node-internal RPC |
 
-## Gaps
+## Known Minor Gaps
 
-| stellar-rpc Component | Priority | Notes |
-|------------------------|----------|-------|
-| `getTransactions` status filter | Low | Missing status-based filtering |
-| `getHealth` latency check | Low | Always returns "healthy" regardless of ledger age |
-| `getVersionInfo` build metadata | Low | Empty strings for commit/build/captiveCore |
-| `getEvents` filter limits | Low | No enforcement of max filters/contractIDs/topics |
-| `getEvents` `**` wildcard | Low | Topic wildcard not supported |
-| `sendTransaction` actual error codes | Low | Always returns generic TxFailed |
-| `simulateTransaction` authMode | Low | No auth mode parameter support |
-| `simulateTransaction` stateChanges | Low | Not included in response |
-| `simulateTransaction` resourceConfig | Low | No resource config parameter |
-| HTTP body size limit (512KB) | Low | No request size enforcement |
-| `getLedgerEntries` max 200 keys | Low | No key count limit |
-| Batch request rejection | Low | Multiple requests in one HTTP body not rejected |
+| Item | Priority | Notes |
+|------|----------|-------|
+| `sendTransaction` `diagnosticEventsXdr` for invalid txs | Low | Returns empty array instead of actual diagnostic events from herder |
 
 ## Architectural Differences
 
@@ -326,7 +315,7 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/simulate_transaction.go`, `cmd
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 89 |
-| Gaps (None + Partial) | 16 |
+| Implemented (Full) | 103 |
+| Gaps (None + Partial) | 2 |
 | Intentional Omissions | 5 |
-| **Parity** | **89 / (89 + 16) = 85%** |
+| **Parity** | **103 / (103 + 2) = 98%** |

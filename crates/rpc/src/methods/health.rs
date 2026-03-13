@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 
@@ -6,20 +7,34 @@ use crate::context::RpcContext;
 use crate::error::JsonRpcError;
 use crate::util;
 
-/// Default ledger retention window (number of ledgers kept).
-const DEFAULT_LEDGER_RETENTION_WINDOW: u32 = 2880;
-
 pub async fn handle(ctx: &Arc<RpcContext>) -> Result<serde_json::Value, JsonRpcError> {
     let ledger = ctx.app.ledger_summary();
+    let rpc_config = &ctx.app.config().rpc;
 
-    // stellar-rpc returns "healthy" whenever the server is reachable
-    let status = "healthy";
     let oldest_ledger = util::oldest_ledger(&ctx.app);
+
+    // Determine health status based on ledger age
+    let max_latency = rpc_config.max_healthy_ledger_latency_secs;
+    let status = if max_latency > 0 && ledger.close_time > 0 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let age = now.saturating_sub(ledger.close_time);
+        if age > max_latency {
+            "unhealthy"
+        } else {
+            "healthy"
+        }
+    } else {
+        // Latency check disabled or no ledger close time available
+        "healthy"
+    };
 
     Ok(json!({
         "status": status,
         "latestLedger": ledger.num,
         "oldestLedger": oldest_ledger,
-        "ledgerRetentionWindow": DEFAULT_LEDGER_RETENTION_WINDOW
+        "ledgerRetentionWindow": rpc_config.retention_window
     }))
 }

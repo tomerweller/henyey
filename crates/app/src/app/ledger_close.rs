@@ -166,6 +166,19 @@ impl App {
                     None => None,
                 };
 
+                // Compute status from the transaction result code
+                let status = {
+                    use stellar_xdr::curr::TransactionResultCode;
+                    let code = tx_result.result.result.discriminant();
+                    if code == TransactionResultCode::TxSuccess
+                        || code == TransactionResultCode::TxFeeBumpInnerSuccess
+                    {
+                        henyey_db::TX_STATUS_SUCCESS
+                    } else {
+                        henyey_db::TX_STATUS_FAILED
+                    }
+                };
+
                 conn.store_transaction(
                     header.ledger_seq,
                     index as u32,
@@ -173,6 +186,7 @@ impl App {
                     &tx_body,
                     &tx_result_xdr,
                     tx_meta_xdr.as_deref(),
+                    status,
                 )?;
             }
 

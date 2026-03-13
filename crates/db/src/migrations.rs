@@ -34,7 +34,7 @@ use tracing::info;
 /// This should be incremented whenever a new migration is added.
 /// The database initialization and migration system uses this to
 /// determine if upgrades are needed.
-pub(crate) const CURRENT_VERSION: i32 = 7;
+pub(crate) const CURRENT_VERSION: i32 = 8;
 
 /// Represents a single database migration.
 ///
@@ -151,6 +151,14 @@ const MIGRATIONS: &[Migration] = &[
             );
         "#,
         description: "Add ledger_close_meta table for full LedgerCloseMeta storage",
+    },
+    Migration {
+        from_version: 7,
+        to_version: 8,
+        upgrade_sql: r#"
+            ALTER TABLE txhistory ADD COLUMN status INTEGER NOT NULL DEFAULT 0;
+        "#,
+        description: "Add status column to txhistory for DB-level transaction status filtering",
     },
 ];
 

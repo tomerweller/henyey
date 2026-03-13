@@ -673,7 +673,13 @@ async fn main() -> anyhow::Result<()> {
     init_logging(&cli)?;
 
     // Load or create configuration
-    let config = load_config(&cli)?;
+    let mut config = load_config(&cli)?;
+
+    // Inject build metadata from compile-time environment variables
+    config.build = henyey_app::BuildMetadata {
+        commit_hash: env!("HENYEY_COMMIT_HASH").to_string(),
+        build_timestamp: env!("HENYEY_BUILD_TIMESTAMP").to_string(),
+    };
 
     // Apply testing overrides early (before any checkpoint math).
     if config.testing.accelerate_time {

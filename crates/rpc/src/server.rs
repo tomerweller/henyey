@@ -48,6 +48,7 @@ impl RpcServer {
 
         let router = Router::new()
             .route("/", post(rpc_handler))
+            .layer(axum::extract::DefaultBodyLimit::max(512 * 1024))
             .with_state(ctx);
 
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
@@ -169,6 +170,15 @@ async fn rpc_handler(
     State(ctx): State<Arc<RpcContext>>,
     body: axum::body::Bytes,
 ) -> (StatusCode, Json<JsonRpcResponse>) {
+    // Reject batch requests (JSON arrays)
+    if body.first().copied() == Some(b'[') {
+        let resp = JsonRpcResponse::error(
+            serde_json::Value::Null,
+            JsonRpcError::invalid_request("batch requests are not supported"),
+        );
+        return (StatusCode::OK, Json(resp));
+    }
+
     // Parse the request body
     let request: JsonRpcRequest = match serde_json::from_slice(&body) {
         Ok(req) => req,

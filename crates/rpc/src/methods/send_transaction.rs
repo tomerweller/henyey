@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde_json::json;
-use stellar_xdr::curr::{Limits, ReadXdr, TransactionEnvelope};
+use stellar_xdr::curr::{Limits, ReadXdr, TransactionEnvelope, TransactionResultCode};
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
@@ -60,9 +60,9 @@ pub async fn handle(
         | henyey_herder::TxQueueResult::TryAgainLater => {
             obj.insert("status".into(), json!("TRY_AGAIN_LATER"));
         }
-        henyey_herder::TxQueueResult::Invalid(_code) => {
+        henyey_herder::TxQueueResult::Invalid(code) => {
             obj.insert("status".into(), json!("ERROR"));
-            let error_result = build_error_result();
+            let error_result = build_error_result(code);
             util::insert_xdr_field(&mut obj, "errorResult", &error_result, format)?;
             // Empty diagnostic events array
             match format {
@@ -74,28 +74,45 @@ pub async fn handle(
                 }
             }
         }
-        henyey_herder::TxQueueResult::Banned
-        | henyey_herder::TxQueueResult::FeeTooLow
-        | henyey_herder::TxQueueResult::Filtered => {
+        henyey_herder::TxQueueResult::Banned => {
             obj.insert("status".into(), json!("ERROR"));
+            let error_result =
+                build_error_result(Some(TransactionResultCode::TxTooLate));
+            util::insert_xdr_field(&mut obj, "errorResult", &error_result, format)?;
+        }
+        henyey_herder::TxQueueResult::FeeTooLow => {
+            obj.insert("status".into(), json!("ERROR"));
+            let error_result =
+                build_error_result(Some(TransactionResultCode::TxInsufficientFee));
+            util::insert_xdr_field(&mut obj, "errorResult", &error_result, format)?;
+        }
+        henyey_herder::TxQueueResult::Filtered => {
+            obj.insert("status".into(), json!("ERROR"));
+            let error_result =
+                build_error_result(Some(TransactionResultCode::TxFailed));
+            util::insert_xdr_field(&mut obj, "errorResult", &error_result, format)?;
         }
     }
 
     Ok(serde_json::Value::Object(obj))
 }
 
-/// Build a minimal error TransactionResult for the response.
-///
-/// Currently always returns a generic `TxFailed` result. A more complete
-/// implementation would map the actual error code.
-fn build_error_result() -> stellar_xdr::curr::TransactionResult {
+/// Build an error TransactionResult for the response using the actual error code.
+fn build_error_result(
+    code: Option<TransactionResultCode>,
+) -> stellar_xdr::curr::TransactionResult {
+    use henyey_tx::TransactionResultCodeExt;
     use stellar_xdr::curr::{
         TransactionResult, TransactionResultExt, TransactionResultResult,
     };
 
+    let result = code
+        .map(|c| c.to_xdr_result())
+        .unwrap_or(TransactionResultResult::TxInternalError);
+
     TransactionResult {
         fee_charged: 0,
-        result: TransactionResultResult::TxFailed(stellar_xdr::curr::VecM::default()),
+        result,
         ext: TransactionResultExt::V0,
     }
 }

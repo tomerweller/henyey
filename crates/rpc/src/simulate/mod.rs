@@ -35,7 +35,10 @@ const REFUNDABLE_FEE_ADJUSTMENT_FACTOR: f64 = 1.15;
 
 /// The three Soroban operation kinds we can simulate.
 enum SorobanOp {
-    InvokeHostFunction(HostFunction),
+    InvokeHostFunction {
+        host_fn: HostFunction,
+        auth: Vec<stellar_xdr::curr::SorobanAuthorizationEntry>,
+    },
     ExtendFootprintTtl {
         keys: Vec<LedgerKey>,
         extend_to: u32,
@@ -48,16 +51,24 @@ enum SorobanOp {
 /// Extract the Soroban operation, source account, and optional footprint from the envelope.
 fn extract_soroban_op(
     tx_env: &TransactionEnvelope,
-) -> Result<(stellar_xdr::curr::AccountId, SorobanOp), JsonRpcError> {
-    let (source, ops, ext) = match tx_env {
-        TransactionEnvelope::Tx(tx) => (&tx.tx.source_account, &tx.tx.operations, &tx.tx.ext),
+) -> Result<(stellar_xdr::curr::AccountId, SorobanOp, stellar_xdr::curr::Memo), JsonRpcError> {
+    let (source, ops, ext, memo) = match tx_env {
+        TransactionEnvelope::Tx(tx) => (
+            &tx.tx.source_account,
+            &tx.tx.operations,
+            &tx.tx.ext,
+            &tx.tx.memo,
+        ),
         TransactionEnvelope::TxV0(_) => {
             return Err(JsonRpcError::invalid_params("v0 transactions not supported"));
         }
         TransactionEnvelope::TxFeeBump(fb) => match &fb.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
-                (&inner.tx.source_account, &inner.tx.operations, &inner.tx.ext)
-            }
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => (
+                &inner.tx.source_account,
+                &inner.tx.operations,
+                &inner.tx.ext,
+                &inner.tx.memo,
+            ),
         },
     };
 
@@ -71,7 +82,16 @@ fn extract_soroban_op(
 
     match &ops[0].body {
         OperationBody::InvokeHostFunction(op) => {
-            Ok((source_account, SorobanOp::InvokeHostFunction(op.host_function.clone())))
+            let auth: Vec<stellar_xdr::curr::SorobanAuthorizationEntry> =
+                op.auth.iter().cloned().collect();
+            Ok((
+                source_account,
+                SorobanOp::InvokeHostFunction {
+                    host_fn: op.host_function.clone(),
+                    auth,
+                },
+                memo.clone(),
+            ))
         }
         OperationBody::ExtendFootprintTtl(op) => {
             let keys = extract_footprint_keys(ext)?;
@@ -81,16 +101,34 @@ fn extract_soroban_op(
                     keys,
                     extend_to: op.extend_to,
                 },
+                memo.clone(),
             ))
         }
         OperationBody::RestoreFootprint(_) => {
             let keys = extract_footprint_keys(ext)?;
-            Ok((source_account, SorobanOp::RestoreFootprint { keys }))
+            Ok((
+                source_account,
+                SorobanOp::RestoreFootprint { keys },
+                memo.clone(),
+            ))
         }
         _ => Err(JsonRpcError::invalid_params(
             "operation must be InvokeHostFunction, ExtendFootprintTtl, or RestoreFootprint",
         )),
     }
+}
+
+/// Validate memo (MemoText must be ≤ 28 bytes).
+fn validate_memo(memo: &stellar_xdr::curr::Memo) -> Result<(), JsonRpcError> {
+    if let stellar_xdr::curr::Memo::Text(text) = memo {
+        if text.len() > 28 {
+            return Err(JsonRpcError::invalid_params(format!(
+                "memo text too long: {} bytes (max 28)",
+                text.len()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn muxed_to_account_id(source: &stellar_xdr::curr::MuxedAccount) -> stellar_xdr::curr::AccountId {
@@ -152,7 +190,23 @@ pub async fn handle(
     let tx_env = TransactionEnvelope::from_xdr(&tx_bytes, Limits::none())
         .map_err(|e| JsonRpcError::invalid_params(format!("invalid XDR: {e}")))?;
 
-    let (source_account, soroban_op) = extract_soroban_op(&tx_env)?;
+    let (source_account, soroban_op, memo) = extract_soroban_op(&tx_env)?;
+
+    // Validate memo
+    validate_memo(&memo)?;
+
+    // Parse authMode parameter
+    let auth_mode_str = params
+        .get("authMode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Parse resourceConfig parameter
+    let instruction_leeway: u32 = params
+        .get("resourceConfig")
+        .and_then(|v| v.get("instructionLeeway"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
 
     // Get bucket list snapshot
     let bl_snapshot = ctx
@@ -184,7 +238,25 @@ pub async fn handle(
     let snapshot_source = BucketListSnapshotSource::new(bl_snapshot, ledger.num);
 
     match soroban_op {
-        SorobanOp::InvokeHostFunction(host_fn) => {
+        SorobanOp::InvokeHostFunction { host_fn, auth } => {
+            // Validate and resolve authMode
+            if !auth_mode_str.is_empty()
+                && !matches!(
+                    auth_mode_str,
+                    "enforce" | "record" | "record_allow_nonroot"
+                )
+            {
+                return Err(JsonRpcError::invalid_params(format!(
+                    "unsupported authMode: '{}' (allowed: enforce, record, record_allow_nonroot)",
+                    auth_mode_str
+                )));
+            }
+
+            // Non-InvokeHostFunction ops cannot have authMode set — already matched above
+
+            // Determine the effective auth mode
+            let resolved_auth_mode = resolve_auth_mode(auth_mode_str, &auth)?;
+
             handle_invoke(
                 host_fn,
                 source_account,
@@ -193,10 +265,17 @@ pub async fn handle(
                 &soroban_info,
                 ledger.num,
                 format,
+                resolved_auth_mode,
+                instruction_leeway,
             )
             .await
         }
         SorobanOp::ExtendFootprintTtl { keys, extend_to } => {
+            if !auth_mode_str.is_empty() {
+                return Err(JsonRpcError::invalid_params(
+                    "authMode is only supported for InvokeHostFunction operations",
+                ));
+            }
             let soroban_info_clone = soroban_info.clone();
             let result = tokio::task::spawn_blocking(move || {
                 simulate_extend_ttl_op(
@@ -216,6 +295,11 @@ pub async fn handle(
             }
         }
         SorobanOp::RestoreFootprint { keys } => {
+            if !auth_mode_str.is_empty() {
+                return Err(JsonRpcError::invalid_params(
+                    "authMode is only supported for InvokeHostFunction operations",
+                ));
+            }
             let soroban_info_clone = soroban_info.clone();
             let result = tokio::task::spawn_blocking(move || {
                 simulate_restore_op(&snapshot_source, &ledger_info, &keys, &soroban_info_clone)
@@ -226,6 +310,42 @@ pub async fn handle(
             match result {
                 Ok(tx_data) => build_footprint_response(tx_data, &soroban_info, ledger.num, format),
                 Err(e) => build_error_response(e, ledger.num),
+            }
+        }
+    }
+}
+
+/// Resolve the effective `RecordingInvocationAuthMode` from the request parameter.
+fn resolve_auth_mode(
+    auth_mode_str: &str,
+    tx_auth: &[stellar_xdr::curr::SorobanAuthorizationEntry],
+) -> Result<soroban_host::e2e_invoke::RecordingInvocationAuthMode, JsonRpcError> {
+    use soroban_host::e2e_invoke::RecordingInvocationAuthMode;
+
+    match auth_mode_str {
+        "enforce" => Ok(RecordingInvocationAuthMode::Enforcing(tx_auth.to_vec())),
+        "record" => {
+            if !tx_auth.is_empty() {
+                return Err(JsonRpcError::invalid_params(
+                    "authMode 'record' cannot be used when transaction has auth entries",
+                ));
+            }
+            Ok(RecordingInvocationAuthMode::Recording(true))
+        }
+        "record_allow_nonroot" => {
+            if !tx_auth.is_empty() {
+                return Err(JsonRpcError::invalid_params(
+                    "authMode 'record_allow_nonroot' cannot be used when transaction has auth entries",
+                ));
+            }
+            Ok(RecordingInvocationAuthMode::Recording(false))
+        }
+        _ => {
+            // Default: if tx has auth entries -> enforce, else -> record (non-root disabled)
+            if tx_auth.is_empty() {
+                Ok(RecordingInvocationAuthMode::Recording(true))
+            } else {
+                Ok(RecordingInvocationAuthMode::Enforcing(tx_auth.to_vec()))
             }
         }
     }
@@ -243,12 +363,21 @@ async fn handle_invoke(
     soroban_info: &henyey_ledger::SorobanNetworkInfo,
     latest_ledger: u32,
     format: XdrFormat,
+    auth_mode: soroban_host::e2e_invoke::RecordingInvocationAuthMode,
+    instruction_leeway: u32,
 ) -> Result<serde_json::Value, JsonRpcError> {
     let host_fn_clone = host_fn.clone();
     let source_account_clone = source_account.clone();
+    let ledger_info_clone = ledger_info.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        run_invoke_simulation(host_fn_clone, source_account_clone, ledger_info, snapshot_source)
+        run_invoke_simulation(
+            host_fn_clone,
+            source_account_clone,
+            ledger_info_clone,
+            snapshot_source,
+            auth_mode,
+        )
     })
     .await
     .map_err(|e| JsonRpcError::internal(format!("simulation task failed: {e}")))?;
@@ -257,19 +386,29 @@ async fn handle_invoke(
         Ok(sim_output) => build_invoke_response(
             sim_output.recording_result,
             sim_output.diagnostic_events,
+            sim_output.state_changes,
             soroban_info,
             latest_ledger,
             &host_fn,
             &source_account,
             format,
+            instruction_leeway,
         ),
         Err(e) => build_error_response(e, latest_ledger),
     }
 }
 
+/// Represents a single ledger entry state change from simulation.
+struct LedgerEntryDiff {
+    key: LedgerKey,
+    state_before: Option<stellar_xdr::curr::LedgerEntry>,
+    state_after: Option<stellar_xdr::curr::LedgerEntry>,
+}
+
 struct InvokeSimulationOutput {
     recording_result: soroban_host::e2e_invoke::InvokeHostFunctionRecordingModeResult,
     diagnostic_events: Vec<stellar_xdr::curr::DiagnosticEvent>,
+    state_changes: Vec<LedgerEntryDiff>,
 }
 
 fn run_invoke_simulation(
@@ -277,38 +416,105 @@ fn run_invoke_simulation(
     source_account: stellar_xdr::curr::AccountId,
     ledger_info: soroban_host::LedgerInfo,
     snapshot_source: BucketListSnapshotSource,
+    auth_mode: soroban_host::e2e_invoke::RecordingInvocationAuthMode,
 ) -> Result<InvokeSimulationOutput, String> {
     use soroban_host::budget::Budget;
-    use soroban_host::e2e_invoke::{
-        invoke_host_function_in_recording_mode, RecordingInvocationAuthMode,
-    };
+    use soroban_host::e2e_invoke::invoke_host_function_in_recording_mode;
 
     let budget = Budget::default();
     let mut diagnostic_events = Vec::new();
     let seed: [u8; 32] = rand::random();
+
+    let snapshot_rc = Rc::new(snapshot_source);
 
     let result = invoke_host_function_in_recording_mode(
         &budget,
         true, // enable_diagnostics
         &host_fn,
         &source_account,
-        RecordingInvocationAuthMode::Recording(false),
-        ledger_info,
-        Rc::new(snapshot_source),
+        auth_mode,
+        ledger_info.clone(),
+        snapshot_rc.clone(),
         seed,
         &mut diagnostic_events,
     );
 
     match result {
         Ok(recording_result) => match &recording_result.invoke_result {
-            Ok(_) => Ok(InvokeSimulationOutput {
-                recording_result,
-                diagnostic_events,
-            }),
+            Ok(_) => {
+                // Extract state changes (before/after diffs) for read-write entries
+                let state_changes = extract_modified_entries(
+                    &*snapshot_rc,
+                    &recording_result.ledger_changes,
+                    &ledger_info,
+                );
+
+                Ok(InvokeSimulationOutput {
+                    recording_result,
+                    diagnostic_events,
+                    state_changes,
+                })
+            }
             Err(e) => Err(format!("host function invocation failed: {e:?}")),
         },
         Err(e) => Err(format!("simulation failed: {e:?}")),
     }
+}
+
+/// Extract before/after state diffs for read-write entries.
+///
+/// Mirrors `soroban-simulation::extract_modified_entries`.
+fn extract_modified_entries(
+    snapshot: &BucketListSnapshotSource,
+    ledger_changes: &[soroban_host::e2e_invoke::LedgerEntryChange],
+    ledger_info: &soroban_host::LedgerInfo,
+) -> Vec<LedgerEntryDiff> {
+    let mut diffs = Vec::new();
+
+    for change in ledger_changes {
+        if change.read_only {
+            continue;
+        }
+
+        let key = match LedgerKey::from_xdr(&change.encoded_key, Limits::none()) {
+            Ok(k) => k,
+            Err(_) => continue,
+        };
+
+        // Get state before: re-query the snapshot for the entry
+        let state_before = if let Some((entry, live_until)) = snapshot.get_unfiltered(&key) {
+            // Check if entry is expired
+            if let Some(lu) = live_until {
+                if lu < ledger_info.sequence_number {
+                    None // expired = treated as non-existent
+                } else {
+                    Some(entry)
+                }
+            } else {
+                Some(entry)
+            }
+        } else {
+            None
+        };
+
+        // Get state after: decode from encoded_new_value
+        let state_after = change.encoded_new_value.as_ref().and_then(|v| {
+            stellar_xdr::curr::LedgerEntry::from_xdr(v, Limits::none()).ok()
+        });
+
+        // Skip entries where both before and after are None (no diff)
+        if state_before.is_none() && state_after.is_none() {
+            continue;
+        }
+
+        diffs.push(LedgerEntryDiff {
+            key,
+            state_before,
+            state_after,
+        });
+    }
+
+    diffs
 }
 
 // ---------------------------------------------------------------------------
@@ -539,17 +745,19 @@ fn simulate_restore_op(
 fn build_invoke_response(
     sim_result: soroban_host::e2e_invoke::InvokeHostFunctionRecordingModeResult,
     diagnostic_events: Vec<stellar_xdr::curr::DiagnosticEvent>,
+    state_changes: Vec<LedgerEntryDiff>,
     soroban_info: &henyey_ledger::SorobanNetworkInfo,
     latest_ledger: u32,
     host_fn: &HostFunction,
     _source_account: &stellar_xdr::curr::AccountId,
     format: XdrFormat,
+    instruction_leeway: u32,
 ) -> Result<serde_json::Value, JsonRpcError> {
     let resources = &sim_result.resources;
 
     // Apply resource adjustments (mirrors soroban-simulation default_adjustment)
     let mut adjusted_resources = resources.clone();
-    adjust_resources(&mut adjusted_resources);
+    adjust_resources(&mut adjusted_resources, instruction_leeway);
 
     // Compute rent changes for fee estimation
     let rent_changes = soroban_host::e2e_invoke::extract_rent_changes(&sim_result.ledger_changes);
@@ -657,7 +865,95 @@ fn build_invoke_response(
         );
     }
 
+    // State changes (ledger entry diffs)
+    if !state_changes.is_empty() {
+        let changes_json = serialize_state_changes(&state_changes, format)?;
+        obj.insert("stateChanges".into(), changes_json);
+    }
+
     Ok(serde_json::Value::Object(obj))
+}
+
+/// Serialize state changes to JSON.
+fn serialize_state_changes(
+    diffs: &[LedgerEntryDiff],
+    format: XdrFormat,
+) -> Result<serde_json::Value, JsonRpcError> {
+    let mut entries = Vec::with_capacity(diffs.len());
+
+    for diff in diffs {
+        let change_type = match (&diff.state_before, &diff.state_after) {
+            (None, Some(_)) => "created",
+            (Some(_), Some(_)) => "updated",
+            (Some(_), None) => "deleted",
+            (None, None) => continue,
+        };
+
+        let mut entry = serde_json::Map::new();
+        entry.insert("type".into(), json!(change_type));
+
+        // Key
+        match format {
+            XdrFormat::Base64 => {
+                let key_bytes = diff
+                    .key
+                    .to_xdr(Limits::none())
+                    .map_err(|e| JsonRpcError::internal(format!("XDR encode error: {e}")))?;
+                entry.insert("key".into(), json!(BASE64.encode(&key_bytes)));
+            }
+            XdrFormat::Json => {
+                let key_json = serde_json::to_value(&diff.key)
+                    .map_err(|e| JsonRpcError::internal(format!("JSON serialize error: {e}")))?;
+                entry.insert("keyJson".into(), key_json);
+            }
+        }
+
+        // Before
+        match (&diff.state_before, format) {
+            (Some(before), XdrFormat::Base64) => {
+                let bytes = before
+                    .to_xdr(Limits::none())
+                    .map_err(|e| JsonRpcError::internal(format!("XDR encode error: {e}")))?;
+                entry.insert("before".into(), json!(BASE64.encode(&bytes)));
+            }
+            (Some(before), XdrFormat::Json) => {
+                let jv = serde_json::to_value(before)
+                    .map_err(|e| JsonRpcError::internal(format!("JSON serialize error: {e}")))?;
+                entry.insert("beforeJson".into(), jv);
+            }
+            (None, XdrFormat::Base64) => {
+                entry.insert("before".into(), serde_json::Value::Null);
+            }
+            (None, XdrFormat::Json) => {
+                entry.insert("beforeJson".into(), serde_json::Value::Null);
+            }
+        }
+
+        // After
+        match (&diff.state_after, format) {
+            (Some(after), XdrFormat::Base64) => {
+                let bytes = after
+                    .to_xdr(Limits::none())
+                    .map_err(|e| JsonRpcError::internal(format!("XDR encode error: {e}")))?;
+                entry.insert("after".into(), json!(BASE64.encode(&bytes)));
+            }
+            (Some(after), XdrFormat::Json) => {
+                let jv = serde_json::to_value(after)
+                    .map_err(|e| JsonRpcError::internal(format!("JSON serialize error: {e}")))?;
+                entry.insert("afterJson".into(), jv);
+            }
+            (None, XdrFormat::Base64) => {
+                entry.insert("after".into(), serde_json::Value::Null);
+            }
+            (None, XdrFormat::Json) => {
+                entry.insert("afterJson".into(), serde_json::Value::Null);
+            }
+        }
+
+        entries.push(serde_json::Value::Object(entry));
+    }
+
+    Ok(serde_json::Value::Array(entries))
 }
 
 /// Build the response for ExtendFootprintTtl / RestoreFootprint.
@@ -717,10 +1013,15 @@ fn sim_adjust(value: u32, multiplicative: f64, additive: u32) -> u32 {
 }
 
 /// Apply resource adjustment factors matching soroban-simulation defaults.
-fn adjust_resources(resources: &mut SorobanResources) {
-    resources.instructions = sim_adjust(resources.instructions, 1.04, 50_000);
-    resources.disk_read_bytes = sim_adjust(resources.disk_read_bytes, 1.0, 2_000);
-    resources.write_bytes = sim_adjust(resources.write_bytes, 1.0, 2_000);
+///
+/// `instruction_leeway` comes from the `resourceConfig.instructionLeeway` request param.
+/// The effective additive factor is `max(50_000, instruction_leeway)`.
+/// `disk_read_bytes` and `write_bytes` use `(1.0, 0)` (no additive adjustment) per upstream.
+fn adjust_resources(resources: &mut SorobanResources, instruction_leeway: u32) {
+    let additive = 50_000u32.max(instruction_leeway);
+    resources.instructions = sim_adjust(resources.instructions, 1.04, additive);
+    resources.disk_read_bytes = sim_adjust(resources.disk_read_bytes, 1.0, 0);
+    resources.write_bytes = sim_adjust(resources.write_bytes, 1.0, 0);
 }
 
 // ---------------------------------------------------------------------------

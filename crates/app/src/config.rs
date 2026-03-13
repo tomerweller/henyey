@@ -153,6 +153,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub rpc: RpcConfig,
 
+    /// Build metadata (programmatically set, not from TOML).
+    #[serde(skip)]
+    pub build: BuildMetadata,
+
     /// Whether this config was translated from stellar-core format.
     /// When true, the overlay layer will not inject default seed peers
     /// if no KNOWN_PEERS were specified in the original config.
@@ -912,6 +916,11 @@ pub struct RpcConfig {
     /// Number of ledgers to retain for range queries (~1 day at 5s close).
     #[serde(default = "default_rpc_retention_window")]
     pub retention_window: u32,
+
+    /// Maximum ledger age (in seconds) before getHealth reports "unhealthy".
+    /// Set to 0 to disable the latency check.
+    #[serde(default = "default_max_healthy_ledger_latency")]
+    pub max_healthy_ledger_latency_secs: u64,
 }
 
 impl Default for RpcConfig {
@@ -920,6 +929,7 @@ impl Default for RpcConfig {
             enabled: false,
             port: default_rpc_port(),
             retention_window: default_rpc_retention_window(),
+            max_healthy_ledger_latency_secs: default_max_healthy_ledger_latency(),
         }
     }
 }
@@ -930,6 +940,22 @@ fn default_rpc_port() -> u16 {
 
 fn default_rpc_retention_window() -> u32 {
     2880
+}
+
+fn default_max_healthy_ledger_latency() -> u64 {
+    30
+}
+
+/// Build-time metadata populated by the binary crate's `build.rs`.
+///
+/// These values are not read from TOML; they are set programmatically
+/// before creating the `App`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BuildMetadata {
+    /// Git commit hash (from `git rev-parse HEAD`).
+    pub commit_hash: String,
+    /// Build timestamp in ISO 8601 format.
+    pub build_timestamp: String,
 }
 
 fn default_compat_http_port() -> u16 {
@@ -1115,6 +1141,7 @@ impl AppConfig {
             diagnostics: DiagnosticsConfig::default(),
             testing: TestingConfig::default(),
             rpc: RpcConfig::default(),
+            build: BuildMetadata::default(),
             is_compat_config: false,
         }
     }
@@ -1186,6 +1213,7 @@ impl AppConfig {
             diagnostics: DiagnosticsConfig::default(),
             testing: TestingConfig::default(),
             rpc: RpcConfig::default(),
+            build: BuildMetadata::default(),
             is_compat_config: false,
         }
     }

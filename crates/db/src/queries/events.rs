@@ -135,8 +135,13 @@ impl EventQueries for Connection {
 
         // Topic filters - each topic array is an OR of possible values for that position
         // "*" means wildcard (skip that topic position)
+        // "**" means match all remaining positions (stop adding SQL constraints)
         if !topics.is_empty() {
             for (i, topic_alternatives) in topics.iter().enumerate() {
+                // "**" means "match all remaining positions" — stop filtering here
+                if topic_alternatives.iter().any(|t| t.as_str() == "**") {
+                    break;
+                }
                 let col = match i {
                     0 => "topic1",
                     1 => "topic2",
@@ -144,7 +149,7 @@ impl EventQueries for Connection {
                     3 => "topic4",
                     _ => continue,
                 };
-                // Filter out wildcards
+                // Filter out single-segment wildcards
                 let non_wildcard: Vec<&String> = topic_alternatives
                     .iter()
                     .filter(|t| t.as_str() != "*")
