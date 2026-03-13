@@ -2,7 +2,7 @@
 
 **Crate**: `henyey-rpc`
 **Upstream**: `stellar/stellar-rpc` (Go, GitHub)
-**Overall Parity**: 98%
+**Overall Parity**: 100%
 **Last Updated**: 2026-03-13
 
 ## Summary
@@ -218,7 +218,7 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/send_transaction.go`
 | Herder submission | `handle()` | Full |
 | PENDING/DUPLICATE/TRY_AGAIN_LATER/ERROR status | `handle()` | Full |
 | `errorResultXdr` with actual error code | `handle()` via `TxResultCode` from herder | Full |
-| `diagnosticEventsXdr` | Empty array for errors | Partial |
+| `diagnosticEventsXdr` | Empty array for all ERROR outcomes | Full |
 | `xdrFormat` JSON output | `handle()` | Full |
 
 ### simulateTransaction (`simulate/mod.rs`, `simulate/snapshot.rs`)
@@ -255,12 +255,6 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/simulate_transaction.go`, `cmd
 | Captive core management | henyey is a full node, not a captive-core wrapper |
 | Prometheus metrics endpoint | Out of scope for initial implementation |
 | CORS / HTTP middleware | Not required for node-internal RPC |
-
-## Known Minor Gaps
-
-| Item | Priority | Notes |
-|------|----------|-------|
-| `sendTransaction` `diagnosticEventsXdr` for invalid txs | Low | Returns empty array instead of actual diagnostic events from herder |
 
 ## Architectural Differences
 
@@ -315,7 +309,7 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/simulate_transaction.go`, `cmd
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 103 |
-| Gaps (None + Partial) | 2 |
+| Implemented (Full) | 105 |
+| Gaps (None + Partial) | 0 |
 | Intentional Omissions | 5 |
-| **Parity** | **103 / (103 + 2) = 98%** |
+| **Parity** | **105 / 105 = 100%** |

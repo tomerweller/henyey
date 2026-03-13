@@ -400,7 +400,7 @@ henyey/
 
 | Crate | Purpose | Parity |
 |-------|---------|--------|
-| [`henyey-rpc`](crates/rpc/README.md) | Stellar JSON-RPC 2.0 server (SEP-35), transaction simulation | [98%](crates/rpc/PARITY_STATUS.md) |
+| [`henyey-rpc`](crates/rpc/README.md) | Stellar JSON-RPC 2.0 server (SEP-35), transaction simulation | [100%](crates/rpc/PARITY_STATUS.md) |
 
 ### Utilities
 

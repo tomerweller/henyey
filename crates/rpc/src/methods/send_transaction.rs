@@ -64,37 +64,44 @@ pub async fn handle(
             obj.insert("status".into(), json!("ERROR"));
             let error_result = build_error_result(code);
             util::insert_xdr_field(&mut obj, "errorResult", &error_result, format)?;
-            // Empty diagnostic events array
-            match format {
-                XdrFormat::Base64 => {
-                    obj.insert("diagnosticEventsXdr".into(), json!([]));
-                }
-                XdrFormat::Json => {
-                    obj.insert("diagnosticEventsJson".into(), json!([]));
-                }
-            }
+            insert_empty_diagnostic_events(&mut obj, format);
         }
         henyey_herder::TxQueueResult::Banned => {
             obj.insert("status".into(), json!("ERROR"));
             let error_result =
                 build_error_result(Some(TransactionResultCode::TxTooLate));
             util::insert_xdr_field(&mut obj, "errorResult", &error_result, format)?;
+            insert_empty_diagnostic_events(&mut obj, format);
         }
         henyey_herder::TxQueueResult::FeeTooLow => {
             obj.insert("status".into(), json!("ERROR"));
             let error_result =
                 build_error_result(Some(TransactionResultCode::TxInsufficientFee));
             util::insert_xdr_field(&mut obj, "errorResult", &error_result, format)?;
+            insert_empty_diagnostic_events(&mut obj, format);
         }
         henyey_herder::TxQueueResult::Filtered => {
             obj.insert("status".into(), json!("ERROR"));
             let error_result =
                 build_error_result(Some(TransactionResultCode::TxFailed));
             util::insert_xdr_field(&mut obj, "errorResult", &error_result, format)?;
+            insert_empty_diagnostic_events(&mut obj, format);
         }
     }
 
     Ok(serde_json::Value::Object(obj))
+}
+
+/// Insert an empty diagnosticEvents array into the response.
+fn insert_empty_diagnostic_events(obj: &mut serde_json::Map<String, serde_json::Value>, format: XdrFormat) {
+    match format {
+        XdrFormat::Base64 => {
+            obj.insert("diagnosticEventsXdr".into(), json!([]));
+        }
+        XdrFormat::Json => {
+            obj.insert("diagnosticEventsJson".into(), json!([]));
+        }
+    }
 }
 
 /// Build an error TransactionResult for the response using the actual error code.
