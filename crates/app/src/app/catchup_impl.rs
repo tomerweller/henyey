@@ -919,20 +919,12 @@ impl App {
                             continue;
                         }
 
-                        // Validate slot range: reject slots impossibly far from LCL.
-                        // Use the same LEDGER_VALIDITY_BRACKET (100) as the herder.
-                        let lcl_seq = self.ledger_manager.current_ledger_seq() as u64;
-                        const LEDGER_VALIDITY_BRACKET: u64 = 100;
-                        if slot > lcl_seq + LEDGER_VALIDITY_BRACKET {
-                            tracing::debug!(
-                                slot,
-                                lcl_seq,
-                                max = lcl_seq + LEDGER_VALIDITY_BRACKET,
-                                "Rejecting EXTERNALIZE during catchup: slot outside validity bracket"
-                            );
-                            rejected_externalized += 1;
-                            continue;
-                        }
+                        // During catchup, the LCL advances from an old value.
+                        // Don't reject EXTERNALIZE based on slot distance from LCL —
+                        // we WANT to capture EXTERNALIZE for slots far ahead so their
+                        // tx_sets can be pre-fetched.  Close-time validation (above)
+                        // and signature verification (below) are sufficient guards
+                        // against invalid messages.
 
                         // Verify envelope signature to prevent accepting forged messages
                         if let Err(e) = scp_driver.verify_envelope(&envelope) {
@@ -1589,6 +1581,32 @@ impl App {
                     self.update_bucket_snapshot();
 
                     tracing::info!(ledger_seq = result.ledger_seq, "{} catchup complete", label);
+
+                    // Request fresh SCP state from peers now that our LCL is
+                    // close to the network head.  This brings EXTERNALIZE for
+                    // the most recent ~12 slots, maximizing the number of gap
+                    // slots we can bridge via rapid close.  We do two rounds:
+                    // first to get EXTERNALIZE, then to fetch the tx_sets.
+                    if let Some(overlay) = self.overlay().await {
+                        let _ = overlay.request_scp_state(result.ledger_seq).await;
+                        tracing::info!(
+                            ledger_seq = result.ledger_seq,
+                            "Requested fresh SCP state before rapid close"
+                        );
+                        // Brief pause to let SCP state responses + tx_set
+                        // responses arrive before we start rapid close.
+                        // Note: we can't call process_externalized_slots here
+                        // (recursive async cycle), but the EXTERNALIZE messages
+                        // arrive via the overlay and get recorded by the herder.
+                        // The pending tx_set requests are registered by
+                        // check_ledger_close when try_apply_buffered_ledgers
+                        // runs below.
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        // Request any pending tx_sets that were registered.
+                        self.request_pending_tx_sets().await;
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+
                     let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
                     let pending_count = self.herder.get_pending_tx_sets().len();
                     let buffer_count = self.syncing_ledgers.read().await.len();

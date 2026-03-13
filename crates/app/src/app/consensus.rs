@@ -287,17 +287,45 @@ impl App {
                     let target_checkpoint =
                         henyey_history::checkpoint::checkpoint_containing(catchup_target);
                     if target_checkpoint as u64 > latest_externalized {
-                        tracing::info!(
-                            current_ledger,
-                            next_slot,
-                            catchup_target,
-                            target_checkpoint,
-                            latest_externalized,
-                            "Next slot missing but target checkpoint not yet published — \
-                             requesting SCP state from peers instead of archive catchup"
-                        );
-                        // Fall through to the SCP state request below instead of
-                        // triggering archive catchup that would fail.
+                        // The checkpoint hasn't been published yet.  On the
+                        // first two attempts, request SCP state from peers in
+                        // case they still have the EXTERNALIZE cached.  After
+                        // that, stop wasting cycles — just wait for the
+                        // checkpoint to be published.  This avoids the
+                        // previous pattern of 6 recovery iterations + failed
+                        // catchup + cooldown (~30-60s) before settling down.
+                        if attempts <= 2 {
+                            tracing::info!(
+                                current_ledger,
+                                next_slot,
+                                catchup_target,
+                                target_checkpoint,
+                                latest_externalized,
+                                attempts,
+                                "Next slot missing, checkpoint not published — \
+                                 requesting SCP state from peers"
+                            );
+                            // Fall through to SCP state request below.
+                        } else {
+                            tracing::info!(
+                                current_ledger,
+                                next_slot,
+                                target_checkpoint,
+                                latest_externalized,
+                                attempts,
+                                "Waiting for checkpoint {} to be published \
+                                 (next slot EXTERNALIZE not available from peers)",
+                                target_checkpoint,
+                            );
+                            // Don't request SCP state or trigger catchup —
+                            // just return and wait for the next consensus tick.
+                            // Reset the counter so we don't escalate to catchup
+                            // (which would also fail since the checkpoint isn't
+                            // published).
+                            self.recovery_attempts_without_progress
+                                .store(2, Ordering::SeqCst);
+                            return;
+                        }
                     } else {
                         tracing::warn!(
                             current_ledger,

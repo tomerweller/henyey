@@ -996,6 +996,23 @@ impl App {
                         if slot == advance_to + 1 {
                             advance_to = slot;
                         }
+                    } else {
+                        // check_ledger_close returned None — the externalized
+                        // data for this slot was evicted from cache.  If we
+                        // already have a syncing_ledgers entry with a tx_set_hash,
+                        // re-register the pending tx_set request so
+                        // request_pending_tx_sets can try to fetch it.
+                        if let Some(existing) = buffer.get(&(slot as u32)) {
+                            if existing.tx_set.is_none() {
+                                self.herder
+                                    .scp_driver()
+                                    .request_tx_set(existing.tx_set_hash, slot);
+                                missing_tx_set = true;
+                            }
+                        }
+                        if slot == advance_to + 1 {
+                            advance_to = slot;
+                        }
                     }
                 }
             }
