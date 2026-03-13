@@ -232,6 +232,21 @@ impl Maintainer {
             }
         }
 
+        // Delete old contract events
+        match self
+            .database
+            .delete_old_events(lmin, self.config.count)
+        {
+            Ok(deleted) => {
+                if deleted > 0 {
+                    debug!(deleted = deleted, "Deleted old contract events");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to delete old events");
+            }
+        }
+
         let elapsed = start.elapsed();
         if elapsed > Duration::from_secs(2) {
             warn!(
@@ -264,6 +279,10 @@ impl Maintainer {
 
         if let Err(e) = self.database.delete_old_ledger_headers(lmin, count) {
             warn!(error = %e, "Failed to delete old ledger headers");
+        }
+
+        if let Err(e) = self.database.delete_old_events(lmin, count) {
+            warn!(error = %e, "Failed to delete old events");
         }
     }
 }

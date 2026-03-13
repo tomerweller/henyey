@@ -325,6 +325,17 @@ impl Database {
         })
     }
 
+    /// Deletes old contract events up to and including `max_ledger`.
+    ///
+    /// Removes at most `count` entries. Used by the Maintainer for garbage
+    /// collection of old event history.
+    pub fn delete_old_events(&self, max_ledger: u32, count: u32) -> Result<u32> {
+        self.with_connection(|conn| {
+            use queries::EventQueries;
+            conn.delete_old_events(max_ledger, count)
+        })
+    }
+
     /// Loads SCP envelopes for a ledger.
     ///
     /// Returns the consensus messages that were recorded for the specified ledger.

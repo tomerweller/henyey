@@ -203,10 +203,14 @@ fn build_success_response(
         Err(_) => None,
     };
 
+    // Apply resource adjustments (mirrors soroban-simulation default_adjustment)
+    let mut adjusted_resources = resources.clone();
+    adjust_resources(&mut adjusted_resources);
+
     // Build SorobanTransactionData
     let soroban_data = SorobanTransactionData {
         ext: stellar_xdr::curr::SorobanTransactionDataExt::V0,
-        resources: resources.clone(),
+        resources: adjusted_resources,
         resource_fee: compute_resource_fee(resources, soroban_info),
     };
 
@@ -260,6 +264,20 @@ fn build_error_response(error: String, latest_ledger: u32) -> Result<serde_json:
     }))
 }
 
+/// Apply resource adjustment factors matching soroban-simulation defaults.
+///
+/// - instructions: 1.04x + 50,000
+/// - read_bytes / write_bytes: no adjustment
+///
+/// This ensures the transaction has enough headroom to execute on a network
+/// whose state may have advanced since the simulation snapshot.
+fn adjust_resources(resources: &mut stellar_xdr::curr::SorobanResources) {
+    if resources.instructions > 0 {
+        let adjusted = ((resources.instructions as f64) * 1.04).floor() as u32;
+        resources.instructions = adjusted.saturating_add(50_000);
+    }
+}
+
 fn compute_resource_fee(
     resources: &stellar_xdr::curr::SorobanResources,
     soroban_info: &henyey_ledger::SorobanNetworkInfo,
@@ -291,7 +309,11 @@ fn compute_resource_fee(
     let (non_refundable, refundable) =
         compute_transaction_resource_fee(&tx_resources, &fee_config);
 
-    // Add adjustment factor (20% overhead like soroban-simulation)
-    let total = non_refundable + refundable;
-    total + (total / 5) // +20%
+    // Apply 15% adjustment to refundable fee (matches soroban-simulation default)
+    let adjusted_refundable = if refundable > 0 {
+        ((refundable as f64) * 1.15).floor() as i64
+    } else {
+        0
+    };
+    non_refundable.saturating_add(adjusted_refundable)
 }

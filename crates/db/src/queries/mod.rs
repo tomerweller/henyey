@@ -33,6 +33,7 @@
 
 pub mod ban;
 pub mod bucket_list;
+pub mod events;
 pub mod history;
 pub mod ledger;
 pub mod peers;
@@ -42,6 +43,7 @@ pub mod state;
 
 pub use ban::BanQueries;
 pub use bucket_list::BucketListQueries;
+pub use events::{EventQueries, EventRecord};
 pub use history::HistoryQueries;
 pub use ledger::LedgerQueries;
 pub use peers::{PeerQueries, PeerRecord};

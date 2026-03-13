@@ -176,6 +176,20 @@ impl App {
                 )?;
             }
 
+            // Extract and store contract events from transaction metadata
+            if let Some(metas) = tx_metas {
+                let events = Self::extract_contract_events(
+                    header.ledger_seq,
+                    &ordered_txs,
+                    tx_results,
+                    metas,
+                    network_id,
+                );
+                if !events.is_empty() {
+                    conn.store_events(&events)?;
+                }
+            }
+
             conn.store_scp_history(header.ledger_seq, &scp_envelopes)?;
             for (hash, qset) in &scp_quorum_sets {
                 conn.store_scp_quorum_set(hash, header.ledger_seq, qset)?;
@@ -189,6 +203,126 @@ impl App {
         })?;
 
         Ok(())
+    }
+
+    /// Extract contract events from transaction metadata for indexing.
+    fn extract_contract_events(
+        ledger_seq: u32,
+        ordered_txs: &[stellar_xdr::curr::TransactionEnvelope],
+        tx_results: &[TransactionResultPair],
+        tx_metas: &[TransactionMeta],
+        network_id: NetworkId,
+    ) -> Vec<henyey_db::EventRecord> {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+        use stellar_xdr::curr::{
+            ContractEvent, ContractEventType, Limits, TransactionResultCode,
+        };
+
+        let mut all_events = Vec::new();
+
+        for (tx_index, meta) in tx_metas.iter().enumerate() {
+            // Compute tx hash
+            let tx = match ordered_txs.get(tx_index) {
+                Some(tx) => tx,
+                None => continue,
+            };
+            let frame = TransactionFrame::with_network(tx.clone(), network_id);
+            let tx_hash_hex = match frame.hash(&network_id) {
+                Ok(h) => h.to_hex(),
+                Err(_) => continue,
+            };
+
+            // Determine if the tx succeeded
+            let tx_succeeded = tx_results
+                .get(tx_index)
+                .map(|r| {
+                    let code = r.result.result.discriminant();
+                    code == TransactionResultCode::TxSuccess
+                        || code == TransactionResultCode::TxFeeBumpInnerSuccess
+                })
+                .unwrap_or(false);
+
+            // Extract events from the meta based on version
+            let contract_events: Vec<(u32, &ContractEvent)> = match meta {
+                TransactionMeta::V3(v3) => {
+                    // V3: contract events in soroban_meta.events
+                    if let Some(ref soroban) = v3.soroban_meta {
+                        soroban.events.iter().map(|e| (0u32, e)).collect()
+                    } else {
+                        Vec::new()
+                    }
+                }
+                TransactionMeta::V4(v4) => {
+                    // V4: contract events are per-operation in operations[i].events
+                    let mut events = Vec::new();
+                    for (op_idx, op_meta) in v4.operations.iter().enumerate() {
+                        for event in op_meta.events.iter() {
+                            events.push((op_idx as u32, event));
+                        }
+                    }
+                    // Also include tx-level events (fee events)
+                    for te in v4.events.iter() {
+                        events.push((0u32, &te.event));
+                    }
+                    events
+                }
+                _ => Vec::new(),
+            };
+
+            for (event_index, (op_index, event)) in contract_events.iter().enumerate() {
+                // Compute TOID-based event ID
+                let toid = ((ledger_seq as u64) << 32)
+                    | ((tx_index as u64) << 12)
+                    | (*op_index as u64);
+                let event_id = format!("{:019}-{:010}", toid, event_index);
+
+                // Event type
+                let event_type = match event.type_ {
+                    ContractEventType::Contract => 0,
+                    ContractEventType::System => 1,
+                    ContractEventType::Diagnostic => 2,
+                };
+
+                // Contract ID
+                let contract_id = event.contract_id.as_ref().map(|h| {
+                    stellar_strkey::Contract(h.0.clone().into()).to_string()
+                });
+
+                // Extract topics
+                let topics: Vec<String> = match &event.body {
+                    stellar_xdr::curr::ContractEventBody::V0(body) => body
+                        .topics
+                        .iter()
+                        .filter_map(|t| {
+                            t.to_xdr(Limits::none())
+                                .ok()
+                                .map(|b| BASE64.encode(&b))
+                        })
+                        .collect(),
+                };
+
+                // Encode full event as base64 XDR
+                let event_xdr = match event.to_xdr(Limits::none()) {
+                    Ok(b) => BASE64.encode(&b),
+                    Err(_) => continue,
+                };
+
+                all_events.push(henyey_db::EventRecord {
+                    id: event_id,
+                    ledger_seq,
+                    tx_index: tx_index as u32,
+                    op_index: *op_index,
+                    tx_hash: tx_hash_hex.clone(),
+                    contract_id,
+                    event_type,
+                    topics,
+                    event_xdr,
+                    in_successful_contract_call: tx_succeeded,
+                });
+            }
+        }
+
+        all_events
     }
 
     /// Attempt to restore node state from persisted DB and on-disk bucket files.

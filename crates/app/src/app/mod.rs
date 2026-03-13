@@ -62,7 +62,8 @@ use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 use henyey_common::{Hash256, NetworkId};
 use henyey_clock::{Clock, RealClock};
 use henyey_db::{
-    BucketListQueries, HistoryQueries, LedgerQueries, PublishQueueQueries, ScpQueries,
+    BucketListQueries, EventQueries, HistoryQueries, LedgerQueries, PublishQueueQueries,
+    ScpQueries,
 };
 use henyey_db::queries::StateQueries;
 use henyey_db::schema::state_keys;

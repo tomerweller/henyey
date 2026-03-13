@@ -157,6 +157,25 @@ else
 fi
 
 pass "account setup"
+
+# When using a custom RPC, wait for accounts to become visible in getLedgerEntries.
+# Some nodes (e.g. henyey) catch up in batches and need time to index new accounts.
+if $CUSTOM_RPC; then
+  ALICE_LEDGER_KEY=$(stellar xdr encode --type LedgerKey \
+    "{\"account\":{\"account_id\":\"$ALICE_ADDR\"}}" 2>/dev/null)
+  if [[ -n "$ALICE_LEDGER_KEY" ]]; then
+    echo "Waiting for accounts to appear in RPC node (up to 10 min)..."
+    for _wait_i in $(seq 1 120); do
+      if rpc_call getLedgerEntries "{\"keys\":[\"$ALICE_LEDGER_KEY\"]}" 2>/dev/null | \
+         jq -e '.result.entries[0].xdr' &>/dev/null; then
+        echo "Accounts visible after $((_wait_i * 5))s"
+        break
+      fi
+      sleep 5
+    done
+  fi
+fi
+
 echo ""
 
 # ── 3. Deploy SAC for native XLM ────────────────────────────────────────────

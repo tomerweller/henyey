@@ -111,6 +111,25 @@ CREATE TABLE IF NOT EXISTS publishqueue (
     ledgerseq INTEGER PRIMARY KEY,
     state TEXT NOT NULL
 );
+
+-- Contract events (for getEvents RPC)
+CREATE TABLE IF NOT EXISTS events (
+    id TEXT PRIMARY KEY NOT NULL,
+    ledgerseq INTEGER NOT NULL,
+    tx_index INTEGER NOT NULL,
+    op_index INTEGER NOT NULL,
+    tx_hash TEXT NOT NULL,
+    contract_id TEXT,
+    event_type INTEGER NOT NULL,
+    topic1 TEXT,
+    topic2 TEXT,
+    topic3 TEXT,
+    topic4 TEXT,
+    event_xdr TEXT NOT NULL,
+    in_successful_contract_call INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS events_ledger ON events(ledgerseq);
+CREATE INDEX IF NOT EXISTS events_contract ON events(contract_id, ledgerseq);
 "#;
 
 /// Well-known keys for the `storestate` table.
