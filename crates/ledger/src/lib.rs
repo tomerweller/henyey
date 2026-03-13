@@ -85,8 +85,8 @@ mod soroban_state;
 
 // Re-export main types
 pub use close::{
-    LedgerCloseData, LedgerCloseResult, LedgerCloseStats, SorobanPhaseStructure,
-    TransactionSetVariant, TxWithFee, UpgradeContext,
+    LedgerCloseData, LedgerClosePerf, LedgerCloseResult, LedgerCloseStats,
+    SorobanPhaseStructure, TransactionSetVariant, TxWithFee, UpgradeContext,
 };
 pub use config_upgrade::{ConfigUpgradeSetFrame, ConfigUpgradeValidity};
 pub use delta::{EntryChange, LedgerDelta};

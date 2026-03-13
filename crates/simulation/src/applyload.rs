@@ -20,7 +20,7 @@ use std::time::Instant;
 use anyhow::{ensure, Context, Result};
 use henyey_app::App;
 use henyey_common::Hash256;
-use henyey_ledger::{LedgerCloseData, TransactionSetVariant};
+use henyey_ledger::{LedgerCloseData, LedgerClosePerf, TransactionSetVariant};
 use stellar_xdr::curr::{
     ConfigSettingEntry, ContractDataDurability, ContractId, ContractIdPreimage,
     ContractIdPreimageFromAddress, ExtensionPoint, Hash, LedgerEntry, LedgerEntryData,
@@ -373,7 +373,7 @@ impl ApplyLoad {
         txs: Vec<TransactionEnvelope>,
         upgrades: Vec<LedgerUpgrade>,
         record_soroban_utilization: bool,
-    ) -> Result<()> {
+    ) -> Result<Option<LedgerClosePerf>> {
         // Grab header info upfront and drop borrow on lm.
         let header = self.app.ledger_manager().current_header();
         let header_hash = self.app.ledger_manager().current_header_hash();
@@ -400,6 +400,8 @@ impl ApplyLoad {
 
         let result = self.app.ledger_manager().close_ledger(close_data, None)?;
 
+        let perf = result.perf;
+
         // Count successes/failures from the result.
         for tx_result in &result.tx_results {
             match &tx_result.result.result {
@@ -418,7 +420,7 @@ impl ApplyLoad {
             }
         }
 
-        Ok(())
+        Ok(perf)
     }
 
     /// Run the full benchmark.
@@ -1137,9 +1139,28 @@ impl ApplyLoad {
     /// Run iterations at the given TPS and report average close time.
     ///
     /// Matches stellar-core `ApplyLoad::benchmarkSacTps()`.
-    fn benchmark_sac_tps(&mut self, txs_per_ledger: u32) -> Result<f64> {
+    pub fn benchmark_sac_tps(&mut self, txs_per_ledger: u32) -> Result<f64> {
         let num_ledgers = self.config.num_ledgers;
         let mut total_time_ms = 0.0;
+
+        // Accumulators for LedgerClosePerf sub-phases (microseconds).
+        let mut agg_begin_close_us: u64 = 0;
+        let mut agg_classic_exec_us: u64 = 0;
+        let mut agg_soroban_exec_us: u64 = 0;
+        let mut agg_prepare_us: u64 = 0;
+        let mut agg_config_load_us: u64 = 0;
+        let mut agg_executor_setup_us: u64 = 0;
+        let mut agg_fee_pre_deduct_us: u64 = 0;
+        let mut agg_post_exec_us: u64 = 0;
+        let mut agg_commit_setup_us: u64 = 0;
+        let mut agg_bucket_lock_wait_us: u64 = 0;
+        let mut agg_eviction_us: u64 = 0;
+        let mut agg_soroban_state_us: u64 = 0;
+        let mut agg_add_batch_us: u64 = 0;
+        let mut agg_hot_archive_us: u64 = 0;
+        let mut agg_header_us: u64 = 0;
+        let mut agg_meta_us: u64 = 0;
+        let mut agg_total_us: u64 = 0;
 
         for iter in 0..num_ledgers {
             self.warm_account_cache();
@@ -1155,16 +1176,53 @@ impl ApplyLoad {
             );
 
             let start = Instant::now();
-            self.close_ledger(txs, Vec::new(), false)?;
+            let perf = self.close_ledger(txs, Vec::new(), false)?;
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
             total_time_ms += elapsed_ms;
 
-            warn!(
-                "  Ledger {}/{} completed in {:.2}ms",
-                iter + 1,
-                num_ledgers,
-                elapsed_ms
-            );
+            if let Some(ref p) = perf {
+                agg_begin_close_us += p.begin_close_us;
+                agg_classic_exec_us += p.classic_exec_us;
+                agg_soroban_exec_us += p.soroban_exec_us;
+                agg_prepare_us += p.prepare_us;
+                agg_config_load_us += p.config_load_us;
+                agg_executor_setup_us += p.executor_setup_us;
+                agg_fee_pre_deduct_us += p.fee_pre_deduct_us;
+                agg_post_exec_us += p.post_exec_us;
+                agg_commit_setup_us += p.commit_setup_us;
+                agg_bucket_lock_wait_us += p.bucket_lock_wait_us;
+                agg_eviction_us += p.eviction_us;
+                agg_soroban_state_us += p.soroban_state_us;
+                agg_add_batch_us += p.add_batch_us;
+                agg_hot_archive_us += p.hot_archive_us;
+                agg_header_us += p.header_us;
+                agg_meta_us += p.meta_us;
+                agg_total_us += p.total_us;
+
+                warn!(
+                    "  Ledger {}/{}: {:.1}ms total | soroban={:.1}ms (prep={:.1} cfg={:.1} exec_setup={:.1} fee={:.1} post={:.1}) \
+                     commit={:.1}ms bucket={:.1}ms meta={:.1}ms",
+                    iter + 1,
+                    num_ledgers,
+                    elapsed_ms,
+                    p.soroban_exec_us as f64 / 1000.0,
+                    p.prepare_us as f64 / 1000.0,
+                    p.config_load_us as f64 / 1000.0,
+                    p.executor_setup_us as f64 / 1000.0,
+                    p.fee_pre_deduct_us as f64 / 1000.0,
+                    p.post_exec_us as f64 / 1000.0,
+                    (p.commit_setup_us + p.bucket_lock_wait_us + p.eviction_us + p.soroban_state_us) as f64 / 1000.0,
+                    p.add_batch_us as f64 / 1000.0,
+                    p.meta_us as f64 / 1000.0,
+                );
+            } else {
+                warn!(
+                    "  Ledger {}/{} completed in {:.2}ms (no perf data)",
+                    iter + 1,
+                    num_ledgers,
+                    elapsed_ms
+                );
+            }
 
             // Verify all txs succeeded.
             let new_success = self.apply_soroban_success - initial_success;
@@ -1181,6 +1239,7 @@ impl ApplyLoad {
         }
 
         let avg_time = total_time_ms / num_ledgers as f64;
+        let n = num_ledgers as f64;
         warn!(
             "  Total time: {:.2}ms for {} ledgers",
             total_time_ms, num_ledgers
@@ -1188,6 +1247,57 @@ impl ApplyLoad {
         warn!(
             "  Average total tx apply time per ledger: {:.2}ms",
             avg_time
+        );
+        warn!(
+            "  PERF BREAKDOWN (avg ms/ledger over {} ledgers):",
+            num_ledgers
+        );
+        warn!(
+            "    begin_close:    {:.2}ms",
+            agg_begin_close_us as f64 / 1000.0 / n
+        );
+        warn!(
+            "    tx_apply:       prepare={:.2} config_load={:.2} executor_setup={:.2} fee_pre_deduct={:.2} post_exec={:.2}",
+            agg_prepare_us as f64 / 1000.0 / n,
+            agg_config_load_us as f64 / 1000.0 / n,
+            agg_executor_setup_us as f64 / 1000.0 / n,
+            agg_fee_pre_deduct_us as f64 / 1000.0 / n,
+            agg_post_exec_us as f64 / 1000.0 / n,
+        );
+        warn!(
+            "    classic_exec:   {:.2}ms",
+            agg_classic_exec_us as f64 / 1000.0 / n
+        );
+        warn!(
+            "    soroban_exec:   {:.2}ms",
+            agg_soroban_exec_us as f64 / 1000.0 / n
+        );
+        warn!(
+            "    commit:         setup={:.2} bucket_wait={:.2} eviction={:.2} soroban_state={:.2}",
+            agg_commit_setup_us as f64 / 1000.0 / n,
+            agg_bucket_lock_wait_us as f64 / 1000.0 / n,
+            agg_eviction_us as f64 / 1000.0 / n,
+            agg_soroban_state_us as f64 / 1000.0 / n,
+        );
+        warn!(
+            "    add_batch:      {:.2}ms",
+            agg_add_batch_us as f64 / 1000.0 / n
+        );
+        warn!(
+            "    hot_archive:    {:.2}ms",
+            agg_hot_archive_us as f64 / 1000.0 / n
+        );
+        warn!(
+            "    header_hash:    {:.2}ms",
+            agg_header_us as f64 / 1000.0 / n
+        );
+        warn!(
+            "    meta:           {:.2}ms",
+            agg_meta_us as f64 / 1000.0 / n
+        );
+        warn!(
+            "    total (perf):   {:.2}ms",
+            agg_total_us as f64 / 1000.0 / n
         );
 
         Ok(avg_time)

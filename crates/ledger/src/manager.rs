@@ -1657,6 +1657,11 @@ impl LedgerManager {
             timing_tx_exec_us: 0,
             timing_classic_exec_us: 0,
             timing_soroban_exec_us: 0,
+            timing_prepare_us: 0,
+            timing_config_load_us: 0,
+            timing_executor_setup_us: 0,
+            timing_fee_pre_deduct_us: 0,
+            timing_post_exec_us: 0,
             tx_perf: Vec::new(),
             soroban_fee_write_1kb: 0,
         })
@@ -2218,6 +2223,12 @@ struct LedgerCloseContext<'a> {
     timing_tx_exec_us: u64,
     timing_classic_exec_us: u64,
     timing_soroban_exec_us: u64,
+    // Sub-phase timings from apply_transactions (microseconds).
+    timing_prepare_us: u64,
+    timing_config_load_us: u64,
+    timing_executor_setup_us: u64,
+    timing_fee_pre_deduct_us: u64,
+    timing_post_exec_us: u64,
     /// Per-transaction execution timing and metadata for perf reporting.
     tx_perf: Vec<crate::close::TxPerf>,
     /// Soroban fee per 1KB write (rent fee), cached from SorobanConfig for meta ext V1.
@@ -3536,6 +3547,13 @@ impl<'a> LedgerCloseContext<'a> {
             "PROFILE apply_txs"
         );
 
+        // Store sub-phase timings for LedgerClosePerf.
+        self.timing_prepare_us = prepare_us;
+        self.timing_config_load_us = config_load_us;
+        self.timing_executor_setup_us = executor_setup_us;
+        self.timing_fee_pre_deduct_us = fee_pre_deduct_us;
+        self.timing_post_exec_us = post_exec_us;
+
         Ok(tx_set_result.results)
     }
 
@@ -4838,6 +4856,11 @@ impl<'a> LedgerCloseContext<'a> {
             tx_exec_us: self.timing_tx_exec_us,
             classic_exec_us: self.timing_classic_exec_us,
             soroban_exec_us: self.timing_soroban_exec_us,
+            prepare_us: self.timing_prepare_us,
+            config_load_us: self.timing_config_load_us,
+            executor_setup_us: self.timing_executor_setup_us,
+            fee_pre_deduct_us: self.timing_fee_pre_deduct_us,
+            post_exec_us: self.timing_post_exec_us,
             commit_setup_us,
             bucket_lock_wait_us,
             eviction_us,
@@ -5913,6 +5936,11 @@ mod tests {
             timing_tx_exec_us: 0,
             timing_classic_exec_us: 0,
             timing_soroban_exec_us: 0,
+            timing_prepare_us: 0,
+            timing_config_load_us: 0,
+            timing_executor_setup_us: 0,
+            timing_fee_pre_deduct_us: 0,
+            timing_post_exec_us: 0,
             tx_perf: Vec::new(),
             soroban_fee_write_1kb: 0,
         }

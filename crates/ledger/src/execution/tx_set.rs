@@ -1027,7 +1027,8 @@ pub(super) fn execute_stage_clusters(
                     emit_soroban_tx_meta_ext_v1,
                     enable_soroban_diagnostic_events,
                 };
-                execute_single_cluster(
+                let cluster_wall_start = std::time::Instant::now();
+                let result = execute_single_cluster(
                     &snapshot,
                     &clusters[idx],
                     cluster_offset,
@@ -1038,7 +1039,10 @@ pub(super) fn execute_stage_clusters(
                         prior_stage: &prior_stage,
                         pre_charged_fees: &cluster_fees,
                     },
-                )
+                );
+                let wall_us = cluster_wall_start.elapsed().as_micros() as u64;
+                let tx_count = clusters[idx].len();
+                (result, wall_us, tx_count)
             }));
         }
 
@@ -1054,7 +1058,7 @@ pub(super) fn execute_stage_clusters(
     // use Handle::block_on directly. When called from a tokio worker thread
     // (runtime_handle is None), use block_in_place to safely enter a blocking
     // context before calling block_on.
-    let thread_results: Vec<Result<(TxSetResult, LedgerDelta, i64)>> =
+    let thread_results: Vec<(Result<(TxSetResult, LedgerDelta, i64)>, u64, usize)> =
         if let Some(handle) = runtime_handle {
             handle.block_on(spawn_and_collect)
         } else {
@@ -1067,15 +1071,33 @@ pub(super) fn execute_stage_clusters(
     // Merge results in cluster order (deterministic).
     let merge_start = std::time::Instant::now();
     let mut cluster_results = Vec::with_capacity(thread_results.len());
-    for result in thread_results {
+    let mut cluster_wall_times: Vec<(u64, usize)> = Vec::with_capacity(thread_results.len());
+    for (result, wall_us, tx_count) in thread_results {
         let (cr, cluster_delta, total_fees) = result?;
         delta.merge(cluster_delta)?;
         if total_fees != 0 {
             delta.record_fee_pool_delta(total_fees);
         }
         cluster_results.push(cr);
+        cluster_wall_times.push((wall_us, tx_count));
     }
     let delta_merge_us = merge_start.elapsed().as_micros() as u64;
+
+    // Log per-cluster wall times for straggler analysis.
+    let wall_times_us: Vec<u64> = cluster_wall_times.iter().map(|(w, _)| *w).collect();
+    let min_us = wall_times_us.iter().copied().min().unwrap_or(0);
+    let max_us = wall_times_us.iter().copied().max().unwrap_or(0);
+    let avg_us = if wall_times_us.is_empty() {
+        0
+    } else {
+        wall_times_us.iter().sum::<u64>() / wall_times_us.len() as u64
+    };
+    let per_cluster_str: String = cluster_wall_times
+        .iter()
+        .enumerate()
+        .map(|(i, (w, n))| format!("c{}:{:.1}ms/{}tx", i, *w as f64 / 1000.0, n))
+        .collect::<Vec<_>>()
+        .join(" ");
 
     tracing::debug!(
         ledger_seq = context.sequence,
@@ -1083,6 +1105,10 @@ pub(super) fn execute_stage_clusters(
         clone_setup_us,
         spawn_collect_us,
         delta_merge_us,
+        min_cluster_us = min_us,
+        max_cluster_us = max_us,
+        avg_cluster_us = avg_us,
+        clusters = %per_cluster_str,
         "PROFILE stage_clusters"
     );
 

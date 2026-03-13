@@ -437,17 +437,11 @@ fn less_than_xored(left: &Hash256, right: &Hash256, x: &Hash256) -> bool {
     false
 }
 
-fn apply_sort_cmp(
-    a: &TransactionEnvelope,
-    b: &TransactionEnvelope,
-    set_hash: &Hash256,
-) -> Ordering {
-    let left = tx_hash(a);
-    let right = tx_hash(b);
+fn cmp_hashes(left: &Hash256, right: &Hash256, set_hash: &Hash256) -> Ordering {
     if left == right {
         return Ordering::Equal;
     }
-    if less_than_xored(&left, &right, set_hash) {
+    if less_than_xored(left, right, set_hash) {
         Ordering::Less
     } else {
         Ordering::Greater
@@ -496,12 +490,18 @@ fn sorted_for_apply_sequential(
             .push((tx, base_fee));
     }
 
-    let mut queues: Vec<std::collections::VecDeque<(TransactionEnvelope, Option<u32>)>> =
+    // Pre-compute TX hashes and attach to each item to avoid redundant XDR+SHA256 during sort.
+    let mut queues: Vec<std::collections::VecDeque<(TransactionEnvelope, Option<u32>, Hash256)>> =
         by_account
             .into_values()
             .map(|mut txs| {
                 txs.sort_by(|a, b| tx_sequence_number(&a.0).cmp(&tx_sequence_number(&b.0)));
-                txs.into_iter().collect()
+                txs.into_iter()
+                    .map(|(tx, fee)| {
+                        let h = tx_hash(&tx);
+                        (tx, fee, h)
+                    })
+                    .collect()
             })
             .collect();
 
@@ -513,8 +513,8 @@ fn sorted_for_apply_sequential(
                 batch.push(item);
             }
         }
-        batch.sort_by(|a, b| apply_sort_cmp(&a.0, &b.0, &set_hash));
-        result.extend(batch);
+        batch.sort_by(|a, b| cmp_hashes(&a.2, &b.2, &set_hash));
+        result.extend(batch.into_iter().map(|(tx, fee, _)| (tx, fee)));
     }
     result
 }
@@ -529,14 +529,30 @@ fn sort_parallel_stages(
     stages: &[stellar_xdr::curr::ParallelTxExecutionStage],
     set_hash: &Hash256,
 ) -> Vec<Vec<Vec<TransactionEnvelope>>> {
-    let mut stage_vec: Vec<Vec<Vec<TransactionEnvelope>>> = stages
+    // Pre-compute TX hashes alongside each TX to avoid redundant XDR+SHA256 during sort.
+    let mut stage_vec: Vec<Vec<Vec<(TransactionEnvelope, Hash256)>>> = stages
         .iter()
-        .map(|stage| stage.0.iter().map(|cluster| cluster.0.to_vec()).collect())
+        .map(|stage| {
+            stage
+                .0
+                .iter()
+                .map(|cluster| {
+                    cluster
+                        .0
+                        .iter()
+                        .map(|tx| {
+                            let h = tx_hash(tx);
+                            (tx.clone(), h)
+                        })
+                        .collect()
+                })
+                .collect()
+        })
         .collect();
 
     for stage in stage_vec.iter_mut() {
         for cluster in stage.iter_mut() {
-            cluster.sort_by(|a, b| apply_sort_cmp(a, b, set_hash));
+            cluster.sort_by(|a, b| cmp_hashes(&a.1, &b.1, set_hash));
         }
     }
 
@@ -547,10 +563,19 @@ fn sort_parallel_stages(
         if a[0].is_empty() || b[0].is_empty() {
             return a[0].len().cmp(&b[0].len());
         }
-        apply_sort_cmp(&a[0][0], &b[0][0], set_hash)
+        cmp_hashes(&a[0][0].1, &b[0][0].1, set_hash)
     });
 
+    // Strip hashes
     stage_vec
+        .into_iter()
+        .map(|stage| {
+            stage
+                .into_iter()
+                .map(|cluster| cluster.into_iter().map(|(tx, _)| tx).collect())
+                .collect()
+        })
+        .collect()
 }
 
 /// Sort stages/clusters for parallel apply, preserving the nested structure.
@@ -808,6 +833,13 @@ pub struct LedgerClosePerf {
     pub commit_close_us: u64,
     pub meta_us: u64,
     pub total_us: u64,
+
+    /// Sub-phase timings from apply_transactions (microseconds).
+    pub prepare_us: u64,
+    pub config_load_us: u64,
+    pub executor_setup_us: u64,
+    pub fee_pre_deduct_us: u64,
+    pub post_exec_us: u64,
 
     /// Per-transaction timing (sorted by exec_us descending).
     pub tx_timings: Vec<TxPerf>,

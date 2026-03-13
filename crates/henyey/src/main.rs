@@ -630,7 +630,7 @@ enum Commands {
     /// Matches stellar-core's `apply-load` CLI subcommand.
     #[command(name = "apply-load")]
     ApplyLoad {
-        /// Benchmark mode: "ledger-limits" (default) or "max-sac-tps"
+        /// Benchmark mode: "ledger-limits" (default), "max-sac-tps", or "single-shot"
         #[arg(long, default_value = "ledger-limits")]
         mode: String,
 
@@ -645,6 +645,10 @@ enum Commands {
         /// Max parallel Soroban execution clusters per stage (default: 16)
         #[arg(long, default_value = "16")]
         clusters: u32,
+
+        /// Total SAC transfer TXs for single-shot mode (default: 25000)
+        #[arg(long, default_value = "25000")]
+        tx_count: u32,
     },
 }
 
@@ -796,7 +800,8 @@ async fn main() -> anyhow::Result<()> {
             num_ledgers,
             classic_txs_per_ledger,
             clusters,
-        } => cmd_apply_load(config, &mode, num_ledgers, classic_txs_per_ledger, clusters).await,
+            tx_count,
+        } => cmd_apply_load(config, &mode, num_ledgers, classic_txs_per_ledger, clusters, tx_count).await,
     }
 }
 
@@ -1197,17 +1202,19 @@ async fn cmd_apply_load(
     num_ledgers: u32,
     classic_txs_per_ledger: u32,
     clusters: u32,
+    tx_count: u32,
 ) -> anyhow::Result<()> {
     use henyey_simulation::{ApplyLoad, ApplyLoadConfig, ApplyLoadMode};
 
     let mode = match mode_str {
         "ledger-limits" => ApplyLoadMode::LimitBased,
-        "max-sac-tps" => ApplyLoadMode::MaxSacTps,
+        "max-sac-tps" | "single-shot" => ApplyLoadMode::MaxSacTps,
         other => anyhow::bail!(
-            "Unknown apply-load mode '{}'. Valid modes: ledger-limits, max-sac-tps",
+            "Unknown apply-load mode '{}'. Valid modes: ledger-limits, max-sac-tps, single-shot",
             other
         ),
     };
+    let is_single_shot = mode_str == "single-shot";
 
     // Configure for standalone benchmark operation.
     // The node never connects to peers or runs consensus — ApplyLoad
@@ -1235,7 +1242,7 @@ async fn cmd_apply_load(
 
     // Build the ApplyLoad configuration.
     let al_config = ApplyLoadConfig {
-        num_ledgers,
+        num_ledgers: if is_single_shot { 1 } else { num_ledgers },
         classic_txs_per_ledger,
         ledger_max_dependent_tx_clusters: clusters,
         ..ApplyLoadConfig::default()
@@ -1301,6 +1308,21 @@ async fn cmd_apply_load(
                 "  Write entries:   {:.1}%",
                 harness.write_entry_utilization().mean() / 1000.0
             );
+        }
+
+        ApplyLoadMode::MaxSacTps if is_single_shot => {
+            // Round tx_count down to nearest multiple of clusters.
+            let txs = (tx_count / clusters) * clusters;
+            println!("Single-shot: closing 1 ledger with {} SAC TXs across {} clusters...", txs, clusters);
+            println!();
+
+            let avg_ms = harness.benchmark_sac_tps(txs)?;
+
+            println!();
+            println!("=== Single-Shot Result ===");
+            println!("TXs: {}, Clusters: {}, Avg close: {:.1}ms", txs, clusters, avg_ms);
+            println!("Effective TPS: {:.0}", txs as f64 / (avg_ms / 1000.0));
+            println!("Success rate: {:.1}%", harness.success_rate() * 100.0);
         }
 
         ApplyLoadMode::MaxSacTps => {
