@@ -209,6 +209,16 @@ impl Database {
         })
     }
 
+    /// Returns the lowest ledger sequence number stored in the database.
+    ///
+    /// Returns `None` if no ledgers have been stored yet.
+    pub fn get_oldest_ledger_seq(&self) -> Result<Option<u32>> {
+        self.with_connection(|conn| {
+            use queries::LedgerQueries;
+            conn.get_oldest_ledger_seq()
+        })
+    }
+
     /// Returns the ledger header for a given sequence number.
     ///
     /// Returns `None` if the ledger is not found.
@@ -333,6 +343,39 @@ impl Database {
         self.with_connection(|conn| {
             use queries::EventQueries;
             conn.delete_old_events(max_ledger, count)
+        })
+    }
+
+    /// Stores a serialized `LedgerCloseMeta` for the given ledger sequence.
+    ///
+    /// Used at ledger close time to persist the full metadata blob for
+    /// RPC serving (getTransactions, getLedgers).
+    pub fn store_ledger_close_meta(&self, sequence: u32, meta: &[u8]) -> Result<()> {
+        self.with_connection(|conn| {
+            use queries::LedgerCloseMetaQueries;
+            conn.store_ledger_close_meta(sequence, meta)
+        })
+    }
+
+    /// Deletes old ledger close metadata entries up to and including `max_ledger`.
+    ///
+    /// Removes at most `count` entries. Used by the Maintainer for garbage
+    /// collection within the RPC retention window.
+    pub fn delete_old_ledger_close_meta(&self, max_ledger: u32, count: u32) -> Result<u32> {
+        self.with_connection(|conn| {
+            use queries::LedgerCloseMetaQueries;
+            conn.delete_old_ledger_close_meta(max_ledger, count)
+        })
+    }
+
+    /// Deletes old transaction history entries up to and including `max_ledger`.
+    ///
+    /// Removes at most `count` entries from `txhistory`, `txsets`, and `txresults`.
+    /// Used by the Maintainer for garbage collection.
+    pub fn delete_old_tx_history(&self, max_ledger: u32, count: u32) -> Result<u32> {
+        self.with_connection(|conn| {
+            use queries::HistoryQueries;
+            conn.delete_old_tx_history(max_ledger, count)
         })
     }
 

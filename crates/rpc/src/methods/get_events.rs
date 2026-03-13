@@ -6,7 +6,7 @@ use serde_json::json;
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
-use crate::util::format_unix_timestamp_utc;
+use crate::util::{self, format_unix_timestamp_utc};
 
 /// Default number of events returned per query.
 const DEFAULT_EVENTS_LIMIT: u64 = 100;
@@ -104,13 +104,16 @@ pub async fn handle(
 
     let last_cursor = events.last().map(|e| e.id.as_str()).unwrap_or("");
 
+    let oldest = util::oldest_ledger(&ctx.app);
+    let oldest_close_time = get_ledger_close_time(ctx, oldest);
+
     Ok(json!({
         "events": event_json,
         "cursor": last_cursor,
         "latestLedger": ledger.num,
         "latestLedgerCloseTime": ledger.close_time.to_string(),
-        "oldestLedger": 1,
-        "oldestLedgerCloseTime": "0"
+        "oldestLedger": oldest,
+        "oldestLedgerCloseTime": oldest_close_time
     }))
 }
 

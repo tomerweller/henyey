@@ -396,6 +396,12 @@ henyey/
 | [`henyey-history`](crates/henyey-history/README.md) | History archive I/O, catchup, replay, verification, publishing | [82%](crates/henyey-history/PARITY_STATUS.md) |
 | [`henyey-historywork`](crates/henyey-historywork/README.md) | History work scheduling, publish/catchup task management | [56%](crates/henyey-historywork/PARITY_STATUS.md) |
 
+### RPC
+
+| Crate | Purpose | Parity |
+|-------|---------|--------|
+| [`henyey-rpc`](crates/rpc/README.md) | Stellar JSON-RPC 2.0 server (SEP-35), transaction simulation | [67%](crates/rpc/PARITY_STATUS.md) |
+
 ### Utilities
 
 | Crate | Purpose | Parity |

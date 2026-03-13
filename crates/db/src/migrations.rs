@@ -34,7 +34,7 @@ use tracing::info;
 /// This should be incremented whenever a new migration is added.
 /// The database initialization and migration system uses this to
 /// determine if upgrades are needed.
-pub(crate) const CURRENT_VERSION: i32 = 6;
+pub(crate) const CURRENT_VERSION: i32 = 7;
 
 /// Represents a single database migration.
 ///
@@ -140,6 +140,17 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS events_contract ON events(contract_id, ledgerseq);
         "#,
         description: "Add events table for contract event indexing",
+    },
+    Migration {
+        from_version: 6,
+        to_version: 7,
+        upgrade_sql: r#"
+            CREATE TABLE IF NOT EXISTS ledger_close_meta (
+                sequence INTEGER PRIMARY KEY,
+                meta BLOB NOT NULL
+            );
+        "#,
+        description: "Add ledger_close_meta table for full LedgerCloseMeta storage",
     },
 ];
 

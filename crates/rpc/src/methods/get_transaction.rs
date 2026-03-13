@@ -4,9 +4,11 @@ use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde_json::json;
+use stellar_xdr::curr::{Limits, ReadXdr, TransactionEnvelope};
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
+use crate::util;
 
 pub async fn handle(
     ctx: &Arc<RpcContext>,
@@ -18,6 +20,20 @@ pub async fn handle(
         .ok_or_else(|| JsonRpcError::invalid_params("missing 'hash' parameter"))?;
 
     let ledger = ctx.app.ledger_summary();
+    let oldest = util::oldest_ledger(&ctx.app);
+
+    // Look up the oldest ledger close time
+    let oldest_close_time = ctx
+        .app
+        .database()
+        .with_connection(|conn| {
+            use henyey_db::LedgerQueries;
+            conn.load_ledger_header(oldest)
+        })
+        .ok()
+        .flatten()
+        .map(|h| h.scp_value.close_time.0.to_string())
+        .unwrap_or_else(|| "0".to_string());
 
     // Look up the transaction in the database
     let tx_record = ctx
@@ -33,7 +49,7 @@ pub async fn handle(
         Some(record) => {
             let envelope_xdr = BASE64.encode(&record.body);
             // DB stores TransactionResultPair; extract just TransactionResult for the API
-            let result_xdr = match extract_result_xdr(&record.result) {
+            let result_xdr = match util::extract_result_xdr(&record.result) {
                 Some(result_bytes) => BASE64.encode(&result_bytes),
                 None => BASE64.encode(&record.result), // fallback
             };
@@ -57,55 +73,45 @@ pub async fn handle(
                 .unwrap_or_else(|| "0".to_string());
 
             // Determine status from the result XDR
-            let status = determine_tx_status(&record.result);
+            let status = util::determine_tx_status(&record.result);
 
-            Ok(json!({
+            // Detect fee bump from the envelope
+            let fee_bump = TransactionEnvelope::from_xdr(&record.body, Limits::none())
+                .map(|env| matches!(env, TransactionEnvelope::TxFeeBump(_)))
+                .unwrap_or(false);
+
+            let mut tx = json!({
                 "status": status,
                 "latestLedger": ledger.num,
                 "latestLedgerCloseTime": ledger.close_time.to_string(),
-                "oldestLedger": 1,
-                "oldestLedgerCloseTime": "0",
+                "oldestLedger": oldest,
+                "oldestLedgerCloseTime": oldest_close_time,
                 "ledger": record.ledger_seq,
                 "createdAt": created_at,
                 "applicationOrder": record.tx_index + 1,
+                "feeBump": fee_bump,
                 "envelopeXdr": envelope_xdr,
                 "resultXdr": result_xdr,
                 "resultMetaXdr": result_meta_xdr
-            }))
+            });
+
+            // Extract diagnostic events from meta if available
+            if let Some(ref meta_bytes) = record.meta {
+                if let Some(events_xdr) = util::extract_diagnostic_events_xdr(meta_bytes) {
+                    tx.as_object_mut()
+                        .unwrap()
+                        .insert("diagnosticEventsXdr".into(), json!(events_xdr));
+                }
+            }
+
+            Ok(tx)
         }
         None => Ok(json!({
             "status": "NOT_FOUND",
             "latestLedger": ledger.num,
             "latestLedgerCloseTime": ledger.close_time.to_string(),
-            "oldestLedger": 1,
-            "oldestLedgerCloseTime": "0"
+            "oldestLedger": oldest,
+            "oldestLedgerCloseTime": oldest_close_time
         })),
     }
-}
-
-fn determine_tx_status(result_bytes: &[u8]) -> &'static str {
-    use stellar_xdr::curr::{Limits, ReadXdr, TransactionResultPair, TransactionResultCode};
-
-    // The database stores TransactionResultPair (hash + result)
-    match TransactionResultPair::from_xdr(result_bytes, Limits::none()) {
-        Ok(pair) => {
-            let code = pair.result.result.discriminant();
-            if code == TransactionResultCode::TxSuccess
-                || code == TransactionResultCode::TxFeeBumpInnerSuccess
-            {
-                "SUCCESS"
-            } else {
-                "FAILED"
-            }
-        }
-        Err(_) => "FAILED",
-    }
-}
-
-/// Extract just the TransactionResult XDR from the stored TransactionResultPair bytes.
-fn extract_result_xdr(result_pair_bytes: &[u8]) -> Option<Vec<u8>> {
-    use stellar_xdr::curr::{Limits, ReadXdr, TransactionResultPair, WriteXdr};
-
-    let pair = TransactionResultPair::from_xdr(result_pair_bytes, Limits::none()).ok()?;
-    pair.result.to_xdr(Limits::none()).ok()
 }

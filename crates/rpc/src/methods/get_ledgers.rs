@@ -1,20 +1,176 @@
+//! Handler for the `getLedgers` JSON-RPC method.
+//!
+//! Returns a paginated list of ledger metadata within a ledger range.
+//! Supports cursor-based pagination using ledger sequence numbers.
+
 use std::sync::Arc;
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde_json::json;
+use stellar_xdr::curr::{LedgerCloseMeta, LedgerHeaderHistoryEntry, Limits, ReadXdr, WriteXdr};
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
+use crate::util;
+
+/// Default number of ledgers returned per query.
+const DEFAULT_LEDGER_LIMIT: u32 = 5;
+/// Maximum number of ledgers that can be requested in a single query.
+const MAX_LEDGER_LIMIT: u32 = 200;
 
 pub async fn handle(
     ctx: &Arc<RpcContext>,
-    _params: serde_json::Value,
+    params: serde_json::Value,
 ) -> Result<serde_json::Value, JsonRpcError> {
     let ledger = ctx.app.ledger_summary();
+    let oldest = util::oldest_ledger(&ctx.app);
 
-    // getLedgers range query is not yet fully implemented.
+    // Look up oldest ledger close time
+    let oldest_close_time = get_ledger_close_time_str(ctx, oldest);
+
+    // Parse parameters
+    let start_ledger = params
+        .get("startLedger")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+
+    let pagination = params.get("pagination");
+    let cursor_str = pagination
+        .and_then(|p| p.get("cursor"))
+        .and_then(|v| v.as_str());
+    let limit = pagination
+        .and_then(|p| p.get("limit"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+
+    // Validate and resolve pagination.
+    // getLedgers cursor is a plain ledger sequence (not a TOID).
+    let (effective_start, effective_limit) = validate_ledger_pagination(
+        start_ledger,
+        cursor_str,
+        limit,
+        oldest,
+        ledger.num,
+    )?;
+
+    // End ledger for query: latest + 1 (exclusive upper bound)
+    let end_ledger = ledger.num + 1;
+
+    // Query ledger close metas from database
+    let metas = ctx
+        .app
+        .database()
+        .with_connection(|conn| {
+            use henyey_db::LedgerCloseMetaQueries;
+            conn.load_ledger_close_metas_in_range(effective_start, end_ledger, effective_limit)
+        })
+        .map_err(|e| JsonRpcError::internal(format!("database error: {}", e)))?;
+
+    // Build response
+    let mut ledgers = Vec::with_capacity(metas.len());
+    let mut last_cursor = String::new();
+
+    for (sequence, meta_bytes) in &metas {
+        let lcm = LedgerCloseMeta::from_xdr(meta_bytes.as_slice(), Limits::none())
+            .map_err(|e| JsonRpcError::internal(format!("corrupt LedgerCloseMeta: {e}")))?;
+
+        let (hash, header_xdr, close_time) = extract_header_info(&lcm)?;
+        let metadata_xdr = BASE64.encode(meta_bytes);
+
+        last_cursor = sequence.to_string();
+
+        ledgers.push(json!({
+            "hash": hash,
+            "sequence": sequence,
+            "ledgerCloseTime": close_time.to_string(),
+            "headerXdr": header_xdr,
+            "metadataXdr": metadata_xdr
+        }));
+    }
+
     Ok(json!({
-        "ledgers": [],
+        "ledgers": ledgers,
         "latestLedger": ledger.num,
-        "cursor": ""
+        "latestLedgerCloseTime": ledger.close_time.to_string(),
+        "oldestLedger": oldest,
+        "oldestLedgerCloseTime": oldest_close_time,
+        "cursor": last_cursor
     }))
+}
+
+/// Validate getLedgers pagination. Cursor is a plain ledger sequence.
+fn validate_ledger_pagination(
+    start_ledger: Option<u32>,
+    cursor: Option<&str>,
+    limit: Option<u32>,
+    oldest_ledger: u32,
+    latest_ledger: u32,
+) -> Result<(u32, u32), JsonRpcError> {
+    if cursor.is_some() && start_ledger.is_some() {
+        return Err(JsonRpcError::invalid_params(
+            "startLedger and cursor are mutually exclusive",
+        ));
+    }
+
+    let limit = limit
+        .unwrap_or(DEFAULT_LEDGER_LIMIT)
+        .min(MAX_LEDGER_LIMIT)
+        .max(1);
+
+    if let Some(c) = cursor {
+        if c.is_empty() {
+            return Err(JsonRpcError::invalid_params("cursor must not be empty"));
+        }
+        let seq: u32 = c
+            .parse()
+            .map_err(|_| JsonRpcError::invalid_params(format!("invalid cursor: {c}")))?;
+        // Start from cursor + 1 (cursor is the last seen ledger)
+        return Ok((seq + 1, limit));
+    }
+
+    let start = start_ledger.ok_or_else(|| {
+        JsonRpcError::invalid_params("startLedger or cursor is required")
+    })?;
+
+    if start < oldest_ledger || start > latest_ledger {
+        return Err(JsonRpcError::invalid_params(format!(
+            "startLedger must be within [{oldest_ledger}, {latest_ledger}]"
+        )));
+    }
+
+    Ok((start, limit))
+}
+
+/// Extract hash, base64 header XDR, and close time from a LedgerCloseMeta.
+fn extract_header_info(
+    lcm: &LedgerCloseMeta,
+) -> Result<(String, String, u64), JsonRpcError> {
+    let header_entry: &LedgerHeaderHistoryEntry = match lcm {
+        LedgerCloseMeta::V0(v0) => &v0.ledger_header,
+        LedgerCloseMeta::V1(v1) => &v1.ledger_header,
+        LedgerCloseMeta::V2(v2) => &v2.ledger_header,
+    };
+
+    let hash = hex::encode(header_entry.hash.0);
+    let header_xdr = header_entry
+        .to_xdr(Limits::none())
+        .map(|b| BASE64.encode(&b))
+        .map_err(|e| JsonRpcError::internal(format!("XDR encode error: {e}")))?;
+    let close_time = header_entry.header.scp_value.close_time.0;
+
+    Ok((hash, header_xdr, close_time))
+}
+
+/// Get ledger close time as a string.
+fn get_ledger_close_time_str(ctx: &RpcContext, ledger_seq: u32) -> String {
+    ctx.app
+        .database()
+        .with_connection(|conn| {
+            use henyey_db::LedgerQueries;
+            conn.load_ledger_header(ledger_seq)
+        })
+        .ok()
+        .flatten()
+        .map(|h| h.scp_value.close_time.0.to_string())
+        .unwrap_or_else(|| "0".to_string())
 }

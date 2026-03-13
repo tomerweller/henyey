@@ -1908,6 +1908,19 @@ impl App {
         if let Err(e) = self.db.delete_old_ledger_headers(lmin, count) {
             tracing::warn!(error = %e, "Failed to delete old ledger headers");
         }
+
+        // Clean up RPC-specific tables if RPC is enabled
+        if self.config.rpc.enabled {
+            let rpc_lmin = lcl.saturating_sub(self.config.rpc.retention_window);
+
+            if let Err(e) = self.db.delete_old_ledger_close_meta(rpc_lmin, count) {
+                tracing::warn!(error = %e, "Failed to delete old ledger close meta");
+            }
+
+            if let Err(e) = self.db.delete_old_tx_history(rpc_lmin, count) {
+                tracing::warn!(error = %e, "Failed to delete old tx history");
+            }
+        }
     }
 
     /// Delete bucket files on disk that are no longer referenced by the live

@@ -130,6 +130,12 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_ledger ON events(ledgerseq);
 CREATE INDEX IF NOT EXISTS events_contract ON events(contract_id, ledgerseq);
+
+-- Ledger close metadata (full LedgerCloseMeta XDR, for RPC serving)
+CREATE TABLE IF NOT EXISTS ledger_close_meta (
+    sequence INTEGER PRIMARY KEY,
+    meta BLOB NOT NULL
+);
 "#;
 
 /// Well-known keys for the `storestate` table.

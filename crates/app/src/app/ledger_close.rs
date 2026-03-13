@@ -1463,6 +1463,30 @@ impl App {
             tracing::warn!(error = %err, "Failed to persist ledger close data");
         }
 
+        // Persist full LedgerCloseMeta for RPC serving (getTransactions, getLedgers).
+        if let Some(ref meta) = result.meta {
+            match meta.to_xdr(stellar_xdr::curr::Limits::none()) {
+                Ok(meta_xdr) => {
+                    if let Err(err) =
+                        self.db.store_ledger_close_meta(pending.ledger_seq, &meta_xdr)
+                    {
+                        tracing::warn!(
+                            error = %err,
+                            ledger_seq = pending.ledger_seq,
+                            "Failed to persist LedgerCloseMeta"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        ledger_seq = pending.ledger_seq,
+                        "Failed to serialize LedgerCloseMeta"
+                    );
+                }
+            }
+        }
+
         // Separate successful and failed transactions for queue management.
         let mut applied_hashes = Vec::new();
         let mut failed_hashes = Vec::new();

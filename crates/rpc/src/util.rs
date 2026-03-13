@@ -1,6 +1,165 @@
 //! Shared utility functions for the RPC crate.
 
-use stellar_xdr::curr::{LedgerKey, Limits, WriteXdr};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use stellar_xdr::curr::{
+    DiagnosticEvent, LedgerKey, Limits, ReadXdr, TransactionMeta, TransactionResultCode,
+    TransactionResultPair, WriteXdr,
+};
+
+use crate::error::JsonRpcError;
+
+// ---------------------------------------------------------------------------
+// TOID (Total Order ID) encoding
+// ---------------------------------------------------------------------------
+
+/// Bit layout: [63..32] = ledger_seq, [31..12] = tx_order (20 bits), [11..0] = op_index (12 bits).
+const LEDGER_SHIFT: u32 = 32;
+const TX_ORDER_SHIFT: u32 = 12;
+const TX_ORDER_MASK: u64 = 0x000F_FFFF; // 20 bits
+const OP_INDEX_MASK: u64 = 0x0000_0FFF; // 12 bits
+
+/// Encode a (ledger, tx_order, op_index) triple into a TOID.
+pub(crate) fn toid_encode(ledger_seq: u32, tx_order: u32, op_index: u32) -> i64 {
+    let v = ((ledger_seq as u64) << LEDGER_SHIFT)
+        | (((tx_order as u64) & TX_ORDER_MASK) << TX_ORDER_SHIFT)
+        | ((op_index as u64) & OP_INDEX_MASK);
+    v as i64
+}
+
+/// Decode a TOID back to (ledger_seq, tx_order, op_index).
+pub(crate) fn toid_decode(toid: i64) -> (u32, u32, u32) {
+    let v = toid as u64;
+    let ledger_seq = (v >> LEDGER_SHIFT) as u32;
+    let tx_order = ((v >> TX_ORDER_SHIFT) & TX_ORDER_MASK) as u32;
+    let op_index = (v & OP_INDEX_MASK) as u32;
+    (ledger_seq, tx_order, op_index)
+}
+
+/// Parse a decimal-string cursor into a TOID (i64).
+pub(crate) fn toid_parse_cursor(cursor: &str) -> Result<i64, JsonRpcError> {
+    cursor
+        .parse::<i64>()
+        .map_err(|_| JsonRpcError::invalid_params(format!("invalid cursor: {cursor}")))
+}
+
+// ---------------------------------------------------------------------------
+// Pagination validation
+// ---------------------------------------------------------------------------
+
+/// Validate and normalise pagination parameters shared by `getTransactions` and `getLedgers`.
+///
+/// Returns `(effective_start_ledger, effective_start_cursor, effective_limit)`.
+///
+/// * `start_ledger` and `cursor` are mutually exclusive.
+/// * If a cursor is provided it takes priority; `start_ledger` is ignored.
+/// * `start_ledger` must be within `[oldest_ledger, latest_ledger]`.
+/// * `limit` is clamped to `[1, max_limit]` and defaults to `default_limit`.
+pub(crate) fn validate_pagination(
+    start_ledger: Option<u32>,
+    cursor: Option<&str>,
+    limit: Option<u32>,
+    default_limit: u32,
+    max_limit: u32,
+    oldest_ledger: u32,
+    latest_ledger: u32,
+) -> Result<(u32, Option<i64>, u32), JsonRpcError> {
+    // cursor and startLedger are mutually exclusive
+    if cursor.is_some() && start_ledger.is_some() {
+        return Err(JsonRpcError::invalid_params(
+            "startLedger and cursor are mutually exclusive",
+        ));
+    }
+
+    let limit = limit.unwrap_or(default_limit).min(max_limit).max(1);
+
+    if let Some(c) = cursor {
+        if c.is_empty() {
+            return Err(JsonRpcError::invalid_params("cursor must not be empty"));
+        }
+        let toid = toid_parse_cursor(c)?;
+        let (ledger, _, _) = toid_decode(toid);
+        return Ok((ledger, Some(toid), limit));
+    }
+
+    let start = start_ledger
+        .ok_or_else(|| JsonRpcError::invalid_params("startLedger or cursor is required"))?;
+
+    if start < oldest_ledger || start > latest_ledger {
+        return Err(JsonRpcError::invalid_params(format!(
+            "startLedger must be within [{oldest_ledger}, {latest_ledger}]"
+        )));
+    }
+
+    Ok((start, None, limit))
+}
+
+// ---------------------------------------------------------------------------
+// Transaction helpers (shared by getTransaction and getTransactions)
+// ---------------------------------------------------------------------------
+
+/// Determine the transaction status ("SUCCESS" or "FAILED") from a `TransactionResultPair` blob.
+pub(crate) fn determine_tx_status(result_bytes: &[u8]) -> &'static str {
+    match TransactionResultPair::from_xdr(result_bytes, Limits::none()) {
+        Ok(pair) => {
+            let code = pair.result.result.discriminant();
+            if code == TransactionResultCode::TxSuccess
+                || code == TransactionResultCode::TxFeeBumpInnerSuccess
+            {
+                "SUCCESS"
+            } else {
+                "FAILED"
+            }
+        }
+        Err(_) => "FAILED",
+    }
+}
+
+/// Extract just the `TransactionResult` XDR bytes from a stored `TransactionResultPair` blob.
+pub(crate) fn extract_result_xdr(result_pair_bytes: &[u8]) -> Option<Vec<u8>> {
+    let pair = TransactionResultPair::from_xdr(result_pair_bytes, Limits::none()).ok()?;
+    pair.result.to_xdr(Limits::none()).ok()
+}
+
+/// Get the oldest ledger sequence from the database, defaulting to 1 on error.
+pub(crate) fn oldest_ledger(app: &henyey_app::App) -> u32 {
+    app.database()
+        .get_oldest_ledger_seq()
+        .unwrap_or(Some(1))
+        .unwrap_or(1)
+}
+
+/// Extract diagnostic events from `TransactionMeta` bytes as base64-encoded XDR strings.
+///
+/// Returns `None` if no diagnostic events are present or the meta cannot be parsed.
+/// V3 meta has events in `soroban_meta.diagnostic_events`, V4 has them directly.
+pub(crate) fn extract_diagnostic_events_xdr(meta_bytes: &[u8]) -> Option<Vec<String>> {
+    let meta = TransactionMeta::from_xdr(meta_bytes, Limits::none()).ok()?;
+
+    let events: &[DiagnosticEvent] = match &meta {
+        TransactionMeta::V3(v3) => v3
+            .soroban_meta
+            .as_ref()
+            .map(|sm| sm.diagnostic_events.as_slice())
+            .unwrap_or(&[]),
+        TransactionMeta::V4(v4) => v4.diagnostic_events.as_slice(),
+        _ => return None,
+    };
+
+    if events.is_empty() {
+        return None;
+    }
+
+    let encoded: Vec<String> = events
+        .iter()
+        .filter_map(|e| e.to_xdr(Limits::none()).ok().map(|b| BASE64.encode(&b)))
+        .collect();
+
+    if encoded.is_empty() {
+        None
+    } else {
+        Some(encoded)
+    }
+}
 
 /// Build the TTL lookup key for a contract data or contract code ledger key.
 ///
@@ -84,4 +243,105 @@ pub(crate) fn format_unix_timestamp_utc(unix_ts: u64) -> String {
 
 fn is_leap_year(year: i32) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_toid_roundtrip() {
+        let cases = [
+            (1u32, 0u32, 0u32),
+            (100, 5, 3),
+            (u32::MAX >> 1, (1 << 20) - 1, (1 << 12) - 1), // max values
+            (0, 0, 0),
+        ];
+        for (ledger, tx_order, op_index) in cases {
+            let encoded = toid_encode(ledger, tx_order, op_index);
+            let (l, t, o) = toid_decode(encoded);
+            assert_eq!(
+                (l, t, o),
+                (ledger, tx_order, op_index),
+                "roundtrip failed for ({ledger}, {tx_order}, {op_index})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_toid_ordering() {
+        // Transactions in later ledgers have higher TOID values
+        assert!(toid_encode(2, 0, 0) > toid_encode(1, 0, 0));
+        // Higher tx_order in same ledger has higher TOID
+        assert!(toid_encode(1, 2, 0) > toid_encode(1, 1, 0));
+        // Higher op_index has higher TOID
+        assert!(toid_encode(1, 1, 2) > toid_encode(1, 1, 1));
+    }
+
+    #[test]
+    fn test_toid_parse_cursor() {
+        let toid = toid_encode(100, 5, 0);
+        let s = toid.to_string();
+        assert_eq!(toid_parse_cursor(&s).unwrap(), toid);
+
+        assert!(toid_parse_cursor("not_a_number").is_err());
+    }
+
+    #[test]
+    fn test_validate_pagination_start_ledger() {
+        let (start, cursor, limit) =
+            validate_pagination(Some(10), None, None, 5, 200, 1, 100).unwrap();
+        assert_eq!(start, 10);
+        assert!(cursor.is_none());
+        assert_eq!(limit, 5); // default
+    }
+
+    #[test]
+    fn test_validate_pagination_cursor() {
+        let toid = toid_encode(50, 3, 0);
+        let cursor_str = toid.to_string();
+        let (start, cursor, limit) =
+            validate_pagination(None, Some(&cursor_str), Some(20), 5, 200, 1, 100).unwrap();
+        assert_eq!(start, 50);
+        assert_eq!(cursor, Some(toid));
+        assert_eq!(limit, 20);
+    }
+
+    #[test]
+    fn test_validate_pagination_mutual_exclusion() {
+        let toid = toid_encode(50, 3, 0);
+        let cursor_str = toid.to_string();
+        let result = validate_pagination(Some(10), Some(&cursor_str), None, 5, 200, 1, 100);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_pagination_start_ledger_out_of_range() {
+        let result = validate_pagination(Some(200), None, None, 5, 200, 1, 100);
+        assert!(result.is_err());
+
+        let result = validate_pagination(Some(0), None, None, 5, 200, 1, 100);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_pagination_limit_clamping() {
+        // Over max
+        let (_, _, limit) = validate_pagination(Some(10), None, Some(500), 5, 200, 1, 100).unwrap();
+        assert_eq!(limit, 200);
+        // Under min
+        let (_, _, limit) = validate_pagination(Some(10), None, Some(0), 5, 200, 1, 100).unwrap();
+        assert_eq!(limit, 1);
+    }
+
+    #[test]
+    fn test_validate_pagination_missing_both() {
+        let result = validate_pagination(None, None, None, 5, 200, 1, 100);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_determine_tx_status_invalid() {
+        assert_eq!(determine_tx_status(&[0, 1, 2]), "FAILED");
+    }
 }

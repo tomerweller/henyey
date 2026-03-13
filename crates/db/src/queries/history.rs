@@ -112,6 +112,28 @@ pub trait HistoryQueries {
         tx_stream: &mut XdrOutputStream,
         result_stream: &mut XdrOutputStream,
     ) -> Result<(u32, u32), DbError>;
+
+    /// Loads transactions in a ledger range, for cursor-based pagination.
+    ///
+    /// Returns transactions where `(ledgerseq, txindex) > (start_ledger, start_tx_index)`
+    /// and `ledgerseq < end_ledger`, ordered by `(ledgerseq, txindex)` ascending,
+    /// limited to `limit` rows.
+    ///
+    /// If `start_tx_index` is `None`, starts from the beginning of `start_ledger`.
+    fn load_transactions_in_range(
+        &self,
+        start_ledger: u32,
+        start_tx_index: Option<u32>,
+        end_ledger: u32,
+        limit: u32,
+    ) -> Result<Vec<TxRecord>, DbError>;
+
+    /// Deletes old transaction history entries with `ledgerseq <= max_ledger`.
+    ///
+    /// Cleans `txhistory`, `txsets`, and `txresults` tables.
+    /// Removes at most `count` entries from each table.
+    /// Returns the total number of entries deleted across all tables.
+    fn delete_old_tx_history(&self, max_ledger: u32, count: u32) -> Result<u32, DbError>;
 }
 
 impl HistoryQueries for Connection {
@@ -267,6 +289,105 @@ impl HistoryQueries for Connection {
         }
 
         Ok((tx_written, result_written))
+    }
+
+    fn load_transactions_in_range(
+        &self,
+        start_ledger: u32,
+        start_tx_index: Option<u32>,
+        end_ledger: u32,
+        limit: u32,
+    ) -> Result<Vec<TxRecord>, DbError> {
+        let mut results = Vec::new();
+
+        match start_tx_index {
+            Some(tx_index) => {
+                // Cursor-based: start after (start_ledger, tx_index)
+                let mut stmt = self.prepare(
+                    "SELECT txid, ledgerseq, txindex, txbody, txresult, txmeta \
+                     FROM txhistory \
+                     WHERE (ledgerseq > ?1 OR (ledgerseq = ?1 AND txindex > ?2)) \
+                       AND ledgerseq < ?3 \
+                     ORDER BY ledgerseq ASC, txindex ASC \
+                     LIMIT ?4",
+                )?;
+                let rows =
+                    stmt.query_map(params![start_ledger, tx_index, end_ledger, limit], |row| {
+                        Ok(TxRecord {
+                            tx_id: row.get(0)?,
+                            ledger_seq: row.get(1)?,
+                            tx_index: row.get(2)?,
+                            body: row.get(3)?,
+                            result: row.get(4)?,
+                            meta: row.get(5)?,
+                        })
+                    })?;
+                for row in rows {
+                    results.push(row?);
+                }
+            }
+            None => {
+                // Start from beginning of start_ledger
+                let mut stmt = self.prepare(
+                    "SELECT txid, ledgerseq, txindex, txbody, txresult, txmeta \
+                     FROM txhistory \
+                     WHERE ledgerseq >= ?1 AND ledgerseq < ?2 \
+                     ORDER BY ledgerseq ASC, txindex ASC \
+                     LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(params![start_ledger, end_ledger, limit], |row| {
+                    Ok(TxRecord {
+                        tx_id: row.get(0)?,
+                        ledger_seq: row.get(1)?,
+                        tx_index: row.get(2)?,
+                        body: row.get(3)?,
+                        result: row.get(4)?,
+                        meta: row.get(5)?,
+                    })
+                })?;
+                for row in rows {
+                    results.push(row?);
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    fn delete_old_tx_history(&self, max_ledger: u32, count: u32) -> Result<u32, DbError> {
+        let mut total = 0u32;
+
+        // Delete from txhistory
+        let deleted = self.execute(
+            "DELETE FROM txhistory WHERE rowid IN (\
+                SELECT rowid FROM txhistory WHERE ledgerseq <= ?1 \
+                ORDER BY ledgerseq ASC LIMIT ?2\
+            )",
+            params![max_ledger, count],
+        )?;
+        total += deleted as u32;
+
+        // Delete from txsets
+        let deleted = self.execute(
+            "DELETE FROM txsets WHERE ledgerseq IN (\
+                SELECT ledgerseq FROM txsets WHERE ledgerseq <= ?1 \
+                ORDER BY ledgerseq ASC LIMIT ?2\
+            )",
+            params![max_ledger, count],
+        )?;
+        total += deleted as u32;
+
+        // Delete from txresults
+        let deleted = self.execute(
+            "DELETE FROM txresults WHERE ledgerseq IN (\
+                SELECT ledgerseq FROM txresults WHERE ledgerseq <= ?1 \
+                ORDER BY ledgerseq ASC LIMIT ?2\
+            )",
+            params![max_ledger, count],
+        )?;
+        total += deleted as u32;
+
+        Ok(total)
     }
 }
 

@@ -10,6 +10,8 @@
 //!   to support checkpoint publishing
 //! - **scphistory**: Old SCP consensus envelopes are pruned
 //! - **scpquorums**: Old quorum sets are pruned based on their last-seen ledger
+//! - **ledger_close_meta**: Old full ledger close metadata (RPC retention window)
+//! - **txhistory / txsets / txresults**: Old transaction data (RPC retention window)
 //!
 //! # Configuration
 //!
@@ -53,6 +55,10 @@ pub struct MaintenanceConfig {
     pub count: u32,
     /// Whether maintenance is enabled.
     pub enabled: bool,
+    /// RPC retention window in ledgers. When set, the maintainer will also clean
+    /// up `ledger_close_meta`, `txhistory`, `txsets`, and `txresults` tables,
+    /// keeping only ledgers within this window of the LCL.
+    pub rpc_retention_window: Option<u32>,
 }
 
 impl Default for MaintenanceConfig {
@@ -61,6 +67,7 @@ impl Default for MaintenanceConfig {
             period: DEFAULT_MAINTENANCE_PERIOD,
             count: DEFAULT_MAINTENANCE_COUNT,
             enabled: true,
+            rpc_retention_window: None,
         }
     }
 }
@@ -72,6 +79,12 @@ impl MaintenanceConfig {
             enabled: false,
             ..Default::default()
         }
+    }
+
+    /// Set the RPC retention window.
+    pub fn with_rpc_retention_window(mut self, window: u32) -> Self {
+        self.rpc_retention_window = Some(window);
+        self
     }
 }
 
@@ -247,6 +260,39 @@ impl Maintainer {
             }
         }
 
+        // Clean up RPC-specific tables if retention window is configured
+        if let Some(retention_window) = self.config.rpc_retention_window {
+            let rpc_lmin = lcl.saturating_sub(retention_window);
+
+            match self
+                .database
+                .delete_old_ledger_close_meta(rpc_lmin, self.config.count)
+            {
+                Ok(deleted) => {
+                    if deleted > 0 {
+                        debug!(deleted = deleted, "Deleted old ledger close meta");
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to delete old ledger close meta");
+                }
+            }
+
+            match self
+                .database
+                .delete_old_tx_history(rpc_lmin, self.config.count)
+            {
+                Ok(deleted) => {
+                    if deleted > 0 {
+                        debug!(deleted = deleted, "Deleted old tx history");
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to delete old tx history");
+                }
+            }
+        }
+
         let elapsed = start.elapsed();
         if elapsed > Duration::from_secs(2) {
             warn!(
@@ -283,6 +329,19 @@ impl Maintainer {
 
         if let Err(e) = self.database.delete_old_events(lmin, count) {
             warn!(error = %e, "Failed to delete old events");
+        }
+
+        // Clean up RPC-specific tables if retention window is configured
+        if let Some(retention_window) = self.config.rpc_retention_window {
+            let rpc_lmin = lcl.saturating_sub(retention_window);
+
+            if let Err(e) = self.database.delete_old_ledger_close_meta(rpc_lmin, count) {
+                warn!(error = %e, "Failed to delete old ledger close meta");
+            }
+
+            if let Err(e) = self.database.delete_old_tx_history(rpc_lmin, count) {
+                warn!(error = %e, "Failed to delete old tx history");
+            }
         }
     }
 }

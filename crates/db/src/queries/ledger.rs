@@ -64,6 +64,11 @@ pub trait LedgerQueries {
     ///
     /// This is used by the Maintainer to garbage collect old ledger history.
     fn delete_old_ledger_headers(&self, max_ledger: u32, count: u32) -> Result<u32, DbError>;
+
+    /// Returns the lowest ledger sequence number in the database.
+    ///
+    /// Returns `None` if no ledgers have been stored.
+    fn get_oldest_ledger_seq(&self) -> Result<Option<u32>, DbError>;
 }
 
 impl LedgerQueries for Connection {
@@ -198,6 +203,15 @@ impl LedgerQueries for Connection {
             params![max_ledger, count],
         )?;
         Ok(deleted as u32)
+    }
+
+    fn get_oldest_ledger_seq(&self) -> Result<Option<u32>, DbError> {
+        let result: Option<Option<u32>> = self
+            .query_row("SELECT MIN(ledgerseq) FROM ledgerheaders", [], |row| {
+                row.get::<_, Option<u32>>(0)
+            })
+            .optional()?;
+        Ok(result.flatten())
     }
 }
 

@@ -4,6 +4,7 @@ use serde_json::json;
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
+use crate::util;
 
 /// Default ledger retention window (number of ledgers kept).
 const DEFAULT_LEDGER_RETENTION_WINDOW: u32 = 2880;
@@ -13,10 +14,7 @@ pub async fn handle(ctx: &Arc<RpcContext>) -> Result<serde_json::Value, JsonRpcE
 
     // stellar-rpc returns "healthy" whenever the server is reachable
     let status = "healthy";
-    let oldest_ledger = ledger
-        .num
-        .saturating_sub(DEFAULT_LEDGER_RETENTION_WINDOW)
-        .max(1);
+    let oldest_ledger = util::oldest_ledger(&ctx.app);
 
     Ok(json!({
         "status": status,

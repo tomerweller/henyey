@@ -127,10 +127,7 @@ impl EventQueries for Connection {
                 .enumerate()
                 .map(|_| "?".to_string())
                 .collect();
-            sql.push_str(&format!(
-                " AND contract_id IN ({})",
-                placeholders.join(",")
-            ));
+            sql.push_str(&format!(" AND contract_id IN ({})", placeholders.join(",")));
             for cid in contract_ids {
                 param_values.push(Box::new(cid.clone()));
             }
@@ -157,11 +154,7 @@ impl EventQueries for Connection {
                 }
                 let placeholders: Vec<String> =
                     non_wildcard.iter().map(|_| "?".to_string()).collect();
-                sql.push_str(&format!(
-                    " AND {} IN ({})",
-                    col,
-                    placeholders.join(",")
-                ));
+                sql.push_str(&format!(" AND {} IN ({})", col, placeholders.join(",")));
                 for t in non_wildcard {
                     param_values.push(Box::new(t.clone()));
                 }
