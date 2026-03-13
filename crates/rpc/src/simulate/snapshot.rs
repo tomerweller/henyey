@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use henyey_bucket::SearchableBucketListSnapshot;
 use soroban_env_host_p25 as soroban_host;
-use stellar_xdr::curr::LedgerKey;
+use stellar_xdr::curr::{LedgerEntry, LedgerKey};
 
 use soroban_host::storage::{EntryWithLiveUntil, SnapshotSource};
 use soroban_host::HostError;
@@ -30,6 +30,17 @@ impl BucketListSnapshotSource {
             snapshot,
             current_ledger,
         }
+    }
+
+    /// Look up a ledger entry without TTL filtering.
+    ///
+    /// Returns the entry and its TTL regardless of whether the entry is expired.
+    /// Used for ExtendTTL and Restore simulation where we need access to
+    /// archived/expired entries.
+    pub(crate) fn get_unfiltered(&self, key: &LedgerKey) -> Option<(LedgerEntry, Option<u32>)> {
+        let live_until = get_entry_ttl(&self.snapshot, key);
+        let entry = self.snapshot.load(key)?;
+        Some((entry, live_until))
     }
 }
 

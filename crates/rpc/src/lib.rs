@@ -6,6 +6,7 @@
 mod context;
 mod dispatch;
 mod error;
+mod fee_window;
 mod methods;
 mod server;
 mod simulate;

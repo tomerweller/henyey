@@ -5,9 +5,8 @@
 
 use std::sync::Arc;
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde_json::json;
-use stellar_xdr::curr::{LedgerCloseMeta, LedgerHeaderHistoryEntry, Limits, ReadXdr, WriteXdr};
+use stellar_xdr::curr::{LedgerCloseMeta, LedgerHeaderHistoryEntry, Limits, ReadXdr};
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
@@ -22,6 +21,8 @@ pub async fn handle(
     ctx: &Arc<RpcContext>,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, JsonRpcError> {
+    let format = util::parse_format(&params)?;
+
     let ledger = ctx.app.ledger_summary();
     let oldest = util::oldest_ledger(&ctx.app);
 
@@ -74,18 +75,26 @@ pub async fn handle(
         let lcm = LedgerCloseMeta::from_xdr(meta_bytes.as_slice(), Limits::none())
             .map_err(|e| JsonRpcError::internal(format!("corrupt LedgerCloseMeta: {e}")))?;
 
-        let (hash, header_xdr, close_time) = extract_header_info(&lcm)?;
-        let metadata_xdr = BASE64.encode(meta_bytes);
+        let header_entry = extract_header_entry(&lcm);
+        let hash = hex::encode(header_entry.hash.0);
+        let close_time = header_entry.header.scp_value.close_time.0;
 
         last_cursor = sequence.to_string();
 
-        ledgers.push(json!({
-            "hash": hash,
-            "sequence": sequence,
-            "ledgerCloseTime": close_time.to_string(),
-            "headerXdr": header_xdr,
-            "metadataXdr": metadata_xdr
-        }));
+        let mut obj = serde_json::Map::new();
+        obj.insert("hash".into(), json!(hash));
+        obj.insert("sequence".into(), json!(sequence));
+        obj.insert("ledgerCloseTime".into(), json!(close_time.to_string()));
+
+        // Header XDR — encode the LedgerHeaderHistoryEntry
+        util::insert_xdr_field(&mut obj, "header", header_entry, format)?;
+
+        // Metadata XDR — encode the full LedgerCloseMeta
+        util::insert_raw_xdr_field::<LedgerCloseMeta>(
+            &mut obj, "metadata", meta_bytes, format,
+        )?;
+
+        ledgers.push(serde_json::Value::Object(obj));
     }
 
     Ok(json!({
@@ -141,24 +150,13 @@ fn validate_ledger_pagination(
     Ok((start, limit))
 }
 
-/// Extract hash, base64 header XDR, and close time from a LedgerCloseMeta.
-fn extract_header_info(
-    lcm: &LedgerCloseMeta,
-) -> Result<(String, String, u64), JsonRpcError> {
-    let header_entry: &LedgerHeaderHistoryEntry = match lcm {
+/// Extract the LedgerHeaderHistoryEntry reference from a LedgerCloseMeta.
+fn extract_header_entry(lcm: &LedgerCloseMeta) -> &LedgerHeaderHistoryEntry {
+    match lcm {
         LedgerCloseMeta::V0(v0) => &v0.ledger_header,
         LedgerCloseMeta::V1(v1) => &v1.ledger_header,
         LedgerCloseMeta::V2(v2) => &v2.ledger_header,
-    };
-
-    let hash = hex::encode(header_entry.hash.0);
-    let header_xdr = header_entry
-        .to_xdr(Limits::none())
-        .map(|b| BASE64.encode(&b))
-        .map_err(|e| JsonRpcError::internal(format!("XDR encode error: {e}")))?;
-    let close_time = header_entry.header.scp_value.close_time.0;
-
-    Ok((hash, header_xdr, close_time))
+    }
 }
 
 /// Get ledger close time as a string.

@@ -5,9 +5,10 @@
 
 use std::sync::Arc;
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde_json::json;
-use stellar_xdr::curr::{Limits, ReadXdr, TransactionEnvelope};
+use stellar_xdr::curr::{
+    Limits, ReadXdr, TransactionEnvelope, TransactionMeta, TransactionResult,
+};
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
@@ -22,6 +23,8 @@ pub async fn handle(
     ctx: &Arc<RpcContext>,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, JsonRpcError> {
+    let format = util::parse_format(&params)?;
+
     let ledger = ctx.app.ledger_summary();
     let oldest = util::oldest_ledger(&ctx.app);
 
@@ -89,17 +92,6 @@ pub async fn handle(
     for record in &records {
         let status = util::determine_tx_status(&record.result);
 
-        let envelope_xdr = BASE64.encode(&record.body);
-        let result_xdr = match util::extract_result_xdr(&record.result) {
-            Some(result_bytes) => BASE64.encode(&result_bytes),
-            None => BASE64.encode(&record.result),
-        };
-        let result_meta_xdr = record
-            .meta
-            .as_ref()
-            .map(|m| BASE64.encode(m))
-            .unwrap_or_default();
-
         // Detect fee bump from the envelope
         let fee_bump = is_fee_bump_envelope(&record.body);
 
@@ -113,28 +105,39 @@ pub async fn handle(
         let toid = util::toid_encode(record.ledger_seq, application_order, 0);
         last_cursor = toid.to_string();
 
-        let mut tx = json!({
-            "status": status,
-            "applicationOrder": application_order,
-            "feeBump": fee_bump,
-            "envelopeXdr": envelope_xdr,
-            "resultXdr": result_xdr,
-            "resultMetaXdr": result_meta_xdr,
-            "ledger": record.ledger_seq,
-            "createdAt": created_at,
-            "txHash": record.tx_id
-        });
+        let mut obj = serde_json::Map::new();
+        obj.insert("status".into(), json!(status));
+        obj.insert("applicationOrder".into(), json!(application_order));
+        obj.insert("feeBump".into(), json!(fee_bump));
+        obj.insert("ledger".into(), json!(record.ledger_seq));
+        obj.insert("createdAt".into(), json!(created_at));
+        obj.insert("txHash".into(), json!(record.tx_id));
 
-        // Extract diagnostic events from meta if available
+        // Envelope XDR
+        util::insert_raw_xdr_field::<TransactionEnvelope>(
+            &mut obj, "envelope", &record.body, format,
+        )?;
+
+        // Result XDR
+        let result_bytes = util::extract_result_xdr(&record.result)
+            .unwrap_or_else(|| record.result.clone());
+        util::insert_raw_xdr_field::<TransactionResult>(
+            &mut obj, "result", &result_bytes, format,
+        )?;
+
+        // Result meta XDR
         if let Some(ref meta_bytes) = record.meta {
-            if let Some(events_xdr) = util::extract_diagnostic_events_xdr(meta_bytes) {
-                tx.as_object_mut()
-                    .unwrap()
-                    .insert("diagnosticEventsXdr".into(), json!(events_xdr));
-            }
+            util::insert_raw_xdr_field::<TransactionMeta>(
+                &mut obj, "resultMeta", meta_bytes, format,
+            )?;
         }
 
-        transactions.push(tx);
+        // Diagnostic events
+        if let Some(ref meta_bytes) = record.meta {
+            util::insert_diagnostic_events(&mut obj, meta_bytes, format)?;
+        }
+
+        transactions.push(serde_json::Value::Object(obj));
     }
 
     Ok(json!({
@@ -172,4 +175,3 @@ fn get_ledger_close_time_num(ctx: &RpcContext, ledger_seq: u32) -> u64 {
 fn get_ledger_close_time(ctx: &RpcContext, ledger_seq: u32) -> String {
     get_ledger_close_time_num(ctx, ledger_seq).to_string()
 }
-

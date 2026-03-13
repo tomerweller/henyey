@@ -1,12 +1,146 @@
 //! Shared utility functions for the RPC crate.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use serde::Serialize;
 use stellar_xdr::curr::{
     DiagnosticEvent, LedgerKey, Limits, ReadXdr, TransactionMeta, TransactionResultCode,
     TransactionResultPair, WriteXdr,
 };
 
 use crate::error::JsonRpcError;
+
+// ---------------------------------------------------------------------------
+// XDR format helpers (xdrFormat / "format" parameter support)
+// ---------------------------------------------------------------------------
+//
+// The upstream stellar-rpc uses separate JSON keys for XDR vs JSON output:
+//   - `xdrFormat: "xdr"` (default) → `envelopeXdr`, `headerXdr`, etc. (base64 strings)
+//   - `xdrFormat: "json"` → `envelopeJson`, `headerJson`, etc. (JSON objects)
+//
+// Callers use `insert_xdr_field()` to add the appropriate key/value pair
+// to their response objects.
+
+/// Whether the caller wants base64 XDR strings or JSON objects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum XdrFormat {
+    /// Default: base64-encoded XDR bytes.
+    Base64,
+    /// JSON: serde-serialized XDR types.
+    Json,
+}
+
+/// Parse the `"xdrFormat"` parameter from JSON-RPC params.
+///
+/// Accepted values: `"xdr"` (default), `"json"`.
+pub(crate) fn parse_format(params: &serde_json::Value) -> Result<XdrFormat, JsonRpcError> {
+    let val = params.get("xdrFormat").and_then(|v| v.as_str());
+
+    match val {
+        None | Some("xdr") => Ok(XdrFormat::Base64),
+        Some("json") => Ok(XdrFormat::Json),
+        Some(other) => Err(JsonRpcError::invalid_params(format!(
+            "unsupported xdrFormat: {other:?} (expected \"xdr\" or \"json\")"
+        ))),
+    }
+}
+
+/// Insert an XDR field into a JSON object with the correct key name.
+///
+/// When format is `Base64`, inserts `"{base_name}Xdr": "<base64>"`.
+/// When format is `Json`, inserts `"{base_name}Json": <json_object>`.
+///
+/// `base_name` should be the stem without Xdr/Json suffix (e.g. `"envelope"`, `"header"`).
+pub(crate) fn insert_xdr_field<T: WriteXdr + Serialize>(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    base_name: &str,
+    val: &T,
+    format: XdrFormat,
+) -> Result<(), JsonRpcError> {
+    match format {
+        XdrFormat::Base64 => {
+            let bytes = val
+                .to_xdr(Limits::none())
+                .map_err(|e| JsonRpcError::internal(format!("XDR encode error: {e}")))?;
+            obj.insert(
+                format!("{base_name}Xdr"),
+                serde_json::Value::String(BASE64.encode(&bytes)),
+            );
+        }
+        XdrFormat::Json => {
+            let json_val = serde_json::to_value(val)
+                .map_err(|e| JsonRpcError::internal(format!("JSON serialize error: {e}")))?;
+            obj.insert(format!("{base_name}Json"), json_val);
+        }
+    }
+    Ok(())
+}
+
+/// Insert an XDR field from raw bytes into a JSON object with the correct key name.
+///
+/// Like `insert_xdr_field` but starts from raw XDR bytes. In JSON mode the bytes
+/// are first deserialized as type `T`.
+pub(crate) fn insert_raw_xdr_field<T: ReadXdr + Serialize>(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    base_name: &str,
+    bytes: &[u8],
+    format: XdrFormat,
+) -> Result<(), JsonRpcError> {
+    match format {
+        XdrFormat::Base64 => {
+            obj.insert(
+                format!("{base_name}Xdr"),
+                serde_json::Value::String(BASE64.encode(bytes)),
+            );
+        }
+        XdrFormat::Json => {
+            let val = T::from_xdr(bytes, Limits::none())
+                .map_err(|e| JsonRpcError::internal(format!("XDR decode error: {e}")))?;
+            let json_val = serde_json::to_value(&val)
+                .map_err(|e| JsonRpcError::internal(format!("JSON serialize error: {e}")))?;
+            obj.insert(format!("{base_name}Json"), json_val);
+        }
+    }
+    Ok(())
+}
+
+/// Insert an array of XDR items into a JSON object with the correct key name.
+///
+/// `Base64`: inserts `"{base_name}Xdr": ["<b64>", ...]`.
+/// `Json`: inserts `"{base_name}Json": [{...}, ...]`.
+pub(crate) fn insert_xdr_array_field<T: WriteXdr + Serialize>(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    base_name: &str,
+    items: &[T],
+    format: XdrFormat,
+) -> Result<(), JsonRpcError> {
+    match format {
+        XdrFormat::Base64 => {
+            let encoded: Vec<serde_json::Value> = items
+                .iter()
+                .map(|item| {
+                    item.to_xdr(Limits::none())
+                        .map(|b| serde_json::Value::String(BASE64.encode(&b)))
+                        .map_err(|e| JsonRpcError::internal(format!("XDR encode error: {e}")))
+                })
+                .collect::<Result<_, _>>()?;
+            obj.insert(format!("{base_name}Xdr"), serde_json::Value::Array(encoded));
+        }
+        XdrFormat::Json => {
+            let json_items: Vec<serde_json::Value> = items
+                .iter()
+                .map(|item| {
+                    serde_json::to_value(item)
+                        .map_err(|e| JsonRpcError::internal(format!("JSON serialize error: {e}")))
+                })
+                .collect::<Result<_, _>>()?;
+            obj.insert(
+                format!("{base_name}Json"),
+                serde_json::Value::Array(json_items),
+            );
+        }
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // TOID (Total Order ID) encoding
@@ -128,11 +262,11 @@ pub(crate) fn oldest_ledger(app: &henyey_app::App) -> u32 {
         .unwrap_or(1)
 }
 
-/// Extract diagnostic events from `TransactionMeta` bytes as base64-encoded XDR strings.
+/// Extract diagnostic events from `TransactionMeta` bytes.
 ///
 /// Returns `None` if no diagnostic events are present or the meta cannot be parsed.
 /// V3 meta has events in `soroban_meta.diagnostic_events`, V4 has them directly.
-pub(crate) fn extract_diagnostic_events_xdr(meta_bytes: &[u8]) -> Option<Vec<String>> {
+pub(crate) fn extract_diagnostic_events(meta_bytes: &[u8]) -> Option<Vec<DiagnosticEvent>> {
     let meta = TransactionMeta::from_xdr(meta_bytes, Limits::none()).ok()?;
 
     let events: &[DiagnosticEvent] = match &meta {
@@ -146,19 +280,25 @@ pub(crate) fn extract_diagnostic_events_xdr(meta_bytes: &[u8]) -> Option<Vec<Str
     };
 
     if events.is_empty() {
-        return None;
-    }
-
-    let encoded: Vec<String> = events
-        .iter()
-        .filter_map(|e| e.to_xdr(Limits::none()).ok().map(|b| BASE64.encode(&b)))
-        .collect();
-
-    if encoded.is_empty() {
         None
     } else {
-        Some(encoded)
+        Some(events.to_vec())
     }
+}
+
+/// Insert diagnostic events from `TransactionMeta` bytes into a JSON object.
+///
+/// Adds `diagnosticEventsXdr` (base64 array) or `diagnosticEventsJson` (JSON array)
+/// depending on the format. Does nothing if no diagnostic events are present.
+pub(crate) fn insert_diagnostic_events(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    meta_bytes: &[u8],
+    format: XdrFormat,
+) -> Result<(), JsonRpcError> {
+    if let Some(events) = extract_diagnostic_events(meta_bytes) {
+        insert_xdr_array_field(obj, "diagnosticEvents", &events, format)?;
+    }
+    Ok(())
 }
 
 /// Build the TTL lookup key for a contract data or contract code ledger key.

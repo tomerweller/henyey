@@ -193,6 +193,11 @@ pub struct SorobanNetworkInfo {
     pub starting_eviction_scan_level: u32,
     /// Computed value: average bucket list size.
     pub average_bucket_list_size: u64,
+    /// Rent write fee configuration fields (from ContractLedgerCostV0).
+    pub state_target_size_bytes: i64,
+    pub rent_fee_1kb_state_size_low: i64,
+    pub rent_fee_1kb_state_size_high: i64,
+    pub state_size_rent_fee_growth_factor: u32,
     /// SCP timing settings (Protocol 23+).
     pub nomination_timeout_initial_ms: u32,
     pub nomination_timeout_increment_ms: u32,

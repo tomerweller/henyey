@@ -11,6 +11,7 @@ use henyey_app::App;
 use crate::context::RpcContext;
 use crate::dispatch;
 use crate::error::JsonRpcError;
+use crate::fee_window::FeeWindows;
 use crate::types::{JsonRpcRequest, JsonRpcResponse};
 
 /// Stellar JSON-RPC 2.0 server.
@@ -27,11 +28,23 @@ impl RpcServer {
 
     /// Start the RPC server.
     pub async fn start(self) -> anyhow::Result<()> {
+        let retention = self.app.config().rpc.retention_window;
+        let fee_windows = Arc::new(FeeWindows::new(retention));
+
         let ctx = Arc::new(RpcContext {
             app: self.app.clone(),
+            fee_windows: fee_windows.clone(),
         });
 
         let mut shutdown_rx = self.app.subscribe_shutdown();
+
+        // Spawn background task to populate fee windows from DB
+        let poller_app = self.app.clone();
+        let poller_windows = fee_windows.clone();
+        let mut poller_shutdown = self.app.subscribe_shutdown();
+        tokio::spawn(async move {
+            fee_window_poller(poller_app, poller_windows, &mut poller_shutdown).await;
+        });
 
         let router = Router::new()
             .route("/", post(rpc_handler))
@@ -50,6 +63,105 @@ impl RpcServer {
         tracing::info!("JSON-RPC server stopped");
         Ok(())
     }
+}
+
+/// Background task that polls for new ledgers and feeds fees into the window.
+///
+/// On startup, does a bulk load of the last `retention_window` ledgers from DB,
+/// then polls every second for new ones.
+async fn fee_window_poller(
+    app: Arc<App>,
+    windows: Arc<FeeWindows>,
+    shutdown: &mut tokio::sync::broadcast::Receiver<()>,
+) {
+    let retention = app.config().rpc.retention_window;
+
+    // Initial bulk load
+    if let Err(e) = bulk_load_fees(&app, &windows, retention) {
+        tracing::warn!(error = %e, "Failed initial fee window load");
+    }
+
+    // Poll loop
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = shutdown.recv() => {
+                tracing::info!("Fee window poller shutting down");
+                return;
+            }
+        }
+
+        let current_ledger = app.ledger_summary().num;
+        let window_latest = windows.latest_ledger();
+
+        if current_ledger <= window_latest {
+            continue;
+        }
+
+        // Load new ledgers [window_latest+1, current_ledger]
+        let start = if window_latest == 0 {
+            // Not yet loaded — shouldn't happen after bulk load, but handle gracefully
+            current_ledger.saturating_sub(retention).max(1)
+        } else {
+            window_latest + 1
+        };
+
+        let metas = match app
+            .database()
+            .with_connection(|conn| {
+                use henyey_db::LedgerCloseMetaQueries;
+                conn.load_ledger_close_metas_in_range(start, current_ledger + 1, retention)
+            })
+        {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to load LCMs for fee window");
+                continue;
+            }
+        };
+
+        for (_seq, meta_bytes) in &metas {
+            if let Err(e) = windows.ingest_ledger_close_meta(meta_bytes) {
+                tracing::warn!(error = %e, "Failed to ingest fees from LCM");
+                // On contiguity errors, reset and try again next iteration
+                windows.reset();
+                break;
+            }
+        }
+    }
+}
+
+/// Bulk-load the last N ledgers' fees from the database.
+fn bulk_load_fees(app: &App, windows: &FeeWindows, retention: u32) -> Result<(), String> {
+    let current = app.ledger_summary().num;
+    if current == 0 {
+        return Ok(());
+    }
+
+    let start = current.saturating_sub(retention).max(1);
+    let metas = app
+        .database()
+        .with_connection(|conn| {
+            use henyey_db::LedgerCloseMetaQueries;
+            conn.load_ledger_close_metas_in_range(start, current + 1, retention)
+        })
+        .map_err(|e| format!("DB error loading LCMs: {e}"))?;
+
+    tracing::info!(
+        count = metas.len(),
+        start,
+        end = current,
+        "Bulk-loading fee window from DB"
+    );
+
+    for (_seq, meta_bytes) in &metas {
+        windows.ingest_ledger_close_meta(meta_bytes)?;
+    }
+
+    Ok(())
 }
 
 /// Single axum handler for all JSON-RPC requests.

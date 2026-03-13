@@ -45,7 +45,7 @@ flowchart TD
 | Type | Description |
 |------|-------------|
 | `RpcServer` | Public entry point; binds an HTTP listener and serves JSON-RPC requests |
-| `RpcContext` | Shared state (`Arc<App>`) passed to every handler via axum state |
+| `RpcContext` | Shared state (`Arc<App>`, `Arc<FeeWindows>`) passed to every handler via axum state |
 | `JsonRpcRequest` | Deserialized JSON-RPC 2.0 request envelope |
 | `JsonRpcResponse` | Serialized JSON-RPC 2.0 response envelope (result or error) |
 | `JsonRpcError` | Standard JSON-RPC 2.0 error object with code, message, optional data |
@@ -95,12 +95,13 @@ curl -X POST http://localhost:8000 \
 | `dispatch.rs` | Method name routing to handler functions |
 | `error.rs` | `JsonRpcError` type and standard error code constructors |
 | `types/jsonrpc.rs` | `JsonRpcRequest` / `JsonRpcResponse` serde types |
-| `util.rs` | Shared helpers: TOID encoding, pagination validation, tx status, TTL key construction, timestamp formatting |
+| `util.rs` | Shared helpers: TOID encoding, pagination validation, tx status, TTL key construction, xdrFormat support, timestamp formatting |
+| `fee_window.rs` | Fee distribution computation, ring buffer, sliding window fee stats |
 | `methods/health.rs` | `getHealth` — returns server status and ledger window |
 | `methods/network.rs` | `getNetwork` — returns passphrase and protocol version |
-| `methods/latest_ledger.rs` | `getLatestLedger` — returns latest ledger sequence and hash |
+| `methods/latest_ledger.rs` | `getLatestLedger` — returns latest ledger sequence, hash, close time, header/meta XDR |
 | `methods/version_info.rs` | `getVersionInfo` — returns node version metadata |
-| `methods/fee_stats.rs` | `getFeeStats` — returns fee percentile statistics |
+| `methods/fee_stats.rs` | `getFeeStats` — returns fee percentile statistics from sliding window |
 | `methods/get_ledger_entries.rs` | `getLedgerEntries` — reads entries from bucket list snapshot with TTL lookup |
 | `methods/get_transaction.rs` | `getTransaction` — looks up a transaction by hash from the database |
 | `methods/get_transactions.rs` | `getTransactions` — paginated range query over transactions with TOID cursor |
@@ -108,8 +109,8 @@ curl -X POST http://localhost:8000 \
 | `methods/get_events.rs` | `getEvents` — queries contract events with filters and pagination |
 | `methods/send_transaction.rs` | `sendTransaction` — submits a transaction envelope to the herder |
 | `methods/simulate_transaction.rs` | `simulateTransaction` — delegates to the simulate module |
-| `simulate/mod.rs` | Soroban simulation: host function extraction, resource adjustment, fee computation |
-| `simulate/snapshot.rs` | `BucketListSnapshotSource` — soroban-host `SnapshotSource` adapter |
+| `simulate/mod.rs` | Soroban simulation: InvokeHostFunction, ExtendTTL, Restore; resource adjustment, fee computation |
+| `simulate/snapshot.rs` | `BucketListSnapshotSource` — soroban-host `SnapshotSource` adapter with filtered/unfiltered access |
 
 ## Design Notes
 
@@ -125,6 +126,23 @@ curl -X POST http://localhost:8000 \
 - **Resource adjustment**: `simulateTransaction` applies the same adjustment
   factors as `soroban-simulation` (1.04x + 50k for CPU instructions, 1.15x
   for refundable fees) to give transactions headroom against state drift.
+
+- **ExtendTTL/Restore simulation**: `simulateTransaction` handles all three
+  Soroban operation types. ExtendTTL and Restore simulations compute rent
+  fees by looking up entries and TTLs from the bucket list snapshot, mirroring
+  `soroban-simulation`'s `simulate_extend_ttl_op_resources` and
+  `simulate_restore_op_resources`.
+
+- **xdrFormat support**: All methods support `xdrFormat: "json"` parameter
+  which returns XDR fields as native JSON objects (via `stellar-xdr` serde
+  support) instead of base64-encoded strings. Field names change
+  (`envelopeXdr` → `envelopeJson`, etc.) matching upstream behavior.
+
+- **Fee window**: `FeeWindows` maintains two independent sliding windows
+  (classic and Soroban) backed by ring buffers. A background poller reads
+  new LCMs from the database every second, avoiding coupling with the
+  ledger close path. Fee distributions use nearest-rank percentile
+  computation matching the upstream Go implementation.
 
 - **Visibility**: All internal modules and types are `pub(crate)`. Only
   `RpcServer` is exported from the crate.

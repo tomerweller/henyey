@@ -363,6 +363,10 @@ pub fn load_soroban_network_info(snapshot: &SnapshotHandle) -> Option<SorobanNet
         info.fee_read_ledger_entry = cost.fee_disk_read_ledger_entry;
         info.fee_write_ledger_entry = cost.fee_write_ledger_entry;
         info.fee_read_1kb = cost.fee_disk_read1_kb;
+        info.state_target_size_bytes = cost.soroban_state_target_size_bytes;
+        info.rent_fee_1kb_state_size_low = cost.rent_fee1_kb_soroban_state_size_low;
+        info.rent_fee_1kb_state_size_high = cost.rent_fee1_kb_soroban_state_size_high;
+        info.state_size_rent_fee_growth_factor = cost.soroban_state_rent_fee_growth_factor;
     }
 
     // Load fee_write_1kb from extended cost settings

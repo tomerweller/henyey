@@ -2,11 +2,13 @@
 
 use std::sync::Arc;
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde_json::json;
+use stellar_xdr::curr::{ContractEvent, ContractEventBody, Limits, ReadXdr, ScVal, WriteXdr};
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
-use crate::util::{self, format_unix_timestamp_utc};
+use crate::util::{self, format_unix_timestamp_utc, XdrFormat};
 
 /// Default number of events returned per query.
 const DEFAULT_EVENTS_LIMIT: u64 = 100;
@@ -17,6 +19,8 @@ pub async fn handle(
     ctx: &Arc<RpcContext>,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, JsonRpcError> {
+    let format = util::parse_format(&params)?;
+
     let ledger = ctx.app.ledger_summary();
 
     let start_ledger = params
@@ -75,31 +79,29 @@ pub async fn handle(
             _ => "contract",
         };
 
-        // Extract value from the ContractEvent XDR
-        let value_xdr = extract_event_value(&event.event_xdr);
+        let mut obj = serde_json::Map::new();
+        obj.insert("type".into(), json!(event_type_str));
+        obj.insert("ledger".into(), json!(event.ledger_seq));
+        obj.insert("ledgerClosedAt".into(), json!(close_time));
+        obj.insert("id".into(), json!(event.id));
+        obj.insert("operationIndex".into(), json!(event.op_index));
+        obj.insert("transactionIndex".into(), json!(event.tx_index));
+        obj.insert("txHash".into(), json!(event.tx_hash));
+        obj.insert(
+            "inSuccessfulContractCall".into(),
+            json!(event.in_successful_contract_call),
+        );
 
-        let mut obj = json!({
-            "type": event_type_str,
-            "ledger": event.ledger_seq,
-            "ledgerClosedAt": close_time,
-            "contractId": event.contract_id,
-            "id": event.id,
-            "operationIndex": event.op_index,
-            "transactionIndex": event.tx_index,
-            "txHash": event.tx_hash,
-            "inSuccessfulContractCall": event.in_successful_contract_call,
-            "topic": event.topics,
-            "value": value_xdr,
-        });
+        // contractId
+        match &event.contract_id {
+            Some(cid) => obj.insert("contractId".into(), json!(cid)),
+            None => obj.insert("contractId".into(), json!("")),
+        };
 
-        // Remove null contractId for system events
-        if event.contract_id.is_none() {
-            obj.as_object_mut()
-                .unwrap()
-                .insert("contractId".to_string(), json!(""));
-        }
+        // Extract value and topic from the ContractEvent XDR, format-aware
+        insert_event_fields(&mut obj, &event.event_xdr, &event.topics, format)?;
 
-        event_json.push(obj);
+        event_json.push(serde_json::Value::Object(obj));
     }
 
     let last_cursor = events.last().map(|e| e.id.as_str()).unwrap_or("");
@@ -177,11 +179,46 @@ fn get_ledger_close_time(ctx: &RpcContext, ledger_seq: u32) -> String {
         .unwrap_or_default()
 }
 
-/// Extract the value XDR (base64) from a ContractEvent's body.
-fn extract_event_value(event_xdr_b64: &str) -> String {
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-    use stellar_xdr::curr::{ContractEvent, ContractEventBody, Limits, ReadXdr, WriteXdr};
+/// Insert event value and topic fields into the JSON object, format-aware.
+fn insert_event_fields(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    event_xdr_b64: &str,
+    topics: &[String],
+    format: XdrFormat,
+) -> Result<(), JsonRpcError> {
+    match format {
+        XdrFormat::Base64 => {
+            // value: base64 of the ScVal data from the event body
+            let value = extract_event_value_b64(event_xdr_b64);
+            obj.insert("value".into(), json!(value));
+            // topic: array of base64-encoded topic ScVals (already stored as base64)
+            obj.insert("topic".into(), json!(topics));
+        }
+        XdrFormat::Json => {
+            // value: JSON representation of the ScVal
+            if let Some(val) = extract_event_value_scval(event_xdr_b64) {
+                let json_val = serde_json::to_value(&val)
+                    .map_err(|e| JsonRpcError::internal(format!("JSON serialize error: {e}")))?;
+                obj.insert("valueJson".into(), json_val);
+            }
+            // topic: array of JSON ScVals
+            let mut topic_json = Vec::with_capacity(topics.len());
+            for t in topics {
+                let bytes = BASE64.decode(t).unwrap_or_default();
+                if let Ok(scval) = ScVal::from_xdr(&bytes, Limits::none()) {
+                    let jv = serde_json::to_value(&scval)
+                        .map_err(|e| JsonRpcError::internal(format!("JSON serialize error: {e}")))?;
+                    topic_json.push(jv);
+                }
+            }
+            obj.insert("topicJson".into(), json!(topic_json));
+        }
+    }
+    Ok(())
+}
 
+/// Extract the value XDR (base64) from a ContractEvent's body.
+fn extract_event_value_b64(event_xdr_b64: &str) -> String {
     let bytes = match BASE64.decode(event_xdr_b64) {
         Ok(b) => b,
         Err(_) => return String::new(),
@@ -199,5 +236,14 @@ fn extract_event_value(event_xdr_b64: &str) -> String {
             .ok()
             .map(|b| BASE64.encode(&b))
             .unwrap_or_default(),
+    }
+}
+
+/// Extract the value ScVal from a ContractEvent's body.
+fn extract_event_value_scval(event_xdr_b64: &str) -> Option<ScVal> {
+    let bytes = BASE64.decode(event_xdr_b64).ok()?;
+    let event = ContractEvent::from_xdr(&bytes, Limits::none()).ok()?;
+    match event.body {
+        ContractEventBody::V0(body) => Some(body.data),
     }
 }

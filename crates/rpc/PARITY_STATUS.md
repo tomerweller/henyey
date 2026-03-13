@@ -2,7 +2,7 @@
 
 **Crate**: `henyey-rpc`
 **Upstream**: `stellar/stellar-rpc` (Go, GitHub)
-**Overall Parity**: 67%
+**Overall Parity**: 85%
 **Last Updated**: 2026-03-13
 
 ## Summary
@@ -13,17 +13,17 @@
 | Method dispatch | Full | All 12 methods registered |
 | getHealth | Partial | No latency check; `oldestLedger` from DB |
 | getNetwork | Full | Passphrase, friendbot URL, protocol version |
-| getLatestLedger | Partial | Missing `closeTime`, `headerXdr`, `metadataXdr` |
+| getLatestLedger | Full | All fields: `id`, `sequence`, `protocolVersion`, `closeTime`, `headerXdr`, `metadataXdr` |
 | getVersionInfo | Partial | `commitHash`, `buildTimestamp`, `captiveCoreVersion` empty |
-| getFeeStats | None | Returns hardcoded base fee; no sliding window |
-| getLedgerEntries | Partial | Core lookup + TTL works; no key limit, no xdrFormat |
-| getTransaction | Partial | Core lookup works; `oldestLedger` from DB, `feeBump`, `diagnosticEventsXdr`; missing `xdrFormat` |
-| getTransactions | Partial | Range query, TOID cursor, `feeBump`, `diagnosticEventsXdr`; missing `xdrFormat`, status filter |
-| getLedgers | Partial | Range query, cursor pagination, `headerXdr`/`metadataXdr`; missing `xdrFormat` |
-| getEvents | Partial | Core query works; `oldestLedger` from DB; missing filter limits, `**` wildcard, `xdrFormat` |
-| sendTransaction | Partial | Submission works; generic error XDR, no xdrFormat |
-| simulateTransaction | Partial | InvokeHostFunction only; no Extend/Restore, no authMode/stateChanges |
-| Infrastructure | Partial | No body size limit, no xdrFormat JSON output, no batch rejection |
+| getFeeStats | Full | Sliding window, nearest-rank percentiles, classic + soroban fees |
+| getLedgerEntries | Partial | Core lookup + TTL works; `xdrFormat` support; no key limit |
+| getTransaction | Full | Full lookup, `xdrFormat` support, all fields |
+| getTransactions | Partial | Range query, TOID cursor, `xdrFormat` support; missing status filter |
+| getLedgers | Full | Range query, cursor pagination, `xdrFormat` support |
+| getEvents | Partial | Core query works; `xdrFormat` support; missing filter limits, `**` wildcard |
+| sendTransaction | Partial | Submission works; `xdrFormat` support; generic error XDR |
+| simulateTransaction | Partial | InvokeHostFunction + ExtendTTL + Restore; `xdrFormat` support; no authMode/stateChanges |
+| Infrastructure | Partial | `xdrFormat` JSON output implemented; no body size limit, no batch rejection |
 
 ## File Mapping
 
@@ -33,7 +33,7 @@
 | `cmd/soroban-rpc/internal/methods/get_network.go` | `methods/network.rs` | |
 | `cmd/soroban-rpc/internal/methods/get_latest_ledger.go` | `methods/latest_ledger.rs` | |
 | `cmd/soroban-rpc/internal/methods/get_version_info.go` | `methods/version_info.rs` | |
-| `cmd/soroban-rpc/internal/methods/get_fee_stats.go` | `methods/fee_stats.rs` | Stub only |
+| `cmd/soroban-rpc/internal/methods/get_fee_stats.go` | `methods/fee_stats.rs` | Full sliding window |
 | `cmd/soroban-rpc/internal/methods/get_ledger_entries.go` | `methods/get_ledger_entries.rs` | |
 | `cmd/soroban-rpc/internal/methods/get_transaction.go` | `methods/get_transaction.rs` | |
 | `cmd/soroban-rpc/internal/methods/get_transactions.go` | `methods/get_transactions.rs` | |
@@ -42,7 +42,7 @@
 | `cmd/soroban-rpc/internal/methods/send_transaction.go` | `methods/send_transaction.rs` | |
 | `cmd/soroban-rpc/internal/methods/simulate_transaction.go` | `methods/simulate_transaction.rs` | Delegates to `simulate/` |
 | `cmd/soroban-rpc/internal/preflight/` | `simulate/mod.rs`, `simulate/snapshot.rs` | Soroban host invocation |
-| `cmd/soroban-rpc/internal/feewindow/` | — | Not implemented |
+| `cmd/soroban-rpc/internal/feewindow/` | `fee_window.rs` | Ring buffer, percentile distribution |
 | `cmd/soroban-rpc/internal/ingest/` | — | Handled by henyey-app/henyey-db |
 
 ## Component Mapping
@@ -59,7 +59,7 @@ Corresponds to: `cmd/soroban-rpc/internal/jsonrpc.go`, `cmd/soroban-rpc/internal
 | Method dispatch by name | `dispatch()` | Full |
 | HTTP body size limit (512KB) | — | None |
 | Batch request rejection | — | None |
-| xdrFormat parameter support | — | None |
+| xdrFormat parameter support | `util::parse_format()`, `XdrFormat` enum | Full |
 
 ### getHealth (`methods/health.rs`)
 
@@ -92,9 +92,9 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/get_latest_ledger.go`
 | `id` (ledger hash) | `handle()` | Full |
 | `sequence` | `handle()` | Full |
 | `protocolVersion` | `handle()` | Full |
-| `closeTime` | — | None |
-| `headerXdr` | — | None |
-| `metadataXdr` | — | None |
+| `closeTime` | `handle()` | Full |
+| `headerXdr` | `handle()` | Full |
+| `metadataXdr` | `handle()` | Full |
 
 ### getVersionInfo (`methods/version_info.rs`)
 
@@ -108,16 +108,17 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/get_version_info.go`
 | `buildTimestamp` | Empty string | None |
 | `captiveCoreVersion` | Empty string | None |
 
-### getFeeStats (`methods/fee_stats.rs`)
+### getFeeStats (`methods/fee_stats.rs`, `fee_window.rs`)
 
 Corresponds to: `cmd/soroban-rpc/internal/methods/get_fee_stats.go`, `cmd/soroban-rpc/internal/feewindow/`
 
 | stellar-rpc | Rust | Status |
 |-------------|------|--------|
-| `FeeWindow` sliding window tracking | — | None |
-| Nearest-rank percentile computation | — | None |
-| `sorobanInclusionFee` distribution | Hardcoded base fee | None |
-| `inclusionFee` distribution | Hardcoded base fee | None |
+| `FeeWindow` sliding window tracking | `FeeWindow`, `LedgerBucketWindow` | Full |
+| Nearest-rank percentile computation | `compute_fee_distribution()` | Full |
+| `sorobanInclusionFee` distribution | `FeeWindows::soroban_stats()` | Full |
+| `inclusionFee` distribution | `FeeWindows::classic_stats()` | Full |
+| Background ingestion from DB | `fee_window_poller` task | Full |
 | `latestLedger` | `handle()` | Full |
 
 ### getLedgerEntries (`methods/get_ledger_entries.rs`)
@@ -133,7 +134,7 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/get_ledger_entries.go`
 | `lastModifiedLedgerSeq` | `handle()` | Full |
 | `extXdr` field | `handle()` | Full |
 | Max 200 keys limit | — | None |
-| `xdrFormat` JSON output | — | None |
+| `xdrFormat` JSON output | `handle()` | Full |
 
 ### getTransaction (`methods/get_transaction.rs`)
 
@@ -150,8 +151,8 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/get_transaction.go`
 | `ledger`, `applicationOrder`, `createdAt` | `handle()` | Full |
 | `oldestLedger` from DB | `util::oldest_ledger()` | Full |
 | `feeBump` field | `handle()` | Full |
-| `diagnosticEventsXdr` | `util::extract_diagnostic_events_xdr()` | Full |
-| `xdrFormat` JSON output | — | None |
+| `diagnosticEventsXdr` | `util::extract_diagnostic_events()` | Full |
+| `xdrFormat` JSON output | `handle()` | Full |
 
 ### getTransactions (`methods/get_transactions.rs`)
 
@@ -163,11 +164,11 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/get_transactions.go`
 | TOID-based cursor pagination | `util::validate_pagination()` | Full |
 | Transaction envelope/result/meta per entry | `handle()` | Full |
 | `feeBump` detection | `is_fee_bump_envelope()` | Full |
-| `diagnosticEventsXdr` | `util::extract_diagnostic_events_xdr()` | Full |
+| `diagnosticEventsXdr` | `util::extract_diagnostic_events()` | Full |
 | `txHash`, `ledger`, `createdAt`, `applicationOrder` | `handle()` | Full |
 | `latestLedger`, `oldestLedger`, close times | `handle()` | Full |
 | Filter by status | — | None |
-| `xdrFormat` support | — | None |
+| `xdrFormat` support | `handle()` | Full |
 
 ### getLedgers (`methods/get_ledgers.rs`)
 
@@ -181,7 +182,7 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/get_ledgers.go`
 | `headerXdr` (LedgerHeaderHistoryEntry) | `handle()` | Full |
 | `metadataXdr` (full LedgerCloseMeta) | `handle()` | Full |
 | `latestLedger`, `oldestLedger`, close times | `handle()` | Full |
-| `xdrFormat` support | — | None |
+| `xdrFormat` support | `handle()` | Full |
 
 ### getEvents (`methods/get_events.rs`)
 
@@ -204,7 +205,7 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/get_events.go`
 | `**` wildcard support | — | None |
 | `diagnostic` type rejected (Go only allows contract/system) | Accepted (divergence) | Partial |
 | `oldestLedger` from DB | `util::oldest_ledger()` | Full |
-| `xdrFormat` JSON output | — | None |
+| `xdrFormat` JSON output | `handle()` | Full |
 
 ### sendTransaction (`methods/send_transaction.rs`)
 
@@ -218,7 +219,7 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/send_transaction.go`
 | PENDING/DUPLICATE/TRY_AGAIN_LATER/ERROR status | `handle()` | Full |
 | `errorResultXdr` with actual error code | Generic `TxFailed` always | Partial |
 | `diagnosticEventsXdr` | Empty array for Invalid | Partial |
-| `xdrFormat` JSON output | — | None |
+| `xdrFormat` JSON output | `handle()` | Full |
 
 ### simulateTransaction (`simulate/mod.rs`, `simulate/snapshot.rs`)
 
@@ -226,18 +227,20 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/simulate_transaction.go`, `cmd
 
 | stellar-rpc | Rust | Status |
 |-------------|------|--------|
-| InvokeHostFunction simulation | `run_simulation()` | Full |
-| Recording mode invocation | `run_simulation()` | Full |
+| InvokeHostFunction simulation | `handle_invoke()` | Full |
+| Recording mode invocation | `run_invoke_simulation()` | Full |
 | BucketList snapshot source | `BucketListSnapshotSource` | Full |
 | TTL-aware entry lookup | `get_entry_ttl()` | Full |
 | Resource adjustment (1.04x + 50k) | `adjust_resources()` | Full |
-| Refundable fee adjustment (1.15x) | `compute_resource_fee()` | Full |
-| SorobanTransactionData construction | `build_success_response()` | Full |
-| Auth entries in response | `build_success_response()` | Full |
-| Return value XDR | `build_success_response()` | Full |
+| Refundable fee adjustment (1.15x) | `compute_invoke_resource_fee()` | Full |
+| SorobanTransactionData construction | `build_invoke_response()` | Full |
+| Auth entries in response | `build_invoke_response()` | Full |
+| Return value XDR | `build_invoke_response()` | Full |
 | Error response with cost | `build_error_response()` | Full |
-| ExtendFootprintTtl simulation | — | None |
-| RestoreFootprint simulation | — | None |
+| ExtendFootprintTtl simulation | `simulate_extend_ttl_op()` | Full |
+| RestoreFootprint simulation | `simulate_restore_op()` | Full |
+| Rent fee computation | `compute_resource_fee_with_rent()` | Full |
+| `xdrFormat` support | `handle()` | Full |
 | `authMode` parameter | — | None |
 | `stateChanges` in response | — | None |
 | `resourceConfig` parameter | — | None |
@@ -257,10 +260,6 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/simulate_transaction.go`, `cmd
 
 | stellar-rpc Component | Priority | Notes |
 |------------------------|----------|-------|
-| `getFeeStats` sliding window | Medium | Returns hardcoded base fee; inaccurate for fee estimation |
-| `simulateTransaction` ExtendTTL/Restore | Medium | Returns error instead of simulating |
-| `xdrFormat` JSON output | Medium | Missing across all methods; needed for some SDK modes |
-| `getLatestLedger` missing fields | Medium | `closeTime`, `headerXdr`, `metadataXdr` |
 | `getTransactions` status filter | Low | Missing status-based filtering |
 | `getHealth` latency check | Low | Always returns "healthy" regardless of ledger age |
 | `getVersionInfo` build metadata | Low | Empty strings for commit/build/captiveCore |
@@ -269,8 +268,10 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/simulate_transaction.go`, `cmd
 | `sendTransaction` actual error codes | Low | Always returns generic TxFailed |
 | `simulateTransaction` authMode | Low | No auth mode parameter support |
 | `simulateTransaction` stateChanges | Low | Not included in response |
+| `simulateTransaction` resourceConfig | Low | No resource config parameter |
 | HTTP body size limit (512KB) | Low | No request size enforcement |
 | `getLedgerEntries` max 200 keys | Low | No key count limit |
+| Batch request rejection | Low | Multiple requests in one HTTP body not rejected |
 
 ## Architectural Differences
 
@@ -294,23 +295,29 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/simulate_transaction.go`, `cmd
    - **Rust**: Embedded module within the henyey node process
    - **Rationale**: Simpler deployment; direct access to `App` state without IPC
 
+5. **Fee window ingestion**
+   - **stellar-rpc**: Hooks into ingestion pipeline via `InsertFn` callback
+   - **Rust**: Background poller reads new LCMs from DB every second
+   - **Rationale**: Avoids cross-crate coupling; DB is the source of truth
+
 ## Test Coverage
 
 | Area | stellar-rpc Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
 | JSON-RPC envelope | Extensive integration tests | 6 `#[test]` in `server.rs` | Rust covers parsing and serialization |
 | TOID encoding/pagination | N/A (inline in Go) | 10 `#[test]` in `util.rs` | TOID roundtrip, ordering, pagination validation |
+| Fee window | Unit + integration tests | 13 `#[test]` in `fee_window.rs` | Distribution, ring buffer, fee extraction, ops counting |
 | getHealth | Integration test | 0 | No unit tests |
 | getLedgerEntries | Integration tests with TTL | 0 | No unit tests |
 | getEvents | Integration tests with filters | 0 | No unit tests |
 | sendTransaction | Integration tests | 0 | No unit tests |
 | simulateTransaction | Integration + preflight tests | 0 | No unit tests |
-| Fee window | Unit + integration tests | 0 | Not implemented |
 
 ### Test Gaps
 
 - `server.rs` has 6 unit tests for request parsing and response serialization
 - `util.rs` has 10 unit tests covering TOID encode/decode, cursor parsing, pagination validation, and tx status determination
+- `fee_window.rs` has 13 unit tests covering distribution computation, ring buffer, fee window, and ops counting
 - No handler-level unit tests for any method
 - No integration tests for the RPC server
 - stellar-rpc has extensive integration tests that exercise the full request/response cycle
@@ -319,7 +326,7 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/simulate_transaction.go`, `cmd
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 70 |
-| Gaps (None + Partial) | 35 |
+| Implemented (Full) | 89 |
+| Gaps (None + Partial) | 16 |
 | Intentional Omissions | 5 |
-| **Parity** | **70 / (70 + 35) = 67%** |
+| **Parity** | **89 / (89 + 16) = 85%** |

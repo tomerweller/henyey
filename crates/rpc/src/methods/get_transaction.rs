@@ -2,9 +2,10 @@
 
 use std::sync::Arc;
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde_json::json;
-use stellar_xdr::curr::{Limits, ReadXdr, TransactionEnvelope};
+use stellar_xdr::curr::{
+    Limits, ReadXdr, TransactionEnvelope, TransactionMeta, TransactionResult,
+};
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
@@ -18,6 +19,8 @@ pub async fn handle(
         .get("hash")
         .and_then(|v| v.as_str())
         .ok_or_else(|| JsonRpcError::invalid_params("missing 'hash' parameter"))?;
+
+    let format = util::parse_format(&params)?;
 
     let ledger = ctx.app.ledger_summary();
     let oldest = util::oldest_ledger(&ctx.app);
@@ -47,18 +50,6 @@ pub async fn handle(
 
     match tx_record {
         Some(record) => {
-            let envelope_xdr = BASE64.encode(&record.body);
-            // DB stores TransactionResultPair; extract just TransactionResult for the API
-            let result_xdr = match util::extract_result_xdr(&record.result) {
-                Some(result_bytes) => BASE64.encode(&result_bytes),
-                None => BASE64.encode(&record.result), // fallback
-            };
-            let result_meta_xdr = record
-                .meta
-                .as_ref()
-                .map(|m| BASE64.encode(m))
-                .unwrap_or_default();
-
             // Look up the ledger close time
             let created_at = ctx
                 .app
@@ -80,31 +71,42 @@ pub async fn handle(
                 .map(|env| matches!(env, TransactionEnvelope::TxFeeBump(_)))
                 .unwrap_or(false);
 
-            let mut tx = json!({
-                "status": status,
-                "latestLedger": ledger.num,
-                "latestLedgerCloseTime": ledger.close_time.to_string(),
-                "oldestLedger": oldest,
-                "oldestLedgerCloseTime": oldest_close_time,
-                "ledger": record.ledger_seq,
-                "createdAt": created_at,
-                "applicationOrder": record.tx_index + 1,
-                "feeBump": fee_bump,
-                "envelopeXdr": envelope_xdr,
-                "resultXdr": result_xdr,
-                "resultMetaXdr": result_meta_xdr
-            });
+            let mut obj = serde_json::Map::new();
+            obj.insert("status".into(), json!(status));
+            obj.insert("latestLedger".into(), json!(ledger.num));
+            obj.insert("latestLedgerCloseTime".into(), json!(ledger.close_time.to_string()));
+            obj.insert("oldestLedger".into(), json!(oldest));
+            obj.insert("oldestLedgerCloseTime".into(), json!(oldest_close_time));
+            obj.insert("ledger".into(), json!(record.ledger_seq));
+            obj.insert("createdAt".into(), json!(created_at));
+            obj.insert("applicationOrder".into(), json!(record.tx_index + 1));
+            obj.insert("feeBump".into(), json!(fee_bump));
 
-            // Extract diagnostic events from meta if available
+            // Envelope XDR
+            util::insert_raw_xdr_field::<TransactionEnvelope>(
+                &mut obj, "envelope", &record.body, format,
+            )?;
+
+            // Result XDR — extract TransactionResult from the stored TransactionResultPair
+            let result_bytes = util::extract_result_xdr(&record.result)
+                .unwrap_or_else(|| record.result.clone());
+            util::insert_raw_xdr_field::<TransactionResult>(
+                &mut obj, "result", &result_bytes, format,
+            )?;
+
+            // Result meta XDR
             if let Some(ref meta_bytes) = record.meta {
-                if let Some(events_xdr) = util::extract_diagnostic_events_xdr(meta_bytes) {
-                    tx.as_object_mut()
-                        .unwrap()
-                        .insert("diagnosticEventsXdr".into(), json!(events_xdr));
-                }
+                util::insert_raw_xdr_field::<TransactionMeta>(
+                    &mut obj, "resultMeta", meta_bytes, format,
+                )?;
             }
 
-            Ok(tx)
+            // Diagnostic events
+            if let Some(ref meta_bytes) = record.meta {
+                util::insert_diagnostic_events(&mut obj, meta_bytes, format)?;
+            }
+
+            Ok(serde_json::Value::Object(obj))
         }
         None => Ok(json!({
             "status": "NOT_FOUND",

@@ -8,12 +8,14 @@ use stellar_xdr::curr::{LedgerEntry, LedgerKey, Limits, ReadXdr, WriteXdr};
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
-use crate::util::ttl_key_for_ledger_key;
+use crate::util::{self, XdrFormat, ttl_key_for_ledger_key};
 
 pub async fn handle(
     ctx: &Arc<RpcContext>,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, JsonRpcError> {
+    let format = util::parse_format(&params)?;
+
     let keys_array = params
         .get("keys")
         .and_then(|v| v.as_array())
@@ -50,34 +52,40 @@ pub async fn handle(
     let mut result_entries = Vec::new();
     for (key_b64, key) in &ledger_keys {
         if let Some(entry) = snapshot.load(key) {
-            // SDF RPC returns LedgerEntryData (not full LedgerEntry) in the xdr field
-            let xdr_bytes = entry
-                .data
-                .to_xdr(Limits::none())
-                .map_err(|e| JsonRpcError::internal(format!("XDR encode error: {}", e)))?;
-            let xdr_b64 = BASE64.encode(&xdr_bytes);
+            let mut obj = serde_json::Map::new();
 
-            let last_modified = entry.last_modified_ledger_seq;
+            // Key — upstream uses "key" for base64, "keyJson" for JSON
+            match format {
+                XdrFormat::Base64 => {
+                    obj.insert("key".into(), json!(key_b64));
+                }
+                XdrFormat::Json => {
+                    util::insert_xdr_field(&mut obj, "key", key, format)?;
+                }
+            }
 
-            // Encode the entry's ext field (from the outer LedgerEntry, not the data)
-            let ext_xdr = entry
-                .ext
-                .to_xdr(Limits::none())
-                .map(|b| BASE64.encode(&b))
-                .unwrap_or_default();
+            // Data XDR — upstream uses "xdr" for base64, "dataJson" for JSON
+            match format {
+                XdrFormat::Base64 => {
+                    let bytes = entry.data.to_xdr(Limits::none())
+                        .map_err(|e| JsonRpcError::internal(format!("XDR encode error: {e}")))?;
+                    obj.insert("xdr".into(), json!(BASE64.encode(&bytes)));
+                }
+                XdrFormat::Json => {
+                    util::insert_xdr_field(&mut obj, "data", &entry.data, XdrFormat::Json)?;
+                }
+            }
 
-            let mut entry_obj = json!({
-                "key": key_b64,
-                "xdr": xdr_b64,
-                "lastModifiedLedgerSeq": last_modified,
-                "extXdr": ext_xdr
-            });
+            obj.insert("lastModifiedLedgerSeq".into(), json!(entry.last_modified_ledger_seq));
+
+            // Ext field — upstream uses "extXdr" / "extJson"
+            util::insert_xdr_field(&mut obj, "ext", &entry.ext, format)?;
 
             // For TTL-bearing entries, look up the TTL
             if let Some(ttl_key) = ttl_key_for_entry(&entry) {
                 if let Some(ttl_entry) = snapshot.load(&ttl_key) {
                     if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl_data) = &ttl_entry.data {
-                        entry_obj.as_object_mut().unwrap().insert(
+                        obj.insert(
                             "liveUntilLedgerSeq".to_string(),
                             json!(ttl_data.live_until_ledger_seq),
                         );
@@ -85,7 +93,7 @@ pub async fn handle(
                 }
             }
 
-            result_entries.push(entry_obj);
+            result_entries.push(serde_json::Value::Object(obj));
         }
     }
 
