@@ -287,22 +287,22 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/simulate_transaction.go`, `cmd
 
 | Area | stellar-rpc Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
-| JSON-RPC envelope | Extensive integration tests | 6 `#[test]` in `server.rs` | Rust covers parsing and serialization |
-| TOID encoding/pagination | N/A (inline in Go) | 10 `#[test]` in `util.rs` | TOID roundtrip, ordering, pagination validation |
+| JSON-RPC envelope | Extensive integration tests | 10 `#[test]` in `server.rs` | Parsing, serialization, batch detection, version validation |
+| TOID encoding/pagination/util | N/A (inline in Go) | 22 `#[test]` in `util.rs` | TOID, pagination, tx status, timestamps, TTL keys, xdrFormat |
 | Fee window | Unit + integration tests | 13 `#[test]` in `fee_window.rs` | Distribution, ring buffer, fee extraction, ops counting |
-| getHealth | Integration test | 0 | No unit tests |
-| getLedgerEntries | Integration tests with TTL | 0 | No unit tests |
-| getEvents | Integration tests with filters | 0 | No unit tests |
-| sendTransaction | Integration tests | 0 | No unit tests |
-| simulateTransaction | Integration + preflight tests | 0 | No unit tests |
+| simulateTransaction | Integration + preflight tests | 44 `#[test]` in `simulate/mod.rs` | sim_adjust, resources, auth, extract_op, XDR fields, state changes, fees, tx size |
+| Snapshot normalization | Unit tests | 8 `#[test]` in `simulate/snapshot.rs` | V0/V1/V2→V3 upgrade, signers, XDR size |
+| getEvents | Integration tests with filters | 8 `#[test]` in `methods/get_events.rs` | Filter parsing, limits, wildcards, type rejection |
+| sendTransaction | Integration tests | 3 `#[test]` in `methods/send_transaction.rs` | Error result construction, diagnostic events, error codes |
+| getHealth | Integration test | 0 | Handler requires `RpcContext` |
+| getLedgerEntries | Integration tests with TTL | 0 | Handler requires `RpcContext` |
+
+**Total: 108 unit tests.**
 
 ### Test Gaps
 
-- `server.rs` has 6 unit tests for request parsing and response serialization
-- `util.rs` has 10 unit tests covering TOID encode/decode, cursor parsing, pagination validation, and tx status determination
-- `fee_window.rs` has 13 unit tests covering distribution computation, ring buffer, fee window, and ops counting
-- No handler-level unit tests for any method
-- No integration tests for the RPC server
+- No handler-level integration tests (handlers require `RpcContext` with a running `App`)
+- No integration tests for the full RPC server request/response cycle
 - stellar-rpc has extensive integration tests that exercise the full request/response cycle
 
 ## Parity Calculation

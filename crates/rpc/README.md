@@ -11,9 +11,12 @@ of Stellar's standalone `soroban-rpc` service.
 
 The crate is consumed by the `henyey` binary, which constructs an `RpcServer`
 and starts it alongside the rest of the node. Internally it depends on
-`henyey-app` for ledger state, `henyey-db` for historical queries,
-`henyey-bucket` for bucket list snapshots, `henyey-herder` for transaction
-submission, and `soroban-env-host-p25` for Soroban transaction simulation.
+`henyey-app` for ledger state and lifecycle, `henyey-db` for historical
+queries, `henyey-bucket` for bucket list snapshots, `henyey-herder` for
+transaction submission, `henyey-ledger` for `SorobanNetworkInfo`,
+`henyey-tx` for transaction frame helpers, `henyey-crypto` for hashing,
+`henyey-common` for shared types, and `soroban-env-host-p25` for Soroban
+transaction simulation.
 
 ## Architecture
 
@@ -24,19 +27,25 @@ flowchart TD
     Dispatch --> Health[getHealth]
     Dispatch --> Network[getNetwork]
     Dispatch --> LatestLedger[getLatestLedger]
+    Dispatch --> VersionInfo[getVersionInfo]
+    Dispatch --> FeeStats[getFeeStats]
     Dispatch --> GetEntries[getLedgerEntries]
     Dispatch --> GetTx[getTransaction]
+    Dispatch --> GetTxs[getTransactions]
+    Dispatch --> GetLedgers[getLedgers]
     Dispatch --> GetEvents[getEvents]
     Dispatch --> SendTx[sendTransaction]
     Dispatch --> SimTx[simulateTransaction]
-    Dispatch --> Other[...]
 
     GetEntries --> BucketSnapshot[(BucketList Snapshot)]
     SimTx --> Simulate[simulate module]
     Simulate --> SorobanHost[soroban-env-host]
     Simulate --> BucketSnapshot
+    FeeStats --> FeeWindows[FeeWindows]
     GetEvents --> DB[(SQLite DB)]
     GetTx --> DB
+    GetTxs --> DB
+    GetLedgers --> DB
     SendTx --> Herder[henyey-herder]
 ```
 
@@ -146,6 +155,44 @@ curl -X POST http://localhost:8000 \
 
 - **Visibility**: All internal modules and types are `pub(crate)`. Only
   `RpcServer` is exported from the crate.
+
+## Configuration
+
+The RPC server is controlled by the `[rpc]` section in the node config:
+
+```toml
+[rpc]
+enabled = true
+port = 8000
+retention_window = 2880
+max_healthy_ledger_latency_secs = 30
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | `bool` | `false` | Enable the JSON-RPC server |
+| `port` | `u16` | `8000` | HTTP listen port |
+| `retention_window` | `u32` | `2880` | Ledgers retained for range queries (~4 hours at 5s close) |
+| `max_healthy_ledger_latency_secs` | `u64` | `30` | Max ledger age before `getHealth` reports unhealthy (0 disables) |
+
+The server is **disabled by default**. Set `enabled = true` in the `[rpc]`
+section of your config to start it.
+
+## Test Coverage
+
+| Area | Test Count | File |
+|------|-----------|------|
+| Simulate pure functions (sim_adjust, resources, auth, extract_op, XDR fields, state changes, fees, tx size) | 44 | `simulate/mod.rs` |
+| Utility helpers (TOID, pagination, tx status, timestamps, TTL keys, xdrFormat) | 22 | `util.rs` |
+| Fee window (distribution, ring buffer, percentiles, ops counting) | 13 | `fee_window.rs` |
+| Server (request parsing, response serialization, batch detection, version validation) | 10 | `server.rs` |
+| Snapshot normalization (V0→V3, signers, XDR size) | 8 | `simulate/snapshot.rs` |
+| Event filter parsing (empty, wildcards, limits, type rejection) | 8 | `methods/get_events.rs` |
+| send_transaction helpers (error result, diagnostic events, error codes) | 3 | `methods/send_transaction.rs` |
+| **Total** | **108** | |
+
+All tests are pure unit tests (`#[test]`) that run without network or
+database access. No integration tests exist for the RPC server yet.
 
 ## stellar-core Mapping
 

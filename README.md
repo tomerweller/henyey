@@ -19,6 +19,7 @@ This Rust implementation aims to mirror stellar-core v25.x behavior for educatio
 graph TD
     henyey["henyey<br/><i>CLI + entrypoint</i>"]
     app["henyey-app<br/><i>orchestration, config, commands</i>"]
+    rpc["rpc<br/><i>JSON-RPC 2.0 server</i>"]
     overlay["overlay<br/><i>P2P network</i>"]
     herder["herder<br/><i>consensus coordination</i>"]
     history["history<br/><i>archive catchup</i>"]
@@ -29,9 +30,13 @@ graph TD
     db["db<br/><i>SQLite persistence</i>"]
 
     henyey --> app
+    app --> rpc
     app --> overlay
     app --> herder
     app --> history
+    rpc --> bucket
+    rpc --> herder
+    rpc --> db
     overlay <--> herder
     herder --> scp
     scp --> ledger
@@ -61,6 +66,11 @@ Supporting crates: `crypto`, `common`, `work`, `historywork`
 - History archive catchup, replay, and verification
 - History archive publishing (checkpoints with XDR record marking)
 - Offline verify-execution against CDP metadata
+
+### JSON-RPC Server
+- Native Stellar JSON-RPC 2.0 server (SEP-35) with all 12 methods
+- Transaction simulation (InvokeHostFunction, ExtendTTL, Restore) via soroban-env-host
+- No external `stellar-rpc` process required
 
 ### stellar-core Compatibility
 - Drop-in replacement for stellar-core in [stellar-rpc](https://github.com/stellar/stellar-rpc) (captive core mode)
@@ -127,9 +137,35 @@ A validator participates in consensus. Requires a secret key and quorum configur
 ./target/release/henyey --config configs/mainnet.toml run
 ```
 
+## Native JSON-RPC Server
+
+Henyey includes a built-in Stellar JSON-RPC 2.0 server ([SEP-35](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0035.md)) that can replace the standalone `stellar-rpc` service entirely. Enable it by adding a `[rpc]` section to your config:
+
+```toml
+[rpc]
+enabled = true
+port = 8000
+```
+
+Then run henyey normally:
+
+```bash
+./target/release/henyey --config configs/testnet.toml run
+```
+
+The RPC server starts alongside the node and serves all 12 standard methods: `getHealth`, `getNetwork`, `getLatestLedger`, `getVersionInfo`, `getFeeStats`, `getLedgerEntries`, `getTransaction`, `getTransactions`, `getLedgers`, `getEvents`, `sendTransaction`, and `simulateTransaction`.
+
+```bash
+curl -X POST http://localhost:8000 \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}'
+```
+
+The native server reads directly from the bucket list (in-memory) and runs Soroban simulation via `soroban-env-host` natively — no captive core subprocess, no CGo bridge, no IPC overhead. See [`crates/rpc/README.md`](crates/rpc/README.md) for details.
+
 ## Running with stellar-rpc
 
-Henyey can serve as a drop-in replacement for stellar-core when used as the backend for [stellar-rpc](https://github.com/stellar/stellar-rpc). No changes to stellar-rpc are required -- henyey automatically detects stellar-core format configuration and translates it internally.
+Henyey can also serve as a drop-in replacement for stellar-core when used as the backend for [stellar-rpc](https://github.com/stellar/stellar-rpc). No changes to stellar-rpc are required -- henyey automatically detects stellar-core format configuration and translates it internally.
 
 ### Prerequisites
 
@@ -334,6 +370,13 @@ node_is_validator = true
 # Classic event emission (off by default)
 emit_classic_events = true
 backfill_stellar_asset_events = false
+
+[rpc]
+# Built-in JSON-RPC server (off by default)
+enabled = true
+port = 8000
+retention_window = 2880
+max_healthy_ledger_latency_secs = 30
 ```
 
 ## Repository Layout
@@ -353,6 +396,7 @@ henyey/
 │   ├── historywork/    # History work scheduling
 │   ├── ledger/         # Ledger close pipeline
 │   ├── overlay/        # P2P networking
+│   ├── rpc/            # JSON-RPC 2.0 server (SEP-35)
 │   ├── scp/            # Consensus protocol
 │   ├── simulation/     # Multi-node simulation harness
 │   ├── tx/             # Transaction execution
