@@ -1,0 +1,175 @@
+# henyey Mainnet Validator Configuration (with RPC + Pruning)
+
+[node]
+name = "henyey-mainnet-validator"
+is_validator = true
+node_seed = "SD5LY6J7V4PMGED7T236IEFZJCZKT2HM2GJCOC6QNFHWZCDZMMHG3SC7"
+max_tx_set_size = 1000
+
+# Mainnet tier 1 validators organized by organization
+# 7 orgs, require 5-of-7 (72%) agreement at top level
+# Each org inner set requires 2-of-3 (67%) or 3-of-5 (60%) agreement
+[node.quorum_set]
+threshold_percent = 72
+validators = []
+
+# SDF (3 validators, 2-of-3)
+[[node.quorum_set.inner_sets]]
+threshold_percent = 67
+validators = [
+    "GCGB2S2KGYARPVIA37HYZXVRM2YZUEXA6S33ZU5BUDC6THSB62LZSTYH",
+    "GCM6QMP3DLRPTAZW2UZPCPX2LF3SXWXKPMP3GKFZBDSF3QZGV2G5QSTK",
+    "GABMKJM6I25XI4K7U6XWMULOUQIQ27BCTMLS6BYYSOWKTBUXVRJSXHYQ",
+]
+inner_sets = []
+
+# LOBSTR (5 validators, 3-of-5)
+[[node.quorum_set.inner_sets]]
+threshold_percent = 60
+validators = [
+    "GCFONE23AB7Y6C5YZOMKUKGETPIAJA4QOYLS5VNS4JHBGKRZCPYHDLW7",
+    "GCB2VSADESRV2DDTIVTFLBDI562K6KE3KMKILBHUHUWFXCUBHGQDI7VL",
+    "GD5QWEVV4GZZTQP46BRXV5CUMMMLP4JTGFD7FWYJJWRL54CELY6JGQ63",
+    "GA7TEPCBDQKI7JQLQ34ZURRMK44DVYCIGVXQQWNSWAEQR6KB4FMCBT7J",
+    "GA5STBMV6QDXFDGD62MEHLLHZTPDI77U3PFOD2SELU5RJDHQWBR5NNK7",
+]
+inner_sets = []
+
+# Blockdaemon (3 validators, 2-of-3)
+[[node.quorum_set.inner_sets]]
+threshold_percent = 67
+validators = [
+    "GAAV2GCVFLNN522ORUYFV33E76VPC22E72S75AQ6MBR5V45Z5DWVPWEU",
+    "GAVXB7SBJRYHSG6KSQHY74N7JAFRL4PFVZCNWW2ARI6ZEKNBJSMSKW7C",
+    "GAYXZ4PZ7P6QOX7EBHPIZXNWY4KCOBYWJCA4WKWRKC7XIUS3UJPT6EZ4",
+]
+inner_sets = []
+
+# Franklin Templeton (3 validators, 2-of-3)
+[[node.quorum_set.inner_sets]]
+threshold_percent = 67
+validators = [
+    "GARYGQ5F2IJEBCZJCBNPWNWVDOFK7IBOHLJKKSG2TMHDQKEEC6P4PE4V",
+    "GCMSM2VFZGRPTZKPH5OABHGH4F3AVS6XTNJXDGCZ3MKCOSUBH3FL6DOB",
+    "GA7DV63PBUUWNUFAF4GAZVXU2OZMYRATDLKTC7VTCG7AU4XUPN5VRX4A",
+]
+inner_sets = []
+
+# SatoshiPay (3 validators, 2-of-3)
+[[node.quorum_set.inner_sets]]
+threshold_percent = 67
+validators = [
+    "GC5SXLNAM3C4NMGK2PXK4R34B5GNZ47FYQ24ZIBFDFOCU6D4KBN4POAE",
+    "GBJQUIXUO4XSNPAUT6ODLZUJRV2NPXYASKUBY4G5MYP3M47PCVI55MNT",
+    "GAK6Z5UVGUVSEK6PEOCAYJISTT5EJBB34PN3NOLEQG2SUKXRVV2F6HZY",
+]
+inner_sets = []
+
+# Creit (3 validators, 2-of-3)
+[[node.quorum_set.inner_sets]]
+threshold_percent = 67
+validators = [
+    "GBPLJDBFZO2H7QQH7YFCH3HFT6EMC42Z2DNJ2QFROCKETAPY54V4DCZD",
+    "GDDANSYOYSY5EPSFHBRPCLX6XMHPPLIMHVIDXG6IPQLVVLRI2BN4HMH3",
+    "GBF7QOLFPTHUEDUPTT4ZTULDTA3QXDIO75JHKJN2IYD7YGQLYUTR75BT",
+]
+inner_sets = []
+
+# PublicNode (3 validators, 2-of-3)
+[[node.quorum_set.inner_sets]]
+threshold_percent = 67
+validators = [
+    "GCVJ4Z6TI6Z2SOGENSPXDQ2U4RKH3CNQKYUHNSSPYFPNWTLGS6EBH7I2",
+    "GCIXVKNFPKWVMKJKVK2V4NK7D4TC6W3BUMXSIJ365QUAXWBRPPJXIR2Z",
+    "GBLJNN3AVZZPG2FYAYTYQKECNWTQYYUUY2KVFN2OUKZKBULXIXBZ4FCT",
+]
+inner_sets = []
+
+[network]
+passphrase = "Public Global Stellar Network ; September 2015"
+base_fee = 100
+base_reserve = 5000000
+max_protocol_version = 25
+
+[database]
+path = "/home/tomer/data/mainnet/mainnet.db"
+pool_size = 10
+
+[buckets]
+directory = "/home/tomer/data/mainnet/buckets"
+cache_size = 256
+
+[[history.archives]]
+name = "sdf1"
+url = "https://history.stellar.org/prd/core-live/core_live_001"
+get_enabled = true
+put_enabled = false
+
+[[history.archives]]
+name = "sdf2"
+url = "https://history.stellar.org/prd/core-live/core_live_002"
+get_enabled = true
+put_enabled = false
+
+[[history.archives]]
+name = "sdf3"
+url = "https://history.stellar.org/prd/core-live/core_live_003"
+get_enabled = true
+put_enabled = false
+
+[overlay]
+peer_port = 8009
+max_inbound_peers = 64
+max_outbound_peers = 8
+target_outbound_peers = 8
+known_peers = [
+    # SDF
+    "core-live-a.stellar.org:11625",
+    "core-live-b.stellar.org:11625",
+    "core-live-c.stellar.org:11625",
+    # LOBSTR
+    "v1.stellar.lobstr.co:11625",
+    "v2.stellar.lobstr.co:11625",
+    "v3.stellar.lobstr.co:11625",
+    "v4.stellar.lobstr.co:11625",
+    "v5.stellar.lobstr.co:11625",
+    # Blockdaemon
+    "stellar-full-validator1.bdnodes.net:11625",
+    "stellar-full-validator2.bdnodes.net:11625",
+    "stellar-full-validator3.bdnodes.net:11625",
+    # Franklin Templeton
+    "stellar1.franklintempleton.com:11625",
+    "stellar2.franklintempleton.com:11625",
+    "stellar3.franklintempleton.com:11625",
+    # SatoshiPay
+    "stellar-de-fra.satoshipay.io:11625",
+    "stellar-sg-sin.satoshipay.io:11625",
+    "stellar-us-iowa.satoshipay.io:11625",
+    # Creit
+    "alpha.validator.stellar.creit.tech:11625",
+    "beta.validator.stellar.creit.tech:11625",
+    "gamma.validator.stellar.creit.tech:11625",
+    # PublicNode
+    "bootes.publicnode.org:11625",
+    "hercules.publicnode.org:11625",
+    "lyra.publicnode.org:11625",
+]
+preferred_peers = []
+
+[http]
+port = 11627
+
+[rpc]
+enabled = true
+port = 8000
+retention_window = 360   # 30 minutes at ~5s/ledger
+
+[maintenance]
+enabled = true
+period_secs = 900        # Run maintenance every 15 minutes
+count = 50000
+
+[logging]
+level = "info"
+format = "text"
+colors = true
