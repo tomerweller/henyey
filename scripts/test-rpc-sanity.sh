@@ -87,19 +87,73 @@ echo "All prerequisites found."
 echo "RPC URL: $RPC_URL_FOR_CURL"
 echo ""
 
-# ── 1. Direct JSON-RPC endpoint tests ───────────────────────────────────────
+# ── 1. JSON-RPC error handling ───────────────────────────────────────────────
+echo "── JSON-RPC error handling ──────────────────────────────────────────"
+
+# Unknown method
+if resp=$(rpc_call nonExistentMethod) && \
+   ERR_CODE=$(echo "$resp" | jq -e '.error.code') && [[ "$ERR_CODE" == "-32601" ]]; then
+  pass "error: unknown method (code=$ERR_CODE)"
+else
+  fail "error: unknown method" "expected .error.code == -32601, got: $(echo "$resp" | jq -c '.error // empty')"
+fi
+
+# Invalid params for getLedgerEntries (empty keys array)
+# Some implementations return -32602 (invalid params), others -32603 (internal error).
+if resp=$(rpc_call getLedgerEntries '{"keys":[]}') && \
+   ERR_CODE=$(echo "$resp" | jq -e '.error.code') && \
+   [[ "$ERR_CODE" == "-32602" || "$ERR_CODE" == "-32603" ]]; then
+  pass "error: getLedgerEntries empty keys (code=$ERR_CODE)"
+else
+  fail "error: getLedgerEntries empty keys" "expected .error.code == -32602 or -32603, got: $(echo "$resp" | jq -c '.error // empty')"
+fi
+
+# Invalid params for getEvents (missing startLedger)
+if resp=$(rpc_call getEvents '{"filters":[]}') && \
+   ERR_CODE=$(echo "$resp" | jq -e '.error.code') && [[ "$ERR_CODE" == "-32602" ]]; then
+  pass "error: getEvents missing startLedger (code=$ERR_CODE)"
+else
+  fail "error: getEvents missing startLedger" "expected .error.code == -32602, got: $(echo "$resp" | jq -c '.error // empty')"
+fi
+
+echo ""
+
+# ── 2. Direct JSON-RPC endpoint tests ───────────────────────────────────────
 echo "── JSON-RPC endpoints ─────────────────────────────────────────────────"
+
+HEALTH_LATEST_LEDGER=""
+HEALTH_OLDEST_LEDGER=""
 
 # getHealth
 if resp=$(rpc_call getHealth) && echo "$resp" | jq -e '.result.status' &>/dev/null; then
-  pass "getHealth"
+  HEALTH_LATEST_LEDGER=$(echo "$resp" | jq -r '.result.latestLedger // empty')
+  HEALTH_OLDEST_LEDGER=$(echo "$resp" | jq -r '.result.oldestLedger // empty')
+  ok=true
+  if [[ -n "$HEALTH_LATEST_LEDGER" ]] && [[ "$HEALTH_LATEST_LEDGER" -gt 0 ]]; then :; else
+    fail "getHealth" "latestLedger missing or not > 0"; ok=false
+  fi
+  if [[ -n "$HEALTH_OLDEST_LEDGER" ]] && [[ "$HEALTH_OLDEST_LEDGER" -gt 0 ]]; then :; else
+    fail "getHealth" "oldestLedger missing or not > 0"; ok=false
+  fi
+  RETENTION=$(echo "$resp" | jq -r '.result.ledgerRetentionWindow // empty')
+  if [[ -n "$RETENTION" ]] && echo "$RETENTION" | grep -qE '^[0-9]+$'; then :; else
+    fail "getHealth" "ledgerRetentionWindow not a number"; ok=false
+  fi
+  if $ok; then
+    pass "getHealth (latest=$HEALTH_LATEST_LEDGER, oldest=$HEALTH_OLDEST_LEDGER, retention=$RETENTION)"
+  fi
 else
   fail "getHealth" "unhealthy or unreachable"
 fi
 
 # getNetwork
 if resp=$(rpc_call getNetwork) && echo "$resp" | jq -e '.result.passphrase' &>/dev/null; then
-  pass "getNetwork"
+  PROTO=$(echo "$resp" | jq -r '.result.protocolVersion // empty')
+  if [[ -n "$PROTO" ]] && [[ "$PROTO" -gt 0 ]]; then
+    pass "getNetwork (protocolVersion=$PROTO)"
+  else
+    fail "getNetwork" "protocolVersion missing or not > 0"
+  fi
 else
   fail "getNetwork" "no passphrase in response"
 fi
@@ -107,14 +161,30 @@ fi
 # getLatestLedger
 if resp=$(rpc_call getLatestLedger) && echo "$resp" | jq -e '.result.sequence' &>/dev/null; then
   LATEST_LEDGER=$(echo "$resp" | jq -r '.result.sequence')
-  pass "getLatestLedger (seq=$LATEST_LEDGER)"
+  ok=true
+  LEDGER_ID=$(echo "$resp" | jq -r '.result.id // empty')
+  if [[ -n "$LEDGER_ID" ]] && echo "$LEDGER_ID" | grep -qE '^[a-f0-9]{64}$'; then :; else
+    fail "getLatestLedger" "id not 64-char hex: $LEDGER_ID"; ok=false
+  fi
+  PROTO=$(echo "$resp" | jq -r '.result.protocolVersion // empty')
+  if [[ -n "$PROTO" ]] && [[ "$PROTO" -gt 0 ]]; then :; else
+    fail "getLatestLedger" "protocolVersion missing or not > 0"; ok=false
+  fi
+  if $ok; then
+    pass "getLatestLedger (seq=$LATEST_LEDGER, id=${LEDGER_ID:0:12}...)"
+  fi
 else
   fail "getLatestLedger" "no sequence in response"
 fi
 
 # getFeeStats
 if resp=$(rpc_call getFeeStats) && echo "$resp" | jq -e '.result' &>/dev/null; then
-  pass "getFeeStats"
+  FEE_LATEST=$(echo "$resp" | jq -r '.result.latestLedger // empty')
+  if [[ -n "$FEE_LATEST" ]] && [[ "$FEE_LATEST" -gt 0 ]]; then
+    pass "getFeeStats (latestLedger=$FEE_LATEST)"
+  else
+    fail "getFeeStats" "latestLedger missing or not > 0"
+  fi
 else
   fail "getFeeStats" "empty result"
 fi
@@ -122,14 +192,19 @@ fi
 # getVersionInfo
 if resp=$(rpc_call getVersionInfo) && echo "$resp" | jq -e '.result.version' &>/dev/null; then
   VERSION=$(echo "$resp" | jq -r '.result.version')
-  pass "getVersionInfo (version=$VERSION)"
+  PROTO=$(echo "$resp" | jq -r '.result.protocolVersion // empty')
+  if [[ -n "$PROTO" ]] && [[ "$PROTO" -gt 0 ]]; then
+    pass "getVersionInfo (version=$VERSION, protocolVersion=$PROTO)"
+  else
+    fail "getVersionInfo" "protocolVersion missing or not > 0"
+  fi
 else
   fail "getVersionInfo" "no version in response"
 fi
 
 echo ""
 
-# ── 2. Setup accounts ───────────────────────────────────────────────────────
+# ── 3. Setup accounts ───────────────────────────────────────────────────────
 echo "── Account setup ────────────────────────────────────────────────────"
 
 if stellar keys generate "$ALICE_KEY" --fund "${CLI_NET_ARGS[@]}" 2>/dev/null; then
@@ -178,7 +253,7 @@ fi
 
 echo ""
 
-# ── 3. Deploy SAC for native XLM ────────────────────────────────────────────
+# ── 4. Deploy SAC for native XLM ────────────────────────────────────────────
 echo "── Deploy SAC (native XLM) ──────────────────────────────────────────"
 
 # The native SAC may already be deployed (it's a singleton per network).
@@ -204,7 +279,7 @@ fi
 
 echo ""
 
-# ── 4. getLedgerEntries — fetch Alice's account ─────────────────────────────
+# ── 5. getLedgerEntries — fetch Alice's account ─────────────────────────────
 echo "── getLedgerEntries ─────────────────────────────────────────────────"
 
 # Encode Alice's account as an XDR LedgerKey (base64). The stellar CLI can do this.
@@ -213,7 +288,18 @@ if ALICE_LEDGER_KEY=$(stellar xdr encode --type LedgerKey \
   PARAMS="{\"keys\":[\"$ALICE_LEDGER_KEY\"]}"
   if resp=$(rpc_call getLedgerEntries "$PARAMS") && \
      echo "$resp" | jq -e '.result.entries[0].xdr' &>/dev/null; then
-    pass "getLedgerEntries"
+    ok=true
+    LAST_MOD=$(echo "$resp" | jq -r '.result.entries[0].lastModifiedLedgerSeq // empty')
+    if [[ -z "$LAST_MOD" ]]; then
+      fail "getLedgerEntries" "lastModifiedLedgerSeq missing"; ok=false
+    fi
+    LE_LATEST=$(echo "$resp" | jq -r '.result.latestLedger // empty')
+    if [[ -z "$LE_LATEST" ]]; then
+      fail "getLedgerEntries" "latestLedger missing"; ok=false
+    fi
+    if $ok; then
+      pass "getLedgerEntries (lastModified=$LAST_MOD, latestLedger=$LE_LATEST)"
+    fi
   else
     fail "getLedgerEntries" "no entry returned"
   fi
@@ -224,7 +310,7 @@ fi
 
 echo ""
 
-# ── 5. Simulate + submit contract invocation ────────────────────────────────
+# ── 6. Simulate + submit contract invocation ────────────────────────────────
 echo "── Contract invoke (simulateTransaction + sendTransaction) ──────────"
 
 TX_HASH=""
@@ -268,7 +354,7 @@ fi
 
 echo ""
 
-# ── 6. getTransaction — fetch completed tx by hash ──────────────────────────
+# ── 7. getTransaction — fetch completed tx by hash ──────────────────────────
 echo "── getTransaction (direct) ──────────────────────────────────────────"
 
 TX_LEDGER=""
@@ -288,7 +374,147 @@ fi
 
 echo ""
 
-# ── 7. getEvents — query transfer events ────────────────────────────────────
+# ── 8. getTransactions — query transactions in a ledger range ────────────────
+echo "── getTransactions ──────────────────────────────────────────────────"
+
+if [[ -n "$TX_LEDGER" ]]; then
+  # Start at the exact tx ledger with a generous limit to ensure we capture our tx
+  PARAMS=$(cat <<JSONEOF
+{
+  "startLedger": $TX_LEDGER,
+  "pagination": {"limit": 200}
+}
+JSONEOF
+)
+  if resp=$(rpc_call getTransactions "$PARAMS") && \
+     echo "$resp" | jq -e '.result.transactions[0]' &>/dev/null; then
+    ok=true
+    # Verify required fields on first transaction
+    for field in txHash envelopeXdr resultXdr status ledger applicationOrder createdAt; do
+      if ! echo "$resp" | jq -e ".result.transactions[0].$field" &>/dev/null; then
+        fail "getTransactions" "missing field: $field"; ok=false; break
+      fi
+    done
+    # Cross-check: one of the returned txHashes should match our TX_HASH
+    if [[ -n "$TX_HASH" ]]; then
+      HASH_MATCH=$(echo "$resp" | jq --arg h "$TX_HASH" \
+        '[.result.transactions[] | select(.txHash == $h)] | length')
+      if [[ "$HASH_MATCH" -eq 0 ]]; then
+        fail "getTransactions" "none of the returned txHashes match $TX_HASH"; ok=false
+      fi
+    fi
+    TX_COUNT=$(echo "$resp" | jq '.result.transactions | length')
+    if $ok; then
+      pass "getTransactions ($TX_COUNT txs, hash cross-check ok)"
+    fi
+  else
+    fail "getTransactions" "no transactions returned"
+  fi
+
+  # Pagination test: limit=1, then use cursor
+  START=$((TX_LEDGER - 1))
+  if [[ $START -lt 1 ]]; then START=1; fi
+  PARAMS_PAGE1=$(cat <<JSONEOF
+{
+  "startLedger": $START,
+  "pagination": {"limit": 1}
+}
+JSONEOF
+)
+  if resp1=$(rpc_call getTransactions "$PARAMS_PAGE1") && \
+     CURSOR=$(echo "$resp1" | jq -r '.result.cursor // empty') && [[ -n "$CURSOR" ]]; then
+    PARAMS_PAGE2=$(cat <<JSONEOF
+{
+  "pagination": {"cursor": "$CURSOR", "limit": 1}
+}
+JSONEOF
+)
+    if resp2=$(rpc_call getTransactions "$PARAMS_PAGE2") && \
+       echo "$resp2" | jq -e '.result.transactions[0]' &>/dev/null; then
+      pass "getTransactions pagination (cursor=$CURSOR)"
+    else
+      fail "getTransactions pagination" "second page returned no results"
+    fi
+  else
+    fail "getTransactions pagination" "no cursor in first page response"
+  fi
+else
+  fail "getTransactions" "skipped (no tx ledger available)"
+  fail "getTransactions pagination" "skipped (no tx ledger available)"
+fi
+
+echo ""
+
+# ── 9. getLedgers — query ledgers by sequence range ──────────────────────────
+echo "── getLedgers ────────────────────────────────────────────────────────"
+
+if [[ -n "$TX_LEDGER" ]]; then
+  START=$((TX_LEDGER - 1))
+  if [[ $START -lt 1 ]]; then START=1; fi
+  PARAMS=$(cat <<JSONEOF
+{
+  "startLedger": $START,
+  "pagination": {"limit": 5}
+}
+JSONEOF
+)
+  if resp=$(rpc_call getLedgers "$PARAMS") && \
+     echo "$resp" | jq -e '.result.ledgers[0]' &>/dev/null; then
+    ok=true
+    # Verify required fields
+    for field in hash sequence headerXdr ledgerCloseTime; do
+      if ! echo "$resp" | jq -e ".result.ledgers[0].$field" &>/dev/null; then
+        fail "getLedgers" "missing field: $field"; ok=false; break
+      fi
+    done
+    # Verify hash is 64-char hex
+    LEDGER_HASH=$(echo "$resp" | jq -r '.result.ledgers[0].hash // empty')
+    if ! echo "$LEDGER_HASH" | grep -qE '^[a-f0-9]{64}$'; then
+      fail "getLedgers" "hash not 64-char hex: $LEDGER_HASH"; ok=false
+    fi
+    # Verify sequence is a number
+    SEQ=$(echo "$resp" | jq -r '.result.ledgers[0].sequence // empty')
+    if ! echo "$SEQ" | grep -qE '^[0-9]+$'; then
+      fail "getLedgers" "sequence not a number: $SEQ"; ok=false
+    fi
+    # Cross-check: one of the returned sequences should match TX_LEDGER
+    SEQ_MATCH=$(echo "$resp" | jq --argjson s "$TX_LEDGER" \
+      '[.result.ledgers[] | select(.sequence == $s)] | length')
+    if [[ "$SEQ_MATCH" -eq 0 ]]; then
+      fail "getLedgers" "none of the returned sequences match TX_LEDGER=$TX_LEDGER"; ok=false
+    fi
+    LEDGER_COUNT=$(echo "$resp" | jq '.result.ledgers | length')
+    if $ok; then
+      pass "getLedgers ($LEDGER_COUNT ledgers, seq cross-check ok)"
+    fi
+  else
+    fail "getLedgers" "no ledgers returned"
+  fi
+elif [[ -n "$LATEST_LEDGER" ]]; then
+  # Fallback: use latest ledger range
+  START=$((LATEST_LEDGER - 5))
+  if [[ $START -lt 1 ]]; then START=1; fi
+  PARAMS=$(cat <<JSONEOF
+{
+  "startLedger": $START,
+  "pagination": {"limit": 5}
+}
+JSONEOF
+)
+  if resp=$(rpc_call getLedgers "$PARAMS") && \
+     echo "$resp" | jq -e '.result.ledgers[0]' &>/dev/null; then
+    LEDGER_COUNT=$(echo "$resp" | jq '.result.ledgers | length')
+    pass "getLedgers (fallback, $LEDGER_COUNT ledgers, no tx to cross-check)"
+  else
+    fail "getLedgers" "no ledgers returned"
+  fi
+else
+  fail "getLedgers" "skipped (no ledger info available)"
+fi
+
+echo ""
+
+# ── 10. getEvents — query transfer events ────────────────────────────────────
 echo "── getEvents ────────────────────────────────────────────────────────"
 
 if [[ -n "$CONTRACT_ID" && -n "$TX_LEDGER" && -n "$ALICE_ADDR" ]]; then
@@ -346,6 +572,48 @@ JSONEOF
   fi
 else
   fail "getEvents" "skipped (no contract or ledger info)"
+fi
+
+echo ""
+
+# ── 11. Data consistency cross-checks ────────────────────────────────────────
+echo "── Consistency cross-checks ─────────────────────────────────────────"
+
+# Re-fetch health to get up-to-date ledger bounds (the initial call was before tx submission)
+FRESH_HEALTH_LATEST=""
+FRESH_HEALTH_OLDEST=""
+if fresh_resp=$(rpc_call getHealth) && echo "$fresh_resp" | jq -e '.result.status' &>/dev/null; then
+  FRESH_HEALTH_LATEST=$(echo "$fresh_resp" | jq -r '.result.latestLedger // empty')
+  FRESH_HEALTH_OLDEST=$(echo "$fresh_resp" | jq -r '.result.oldestLedger // empty')
+fi
+# Also re-fetch getLatestLedger
+FRESH_LATEST_LEDGER=""
+if fresh_resp=$(rpc_call getLatestLedger) && echo "$fresh_resp" | jq -e '.result.sequence' &>/dev/null; then
+  FRESH_LATEST_LEDGER=$(echo "$fresh_resp" | jq -r '.result.sequence')
+fi
+
+# getLatestLedger sequence >= getHealth latestLedger (they should match or be close)
+if [[ -n "$FRESH_LATEST_LEDGER" && -n "$FRESH_HEALTH_LATEST" ]]; then
+  if [[ "$FRESH_LATEST_LEDGER" -ge "$FRESH_HEALTH_LATEST" ]]; then
+    pass "consistency: getLatestLedger ($FRESH_LATEST_LEDGER) >= getHealth latestLedger ($FRESH_HEALTH_LATEST)"
+  else
+    fail "consistency: getLatestLedger vs getHealth" \
+      "getLatestLedger=$FRESH_LATEST_LEDGER < getHealth.latestLedger=$FRESH_HEALTH_LATEST"
+  fi
+else
+  fail "consistency: getLatestLedger vs getHealth" "skipped (missing data)"
+fi
+
+# getTransaction ledger falls within getHealth [oldestLedger, latestLedger]
+if [[ -n "$TX_LEDGER" && -n "$FRESH_HEALTH_OLDEST" && -n "$FRESH_HEALTH_LATEST" ]]; then
+  if [[ "$TX_LEDGER" -ge "$FRESH_HEALTH_OLDEST" && "$TX_LEDGER" -le "$FRESH_HEALTH_LATEST" ]]; then
+    pass "consistency: tx ledger ($TX_LEDGER) in range [$FRESH_HEALTH_OLDEST, $FRESH_HEALTH_LATEST]"
+  else
+    fail "consistency: tx ledger range" \
+      "TX_LEDGER=$TX_LEDGER not in [$FRESH_HEALTH_OLDEST, $FRESH_HEALTH_LATEST]"
+  fi
+else
+  fail "consistency: tx ledger range" "skipped (missing data)"
 fi
 
 echo ""
