@@ -649,6 +649,10 @@ enum Commands {
         /// Total SAC transfer TXs for single-shot mode (default: 25000)
         #[arg(long, default_value = "25000")]
         tx_count: u32,
+
+        /// Number of iterations for single-shot mode (default: 10)
+        #[arg(long, default_value = "10")]
+        iterations: u32,
     },
 }
 
@@ -807,7 +811,8 @@ async fn main() -> anyhow::Result<()> {
             classic_txs_per_ledger,
             clusters,
             tx_count,
-        } => cmd_apply_load(config, &mode, num_ledgers, classic_txs_per_ledger, clusters, tx_count).await,
+            iterations,
+        } => cmd_apply_load(config, &mode, num_ledgers, classic_txs_per_ledger, clusters, tx_count, iterations).await,
     }
 }
 
@@ -1209,6 +1214,7 @@ async fn cmd_apply_load(
     classic_txs_per_ledger: u32,
     clusters: u32,
     tx_count: u32,
+    iterations: u32,
 ) -> anyhow::Result<()> {
     use henyey_simulation::{ApplyLoad, ApplyLoadConfig, ApplyLoadMode};
 
@@ -1230,6 +1236,12 @@ async fn cmd_apply_load(
     config.http.enabled = false;
     config.compat_http.enabled = false;
 
+    // Generate an ephemeral node seed for the benchmark (required for validators).
+    if config.node.node_seed.is_none() {
+        let ephemeral = henyey_crypto::SecretKey::generate();
+        config.node.node_seed = Some(ephemeral.to_strkey());
+    }
+
     // Use a temporary directory for the database and buckets.
     let data_dir = tempfile::tempdir()?;
     config.database.path = data_dir.path().join("apply-load.db");
@@ -1248,7 +1260,7 @@ async fn cmd_apply_load(
 
     // Build the ApplyLoad configuration.
     let al_config = ApplyLoadConfig {
-        num_ledgers: if is_single_shot { 1 } else { num_ledgers },
+        num_ledgers: if is_single_shot { iterations } else { num_ledgers },
         classic_txs_per_ledger,
         ledger_max_dependent_tx_clusters: clusters,
         ..ApplyLoadConfig::default()
@@ -1319,15 +1331,15 @@ async fn cmd_apply_load(
         ApplyLoadMode::MaxSacTps if is_single_shot => {
             // Round tx_count down to nearest multiple of clusters.
             let txs = (tx_count / clusters) * clusters;
-            println!("Single-shot: closing 1 ledger with {} SAC TXs across {} clusters...", txs, clusters);
+            println!("Single-shot: closing {} ledgers with {} SAC TXs across {} clusters...", iterations, txs, clusters);
             println!();
 
             let avg_ms = harness.benchmark_sac_tps(txs)?;
 
             println!();
-            println!("=== Single-Shot Result ===");
-            println!("TXs: {}, Clusters: {}, Avg close: {:.1}ms", txs, clusters, avg_ms);
-            println!("Effective TPS: {:.0}", txs as f64 / (avg_ms / 1000.0));
+            println!("=== Single-Shot Result ({} iterations) ===", iterations);
+            println!("TXs/ledger: {}, Clusters: {}, Avg close: {:.1}ms", txs, clusters, avg_ms);
+            println!("Average TPS: {:.0}", txs as f64 / (avg_ms / 1000.0));
             println!("Success rate: {:.1}%", harness.success_rate() * 100.0);
         }
 
