@@ -2049,19 +2049,6 @@ impl TransactionExecutor {
     /// After this method returns `Ok(Ok(..))`, the executor's state has committed
     /// fee deduction, signer removal, and sequence bump. These changes persist
     /// even if the operation body later fails (matching stellar-core behavior).
-    fn pre_apply(
-        &mut self,
-        snapshot: &SnapshotHandle,
-        tx_envelope: &TransactionEnvelope,
-        base_fee: u32,
-        soroban_prng_seed: Option<[u8; 32]>,
-        deduct_fee: bool,
-        fee_source_pre_state: Option<LedgerEntry>,
-    ) -> Result<std::result::Result<PreApplyResult, TransactionExecutionResult>> {
-        let tx_arc = Arc::new(tx_envelope.clone());
-        self.pre_apply_arc(snapshot, &tx_arc, base_fee, soroban_prng_seed, deduct_fee, fee_source_pre_state)
-    }
-
     fn pre_apply_arc(
         &mut self,
         snapshot: &SnapshotHandle,
