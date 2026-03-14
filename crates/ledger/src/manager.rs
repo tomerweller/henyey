@@ -1915,6 +1915,10 @@ impl LedgerManager {
             state.header_hash = new_header_hash;
         }
 
+        // Drop the delta (150K+ entries) on a background thread to avoid blocking
+        // the critical path with deallocation. The delta is no longer needed.
+        std::thread::spawn(move || drop(delta));
+
         Ok(())
     }
 
