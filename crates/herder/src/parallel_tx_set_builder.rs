@@ -633,30 +633,26 @@ pub fn stages_to_xdr_phase(
             let mut sorted_clusters: Vec<Vec<TransactionEnvelope>> = stage
                 .into_iter()
                 .map(|mut cluster| {
-                    // 1. Sort transactions within each cluster by hash
-                    cluster.sort_by(|a, b| {
-                        let ha = Hash256::hash_xdr(a).unwrap_or_default();
-                        let hb = Hash256::hash_xdr(b).unwrap_or_default();
-                        ha.0.cmp(&hb.0)
+                    // 1. Sort transactions within each cluster by hash.
+                    // Pre-compute hashes to avoid redundant XDR serialization
+                    // during comparisons (O(N log N) comparisons → O(N) hashes).
+                    cluster.sort_by_cached_key(|tx| {
+                        Hash256::hash_xdr(tx).unwrap_or_default().0
                     });
                     cluster
                 })
                 .collect();
             // 2. Sort clusters within each stage by first-TX hash
-            sorted_clusters.sort_by(|a, b| {
-                let ha = Hash256::hash_xdr(&a[0]).unwrap_or_default();
-                let hb = Hash256::hash_xdr(&b[0]).unwrap_or_default();
-                ha.0.cmp(&hb.0)
+            sorted_clusters.sort_by_cached_key(|cluster| {
+                Hash256::hash_xdr(&cluster[0]).unwrap_or_default().0
             });
             sorted_clusters
         })
         .collect();
 
     // 3. Sort stages by first-TX-of-first-cluster hash
-    sorted_stages.sort_by(|a, b| {
-        let ha = Hash256::hash_xdr(&a[0][0]).unwrap_or_default();
-        let hb = Hash256::hash_xdr(&b[0][0]).unwrap_or_default();
-        ha.0.cmp(&hb.0)
+    sorted_stages.sort_by_cached_key(|stage| {
+        Hash256::hash_xdr(&stage[0][0]).unwrap_or_default().0
     });
 
     let execution_stages: Vec<ParallelTxExecutionStage> = sorted_stages
@@ -689,8 +685,8 @@ pub fn stages_to_xdr_phase(
 /// are round-robin distributed into `ledger_max_dependent_tx_clusters` clusters
 /// in a single stage. All TXs are included (no surge-pricing drops).
 pub fn build_two_phase_tx_set(
-    classic_txs: &[TransactionEnvelope],
-    soroban_txs: &[TransactionEnvelope],
+    classic_txs: Vec<TransactionEnvelope>,
+    soroban_txs: Vec<TransactionEnvelope>,
     previous_ledger_hash: &Hash256,
     soroban_base_fee: Option<i64>,
     ledger_max_dependent_tx_clusters: u32,
@@ -703,9 +699,6 @@ pub fn build_two_phase_tx_set(
             TxSetComponent::TxsetCompTxsMaybeDiscountedFee(TxSetComponentTxsMaybeDiscountedFee {
                 base_fee: None,
                 txs: classic_txs
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
                     .try_into()
                     .unwrap_or_default(),
             });
@@ -726,8 +719,8 @@ pub fn build_two_phase_tx_set(
         let num_clusters = ledger_max_dependent_tx_clusters.max(1) as usize;
         let mut cluster_txs: Vec<Vec<TransactionEnvelope>> =
             (0..num_clusters).map(|_| Vec::new()).collect();
-        for (i, tx) in soroban_txs.iter().enumerate() {
-            cluster_txs[i % num_clusters].push(tx.clone());
+        for (i, tx) in soroban_txs.into_iter().enumerate() {
+            cluster_txs[i % num_clusters].push(tx);
         }
         let stages = vec![cluster_txs
             .into_iter()

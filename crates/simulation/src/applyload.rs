@@ -378,17 +378,17 @@ impl ApplyLoad {
         let header = self.app.ledger_manager().current_header();
         let header_hash = self.app.ledger_manager().current_header_hash();
 
-        // Build a GeneralizedTransactionSet from the envelopes.
-        let tx_set = self.build_tx_set_from_envelopes(&txs, &header_hash);
-
+        // Record utilization before consuming txs (needs borrow).
         if record_soroban_utilization {
             ensure!(
                 self.mode == ApplyLoadMode::LimitBased,
                 "utilization recording only supported in LimitBased mode"
             );
-            // Record utilization: compare tx set resources against ledger limits.
             self.record_utilization(&txs);
         }
+
+        // Build a GeneralizedTransactionSet from the envelopes (consumes txs).
+        let tx_set = self.build_tx_set_from_envelopes(txs, &header_hash);
 
         let close_data = LedgerCloseData::new(
             header.ledger_seq + 1,
@@ -1619,15 +1619,15 @@ impl ApplyLoad {
     /// herder to partition Soroban TXs into stages and clusters.
     fn build_tx_set_from_envelopes(
         &self,
-        txs: &[TransactionEnvelope],
+        txs: Vec<TransactionEnvelope>,
         prev_ledger_hash: &Hash256,
     ) -> TransactionSetVariant {
         let (classic_txs, soroban_txs): (Vec<_>, Vec<_>) =
-            txs.iter().cloned().partition(|env| !is_soroban_envelope(env));
+            txs.into_iter().partition(|env| !is_soroban_envelope(env));
 
         let gen_tx_set = henyey_herder::build_two_phase_tx_set(
-            &classic_txs,
-            &soroban_txs,
+            classic_txs,
+            soroban_txs,
             prev_ledger_hash,
             None,
             self.config.ledger_max_dependent_tx_clusters,
