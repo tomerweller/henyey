@@ -4586,7 +4586,7 @@ impl<'a> LedgerCloseContext<'a> {
             );
 
             let add_batch_start = std::time::Instant::now();
-            bucket_list.add_batch(
+            bucket_list.add_batch_unique(
                 self.close_data.ledger_seq,
                 protocol_version,
                 BucketListType::Live,

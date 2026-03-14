@@ -1659,6 +1659,34 @@ impl BucketList {
         live_entries: Vec<LedgerEntry>,
         dead_entries: Vec<LedgerKey>,
     ) -> Result<()> {
+        self.add_batch_impl(ledger_seq, protocol_version, bucket_list_type, init_entries, live_entries, dead_entries, false)
+    }
+
+    /// Like `add_batch`, but skips deduplication when entries are known to be
+    /// unique (e.g. from a coalesced `LedgerDelta`). Saves ~200ms on 100K entries.
+    pub fn add_batch_unique(
+        &mut self,
+        ledger_seq: u32,
+        protocol_version: u32,
+        bucket_list_type: BucketListType,
+        init_entries: Vec<LedgerEntry>,
+        live_entries: Vec<LedgerEntry>,
+        dead_entries: Vec<LedgerKey>,
+    ) -> Result<()> {
+        self.add_batch_impl(ledger_seq, protocol_version, bucket_list_type, init_entries, live_entries, dead_entries, true)
+    }
+
+    fn add_batch_impl(
+        &mut self,
+        ledger_seq: u32,
+        protocol_version: u32,
+        bucket_list_type: BucketListType,
+        init_entries: Vec<LedgerEntry>,
+        live_entries: Vec<LedgerEntry>,
+        dead_entries: Vec<LedgerKey>,
+        skip_dedup: bool,
+    ) -> Result<()> {
+        let add_batch_start = std::time::Instant::now();
         let use_init = protocol_version_starts_from(protocol_version, ProtocolVersion::V11);
 
         let mut entries: Vec<BucketEntry> = Vec::new();
@@ -1674,24 +1702,30 @@ impl BucketList {
             entries.push(BucketEntry::Metaentry(meta));
         }
 
-        // Deduplicate init_entries - keep only the last occurrence of each key.
-        // This handles the case where the same entry is created and updated in the same ledger.
-        // Uses structural key comparison (via sort + dedup) instead of XDR serialization.
-        let dedup_init = deduplicate_entries_by_sort(init_entries);
-        if use_init {
-            entries.extend(dedup_init.into_iter().map(BucketEntry::Initentry));
+        let dedup_start = std::time::Instant::now();
+        if skip_dedup {
+            // Entries from a coalesced delta are already unique per key.
+            if use_init {
+                entries.extend(init_entries.into_iter().map(BucketEntry::Initentry));
+            } else {
+                entries.extend(init_entries.into_iter().map(BucketEntry::Liveentry));
+            }
+            entries.extend(live_entries.into_iter().map(BucketEntry::Liveentry));
+            entries.extend(dead_entries.into_iter().map(BucketEntry::Deadentry));
         } else {
-            entries.extend(dedup_init.into_iter().map(BucketEntry::Liveentry));
+            // Deduplicate init_entries - keep only the last occurrence of each key.
+            let dedup_init = deduplicate_entries_by_sort(init_entries);
+            if use_init {
+                entries.extend(dedup_init.into_iter().map(BucketEntry::Initentry));
+            } else {
+                entries.extend(dedup_init.into_iter().map(BucketEntry::Liveentry));
+            }
+            let dedup_live = deduplicate_entries_by_sort(live_entries);
+            entries.extend(dedup_live.into_iter().map(BucketEntry::Liveentry));
+            let dedup_dead = deduplicate_keys_by_sort(dead_entries);
+            entries.extend(dedup_dead.into_iter().map(BucketEntry::Deadentry));
         }
-
-        // Deduplicate live_entries - keep only the last occurrence of each key.
-        let dedup_live = deduplicate_entries_by_sort(live_entries);
-        entries.extend(dedup_live.into_iter().map(BucketEntry::Liveentry));
-
-        // Deduplicate dead_entries - keep only unique keys.
-        // Uses structural key comparison (via sort + dedup) instead of XDR serialization.
-        let dedup_dead = deduplicate_keys_by_sort(dead_entries);
-        entries.extend(dedup_dead.into_iter().map(BucketEntry::Deadentry));
+        let dedup_us = dedup_start.elapsed().as_micros() as u64;
 
         // Create the new bucket with in-memory entries for level 0 optimization.
         // We use fresh_in_memory_only() which skips hash computation because:
@@ -1703,17 +1737,35 @@ impl BucketList {
         // No global cache write-through is needed: new entries go to level 0
         // (always InMemory), and lookups check level 0 first, so stale
         // deeper-level per-bucket caches don't cause incorrect results.
+        let sort_start = std::time::Instant::now();
         let new_bucket = Bucket::fresh_in_memory_only({
             let mut e = entries;
-            e.sort_by(crate::entry::compare_entries);
+            // Use sort_by_cached_key to avoid repeated LedgerKey allocation.
+            // key() clones AccountId/Asset/etc on every call; with O(n log n)
+            // comparisons that's millions of allocations. Caching the key once
+            // per entry reduces it to O(n).
+            e.sort_by_cached_key(|entry| entry.key());
             e
         });
+        let sort_us = sort_start.elapsed().as_micros() as u64;
 
+        let internal_start = std::time::Instant::now();
         self.add_batch_internal(ledger_seq, protocol_version, new_bucket)?;
+        let internal_us = internal_start.elapsed().as_micros() as u64;
         self.ledger_seq = ledger_seq;
 
         // Initialize per-bucket caches for any new DiskIndex buckets
         self.maybe_initialize_caches();
+
+        let total_us = add_batch_start.elapsed().as_micros() as u64;
+        tracing::debug!(
+            ledger_seq,
+            total_us,
+            dedup_us,
+            sort_us,
+            internal_us,
+            "PROFILE add_batch"
+        );
 
         Ok(())
     }
