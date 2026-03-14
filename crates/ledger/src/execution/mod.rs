@@ -1744,14 +1744,13 @@ impl TransactionExecutor {
     /// Validate a transaction's structure, accounts, fees, preconditions, sequence,
     /// and signatures before any state changes. Returns the validated data needed
     /// for execution, or a `ValidationFailure` on validation failure.
-    fn validate_preconditions(
+    fn validate_preconditions_with_frame(
         &mut self,
         snapshot: &SnapshotHandle,
-        tx_envelope: &TransactionEnvelope,
+        frame: TransactionFrame,
         base_fee: u32,
     ) -> Result<std::result::Result<ValidatedTransaction, ValidationFailure>> {
         let val_start = std::time::Instant::now();
-        let frame = TransactionFrame::from_owned_with_network(tx_envelope.clone(), self.network_id);
         let fee_source_id = henyey_tx::muxed_to_account_id(&frame.fee_source_account());
         let inner_source_id = henyey_tx::muxed_to_account_id(&frame.inner_source_account());
 
@@ -2067,17 +2066,19 @@ impl TransactionExecutor {
         // get the refundable fee subtracted from feeCharged via
         // finalizeFeeRefund(). We need to replicate this by setting fee_refund
         // on the failure result when validate_preconditions fails.
+        // Create the frame once and reuse for both soroban fee check and validation.
+        let frame = TransactionFrame::from_owned_with_network(tx_envelope.clone(), self.network_id);
+
         let soroban_max_refundable = {
-            let pre_frame = TransactionFrame::from_owned(tx_envelope.clone());
-            if pre_frame.is_soroban() {
+            if frame.is_soroban() {
                 let (non_refundable_fee, _) = compute_soroban_resource_fee(
-                    &pre_frame,
+                    &frame,
                     self.protocol_version,
                     &self.soroban_config,
                     0,
                 )
                 .unwrap_or((0, 0));
-                pre_frame
+                frame
                     .declared_soroban_resource_fee()
                     .saturating_sub(non_refundable_fee)
             } else {
@@ -2086,7 +2087,7 @@ impl TransactionExecutor {
         };
 
         // Phase 1-6: Validate structure, accounts, fees, preconditions, sequence, signatures
-        let validated = match self.validate_preconditions(snapshot, tx_envelope, base_fee)? {
+        let validated = match self.validate_preconditions_with_frame(snapshot, frame, base_fee)? {
             Ok(v) => v,
             Err(validation_failure) => {
                 let mut failure_result = validation_failure.result;
@@ -2102,15 +2103,15 @@ impl TransactionExecutor {
                 // though the TX failed. This matches stellar-core's
                 // commonPreApply which calls processSeqNum before returning.
                 if validation_failure.past_seq_check {
-                    let frame = TransactionFrame::from_owned_with_network(
+                    let fail_frame = TransactionFrame::from_owned_with_network(
                         tx_envelope.clone(),
                         self.network_id,
                     );
                     let inner_source_id =
-                        henyey_tx::muxed_to_account_id(&frame.inner_source_account());
+                        henyey_tx::muxed_to_account_id(&fail_frame.inner_source_account());
                     if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
                         acc.seq_num =
-                            stellar_xdr::curr::SequenceNumber(frame.sequence_number());
+                            stellar_xdr::curr::SequenceNumber(fail_frame.sequence_number());
                         henyey_tx::state::update_account_seq_info(
                             acc,
                             self.ledger_seq,
