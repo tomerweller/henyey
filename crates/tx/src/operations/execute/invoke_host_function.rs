@@ -12,6 +12,22 @@ use stellar_xdr::curr::{
 
 use henyey_common::protocol::{protocol_version_is_before, ProtocolVersion};
 
+/// Compute the XDR-encoded byte length of a value without heap allocation.
+fn xdr_encoded_len(val: &impl WriteXdr) -> usize {
+    struct CountingWriter(usize);
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut w = stellar_xdr::curr::Limited::new(CountingWriter(0), Limits::none());
+    val.write_xdr(&mut w).map(|_| w.inner.0).unwrap_or(0)
+}
+
 /// Check if a ledger key is for a Soroban entry.
 fn is_soroban_key(key: &LedgerKey) -> bool {
     matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_))
@@ -200,23 +216,21 @@ fn validate_footprint_entry(
     };
 
     if let Some(entry) = entry {
-        if let Ok(bytes) = entry.to_xdr(Limits::none()) {
-            let entry_size = bytes.len();
-            if !validate_contract_ledger_entry(
-                key,
+        let entry_size = xdr_encoded_len(&entry);
+        if !validate_contract_ledger_entry(
+            key,
+            entry_size,
+            max_contract_size_bytes,
+            max_contract_data_entry_size_bytes,
+        ) {
+            tracing::warn!(
                 entry_size,
                 max_contract_size_bytes,
                 max_contract_data_entry_size_bytes,
-            ) {
-                tracing::warn!(
-                    entry_size,
-                    max_contract_size_bytes,
-                    max_contract_data_entry_size_bytes,
-                    key_type = ?std::mem::discriminant(key),
-                    "Footprint entry size exceeds limit during read phase"
-                );
-                return false;
-            }
+                key_type = ?std::mem::discriminant(key),
+                "Footprint entry size exceeds limit during read phase"
+            );
+            return false;
         }
     }
     true
@@ -490,22 +504,20 @@ fn validate_and_compute_write_bytes(
             if matches!(entry.data, stellar_xdr::curr::LedgerEntryData::Ttl(_)) {
                 continue;
             }
-            // Get the XDR size of the entry
-            if let Ok(bytes) = entry.to_xdr(Limits::none()) {
-                let entry_size = bytes.len();
+            // Compute XDR size without heap allocation.
+            let entry_size = xdr_encoded_len(entry);
 
-                // Validate entry size against network config limits (stellar-core validateContractLedgerEntry)
-                if !validate_contract_ledger_entry(
-                    &change.key,
-                    entry_size,
-                    max_contract_size_bytes,
-                    max_contract_data_entry_size_bytes,
-                ) {
-                    return StorageChangeValidation::EntrySizeExceeded;
-                }
-
-                total = total.saturating_add(entry_size as u32);
+            // Validate entry size against network config limits (stellar-core validateContractLedgerEntry)
+            if !validate_contract_ledger_entry(
+                &change.key,
+                entry_size,
+                max_contract_size_bytes,
+                max_contract_data_entry_size_bytes,
+            ) {
+                return StorageChangeValidation::EntrySizeExceeded;
             }
+
+            total = total.saturating_add(entry_size as u32);
         }
     }
     StorageChangeValidation::Valid {
@@ -548,11 +560,8 @@ fn disk_read_bytes_exceeded(
         };
 
         if let Some(entry) = entry {
-            let bytes: Vec<u8> = match WriteXdr::to_xdr(&entry, Limits::none()) {
-                Ok(b) => b,
-                Err(_) => return false,
-            };
-            *total = total.saturating_add(bytes.len() as u32);
+            let len = xdr_encoded_len(&entry);
+            *total = total.saturating_add(len as u32);
             if *total > limit {
                 return true;
             }
