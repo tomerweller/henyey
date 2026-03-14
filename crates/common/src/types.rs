@@ -69,8 +69,38 @@ impl Hash256 {
     pub fn hash_xdr<T: stellar_xdr::curr::WriteXdr>(
         value: &T,
     ) -> Result<Self, stellar_xdr::curr::Error> {
-        let bytes = value.to_xdr(stellar_xdr::curr::Limits::none())?;
-        Ok(Self::hash(&bytes))
+        Self::hash_xdr_streaming(value)
+    }
+
+    /// Compute the SHA-256 hash of XDR-encoded data using streaming serialization.
+    ///
+    /// Writes XDR directly into the SHA-256 hasher without allocating
+    /// an intermediate buffer. This is significantly faster for large
+    /// structures (e.g. transaction sets with thousands of entries).
+    pub fn hash_xdr_streaming<T: stellar_xdr::curr::WriteXdr>(
+        value: &T,
+    ) -> Result<Self, stellar_xdr::curr::Error> {
+        use sha2::{Digest, Sha256};
+        use stellar_xdr::curr::Limited;
+
+        struct Sha256Writer(Sha256);
+        impl std::io::Write for Sha256Writer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.update(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut writer = Sha256Writer(Sha256::new());
+        let mut limited = Limited::new(&mut writer, stellar_xdr::curr::Limits::none());
+        value.write_xdr(&mut limited)?;
+        let result = writer.0.finalize();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&result);
+        Ok(Self(bytes))
     }
 
     /// Returns a reference to the underlying 32-byte array.

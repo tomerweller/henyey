@@ -103,6 +103,9 @@ pub struct LedgerCloseData {
     /// correct ledger header hash. Validators sign their consensus values,
     /// so this is typically `Signed` for live network operation.
     pub stellar_value_ext: StellarValueExt,
+
+    /// Cached transaction set hash (computed once, reused).
+    cached_tx_set_hash: std::cell::OnceCell<Hash256>,
 }
 
 impl LedgerCloseData {
@@ -121,6 +124,7 @@ impl LedgerCloseData {
             scp_history: Vec::new(),
             prev_ledger_hash,
             stellar_value_ext: StellarValueExt::Basic,
+            cached_tx_set_hash: std::cell::OnceCell::new(),
         }
     }
 
@@ -158,7 +162,7 @@ impl LedgerCloseData {
 
     /// Get the transaction set hash.
     pub fn tx_set_hash(&self) -> Hash256 {
-        self.tx_set.hash()
+        *self.cached_tx_set_hash.get_or_init(|| self.tx_set.hash())
     }
 
     /// Check if there are any upgrades.
@@ -670,8 +674,11 @@ fn envelope_is_soroban(env: &TransactionEnvelope) -> bool {
 impl TransactionSetVariant {
     /// Parse the transaction set once, producing all views needed by `apply_transactions()`.
     pub fn prepare(&self) -> PreparedTxSet {
-        let hash = self.hash();
+        self.prepare_with_hash(self.hash())
+    }
 
+    /// Prepare with a pre-computed hash (avoids recomputing when cached).
+    pub fn prepare_with_hash(&self, hash: Hash256) -> PreparedTxSet {
         let (classic_txs, soroban_phase, all_txs) = match self {
             TransactionSetVariant::Classic(set) => {
                 let txs: Vec<TxWithFee> = set.txs.iter().cloned().map(|tx| (tx, None)).collect();

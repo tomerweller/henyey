@@ -3200,7 +3200,8 @@ impl<'a> LedgerCloseContext<'a> {
         use henyey_common::protocol::PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION;
 
         let prepare_start = std::time::Instant::now();
-        let prepared = self.close_data.tx_set.prepare();
+        let tx_set_hash = self.close_data.tx_set_hash();
+        let prepared = self.close_data.tx_set.prepare_with_hash(tx_set_hash);
         let prepare_us = prepare_start.elapsed().as_micros() as u64;
 
         if prepared.all_txs.is_empty() {
