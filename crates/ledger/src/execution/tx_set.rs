@@ -208,12 +208,14 @@ pub fn run_transactions_on_executor(
         let tx_prng_seed = sub_sha256(&soroban_base_prng_seed, tx_index as u32);
         // Execute with deduct_fee=false — fees were already pre-deducted above
         // (when deduct_fee=true) or not needed (when deduct_fee=false from caller).
-        let mut result = executor.execute_transaction_with_fee_mode(
+        let mut result = executor.execute_transaction_with_arc(
             snapshot,
-            tx,
+            Arc::clone(tx),
             tx_fee,
             Some(tx_prng_seed),
             false,
+            None,
+            true, // should_apply: always execute body in sequential path
         )?;
 
         // When fees were pre-charged (parallel path), the executor runs with
@@ -785,9 +787,9 @@ pub(super) fn execute_single_cluster(
         // after preParallelApply detected insufficient balance.
         let pre = &params.pre_charged_fees[local_idx];
         let exec_start = std::time::Instant::now();
-        let mut result = executor.execute_transaction_with_fee_mode_and_pre_state(
+        let mut result = executor.execute_transaction_with_arc(
             snapshot,
-            tx,
+            Arc::clone(tx),
             tx_fee,
             Some(tx_prng_seed),
             false,

@@ -2058,16 +2058,23 @@ impl TransactionExecutor {
         deduct_fee: bool,
         fee_source_pre_state: Option<LedgerEntry>,
     ) -> Result<std::result::Result<PreApplyResult, TransactionExecutionResult>> {
+        let tx_arc = Arc::new(tx_envelope.clone());
+        self.pre_apply_arc(snapshot, &tx_arc, base_fee, soroban_prng_seed, deduct_fee, fee_source_pre_state)
+    }
+
+    fn pre_apply_arc(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        tx_envelope: &Arc<TransactionEnvelope>,
+        base_fee: u32,
+        soroban_prng_seed: Option<[u8; 32]>,
+        deduct_fee: bool,
+        fee_source_pre_state: Option<LedgerEntry>,
+    ) -> Result<std::result::Result<PreApplyResult, TransactionExecutionResult>> {
         let tx_timing_start = std::time::Instant::now();
 
-        // For Soroban TXs, compute the max refundable fee BEFORE validation.
-        // In stellar-core, the RefundableFeeTracker is initialized in
-        // commonPreApply() before commonValid(), so even validation failures
-        // get the refundable fee subtracted from feeCharged via
-        // finalizeFeeRefund(). We need to replicate this by setting fee_refund
-        // on the failure result when validate_preconditions fails.
-        // Create the frame once and reuse for both soroban fee check and validation.
-        let frame = TransactionFrame::from_owned_with_network(tx_envelope.clone(), self.network_id);
+        // Create the frame once from Arc (cheap clone) and reuse for both soroban fee check and validation.
+        let frame = TransactionFrame::with_network(Arc::clone(tx_envelope), self.network_id);
 
         let soroban_max_refundable = {
             if frame.is_soroban() {
@@ -2103,8 +2110,8 @@ impl TransactionExecutor {
                 // though the TX failed. This matches stellar-core's
                 // commonPreApply which calls processSeqNum before returning.
                 if validation_failure.past_seq_check {
-                    let fail_frame = TransactionFrame::from_owned_with_network(
-                        tx_envelope.clone(),
+                    let fail_frame = TransactionFrame::with_network(
+                        Arc::clone(tx_envelope),
                         self.network_id,
                     );
                     let inner_source_id =
@@ -2550,9 +2557,28 @@ impl TransactionExecutor {
         fee_source_pre_state: Option<LedgerEntry>,
         should_apply: bool,
     ) -> Result<TransactionExecutionResult> {
+        let tx_arc = Arc::new(tx_envelope.clone());
+        self.execute_transaction_with_arc(
+            snapshot, tx_arc, base_fee, soroban_prng_seed,
+            deduct_fee, fee_source_pre_state, should_apply,
+        )
+    }
+
+    /// Execute a transaction from a shared Arc envelope (avoids cloning the envelope).
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_transaction_with_arc(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        tx_envelope: Arc<TransactionEnvelope>,
+        base_fee: u32,
+        soroban_prng_seed: Option<[u8; 32]>,
+        deduct_fee: bool,
+        fee_source_pre_state: Option<LedgerEntry>,
+        should_apply: bool,
+    ) -> Result<TransactionExecutionResult> {
         // Phase 1: Pre-apply (validate, charge fees, remove signers, bump seq)
-        let pre = match self.pre_apply(
-            snapshot, tx_envelope, base_fee,
+        let pre = match self.pre_apply_arc(
+            snapshot, &tx_envelope, base_fee,
             soroban_prng_seed, deduct_fee, fee_source_pre_state,
         )? {
             Ok(pre) => pre,
