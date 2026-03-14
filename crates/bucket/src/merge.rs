@@ -68,10 +68,10 @@ struct IncrementalMergeOutput {
 }
 
 impl IncrementalMergeOutput {
-    fn new() -> Self {
+    fn with_capacity(entry_count_hint: usize) -> Self {
         Self {
-            entries: Vec::new(),
-            key_index: HashMap::new(),
+            entries: Vec::with_capacity(entry_count_hint),
+            key_index: HashMap::with_capacity(entry_count_hint),
             hasher: Sha256::new(),
             xdr_buf: Vec::with_capacity(4096),
         }
@@ -251,7 +251,7 @@ fn merge_with_shadows_impl(
     let (_, output_meta) =
         build_output_metadata(old_meta.as_ref(), new_meta.as_ref(), max_protocol_version)?;
 
-    let mut merged = IncrementalMergeOutput::new();
+    let mut merged = IncrementalMergeOutput::with_capacity(old_bucket.len() + new_bucket.len());
 
     // Create shadow cursors for inline shadow checking.
     // For protocol >= 12 (V12, shadows removed), shadow_buckets is always

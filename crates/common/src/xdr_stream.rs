@@ -20,6 +20,27 @@ use std::path::Path;
 
 use stellar_xdr::curr::{Limits, ReadXdr, WriteXdr};
 
+/// Compute the XDR-encoded byte length of a value without heap allocation.
+///
+/// Uses a counting writer that discards output bytes, avoiding the `Vec<u8>`
+/// allocation that `to_xdr(Limits::none())` would perform. For values
+/// serialized only to measure their size (e.g., contract events, return values,
+/// ledger entry size validation), this is significantly faster.
+pub fn xdr_encoded_len(val: &impl WriteXdr) -> usize {
+    struct CountingWriter(usize);
+    impl Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut w = stellar_xdr::curr::Limited::new(CountingWriter(0), Limits::none());
+    val.write_xdr(&mut w).map(|_| w.inner.0).unwrap_or(0)
+}
+
 /// Serialize a value to XDR and write it as a size-prefixed frame.
 ///
 /// Returns the total number of bytes written (4-byte header + payload).

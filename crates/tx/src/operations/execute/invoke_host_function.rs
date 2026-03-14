@@ -11,22 +11,7 @@ use stellar_xdr::curr::{
 };
 
 use henyey_common::protocol::{protocol_version_is_before, ProtocolVersion};
-
-/// Compute the XDR-encoded byte length of a value without heap allocation.
-fn xdr_encoded_len(val: &impl WriteXdr) -> usize {
-    struct CountingWriter(usize);
-    impl std::io::Write for CountingWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 += buf.len();
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut w = stellar_xdr::curr::Limited::new(CountingWriter(0), Limits::none());
-    val.write_xdr(&mut w).map(|_| w.inner.0).unwrap_or(0)
-}
+use henyey_common::xdr_encoded_len;
 
 /// Check if a ledger key is for a Soroban entry.
 fn is_soroban_key(key: &LedgerKey) -> bool {

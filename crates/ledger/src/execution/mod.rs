@@ -1602,10 +1602,10 @@ impl TransactionExecutor {
     pub fn process_fee_only(
         &mut self,
         snapshot: &SnapshotHandle,
-        tx_envelope: &TransactionEnvelope,
+        tx_envelope: &Arc<TransactionEnvelope>,
         base_fee: u32,
     ) -> Result<(LedgerEntryChanges, i64)> {
-        let frame = TransactionFrame::from_owned_with_network(tx_envelope.clone(), self.network_id);
+        let frame = TransactionFrame::with_network(Arc::clone(tx_envelope), self.network_id);
         let fee_source_id = henyey_tx::muxed_to_account_id(&frame.fee_source_account());
         let inner_source_id = henyey_tx::muxed_to_account_id(&frame.inner_source_account());
 

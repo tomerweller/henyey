@@ -28,7 +28,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use stellar_xdr::curr::{Limited, Limits, StellarMessage, WriteXdr};
+use stellar_xdr::curr::{StellarMessage, WriteXdr};
 use tracing::{debug, trace, warn};
 
 /// Callback trait for SCP queue trimming decisions.
@@ -932,24 +932,9 @@ pub fn is_flow_controlled_message(msg: &StellarMessage) -> bool {
     )
 }
 
-/// A writer that counts bytes written without allocating.
-struct CountingWriter(u64);
-
-impl std::io::Write for CountingWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0 += buf.len() as u64;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 /// Get message body size in bytes without heap allocation.
 pub fn msg_body_size(msg: &StellarMessage) -> u64 {
-    let mut w = Limited::new(CountingWriter(0), Limits::none());
-    msg.write_xdr(&mut w).map(|_| w.inner.0).unwrap_or(0)
+    henyey_common::xdr_encoded_len(msg) as u64
 }
 
 /// RAII guard for flow control capacity tracking.

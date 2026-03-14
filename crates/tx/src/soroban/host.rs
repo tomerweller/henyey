@@ -43,24 +43,11 @@ use super::SorobanConfig;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 
-/// Compute the XDR-encoded byte length of a value without heap allocation.
-///
-/// Uses a counting writer that discards bytes, avoiding the `Vec<u8>` allocation
-/// that `to_xdr(Limits::none())` would perform. For values serialized only to
-/// measure their size (e.g., contract events, return values), this is ~3-5x faster.
+use henyey_common::xdr_encoded_len as xdr_encoded_len_usize;
+
+/// Compute the XDR-encoded byte length as u32 (convenience wrapper).
 fn xdr_encoded_len(val: &impl WriteXdr) -> u32 {
-    struct CountingWriter(u32);
-    impl std::io::Write for CountingWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 += buf.len() as u32;
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut w = stellar_xdr::curr::Limited::new(CountingWriter(0), Limits::none());
-    val.write_xdr(&mut w).map(|_| w.inner.0).unwrap_or(0)
+    xdr_encoded_len_usize(val) as u32
 }
 
 /// Return type for `get_archived_with_restore_info` (p24 version).

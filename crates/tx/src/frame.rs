@@ -114,11 +114,6 @@ impl TransactionFrame {
         &self.envelope
     }
 
-    /// Get the shared Arc reference to the envelope.
-    pub fn envelope_arc(&self) -> &Arc<TransactionEnvelope> {
-        &self.envelope
-    }
-
     /// Consume the frame and return the envelope.
     pub fn into_envelope(self) -> TransactionEnvelope {
         Arc::try_unwrap(self.envelope).unwrap_or_else(|arc| (*arc).clone())
