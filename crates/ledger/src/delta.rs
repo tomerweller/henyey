@@ -565,8 +565,11 @@ impl LedgerDelta {
     ///
     /// This is useful when combining changes from multiple operations.
     pub fn merge(&mut self, other: LedgerDelta) -> Result<()> {
+        // Build a map from change_order for O(1) lookup, consuming `other` by value
+        // to avoid cloning entries.
+        let mut other_changes = other.changes;
         for key_bytes in other.change_order {
-            if let Some(change) = other.changes.get(&key_bytes) {
+            if let Some(change) = other_changes.remove(&key_bytes) {
                 match change {
                     EntryChange::Created(entry) => {
                         if let Some(existing) = self.changes.get(&key_bytes) {
@@ -577,7 +580,7 @@ impl LedgerDelta {
                                         key_bytes,
                                         EntryChange::Updated {
                                             previous: previous.clone(),
-                                            current: Box::new(entry.clone()),
+                                            current: Box::new(entry),
                                         },
                                     );
                                 }
@@ -586,7 +589,7 @@ impl LedgerDelta {
                                     // same entry that an earlier stage already restored
                                     // from the hot archive.  Keep the later value.
                                     self.changes
-                                        .insert(key_bytes, EntryChange::Created(entry.clone()));
+                                        .insert(key_bytes, EntryChange::Created(entry));
                                 }
                                 EntryChange::Updated { .. } => {
                                     return Err(LedgerError::Internal(
@@ -597,7 +600,7 @@ impl LedgerDelta {
                         } else {
                             self.change_order.push(key_bytes.clone());
                             self.changes
-                                .insert(key_bytes, EntryChange::Created(entry.clone()));
+                                .insert(key_bytes, EntryChange::Created(entry));
                         }
                     }
                     EntryChange::Updated { previous, current } => {
@@ -606,7 +609,7 @@ impl LedgerDelta {
                                 EntryChange::Created(_) => {
                                     self.changes.insert(
                                         key_bytes,
-                                        EntryChange::Created(current.as_ref().clone()),
+                                        EntryChange::Created(*current),
                                     );
                                 }
                                 EntryChange::Updated { previous: orig, .. } => {
@@ -614,7 +617,7 @@ impl LedgerDelta {
                                         key_bytes,
                                         EntryChange::Updated {
                                             previous: orig.clone(),
-                                            current: current.clone(),
+                                            current,
                                         },
                                     );
                                 }
@@ -633,8 +636,8 @@ impl LedgerDelta {
                             self.changes.insert(
                                 key_bytes,
                                 EntryChange::Updated {
-                                    previous: previous.clone(),
-                                    current: current.clone(),
+                                    previous,
+                                    current,
                                 },
                             );
                         }
@@ -667,7 +670,7 @@ impl LedgerDelta {
                                     // Both previous values should be identical since both
                                     // clusters loaded from the same snapshot.
                                     debug_assert!(
-                                        existing_prev == previous,
+                                        existing_prev == &previous,
                                         "merge: Deleted+Deleted previous values differ for same key"
                                     );
                                 }
@@ -677,7 +680,7 @@ impl LedgerDelta {
                             self.changes.insert(
                                 key_bytes,
                                 EntryChange::Deleted {
-                                    previous: previous.clone(),
+                                    previous,
                                 },
                             );
                         }

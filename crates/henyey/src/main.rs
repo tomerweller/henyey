@@ -652,8 +652,8 @@ enum Commands {
         #[arg(long, default_value = "16")]
         clusters: u32,
 
-        /// Total SAC transfer TXs for single-shot mode (default: 25000)
-        #[arg(long, default_value = "25000")]
+        /// Total SAC transfer TXs for single-shot mode (default: 50000)
+        #[arg(long, default_value = "50000")]
         tx_count: u32,
 
         /// Number of iterations for single-shot mode (default: 10)

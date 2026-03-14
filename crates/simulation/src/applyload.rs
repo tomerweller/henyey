@@ -182,7 +182,7 @@ impl Default for ApplyLoadConfig {
             num_disk_read_entries: Vec::new(),
             num_disk_read_entries_distribution: Vec::new(),
             max_sac_tps_min_tps: 100,
-            max_sac_tps_max_tps: 10_000,
+            max_sac_tps_max_tps: 15_000,
             max_sac_tps_target_close_time_ms: 5000.0,
             batch_sac_count: 1,
             num_ledgers: 10,
