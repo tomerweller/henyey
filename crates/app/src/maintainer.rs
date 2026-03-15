@@ -307,7 +307,7 @@ impl Maintainer {
         }
 
         let elapsed = start.elapsed();
-        if elapsed > Duration::from_secs(2) {
+        if elapsed > Duration::from_secs(10) {
             warn!(
                 elapsed_ms = elapsed.as_millis(),
                 "Maintenance took too long; consider increasing AUTOMATIC_MAINTENANCE_COUNT \

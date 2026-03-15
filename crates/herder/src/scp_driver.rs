@@ -1589,16 +1589,31 @@ impl ScpDriver {
         let tx_set_count = self.tx_set_cache.len();
         let pending_count = self.pending_tx_sets.len();
         let externalized_count = self.externalized.read().len();
+        let qs_count = self.quorum_sets.len();
+        let qs_hash_count = self.quorum_sets_by_hash.len();
 
         self.tx_set_cache.clear();
         self.pending_tx_sets.clear();
         self.externalized.write().clear();
 
-        if tx_set_count > 0 || pending_count > 0 || externalized_count > 0 {
+        // Clear quorum set caches, preserving only the local node's entry.
+        let local_key: [u8; 32] = *self.config.node_id.as_bytes();
+        let local_qs = self.local_quorum_set.read().clone();
+        self.quorum_sets.clear();
+        self.quorum_sets_by_hash.clear();
+        if let Some(qs) = local_qs {
+            let hash = hash_quorum_set(&qs);
+            self.quorum_sets.insert(local_key, qs.clone());
+            self.quorum_sets_by_hash.insert(hash, qs);
+        }
+
+        if tx_set_count > 0 || pending_count > 0 || externalized_count > 0 || qs_count > 1 {
             tracing::info!(
                 tx_set_count,
                 pending_count,
                 externalized_count,
+                qs_count,
+                qs_hash_count,
                 "Cleared scp_driver caches"
             );
         }
@@ -1657,6 +1672,34 @@ impl ScpDriver {
 
         // Clean up pending tx set requests for old slots
         self.cleanup_old_pending_slots(slot);
+
+        // Clean up quorum set caches to prevent unbounded growth.
+        // In stellar-core these use weak_ptr and expire automatically;
+        // here we clear and re-insert only the local node's quorum set.
+        // Missing entries will be re-fetched from peers on demand via
+        // the pending_quorum_sets mechanism.
+        let local_key: [u8; 32] = *self.config.node_id.as_bytes();
+        let local_qs = self.local_quorum_set.read().clone();
+
+        let prev_by_node = self.quorum_sets.len();
+        let prev_by_hash = self.quorum_sets_by_hash.len();
+
+        self.quorum_sets.clear();
+        self.quorum_sets_by_hash.clear();
+
+        if let Some(qs) = local_qs {
+            let hash = hash_quorum_set(&qs);
+            self.quorum_sets.insert(local_key, qs.clone());
+            self.quorum_sets_by_hash.insert(hash, qs);
+        }
+
+        if prev_by_node > 1 || prev_by_hash > 1 {
+            tracing::debug!(
+                prev_by_node,
+                prev_by_hash,
+                "Cleared quorum set caches during slot purge"
+            );
+        }
     }
 
     /// Get local SCP envelopes for a slot.
