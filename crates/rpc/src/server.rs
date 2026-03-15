@@ -124,13 +124,26 @@ async fn fee_window_poller(
             }
         };
 
-        for (_seq, meta_bytes) in &metas {
+        let mut gap_found = false;
+        for (i, (_seq, meta_bytes)) in metas.iter().enumerate() {
             if let Err(e) = windows.ingest_ledger_close_meta(meta_bytes) {
-                tracing::warn!(error = %e, "Failed to ingest fees from LCM");
-                // On contiguity errors, reset and try again next iteration
+                tracing::warn!(error = %e, "Gap in LCM data, resetting fee window to post-gap range");
+                // Gap detected — reset and re-ingest from this point forward
                 windows.reset();
+                gap_found = true;
+                for (_seq2, meta_bytes2) in &metas[i..] {
+                    if let Err(e2) = windows.ingest_ledger_close_meta(meta_bytes2) {
+                        tracing::warn!(error = %e2, "Multiple gaps in LCM data");
+                        windows.reset();
+                        break;
+                    }
+                }
                 break;
             }
+        }
+        if gap_found {
+            // Already handled the gap above, continue to next poll cycle
+            continue;
         }
     }
 }
@@ -158,8 +171,23 @@ fn bulk_load_fees(app: &App, windows: &FeeWindows, retention: u32) -> Result<(),
         "Bulk-loading fee window from DB"
     );
 
-    for (_seq, meta_bytes) in &metas {
-        windows.ingest_ledger_close_meta(meta_bytes)?;
+    // Ingest metas, skipping over any gaps (e.g., from catchup).
+    // Only keep the contiguous suffix so the window starts clean.
+    for (i, (_seq, meta_bytes)) in metas.iter().enumerate() {
+        if let Err(_e) = windows.ingest_ledger_close_meta(meta_bytes) {
+            // Gap detected — reset and re-ingest from this point forward.
+            // This discards pre-gap data and starts the window at the post-gap
+            // contiguous range.
+            windows.reset();
+            // Re-ingest remaining entries from current position
+            for (_seq2, meta_bytes2) in &metas[i..] {
+                if let Err(e2) = windows.ingest_ledger_close_meta(meta_bytes2) {
+                    // Another gap in the suffix — give up on bulk load
+                    return Err(format!("multiple gaps in fee window data: {e2}"));
+                }
+            }
+            return Ok(());
+        }
     }
 
     Ok(())

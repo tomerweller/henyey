@@ -612,4 +612,45 @@ mod tests {
         );
         assert_eq!(count_ops_from_result(&TransactionResultResult::TxBadSeq), 0);
     }
+
+    #[test]
+    fn test_ring_buffer_gap_detection() {
+        // Simulate a catchup gap: ledgers 10-12, then gap, then 20-22
+        let mut buf = LedgerBucketWindow::new(100);
+        buf.append(10, vec![100]).unwrap();
+        buf.append(11, vec![200]).unwrap();
+        buf.append(12, vec![300]).unwrap();
+
+        // Gap: trying to append 20 should fail
+        let err = buf.append(20, vec![400]).unwrap_err();
+        assert!(err.contains("not contiguous"));
+        assert!(err.contains("expected 13 but got 20"));
+
+        // After reset, can start fresh from the post-gap range
+        buf.reset();
+        assert_eq!(buf.len(), 0);
+        buf.append(20, vec![400]).unwrap();
+        buf.append(21, vec![500]).unwrap();
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf.latest_ledger(), 21);
+    }
+
+    #[test]
+    fn test_fee_windows_reset_on_gap() {
+        let fw = FeeWindows::new(100);
+
+        // Pre-gap range
+        fw.classic.append(10, vec![100]).unwrap();
+        fw.soroban.append(10, vec![]).unwrap();
+        assert_eq!(fw.latest_ledger(), 10);
+
+        // Reset simulates the gap-handling behavior
+        fw.reset();
+        assert_eq!(fw.latest_ledger(), 0);
+
+        // Post-gap range works fine
+        fw.classic.append(20, vec![200]).unwrap();
+        fw.soroban.append(20, vec![]).unwrap();
+        assert_eq!(fw.latest_ledger(), 20);
+    }
 }
