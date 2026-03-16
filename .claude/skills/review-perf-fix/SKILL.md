@@ -109,6 +109,14 @@ Use subagents (Task tool with `explore` type) to find:
 
 ## Phase 2: Performance Measurement
 
+**IMPORTANT — Measurement Isolation**: Baseline and without-fix measurements
+MUST be taken sequentially in the same session. Do NOT reuse baseline
+measurements from a prior session or a different day. Environmental variance
+(CPU thermals, background load, OS scheduling) can cause 5–7% drift between
+sessions on the same machine with the same binary. Always measure:
+baseline → without-fix (or vice versa) back-to-back, with no significant
+time gap between them.
+
 ### Step 6: Build Baseline Binary
 
 Build the current HEAD as the baseline:
@@ -233,6 +241,54 @@ condition concerns might be UNNECESSARY. Explain your reasoning.
 
 ---
 
+## Phase 4: Revert Recommendation (MARGINAL commits only)
+
+For each commit with a **MARGINAL** verdict, assess whether it should be
+reverted based on complexity cost vs. the value it provides.
+
+### Step 14: Assess Complexity Cost
+
+Evaluate:
+
+- **Lines added/removed**: Net lines of code added. Large positive deltas
+  increase maintenance burden.
+- **Conceptual complexity**: New types, traits, abstractions, threading
+  patterns, lifetime annotations, or API surface. Code that requires
+  understanding a new concept to maintain is more expensive than mechanical
+  changes.
+- **Signature pollution**: Functions that gained new parameters (especially
+  threaded-through `Option<&Cache>` patterns) impose cost on every caller.
+- **Maintenance burden**: Will this code need updates when surrounding code
+  changes? Does it add invariants that must be maintained?
+
+### Step 15: Check Supersession
+
+Determine whether a later commit in the series (or a subsequent change)
+makes this optimization redundant:
+
+- Does a later commit solve the same problem more completely?
+- Does a later commit bypass the code path this optimization targets?
+- If superseded, would removing this commit break the later one?
+
+### Step 16: Render Revert Recommendation
+
+Categorize each MARGINAL commit:
+
+- **REVERT**: Complexity clearly outweighs value. The optimization is
+  superseded, adds significant code surface, or introduces patterns that
+  complicate maintenance. Remove it.
+- **CONSIDER REVERTING**: Borderline. The optimization is partially
+  superseded or has moderate complexity for no measurable gain. Decision
+  depends on whether the non-benchmark production path exercises the code.
+- **KEEP**: Low complexity (trivial changes, net-deletion, or purely
+  mechanical improvements). The code is better with the change regardless
+  of performance. Good Rust idioms, code cleanup, or production-path value.
+
+Include a summary table grouping all MARGINAL commits by recommendation,
+with commit hash, line counts, and a one-line reason for each.
+
+---
+
 ## Output Format
 
 For each commit, produce:
@@ -278,6 +334,12 @@ If none: "No similar opportunities identified.")
 
 ## Recommendations
 (Prioritized follow-up actions, if any.)
+
+## Revert Recommendation (MARGINAL only)
+- **Complexity cost**: lines, abstractions, signature pollution
+- **Superseded by**: commit(s) that make this redundant, or "N/A"
+- **Recommendation**: REVERT / CONSIDER REVERTING / KEEP
+- **Rationale**: 1-2 sentences
 ```
 
 ### Batch Summary (range mode only)
@@ -293,6 +355,14 @@ After all individual reviews, append:
 | 2 | def456 | ... | ... | ... | ... | ... | ... |
 
 **Cumulative**: If all UNNECESSARY fixes were removed, estimated TPS would be ~X.
+
+# Revert Recommendations (MARGINAL commits)
+
+| Recommendation | Commit | # | Lines | Reason |
+|----------------|--------|---|-------|--------|
+| REVERT | abc123 | 1 | +134/−43 | High signature pollution, superseded by #15 |
+| CONSIDER REVERTING | ... | ... | ... | ... |
+| KEEP | ... | ... | ... | ... |
 ```
 
 ---
@@ -352,8 +422,12 @@ When all reviews are complete (or on abort):
 - Do not speculate — read the code until you understand the optimization.
 - The benchmark is noisy. A <1% delta with overlapping run ranges is
   indistinguishable from noise. Say so explicitly rather than claiming a gain.
-- For batch reviews, reuse the baseline binary and baseline TPS across commits
-  (only build the baseline once). Each commit gets its own without-fix binary.
+- For batch reviews, reuse the baseline binary across commits but
+  **re-measure baseline TPS** at the start of each measurement session.
+  If the session spans multiple hours or days, re-measure baseline before
+  each batch of without-fix measurements. Each commit gets its own
+  without-fix binary. Compare each without-fix result against the baseline
+  measured in the same session.
 - If a commit contains both perf and non-perf changes, isolate only the
   perf-relevant hunks when generating the reverse patch.
 - Use subagents for codebase-wide searches to keep analysis thorough without

@@ -80,6 +80,52 @@ uncertainty is too high to distinguish individual contributions.
 **Verdict summary**: 7 ESSENTIAL, 2 WORTHWHILE, 16 MARGINAL, 1 SUPERSEDED, 1 unable to isolate.
 All 27 commits are **SOUND** — no correctness concerns found.
 
+## Revert Recommendations
+
+For the 15 MARGINAL commits, we assessed whether each should be reverted based
+on complexity cost (lines added, conceptual complexity, maintenance burden) and
+whether it has been superseded by later commits. The three categories are:
+
+- **REVERT**: Complexity outweighs value. Remove.
+- **CONSIDER REVERTING**: Borderline — superseded or moderate complexity for no gain. Review case-by-case.
+- **KEEP**: Low complexity, good code quality, or provides production-path value even without benchmark gain.
+
+### REVERT (4 commits)
+
+| Commit | # | Lines | Reason |
+|--------|---|-------|--------|
+| `0edb0d4` | 4 | +236/−77 | Splits 3 maps into 6 with ~90 lines of routing helpers and duplicated rollback logic. Highest-complexity MARGINAL commit. Targets offer-heavy ledgers but benchmark has no offers. |
+| `aeea796` | 21 | +150/−38 | Manual `std::thread::scope` parallelization of TX hash computation. Superseded by #27's `prepare_presorted` which skips hashing entirely. Adds concurrency complexity for no measured gain. |
+| `f901afb` | 1 | +134/−43 | Threads `Option<&TtlKeyCache>` through ~15 function signatures across 6 files. Per-TX cache rebuild offsets gains. All value comes from #15 (3 lines) which depends on this. |
+| `e7fde6b` | 15 | +3/−2 | Depends on #1 — reuses TTL cache across TXs. If #1 is reverted, this must be reverted too. On its own: trivially simple, but without #1 it has no foundation. |
+
+### CONSIDER REVERTING (4 commits)
+
+| Commit | # | Lines | Reason |
+|--------|---|-------|--------|
+| `beba273` | 10 | +256/−38 | ~60% is perf-logging infrastructure (useful but orthogonal to the optimization). Hash pre-computation table superseded by #27's `prepare_presorted`. Consider extracting the perf logging into a separate commit and reverting the hash table. |
+| `98bbce4` | 14 | +93/−59 | Structural key comparison for bucket dedup via sort+dedup. Superseded by #25's `add_batch_unique` which skips dedup entirely on the benchmark path. Still useful for non-benchmark paths — keep if those paths are exercised in production. |
+| `1e915d7` | 18 | +80/−15 | Introduces `IncrementalMergeOutput` abstraction for streaming merge hashing. Adds a new struct/API for no measured gain. The streaming hash pattern from #13 already addresses the general case. |
+| `bae9e05` | 13 | +43/−5 | `Sha256Writer` + `OnceCell` TX set hash caching. The `Sha256Writer` is reused by #24, so reverting requires checking that dependency. Moderate complexity for no gain, but not harmful. |
+
+### KEEP (7 commits)
+
+| Commit | # | Lines | Reason |
+|--------|---|-------|--------|
+| `3b48532` | 3 | +83/−227 | Net −144 lines. Pure cleanup: removes dead debug logging, simplifies data structures. Code is better after this commit regardless of performance. |
+| `7460dd7` | 8 | +233/−194 | Mechanical `.clone()` removal. More idiomatic Rust, better move semantics. Net +39 lines but purely mechanical. |
+| `b74e111` | 2 | +108/−93 | `DeltaSlice<'a>` zero-copy abstraction. Genuine API improvement — callers work with slices instead of cloned Vecs. Savepoint skip superseded by #7 but slice type is still valuable. |
+| `d95e7e2` | 6 | +100/−60 | Skip ed25519 point decompression on cache hits. Architecturally correct (matches stellar-core), simplifies call sites by passing raw bytes. |
+| `f0fabc5` | 11 | +72/−28 | `sort_by_cached_key` in TX set builder. Idiomatic Rust stdlib usage. Essential for production herder path even though benchmark bypasses it. |
+| `066299f` | 19 | +68/−53 | `CountingWriter` for XDR size checks. Eliminates 8 allocation-to-measure sites. Clean API improvement. |
+| `a0cdeae` | 9 | +3/−2 | 5-line change: SHA-256 → BLAKE2 for cache key. Trivial, matches stellar-core, zero maintenance cost. |
+
+### Summary
+
+- **4 REVERT** commits total **+523/−160 lines** of complexity with no measured gain. Removing them simplifies the codebase significantly.
+- **4 CONSIDER REVERTING** commits total **+472/−117 lines**, largely superseded by later commits. Case-by-case decision based on production path usage.
+- **7 KEEP** commits are net-positive for code quality regardless of performance.
+
 ## Summary Table
 
 | # | Commit | Lines | Description |
