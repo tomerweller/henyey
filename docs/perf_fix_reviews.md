@@ -42,7 +42,7 @@ compares measurements taken under similar conditions.
 | 1 | `f901afb` | SOUND | 11810 | 11981 | −1.4% | MARGINAL |
 | 2 | `b74e111` | SOUND | 11810 | 12145 | −2.8% | MARGINAL |
 | 3 | `3b48532` | SOUND | 11810 | 12321 | −4.1% | MARGINAL |
-| 4 | `0edb0d4` | SOUND | 11810 | 12513 | −5.6% | MARGINAL |
+| 4 | `0edb0d4` | SOUND | — | — | — | SUPERSEDED |
 | 5 | `87e7c2e` | SOUND | 11810 | 10189 | +15.9% | **ESSENTIAL** |
 | 6 | `d95e7e2` | SOUND | 11810 | 12264 | −3.7% | MARGINAL |
 | 7 | `cd10876` | SOUND | 11810 | ~357† | ~3200% | **ESSENTIAL** |
@@ -77,41 +77,79 @@ commits shift to small positive deltas (+2–5%). This suggests many of them
 *do* contribute measurably, but the effect is small and the measurement
 uncertainty is too high to distinguish individual contributions.
 
-**Verdict summary**: 7 ESSENTIAL, 2 WORTHWHILE, 16 MARGINAL, 1 SUPERSEDED, 1 unable to isolate.
+**Verdict summary**: 7 ESSENTIAL, 3 WORTHWHILE, 15 MARGINAL, 2 SUPERSEDED.
 All 27 commits are **SOUND** — no correctness concerns found.
+
+## Phase 4 Re-measurement (Session `7212e6cb`)
+
+The original Phase 2/3 measurements suffered from 5-7% environmental drift between
+baseline and "without" runs (a background mainnet validator consumed variable CPU).
+Phase 4 re-measures all REVERT and CONSIDER REVERTING commits with strict protocol:
+
+- **Same-session baseline**: 3 runs, take median, measured immediately before/after each commit
+- **Surgical isolation**: Remove the optimization from HEAD, build, benchmark, restore
+- **Baseline**: **12224 TPS** (runs: 12194, 12269, 12224; confirmed at 12231, 12257, 12179)
+- **Artifacts**: `~/data/7212e6cb/`
+
+### Phase 4 Results
+
+| # | Commit | Without TPS | Baseline | Delta | Phase 2 Delta | Verdict |
+|---|--------|-------------|----------|-------|---------------|---------|
+| 21 | `aeea796` | 12186 | 12224 | **+0.3%** | −1.2% | NOISE — no measurable gain |
+| 15 | `e7fde6b` | 12073 | 12224 | **+1.2%** | −2.3% | NOISE/MARGINAL — borderline |
+| 1 | `f901afb` | 12075 | 12224 | **+1.2%** | −1.4% | NOISE/MARGINAL — borderline |
+| 14 | `98bbce4` | 12193 | 12224 | **+0.3%** | −2.7% | NOISE — no measurable gain |
+| 18 | `1e915d7` | 12291 | 12224 | **−0.5%** | +2.9% | NOISE — no measurable gain |
+| 13 | `bae9e05` | 12164 | 12224 | **+0.5%** | −2.1% | NOISE — no measurable gain |
+| 10 | `beba273` | — | — | — | −2.7% | NOT ISOLATABLE — qualitative only |
+| 4 | `0edb0d4` | — | — | — | −5.6% | SUPERSEDED by OfferStore |
+
+**Key finding**: With same-session baseline measurement, **none** of the MARGINAL
+commits show a statistically significant gain. The largest delta is +1.2% for
+commits #1 and #15, which is at the boundary of measurement noise (~2-3%).
+
+**Benchmark path caveat**: The `apply-load` benchmark uses `prepare_presorted`
+(from commit #27) which **skips hashing and sorting**. Commits that optimize the
+`prepare_with_hash` / `sort_parallel_stages` path (#21 parallel hashing, #10 hash
+pre-computation) are invisible to the benchmark. Their value is on the production
+path only.
 
 ## Revert Recommendations
 
 For the 15 MARGINAL commits, we assessed whether each should be reverted based
 on complexity cost (lines added, conceptual complexity, maintenance burden) and
-whether it has been superseded by later commits. The three categories are:
+whether it has been superseded by later commits. Phase 4 re-measurement with
+same-session baselines showed that **none** of the MARGINAL commits have a
+statistically significant benchmark gain. All deltas are within noise (≤1.2%).
+
+The three categories are:
 
 - **REVERT**: Complexity outweighs value. Remove.
-- **CONSIDER REVERTING**: Borderline — superseded or moderate complexity for no gain. Review case-by-case.
+- **CONSIDER REVERTING**: Borderline — moderate complexity for no measured gain. Review case-by-case.
 - **KEEP**: Low complexity, good code quality, or provides production-path value even without benchmark gain.
 
-### REVERT (4 commits)
+### REVERT (3 commits)
+
+| Commit | # | Lines | Phase 4 Δ | Reason |
+|--------|---|-------|-----------|--------|
+| `aeea796` | 21 | +150/−38 | +0.3% (noise) | Manual `std::thread::scope` parallelization of TX hash computation. Superseded by #27's `prepare_presorted` which skips hashing entirely. Adds concurrency complexity for no measured gain on either benchmark or production path. |
+| `1e915d7` | 18 | +80/−15 | −0.5% (noise) | `IncrementalMergeOutput` abstraction for streaming merge hashing. Adds a new struct/API layer with no measured gain. The streaming hash pattern from #13 already handles the general case. |
+| `98bbce4` | 14 | +93/−59 | +0.3% (noise) | Structural key comparison for bucket dedup via sort+dedup. Superseded by #25's `add_batch_unique` which skips dedup on the hot path. The old HashMap dedup at line 1072 is kept as dead code — reverting is mechanical. |
+
+### CONSIDER REVERTING (3 commits)
+
+| Commit | # | Lines | Phase 4 Δ | Reason |
+|--------|---|-------|-----------|--------|
+| `f901afb` | 1 | +134/−43 | +1.2% (borderline) | Threads `Option<&TtlKeyCache>` through ~15 function signatures across 6 files. Phase 4 shows +1.2% gain — borderline significant. Combined with #15 (which depends on it), the pair contributes ~1.2%. The signature threading complexity is the main cost. |
+| `e7fde6b` | 15 | +3/−2 | +1.2% (borderline) | Reuses TTL cache across TXs. Depends on #1 — if #1 is reverted, this must go too. Trivially simple on its own, but the measured benefit (+1.2%) is borderline. |
+| `beba273` | 10 | +256/−38 | not isolatable | ~60% is perf-logging infrastructure. Hash pre-computation targets production `prepare_with_hash` path (bypassed by benchmark). Cannot cleanly measure. Consider extracting perf logging and reverting hash table. |
+
+### KEEP (9 commits — includes #4 and #13 moved from prior categories)
 
 | Commit | # | Lines | Reason |
 |--------|---|-------|--------|
-| `0edb0d4` | 4 | +236/−77 | Splits 3 maps into 6 with ~90 lines of routing helpers and duplicated rollback logic. Highest-complexity MARGINAL commit. Targets offer-heavy ledgers but benchmark has no offers. |
-| `aeea796` | 21 | +150/−38 | Manual `std::thread::scope` parallelization of TX hash computation. Superseded by #27's `prepare_presorted` which skips hashing entirely. Adds concurrency complexity for no measured gain. |
-| `f901afb` | 1 | +134/−43 | Threads `Option<&TtlKeyCache>` through ~15 function signatures across 6 files. Per-TX cache rebuild offsets gains. All value comes from #15 (3 lines) which depends on this. |
-| `e7fde6b` | 15 | +3/−2 | Depends on #1 — reuses TTL cache across TXs. If #1 is reverted, this must be reverted too. On its own: trivially simple, but without #1 it has no foundation. |
-
-### CONSIDER REVERTING (4 commits)
-
-| Commit | # | Lines | Reason |
-|--------|---|-------|--------|
-| `beba273` | 10 | +256/−38 | ~60% is perf-logging infrastructure (useful but orthogonal to the optimization). Hash pre-computation table superseded by #27's `prepare_presorted`. Consider extracting the perf logging into a separate commit and reverting the hash table. |
-| `98bbce4` | 14 | +93/−59 | Structural key comparison for bucket dedup via sort+dedup. Superseded by #25's `add_batch_unique` which skips dedup entirely on the benchmark path. Still useful for non-benchmark paths — keep if those paths are exercised in production. |
-| `1e915d7` | 18 | +80/−15 | Introduces `IncrementalMergeOutput` abstraction for streaming merge hashing. Adds a new struct/API for no measured gain. The streaming hash pattern from #13 already addresses the general case. |
-| `bae9e05` | 13 | +43/−5 | `Sha256Writer` + `OnceCell` TX set hash caching. The `Sha256Writer` is reused by #24, so reverting requires checking that dependency. Moderate complexity for no gain, but not harmful. |
-
-### KEEP (7 commits)
-
-| Commit | # | Lines | Reason |
-|--------|---|-------|--------|
+| `0edb0d4` | 4 | +236/−77 | **SUPERSEDED** — entirely replaced by OfferStore. Code is dead but harmless; will be removed when OfferStore lands. |
+| `bae9e05` | 13 | +43/−5 | Phase 4: +0.5% (noise). But `Sha256Writer` is reused by #24 (WORTHWHILE). `OnceCell` TX set hash caching provides correctness value on production path. Low complexity, keep. |
 | `3b48532` | 3 | +83/−227 | Net −144 lines. Pure cleanup: removes dead debug logging, simplifies data structures. Code is better after this commit regardless of performance. |
 | `7460dd7` | 8 | +233/−194 | Mechanical `.clone()` removal. More idiomatic Rust, better move semantics. Net +39 lines but purely mechanical. |
 | `b74e111` | 2 | +108/−93 | `DeltaSlice<'a>` zero-copy abstraction. Genuine API improvement — callers work with slices instead of cloned Vecs. Savepoint skip superseded by #7 but slice type is still valuable. |
@@ -122,9 +160,9 @@ whether it has been superseded by later commits. The three categories are:
 
 ### Summary
 
-- **4 REVERT** commits total **+523/−160 lines** of complexity with no measured gain. Removing them simplifies the codebase significantly.
-- **4 CONSIDER REVERTING** commits total **+472/−117 lines**, largely superseded by later commits. Case-by-case decision based on production path usage.
-- **7 KEEP** commits are net-positive for code quality regardless of performance.
+- **3 REVERT** commits total **+323/−112 lines** of complexity with no measured gain. Removing them simplifies the codebase.
+- **3 CONSIDER REVERTING** commits total **+393/−83 lines**. Commits #1+#15 show borderline +1.2% gain — keep if the 25-signature threading complexity is acceptable. #10 cannot be measured.
+- **9 KEEP** commits are net-positive for code quality regardless of performance (includes 2 SUPERSEDED).
 
 ## Summary Table
 
@@ -182,6 +220,7 @@ whether it has been superseded by later commits. The three categories are:
 - **Baseline (HEAD)**: 11810 TPS (runs: 11792, 11810, 11917)
 - **Without fix**: 11981 TPS (runs: 11873, 11981, 12085)
 - **Delta**: −171 TPS (−1.4%)
+- **Phase 4 re-measurement** (session `7212e6cb`): Without: 12075 (runs: 12113, 12075, 12026), Baseline: 12224 → **+1.2% (borderline)**. Surgical isolation: made `get_or_compute_key_hash` always ignore the cache (bypass lookup, always compute). Same-session measurement shows a small but borderline gain.
 - **Measurement notes**: Negative delta means removing the optimization yielded *higher* TPS, but the delta is well within benchmark noise (~3-5%). The result is indistinguishable from no change. Subsequent commit #15 (`e7fde6b`) extends this cache to persist across TXs; the per-TX cache in this commit alone has minimal impact because the cost of building the `HashMap` on each TX roughly offsets the saved hash computations.
 
 #### Necessity Judgment
@@ -301,7 +340,8 @@ No similar opportunities identified. The debug logging patterns were specific to
 - **TPS gain**: −5.6% (at edge of noise, no offers in benchmark)
 - **Complexity**: +236/−77 lines, 3 files, adds 6 new map fields + 9 routing methods
 - **Risk**: Low (SOUND correctness)
-- **Verdict**: **MARGINAL**
+- **Verdict**: **SUPERSEDED**
+- **Phase 4 note**: The split-map optimization has been entirely replaced by the OfferStore implementation. The offer-specific and non-offer map split is now dead code. Will be removed when OfferStore lands as the production offer management solution.
 - **Rationale**: The optimization targets a real production scenario (offer-heavy ledgers) but the benchmark workload has no offers, making the gain unmeasurable. The split-map approach adds significant code surface area (9 routing methods, split rollback logic). For production workloads with offers, this would be beneficial. For the benchmark workload, it's pure complexity.
 
 #### Similar Opportunities
@@ -517,6 +557,7 @@ No similar opportunities — this is the only internal hash computation that was
 - **Baseline (HEAD)**: 11810 TPS (runs: 11792, 11810, 11917)
 - **Without fix**: 12137 TPS (runs: 11982, 12146, 12137)
 - **Delta**: −327 TPS (−2.7%)
+- **Phase 4 assessment** (session `7212e6cb`): **NOT ISOLATABLE** — hash pre-computation woven into production path (`prepare_with_hash`) and performance logging across 5 files (~130 lines). Cannot safely remove. Benchmark uses `prepare_presorted` which bypasses this path entirely, so the optimization is invisible to the benchmark but important for production.
 - **Measurement notes**: Within noise. The hash precomputation was a huge win in the original commit (+29% TPS at the time) because `prepare()` was doing O(n log n) hash recomputations. However, subsequent commits (#11's `sort_by_cached_key` and #27's `prepare_presorted`) largely eliminated redundant hashing in the sort path, making this commit's precomputation table redundant for the current benchmark. The prepare phase is no longer the bottleneck it was.
 
 #### Necessity Judgment
@@ -623,6 +664,7 @@ Addressed by the subsequent commit that derived `Ord` for all XDR types.
 - **Baseline (HEAD)**: 11810 TPS (runs: 11792, 11810, 11917)
 - **Without fix**: 12065 TPS (runs: 12065, 12030, 12208)
 - **Delta**: −255 TPS (−2.1%)
+- **Phase 4 re-measurement** (session `7212e6cb`): Without: 12164 (runs: 12121, 12164, 12197), Baseline: 12224 → **+0.5% (noise)**. Surgical isolation: made `hash_xdr` serialize to `Vec<u8>` first then hash, bypassing `Sha256Writer` streaming. Confirms no measurable gain in the benchmark.
 - **Measurement notes**: Within noise. The streaming hash avoids one large allocation per `hash_xdr()` call, but the dominant cost is the SHA-256 computation itself, not the allocation. The OnceCell caching of `tx_set_hash()` saves one redundant hash but this was already a small portion of the total cost.
 
 #### Necessity Judgment
@@ -660,6 +702,7 @@ The `Sha256Writer` pattern could be reused anywhere XDR values are hashed. It wa
 - **Baseline (HEAD)**: 11810 TPS (runs: 11792, 11810, 11917)
 - **Without fix**: 12142 TPS (runs: 12142, 11990, 12222)
 - **Delta**: −332 TPS (−2.7%)
+- **Phase 4 re-measurement** (session `7212e6cb`): Without: 12193 (runs: 12072, 12193, 12286), Baseline: 12224 → **+0.3% (noise)**. Surgical isolation: swapped `deduplicate_entries_by_sort` calls to old `deduplicate_entries` (HashMap-based). Confirms no measurable gain — benchmark uses `add_batch_unique` which bypasses dedup entirely.
 - **Measurement notes**: Within noise. The benchmark path now uses `add_batch_unique()` (commit #25) which bypasses deduplication entirely when entries come from a coalesced delta. The structural dedup in `deduplicate_entries_by_sort()` is only exercised in non-benchmark paths.
 
 #### Necessity Judgment
@@ -697,6 +740,7 @@ No similar opportunities — all dedup paths have been addressed.
 - **Baseline (HEAD)**: 11810 TPS (runs: 11792, 11810, 11917)
 - **Without fix**: 12088 TPS (runs: 11923, 12088, 12104)
 - **Delta**: −278 TPS (−2.3%)
+- **Phase 4 re-measurement** (session `7212e6cb`): Without: 12073 (runs: 12089, 12002, 12073), Baseline: 12224 → **+1.2% (borderline)**. Surgical isolation: changed `self.ttl_key_cache.take().unwrap_or_default()` → `TtlKeyCache::new()` at `execution/mod.rs:1342`. Same-session measurement shows small but borderline gain.
 - **Measurement notes**: Within noise. The cross-TX cache reuse saves hash recomputations for shared footprint entries, but the savings are small relative to the total Soroban execution cost (~420ms of which hash computation is a small fraction).
 
 #### Necessity Judgment
@@ -804,6 +848,7 @@ No similar opportunities — all hot-path envelope clones are now Arc clones.
 - **Baseline (HEAD)**: 11810 TPS (runs: 11792, 11810, 11917)
 - **Without fix**: 11479 TPS (runs: 11265, 11479, 12239)
 - **Delta**: +331 TPS (+2.9%)
+- **Phase 4 re-measurement** (session `7212e6cb`): Without: 12291 (runs: 12292, 12291, 12242), Baseline: 12224 → **−0.5% (noise)**. Surgical isolation: modified `IncrementalMergeOutput::push` to skip XDR serialization/hashing, modified `into_bucket` to call `from_sorted_entries` instead of using pre-computed hash. Confirms no measurable gain — level-0 bucket updates use `fresh_in_memory_only` which already skips hash computation.
 - **Measurement notes**: Slightly positive but within noise. The wide spread in runs (11265–12239) indicates high variance. The incremental merge hash saves one full pass over merge output, but bucket merges happen in the background and may not be on the critical path for the benchmark.
 
 #### Necessity Judgment
@@ -915,6 +960,7 @@ No similar O(n²) patterns identified in the current codebase.
 - **Baseline (HEAD)**: 11810 TPS (runs: 11792, 11810, 11917)
 - **Without fix**: 11951 TPS (runs: 11961, 11613, 11951)
 - **Delta**: −141 TPS (−1.2%)
+- **Phase 4 re-measurement** (session `7212e6cb`): Without: 12186 (runs: 12101, 12186, 12216), Baseline: 12224 → **+0.3% (noise)**. Surgical isolation: replaced `std::thread::scope` parallel hashing with sequential loop in `close.rs:550-605`. Same-session measurement confirms no measurable gain.
 - **Measurement notes**: Within noise. The parallel TX hashing is less impactful in the benchmark because commit #27's `prepare_presorted` skips per-TX hashing entirely. The delta merge and cluster result optimizations save clones but are not on the critical path.
 
 #### Necessity Judgment
