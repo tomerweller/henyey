@@ -22,16 +22,20 @@ graph TD
     Dispatch --> Run["run: start node"]
     Dispatch --> Catchup["catchup: sync from archives"]
     Dispatch --> VerifyExec["verify-execution: CDP comparison"]
+    Dispatch --> ApplyLoad["apply-load: benchmark"]
     Dispatch --> Admin["admin: new-db, new-keypair, info, sample-config"]
     Dispatch --> History["verify-history, publish-history, verify-checkpoints"]
     Dispatch --> Tools["dump-ledger, bucket-info, self-check, debug-bucket-entry"]
     Dispatch --> Quorum["check-quorum-intersection"]
     Dispatch --> HttpCmd["http-command"]
     Run --> App["henyey-app"]
+    Run --> RPC["henyey-rpc (JSON-RPC server)"]
+    Run --> LoadGen["SimulationLoadGenRunner"]
     Catchup --> App
     VerifyExec --> Ledger["henyey-ledger"]
     VerifyExec --> Bucket["henyey-bucket"]
     VerifyExec --> HistoryLib["henyey-history (CDP)"]
+    ApplyLoad --> Sim["henyey-simulation"]
     Tools --> Bucket
     Quorum --> SCP["henyey-scp"]
 ```
@@ -41,10 +45,11 @@ graph TD
 | Type | Description |
 |------|-------------|
 | `Cli` | Top-level clap argument struct with global options (config, verbose, network, metadata-output-stream) |
-| `Commands` | Enum of all CLI subcommands (Run, Catchup, NewDb, VerifyExecution, DumpLedger, etc.) |
+| `Commands` | Enum of all CLI subcommands (Run, Catchup, NewDb, VerifyExecution, ApplyLoad, DumpLedger, etc.) |
 | `CliLogFormat` | Log format selection enum (Text, Json) |
 | `VerifyExecutionOptions` | Options struct for the verify-execution command |
 | `CommandArchiveTarget` | Configuration for publishing to remote archives via shell commands |
+| `SimulationLoadGenRunner` | Concrete `LoadGenRunner` implementation backed by `LoadGenerator` from `henyey-simulation`; wired into the running node to drive synthetic load generation |
 
 ## Usage
 
@@ -86,6 +91,19 @@ henyey --testnet verify-execution --from 310000 --to 311000 --stop-on-error
 # This restores bucket list state from a checkpoint, then re-executes
 # transactions via close_ledger and compares results against CDP metadata.
 # Differences indicate execution divergence from stellar-core.
+```
+
+### Benchmarking with apply-load
+
+```bash
+# Run limit-based benchmark (default: 10 ledgers)
+henyey apply-load
+
+# Soroban SAC transfer throughput benchmark
+henyey apply-load --mode max-sac-tps --tx-count 50000
+
+# Single-shot mode with multiple iterations
+henyey apply-load --mode single-shot --iterations 5
 ```
 
 ### Other commands
@@ -130,8 +148,10 @@ henyey version
 | Module | Description |
 |--------|-------------|
 | `main.rs` | CLI entry point, argument parsing, configuration loading, and all command handlers |
+| `main.rs` (`loadgen_runner`) | Inner module containing `SimulationLoadGenRunner`, the concrete `LoadGenRunner` implementation that bridges `henyey-app` and `henyey-simulation` |
 | `quorum_intersection.rs` | Quorum intersection analysis -- loads a JSON network config and checks that all quorums overlap |
 | `bin/header_compare.rs` | Separate binary for comparing ledger headers between a local database and a history archive |
+| `build.rs` | Build script that captures the git commit hash and build timestamp into compile-time environment variables (`HENYEY_COMMIT_HASH`, `HENYEY_BUILD_TIMESTAMP`) |
 
 ## Design Notes
 
@@ -156,6 +176,13 @@ henyey version
   (Crypto Data Platform) as ground truth for comparing transaction execution results. This is
   unique to the Rust implementation and is the primary tool for parity testing.
 
+- **RPC integration**: When RPC is enabled in config, `cmd_run` spawns a `henyey_rpc::RpcServer`
+  alongside the node, providing a JSON-RPC interface on the configured port.
+
+- **Load generation wiring**: `cmd_run` injects a `SimulationLoadGenRunner` factory into the
+  `RunOptions`, allowing the running node to generate synthetic load on demand via the
+  `LoadGenRunner` trait from `henyey-app`.
+
 ## stellar-core Mapping
 
 | Rust | stellar-core |
@@ -163,6 +190,7 @@ henyey version
 | `main.rs` (CLI + dispatch) | `src/main/main.cpp`, `src/main/CommandLine.cpp` |
 | `main.rs` (`cmd_run`) | `src/main/ApplicationUtils.cpp` (`runWithConfig`) |
 | `main.rs` (`cmd_catchup`) | `src/main/ApplicationUtils.cpp` (`catchup`) |
+| `main.rs` (`cmd_apply_load`) | `src/main/CommandLine.cpp` (`runApplyLoad`) |
 | `main.rs` (`cmd_publish_history`) | `src/main/ApplicationUtils.cpp` (`publish`) |
 | `main.rs` (`cmd_verify_history`) | `src/main/ApplicationUtils.cpp` (`verifyHistory`) |
 | `main.rs` (`cmd_self_check`) | `src/main/ApplicationUtils.cpp` (`selfCheck`) |
@@ -175,6 +203,7 @@ henyey version
 | `main.rs` (`cmd_offline_info`) | `src/main/CommandLine.cpp` (`runOfflineInfo`) |
 | `main.rs` (`cmd_version`) | `src/main/CommandLine.cpp` (`runVersion`) |
 | `main.rs` (`cmd_new_hist`) | `src/main/CommandLine.cpp` (`runNewHist`) |
+| `loadgen_runner` module | `src/simulation/LoadGenerator.cpp` (runner integration) |
 | `quorum_intersection.rs` | `src/herder/QuorumIntersectionChecker*` (v1 brute-force only) |
 | `bin/header_compare.rs` | No direct upstream equivalent (debugging tool) |
 

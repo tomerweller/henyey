@@ -2,8 +2,8 @@
 
 **Crate**: `henyey`
 **Upstream**: `stellar-core/src/main/` (CLI subset only)
-**Overall Parity**: 51%
-**Last Updated**: 2026-03-06
+**Overall Parity**: 54%
+**Last Updated**: 2026-03-17
 
 ## Summary
 
@@ -19,6 +19,8 @@
 | HTTP Command | Full | `http-command` to local node |
 | Self-Check | Full | Header chain, bucket hash, crypto benchmark |
 | Dump Ledger | Full | `dump-ledger` with type/modified filters |
+| Apply Load | Full | `apply-load` with ledger-limits and max-sac-tps modes |
+| Load Generation | Full | `generateLoad` via HTTP command handler bridge |
 | Quorum Intersection | Partial | V1 brute-force only; V2 SAT-solver not implemented |
 | Key/Crypto Utilities | Partial | `convert-id` implemented; `sec-to-pub`, `sign-transaction` not yet |
 | XDR Tools | None | `decode-xdr`/`encode-xdr` removed; `dump-xdr` not implemented |
@@ -99,6 +101,13 @@ Corresponds to: `CommandLine.cpp`
 | `runMergeBucketList()` | -- | None |
 | `runDumpStateArchivalStatistics()` | -- | None |
 
+#### Load Testing
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `runApplyLoad()` | `cmd_apply_load()` | Full |
+| `runGenerateSyntheticLoad()` | `loadgen_runner::SimulationLoadGenRunner` | Full |
+
 #### Other Commands
 
 | stellar-core | Rust | Status |
@@ -144,8 +153,6 @@ Features excluded by design. These are NOT counted against parity %.
 | `runRebuildLedgerFromBuckets()` (BUILD_TESTS) | Test-only infrastructure |
 | `runFuzz()` / `runGenFuzz()` (BUILD_TESTS) | Would use `cargo-fuzz` if needed |
 | `runTest()` (BUILD_TESTS) | Uses `cargo test` instead |
-| `runApplyLoad()` (BUILD_TESTS) | Benchmarking infrastructure; out of scope |
-| `runGenerateSyntheticLoad()` (BUILD_TESTS) | Test load generation; out of scope |
 | Tracy memory tracking | C++-specific profiling; Rust uses different tooling |
 
 ## Gaps
@@ -207,13 +214,14 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
-| CLI Parsing | 0 TEST_CASE | 5 #[test] | Rust has explicit CLI parsing tests |
+| CLI Parsing | 0 TEST_CASE | 8 #[test] | Rust has explicit CLI parsing + loadgen mode tests |
 | Config | 8 TEST_CASE / 18 SECTION | 0 #[test] | Config tests are in `henyey-app` crate |
 | Command Handler | 3 TEST_CASE / 25 SECTION | 0 #[test] | HTTP handler tests in `henyey-app` |
 | Application Utils | 4 TEST_CASE / 5 SECTION | 0 #[test] | Catchup/run logic tested via integration |
 | Self-Check | 1 TEST_CASE | 0 #[test] | Self-check tested manually |
 | Query Server | 1 TEST_CASE / 9 SECTION | 0 #[test] | No query server in Rust |
 | Quorum Intersection | 0 TEST_CASE | 5 #[test] | Rust has dedicated quorum intersection tests |
+| Load Generation | 0 TEST_CASE | 3 #[test] | Loadgen runner parse_mode tests |
 
 ### Test Gaps
 
@@ -271,11 +279,12 @@ The `verify-execution` tool compares transaction execution against CDP (Crypto D
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 18 |
+| Implemented (Full) | 20 |
 | Gaps (None + Partial) | 17 |
-| Intentional Omissions | 9 |
-| **Parity** | **18 / (18 + 17) = 51%** |
+| Intentional Omissions | 7 |
+| **Parity** | **20 / (20 + 17) = 54%** |
 
-Note: Parity increased from 43% to 51% because `convert-id`, `force-scp`, and `new-hist` were
-implemented (previously listed as gaps or omissions). Two medium-priority gaps remain:
-`sec-to-pub` and `sign-transaction`.
+Note: Parity increased from 51% to 54% because `apply-load` and `generate-load`
+(synthetic load generation) were implemented. Previously listed as intentional
+omissions ("Benchmarking infrastructure; out of scope"), both are now fully functional
+via `cmd_apply_load()` and the `loadgen_runner::SimulationLoadGenRunner` module.
