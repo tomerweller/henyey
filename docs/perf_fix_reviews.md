@@ -1226,3 +1226,65 @@ Five sub-optimizations:
 2. Add a unit test for `drain_categorization_for_bucket_update` verifying identical counts/entries as the non-draining version.
 3. Add a unit test for `prepare_presorted` verifying structural equivalence with `prepare_with_hash` for a given input.
 4. Document the `presorted` field with a clear warning that it's simulation-only.
+
+---
+
+## Vendored Typed API vs Standard XDR API Benchmark
+
+**Date**: Mar 17, 2026
+**Session**: `7212e6cb` — artifacts at `~/data/7212e6cb/`
+**Branch**: `bench/standard-xdr-api` (commit `53f31fe`)
+
+### Background
+
+The soroban-env-host crates are vendored at `vendor/soroban-env-p25/` with a
+custom "typed API" backported from `tomerweller/rs-soroban-env` commit
+`74d051cf`. The typed API adds `invoke_host_function_typed()` which accepts
+and returns native Rust types (`Rc<LedgerKey>`, `Rc<LedgerEntry>`, `ScVal`)
+instead of `&[u8]` XDR byte vectors, eliminating serialization round-trips at
+the embedder-host boundary.
+
+Both APIs share the same `invoke_host_function_core()` — actual contract
+execution is identical. The savings come purely from avoiding XDR
+encode/decode of inputs and outputs.
+
+### Methodology
+
+- **Benchmark**: `apply-load --mode single-shot --tx-count 50000 --clusters 4 --iterations 10`
+- **Workload**: SAC (Stellar Asset Contract) transfer transactions
+- **Protocol**: 3 runs per binary, alternating (baseline, standard, baseline, standard, ...) to minimize environmental drift
+- **Baseline binary**: `~/data/7212e6cb/baseline-fresh` (built from `main`, uses typed API)
+- **Standard binary**: `~/data/7212e6cb/standard-api` (built from `bench/standard-xdr-api`, uses XDR API)
+
+### Results
+
+| Run | Baseline (Typed API) | Standard (XDR API) | Delta |
+|-----|---------------------:|-------------------:|------:|
+| 1   | 14,721 TPS           | 14,355 TPS         | -2.5% |
+| 2   | 14,804 TPS           | 14,301 TPS         | -3.4% |
+| 3   | 14,698 TPS           | 14,185 TPS         | -3.5% |
+
+- **Baseline median**: **14,721 TPS** (sorted: 14698, 14721, 14804)
+- **Standard median**: **14,301 TPS** (sorted: 14185, 14301, 14355)
+- **Delta**: **-420 TPS / -2.9%**
+
+No overlap between ranges (baseline worst: 14,698 > standard best: 14,355).
+
+### Where the Time Goes
+
+The difference appears almost entirely in the `soroban_exec` phase:
+
+| Metric (avg ms/ledger) | Typed API | Standard API | Gap |
+|------------------------|----------:|-------------:|----:|
+| soroban_exec           | 2,389     | 2,501–2,537  | ~120–148 ms |
+| Per-transaction overhead | —       | —            | ~2–3 μs |
+
+All other phases (prepare, commit, bucket, etc.) are statistically identical.
+
+### Conclusion
+
+The vendored typed API provides a **consistent, measurable ~2.9% throughput
+improvement** by eliminating XDR serialization at the embedder boundary. The
+gain is real (zero overlap across 3 alternating runs) and justifies the
+vendoring approach. The per-transaction overhead of ~2–3 μs will compound
+with heavier Soroban workloads that involve more/larger ledger entries.
