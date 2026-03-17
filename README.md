@@ -430,7 +430,7 @@ henyey/
 |-------|---------|--------|
 | [`henyey`](crates/henyey/README.md) | CLI entrypoint, argument parsing, command dispatch | [51%](crates/henyey/PARITY_STATUS.md) |
 | [`henyey-app`](crates/henyey-app/README.md) | Application wiring, lifecycle, HTTP APIs, meta streaming, history publishing | [73%](crates/henyey-app/PARITY_STATUS.md) |
-| [`henyey-common`](crates/henyey-common/README.md) | Shared types, config helpers, time utilities | [99%](crates/henyey-common/PARITY_STATUS.md) |
+| [`henyey-common`](crates/henyey-common/README.md) | Shared types, config helpers, time utilities | [95%](crates/henyey-common/PARITY_STATUS.md) |
 | [`henyey-clock`](crates/clock/README.md) | Injectable clock abstractions for deterministic simulation and runtime timing | [100%](crates/clock/PARITY_STATUS.md) |
 | [`henyey-crypto`](crates/henyey-crypto/README.md) | Ed25519 signing, SHA-256 hashing, strkey encoding | [78%](crates/henyey-crypto/PARITY_STATUS.md) |
 | [`henyey-db`](crates/henyey-db/README.md) | SQLite schema, migrations, query layer | [94%](crates/henyey-db/PARITY_STATUS.md) |

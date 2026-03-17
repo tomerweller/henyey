@@ -9,7 +9,6 @@
 //! - [`big_divide`]: Calculate `A * B / C` using
 //!   128-bit intermediate precision to avoid overflow
 //! - [`saturating_multiply`]: Overflow-safe multiplication capped at `i64::MAX`
-//! - [`big_square_root`]: Square root of `a * b` using 128-bit precision
 //!
 //! # Rounding
 //!
@@ -165,7 +164,8 @@ pub(crate) fn big_divide_unsigned(
 /// * `a` - 128-bit numerator
 /// * `b` - 64-bit divisor (must be > 0)
 /// * `rounding` - Whether to round down or up
-pub fn big_divide_128(a: u128, b: i64, rounding: Rounding) -> Result<i64, MathError> {
+#[allow(dead_code)] // Parity with stellar-core; not yet called in production
+pub(crate) fn big_divide_128(a: u128, b: i64, rounding: Rounding) -> Result<i64, MathError> {
     if b <= 0 {
         return Err(MathError::DivisionByZero);
     }
@@ -180,7 +180,12 @@ pub fn big_divide_128(a: u128, b: i64, rounding: Rounding) -> Result<i64, MathEr
 }
 
 /// Divides a 128-bit value by a 64-bit unsigned divisor.
-pub fn big_divide_unsigned_128(a: u128, b: u64, rounding: Rounding) -> Result<u64, MathError> {
+#[allow(dead_code)] // Parity with stellar-core; not yet called in production
+pub(crate) fn big_divide_unsigned_128(
+    a: u128,
+    b: u64,
+    rounding: Rounding,
+) -> Result<u64, MathError> {
     if b == 0 {
         return Err(MathError::DivisionByZero);
     }
@@ -209,7 +214,8 @@ pub fn big_divide_unsigned_128(a: u128, b: u64, rounding: Rounding) -> Result<u6
 ///
 /// This cannot overflow since u64 * u64 always fits in u128.
 #[inline]
-pub fn big_multiply_unsigned(a: u64, b: u64) -> u128 {
+#[allow(dead_code)] // Parity with stellar-core; not yet called in production
+pub(crate) fn big_multiply_unsigned(a: u64, b: u64) -> u128 {
     (a as u128) * (b as u128)
 }
 
@@ -219,7 +225,8 @@ pub fn big_multiply_unsigned(a: u64, b: u64) -> u128 {
 ///
 /// Panics if either input is negative.
 #[inline]
-pub fn big_multiply(a: i64, b: i64) -> u128 {
+#[allow(dead_code)] // Parity with stellar-core; not yet called in production
+pub(crate) fn big_multiply(a: i64, b: i64) -> u128 {
     assert!(
         a >= 0 && b >= 0,
         "big_multiply requires non-negative inputs"
@@ -281,7 +288,8 @@ pub(crate) fn is_representable_as_i64(d: f64) -> bool {
 /// Converts a double to u32, clamping to the valid range.
 ///
 /// NaN is converted to `u32::MAX`.
-pub fn double_to_clamped_u32(d: f64) -> u32 {
+#[allow(dead_code)] // Parity with stellar-core; not yet called in production
+pub(crate) fn double_to_clamped_u32(d: f64) -> u32 {
     if d.is_nan() {
         return u32::MAX;
     }
@@ -293,7 +301,8 @@ pub fn double_to_clamped_u32(d: f64) -> u32 {
 /// Returns x such that `x * x <= a * b < (x + 1) * (x + 1)`.
 ///
 /// Uses the modified Babylonian method with 128-bit precision.
-pub fn big_square_root(a: u64, b: u64) -> u64 {
+#[allow(dead_code)] // Parity with stellar-core; not yet called in production
+pub(crate) fn big_square_root(a: u64, b: u64) -> u64 {
     if a == 0 || b == 0 {
         return 0;
     }
@@ -310,6 +319,7 @@ pub fn big_square_root(a: u64, b: u64) -> u64 {
 }
 
 /// Computes ceil(sqrt(a * b)) using the modified Babylonian method.
+#[allow(dead_code)] // Called only by big_square_root (which is parity-only)
 fn big_square_root_ceil(a: u64, b: u64) -> u64 {
     if a == 0 || b == 0 {
         return 0;

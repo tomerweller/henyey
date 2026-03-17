@@ -192,6 +192,28 @@ impl AsRef<[u8]> for Hash256 {
     }
 }
 
+// ============================================================================
+// Hash XOR Operations
+// ============================================================================
+
+/// XOR two hashes together, modifying the first in place.
+impl std::ops::BitXorAssign for Hash256 {
+    fn bitxor_assign(&mut self, rhs: Self) {
+        for (a, b) in self.0.iter_mut().zip(rhs.0.iter()) {
+            *a ^= b;
+        }
+    }
+}
+
+impl std::ops::BitXor for Hash256 {
+    type Output = Self;
+
+    fn bitxor(mut self, rhs: Self) -> Self::Output {
+        self ^= rhs;
+        self
+    }
+}
+
 /// Extract the [`LedgerKey`] from a [`LedgerEntry`].
 ///
 /// This is the canonical, infallible conversion from a ledger entry to its
@@ -282,5 +304,18 @@ mod tests {
         assert_eq!(ThresholdLevel::Low as usize, 1);
         assert_eq!(ThresholdLevel::Med as usize, 2);
         assert_eq!(ThresholdLevel::High as usize, 3);
+    }
+
+    #[test]
+    fn test_hash_xor() {
+        let mut h1 = Hash256::from_bytes([0xff; 32]);
+        let h2 = Hash256::from_bytes([0xff; 32]);
+        h1 ^= h2;
+        assert!(h1.is_zero());
+
+        let h3 = Hash256::from_bytes([0x0f; 32]);
+        let h4 = Hash256::from_bytes([0xf0; 32]);
+        let result = h3 ^ h4;
+        assert_eq!(result.0, [0xff; 32]);
     }
 }

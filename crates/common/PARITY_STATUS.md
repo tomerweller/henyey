@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-common`
 **Upstream**: `stellar-core/src/util/`
-**Overall Parity**: 99%
-**Last Updated**: 2026-03-05
+**Overall Parity**: 95%
+**Last Updated**: 2026-03-17
 
 ## Summary
 
@@ -11,11 +11,11 @@
 |------|--------|-------|
 | Protocol Version | Full | All constants and comparisons match |
 | Types / Hash | Full | Hash256, XOR, zero-check |
-| Asset Utilities | Full | Validation, issuer, balance, price ops |
+| Asset Utilities | Full | Validation, issuer, balance, bucket keys |
 | Numeric (64-bit) | Full | bigDivide, saturating ops, sqrt |
 | Numeric (128-bit) | Full | bigDivide128, bigMultiply |
-| Resource Accounting | Full | All Resource methods and friends |
-| Metadata Normalization | Full | Sorting matches stellar-core exactly |
+| Resource Accounting | Partial | `anyLessThan` and `limitTo` missing |
+| Metadata Normalization | Partial | TransactionMeta done; LedgerCloseMeta missing |
 | XDR Output Stream | Full | writeOne with size-prefix framing |
 | XDR Durable Output | Full | durableWriteOne with fsync |
 | XDR Input Stream | Partial | readOne implemented; readPage missing |
@@ -30,11 +30,11 @@
 | stellar-core File | Rust Module | Notes |
 |--------------------|-------------|-------|
 | `ProtocolVersion.h` / `ProtocolVersion.cpp` | `protocol.rs` | Full parity |
-| `types.h` / `types.cpp` | `asset.rs`, `types.rs` | Full parity for protocol functions; utility functions covered by Rust stdlib |
+| `types.h` / `types.cpp` | `asset.rs`, `types.rs` | Full parity for protocol functions; some utilities in other crates |
 | `numeric.h` / `numeric.cpp` | `math.rs` | Full parity |
 | `numeric128.h` | `math.rs` | `hugeDivide` inlined in henyey-tx |
-| `TxResource.h` / `TxResource.cpp` | `resource.rs` | Full parity |
-| `MetaUtils.h` / `MetaUtils.cpp` | `meta.rs` | Full parity |
+| `TxResource.h` / `TxResource.cpp` | `resource.rs` | `anyLessThan` and `limitTo` missing |
+| `MetaUtils.h` / `MetaUtils.cpp` | `meta.rs` | TransactionMeta full; LedgerCloseMeta missing |
 | `XDRStream.h` | `xdr_stream.rs` | Output + durable full; input partial (readPage missing) |
 | `Fs.h` / `Fs.cpp` | `fs_utils.rs` | `durableRename` only; other Fs functions intentionally omitted |
 | `Math.h` / `Math.cpp` | — | Random/clustering utilities intentionally omitted |
@@ -65,7 +65,6 @@ Corresponds to: `types.h` (Hash / uint256 portion)
 | `Hash` (xdr::opaque_array<32>) | `Hash256` | Full |
 | `isZero(uint256 const&)` | `Hash256::is_zero()` | Full |
 | `operator^=` for Hash | `BitXorAssign` for Hash256 | Full |
-| `lessThanXored()` | `less_than_xored()` | Full |
 
 ### asset (`asset.rs`)
 
@@ -90,12 +89,10 @@ Corresponds to: `types.h` (asset / balance / utility portion)
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `LedgerEntryKey()` | `ledger_entry_key()` | Full |
+| `LedgerEntryKey()` | `entry_to_key()` | Full |
 | `getBucketLedgerKey(BucketEntry)` | `get_bucket_ledger_key()` | Full |
 | `getBucketLedgerKey(HotArchiveBucketEntry)` | `get_hot_archive_bucket_ledger_key()` | Full |
 | `addBalance()` | `add_balance()` | Full |
-| `operator>=(Price)` | `price_ge()` | Full |
-| `operator>(Price)` | `price_gt()` | Full |
 
 ### math (`math.rs`)
 
@@ -152,13 +149,13 @@ Corresponds to: `TxResource.h`
 | `operator<=` | `leq()` / `PartialOrd` | Full |
 | `operator==` | `PartialEq` impl | Full |
 | `operator>` | `PartialOrd` impl | Full |
-| `anyLessThan()` | `any_less_than()` | Full |
 | `anyGreater()` | `any_greater()` | Full |
 | `subtractNonNegative()` | `subtract_non_negative()` | Full |
-| `limitTo()` | `limit_to()` | Full |
 | `multiplyByDouble()` | `multiply_by_double()` | Full |
 | `saturatedMultiplyByDouble()` | `saturated_multiply_by_double()` | Full |
 | `bigDivideOrThrow()` (Resource) | `big_divide_resource()` | Full |
+| `anyLessThan()` | — | None |
+| `limitTo()` | — | None |
 
 ### meta (`meta.rs`)
 
@@ -167,7 +164,7 @@ Corresponds to: `MetaUtils.h`
 | stellar-core | Rust | Status |
 |--------------|------|--------|
 | `normalizeMeta(TransactionMeta&)` | `normalize_transaction_meta()` | Full |
-| `normalizeMeta(LedgerCloseMeta&)` | `normalize_ledger_close_meta()` | Full |
+| `normalizeMeta(LedgerCloseMeta&)` | — | None |
 
 ### xdr_stream (`xdr_stream.rs`)
 
@@ -199,6 +196,8 @@ Features excluded by design. These are NOT counted against parity %.
 
 | stellar-core Component | Reason |
 |------------------------|--------|
+| `lessThanXored()` (`types.h`) | Implemented in `henyey-ledger` where it is used |
+| `operator>=(Price)` / `operator>(Price)` (`types.h`) | Implemented in `henyey-tx` where price comparison is needed |
 | `compareAsset()` (`types.h`) | Rust XDR types derive `PartialEq`; direct `==` comparison works |
 | `unsignedToSigned(uint32_t)` / `unsignedToSigned(uint64_t)` (`types.h`) | Rust `TryFrom` / `as` casts; no wrapper needed |
 | `formatSize()` (`types.h`) | Formatting utility; not protocol-critical |
@@ -233,7 +232,6 @@ Features excluded by design. These are NOT counted against parity %.
 | `must_use` macro (`must_use.h`) | Rust `#[must_use]` attribute is built-in |
 | `ThreadAnnotations` (`ThreadAnnotations.h`) | Rust borrow checker provides thread safety statically |
 | `SpdlogTweaks` (`SpdlogTweaks.h`) | C++ logging library configuration |
-| `FileSystemException` (`FileSystemException.h`) | Rust uses `std::io::Error` |
 | `asio.h` | C++ async IO library wrapper; Rust uses tokio |
 | `RandomEvictionCache` (`RandomEvictionCache.h`) | Data structure; implement when needed by dependent crates |
 | `BitSet` (`BitSet.h`) | Data structure; implement when needed (e.g., for SCP) |
@@ -254,7 +252,10 @@ Features not yet implemented. These ARE counted against parity %.
 
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
-| `XDRInputFileStream::readPage()` | Low | Page-based reading with key search; BucketListDB optimization |
+| `anyLessThan()` (`TxResource.h`) | Medium | Resource comparison; used in surge pricing |
+| `limitTo()` (`TxResource.h`) | Medium | Resource clamping; used in surge pricing |
+| `normalizeMeta(LedgerCloseMeta&)` (`MetaUtils.h`) | Medium | LedgerCloseMeta normalization; needed for deterministic meta hashing |
+| `XDRInputFileStream::readPage()` (`XDRStream.h`) | Low | Page-based reading with key search; BucketListDB optimization |
 
 ## Architectural Differences
 
@@ -293,24 +294,25 @@ Features not yet implemented. These ARE counted against parity %.
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
 | Balance | 1 TEST_CASE | 1 #[test] | Covered |
-| BigDivide | 4 TEST_CASE / 8 SECTION | 10 #[test] | Good coverage |
-| Uint128 | 3 TEST_CASE / 5 SECTION | 2 #[test] | Adequate |
-| XDRStream | 2 TEST_CASE / 3 SECTION | 10 #[test] | Output, durable, and input roundtrip coverage |
-| Timer | 8 TEST_CASE | 2 #[test] | Rust covers epoch conversions only |
+| BigDivide | 4 TEST_CASE / 9 SECTION | 10 #[test] | Good coverage |
+| Uint128 | 3 TEST_CASE / 6 SECTION | 2 #[test] | Adequate |
+| XDRStream | 2 TEST_CASE / 3 SECTION | 13 #[test] | Output, durable, and input roundtrip coverage |
+| Timer | 9 TEST_CASE | 2 #[test] | Rust covers epoch conversions only |
 | Filesystem | 4 TEST_CASE | 3 #[test] | `durable_rename` basic, overwrite, error cases |
 | Math (random) | 1 TEST_CASE / 5 SECTION | 0 #[test] | Intentionally omitted (rand crate) |
-| Cache | 8 TEST_CASE | 0 #[test] | Intentionally omitted |
+| Cache | 10 TEST_CASE | 0 #[test] | Intentionally omitted |
 | BitSet | 6 TEST_CASE | 0 #[test] | Intentionally omitted |
-| Decoder | 9 TEST_CASE | 0 #[test] | Intentionally omitted |
+| Decoder | 9 TEST_CASE / 7 SECTION | 0 #[test] | Intentionally omitted |
 | Scheduler | 2 TEST_CASE | 0 #[test] | Intentionally omitted |
 | StatusManager | 5 TEST_CASE | 0 #[test] | Intentionally omitted |
-| Metrics | 12 TEST_CASE | 0 #[test] | Intentionally omitted |
+| Metrics | 16 TEST_CASE | 0 #[test] | Intentionally omitted |
 | BinaryFuse | 1 TEST_CASE / 3 SECTION | 0 #[test] | Intentionally omitted |
 | Protocol | — | 4 #[test] | Rust-only tests |
-| Types/Hash | — | 3 #[test] | Rust-only tests |
-| Asset | — | 19 #[test] | Rust-only tests |
+| Types/Hash | — | 5 #[test] | Rust-only tests |
+| Asset | — | 9 #[test] | Rust-only tests |
 | Resource | — | 13 #[test] | Rust-only tests |
 | Network | — | 3 #[test] | Rust-only tests |
+| Memory | — | 5 #[test] | Rust-only tests |
 | Meta | — | 0 #[test] | No unit tests; relies on integration tests |
 
 ### Test Gaps
@@ -318,12 +320,13 @@ Features not yet implemented. These ARE counted against parity %.
 - **Metadata normalization**: No dedicated unit tests in `meta.rs`; upstream has no dedicated test file either, but parity is verified through integration testing.
 - **XDR readPage**: `readPage()` not tested because not implemented.
 - **hugeDivide**: Algorithm inlined in `henyey-tx` `exchange_with_pool()`; tested via offer exchange tests.
+- **Resource anyLessThan/limitTo**: Not tested because not implemented.
 
 ## Parity Calculation
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 76 |
-| Gaps (None) | 1 |
-| Intentional Omissions | 47 |
-| **Parity** | **76 / (76 + 1) = 99%** |
+| Implemented (Full) | 74 |
+| Gaps (None) | 4 |
+| Intentional Omissions | 50 |
+| **Parity** | **74 / (74 + 4) = 95%** |

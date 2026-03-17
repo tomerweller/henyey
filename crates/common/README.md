@@ -22,6 +22,7 @@ graph TD
     A --> K[time]
     A --> L[xdr_stream]
     A --> M[fs_utils]
+    A --> N[memory]
 
     E -->|uses| B
     E -->|uses| D
@@ -50,6 +51,8 @@ graph TD
 | `DurableXdrOutputStream` | XDR frame writer with fsync-after-every-write for crash safety |
 | `XdrInputStream` | Size-prefixed XDR frame reader compatible with stellar-core wire format |
 | `BucketListDbConfig` | Configuration for BucketListDB indexing and caching behavior |
+| `MemoryEstimate` | Trait for types that report their approximate heap memory usage |
+| `ComponentMemory` | Named memory measurement from a single component (name, heap bytes, entry count) |
 | `NoIssuerError` | Error returned when requesting the issuer of a native asset |
 
 ## Usage
@@ -109,7 +112,7 @@ assert!(r.leq(&limit));
 | Module | Description |
 |--------|-------------|
 | `lib.rs` | Crate root with re-exports of key types and the `stellar_xdr` crate |
-| `types.rs` | `Hash256` type: SHA-256 hashing, hex conversion, XDR interop |
+| `types.rs` | `Hash256` type: SHA-256 hashing, hex conversion, XDR interop, `entry_to_key` |
 | `math.rs` | 128-bit arithmetic (`big_divide`, `big_square_root`), saturating ops, rounding modes |
 | `protocol.rs` | `ProtocolVersion` enum, version comparison functions, feature gate constants |
 | `asset.rs` | Asset validation, code conversion, issuer utilities, balance math, price comparison, hash XOR, ledger key extraction |
@@ -119,6 +122,7 @@ assert!(r.leq(&limit));
 | `network.rs` | `NetworkId` derived from network passphrase via SHA-256 |
 | `error.rs` | `Error` enum and `Result` type alias |
 | `time.rs` | Unix/Stellar epoch conversions, current timestamp helpers |
+| `memory.rs` | `MemoryEstimate` trait and helpers (`hashmap_heap_bytes`, `vec_heap_bytes`) for per-component heap tracking |
 | `fs_utils.rs` | Crash-safe filesystem operations (`durable_rename` with parent directory fsync) |
 | `xdr_stream.rs` | `XdrOutputStream` / `DurableXdrOutputStream` / `XdrInputStream` for size-prefixed XDR frames (RFC 4506 record marking) |
 
@@ -142,6 +146,7 @@ assert!(r.leq(&limit));
 | `config.rs` | `src/main/Config.h/.cpp` (Rust-native TOML implementation) |
 | `error.rs` | Rust-native (no direct upstream equivalent) |
 | `time.rs` | `src/util/Timer.h/.cpp` (subset) |
+| `memory.rs` | Rust-native (no direct upstream equivalent) |
 | `fs_utils.rs` | `src/util/Fs.h/.cpp` (`durableRename` only) |
 | `xdr_stream.rs` | `src/util/XDRStream.h` (output + durable output + basic input) |
 

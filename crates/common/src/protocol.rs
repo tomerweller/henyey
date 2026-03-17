@@ -169,17 +169,9 @@ pub fn protocol_version_starts_from(version: u32, from: ProtocolVersion) -> bool
 }
 
 /// Returns `true` if `version` equals the target version exactly.
-///
-/// # Example
-///
-/// ```rust
-/// use henyey_common::protocol::{protocol_version_equals, ProtocolVersion};
-///
-/// assert!(protocol_version_equals(20, ProtocolVersion::V20));
-/// assert!(!protocol_version_equals(21, ProtocolVersion::V20));
-/// ```
+#[allow(dead_code)] // Parity with stellar-core; not yet called in production
 #[inline]
-pub fn protocol_version_equals(version: u32, equals: ProtocolVersion) -> bool {
+pub(crate) fn protocol_version_equals(version: u32, equals: ProtocolVersion) -> bool {
     version == equals.as_u32()
 }
 

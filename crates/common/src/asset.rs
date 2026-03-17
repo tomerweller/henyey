@@ -32,7 +32,7 @@ pub const LIQUIDITY_POOL_FEE_V18: i32 = 30;
 ///
 /// Returns true for characters in the range 0x20-0x7E (space through tilde).
 #[inline]
-pub fn is_ascii_non_control(c: char) -> bool {
+pub(crate) fn is_ascii_non_control(c: char) -> bool {
     matches!(c, ' '..='~')
 }
 
@@ -297,7 +297,8 @@ pub fn is_issuer(acc: &AccountId, asset: &Asset) -> bool {
 }
 
 /// Check if an account is the issuer of a TrustLineAsset.
-pub fn is_trustline_asset_issuer(acc: &AccountId, asset: &TrustLineAsset) -> bool {
+#[allow(dead_code)] // Parity with stellar-core; not yet called in production
+pub(crate) fn is_trustline_asset_issuer(acc: &AccountId, asset: &TrustLineAsset) -> bool {
     get_trustline_asset_issuer(asset).is_ok_and(|issuer| issuer == acc)
 }
 
@@ -372,7 +373,8 @@ pub fn add_balance(balance: i64, delta: i64, max_balance: i64) -> Option<i64> {
 /// # Panics
 ///
 /// Panics for METAENTRY entries.
-pub fn get_hot_archive_bucket_ledger_key(be: &HotArchiveBucketEntry) -> LedgerKey {
+#[allow(dead_code)] // Parity with stellar-core; not yet called in production
+pub(crate) fn get_hot_archive_bucket_ledger_key(be: &HotArchiveBucketEntry) -> LedgerKey {
     match be {
         HotArchiveBucketEntry::Archived(entry) => crate::entry_to_key(entry),
         HotArchiveBucketEntry::Live(key) => key.clone(),
@@ -387,37 +389,14 @@ pub fn get_hot_archive_bucket_ledger_key(be: &HotArchiveBucketEntry) -> LedgerKe
 /// # Panics
 ///
 /// Panics for METAENTRY entries.
-pub fn get_bucket_ledger_key(be: &BucketEntry) -> LedgerKey {
+#[allow(dead_code)] // Parity with stellar-core; not yet called in production
+pub(crate) fn get_bucket_ledger_key(be: &BucketEntry) -> LedgerKey {
     match be {
         BucketEntry::Liveentry(entry) | BucketEntry::Initentry(entry) => crate::entry_to_key(entry),
         BucketEntry::Deadentry(key) => key.clone(),
         BucketEntry::Metaentry(_) => {
             panic!("Tried to get key for METAENTRY")
         }
-    }
-}
-
-// ============================================================================
-// Hash XOR Operations
-// ============================================================================
-
-use crate::Hash256;
-
-/// XOR two hashes together, modifying the first in place.
-impl std::ops::BitXorAssign for Hash256 {
-    fn bitxor_assign(&mut self, rhs: Self) {
-        for (a, b) in self.0.iter_mut().zip(rhs.0.iter()) {
-            *a ^= b;
-        }
-    }
-}
-
-impl std::ops::BitXor for Hash256 {
-    type Output = Self;
-
-    fn bitxor(mut self, rhs: Self) -> Self::Output {
-        self ^= rhs;
-        self
     }
 }
 
@@ -562,18 +541,5 @@ mod tests {
 
         // Edge case: exact zero
         assert_eq!(add_balance(100, -100, i64::MAX), Some(0));
-    }
-
-    #[test]
-    fn test_hash_xor() {
-        let mut h1 = Hash256::from_bytes([0xff; 32]);
-        let h2 = Hash256::from_bytes([0xff; 32]);
-        h1 ^= h2;
-        assert!(h1.is_zero());
-
-        let h3 = Hash256::from_bytes([0x0f; 32]);
-        let h4 = Hash256::from_bytes([0xf0; 32]);
-        let result = h3 ^ h4;
-        assert_eq!(result.0, [0xff; 32]);
     }
 }
