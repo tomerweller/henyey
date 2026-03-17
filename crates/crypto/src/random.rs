@@ -50,11 +50,6 @@ pub fn random_u64() -> u64 {
     OsRng.next_u64()
 }
 
-/// Generates a random 32-bit unsigned integer.
-pub fn random_u32() -> u32 {
-    OsRng.next_u32()
-}
-
 /// Fills a mutable slice with cryptographically secure random bytes.
 ///
 /// This is useful when you need to fill a dynamically-sized buffer.

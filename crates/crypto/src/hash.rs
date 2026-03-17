@@ -62,28 +62,6 @@ pub fn sha256(data: &[u8]) -> Hash256 {
     Hash256::hash(data)
 }
 
-/// Computes the SHA-256 hash of multiple data chunks.
-///
-/// This is equivalent to concatenating all chunks and hashing the result,
-/// but avoids the memory allocation of creating an intermediate buffer.
-///
-/// # Example
-///
-/// ```
-/// use henyey_crypto::{sha256, sha256_multi};
-///
-/// let hash1 = sha256(b"helloworld");
-/// let hash2 = sha256_multi(&[b"hello", b"world"]);
-/// assert_eq!(hash1, hash2);
-/// ```
-pub fn sha256_multi(chunks: &[&[u8]]) -> Hash256 {
-    let mut hasher = Sha256::new();
-    for chunk in chunks {
-        hasher.update(chunk);
-    }
-    Hash256::from(<[u8; 32]>::from(hasher.finalize()))
-}
-
 /// Computes a sub-seed SHA-256 hash from a seed and counter.
 ///
 /// This is used for per-transaction PRNG sub-seeding in Soroban.
@@ -180,76 +158,6 @@ pub fn blake2(data: &[u8]) -> Hash256 {
     Hash256::from(<[u8; 32]>::from(hasher.finalize()))
 }
 
-/// Computes the BLAKE2b-256 hash of multiple data chunks.
-///
-/// This is equivalent to concatenating all chunks and hashing the result,
-/// but avoids the memory allocation of creating an intermediate buffer.
-///
-/// # Example
-///
-/// ```
-/// use henyey_crypto::{blake2, blake2_multi};
-///
-/// let hash1 = blake2(b"helloworld");
-/// let hash2 = blake2_multi(&[b"hello", b"world"]);
-/// assert_eq!(hash1, hash2);
-/// ```
-pub fn blake2_multi(chunks: &[&[u8]]) -> Hash256 {
-    let mut hasher = Blake2b256::new();
-    for chunk in chunks {
-        hasher.update(chunk);
-    }
-    Hash256::from(<[u8; 32]>::from(hasher.finalize()))
-}
-
-/// A streaming BLAKE2b-256 hasher for incremental hash computation.
-///
-/// Use this when you need to hash data that is not available all at once,
-/// such as when reading from a stream or processing data in chunks.
-///
-/// # Example
-///
-/// ```
-/// use henyey_crypto::Blake2Hasher;
-///
-/// let mut hasher = Blake2Hasher::new();
-/// hasher.update(b"chunk 1");
-/// hasher.update(b"chunk 2");
-/// let hash = hasher.finalize();
-/// ```
-pub struct Blake2Hasher {
-    inner: Blake2b256,
-}
-
-impl Blake2Hasher {
-    /// Creates a new BLAKE2b-256 hasher.
-    pub fn new() -> Self {
-        Self {
-            inner: Blake2b256::new(),
-        }
-    }
-
-    /// Feeds data into the hasher.
-    ///
-    /// This method can be called multiple times to incrementally add data.
-    pub fn update(&mut self, data: &[u8]) {
-        self.inner.update(data);
-    }
-
-    /// Consumes the hasher and returns the computed hash.
-    ///
-    /// After calling this method, the hasher cannot be used again.
-    pub fn finalize(self) -> Hash256 {
-        Hash256::from(<[u8; 32]>::from(self.inner.finalize()))
-    }
-}
-
-impl Default for Blake2Hasher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Type alias for HMAC-SHA256.
 type HmacSha256 = Hmac<Sha256>;
 
@@ -275,30 +183,6 @@ type HmacSha256 = Hmac<Sha256>;
 pub fn hmac_sha256(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);
-    let result = mac.finalize();
-    result.into_bytes().into()
-}
-
-/// Computes the HMAC-SHA256 of multiple data chunks.
-///
-/// This is equivalent to concatenating all chunks and computing the MAC,
-/// but avoids memory allocation.
-///
-/// # Example
-///
-/// ```
-/// use henyey_crypto::{hmac_sha256, hmac_sha256_multi};
-///
-/// let key = [0u8; 32];
-/// let mac1 = hmac_sha256(&key, b"helloworld");
-/// let mac2 = hmac_sha256_multi(&key, &[b"hello", b"world"]);
-/// assert_eq!(mac1, mac2);
-/// ```
-pub fn hmac_sha256_multi(key: &[u8; 32], chunks: &[&[u8]]) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-    for chunk in chunks {
-        mac.update(chunk);
-    }
     let result = mac.finalize();
     result.into_bytes().into()
 }
@@ -358,20 +242,6 @@ pub fn hmac_sha256_verify(mac: &[u8; 32], key: &[u8; 32], data: &[u8]) -> bool {
 pub fn hkdf_extract(ikm: &[u8]) -> [u8; 32] {
     let zero_salt = [0u8; 32];
     hmac_sha256(&zero_salt, ikm)
-}
-
-/// Performs HKDF-Extract with a specified salt.
-///
-/// # Arguments
-///
-/// * `salt` - The salt value (32 bytes)
-/// * `ikm` - Input Keying Material
-///
-/// # Returns
-///
-/// A 32-byte Pseudo-Random Key (PRK).
-pub fn hkdf_extract_with_salt(salt: &[u8; 32], ikm: &[u8]) -> [u8; 32] {
-    hmac_sha256(salt, ikm)
 }
 
 /// Performs single-step HKDF-Expand.
@@ -458,33 +328,6 @@ pub fn xdr_sha256<T: WriteXdr>(value: &T) -> Result<Hash256, stellar_xdr::curr::
     Ok(sha256(&bytes))
 }
 
-/// Computes the BLAKE2b-256 hash of an XDR-encoded value.
-///
-/// This serializes the value to XDR format and hashes the result.
-/// Note: This allocates a temporary buffer for the XDR encoding.
-///
-/// # Arguments
-///
-/// * `value` - Any value that implements `WriteXdr`
-///
-/// # Returns
-///
-/// The BLAKE2b-256 hash of the XDR-encoded value, or an error if encoding fails.
-///
-/// # Example
-///
-/// ```ignore
-/// use henyey_crypto::xdr_blake2;
-/// use stellar_xdr::curr::ScpEnvelope;
-///
-/// let envelope: ScpEnvelope = /* ... */;
-/// let hash = xdr_blake2(&envelope)?;
-/// ```
-pub fn xdr_blake2<T: WriteXdr>(value: &T) -> Result<Hash256, stellar_xdr::curr::Error> {
-    let bytes = value.to_xdr(stellar_xdr::curr::Limits::none())?;
-    Ok(blake2(&bytes))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,13 +349,6 @@ mod tests {
             hash.to_hex(),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
-    }
-
-    #[test]
-    fn test_sha256_multi() {
-        let hash1 = sha256(b"helloworld");
-        let hash2 = sha256_multi(&[b"hello", b"world"]);
-        assert_eq!(hash1, hash2);
     }
 
     #[test]
@@ -553,23 +389,6 @@ mod tests {
     }
 
     #[test]
-    fn test_blake2_multi() {
-        let hash1 = blake2(b"helloworld");
-        let hash2 = blake2_multi(&[b"hello", b"world"]);
-        assert_eq!(hash1, hash2);
-    }
-
-    #[test]
-    fn test_streaming_blake2_hasher() {
-        let mut hasher = Blake2Hasher::new();
-        hasher.update(b"hello");
-        hasher.update(b"world");
-        let hash = hasher.finalize();
-
-        assert_eq!(hash, blake2(b"helloworld"));
-    }
-
-    #[test]
     fn test_blake2_differs_from_sha256() {
         // BLAKE2 and SHA-256 should produce different results
         let data = b"test data";
@@ -581,14 +400,6 @@ mod tests {
         let key = [0u8; 32];
         let mac = hmac_sha256(&key, b"message");
         assert_eq!(mac.len(), 32);
-    }
-
-    #[test]
-    fn test_hmac_sha256_multi() {
-        let key = [0u8; 32];
-        let mac1 = hmac_sha256(&key, b"helloworld");
-        let mac2 = hmac_sha256_multi(&key, &[b"hello", b"world"]);
-        assert_eq!(mac1, mac2);
     }
 
     #[test]
@@ -650,23 +461,6 @@ mod tests {
     }
 
     #[test]
-    fn test_hkdf_extract_with_salt() {
-        let ikm = b"input keying material";
-
-        // Different salts should produce different PRKs
-        let salt1 = [0u8; 32];
-        let salt2 = [1u8; 32];
-
-        let prk1 = hkdf_extract_with_salt(&salt1, ikm);
-        let prk2 = hkdf_extract_with_salt(&salt2, ikm);
-
-        assert_ne!(prk1, prk2);
-
-        // Zero salt should match hkdf_extract
-        assert_eq!(prk1, hkdf_extract(ikm));
-    }
-
-    #[test]
     fn test_xdr_sha256() {
         use stellar_xdr::curr::Uint256;
 
@@ -678,30 +472,14 @@ mod tests {
     }
 
     #[test]
-    fn test_xdr_blake2() {
-        use stellar_xdr::curr::Uint256;
-
-        let value = Uint256([0u8; 32]);
-        let hash = xdr_blake2(&value).unwrap();
-
-        // Should produce a valid 32-byte hash
-        assert_eq!(hash.as_bytes().len(), 32);
-    }
-
-    #[test]
-    fn test_xdr_hashers_produce_same_as_functions() {
+    fn test_xdr_sha256_matches_direct_hash() {
         use stellar_xdr::curr::Uint256;
 
         let value = Uint256([42u8; 32]);
         let xdr_bytes = value.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
 
-        // Direct XDR hash should match hash of XDR bytes
         let sha256_hash = xdr_sha256(&value).unwrap();
         let direct_sha256 = sha256(&xdr_bytes);
         assert_eq!(sha256_hash, direct_sha256);
-
-        let blake2_hash = xdr_blake2(&value).unwrap();
-        let direct_blake2 = blake2(&xdr_bytes);
-        assert_eq!(blake2_hash, direct_blake2);
     }
 }

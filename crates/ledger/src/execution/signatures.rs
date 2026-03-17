@@ -316,7 +316,7 @@ pub(super) fn has_signed_payload_match(
         Ok(s) => s,
         Err(_) => return false,
     };
-    henyey_crypto::verify(&pk, &signed_payload.payload, &ed_sig).is_ok()
+    pk.verify(&signed_payload.payload, &ed_sig).is_ok()
 }
 
 /// Check extra signers against the signature tracker.
@@ -711,22 +711,14 @@ pub(super) fn has_signed_payload_signature(
             Ok(s) => s,
             Err(_) => return false,
         };
-        henyey_crypto::verify(&pk, &signed_payload.payload, &ed_sig).is_ok()
+        pk.verify(&signed_payload.payload, &ed_sig).is_ok()
     })
 }
 
 /// Compute subSha256(baseSeed, index) as used by stellar-core for PRNG seeds.
 ///
-/// This computes SHA256(baseSeed || xdr::xdr_to_opaque(index)) where index is a u64.
-/// XDR encodes uint64 as 8 bytes in big-endian (network byte order).
-///
-/// Note: stellar-core uses `static_cast<uint64_t>(index)` before passing to `xdr::xdr_to_opaque`,
-/// so even though the index is originally an int, it's serialized as 8 bytes.
+/// Thin wrapper around [`henyey_crypto::sub_sha256`] that accepts the concrete
+/// types used by the ledger execution layer.
 pub(super) fn sub_sha256(base_seed: &[u8; 32], index: u32) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(base_seed);
-    // XDR uint64 is 8 bytes big-endian
-    hasher.update((index as u64).to_be_bytes());
-    hasher.finalize().into()
+    henyey_crypto::sub_sha256(base_seed, index as u64).0
 }

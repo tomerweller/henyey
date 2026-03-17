@@ -851,7 +851,7 @@ impl App {
             Ok(sig) => sig,
             Err(_) => return false,
         };
-        henyey_crypto::verify(&public_key, message, &sig).is_ok()
+        public_key.verify(message, &sig).is_ok()
     }
 
     fn node_id_bytes(node_id: &stellar_xdr::curr::NodeId) -> Option<[u8; 32]> {

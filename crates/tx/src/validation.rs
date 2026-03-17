@@ -816,7 +816,7 @@ fn has_signed_payload_signature(
             Ok(s) => s,
             Err(_) => return false,
         };
-        henyey_crypto::verify(&pk, &signed_payload.payload, &ed_sig).is_ok()
+        pk.verify(&signed_payload.payload, &ed_sig).is_ok()
     })
 }
 

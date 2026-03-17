@@ -228,16 +228,6 @@ impl From<Curve25519Secret> for stellar_xdr::curr::Curve25519Secret {
     }
 }
 
-/// Clears Curve25519 key material by replacing both keys with zeroed values.
-///
-/// This is a security measure to ensure sensitive key material doesn't
-/// linger in memory after use. The previous `Curve25519Secret` is zeroized
-/// on drop via `ZeroizeOnDrop`.
-pub fn clear_curve25519_keys(public: &mut Curve25519Public, secret: &mut Curve25519Secret) {
-    *secret = Curve25519Secret::from_bytes([0u8; 32]);
-    *public = Curve25519Public::from_bytes([0u8; 32]);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,22 +339,6 @@ mod tests {
         let restored_public: Curve25519Public = xdr_public.into();
 
         assert_eq!(public.to_bytes(), restored_public.to_bytes());
-    }
-
-    #[test]
-    fn test_clear_keys() {
-        let mut secret = Curve25519Secret::random();
-        let mut public = secret.derive_public();
-
-        // Ensure they're not zero initially
-        assert_ne!(secret.to_bytes(), [0u8; 32]);
-        assert_ne!(public.to_bytes(), [0u8; 32]);
-
-        clear_curve25519_keys(&mut public, &mut secret);
-
-        // After clearing, they should be zero
-        assert_eq!(secret.to_bytes(), [0u8; 32]);
-        assert_eq!(public.to_bytes(), [0u8; 32]);
     }
 
     #[test]

@@ -349,7 +349,7 @@ fn verify_ed25519_signed_payload(sig: &DecoratedSignature, signer: &Signer) -> b
     // stellar-core verifies the signature against the raw payload bytes,
     // not a hash. This is per CAP-0040 - the signed payload signer
     // requires a valid signature of the payload from the ed25519 public key.
-    henyey_crypto::verify(&public_key, &signed_payload.payload, &ed_sig).is_ok()
+    public_key.verify(&signed_payload.payload, &ed_sig).is_ok()
 }
 
 /// Collect all signers for an account including the master key.

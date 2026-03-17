@@ -2,36 +2,36 @@
 
 **Crate**: `henyey-crypto`
 **Upstream**: `stellar-core/src/crypto/`
-**Overall Parity**: 78%
-**Last Updated**: 2026-03-05
+**Overall Parity**: 69%
+**Last Updated**: 2026-03-17
 
 ## Summary
 
 | Area | Status | Notes |
 |------|--------|-------|
-| SHA-256 Hashing | Full | All functions including streaming, HMAC, HKDF |
-| BLAKE2 Hashing | Full | Single-shot, streaming, and XDR hashing |
+| SHA-256 Hashing | Partial | Single-shot, streaming (no reset), HMAC, HKDF, XDR hashing |
+| BLAKE2 Hashing | Partial | Single-shot only; no streaming hasher or XDR hashing |
 | Hex Encoding | Full | All four upstream functions implemented |
 | Random Generation | Full | CSPRNG via OsRng |
 | Curve25519 ECDH | Full | Key exchange, shared key derivation |
 | Sealed Box Encryption | Full | Encrypt/decrypt via crypto_box |
-| Ed25519 Keys & Signatures | Full | Generate, sign, verify, StrKey encode/decode |
-| StrKey Encoding | Full | Via re-exported `stellar_strkey` crate |
-| Short Hash (SipHash) | Full | computeHash, xdrComputeHash, seed management |
-| SignerKey Utilities | Full | preAuthTx, hashX, ed25519Payload |
-| Signature Verification Cache | None | Performance optimization, not correctness |
-| Key/Logging Utilities | None | toShortString, logKey, canConvert, etc. |
+| Ed25519 Keys & Signatures | Partial | Generate, sign, verify, StrKey; missing isZero, ==, < |
+| StrKey Encoding | Partial | Core encode/decode via `stellar_strkey`; missing size/convert utils |
+| Short Hash (SipHash) | Full | initialize, computeHash, xdrComputeHash, seed |
+| SignerKey Utilities | Full | preAuthTx, hashX, ed25519Payload, getEd25519 |
+| Signature Verification Cache | Partial | BLAKE2-keyed FIFO cache; missing clear/seed/flush APIs |
+| Key/Logging Utilities | None | toShortString, logKey, random helpers |
 
 ## File Mapping
 
 | stellar-core File | Rust Module | Notes |
 |--------------------|-------------|-------|
 | `SHA.h` / `SHA.cpp` | `hash.rs` | SHA-256, HMAC-SHA256, HKDF |
-| `BLAKE2.h` / `BLAKE2.cpp` | `hash.rs` | BLAKE2b-256 hashing |
+| `BLAKE2.h` / `BLAKE2.cpp` | `hash.rs` | BLAKE2b-256 single-shot only |
 | `Hex.h` / `Hex.cpp` | `hex.rs` | Hex encoding/decoding |
 | `Random.h` / `Random.cpp` | `random.rs` | CSPRNG |
 | `Curve25519.h` / `Curve25519.cpp` | `curve25519.rs`, `sealed_box.rs` | ECDH and sealed box split across two modules |
-| `SecretKey.h` / `SecretKey.cpp` | `keys.rs`, `signature.rs` | Key types and signing utilities |
+| `SecretKey.h` / `SecretKey.cpp` | `keys.rs`, `signature.rs` | Key types, signing, verification with cache |
 | `StrKey.h` / `StrKey.cpp` | *(re-export)* `stellar_strkey` | StrKey encoding/decoding delegated to external crate |
 | `ShortHash.h` / `ShortHash.cpp` | `short_hash.rs` | SipHash-2-4 |
 | `SignerKey.h` / `SignerKey.cpp` | `signer_key.rs` | KeyFunctions<SignerKey> specialization |
@@ -51,7 +51,7 @@ Corresponds to: `SHA.h`, `BLAKE2.h`
 | `sha256(ByteSlice)` | `sha256(&[u8])` | Full |
 | `subSha256(ByteSlice, uint64)` | `sub_sha256(&[u8], u64)` | Full |
 | `SHA256::SHA256()` | `Sha256Hasher::new()` | Full |
-| `SHA256::reset()` | `Sha256Hasher::reset()` | Full |
+| `SHA256::reset()` | -- | None |
 | `SHA256::add(ByteSlice)` | `Sha256Hasher::update(&[u8])` | Full |
 | `SHA256::finish()` | `Sha256Hasher::finalize()` | Full |
 | `xdrSha256<T>(T)` | `xdr_sha256<T: WriteXdr>(T)` | Full |
@@ -60,11 +60,11 @@ Corresponds to: `SHA.h`, `BLAKE2.h`
 | `hkdfExtract(bin)` | `hkdf_extract(&[u8])` | Full |
 | `hkdfExpand(key, bin)` | `hkdf_expand(&[u8; 32], &[u8])` | Full |
 | `blake2(ByteSlice)` | `blake2(&[u8])` | Full |
-| `BLAKE2::BLAKE2()` | `Blake2Hasher::new()` | Full |
-| `BLAKE2::reset()` | `Blake2Hasher::reset()` | Full |
-| `BLAKE2::add(ByteSlice)` | `Blake2Hasher::update(&[u8])` | Full |
-| `BLAKE2::finish()` | `Blake2Hasher::finalize()` | Full |
-| `xdrBlake2<T>(T)` | `xdr_blake2<T: WriteXdr>(T)` | Full |
+| `BLAKE2::BLAKE2()` | -- | None |
+| `BLAKE2::reset()` | -- | None |
+| `BLAKE2::add(ByteSlice)` | -- | None |
+| `BLAKE2::finish()` | -- | None |
+| `xdrBlake2<T>(T)` | -- | None |
 
 ### hex.rs (`hex.rs`)
 
@@ -93,7 +93,6 @@ Corresponds to: `Curve25519.h`
 |--------------|------|--------|
 | `curve25519RandomSecret()` | `Curve25519Secret::random()` | Full |
 | `curve25519DerivePublic(secret)` | `Curve25519Secret::derive_public()` | Full |
-| `clearCurve25519Keys(pub, sec)` | `clear_curve25519_keys(&mut pub, &mut sec)` | Full |
 | `curve25519DeriveSharedKey(sec, lpub, rpub, first)` | `Curve25519Secret::derive_shared_key(sec, lpub, rpub, first)` | Full |
 | `hash<Curve25519Public>::operator()` | `Hash for Curve25519Public` | Full |
 
@@ -124,14 +123,21 @@ Corresponds to: `SecretKey.h`
 | `SecretKey::fromSeed(ByteSlice)` | `SecretKey::from_seed(&[u8; 32])` | Full |
 | `SecretKey::operator==` | -- | None |
 | `SecretKey::operator<` | -- | None |
-| `PubKeyUtils::verifySig(key, sig, bin)` | `PublicKey::verify(&[u8], &Signature)` | Full |
+| `hash<PublicKey>::operator()` | `Hash for PublicKey` (derived) | Full |
+
+### signature.rs (`signature.rs`)
+
+Corresponds to: `SecretKey.h` (PubKeyUtils verification)
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `PubKeyUtils::verifySig(key, sig, bin)` | `verify_hash_from_raw_key(&[u8;32], &Hash256, &Signature)` | Full |
 | `PubKeyUtils::clearVerifySigCache()` | -- | None |
 | `PubKeyUtils::seedVerifySigCache(seed)` | -- | None |
 | `PubKeyUtils::flushVerifySigCacheCounts(hits, misses)` | -- | None |
 | `PubKeyUtils::random()` | -- | None |
 | `StrKeyUtils::logKey(ostream, key)` | -- | None |
 | `HashUtils::random()` | -- | None |
-| `hash<PublicKey>::operator()` | `Hash for PublicKey` (derived) | Full |
 
 ### StrKey (via `stellar_strkey` re-export)
 
@@ -188,10 +194,11 @@ Features excluded by design. These are NOT counted against parity %.
 | stellar-core Component | Reason |
 |------------------------|--------|
 | `ByteSlice` adaptor class | Rust native `&[u8]` slices serve the same purpose |
-| `XDRHasher<T>` CRTP base class | Rust uses allocation-based XDR serialization; the public `xdrSha256`/`xdrBlake2` functions are implemented differently |
+| `XDRHasher<T>` CRTP base class | Rust uses allocation-based XDR serialization; the public `xdrSha256` function is implemented differently |
 | `XDRSHA256::hashBytes()` | Internal CRTP implementation detail; public API `xdrSha256<T>` is fully implemented |
-| `XDRBLAKE2::hashBytes()` | Internal CRTP implementation detail; public API `xdrBlake2<T>` is fully implemented |
+| `XDRBLAKE2::hashBytes()` | Internal CRTP implementation detail |
 | `XDRShortHasher` (zero-alloc streaming) | Performance optimization; `xdr_compute_hash()` provides equivalent functionality via allocation |
+| `clearCurve25519Keys(pub, sec)` | Rust uses `ZeroizeOnDrop` trait; keys are automatically zeroed when dropped |
 | `KeyFunctions<PublicKey>` template specialization | Functionality covered by direct `PublicKey` method implementations |
 | `KeyFunctions<SignerKey>` (5 of 7 methods) | `getKeyTypeName`, `getKeyVersionIsSupported`, `toKeyType`, `toKeyVersion`, `getKeyValue`, `setKeyValue` are replaced by Rust match expressions and direct construction |
 | `SecretKey::benchmarkOpsPerSecond()` | Benchmark-only utility, not needed for correctness |
@@ -207,12 +214,18 @@ Features not yet implemented. These ARE counted against parity %.
 
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
+| `SHA256::reset()` | Low | Streaming hasher consumes on finalize; create new instance instead |
+| `BLAKE2::BLAKE2()` (streaming) | Medium | No streaming BLAKE2 hasher exists; only single-shot `blake2()` |
+| `BLAKE2::reset()` | Medium | Depends on streaming BLAKE2 hasher |
+| `BLAKE2::add()` | Medium | Depends on streaming BLAKE2 hasher |
+| `BLAKE2::finish()` | Medium | Depends on streaming BLAKE2 hasher |
+| `xdrBlake2<T>()` | Medium | XDR BLAKE2 hashing not implemented |
 | `SecretKey::isZero()` | Low | Simple utility; can use `as_bytes() == &[0u8; 32]` |
 | `SecretKey::operator==` | Low | Compare via `as_bytes()` but no `PartialEq` impl |
 | `SecretKey::operator<` | Low | Ordering comparison for sorting |
-| `PubKeyUtils::clearVerifySigCache()` | Low | Signature verification cache not implemented |
-| `PubKeyUtils::seedVerifySigCache()` | Low | Signature verification cache not implemented |
-| `PubKeyUtils::flushVerifySigCacheCounts()` | Low | Signature verification cache not implemented |
+| `PubKeyUtils::clearVerifySigCache()` | Low | Cache exists but no public clear API |
+| `PubKeyUtils::seedVerifySigCache()` | Low | Cache exists but no public seed API |
+| `PubKeyUtils::flushVerifySigCacheCounts()` | Low | Cache exists but no hit/miss counters |
 | `PubKeyUtils::random()` | Low | Random public key generation utility |
 | `HashUtils::random()` | Low | Random hash generation utility |
 | `StrKeyUtils::logKey()` | Low | Logging utility for key inspection |
@@ -236,9 +249,9 @@ Features not yet implemented. These ARE counted against parity %.
    - **Rationale**: Simpler implementation at the cost of one allocation per hash; acceptable for most use cases
 
 3. **Signature verification cache**
-   - **stellar-core**: Maintains a process-wide `RandomEvictionCache<Hash, bool>` that caches verification results keyed by BLAKE2 hash of (key, sig, data), with hit/miss counters
-   - **Rust**: Performs verification on every call without caching
-   - **Rationale**: Cache is a performance optimization; can be added later if profiling shows it is needed
+   - **stellar-core**: Maintains a process-wide `RandomEvictionCache<Hash, bool>` that caches verification results keyed by BLAKE2 hash of (key, sig, data), with hit/miss counters and seed/clear/flush management APIs
+   - **Rust**: Maintains a process-wide `SigVerifyCache` with a 250K-entry FIFO eviction policy, keyed by BLAKE2 hash of (pubkey, sig, hash). Missing: clear API, seed API, and hit/miss counter flushing
+   - **Rationale**: Core caching mechanism is implemented for performance; management APIs not yet needed
 
 4. **Key type template system**
    - **stellar-core**: Uses `KeyFunctions<T>` template specializations to provide generic StrKey encode/decode for `PublicKey`, `SecretKey`, and `SignerKey`
@@ -250,32 +263,40 @@ Features not yet implemented. These ARE counted against parity %.
    - **Rust**: Returns `Result<T, CryptoError>` with typed error variants
    - **Rationale**: Idiomatic Rust error handling; all failure modes are explicit in function signatures
 
+6. **Streaming hasher lifecycle**
+   - **stellar-core**: `SHA256` and `BLAKE2` have `reset()` methods allowing reuse of the hasher object
+   - **Rust**: `Sha256Hasher::finalize()` consumes the hasher; create a new instance to hash again
+   - **Rationale**: Rust's ownership model makes consuming-finalize more natural; no `BLAKE2` streaming hasher exists yet
+
 ## Test Coverage
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
-| Hashing (SHA256, BLAKE2) | 7 TEST_CASE (incl. 2 bench) | 22 #[test] | Rust has more granular tests |
+| SHA-256 Hashing | 5 TEST_CASE (incl. 2 bench) | 15 #[test] | Rust has more granular tests |
+| BLAKE2 Hashing | 5 TEST_CASE (incl. 2 bench) | (included in hash.rs) | 3 BLAKE2-specific tests in hash.rs |
 | HMAC / HKDF | 2 TEST_CASE | 7 #[test] | Good coverage on both sides |
-| Signing / Verification | 3 TEST_CASE (incl. 2 bench) | 7 #[test] | Upstream has Ed25519 test vectors |
-| StrKey | 2 TEST_CASE, 5 SECTION | 13 #[test] | Good coverage on both sides |
+| Signing / Verification | 3 TEST_CASE (incl. 2 bench) | 5 #[test] (keys + signature) | Upstream has Ed25519 test vectors |
+| StrKey | 2 TEST_CASE, 5 SECTION | Covered by `stellar_strkey` | Rust relies on external crate's tests |
 | Short Hash | 3 TEST_CASE (incl. 2 bench) | 5 #[test] | Comparable coverage |
 | Hex | Included in CryptoTests | 8 #[test] | Rust has dedicated hex tests |
-| Curve25519 / ECDH | -- | 9 #[test] | Upstream tests are in overlay |
+| Curve25519 / ECDH | -- | 8 #[test] | Upstream tests are in overlay |
 | Random | 1 TEST_CASE | 3 #[test] | Basic non-determinism checks |
-| SignerKey | Included in StrKey tests | 7 #[test] | Good coverage |
+| SignerKey | 1 TEST_CASE, 5 SECTION | 7 #[test] | Good coverage |
 | Sealed Box | -- | 8 #[test] | Upstream tests in overlay |
+| Sig Verification Cache | Included in verify tests | 2 #[test] | Basic cache hit/miss tests |
 
 ### Test Gaps
 
-- **Ed25519 test vectors**: Upstream has extensive test vectors from IACR 2020/1244 and Zcash (`TEST_CASE` with many sub-cases). The Rust crate relies on `ed25519-dalek`'s own test suite for these vectors rather than replicating them.
-- **StrKey edge cases**: Upstream `CryptoTests.cpp` has a large `TEST_CASE("StrKey tests")` block with many edge cases for invalid StrKeys. The Rust tests cover round-trips and basic error cases but not all upstream edge cases.
-- **Benchmark tests**: Upstream has 6 benchmark `TEST_CASE` entries (SHA256, BLAKE2, ShortHash bytes/XDR, sign-and-verify, verify-hit). The Rust crate has no benchmark tests.
+- **Ed25519 test vectors**: Upstream has extensive test vectors from IACR 2020/1244 (1 TEST_CASE, many sub-vectors) and Zcash (1 TEST_CASE). The Rust crate relies on `ed25519-dalek`'s own test suite for these vectors rather than replicating them.
+- **StrKey edge cases**: Upstream `CryptoTests.cpp` has a large `TEST_CASE("StrKey tests")` block with many edge cases for invalid StrKeys. The Rust tests rely on `stellar_strkey`'s test suite.
+- **Benchmark tests**: Upstream has 6 benchmark `TEST_CASE` entries. The Rust crate has no benchmark tests.
+- **Cache management**: No tests for cache clearing, seeding, or hit/miss counting (APIs not yet implemented).
 
 ## Parity Calculation
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 52 |
-| Gaps (None + Partial) | 15 |
-| Intentional Omissions | 13 |
-| **Parity** | **52 / (52 + 15) = 78%** |
+| Implemented (Full) | 47 |
+| Gaps (None + Partial) | 21 |
+| Intentional Omissions | 14 |
+| **Parity** | **47 / (47 + 21) = 69%** |
