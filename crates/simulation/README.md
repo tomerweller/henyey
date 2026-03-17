@@ -8,8 +8,11 @@ and ledger-close behavior across configurable network topologies.
 `henyey-simulation` provides a lightweight simulation environment that can spin
 up multiple henyey `App` nodes (over TCP or in-memory loopback transport) and
 drive them through ledger close cycles, fault injection, and load generation.
-It corresponds to stellar-core's `src/simulation/` directory and is used
-exclusively for integration testing — it has no role in production.
+It also includes a direct-apply benchmarking harness (`ApplyLoad`) for measuring
+raw transaction application performance without consensus overhead. The crate
+corresponds to stellar-core's `src/simulation/` directory and is used
+exclusively for integration testing and benchmarking — it has no role in
+production.
 
 ## Architecture
 
@@ -19,9 +22,13 @@ graph TD
     S -->|manages| AN[RunningAppNode]
     S -->|models links| LN[LoopbackNetwork]
     S -->|submits txs via| LG[LoadGenerator / TxGenerator]
+    LG -->|Soroban txs| STB[SorobanTxBuilder]
     AN -->|wraps| APP[henyey-app::App]
     AN -->|runs on| TOK[tokio task]
     LN -->|partition / drop| FAULT[Fault Injection]
+    AL[ApplyLoad] -->|bypasses consensus| APP
+    AL -->|generates txs via| LG
+    AL -->|configured by| ALC[ApplyLoadConfig]
 ```
 
 ## Key Types
@@ -34,14 +41,17 @@ graph TD
 | `Topologies` | Factory methods for standard network topologies (core, pair, cycle, etc.) |
 | `LoopbackNetwork` | Deterministic link model with partition and drop-probability controls |
 | `LoadGenerator` | Stateful load generator with account pool, rate limiter, and retry logic |
-| `TxGenerator` | Transaction generator with account cache, fee generation, and payment tx builder |
-| `LoadGenMode` | Load generation mode enum (Pay; Soroban modes deferred) |
-| `GeneratedLoadConfig` | Configuration for load generation (mode, accounts, rate, fee, etc.) |
+| `TxGenerator` | Transaction generator with account cache, fee generation, and payment/Soroban tx builders |
+| `LoadGenMode` | Load generation mode: `Pay`, `SorobanUpload`, `SorobanInvokeSetup`, `SorobanInvoke`, `MixedClassicSoroban` |
+| `GeneratedLoadConfig` | Configuration for load generation (mode, accounts, rate, fee, Soroban params) |
 | `TestAccount` | Cached account with deterministic keypair and mutable sequence number |
-| `LoadResult` | Result of a load generation run (Done, Stopped, Failed) |
-| `GeneratedTransaction` | A single generated transaction descriptor (legacy API) |
-| `LoadStep` | One step of a load plan containing a batch of transactions (legacy API) |
-| `LoadReport` | Summary statistics for a load plan (legacy API) |
+| `LoadResult` | Result of a load generation run (`Done`, `Stopped`, `Failed`) |
+| `ContractInstance` | Deployed Soroban contract metadata (keys, contract ID, size) for load generation |
+| `SorobanTxBuilder` | Fluent builder for Soroban `TransactionEnvelope`s (upload, create, invoke) |
+| `ApplyLoad` | Direct-apply benchmarking harness — bypasses consensus for raw performance measurement |
+| `ApplyLoadConfig` | Configuration for `ApplyLoad` (ledger limits, bucket list setup, TPS search params) |
+| `ApplyLoadMode` | Benchmark mode: `LimitBased` (fill ledger limits) or `MaxSacTps` (binary-search max throughput) |
+| `Histogram` | Simple histogram for recording utilization statistics during benchmarks |
 
 ## Usage
 
@@ -58,20 +68,6 @@ let converged = sim
     .crank_until(|s| s.have_all_externalized(11, 2), Duration::from_secs(30))
     .await;
 assert!(converged);
-```
-
-### App-backed simulation with manual ledger close
-
-```rust
-use henyey_simulation::{Simulation, SimulationMode, Topologies};
-
-let mut sim = Topologies::core3(SimulationMode::OverTcp);
-sim.populate_app_nodes_from_existing(67);
-sim.start_all_nodes().await;
-sim.stabilize_app_tcp_connectivity(1, Duration::from_secs(20)).await?;
-
-let _ = sim.manual_close_all_app_nodes().await?;
-sim.stop_all_nodes().await?;
 ```
 
 ### Fault injection
@@ -91,13 +87,29 @@ sim.heal_partition("node6");
 sim.set_drop_prob("node0", "node1", 0.0);
 ```
 
+### Run a direct-apply benchmark
+
+```rust
+use henyey_simulation::{ApplyLoad, ApplyLoadConfig, ApplyLoadMode};
+
+let config = ApplyLoadConfig {
+    num_ledgers: 20,
+    ..ApplyLoadConfig::default()
+};
+let mut harness = ApplyLoad::new(app, config);
+harness.setup_accounts_and_deploy().await?;
+harness.run(ApplyLoadMode::LimitBased).await?;
+```
+
 ## Module Layout
 
 | Module | Description |
 |--------|-------------|
 | `lib.rs` | `Simulation`, `SimNode`, `SimulationMode`, `Topologies`, genesis bootstrapping |
 | `loopback.rs` | `LoopbackNetwork` — deterministic link graph with partition/drop controls |
-| `loadgen.rs` | `LoadGenerator`, `TxGenerator`, `GeneratedLoadConfig`, load plan types |
+| `loadgen.rs` | `LoadGenerator`, `TxGenerator`, `GeneratedLoadConfig`, `ContractInstance`, load plan types |
+| `loadgen_soroban.rs` | `SorobanTxBuilder` — Soroban transaction building (upload WASM, create contract, invoke) |
+| `applyload.rs` | `ApplyLoad`, `ApplyLoadConfig`, `ApplyLoadMode`, `Histogram` — direct-apply benchmark harness |
 
 ## Design Notes
 
@@ -115,6 +127,10 @@ sim.set_drop_prob("node0", "node1", 0.0);
   `generate_load()` matching stellar-core's LoadGenerator with cumulative
   rate limiting, account pool management (available/in-use), `txBAD_SEQ`
   retry logic, and sequence number refresh from the bucket list.
+- **ApplyLoad bypass**: The `ApplyLoad` harness closes ledgers directly
+  through `LedgerManager`, bypassing consensus and overlay entirely. This
+  isolates transaction-application performance from network and agreement
+  overhead.
 
 ## stellar-core Mapping
 
@@ -124,15 +140,10 @@ sim.set_drop_prob("node0", "node1", 0.0);
 | `lib.rs` (`Topologies`) | `src/simulation/Topologies.h` / `Topologies.cpp` |
 | `loadgen.rs` (`LoadGenerator`) | `src/simulation/LoadGenerator.h` / `LoadGenerator.cpp` |
 | `loadgen.rs` (`TxGenerator`) | `src/simulation/TxGenerator.h` / `TxGenerator.cpp` |
-| — | `src/simulation/ApplyLoad.h` / `ApplyLoad.cpp` (not implemented) |
-| — | `src/simulation/CoreTests.cpp` (upstream test file) |
+| `loadgen_soroban.rs` (`SorobanTxBuilder`) | Soroban helpers in `TxGenerator.cpp` |
+| `applyload.rs` (`ApplyLoad`) | `src/simulation/ApplyLoad.h` / `ApplyLoad.cpp` |
+| — | `src/simulation/CoreTests.cpp` (upstream test file, not ported) |
 
 ## Parity Status
 
 See [PARITY_STATUS.md](PARITY_STATUS.md) for detailed stellar-core parity analysis.
-
-## Run Tests
-
-```bash
-cargo test -p henyey-simulation --tests
-```

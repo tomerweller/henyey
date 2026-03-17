@@ -942,7 +942,7 @@ pub struct CachePerfStats {
 }
 
 /// Performance metrics collected during ledger close.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LedgerClosePerf {
     /// Phase timings in microseconds.
     pub begin_close_us: u64,
@@ -979,6 +979,31 @@ pub struct LedgerClosePerf {
     /// RSS in bytes at start and end of ledger close.
     pub rss_before_bytes: u64,
     pub rss_after_bytes: u64,
+}
+
+impl std::ops::AddAssign<&LedgerClosePerf> for LedgerClosePerf {
+    fn add_assign(&mut self, rhs: &LedgerClosePerf) {
+        self.begin_close_us += rhs.begin_close_us;
+        self.tx_exec_us += rhs.tx_exec_us;
+        self.classic_exec_us += rhs.classic_exec_us;
+        self.soroban_exec_us += rhs.soroban_exec_us;
+        self.commit_setup_us += rhs.commit_setup_us;
+        self.bucket_lock_wait_us += rhs.bucket_lock_wait_us;
+        self.eviction_us += rhs.eviction_us;
+        self.soroban_state_us += rhs.soroban_state_us;
+        self.add_batch_us += rhs.add_batch_us;
+        self.hot_archive_us += rhs.hot_archive_us;
+        self.header_us += rhs.header_us;
+        self.commit_close_us += rhs.commit_close_us;
+        self.meta_us += rhs.meta_us;
+        self.total_us += rhs.total_us;
+        self.prepare_us += rhs.prepare_us;
+        self.config_load_us += rhs.config_load_us;
+        self.executor_setup_us += rhs.executor_setup_us;
+        self.fee_pre_deduct_us += rhs.fee_pre_deduct_us;
+        self.post_exec_us += rhs.post_exec_us;
+        self.tx_count += rhs.tx_count;
+    }
 }
 
 impl LedgerCloseResult {

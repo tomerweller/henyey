@@ -41,6 +41,17 @@ pub enum SimulationMode {
     OverTcp,
 }
 
+/// Check whether all sequence numbers in `seqs` are at least `min_ledger`
+/// and within `max_spread` of each other.
+fn seqs_within_spread(seqs: &[u32], min_ledger: u32, max_spread: u32) -> bool {
+    if seqs.is_empty() {
+        return false;
+    }
+    let min_seq = *seqs.iter().min().unwrap_or(&0);
+    let max_seq = *seqs.iter().max().unwrap_or(&0);
+    min_seq >= min_ledger && max_seq.saturating_sub(min_seq) <= max_spread
+}
+
 #[derive(Debug, Clone)]
 pub struct SimNode {
     pub node_id: String,
@@ -573,15 +584,30 @@ impl Simulation {
         if self.running_apps.is_empty() {
             return false;
         }
-
         let seqs: Vec<u32> = self
             .running_apps
             .values()
             .map(|n| n.app.ledger_info().0)
             .collect();
-        let min_seq = *seqs.iter().min().unwrap_or(&0);
-        let max_seq = *seqs.iter().max().unwrap_or(&0);
-        min_seq >= ledger_seq && max_seq.saturating_sub(min_seq) <= max_spread
+        seqs_within_spread(&seqs, ledger_seq, max_spread)
+    }
+
+    /// Advance a SimNode's ledger sequence and recompute its hash.
+    fn advance_node(&mut self, node_id: &str, next_seq: u32) {
+        let hash_input = format!("{}:{}", node_id, next_seq);
+        if let Some(node) = self.nodes.get_mut(node_id) {
+            node.ledger_seq = next_seq;
+            node.ledger_hash = Hash256::hash(hash_input.as_bytes());
+        }
+    }
+
+    /// Check whether `node_id` has an active link to any non-partitioned peer.
+    fn has_connected_peer(&self, node_id: &str, candidates: &[String]) -> bool {
+        candidates.iter().any(|other| {
+            other != node_id
+                && !self.loopback.is_partitioned(other)
+                && self.loopback.link_active(node_id, other)
+        })
     }
 
     /// Advance a single lightweight SimNode by one ledger (if possible).
@@ -612,20 +638,9 @@ impl Simulation {
             return false;
         }
 
-        let has_path = self.nodes.keys().any(|other| {
-            if other == node_id || self.loopback.is_partitioned(other) {
-                return false;
-            }
-            self.loopback.link_active(node_id, other)
-        });
-
-        if has_path {
-            let next = current + 1;
-            let hash_input = format!("{}:{}", node_id, next);
-            if let Some(node) = self.nodes.get_mut(node_id) {
-                node.ledger_seq = next;
-                node.ledger_hash = Hash256::hash(hash_input.as_bytes());
-            }
+        let ids: Vec<String> = self.nodes.keys().cloned().collect();
+        if self.has_connected_peer(node_id, &ids) {
+            self.advance_node(node_id, current + 1);
             true
         } else {
             false
@@ -684,22 +699,9 @@ impl Simulation {
             }
 
             let current = self.nodes.get(id).map(|n| n.ledger_seq).unwrap_or(1);
-            if current < max_seq {
-                let has_path = ids.iter().any(|other| {
-                    if other == id || self.loopback.is_partitioned(other) {
-                        return false;
-                    }
-                    self.loopback.link_active(id, other)
-                });
-                if has_path {
-                    let next = current + 1;
-                    let hash_input = format!("{}:{}", id, next);
-                    if let Some(node) = self.nodes.get_mut(id) {
-                        node.ledger_seq = next;
-                        node.ledger_hash = Hash256::hash(hash_input.as_bytes());
-                    }
-                    did_work = true;
-                }
+            if current < max_seq && self.has_connected_peer(id, &ids) {
+                self.advance_node(id, current + 1);
+                did_work = true;
             }
         }
 
@@ -728,22 +730,15 @@ impl Simulation {
         if !all_equal {
             return false;
         }
-        let connected = non_partitioned.iter().all(|id| {
-            non_partitioned
-                .iter()
-                .filter(|other| *other != id)
-                .any(|other| self.loopback.link_active(id, other))
-        });
+        let connected = non_partitioned
+            .iter()
+            .all(|id| self.has_connected_peer(id, &non_partitioned));
         if !connected {
             return false;
         }
         let next = max_seq + 1;
         for id in &non_partitioned {
-            let hash_input = format!("{}:{}", id, next);
-            if let Some(node) = self.nodes.get_mut(id) {
-                node.ledger_seq = next;
-                node.ledger_hash = Hash256::hash(hash_input.as_bytes());
-            }
+            self.advance_node(id, next);
         }
         true
     }
@@ -767,21 +762,13 @@ impl Simulation {
         if self.nodes.is_empty() {
             return false;
         }
-
         let seqs: Vec<u32> = self
             .nodes
             .iter()
             .filter(|(id, _)| !self.loopback.is_partitioned(id))
             .map(|(_, n)| n.ledger_seq)
             .collect();
-
-        if seqs.is_empty() {
-            return false;
-        }
-
-        let min_seq = *seqs.iter().min().unwrap_or(&0);
-        let max_seq = *seqs.iter().max().unwrap_or(&0);
-        min_seq >= ledger_seq && max_seq.saturating_sub(min_seq) <= max_spread
+        seqs_within_spread(&seqs, ledger_seq, max_spread)
     }
 
     pub fn ledger_seq(&self, node_id: &str) -> u32 {

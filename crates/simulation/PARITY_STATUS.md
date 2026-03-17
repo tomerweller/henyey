@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-simulation`
 **Upstream**: `stellar-core/src/simulation/`
-**Overall Parity**: 95%
-**Last Updated**: 2026-03-08
+**Overall Parity**: 93%
+**Last Updated**: 2026-03-17
 
 ## Summary
 
@@ -246,7 +246,7 @@ Corresponds to: `ApplyLoad.h`
 | `setupUpgradeContract()` | `setup_upgrade_contract()` | Partial (stub) |
 | `upgradeSettings()` | `upgrade_settings()` | Partial (stub) |
 | `applyConfigUpgrade()` | `apply_config_upgrade()` | Partial (stub) |
-| `warmAccountCache()` | — | None |
+| `warmAccountCache()` | `warm_account_cache()` | Full |
 
 ### Herder / App additions
 
@@ -296,7 +296,6 @@ Features not yet implemented. These ARE counted against parity %.
 | `getStatus()` | Low | JSON status report for GeneratedLoadConfig |
 | `createSorobanInvokeSetupLoad()` | Low | Static factory method |
 | `invokeSorobanLoadTransactionV2()` | Low | V2 invoke with data-entry-count parameters |
-| `warmAccountCache()` (ApplyLoad) | Low | BucketListDB cache warming |
 | `setupUpgradeContract()` full impl | Medium | Currently a stub; blocked on config-upgrade wasm |
 | `upgradeSettings()` full impl | Medium | Currently a stub; blocked on setupUpgradeContract |
 | `applyConfigUpgrade()` full impl | Medium | Currently a stub; blocked on setupUpgradeContract |
@@ -354,10 +353,10 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 113 |
-| Gaps (None + Partial) | 10 |
+| Implemented (Full) | 114 |
+| Gaps (None + Partial) | 9 |
 | Intentional Omissions | 28 |
-| **Parity** | **113 / (113 + 10) = 92%** |
+| **Parity** | **114 / (114 + 9) = 93%** |
 
 Note: SorobanTxBuilder methods (8 items) are not counted separately — they are
 the implementation of the TxGenerator methods already counted above. The 3
@@ -366,3 +365,5 @@ are counted as gaps because they exist as stubs but are not functionally
 complete. The 28 intentional omissions cover config-upgrade-contract approach
 (henyey uses direct LedgerUpgrade), medida metrics, test-only accessors,
 VirtualClock time manipulation, and modes not needed (pregenerated, upgrade).
+`warmAccountCache()` was previously a gap but is now implemented in
+`applyload.rs`.

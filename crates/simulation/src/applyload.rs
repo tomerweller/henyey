@@ -443,8 +443,7 @@ impl ApplyLoad {
         let mut txs: Vec<TransactionEnvelope> = Vec::new();
 
         // Generate classic payment transactions.
-        let accounts = self.tx_gen.accounts().clone();
-        let mut shuffled_ids: Vec<u64> = accounts.keys().copied().collect();
+        let mut shuffled_ids: Vec<u64> = self.tx_gen.accounts().keys().copied().collect();
         // Deterministic shuffle via simple hash-based sort.
         shuffled_ids.sort_by_key(|id| Hash256::hash(&id.to_le_bytes()).0);
 
@@ -469,7 +468,7 @@ impl ApplyLoad {
         // Generate Soroban invoke transactions until resource limits are hit.
         let load_instance = self
             .load_instance
-            .clone()
+            .as_ref()
             .context("load contract not set up")?;
         let mut resources_left = self.max_generation_resources();
         let mut soroban_limit_hit = false;
@@ -688,7 +687,10 @@ impl ApplyLoad {
         // populating all 14+ CONFIG_SETTING entries needed for Soroban.
         let header = self.app.ledger_manager().current_header();
         if header.ledger_version < 25 {
-            info!("ApplyLoad: upgrading protocol {} -> 25", header.ledger_version);
+            info!(
+                "ApplyLoad: upgrading protocol {} -> 25",
+                header.ledger_version
+            );
             self.close_ledger(Vec::new(), vec![LedgerUpgrade::Version(25)], false)?;
         }
 
@@ -1143,26 +1145,7 @@ impl ApplyLoad {
     pub fn benchmark_sac_tps(&mut self, txs_per_ledger: u32) -> Result<f64> {
         let num_ledgers = self.config.num_ledgers;
         let mut total_time_ms = 0.0;
-
-        // Accumulators for LedgerClosePerf sub-phases (microseconds).
-        let mut agg_begin_close_us: u64 = 0;
-        let mut agg_classic_exec_us: u64 = 0;
-        let mut agg_soroban_exec_us: u64 = 0;
-        let mut agg_prepare_us: u64 = 0;
-        let mut agg_config_load_us: u64 = 0;
-        let mut agg_executor_setup_us: u64 = 0;
-        let mut agg_fee_pre_deduct_us: u64 = 0;
-        let mut agg_post_exec_us: u64 = 0;
-        let mut agg_commit_setup_us: u64 = 0;
-        let mut agg_bucket_lock_wait_us: u64 = 0;
-        let mut agg_eviction_us: u64 = 0;
-        let mut agg_soroban_state_us: u64 = 0;
-        let mut agg_add_batch_us: u64 = 0;
-        let mut agg_hot_archive_us: u64 = 0;
-        let mut agg_header_us: u64 = 0;
-        let mut agg_meta_us: u64 = 0;
-        let mut agg_commit_close_us: u64 = 0;
-        let mut agg_total_us: u64 = 0;
+        let mut agg = LedgerClosePerf::default();
 
         for iter in 0..num_ledgers {
             self.warm_account_cache();
@@ -1183,24 +1166,7 @@ impl ApplyLoad {
             total_time_ms += elapsed_ms;
 
             if let Some(ref p) = perf {
-                agg_begin_close_us += p.begin_close_us;
-                agg_classic_exec_us += p.classic_exec_us;
-                agg_soroban_exec_us += p.soroban_exec_us;
-                agg_prepare_us += p.prepare_us;
-                agg_config_load_us += p.config_load_us;
-                agg_executor_setup_us += p.executor_setup_us;
-                agg_fee_pre_deduct_us += p.fee_pre_deduct_us;
-                agg_post_exec_us += p.post_exec_us;
-                agg_commit_setup_us += p.commit_setup_us;
-                agg_bucket_lock_wait_us += p.bucket_lock_wait_us;
-                agg_eviction_us += p.eviction_us;
-                agg_soroban_state_us += p.soroban_state_us;
-                agg_add_batch_us += p.add_batch_us;
-                agg_hot_archive_us += p.hot_archive_us;
-                agg_header_us += p.header_us;
-                agg_meta_us += p.meta_us;
-                agg_commit_close_us += p.commit_close_us;
-                agg_total_us += p.total_us;
+                agg += p;
 
                 warn!(
                     "  Ledger {}/{}: {:.1}ms total | soroban={:.1}ms (prep={:.1} cfg={:.1} exec_setup={:.1} fee={:.1} post={:.1}) \
@@ -1257,62 +1223,73 @@ impl ApplyLoad {
         );
         warn!(
             "    begin_close:    {:.2}ms",
-            agg_begin_close_us as f64 / 1000.0 / n
+            agg.begin_close_us as f64 / 1000.0 / n
         );
         warn!(
             "    tx_apply:       prepare={:.2} config_load={:.2} executor_setup={:.2} fee_pre_deduct={:.2} post_exec={:.2}",
-            agg_prepare_us as f64 / 1000.0 / n,
-            agg_config_load_us as f64 / 1000.0 / n,
-            agg_executor_setup_us as f64 / 1000.0 / n,
-            agg_fee_pre_deduct_us as f64 / 1000.0 / n,
-            agg_post_exec_us as f64 / 1000.0 / n,
+            agg.prepare_us as f64 / 1000.0 / n,
+            agg.config_load_us as f64 / 1000.0 / n,
+            agg.executor_setup_us as f64 / 1000.0 / n,
+            agg.fee_pre_deduct_us as f64 / 1000.0 / n,
+            agg.post_exec_us as f64 / 1000.0 / n,
         );
         warn!(
             "    classic_exec:   {:.2}ms",
-            agg_classic_exec_us as f64 / 1000.0 / n
+            agg.classic_exec_us as f64 / 1000.0 / n
         );
         warn!(
             "    soroban_exec:   {:.2}ms",
-            agg_soroban_exec_us as f64 / 1000.0 / n
+            agg.soroban_exec_us as f64 / 1000.0 / n
         );
         warn!(
             "    commit:         setup={:.2} bucket_wait={:.2} eviction={:.2} soroban_state={:.2}",
-            agg_commit_setup_us as f64 / 1000.0 / n,
-            agg_bucket_lock_wait_us as f64 / 1000.0 / n,
-            agg_eviction_us as f64 / 1000.0 / n,
-            agg_soroban_state_us as f64 / 1000.0 / n,
+            agg.commit_setup_us as f64 / 1000.0 / n,
+            agg.bucket_lock_wait_us as f64 / 1000.0 / n,
+            agg.eviction_us as f64 / 1000.0 / n,
+            agg.soroban_state_us as f64 / 1000.0 / n,
         );
         warn!(
             "    add_batch:      {:.2}ms",
-            agg_add_batch_us as f64 / 1000.0 / n
+            agg.add_batch_us as f64 / 1000.0 / n
         );
         warn!(
             "    hot_archive:    {:.2}ms",
-            agg_hot_archive_us as f64 / 1000.0 / n
+            agg.hot_archive_us as f64 / 1000.0 / n
         );
         warn!(
             "    header_hash:    {:.2}ms",
-            agg_header_us as f64 / 1000.0 / n
+            agg.header_us as f64 / 1000.0 / n
         );
         warn!(
             "    meta:           {:.2}ms",
-            agg_meta_us as f64 / 1000.0 / n
+            agg.meta_us as f64 / 1000.0 / n
         );
         warn!(
             "    commit_close:   {:.2}ms",
-            agg_commit_close_us as f64 / 1000.0 / n
+            agg.commit_close_us as f64 / 1000.0 / n
         );
-        let sum_us = agg_begin_close_us + agg_prepare_us + agg_config_load_us
-            + agg_executor_setup_us + agg_fee_pre_deduct_us + agg_post_exec_us
-            + agg_classic_exec_us + agg_soroban_exec_us
-            + agg_commit_setup_us + agg_bucket_lock_wait_us + agg_eviction_us
-            + agg_soroban_state_us + agg_add_batch_us + agg_hot_archive_us
-            + agg_header_us + agg_meta_us + agg_commit_close_us;
+        let sum_us = agg.begin_close_us
+            + agg.prepare_us
+            + agg.config_load_us
+            + agg.executor_setup_us
+            + agg.fee_pre_deduct_us
+            + agg.post_exec_us
+            + agg.classic_exec_us
+            + agg.soroban_exec_us
+            + agg.commit_setup_us
+            + agg.bucket_lock_wait_us
+            + agg.eviction_us
+            + agg.soroban_state_us
+            + agg.add_batch_us
+            + agg.hot_archive_us
+            + agg.header_us
+            + agg.meta_us
+            + agg.commit_close_us;
         warn!(
             "    total (perf):   {:.2}ms (sum={:.2}ms, gap={:.2}ms)",
-            agg_total_us as f64 / 1000.0 / n,
+            agg.total_us as f64 / 1000.0 / n,
             sum_us as f64 / 1000.0 / n,
-            (agg_total_us - sum_us) as f64 / 1000.0 / n,
+            (agg.total_us - sum_us) as f64 / 1000.0 / n,
         );
 
         Ok(avg_time)
@@ -1326,19 +1303,20 @@ impl ApplyLoad {
         txs: &mut Vec<TransactionEnvelope>,
         count: u32,
     ) -> Result<()> {
-        let accounts = self.tx_gen.accounts().clone();
+        let num_accounts = self.tx_gen.accounts().len();
+        let account_ids: Vec<u64> = self.tx_gen.accounts().keys().copied().collect();
         let ledger_num = self.app.ledger_manager().current_ledger_seq() + 1;
 
         ensure!(
-            accounts.len() >= count as usize,
+            num_accounts >= count as usize,
             "not enough accounts ({}) for {} SAC payments",
-            accounts.len(),
+            num_accounts,
             count
         );
 
         let sac_instance = self
             .sac_instance_xlm
-            .clone()
+            .as_ref()
             .context("XLM SAC not set up")?;
 
         if self.config.batch_sac_count > 1 {
@@ -1379,7 +1357,6 @@ impl ApplyLoad {
             }
         } else {
             // Individual SAC payment mode.
-            let account_ids: Vec<u64> = accounts.keys().copied().collect();
             for i in 0..count {
                 let to_address = ScAddress::Contract(ContractId(Hash(
                     Hash256::hash(format!("dest_{}_{}", i, ledger_num).as_bytes()).0,
@@ -1550,13 +1527,9 @@ impl ApplyLoad {
                 ledger_max_tx_count: ledger_max_tx_count,
             }),
             // 14: CONFIG_SETTING_CONTRACT_PARALLEL_COMPUTE_V0
-            ConfigSettingEntry::ContractParallelComputeV0(
-                ConfigSettingContractParallelComputeV0 {
-                    ledger_max_dependent_tx_clusters: self
-                        .config
-                        .ledger_max_dependent_tx_clusters,
-                },
-            ),
+            ConfigSettingEntry::ContractParallelComputeV0(ConfigSettingContractParallelComputeV0 {
+                ledger_max_dependent_tx_clusters: self.config.ledger_max_dependent_tx_clusters,
+            }),
         ]
     }
 
@@ -1567,9 +1540,7 @@ impl ApplyLoad {
     /// by writing the ConfigUpgradeSet as a synthetic TEMPORARY CONTRACT_DATA
     /// entry directly into the LedgerManager's in-memory Soroban state.
     fn apply_config_upgrade_direct(&mut self, entries: Vec<ConfigSettingEntry>) -> Result<()> {
-        use stellar_xdr::curr::{
-            ConfigUpgradeSet, ConfigUpgradeSetKey, ContractDataEntry,
-        };
+        use stellar_xdr::curr::{ConfigUpgradeSet, ConfigUpgradeSetKey, ContractDataEntry};
 
         // Build the ConfigUpgradeSet
         let num_entries = entries.len();
@@ -1589,36 +1560,30 @@ impl ApplyLoad {
             data: LedgerEntryData::ContractData(ContractDataEntry {
                 ext: ExtensionPoint::V0,
                 contract: ScAddress::Contract(ContractId(Hash(contract_id.0))),
-                key: ScVal::Bytes(
-                    content_hash.0.to_vec().try_into().expect("32 bytes"),
-                ),
+                key: ScVal::Bytes(content_hash.0.to_vec().try_into().expect("32 bytes")),
                 durability: ContractDataDurability::Temporary,
-                val: ScVal::Bytes(
-                    upgrade_bytes.try_into().expect("config upgrade bytes"),
-                ),
+                val: ScVal::Bytes(upgrade_bytes.try_into().expect("config upgrade bytes")),
             }),
             ext: LedgerEntryExt::V0,
         };
 
         // Inject the entry directly into the LedgerManager's in-memory state
         // with a generous TTL so it doesn't expire during the benchmark.
-        self.app.ledger_manager().inject_synthetic_contract_data(
-            contract_data_entry,
-            ledger_seq + 1_000_000,
-        )?;
+        self.app
+            .ledger_manager()
+            .inject_synthetic_contract_data(contract_data_entry, ledger_seq + 1_000_000)?;
 
         // Close a ledger with the config upgrade
         let upgrade_key = ConfigUpgradeSetKey {
             contract_id: ContractId(Hash(contract_id.0)),
             content_hash: Hash(content_hash.0),
         };
-        self.close_ledger(
-            Vec::new(),
-            vec![LedgerUpgrade::Config(upgrade_key)],
-            false,
-        )?;
+        self.close_ledger(Vec::new(), vec![LedgerUpgrade::Config(upgrade_key)], false)?;
 
-        info!("ApplyLoad: config upgrade applied ({} settings)", num_entries);
+        info!(
+            "ApplyLoad: config upgrade applied ({} settings)",
+            num_entries
+        );
         Ok(())
     }
 
