@@ -1,3 +1,9 @@
+//! Transaction set selection from the pending queue.
+//!
+//! Builds candidate transaction sets for consensus by selecting the
+//! highest-fee transactions that fit within ledger capacity, applying
+//! surge pricing and lane-based limits.
+
 use super::*;
 
 impl TransactionQueue {
@@ -58,8 +64,10 @@ impl TransactionQueue {
         let mut classic_txs = Vec::new();
         let mut soroban_txs = Vec::new();
         for tx in &transactions {
-            let frame =
-                henyey_tx::TransactionFrame::from_owned_with_network(tx.clone(), self.config.network_id);
+            let frame = henyey_tx::TransactionFrame::from_owned_with_network(
+                tx.clone(),
+                self.config.network_id,
+            );
             if frame.is_soroban() {
                 soroban_txs.push(tx.clone());
             } else {
@@ -77,8 +85,10 @@ impl TransactionQueue {
             let mut lane_for_tx = Vec::with_capacity(classic_txs.len());
 
             for tx in &classic_txs {
-                let frame =
-                    henyey_tx::TransactionFrame::from_owned_with_network(tx.clone(), self.config.network_id);
+                let frame = henyey_tx::TransactionFrame::from_owned_with_network(
+                    tx.clone(),
+                    self.config.network_id,
+                );
                 let lane = if has_dex_lane && frame.has_dex_operations() {
                     crate::surge_pricing::DEX_LANE
                 } else {
@@ -477,8 +487,8 @@ impl TransactionQueue {
         };
 
         let mut transactions = Vec::new();
-        transactions.extend(classic_selected.into_iter().map(|tx| tx.envelope.clone()));
-        transactions.extend(soroban_selected.into_iter().map(|tx| tx.envelope.clone()));
+        transactions.extend(classic_selected.into_iter().map(|tx| tx.envelope));
+        transactions.extend(soroban_selected.into_iter().map(|tx| tx.envelope));
 
         SelectedTxs {
             transactions,

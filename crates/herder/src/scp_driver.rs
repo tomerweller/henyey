@@ -865,15 +865,7 @@ impl ScpDriver {
                     return false;
                 }
             };
-            let order = match upgrade {
-                LedgerUpgrade::Version(_) => 0,
-                LedgerUpgrade::BaseFee(_) => 1,
-                LedgerUpgrade::MaxTxSetSize(_) => 2,
-                LedgerUpgrade::BaseReserve(_) => 3,
-                LedgerUpgrade::Flags(_) => 4,
-                LedgerUpgrade::Config(_) => 5,
-                LedgerUpgrade::MaxSorobanTxSetSize(_) => 6,
-            };
+            let order = Self::upgrade_type_order(&upgrade);
             if last_upgrade_order.is_some_and(|prev| order <= prev) {
                 debug!("Invalid ledger upgrade encountered");
                 return false;

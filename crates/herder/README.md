@@ -4,43 +4,29 @@ SCP coordination and ledger-close orchestration for henyey.
 
 ## Overview
 
-The Herder is the central coordinator that bridges the overlay network and the ledger manager through SCP (Stellar Consensus Protocol). It orchestrates the entire flow from receiving transactions and SCP messages, through consensus, to triggering ledger close. This crate corresponds to stellar-core's `src/herder/` directory (upstream reference: `stellar-core/src/herder/`) and implements `HerderImpl`, `HerderSCPDriver`, `TransactionQueue`, `PendingEnvelopes`, `Upgrades`, and related components.
+The Herder is the central coordinator that bridges the overlay network and the ledger manager through SCP (Stellar Consensus Protocol). It orchestrates the entire flow from receiving transactions and SCP messages, through consensus, to triggering ledger close. This crate corresponds to stellar-core's `src/herder/` directory and implements `HerderImpl`, `HerderSCPDriver`, `TransactionQueue`, `PendingEnvelopes`, `Upgrades`, and related components.
 
 The Herder operates in two modes: **Observer** (tracks consensus without voting) and **Validator** (proposes values and votes via SCP). It progresses through three states: Booting, Syncing, and Tracking.
 
 ## Architecture
 
 ```mermaid
-stateDiagram-v2
-    [*] --> Booting
-    Booting --> Syncing : start_syncing()
-    Syncing --> Tracking : bootstrap(ledger_seq)
-    Tracking --> Syncing : out-of-sync detected
-
-    state Booting {
-        [*] : No network participation
-    }
-    state Syncing {
-        [*] : Buffers SCP envelopes
-        [*] : Cannot accept transactions
-    }
-    state Tracking {
-        [*] : Full consensus participation
-        [*] : Processes transactions and SCP messages
-    }
-```
-
-```mermaid
 graph TD
-    ON[Overlay Network] --> |Transactions| TQ[TransactionQueue]
-    ON --> |SCP Envelopes| H[Herder]
+    subgraph "State Machine"
+        Boot[Booting] -->|start_syncing| Sync[Syncing]
+        Sync -->|bootstrap| Track[Tracking]
+        Track -->|out-of-sync| Sync
+    end
+
+    ON[Overlay Network] -->|Transactions| TQ[TransactionQueue]
+    ON -->|SCP Envelopes| H[Herder]
     H --> FE[FetchingEnvelopes]
     H --> PE[PendingEnvelopes]
     H --> SD[ScpDriver]
     SD --> SCP[SCP Consensus]
     TQ --> SP[SurgePricing]
-    FE --> |ItemFetcher| ON
-    SCP --> |Externalize| LM[LedgerManager]
+    FE -->|ItemFetcher| ON
+    SCP -->|Externalize| LM[LedgerManager]
 
     TM[TimerManager] -.-> SCP
     SR[SyncRecovery] -.-> H
@@ -167,7 +153,9 @@ let (tx_set, gen_tx_set) = queue.build_generalized_tx_set(
 | `lib.rs` | Crate root: re-exports, `PendingTransaction`, `ExternalizedValue`, `HerderCallback` trait |
 | `herder.rs` | Main `Herder` struct, `HerderConfig`, envelope processing, state transitions |
 | `scp_driver.rs` | `ScpDriver` and `HerderScpCallback`: SCP value validation, signing, tx set caching |
-| `tx_queue/` | `TransactionQueue`, `TransactionSet`, `QueuedTransaction`, tx set building (`mod.rs`, `selection.rs`, `tx_set.rs`) |
+| `tx_queue/mod.rs` | `TransactionQueue`, `QueuedTransaction`, `TxQueueConfig`, queue management |
+| `tx_queue/selection.rs` | Transaction set selection with surge pricing and lane limits |
+| `tx_queue/tx_set.rs` | `TransactionSet`: wire-format parsing, validation, XDR conversion |
 | `tx_queue_limiter.rs` | `TxQueueLimiter`: resource-aware queue admission and eviction |
 | `surge_pricing.rs` | `SurgePricingLaneConfig`, `SurgePricingPriorityQueue`: lane-based fee thresholds |
 | `parallel_tx_set_builder.rs` | Parallel Soroban tx set building: conflict detection, staging, bin packing |
@@ -175,7 +163,7 @@ let (tx_set, gen_tx_set) = queue.build_generalized_tx_set(
 | `fetching_envelopes.rs` | `FetchingEnvelopes`: dependency fetching for TxSets and QuorumSets |
 | `quorum_tracker.rs` | `SlotQuorumTracker`, `QuorumTracker`: quorum membership and security checks |
 | `persistence.rs` | `ScpPersistenceManager`, `SqliteScpPersistence`: SCP state crash recovery |
-| `upgrades.rs` | `Upgrades`, `UpgradeParameters`: ledger upgrade scheduling and validation |
+| `upgrades.rs` | `Upgrades`, `UpgradeParameters`, `CurrentLedgerState`: ledger upgrade scheduling |
 | `ledger_close_data.rs` | `LedgerCloseData`: complete consensus data for ledger close |
 | `tx_set_utils.rs` | Transaction set validation: invalid tx filtering, trimming |
 | `herder_utils.rs` | Utility functions: value extraction, node ID conversion, short strings |

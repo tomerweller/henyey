@@ -1,3 +1,9 @@
+//! Transaction set types and wire-format parsing.
+//!
+//! Defines [`TransactionSet`] for carrying candidate and externalized
+//! transaction sets, plus validation and conversion between the legacy
+//! (v0) and generalized (v1) XDR wire formats.
+
 use super::*;
 
 pub(super) fn sort_txs_by_hash(txs: &mut [TransactionEnvelope]) {
@@ -277,7 +283,8 @@ impl TransactionSet {
     ) -> std::result::Result<Self, String> {
         for env in transactions {
             validate_tx_fee(env)?;
-            let frame = henyey_tx::TransactionFrame::from_owned_with_network(env.clone(), network_id);
+            let frame =
+                henyey_tx::TransactionFrame::from_owned_with_network(env.clone(), network_id);
             if frame.is_soroban() {
                 return Err("Legacy transaction set contains Soroban transaction".to_string());
             }
