@@ -573,7 +573,6 @@ impl BucketListSnapshot {
     ///
     /// This is the snapshot-based equivalent of [`BucketList::scan_bucket_region`].
     /// Uses `self.get_result()` for TTL and entry lookups instead of `BucketList::get()`.
-    #[allow(clippy::too_many_arguments)]
     fn scan_bucket_region(
         &self,
         bucket: &Bucket,
@@ -598,110 +597,79 @@ impl BucketListSnapshot {
             bytes_used += entry_size;
             entries_scanned += 1;
 
-            let live_entry = match &entry {
-                BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => e,
-                BucketEntry::Deadentry(key) => {
-                    seen_keys.insert(key.clone());
-                    if bytes_used >= max_bytes {
-                        iter.bucket_file_offset = start_offset + bytes_used;
-                        return Ok((entries_scanned, bytes_used, false));
+            'process: {
+                let live_entry = match &entry {
+                    BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => e,
+                    BucketEntry::Deadentry(key) => {
+                        seen_keys.insert(key.clone());
+                        break 'process;
                     }
-                    continue;
-                }
-                BucketEntry::Metaentry(_) => {
-                    if bytes_used >= max_bytes {
-                        iter.bucket_file_offset = start_offset + bytes_used;
-                        return Ok((entries_scanned, bytes_used, false));
+                    BucketEntry::Metaentry(_) => {
+                        break 'process;
                     }
-                    continue;
+                };
+
+                if !is_soroban_entry(live_entry) {
+                    break 'process;
                 }
-            };
 
-            if !is_soroban_entry(live_entry) {
-                if bytes_used >= max_bytes {
-                    iter.bucket_file_offset = start_offset + bytes_used;
-                    return Ok((entries_scanned, bytes_used, false));
+                let key = henyey_common::entry_to_key(live_entry);
+
+                if !seen_keys.insert(key.clone()) {
+                    break 'process;
                 }
-                continue;
-            }
 
-            let key = henyey_common::entry_to_key(live_entry);
+                let Some(ttl_key) = get_ttl_key(&key) else {
+                    break 'process;
+                };
 
-            if !seen_keys.insert(key.clone()) {
-                if bytes_used >= max_bytes {
-                    iter.bucket_file_offset = start_offset + bytes_used;
-                    return Ok((entries_scanned, bytes_used, false));
+                // Look up TTL entry from the snapshot (instead of BucketList::get)
+                let Some(ttl_entry) = self.get_result(&ttl_key)? else {
+                    break 'process;
+                };
+
+                let Some(is_expired) = is_ttl_expired(&ttl_entry, current_ledger) else {
+                    break 'process;
+                };
+
+                if !is_expired {
+                    break 'process;
                 }
-                continue;
-            }
 
-            let Some(ttl_key) = get_ttl_key(&key) else {
-                if bytes_used >= max_bytes {
-                    iter.bucket_file_offset = start_offset + bytes_used;
-                    return Ok((entries_scanned, bytes_used, false));
-                }
-                continue;
-            };
-
-            // Look up TTL entry from the snapshot (instead of BucketList::get)
-            let Some(ttl_entry) = self.get_result(&ttl_key)? else {
-                if bytes_used >= max_bytes {
-                    iter.bucket_file_offset = start_offset + bytes_used;
-                    return Ok((entries_scanned, bytes_used, false));
-                }
-                continue;
-            };
-
-            let Some(is_expired) = is_ttl_expired(&ttl_entry, current_ledger) else {
-                if bytes_used >= max_bytes {
-                    iter.bucket_file_offset = start_offset + bytes_used;
-                    return Ok((entries_scanned, bytes_used, false));
-                }
-                continue;
-            };
-
-            if !is_expired {
-                if bytes_used >= max_bytes {
-                    iter.bucket_file_offset = start_offset + bytes_used;
-                    return Ok((entries_scanned, bytes_used, false));
-                }
-                continue;
-            }
-
-            // Entry is expired — collect as eviction candidate.
-            // For persistent entries, archive the NEWEST version from the snapshot.
-            let is_temp = is_temporary_entry(live_entry);
-            let entry_for_candidate = if !is_temp {
-                if let Some(newest_entry) = self.get_result(&key)? {
-                    newest_entry
+                // Entry is expired — collect as eviction candidate.
+                // For persistent entries, archive the NEWEST version from the snapshot.
+                let is_temp = is_temporary_entry(live_entry);
+                let entry_for_candidate = if !is_temp {
+                    if let Some(newest_entry) = self.get_result(&key)? {
+                        newest_entry
+                    } else {
+                        live_entry.clone()
+                    }
                 } else {
                     live_entry.clone()
-                }
-            } else {
-                live_entry.clone()
-            };
+                };
 
-            candidates.push(EvictionCandidate {
-                entry: entry_for_candidate,
-                data_key: key,
-                ttl_key,
-                is_temporary: is_temp,
-                position: EvictionIterator {
-                    bucket_list_level: iter.bucket_list_level,
-                    is_curr_bucket: iter.is_curr_bucket,
-                    bucket_file_offset: start_offset + bytes_used,
-                },
-            });
+                candidates.push(EvictionCandidate {
+                    entry: entry_for_candidate,
+                    data_key: key,
+                    ttl_key,
+                    is_temporary: is_temp,
+                    position: EvictionIterator {
+                        bucket_list_level: iter.bucket_list_level,
+                        is_curr_bucket: iter.is_curr_bucket,
+                        bucket_file_offset: start_offset + bytes_used,
+                    },
+                });
+            }
 
             if bytes_used >= max_bytes {
-                iter.bucket_file_offset = start_offset + bytes_used;
-                return Ok((entries_scanned, bytes_used, false));
+                break;
             }
         }
 
-        // Finished the bucket
+        let budget_exhausted = bytes_used >= max_bytes;
         iter.bucket_file_offset = start_offset + bytes_used;
-        Ok((entries_scanned, bytes_used, true))
+        Ok((entries_scanned, bytes_used, !budget_exhausted))
     }
 }
 

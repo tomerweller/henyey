@@ -256,6 +256,24 @@ impl PendingMerge {
     }
 }
 
+/// Optional BucketList-level context passed to level merges.
+///
+/// Groups the merge behavior flags and shared resources that the
+/// `BucketList` owns and threads into `BucketLevel::prepare_with_normalization`
+/// and `AsyncMergeHandle::start_merge`.
+pub(crate) struct MergeContext<'a> {
+    /// Whether to keep dead (tombstone) entries in the merge output.
+    pub keep_dead_entries: bool,
+    /// If true, convert INIT entries to LIVE entries during the merge.
+    /// Should ALWAYS be false in production; exists for test compatibility.
+    pub normalize_init: bool,
+    /// If true, use an empty bucket instead of the level's actual curr.
+    pub use_empty_curr: bool,
+    pub bucket_dir: Option<&'a std::path::Path>,
+    pub merge_map: Option<&'a std::sync::Arc<std::sync::RwLock<BucketMergeMap>>>,
+    pub merge_counters: Option<Arc<MergeCounters>>,
+}
+
 /// Handle to an asynchronous bucket merge running in a background thread.
 ///
 /// The merge is started immediately when this handle is created, and runs
@@ -698,25 +716,13 @@ impl BucketLevel {
     /// The curr may be empty if this level was already snapped from processing
     /// higher levels first.
     ///
-    /// - `normalize_init`: If true, INIT entries are converted to LIVE. Note: This should
-    ///   ALWAYS be false in production to match stellar-core behavior. stellar-core never
-    ///   normalizes INIT entries to LIVE during merges. This parameter exists for
-    ///   backward compatibility with tests.
-    /// - `use_empty_curr`: If true, use an empty bucket instead of self.curr for the merge.
-    ///   This is used when the level is about to snap its curr (shouldMergeWithEmptyCurr).
-    #[allow(clippy::too_many_arguments)]
+    /// Merge behavior flags and shared resources are bundled in [`MergeContext`].
     fn prepare_with_normalization(
         &mut self,
-        _ledger_seq: u32,
         protocol_version: u32,
         incoming: Arc<Bucket>,
-        keep_dead_entries: bool,
         shadow_buckets: &[Bucket],
-        normalize_init: bool,
-        use_empty_curr: bool,
-        bucket_dir: Option<&std::path::Path>,
-        merge_map: Option<&std::sync::Arc<std::sync::RwLock<BucketMergeMap>>>,
-        merge_counters: Option<Arc<MergeCounters>>,
+        ctx: MergeContext<'_>,
     ) -> Result<()> {
         if self.next.is_some() {
             return Err(BucketError::Merge(
@@ -725,7 +731,7 @@ impl BucketLevel {
         }
 
         // Choose curr or empty based on shouldMergeWithEmptyCurr
-        let curr_for_merge: Arc<Bucket> = if use_empty_curr {
+        let curr_for_merge: Arc<Bucket> = if ctx.use_empty_curr {
             tracing::debug!(
                 level = self.level,
                 "prepare_with_normalization: using EMPTY curr (shouldMergeWithEmptyCurr=true)"
@@ -747,21 +753,21 @@ impl BucketLevel {
             curr_for_merge_entries = curr_for_merge.len(),
             incoming_hash = %incoming.hash(),
             incoming_entries = incoming.len(),
-            keep_dead_entries = keep_dead_entries,
-            normalize_init = normalize_init,
+            keep_dead_entries = ctx.keep_dead_entries,
+            normalize_init = ctx.normalize_init,
             "prepare_with_normalization: about to merge"
         );
 
         // Check merge map for a cached result before starting a new merge.
         // If this exact merge (same inputs + keep_dead_entries) was previously
         // completed, reuse the output instead of re-computing.
-        if let Some(merge_map) = merge_map {
+        if let Some(merge_map) = ctx.merge_map {
             let curr_hash = curr_for_merge.hash();
             let snap_hash = incoming.hash();
-            let key = MergeKey::new(keep_dead_entries, curr_hash, snap_hash);
+            let key = MergeKey::new(ctx.keep_dead_entries, curr_hash, snap_hash);
             if let Some(output_hash) = merge_map.read().unwrap().get_output(&key).copied() {
                 if !output_hash.is_zero() {
-                    if let Some(dir) = bucket_dir {
+                    if let Some(dir) = ctx.bucket_dir {
                         let path = dir.join(canonical_bucket_filename(&output_hash));
                         if path.exists() {
                             match Bucket::from_xdr_file_disk_backed(&path) {
@@ -799,13 +805,13 @@ impl BucketLevel {
             let handle = AsyncMergeHandle::start_merge(
                 curr_for_merge,
                 incoming,
-                keep_dead_entries,
+                ctx.keep_dead_entries,
                 protocol_version,
-                normalize_init,
+                ctx.normalize_init,
                 shadow_buckets.to_vec(),
                 self.level,
-                bucket_dir.map(|p| p.to_path_buf()),
-                merge_counters,
+                ctx.bucket_dir.map(|p| p.to_path_buf()),
+                ctx.merge_counters,
             );
             self.next = Some(PendingMerge::Async(handle));
         } else {
@@ -813,11 +819,11 @@ impl BucketLevel {
             let merged = merge_buckets_with_options_and_shadows_and_counters(
                 &curr_for_merge,
                 &incoming,
-                keep_dead_entries,
+                ctx.keep_dead_entries,
                 protocol_version,
-                normalize_init,
+                ctx.normalize_init,
                 shadow_buckets,
-                merge_counters.as_deref(),
+                ctx.merge_counters.as_deref(),
             )?;
 
             tracing::debug!(
@@ -1830,16 +1836,17 @@ impl BucketList {
                     Vec::new()
                 };
                 self.levels[i].prepare_with_normalization(
-                    ledger_seq,
                     protocol_version,
                     Arc::clone(&spilling_snap),
-                    keep_dead,
                     &shadow_buckets,
-                    normalize_init,
-                    use_empty_curr,
-                    self.bucket_dir.as_deref(),
-                    self.merge_map.as_ref(),
-                    Some(Arc::clone(&self.merge_counters)),
+                    MergeContext {
+                        keep_dead_entries: keep_dead,
+                        normalize_init,
+                        use_empty_curr,
+                        bucket_dir: self.bucket_dir.as_deref(),
+                        merge_map: self.merge_map.as_ref(),
+                        merge_counters: Some(Arc::clone(&self.merge_counters)),
+                    },
                 )?;
 
                 let post_prepare_next_hash = self.levels[i]
@@ -2595,16 +2602,17 @@ impl BucketList {
 
             // Start the merge with the previous level's snap
             self.levels[i].prepare_with_normalization(
-                merge_start_ledger,
                 merge_protocol_version,
                 prev_snap,
-                keep_dead,
                 &[],
-                normalize_init,
-                use_empty_curr,
-                self.bucket_dir.as_deref(),
-                self.merge_map.as_ref(),
-                Some(Arc::clone(&self.merge_counters)),
+                MergeContext {
+                    keep_dead_entries: keep_dead,
+                    normalize_init,
+                    use_empty_curr,
+                    bucket_dir: self.bucket_dir.as_deref(),
+                    merge_map: self.merge_map.as_ref(),
+                    merge_counters: Some(Arc::clone(&self.merge_counters)),
+                },
             )?;
 
             tracing::info!(
@@ -2886,7 +2894,6 @@ impl BucketList {
     /// to the start offset (instead of reading and skipping millions of entries)
     /// and reads record sizes from the file format (instead of re-serializing
     /// every entry to XDR just for byte size computation).
-    #[allow(clippy::too_many_arguments)]
     fn scan_bucket_region(
         &self,
         bucket: &Bucket,
@@ -2917,134 +2924,102 @@ impl BucketList {
             bytes_used += entry_size;
             entries_scanned += 1;
 
-            // Process the entry for eviction
-            let live_entry = match &entry {
-                BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => e,
-                BucketEntry::Deadentry(key) => {
-                    // Mark dead keys as seen
-                    if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
-                        seen_keys.insert(key_bytes);
+            // Process the entry for eviction. The labeled block lets each
+            // skip-branch `break 'process` so that the single budget check
+            // at the end of the loop body is always reached.
+            'process: {
+                let live_entry = match &entry {
+                    BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => e,
+                    BucketEntry::Deadentry(key) => {
+                        // Mark dead keys as seen
+                        if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
+                            seen_keys.insert(key_bytes);
+                        }
+                        break 'process;
                     }
-                    if bytes_used >= max_bytes {
-                        iter.bucket_file_offset = start_offset + bytes_used;
-                        return Ok((entries_scanned, bytes_used, false));
+                    BucketEntry::Metaentry(_) => {
+                        break 'process;
                     }
-                    continue;
+                };
+
+                // Only check Soroban entries
+                if !is_soroban_entry(live_entry) {
+                    break 'process;
                 }
-                BucketEntry::Metaentry(_) => {
-                    if bytes_used >= max_bytes {
-                        iter.bucket_file_offset = start_offset + bytes_used;
-                        return Ok((entries_scanned, bytes_used, false));
+
+                // Get the key for this entry
+                let key = henyey_common::entry_to_key(live_entry);
+
+                // Check if we've already seen this key (from a newer bucket)
+                let key_bytes = match key.to_xdr(Limits::none()) {
+                    Ok(bytes) => bytes,
+                    Err(_) => break 'process,
+                };
+
+                if !seen_keys.insert(key_bytes) {
+                    break 'process;
+                }
+
+                // Get the TTL key
+                let Some(ttl_key) = get_ttl_key(&key) else {
+                    break 'process;
+                };
+
+                // Look up the TTL entry
+                let Some(ttl_entry) = self.get(&ttl_key)? else {
+                    break 'process;
+                };
+
+                // Check if expired
+                let Some(is_expired) = is_ttl_expired(&ttl_entry, current_ledger) else {
+                    break 'process;
+                };
+
+                if !is_expired {
+                    break 'process;
+                }
+
+                // Entry is expired — collect as eviction candidate.
+                // For persistent entries, archive the NEWEST version from the bucket list
+                // (not the potentially stale version from the older bucket being scanned).
+                // See: BucketSnapshot.cpp scanForEviction() lines 247-261
+                let is_temp = is_temporary_entry(live_entry);
+                let entry_for_candidate = if !is_temp {
+                    if let Some(newest_entry) = self.get(&key)? {
+                        newest_entry
+                    } else {
+                        live_entry.clone()
                     }
-                    continue;
-                }
-            };
-
-            // Only check Soroban entries
-            if !is_soroban_entry(live_entry) {
-                if bytes_used >= max_bytes {
-                    iter.bucket_file_offset = start_offset + bytes_used;
-                    return Ok((entries_scanned, bytes_used, false));
-                }
-                continue;
-            }
-
-            // Get the key for this entry
-            let key = henyey_common::entry_to_key(live_entry);
-
-            // Check if we've already seen this key (from a newer bucket)
-            let key_bytes = match key.to_xdr(Limits::none()) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    if bytes_used >= max_bytes {
-                        iter.bucket_file_offset = start_offset + bytes_used;
-                        return Ok((entries_scanned, bytes_used, false));
-                    }
-                    continue;
-                }
-            };
-
-            if !seen_keys.insert(key_bytes) {
-                if bytes_used >= max_bytes {
-                    iter.bucket_file_offset = start_offset + bytes_used;
-                    return Ok((entries_scanned, bytes_used, false));
-                }
-                // Already processed from a newer level
-                continue;
-            }
-
-            // Get the TTL key
-            let Some(ttl_key) = get_ttl_key(&key) else {
-                if bytes_used >= max_bytes {
-                    iter.bucket_file_offset = start_offset + bytes_used;
-                    return Ok((entries_scanned, bytes_used, false));
-                }
-                continue;
-            };
-
-            // Look up the TTL entry
-            let Some(ttl_entry) = self.get(&ttl_key)? else {
-                if bytes_used >= max_bytes {
-                    iter.bucket_file_offset = start_offset + bytes_used;
-                    return Ok((entries_scanned, bytes_used, false));
-                }
-                continue;
-            };
-
-            // Check if expired
-            let Some(is_expired) = is_ttl_expired(&ttl_entry, current_ledger) else {
-                if bytes_used >= max_bytes {
-                    iter.bucket_file_offset = start_offset + bytes_used;
-                    return Ok((entries_scanned, bytes_used, false));
-                }
-                continue;
-            };
-
-            if !is_expired {
-                if bytes_used >= max_bytes {
-                    iter.bucket_file_offset = start_offset + bytes_used;
-                    return Ok((entries_scanned, bytes_used, false));
-                }
-                continue;
-            }
-
-            // Entry is expired — collect as eviction candidate.
-            // For persistent entries, archive the NEWEST version from the bucket list
-            // (not the potentially stale version from the older bucket being scanned).
-            // See: BucketSnapshot.cpp scanForEviction() lines 247-261
-            let is_temp = is_temporary_entry(live_entry);
-            let entry_for_candidate = if !is_temp {
-                if let Some(newest_entry) = self.get(&key)? {
-                    newest_entry
                 } else {
                     live_entry.clone()
-                }
-            } else {
-                live_entry.clone()
-            };
+                };
 
-            candidates.push(EvictionCandidate {
-                entry: entry_for_candidate,
-                data_key: key,
-                ttl_key,
-                is_temporary: is_temp,
-                position: EvictionIterator {
-                    bucket_list_level: iter.bucket_list_level,
-                    is_curr_bucket: iter.is_curr_bucket,
-                    bucket_file_offset: start_offset + bytes_used,
-                },
-            });
+                candidates.push(EvictionCandidate {
+                    entry: entry_for_candidate,
+                    data_key: key,
+                    ttl_key,
+                    is_temporary: is_temp,
+                    position: EvictionIterator {
+                        bucket_list_level: iter.bucket_list_level,
+                        is_curr_bucket: iter.is_curr_bucket,
+                        bucket_file_offset: start_offset + bytes_used,
+                    },
+                });
+            }
 
-            // Only check bytes limit (max_entries is applied in resolution phase)
+            // Single budget check: stop scanning if we've consumed enough bytes.
+            // (max_entries limit is applied in the resolution phase, not here.)
             if bytes_used >= max_bytes {
-                iter.bucket_file_offset = start_offset + bytes_used;
-                return Ok((entries_scanned, bytes_used, false));
+                break;
             }
         }
 
-        // Finished the bucket
+        // Update the iterator position. The third element indicates whether
+        // the bucket was fully scanned (`true`) or we stopped early because
+        // the byte budget was exhausted (`false`).
+        let budget_exhausted = bytes_used >= max_bytes;
         iter.bucket_file_offset = start_offset + bytes_used;
-        Ok((entries_scanned, bytes_used, true))
+        Ok((entries_scanned, bytes_used, !budget_exhausted))
     }
 }
 
@@ -3327,7 +3302,7 @@ mod tests {
         .unwrap();
 
         level
-            .prepare_with_normalization(5, TEST_PROTOCOL, Arc::new(incoming), false, &[], true, false, None, None, None)
+            .prepare_with_normalization(TEST_PROTOCOL, Arc::new(incoming), &[], MergeContext { keep_dead_entries: false, normalize_init: true, use_empty_curr: false, bucket_dir: None, merge_map: None, merge_counters: None })
             .unwrap();
         let _ = level.commit();
 
@@ -4075,16 +4050,17 @@ mod tests {
         let mut level_probe = BucketLevel::new(1);
         level_probe
             .prepare_with_normalization(
-                10,
                 TEST_PROTOCOL,
                 snap_bucket.clone(),
-                true,
                 &[],
-                false,
-                true,  // use_empty_curr → merge(empty, snap_bucket)
-                Some(&bucket_dir),
-                None,
-                None,
+                MergeContext {
+                    keep_dead_entries: true,
+                    normalize_init: false,
+                    use_empty_curr: true, // merge(empty, snap_bucket)
+                    bucket_dir: Some(&bucket_dir),
+                    merge_map: None,
+                    merge_counters: None,
+                },
             )
             .unwrap();
         let _ = level_probe.commit();
@@ -4124,16 +4100,17 @@ mod tests {
         let mut level_fixed = BucketLevel::new(1);
         level_fixed
             .prepare_with_normalization(
-                10,
                 TEST_PROTOCOL,
                 snap_bucket.clone(),
-                true,
                 &[],
-                false,
-                true,
-                Some(&bucket_dir),
-                None,
-                None,
+                MergeContext {
+                    keep_dead_entries: true,
+                    normalize_init: false,
+                    use_empty_curr: true,
+                    bucket_dir: Some(&bucket_dir),
+                    merge_map: None,
+                    merge_counters: None,
+                },
             )
             .unwrap();
         let _ = level_fixed.commit();

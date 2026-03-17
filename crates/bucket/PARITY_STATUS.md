@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-bucket`
 **Upstream**: `stellar-core/src/bucket/`
-**Overall Parity**: 93%
-**Last Updated**: 2026-02-17
+**Overall Parity**: 97%
+**Last Updated**: 2026-03-17
 
 ## Summary
 
@@ -449,9 +449,10 @@ Features not yet implemented. These ARE counted against parity %.
 |------------------------|----------|-------|
 | `BucketManager::getMergeFuture()` / `putMergeFuture()` | Medium | MergeMap exists but not wired into merge workflow |
 | `BucketManager::getBloomMissMeter()` / `getBloomLookupMeter()` | Low | Medida-style meter not integrated |
-| `BucketManager::loadCompleteHotArchiveState()` (full) | Low | Partial via hot archive iteration |
-| `BucketManager::scheduleVerifyReferencedBucketsWork()` (as Work) | Low | Verification exists but not as Work class |
-| `BucketInputIterator::seek()` | Low | Position seeking not exposed |
+| `BucketManager::getMergeTimer()` | Low | Only partial timer via MergeCounters |
+| `BucketManager::getCacheHitMeter()` / `getCacheMissMeter()` | Low | CacheStats exist but no Medida-style meter |
+| `BucketManager::reportBucketEntryCountMetrics()` | Low | BucketEntryCounters exist but metrics reporting partial |
+| `BucketInputIterator::pos()` / `size()` / `seek()` | Low | Position seeking not fully exposed |
 | `EvictionStatistics::submitMetricsAndRestartCycle()` | Low | Simplified eviction stats |
 
 ## Architectural Differences
@@ -503,7 +504,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 138 |
-| Gaps (None + Partial) | 11 |
+| Implemented (Full) | 242 |
+| Gaps (None + Partial) | 8 |
 | Intentional Omissions | 7 |
-| **Parity** | **138 / (138 + 11) = 93%** |
+| **Parity** | **242 / (242 + 8) = 97%** |
