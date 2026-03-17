@@ -3,7 +3,7 @@
 **Crate**: `henyey-historywork`
 **Upstream**: `stellar-core/src/historywork/`
 **Overall Parity**: 56%
-**Last Updated**: 2026-03-05
+**Last Updated**: 2026-03-17
 
 ## Summary
 
@@ -84,7 +84,7 @@ Corresponds to: `BatchDownloadWork.h`
 | stellar-core | Rust | Status |
 |--------------|------|--------|
 | `BatchDownloadWork()` constructor | `BatchDownloadWork::new()` | Full |
-| `getStatus()` | `BatchDownloadWork::get_status()` | Full |
+| `getStatus()` | `BatchDownloadProgress::message()` | Full |
 | `hasNext()` | Implicit in checkpoint iterator | Full |
 | `yieldMoreWork()` | `download_checkpoint_file()` | Full |
 | `resetIter()` | Not needed (single-pass async) | Full |
@@ -156,15 +156,15 @@ Corresponds to: `Progress.h`
 
 ### Publish Work Items (`lib.rs`)
 
-These are Rust-specific work items with no direct 1:1 upstream equivalent. They publish downloaded data to an archive via the `ArchiveWriter` trait.
+These are Rust-specific work items with no direct 1:1 upstream equivalent. They publish downloaded data to an archive via the `ArchiveWriter` trait. The individual publish types were consolidated into `PublishXdrWork` with factory methods (`::headers()`, `::transactions()`, `::results()`, `::scp()`), plus a separate `PublishBucketsWork`.
 
 | Rust Work Item | Upstream Equivalent | Status |
 |--------------|------|--------|
 | `PublishBucketsWork` | Part of `PutSnapshotFilesWork` | Partial (mirror only) |
-| `PublishLedgerHeadersWork` | Part of `PutSnapshotFilesWork` | Partial (mirror only) |
-| `PublishTransactionsWork` | Part of `PutSnapshotFilesWork` | Partial (mirror only) |
-| `PublishResultsWork` | Part of `PutSnapshotFilesWork` | Partial (mirror only) |
-| `PublishScpHistoryWork` | Part of `PutSnapshotFilesWork` | Partial (mirror only) |
+| `PublishXdrWork::headers()` | Part of `PutSnapshotFilesWork` | Partial (mirror only) |
+| `PublishXdrWork::transactions()` | Part of `PutSnapshotFilesWork` | Partial (mirror only) |
+| `PublishXdrWork::results()` | Part of `PutSnapshotFilesWork` | Partial (mirror only) |
+| `PublishXdrWork::scp()` | Part of `PutSnapshotFilesWork` | Partial (mirror only) |
 
 ### Helper Functions and Types (`lib.rs`)
 
@@ -236,7 +236,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 6. **Publish Pipeline**
    - **stellar-core**: Multi-step snapshot pipeline: `WriteSnapshotWork` -> `ResolveSnapshotWork` -> `PutSnapshotFilesWork` (which does differential upload via `PutFilesWork`)
-   - **Rust**: Individual publish work items (`PublishBucketsWork`, `PublishLedgerHeadersWork`, etc.) that publish from downloaded state via `ArchiveWriter` trait
+   - **Rust**: Individual publish work items (`PublishBucketsWork`, `PublishXdrWork`) that publish from downloaded state via `ArchiveWriter` trait
    - **Rationale**: Current Rust implementation supports archive mirroring; full archiving-node publish from live state is not yet implemented
 
 7. **Archive Selection**
@@ -253,6 +253,7 @@ Features not yet implemented. These ARE counted against parity %.
 | Checkpoint range | -- | 3 #[test] | `test_checkpoint_range_count`, `_iter`, `_ledger_range` |
 | File type / progress | -- | 2 #[test] | `test_history_file_type_display`, `test_batch_download_progress_message` |
 | Well-known path | -- | 1 #[test] | `test_well_known_stellar_history_path` |
+| Retry constants | -- | 2 #[test] | `test_retry_a_few_constant`, `test_retry_a_lot_constant` |
 | Integration (download) | Part of `CatchupSimulation` | 1 #[tokio::test] in `history_work.rs` | Rust has end-to-end test |
 | State assembly | -- | 2 #[tokio::test] in `checkpoint_data.rs` | Basic state tests |
 

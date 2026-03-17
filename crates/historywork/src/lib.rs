@@ -275,7 +275,7 @@ async fn set_progress(state: &SharedHistoryState, stage: HistoryWorkStage, messa
 /// # Output
 ///
 /// On success, populates `state.has` with the parsed [`HistoryArchiveState`].
-pub struct GetHistoryArchiveStateWork {
+pub(crate) struct GetHistoryArchiveStateWork {
     archive: Arc<HistoryArchive>,
     checkpoint: u32,
     state: SharedHistoryState,
@@ -289,7 +289,7 @@ impl GetHistoryArchiveStateWork {
     /// * `archive` - The history archive to fetch from
     /// * `checkpoint` - The checkpoint ledger sequence number
     /// * `state` - Shared state to store the downloaded HAS
-    pub fn new(archive: Arc<HistoryArchive>, checkpoint: u32, state: SharedHistoryState) -> Self {
+    pub(crate) fn new(archive: Arc<HistoryArchive>, checkpoint: u32, state: SharedHistoryState) -> Self {
         Self {
             archive,
             checkpoint,
@@ -337,7 +337,7 @@ impl Work for GetHistoryArchiveStateWork {
 /// # Output
 ///
 /// On success, saves bucket files to disk in the configured bucket directory.
-pub struct DownloadBucketsWork {
+pub(crate) struct DownloadBucketsWork {
     archive: Arc<HistoryArchive>,
     state: SharedHistoryState,
     bucket_dir: PathBuf,
@@ -351,7 +351,7 @@ impl DownloadBucketsWork {
     /// * `archive` - The history archive to fetch buckets from
     /// * `state` - Shared state containing the HAS
     /// * `bucket_dir` - Directory where bucket files will be saved
-    pub fn new(archive: Arc<HistoryArchive>, state: SharedHistoryState, bucket_dir: PathBuf) -> Self {
+    pub(crate) fn new(archive: Arc<HistoryArchive>, state: SharedHistoryState, bucket_dir: PathBuf) -> Self {
         Self { archive, state, bucket_dir }
     }
 }
@@ -487,7 +487,7 @@ impl Work for DownloadBucketsWork {
 /// # Output
 ///
 /// On success, populates `state.headers` with verified header entries.
-pub struct DownloadLedgerHeadersWork {
+pub(crate) struct DownloadLedgerHeadersWork {
     archive: Arc<HistoryArchive>,
     checkpoint: u32,
     state: SharedHistoryState,
@@ -501,7 +501,7 @@ impl DownloadLedgerHeadersWork {
     /// * `archive` - The history archive to fetch headers from
     /// * `checkpoint` - The checkpoint ledger sequence number
     /// * `state` - Shared state where headers will be stored
-    pub fn new(archive: Arc<HistoryArchive>, checkpoint: u32, state: SharedHistoryState) -> Self {
+    pub(crate) fn new(archive: Arc<HistoryArchive>, checkpoint: u32, state: SharedHistoryState) -> Self {
         Self {
             archive,
             checkpoint,
@@ -559,7 +559,7 @@ impl Work for DownloadLedgerHeadersWork {
 /// # Output
 ///
 /// On success, populates `state.transactions` with verified transaction entries.
-pub struct DownloadTransactionsWork {
+pub(crate) struct DownloadTransactionsWork {
     archive: Arc<HistoryArchive>,
     checkpoint: u32,
     state: SharedHistoryState,
@@ -573,7 +573,7 @@ impl DownloadTransactionsWork {
     /// * `archive` - The history archive to fetch transactions from
     /// * `checkpoint` - The checkpoint ledger sequence number
     /// * `state` - Shared state where transactions will be stored
-    pub fn new(archive: Arc<HistoryArchive>, checkpoint: u32, state: SharedHistoryState) -> Self {
+    pub(crate) fn new(archive: Arc<HistoryArchive>, checkpoint: u32, state: SharedHistoryState) -> Self {
         Self {
             archive,
             checkpoint,
@@ -656,7 +656,7 @@ impl Work for DownloadTransactionsWork {
 /// # Output
 ///
 /// On success, populates `state.tx_results` with verified result entries.
-pub struct DownloadTxResultsWork {
+pub(crate) struct DownloadTxResultsWork {
     archive: Arc<HistoryArchive>,
     checkpoint: u32,
     state: SharedHistoryState,
@@ -670,7 +670,7 @@ impl DownloadTxResultsWork {
     /// * `archive` - The history archive to fetch results from
     /// * `checkpoint` - The checkpoint ledger sequence number
     /// * `state` - Shared state where results will be stored
-    pub fn new(archive: Arc<HistoryArchive>, checkpoint: u32, state: SharedHistoryState) -> Self {
+    pub(crate) fn new(archive: Arc<HistoryArchive>, checkpoint: u32, state: SharedHistoryState) -> Self {
         Self {
             archive,
             checkpoint,
@@ -754,7 +754,7 @@ impl Work for DownloadTxResultsWork {
 /// # Output
 ///
 /// On success, populates `state.scp_history` with SCP entries.
-pub struct DownloadScpHistoryWork {
+pub(crate) struct DownloadScpHistoryWork {
     archive: Arc<HistoryArchive>,
     checkpoint: u32,
     state: SharedHistoryState,
@@ -768,7 +768,7 @@ impl DownloadScpHistoryWork {
     /// * `archive` - The history archive to fetch SCP history from
     /// * `checkpoint` - The checkpoint ledger sequence number
     /// * `state` - Shared state where SCP history will be stored
-    pub fn new(archive: Arc<HistoryArchive>, checkpoint: u32, state: SharedHistoryState) -> Self {
+    pub(crate) fn new(archive: Arc<HistoryArchive>, checkpoint: u32, state: SharedHistoryState) -> Self {
         Self {
             archive,
             checkpoint,
@@ -864,17 +864,12 @@ impl LocalArchiveWriter {
     pub fn new(base_dir: PathBuf) -> Self {
         Self { base_dir }
     }
-
-    /// Resolves a relative archive path to an absolute filesystem path.
-    fn full_path(&self, path: &str) -> PathBuf {
-        self.base_dir.join(path)
-    }
 }
 
 #[async_trait]
 impl ArchiveWriter for LocalArchiveWriter {
     async fn put_bytes(&self, path: &str, data: &[u8]) -> Result<()> {
-        let full_path = self.full_path(path);
+        let full_path = self.base_dir.join(path);
         if let Some(parent) = full_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -905,28 +900,6 @@ fn serialize_entries<T: WriteXdr>(entries: &[T]) -> Result<Vec<u8>> {
         data.extend_from_slice(&xdr);
     }
     Ok(data)
-}
-
-/// Serializes XDR entries, gzip-compresses them, and writes to an archive path.
-///
-/// This is the common publish pipeline used by headers, transactions, results,
-/// and SCP history publish work items: serialize to XDR -> gzip -> write.
-async fn publish_xdr_entries<T: WriteXdr>(
-    writer: &dyn ArchiveWriter,
-    entries: &[T],
-    category: &str,
-    checkpoint: u32,
-    extension: &str,
-) -> Result<(), String> {
-    let data = serialize_entries(entries)
-        .map_err(|err| format!("failed to serialize {category}: {err}"))?;
-    let gz =
-        gzip_bytes(&data).map_err(|err| format!("failed to gzip {category}: {err}"))?;
-    let path = checkpoint_path(category, checkpoint, extension);
-    writer
-        .put_bytes(&path, &gz)
-        .await
-        .map_err(|err| format!("failed to publish {category}: {err}"))
 }
 
 /// Maximum number of concurrent download requests, matching stellar-core's
@@ -964,7 +937,7 @@ const WELL_KNOWN_STELLAR_HISTORY_PATH: &str = ".well-known/stellar-history.json"
 /// # Dependencies
 ///
 /// Requires [`GetHistoryArchiveStateWork`] to have completed with a valid HAS.
-pub struct PublishHistoryArchiveStateWork {
+pub(crate) struct PublishHistoryArchiveStateWork {
     writer: Arc<dyn ArchiveWriter>,
     checkpoint: u32,
     state: SharedHistoryState,
@@ -978,7 +951,7 @@ impl PublishHistoryArchiveStateWork {
     /// * `writer` - The archive writer to publish to
     /// * `checkpoint` - The checkpoint ledger sequence number
     /// * `state` - Shared state containing the HAS to publish
-    pub fn new(writer: Arc<dyn ArchiveWriter>, checkpoint: u32, state: SharedHistoryState) -> Self {
+    pub(crate) fn new(writer: Arc<dyn ArchiveWriter>, checkpoint: u32, state: SharedHistoryState) -> Self {
         Self {
             writer,
             checkpoint,
@@ -1049,7 +1022,7 @@ impl Work for PublishHistoryArchiveStateWork {
 /// # Dependencies
 ///
 /// Requires [`DownloadBucketsWork`] to have completed with valid bucket data.
-pub struct PublishBucketsWork {
+pub(crate) struct PublishBucketsWork {
     writer: Arc<dyn ArchiveWriter>,
     state: SharedHistoryState,
 }
@@ -1061,60 +1034,46 @@ impl PublishBucketsWork {
     ///
     /// * `writer` - The archive writer to publish to
     /// * `state` - Shared state containing the buckets to publish
-    pub fn new(writer: Arc<dyn ArchiveWriter>, state: SharedHistoryState) -> Self {
+    pub(crate) fn new(writer: Arc<dyn ArchiveWriter>, state: SharedHistoryState) -> Self {
         Self { writer, state }
     }
 }
 
-/// Describes how to extract data from shared state for a publish work item.
-///
-/// Each variant maps to a specific data category in [`HistoryWorkState`] and
-/// its corresponding archive path, work name, and progress stage.
-enum PublishCategory {
-    /// Ledger headers → `ledger/*.xdr.gz`
-    Headers,
-    /// Transaction sets → `transactions/*.xdr.gz`
-    Transactions,
-    /// Transaction results → `results/*.xdr.gz`
-    Results,
-    /// SCP history → `scp/*.xdr.gz`
-    Scp,
-}
-
-impl PublishCategory {
-    fn work_name(&self) -> &'static str {
+impl HistoryFileType {
+    /// Returns the string representation used in archive paths.
+    pub fn type_string(&self) -> &'static str {
         match self {
-            Self::Headers => "publish-ledger-headers",
+            Self::Ledger => "ledger",
+            Self::Transactions => "transactions",
+            Self::Results => "results",
+            Self::Scp => "scp",
+        }
+    }
+
+    fn publish_work_name(&self) -> &'static str {
+        match self {
+            Self::Ledger => "publish-ledger-headers",
             Self::Transactions => "publish-transactions",
             Self::Results => "publish-results",
             Self::Scp => "publish-scp-history",
         }
     }
 
-    fn stage(&self) -> HistoryWorkStage {
+    fn publish_stage(&self) -> HistoryWorkStage {
         match self {
-            Self::Headers => HistoryWorkStage::PublishHeaders,
+            Self::Ledger => HistoryWorkStage::PublishHeaders,
             Self::Transactions => HistoryWorkStage::PublishTransactions,
             Self::Results => HistoryWorkStage::PublishResults,
             Self::Scp => HistoryWorkStage::PublishScp,
         }
     }
 
-    fn progress_message(&self) -> &'static str {
+    fn publish_progress_message(&self) -> &'static str {
         match self {
-            Self::Headers => "publishing headers",
+            Self::Ledger => "publishing headers",
             Self::Transactions => "publishing transactions",
             Self::Results => "publishing results",
             Self::Scp => "publishing SCP history",
-        }
-    }
-
-    fn archive_category(&self) -> &'static str {
-        match self {
-            Self::Headers => "ledger",
-            Self::Transactions => "transactions",
-            Self::Results => "results",
-            Self::Scp => "scp",
         }
     }
 }
@@ -1127,96 +1086,103 @@ impl PublishCategory {
 /// # Dependencies
 ///
 /// Each category depends on its corresponding download work item having completed.
-pub struct PublishXdrWork {
+pub(crate) struct PublishXdrWork {
     writer: Arc<dyn ArchiveWriter>,
     checkpoint: u32,
     state: SharedHistoryState,
-    category: PublishCategory,
+    file_type: HistoryFileType,
 }
 
 impl PublishXdrWork {
     /// Creates a new publish work item for ledger headers.
-    pub fn headers(
+    pub(crate) fn headers(
         writer: Arc<dyn ArchiveWriter>,
         checkpoint: u32,
         state: SharedHistoryState,
     ) -> Self {
-        Self { writer, checkpoint, state, category: PublishCategory::Headers }
+        Self { writer, checkpoint, state, file_type: HistoryFileType::Ledger }
     }
 
     /// Creates a new publish work item for transactions.
-    pub fn transactions(
+    pub(crate) fn transactions(
         writer: Arc<dyn ArchiveWriter>,
         checkpoint: u32,
         state: SharedHistoryState,
     ) -> Self {
-        Self { writer, checkpoint, state, category: PublishCategory::Transactions }
+        Self { writer, checkpoint, state, file_type: HistoryFileType::Transactions }
     }
 
     /// Creates a new publish work item for transaction results.
-    pub fn results(
+    pub(crate) fn results(
         writer: Arc<dyn ArchiveWriter>,
         checkpoint: u32,
         state: SharedHistoryState,
     ) -> Self {
-        Self { writer, checkpoint, state, category: PublishCategory::Results }
+        Self { writer, checkpoint, state, file_type: HistoryFileType::Results }
     }
 
     /// Creates a new publish work item for SCP history.
-    pub fn scp(
+    pub(crate) fn scp(
         writer: Arc<dyn ArchiveWriter>,
         checkpoint: u32,
         state: SharedHistoryState,
     ) -> Self {
-        Self { writer, checkpoint, state, category: PublishCategory::Scp }
+        Self { writer, checkpoint, state, file_type: HistoryFileType::Scp }
     }
 }
 
 #[async_trait]
 impl Work for PublishXdrWork {
     fn name(&self) -> &str {
-        self.category.work_name()
+        self.file_type.publish_work_name()
     }
 
     async fn run(&mut self, _ctx: WorkContext) -> WorkOutcome {
         set_progress(
             &self.state,
-            self.category.stage(),
-            self.category.progress_message(),
+            self.file_type.publish_stage(),
+            self.file_type.publish_progress_message(),
         )
         .await;
 
-        let guard = self.state.lock().await;
-        let category_str = self.category.archive_category();
-        let result = match &self.category {
-            PublishCategory::Headers => {
-                let data = guard.headers.clone();
-                drop(guard);
-                publish_xdr_entries(self.writer.as_ref(), &data, category_str, self.checkpoint, "xdr.gz").await
-            }
-            PublishCategory::Transactions => {
-                let data = guard.transactions.clone();
-                drop(guard);
-                publish_xdr_entries(self.writer.as_ref(), &data, category_str, self.checkpoint, "xdr.gz").await
-            }
-            PublishCategory::Results => {
-                let data = guard.tx_results.clone();
-                drop(guard);
-                publish_xdr_entries(self.writer.as_ref(), &data, category_str, self.checkpoint, "xdr.gz").await
-            }
-            PublishCategory::Scp => {
-                let data = guard.scp_history.clone();
-                drop(guard);
-                if data.is_empty() {
-                    return WorkOutcome::Failed("SCP history not available".to_string());
+        let category_str = self.file_type.type_string();
+
+        // Serialize entries while holding the lock, then release before I/O.
+        let serialized = {
+            let guard = self.state.lock().await;
+            match &self.file_type {
+                HistoryFileType::Ledger => serialize_entries(&guard.headers),
+                HistoryFileType::Transactions => serialize_entries(&guard.transactions),
+                HistoryFileType::Results => serialize_entries(&guard.tx_results),
+                HistoryFileType::Scp => {
+                    if guard.scp_history.is_empty() {
+                        return WorkOutcome::Failed("SCP history not available".to_string());
+                    }
+                    serialize_entries(&guard.scp_history)
                 }
-                publish_xdr_entries(self.writer.as_ref(), &data, category_str, self.checkpoint, "xdr.gz").await
             }
         };
 
-        match result {
+        let data = match serialized {
+            Ok(data) => data,
+            Err(err) => {
+                return WorkOutcome::Failed(format!("failed to serialize {category_str}: {err}"))
+            }
+        };
+
+        let gz = match gzip_bytes(&data) {
+            Ok(gz) => gz,
+            Err(err) => {
+                return WorkOutcome::Failed(format!("failed to gzip {category_str}: {err}"))
+            }
+        };
+
+        let path = checkpoint_path(category_str, self.checkpoint, "xdr.gz");
+        match self.writer.put_bytes(&path, &gz).await {
             Ok(()) => WorkOutcome::Success,
-            Err(err) => WorkOutcome::Failed(err),
+            Err(err) => {
+                WorkOutcome::Failed(format!("failed to publish {category_str}: {err}"))
+            }
         }
     }
 }
@@ -1704,18 +1670,6 @@ pub enum HistoryFileType {
     Scp,
 }
 
-impl HistoryFileType {
-    /// Returns the string representation used in archive paths.
-    pub fn type_string(&self) -> &'static str {
-        match self {
-            HistoryFileType::Ledger => "ledger",
-            HistoryFileType::Transactions => "transactions",
-            HistoryFileType::Results => "results",
-            HistoryFileType::Scp => "scp",
-        }
-    }
-}
-
 impl std::fmt::Display for HistoryFileType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.type_string())
@@ -1881,7 +1835,7 @@ impl BatchDownloadProgress {
 ///     state.clone(),
 /// );
 /// ```
-pub struct BatchDownloadWork {
+pub(crate) struct BatchDownloadWork {
     archive: Arc<HistoryArchive>,
     range: CheckpointRange,
     file_type: HistoryFileType,
@@ -1897,7 +1851,7 @@ impl BatchDownloadWork {
     /// * `range` - The checkpoint range to download
     /// * `file_type` - The type of files to download
     /// * `state` - Shared state where downloaded data will be stored
-    pub fn new(
+    pub(crate) fn new(
         archive: Arc<HistoryArchive>,
         range: CheckpointRange,
         file_type: HistoryFileType,
@@ -1909,14 +1863,6 @@ impl BatchDownloadWork {
             file_type,
             state,
         }
-    }
-
-    /// Returns a formatted status string showing download progress.
-    pub fn get_status(&self) -> String {
-        format!(
-            "batch-download-{}-{:08x}-{:08x}",
-            self.file_type, self.range.first, self.range.last
-        )
     }
 }
 

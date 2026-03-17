@@ -70,7 +70,7 @@ All work items share state through `SharedHistoryState`, a thread-safe container
 | `CheckpointRange` | Range of checkpoints for batch operations |
 | `HistoryFileType` | Enum for archive file types (Ledger, Transactions, Results, Scp) |
 | `BatchDownloadWork` | Work item for downloading files across a checkpoint range |
-| `BatchDownloadWorkBuilder` | Factory for registering batch download work items |
+| `BatchDownloadWorkIds` | IDs returned by `BatchDownloadWorkBuilder::register` for dependency tracking |
 | `BatchDownloadState` | Shared container for multi-checkpoint download data |
 | `CheckSingleLedgerHeaderWork` | Self-contained work item to verify a ledger header against the archive |
 
@@ -179,8 +179,9 @@ let headers_for_checkpoint_128 = &guard.headers[&128];
 - **Parallel Downloads**: Bucket and batch downloads use up to 16 concurrent requests,
   matching the stellar-core `MAX_CONCURRENT_SUBPROCESSES` limit (see `MAX_CONCURRENT_DOWNLOADS`).
 
-- **Retry Logic**: Download work items are configured with 3 retries; publish
-  work items use 2 retries.
+- **Retry Logic**: Download work items are configured per CATCHUP_SPEC section 9.1:
+  `RETRY_A_LOT` (32) for bulk data (buckets, headers, transactions, results) and
+  `RETRY_A_FEW` (5) for HAS and SCP. Publish work items use 2 retries.
 
 - **Verification**: All downloaded data is verified against known hashes before
   being stored in shared state. Verification is performed inline rather than in
