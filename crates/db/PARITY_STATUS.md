@@ -3,22 +3,24 @@
 **Crate**: `henyey-db`
 **Upstream**: `stellar-core/src/database/`, plus SQL operations from `src/overlay/PeerManager.*`, `src/overlay/BanManager*.*`, `src/herder/HerderPersistence*.*`, `src/main/PersistentState.*`, `src/ledger/LedgerHeaderUtils.*`, `src/transactions/TransactionSQL.*`, `src/history/HistoryManager*.*`
 **Overall Parity**: 94%
-**Last Updated**: 2026-03-05
+**Last Updated**: 2026-03-17
 
 ## Summary
 
 | Area | Status | Notes |
 |------|--------|-------|
 | Connection management | Full | r2d2 pool replaces SOCI sessions |
-| Schema migrations | Full | Independent versioning scheme |
+| Schema migrations | Full | Independent versioning (v8), 7 migrations |
 | State persistence (storestate) | Full | Key-value get/set/delete |
-| Ledger header SQL | Full | Store, load by seq, load by hash, max seq, stream to XDR, delete old |
+| Ledger header SQL | Full | Store, load by seq/hash, max/min seq, stream, delete |
 | SCP history persistence | Full | Envelopes, quorum sets, stream to XDR |
 | SCP state crash recovery | Full | Slot state and tx set persistence |
 | Peer management SQL | Full | All CRUD and random peer queries |
 | Ban list SQL | Full | Ban/unban/check/list |
-| Transaction history SQL | Full | Store and load tx records, sets, results, stream to XDR |
-| Publish queue SQL | Full | Enqueue/dequeue/list |
+| Transaction history SQL | Full | Store/load tx records, sets, results, stream, pagination, delete |
+| Publish queue SQL | Full | Enqueue/dequeue/list/HAS lookup/cleanup |
+| Contract events SQL | Full | Rust-specific; store/query/delete events |
+| Ledger close metadata SQL | Full | Rust-specific; store/load/range/delete |
 | Bucket list snapshots | Full | Rust-specific checkpoint storage |
 | Quorum info table | None | getNodeQuorumSet not implemented |
 
@@ -35,8 +37,11 @@
 | `PeerManager.h` / `PeerManager.cpp` | `queries/peers.rs` | Peer table CRUD and random queries |
 | `BanManager.h` / `BanManagerImpl.cpp` | `queries/ban.rs` | Ban list management |
 | `HistoryManagerImpl.cpp` (SQL subset) | `queries/publish_queue.rs` | Publish queue table operations |
-| `schema.rs` | N/A | Rust-specific schema definitions |
-| `error.rs` | N/A | Rust-specific error types |
+| N/A | `queries/events.rs` | Rust-specific contract event indexing |
+| N/A | `queries/ledger_close_meta.rs` | Rust-specific LedgerCloseMeta storage |
+| N/A | `queries/bucket_list.rs` | Rust-specific bucket list checkpoint storage |
+| N/A | `schema.rs` | Rust-specific schema definitions |
+| N/A | `error.rs` | Rust-specific error types |
 
 ## Component Mapping
 
@@ -114,6 +119,7 @@ Corresponds to: `LedgerHeaderUtils.h`
 | `deleteOldEntries()` | `LedgerQueries::delete_old_ledger_headers()` | Full |
 | `copyToStream()` | `LedgerQueries::copy_ledger_headers_to_stream()` | Full |
 | N/A | `LedgerQueries::get_ledger_hash()` | Full (Rust addition) |
+| N/A | `LedgerQueries::get_oldest_ledger_seq()` | Full (Rust addition) |
 
 ### history (`queries/history.rs`)
 
@@ -131,6 +137,8 @@ Corresponds to: `TransactionSQL.h`
 | N/A | `HistoryQueries::load_tx_history_entry()` | Full (Rust addition) |
 | N/A | `HistoryQueries::store_tx_result_entry()` | Full (Rust addition) |
 | N/A | `HistoryQueries::load_tx_result_entry()` | Full (Rust addition) |
+| N/A | `HistoryQueries::load_transactions_in_range()` | Full (Rust addition) |
+| N/A | `HistoryQueries::delete_old_tx_history()` | Full (Rust addition) |
 
 ### scp (`queries/scp.rs`)
 
@@ -196,9 +204,41 @@ Corresponds to: `HistoryManager.h` (SQL publish queue subset)
 | stellar-core | Rust | Status |
 |--------------|------|--------|
 | `HistoryManager::dropAll()` | `CREATE_SCHEMA` (publishqueue table) | Full |
-| N/A | `PublishQueueQueries::enqueue_publish()` | Full |
-| N/A | `PublishQueueQueries::remove_publish()` | Full |
-| N/A | `PublishQueueQueries::load_publish_queue()` | Full |
+| N/A | `PublishQueueQueries::enqueue_publish()` | Full (Rust addition) |
+| N/A | `PublishQueueQueries::remove_publish()` | Full (Rust addition) |
+| N/A | `PublishQueueQueries::remove_above_lcl()` | Full (Rust addition) |
+| N/A | `PublishQueueQueries::load_publish_queue()` | Full (Rust addition) |
+| N/A | `PublishQueueQueries::load_publish_has()` | Full (Rust addition) |
+
+### events (`queries/events.rs`)
+
+Rust-specific module — no upstream equivalent.
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| N/A | `EventQueries::store_events()` | Full (Rust addition) |
+| N/A | `EventQueries::query_events()` | Full (Rust addition) |
+| N/A | `EventQueries::delete_old_events()` | Full (Rust addition) |
+
+### ledger_close_meta (`queries/ledger_close_meta.rs`)
+
+Rust-specific module — no upstream equivalent.
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| N/A | `LedgerCloseMetaQueries::store_ledger_close_meta()` | Full (Rust addition) |
+| N/A | `LedgerCloseMetaQueries::load_ledger_close_meta()` | Full (Rust addition) |
+| N/A | `LedgerCloseMetaQueries::load_ledger_close_metas_in_range()` | Full (Rust addition) |
+| N/A | `LedgerCloseMetaQueries::delete_old_ledger_close_meta()` | Full (Rust addition) |
+
+### bucket_list (`queries/bucket_list.rs`)
+
+Rust-specific module — no upstream equivalent.
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| N/A | `BucketListQueries::store_bucket_list()` | Full (Rust addition) |
+| N/A | `BucketListQueries::load_bucket_list()` | Full (Rust addition) |
 
 ## Intentional Omissions
 
@@ -244,7 +284,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 3. **Schema Versioning**
    - **stellar-core**: MIN_SCHEMA_VERSION = 21, SCHEMA_VERSION = 25; migrations tied to upstream releases
-   - **Rust**: CURRENT_VERSION = 5; independent versioning starting from fresh schema
+   - **Rust**: CURRENT_VERSION = 8; independent versioning starting from fresh schema with 7 migrations (v1→v8)
    - **Rationale**: No need to support legacy upstream schema versions; Rust schema evolves independently
 
 4. **SQLite Configuration**
@@ -262,27 +302,33 @@ Features not yet implemented. These ARE counted against parity %.
    - **Rust**: Uses `storestate` table with prefixed keys (`scpstate:`, `txset:`)
    - **Rationale**: Simpler implementation; prefix-based key namespacing avoids need for separate table
 
+7. **Rust-Specific Tables**
+   - **stellar-core**: No equivalent tables
+   - **Rust**: `events` (contract event indexing for getEvents RPC), `ledger_close_meta` (full LedgerCloseMeta XDR for getTransactions/getLedgers RPC), `bucketlist` (checkpoint bucket hash snapshots)
+   - **Rationale**: Henyey integrates RPC serving and checkpoint management directly, requiring additional storage that stellar-core delegates to external services (Horizon, RPC server)
+
 ## Test Coverage
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
 | Database core | 5 TEST_CASE / 4 SECTION | 5 `#[test]` in `migrations.rs` | Schema and version tests covered |
 | Connection string | 1 TEST_CASE / 18 SECTION | 0 | Intentionally omitted (SQLite only) |
-| Ledger headers | Tested in LedgerManager tests | 8 `#[test]` in `ledger.rs` | Store, load, max seq, hash, stream, delete |
-| SCP persistence | Tested in Herder tests | 8 `#[test]` in `scp.rs` | Envelopes, quorum sets, streaming, cleanup |
+| Ledger headers | Tested in LedgerManager tests | 9 `#[test]` in `ledger.rs` | Store, load, max seq, hash, stream, delete, partial range, by-hash |
+| SCP persistence | Tested in Herder tests | 8 `#[test]` in `scp.rs` | Envelopes, quorum sets, streaming, readback, cleanup |
 | SCP state recovery | Tested in Herder tests | 2 `#[test]` in `scp_persistence.rs` | Slot state and tx set persistence |
 | Peer management | Tested in OverlayManager tests | 6 `#[test]` in `peers.rs` | CRUD, random queries, cleanup |
-| Ban list | Tested in BanManager tests | 0 (inline in `ban.rs`) | Functions tested via Database API |
-| Transaction history | Tested in TransactionSQL tests | 10 `#[test]` in `history.rs` | Store/load transactions, sets, results, streaming |
+| Ban list | Tested in BanManager tests | 0 | No `#[cfg(test)]` block in `ban.rs` |
+| Transaction history | Tested in TransactionSQL tests | 10 `#[test]` in `history.rs` | Store/load transactions, sets, results, streaming, readback |
 | Bucket list | N/A (Rust-specific) | 2 `#[test]` in `bucket_list.rs` | Rust-only checkpoint storage |
 | State queries | Tested in PersistentState tests | 3 `#[test]` in `state.rs` | Get, set, delete, LCL |
-| Publish queue | Tested in HistoryManager tests | 0 (inline in `publish_queue.rs`) | Functions tested via Database API |
+| Publish queue | Tested in HistoryManager tests | 2 `#[test]` in `publish_queue.rs` | Enqueue/overwrite and idempotency |
+| Contract events | N/A (Rust-specific) | 4 `#[test]` in `events.rs` | Boundary, limit, empty, threshold |
+| Ledger close meta | N/A (Rust-specific) | 5 `#[test]` in `ledger_close_meta.rs` | Store, load, replace, range, delete |
 
 ### Test Gaps
 
 - **MVCC / concurrent access**: stellar-core has an explicit `sqlite MVCC test` (`checkMVCCIsolation`). No equivalent Rust test exists.
 - **Ban list unit tests**: The `ban.rs` module has no `#[cfg(test)]` block; bans are only tested through the `Database` API.
-- **Publish queue unit tests**: The `publish_queue.rs` module has no `#[cfg(test)]` block.
 - **Integration tests**: No integration tests exist in `crates/db/tests/`. All tests are unit tests in source modules.
 
 ## Parity Calculation

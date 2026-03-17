@@ -32,23 +32,27 @@ pub struct EventRecord {
     pub in_successful_contract_call: bool,
 }
 
+/// Parameters for querying contract events.
+///
+/// Groups the filter and pagination fields needed by
+/// [`EventQueries::query_events`] to avoid a long parameter list.
+pub struct EventQueryParams<'a> {
+    pub start_ledger: u32,
+    pub end_ledger: Option<u32>,
+    pub event_type: Option<&'a str>,
+    pub contract_ids: &'a [String],
+    pub topics: &'a [Vec<String>],
+    pub cursor: Option<&'a str>,
+    pub limit: u32,
+}
+
 /// Query trait for contract event operations.
 pub trait EventQueries {
     /// Stores a batch of contract events for a ledger.
     fn store_events(&self, events: &[EventRecord]) -> Result<(), DbError>;
 
     /// Queries events with filters.
-    #[allow(clippy::too_many_arguments)]
-    fn query_events(
-        &self,
-        start_ledger: u32,
-        end_ledger: Option<u32>,
-        event_type: Option<&str>,
-        contract_ids: &[String],
-        topics: &[Vec<String>],
-        cursor: Option<&str>,
-        limit: u32,
-    ) -> Result<Vec<EventRecord>, DbError>;
+    fn query_events(&self, params: &EventQueryParams) -> Result<Vec<EventRecord>, DbError>;
 
     /// Deletes events at or below the given ledger sequence.
     fn delete_old_events(&self, max_ledger: u32, count: u32) -> Result<u32, DbError>;
@@ -86,31 +90,22 @@ impl EventQueries for Connection {
         Ok(())
     }
 
-    fn query_events(
-        &self,
-        start_ledger: u32,
-        end_ledger: Option<u32>,
-        event_type: Option<&str>,
-        contract_ids: &[String],
-        topics: &[Vec<String>],
-        cursor: Option<&str>,
-        limit: u32,
-    ) -> Result<Vec<EventRecord>, DbError> {
+    fn query_events(&self, params: &EventQueryParams) -> Result<Vec<EventRecord>, DbError> {
         let mut sql = String::from(
             "SELECT id, ledgerseq, tx_index, op_index, tx_hash, contract_id, \
              event_type, topic1, topic2, topic3, topic4, event_xdr, \
              in_successful_contract_call FROM events WHERE ledgerseq >= ?",
         );
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        param_values.push(Box::new(start_ledger));
+        param_values.push(Box::new(params.start_ledger));
 
-        if let Some(end) = end_ledger {
+        if let Some(end) = params.end_ledger {
             sql.push_str(" AND ledgerseq <= ?");
             param_values.push(Box::new(end));
         }
 
         // Event type filter
-        if let Some(et) = event_type {
+        if let Some(et) = params.event_type {
             let type_code = match et {
                 "contract" => 0,
                 "system" => 1,
@@ -122,14 +117,15 @@ impl EventQueries for Connection {
         }
 
         // Contract ID filter
-        if !contract_ids.is_empty() {
-            let placeholders: Vec<String> = contract_ids
+        if !params.contract_ids.is_empty() {
+            let placeholders: Vec<String> = params
+                .contract_ids
                 .iter()
                 .enumerate()
                 .map(|_| "?".to_string())
                 .collect();
             sql.push_str(&format!(" AND contract_id IN ({})", placeholders.join(",")));
-            for cid in contract_ids {
+            for cid in params.contract_ids {
                 param_values.push(Box::new(cid.clone()));
             }
         }
@@ -137,8 +133,8 @@ impl EventQueries for Connection {
         // Topic filters - each topic array is an OR of possible values for that position
         // "*" means wildcard (skip that topic position)
         // "**" means match all remaining positions (stop adding SQL constraints)
-        if !topics.is_empty() {
-            for (i, topic_alternatives) in topics.iter().enumerate() {
+        if !params.topics.is_empty() {
+            for (i, topic_alternatives) in params.topics.iter().enumerate() {
                 // "**" means "match all remaining positions" — stop filtering here
                 if topic_alternatives.iter().any(|t| t.as_str() == "**") {
                     break;
@@ -168,13 +164,13 @@ impl EventQueries for Connection {
         }
 
         // Cursor-based pagination
-        if let Some(cursor_val) = cursor {
+        if let Some(cursor_val) = params.cursor {
             sql.push_str(" AND id > ?");
             param_values.push(Box::new(cursor_val.to_string()));
         }
 
         sql.push_str(" ORDER BY id ASC LIMIT ?");
-        param_values.push(Box::new(limit));
+        param_values.push(Box::new(params.limit));
 
         let params_refs: Vec<&dyn rusqlite::types::ToSql> =
             param_values.iter().map(|p| p.as_ref()).collect();

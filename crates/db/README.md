@@ -4,7 +4,7 @@ SQLite persistence layer for the henyey Stellar blockchain node.
 
 ## Overview
 
-This crate provides database abstraction for the henyey node, handling persistent storage and retrieval of ledger headers, transaction history, SCP consensus state, bucket list snapshots, peer records, and operational configuration. It corresponds to stellar-core's `src/database/` module and the SQL operations spread across its codebase. The Rust implementation uses `rusqlite` with `r2d2` connection pooling (SQLite only), whereas stellar-core uses SOCI with SQLite and PostgreSQL support.
+This crate provides database abstraction for the henyey node, handling persistent storage and retrieval of ledger headers, transaction history, SCP consensus state, bucket list snapshots, contract events, ledger close metadata, peer records, and operational configuration. It corresponds to stellar-core's `src/database/` module and the SQL operations spread across its codebase. The Rust implementation uses `rusqlite` with `r2d2` connection pooling (SQLite only), whereas stellar-core uses SOCI with SQLite and PostgreSQL support.
 
 ## Architecture
 
@@ -21,6 +21,8 @@ graph TD
     CONN --> BLQ[BucketListQueries]
     CONN --> PUB[PublishQueueQueries]
     CONN --> BAN[BanQueries]
+    CONN --> EQ[EventQueries]
+    CONN --> LCM[LedgerCloseMetaQueries]
     CONN --> SCP_P[ScpStatePersistenceQueries]
 
     DB -->|initialize| MIG[migrations.rs]
@@ -38,6 +40,9 @@ graph TD
 | `PooledConnection` | A connection borrowed from the r2d2 pool |
 | `PeerRecord` | Network peer connection metadata (next attempt, failures, type) |
 | `TxRecord` | Stored transaction with body, result, and optional metadata |
+| `StoreTxParams` | Parameter struct for storing a transaction |
+| `EventRecord` | Stored contract event with topics, contract ID, and XDR |
+| `EventQueryParams` | Filter and pagination parameters for event queries |
 | `SqliteScpPersistence` | SCP state persistence backed by SQLite |
 | `LedgerQueries` | Trait for ledger header storage and retrieval |
 | `HistoryQueries` | Trait for transaction history and results |
@@ -48,6 +53,8 @@ graph TD
 | `BucketListQueries` | Trait for bucket list snapshots |
 | `PublishQueueQueries` | Trait for history archive publish queue |
 | `BanQueries` | Trait for node ban list management |
+| `EventQueries` | Trait for contract event storage and querying |
+| `LedgerCloseMetaQueries` | Trait for full LedgerCloseMeta blob storage |
 
 ## Usage
 
@@ -106,20 +113,22 @@ db.transaction(|tx| {
 | `migrations.rs` | Versioned migration system: `CURRENT_VERSION`, `run_migrations`, `verify_schema` |
 | `scp_persistence.rs` | `SqliteScpPersistence` bridging herder persistence to database queries |
 | `queries/mod.rs` | Re-exports all query traits |
-| `queries/ledger.rs` | `LedgerQueries` trait: store/load headers, load by hash, get latest seq, stream to XDR, delete old entries |
-| `queries/history.rs` | `HistoryQueries` trait: individual txs, tx sets, tx results, stream to XDR |
+| `queries/ledger.rs` | `LedgerQueries` trait: store/load headers, load by hash, get latest/oldest seq, stream to XDR, delete old entries |
+| `queries/history.rs` | `HistoryQueries` trait: individual txs, tx sets, tx results, range queries with cursor pagination, stream to XDR |
 | `queries/scp.rs` | `ScpQueries` and `ScpStatePersistenceQueries` traits: envelopes, quorum sets, stream to XDR, slot state |
 | `queries/state.rs` | `StateQueries` trait: generic key-value get/set/delete on storestate table |
 | `queries/peers.rs` | `PeerQueries` trait: store/load peers, random peer selection with filters |
 | `queries/bucket_list.rs` | `BucketListQueries` trait: store/load bucket list levels at checkpoint ledgers |
-| `queries/publish_queue.rs` | `PublishQueueQueries` trait: enqueue/dequeue/load pending history checkpoints |
+| `queries/publish_queue.rs` | `PublishQueueQueries` trait: enqueue/dequeue/load pending history checkpoints with HAS JSON |
 | `queries/ban.rs` | `BanQueries` trait: ban/unban nodes, check ban status |
+| `queries/events.rs` | `EventQueries` trait: store/query/delete contract events with topic and contract ID filtering |
+| `queries/ledger_close_meta.rs` | `LedgerCloseMetaQueries` trait: store/load/delete full LedgerCloseMeta XDR blobs for RPC serving |
 
 ## Design Notes
 
 - **Query traits on Connection**: All query methods are implemented as traits on `rusqlite::Connection`. This allows them to work with both raw connections and transactions (which deref to `Connection`), and lets `Database` provide thin wrappers via `with_connection`.
 
-- **Schema migrations**: Fresh databases get the full schema from `CREATE_SCHEMA`; existing databases are migrated incrementally. Each migration runs in its own transaction for atomicity.
+- **Schema migrations**: Fresh databases get the full schema from `CREATE_SCHEMA`; existing databases are migrated incrementally. Each migration runs in its own transaction for atomicity. The current schema version is 8.
 
 - **SQLite tuning**: WAL journal mode, FULL synchronous (required for WAL power-loss safety), 64 MB cache, 30 s busy timeout, foreign keys ON, temp store in memory. The connection pool allows up to 10 concurrent connections for file-based databases and 1 for in-memory.
 
@@ -142,6 +151,8 @@ db.transaction(|tx| {
 | `queries/history.rs` | `src/transactions/TransactionSQL.cpp` |
 | `queries/publish_queue.rs` | `src/history/HistoryManagerImpl.cpp` |
 | `queries/bucket_list.rs` | No direct stellar-core equivalent (Rust-specific) |
+| `queries/events.rs` | No direct stellar-core equivalent (RPC-specific) |
+| `queries/ledger_close_meta.rs` | No direct stellar-core equivalent (RPC-specific) |
 | `scp_persistence.rs` | `src/herder/HerderPersistenceImpl.cpp` |
 
 ## Parity Status

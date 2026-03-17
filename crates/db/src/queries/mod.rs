@@ -44,8 +44,8 @@ pub mod state;
 
 pub use ban::BanQueries;
 pub use bucket_list::BucketListQueries;
-pub use events::{EventQueries, EventRecord};
-pub use history::{HistoryQueries, TxRecord, TX_STATUS_FAILED, TX_STATUS_SUCCESS};
+pub use events::{EventQueries, EventQueryParams, EventRecord};
+pub use history::{HistoryQueries, StoreTxParams, TxRecord, TX_STATUS_FAILED, TX_STATUS_SUCCESS};
 pub use ledger::LedgerQueries;
 pub use ledger_close_meta::LedgerCloseMetaQueries;
 pub use peers::{PeerQueries, PeerRecord};

@@ -559,7 +559,6 @@ mod tests {
         assert_eq!(all.len(), 1);
     }
 
-    // Item 13: copy_scp_history_to_stream tests
     #[test]
     fn test_copy_scp_history_to_stream_basic() {
         let conn = setup_db();

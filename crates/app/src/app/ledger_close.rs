@@ -179,15 +179,15 @@ impl App {
                     }
                 };
 
-                conn.store_transaction(
-                    header.ledger_seq,
-                    index as u32,
-                    &tx_id,
-                    &tx_body,
-                    &tx_result_xdr,
-                    tx_meta_xdr.as_deref(),
+                conn.store_transaction(&henyey_db::StoreTxParams {
+                    ledger_seq: header.ledger_seq,
+                    tx_index: index as u32,
+                    tx_id: &tx_id,
+                    body: &tx_body,
+                    result: &tx_result_xdr,
+                    meta: tx_meta_xdr.as_deref(),
                     status,
-                )?;
+                })?;
             }
 
             // Extract and store contract events from transaction metadata

@@ -55,15 +55,15 @@ pub async fn handle(
         .database()
         .with_connection(|conn| {
             use henyey_db::EventQueries;
-            conn.query_events(
+            conn.query_events(&henyey_db::EventQueryParams {
                 start_ledger,
                 end_ledger,
                 event_type,
-                &contract_ids,
-                &topic_filters,
+                contract_ids: &contract_ids,
+                topics: &topic_filters,
                 cursor,
                 limit,
-            )
+            })
         })
         .map_err(|e| JsonRpcError::internal(format!("database error: {}", e)))?;
 

@@ -1924,15 +1924,15 @@ impl CatchupManager {
                             }
                         };
 
-                        conn.store_transaction(
-                            data.header.ledger_seq,
-                            idx as u32,
-                            &tx_id,
-                            &tx_body,
-                            &tx_result_xdr,
-                            None,
+                        conn.store_transaction(&henyey_db::StoreTxParams {
+                            ledger_seq: data.header.ledger_seq,
+                            tx_index: idx as u32,
+                            tx_id: &tx_id,
+                            body: &tx_body,
+                            result: &tx_result_xdr,
+                            meta: None,
                             status,
-                        )?;
+                        })?;
                     }
                 }
 
