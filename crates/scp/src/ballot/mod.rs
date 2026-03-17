@@ -400,47 +400,24 @@ impl BallotProtocol {
 
     /// Get a string representation of the local state for debugging.
     pub fn get_local_state(&self) -> String {
+        fn fmt_ballot(state: &mut String, label: &str, ballot: &Option<ScpBallot>) {
+            if let Some(b) = ballot {
+                state.push_str(&format!(
+                    " {}=({},{})",
+                    label,
+                    b.counter,
+                    hex::encode(&b.value.as_slice()[..4.min(b.value.len())])
+                ));
+            }
+        }
+
         let mut state = format!("phase={:?}", self.phase);
 
-        if let Some(b) = &self.current_ballot {
-            state.push_str(&format!(
-                " b=({},{})",
-                b.counter,
-                hex::encode(&b.value.as_slice()[..4.min(b.value.len())])
-            ));
-        }
-
-        if let Some(p) = &self.prepared {
-            state.push_str(&format!(
-                " p=({},{})",
-                p.counter,
-                hex::encode(&p.value.as_slice()[..4.min(p.value.len())])
-            ));
-        }
-
-        if let Some(pp) = &self.prepared_prime {
-            state.push_str(&format!(
-                " p'=({},{})",
-                pp.counter,
-                hex::encode(&pp.value.as_slice()[..4.min(pp.value.len())])
-            ));
-        }
-
-        if let Some(h) = &self.high_ballot {
-            state.push_str(&format!(
-                " h=({},{})",
-                h.counter,
-                hex::encode(&h.value.as_slice()[..4.min(h.value.len())])
-            ));
-        }
-
-        if let Some(c) = &self.commit {
-            state.push_str(&format!(
-                " c=({},{})",
-                c.counter,
-                hex::encode(&c.value.as_slice()[..4.min(c.value.len())])
-            ));
-        }
+        fmt_ballot(&mut state, "b", &self.current_ballot);
+        fmt_ballot(&mut state, "p", &self.prepared);
+        fmt_ballot(&mut state, "p'", &self.prepared_prime);
+        fmt_ballot(&mut state, "h", &self.high_ballot);
+        fmt_ballot(&mut state, "c", &self.commit);
 
         state.push_str(&format!(" heard_from_quorum={}", self.heard_from_quorum));
 
@@ -628,7 +605,7 @@ impl BallotProtocol {
     /// True if state was successfully restored, false if the envelope is invalid
     /// for state restoration.
     pub fn set_state_from_envelope(&mut self, envelope: &ScpEnvelope) -> bool {
-        match &envelope.statement.pledges {
+        let valid = match &envelope.statement.pledges {
             ScpStatementPledges::Prepare(prep) => {
                 self.current_ballot = Some(prep.ballot.clone());
                 self.prepared = prep.prepared.clone();
@@ -647,12 +624,6 @@ impl BallotProtocol {
                 }
                 self.value = Some(prep.ballot.value.clone());
                 self.phase = BallotPhase::Prepare;
-                self.latest_envelopes
-                    .insert(envelope.statement.node_id.clone(), envelope.clone());
-                self.last_envelope = Some(envelope.clone());
-                // Spec: SCP_SPEC §9.13 — set last_envelope_emit to prevent re-emission
-                // after crash recovery.
-                self.last_envelope_emit = Some(envelope.clone());
                 true
             }
             ScpStatementPledges::Confirm(conf) => {
@@ -672,11 +643,6 @@ impl BallotProtocol {
                 });
                 self.value = Some(conf.ballot.value.clone());
                 self.phase = BallotPhase::Confirm;
-                self.latest_envelopes
-                    .insert(envelope.statement.node_id.clone(), envelope.clone());
-                self.last_envelope = Some(envelope.clone());
-                // Spec: SCP_SPEC §9.13 — set last_envelope_emit to prevent re-emission.
-                self.last_envelope_emit = Some(envelope.clone());
                 true
             }
             ScpStatementPledges::Externalize(ext) => {
@@ -696,15 +662,21 @@ impl BallotProtocol {
                 });
                 self.value = Some(ext.commit.value.clone());
                 self.phase = BallotPhase::Externalize;
-                self.latest_envelopes
-                    .insert(envelope.statement.node_id.clone(), envelope.clone());
-                self.last_envelope = Some(envelope.clone());
-                // Spec: SCP_SPEC §9.13 — set last_envelope_emit to prevent re-emission.
-                self.last_envelope_emit = Some(envelope.clone());
                 true
             }
             _ => false,
+        };
+
+        if valid {
+            self.latest_envelopes
+                .insert(envelope.statement.node_id.clone(), envelope.clone());
+            self.last_envelope = Some(envelope.clone());
+            // Spec: SCP_SPEC §9.13 — set last_envelope_emit to prevent re-emission
+            // after crash recovery.
+            self.last_envelope_emit = Some(envelope.clone());
         }
+
+        valid
     }
 
     /// Bump the ballot to a specific counter value.
@@ -753,29 +725,6 @@ impl BallotProtocol {
         }
 
         updated
-    }
-
-    /// Abandon the current ballot and move to a new one.
-    ///
-    /// This is a public wrapper around the internal abandon logic,
-    /// used when we need to give up on the current ballot and try a new one.
-    /// Properly emits envelopes and checks heard-from-quorum via `bump_state`.
-    ///
-    /// # Arguments
-    /// * `counter` - The counter for the new ballot (0 to auto-increment)
-    /// * `local_node_id` - The local node's identifier
-    /// * `local_quorum_set` - The local node's quorum set
-    /// * `driver` - The SCP driver
-    /// * `slot_index` - The slot index
-    ///
-    /// # Returns
-    /// True if the ballot was abandoned successfully.
-    pub(crate) fn abandon_ballot_public<'a, D: SCPDriver>(
-        &mut self,
-        counter: u32,
-        ctx: &SlotContext<'a, D>,
-    ) -> bool {
-        self.abandon_ballot(counter, ctx)
     }
 }
 
@@ -2311,7 +2260,7 @@ mod tests {
     }
 
     #[test]
-    fn test_abandon_ballot_public() {
+    fn test_abandon_ballot() {
         let node = make_node_id(1);
         let other = make_node_id(99);
         let quorum_set = make_quorum_set(vec![node.clone(), other.clone()], 2);
@@ -2325,11 +2274,11 @@ mod tests {
         assert_eq!(ballot.current_ballot().map(|b| b.counter), Some(1));
 
         // Abandon to counter 5
-        assert!(ballot.abandon_ballot_public(5, &ctx!(&node, &quorum_set, &driver, 1)));
+        assert!(ballot.abandon_ballot(5, &ctx!(&node, &quorum_set, &driver, 1)));
         assert_eq!(ballot.current_ballot().map(|b| b.counter), Some(5));
 
         // Abandon with counter 0 should auto-increment
-        assert!(ballot.abandon_ballot_public(0, &ctx!(&node, &quorum_set, &driver, 1)));
+        assert!(ballot.abandon_ballot(0, &ctx!(&node, &quorum_set, &driver, 1)));
         assert_eq!(ballot.current_ballot().map(|b| b.counter), Some(6));
     }
 
@@ -2829,7 +2778,7 @@ mod tests {
         bp.set_composite_candidate(Some(value_composite.clone()));
 
         // Abandon should use composite candidate value
-        assert!(bp.abandon_ballot_public(0, &ctx!(&node, &quorum_set, &driver, 1)));
+        assert!(bp.abandon_ballot(0, &ctx!(&node, &quorum_set, &driver, 1)));
         assert_eq!(
             bp.current_ballot.as_ref().unwrap().value,
             value_composite,
@@ -2855,7 +2804,7 @@ mod tests {
         bp.value = Some(value_current.clone());
 
         // No composite candidate set
-        assert!(bp.abandon_ballot_public(0, &ctx!(&node, &quorum_set, &driver, 1)));
+        assert!(bp.abandon_ballot(0, &ctx!(&node, &quorum_set, &driver, 1)));
         assert_eq!(
             bp.current_ballot.as_ref().unwrap().value,
             value_current,
@@ -2880,7 +2829,7 @@ mod tests {
         bp.value = Some(value_current.clone());
 
         // Abandon with specific counter
-        assert!(bp.abandon_ballot_public(10, &ctx!(&node, &quorum_set, &driver, 1)));
+        assert!(bp.abandon_ballot(10, &ctx!(&node, &quorum_set, &driver, 1)));
         assert_eq!(
             bp.current_ballot.as_ref().unwrap().counter,
             10,

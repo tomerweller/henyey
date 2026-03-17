@@ -3,7 +3,7 @@
 **Crate**: `henyey-scp`
 **Upstream**: `stellar-core/src/scp/`
 **Overall Parity**: 100%
-**Last Updated**: 2026-03-05
+**Last Updated**: 2026-03-17
 
 ## Summary
 
@@ -129,7 +129,7 @@ Corresponds to: `BallotProtocol.h`
 | `BallotProtocol()` | `BallotProtocol::new()` | Full |
 | `processEnvelope()` | `process_envelope()` | Full |
 | `ballotProtocolTimerExpired()` | `bump_timeout()` / `bump_on_timeout()` | Full |
-| `abandonBallot()` | `abandon_ballot()`, `abandon_ballot_public()` | Full |
+| `abandonBallot()` | `abandon_ballot()` | Full |
 | `bumpState(Value, bool)` | `bump()` | Full |
 | `bumpState(Value, uint32)` | `bump_state()` / `bump_to_counter()` | Full |
 | `getJsonInfo()` | `get_info()` | Full |
@@ -383,12 +383,12 @@ No known gaps.
 | Display formatting | N/A | 4 #[test] in `format.rs` | String formatting |
 | Info/JSON types | N/A | 4 #[test] in `info.rs` | Serialization tests |
 | Slot management | Covered within SCPTests.cpp | 26 #[test] in `slot.rs` | Per-slot operations |
-| SCP coordinator | Covered within SCPTests.cpp | 14 #[test] in `scp.rs` | Top-level API tests |
+| SCP coordinator | Covered within SCPTests.cpp | 15 #[test] in `scp.rs` | Top-level API tests |
 | Driver | N/A | 11 #[test] in `driver.rs` | Weight computation, timeout |
 | Quorum config | N/A | 5 #[test] in `quorum_config.rs` | Config parsing |
 | Lib-level helpers | N/A | 2 #[test] in `lib.rs` | EnvelopeState, QuorumInfoNodeState |
 
-**Totals**: Upstream: 9 TEST_CASE / 189 SECTION. Rust: 183 unit #[test] + 180 integration #[test] = 363 total.
+**Totals**: Upstream: 9 TEST_CASE / 189 SECTION. Rust: 184 unit #[test] + 180 integration #[test] = 364 total.
 
 ### Test Gaps
 

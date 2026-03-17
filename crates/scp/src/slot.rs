@@ -674,7 +674,7 @@ impl Slot {
     pub fn abandon_ballot<D: SCPDriver>(&mut self, driver: &Arc<D>, counter: u32) -> bool {
         self.sync_composite_candidate();
         let ctx = slot_ctx!(self, driver);
-        self.ballot.abandon_ballot_public(counter, &ctx)
+        self.ballot.abandon_ballot(counter, &ctx)
     }
 
     /// Bump the ballot to a specific counter value.

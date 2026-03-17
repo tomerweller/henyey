@@ -182,10 +182,6 @@ where
 /// # Returns
 /// True if the nodes form a blocking set.
 pub fn is_blocking_set(quorum_set: &ScpQuorumSet, nodes: &HashSet<NodeId>) -> bool {
-    is_blocking_set_helper(quorum_set, nodes)
-}
-
-fn is_blocking_set_helper(quorum_set: &ScpQuorumSet, nodes: &HashSet<NodeId>) -> bool {
     let total = quorum_set.validators.len() + quorum_set.inner_sets.len();
     let threshold = quorum_set.threshold as usize;
 
@@ -208,7 +204,7 @@ fn is_blocking_set_helper(quorum_set: &ScpQuorumSet, nodes: &HashSet<NodeId>) ->
 
     // Count inner sets that are blocked
     for inner_set in quorum_set.inner_sets.iter() {
-        if is_blocking_set_helper(inner_set, nodes) {
+        if is_blocking_set(inner_set, nodes) {
             count += 1;
         }
     }

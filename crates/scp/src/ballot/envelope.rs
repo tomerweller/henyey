@@ -1,3 +1,5 @@
+//! Ballot protocol envelope emission and recording.
+
 use super::*;
 
 impl BallotProtocol {

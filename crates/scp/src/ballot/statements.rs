@@ -1,3 +1,5 @@
+//! Ballot statement comparison, quorum set resolution, and federated accept/ratify logic.
+
 use std::cmp::Ordering;
 
 use super::*;

@@ -1,3 +1,5 @@
+//! Ballot protocol state machine transitions (advance_slot, attempt_*, bump, abandon).
+
 use std::cmp::Ordering;
 
 use super::statements::{are_ballots_less_and_compatible, are_ballots_less_and_incompatible};
@@ -481,7 +483,7 @@ impl BallotProtocol {
     /// Matches stellar-core `abandonBallot(n)` which checks `mSlot.getLatestCompositeCandidate()`
     /// first, then falls back to `mCurrentBallot->value`, then calls `bumpState(value, n)`.
     /// This properly emits envelopes and checks heard-from-quorum (via `bump_state`).
-    pub(super) fn abandon_ballot<'a, D: SCPDriver>(
+    pub(crate) fn abandon_ballot<'a, D: SCPDriver>(
         &mut self,
         counter: u32,
         ctx: &SlotContext<'a, D>,
