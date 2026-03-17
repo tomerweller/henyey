@@ -57,10 +57,15 @@ graph TD
 | `TransactionSetVariant` | Classic or generalized (v1) transaction set |
 | `LedgerCloseStats` | Statistics from ledger close processing |
 | `ConfigUpgradeSetFrame` | Loads, validates, and applies Soroban config upgrades |
-| `ConfigUpgradeResult` | Named result from config upgrade application (replaces tuple) |
+| `ConfigUpgradeValidity` | Validation result enum for Soroban config upgrades |
+| `CacheInitResult` | Result from `scan_level_pairs_for_caches` (offer index + Soroban state) |
 | `InMemorySorobanState` | In-memory cache for contract data/code with co-located TTLs |
 | `SharedSorobanState` | Thread-safe `RwLock` wrapper around `InMemorySorobanState` |
+| `SorobanRentConfig` | Rent fee configuration extracted from ledger state |
+| `SorobanStateStats` | Size statistics for the in-memory Soroban state |
 | `SorobanNetworkInfo` | Network-level Soroban configuration (passphrase, limits) |
+| `TxWithFee` | Transaction envelope paired with optional per-component base fee |
+| `OfferDescriptor` | DEX offer key fields for deterministic ordering and comparison |
 
 ## Usage
 
@@ -134,6 +139,8 @@ let entry = handle.get_entry(&key)?;
 | `config_upgrade.rs` | `ConfigUpgradeSetFrame` for Soroban network configuration upgrades |
 | `offer.rs` | `OfferDescriptor`, `AssetPair`, offer sorting and comparison for DEX |
 | `prepare_liabilities.rs` | Liability preparation for protocol upgrades and reserve increases |
+| `offer_store.rs` | Re-exports the unified offer store from `henyey-tx` |
+| `memory_report.rs` | Process memory reporting (RSS, jemalloc stats, per-component breakdown) |
 | `error.rs` | `LedgerError` enum with variants for all ledger failure modes |
 
 ## Design Notes
@@ -187,6 +194,8 @@ provides an `RwLock`-guarded wrapper for concurrent access to the Soroban cache.
 | `offer.rs` | `src/ledger/LedgerTxn.h` (offer ordering utilities) |
 | `prepare_liabilities.rs` | `src/herder/Upgrades.cpp` (prepareLiabilities) |
 | `error.rs` | Various error returns across stellar-core ledger files |
+| `offer_store.rs` | Offer management in `LedgerTxn.cpp` / DEX exchange loop |
+| `memory_report.rs` | No upstream equivalent (henyey-specific observability) |
 | `lib.rs` (fees/reserves) | Inline calculations in `LedgerTxnImpl.cpp` |
 
 ## Parity Status

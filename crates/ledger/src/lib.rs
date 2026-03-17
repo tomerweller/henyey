@@ -78,7 +78,7 @@ mod header;
 mod manager;
 pub mod offer;
 pub mod offer_store;
-pub mod memory_report;
+pub(crate) mod memory_report;
 mod prepare_liabilities;
 mod snapshot;
 mod soroban_state;

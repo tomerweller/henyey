@@ -9,6 +9,9 @@ use std::sync::Arc;
 
 use super::*;
 
+/// Result of a parallel cluster execution: (result, elapsed_us, cluster_index).
+type ClusterThreadResult = (Result<(TxSetResult, LedgerDelta, i64)>, u64, usize);
+
 /// Execute a full transaction set.
 ///
 /// # Arguments
@@ -16,7 +19,7 @@ use super::*;
 /// * `soroban` - Soroban execution context (config, PRNG seed, module cache, etc.)
 pub fn execute_transaction_set(
     snapshot: &SnapshotHandle,
-    transactions: &[(Arc<TransactionEnvelope>, Option<u32>)],
+    transactions: &[TxWithFee],
     context: &LedgerContext,
     delta: &mut LedgerDelta,
     soroban: SorobanContext<'_>,
@@ -39,7 +42,7 @@ pub fn execute_transaction_set(
 /// * `deduct_fee` - Whether to deduct fees from source accounts.
 pub fn execute_transaction_set_with_fee_mode(
     snapshot: &SnapshotHandle,
-    transactions: &[(Arc<TransactionEnvelope>, Option<u32>)],
+    transactions: &[TxWithFee],
     context: &LedgerContext,
     delta: &mut LedgerDelta,
     soroban: SorobanContext<'_>,
@@ -97,7 +100,7 @@ pub fn execute_transaction_set_with_fee_mode(
 pub fn run_transactions_on_executor(
     executor: &mut TransactionExecutor,
     snapshot: &SnapshotHandle,
-    transactions: &[(Arc<TransactionEnvelope>, Option<u32>)],
+    transactions: &[TxWithFee],
     base_fee: u32,
     soroban_base_prng_seed: [u8; 32],
     deduct_fee: bool,
@@ -563,8 +566,8 @@ pub fn execute_soroban_parallel_phase(
 /// stellar-core's phase iteration order).
 ///
 /// Returns `(classic_pre_charged, soroban_pre_charged, total_fee_pool)`.
-pub fn pre_deduct_all_fees_on_delta(
-    classic_txs: &[(Arc<TransactionEnvelope>, Option<u32>)],
+pub(crate) fn pre_deduct_all_fees_on_delta(
+    classic_txs: &[TxWithFee],
     soroban_phase: &crate::close::SorobanPhaseStructure,
     base_fee: u32,
     network_id: NetworkId,
@@ -694,7 +697,7 @@ fn soroban_write_footprint(tx: &TransactionEnvelope) -> Option<Vec<LedgerKey>> {
 /// Returns `(TxSetResult, per_cluster_delta, total_fees)`.
 pub(super) fn execute_single_cluster(
     snapshot: &SnapshotHandle,
-    cluster: &[(Arc<TransactionEnvelope>, Option<u32>)],
+    cluster: &[TxWithFee],
     cluster_offset: usize,
     context: &LedgerContext,
     soroban: &SorobanContext<'_>,
@@ -941,10 +944,9 @@ pub(super) fn execute_single_cluster(
 /// When a stage has multiple clusters, they are executed in parallel using
 /// `tokio::task::spawn_blocking` (one blocking task per cluster). Results are
 /// merged into `delta` in deterministic cluster order.
-#[allow(clippy::type_complexity)]
 pub(super) fn execute_stage_clusters(
     snapshot: &SnapshotHandle,
-    clusters: &[Vec<(Arc<TransactionEnvelope>, Option<u32>)>],
+    clusters: &[Vec<TxWithFee>],
     global_tx_offset: usize,
     context: &LedgerContext,
     soroban: &SorobanContext<'_>,
@@ -1099,7 +1101,7 @@ pub(super) fn execute_stage_clusters(
     // use Handle::block_on directly. When called from a tokio worker thread
     // (runtime_handle is None), use block_in_place to safely enter a blocking
     // context before calling block_on.
-    let thread_results: Vec<(Result<(TxSetResult, LedgerDelta, i64)>, u64, usize)> =
+    let thread_results: Vec<ClusterThreadResult> =
         if let Some(handle) = runtime_handle {
             handle.block_on(spawn_and_collect)
         } else {
@@ -1264,7 +1266,7 @@ pub fn compute_state_size_window_entry(
 /// to determine which order books will be accessed during execution.
 #[cfg(test)]
 fn collect_dex_asset_pairs(
-    transactions: &[(Arc<TransactionEnvelope>, Option<u32>)],
+    transactions: &[TxWithFee],
 ) -> HashSet<(Asset, Asset)> {
     let mut pairs = HashSet::new();
     for (tx, _) in transactions {
@@ -1326,7 +1328,7 @@ mod tests {
         })
     }
 
-    fn make_tx_with_ops(ops: Vec<Operation>) -> (Arc<TransactionEnvelope>, Option<u32>) {
+    fn make_tx_with_ops(ops: Vec<Operation>) -> TxWithFee {
         let ops_vec: VecM<Operation, 100> = ops.try_into().unwrap();
         let tx = Transaction {
             source_account: MuxedAccount::Ed25519(Uint256([1u8; 32])),

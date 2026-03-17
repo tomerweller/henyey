@@ -430,7 +430,7 @@ pub(super) fn build_entry_changes_with_state_overrides(
 }
 
 /// Ledger state changes for building entry change metadata.
-pub struct LedgerChanges<'a> {
+pub(super) struct LedgerChanges<'a> {
     pub created: &'a [LedgerEntry],
     pub updated: &'a [LedgerEntry],
     pub update_states: &'a [LedgerEntry],

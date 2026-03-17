@@ -75,6 +75,7 @@ use stellar_xdr::curr::{
 use tracing::{debug, warn};
 
 use crate::delta::LedgerDelta;
+use crate::close::TxWithFee;
 use crate::snapshot::SnapshotHandle;
 use crate::{LedgerError, Result};
 
@@ -87,9 +88,11 @@ mod result_mapping;
 mod signatures;
 mod tx_set;
 
-pub use config::{load_config_setting, load_soroban_config, load_soroban_network_info, compute_soroban_resource_fee};
+pub use config::load_soroban_config;
+pub(crate) use config::{load_soroban_network_info, compute_soroban_resource_fee};
 pub use result_mapping::build_tx_result_pair;
-pub use tx_set::{execute_transaction_set, execute_transaction_set_with_fee_mode, run_transactions_on_executor, execute_soroban_parallel_phase, pre_deduct_all_fees_on_delta, compute_state_size_window_entry};
+pub use tx_set::{execute_transaction_set, execute_transaction_set_with_fee_mode, run_transactions_on_executor, execute_soroban_parallel_phase, compute_state_size_window_entry};
+pub(crate) use tx_set::pre_deduct_all_fees_on_delta;
 
 use meta::*;
 use result_mapping::*;
@@ -4157,8 +4160,7 @@ impl<'a> SignatureTracker<'a> {
 // Parallel Soroban Phase Execution
 // ---------------------------------------------------------------------------
 
-/// Transaction envelope paired with an optional per-TX base fee override.
-type TxWithFee = (Arc<TransactionEnvelope>, Option<u32>);
+
 
 /// Result of executing a transaction set (or a single cluster within one).
 pub struct TxSetResult {

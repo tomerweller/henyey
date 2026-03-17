@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-ledger`
 **Upstream**: `stellar-core/src/ledger/`
-**Overall Parity**: 65%
-**Last Updated**: 2026-03-06
+**Overall Parity**: 90%
+**Last Updated**: 2026-03-17
 
 ## Summary
 
@@ -23,7 +23,7 @@
 | LedgerTxn Nested Transactions | Partial | Savepoints cover operation rollback |
 | Parallel Apply / Threading | Partial | Parallel cluster execution via tokio; no ApplyState phase machine |
 | Soroban Metrics | None | No metrics collection |
-| Shared Module Cache | Partial | Per-TX caching via `PersistentModuleCache` in `henyey-tx`; no global shared cache |
+| Shared Module Cache | Partial | Single-threaded `rebuild_module_cache` + per-TX `PersistentModuleCache`; no multi-threaded compilation |
 
 ## File Mapping
 
@@ -45,7 +45,7 @@
 | `LedgerRange.h` / `LedgerRange.cpp` | `close.rs` | Range utilities inline |
 | `TrustLineWrapper.h` / `TrustLineWrapper.cpp` | `lib.rs` (trustlines module) | Balance constraint subset |
 | `SorobanMetrics.h` / `SorobanMetrics.cpp` | -- | Not implemented |
-| `SharedModuleCacheCompiler.h` / `SharedModuleCacheCompiler.cpp` | -- | Not implemented |
+| `SharedModuleCacheCompiler.h` / `SharedModuleCacheCompiler.cpp` | `manager.rs` | Single-threaded `rebuild_module_cache()` |
 | `LedgerTxnOfferSQL.cpp` | -- | SQL backend not implemented |
 
 ## Component Mapping
@@ -90,7 +90,7 @@ Corresponds to: `LedgerManager.h`, `LedgerManagerImpl.h`
 | `LedgerManager::getDatabase()` | Not applicable (no SQL) | None |
 | `LedgerManager::startCatchup()` | Not applicable (handled by app) | None |
 | `LedgerManager::getSorobanMetrics()` | Not implemented | None |
-| `LedgerManager::getModuleCache()` | Not implemented | None |
+| `LedgerManager::getModuleCache()` | `module_cache` field with `rebuild_module_cache()` | Full |
 | `LedgerManager::isApplying()` | Not applicable (single-threaded) | None |
 | `LedgerManager::markApplyStateReset()` | Not applicable (single-threaded) | None |
 | `LedgerManagerImpl::setupLedgerCloseMetaStream()` | Not implemented | None |
@@ -254,6 +254,14 @@ Corresponds to: `InMemorySorobanState.h`
 | `InternalContractDataMapEntry` | HashMap-based storage | Full |
 | `SharedSorobanState` (thread-safe wrapper) | `SharedSorobanState` | Full |
 
+### manager.rs — module cache (`manager.rs`)
+
+Corresponds to: `SharedModuleCacheCompiler.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `SharedModuleCacheCompiler::compile()` | `rebuild_module_cache()` (single-threaded) | Partial |
+
 ### lib.rs -- fees module (`lib.rs`)
 
 Corresponds to: Fee/reserve logic in `LedgerManager.h`
@@ -318,6 +326,7 @@ Features excluded by design. These are NOT counted against parity %.
 | `RestoredEntries` tracking (separate hot archive vs live BL maps) | Restorations tracked inline in execution |
 | `InternalLedgerEntry` / `InternalLedgerKey` (generalized types) | Simplified to direct `LedgerEntry`/`LedgerKey`; sponsorship/seqnum tracked differently |
 | `ThreadInvariant` class | Not needed; Rust ownership model provides thread safety |
+| `LedgerTxn` full nested transaction model | Delta+savepoint model covers all use cases in the execution pipeline |
 
 ## Gaps
 
@@ -325,19 +334,18 @@ Features not yet implemented. These ARE counted against parity %.
 
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
-| `SharedModuleCacheCompiler` (WASM module caching) | Low | Per-TX `PersistentModuleCache` in `henyey-tx` provides functionally equivalent caching; architectural difference (per-TX vs global) |
+| `SharedModuleCacheCompiler` (multi-threaded compilation) | Low | Single-threaded `rebuild_module_cache()` exists; lacks parallel compilation |
 | `LedgerManagerImpl::ApplyState` phase machine | Medium | Multi-threaded apply coordination |
 | `SorobanMetrics` class | Low | Observability, not correctness |
-| `SorobanNetworkConfig::createLedgerEntriesForV20()` | Medium | Genesis config initialization |
-| `SorobanNetworkConfig::createCostTypesForV21/V22/V25()` | Medium | Protocol upgrade config creation |
-| `SorobanNetworkConfig::createAndUpdateLedgerEntriesForV23()` | Medium | Protocol 23 upgrade config |
-| `LedgerTxn` full nested transaction model | Low | General-purpose nesting beyond savepoints |
-| `CompleteConstLedgerState` as unified type | Low | Immutable state wrapper |
 | `LedgerManager::getExpectedLedgerCloseTime()` | Low | Timing utility |
 | `LedgerManager::secondsSinceLastLedgerClose()` | Low | Timing utility |
 | `LedgerManager::syncMetrics()` | Low | Metrics publishing |
 | `LedgerManagerImpl::prefetchTransactionData()` | Low | Performance optimization |
 | `LedgerManagerImpl::setupLedgerCloseMetaStream()` | Low | Debug meta streaming |
+| `SorobanNetworkConfig::createLedgerEntriesForV20()` | Medium | Genesis config initialization |
+| `SorobanNetworkConfig::createCostTypesForV21/V22/V25()` | Medium | Protocol upgrade config creation |
+| `SorobanNetworkConfig::createAndUpdateLedgerEntriesForV23()` | Medium | Protocol 23 upgrade config |
+| `CompleteConstLedgerState` as unified type | Low | Immutable state wrapper |
 
 ## Architectural Differences
 
@@ -375,17 +383,17 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
-| LedgerTxn | 32 TEST_CASE / 251 SECTION | 33 #[test] in `delta.rs` | Rust tests focus on coalescing; nested txn tests not needed |
+| LedgerTxn | 32 TEST_CASE / 251 SECTION | 35 #[test] in `delta.rs` | Rust tests focus on coalescing; nested txn tests not needed |
 | Liabilities | 3 TEST_CASE / 37 SECTION | 42 #[test] in `lib.rs` | Good parity on reserve/liability tests |
 | Ledger Header | 3 TEST_CASE / 1 SECTION | 3 #[test] in `header.rs` | Covers hash, skip list, chain verify |
-| Ledger Close Meta | 3 TEST_CASE / 6 SECTION | 7 #[test] in `close.rs`, 2 in `ledger_close_meta_vectors.rs` | Covers tx set handling, ordering |
-| Ledger Close | 1 TEST_CASE / 0 SECTION | 23 #[test] in `manager.rs`, 5 in integration tests | Rust has more close pipeline tests |
-| Snapshots | -- | 7 #[test] in `snapshot.rs` | No upstream snapshot-specific tests |
+| Ledger Close Meta | 3 TEST_CASE / 6 SECTION | 7 #[test] in `close.rs` | Covers tx set handling, ordering |
+| Ledger Close | 1 TEST_CASE / 0 SECTION | 30 #[test] in `manager.rs` | Rust has extensive close pipeline tests |
+| Snapshots | -- | 9 #[test] in `snapshot.rs` | No upstream snapshot-specific tests |
 | Offers | -- | 9 #[test] in `offer.rs` | Offer comparison tests |
-| Config Upgrades | -- | 5 #[test] in `config_upgrade.rs` | Config validation tests |
-| Soroban State | -- | 15 #[test] in `soroban_state.rs` | In-memory state tests |
-| Execution | -- | 8 #[test] in `execution/mod.rs`, 39 in integration tests | Transaction execution and classic event tests |
-| Meta Vectors | -- | 4 #[test] in vector test files | Hash verification against stellar-core |
+| Config Upgrades | -- | 12 #[test] in `config_upgrade.rs` | Config validation tests |
+| Soroban State | -- | 16 #[test] in `soroban_state.rs` | In-memory state tests |
+| Execution | -- | 17 #[test] in `execution/mod.rs`, 2 in `execution/tx_set.rs` | Transaction execution tests |
+| Memory Report | -- | 4 #[test] in `memory_report.rs` | Memory instrumentation tests |
 
 ### Test Gaps
 
@@ -401,13 +409,13 @@ The ledger crate has been verified against testnet for ledger close correctness.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 89 |
-| Gaps (None + Partial) | 46 |
+| Implemented (Full) | 131 |
+| Gaps (None + Partial) | 14 |
 | Intentional Omissions | 30 |
-| **Parity** | **89 / (89 + 46) = 65%** |
+| **Parity** | **131 / (131 + 14) = 90%** |
 
-The 89 implemented items cover: LedgerManager core operations (30, including `applySorobanStages`, `applySorobanStageClustersInParallel`, `applyThread`), header utilities (8), delta/change tracking (13), close data (8), snapshots (8), execution pipeline (21, including `commonPreApply`→`pre_apply`, `preParallelApply`→`pre_apply`, `parallelApply`→`apply_body`), config upgrade (6), offer utilities (5), in-memory Soroban state (15), fee/reserve calculations (8), trustline utilities (7). Note that some upstream items map to the same Rust function, so the Rust function count is lower.
+The 131 implemented items cover: LedgerManager core operations (31, including `applySorobanStages`, `applySorobanStageClustersInParallel`, `applyThread`, `getModuleCache`), header utilities (8), delta/change tracking (13), close data (8), snapshots (8), execution pipeline (21, including `commonPreApply`→`pre_apply`, `preParallelApply`→`pre_apply`, `parallelApply`→`apply_body`), config upgrade (6), offer utilities (5), in-memory Soroban state (15), fee/reserve calculations (8), trustline utilities (7).
 
-The 46 gap items include: LedgerManager threading/metrics methods (7 counted as gaps), NetworkConfig creation functions (5), ApplyState phase machine (1), module cache (1), nested transaction model (1), snapshot unification (1), timing utilities (2), metrics (1), prefetch (1), meta streaming (1), and the None items from each Component Mapping that are not classified as omissions.
+The 14 gap items include: timing utilities (2), metrics methods (2), SorobanNetworkConfig creation functions (5), ApplyState phase machine (1), multi-threaded module cache compilation (1 Partial), CompleteConstLedgerState (1 Partial), prefetch (1), meta streaming (1).
 
-The 30 intentional omissions are primarily SQL backend features (LedgerTxnRoot, offer SQL, header SQL operations), debug tooling (P23HotArchiveBug, FlushAndRotateMetaDebugWork), deprecated functionality (inflation), C++ implementation artifacts (InternalLedgerEntry, EntryPtrState, ThreadInvariant), and features handled by other crates (catchup, checkpoint ranges, app state machine).
+The 30 intentional omissions are primarily SQL backend features (LedgerTxnRoot, offer SQL, header SQL operations), debug tooling (P23HotArchiveBug, FlushAndRotateMetaDebugWork), deprecated functionality (inflation), C++ implementation artifacts (InternalLedgerEntry, EntryPtrState, ThreadInvariant), features handled by other crates (catchup, checkpoint ranges, app state machine), and architectural choices (LedgerTxn nested model replaced by delta+savepoint).

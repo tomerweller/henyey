@@ -125,7 +125,6 @@ impl EntryChange {
     }
 }
 
-
 /// Accumulator for all ledger entry changes during a single ledger close.
 ///
 /// `LedgerDelta` provides a transactional view of state changes, allowing
@@ -247,8 +246,7 @@ impl LedgerDelta {
             match existing {
                 EntryChange::Created(_) => {
                     // If we created and then updated, just record as created with new value
-                    self.changes
-                        .insert(key, EntryChange::Created(current));
+                    self.changes.insert(key, EntryChange::Created(current));
                 }
                 EntryChange::Updated { previous: orig, .. } => {
                     // Update the current value, keep original previous
@@ -579,7 +577,9 @@ impl LedgerDelta {
             };
             match &entry_ref.data {
                 stellar_xdr::curr::LedgerEntryData::Offer(_) => has_offers = true,
-                stellar_xdr::curr::LedgerEntryData::Trustline(tl) if matches!(tl.asset, stellar_xdr::curr::TrustLineAsset::PoolShare(_)) => {
+                stellar_xdr::curr::LedgerEntryData::Trustline(tl)
+                    if matches!(tl.asset, stellar_xdr::curr::TrustLineAsset::PoolShare(_)) =>
+                {
                     has_pool_share_trustlines = true;
                 }
                 _ => {}
@@ -636,7 +636,9 @@ impl LedgerDelta {
                     has_offers = true;
                     true
                 }
-                stellar_xdr::curr::LedgerEntryData::Trustline(tl) if matches!(tl.asset, stellar_xdr::curr::TrustLineAsset::PoolShare(_)) => {
+                stellar_xdr::curr::LedgerEntryData::Trustline(tl)
+                    if matches!(tl.asset, stellar_xdr::curr::TrustLineAsset::PoolShare(_)) =>
+                {
                     has_pool_share_trustlines = true;
                     true
                 }

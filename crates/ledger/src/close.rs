@@ -36,6 +36,18 @@ use crate::delta::LedgerDelta;
 use crate::error::LedgerError;
 use crate::snapshot::SnapshotHandle;
 
+/// A transaction paired with an optional per-component base fee override.
+pub type TxWithFee = (Arc<TransactionEnvelope>, Option<u32>);
+
+/// Parallel execution stages: stages > clusters > transactions (with fees).
+type ParallelStages = Vec<Vec<Vec<TxWithFee>>>;
+
+/// Transaction with fee and precomputed hash, used during canonical sorting.
+type TxWithHash = (Arc<TransactionEnvelope>, Option<u32>, Hash256);
+
+/// Arc'd transaction with precomputed hash, used during parallel stage sorting.
+type ArcTxWithHash = (Arc<TransactionEnvelope>, Hash256);
+
 /// Result of applying config upgrades during ledger close.
 pub struct ConfigUpgradeResult {
     /// Whether state archival settings changed (requires eviction scan resize).
@@ -330,11 +342,11 @@ impl TransactionSetVariant {
     }
 
     /// Get owned transactions with optional per-component base fee overrides.
-    pub fn transactions_with_base_fee(&self) -> Vec<(Arc<TransactionEnvelope>, Option<u32>)> {
+    pub fn transactions_with_base_fee(&self) -> Vec<TxWithFee> {
         let set_hash = self.hash();
         match self {
             TransactionSetVariant::Classic(set) => {
-                let txs: Vec<(Arc<TransactionEnvelope>, Option<u32>)> = set
+                let txs: Vec<TxWithFee> = set
                     .txs
                     .iter()
                     .cloned()
@@ -379,11 +391,11 @@ impl TransactionSetVariant {
     ///
     /// Returns only the V0 (classic) phase transactions, sorted for apply.
     /// Returns an empty vec for Classic transaction sets.
-    pub fn classic_phase_transactions(&self) -> Vec<(Arc<TransactionEnvelope>, Option<u32>)> {
+    pub fn classic_phase_transactions(&self) -> Vec<TxWithFee> {
         let set_hash = self.hash();
         match self {
             TransactionSetVariant::Classic(set) => {
-                let txs: Vec<(Arc<TransactionEnvelope>, Option<u32>)> = set
+                let txs: Vec<TxWithFee> = set
                     .txs
                     .iter()
                     .cloned()
@@ -498,17 +510,12 @@ fn tx_sequence_number(tx: &TransactionEnvelope) -> i64 {
     }
 }
 
-#[allow(clippy::type_complexity)]
-fn sorted_for_apply_sequential(
-    txs: Vec<(Arc<TransactionEnvelope>, Option<u32>)>,
-    set_hash: Hash256,
-) -> Vec<(Arc<TransactionEnvelope>, Option<u32>)> {
+fn sorted_for_apply_sequential(txs: Vec<TxWithFee>, set_hash: Hash256) -> Vec<TxWithFee> {
     if txs.len() <= 1 {
         return txs;
     }
 
-    let mut by_account: HashMap<AccountId, Vec<(Arc<TransactionEnvelope>, Option<u32>)>> =
-        HashMap::new();
+    let mut by_account: HashMap<AccountId, Vec<TxWithFee>> = HashMap::new();
     for (tx, base_fee) in txs {
         let account_id = tx_source_id(&tx);
         by_account
@@ -518,9 +525,7 @@ fn sorted_for_apply_sequential(
     }
 
     // Pre-compute TX hashes and attach to each item to avoid redundant XDR+SHA256 during sort.
-    let mut queues: Vec<
-        std::collections::VecDeque<(Arc<TransactionEnvelope>, Option<u32>, Hash256)>,
-    > = by_account
+    let mut queues: Vec<std::collections::VecDeque<TxWithHash>> = by_account
         .into_values()
         .map(|mut txs| {
             txs.sort_by(|a, b| tx_sequence_number(&a.0).cmp(&tx_sequence_number(&b.0)));
@@ -553,13 +558,12 @@ fn sorted_for_apply_sequential(
 /// and stages are sorted by their first cluster's first transaction.
 /// Clusters within a stage are NOT sorted -- they are independent, so stellar-core
 /// preserves XDR order to keep deterministic result ordering.
-#[allow(clippy::type_complexity)]
 fn sort_parallel_stages(
     stages: &[stellar_xdr::curr::ParallelTxExecutionStage],
     set_hash: &Hash256,
 ) -> Vec<Vec<Vec<Arc<TransactionEnvelope>>>> {
     // Pre-compute TX hashes alongside each TX to avoid redundant XDR+SHA256 during sort.
-    let mut stage_vec: Vec<Vec<Vec<(Arc<TransactionEnvelope>, Hash256)>>> = stages
+    let mut stage_vec: Vec<Vec<Vec<ArcTxWithHash>>> = stages
         .iter()
         .map(|stage| {
             stage
@@ -615,7 +619,7 @@ fn sorted_stages_for_parallel(
     stages: &[stellar_xdr::curr::ParallelTxExecutionStage],
     set_hash: Hash256,
     base_fee: Option<u32>,
-) -> Vec<Vec<Vec<TxWithFee>>> {
+) -> ParallelStages {
     sort_parallel_stages(stages, &set_hash)
         .into_iter()
         .map(|stage| {
@@ -631,16 +635,13 @@ fn sorted_for_apply_parallel(
     stages: &[stellar_xdr::curr::ParallelTxExecutionStage],
     set_hash: Hash256,
     base_fee: Option<u32>,
-) -> Vec<(Arc<TransactionEnvelope>, Option<u32>)> {
+) -> Vec<TxWithFee> {
     sort_parallel_stages(stages, &set_hash)
         .into_iter()
         .flat_map(|stage| stage.into_iter().flatten())
         .map(|tx| (tx, base_fee))
         .collect()
 }
-
-/// A transaction paired with an optional per-component base fee override.
-pub type TxWithFee = (Arc<TransactionEnvelope>, Option<u32>);
 
 /// Structured Soroban parallel phase preserving stage/cluster nesting.
 ///
@@ -653,7 +654,7 @@ pub struct SorobanPhaseStructure {
     pub base_fee: Option<u32>,
     /// Stages of clusters of sorted transactions with base fee.
     /// stages[i][j] = cluster j of stage i, containing sorted (tx, base_fee) pairs.
-    pub stages: Vec<Vec<Vec<TxWithFee>>>,
+    pub stages: ParallelStages,
 }
 
 /// Pre-extracted per-transaction metadata.
@@ -742,21 +743,20 @@ impl TransactionSetVariant {
                         stellar_xdr::curr::TransactionPhase::V1(parallel) => {
                             let base_fee =
                                 parallel.base_fee.and_then(|fee| u32::try_from(fee).ok());
-                            let stages: Vec<Vec<Vec<TxWithFee>>> =
-                                Vec::from(parallel.execution_stages)
-                                    .into_iter()
-                                    .map(|stage| {
-                                        Vec::from(stage.0)
-                                            .into_iter()
-                                            .map(|cluster| {
-                                                Vec::from(cluster.0)
-                                                    .into_iter()
-                                                    .map(|tx| (Arc::new(tx), base_fee))
-                                                    .collect()
-                                            })
-                                            .collect()
-                                    })
-                                    .collect();
+                            let stages: ParallelStages = Vec::from(parallel.execution_stages)
+                                .into_iter()
+                                .map(|stage| {
+                                    Vec::from(stage.0)
+                                        .into_iter()
+                                        .map(|cluster| {
+                                            Vec::from(cluster.0)
+                                                .into_iter()
+                                                .map(|tx| (Arc::new(tx), base_fee))
+                                                .collect()
+                                        })
+                                        .collect()
+                                })
+                                .collect();
 
                             for stage in &stages {
                                 for cluster in stage {

@@ -7,7 +7,7 @@
 use super::*;
 
 /// Load a ConfigSettingEntry from the snapshot by ID.
-pub fn load_config_setting(
+pub(crate) fn load_config_setting(
     snapshot: &SnapshotHandle,
     id: ConfigSettingId,
 ) -> Option<ConfigSettingEntry> {
@@ -317,7 +317,7 @@ pub fn load_soroban_config(snapshot: &SnapshotHandle, protocol_version: u32) -> 
 ///
 /// This loads all the configuration settings needed for the /sorobaninfo endpoint,
 /// matching the "basic" format from stellar-core.
-pub fn load_soroban_network_info(snapshot: &SnapshotHandle) -> Option<SorobanNetworkInfo> {
+pub(crate) fn load_soroban_network_info(snapshot: &SnapshotHandle) -> Option<SorobanNetworkInfo> {
     // Check if we have any Soroban config (indicates protocol 20+)
     let compute_v0 = load_config_setting(snapshot, ConfigSettingId::ContractComputeV0)?;
 
@@ -449,7 +449,7 @@ pub fn load_soroban_network_info(snapshot: &SnapshotHandle) -> Option<SorobanNet
     Some(info)
 }
 
-pub fn compute_soroban_resource_fee(
+pub(crate) fn compute_soroban_resource_fee(
     frame: &TransactionFrame,
     protocol_version: u32,
     config: &SorobanConfig,
