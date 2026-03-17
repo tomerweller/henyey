@@ -156,7 +156,7 @@ impl LedgerStateManager {
 
         // Update state — delta recording is deferred to flush_modified_entries()
         // which compares current state against the snapshot.
-        self.ttl_entries.insert(key_hash.clone(), entry.clone());
+        self.ttl_entries.insert(key_hash.clone(), entry);
 
         // Track modification
         if !self.modified_ttl.contains(&key_hash) {
@@ -192,7 +192,7 @@ impl LedgerStateManager {
         }
 
         // Update last_modified_key for bucket list computation
-        self.set_last_modified_key(ledger_key.clone(), self.ledger_seq);
+        self.set_last_modified_key(ledger_key, self.ledger_seq);
 
         // Update state only (no delta recording)
         self.ttl_entries.insert(key_hash.clone(), entry.clone());

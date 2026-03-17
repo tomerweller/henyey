@@ -616,9 +616,7 @@ fn redeem_into_claimable_balance(
     }
 
     // Handle sponsorship for the claimable balance.
-    let cb_ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
-        balance_id: balance_id.clone(),
-    });
+    let cb_ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance { balance_id });
 
     // Check if the sponsoring account is itself in a sponsorship sandwich
     if let Some(sandwich_sponsor) = state.active_sponsor_for(cb_sponsoring_acc_id) {
@@ -627,12 +625,15 @@ fn redeem_into_claimable_balance(
             return Ok(RemoveResult::LowReserve);
         }
 
-        if let Err(_) = state.apply_entry_sponsorship_with_sponsor(
-            cb_ledger_key.clone(),
-            &sandwich_sponsor,
-            None, // claimable balances are not subentries
-            1,
-        ) {
+        if state
+            .apply_entry_sponsorship_with_sponsor(
+                cb_ledger_key,
+                &sandwich_sponsor,
+                None, // claimable balances are not subentries
+                1,
+            )
+            .is_err()
+        {
             return Ok(RemoveResult::LowReserve);
         }
     } else {
@@ -644,7 +645,7 @@ fn redeem_into_claimable_balance(
             panic!("no numSponsoring available for revoke");
         }
 
-        state.set_entry_sponsor(cb_ledger_key.clone(), cb_sponsoring_acc_id.clone());
+        state.set_entry_sponsor(cb_ledger_key, cb_sponsoring_acc_id.clone());
         state.update_num_sponsoring(cb_sponsoring_acc_id, 1)?;
     }
 

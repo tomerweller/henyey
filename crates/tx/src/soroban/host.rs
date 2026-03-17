@@ -414,9 +414,8 @@ impl<'a> LedgerSnapshotAdapter<'a> {
                             // Get the TTL entry for the restore info
                             let key_hash =
                                 super::get_or_compute_key_hash(self.ttl_key_cache, current_key);
-                            let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
-                                key_hash: key_hash.clone(),
-                            });
+                            let ttl_key =
+                                LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl { key_hash });
                             let ttl_entry = self.state.get_entry(&ttl_key);
 
                             ttl_entry.map(|te| super::protocol::LiveBucketListRestore {
@@ -618,9 +617,7 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
                         // Get the TTL entry for the restore info
                         let key_hash =
                             super::get_or_compute_key_hash(self.ttl_key_cache, key.as_ref());
-                        let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
-                            key_hash: key_hash.clone(),
-                        });
+                        let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl { key_hash });
                         let ttl_entry = self.state.get_entry(&ttl_key);
 
                         ttl_entry.map(|te| super::protocol::LiveBucketListRestore {

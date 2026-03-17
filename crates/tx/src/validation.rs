@@ -402,7 +402,7 @@ pub fn validate_time_bounds(
     let time_bounds = match frame.preconditions() {
         Preconditions::None => return Ok(()),
         Preconditions::Time(tb) => Some(tb),
-        Preconditions::V2(cond) => cond.time_bounds.clone(),
+        Preconditions::V2(cond) => cond.time_bounds,
     };
 
     if let Some(tb) = time_bounds {
@@ -436,7 +436,7 @@ pub fn validate_ledger_bounds(
 ) -> std::result::Result<(), ValidationError> {
     let ledger_bounds = match frame.preconditions() {
         Preconditions::None | Preconditions::Time(_) => return Ok(()),
-        Preconditions::V2(cond) => cond.ledger_bounds.clone(),
+        Preconditions::V2(cond) => cond.ledger_bounds,
     };
 
     if let Some(lb) = ledger_bounds {

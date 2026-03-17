@@ -149,7 +149,7 @@ impl LedgerStateManager {
                 let contract = contract_data.contract.clone();
                 let cd_key = contract_data.key.clone();
                 let durability = contract_data.durability;
-                let key = ContractDataKey::new(contract.clone(), cd_key.clone(), durability);
+                let key = StorageKey::new(contract.clone(), cd_key.clone(), durability);
                 self.contract_data.entries_mut().insert(key, contract_data);
                 let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
                     contract,
@@ -428,7 +428,7 @@ impl LedgerStateManager {
                 self.liquidity_pools.entries_mut().insert(key, lp.clone());
             }
             LedgerEntryData::ContractData(cd) => {
-                let key = ContractDataKey::new(cd.contract.clone(), cd.key.clone(), cd.durability);
+                let key = StorageKey::new(cd.contract.clone(), cd.key.clone(), cd.durability);
                 self.contract_data.entries_mut().insert(key, cd.clone());
             }
             LedgerEntryData::ContractCode(cc) => {
@@ -484,7 +484,7 @@ impl LedgerStateManager {
                     .remove(&k.liquidity_pool_id);
             }
             LedgerKey::ContractData(k) => {
-                let cd_key = ContractDataKey::new(k.contract.clone(), k.key.clone(), k.durability);
+                let cd_key = StorageKey::new(k.contract.clone(), k.key.clone(), k.durability);
                 self.contract_data.entries_mut().remove(&cd_key);
             }
             LedgerKey::ContractCode(k) => {
@@ -675,7 +675,7 @@ impl LedgerStateManager {
         asset: &Asset,
     ) -> Option<&mut TrustLineEntry> {
         let asset_key = asset_to_trustline_asset(asset);
-        let key = (account_id.clone(), asset_key.clone());
+        let key = (account_id.clone(), asset_key);
 
         if self.trustlines.contains_key(&key) {
             // Save snapshot if not already saved or if it's None (for newly created entries).
@@ -934,7 +934,7 @@ impl LedgerStateManager {
 
         // Build record and insert into canonical offer store
         let record = OfferRecord {
-            entry: entry.clone(),
+            entry,
             last_modified: self.ledger_seq,
             sponsor,
             has_ext,
@@ -1165,7 +1165,7 @@ impl LedgerStateManager {
             name,
             entry.data_name.as_vec()
         );
-        let key = (entry.account_id.clone(), name.clone());
+        let key = (entry.account_id.clone(), name);
         let ledger_key = LedgerKey::Data(LedgerKeyData {
             account_id: entry.account_id.clone(),
             data_name: entry.data_name.clone(),
@@ -1180,7 +1180,7 @@ impl LedgerStateManager {
     /// Update an existing data entry.
     pub fn update_data(&mut self, entry: DataEntry) {
         let name = data_name_to_string(&entry.data_name);
-        let key = (entry.account_id.clone(), name.clone());
+        let key = (entry.account_id.clone(), name);
         let ledger_key = LedgerKey::Data(LedgerKeyData {
             account_id: entry.account_id.clone(),
             data_name: entry.data_name.clone(),
@@ -1229,7 +1229,7 @@ impl LedgerStateManager {
         key: &ScVal,
         durability: ContractDataDurability,
     ) -> Option<&ContractDataEntry> {
-        let lookup_key = ContractDataKey::new(contract.clone(), key.clone(), durability);
+        let lookup_key = StorageKey::new(contract.clone(), key.clone(), durability);
         self.contract_data.get(&lookup_key)
     }
 
@@ -1240,7 +1240,7 @@ impl LedgerStateManager {
         key: &ScVal,
         durability: ContractDataDurability,
     ) -> Option<&mut ContractDataEntry> {
-        let lookup_key = ContractDataKey::new(contract.clone(), key.clone(), durability);
+        let lookup_key = StorageKey::new(contract.clone(), key.clone(), durability);
         if !self.contract_data.contains(&lookup_key) {
             return None;
         }
@@ -1257,7 +1257,7 @@ impl LedgerStateManager {
 
     /// Create a new contract data entry.
     pub fn create_contract_data(&mut self, entry: ContractDataEntry) {
-        let key = ContractDataKey::new(entry.contract.clone(), entry.key.clone(), entry.durability);
+        let key = StorageKey::new(entry.contract.clone(), entry.key.clone(), entry.durability);
         let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
             contract: entry.contract.clone(),
             key: entry.key.clone(),
@@ -1272,7 +1272,7 @@ impl LedgerStateManager {
 
     /// Update an existing contract data entry.
     pub fn update_contract_data(&mut self, entry: ContractDataEntry) {
-        let key = ContractDataKey::new(entry.contract.clone(), entry.key.clone(), entry.durability);
+        let key = StorageKey::new(entry.contract.clone(), entry.key.clone(), entry.durability);
         let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
             contract: entry.contract.clone(),
             key: entry.key.clone(),
@@ -1300,7 +1300,7 @@ impl LedgerStateManager {
         key: &ScVal,
         durability: ContractDataDurability,
     ) {
-        let lookup_key = ContractDataKey::new(contract.clone(), key.clone(), durability);
+        let lookup_key = StorageKey::new(contract.clone(), key.clone(), durability);
         let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
             contract: contract.clone(),
             key: key.clone(),
@@ -1609,8 +1609,7 @@ impl LedgerStateManager {
     pub fn is_entry_deleted(&self, key: &LedgerKey) -> bool {
         match key {
             LedgerKey::ContractData(k) => {
-                let lookup_key =
-                    ContractDataKey::new(k.contract.clone(), k.key.clone(), k.durability);
+                let lookup_key = StorageKey::new(k.contract.clone(), k.key.clone(), k.durability);
                 self.contract_data.is_deleted(&lookup_key)
             }
             LedgerKey::ContractCode(k) => self.contract_code.is_deleted(&k.hash),
@@ -1629,8 +1628,7 @@ impl LedgerStateManager {
     pub fn mark_entry_deleted(&mut self, key: &LedgerKey) {
         match key {
             LedgerKey::ContractData(k) => {
-                let lookup_key =
-                    ContractDataKey::new(k.contract.clone(), k.key.clone(), k.durability);
+                let lookup_key = StorageKey::new(k.contract.clone(), k.key.clone(), k.durability);
                 self.contract_data.mark_deleted(lookup_key);
             }
             LedgerKey::ContractCode(k) => {

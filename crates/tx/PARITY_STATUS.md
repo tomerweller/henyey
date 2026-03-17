@@ -3,7 +3,7 @@
 **Crate**: `henyey-tx`
 **Upstream**: `stellar-core/src/transactions/`
 **Overall Parity**: 97%
-**Last Updated**: 2026-03-05
+**Last Updated**: 2026-03-17
 
 ## Summary
 
@@ -513,29 +513,29 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
-| InvokeHostFunction | 70 TEST_CASE / 301 SECTION | 19 #[test] | Testnet integration covers gaps |
+| InvokeHostFunction | 70 TEST_CASE / 301 SECTION | 25 #[test] | Testnet integration covers gaps |
 | Offer management | 2 TEST_CASE / 178 SECTION | 34 #[test] | Good unit coverage |
 | TxEnvelope/Signatures | 5 TEST_CASE / 154 SECTION | 15 #[test] | Testnet integration covers gaps |
 | PathPaymentStrictReceive | 2 TEST_CASE / 123 SECTION | 21 #[test] | Testnet integration covers gaps |
 | Exchange mechanics | 6 TEST_CASE / 85 SECTION | 16 #[test] | Good exchange math coverage |
-| LiquidityPool trading | 2 TEST_CASE / 86 SECTION | 14 #[test] | Testnet integration covers gaps |
+| LiquidityPool trading | 2 TEST_CASE / 86 SECTION | 17 #[test] | Testnet integration covers gaps |
 | Payment | 2 TEST_CASE / 76 SECTION | 26 #[test] | Good coverage |
 | ClaimableBalance | 1 TEST_CASE / 72 SECTION | 28 #[test] | Good coverage |
-| SetTrustLineFlags | 2 TEST_CASE / 70 SECTION | 12 #[test] | Testnet integration covers gaps |
+| SetTrustLineFlags | 2 TEST_CASE / 70 SECTION | 16 #[test] | Testnet integration covers gaps |
 | ManageBuyOffer | 8 TEST_CASE / 69 SECTION | 35 #[test] (shared) | Shared with sell offer tests |
 | RevokeSponsorship | 1 TEST_CASE / 65 SECTION | 15 #[test] | Testnet integration covers gaps |
 | PathPaymentStrictSend | 2 TEST_CASE / 58 SECTION | 21 #[test] (shared) | Shared with strict receive tests |
-| AllowTrust | 2 TEST_CASE / 54 SECTION | 12 #[test] | Testnet integration covers gaps |
+| AllowTrust | 2 TEST_CASE / 54 SECTION | 16 #[test] (shared) | Shared with trust flags tests |
 | AccountMerge | 2 TEST_CASE / 46 SECTION | 17 #[test] | Good coverage |
-| TxResults | 1 TEST_CASE / 38 SECTION | 28 #[test] | Good coverage |
+| TxResults | 1 TEST_CASE / 38 SECTION | 31 #[test] | Good coverage |
 | ChangeTrust | 2 TEST_CASE / 37 SECTION | 21 #[test] | Good coverage |
 | FeeBumpTransaction | 1 TEST_CASE / 23 SECTION | 19 #[test] | Good coverage |
 | SetOptions | 1 TEST_CASE / 21 SECTION | 24 #[test] | Exceeds upstream |
-| ClawbackOps | 1 TEST_CASE / 18 SECTION | 14 #[test] | Good coverage |
+| ClawbackOps | 1 TEST_CASE / 18 SECTION | 16 #[test] | Good coverage |
 | Inflation | 2 TEST_CASE / 16 SECTION | 7 #[test] | Deprecated operation |
-| ClawbackClaimableBalance | 1 TEST_CASE / 14 SECTION | 14 #[test] (shared) | Shared with clawback tests |
-| LiquidityPoolDeposit | 1 TEST_CASE / 12 SECTION | 14 #[test] (shared) | Shared pool tests |
-| LiquidityPoolWithdraw | 1 TEST_CASE / 12 SECTION | 14 #[test] (shared) | Shared pool tests |
+| ClawbackClaimableBalance | 1 TEST_CASE / 14 SECTION | 16 #[test] (shared) | Shared with clawback tests |
+| LiquidityPoolDeposit | 1 TEST_CASE / 12 SECTION | 17 #[test] (shared) | Shared pool tests |
+| LiquidityPoolWithdraw | 1 TEST_CASE / 12 SECTION | 17 #[test] (shared) | Shared pool tests |
 | BumpSequence | 1 TEST_CASE / 11 SECTION | 6 #[test] | Adequate coverage |
 | CreateAccount | 1 TEST_CASE / 10 SECTION | 13 #[test] | Exceeds upstream |
 | BeginSponsoring | 1 TEST_CASE / 9 SECTION | 15 #[test] (shared) | Shared sponsorship tests |
@@ -544,33 +544,38 @@ Features not yet implemented. These ARE counted against parity %.
 | EndSponsoring | 1 TEST_CASE / 2 SECTION | 15 #[test] (shared) | Shared sponsorship tests |
 | SignatureUtils | 2 TEST_CASE / 0 SECTION | 15 #[test] | Good coverage |
 | ParallelApply | 4 TEST_CASE / 0 SECTION | 0 #[test] | N/A (not implemented) |
-| State management | - | 51 #[test] | Rust-only: savepoint, rollback, offer index |
+| State management | - | 57 #[test] | Rust-only: savepoint, rollback, offer index |
+| Entry store | - | 45 #[test] | Rust-only: generic entry store |
 | Meta building | - | 20 #[test] | Rust-only: TransactionMeta construction |
 | Lumen reconciler | - | 17 #[test] | Rust-only: SAC event reconciliation |
-| Result tracking | - | 28 #[test] | Rust-only: MutableTransactionResult |
+| Result tracking | - | 31 #[test] | Rust-only: MutableTransactionResult |
 | Live execution | - | 28 #[test] | Rust-only: fee/seq/refund flow |
 | History apply | - | 20 #[test] | Rust-only: catchup mode |
-| Frame properties | - | 40 #[test] | Rust-only: envelope accessors |
-| Validation | - | 26 #[test] | Rust-only: precondition checks |
-| Soroban types | - | 19 #[test] | Rust-only: protocol type mapping |
+| Frame properties | - | 42 #[test] | Rust-only: envelope accessors |
+| Validation | - | 28 #[test] | Rust-only: precondition checks |
+| Soroban types | - | 2 #[test] | Rust-only: protocol type mapping |
 | Soroban errors | - | 15 #[test] | Rust-only: error code mapping |
 | Soroban storage | - | 12 #[test] | Rust-only: storage snapshot |
-| Soroban events | - | 11 #[test] | Rust-only: contract events |
+| Soroban events | - | 5 #[test] | Rust-only: contract events |
 | Soroban budget | - | 9 #[test] | Rust-only: budget tracking |
-| Soroban host | - | 7 #[test] | Rust-only: host configuration |
+| Soroban host | - | 14 #[test] | Rust-only: host configuration |
+| Prefetch | - | 11 #[test] | Rust-only: footprint prefetch |
+| Test utilities | - | 14 #[test] | Rust-only: test infrastructure |
+| Error types | - | 12 #[test] | Rust-only: error mapping |
+| Operation dispatch | - | 61 #[test] | Rust-only: operation routing and helpers |
 
-**Total: 130 TEST_CASE / 1,672 SECTION upstream vs. 815 #[test] in Rust**
+**Total: 130 TEST_CASE / 1,672 SECTION upstream vs. 883 #[test] in Rust**
 
 ### Test Gaps
 
 The following upstream test areas have limited Rust unit test equivalents, though many are covered by testnet integration:
 
-1. **InvokeHostFunction edge cases** (301 SECTIONs vs 19 tests) -- Soroban contract invocation, storage, archival edge cases
-2. **Offer exchange mechanics** (178 SECTIONs vs 34 tests) -- DEX crossing, rounding, self-trade
+1. **InvokeHostFunction edge cases** (301 SECTIONs vs 25 tests) -- Soroban contract invocation, storage, archival edge cases
+2. **Offer exchange mechanics** (178 SECTIONs vs 35 tests) -- DEX crossing, rounding, self-trade
 3. **TxEnvelope multisig scenarios** (154 SECTIONs vs 15 tests) -- Complex multisig, extra signers, batching
-4. **PathPayment complex paths** (123 SECTIONs vs 20 tests) -- Multi-hop paths, pool+book interaction
-5. **LiquidityPool trading** (86 SECTIONs vs 13 tests) -- Cross-pool operations
-6. **SetTrustLineFlags** (70 SECTIONs vs 11 tests) -- Authorization state transitions
+4. **PathPayment complex paths** (123 SECTIONs vs 21 tests) -- Multi-hop paths, pool+book interaction
+5. **LiquidityPool trading** (86 SECTIONs vs 17 tests) -- Cross-pool operations
+6. **SetTrustLineFlags** (70 SECTIONs vs 16 tests) -- Authorization state transitions
 
 ## Verification Results
 

@@ -16,7 +16,6 @@ use std::hash::Hash;
 /// Per-type entry store bundling the parallel collections needed for snapshot,
 /// rollback, commit, and flush lifecycle management.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct EntryStore<K: Eq + Hash + Clone, V: Clone> {
     /// Live entries.
     entries: HashMap<K, V>,
@@ -33,7 +32,6 @@ pub struct EntryStore<K: Eq + Hash + Clone, V: Clone> {
 }
 
 /// Savepoint state for a single entry store, captured by `EntryStore::create_savepoint`.
-#[allow(dead_code)]
 pub struct EntryStoreSavepoint<K: Eq + Hash + Clone, V: Clone> {
     /// Clone of the snapshot map at savepoint time.
     snapshots: HashMap<K, Option<V>>,
@@ -46,7 +44,6 @@ pub struct EntryStoreSavepoint<K: Eq + Hash + Clone, V: Clone> {
     modified_len: usize,
 }
 
-#[allow(dead_code)]
 impl<K, V> EntryStore<K, V>
 where
     K: Eq + Hash + Clone,

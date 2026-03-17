@@ -4,7 +4,7 @@ Transaction validation and execution for henyey.
 
 ## Overview
 
-This crate provides the core transaction processing logic for the Stellar network, supporting both classic Stellar operations and Soroban smart contract execution. It is the heart of ledger state changes in henyey.
+This crate provides the core transaction processing logic for the Stellar network, supporting both classic Stellar operations and Soroban smart contract execution. It is the heart of ledger state changes in henyey, corresponding to stellar-core's `src/transactions/` directory.
 
 ### Operating Modes
 
@@ -28,399 +28,52 @@ Re-executing historical transactions is problematic for several reasons:
 
 ## Architecture
 
-```
-                              Transaction Pipeline
+```mermaid
+flowchart TD
+    E[TransactionFrame<br/>frame.rs] --> V[Validation<br/>validation.rs]
+    E --> H[Historical Apply<br/>apply.rs]
+    E --> L[Live Execution<br/>live_execution.rs]
 
-    +-----------------+     +------------------+     +------------------+
-    | TransactionFrame|---->| TransactionValidator|->| TransactionExecutor|
-    |   (frame.rs)    |     |   (validation.rs)|    |    (apply.rs)    |
-    +-----------------+     +------------------+     +------------------+
-           |                        |                        |
-           v                        v                        v
-    +-------------+         +---------------+        +---------------+
-    | - Envelope  |         | - Structure   |        | - Historical  |
-    | - Hash      |         | - Signatures  |        |   Replay      |
-    | - Resources |         | - Time/Ledger |        | - State       |
-    | - Detection |         |   Bounds      |        |   Changes     |
-    +-------------+         +---------------+        +---------------+
-                                                            |
-                                                            v
-                            +--------------------------------------+
-                            |       LedgerStateManager             |
-                            |       (state/)                       |
-                            |                                      |
-                            |  In-memory entries + snapshots       |
-                            |  EntryStore<K,V> for 5 entry types   |
-                            |  Per-operation Savepoint rollback    |
-                            +------------------+-------------------+
-                                               |
-                                               v
-                            +--------------------------------------+
-                            |           LedgerDelta                |
-                            | (Accumulates state changes)          |
-                            |                                      |
-                            | - Creates (new entries)              |
-                            | - Updates (modified entries)         |
-                            | - Deletes (removed entries)          |
-                            | - Change ordering for metadata       |
-                            +--------------------------------------+
-                                               |
-                                               v
-                                        To Bucket List
-```
+    V --> SIG[SignatureChecker<br/>signature_checker.rs]
 
-### Module Structure
+    L --> OPS[Operation Dispatch<br/>operations/execute/]
+    OPS --> CLASSIC[Classic Ops<br/>24 operations]
+    OPS --> SOROBAN[Soroban Ops<br/>soroban/]
 
-```
-henyey-tx/
-├── src/
-│   ├── lib.rs              # Public API, re-exports, high-level types
-│   ├── frame.rs            # TransactionFrame - envelope wrapper
-│   ├── apply.rs            # Historical transaction application (catchup mode)
-│   ├── live_execution.rs   # Live transaction execution (validator mode)
-│   ├── validation.rs       # Transaction validation logic
-│   ├── result.rs           # Result type wrappers (TxApplyResult, etc.)
-│   ├── error.rs            # Error types (TxError, etc.)
-│   ├── events.rs           # Classic SAC event emission
-│   ├── lumen_reconciler.rs # XLM balance reconciliation for events
-│   ├── meta_builder.rs     # Transaction metadata construction
-│   ├── fee_bump.rs         # Fee bump transaction handling
-│   ├── scval_utils.rs      # Soroban ScVal conversion utilities
-│   ├── signature_checker.rs # Multi-sig threshold checking
-│   ├── state/
-│   │   ├── mod.rs          # LedgerStateManager, Savepoint, SorobanState, rollback
-│   │   ├── entries.rs      # Per-type CRUD (load/create/update/delete) methods
-│   │   ├── entry_store.rs  # Generic EntryStore<K,V> with snapshot/rollback lifecycle
-│   │   ├── offer_index.rs  # BTreeMap-based orderbook for O(log n) best-offer lookups
-│   │   ├── sponsorship.rs  # Sponsorship stack management
-│   │   └── ttl.rs          # TTL entry management and deferred read-only bumps
-│   ├── operations/
-│   │   ├── mod.rs          # Operation types and validation
-│   │   └── execute/
-│   │       ├── mod.rs      # Operation dispatch and shared context types
-│   │       ├── offer_utils.rs # Shared DEX offer helpers (cross_offer, liabilities)
-│   │       └── ...         # Per-operation execution implementations
-│   └── soroban/
-│       ├── mod.rs          # Soroban module entry point
-│       ├── host.rs         # Host function execution via e2e_invoke
-│       ├── budget.rs       # Resource budget tracking
-│       ├── storage.rs      # Contract storage interface
-│       ├── events.rs       # Contract event handling
-│       ├── error.rs        # Protocol version error conversion
-│       └── protocol/       # Protocol-versioned host implementations
+    CLASSIC --> SM[LedgerStateManager<br/>state/]
+    SOROBAN --> SM
+    H --> DELTA[LedgerDelta<br/>apply.rs]
+    SM --> DELTA
+
+    SM --> OS[OfferStore<br/>state/offer_store.rs]
+    SM --> ES[EntryStore&lt;K,V&gt;<br/>state/entry_store.rs]
+
+    DELTA --> BL[To Bucket List]
+    DELTA --> META[TransactionMetaBuilder<br/>meta_builder.rs]
 ```
 
 ## Key Types
 
-### Transaction Processing
-
-#### `TransactionFrame`
-
-Wrapper around XDR `TransactionEnvelope` providing a unified API regardless of envelope version:
-
-```rust
-use henyey_tx::TransactionFrame;
-use henyey_common::NetworkId;
-
-let frame = TransactionFrame::new(envelope);
-
-// Access properties uniformly
-println!("Fee: {} stroops", frame.fee());
-println!("Operations: {}", frame.operation_count());
-println!("Is Soroban: {}", frame.is_soroban());
-
-// Compute network-bound hash
-let hash = frame.hash(&NetworkId::testnet())?;
-```
-
-Handles:
-- V0 transactions (legacy with raw Ed25519 public key)
-- V1 transactions (modern with MuxedAccount support)
-- Fee bump transactions (wrapper with higher fee)
-
-#### `TransactionValidator`
-
-High-level validator for transaction envelopes:
-
-```rust
-use henyey_tx::{TransactionValidator, ValidationResult};
-
-let validator = TransactionValidator::testnet(ledger_seq, close_time);
-
-match validator.validate(&envelope) {
-    ValidationResult::Valid => { /* proceed */ }
-    ValidationResult::TooLate => { /* transaction expired */ }
-    ValidationResult::InsufficientFee => { /* fee too low */ }
-    _ => { /* other failure */ }
-}
-```
-
-#### `TransactionExecutor`
-
-Executor for applying transactions:
-
-```rust
-use henyey_tx::{TransactionExecutor, ApplyContext, LedgerDelta};
-
-let executor = TransactionExecutor::new(context);
-
-// For catchup mode (recommended)
-let result = executor.apply_historical(&envelope, &tx_result, &tx_meta, &mut delta)?;
-```
-
-### Ledger State
-
-#### `LedgerDelta`
-
-Accumulates all state changes during transaction execution:
-
-```rust
-use henyey_tx::LedgerDelta;
-
-let mut delta = LedgerDelta::new(ledger_seq);
-
-// After applying transactions:
-for entry in delta.created_entries() {
-    bucket_list.add(entry)?;
-}
-for entry in delta.updated_entries() {
-    bucket_list.update(entry)?;
-}
-for key in delta.deleted_keys() {
-    bucket_list.delete(key)?;
-}
-```
-
-The delta preserves change ordering through `ChangeRef`, which is critical for correct transaction metadata construction:
-
-```
-Transaction Meta Structure:
-+---------------------------+
-| tx_changes_before         |  <- Fee deduction, sequence bump
-+---------------------------+
-| operation[0].changes      |  <- First operation's state changes
-| operation[1].changes      |  <- Second operation's state changes
-| ...                       |
-+---------------------------+
-| tx_changes_after          |  <- Post-operation adjustments
-+---------------------------+
-```
-
-#### `LedgerStateManager`
-
-In-memory ledger state for transaction execution:
-
-```rust
-use henyey_tx::LedgerStateManager;
-
-let state = LedgerStateManager::new();
-
-// Load accounts from bucket list
-state.load_account(&account_id)?;
-
-// Query state
-if let Some(account) = state.get_account(&account_id) {
-    println!("Balance: {}", account.balance);
-}
-```
-
-Features:
-- **Savepoint-based rollback**: Lightweight state checkpoints (`Savepoint`) that can undo all entry types on failure (see [Savepoint Architecture](#savepoint-architecture) below)
-- **`EntryStore<K,V>`**: Generic store that bundles live entries, snapshots, created/modified/deleted tracking, and savepoint/rollback for 5 entry types (Data, ContractData, ContractCode, ClaimableBalance, LiquidityPool). 4 complex types (Account, Trustline, Offer, TTL) remain hand-written due to unique behaviors.
-- **O(1) delta rollback**: `DeltaSnapshot` captures vector lengths instead of cloning the entire `LedgerDelta`, yielding ~43% speedup on `apply_txs`
-- Per-operation savepoints for automatic rollback of failed operations
-- Speculative orderbook exchange savepoints (path payments)
-- Multi-operation transaction tracking
-- Sponsorship stack management
-- Minimum balance calculations
-- BTreeMap-based offer index for O(log n) best-offer lookups
-
-#### `LedgerContext`
-
-Provides ledger-level context needed for validation and execution:
-
-```rust
-use henyey_tx::LedgerContext;
-
-let context = LedgerContext {
-    sequence: 12345678,
-    close_time: 1625000000,
-    protocol_version: 21,
-    network_id: NetworkId::mainnet(),
-    base_fee: 100,
-    base_reserve: 5000000,
-    // ... other fields
-};
-```
-
-### Results
-
-#### `TxApplyResult`
-
-Complete result of applying a transaction:
-
-```rust
-let result = apply_from_history(&frame, &tx_result, &meta, &mut delta)?;
-
-if result.success {
-    println!("Fee charged: {} stroops", result.fee_charged);
-    // Access detailed results via result.result (TxResultWrapper)
-}
-```
-
-#### `ValidationError`
-
-Detailed validation failure information:
-
-```rust
-use henyey_tx::ValidationError;
-
-match validate_full(&frame, &context, &account) {
-    Ok(()) => { /* valid */ }
-    Err(errors) => {
-        for error in errors {
-            match error {
-                ValidationError::TooLate { max_time, close_time } => {
-                    println!("Expired at {}, ledger close at {}", max_time, close_time);
-                }
-                // ... handle other errors
-            }
-        }
-    }
-}
-```
-
-## Supported Operations
-
-### Classic Operations
-
-| Category | Operations | Notes |
-|----------|-----------|-------|
-| **Account** | `CreateAccount`, `AccountMerge`, `SetOptions`, `BumpSequence` | Core account management |
-| **Payments** | `Payment`, `PathPaymentStrictReceive`, `PathPaymentStrictSend` | Asset transfers with optional path finding |
-| **DEX** | `ManageSellOffer`, `ManageBuyOffer`, `CreatePassiveSellOffer` | Decentralized exchange operations |
-| **Trust** | `ChangeTrust`, `AllowTrust`, `SetTrustLineFlags` | Trustline management |
-| **Data** | `ManageData` | Account data entries (64 byte values) |
-| **Claimable Balances** | `CreateClaimableBalance`, `ClaimClaimableBalance` | Conditional balance claims |
-| **Sponsorship** | `BeginSponsoringFutureReserves`, `EndSponsoringFutureReserves`, `RevokeSponsorship` | Reserve sponsorship |
-| **Clawback** | `Clawback`, `ClawbackClaimableBalance` | Asset issuer clawback |
-| **Liquidity Pools** | `LiquidityPoolDeposit`, `LiquidityPoolWithdraw` | AMM operations |
-| **Deprecated** | `Inflation` | No longer functional |
-
-### Soroban Operations
-
-| Operation | Description |
-|-----------|-------------|
-| `InvokeHostFunction` | Execute contract functions with full state access |
-| `ExtendFootprintTtl` | Extend the time-to-live of contract state entries |
-| `RestoreFootprint` | Restore archived contract state from the hot archive |
-
-## Soroban Integration
-
-### Architecture
-
-Soroban execution follows this pipeline:
-
-```
-Transaction with InvokeHostFunction
-           |
-           v
-+---------------------+
-| Footprint Validation |  <- Verify declared read/write keys
-+---------------------+
-           |
-           v
-+---------------------+
-| Build Storage Map    |  <- Load typed entries from state manager
-+---------------------+
-           |
-           v
-+---------------------------+
-| invoke_host_function_typed |  <- Typed API (no XDR ser/de for P25)
-| via PersistentModuleCache  |  <- Reuses compiled WASM across TXs
-+---------------------------+
-           |
-           v
-+---------------------+
-| Collect Changes      |  <- Typed storage changes, events, fees
-+---------------------+
-           |
-           v
-Apply to LedgerDelta
-```
-
-### Protocol Versioning
-
-The crate uses two vendored copies of `soroban-env-host` (under `vendor/soroban-env-p24/` and `vendor/soroban-env-p25/`) to ensure deterministic replay across protocol versions:
-
-| Protocol | soroban-env-host | XDR crate | Boundary cost |
-|----------|-----------------|-----------|---------------|
-| 24       | `soroban-env-host-p24` | `stellar-xdr 24.0.0` | XDR roundtrip per type (P25 workspace types differ from P24) |
-| 25+      | `soroban-env-host-p25` | `stellar-xdr 25.0.0` | Zero-copy (same XDR crate as workspace) |
-
-This versioning is critical because:
-- Host function semantics may change between versions
-- Cost model parameters differ per protocol
-- PRNG behavior must match exactly for determinism
-
-Both paths use the **typed invoke API** (`invoke_host_function_typed()`) which passes `Rc<LedgerEntry>` and `Rc<TtlEntry>` directly instead of serialized XDR bytes. For P25, this eliminates all XDR conversion at the boundary. For P24, type bridge functions convert between the P25 workspace types and P24 host types (an irreducible cost of dual-protocol support).
-
-### Key Components
-
-- **`SorobanConfig`**: Network configuration including cost parameters, TTL limits, and fee configuration. Loaded from `ConfigSettingEntry` entries.
-
-- **`SorobanBudget`**: Tracks resource consumption (CPU, memory, I/O) against declared limits.
-
-- **`SorobanStorage`**: Provides the storage interface for contract state, tracking reads and writes during execution.
-
-- **`execute_host_function_with_cache`**: Main entry point that dispatches to the correct protocol-versioned host. Accepts a `PersistentModuleCache` for WASM module reuse.
-
-- **`PersistentModuleCache`**: Enum wrapping P24/P25 compiled WASM module caches. Created once per ledger close and reused across all transactions, avoiding redundant WASM compilation.
-
-- **`SorobanContext`**: Bundle struct threading optional Soroban parameters (`SorobanTransactionData`, `SorobanConfig`, `PersistentModuleCache`, `HotArchiveLookup`, `TtlKeyCache`) through operation execution. Non-Soroban transactions use `SorobanContext::none()`.
-
-### Entry TTL and Archival
-
-Soroban entries (ContractData, ContractCode) have time-to-live (TTL) values:
-
-- **Temporary entries**: Short-lived, cheaper storage. Automatically deleted when TTL expires.
-
-- **Persistent entries**: Long-lived storage. When TTL expires, entries move to the "hot archive" and can be restored via `RestoreFootprint`.
-
-The storage adapter checks TTL values and excludes expired entries from the snapshot, matching stellar-core behavior.
-
-## Classic Events (SAC Events)
-
-Starting with Protocol 23, classic operations emit SEP-0041 compatible events for asset movements:
-
-| Event | Description | Operations |
-|-------|-------------|------------|
-| `transfer` | Asset moved between non-issuer accounts | Payment, PathPayment, AccountMerge |
-| `mint` | Asset issued from the issuer | Payment from issuer |
-| `burn` | Asset returned to the issuer | Payment to issuer |
-| `clawback` | Asset forcibly clawed back | Clawback |
-| `set_authorized` | Authorization status changed | SetTrustLineFlags, AllowTrust |
-| `fee` | Transaction fee payment | All transactions |
-
-### Event Backfilling
-
-Events can be backfilled for pre-Protocol 23 ledgers:
-
-```rust
-use henyey_tx::{TxEventManager, ClassicEventConfig};
-
-let config = ClassicEventConfig {
-    emit_events: true,
-    emit_diagnostic_events: false,
-    backfill_mode: true,  // For pre-P23 ledgers
-};
-
-let mut event_manager = TxEventManager::new(config, ledger_seq);
-// ... apply operations
-let events = event_manager.build_events()?;
-```
-
-## Usage Examples
+| Type | Description |
+|------|-------------|
+| `TransactionFrame` | Wrapper around XDR `TransactionEnvelope` with unified API for V0/V1/FeeBump |
+| `TransactionValidator` | High-level validator for transaction envelopes |
+| `LiveExecutionContext` | Context for live transaction execution (fee pool, state, protocol config) |
+| `LedgerDelta` | Accumulates creates/updates/deletes during execution for persistence |
+| `LedgerStateManager` | In-memory ledger state with savepoint-based rollback |
+| `LedgerContext` | Ledger-level context (sequence, close time, base fee, network ID) |
+| `OfferStore` | Unified offer store with canonical data, indexes, and metadata |
+| `EntryStore<K,V>` | Generic store with snapshot/rollback for 5 entry types |
+| `OfferIndex` | BTreeMap-based orderbook for O(log n) best-offer lookups |
+| `FeeBumpFrame` | Fee bump transaction wrapper and validation |
+| `SorobanContext` | Bundle of optional Soroban parameters threaded through execution |
+| `SorobanConfig` | Network configuration for Soroban (cost params, TTL limits, fees) |
+| `PersistentModuleCache` | Per-ledger compiled WASM cache (P24/P25 protocol-versioned) |
+| `MutableTransactionResult` | Mutable result tracking during apply phase |
+| `TxApplyResult` | Complete result of applying a transaction |
+| `ValidationError` | Structured validation failure information |
+
+## Usage
 
 ### Live Execution Mode
 
@@ -434,12 +87,7 @@ use henyey_tx::{
 
 // Set up execution context with ledger state
 let ledger_ctx = LedgerContext::new(
-    ledger_seq,
-    close_time,
-    base_fee,
-    base_reserve,
-    protocol_version,
-    network_id,
+    ledger_seq, close_time, base_fee, base_reserve, protocol_version, network_id,
 );
 let state = LedgerStateManager::new(base_reserve, ledger_seq);
 let mut ctx = LiveExecutionContext::new(ledger_ctx, state);
@@ -454,10 +102,8 @@ for frame in &transaction_set {
 // Phase 2: Apply operations for each transaction
 for (frame, fee_result) in &mut results {
     if !fee_result.should_apply {
-        continue; // Skip failed transactions
+        continue;
     }
-
-    // Apply operations (operation execution code)
     // ... apply_operations(frame, &mut ctx, &mut fee_result.tx_result)?;
 
     // Phase 3: Post-apply processing (pre-P23 Soroban refunds)
@@ -468,9 +114,6 @@ for (frame, fee_result) in &mut results {
 for (frame, fee_result) in &mut results {
     process_post_tx_set_apply(frame, &mut ctx, &mut fee_result.tx_result, None)?;
 }
-
-// Collect fee pool delta and finalize
-println!("Total fees collected: {}", ctx.fee_pool_delta());
 ```
 
 ### Catchup/Replay Mode
@@ -479,28 +122,16 @@ println!("Total fees collected: {}", ctx.fee_pool_delta());
 use henyey_tx::{TransactionFrame, apply_from_history, LedgerDelta};
 use stellar_xdr::curr::{TransactionEnvelope, TransactionResult, TransactionMeta};
 
-// Parse transaction from archive
-let envelope: TransactionEnvelope = /* from archive */;
-let result: TransactionResult = /* from archive */;
-let meta: TransactionMeta = /* from archive */;
-
-// Create frame wrapper
-let frame = TransactionFrame::new(envelope);
+let frame = TransactionFrame::from_owned(envelope);
 
 // Apply historical transaction to accumulate state changes
 let mut delta = LedgerDelta::new(ledger_seq);
 let apply_result = apply_from_history(&frame, &result, &meta, &mut delta)?;
 
 // Delta now contains all state changes in execution order
-for entry in delta.created_entries() {
-    bucket_list.add(entry)?;
-}
-for entry in delta.updated_entries() {
-    bucket_list.update(entry)?;
-}
-for key in delta.deleted_keys() {
-    bucket_list.delete(key)?;
-}
+for entry in delta.created_entries() { /* persist */ }
+for entry in delta.updated_entries() { /* persist */ }
+for key in delta.deleted_keys() { /* remove */ }
 ```
 
 ### Transaction Validation
@@ -508,10 +139,8 @@ for key in delta.deleted_keys() {
 ```rust
 use henyey_tx::{TransactionValidator, ValidationResult};
 
-// Create validator for testnet
 let validator = TransactionValidator::testnet(ledger_seq, close_time);
 
-// Basic validation (structure, bounds)
 match validator.validate(&envelope) {
     ValidationResult::Valid => println!("Transaction is valid"),
     ValidationResult::InsufficientFee => println!("Fee too low"),
@@ -523,20 +152,46 @@ match validator.validate(&envelope) {
 let result = validator.validate_with_account(&envelope, &source_account);
 ```
 
-### Processing a Transaction Set
+## Module Layout
 
-```rust
-use henyey_tx::apply_transaction_set_from_history;
-
-// Apply entire transaction set from historical ledger
-let ledger_changes = apply_transaction_set_from_history(
-    &tx_set,
-    &results,
-    &metas,
-    ledger_seq,
-    &state,
-)?;
-```
+| Module | Description |
+|--------|-------------|
+| `lib.rs` | Public API, re-exports, `TransactionValidator`, `ValidationResult` |
+| `frame.rs` | `TransactionFrame` -- envelope wrapper with unified V0/V1/FeeBump API |
+| `apply.rs` | `LedgerDelta`, `ChangeRef`, historical transaction application (catchup mode) |
+| `live_execution.rs` | Live execution functions: `process_fee_seq_num`, `process_post_apply`, etc. |
+| `validation.rs` | `LedgerContext`, `ValidationError`, structure/signature/bounds validation |
+| `result.rs` | `MutableTransactionResult`, `TxApplyResult`, `RefundableFeeTracker` |
+| `error.rs` | `TxError` and error types |
+| `events.rs` | Classic SAC event emission (`TxEventManager`, `OpEventManager`) |
+| `lumen_reconciler.rs` | XLM balance reconciliation for fee/transfer events |
+| `meta_builder.rs` | `TransactionMetaBuilder` for V2/V3/V4 transaction metadata |
+| `fee_bump.rs` | `FeeBumpFrame`, fee bump validation and result wrapping |
+| `scval_utils.rs` | Soroban `ScVal` conversion utilities for event construction |
+| `signature_checker.rs` | `SignatureChecker` with multi-sig threshold verification |
+| `test_utils.rs` | Test helper functions (test-only) |
+| `state/mod.rs` | `LedgerStateManager`, `Savepoint`, rollback logic |
+| `state/entries.rs` | Per-type CRUD methods (load/create/update/delete) |
+| `state/entry_store.rs` | Generic `EntryStore<K,V>` with snapshot/rollback lifecycle |
+| `state/offer_index.rs` | `OfferIndex` -- BTreeMap-based orderbook for best-offer lookups |
+| `state/offer_store.rs` | `OfferStore` -- unified offer data + indexes + metadata (shared via `Arc<Mutex>`) |
+| `state/sponsorship.rs` | Sponsorship stack management |
+| `state/ttl.rs` | TTL entry management and deferred read-only bumps |
+| `operations/mod.rs` | Operation types, validation dispatch, threshold levels |
+| `operations/execute/mod.rs` | Operation execution dispatch and shared helpers |
+| `operations/execute/offer_exchange.rs` | Offer exchange math (`exchange_v10`, price error thresholds) |
+| `operations/execute/offer_utils.rs` | Shared DEX offer helpers (cross offer, liabilities, deletion) |
+| `operations/execute/prefetch.rs` | Prefetch key collection for per-ledger batch loading |
+| `operations/execute/*.rs` | Per-operation implementations (24 classic + 3 Soroban) |
+| `soroban/mod.rs` | `SorobanContext`, `HotArchiveLookup`, `TtlKeyCache`, key hashing |
+| `soroban/host.rs` | `execute_host_function_with_cache`, `PersistentModuleCache` |
+| `soroban/budget.rs` | `SorobanBudget`, `SorobanConfig`, `FeeConfiguration` |
+| `soroban/storage.rs` | `SorobanStorage` -- contract storage interface |
+| `soroban/error.rs` | Protocol-versioned error code conversion |
+| `soroban/protocol/mod.rs` | Protocol version dispatch |
+| `soroban/protocol/p24.rs` | P24 host implementation (soroban-env-host-p24) |
+| `soroban/protocol/p25.rs` | P25 host implementation (soroban-env-host-p25) |
+| `soroban/protocol/types.rs` | Shared types (`LiveBucketListRestore`) |
 
 ## Design Notes
 
@@ -552,19 +207,19 @@ commit/rollback pattern.
   +-----------------------+
   | LedgerStateManager    |
   |                       |       create_savepoint()
-  |  accounts (manual)    | ─────────────────────────────> +------------------+
-  |  trustlines (manual)  |                                |    Savepoint     |
-  |  offers (manual)      |                                |                  |
-  |  ttl_entries (manual) |       rollback_to_savepoint()  | - snapshot maps  |
-  |  data (EntryStore)    | <───────────────────────────── | - pre-values     |
-  |  contract_data (ES)   |                                | - created sets   |
-  |  contract_code (ES)   |         (on failure)           | - delta lengths  |
-  |  claimable_bal (ES)   |                                | - modified lens  |
-  |  liquidity_pool (ES)  |                                | - metadata state |
-  |  ...                  |                                | - id_pool        |
-  +-----------+-----------+                                +------------------+
-              |                                     EntryStore types delegate to
-              | flush_modified_entries()             EntryStoreSavepoint internally
+  |  accounts (manual)    | ────────────────────────────> +------------------+
+  |  trustlines (manual)  |                               |    Savepoint     |
+  |  offers (OfferStore)  |                               |                  |
+  |  ttl_entries (manual) |       rollback_to_savepoint() | - snapshot maps  |
+  |  data (EntryStore)    | <──────────────────────────── | - pre-values     |
+  |  contract_data (ES)   |                               | - created sets   |
+  |  contract_code (ES)   |         (on failure)          | - delta lengths  |
+  |  claimable_bal (ES)   |                               | - modified lens  |
+  |  liquidity_pool (ES)  |                               | - metadata state |
+  |  ...                  |                               | - id_pool        |
+  +-----------+-----------+                               +------------------+
+              |                                    EntryStore types delegate to
+              | flush_modified_entries()            EntryStoreSavepoint internally
               v
   +-----------------------+
   |     LedgerDelta       |  (output change log)
@@ -580,96 +235,59 @@ commit/rollback pattern.
        Transaction Meta
 ```
 
-**Key concepts:**
+Key concepts:
 
-- **Savepoint**: A lightweight state checkpoint that captures the current values of all
-  entry types. Four complex types (accounts, trustlines, offers, TTL) use manual
-  snapshot maps; five types (data, contract_data, contract_code, claimable_balances,
-  liquidity_pools) delegate to `EntryStoreSavepoint`. The savepoint also captures
-  metadata tracking, delta vector lengths (via `DeltaSnapshot`), modified tracking
-  vec lengths, created entry sets, and the id_pool. Creating a savepoint is O(k)
-  where k is the number of entries modified so far in the current transaction.
+- **Savepoint**: Captures current values of all entry types. Four complex types
+  (accounts, trustlines, offers, TTL) use manual snapshot maps; five types (data,
+  contract_data, contract_code, claimable_balances, liquidity_pools) delegate to
+  `EntryStoreSavepoint`. Also captures delta vector lengths via `DeltaSnapshot`,
+  metadata tracking, created entry sets, and the id_pool.
 
-- **Per-operation rollback**: Each operation in a multi-operation transaction gets a
-  savepoint before execution (in the `henyey-ledger` execution loop). If the
-  operation fails, `rollback_to_savepoint()` undoes all state changes so subsequent
-  operations see clean state. This matches stellar-core's nested `LedgerTxn`
-  behavior where each operation runs in a child transaction that is committed on
-  success or rolled back on failure.
+- **Per-operation rollback**: Each operation gets a savepoint before execution.
+  On failure, `rollback_to_savepoint()` undoes all state changes. This matches
+  stellar-core's nested `LedgerTxn` where each operation runs in a child
+  transaction.
 
 - **Speculative orderbook exchange**: Path payment operations use savepoints when
-  comparing orderbook vs. liquidity pool routes. The orderbook path is executed
-  speculatively on the real state; if the pool provides a better rate, the savepoint
-  rolls back the speculative orderbook changes. This avoids cloning the entire state
-  (which would be O(n) for 911K+ offers).
+  comparing orderbook vs. liquidity pool routes. The orderbook path executes
+  speculatively; if the pool provides a better rate, the savepoint rolls back
+  the speculative changes.
 
-- **LedgerDelta vs Savepoint**: `LedgerDelta` is the output change log that records
-  creates, updates, and deletes for transaction metadata and bucket list updates.
-  `Savepoint` is the internal undo mechanism. They interact because savepoint rollback
-  also truncates the delta's vectors back to their pre-savepoint lengths, ensuring no
-  stale entries from failed operations appear in the final output. Delta rollback uses
-  `DeltaSnapshot`, which captures only the vector lengths (not a full clone), making
-  it O(1) instead of O(N) where N is the accumulated delta size.
+- **Three-phase rollback**: (1) Restore entries first touched after savepoint,
+  (2) restore entries already in snapshot map to pre-savepoint values,
+  (3) restore all tracking state. `EntryStore` types handle all three phases
+  internally. The `deleted` set (Soroban cross-TX deletion tracking) is
+  intentionally not rolled back.
 
-- **Three-phase rollback** (`rollback_to_savepoint`):
-  1. **Phase 1 -- Restore newly snapshot'd entries**: Entries that were first touched
-     after the savepoint have their snapshot values restored (these snapshots hold the
-     pre-TX bucket list values).
-  2. **Phase 2 -- Restore pre-savepoint entries**: Entries that were already in the
-     snapshot map at savepoint creation time are restored to their pre-savepoint
-     current values (captured in the savepoint's `*_pre_values` vecs).
-  3. **Phase 3 -- Restore tracking state**: Snapshot maps, created entry sets,
-     modified vec lengths, entry metadata (last_modified, sponsorships), delta vector
-     lengths, op_entry_snapshots, and id_pool are all restored to their savepoint values.
+### OfferStore
 
-  For `EntryStore`-based types, all three phases are handled internally by
-  `EntryStore::rollback_to_savepoint()`. Note that the `deleted` set (used by
-  Soroban types for cross-TX deletion tracking) is intentionally *not* rolled back.
+The `OfferStore` (`state/offer_store.rs`) is a unified offer store shared between
+`LedgerManager` (in `henyey-ledger`) and `LedgerStateManager` via `Arc<Mutex<>>`.
+Each offer is stored as an `OfferRecord` that bundles the entry, last-modified
+ledger, and sponsorship metadata inline, eliminating the ~1 GB duplication that
+previously existed between the ledger manager's offer data and the executor's
+in-memory state.
 
-- **No manual rollback in operations**: Individual operation implementations (e.g.,
-  `claimable_balance.rs`, `payment.rs`, `change_trust.rs`) do not contain manual
-  rollback code. All rollback is handled automatically by the per-operation savepoint
-  in the execution loop.
+### Protocol Versioning for Soroban
 
-### State Management Philosophy
-
-The crate separates state reading (via `LedgerReader` trait) from state modification (via `LedgerDelta`). This allows:
-
-1. **Lazy loading**: State is loaded on-demand from the bucket list
-2. **Atomic updates**: All changes are accumulated then applied together
-3. **Savepoint rollback**: Failed operations are automatically rolled back via per-operation savepoints, matching stellar-core's nested `LedgerTxn` pattern (see [Savepoint Architecture](#savepoint-architecture) above)
-
-### Delta Tracking
-
-`LedgerDelta` records all state changes in execution order, preserving:
-
-- Pre-state for updates and deletes (for building proper transaction metadata)
-- Change ordering via `ChangeRef` enum
-- Fee accumulation
-- Soroban-specific changes (TTL updates, events)
-
-### Error Handling
-
-The crate uses a layered error approach:
-
-1. **`TxError`**: Top-level errors for transaction processing
-2. **`ValidationError`**: Specific validation failures with context
-3. **`OperationValidationError`**: Per-operation validation errors
+The crate uses two vendored copies of `soroban-env-host` (under `vendor/soroban-env-p24/`
+and `vendor/soroban-env-p25/`) to ensure deterministic replay across protocol versions.
+Both paths use the **typed invoke API** which passes `Rc<LedgerEntry>` directly. For P25,
+this is zero-copy (same XDR crate as workspace). For P24, type bridge functions convert
+between P25 workspace types and P24 host types.
 
 ## stellar-core Mapping
 
-This crate corresponds to the following stellar-core components:
-
-| Rust Module | stellar-core Component |
-|------------|---------------|
+| Rust | stellar-core |
+|------|--------------|
 | `frame.rs` | `src/transactions/TransactionFrame.cpp` |
-| `live_execution.rs` | `src/transactions/TransactionFrame.cpp` (processFeeSeqNum, processPostApply, etc.) |
+| `live_execution.rs` | `src/transactions/TransactionFrame.cpp` (processFeeSeqNum, etc.) |
 | `validation.rs` | `src/transactions/TransactionUtils.cpp` |
 | `apply.rs` | `src/ledger/LedgerTxn.cpp` |
-| `state/mod.rs` | `src/ledger/LedgerStateSnapshot.cpp`, `src/ledger/LedgerTxn.cpp` (nested commit/rollback via Savepoint) |
+| `state/mod.rs` | `src/ledger/LedgerStateSnapshot.cpp`, `src/ledger/LedgerTxn.cpp` |
 | `state/entries.rs` | `src/ledger/LedgerTxn.cpp` (per-type load/create/update/delete) |
-| `state/entry_store.rs` | No direct upstream equivalent (generic deduplication of per-type bookkeeping) |
 | `state/offer_index.rs` | `src/ledger/LedgerTxn.cpp` (offer ordering by price/id) |
+| `state/offer_store.rs` | `src/ledger/LedgerTxn.cpp` (offer storage) |
 | `state/sponsorship.rs` | `src/ledger/LedgerTxn.cpp` (sponsorship tracking) |
 | `state/ttl.rs` | `src/ledger/LedgerTxn.cpp` (TTL entry management) |
 | `meta_builder.rs` | `src/transactions/TransactionMetaBuilder.cpp` |
@@ -677,26 +295,11 @@ This crate corresponds to the following stellar-core components:
 | `signature_checker.rs` | `src/transactions/SignatureChecker.cpp` |
 | `events.rs` | `src/transactions/EventManager.cpp` |
 | `lumen_reconciler.rs` | `src/transactions/LumenEventReconciler.cpp` |
-| `operations/` | `src/transactions/OperationFrame.cpp`, `src/transactions/*OpFrame.cpp` |
-| `operations/execute/offer_utils.rs` | `src/transactions/OfferExchange.cpp` (shared DEX helpers) |
+| `operations/execute/offer_exchange.rs` | `src/transactions/OfferExchange.cpp` |
+| `operations/execute/offer_utils.rs` | `src/transactions/OfferExchange.cpp` (helpers) |
+| `operations/execute/*.rs` | `src/transactions/*OpFrame.cpp` |
 | `soroban/` | `src/transactions/InvokeHostFunctionOpFrame.cpp` |
 
-## Testing
-
-Integration tests should cover:
-
-- Per-operation edge cases (offers, trustlines, claimable balances)
-- Soroban footprint and resource limit scenarios
-- Transaction metadata hash verification against stellar-core
-- Multi-operation transaction rollback behavior
-- Fee bump transaction handling
-- Sponsorship chains
-- Classic event emission correctness
-
-## stellar-core Parity Status
+## Parity Status
 
 See [PARITY_STATUS.md](PARITY_STATUS.md) for detailed stellar-core parity analysis.
-
-## License
-
-Same as the parent henyey project.

@@ -204,13 +204,8 @@ pub trait LedgerReader {
 }
 
 /// Re-export `StorageKey` from the soroban module as the canonical key type
-/// for contract data entries. Previously a separate `ContractDataKey` struct
-/// with identical fields existed here; it has been unified into `StorageKey`.
+/// for contract data entries.
 pub use crate::soroban::StorageKey;
-
-/// Type alias for backwards compatibility. `ContractDataKey` was merged into
-/// `StorageKey` — they have identical fields (`contract`, `key`, `durability`).
-pub type ContractDataKey = StorageKey;
 
 // ==================== Offer Index ====================
 //
@@ -240,7 +235,7 @@ pub struct LedgerStateManager {
     /// Data entries by (account, name).
     data_entries: EntryStore<DataKey, DataEntry>,
     /// Contract data entries by (contract, key, durability).
-    contract_data: EntryStore<ContractDataKey, ContractDataEntry>,
+    contract_data: EntryStore<StorageKey, ContractDataEntry>,
     /// Contract code entries by hash.
     contract_code: EntryStore<Hash, ContractCodeEntry>,
     /// TTL entries by key hash.
@@ -1067,8 +1062,7 @@ impl LedgerStateManager {
                     })
             }
             LedgerKey::ContractData(k) => {
-                let lookup_key =
-                    ContractDataKey::new(k.contract.clone(), k.key.clone(), k.durability);
+                let lookup_key = StorageKey::new(k.contract.clone(), k.key.clone(), k.durability);
                 self.contract_data
                     .snapshot_value(&lookup_key)
                     .cloned()
@@ -1159,8 +1153,6 @@ impl LedgerStateManager {
         let offer_key_size = 44; // (AccountId, i64)
         let hash_size = 32;
         let ledger_key_size = 80; // enum with variants
-        let _asset_pair_size = 120;
-
         let account_entry_size = 200;
         let trustline_entry_size = 150;
         let offer_entry_size = 200;

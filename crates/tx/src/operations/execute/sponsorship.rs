@@ -127,8 +127,6 @@ pub fn execute_revoke_sponsorship(
                     RevokeSponsorshipResultCode::DoesNotExist,
                 ));
             };
-            let entry = entry.clone();
-
             let (owner_id, multiplier) = match &entry.data {
                 LedgerEntryData::Account(a) => (a.account_id.clone(), 2i64),
                 LedgerEntryData::Trustline(tl) => {
