@@ -286,11 +286,19 @@ impl HotArchiveBucket {
         let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
             BucketError::Serialization(format!("failed to serialize ledger key: {}", e))
         })?;
+        self.get_by_bytes(&key_bytes)
+    }
+
+    /// Look up an entry by pre-serialized key bytes.
+    ///
+    /// This avoids redundant XDR serialization when the caller already has the
+    /// serialized key (e.g., when searching across multiple buckets).
+    pub fn get_by_bytes(&self, key_bytes: &[u8]) -> Result<Option<HotArchiveBucketEntry>> {
         match &self.storage {
-            HotArchiveStorage::InMemory { entries, .. } => Ok(entries.get(&key_bytes).cloned()),
+            HotArchiveStorage::InMemory { entries, .. } => Ok(entries.get(key_bytes).cloned()),
             HotArchiveStorage::DiskBacked { path, .. } => {
                 let index = self.ensure_index();
-                if let Some(&offset) = index.get(&key_bytes) {
+                if let Some(&offset) = index.get(key_bytes) {
                     let entry = Self::read_entry_at_offset(path, offset)?;
                     Ok(Some(entry))
                 } else {
@@ -1119,9 +1127,13 @@ impl HotArchiveBucketList {
 
     /// Look up an archived entry by key.
     pub fn get(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
+        // Serialize key once, then search across all levels/buckets with pre-serialized bytes
+        let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
+            BucketError::Serialization(format!("failed to serialize ledger key: {}", e))
+        })?;
         for level in &self.levels {
             for bucket in [&level.curr, &level.snap] {
-                if let Some(entry) = bucket.get(key)? {
+                if let Some(entry) = bucket.get_by_bytes(&key_bytes)? {
                     match entry {
                         HotArchiveBucketEntry::Archived(e) => return Ok(Some(e)),
                         HotArchiveBucketEntry::Live(_) => return Ok(None), // Restored, not in archive

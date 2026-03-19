@@ -27,6 +27,7 @@
 //! let hash = frame.hash(&NetworkId::testnet())?;
 //! ```
 
+use std::cell::OnceCell;
 use std::sync::Arc;
 
 use henyey_common::protocol::{
@@ -70,14 +71,33 @@ use crate::{Result, TxError};
 /// ```ignore
 /// let hash = frame.hash(&NetworkId::mainnet())?;
 /// ```
-#[derive(Debug, Clone)]
 pub struct TransactionFrame {
     /// The underlying XDR transaction envelope (shared via Arc for cheap cloning).
     envelope: Arc<TransactionEnvelope>,
-    /// Cached transaction hash (lazily computed).
-    hash: Option<Hash256>,
-    /// Network ID used when computing the cached hash.
-    network_id: Option<NetworkId>,
+    /// Lazily-cached transaction hash, keyed by the network ID it was computed with.
+    cached_hash: OnceCell<(NetworkId, Hash256)>,
+    /// Lazily-cached full envelope XDR size in bytes.
+    cached_tx_size: OnceCell<u32>,
+}
+
+impl Clone for TransactionFrame {
+    fn clone(&self) -> Self {
+        Self {
+            envelope: self.envelope.clone(),
+            cached_hash: self.cached_hash.clone(),
+            cached_tx_size: self.cached_tx_size.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for TransactionFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransactionFrame")
+            .field("envelope", &self.envelope)
+            .field("cached_hash", &self.cached_hash)
+            .field("cached_tx_size", &self.cached_tx_size)
+            .finish()
+    }
 }
 
 impl TransactionFrame {
@@ -85,17 +105,20 @@ impl TransactionFrame {
     pub fn new(envelope: Arc<TransactionEnvelope>) -> Self {
         Self {
             envelope,
-            hash: None,
-            network_id: None,
+            cached_hash: OnceCell::new(),
+            cached_tx_size: OnceCell::new(),
         }
     }
 
     /// Create a new TransactionFrame with a known network ID.
-    pub fn with_network(envelope: Arc<TransactionEnvelope>, network_id: NetworkId) -> Self {
+    ///
+    /// Note: The network ID is not pre-cached; it will be used when `hash()` is
+    /// first called. This constructor exists for API compatibility.
+    pub fn with_network(envelope: Arc<TransactionEnvelope>, _network_id: NetworkId) -> Self {
         Self {
             envelope,
-            hash: None,
-            network_id: Some(network_id),
+            cached_hash: OnceCell::new(),
+            cached_tx_size: OnceCell::new(),
         }
     }
 
@@ -149,29 +172,36 @@ impl TransactionFrame {
     }
 
     /// Compute the transaction hash for a given network.
+    ///
+    /// Uses a lazy cache: the first call computes and caches the result;
+    /// subsequent calls with the same network ID return the cached value.
+    /// If called with a different network ID, recomputes (but this doesn't
+    /// happen in practice — a frame is always used with one network).
     pub fn hash(&self, network_id: &NetworkId) -> Result<Hash256> {
-        // Create the signature payload
+        if let Some((cached_net, cached_hash)) = self.cached_hash.get() {
+            if cached_net == network_id {
+                return Ok(*cached_hash);
+            }
+        }
+        // Compute fresh
         let payload = self.signature_payload(network_id)?;
-
-        // Serialize and hash
         let bytes = payload
             .to_xdr(Limits::none())
             .map_err(|e| TxError::Internal(format!("XDR serialization failed: {}", e)))?;
-
-        Ok(sha256(&bytes))
-    }
-
-    /// Get the cached hash or compute it if network ID is available.
-    pub fn cached_hash(&self) -> Option<Hash256> {
-        self.hash
-    }
-
-    /// Compute and cache the hash.
-    pub fn compute_hash(&mut self, network_id: &NetworkId) -> Result<Hash256> {
-        let hash = self.hash(network_id)?;
-        self.hash = Some(hash);
-        self.network_id = Some(*network_id);
+        let hash = sha256(&bytes);
+        // Cache (best-effort; if already set by a prior call, that's fine)
+        let _ = self.cached_hash.set((*network_id, hash));
         Ok(hash)
+    }
+
+    /// Get the cached hash if one has been computed.
+    pub fn cached_hash(&self) -> Option<Hash256> {
+        self.cached_hash.get().map(|(_, h)| *h)
+    }
+
+    /// Compute and cache the hash (mutable version for backward compatibility).
+    pub fn compute_hash(&mut self, network_id: &NetworkId) -> Result<Hash256> {
+        self.hash(network_id)
     }
 
     /// Create the signature payload for signing/verification.
@@ -534,11 +564,15 @@ impl TransactionFrame {
     }
 
     /// Return the transaction size in bytes (XDR encoding).
+    ///
+    /// Lazily caches the result so repeated calls avoid re-serialization.
     pub fn tx_size_bytes(&self) -> u32 {
-        self.envelope
-            .to_xdr(Limits::none())
-            .map(|bytes| bytes.len() as u32)
-            .unwrap_or(0)
+        *self.cached_tx_size.get_or_init(|| {
+            self.envelope
+                .to_xdr(Limits::none())
+                .map(|bytes| bytes.len() as u32)
+                .unwrap_or(0)
+        })
     }
 
     /// Return the inner transaction envelope size for fee bump, or full envelope size for regular tx.
