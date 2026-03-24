@@ -57,7 +57,7 @@ use henyey_bucket::{
     HotArchiveBucketList, HotArchiveBucketListSnapshot,
 };
 use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
-use henyey_common::{Hash256, NetworkId};
+use henyey_common::{deterministic_seed, Hash256, NetworkId};
 use henyey_clock::{Clock, RealClock};
 use henyey_db::{
     BucketListQueries, EventQueries, HistoryQueries, LedgerQueries, PublishQueueQueries,
@@ -992,7 +992,7 @@ impl App {
 
         for i in 0..genesis_test_account_count {
             let name = format!("TestAccount-{}", i);
-            let seed = deterministic_seed_for_test_account(&name);
+            let seed = deterministic_seed(&name);
             let secret = henyey_crypto::SecretKey::from_seed(&seed);
             let public = secret.public_key();
             let acct_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
@@ -2040,16 +2040,6 @@ impl App {
 
         tracing::info!("Event loop watchdog started");
     }
-}
-
-/// Deterministic seed derivation matching stellar-core `txtest::getAccount()`.
-///
-/// The name is right-padded with `.` to 32 bytes, then used as an Ed25519 seed.
-fn deterministic_seed_for_test_account(name: &str) -> [u8; 32] {
-    let mut seed = [b'.'; 32];
-    let len = name.len().min(32);
-    seed[..len].copy_from_slice(&name.as_bytes()[..len]);
-    seed
 }
 
 #[cfg(test)]

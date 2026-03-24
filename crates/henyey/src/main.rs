@@ -75,6 +75,7 @@ use henyey_app::{
     logging, run_catchup, run_node, App, AppConfig, CatchupMode as CatchupModeInternal,
     CatchupOptions, LogConfig, LogFormat, RunMode, RunOptions,
 };
+use henyey_common::deterministic_seed;
 
 // ---------------------------------------------------------------------------
 // LoadGenRunner implementation (bridges henyey-simulation into henyey-app)
@@ -229,6 +230,8 @@ mod loadgen_runner {
             assert_eq!(SimulationLoadGenRunner::parse_mode(""), None);
             assert_eq!(SimulationLoadGenRunner::parse_mode("unknown"), None);
             assert_eq!(SimulationLoadGenRunner::parse_mode("transfer"), None);
+            // "stop" is handled at the HTTP layer, not as a generation mode.
+            assert_eq!(SimulationLoadGenRunner::parse_mode("stop"), None);
         }
 
         #[test]
@@ -318,6 +321,19 @@ mod loadgen_runner {
             });
 
             Ok(())
+        }
+
+        fn stop_load(&self) {
+            // Set the stopped flag on the generator so the running task
+            // breaks out of its loop on the next iteration. This matches
+            // stellar-core's LoadGenerator::stop() which cancels the timer
+            // and resets state. The background task will observe Stopped
+            // and clear the running flag.
+            if let Ok(mut guard) = self.inner.generator.try_lock() {
+                if let Some(gen) = guard.as_mut() {
+                    gen.stop();
+                }
+            }
         }
 
         fn is_running(&self) -> bool {
@@ -1313,15 +1329,6 @@ async fn cmd_new_db(
     Ok(())
 }
 
-/// Deterministic seed derivation matching stellar-core `txtest::getAccount()`.
-///
-/// The name is right-padded with `.` to 32 bytes, then used as an ed25519 seed.
-fn deterministic_seed(name: &str) -> [u8; 32] {
-    let mut seed = [b'.'; 32];
-    let len = name.len().min(32);
-    seed[..len].copy_from_slice(&name.as_bytes()[..len]);
-    seed
-}
 
 /// Initialize the genesis ledger (ledger 1) in the database.
 ///

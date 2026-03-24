@@ -54,6 +54,12 @@ pub trait LoadGenRunner: Send + Sync + 'static {
     /// or `Err(message)` if it could not be started (e.g., invalid mode).
     fn start_load(&self, request: LoadGenRequest) -> Result<(), String>;
 
+    /// Stop a running load generation. No-op if nothing is running.
+    ///
+    /// Matches stellar-core's `LoadGenerator::stop()` which cancels the
+    /// step timer, marks the run as failed, and resets state.
+    fn stop_load(&self);
+
     /// Whether a load generation run is currently in progress.
     fn is_running(&self) -> bool;
 }
@@ -99,6 +105,16 @@ pub(crate) async fn generateload_handler(
             });
         }
     };
+
+    // Handle stop mode before checking is_running — matches stellar-core
+    // which processes "stop" before any other mode validation.
+    if params.mode.eq_ignore_ascii_case("stop") {
+        loadgen_state.runner.stop_load();
+        return Json(GenerateLoadResponse {
+            status: "ok".to_string(),
+            info: Some("Stopped load generation".to_string()),
+        });
+    }
 
     // Check if a run is already in progress
     if loadgen_state.runner.is_running() {
@@ -230,5 +246,18 @@ mod tests {
         assert_eq!(cloned.accounts, request.accounts);
         assert_eq!(cloned.tx_rate, request.tx_rate);
         assert_eq!(cloned.instances, request.instances);
+    }
+
+    /// Verify that mode=stop is handled at the HTTP layer before is_running
+    /// and is case-insensitive, matching stellar-core behavior.
+    #[test]
+    fn test_stop_mode_case_insensitive() {
+        for mode in &["stop", "STOP", "Stop", "sToP"] {
+            assert!(
+                mode.eq_ignore_ascii_case("stop"),
+                "Expected '{}' to match stop mode",
+                mode
+            );
+        }
     }
 }

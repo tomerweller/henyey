@@ -569,6 +569,13 @@ pub(crate) async fn compat_generateload_handler(
         }
     };
 
+    // Handle stop mode before checking is_running — stellar-core processes
+    // "stop" before any other mode validation and returns a plain string.
+    if params.mode.eq_ignore_ascii_case("stop") {
+        loadgen_state.runner.stop_load();
+        return Json(serde_json::json!("Stopped load generation"));
+    }
+
     // Check if a run is already in progress
     if loadgen_state.runner.is_running() {
         return Json(serde_json::json!({

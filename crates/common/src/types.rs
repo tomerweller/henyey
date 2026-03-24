@@ -267,6 +267,20 @@ pub fn entry_to_key(entry: &stellar_xdr::curr::LedgerEntry) -> stellar_xdr::curr
 /// Variants: `MasterWeight = 0`, `Low = 1`, `Med = 2`, `High = 3`.
 pub type ThresholdLevel = stellar_xdr::curr::ThresholdIndexes;
 
+/// Deterministic seed derivation matching stellar-core `txtest::getAccount()`.
+///
+/// The name is right-padded with `'.'` to fill 32 bytes, then used as an
+/// Ed25519 seed. Names longer than 32 bytes are truncated.
+///
+/// This is used for test account key derivation (`/testacc`, `GENESIS_TEST_ACCOUNT_COUNT`,
+/// and load generation).
+pub fn deterministic_seed(name: &str) -> [u8; 32] {
+    let mut seed = [b'.'; 32];
+    let len = name.len().min(32);
+    seed[..len].copy_from_slice(&name.as_bytes()[..len]);
+    seed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,5 +331,25 @@ mod tests {
         let h4 = Hash256::from_bytes([0xf0; 32]);
         let result = h3 ^ h4;
         assert_eq!(result.0, [0xff; 32]);
+    }
+
+    #[test]
+    fn test_deterministic_seed_padding() {
+        let seed = deterministic_seed("root");
+        assert_eq!(&seed[..4], b"root");
+        assert!(seed[4..].iter().all(|&b| b == b'.'));
+    }
+
+    #[test]
+    fn test_deterministic_seed_full_length() {
+        let name = "a]".repeat(16); // 32 bytes
+        let seed = deterministic_seed(&name);
+        assert_eq!(&seed[..], name.as_bytes());
+    }
+
+    #[test]
+    fn test_deterministic_seed_empty() {
+        let seed = deterministic_seed("");
+        assert!(seed.iter().all(|&b| b == b'.'));
     }
 }

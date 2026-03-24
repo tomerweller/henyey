@@ -14,6 +14,8 @@
 
 use std::sync::Arc;
 
+use henyey_common::deterministic_seed;
+
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use axum::Json;
@@ -85,16 +87,6 @@ pub(crate) async fn compat_testacc_handler(
             Json(serde_json::json!({})).into_response()
         }
     }
-}
-
-/// Deterministic seed derivation matching stellar-core `txtest::getAccount()`.
-///
-/// The name is right-padded with `.` to 32 bytes, then used as an ed25519 seed.
-fn deterministic_seed(name: &str) -> [u8; 32] {
-    let mut seed = [b'.'; 32];
-    let len = name.len().min(32);
-    seed[..len].copy_from_slice(&name.as_bytes()[..len]);
-    seed
 }
 
 /// stellar-core compatible testacc response.
