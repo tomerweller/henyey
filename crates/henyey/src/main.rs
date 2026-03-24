@@ -117,21 +117,39 @@ mod loadgen_runner {
             }
         }
 
-        fn parse_mode(mode: &str) -> Option<LoadGenMode> {
-            if mode.eq_ignore_ascii_case("pay") || mode.eq_ignore_ascii_case("create") {
-                Some(LoadGenMode::Pay)
-            } else if mode.eq_ignore_ascii_case("sorobanupload") {
-                Some(LoadGenMode::SorobanUpload)
-            } else if mode.eq_ignore_ascii_case("sorobaninvokesetup") {
-                Some(LoadGenMode::SorobanInvokeSetup)
-            } else if mode.eq_ignore_ascii_case("sorobaninvoke") {
-                Some(LoadGenMode::SorobanInvoke)
-            } else if mode.eq_ignore_ascii_case("mixed")
-                || mode.eq_ignore_ascii_case("mixedclassicsoroban")
-            {
-                Some(LoadGenMode::MixedClassicSoroban)
+        /// Returns `Some("deprecation message")` for modes that are
+        /// deprecated in stellar-core v25 and should be rejected before
+        /// reaching the load generator.
+        fn deprecated_mode(mode: &str) -> Option<&'static str> {
+            if mode.eq_ignore_ascii_case("create") {
+                Some(
+                    "DEPRECATED: CREATE mode has been removed. \
+                     Use GENESIS_TEST_ACCOUNT_COUNT configuration parameter \
+                     to create test accounts at genesis instead.",
+                )
             } else {
                 None
+            }
+        }
+
+        /// Parse a mode string into a `LoadGenMode`.
+        ///
+        /// Accepts both stellar-core underscore names (e.g. `soroban_upload`)
+        /// and henyey's legacy no-separator names (e.g. `sorobanupload`).
+        /// Case-insensitive.
+        fn parse_mode(mode: &str) -> Option<LoadGenMode> {
+            let normalized = mode.to_ascii_lowercase();
+            match normalized.as_str() {
+                "pay" => Some(LoadGenMode::Pay),
+                "soroban_upload" | "sorobanupload" => Some(LoadGenMode::SorobanUpload),
+                "soroban_invoke_setup" | "sorobaninvokesetup" => {
+                    Some(LoadGenMode::SorobanInvokeSetup)
+                }
+                "soroban_invoke" | "sorobaninvoke" => Some(LoadGenMode::SorobanInvoke),
+                "mixed_classic_soroban" | "mixedclassicsoroban" | "mixed" => {
+                    Some(LoadGenMode::MixedClassicSoroban)
+                }
+                _ => None,
             }
         }
     }
@@ -145,10 +163,6 @@ mod loadgen_runner {
         fn test_parse_mode_valid_modes() {
             assert_eq!(
                 SimulationLoadGenRunner::parse_mode("pay"),
-                Some(LoadGenMode::Pay)
-            );
-            assert_eq!(
-                SimulationLoadGenRunner::parse_mode("create"),
                 Some(LoadGenMode::Pay)
             );
             assert_eq!(
@@ -174,13 +188,34 @@ mod loadgen_runner {
         }
 
         #[test]
+        fn test_parse_mode_stellar_core_underscore_names() {
+            // stellar-core uses underscored mode names; SSC sends these.
+            assert_eq!(
+                SimulationLoadGenRunner::parse_mode("soroban_upload"),
+                Some(LoadGenMode::SorobanUpload)
+            );
+            assert_eq!(
+                SimulationLoadGenRunner::parse_mode("soroban_invoke_setup"),
+                Some(LoadGenMode::SorobanInvokeSetup)
+            );
+            assert_eq!(
+                SimulationLoadGenRunner::parse_mode("soroban_invoke"),
+                Some(LoadGenMode::SorobanInvoke)
+            );
+            assert_eq!(
+                SimulationLoadGenRunner::parse_mode("mixed_classic_soroban"),
+                Some(LoadGenMode::MixedClassicSoroban)
+            );
+        }
+
+        #[test]
         fn test_parse_mode_case_insensitive() {
             assert_eq!(
                 SimulationLoadGenRunner::parse_mode("PAY"),
                 Some(LoadGenMode::Pay)
             );
             assert_eq!(
-                SimulationLoadGenRunner::parse_mode("SorobanUpload"),
+                SimulationLoadGenRunner::parse_mode("Soroban_Upload"),
                 Some(LoadGenMode::SorobanUpload)
             );
             assert_eq!(
@@ -195,14 +230,33 @@ mod loadgen_runner {
             assert_eq!(SimulationLoadGenRunner::parse_mode("unknown"), None);
             assert_eq!(SimulationLoadGenRunner::parse_mode("transfer"), None);
         }
+
+        #[test]
+        fn test_create_mode_is_deprecated() {
+            // "create" is deprecated in stellar-core v25 and must NOT be
+            // treated as "pay". parse_mode should not recognize it.
+            assert_eq!(SimulationLoadGenRunner::parse_mode("create"), None);
+            assert_eq!(SimulationLoadGenRunner::parse_mode("CREATE"), None);
+
+            // deprecated_mode should return the deprecation message.
+            assert!(SimulationLoadGenRunner::deprecated_mode("create").is_some());
+            assert!(SimulationLoadGenRunner::deprecated_mode("CREATE").is_some());
+            assert!(SimulationLoadGenRunner::deprecated_mode("pay").is_none());
+        }
     }
 
     impl LoadGenRunner for SimulationLoadGenRunner {
         fn start_load(&self, request: LoadGenRequest) -> Result<(), String> {
+            // Check for deprecated modes before parsing (matches stellar-core
+            // CommandHandler::generateLoad which checks before getMode).
+            if let Some(msg) = Self::deprecated_mode(&request.mode) {
+                return Err(msg.to_string());
+            }
+
             let mode = Self::parse_mode(&request.mode).ok_or_else(|| {
                 format!(
-                    "Unknown mode: '{}'. Use: create, pay, sorobanupload, \
-                     sorobaninvokesetup, sorobaninvoke, mixed.",
+                    "Unknown mode: '{}'. Use: pay, soroban_upload, \
+                     soroban_invoke_setup, soroban_invoke, mixed_classic_soroban.",
                     request.mode
                 )
             })?;

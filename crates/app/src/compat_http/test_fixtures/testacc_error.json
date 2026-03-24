@@ -1,0 +1,4 @@
+{
+  "status": "error",
+  "detail": "Bad HTTP GET: try something like: testacc?name=bob"
+}

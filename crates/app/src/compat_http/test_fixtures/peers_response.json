@@ -1,0 +1,30 @@
+{
+  "authenticated_peers": {
+    "inbound": [
+      {
+        "address": "1.2.3.4:11625",
+        "elapsed": 3600,
+        "id": "GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGSNFHEBD9AFZQ7TM4JRS9A",
+        "olver": 35,
+        "ver": "stellar-core v25.0.1",
+        "message_read": 1000,
+        "message_write": 500
+      }
+    ],
+    "outbound": [
+      {
+        "address": "5.6.7.8:11625",
+        "elapsed": 1800,
+        "id": "GBCR5OVQ54S2EKHLBZMK6VYMTXZHXN3T45Y6PRX4PX4FXDMJJGY4FD42",
+        "olver": 35,
+        "ver": "stellar-core v25.0.1",
+        "message_read": 500,
+        "message_write": 250
+      }
+    ]
+  },
+  "pending_peers": {
+    "inbound": [],
+    "outbound": []
+  }
+}

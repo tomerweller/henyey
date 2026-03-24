@@ -1,0 +1,39 @@
+{
+  "info": {
+    "build": "v25.0.1",
+    "protocol_version": 25,
+    "state": "Synced!",
+    "startedOn": "2026-01-15T12:00:00Z",
+    "ledger": {
+      "num": 12345,
+      "hash": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+      "closeTime": 1700000000,
+      "version": 25,
+      "baseFee": 100,
+      "baseReserve": 100000000,
+      "maxTxSetSize": 1000,
+      "maxSorobanTxSetSize": 100,
+      "age": 5
+    },
+    "peers": {
+      "pending_count": 3,
+      "authenticated_count": 10
+    },
+    "network": "Test SDF Network ; September 2015",
+    "status": [
+      "Catching up: Applying buckets 50.0%"
+    ],
+    "quorum": {
+      "node": "GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGSNFHEBD9AFZQ7TM4JRS9A",
+      "qset": {
+        "phase": "EXTERNALIZE",
+        "agree": 3,
+        "disagree": 0,
+        "missing": 0,
+        "delayed": 0,
+        "fail_at": 1,
+        "hash": "abcdef"
+      }
+    }
+  }
+}

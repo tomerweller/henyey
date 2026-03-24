@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 /// All parameters are optional with sensible defaults.
 #[derive(Debug, Deserialize)]
 pub struct GenerateLoadParams {
-    /// Load generation mode: "create", "pay", "sorobanupload",
-    /// "sorobaninvokesetup", "sorobaninvoke", "mixed".
+    /// Load generation mode: "pay", "soroban_upload",
+    /// "soroban_invoke_setup", "soroban_invoke", "mixed_classic_soroban".
+    /// The "create" mode is deprecated and returns an error.
     #[serde(default = "default_mode")]
     pub mode: String,
 
@@ -59,7 +60,7 @@ pub struct GenerateLoadParams {
 }
 
 fn default_mode() -> String {
-    "create".to_string()
+    "pay".to_string()
 }
 
 fn default_accounts() -> u32 {
@@ -96,7 +97,7 @@ mod tests {
     fn test_defaults_when_empty_json() {
         // Deserialize from an empty JSON object to test serde defaults.
         let params: GenerateLoadParams = serde_json::from_str("{}").unwrap();
-        assert_eq!(params.mode, "create");
+        assert_eq!(params.mode, "pay");
         assert_eq!(params.accounts, 100);
         assert_eq!(params.txs, 100);
         assert_eq!(params.txrate, 10);

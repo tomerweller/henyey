@@ -1,0 +1,15 @@
+{
+  "current": {
+    "ledgerVersion": 25,
+    "baseFee": 100,
+    "baseReserve": 100000000,
+    "maxTxSetSize": 1000
+  },
+  "scheduled": {
+    "upgradetime": 0,
+    "protocolversion": null,
+    "basefee": null,
+    "basereserve": null,
+    "maxtxsetsize": null
+  }
+}

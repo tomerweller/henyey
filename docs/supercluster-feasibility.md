@@ -199,11 +199,76 @@ Impact:
 - history missions belong after mixed-image bring-up and basic HTTP parity work
 - the risk is lower than metrics/loadgen, but it is real
 
-### 7. SSC may expect additional CLI surface beyond the currently documented path
+### 7. `create` mode silently aliases to `pay`
+
+The `/generateload` mode parser in `crates/henyey/src/main.rs:120` maps `"create"` to `LoadGenMode::Pay`. If SSC sends `mode=create` expecting account-creation semantics (pre-funding test accounts before a payment run), Henyey will silently issue payments instead.
+
+This is not a crash-level bug -- it is a silent behavioral divergence that would produce wrong mission results without any error signal. It must be verified against SSC's actual `create` usage and either:
+
+- corrected to implement real account-creation behavior, or
+- explicitly documented as a known deviation with the missions it affects
+
+### 8. `--minimal-for-in-memory-mode` is accepted but silently ignored
+
+The `new-db` command accepts the `--minimal-for-in-memory-mode` flag for stellar-core compatibility (`crates/henyey/src/main.rs:422`), but the flag is a no-op. Henyey always creates a persistent SQLite database.
+
+If SSC passes this flag expecting in-memory node behavior (faster startup, no disk state), the resulting node will behave differently than expected -- persistent state, slower teardown, possible stale-state issues across mission restarts.
+
+Impact:
+
+- may cause subtle mission failures that look like state corruption rather than a compatibility gap
+- should be an explicit known-limitation callout, not a silent no-op
+
+### 9. SSC may expect additional CLI surface beyond the currently documented path
 
 The original document mentions SSC container commands including `test`. I did not find a Henyey `test` subcommand in `crates/henyey/src/main.rs:343`.
 
 This may or may not matter depending on which missions are targeted, but it should be treated as an explicit verification item instead of left implicit.
+
+## Testing Coverage Baseline
+
+The execution plan cannot be evaluated without understanding the current test coverage of the SSC-facing surface. This section documents the baseline as of today.
+
+### Compat HTTP handlers: zero test coverage
+
+The entire `crates/app/src/compat_http/` module tree -- 6 handler files, ~1,064 lines of code -- has no unit tests and no integration tests. None of the response shapes, error paths, or serialization logic is tested.
+
+Specific untested areas:
+
+- `/info` response shape (`CompatInfoResponse` serialization, `AppState` to string mapping)
+- `/tx` handler (base64 decode, XDR parse, result encoding)
+- `/peers` handler (inbound/outbound categorization, peer entry formatting)
+- `/metrics` handler (medida-style JSON response shape)
+- `/generateload` compat handler (config gate check, request construction, error JSON format)
+- `parse_iso8601_to_unix` and `is_leap_year` helper functions
+- `safe_router_panic_handler` (panic → `{"exception": "generic"}`)
+- All plaintext admin endpoint formatting
+
+### No response-shape parity tests exist
+
+There are no tests anywhere in the codebase that validate compat HTTP JSON responses against stellar-core's wire format. This is the single most important testing gap for SSC work. SSC makes assertions about specific field names, nesting, and value types in the responses it reads. Without parity tests, every endpoint is a potential silent incompatibility.
+
+### Compat config parsing: well tested
+
+The config parsing layer (`crates/app/src/compat_config.rs`) has 22 unit tests covering format detection, key translation, HISTORY parsing, quorum sets, peer extraction, and testing flags. This is the strongest tested area of the SSC surface.
+
+### Generateload types and mode parsing: moderately tested
+
+- `parse_mode` has 3 tests covering valid modes, case insensitivity, and invalid inputs
+- `GenerateLoadParams` has 5 tests covering serde defaults and serialization
+- `LoadGenRequest` construction has 3 tests
+
+However, no tests exercise the compat HTTP handler path for `/generateload` -- the config gate, the runner injection check, and the error response shapes are all untested.
+
+### Metrics: no tests
+
+Neither the native Prometheus metrics handler nor the compat medida-style JSON handler has any tests.
+
+### Testing gap impact on the execution plan
+
+Every phase in the execution plan produces new compatibility code (endpoints, response shapes, mode normalization). Without a testing discipline, each phase will ship code that can only be validated by running SSC missions end to end -- which is slow, hard to debug, and not repeatable in CI.
+
+The plan must require unit-level response-shape tests for every compat endpoint before mission-level validation. This is not optional.
 
 ## Mission Feasibility Reframed
 
@@ -254,11 +319,18 @@ Concrete engineering tasks:
 7. Smoke-test the image locally by launching the container with a generated compat config and hitting `/info` on port 11626.
 8. Capture a short troubleshooting section for image/build failures so the next engineer does not need to rediscover packaging details.
 
+Required tests:
+
+1. A CI-runnable script or test that builds the Docker image from the checked-in Dockerfile and verifies it exits cleanly for `new-db`, `new-hist`, `version`, and `force-scp` commands.
+2. A container smoke test that launches the image with a minimal compat config, waits for startup, and asserts that `/info` on port 11626 returns valid JSON with the expected top-level fields.
+3. If any entrypoint commands are explicitly unsupported, a test or documented assertion that the container exits with a clear error rather than silently misbehaving.
+
 Suggested deliverables:
 
 - checked-in Dockerfile and build instructions
 - one short runbook section for local image verification
 - a verified list of supported SSC entrypoint commands
+- CI smoke test for image build and basic entrypoint validation
 
 ### Phase 1 -- Mixed-image mission bring-up
 
@@ -292,11 +364,19 @@ Concrete engineering tasks:
 7. Add a mission matrix to the document or a sibling handoff note listing which mixed-image missions were attempted, passed, failed, or remain untried.
 8. Once the first mission passes, expand to one topology-oriented mixed-image mission and one version-mix mission.
 
+Required tests:
+
+1. Before running missions, add unit tests for the compat `/info` response shape -- validate that the JSON structure matches the fields SSC reads (protocol version, ledger number, state, network passphrase). Use a captured stellar-core `/info` response as the reference fixture.
+2. Add unit tests for `/peers` response shape (SSC uses this to verify topology).
+3. Add unit tests for `/quorum` and `/scp` response shapes if those are read by the target missions.
+4. Record the first mission run as a structured failure log. Each failure should specify: which HTTP endpoint or CLI command failed, what the expected vs actual behavior was, and whether the fix is a response-shape issue or a behavioral issue.
+
 Suggested deliverables:
 
 - one passing mixed-image mission with notes
 - a failure log for any blocked mixed-image missions
 - a short compatibility matrix for mixed-image coverage
+- unit tests for `/info`, `/peers`, and any other endpoints the first mission touches
 
 ### Phase 2 -- Close the Henyey-only payment mission blockers
 
@@ -329,11 +409,19 @@ Concrete engineering tasks:
 10. Run an all-Henyey simple payment mission in SSC and capture any residual incompatibilities.
 11. Repeat until the mission passes without relying on stubbed metrics or manual intervention.
 
+Required tests:
+
+1. `/testacc` unit tests: validate the response JSON shape against a captured stellar-core `/testacc` response. Test with valid named accounts, missing accounts, and malformed query parameters.
+2. `/metrics` parity tests: capture a real stellar-core `/metrics` response, extract the metric names SSC reads (identified in task #4 above), and write unit tests that assert the compat handler returns those exact metric names with the expected JSON nesting (`{"metrics": {"name": {"count": N, ...}}}`).
+3. `/generateload` mode normalization tests: for every SSC mode name identified in task #6, assert that the compat handler either accepts it and maps to the correct internal mode, or returns a clear error. Cover: `create` (verify it does the right thing, not silently alias to pay), `pay`, `soroban_upload`, `soroban_invoke`, `mixed_classic_soroban`, `upgrade_setup`, `create_upgrade`, `stop`, `pay_pregenerated`.
+4. `/generateload` gating tests: assert that requests fail cleanly when (a) the `loadgen` feature is disabled, (b) `ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING` is false, and (c) no `LoadGenRunner` is injected.
+5. Response-shape regression tests: for every new or modified compat endpoint, add a test that serializes the response and asserts it matches a reference fixture. These tests should break if someone changes the response shape without updating the fixture.
+
 Suggested deliverables:
 
-- `/testacc` implementation with tests
-- expanded compat `/metrics` with SSC-targeted coverage
-- documented `/generateload` compatibility table
+- `/testacc` implementation with response-shape parity tests
+- expanded compat `/metrics` with SSC-targeted coverage and parity tests
+- documented `/generateload` compatibility table with mode-mapping tests
 - one passing all-Henyey simple payment mission
 
 ### Phase 3 -- History and upgrade mission validation
@@ -363,11 +451,19 @@ Concrete engineering tasks:
 7. If mixed-image history flows are in scope, test both directions: Henyey publishing for stellar-core catchup and stellar-core publishing for Henyey catchup.
 8. Document any unsupported archive command variants or mission assumptions that require either code changes or explicit non-support.
 
+Required tests:
+
+1. HISTORY parsing tests: capture actual SSC-generated HISTORY config sections (from SSC source or a real mission run) and add them as test fixtures in the compat config test suite. Verify that `get`, `put`, and `mkdir` commands are parsed correctly for every template variant SSC produces.
+2. URL extraction edge cases: the `extract_url_from_curl_cmd` function is tested with 3 cases today. Add tests for SSC-specific command templates, including any that use `wget` instead of `curl`, have extra flags, or use different placeholder syntax.
+3. `/upgrades` response-shape test: validate the JSON response against what SSC reads when scheduling and querying protocol upgrades.
+4. Publish/catchup round-trip test: an integration test that publishes a checkpoint from one Henyey instance and catches up from it with another, outside of SSC. This validates the machinery before adding SSC orchestration complexity on top.
+
 Suggested deliverables:
 
 - HISTORY parsing tests for SSC-generated templates
 - one passing publish/catchup SSC scenario
 - one passing upgrade-oriented SSC scenario or a precise blocker report
+- publish/catchup round-trip integration test
 
 ### Phase 4 -- Optional parity work for lower-priority missions
 
@@ -393,6 +489,11 @@ Concrete engineering tasks:
 5. Evaluate whether MaxTPS missions require additional backend or build assumptions beyond current Henyey support, and document those explicitly.
 6. Create a backlog table of lower-priority SSC missions with status, blockers, and whether each blocker is protocol, packaging, metrics, loadgen, or survey related.
 
+Required tests:
+
+1. Survey endpoint parity tests: before wiring the compat survey endpoints to the native implementation, capture stellar-core survey response fixtures and write tests that assert the compat adapters produce matching shapes.
+2. Extended `/metrics` parity tests: any new metric names added beyond the Phase 2 minimum should have fixture-based tests.
+
 Suggested deliverables:
 
 - wired survey compat endpoints if survey missions are in scope
@@ -409,6 +510,7 @@ This section is intended for the next engineer picking up the work.
 - image exposes `stellar-core`
 - SSC-required commands verified in-container
 - build/run instructions documented
+- CI smoke test for image build and entrypoint validation passes
 
 ### Phase 1 handoff checklist
 
@@ -416,19 +518,23 @@ This section is intended for the next engineer picking up the work.
 - mission run logs captured
 - passing/failing mission matrix started
 - known startup and network issues categorized
+- unit tests for `/info` and `/peers` response shapes pass against stellar-core reference fixtures
 
 ### Phase 2 handoff checklist
 
-- `/testacc` implemented and tested
-- compat `/metrics` no longer a 3-counter stub
-- `/generateload` alias/mode behavior documented and tested
+- `/testacc` implemented and tested with response-shape parity tests
+- compat `/metrics` no longer a 3-counter stub, covered by parity tests
+- `/generateload` alias/mode behavior documented and tested, including `create` mode semantics
 - all-Henyey payment mission attempted and results recorded
+- response-shape regression tests exist for every new or modified endpoint
 
 ### Phase 3 handoff checklist
 
-- HISTORY parsing tested against SSC-style templates
+- HISTORY parsing tested against SSC-style templates (fixtures from real SSC configs)
+- publish/catchup round-trip integration test passes outside SSC
 - publish/catchup scenario exercised under SSC
 - upgrade mission exercised under SSC
+- `/upgrades` response shape tested against stellar-core reference
 - remaining history/upgrade blockers documented precisely
 
 ### Phase 4 handoff checklist
@@ -436,6 +542,7 @@ This section is intended for the next engineer picking up the work.
 - survey scope explicitly decided
 - long-tail mission matrix updated
 - deferred work separated from active blockers
+- any new compat endpoints have response-shape parity tests
 
 ## What Must Be True Before Saying "Henyey-Only SSC Is Ready"
 
@@ -445,8 +552,10 @@ The project should not claim Henyey-only SSC readiness until all of the followin
 - mixed-image missions pass reliably
 - `/testacc` exists and is exercised by SSC
 - compat `/metrics` is sufficiently wire-compatible for SSC mission logic
-- `/generateload` compatibility is validated with the actual SSC parameter set
+- `/generateload` compatibility is validated with the actual SSC parameter set, including verified `create` mode semantics
 - at least one Henyey-only payment/topology mission passes end to end
+- every SSC-facing compat endpoint has unit tests that validate its response shape against a stellar-core reference fixture
+- the `create` mode and `--minimal-for-in-memory-mode` behavioral deviations are either fixed or explicitly documented with their mission impact
 
 Anything short of that is promising groundwork, not execution readiness.
 

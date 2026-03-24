@@ -1,0 +1,7 @@
+{
+  "status": {
+    "mode": "pay",
+    "txs_remaining": 100,
+    "tx_rate": "10 tx/s"
+  }
+}

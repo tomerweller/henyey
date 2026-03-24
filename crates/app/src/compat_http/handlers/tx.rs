@@ -155,3 +155,100 @@ struct CompatTxResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostic_events: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify PENDING response shape: `{"status": "PENDING"}` with no error/diagnostic_events.
+    #[test]
+    fn test_tx_response_pending_shape() {
+        let response = CompatTxResponse {
+            status: "PENDING".into(),
+            error: None,
+            diagnostic_events: None,
+        };
+
+        let value = serde_json::to_value(&response).unwrap();
+        let obj = value.as_object().unwrap();
+
+        assert_eq!(obj.len(), 1, "PENDING response should only have 'status'");
+        assert_eq!(value["status"], "PENDING");
+        assert!(obj.get("error").is_none(), "error should be absent for PENDING");
+        assert!(
+            obj.get("diagnostic_events").is_none(),
+            "diagnostic_events should be absent for PENDING"
+        );
+    }
+
+    /// Verify ERROR response shape: `{"status": "ERROR", "error": "<base64>"}`.
+    #[test]
+    fn test_tx_response_error_shape() {
+        let response = CompatTxResponse {
+            status: "ERROR".into(),
+            error: Some("AAAAAAAAAGT////7".into()),
+            diagnostic_events: None,
+        };
+
+        let value = serde_json::to_value(&response).unwrap();
+        let obj = value.as_object().unwrap();
+
+        assert_eq!(obj.len(), 2, "ERROR response should have 'status' and 'error'");
+        assert_eq!(value["status"], "ERROR");
+        assert!(value["error"].is_string(), "error must be a string");
+        assert!(
+            obj.get("diagnostic_events").is_none(),
+            "diagnostic_events should be absent when None"
+        );
+    }
+
+    /// Verify ERROR response with diagnostic_events includes all three fields.
+    #[test]
+    fn test_tx_response_error_with_diagnostics_shape() {
+        let response = CompatTxResponse {
+            status: "ERROR".into(),
+            error: Some("AAAAAAAAAGT////7".into()),
+            diagnostic_events: Some("AAAAAQ==".into()),
+        };
+
+        let value = serde_json::to_value(&response).unwrap();
+        let obj = value.as_object().unwrap();
+
+        assert_eq!(obj.len(), 3, "should have status, error, diagnostic_events");
+        assert_eq!(value["status"], "ERROR");
+        assert!(value["error"].is_string());
+        assert!(value["diagnostic_events"].is_string());
+    }
+
+    /// Verify all valid status strings.
+    #[test]
+    fn test_tx_response_all_status_strings() {
+        for status in ["PENDING", "DUPLICATE", "ERROR", "TRY_AGAIN_LATER", "FILTERED"] {
+            let response = CompatTxResponse {
+                status: status.into(),
+                error: None,
+                diagnostic_events: None,
+            };
+            let value = serde_json::to_value(&response).unwrap();
+            assert_eq!(value["status"], status);
+        }
+    }
+
+    /// Verify `encode_tx_result` produces valid base64.
+    #[test]
+    fn test_encode_tx_result_produces_valid_base64() {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
+        let b64 = encode_tx_result(TransactionResultResult::TxInternalError, 0);
+        assert!(!b64.is_empty(), "encoded result should not be empty");
+
+        // Should be valid base64
+        let decoded = BASE64.decode(&b64);
+        assert!(decoded.is_ok(), "should be valid base64");
+
+        // Should be valid XDR
+        let bytes = decoded.unwrap();
+        let result = TransactionResult::from_xdr(&bytes, Limits::none());
+        assert!(result.is_ok(), "should be valid TransactionResult XDR");
+    }
+}

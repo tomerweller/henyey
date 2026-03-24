@@ -112,3 +112,246 @@ struct CompatPeerInfo {
     pending_count: usize,
     authenticated_count: usize,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that the `/info` response JSON shape matches stellar-core.
+    ///
+    /// This test constructs a `CompatInfoWrapper` by hand and asserts that the
+    /// serialised JSON has exactly the top-level and nested keys that
+    /// stellar-core's `getJsonInfo()` emits (field names, casing, nesting).
+    #[test]
+    fn test_info_response_shape_synced() {
+        let wrapper = CompatInfoWrapper {
+            info: CompatInfoResponse {
+                build: "henyey-v0.1.0".into(),
+                protocol_version: 25,
+                state: "Synced!".into(),
+                started_on: "2026-01-15T12:00:00Z".into(),
+                ledger: CompatLedgerInfo {
+                    num: 12345,
+                    hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".into(),
+                    close_time: 1700000000,
+                    version: 25,
+                    base_fee: 100,
+                    base_reserve: 100000000,
+                    max_tx_set_size: 1000,
+                    flags: None,
+                    age: 5,
+                },
+                peers: CompatPeerInfo {
+                    pending_count: 3,
+                    authenticated_count: 10,
+                },
+                network: "Test SDF Network ; September 2015".into(),
+                status: vec!["Catching up: Applying buckets 50.0%".into()],
+            },
+        };
+
+        let value = serde_json::to_value(&wrapper).unwrap();
+
+        // Top-level: {"info": {...}}
+        assert!(value.is_object(), "top-level must be an object");
+        assert!(value.get("info").is_some(), "must have 'info' wrapper key");
+        let info = &value["info"];
+
+        // Required top-level fields inside "info"
+        let expected_top_keys = [
+            "build",
+            "protocol_version",
+            "state",
+            "startedOn",
+            "ledger",
+            "peers",
+            "network",
+            "status",
+        ];
+        for key in &expected_top_keys {
+            assert!(info.get(key).is_some(), "missing top-level key: {key}");
+        }
+
+        // Ledger sub-object: camelCase field names
+        let ledger = &info["ledger"];
+        let expected_ledger_keys = [
+            "num",
+            "hash",
+            "closeTime",
+            "version",
+            "baseFee",
+            "baseReserve",
+            "maxTxSetSize",
+            "age",
+        ];
+        for key in &expected_ledger_keys {
+            assert!(ledger.get(key).is_some(), "missing ledger key: {key}");
+        }
+
+        // flags should be absent when None (skip_serializing_if)
+        assert!(
+            ledger.get("flags").is_none(),
+            "flags should be absent when None"
+        );
+
+        // Peers sub-object: snake_case (stellar-core inconsistency)
+        let peers = &info["peers"];
+        assert!(peers.get("pending_count").is_some());
+        assert!(peers.get("authenticated_count").is_some());
+
+        // Status is an array
+        assert!(info["status"].is_array(), "status must be an array");
+
+        // startedOn uses camelCase (not started_on)
+        assert!(
+            info.get("started_on").is_none(),
+            "should use startedOn, not started_on"
+        );
+    }
+
+    /// Verify that the `flags` field appears when set.
+    #[test]
+    fn test_info_response_flags_present_when_set() {
+        let wrapper = CompatInfoWrapper {
+            info: CompatInfoResponse {
+                build: "henyey-v0.1.0".into(),
+                protocol_version: 25,
+                state: "Booting".into(),
+                started_on: "2026-01-15T12:00:00Z".into(),
+                ledger: CompatLedgerInfo {
+                    num: 0,
+                    hash: "0".repeat(64),
+                    close_time: 0,
+                    version: 0,
+                    base_fee: 100,
+                    base_reserve: 100000000,
+                    max_tx_set_size: 1000,
+                    flags: Some(3),
+                    age: 0,
+                },
+                peers: CompatPeerInfo {
+                    pending_count: 0,
+                    authenticated_count: 0,
+                },
+                network: "Test SDF Network ; September 2015".into(),
+                status: vec![],
+            },
+        };
+
+        let value = serde_json::to_value(&wrapper).unwrap();
+        let ledger = &value["info"]["ledger"];
+        assert_eq!(ledger["flags"], 3, "flags must be present when Some");
+    }
+
+    /// Verify booting state has empty status array.
+    #[test]
+    fn test_info_response_booting_empty_status() {
+        let wrapper = CompatInfoWrapper {
+            info: CompatInfoResponse {
+                build: "henyey-v0.1.0".into(),
+                protocol_version: 25,
+                state: "Booting".into(),
+                started_on: "2026-01-15T12:00:00Z".into(),
+                ledger: CompatLedgerInfo {
+                    num: 0,
+                    hash: "0".repeat(64),
+                    close_time: 0,
+                    version: 0,
+                    base_fee: 100,
+                    base_reserve: 100000000,
+                    max_tx_set_size: 1000,
+                    flags: None,
+                    age: 0,
+                },
+                peers: CompatPeerInfo {
+                    pending_count: 0,
+                    authenticated_count: 0,
+                },
+                network: "Test SDF Network ; September 2015".into(),
+                status: vec![],
+            },
+        };
+
+        let value = serde_json::to_value(&wrapper).unwrap();
+        let status = value["info"]["status"].as_array().unwrap();
+        assert!(status.is_empty(), "booting state should have empty status array");
+    }
+
+    /// Cross-check: serialize and deserialize as generic JSON to ensure
+    /// roundtrip integrity and that no unexpected keys leak.
+    #[test]
+    fn test_info_response_no_unexpected_keys() {
+        let wrapper = CompatInfoWrapper {
+            info: CompatInfoResponse {
+                build: "henyey-v0.1.0".into(),
+                protocol_version: 25,
+                state: "Synced!".into(),
+                started_on: "2026-01-15T12:00:00Z".into(),
+                ledger: CompatLedgerInfo {
+                    num: 1,
+                    hash: "a".repeat(64),
+                    close_time: 100,
+                    version: 25,
+                    base_fee: 100,
+                    base_reserve: 100000000,
+                    max_tx_set_size: 1000,
+                    flags: None,
+                    age: 0,
+                },
+                peers: CompatPeerInfo {
+                    pending_count: 0,
+                    authenticated_count: 0,
+                },
+                network: "Test SDF Network ; September 2015".into(),
+                status: vec![],
+            },
+        };
+
+        let value = serde_json::to_value(&wrapper).unwrap();
+        let top = value.as_object().unwrap();
+
+        // Only "info" at the top level
+        assert_eq!(top.len(), 1, "top-level should only have 'info'");
+
+        let info = top["info"].as_object().unwrap();
+        let allowed_info_keys: std::collections::HashSet<&str> = [
+            "build",
+            "protocol_version",
+            "state",
+            "startedOn",
+            "ledger",
+            "peers",
+            "network",
+            "status",
+        ]
+        .into_iter()
+        .collect();
+        for key in info.keys() {
+            assert!(
+                allowed_info_keys.contains(key.as_str()),
+                "unexpected info key: {key}"
+            );
+        }
+
+        let ledger = info["ledger"].as_object().unwrap();
+        let allowed_ledger_keys: std::collections::HashSet<&str> = [
+            "num",
+            "hash",
+            "closeTime",
+            "version",
+            "baseFee",
+            "baseReserve",
+            "maxTxSetSize",
+            "flags",
+            "age",
+        ]
+        .into_iter()
+        .collect();
+        for key in ledger.keys() {
+            assert!(
+                allowed_ledger_keys.contains(key.as_str()),
+                "unexpected ledger key: {key}"
+            );
+        }
+    }
+}

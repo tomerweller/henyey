@@ -1150,6 +1150,18 @@ impl App {
         Some(account.seq_num.0)
     }
 
+    /// Load a full account entry from the current bucket list snapshot.
+    ///
+    /// Returns `None` if the account does not exist.
+    /// Used by the compat HTTP `/testacc` endpoint.
+    pub fn load_account(
+        &self,
+        account_id: &stellar_xdr::curr::AccountId,
+    ) -> Option<stellar_xdr::curr::AccountEntry> {
+        let snapshot = self.ledger_manager.create_snapshot().ok()?;
+        snapshot.get_account(account_id).ok()?
+    }
+
     /// Check whether a ledger entry exists in the current bucket list.
     ///
     /// Used by the simulation LoadGenerator to verify Soroban state is synced.

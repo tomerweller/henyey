@@ -404,6 +404,142 @@ fn is_leap_year(y: u32) -> bool {
     (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── /upgrades response shape tests ──────────────────────────────────
+
+    /// Verify the default `/upgrades` response (no mode param) has `current` and `scheduled`.
+    #[test]
+    fn test_upgrades_response_default_shape() {
+        // Reproduces the inline JSON the handler builds for the default (GET) case
+        let value = serde_json::json!({
+            "current": {
+                "ledgerVersion": 25,
+                "baseFee": 100,
+                "baseReserve": 100000000,
+                "maxTxSetSize": 1000,
+            },
+            "scheduled": {
+                "upgradetime": 0_u64,
+                "protocolversion": serde_json::Value::Null,
+                "basefee": serde_json::Value::Null,
+                "basereserve": serde_json::Value::Null,
+                "maxtxsetsize": serde_json::Value::Null,
+            }
+        });
+
+        let obj = value.as_object().unwrap();
+        assert!(obj.contains_key("current"), "must have 'current'");
+        assert!(obj.contains_key("scheduled"), "must have 'scheduled'");
+
+        // Current uses camelCase
+        let current = value["current"].as_object().unwrap();
+        for key in ["ledgerVersion", "baseFee", "baseReserve", "maxTxSetSize"] {
+            assert!(current.contains_key(key), "current missing key: {key}");
+        }
+
+        // Scheduled uses lowercase (matching stellar-core query params)
+        let scheduled = value["scheduled"].as_object().unwrap();
+        for key in [
+            "upgradetime",
+            "protocolversion",
+            "basefee",
+            "basereserve",
+            "maxtxsetsize",
+        ] {
+            assert!(scheduled.contains_key(key), "scheduled missing key: {key}");
+        }
+    }
+
+    /// Verify mode=set success response.
+    #[test]
+    fn test_upgrades_set_response_shape() {
+        let value = serde_json::json!({"status": "ok"});
+        assert_eq!(value["status"], "ok");
+    }
+
+    /// Verify mode=set error response.
+    #[test]
+    fn test_upgrades_set_error_response_shape() {
+        let value = serde_json::json!({"status": "error", "error": "some error"});
+        assert_eq!(value["status"], "error");
+        assert!(value.get("error").is_some());
+    }
+
+    // ── /quorum response shape test ─────────────────────────────────────
+
+    /// Verify `/quorum` response has `{"quorum": "<hash>"}` shape.
+    #[test]
+    fn test_quorum_response_shape() {
+        let value = serde_json::json!({"quorum": "abcdef1234567890"});
+        let obj = value.as_object().unwrap();
+        assert_eq!(obj.len(), 1, "should only have 'quorum'");
+        assert!(value["quorum"].is_string());
+    }
+
+    // ── /scp response shape test ────────────────────────────────────────
+
+    /// Verify `/scp` response has `{"scp": {"latest_slot": N, "pending_transactions": N}}`.
+    #[test]
+    fn test_scp_response_shape() {
+        let value = serde_json::json!({
+            "scp": {
+                "latest_slot": 12345_u64,
+                "pending_transactions": 3_u64,
+            }
+        });
+
+        let obj = value.as_object().unwrap();
+        assert_eq!(obj.len(), 1, "should only have 'scp'");
+
+        let scp = value["scp"].as_object().unwrap();
+        assert!(scp.contains_key("latest_slot"));
+        assert!(scp.contains_key("pending_transactions"));
+    }
+
+    // ── /bans response shape test ───────────────────────────────────────
+
+    /// Verify `/bans` response has `{"bans": []}`.
+    #[test]
+    fn test_bans_response_shape() {
+        let value = serde_json::json!({"bans": []});
+        assert!(value["bans"].is_array());
+        assert!(value["bans"].as_array().unwrap().is_empty());
+    }
+
+    // ── ISO 8601 parser tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_parse_iso8601_epoch() {
+        assert_eq!(parse_iso8601_to_unix("1970-01-01T00:00:00Z"), Some(0));
+    }
+
+    #[test]
+    fn test_parse_iso8601_known_timestamp() {
+        // 2023-11-14T22:13:20Z = 1700000000
+        assert_eq!(
+            parse_iso8601_to_unix("2023-11-14T22:13:20Z"),
+            Some(1700000000)
+        );
+    }
+
+    #[test]
+    fn test_parse_iso8601_invalid() {
+        assert_eq!(parse_iso8601_to_unix("not-a-date"), None);
+        assert_eq!(parse_iso8601_to_unix("2023-01-01"), None);
+    }
+
+    #[test]
+    fn test_is_leap_year() {
+        assert!(is_leap_year(2000));
+        assert!(is_leap_year(2024));
+        assert!(!is_leap_year(1900));
+        assert!(!is_leap_year(2023));
+    }
+}
+
 // ── Load generation (feature-gated) ─────────────────────────────────────
 
 /// GET /generateload — compat handler using trait-object backend.

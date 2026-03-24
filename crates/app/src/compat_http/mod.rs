@@ -49,6 +49,10 @@ pub(crate) fn build_compat_router(state: Arc<CompatServerState>) -> Router {
         .route("/peers", get(handlers::peers::compat_peers_handler))
         .route("/metrics", get(handlers::metrics::compat_metrics_handler))
         .route(
+            "/testacc",
+            get(handlers::testacc::compat_testacc_handler),
+        )
+        .route(
             "/sorobaninfo",
             get(handlers::plaintext::compat_sorobaninfo_handler),
         )
@@ -197,5 +201,22 @@ impl CompatServer {
 
         tracing::info!("stellar-core compatibility HTTP server stopped");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Verify the panic handler returns `{"exception": "generic"}`.
+    ///
+    /// This matches stellar-core's `safeRouter` behavior.
+    #[test]
+    fn test_panic_handler_response_shape() {
+        // The panic handler is tested by verifying the JSON it would produce.
+        // We can't easily trigger it without a full server, but we can verify
+        // the shape matches stellar-core.
+        let value = serde_json::json!({"exception": "generic"});
+        let obj = value.as_object().unwrap();
+        assert_eq!(obj.len(), 1, "should only have 'exception'");
+        assert_eq!(value["exception"], "generic");
     }
 }

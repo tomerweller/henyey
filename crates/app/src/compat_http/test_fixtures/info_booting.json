@@ -1,0 +1,24 @@
+{
+  "info": {
+    "build": "v25.0.1",
+    "protocol_version": 25,
+    "state": "Booting",
+    "startedOn": "2026-01-15T12:00:00Z",
+    "ledger": {
+      "num": 0,
+      "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "closeTime": 0,
+      "version": 0,
+      "baseFee": 100,
+      "baseReserve": 100000000,
+      "maxTxSetSize": 1000,
+      "age": 0
+    },
+    "peers": {
+      "pending_count": 0,
+      "authenticated_count": 0
+    },
+    "network": "Test SDF Network ; September 2015",
+    "status": []
+  }
+}
