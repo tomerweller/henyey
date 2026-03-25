@@ -372,6 +372,9 @@ pub struct App {
 
     /// Total number of times the node lost sync.
     lost_sync_count: AtomicU64,
+    /// Number of ledger closes that contained at least one transaction.
+    /// Mirrors stellar-core's `ledger.transaction.count` histogram `.count`.
+    ledger_tx_count: AtomicU64,
     /// Current max tx size in bytes for flow control (tracks upgrades).
     /// Mirrors upstream `mMaxTxSize` in HerderImpl.
     max_tx_size_bytes: AtomicU32,
@@ -669,6 +672,7 @@ impl App {
             recovery_attempts_without_progress: AtomicU64::new(0),
             recovery_baseline_ledger: AtomicU64::new(0),
             lost_sync_count: AtomicU64::new(0),
+            ledger_tx_count: AtomicU64::new(0),
             max_tx_size_bytes: AtomicU32::new(
                 henyey_herder::flow_control::MAX_CLASSIC_TX_SIZE_BYTES,
             ),
@@ -1340,6 +1344,12 @@ impl App {
 
     pub fn pending_transaction_count(&self) -> usize {
         self.herder.stats().pending_transactions
+    }
+
+    /// Number of ledger closes that contained at least one transaction.
+    /// Mirrors stellar-core's `ledger.transaction.count` histogram `.count`.
+    pub fn ledger_tx_count(&self) -> u64 {
+        self.ledger_tx_count.load(Ordering::Relaxed)
     }
 
     pub async fn submit_transaction(

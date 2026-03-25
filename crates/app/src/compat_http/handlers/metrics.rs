@@ -30,6 +30,7 @@ pub(crate) async fn compat_metrics_handler(
     let app = &state.app;
     let (seq, _, _, protocol_version) = app.ledger_info();
     let (pending_count, authenticated_count) = app.peer_counts().await;
+    let ledger_tx_count = app.ledger_tx_count();
 
     Json(serde_json::json!({
         "metrics": {
@@ -48,6 +49,21 @@ pub(crate) async fn compat_metrics_handler(
                 "mean": 0.0,
                 "stddev": 0.0,
                 "sum": 0.0,
+                "median": 0.0,
+                "75%": 0.0,
+                "95%": 0.0,
+                "98%": 0.0,
+                "99%": 0.0,
+                "99.9%": 0.0,
+                "100%": 0.0
+            },
+            "ledger.transaction.count": {
+                "type": "histogram",
+                "count": ledger_tx_count,
+                "min": 0.0,
+                "max": 0.0,
+                "mean": 0.0,
+                "stddev": 0.0,
                 "median": 0.0,
                 "75%": 0.0,
                 "95%": 0.0,
@@ -170,6 +186,7 @@ mod tests {
         let value = serde_json::json!({
             "metrics": {
                 "ledger.ledger.close": { "type": "timer", "count": 0 },
+                "ledger.transaction.count": { "type": "histogram", "count": 0 },
                 "peer.peer.count": { "type": "counter", "count": 0 },
                 "peer.peer.authenticated-count": { "type": "counter", "count": 0 },
                 "peer.peer.pending-count": { "type": "counter", "count": 0 },
@@ -181,7 +198,7 @@ mod tests {
         });
 
         let metrics = value["metrics"].as_object().unwrap();
-        assert_eq!(metrics.len(), 8, "should have 8 metrics");
+        assert_eq!(metrics.len(), 9, "should have 9 metrics");
         for (name, metric) in metrics {
             assert!(
                 metric.get("type").is_some(),

@@ -1539,6 +1539,11 @@ impl App {
             }
         }
 
+        // Track non-empty ledger closes for the `ledger.transaction.count` metric.
+        if !pending.tx_set.transactions.is_empty() {
+            self.ledger_tx_count.fetch_add(1, Ordering::Relaxed);
+        }
+
         self.herder
             .ledger_closed(pending.ledger_seq as u64, &applied_hashes);
 
