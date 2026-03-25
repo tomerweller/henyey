@@ -290,7 +290,6 @@ impl OfferIndex {
     pub fn order_book_capacity(&self) -> usize {
         self.order_books.capacity()
     }
-
 }
 
 #[cfg(test)]
