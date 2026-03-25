@@ -624,6 +624,7 @@ impl App {
                 .map_err(|e| anyhow::anyhow!("Failed to restore live bucket list: {}", e))?;
         bucket_list.set_bucket_dir(bucket_dir.clone());
         bucket_list.set_ledger_seq(lcl_seq);
+        henyey_ledger::log_startup_memory("after_restore_bucket_list");
 
         // Step 6b: Extract Arc<Bucket> pairs before starting merges.
         // The scan thread owns these Arc clones independently of bucket_list.
@@ -735,6 +736,8 @@ impl App {
         let cache_data = scan_handle
             .await
             .map_err(|e| anyhow::anyhow!("Cache scan thread panicked: {:?}", e))?;
+
+        henyey_ledger::log_startup_memory("after_cache_scan_and_merges");
 
         tracing::info!(
             elapsed_ms = reconstruct_start.elapsed().as_millis() as u64,

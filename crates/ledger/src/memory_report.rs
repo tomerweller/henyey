@@ -206,6 +206,32 @@ impl MemoryReport {
     }
 }
 
+/// Log a memory snapshot during startup with a phase label.
+///
+/// Lighter than a full `MemoryReport` — captures RSS and jemalloc stats
+/// without per-component breakdowns. Intended for startup milestones where
+/// component data structures may not yet be fully constructed.
+pub fn log_startup_memory(phase: &str) {
+    let pm = ProcessMemory::capture();
+    let alloc = AllocatorStats::capture();
+    let to_mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+    info!(
+        phase,
+        rss_mb = format!("{:.0}", to_mb(pm.rss_bytes)),
+        jemalloc_allocated_mb = format!("{:.0}", to_mb(alloc.allocated)),
+        jemalloc_resident_mb = format!("{:.0}", to_mb(alloc.resident)),
+        fragmentation_pct = if alloc.allocated > 0 {
+            format!(
+                "{:.1}",
+                (alloc.resident as f64 - alloc.allocated as f64) / alloc.allocated as f64 * 100.0
+            )
+        } else {
+            "n/a".to_string()
+        },
+        "Startup memory checkpoint"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

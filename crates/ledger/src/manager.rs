@@ -1237,12 +1237,14 @@ impl LedgerManager {
             header,
             header_hash,
         )?;
+        crate::memory_report::log_startup_memory("after_verify_install_buckets");
 
         // Initialize per-bucket caches for all DiskIndex buckets.
         {
             let bucket_list = self.bucket_list.read();
             bucket_list.maybe_initialize_caches();
         }
+        crate::memory_report::log_startup_memory("after_bucket_cache_init");
 
         // Install pre-computed cache data.
         *self.offer_store.lock() = OfferStore::from_bucket_list_entries(cache_data.offers);
@@ -1250,6 +1252,7 @@ impl LedgerManager {
         *self.module_cache.write() = cache_data.module_cache;
         *self.soroban_state.write() = cache_data.soroban_state;
         *self.offers_initialized.write() = true;
+        crate::memory_report::log_startup_memory("after_cache_install");
 
         info!(
             ledger_seq = self.state.read().header.ledger_seq,
@@ -1396,7 +1399,7 @@ impl LedgerManager {
     /// - TTL -> soroban state
     /// - ConfigSetting -> soroban state
     fn initialize_all_caches(&self, protocol_version: u32, _ledger_seq: u32) -> Result<()> {
-        let rss_before = get_rss_bytes();
+        crate::memory_report::log_startup_memory("before_cache_scan");
 
         let bucket_list = self.bucket_list.read();
         let cache_data = scan_bucket_list_for_caches(
@@ -1404,12 +1407,12 @@ impl LedgerManager {
             protocol_version,
             self.config.scan_thread_count,
         );
-        let rss_after_scan = get_rss_bytes();
+        crate::memory_report::log_startup_memory("after_cache_scan");
 
         // Initialize per-bucket caches for all DiskIndex buckets.
         // Uses proportional sizing based on the BucketListDB config.
         bucket_list.maybe_initialize_caches();
-        let rss_after_bucket_cache = get_rss_bytes();
+        crate::memory_report::log_startup_memory("after_bucket_cache_init");
         drop(bucket_list);
 
         *self.offer_store.lock() = OfferStore::from_bucket_list_entries(cache_data.offers);
@@ -1417,15 +1420,7 @@ impl LedgerManager {
         *self.module_cache.write() = cache_data.module_cache;
         *self.soroban_state.write() = cache_data.soroban_state;
         *self.offers_initialized.write() = true;
-        let rss_after_install = get_rss_bytes();
-
-        info!(
-            before_mb = rss_before / (1024 * 1024),
-            after_scan_mb = rss_after_scan / (1024 * 1024),
-            after_bucket_cache_mb = rss_after_bucket_cache / (1024 * 1024),
-            after_install_mb = rss_after_install / (1024 * 1024),
-            "initialize_all_caches memory"
-        );
+        crate::memory_report::log_startup_memory("after_cache_install");
 
         Ok(())
     }

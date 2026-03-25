@@ -104,6 +104,7 @@ pub use manager::{
     prepend_fee_event, scan_level_pairs_for_caches, CacheInitResult, LedgerManager,
     LedgerManagerConfig,
 };
+pub use memory_report::log_startup_memory;
 pub use snapshot::{
     EntriesLookupFn, EntryLookupFn, LedgerSnapshot, PoolShareTrustlinesByAccountFn,
     SnapshotBuilder, SnapshotHandle,
