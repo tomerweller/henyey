@@ -2,14 +2,16 @@ name: Quickstart
 
 on:
   pull_request:
+  push:
+    branches: [main]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    if: github.event.pull_request.head.repo.private == false
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.private == false
     uses: stellar/quickstart/.github/workflows/build.yml@main
     with:
       images: |
@@ -21,7 +23,7 @@ jobs:
               "horizon_skip_protocol_version_check": true
             },
             "deps": [
-              { "name": "core", "repo": "${{ github.event.pull_request.head.repo.full_name }}", "ref": "${{ github.event.pull_request.head.sha }}" }
+              { "name": "core", "repo": "${{ github.event.pull_request.head.repo.full_name || github.repository }}", "ref": "${{ github.event.pull_request.head.sha || github.sha }}" }
             ],
             "tests": {
               "continue-on-error": false,
