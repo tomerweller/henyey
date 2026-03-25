@@ -1,0 +1,5 @@
+#!/bin/sh
+# No-op shim for quickstart compatibility.
+# The stellar/quickstart Dockerfile runs ./configure unconditionally.
+# Henyey uses Cargo and does not need autotools configure, so this script is a no-op.
+exit 0

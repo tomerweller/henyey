@@ -1,0 +1,35 @@
+name: Quickstart
+
+on:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.event.pull_request.head.repo.private == false
+    uses: stellar/quickstart/.github/workflows/build.yml@main
+    with:
+      images: |
+        [
+          {
+            "tag": "testing-with-pr",
+            "inherit": "testing",
+            "config": {
+              "horizon_skip_protocol_version_check": true
+            },
+            "deps": [
+              { "name": "core", "repo": "${{ github.event.pull_request.head.repo.full_name }}", "ref": "${{ github.event.pull_request.head.sha }}" }
+            ],
+            "tests": {
+              "continue-on-error": false,
+              "additional-tests": [
+                { "arch": "amd64", "network": "testnet", "enable": "core,rpc,horizon" },
+                { "arch": "amd64", "network": "pubnet", "enable": "core,rpc,horizon" }
+              ]
+            }
+          }
+        ]
+      archs: '["amd64"]'
