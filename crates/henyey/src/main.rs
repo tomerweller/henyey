@@ -61,6 +61,7 @@
 //! are handled by the underlying library crates.
 
 mod quorum_intersection;
+mod settings_upgrade;
 
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
@@ -709,6 +710,37 @@ enum Commands {
         to: Option<u32>,
     },
 
+    /// Generate transactions to upgrade Soroban config settings
+    ///
+    /// Produces 4 transaction envelopes needed for a Soroban config settings
+    /// upgrade: restore WASM, upload WASM, create contract, invoke contract.
+    /// When `--signtxs` is passed, reads a secret key from stdin and signs all
+    /// transactions. Output is compatible with stellar-core's
+    /// `get-settings-upgrade-txs` command.
+    #[command(name = "get-settings-upgrade-txs")]
+    GetSettingsUpgradeTxs {
+        /// Source account public key (G...)
+        public_key: String,
+
+        /// Current sequence number of the source account
+        seq_num: i64,
+
+        /// Network passphrase
+        network_passphrase: String,
+
+        /// ConfigUpgradeSet in base64 XDR
+        #[arg(long = "xdr")]
+        xdr_base64: String,
+
+        /// Sign all transactions (reads secret key from stdin)
+        #[arg(long)]
+        signtxs: bool,
+
+        /// Additional resource fee for all transactions
+        #[arg(long = "add-resource-fee", default_value = "0")]
+        add_resource_fee: i64,
+    },
+
     /// Run apply-time load test (benchmarks raw transaction application)
     ///
     /// Creates a standalone node with genesis, deploys contracts, populates
@@ -757,6 +789,23 @@ async fn main() -> anyhow::Result<()> {
         Commands::ConvertId { id } => {
             cmd_convert_id(id);
             return Ok(());
+        }
+        Commands::GetSettingsUpgradeTxs {
+            public_key,
+            seq_num,
+            network_passphrase,
+            xdr_base64,
+            signtxs,
+            add_resource_fee,
+        } => {
+            return settings_upgrade::run(
+                public_key,
+                *seq_num,
+                network_passphrase,
+                xdr_base64,
+                *signtxs,
+                *add_resource_fee,
+            );
         }
         _ => {}
     }
@@ -893,7 +942,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::OfflineInfo => cmd_offline_info(config),
 
         // Handled by early return above; included for exhaustive match.
-        Commands::Version | Commands::ConvertId { .. } => unreachable!(),
+        Commands::Version | Commands::ConvertId { .. } | Commands::GetSettingsUpgradeTxs { .. } => {
+            unreachable!()
+        }
 
         Commands::ForceScp => {
             cmd_force_scp(&config)?;
