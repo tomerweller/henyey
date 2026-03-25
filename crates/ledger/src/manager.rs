@@ -4727,6 +4727,17 @@ impl<'a> LedgerCloseContext<'a> {
                             std::mem::take(&mut self.hot_archive_restored_keys),
                         )?;
                     }
+                } else {
+                    // On the upgrade ledger (prev_version < V23, protocol_version >= V23),
+                    // stellar-core does NOT call addHotArchiveBatch. But we need to
+                    // advance the hot archive's ledger_seq so the NEXT ledger doesn't
+                    // retroactively process pre-V23 ledgers via advance_to_ledger.
+                    // stellar-core's bucket list starts fresh at the first V23+ ledger
+                    // (e.g., addBatch(ledgerSeq=3, ...)) with no prior history.
+                    let mut hot_archive_guard = self.manager.hot_archive_bucket_list.write();
+                    if let Some(ref mut hot_archive) = *hot_archive_guard {
+                        hot_archive.set_ledger_seq(self.close_data.ledger_seq);
+                    }
                 }
 
                 // Combine live and hot archive hashes (using upgraded version,
