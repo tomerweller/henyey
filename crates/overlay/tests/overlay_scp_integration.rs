@@ -73,10 +73,7 @@ async fn test_overlay_scp_message_roundtrip() {
     let peer_addr_b = PeerAddress::new("127.0.0.1", port_b);
     let _peer_id = manager_a.connect(&peer_addr_b).await.expect("connect");
 
-    let mut scp_rx_b = manager_b
-        .subscribe_scp()
-        .await
-        .expect("subscribe_scp");
+    let mut scp_rx_b = manager_b.subscribe_scp().await.expect("subscribe_scp");
     let message = StellarMessage::ScpMessage(make_test_envelope(1));
     manager_a
         .broadcast(message.clone())

@@ -28,8 +28,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
 use henyey_common::Hash256;
+use parking_lot::RwLock;
 
 use crate::future_bucket::{FutureBucket, MergeKey};
 

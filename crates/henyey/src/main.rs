@@ -384,7 +384,12 @@ struct Cli {
     log_level_compat: Option<String>,
 
     /// Report metric on exit (stellar-core compatibility; accepted but ignored).
-    #[arg(long = "metric", value_name = "METRIC-NAME", global = true, hide = true)]
+    #[arg(
+        long = "metric",
+        value_name = "METRIC-NAME",
+        global = true,
+        hide = true
+    )]
     metric: Option<String>,
 
     #[command(subcommand)]
@@ -786,9 +791,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Apply testing overrides early (before any checkpoint math).
     if config.testing.accelerate_time {
-        henyey_history::set_checkpoint_frequency(
-            henyey_history::ACCELERATED_CHECKPOINT_FREQUENCY,
-        );
+        henyey_history::set_checkpoint_frequency(henyey_history::ACCELERATED_CHECKPOINT_FREQUENCY);
     }
 
     // Execute command
@@ -897,9 +900,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
 
-        Commands::NewHist { name } => {
-            cmd_new_hist(&config, &name).await
-        }
+        Commands::NewHist { name } => cmd_new_hist(&config, &name).await,
 
         Commands::VerifyCheckpoints { output, from, to } => {
             cmd_verify_checkpoints(config, output, from, to).await
@@ -912,7 +913,18 @@ async fn main() -> anyhow::Result<()> {
             clusters,
             tx_count,
             iterations,
-        } => cmd_apply_load(config, &mode, num_ledgers, classic_txs_per_ledger, clusters, tx_count, iterations).await,
+        } => {
+            cmd_apply_load(
+                config,
+                &mode,
+                num_ledgers,
+                classic_txs_per_ledger,
+                clusters,
+                tx_count,
+                iterations,
+            )
+            .await
+        }
     }
 }
 
@@ -986,7 +998,7 @@ fn all_archives(config: &AppConfig) -> anyhow::Result<Vec<henyey_history::Histor
 /// - Immediate protocol upgrade to latest version (v25)
 fn local_config() -> AppConfig {
     use henyey_app::config::{
-        CompatHttpConfig, DatabaseConfig, BucketConfig, HistoryArchiveEntry, HistoryConfig,
+        BucketConfig, CompatHttpConfig, DatabaseConfig, HistoryArchiveEntry, HistoryConfig,
         HttpConfig, NetworkConfig, NodeConfig, OverlayConfig, QuorumSetConfig, TestingConfig,
         UpgradeConfig,
     };
@@ -1199,11 +1211,18 @@ async fn cmd_run(
 
             // Create database and initialize genesis ledger.
             let db = henyey_db::Database::open(db_path)?;
-            initialize_genesis_ledger(&db, &config.network.passphrase, config.testing.genesis_test_account_count)?;
+            initialize_genesis_ledger(
+                &db,
+                &config.network.passphrase,
+                config.testing.genesis_test_account_count,
+            )?;
             tracing::info!("Local mode: genesis ledger initialized");
 
             // Initialize local history archive.
-            let history_dir = config.database.path.parent()
+            let history_dir = config
+                .database
+                .path
+                .parent()
                 .unwrap_or(std::path::Path::new("."))
                 .join("history");
             std::fs::create_dir_all(&history_dir)?;
@@ -1245,14 +1264,16 @@ async fn cmd_run(
             Box::new(loadgen_runner::SimulationLoadGenRunner::new(app))
         })),
         extra_server_spawner: if rpc_enabled {
-            Some(std::sync::Arc::new(move |app: &std::sync::Arc<henyey_app::App>| {
-                let rpc_server = henyey_rpc::RpcServer::new(rpc_port, app.clone());
-                vec![tokio::spawn(async move {
-                    if let Err(e) = rpc_server.start().await {
-                        tracing::error!(error = %e, "JSON-RPC server error");
-                    }
-                })]
-            }))
+            Some(std::sync::Arc::new(
+                move |app: &std::sync::Arc<henyey_app::App>| {
+                    let rpc_server = henyey_rpc::RpcServer::new(rpc_port, app.clone());
+                    vec![tokio::spawn(async move {
+                        if let Err(e) = rpc_server.start().await {
+                            tracing::error!(error = %e, "JSON-RPC server error");
+                        }
+                    })]
+                },
+            ))
         } else {
             None
         },
@@ -1328,7 +1349,6 @@ async fn cmd_new_db(
     println!("Database created successfully at: {}", db_path.display());
     Ok(())
 }
-
 
 /// Initialize the genesis ledger (ledger 1) in the database.
 ///
@@ -1411,9 +1431,7 @@ fn initialize_genesis_ledger(
         let seed = deterministic_seed(&name);
         let secret = henyey_crypto::SecretKey::from_seed(&seed);
         let public = secret.public_key();
-        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
-            *public.as_bytes(),
-        )));
+        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(*public.as_bytes())));
 
         genesis_entries.push(LedgerEntry {
             last_modified_ledger_seq: 1,
@@ -1527,8 +1545,8 @@ fn initialize_genesis_ledger(
 
     // 11. Persist everything to the database
     db.with_connection(|conn| {
-        use henyey_db::queries::{BucketListQueries, LedgerQueries, StateQueries};
         use henyey_db::queries::HistoryQueries;
+        use henyey_db::queries::{BucketListQueries, LedgerQueries, StateQueries};
 
         conn.store_ledger_header(&header, &header_xdr)?;
         conn.store_tx_history_entry(1, &genesis_tx_history)?;
@@ -1611,14 +1629,20 @@ async fn cmd_apply_load(
 
     // Build the ApplyLoad configuration.
     let al_config = ApplyLoadConfig {
-        num_ledgers: if is_single_shot { iterations } else { num_ledgers },
+        num_ledgers: if is_single_shot {
+            iterations
+        } else {
+            num_ledgers
+        },
         classic_txs_per_ledger,
         ledger_max_dependent_tx_clusters: clusters,
         ..ApplyLoadConfig::default()
     };
 
-    println!("apply-load: mode={:?}, num_ledgers={}, classic_txs_per_ledger={}, clusters={}",
-        mode, num_ledgers, classic_txs_per_ledger, clusters);
+    println!(
+        "apply-load: mode={:?}, num_ledgers={}, classic_txs_per_ledger={}, clusters={}",
+        mode, num_ledgers, classic_txs_per_ledger, clusters
+    );
     println!();
 
     // Construct the harness (performs full setup: accounts, contracts, bucket list).
@@ -1682,14 +1706,20 @@ async fn cmd_apply_load(
         ApplyLoadMode::MaxSacTps if is_single_shot => {
             // Round tx_count down to nearest multiple of clusters.
             let txs = (tx_count / clusters) * clusters;
-            println!("Single-shot: closing {} ledgers with {} SAC TXs across {} clusters...", iterations, txs, clusters);
+            println!(
+                "Single-shot: closing {} ledgers with {} SAC TXs across {} clusters...",
+                iterations, txs, clusters
+            );
             println!();
 
             let avg_ms = harness.benchmark_sac_tps(txs)?;
 
             println!();
             println!("=== Single-Shot Result ({} iterations) ===", iterations);
-            println!("TXs/ledger: {}, Clusters: {}, Avg close: {:.1}ms", txs, clusters, avg_ms);
+            println!(
+                "TXs/ledger: {}, Clusters: {}, Avg close: {:.1}ms",
+                txs, clusters, avg_ms
+            );
             println!("Average TPS: {:.0}", txs as f64 / (avg_ms / 1000.0));
             println!("Success rate: {:.1}%", harness.success_rate() * 100.0);
         }
@@ -1718,10 +1748,7 @@ async fn cmd_apply_load(
 fn cmd_force_scp(config: &AppConfig) -> anyhow::Result<()> {
     let db_path = &config.database.path;
     if !db_path.exists() {
-        anyhow::bail!(
-            "Database not found at {:?}. Run new-db first.",
-            db_path
-        );
+        anyhow::bail!("Database not found at {:?}. Run new-db first.", db_path);
     }
 
     let db = henyey_db::Database::open(db_path)?;
@@ -1743,8 +1770,7 @@ fn cmd_force_scp(config: &AppConfig) -> anyhow::Result<()> {
 /// `new-hist` command for local filesystem archives.
 async fn cmd_new_hist(config: &AppConfig, name: &str) -> anyhow::Result<()> {
     use henyey_history::{
-        ArchiveEntry, HistoryArchiveManager, RemoteArchive,
-        remote_archive::RemoteArchiveConfig,
+        remote_archive::RemoteArchiveConfig, ArchiveEntry, HistoryArchiveManager, RemoteArchive,
     };
 
     // Find the named archive in config
@@ -1776,7 +1802,9 @@ async fn cmd_new_hist(config: &AppConfig, name: &str) -> anyhow::Result<()> {
     manager.add_archive(ArchiveEntry::write_only(name.to_string(), remote));
 
     // Initialize the archive
-    manager.initialize_history_archive(name).await
+    manager
+        .initialize_history_archive(name)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to initialize archive '{}': {}", name, e))?;
 
     println!("History archive '{}' initialized successfully", name);
@@ -1936,7 +1964,16 @@ fn cmd_offline_info(config: AppConfig) -> anyhow::Result<()> {
                     flags,
                 )
             } else {
-                (seq as i64, String::new(), 0i64, 0i64, 0i64, 0i64, 0i64, 0i64)
+                (
+                    seq as i64,
+                    String::new(),
+                    0i64,
+                    0i64,
+                    0i64,
+                    0i64,
+                    0i64,
+                    0i64,
+                )
             }
         } else {
             (0i64, String::new(), 0i64, 0i64, 0i64, 0i64, 0i64, 0i64)
@@ -1947,11 +1984,7 @@ fn cmd_offline_info(config: AppConfig) -> anyhow::Result<()> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    let age = if close_time > 0 {
-        now - close_time
-    } else {
-        0
-    };
+    let age = if close_time > 0 { now - close_time } else { 0 };
 
     // Build the JSON response matching stellar-core's format.
     // The Go code only reads info.ledger.num, but we provide the full
@@ -2237,20 +2270,18 @@ async fn cmd_verify_history(
 
 /// Publish history command handler.
 async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<()> {
-    use std::fs;
-    use std::path::PathBuf;
     use henyey_bucket::{BucketList, BucketManager};
     use henyey_common::Hash256;
     use henyey_history::archive_state::HistoryArchiveState;
     use henyey_history::checkpoint::{checkpoint_containing, next_checkpoint};
-    use henyey_history::paths::root_has_path;
-    use henyey_history::publish::{
-        build_history_archive_state, PublishConfig, PublishManager,
-    };
-    use henyey_history::verify;
     use henyey_history::checkpoint_frequency;
+    use henyey_history::paths::root_has_path;
+    use henyey_history::publish::{build_history_archive_state, PublishConfig, PublishManager};
+    use henyey_history::verify;
     use henyey_ledger::compute_header_hash;
     use henyey_ledger::TransactionSetVariant;
+    use std::fs;
+    use std::path::PathBuf;
     use stellar_xdr::curr::TransactionHistoryEntryExt;
     use url::Url;
 
@@ -2327,11 +2358,10 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
     println!("Current ledger in database: {}", current_ledger);
 
     // Calculate checkpoints to publish
-    let latest_checkpoint =
-        henyey_history::checkpoint::latest_checkpoint_before_or_at(current_ledger)
-            .ok_or_else(|| {
-                anyhow::anyhow!("No checkpoint available for ledger {}", current_ledger)
-            })?;
+    let latest_checkpoint = henyey_history::checkpoint::latest_checkpoint_before_or_at(
+        current_ledger,
+    )
+    .ok_or_else(|| anyhow::anyhow!("No checkpoint available for ledger {}", current_ledger))?;
 
     println!("Latest publishable checkpoint: {}", latest_checkpoint);
 
@@ -2532,7 +2562,14 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
             };
             let manager = PublishManager::new(publish_config);
             manager
-                .publish_checkpoint(checkpoint, &headers, &tx_entries, &tx_results, &bucket_list, None)
+                .publish_checkpoint(
+                    checkpoint,
+                    &headers,
+                    &tx_entries,
+                    &tx_results,
+                    &bucket_list,
+                    None,
+                )
                 .await?;
 
             let has = build_history_archive_state(
@@ -2561,7 +2598,14 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
                 continue;
             }
             manager
-                .publish_checkpoint(checkpoint, &headers, &tx_entries, &tx_results, &bucket_list, None)
+                .publish_checkpoint(
+                    checkpoint,
+                    &headers,
+                    &tx_entries,
+                    &tx_results,
+                    &bucket_list,
+                    None,
+                )
                 .await?;
             write_scp_history_file(path, checkpoint, &scp_entries)?;
             let has = build_history_archive_state(
@@ -2626,8 +2670,8 @@ fn build_scp_history_entries(
     start_ledger: u32,
     checkpoint: u32,
 ) -> anyhow::Result<Vec<stellar_xdr::curr::ScpHistoryEntry>> {
-    use std::collections::HashSet;
     use henyey_common::Hash256;
+    use std::collections::HashSet;
     use stellar_xdr::curr::{LedgerScpMessages, ScpHistoryEntry, ScpHistoryEntryV0};
 
     let mut entries = Vec::new();
@@ -2683,8 +2727,8 @@ fn write_scp_history_file(
 ) -> anyhow::Result<()> {
     use flate2::write::GzEncoder;
     use flate2::Compression;
-    use std::io::Write;
     use henyey_history::paths::checkpoint_path;
+    use std::io::Write;
     use stellar_xdr::curr::Limits;
 
     let path = base_dir.join(checkpoint_path("scp", checkpoint, "xdr.gz"));
@@ -2707,9 +2751,7 @@ fn write_scp_history_file(
 /// Extracts the quorum set hash from an SCP statement.
 ///
 /// Different SCP pledge types store the quorum set hash in different fields.
-fn scp_quorum_set_hash(
-    statement: &stellar_xdr::curr::ScpStatement,
-) -> stellar_xdr::curr::Hash {
+fn scp_quorum_set_hash(statement: &stellar_xdr::curr::ScpStatement) -> stellar_xdr::curr::Hash {
     match &statement.pledges {
         stellar_xdr::curr::ScpStatementPledges::Nominate(nom) => nom.quorum_set_hash.clone(),
         stellar_xdr::curr::ScpStatementPledges::Prepare(prep) => prep.quorum_set_hash.clone(),
@@ -2908,8 +2950,7 @@ async fn download_buckets_parallel(
     // This builds the in-memory index for each bucket (SHA256 hash + offset index).
     // Thread safety: load_bucket takes read lock to check cache, then brief write lock to insert.
     let load_start = std::time::Instant::now();
-    let unique_hashes_vec: Vec<henyey_common::Hash256> =
-        unique_hashes.into_iter().collect();
+    let unique_hashes_vec: Vec<henyey_common::Hash256> = unique_hashes.into_iter().collect();
     let load_count = unique_hashes_vec.len();
 
     let load_results: Vec<anyhow::Result<()>> = stream::iter(unique_hashes_vec.into_iter())
@@ -3140,9 +3181,7 @@ fn print_tx_result_diffs(
     our_results: &[stellar_xdr::curr::TransactionResultPair],
     cdp_results: &[stellar_xdr::curr::TransactionResultPair],
 ) {
-    use stellar_xdr::curr::{
-        InnerTransactionResultResult, TransactionResultResult, WriteXdr,
-    };
+    use stellar_xdr::curr::{InnerTransactionResultResult, TransactionResultResult, WriteXdr};
     println!(
         "    TX count: ours={} CDP={}",
         our_results.len(),
@@ -3261,14 +3300,8 @@ fn print_tx_result_diffs(
                             );
                         }
                     } else {
-                        println!(
-                            "        Inner result ours: {:?}",
-                            our_inner.result.result
-                        );
-                        println!(
-                            "        Inner result CDP:  {:?}",
-                            cdp_inner.result.result
-                        );
+                        println!("        Inner result ours: {:?}", our_inner.result.result);
+                        println!("        Inner result CDP:  {:?}", cdp_inner.result.result);
                     }
                 }
                 (
@@ -3306,10 +3339,7 @@ fn print_tx_result_diffs(
                     {
                         print_all_ops("CDP inner", cdp_ops);
                     } else {
-                        println!(
-                            "        CDP inner result: {:?}",
-                            cdp_inner.result.result
-                        );
+                        println!("        CDP inner result: {:?}", cdp_inner.result.result);
                     }
                 }
                 (
@@ -3320,10 +3350,7 @@ fn print_tx_result_diffs(
                         "        Inner fee: ours={} CDP={}",
                         our_inner.result.fee_charged, cdp_inner.result.fee_charged
                     );
-                    println!(
-                        "        Ours inner result: {:?}",
-                        our_inner.result.result
-                    );
+                    println!("        Ours inner result: {:?}", our_inner.result.result);
                     if let InnerTransactionResultResult::TxSuccess(cdp_ops) =
                         &cdp_inner.result.result
                     {
@@ -3384,7 +3411,6 @@ async fn cmd_verify_execution(
     config: AppConfig,
     opts: VerifyExecutionOptions,
 ) -> anyhow::Result<()> {
-    use std::sync::Arc;
     use henyey_bucket::{BucketList, BucketManager, HasNextState, HotArchiveBucketList};
     use henyey_common::Hash256;
     use henyey_history::cdp::{
@@ -3393,6 +3419,7 @@ async fn cmd_verify_execution(
     };
     use henyey_history::checkpoint;
     use henyey_ledger::{LedgerManager, LedgerManagerConfig};
+    use std::sync::Arc;
 
     let VerifyExecutionOptions {
         from,
@@ -3425,9 +3452,11 @@ async fn cmd_verify_execution(
     // Set network-specific CDP defaults
     let cdp_url = cdp_url.unwrap_or_else(|| {
         if is_mainnet {
-            "https://aws-public-blockchain.s3.us-east-2.amazonaws.com/v1.1/stellar/ledgers/pubnet".to_string()
+            "https://aws-public-blockchain.s3.us-east-2.amazonaws.com/v1.1/stellar/ledgers/pubnet"
+                .to_string()
         } else {
-            "https://aws-public-blockchain.s3.us-east-2.amazonaws.com/v1.1/stellar/ledgers/testnet".to_string()
+            "https://aws-public-blockchain.s3.us-east-2.amazonaws.com/v1.1/stellar/ledgers/testnet"
+                .to_string()
         }
     });
     let cdp_date = cdp_date.unwrap_or_else(|| {
@@ -3450,7 +3479,11 @@ async fn cmd_verify_execution(
 
     if !quiet {
         println!("Archive: {}", config.history.archives[0].url);
-        let cdp_date_display = if cdp_date.is_empty() { "none (range-based)" } else { &cdp_date };
+        let cdp_date_display = if cdp_date.is_empty() {
+            "none (range-based)"
+        } else {
+            &cdp_date
+        };
         println!("CDP: {} (date: {})", cdp_url, cdp_date_display);
         if let Some(ref cache) = cache_base {
             println!("Cache: {}", cache.display());
@@ -3505,11 +3538,17 @@ async fn cmd_verify_execution(
         let path = temp.path().to_path_buf();
         (Some(temp), path)
     };
-    let bucket_manager = Arc::new(BucketManager::with_persist_index(bucket_path.clone(), true)?);
+    let bucket_manager = Arc::new(BucketManager::with_persist_index(
+        bucket_path.clone(),
+        true,
+    )?);
 
     // Download initial state
     if !quiet {
-        println!("Downloading initial state at checkpoint {}...", init_checkpoint);
+        println!(
+            "Downloading initial state at checkpoint {}...",
+            init_checkpoint
+        );
     }
     let init_has = archive.get_checkpoint_has(init_checkpoint).await?;
 
@@ -3530,9 +3569,21 @@ async fn cmd_verify_execution(
         .iter()
         .map(|level| HasNextState {
             state: level.next.state,
-            output: level.next.output.as_ref().and_then(|h| Hash256::from_hex(h).ok()),
-            input_curr: level.next.curr.as_ref().and_then(|h| Hash256::from_hex(h).ok()),
-            input_snap: level.next.snap.as_ref().and_then(|h| Hash256::from_hex(h).ok()),
+            output: level
+                .next
+                .output
+                .as_ref()
+                .and_then(|h| Hash256::from_hex(h).ok()),
+            input_curr: level
+                .next
+                .curr
+                .as_ref()
+                .and_then(|h| Hash256::from_hex(h).ok()),
+            input_snap: level
+                .next
+                .snap
+                .as_ref()
+                .and_then(|h| Hash256::from_hex(h).ok()),
         })
         .collect();
 
@@ -3556,9 +3607,21 @@ async fn cmd_verify_execution(
                 .iter()
                 .map(|level| HasNextState {
                     state: level.next.state,
-                    output: level.next.output.as_ref().and_then(|h| Hash256::from_hex(h).ok()),
-                    input_curr: level.next.curr.as_ref().and_then(|h| Hash256::from_hex(h).ok()),
-                    input_snap: level.next.snap.as_ref().and_then(|h| Hash256::from_hex(h).ok()),
+                    output: level
+                        .next
+                        .output
+                        .as_ref()
+                        .and_then(|h| Hash256::from_hex(h).ok()),
+                    input_curr: level
+                        .next
+                        .curr
+                        .as_ref()
+                        .and_then(|h| Hash256::from_hex(h).ok()),
+                    input_snap: level
+                        .next
+                        .snap
+                        .as_ref()
+                        .and_then(|h| Hash256::from_hex(h).ok()),
                 })
                 .collect()
         });
@@ -3592,22 +3655,24 @@ async fn cmd_verify_execution(
     // Download buckets
     let (cached, downloaded) =
         download_buckets_parallel(&archive, bucket_manager.clone(), all_hashes).await?;
-    println!("[INIT] Bucket download: {} cached, {} downloaded", cached, downloaded);
+    println!(
+        "[INIT] Bucket download: {} cached, {} downloaded",
+        cached, downloaded
+    );
 
     // Restore bucket lists
-    let mut bucket_list = BucketList::restore_from_has(
-        &bucket_hashes,
-        &live_next_states,
-        |hash| bucket_manager.load_bucket(hash).map(|b| (*b).clone()),
-    )?;
+    let mut bucket_list =
+        BucketList::restore_from_has(&bucket_hashes, &live_next_states, |hash| {
+            bucket_manager.load_bucket(hash).map(|b| (*b).clone())
+        })?;
     bucket_list.set_bucket_dir(bucket_manager.bucket_dir().to_path_buf());
 
     let mut hot_archive_bucket_list = match (&hot_archive_hashes, &hot_archive_next_states) {
-        (Some(ref hashes), Some(ref next_states)) => HotArchiveBucketList::restore_from_has(
-            hashes,
-            next_states,
-            |hash| bucket_manager.load_hot_archive_bucket(hash),
-        )?,
+        (Some(ref hashes), Some(ref next_states)) => {
+            HotArchiveBucketList::restore_from_has(hashes, next_states, |hash| {
+                bucket_manager.load_hot_archive_bucket(hash)
+            })?
+        }
         _ => HotArchiveBucketList::new(),
     };
 
@@ -3629,13 +3694,15 @@ async fn cmd_verify_execution(
     // In stellar-core online mode, restartMerges uses mLevels[i-1].getSnap() (the old snap
     // from HAS) to start merges. Without structure-based restarts, add_batch would
     // use snap() which returns the snapped curr (different input!).
-    bucket_list.restart_merges_from_has(
-        init_checkpoint,
-        init_protocol_version,
-        &live_next_states,
-        |hash| bucket_manager.load_bucket(hash).map(|b| (*b).clone()),
-        true, // restart_structure_based = true to match stellar-core online mode
-    ).await?;
+    bucket_list
+        .restart_merges_from_has(
+            init_checkpoint,
+            init_protocol_version,
+            &live_next_states,
+            |hash| bucket_manager.load_bucket(hash).map(|b| (*b).clone()),
+            true, // restart_structure_based = true to match stellar-core online mode
+        )
+        .await?;
 
     if let Some(ref ha_next_states) = hot_archive_next_states {
         hot_archive_bucket_list.restart_merges_from_has(
@@ -3658,9 +3725,8 @@ async fn cmd_verify_execution(
     );
 
     // Wire merge map for bucket merge deduplication during replay.
-    let finished_merges = std::sync::Arc::new(std::sync::RwLock::new(
-        henyey_bucket::BucketMergeMap::new(),
-    ));
+    let finished_merges =
+        std::sync::Arc::new(std::sync::RwLock::new(henyey_bucket::BucketMergeMap::new()));
     ledger_manager.set_merge_map(finished_merges);
 
     let init_header_entry = init_header_entry
@@ -3673,7 +3739,10 @@ async fn cmd_verify_execution(
         init_header_hash,
     )?;
 
-    println!("[INIT] TOTAL initialization: {:.2}s", init_start.elapsed().as_secs_f64());
+    println!(
+        "[INIT] TOTAL initialization: {:.2}s",
+        init_start.elapsed().as_secs_f64()
+    );
 
     // Track results
     let mut ledgers_verified = 0u32;
@@ -3809,14 +3878,20 @@ async fn cmd_verify_execution(
                     println!();
                     println!("  Ledger {}: MISMATCH", seq);
                     if !header_matches {
-                        println!("    Header hash: ours={} expected={}",
-                            result.header_hash.to_hex(), expected_header_hash.to_hex());
+                        println!(
+                            "    Header hash: ours={} expected={}",
+                            result.header_hash.to_hex(),
+                            expected_header_hash.to_hex()
+                        );
                         let bucket_levels = ledger_manager.bucket_list_levels();
                         print_header_field_diffs(&result.header, &cdp_header, &bucket_levels);
                     }
                     if !tx_result_matches {
-                        println!("    TX result hash: ours={} expected={}",
-                            our_tx_result_hash.to_hex(), expected_tx_result_hash.to_hex());
+                        println!(
+                            "    TX result hash: ours={} expected={}",
+                            our_tx_result_hash.to_hex(),
+                            expected_tx_result_hash.to_hex()
+                        );
                     }
 
                     if show_diff && !tx_result_matches {
@@ -3828,38 +3903,82 @@ async fn cmd_verify_execution(
                         // Extract eviction data from CDP meta
                         let cdp_evicted_keys = henyey_history::cdp::extract_evicted_keys(&lcm);
                         let tx_metas = henyey_history::cdp::extract_transaction_metas(&lcm);
-                        let cdp_restored_keys = henyey_history::cdp::extract_restored_keys(&tx_metas);
+                        let cdp_restored_keys =
+                            henyey_history::cdp::extract_restored_keys(&tx_metas);
 
                         // Count CDP entry changes
                         let mut cdp_creates = 0u32;
                         let mut cdp_updates = 0u32;
                         let mut cdp_deletes = 0u32;
                         for tx_meta in &tx_metas {
-                            fn count_changes(changes: &[stellar_xdr::curr::LedgerEntryChange], creates: &mut u32, updates: &mut u32, deletes: &mut u32) {
+                            fn count_changes(
+                                changes: &[stellar_xdr::curr::LedgerEntryChange],
+                                creates: &mut u32,
+                                updates: &mut u32,
+                                deletes: &mut u32,
+                            ) {
                                 for change in changes {
                                     match change {
-                                        stellar_xdr::curr::LedgerEntryChange::Created(_) => *creates += 1,
-                                        stellar_xdr::curr::LedgerEntryChange::Updated(_) => *updates += 1,
-                                        stellar_xdr::curr::LedgerEntryChange::Removed(_) => *deletes += 1,
-                                        stellar_xdr::curr::LedgerEntryChange::Restored(_) => *updates += 1,
-                                        stellar_xdr::curr::LedgerEntryChange::State(_) => {},
+                                        stellar_xdr::curr::LedgerEntryChange::Created(_) => {
+                                            *creates += 1
+                                        }
+                                        stellar_xdr::curr::LedgerEntryChange::Updated(_) => {
+                                            *updates += 1
+                                        }
+                                        stellar_xdr::curr::LedgerEntryChange::Removed(_) => {
+                                            *deletes += 1
+                                        }
+                                        stellar_xdr::curr::LedgerEntryChange::Restored(_) => {
+                                            *updates += 1
+                                        }
+                                        stellar_xdr::curr::LedgerEntryChange::State(_) => {}
                                     }
                                 }
                             }
                             match tx_meta {
                                 stellar_xdr::curr::TransactionMeta::V3(v3) => {
-                                    count_changes(&v3.tx_changes_before, &mut cdp_creates, &mut cdp_updates, &mut cdp_deletes);
+                                    count_changes(
+                                        &v3.tx_changes_before,
+                                        &mut cdp_creates,
+                                        &mut cdp_updates,
+                                        &mut cdp_deletes,
+                                    );
                                     for op in v3.operations.iter() {
-                                        count_changes(&op.changes, &mut cdp_creates, &mut cdp_updates, &mut cdp_deletes);
+                                        count_changes(
+                                            &op.changes,
+                                            &mut cdp_creates,
+                                            &mut cdp_updates,
+                                            &mut cdp_deletes,
+                                        );
                                     }
-                                    count_changes(&v3.tx_changes_after, &mut cdp_creates, &mut cdp_updates, &mut cdp_deletes);
+                                    count_changes(
+                                        &v3.tx_changes_after,
+                                        &mut cdp_creates,
+                                        &mut cdp_updates,
+                                        &mut cdp_deletes,
+                                    );
                                 }
                                 stellar_xdr::curr::TransactionMeta::V4(v4) => {
-                                    count_changes(&v4.tx_changes_before, &mut cdp_creates, &mut cdp_updates, &mut cdp_deletes);
+                                    count_changes(
+                                        &v4.tx_changes_before,
+                                        &mut cdp_creates,
+                                        &mut cdp_updates,
+                                        &mut cdp_deletes,
+                                    );
                                     for op in v4.operations.iter() {
-                                        count_changes(&op.changes, &mut cdp_creates, &mut cdp_updates, &mut cdp_deletes);
+                                        count_changes(
+                                            &op.changes,
+                                            &mut cdp_creates,
+                                            &mut cdp_updates,
+                                            &mut cdp_deletes,
+                                        );
                                     }
-                                    count_changes(&v4.tx_changes_after, &mut cdp_creates, &mut cdp_updates, &mut cdp_deletes);
+                                    count_changes(
+                                        &v4.tx_changes_after,
+                                        &mut cdp_creates,
+                                        &mut cdp_updates,
+                                        &mut cdp_deletes,
+                                    );
                                 }
                                 _ => {}
                             }
@@ -3872,8 +3991,12 @@ async fn cmd_verify_execution(
                         for um in &cdp_upgrade_metas {
                             for change in um.changes.iter() {
                                 match change {
-                                    stellar_xdr::curr::LedgerEntryChange::Created(_) => upgrade_creates += 1,
-                                    stellar_xdr::curr::LedgerEntryChange::Updated(_) => upgrade_updates += 1,
+                                    stellar_xdr::curr::LedgerEntryChange::Created(_) => {
+                                        upgrade_creates += 1
+                                    }
+                                    stellar_xdr::curr::LedgerEntryChange::Updated(_) => {
+                                        upgrade_updates += 1
+                                    }
                                     _ => {}
                                 }
                             }
@@ -3897,7 +4020,9 @@ async fn cmd_verify_execution(
                                                 }
                                                 other => format!("{:?}", std::mem::discriminant(other)),
                                             };
-                                            let xdr_bytes = entry.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
+                                            let xdr_bytes = entry
+                                                .to_xdr(stellar_xdr::curr::Limits::none())
+                                                .unwrap_or_default();
                                             let xdr_size = xdr_bytes.len();
                                             let hash = {
                                                 let mut h = Sha256::new();
@@ -3915,7 +4040,9 @@ async fn cmd_verify_execution(
                                                 }
                                                 other => format!("{:?}", std::mem::discriminant(other)),
                                             };
-                                            let xdr_bytes = entry.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
+                                            let xdr_bytes = entry
+                                                .to_xdr(stellar_xdr::curr::Limits::none())
+                                                .unwrap_or_default();
                                             let xdr_size = xdr_bytes.len();
                                             let hash = {
                                                 let mut h = Sha256::new();
@@ -3933,7 +4060,10 @@ async fn cmd_verify_execution(
                                                 }
                                                 other => format!("{:?}", std::mem::discriminant(other)),
                                             };
-                                            println!("      upgrade[{}] State(before): key={}", ui, key_str);
+                                            println!(
+                                                "      upgrade[{}] State(before): key={}",
+                                                ui, key_str
+                                            );
                                         }
                                         _ => {}
                                     }
@@ -3946,29 +4076,51 @@ async fn cmd_verify_execution(
                             use sha2::{Digest, Sha256};
                             // Coalesce: keep last Updated entry per key
                             // Include ALL change sources: fee_processing, tx_apply_processing, and post_tx_apply_fee_processing
-                            let mut final_entries: std::collections::HashMap<Vec<u8>, stellar_xdr::curr::LedgerEntry> = std::collections::HashMap::new();
+                            let mut final_entries: std::collections::HashMap<
+                                Vec<u8>,
+                                stellar_xdr::curr::LedgerEntry,
+                            > = std::collections::HashMap::new();
                             // Helper to process a slice of changes into the coalesced map
-                            let coalesce_changes = |changes: &[stellar_xdr::curr::LedgerEntryChange], map: &mut std::collections::HashMap<Vec<u8>, stellar_xdr::curr::LedgerEntry>| {
-                                for change in changes {
-                                    match change {
-                                        stellar_xdr::curr::LedgerEntryChange::Updated(entry)
-                                        | stellar_xdr::curr::LedgerEntryChange::Created(entry)
-                                        | stellar_xdr::curr::LedgerEntryChange::Restored(entry) => {
-                                            let key = henyey_common::entry_to_key(entry);
-                                            if let Ok(kb) = key.to_xdr(stellar_xdr::curr::Limits::none()) {
-                                                map.insert(kb, entry.clone());
+                            let coalesce_changes =
+                                |changes: &[stellar_xdr::curr::LedgerEntryChange],
+                                 map: &mut std::collections::HashMap<
+                                    Vec<u8>,
+                                    stellar_xdr::curr::LedgerEntry,
+                                >| {
+                                    for change in changes {
+                                        match change {
+                                            stellar_xdr::curr::LedgerEntryChange::Updated(
+                                                entry,
+                                            )
+                                            | stellar_xdr::curr::LedgerEntryChange::Created(
+                                                entry,
+                                            )
+                                            | stellar_xdr::curr::LedgerEntryChange::Restored(
+                                                entry,
+                                            ) => {
+                                                let key = henyey_common::entry_to_key(entry);
+                                                if let Ok(kb) =
+                                                    key.to_xdr(stellar_xdr::curr::Limits::none())
+                                                {
+                                                    map.insert(kb, entry.clone());
+                                                }
                                             }
-                                        }
-                                        stellar_xdr::curr::LedgerEntryChange::Removed(key) => {
-                                            if let Ok(kb) = key.to_xdr(stellar_xdr::curr::Limits::none()) {
-                                                map.remove(&kb);
+                                            stellar_xdr::curr::LedgerEntryChange::Removed(key) => {
+                                                if let Ok(kb) =
+                                                    key.to_xdr(stellar_xdr::curr::Limits::none())
+                                                {
+                                                    map.remove(&kb);
+                                                }
                                             }
+                                            _ => {}
                                         }
-                                        _ => {}
                                     }
-                                }
-                            };
-                            let coalesce_tx_meta = |meta: &stellar_xdr::curr::TransactionMeta, map: &mut std::collections::HashMap<Vec<u8>, stellar_xdr::curr::LedgerEntry>| {
+                                };
+                            let coalesce_tx_meta = |meta: &stellar_xdr::curr::TransactionMeta,
+                                                    map: &mut std::collections::HashMap<
+                                Vec<u8>,
+                                stellar_xdr::curr::LedgerEntry,
+                            >| {
                                 match meta {
                                     stellar_xdr::curr::TransactionMeta::V3(v3) => {
                                         coalesce_changes(&v3.tx_changes_before, map);
@@ -3992,37 +4144,58 @@ async fn cmd_verify_execution(
                                 stellar_xdr::curr::LedgerCloseMeta::V0(v0) => {
                                     for tp in v0.tx_processing.iter() {
                                         coalesce_changes(&tp.fee_processing, &mut final_entries);
-                                        coalesce_tx_meta(&tp.tx_apply_processing, &mut final_entries);
+                                        coalesce_tx_meta(
+                                            &tp.tx_apply_processing,
+                                            &mut final_entries,
+                                        );
                                         // V0 TransactionResultMeta has no post_tx_apply_fee_processing
                                     }
                                 }
                                 stellar_xdr::curr::LedgerCloseMeta::V1(v1) => {
                                     for tp in v1.tx_processing.iter() {
                                         coalesce_changes(&tp.fee_processing, &mut final_entries);
-                                        coalesce_tx_meta(&tp.tx_apply_processing, &mut final_entries);
+                                        coalesce_tx_meta(
+                                            &tp.tx_apply_processing,
+                                            &mut final_entries,
+                                        );
                                         // V1 TransactionResultMeta has no post_tx_apply_fee_processing
                                     }
                                 }
                                 stellar_xdr::curr::LedgerCloseMeta::V2(v2) => {
                                     for tp in v2.tx_processing.iter() {
                                         coalesce_changes(&tp.fee_processing, &mut final_entries);
-                                        coalesce_tx_meta(&tp.tx_apply_processing, &mut final_entries);
-                                        coalesce_changes(&tp.post_tx_apply_fee_processing, &mut final_entries);
+                                        coalesce_tx_meta(
+                                            &tp.tx_apply_processing,
+                                            &mut final_entries,
+                                        );
+                                        coalesce_changes(
+                                            &tp.post_tx_apply_fee_processing,
+                                            &mut final_entries,
+                                        );
                                     }
                                 }
                             }
-                            println!("    CDP TX final entries (coalesced, {} unique keys)", final_entries.len());
+                            println!(
+                                "    CDP TX final entries (coalesced, {} unique keys)",
+                                final_entries.len()
+                            );
 
                             // Compare CDP entries with our bucket list state
                             let bl = ledger_manager.bucket_list();
-                            let bl_snapshot = henyey_bucket::BucketListSnapshot::new(&bl, result.header.clone());
+                            let bl_snapshot =
+                                henyey_bucket::BucketListSnapshot::new(&bl, result.header.clone());
                             drop(bl);
                             let mut diffs = 0;
                             let mut missing = 0;
                             for (key_bytes, cdp_entry) in final_entries.iter() {
                                 use stellar_xdr::curr::ReadXdr;
-                                if let Ok(key) = stellar_xdr::curr::LedgerKey::from_xdr(key_bytes.as_slice(), stellar_xdr::curr::Limits::none()) {
-                                    let cdp_xdr = cdp_entry.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
+                                if let Ok(key) = stellar_xdr::curr::LedgerKey::from_xdr(
+                                    key_bytes.as_slice(),
+                                    stellar_xdr::curr::Limits::none(),
+                                ) {
+                                    let cdp_xdr = cdp_entry
+                                        .to_xdr(stellar_xdr::curr::Limits::none())
+                                        .unwrap_or_default();
                                     let cdp_hash = {
                                         let mut h = Sha256::new();
                                         h.update(&cdp_xdr);
@@ -4030,7 +4203,9 @@ async fn cmd_verify_execution(
                                     };
                                     match bl_snapshot.get(&key) {
                                         Some(our_entry) => {
-                                            let our_xdr = our_entry.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
+                                            let our_xdr = our_entry
+                                                .to_xdr(stellar_xdr::curr::Limits::none())
+                                                .unwrap_or_default();
                                             let our_hash = {
                                                 let mut h = Sha256::new();
                                                 h.update(&our_xdr);
@@ -4038,19 +4213,56 @@ async fn cmd_verify_execution(
                                             };
                                             if our_hash != cdp_hash {
                                                 diffs += 1;
-                                                let key_str = format!("{:?}", std::mem::discriminant(&cdp_entry.data));
-                                                println!("    ENTRY DIFF #{}: key={:?}", diffs, key_str);
-                                                println!("      CDP:  lm={} hash={}", cdp_entry.last_modified_ledger_seq, cdp_hash);
-                                                println!("      Ours: lm={} hash={}", our_entry.last_modified_ledger_seq, our_hash);
-                                                println!("      CDP  xdr: {}", hex::encode(&cdp_xdr[..cdp_xdr.len().min(200)]));
-                                                println!("      Ours xdr: {}", hex::encode(&our_xdr[..our_xdr.len().min(200)]));
+                                                let key_str = format!(
+                                                    "{:?}",
+                                                    std::mem::discriminant(&cdp_entry.data)
+                                                );
+                                                println!(
+                                                    "    ENTRY DIFF #{}: key={:?}",
+                                                    diffs, key_str
+                                                );
+                                                println!(
+                                                    "      CDP:  lm={} hash={}",
+                                                    cdp_entry.last_modified_ledger_seq, cdp_hash
+                                                );
+                                                println!(
+                                                    "      Ours: lm={} hash={}",
+                                                    our_entry.last_modified_ledger_seq, our_hash
+                                                );
+                                                println!(
+                                                    "      CDP  xdr: {}",
+                                                    hex::encode(&cdp_xdr[..cdp_xdr.len().min(200)])
+                                                );
+                                                println!(
+                                                    "      Ours xdr: {}",
+                                                    hex::encode(&our_xdr[..our_xdr.len().min(200)])
+                                                );
                                                 // For offers, show readable details
-                                                if let (stellar_xdr::curr::LedgerEntryData::Offer(cdp_o), stellar_xdr::curr::LedgerEntryData::Offer(our_o)) = (&cdp_entry.data, &our_entry.data) {
+                                                if let (
+                                                    stellar_xdr::curr::LedgerEntryData::Offer(
+                                                        cdp_o,
+                                                    ),
+                                                    stellar_xdr::curr::LedgerEntryData::Offer(
+                                                        our_o,
+                                                    ),
+                                                ) = (&cdp_entry.data, &our_entry.data)
+                                                {
                                                     println!("      CDP  offer: seller={:?} amount={} price={}/{}", hex::encode(&{let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) = cdp_o.seller_id.0; pk.0}[..8]), cdp_o.amount, cdp_o.price.n, cdp_o.price.d);
                                                     println!("      Ours offer: seller={:?} amount={} price={}/{}", hex::encode(&{let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) = our_o.seller_id.0; pk.0}[..8]), our_o.amount, our_o.price.n, our_o.price.d);
                                                 }
-                                                if let (stellar_xdr::curr::LedgerEntryData::Account(cdp_a), stellar_xdr::curr::LedgerEntryData::Account(our_a)) = (&cdp_entry.data, &our_entry.data) {
-                                                    let cdp_pk = {let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) = cdp_a.account_id.0; hex::encode(&pk.0[..16])};
+                                                if let (
+                                                    stellar_xdr::curr::LedgerEntryData::Account(
+                                                        cdp_a,
+                                                    ),
+                                                    stellar_xdr::curr::LedgerEntryData::Account(
+                                                        our_a,
+                                                    ),
+                                                ) = (&cdp_entry.data, &our_entry.data)
+                                                {
+                                                    let cdp_pk = {
+                                                        let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) = cdp_a.account_id.0;
+                                                        hex::encode(&pk.0[..16])
+                                                    };
                                                     // Extract sponsorship counts from extensions
                                                     let get_ext = |a: &stellar_xdr::curr::AccountEntry| -> (u32, u32, u32) {
                                                         match &a.ext {
@@ -4061,16 +4273,23 @@ async fn cmd_verify_execution(
                                                             },
                                                         }
                                                     };
-                                                    let (cdp_ing, cdp_ed, cdp_sigs) = get_ext(cdp_a);
-                                                    let (our_ing, our_ed, our_sigs) = get_ext(our_a);
+                                                    let (cdp_ing, cdp_ed, cdp_sigs) =
+                                                        get_ext(cdp_a);
+                                                    let (our_ing, our_ed, our_sigs) =
+                                                        get_ext(our_a);
                                                     println!("      CDP  account: id={} balance={} seq={} sub_entries={} flags={} num_sponsoring={} num_sponsored={} signer_sponsors={}",
                                                         cdp_pk, cdp_a.balance, cdp_a.seq_num.0, cdp_a.num_sub_entries, cdp_a.flags, cdp_ing, cdp_ed, cdp_sigs);
                                                     println!("      Ours account: id={} balance={} seq={} sub_entries={} flags={} num_sponsoring={} num_sponsored={} signer_sponsors={}",
                                                         cdp_pk, our_a.balance, our_a.seq_num.0, our_a.num_sub_entries, our_a.flags, our_ing, our_ed, our_sigs);
                                                     if cdp_a.balance != our_a.balance {
-                                                        println!("      BALANCE DIFF: {} (ours - cdp)", our_a.balance - cdp_a.balance);
+                                                        println!(
+                                                            "      BALANCE DIFF: {} (ours - cdp)",
+                                                            our_a.balance - cdp_a.balance
+                                                        );
                                                     }
-                                                    if cdp_a.num_sub_entries != our_a.num_sub_entries {
+                                                    if cdp_a.num_sub_entries
+                                                        != our_a.num_sub_entries
+                                                    {
                                                         println!("      SUB_ENTRIES DIFF: {} (ours - cdp)", our_a.num_sub_entries as i64 - cdp_a.num_sub_entries as i64);
                                                     }
                                                     if cdp_ing != our_ing {
@@ -4080,7 +4299,15 @@ async fn cmd_verify_execution(
                                                         println!("      NUM_SPONSORED DIFF: {} (ours - cdp)", our_ed as i64 - cdp_ed as i64);
                                                     }
                                                 }
-                                                if let (stellar_xdr::curr::LedgerEntryData::Trustline(cdp_t), stellar_xdr::curr::LedgerEntryData::Trustline(our_t)) = (&cdp_entry.data, &our_entry.data) {
+                                                if let (
+                                                    stellar_xdr::curr::LedgerEntryData::Trustline(
+                                                        cdp_t,
+                                                    ),
+                                                    stellar_xdr::curr::LedgerEntryData::Trustline(
+                                                        our_t,
+                                                    ),
+                                                ) = (&cdp_entry.data, &our_entry.data)
+                                                {
                                                     println!("      CDP  trustline: balance={} asset={:?}", cdp_t.balance, cdp_t.asset);
                                                     println!("      Ours trustline: balance={} asset={:?}", our_t.balance, our_t.asset);
                                                 }
@@ -4090,16 +4317,26 @@ async fn cmd_verify_execution(
                                                     println!("      CDP  pool: reserve_a={} reserve_b={}", cdp_cp.reserve_a, cdp_cp.reserve_b);
                                                     println!("      Ours pool: reserve_a={} reserve_b={}", our_cp.reserve_a, our_cp.reserve_b);
                                                 }
-                                                if diffs >= 20 { break; }
+                                                if diffs >= 20 {
+                                                    break;
+                                                }
                                             }
                                         }
                                         None => {
                                             // For offers, try the offer_store instead of bucket list snapshot
                                             // (offers are not indexed in bucket list snapshot)
-                                            if let stellar_xdr::curr::LedgerEntryData::Offer(ref cdp_offer) = cdp_entry.data {
+                                            if let stellar_xdr::curr::LedgerEntryData::Offer(
+                                                ref cdp_offer,
+                                            ) = cdp_entry.data
+                                            {
                                                 let offer_store = ledger_manager.offer_store_lock();
-                                                if let Some(our_entry) = offer_store.get_ledger_entry_by_id(cdp_offer.offer_id).as_ref() {
-                                                    let our_xdr = our_entry.to_xdr(stellar_xdr::curr::Limits::none()).unwrap_or_default();
+                                                if let Some(our_entry) = offer_store
+                                                    .get_ledger_entry_by_id(cdp_offer.offer_id)
+                                                    .as_ref()
+                                                {
+                                                    let our_xdr = our_entry
+                                                        .to_xdr(stellar_xdr::curr::Limits::none())
+                                                        .unwrap_or_default();
                                                     let our_hash = {
                                                         let mut h = Sha256::new();
                                                         h.update(&our_xdr);
@@ -4118,7 +4355,10 @@ async fn cmd_verify_execution(
                                                 } else {
                                                     // Offer is truly missing from our state
                                                     missing += 1;
-                                                    let cdp_seller = {let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) = cdp_offer.seller_id.0; hex::encode(&pk.0)};
+                                                    let cdp_seller = {
+                                                        let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) = cdp_offer.seller_id.0;
+                                                        hex::encode(&pk.0)
+                                                    };
                                                     println!("    TRULY MISSING offer: id={} seller={} amount={} price={}/{} cdp_lm={}",
                                                         cdp_offer.offer_id, cdp_seller, cdp_offer.amount,
                                                         cdp_offer.price.n, cdp_offer.price.d, cdp_entry.last_modified_ledger_seq);
@@ -4142,7 +4382,10 @@ async fn cmd_verify_execution(
                                                     other => format!("{:?}", std::mem::discriminant(other)),
                                                 };
                                                 println!("    MISSING in our state: {} cdp_lm={} hash={}", key_str, cdp_entry.last_modified_ledger_seq, cdp_hash);
-                                                println!("      cdp_xdr: {}", hex::encode(&cdp_xdr[..cdp_xdr.len().min(200)]));
+                                                println!(
+                                                    "      cdp_xdr: {}",
+                                                    hex::encode(&cdp_xdr[..cdp_xdr.len().min(200)])
+                                                );
                                             }
                                         }
                                     }
@@ -4161,8 +4404,11 @@ async fn cmd_verify_execution(
                 if let Some(ref perf) = result.perf {
                     total_close_us += perf.total_us;
                     total_tx_exec_us += perf.tx_exec_us;
-                    total_commit_us += perf.commit_setup_us + perf.add_batch_us
-                        + perf.hot_archive_us + perf.header_us + perf.commit_close_us;
+                    total_commit_us += perf.commit_setup_us
+                        + perf.add_batch_us
+                        + perf.hot_archive_us
+                        + perf.header_us
+                        + perf.commit_close_us;
                     total_add_batch_us += perf.add_batch_us;
                     total_eviction_us += perf.eviction_us;
                     total_tx_count += perf.tx_count;
@@ -4183,8 +4429,7 @@ async fn cmd_verify_execution(
                     // Print per-ledger summary every 64 ledgers or if slow
                     if !quiet && (ledgers_verified % 64 == 0 || perf.total_us > 500_000) {
                         let cache_rate = if perf.cache.hits + perf.cache.misses > 0 {
-                            perf.cache.hits as f64
-                                / (perf.cache.hits + perf.cache.misses) as f64
+                            perf.cache.hits as f64 / (perf.cache.hits + perf.cache.misses) as f64
                                 * 100.0
                         } else {
                             0.0
@@ -4196,8 +4441,11 @@ async fn cmd_verify_execution(
                             seq,
                             perf.total_us as f64 / 1000.0,
                             perf.tx_exec_us as f64 / 1000.0,
-                            (perf.commit_setup_us + perf.add_batch_us + perf.hot_archive_us
-                                + perf.header_us + perf.commit_close_us) as f64
+                            (perf.commit_setup_us
+                                + perf.add_batch_us
+                                + perf.hot_archive_us
+                                + perf.header_us
+                                + perf.commit_close_us) as f64
                                 / 1000.0,
                             perf.add_batch_us as f64 / 1000.0,
                             perf.eviction_us as f64 / 1000.0,
@@ -4221,8 +4469,6 @@ async fn cmd_verify_execution(
                         }
                     }
                 }
-
-
             }
 
             // Update prev hash for next ledger
@@ -4250,8 +4496,10 @@ async fn cmd_verify_execution(
     println!();
     println!("  Total time: {:.2}s", verification_time.as_secs_f64());
     if ledgers_verified > 0 {
-        println!("  Average per ledger: {:.2}ms",
-            verification_time.as_millis() as f64 / ledgers_verified as f64);
+        println!(
+            "  Average per ledger: {:.2}ms",
+            verification_time.as_millis() as f64 / ledgers_verified as f64
+        );
     }
 
     // Performance summary
@@ -4266,12 +4514,21 @@ async fn cmd_verify_execution(
         println!("    close_ledger:  {:.2}ms", avg_close_ms);
         println!("    tx_exec:       {:.2}ms", avg_tx_exec_ms);
         println!("    commit:        {:.2}ms", avg_commit_ms);
-        println!("    add_batch:     {:.2}ms", total_add_batch_us as f64 / ledgers_verified as f64 / 1000.0);
-        println!("    eviction:      {:.2}ms", total_eviction_us as f64 / ledgers_verified as f64 / 1000.0);
+        println!(
+            "    add_batch:     {:.2}ms",
+            total_add_batch_us as f64 / ledgers_verified as f64 / 1000.0
+        );
+        println!(
+            "    eviction:      {:.2}ms",
+            total_eviction_us as f64 / ledgers_verified as f64 / 1000.0
+        );
         println!();
         println!("  Transactions:");
         println!("    total:         {}", total_tx_count);
-        println!("    avg/ledger:    {:.1}", total_tx_count as f64 / ledgers_verified as f64);
+        println!(
+            "    avg/ledger:    {:.1}",
+            total_tx_count as f64 / ledgers_verified as f64
+        );
         println!();
         println!("  Cache:");
         let overall_cache_rate = if total_cache_hits + total_cache_misses > 0 {
@@ -4284,22 +4541,37 @@ async fn cmd_verify_execution(
         println!("    total misses:  {}", total_cache_misses);
         println!();
         println!("  Memory:");
-        println!("    peak RSS:      {:.1}MB", peak_rss_bytes as f64 / (1024.0 * 1024.0));
+        println!(
+            "    peak RSS:      {:.1}MB",
+            peak_rss_bytes as f64 / (1024.0 * 1024.0)
+        );
         println!();
-        println!("  Slowest ledger:  {} ({:.1}ms)", slowest_ledger_seq, slowest_ledger_us as f64 / 1000.0);
+        println!(
+            "  Slowest ledger:  {} ({:.1}ms)",
+            slowest_ledger_seq,
+            slowest_ledger_us as f64 / 1000.0
+        );
 
         // Top 10 slowest transactions overall
         slowest_txs.sort_by(|a, b| b.2.cmp(&a.2));
         println!();
         println!("  Top 10 slowest transactions:");
         for (i, (ledger, hash, us)) in slowest_txs.iter().take(10).enumerate() {
-            println!("    {}. L{} {}..  {:.1}ms",
-                i + 1, ledger, &hash[..hash.len().min(16)], *us as f64 / 1000.0);
+            println!(
+                "    {}. L{} {}..  {:.1}ms",
+                i + 1,
+                ledger,
+                &hash[..hash.len().min(16)],
+                *us as f64 / 1000.0
+            );
         }
     }
 
     if ledgers_mismatched > 0 {
-        anyhow::bail!("Verification failed with {} mismatched ledgers", ledgers_mismatched);
+        anyhow::bail!(
+            "Verification failed with {} mismatched ledgers",
+            ledgers_mismatched
+        );
     }
 
     Ok(())
@@ -4321,10 +4593,10 @@ async fn cmd_debug_bucket_entry(
     checkpoint_seq: u32,
     account_hex: &str,
 ) -> anyhow::Result<()> {
-    use std::sync::Arc;
     use henyey_bucket::{BucketEntry, BucketList, BucketManager};
     use henyey_common::Hash256;
     use henyey_history::is_checkpoint_ledger;
+    use std::sync::Arc;
     use stellar_xdr::curr::{
         AccountId, LedgerEntryData, LedgerKey, LedgerKeyAccount, PublicKey, Uint256,
     };
@@ -4531,8 +4803,8 @@ async fn cmd_dump_ledger(
     limit: Option<u64>,
     last_modified_ledger_count: Option<u32>,
 ) -> anyhow::Result<()> {
-    use std::io::Write;
     use henyey_bucket::BucketManager;
+    use std::io::Write;
     use stellar_xdr::curr::LedgerEntryType;
 
     // Parse entry type filter if provided
@@ -4578,11 +4850,8 @@ async fn cmd_dump_ledger(
         last_modified_ledger_count.map(|count| current_ledger.saturating_sub(count));
 
     // Load bucket list snapshot for the current checkpoint
-    let checkpoint =
-        henyey_history::checkpoint::latest_checkpoint_before_or_at(current_ledger)
-            .ok_or_else(|| {
-                anyhow::anyhow!("No checkpoint available for ledger {}", current_ledger)
-            })?;
+    let checkpoint = henyey_history::checkpoint::latest_checkpoint_before_or_at(current_ledger)
+        .ok_or_else(|| anyhow::anyhow!("No checkpoint available for ledger {}", current_ledger))?;
 
     println!("Using checkpoint: {}", checkpoint);
 
@@ -4669,9 +4938,9 @@ async fn cmd_dump_ledger(
 /// 2. Bucket hash verification - verifies all bucket files have correct hashes
 /// 3. Crypto benchmarking - measures Ed25519 sign/verify performance
 async fn cmd_self_check(config: AppConfig) -> anyhow::Result<()> {
-    use std::time::Instant;
     use henyey_bucket::BucketManager;
     use henyey_crypto::SecretKey;
+    use std::time::Instant;
 
     let mut all_ok = true;
 
@@ -4739,9 +5008,8 @@ async fn cmd_self_check(config: AppConfig) -> anyhow::Result<()> {
     )?;
 
     // Get the checkpoint for the current ledger
-    let checkpoint =
-        henyey_history::checkpoint::latest_checkpoint_before_or_at(latest_seq)
-            .ok_or_else(|| anyhow::anyhow!("No checkpoint available for ledger {}", latest_seq))?;
+    let checkpoint = henyey_history::checkpoint::latest_checkpoint_before_or_at(latest_seq)
+        .ok_or_else(|| anyhow::anyhow!("No checkpoint available for ledger {}", latest_seq))?;
 
     let levels = db
         .load_bucket_list(checkpoint)?
@@ -4843,9 +5111,9 @@ async fn cmd_verify_checkpoints(
     from: Option<u32>,
     to: Option<u32>,
 ) -> anyhow::Result<()> {
-    use std::io::Write;
     use henyey_history::{checkpoint, verify};
     use henyey_ledger::compute_header_hash;
+    use std::io::Write;
 
     println!("Verifying checkpoint hashes...");
     println!();
@@ -5116,7 +5384,9 @@ mod tests {
             let has_json = conn.get_state(state_keys::HISTORY_ARCHIVE_STATE).unwrap();
             assert!(has_json.is_some());
             let has_str = has_json.unwrap();
-            assert!(has_str.contains("\"currentLedger\": 1") || has_str.contains("\"currentLedger\":1"));
+            assert!(
+                has_str.contains("\"currentLedger\": 1") || has_str.contains("\"currentLedger\":1")
+            );
 
             // Verify ledger header is stored
             let header = conn.load_ledger_header(1).unwrap();
@@ -5184,9 +5454,10 @@ mod tests {
             // (it should include 11 accounts instead of 1)
             let db2 = henyey_db::Database::open_in_memory().unwrap();
             initialize_genesis_ledger(&db2, passphrase, 0).unwrap();
-            let header0 = db2.with_connection(|c| {
-                c.load_ledger_header(1)
-            }).unwrap().unwrap();
+            let header0 = db2
+                .with_connection(|c| c.load_ledger_header(1))
+                .unwrap()
+                .unwrap();
             assert_ne!(header.bucket_list_hash, header0.bucket_list_hash);
 
             Ok(())

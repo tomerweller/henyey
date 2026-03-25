@@ -36,7 +36,9 @@ impl App {
 
             // Record local close time for drift tracking before triggering consensus.
             // This captures when we started the consensus round.
-            let local_time = self.clock.system_now()
+            let local_time = self
+                .clock
+                .system_now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
@@ -51,12 +53,15 @@ impl App {
             // 4. Start SCP nomination with that value
 
             // For now, trigger the herder
-            self.consensus_trigger_attempts.fetch_add(1, Ordering::Relaxed);
+            self.consensus_trigger_attempts
+                .fetch_add(1, Ordering::Relaxed);
             if let Err(e) = self.herder.trigger_next_ledger(next_slot).await {
-                self.consensus_trigger_failures.fetch_add(1, Ordering::Relaxed);
+                self.consensus_trigger_failures
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::error!(error = %e, slot = next_slot, "Failed to trigger ledger");
             } else {
-                self.consensus_trigger_successes.fetch_add(1, Ordering::Relaxed);
+                self.consensus_trigger_successes
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -154,11 +159,9 @@ impl App {
             // Guard against concurrent catchup
             if !self.catchup_in_progress.swap(true, Ordering::SeqCst) {
                 self.set_state(AppState::CatchingUp).await;
-                self.herder
-                    .set_state(henyey_herder::HerderState::Syncing);
+                self.herder.set_state(henyey_herder::HerderState::Syncing);
 
-                let catchup_message_handle =
-                    self.start_catchup_message_caching_from_self().await;
+                let catchup_message_handle = self.start_catchup_message_caching_from_self().await;
 
                 self.set_phase(14); // 14 = catchup_running
                 let catchup_result = self.catchup(CatchupTarget::Current).await;
@@ -200,9 +203,7 @@ impl App {
             {
                 let mut buffer = self.syncing_ledgers.write().await;
                 let pre_count = buffer.len();
-                buffer.retain(|seq, info| {
-                    *seq > current_ledger && info.tx_set.is_some()
-                });
+                buffer.retain(|seq, info| *seq > current_ledger && info.tx_set.is_some());
                 let removed = pre_count - buffer.len();
                 if removed > 0 {
                     tracing::info!(
@@ -256,7 +257,9 @@ impl App {
         // path is catchup — requesting SCP state from peers is futile.
         let next_slot = current_ledger as u64 + 1;
         if latest_externalized > next_slot {
-            let missing_slots = self.herder.find_missing_slots_in_range(next_slot, latest_externalized);
+            let missing_slots = self
+                .herder
+                .find_missing_slots_in_range(next_slot, latest_externalized);
             if !missing_slots.is_empty() {
                 let missing_count = missing_slots.len();
                 let first_missing = missing_slots.first().copied().unwrap_or(0);
@@ -282,8 +285,8 @@ impl App {
                     // if the checkpoint containing that target hasn't been published,
                     // archive-based catchup would block on 404s.  Fall through to
                     // the SCP state request so peers can provide the missing data.
-                    let catchup_target = latest_externalized
-                        .saturating_sub(TX_SET_REQUEST_WINDOW) as u32;
+                    let catchup_target =
+                        latest_externalized.saturating_sub(TX_SET_REQUEST_WINDOW) as u32;
                     let target_checkpoint =
                         henyey_history::checkpoint::checkpoint_containing(catchup_target);
                     if target_checkpoint as u64 > latest_externalized {
@@ -337,9 +340,8 @@ impl App {
                         // Clear stale syncing_ledgers entries that will never be closeable
                         {
                             let mut buffer = self.syncing_ledgers.write().await;
-                            buffer.retain(|seq, info| {
-                                *seq > current_ledger && info.tx_set.is_some()
-                            });
+                            buffer
+                                .retain(|seq, info| *seq > current_ledger && info.tx_set.is_some());
                         }
                         self.maybe_start_externalized_catchup(latest_externalized)
                             .await;
@@ -437,7 +439,10 @@ impl App {
 
             // Request SCP state from peers
             let ledger_seq = current_ledger;
-            tracing::info!(ledger_seq, "Requesting SCP state from peers (recovery task)");
+            tracing::info!(
+                ledger_seq,
+                "Requesting SCP state from peers (recovery task)"
+            );
             match overlay_clone.request_scp_state(ledger_seq).await {
                 Ok(count) => {
                     tracing::info!(
@@ -566,7 +571,10 @@ impl App {
         }
     }
 
-    pub(super) fn tx_hash(&self, tx_env: &stellar_xdr::curr::TransactionEnvelope) -> Option<Hash256> {
+    pub(super) fn tx_hash(
+        &self,
+        tx_env: &stellar_xdr::curr::TransactionEnvelope,
+    ) -> Option<Hash256> {
         Hash256::hash_xdr(tx_env).ok()
     }
 
@@ -640,7 +648,8 @@ impl App {
 
         if let Some(next) = timeouts.next_nomination {
             if now >= next {
-                self.nomination_timeout_fires.fetch_add(1, Ordering::Relaxed);
+                self.nomination_timeout_fires
+                    .fetch_add(1, Ordering::Relaxed);
                 self.herder.handle_nomination_timeout(slot);
                 timeouts.next_nomination = None;
             }

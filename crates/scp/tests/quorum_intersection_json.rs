@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
-use serde::Deserialize;
 use henyey_scp::quorum_config::parse_node_id;
 use henyey_scp::{is_quorum, is_quorum_slice};
+use serde::Deserialize;
 use stellar_xdr::curr::{NodeId, ScpQuorumSet};
 
 #[derive(Debug, Deserialize)]

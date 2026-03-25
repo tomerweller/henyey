@@ -46,9 +46,10 @@
 //! 4. Combined hash = SHA256(live_hash || hot_archive_hash)
 
 use crate::{is_checkpoint_ledger, verify, HistoryError, Result};
-use sha2::{Digest, Sha256};
 use henyey_bucket::{EvictionIterator, EvictionIteratorExt};
-use henyey_common::protocol::{protocol_version_is_before, protocol_version_starts_from, ProtocolVersion};
+use henyey_common::protocol::{
+    protocol_version_is_before, protocol_version_starts_from, ProtocolVersion,
+};
 use henyey_common::{Hash256, NetworkId};
 use henyey_ledger::{
     execution::{execute_transaction_set, load_soroban_config, SorobanContext},
@@ -57,11 +58,11 @@ use henyey_ledger::{
 };
 use henyey_tx::soroban::PersistentModuleCache;
 use henyey_tx::{muxed_to_account_id, LedgerContext, TransactionFrame};
+use sha2::{Digest, Sha256};
 use stellar_xdr::curr::{
-    BucketListType, ConfigSettingEntry, ConfigSettingId,
-    LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerHeader, LedgerKey, LedgerKeyConfigSetting,
-    StateArchivalSettings, TransactionEnvelope, TransactionMeta, TransactionResultPair,
-    TransactionResultSet, WriteXdr,
+    BucketListType, ConfigSettingEntry, ConfigSettingId, LedgerEntry, LedgerEntryData,
+    LedgerEntryExt, LedgerHeader, LedgerKey, LedgerKeyConfigSetting, StateArchivalSettings,
+    TransactionEnvelope, TransactionMeta, TransactionResultPair, TransactionResultSet, WriteXdr,
 };
 
 fn load_state_archival_settings(snapshot: &SnapshotHandle) -> Option<StateArchivalSettings> {
@@ -123,9 +124,8 @@ fn run_eviction_scan(
         });
     }
 
-    let iter = eviction_iterator.unwrap_or_else(|| {
-        EvictionIterator::new(eviction_settings.starting_eviction_scan_level)
-    });
+    let iter = eviction_iterator
+        .unwrap_or_else(|| EvictionIterator::new(eviction_settings.starting_eviction_scan_level));
     let eviction_result = bucket_list
         .scan_for_eviction_incremental(iter, header.ledger_seq, eviction_settings)
         .map_err(HistoryError::Bucket)?;
@@ -158,10 +158,8 @@ fn run_eviction_scan(
         })
         .collect();
 
-    let resolved = eviction_result.resolve(
-        eviction_settings.max_entries_to_archive,
-        &modified_ttl_keys,
-    );
+    let resolved =
+        eviction_result.resolve(eviction_settings.max_entries_to_archive, &modified_ttl_keys);
 
     Ok(EvictionScanResult {
         evicted_keys: resolved.evicted_keys,
@@ -207,11 +205,8 @@ fn verify_bucket_list_hash(
         expected_hash = %expected.to_hex(),
         "Verifying bucket list hash"
     );
-    let actual = combined_bucket_list_hash(
-        bucket_list,
-        hot_archive_bucket_list,
-        header.ledger_version,
-    );
+    let actual =
+        combined_bucket_list_hash(bucket_list, hot_archive_bucket_list, header.ledger_version);
     if actual != expected {
         tracing::error!(
             ledger_seq = header.ledger_seq,
@@ -276,8 +271,7 @@ fn classify_delta_entries(
                 | stellar_xdr::curr::LedgerEntryData::ContractData(_)
         );
 
-        let already_in_bucket_list =
-            should_check && bucket_list.get(&key).ok().flatten().is_some();
+        let already_in_bucket_list = should_check && bucket_list.get(&key).ok().flatten().is_some();
 
         if already_in_bucket_list {
             tracing::debug!(
@@ -321,8 +315,7 @@ fn classify_delta_entries(
 
     // Remove restored entries from dead_entries.
     if !hot_archive_restored_keys.is_empty() {
-        let restored_set: std::collections::HashSet<_> =
-            hot_archive_restored_keys.iter().collect();
+        let restored_set: std::collections::HashSet<_> = hot_archive_restored_keys.iter().collect();
         dead_entries.retain(|k| !restored_set.contains(k));
     }
 
@@ -399,8 +392,7 @@ fn compute_soroban_state_size_delta(
             }
             EntryChange::Updated { previous, current } => {
                 let old_size = soroban_entry_size(previous, protocol_version, cost_params);
-                let new_size =
-                    soroban_entry_size(current.as_ref(), protocol_version, cost_params);
+                let new_size = soroban_entry_size(current.as_ref(), protocol_version, cost_params);
                 delta += new_size - old_size;
             }
             EntryChange::Deleted { previous } => {
@@ -801,8 +793,11 @@ pub fn replay_ledger_with_execution(
     let bucket_list_ref = std::sync::Arc::new(std::sync::RwLock::new(bucket_list.clone()));
     // Also include hot archive bucket list for archived entries and their TTLs.
     // Use parking_lot::RwLock<Option<...>> to match the type expected by execute_transaction_set.
-    let hot_archive_ref: std::sync::Arc<parking_lot::RwLock<Option<henyey_bucket::HotArchiveBucketList>>> =
-        std::sync::Arc::new(parking_lot::RwLock::new(Some(hot_archive_bucket_list.clone())));
+    let hot_archive_ref: std::sync::Arc<
+        parking_lot::RwLock<Option<henyey_bucket::HotArchiveBucketList>>,
+    > = std::sync::Arc::new(parking_lot::RwLock::new(Some(
+        hot_archive_bucket_list.clone(),
+    )));
     let hot_archive_for_lookup = hot_archive_ref.clone();
     let lookup_fn = std::sync::Arc::new(move |key: &LedgerKey| {
         // First try the live bucket list
@@ -858,24 +853,24 @@ pub fn replay_ledger_with_execution(
         *network_id,
     );
     let mut tx_set_result = execute_transaction_set(
-            &snapshot,
-            &transactions,
-            &ledger_context,
-            &mut delta,
-            SorobanContext {
-                config: soroban_config,
-                base_prng_seed: soroban_base_prng_seed.0,
-                classic_events,
-                module_cache,
-                hot_archive: Some(hot_archive_ref.clone()),
-                runtime_handle: None,
-                soroban_state: None,
-                offer_store: None,
-                emit_soroban_tx_meta_ext_v1: false,
-                enable_soroban_diagnostic_events: false,
-            },
-        )
-        .map_err(|e| HistoryError::CatchupFailed(format!("replay execution failed: {}", e)))?;
+        &snapshot,
+        &transactions,
+        &ledger_context,
+        &mut delta,
+        SorobanContext {
+            config: soroban_config,
+            base_prng_seed: soroban_base_prng_seed.0,
+            classic_events,
+            module_cache,
+            hot_archive: Some(hot_archive_ref.clone()),
+            runtime_handle: None,
+            soroban_state: None,
+            offer_store: None,
+            emit_soroban_tx_meta_ext_v1: false,
+            enable_soroban_diagnostic_events: false,
+        },
+    )
+    .map_err(|e| HistoryError::CatchupFailed(format!("replay execution failed: {}", e)))?;
 
     // Add fee events to transaction metadata (matching online mode behavior)
     if classic_events.events_enabled(header.ledger_version) {
@@ -899,12 +894,12 @@ pub fn replay_ledger_with_execution(
     }
 
     if config.verify_results {
-        let result_set = TransactionResultSet {
-            results: tx_set_result.tx_results
-                .clone()
-                .try_into()
-                .map_err(|_| HistoryError::CatchupFailed("tx result set too large".to_string()))?,
-        };
+        let result_set =
+            TransactionResultSet {
+                results: tx_set_result.tx_results.clone().try_into().map_err(|_| {
+                    HistoryError::CatchupFailed("tx result set too large".to_string())
+                })?,
+            };
         let xdr = result_set
             .to_xdr(stellar_xdr::curr::Limits::none())
             .map_err(|e| {
@@ -994,9 +989,12 @@ pub fn replay_ledger_with_execution(
     });
     if !has_window_entry {
         if let Some(state_size) = soroban_state_size {
-            if let Some(window_entry) =
-                compute_soroban_state_size_window_entry(header.ledger_seq, bucket_list, state_size, None)
-            {
+            if let Some(window_entry) = compute_soroban_state_size_window_entry(
+                header.ledger_seq,
+                bucket_list,
+                state_size,
+                None,
+            ) {
                 tracing::debug!(
                     ledger_seq = header.ledger_seq,
                     soroban_state_size = state_size,
@@ -1083,7 +1081,8 @@ pub fn replay_ledger_with_execution(
     }
 
     let tx_count = tx_set_result.results.len() as u32;
-    let op_count: u32 = tx_set_result.results
+    let op_count: u32 = tx_set_result
+        .results
         .iter()
         .map(|r| r.operation_results.len() as u32)
         .sum();
@@ -1246,7 +1245,9 @@ pub fn extract_ledger_changes(
                     &v2.tx_changes_before,
                     v2.operations.iter().map(|op| &op.changes),
                     &v2.tx_changes_after,
-                    &mut init_entries, &mut live_entries, &mut dead_entries,
+                    &mut init_entries,
+                    &mut live_entries,
+                    &mut dead_entries,
                 );
             }
             TransactionMeta::V3(v3) => {
@@ -1254,7 +1255,9 @@ pub fn extract_ledger_changes(
                     &v3.tx_changes_before,
                     v3.operations.iter().map(|op| &op.changes),
                     &v3.tx_changes_after,
-                    &mut init_entries, &mut live_entries, &mut dead_entries,
+                    &mut init_entries,
+                    &mut live_entries,
+                    &mut dead_entries,
                 );
             }
             TransactionMeta::V4(v4) => {
@@ -1262,7 +1265,9 @@ pub fn extract_ledger_changes(
                     &v4.tx_changes_before,
                     v4.operations.iter().map(|op| &op.changes),
                     &v4.tx_changes_after,
-                    &mut init_entries, &mut live_entries, &mut dead_entries,
+                    &mut init_entries,
+                    &mut live_entries,
+                    &mut dead_entries,
                 );
             }
         }
@@ -1770,7 +1775,8 @@ mod tests {
         };
 
         // Create initial window with 5 samples
-        let initial_window: stellar_xdr::curr::VecM<u64> = vec![1000, 2000, 3000, 4000, 5000].try_into().unwrap();
+        let initial_window: stellar_xdr::curr::VecM<u64> =
+            vec![1000, 2000, 3000, 4000, 5000].try_into().unwrap();
 
         // Set up bucket list with required config entries
         let mut bucket_list = BucketList::new();
@@ -1778,26 +1784,54 @@ mod tests {
         // Add StateArchival config
         let archival_entry = LedgerEntry {
             last_modified_ledger_seq: 1,
-            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(archival.clone())),
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(
+                archival.clone(),
+            )),
             ext: LedgerEntryExt::V0,
         };
-        bucket_list.add_batch(1, 25, BucketListType::Live, vec![], vec![archival_entry], vec![]).expect("add archival");
+        bucket_list
+            .add_batch(
+                1,
+                25,
+                BucketListType::Live,
+                vec![],
+                vec![archival_entry],
+                vec![],
+            )
+            .expect("add archival");
 
         // Add LiveSorobanStateSizeWindow config
         let window_entry = LedgerEntry {
             last_modified_ledger_seq: 1,
-            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(initial_window)),
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(
+                initial_window,
+            )),
             ext: LedgerEntryExt::V0,
         };
-        bucket_list.add_batch(2, 25, BucketListType::Live, vec![], vec![window_entry], vec![]).expect("add window");
+        bucket_list
+            .add_batch(
+                2,
+                25,
+                BucketListType::Live,
+                vec![],
+                vec![window_entry],
+                vec![],
+            )
+            .expect("add window");
 
         // Test at sample boundary (seq % 100 == 0) with new state size 6000
-        let result = compute_soroban_state_size_window_entry(200, &bucket_list, 6000, Some(&archival));
-        assert!(result.is_some(), "Should produce window entry at sample boundary");
+        let result =
+            compute_soroban_state_size_window_entry(200, &bucket_list, 6000, Some(&archival));
+        assert!(
+            result.is_some(),
+            "Should produce window entry at sample boundary"
+        );
 
         let entry = result.unwrap();
         match entry.data {
-            LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(window)) => {
+            LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(
+                window,
+            )) => {
                 let window_vec: Vec<u64> = window.into();
                 // Old window: [1000, 2000, 3000, 4000, 5000]
                 // After sample: [2000, 3000, 4000, 5000, 6000]
@@ -1818,27 +1852,54 @@ mod tests {
             ..StateArchivalSettings::default()
         };
 
-        let initial_window: stellar_xdr::curr::VecM<u64> = vec![1000, 2000, 3000, 4000, 5000].try_into().unwrap();
+        let initial_window: stellar_xdr::curr::VecM<u64> =
+            vec![1000, 2000, 3000, 4000, 5000].try_into().unwrap();
 
         let mut bucket_list = BucketList::new();
 
         let archival_entry = LedgerEntry {
             last_modified_ledger_seq: 1,
-            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(archival.clone())),
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(
+                archival.clone(),
+            )),
             ext: LedgerEntryExt::V0,
         };
-        bucket_list.add_batch(1, 25, BucketListType::Live, vec![], vec![archival_entry], vec![]).expect("add archival");
+        bucket_list
+            .add_batch(
+                1,
+                25,
+                BucketListType::Live,
+                vec![],
+                vec![archival_entry],
+                vec![],
+            )
+            .expect("add archival");
 
         let window_entry = LedgerEntry {
             last_modified_ledger_seq: 1,
-            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(initial_window)),
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(
+                initial_window,
+            )),
             ext: LedgerEntryExt::V0,
         };
-        bucket_list.add_batch(2, 25, BucketListType::Live, vec![], vec![window_entry], vec![]).expect("add window");
+        bucket_list
+            .add_batch(
+                2,
+                25,
+                BucketListType::Live,
+                vec![],
+                vec![window_entry],
+                vec![],
+            )
+            .expect("add window");
 
         // Test NOT at sample boundary (seq % 100 != 0)
-        let result = compute_soroban_state_size_window_entry(201, &bucket_list, 6000, Some(&archival));
-        assert!(result.is_none(), "Should NOT produce window entry when not at sample boundary");
+        let result =
+            compute_soroban_state_size_window_entry(201, &bucket_list, 6000, Some(&archival));
+        assert!(
+            result.is_none(),
+            "Should NOT produce window entry when not at sample boundary"
+        );
     }
 
     #[tokio::test]
@@ -1853,31 +1914,60 @@ mod tests {
         };
 
         // Current window has 5 entries
-        let initial_window: stellar_xdr::curr::VecM<u64> = vec![1000, 2000, 3000, 4000, 5000].try_into().unwrap();
+        let initial_window: stellar_xdr::curr::VecM<u64> =
+            vec![1000, 2000, 3000, 4000, 5000].try_into().unwrap();
 
         let mut bucket_list = BucketList::new();
 
         let archival_entry = LedgerEntry {
             last_modified_ledger_seq: 1,
-            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(archival.clone())),
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(
+                archival.clone(),
+            )),
             ext: LedgerEntryExt::V0,
         };
-        bucket_list.add_batch(1, 25, BucketListType::Live, vec![], vec![archival_entry], vec![]).expect("add archival");
+        bucket_list
+            .add_batch(
+                1,
+                25,
+                BucketListType::Live,
+                vec![],
+                vec![archival_entry],
+                vec![],
+            )
+            .expect("add archival");
 
         let window_entry = LedgerEntry {
             last_modified_ledger_seq: 1,
-            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(initial_window)),
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(
+                initial_window,
+            )),
             ext: LedgerEntryExt::V0,
         };
-        bucket_list.add_batch(2, 25, BucketListType::Live, vec![], vec![window_entry], vec![]).expect("add window");
+        bucket_list
+            .add_batch(
+                2,
+                25,
+                BucketListType::Live,
+                vec![],
+                vec![window_entry],
+                vec![],
+            )
+            .expect("add window");
 
         // Even when not at sample boundary, resize should trigger update
-        let result = compute_soroban_state_size_window_entry(201, &bucket_list, 6000, Some(&archival));
-        assert!(result.is_some(), "Should produce window entry when resizing");
+        let result =
+            compute_soroban_state_size_window_entry(201, &bucket_list, 6000, Some(&archival));
+        assert!(
+            result.is_some(),
+            "Should produce window entry when resizing"
+        );
 
         let entry = result.unwrap();
         match entry.data {
-            LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(window)) => {
+            LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(
+                window,
+            )) => {
                 let window_vec: Vec<u64> = window.into();
                 // Old: [1000, 2000, 3000, 4000, 5000] -> resized to [3000, 4000, 5000]
                 assert_eq!(window_vec, vec![3000, 4000, 5000]);
@@ -1889,8 +1979,7 @@ mod tests {
     /// Helper to create a ContractData entry with specific size characteristics.
     fn make_contract_data_entry(seq: u32, key_bytes: &[u8], val_bytes: &[u8]) -> LedgerEntry {
         use stellar_xdr::curr::{
-            ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint, ScAddress,
-            ScVal,
+            ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint, ScAddress, ScVal,
         };
         LedgerEntry {
             last_modified_ledger_seq: seq,

@@ -108,8 +108,7 @@ async fn test_additional_topology_builders_exist() {
     let hierarchical = Topologies::hierarchical_quorum(2, SimulationMode::OverLoopback);
     assert!(hierarchical.node_ids().len() >= 6);
 
-    let simplified =
-        Topologies::hierarchical_quorum_simplified(4, 3, SimulationMode::OverLoopback);
+    let simplified = Topologies::hierarchical_quorum_simplified(4, 3, SimulationMode::OverLoopback);
     assert_eq!(simplified.node_ids().len(), 7);
 
     let custom = Topologies::custom_a(SimulationMode::OverLoopback);

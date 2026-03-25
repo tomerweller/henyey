@@ -243,7 +243,10 @@ async fn test_history_work_chain() {
 
     let guard = state.lock().await;
     assert!(guard.has.is_some());
-    assert!(guard.bucket_dir.is_some(), "bucket_dir should be set after download");
+    assert!(
+        guard.bucket_dir.is_some(),
+        "bucket_dir should be set after download"
+    );
     assert_eq!(guard.headers.len(), 1);
     assert_eq!(guard.transactions.len(), 1);
     assert_eq!(guard.tx_results.len(), 1);

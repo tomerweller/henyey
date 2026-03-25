@@ -76,17 +76,17 @@ mod error;
 pub mod execution;
 mod header;
 mod manager;
+pub(crate) mod memory_report;
 pub mod offer;
 pub mod offer_store;
-pub(crate) mod memory_report;
 mod prepare_liabilities;
 mod snapshot;
 mod soroban_state;
 
 // Re-export main types
 pub use close::{
-    LedgerCloseData, LedgerClosePerf, LedgerCloseResult, LedgerCloseStats,
-    SorobanPhaseStructure, TransactionSetVariant, TxWithFee, UpgradeContext,
+    LedgerCloseData, LedgerClosePerf, LedgerCloseResult, LedgerCloseStats, SorobanPhaseStructure,
+    TransactionSetVariant, TxWithFee, UpgradeContext,
 };
 pub use config_upgrade::{ConfigUpgradeSetFrame, ConfigUpgradeValidity};
 pub use delta::{EntryChange, LedgerDelta};
@@ -101,8 +101,8 @@ pub use header::{
     verify_skip_list, SKIP_1, SKIP_2, SKIP_3, SKIP_4, SKIP_LIST_SIZE,
 };
 pub use manager::{
-    prepend_fee_event, scan_level_pairs_for_caches, CacheInitResult,
-    LedgerManager, LedgerManagerConfig,
+    prepend_fee_event, scan_level_pairs_for_caches, CacheInitResult, LedgerManager,
+    LedgerManagerConfig,
 };
 pub use snapshot::{
     EntriesLookupFn, EntryLookupFn, LedgerSnapshot, PoolShareTrustlinesByAccountFn,
@@ -465,7 +465,9 @@ pub mod trustlines {
     ///
     /// `balance - selling_liabilities`
     pub fn available_to_send(trustline: &TrustLineEntry) -> i64 {
-        trustline.balance.saturating_sub(selling_liabilities(trustline))
+        trustline
+            .balance
+            .saturating_sub(selling_liabilities(trustline))
     }
 
     /// Calculate the available capacity to receive on a trustline.
@@ -729,8 +731,7 @@ mod tests {
         );
 
         // Maximum balance with liabilities at limit
-        let max_liab =
-            create_account_with_liabilities(i64::MAX, 0, i64::MAX - min_balance(0), 0);
+        let max_liab = create_account_with_liabilities(i64::MAX, 0, i64::MAX - min_balance(0), 0);
         assert_eq!(reserves::available_to_send(&max_liab, BASE_RESERVE), 0);
     }
 
@@ -741,10 +742,7 @@ mod tests {
         // 3 sub-entries: min_balance = (2+3)*5M = 25M
         // balance = 30M, selling = 0 → available = 5M
         let a = create_account_with_liabilities(30_000_000, 3, 0, 0);
-        assert_eq!(
-            reserves::available_to_send(&a, BASE_RESERVE),
-            5_000_000
-        );
+        assert_eq!(reserves::available_to_send(&a, BASE_RESERVE), 5_000_000);
 
         // 3 sub-entries, selling = 5M → available = 0
         let b = create_account_with_liabilities(30_000_000, 3, 5_000_000, 0);
@@ -758,21 +756,12 @@ mod tests {
         // Sponsorship adjusts min balance; selling liabilities further constrain
         // 0 sub-entries, 2 sponsoring, 1 sponsored: min = (2+0+2-1)*5M = 15M
         let a = create_account_with_sponsorship(20_000_000, 0, 0, 0, 2, 1);
-        assert_eq!(
-            reserves::minimum_balance(&a, BASE_RESERVE),
-            15_000_000
-        );
-        assert_eq!(
-            reserves::available_to_send(&a, BASE_RESERVE),
-            5_000_000
-        );
+        assert_eq!(reserves::minimum_balance(&a, BASE_RESERVE), 15_000_000);
+        assert_eq!(reserves::available_to_send(&a, BASE_RESERVE), 5_000_000);
 
         // Same but with selling liabilities = 3M
         let b = create_account_with_sponsorship(20_000_000, 0, 3_000_000, 0, 2, 1);
-        assert_eq!(
-            reserves::available_to_send(&b, BASE_RESERVE),
-            2_000_000
-        );
+        assert_eq!(reserves::available_to_send(&b, BASE_RESERVE), 2_000_000);
     }
 
     // =========================================================================
@@ -795,10 +784,7 @@ mod tests {
     fn test_buying_liabilities_constrain_available_to_receive() {
         // No liabilities: can receive up to i64::MAX - balance
         let a = create_account_with_liabilities(100_000_000, 0, 0, 0);
-        assert_eq!(
-            reserves::available_to_receive(&a),
-            i64::MAX - 100_000_000
-        );
+        assert_eq!(reserves::available_to_receive(&a), i64::MAX - 100_000_000);
 
         // With buying liabilities: capacity reduced
         let b = create_account_with_liabilities(100_000_000, 0, 0, 50_000_000);
@@ -825,8 +811,7 @@ mod tests {
         assert_eq!(reserves::available_to_receive(&near_max), 1);
 
         // Half balance, half buying liabilities: can receive 1
-        let half =
-            create_account_with_liabilities(i64::MAX / 2, 0, 0, i64::MAX / 2);
+        let half = create_account_with_liabilities(i64::MAX / 2, 0, 0, i64::MAX / 2);
         assert_eq!(reserves::available_to_receive(&half), 1);
     }
 
@@ -929,12 +914,8 @@ mod tests {
     #[test]
     fn test_can_add_sub_entry_with_selling_liabilities() {
         // Balance = min(0) + reserve + 100, selling = 100: can add
-        let a = create_account_with_liabilities(
-            min_balance(0) + BASE_RESERVE as i64 + 100,
-            0,
-            100,
-            0,
-        );
+        let a =
+            create_account_with_liabilities(min_balance(0) + BASE_RESERVE as i64 + 100, 0, 100, 0);
         assert!(reserves::can_add_sub_entry(&a, BASE_RESERVE));
 
         // Balance = min(0) + reserve, selling = 1: cannot add (selling eats into reserve)
@@ -955,10 +936,7 @@ mod tests {
 
         // After removing sub-entry: min=10M, balance=14M → 4M available
         let after = create_test_account(14_000_000, 0);
-        assert_eq!(
-            reserves::available_to_send(&after, BASE_RESERVE),
-            4_000_000
-        );
+        assert_eq!(reserves::available_to_send(&after, BASE_RESERVE), 4_000_000);
     }
 
     /// Sub-entry with sponsorship.
@@ -1049,42 +1027,32 @@ mod tests {
     fn test_account_available_limit_comprehensive() {
         // No liabilities: can receive up to MAX - balance
         assert_eq!(
-            reserves::available_to_receive(
-                &create_account_with_liabilities(1000, 0, 0, 0)
-            ),
+            reserves::available_to_receive(&create_account_with_liabilities(1000, 0, 0, 0)),
             i64::MAX - 1000
         );
 
         // Buying liabilities reduce receive capacity
         assert_eq!(
-            reserves::available_to_receive(
-                &create_account_with_liabilities(1000, 0, 0, 500)
-            ),
+            reserves::available_to_receive(&create_account_with_liabilities(1000, 0, 0, 500)),
             i64::MAX - 1500
         );
 
         // At max: nothing receivable
         assert_eq!(
-            reserves::available_to_receive(
-                &create_account_with_liabilities(i64::MAX, 0, 0, 0)
-            ),
+            reserves::available_to_receive(&create_account_with_liabilities(i64::MAX, 0, 0, 0)),
             0
         );
 
         // Selling liabilities don't affect receive capacity
         assert_eq!(
-            reserves::available_to_receive(
-                &create_account_with_liabilities(1000, 0, 500, 0)
-            ),
+            reserves::available_to_receive(&create_account_with_liabilities(1000, 0, 500, 0)),
             i64::MAX - 1000
         );
 
         // With sub-entries: available to receive is not affected by min_balance
         // (buying capacity is just MAX - balance - buying_liab)
         assert_eq!(
-            reserves::available_to_receive(
-                &create_account_with_liabilities(1000, 5, 0, 0)
-            ),
+            reserves::available_to_receive(&create_account_with_liabilities(1000, 5, 0, 0)),
             i64::MAX - 1000
         );
     }
@@ -1104,9 +1072,8 @@ mod tests {
                     continue;
                 }
 
-                let account = create_account_with_sponsorship(
-                    balance, 0, 0, 0, sponsoring, sponsored,
-                );
+                let account =
+                    create_account_with_sponsorship(balance, 0, 0, 0, sponsoring, sponsored);
                 let min_bal = reserves::minimum_balance(&account, BASE_RESERVE);
                 let available = reserves::available_to_send(&account, BASE_RESERVE);
 
@@ -1174,10 +1141,7 @@ mod tests {
         // balance = 1, sub_entries = 100, min = (2+100)*5M = 510M → very negative
         let b = create_test_account(1, 100);
         let min_100 = (2 + 100) * BASE_RESERVE as i64;
-        assert_eq!(
-            reserves::available_to_send(&b, BASE_RESERVE),
-            1 - min_100
-        );
+        assert_eq!(reserves::available_to_send(&b, BASE_RESERVE), 1 - min_100);
     }
 
     /// available_to_receive: at MAX balance, capacity is 0; beyond that saturates.
@@ -1213,8 +1177,8 @@ mod tests {
     // =========================================================================
 
     use stellar_xdr::curr::{
-        TrustLineEntry, TrustLineEntryExt, TrustLineEntryV1, TrustLineEntryV1Ext,
-        TrustLineAsset, AlphaNum4, AssetCode4,
+        AlphaNum4, AssetCode4, TrustLineAsset, TrustLineEntry, TrustLineEntryExt, TrustLineEntryV1,
+        TrustLineEntryV1Ext,
     };
 
     /// Helper: create a V0 trustline (no liabilities tracking).

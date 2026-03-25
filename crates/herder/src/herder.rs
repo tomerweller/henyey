@@ -46,9 +46,9 @@ use henyey_crypto::{PublicKey, SecretKey};
 use henyey_ledger::LedgerManager;
 use henyey_scp::{BallotPhase, SlotIndex, SCP};
 use stellar_xdr::curr::{
-    EnvelopeType, LedgerCloseValueSignature, LedgerUpgrade, Limits, NodeId, ReadXdr,
-    ScpEnvelope, ScpQuorumSet, Signature as XdrSignature, StellarValue, StellarValueExt,
-    TimePoint, TransactionEnvelope, Uint256, UpgradeType, Value, WriteXdr,
+    EnvelopeType, LedgerCloseValueSignature, LedgerUpgrade, Limits, NodeId, ReadXdr, ScpEnvelope,
+    ScpQuorumSet, Signature as XdrSignature, StellarValue, StellarValueExt, TimePoint,
+    TransactionEnvelope, Uint256, UpgradeType, Value, WriteXdr,
 };
 
 use crate::error::HerderError;
@@ -58,11 +58,11 @@ use crate::pending::{PendingConfig, PendingEnvelopes, PendingResult, PendingStat
 use crate::quorum_tracker::{QuorumTracker, SlotQuorumTracker};
 use crate::scp_driver::{HerderScpCallback, ScpDriver, ScpDriverConfig};
 use crate::state::HerderState;
-use crate::upgrades::{CurrentLedgerState, UpgradeParameters, Upgrades};
 use crate::tx_queue::{
     account_key_from_account_id, TransactionQueue, TransactionSet, TxQueueConfig, TxQueueResult,
     TxQueueStats,
 };
+use crate::upgrades::{CurrentLedgerState, UpgradeParameters, Upgrades};
 use crate::Result;
 
 /// Maximum slot distance for accepting EXTERNALIZE messages.
@@ -387,7 +387,10 @@ impl Herder {
     /// Set runtime upgrade parameters (called from HTTP `/upgrades?mode=set`).
     ///
     /// Returns an error string if validation fails (e.g., protocol version too high).
-    pub fn set_upgrade_parameters(&self, params: UpgradeParameters) -> std::result::Result<(), String> {
+    pub fn set_upgrade_parameters(
+        &self,
+        params: UpgradeParameters,
+    ) -> std::result::Result<(), String> {
         let max_protocol = self.config.max_protocol_version;
         let mut upgrades = self.runtime_upgrades.write();
         upgrades.set_parameters(params, max_protocol)
@@ -613,7 +616,6 @@ impl Herder {
     ///
     /// Returns the slot we purged below, or None if no purging was done.
     pub fn out_of_sync_recovery(&self, lcl: u64) -> Option<u64> {
-
         // Don't call this when tracking normally
         if self.state() == HerderState::Tracking {
             return None;
@@ -647,7 +649,9 @@ impl Herder {
                 .erase_below(purge_slot, last_checkpoint);
 
             // Clear slot quorum tracker entries below purge_slot
-            self.slot_quorum_tracker.write().clear_slots_below(purge_slot);
+            self.slot_quorum_tracker
+                .write()
+                .clear_slots_below(purge_slot);
 
             // Purge SCP state
             if let Some(ref scp) = self.scp {
@@ -710,7 +714,11 @@ impl Herder {
             }
         }
 
-        info!(lcl, tracking_slot = slot, "Herder now tracking next consensus slot");
+        info!(
+            lcl,
+            tracking_slot = slot,
+            "Herder now tracking next consensus slot"
+        );
     }
 
     /// Start syncing (called when catchup begins).
@@ -834,7 +842,10 @@ impl Herder {
 
         // Check if we can receive SCP messages
         if !state.can_receive_scp() {
-            debug!("Rejecting SCP envelope: herder in {:?} state (cannot receive)", state);
+            debug!(
+                "Rejecting SCP envelope: herder in {:?} state (cannot receive)",
+                state
+            );
             return EnvelopeState::Invalid;
         }
 
@@ -863,15 +874,14 @@ impl Herder {
             // enforce_recent = true only if we've never been in sync (tracking index <= genesis)
             let tracking_consensus_index = current_slot.saturating_sub(1);
             let enforce_recent = tracking_consensus_index <= GENESIS_LEDGER_SEQ;
-            if !self.check_envelope_close_time(&envelope, enforce_recent)
-                && slot != checkpoint
-            {
+            if !self.check_envelope_close_time(&envelope, enforce_recent) && slot != checkpoint {
                 debug!(
                     slot,
                     tracking_consensus_index,
                     enforce_recent,
                     checkpoint,
-                    "Rejecting SCP envelope: close-time filter (non-tracking, enforce_recent={})", enforce_recent
+                    "Rejecting SCP envelope: close-time filter (non-tracking, enforce_recent={})",
+                    enforce_recent
                 );
                 return EnvelopeState::Invalid;
             }
@@ -973,8 +983,7 @@ impl Herder {
                 // Like stellar-core, we must wait until the tx_set is available before
                 // recording externalization. Otherwise we create buffered ledgers that can
                 // never close (no tx_set to apply).
-                if let Some(state) =
-                    self.buffer_envelope_until_tx_set(slot, &tx_set_hash, envelope)
+                if let Some(state) = self.buffer_envelope_until_tx_set(slot, &tx_set_hash, envelope)
                 {
                     return state;
                 }
@@ -1043,8 +1052,7 @@ impl Herder {
 
                 // CRITICAL: Don't externalize without the tx_set!
                 // Like stellar-core, we must wait until the tx_set is available.
-                if let Some(state) =
-                    self.buffer_envelope_until_tx_set(slot, &tx_set_hash, envelope)
+                if let Some(state) = self.buffer_envelope_until_tx_set(slot, &tx_set_hash, envelope)
                 {
                     return state;
                 }
@@ -1340,11 +1348,8 @@ impl Herder {
             }
 
             // Update ScpDriver with tracking state for close-time validation
-            self.scp_driver.set_tracking_state(
-                true,
-                externalized_slot + 1,
-                close_time,
-            );
+            self.scp_driver
+                .set_tracking_state(true, externalized_slot + 1, close_time);
 
             // Release any pending envelopes for the new slot
             drop(tracking);
@@ -1474,7 +1479,10 @@ impl Herder {
         // against current ledger state. We must similarly filter static proposed
         // upgrades to avoid proposing already-applied upgrades (e.g., a protocol
         // version upgrade that has already taken effect).
-        let header = self.ledger_manager.read().as_ref()
+        let header = self
+            .ledger_manager
+            .read()
+            .as_ref()
             .map(|lm| lm.current_header())
             .unwrap_or_default();
         let state = CurrentLedgerState {
@@ -1492,7 +1500,10 @@ impl Herder {
 
         // Filter static upgrades against current state to avoid proposing
         // upgrades that have already been applied.
-        let mut upgrade_list: Vec<LedgerUpgrade> = self.config.proposed_upgrades.iter()
+        let mut upgrade_list: Vec<LedgerUpgrade> = self
+            .config
+            .proposed_upgrades
+            .iter()
             .filter(|upgrade| match upgrade {
                 LedgerUpgrade::Version(v) => *v != state.protocol_version,
                 LedgerUpgrade::BaseFee(f) => *f != state.base_fee,
@@ -1744,7 +1755,9 @@ impl Herder {
             .filter_map(|bytes| bytes.try_into().ok().map(UpgradeType))
             .collect();
 
-        let stellar_value = self.make_stellar_value(tx_set.hash, close_time, upgrades).ok()?;
+        let stellar_value = self
+            .make_stellar_value(tx_set.hash, close_time, upgrades)
+            .ok()?;
 
         // Encode to Value
         let value_bytes = stellar_value.to_xdr(Limits::none()).ok()?;
@@ -1763,16 +1776,15 @@ impl Herder {
     ) -> std::result::Result<StellarValue, HerderError> {
         let xdr_tx_set_hash = stellar_xdr::curr::Hash(tx_set_hash.0);
         let xdr_close_time = TimePoint(close_time);
-        let secret_key = self.secret_key.as_ref().ok_or_else(|| {
-            HerderError::Internal("No secret key for signing".to_string())
-        })?;
+        let secret_key = self
+            .secret_key
+            .as_ref()
+            .ok_or_else(|| HerderError::Internal("No secret key for signing".to_string()))?;
         let network_id = self.scp_driver.network_id();
         let mut sign_data = network_id.0.to_vec();
-        sign_data.extend_from_slice(
-            &EnvelopeType::Scpvalue.to_xdr(Limits::none()).map_err(|e| {
-                HerderError::Internal(format!("Failed to encode envelope type: {}", e))
-            })?,
-        );
+        sign_data.extend_from_slice(&EnvelopeType::Scpvalue.to_xdr(Limits::none()).map_err(
+            |e| HerderError::Internal(format!("Failed to encode envelope type: {}", e)),
+        )?);
         sign_data.extend_from_slice(
             &xdr_tx_set_hash.to_xdr(Limits::none()).map_err(|e| {
                 HerderError::Internal(format!("Failed to encode tx set hash: {}", e))
@@ -1784,9 +1796,9 @@ impl Herder {
             })?,
         );
         let sig = secret_key.sign(&sign_data);
-        let node_id = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            Uint256(*secret_key.public_key().as_bytes()),
-        ));
+        let node_id = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
+            *secret_key.public_key().as_bytes(),
+        )));
 
         Ok(StellarValue {
             tx_set_hash: xdr_tx_set_hash,
@@ -2290,11 +2302,7 @@ mod tests {
         // Sign: (networkID, ENVELOPE_TYPE_SCPVALUE, txSetHash, closeTime)
         let network_id = herder.scp_driver.network_id();
         let mut sign_data = network_id.0.to_vec();
-        sign_data.extend_from_slice(
-            &EnvelopeType::Scpvalue
-                .to_xdr(Limits::none())
-                .expect("xdr"),
-        );
+        sign_data.extend_from_slice(&EnvelopeType::Scpvalue.to_xdr(Limits::none()).expect("xdr"));
         sign_data.extend_from_slice(&xdr_tx_set_hash.to_xdr(Limits::none()).expect("xdr"));
         sign_data.extend_from_slice(&close_time.to_xdr(Limits::none()).expect("xdr"));
         let sig = secret_key.sign(&sign_data);
@@ -2817,10 +2825,7 @@ mod tests {
     }
 
     /// Create a nomination envelope with a specific close time in its voted values.
-    fn make_nomination_envelope_with_close_time(
-        slot: u64,
-        close_time: u64,
-    ) -> ScpEnvelope {
+    fn make_nomination_envelope_with_close_time(slot: u64, close_time: u64) -> ScpEnvelope {
         let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
             stellar_xdr::curr::Uint256([1u8; 32]),
         ));

@@ -66,9 +66,7 @@ pub(crate) async fn submit_tx_handler(
             let error_str = code.map_or("txInternalError".to_string(), |c| c.name().to_string());
             (TxStatus::Error, Some(error_str))
         }
-        henyey_herder::TxQueueResult::Banned => {
-            (TxStatus::Error, Some("txBadAuth".to_string()))
-        }
+        henyey_herder::TxQueueResult::Banned => (TxStatus::Error, Some("txBadAuth".to_string())),
         henyey_herder::TxQueueResult::Filtered => (TxStatus::Filtered, None),
         henyey_herder::TxQueueResult::TryAgainLater => (TxStatus::TryAgainLater, None),
     };

@@ -112,24 +112,50 @@ mod tests {
         // Top-level keys
         assert!(obj.contains_key("authenticated_peers"));
         assert!(obj.contains_key("pending_peers"));
-        assert_eq!(obj.len(), 2, "should only have authenticated_peers and pending_peers");
+        assert_eq!(
+            obj.len(),
+            2,
+            "should only have authenticated_peers and pending_peers"
+        );
 
         // Each category has inbound/outbound
         for category_key in ["authenticated_peers", "pending_peers"] {
             let cat = value[category_key].as_object().unwrap();
-            assert!(cat.contains_key("inbound"), "{category_key} missing inbound");
-            assert!(cat.contains_key("outbound"), "{category_key} missing outbound");
-            assert_eq!(cat.len(), 2, "{category_key} should only have inbound/outbound");
+            assert!(
+                cat.contains_key("inbound"),
+                "{category_key} missing inbound"
+            );
+            assert!(
+                cat.contains_key("outbound"),
+                "{category_key} missing outbound"
+            );
+            assert_eq!(
+                cat.len(),
+                2,
+                "{category_key} should only have inbound/outbound"
+            );
         }
 
         // Peer entry fields
         let peer = &value["authenticated_peers"]["inbound"][0];
-        let expected_peer_keys = ["address", "elapsed", "id", "olver", "ver", "message_read", "message_write"];
+        let expected_peer_keys = [
+            "address",
+            "elapsed",
+            "id",
+            "olver",
+            "ver",
+            "message_read",
+            "message_write",
+        ];
         for key in &expected_peer_keys {
             assert!(peer.get(key).is_some(), "missing peer entry key: {key}");
         }
         let peer_obj = peer.as_object().unwrap();
-        assert_eq!(peer_obj.len(), expected_peer_keys.len(), "peer entry has unexpected extra keys");
+        assert_eq!(
+            peer_obj.len(),
+            expected_peer_keys.len(),
+            "peer entry has unexpected extra keys"
+        );
     }
 
     /// Verify empty peers response serializes correctly.
@@ -147,9 +173,21 @@ mod tests {
         };
 
         let value = serde_json::to_value(&response).unwrap();
-        assert!(value["authenticated_peers"]["inbound"].as_array().unwrap().is_empty());
-        assert!(value["authenticated_peers"]["outbound"].as_array().unwrap().is_empty());
-        assert!(value["pending_peers"]["inbound"].as_array().unwrap().is_empty());
-        assert!(value["pending_peers"]["outbound"].as_array().unwrap().is_empty());
+        assert!(value["authenticated_peers"]["inbound"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(value["authenticated_peers"]["outbound"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(value["pending_peers"]["inbound"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(value["pending_peers"]["outbound"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 }

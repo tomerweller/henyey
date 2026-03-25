@@ -28,8 +28,8 @@ use handlers::{
         manualclose_handler, shutdown_handler,
     },
     info::{
-        dumpproposedsettings_handler, health_handler, info_handler, ledger_handler,
-        quorum_handler, root_handler, self_check_handler, status_handler, upgrades_handler,
+        dumpproposedsettings_handler, health_handler, info_handler, ledger_handler, quorum_handler,
+        root_handler, self_check_handler, status_handler, upgrades_handler,
     },
     metrics::metrics_handler,
     peers::{bans_handler, connect_handler, droppeer_handler, peers_handler, unban_handler},
@@ -197,10 +197,7 @@ impl StatusServer {
 
     /// Set the load generation backend (must be called before `start()`).
     #[cfg(feature = "loadgen")]
-    pub fn set_loadgen_runner(
-        &mut self,
-        runner: Box<dyn handlers::generateload::LoadGenRunner>,
-    ) {
+    pub fn set_loadgen_runner(&mut self, runner: Box<dyn handlers::generateload::LoadGenRunner>) {
         self.loadgen_state = Some(Arc::new(handlers::generateload::GenerateLoadState {
             runner,
         }));

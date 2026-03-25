@@ -1,7 +1,11 @@
 use super::*;
 
 impl App {
-    pub(super) fn tx_set_start_index(hash: &Hash256, peers_len: usize, peer_offset: usize) -> usize {
+    pub(super) fn tx_set_start_index(
+        hash: &Hash256,
+        peers_len: usize,
+        peer_offset: usize,
+    ) -> usize {
         if peers_len == 0 {
             return 0;
         }
@@ -92,9 +96,7 @@ impl App {
                     }
                 };
                 let advert = FloodAdvert { tx_hashes };
-                if let Err(e) = overlay
-                    .try_send_to(&peer_id, StellarMessage::FloodAdvert(advert))
-                {
+                if let Err(e) = overlay.try_send_to(&peer_id, StellarMessage::FloodAdvert(advert)) {
                     tracing::debug!(peer = %peer_id, error = %e, "Failed to send tx advert batch");
                 }
             }
@@ -180,7 +182,11 @@ impl App {
         last_request.retain(|_, state| state.last_request > cutoff_short);
     }
 
-    pub(super) async fn record_tx_pull_latency(&self, hash: Hash256, peer: &henyey_overlay::PeerId) {
+    pub(super) async fn record_tx_pull_latency(
+        &self,
+        hash: Hash256,
+        peer: &henyey_overlay::PeerId,
+    ) {
         let now = self.clock.now();
         let mut history = self.tx_demand_history.write().await;
         let Some(entry) = history.get_mut(&hash) else {
@@ -304,13 +310,11 @@ impl App {
             let mut pending = self.tx_pending_demands.write().await;
             self.prune_tx_demands(now, &mut pending, &mut history);
 
-            let mut demand_map: HashMap<
-                henyey_overlay::PeerId,
-                (Vec<Hash256>, Vec<Hash256>),
-            > = peer_ids
-                .iter()
-                .map(|peer| (peer.clone(), (Vec::new(), Vec::new())))
-                .collect();
+            let mut demand_map: HashMap<henyey_overlay::PeerId, (Vec<Hash256>, Vec<Hash256>)> =
+                peer_ids
+                    .iter()
+                    .map(|peer| (peer.clone(), (Vec::new(), Vec::new())))
+                    .collect();
 
             let mut any_new_demand = true;
             while any_new_demand {
@@ -379,9 +383,7 @@ impl App {
                 }
             };
             let demand = FloodDemand { tx_hashes };
-            if let Err(e) = overlay
-                .try_send_to(&peer_id, StellarMessage::FloodDemand(demand))
-            {
+            if let Err(e) = overlay.try_send_to(&peer_id, StellarMessage::FloodDemand(demand)) {
                 tracing::warn!(peer = %peer_id, error = %e, "Failed to send flood demand");
             }
         }
@@ -440,7 +442,10 @@ impl App {
                     type_: MessageType::Transaction,
                     req_hash: stellar_xdr::curr::Uint256(hash.0),
                 };
-                if overlay.try_send_to(peer_id, StellarMessage::DontHave(dont_have)).is_err() {
+                if overlay
+                    .try_send_to(peer_id, StellarMessage::DontHave(dont_have))
+                    .is_err()
+                {
                     dropped += 1;
                     break;
                 }
@@ -597,7 +602,8 @@ impl App {
         let mut classic_count = 0usize;
         let mut soroban_count = 0usize;
         for env in &transactions {
-            let frame = henyey_tx::TransactionFrame::from_owned_with_network(env.clone(), network_id);
+            let frame =
+                henyey_tx::TransactionFrame::from_owned_with_network(env.clone(), network_id);
             if frame.is_soroban() {
                 soroban_count += 1;
             } else {
@@ -684,11 +690,12 @@ impl App {
                 tracing::debug!(hash = hex::encode(hash), peer = %peer_id, "TxSet not found in cache");
                 if let Some(overlay) = self.overlay().await {
                     let ledger_version = self.ledger_manager.current_header().ledger_version;
-                    let message_type = if protocol_version_starts_from(ledger_version, ProtocolVersion::V20) {
-                        stellar_xdr::curr::MessageType::GeneralizedTxSet
-                    } else {
-                        stellar_xdr::curr::MessageType::TxSet
-                    };
+                    let message_type =
+                        if protocol_version_starts_from(ledger_version, ProtocolVersion::V20) {
+                            stellar_xdr::curr::MessageType::GeneralizedTxSet
+                        } else {
+                            stellar_xdr::curr::MessageType::TxSet
+                        };
                     let msg = StellarMessage::DontHave(stellar_xdr::curr::DontHave {
                         type_: message_type,
                         req_hash: stellar_xdr::curr::Uint256(*hash),
@@ -863,11 +870,8 @@ impl App {
                 // GeneralizedTxSet, no DontHave), peers are silently dropping
                 // our requests. Synthetically mark all peers as DontHave.
                 let request_age = now.duration_since(request_state.first_requested);
-                if request_age
-                    >= std::time::Duration::from_secs(TX_SET_REQUEST_TIMEOUT_SECS)
-                {
-                    let dont_have_set =
-                        dont_have.entry(*hash).or_insert_with(HashSet::new);
+                if request_age >= std::time::Duration::from_secs(TX_SET_REQUEST_TIMEOUT_SECS) {
+                    let dont_have_set = dont_have.entry(*hash).or_insert_with(HashSet::new);
                     let already_exhausted = dont_have_set.len() >= peers.len();
                     if !already_exhausted {
                         tracing::debug!(

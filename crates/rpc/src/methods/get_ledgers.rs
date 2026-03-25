@@ -46,13 +46,8 @@ pub async fn handle(
 
     // Validate and resolve pagination.
     // getLedgers cursor is a plain ledger sequence (not a TOID).
-    let (effective_start, effective_limit) = validate_ledger_pagination(
-        start_ledger,
-        cursor_str,
-        limit,
-        oldest,
-        ledger.num,
-    )?;
+    let (effective_start, effective_limit) =
+        validate_ledger_pagination(start_ledger, cursor_str, limit, oldest, ledger.num)?;
 
     // End ledger for query: latest + 1 (exclusive upper bound)
     let end_ledger = ledger.num + 1;
@@ -90,9 +85,7 @@ pub async fn handle(
         util::insert_xdr_field(&mut obj, "header", header_entry, format)?;
 
         // Metadata XDR — encode the full LedgerCloseMeta
-        util::insert_raw_xdr_field::<LedgerCloseMeta>(
-            &mut obj, "metadata", meta_bytes, format,
-        )?;
+        util::insert_raw_xdr_field::<LedgerCloseMeta>(&mut obj, "metadata", meta_bytes, format)?;
 
         ledgers.push(serde_json::Value::Object(obj));
     }
@@ -121,7 +114,9 @@ fn validate_ledger_pagination(
         ));
     }
 
-    let limit = limit.unwrap_or(DEFAULT_LEDGER_LIMIT).clamp(1, MAX_LEDGER_LIMIT);
+    let limit = limit
+        .unwrap_or(DEFAULT_LEDGER_LIMIT)
+        .clamp(1, MAX_LEDGER_LIMIT);
 
     if let Some(c) = cursor {
         if c.is_empty() {
@@ -134,9 +129,8 @@ fn validate_ledger_pagination(
         return Ok((seq + 1, limit));
     }
 
-    let start = start_ledger.ok_or_else(|| {
-        JsonRpcError::invalid_params("startLedger or cursor is required")
-    })?;
+    let start = start_ledger
+        .ok_or_else(|| JsonRpcError::invalid_params("startLedger or cursor is required"))?;
 
     if start < oldest_ledger || start > latest_ledger {
         return Err(JsonRpcError::invalid_params(format!(

@@ -35,14 +35,7 @@ pub fn execute_transaction_set(
     delta: &mut LedgerDelta,
     soroban: SorobanContext<'_>,
 ) -> Result<TxSetResult> {
-    execute_transaction_set_with_fee_mode(
-        snapshot,
-        transactions,
-        context,
-        delta,
-        soroban,
-        true,
-    )
+    execute_transaction_set_with_fee_mode(snapshot, transactions, context, delta, soroban, true)
 }
 
 /// Execute a full transaction set with configurable fee deduction.
@@ -60,12 +53,8 @@ pub fn execute_transaction_set_with_fee_mode(
     deduct_fee: bool,
 ) -> Result<TxSetResult> {
     let id_pool = snapshot.header().id_pool;
-    let mut executor = TransactionExecutor::new(
-        context,
-        id_pool,
-        soroban.config,
-        soroban.classic_events,
-    );
+    let mut executor =
+        TransactionExecutor::new(context, id_pool, soroban.config, soroban.classic_events);
     executor.set_meta_flags(
         soroban.emit_soroban_tx_meta_ext_v1,
         soroban.enable_soroban_diagnostic_events,
@@ -251,10 +240,7 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
             tx_fee as i64,
             protocol_version,
         )?;
-        let tx_meta = result
-            .tx_meta
-            .take()
-            .unwrap_or_else(empty_transaction_meta);
+        let tx_meta = result.tx_meta.take().unwrap_or_else(empty_transaction_meta);
         // Use pre-captured fee_changes from the upfront fee deduction pass
         // (either internal or external), or the per-TX result if fees were
         // not pre-deducted.
@@ -301,8 +287,7 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
             let refund = results[idx].fee_refund;
             if refund > 0 {
                 let frame = TransactionFrame::with_network(Arc::clone(tx), executor.network_id);
-                let fee_source_id =
-                    henyey_tx::muxed_to_account_id(&frame.fee_source_account());
+                let fee_source_id = henyey_tx::muxed_to_account_id(&frame.fee_source_account());
 
                 // Apply refund to the account balance in the delta
                 executor.state.apply_refund_to_delta(&fee_source_id, refund);
@@ -399,8 +384,14 @@ pub fn execute_soroban_parallel_phase(
         // Fees already deducted on delta and fee pool already recorded by caller.
         ext
     } else {
-        let (fees, total_pre_deducted) =
-            pre_deduct_soroban_fees(snapshot, phase, context.base_fee, context.network_id, context.sequence, delta)?;
+        let (fees, total_pre_deducted) = pre_deduct_soroban_fees(
+            snapshot,
+            phase,
+            context.base_fee,
+            context.network_id,
+            context.sequence,
+            delta,
+        )?;
         if total_pre_deducted != 0 {
             delta.record_fee_pool_delta(total_pre_deducted);
         }
@@ -463,7 +454,8 @@ pub fn execute_soroban_parallel_phase(
 
         // Slice pre_charged_fees for this stage's clusters.
         let stage_tx_count: usize = stage.iter().map(|c| c.len()).sum();
-        let stage_pre_charged = &pre_charged_fees[pre_charge_offset..pre_charge_offset + stage_tx_count];
+        let stage_pre_charged =
+            &pre_charged_fees[pre_charge_offset..pre_charge_offset + stage_tx_count];
 
         // Execute each cluster with its own executor, then merge results.
         // Clusters within a stage are independent (no footprint conflicts)
@@ -504,8 +496,7 @@ pub fn execute_soroban_parallel_phase(
             all_results.extend(cr.results.iter().cloned());
             all_tx_results.extend(cr.tx_results.iter().cloned());
             all_tx_result_metas.extend(cr.tx_result_metas.iter().cloned());
-            all_hot_archive_restored_keys
-                .extend(cr.hot_archive_restored_keys.iter().cloned());
+            all_hot_archive_restored_keys.extend(cr.hot_archive_restored_keys.iter().cloned());
         }
         total_result_merge_us += result_merge_start.elapsed().as_micros() as u64;
 
@@ -669,8 +660,12 @@ pub(crate) fn pre_deduct_all_fees_on_delta(
                 let computed_fee = frame.declared_soroban_resource_fee()
                     + std::cmp::min(inclusion_fee, required_fee);
 
-                let (charged_fee, fee_changes) =
-                    delta.deduct_fee_from_account(&fee_source, computed_fee, snapshot, ledger_seq)?;
+                let (charged_fee, fee_changes) = delta.deduct_fee_from_account(
+                    &fee_source,
+                    computed_fee,
+                    snapshot,
+                    ledger_seq,
+                )?;
                 total_fee_pool += charged_fee;
                 soroban_pre_charged.push(PreChargedFee {
                     charged_fee,
@@ -855,10 +850,7 @@ pub(super) fn execute_single_cluster(
             tx_fee as i64,
             context.protocol_version,
         )?;
-        let tx_meta = result
-            .tx_meta
-            .take()
-            .unwrap_or_else(empty_transaction_meta);
+        let tx_meta = result.tx_meta.take().unwrap_or_else(empty_transaction_meta);
         let fee_changes = result
             .fee_changes
             .take()
@@ -991,7 +983,8 @@ pub(super) fn execute_stage_clusters(
     if clusters.len() <= 1 {
         let mut cluster_results = Vec::with_capacity(clusters.len());
         for (cluster_idx, cluster) in clusters.iter().enumerate() {
-            let cluster_pc = &params.pre_charged_fees[pre_charge_offsets[cluster_idx]..pre_charge_offsets[cluster_idx] + cluster.len()];
+            let cluster_pc = &params.pre_charged_fees
+                [pre_charge_offsets[cluster_idx]..pre_charge_offsets[cluster_idx] + cluster.len()];
             let (cr, cluster_delta, total_fees) = execute_single_cluster(
                 snapshot,
                 cluster,
@@ -1028,13 +1021,11 @@ pub(super) fn execute_stage_clusters(
     let emit_soroban_tx_meta_ext_v1 = soroban.emit_soroban_tx_meta_ext_v1;
     let enable_soroban_diagnostic_events = soroban.enable_soroban_diagnostic_events;
     let id_pool = params.id_pool;
-    let clusters: std::sync::Arc<Vec<Vec<TxWithFee>>> =
-        std::sync::Arc::new(clusters.to_vec());
-    let prior_stage: std::sync::Arc<PriorStageState> =
-        std::sync::Arc::new(PriorStageState {
-            entries: params.prior_stage.entries.clone(),
-            deleted_keys: params.prior_stage.deleted_keys.clone(),
-        });
+    let clusters: std::sync::Arc<Vec<Vec<TxWithFee>>> = std::sync::Arc::new(clusters.to_vec());
+    let prior_stage: std::sync::Arc<PriorStageState> = std::sync::Arc::new(PriorStageState {
+        entries: params.prior_stage.entries.clone(),
+        deleted_keys: params.prior_stage.deleted_keys.clone(),
+    });
     // For multi-cluster parallel execution, we need to split pre_charged_fees per cluster.
     // Each cluster gets its own Vec since the spawn_blocking closure needs 'static data.
     let per_cluster_fees: Vec<std::sync::Arc<Vec<PreChargedFee>>> = {
@@ -1116,14 +1107,13 @@ pub(super) fn execute_stage_clusters(
     // use Handle::block_on directly. When called from a tokio worker thread
     // (runtime_handle is None), use block_in_place to safely enter a blocking
     // context before calling block_on.
-    let thread_results: Vec<ClusterThreadResult> =
-        if let Some(handle) = runtime_handle {
-            handle.block_on(spawn_and_collect)
-        } else {
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(spawn_and_collect)
-            })
-        };
+    let thread_results: Vec<ClusterThreadResult> = if let Some(handle) = runtime_handle {
+        handle.block_on(spawn_and_collect)
+    } else {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(spawn_and_collect)
+        })
+    };
     let spawn_collect_us = spawn_start.elapsed().as_micros() as u64;
 
     // Merge results in cluster order (deterministic).
@@ -1280,9 +1270,7 @@ pub fn compute_state_size_window_entry(
 /// Scans all TX operations for offer management and path payment operations
 /// to determine which order books will be accessed during execution.
 #[cfg(test)]
-fn collect_dex_asset_pairs(
-    transactions: &[TxWithFee],
-) -> HashSet<(Asset, Asset)> {
+fn collect_dex_asset_pairs(transactions: &[TxWithFee]) -> HashSet<(Asset, Asset)> {
     let mut pairs = HashSet::new();
     for (tx, _) in transactions {
         let frame = TransactionFrame::new(Arc::clone(tx));
@@ -1326,8 +1314,8 @@ mod tests {
     use super::*;
     use stellar_xdr::curr::{
         AccountId, AlphaNum4, Asset, AssetCode4, ManageSellOfferOp, Memo, MuxedAccount,
-        PathPaymentStrictReceiveOp, Preconditions, PublicKey, SequenceNumber,
-        Transaction, TransactionExt, TransactionV1Envelope, Uint256, VecM,
+        PathPaymentStrictReceiveOp, Preconditions, PublicKey, SequenceNumber, Transaction,
+        TransactionExt, TransactionV1Envelope, Uint256, VecM,
     };
 
     fn make_account_id(seed: u8) -> AccountId {
@@ -1354,14 +1342,20 @@ mod tests {
             operations: ops_vec,
             ext: TransactionExt::V0,
         };
-        (Arc::new(TransactionEnvelope::Tx(TransactionV1Envelope {
-            tx,
-            signatures: VecM::default(),
-        })), None)
+        (
+            Arc::new(TransactionEnvelope::Tx(TransactionV1Envelope {
+                tx,
+                signatures: VecM::default(),
+            })),
+            None,
+        )
     }
 
     fn op(body: OperationBody) -> Operation {
-        Operation { source_account: None, body }
+        Operation {
+            source_account: None,
+            body,
+        }
     }
 
     /// collect_dex_asset_pairs extracts (buying, selling) from manage sell/buy offer ops.
@@ -1370,30 +1364,30 @@ mod tests {
         let usd = credit(b"USD\0", 10);
         let eur = credit(b"EUR\0", 11);
 
-        let tx = make_tx_with_ops(vec![
-            op(OperationBody::ManageSellOffer(ManageSellOfferOp {
+        let tx = make_tx_with_ops(vec![op(OperationBody::ManageSellOffer(
+            ManageSellOfferOp {
                 selling: Asset::Native,
                 buying: usd.clone(),
                 amount: 100,
                 price: stellar_xdr::curr::Price { n: 1, d: 1 },
                 offer_id: 0,
-            })),
-        ]);
+            },
+        ))]);
 
         let pairs = collect_dex_asset_pairs(&[tx]);
         assert_eq!(pairs.len(), 1);
         assert!(pairs.contains(&(usd.clone(), Asset::Native)));
 
         // ManageBuyOffer also captured
-        let tx2 = make_tx_with_ops(vec![
-            op(OperationBody::ManageBuyOffer(stellar_xdr::curr::ManageBuyOfferOp {
+        let tx2 = make_tx_with_ops(vec![op(OperationBody::ManageBuyOffer(
+            stellar_xdr::curr::ManageBuyOfferOp {
                 selling: eur.clone(),
                 buying: usd.clone(),
                 buy_amount: 100,
                 price: stellar_xdr::curr::Price { n: 2, d: 1 },
                 offer_id: 0,
-            })),
-        ]);
+            },
+        ))]);
         let pairs2 = collect_dex_asset_pairs(&[tx2]);
         assert!(pairs2.contains(&(usd.clone(), eur.clone())));
     }
@@ -1408,16 +1402,16 @@ mod tests {
         // PathPaymentStrictReceive: native → EUR → USD → BTC
         // Hops: (EUR, native), (USD, EUR), (BTC, USD)
         let path: VecM<Asset, 5> = vec![eur.clone(), usd.clone()].try_into().unwrap();
-        let tx = make_tx_with_ops(vec![
-            op(OperationBody::PathPaymentStrictReceive(PathPaymentStrictReceiveOp {
+        let tx = make_tx_with_ops(vec![op(OperationBody::PathPaymentStrictReceive(
+            PathPaymentStrictReceiveOp {
                 send_asset: Asset::Native,
                 send_max: 1000,
                 destination: MuxedAccount::Ed25519(Uint256([2u8; 32])),
                 dest_asset: btc.clone(),
                 dest_amount: 500,
                 path,
-            })),
-        ]);
+            },
+        ))]);
 
         let pairs = collect_dex_asset_pairs(&[tx]);
         assert_eq!(pairs.len(), 3, "expected 3 hop pairs, got {:?}", pairs);

@@ -274,7 +274,10 @@ mod tests {
 
         let value = serde_json::to_value(&wrapper).unwrap();
         let status = value["info"]["status"].as_array().unwrap();
-        assert!(status.is_empty(), "booting state should have empty status array");
+        assert!(
+            status.is_empty(),
+            "booting state should have empty status array"
+        );
     }
 
     /// Cross-check: serialize and deserialize as generic JSON to ensure

@@ -183,7 +183,12 @@ impl MessageDispatcher {
             TxSetData::Generalized(_) => "GeneralizedTxSet",
         };
 
-        trace!("Received {} {} from {}", label, hex::encode(hash.0), from_peer);
+        trace!(
+            "Received {} {} from {}",
+            label,
+            hex::encode(hash.0),
+            from_peer
+        );
 
         // Cache it
         {

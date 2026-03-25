@@ -189,7 +189,11 @@ fn test_ledger_close_meta_with_scp_history() {
 
     match meta {
         LedgerCloseMeta::V2(v2) => {
-            assert_eq!(v2.scp_info.len(), 1, "SCP history should be included in meta");
+            assert_eq!(
+                v2.scp_info.len(),
+                1,
+                "SCP history should be included in meta"
+            );
         }
         _ => panic!("expected V2 meta"),
     }
@@ -228,12 +232,10 @@ async fn test_multiple_consecutive_ledger_closes() {
 
         let handle = tokio::runtime::Handle::current();
         let lm = ledger.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            lm.close_ledger(close_data, Some(handle))
-        })
-        .await
-        .expect("spawn_blocking")
-        .unwrap_or_else(|e| panic!("close ledger {}: {}", seq, e));
+        let result = tokio::task::spawn_blocking(move || lm.close_ledger(close_data, Some(handle)))
+            .await
+            .expect("spawn_blocking")
+            .unwrap_or_else(|e| panic!("close ledger {}: {}", seq, e));
 
         assert_eq!(result.header.ledger_seq, seq);
         assert_eq!(ledger.current_ledger_seq(), seq);
@@ -277,7 +279,9 @@ fn test_unsupported_protocol_version_too_high_integration() {
         1,
         header_hash,
     );
-    ledger.close_ledger(close_data, None).expect("close at current version");
+    ledger
+        .close_ledger(close_data, None)
+        .expect("close at current version");
 
     // Now force the stored header to have CURRENT + 1
     ledger.set_header_version_for_test(CURRENT_LEDGER_PROTOCOL_VERSION + 1);
@@ -328,7 +332,9 @@ fn test_unsupported_protocol_version_too_low_integration() {
         1,
         header_hash,
     );
-    ledger.close_ledger(close_data, None).expect("close at current version");
+    ledger
+        .close_ledger(close_data, None)
+        .expect("close at current version");
 
     // Force the stored header to have MIN - 1
     ledger.set_header_version_for_test(MIN_LEDGER_PROTOCOL_VERSION - 1);
@@ -380,12 +386,10 @@ async fn test_close_ledger_from_spawn_blocking() {
     let lm = ledger.clone();
 
     // Close the ledger from a spawn_blocking thread with Some(handle).
-    let result = tokio::task::spawn_blocking(move || {
-        lm.close_ledger(close_data, Some(handle))
-    })
-    .await
-    .expect("spawn_blocking task")
-    .expect("close ledger");
+    let result = tokio::task::spawn_blocking(move || lm.close_ledger(close_data, Some(handle)))
+        .await
+        .expect("spawn_blocking task")
+        .expect("close ledger");
 
     assert!(result.tx_results.is_empty());
     assert_eq!(result.header.ledger_seq, 1);
@@ -436,7 +440,8 @@ async fn test_consecutive_close_ledger_from_spawn_blocking() {
     let handle = tokio::runtime::Handle::current();
     let lm = ledger.clone();
     tokio::task::spawn_blocking(move || {
-        lm.close_ledger(close_data1, Some(handle)).expect("close ledger 1");
+        lm.close_ledger(close_data1, Some(handle))
+            .expect("close ledger 1");
     })
     .await
     .expect("task 1");
@@ -458,7 +463,8 @@ async fn test_consecutive_close_ledger_from_spawn_blocking() {
     let handle2 = tokio::runtime::Handle::current();
     let lm2 = ledger.clone();
     tokio::task::spawn_blocking(move || {
-        lm2.close_ledger(close_data2, Some(handle2)).expect("close ledger 2");
+        lm2.close_ledger(close_data2, Some(handle2))
+            .expect("close ledger 2");
     })
     .await
     .expect("task 2");

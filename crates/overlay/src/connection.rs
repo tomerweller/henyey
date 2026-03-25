@@ -423,12 +423,11 @@ impl Listener {
                 debug!("Accepted connection from {}", remote_addr);
                 Connection::new(stream, ConnectionDirection::Inbound)
             }
-            ListenerKind::Loopback(receiver) => receiver
-                .lock()
-                .await
-                .recv()
-                .await
-                .ok_or_else(|| OverlayError::PeerDisconnected("loopback listener closed".to_string())),
+            ListenerKind::Loopback(receiver) => {
+                receiver.lock().await.recv().await.ok_or_else(|| {
+                    OverlayError::PeerDisconnected("loopback listener closed".to_string())
+                })
+            }
         }
     }
 }

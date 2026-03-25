@@ -472,7 +472,9 @@ impl SnapshotHandle {
         if let Some(ref lookup_fn) = self.lookup_fn {
             let result = lookup_fn(key)?;
             if let Some(ref entry) = result {
-                self.prefetch_cache.write().insert(key.clone(), entry.clone());
+                self.prefetch_cache
+                    .write()
+                    .insert(key.clone(), entry.clone());
             }
             return Ok(result);
         }

@@ -115,7 +115,11 @@ mod tests {
         let value = serde_json::to_value(&response).unwrap();
         let obj = value.as_object().unwrap();
 
-        assert_eq!(obj.len(), 4, "testacc response should have exactly 4 fields");
+        assert_eq!(
+            obj.len(),
+            4,
+            "testacc response should have exactly 4 fields"
+        );
         assert_eq!(value["name"], "bob");
         assert!(value["id"].is_string());
         assert!(value["balance"].is_i64());
@@ -185,7 +189,10 @@ mod tests {
         let public = root_key.public_key();
         let strkey = public.to_strkey();
         // The root account on testnet has a well-known public key
-        assert!(strkey.starts_with('G'), "root key should be a valid G... strkey");
+        assert!(
+            strkey.starts_with('G'),
+            "root key should be a valid G... strkey"
+        );
     }
 
     /// Verify named account key derivation produces consistent results.

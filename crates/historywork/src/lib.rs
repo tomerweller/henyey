@@ -289,7 +289,11 @@ impl GetHistoryArchiveStateWork {
     /// * `archive` - The history archive to fetch from
     /// * `checkpoint` - The checkpoint ledger sequence number
     /// * `state` - Shared state to store the downloaded HAS
-    pub(crate) fn new(archive: Arc<HistoryArchive>, checkpoint: u32, state: SharedHistoryState) -> Self {
+    pub(crate) fn new(
+        archive: Arc<HistoryArchive>,
+        checkpoint: u32,
+        state: SharedHistoryState,
+    ) -> Self {
         Self {
             archive,
             checkpoint,
@@ -351,8 +355,16 @@ impl DownloadBucketsWork {
     /// * `archive` - The history archive to fetch buckets from
     /// * `state` - Shared state containing the HAS
     /// * `bucket_dir` - Directory where bucket files will be saved
-    pub(crate) fn new(archive: Arc<HistoryArchive>, state: SharedHistoryState, bucket_dir: PathBuf) -> Self {
-        Self { archive, state, bucket_dir }
+    pub(crate) fn new(
+        archive: Arc<HistoryArchive>,
+        state: SharedHistoryState,
+        bucket_dir: PathBuf,
+    ) -> Self {
+        Self {
+            archive,
+            state,
+            bucket_dir,
+        }
     }
 }
 
@@ -440,9 +452,8 @@ impl Work for DownloadBucketsWork {
                         let path = bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
                         download_and_save_bucket(&archive, &hash, &path).await?;
 
-                        let count = downloaded_count
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                            + 1;
+                        let count =
+                            downloaded_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                         if count % 5 == 0 || count == total_to_download as u32 {
                             tracing::info!("Downloaded {}/{} buckets", count, total_to_download);
                         }
@@ -501,7 +512,11 @@ impl DownloadLedgerHeadersWork {
     /// * `archive` - The history archive to fetch headers from
     /// * `checkpoint` - The checkpoint ledger sequence number
     /// * `state` - Shared state where headers will be stored
-    pub(crate) fn new(archive: Arc<HistoryArchive>, checkpoint: u32, state: SharedHistoryState) -> Self {
+    pub(crate) fn new(
+        archive: Arc<HistoryArchive>,
+        checkpoint: u32,
+        state: SharedHistoryState,
+    ) -> Self {
         Self {
             archive,
             checkpoint,
@@ -525,9 +540,7 @@ impl Work for DownloadLedgerHeadersWork {
         .await;
         let headers = match self.archive.get_ledger_headers(self.checkpoint).await {
             Ok(headers) => headers,
-            Err(err) => {
-                return WorkOutcome::Failed(format!("failed to download headers: {err}"))
-            }
+            Err(err) => return WorkOutcome::Failed(format!("failed to download headers: {err}")),
         };
 
         let header_chain: Vec<_> = headers.iter().map(|entry| entry.header.clone()).collect();
@@ -573,7 +586,11 @@ impl DownloadTransactionsWork {
     /// * `archive` - The history archive to fetch transactions from
     /// * `checkpoint` - The checkpoint ledger sequence number
     /// * `state` - Shared state where transactions will be stored
-    pub(crate) fn new(archive: Arc<HistoryArchive>, checkpoint: u32, state: SharedHistoryState) -> Self {
+    pub(crate) fn new(
+        archive: Arc<HistoryArchive>,
+        checkpoint: u32,
+        state: SharedHistoryState,
+    ) -> Self {
         Self {
             archive,
             checkpoint,
@@ -665,7 +682,11 @@ impl DownloadTxResultsWork {
     /// * `archive` - The history archive to fetch results from
     /// * `checkpoint` - The checkpoint ledger sequence number
     /// * `state` - Shared state where results will be stored
-    pub(crate) fn new(archive: Arc<HistoryArchive>, checkpoint: u32, state: SharedHistoryState) -> Self {
+    pub(crate) fn new(
+        archive: Arc<HistoryArchive>,
+        checkpoint: u32,
+        state: SharedHistoryState,
+    ) -> Self {
         Self {
             archive,
             checkpoint,
@@ -758,7 +779,11 @@ impl DownloadScpHistoryWork {
     /// * `archive` - The history archive to fetch SCP history from
     /// * `checkpoint` - The checkpoint ledger sequence number
     /// * `state` - Shared state where SCP history will be stored
-    pub(crate) fn new(archive: Arc<HistoryArchive>, checkpoint: u32, state: SharedHistoryState) -> Self {
+    pub(crate) fn new(
+        archive: Arc<HistoryArchive>,
+        checkpoint: u32,
+        state: SharedHistoryState,
+    ) -> Self {
         Self {
             archive,
             checkpoint,
@@ -956,7 +981,11 @@ impl PublishHistoryArchiveStateWork {
     /// * `writer` - The archive writer to publish to
     /// * `checkpoint` - The checkpoint ledger sequence number
     /// * `state` - Shared state containing the HAS to publish
-    pub(crate) fn new(writer: Arc<dyn ArchiveWriter>, checkpoint: u32, state: SharedHistoryState) -> Self {
+    pub(crate) fn new(
+        writer: Arc<dyn ArchiveWriter>,
+        checkpoint: u32,
+        state: SharedHistoryState,
+    ) -> Self {
         Self {
             writer,
             checkpoint,
@@ -993,9 +1022,7 @@ impl Work for PublishHistoryArchiveStateWork {
             .put_bytes(&checkpoint_path, json.as_bytes())
             .await
         {
-            return WorkOutcome::Failed(format!(
-                "failed to publish HAS to checkpoint path: {err}"
-            ));
+            return WorkOutcome::Failed(format!("failed to publish HAS to checkpoint path: {err}"));
         }
 
         // Also publish to the well-known path (RFC 5785)
@@ -1004,9 +1031,7 @@ impl Work for PublishHistoryArchiveStateWork {
             .put_bytes(WELL_KNOWN_STELLAR_HISTORY_PATH, json.as_bytes())
             .await
         {
-            return WorkOutcome::Failed(format!(
-                "failed to publish HAS to well-known path: {err}"
-            ));
+            return WorkOutcome::Failed(format!("failed to publish HAS to well-known path: {err}"));
         }
 
         tracing::info!(
@@ -1164,9 +1189,7 @@ impl Work for PublishXdrWork {
         let path = checkpoint_path(category_str, self.checkpoint, "xdr.gz");
         match self.writer.put_bytes(&path, &gz).await {
             Ok(()) => WorkOutcome::Success,
-            Err(err) => {
-                WorkOutcome::Failed(format!("failed to publish {category_str}: {err}"))
-            }
+            Err(err) => WorkOutcome::Failed(format!("failed to publish {category_str}: {err}")),
         }
     }
 }
@@ -1210,9 +1233,7 @@ impl Work for PublishBucketsWork {
             };
             let gz = match gzip_bytes(&data) {
                 Ok(gz) => gz,
-                Err(err) => {
-                    return WorkOutcome::Failed(format!("failed to gzip bucket: {err}"))
-                }
+                Err(err) => return WorkOutcome::Failed(format!("failed to gzip bucket: {err}")),
             };
             let path = bucket_path(&hash);
             if let Err(err) = self.writer.put_bytes(&path, &gz).await {
@@ -2216,7 +2237,10 @@ mod tests {
 
     #[test]
     fn test_well_known_stellar_history_path() {
-        assert_eq!(WELL_KNOWN_STELLAR_HISTORY_PATH, ".well-known/stellar-history.json");
+        assert_eq!(
+            WELL_KNOWN_STELLAR_HISTORY_PATH,
+            ".well-known/stellar-history.json"
+        );
     }
 
     // ── CATCHUP_SPEC §9.1: Retry constants re-exported from download ─

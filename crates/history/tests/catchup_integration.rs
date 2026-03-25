@@ -8,7 +8,6 @@ use axum::{
     Router,
 };
 use flate2::{write::GzEncoder, Compression};
-use sha2::{Digest, Sha256};
 use henyey_bucket::{Bucket, BucketList, HotArchiveBucketList};
 use henyey_common::Hash256;
 use henyey_db::Database;
@@ -18,6 +17,7 @@ use henyey_history::{
     catchup::{CatchupManagerBuilder, CatchupOptions},
     paths::{bucket_path, checkpoint_path},
 };
+use sha2::{Digest, Sha256};
 use stellar_xdr::curr::{
     Hash, LedgerHeader, LedgerHeaderExt, LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt,
     StellarValue, StellarValueExt, TimePoint, VecM, WriteXdr,
@@ -200,8 +200,8 @@ async fn test_catchup_against_local_archive_checkpoint() {
     let archive = HistoryArchive::new(&base_url).expect("archive");
 
     let bucket_dir = tempfile::tempdir().expect("bucket dir");
-    let bucket_manager = henyey_bucket::BucketManager::new(bucket_dir.path().to_path_buf())
-        .expect("bucket manager");
+    let bucket_manager =
+        henyey_bucket::BucketManager::new(bucket_dir.path().to_path_buf()).expect("bucket manager");
     let db = Database::open_in_memory().expect("db");
 
     let ledger_manager = henyey_ledger::LedgerManager::new(

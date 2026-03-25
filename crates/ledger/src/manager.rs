@@ -25,44 +25,42 @@
 //! for state archival. This stores archived/evicted entries separately from
 //! the live bucket list, and both contribute to the header's bucket list hash.
 
+use crate::offer_store::OfferStore;
 use crate::{
     close::{
         LedgerCloseData, LedgerCloseResult, LedgerCloseStats, TransactionSetVariant, UpgradeContext,
     },
     delta::{EntryChange, LedgerDelta},
     execution::{
-        execute_soroban_parallel_phase, load_soroban_network_info,
-        pre_deduct_all_fees_on_delta, run_transactions_on_executor,
-        SorobanContext, SorobanNetworkInfo, TransactionExecutionResult,
-        TransactionExecutor, TxSetResult,
+        execute_soroban_parallel_phase, load_soroban_network_info, pre_deduct_all_fees_on_delta,
+        run_transactions_on_executor, SorobanContext, SorobanNetworkInfo,
+        TransactionExecutionResult, TransactionExecutor, TxSetResult,
     },
     header::{compute_header_hash, create_next_header, NextHeaderFields},
     snapshot::{LedgerSnapshot, SnapshotHandle},
     LedgerError, Result,
 };
-use parking_lot::{Mutex, RwLock};
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use henyey_bucket::{
     BucketEntry, BucketEntryExt, BucketList, BucketListSnapshot, BucketMergeMap, EvictionIterator,
     EvictionIteratorExt, EvictionResult, HotArchiveBucketList,
 };
-use henyey_common::{BucketListDbConfig, Hash256, NetworkId};
 use henyey_common::protocol::{
     needs_upgrade_to_version, protocol_version_starts_from, ProtocolVersion,
 };
+use henyey_common::{BucketListDbConfig, Hash256, NetworkId};
 use henyey_tx::soroban::PersistentModuleCache;
-use crate::offer_store::OfferStore;
 use henyey_tx::{ClassicEventConfig, LedgerContext, TxEventManager};
+use parking_lot::{Mutex, RwLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use stellar_xdr::curr::{
-    AccountId, BucketListType, ConfigSettingEntry, ConfigSettingId,
-    ExtensionPoint, GeneralizedTransactionSet, Hash,
-    LedgerCloseMeta, LedgerCloseMetaExt, LedgerCloseMetaExtV1, LedgerCloseMetaV2, LedgerEntry,
-    LedgerEntryData, LedgerEntryExt, LedgerHeader, LedgerHeaderHistoryEntry,
-    LedgerHeaderHistoryEntryExt, LedgerKey, LedgerKeyConfigSetting, PoolId,
-    ScpHistoryEntry, StateArchivalSettings, TransactionEventStage, TransactionMeta,
-    TransactionPhase, TransactionResultMetaV1, TransactionSet, TransactionSetV1,
-    TxSetComponent, TxSetComponentTxsMaybeDiscountedFee, UpgradeEntryMeta, VecM,
+    AccountId, BucketListType, ConfigSettingEntry, ConfigSettingId, ExtensionPoint,
+    GeneralizedTransactionSet, Hash, LedgerCloseMeta, LedgerCloseMetaExt, LedgerCloseMetaExtV1,
+    LedgerCloseMetaV2, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerHeader,
+    LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt, LedgerKey, LedgerKeyConfigSetting,
+    PoolId, ScpHistoryEntry, StateArchivalSettings, TransactionEventStage, TransactionMeta,
+    TransactionPhase, TransactionResultMetaV1, TransactionSet, TransactionSetV1, TxSetComponent,
+    TxSetComponentTxsMaybeDiscountedFee, UpgradeEntryMeta, VecM,
 };
 use tracing::{debug, info};
 
@@ -170,7 +168,13 @@ struct LevelScanResult {
     /// Live entries of interest, deduped within this level (curr shadows snap).
     entries: HashMap<LedgerKey, LedgerEntry>,
     /// TTL entries keyed by TTL key hash (separate because TTLs need special handling).
-    ttl_entries: HashMap<Hash, (stellar_xdr::curr::LedgerKeyTtl, crate::soroban_state::TtlData)>,
+    ttl_entries: HashMap<
+        Hash,
+        (
+            stellar_xdr::curr::LedgerKeyTtl,
+            crate::soroban_state::TtlData,
+        ),
+    >,
     /// Keys that were DEAD at this level — used for cross-level shadowing.
     /// A dead entry at a lower level must prevent live entries at higher levels
     /// from being included in the final result.
@@ -186,7 +190,13 @@ struct LevelScanResult {
 /// (pre-collected entries) and the fallback path (full bucket iteration).
 struct LevelScanner {
     entries: HashMap<LedgerKey, LedgerEntry>,
-    ttl_entries: HashMap<Hash, (stellar_xdr::curr::LedgerKeyTtl, crate::soroban_state::TtlData)>,
+    ttl_entries: HashMap<
+        Hash,
+        (
+            stellar_xdr::curr::LedgerKeyTtl,
+            crate::soroban_state::TtlData,
+        ),
+    >,
     seen_keys: HashSet<LedgerKey>,
     dead_keys: HashSet<LedgerKey>,
     dead_ttl_keys: HashSet<Hash>,
@@ -249,7 +259,8 @@ impl LevelScanner {
                     ttl.live_until_ledger_seq,
                     le.last_modified_ledger_seq,
                 );
-                self.ttl_entries.insert(ttl.key_hash.clone(), (ttl_key, ttl_data));
+                self.ttl_entries
+                    .insert(ttl.key_hash.clone(), (ttl_key, ttl_data));
             } else {
                 self.entries.insert(key, le.clone());
             }
@@ -295,13 +306,7 @@ fn scan_single_level(
                 continue;
             }
 
-            scanner.process_entry(
-                &entry,
-                key,
-                soroban_enabled,
-                module_cache,
-                protocol_version,
-            );
+            scanner.process_entry(&entry, key, soroban_enabled, module_cache, protocol_version);
         }
     }
 
@@ -464,9 +469,8 @@ fn scan_and_merge(
     // Sort level indices by total bucket size descending for better load balancing:
     // large levels (which take longest) start immediately, small levels fill gaps.
     let mut sorted_indices: Vec<usize> = (0..num_levels).collect();
-    sorted_indices.sort_by_key(|&i| {
-        std::cmp::Reverse(level_pairs[i].0.len() + level_pairs[i].1.len())
-    });
+    sorted_indices
+        .sort_by_key(|&i| std::cmp::Reverse(level_pairs[i].0.len() + level_pairs[i].1.len()));
 
     // Workers atomically claim slots in the sorted array.
     let next_claim = AtomicUsize::new(0);
@@ -487,13 +491,8 @@ fn scan_and_merge(
                     let idx = sorted_ref[claim_idx];
                     let (curr, snap) = &level_pairs[idx];
                     let level_start = std::time::Instant::now();
-                    let result = scan_single_level(
-                        curr,
-                        snap,
-                        soroban_enabled,
-                        &mc_clone,
-                        protocol_version,
-                    );
+                    let result =
+                        scan_single_level(curr, snap, soroban_enabled, &mc_clone, protocol_version);
                     info!(
                         level = idx,
                         entries = result.entries.len(),
@@ -536,7 +535,9 @@ fn scan_and_merge(
                             offer_count += 1;
                         }
                         LedgerEntryData::Trustline(ref tl) => {
-                            if let stellar_xdr::curr::TrustLineAsset::PoolShare(ref pool_id) = tl.asset {
+                            if let stellar_xdr::curr::TrustLineAsset::PoolShare(ref pool_id) =
+                                tl.asset
+                            {
                                 pool_share_tl_account_index
                                     .entry(tl.account_id.clone())
                                     .or_default()
@@ -600,9 +601,8 @@ fn scan_and_merge(
         "scan_bucket_list_for_caches: merge complete"
     );
 
-    let module_cache = module_cache_arc.map(|arc| {
-        Arc::try_unwrap(arc).unwrap_or_else(|arc| PersistentModuleCache::clone(&arc))
-    });
+    let module_cache = module_cache_arc
+        .map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|arc| PersistentModuleCache::clone(&arc)));
 
     CacheInitResult {
         offers: mem_offers,
@@ -677,9 +677,9 @@ fn build_soroban_rent_config(
         config_setting_id: ConfigSettingId::ContractCostParamsMemoryBytes,
     });
     let mem_params = lookup(&mem_key).and_then(|e| {
-        if let LedgerEntryData::ConfigSetting(
-            ConfigSettingEntry::ContractCostParamsMemoryBytes(params),
-        ) = e.data
+        if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractCostParamsMemoryBytes(
+            params,
+        )) = e.data
         {
             Some(params)
         } else {
@@ -757,8 +757,7 @@ pub fn scan_level_pairs_for_caches(
 
     info!(
         soroban_enabled,
-        scan_thread_count,
-        "scan_bucket_list_for_caches: starting scan..."
+        scan_thread_count, "scan_bucket_list_for_caches: starting scan..."
     );
 
     let result = scan_and_merge(
@@ -1194,7 +1193,12 @@ impl LedgerManager {
         header_hash: Hash256,
     ) -> Result<()> {
         let protocol_version = header.ledger_version;
-        self.verify_and_install_bucket_lists(bucket_list, hot_archive_bucket_list, header, header_hash)?;
+        self.verify_and_install_bucket_lists(
+            bucket_list,
+            hot_archive_bucket_list,
+            header,
+            header_hash,
+        )?;
         self.initialize_all_caches(protocol_version, 0)?;
 
         info!(
@@ -1227,7 +1231,12 @@ impl LedgerManager {
         header_hash: Hash256,
         cache_data: CacheInitResult,
     ) -> Result<()> {
-        self.verify_and_install_bucket_lists(bucket_list, hot_archive_bucket_list, header, header_hash)?;
+        self.verify_and_install_bucket_lists(
+            bucket_list,
+            hot_archive_bucket_list,
+            header,
+            header_hash,
+        )?;
 
         // Initialize per-bucket caches for all DiskIndex buckets.
         {
@@ -1390,7 +1399,11 @@ impl LedgerManager {
         let rss_before = get_rss_bytes();
 
         let bucket_list = self.bucket_list.read();
-        let cache_data = scan_bucket_list_for_caches(&bucket_list, protocol_version, self.config.scan_thread_count);
+        let cache_data = scan_bucket_list_for_caches(
+            &bucket_list,
+            protocol_version,
+            self.config.scan_thread_count,
+        );
         let rss_after_scan = get_rss_bytes();
 
         // Initialize per-bucket caches for all DiskIndex buckets.
@@ -1782,12 +1795,7 @@ impl LedgerManager {
                 let idx = pool_share_idx.read();
                 Ok(idx
                     .get(account_id)
-                    .map(|pool_ids| {
-                        pool_ids
-                            .iter()
-                            .cloned()
-                            .collect()
-                    })
+                    .map(|pool_ids| pool_ids.iter().cloned().collect())
                     .unwrap_or_default())
             });
 
@@ -1853,59 +1861,67 @@ impl LedgerManager {
 
         // Update offer store and pool share index — skip iteration entirely if no relevant changes.
         if has_offers || has_pool_share_trustlines {
-        let offers_initialized = has_offers && *self.offers_initialized.read();
-        for change in &offer_pool_changes {
-            // Quick discriminant check on the entry data to avoid expensive key construction
-            let entry_ref = match change {
-                EntryChange::Created(e) | EntryChange::Deleted { previous: e } => e,
-                EntryChange::Updated { current, .. } => current,
-            };
-            match &entry_ref.data {
-                LedgerEntryData::Offer(_) if offers_initialized => {
-                    let mut store = self.offer_store.lock();
-                    match change {
-                        EntryChange::Created(entry) => {
-                            store.insert_from_ledger_entry(&entry);
-                        }
-                        EntryChange::Updated { current, .. } => {
-                            store.insert_from_ledger_entry(&current);
-                        }
-                        EntryChange::Deleted { previous } => {
-                            if let LedgerEntryData::Offer(ref o) = previous.data {
-                                store.remove_by_seller(&o.seller_id, o.offer_id);
+            let offers_initialized = has_offers && *self.offers_initialized.read();
+            for change in &offer_pool_changes {
+                // Quick discriminant check on the entry data to avoid expensive key construction
+                let entry_ref = match change {
+                    EntryChange::Created(e) | EntryChange::Deleted { previous: e } => e,
+                    EntryChange::Updated { current, .. } => current,
+                };
+                match &entry_ref.data {
+                    LedgerEntryData::Offer(_) if offers_initialized => {
+                        let mut store = self.offer_store.lock();
+                        match change {
+                            EntryChange::Created(entry) => {
+                                store.insert_from_ledger_entry(&entry);
                             }
-                        }
-                    }
-                }
-                LedgerEntryData::Trustline(tl) if matches!(tl.asset, stellar_xdr::curr::TrustLineAsset::PoolShare(_)) => {
-                    match change {
-                        EntryChange::Created(entry) => {
-                            if let LedgerEntryData::Trustline(ref tl) = entry.data {
-                                if let stellar_xdr::curr::TrustLineAsset::PoolShare(ref pool_id) = tl.asset {
-                                    self.pool_share_tl_account_index
-                                        .write()
-                                        .entry(tl.account_id.clone())
-                                        .or_default()
-                                        .insert(pool_id.clone());
+                            EntryChange::Updated { current, .. } => {
+                                store.insert_from_ledger_entry(&current);
+                            }
+                            EntryChange::Deleted { previous } => {
+                                if let LedgerEntryData::Offer(ref o) = previous.data {
+                                    store.remove_by_seller(&o.seller_id, o.offer_id);
                                 }
                             }
                         }
-                        EntryChange::Deleted { previous } => {
-                            if let LedgerEntryData::Trustline(ref tl) = previous.data {
-                                if let stellar_xdr::curr::TrustLineAsset::PoolShare(ref pool_id) = tl.asset {
-                                    let mut idx = self.pool_share_tl_account_index.write();
-                                    if let Some(pools) = idx.get_mut(&tl.account_id) {
-                                        pools.remove(pool_id);
+                    }
+                    LedgerEntryData::Trustline(tl)
+                        if matches!(tl.asset, stellar_xdr::curr::TrustLineAsset::PoolShare(_)) =>
+                    {
+                        match change {
+                            EntryChange::Created(entry) => {
+                                if let LedgerEntryData::Trustline(ref tl) = entry.data {
+                                    if let stellar_xdr::curr::TrustLineAsset::PoolShare(
+                                        ref pool_id,
+                                    ) = tl.asset
+                                    {
+                                        self.pool_share_tl_account_index
+                                            .write()
+                                            .entry(tl.account_id.clone())
+                                            .or_default()
+                                            .insert(pool_id.clone());
                                     }
                                 }
                             }
+                            EntryChange::Deleted { previous } => {
+                                if let LedgerEntryData::Trustline(ref tl) = previous.data {
+                                    if let stellar_xdr::curr::TrustLineAsset::PoolShare(
+                                        ref pool_id,
+                                    ) = tl.asset
+                                    {
+                                        let mut idx = self.pool_share_tl_account_index.write();
+                                        if let Some(pools) = idx.get_mut(&tl.account_id) {
+                                            pools.remove(pool_id);
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {} // Updated pool share trustlines: no index change needed
                         }
-                        _ => {} // Updated pool share trustlines: no index change needed
                     }
+                    _ => {} // Skip non-offer, non-pool-share entries
                 }
-                _ => {} // Skip non-offer, non-pool-share entries
             }
-        }
         } // end if has_offers || has_pool_share_trustlines
 
         // Update state
@@ -1977,11 +1993,7 @@ impl LedgerManager {
                 mmap as u64,
                 0,
             ));
-            components.push(ComponentMemory::new(
-                "bucket_list_cache",
-                cache as u64,
-                0,
-            ));
+            components.push(ComponentMemory::new("bucket_list_cache", cache as u64, 0));
         }
 
         // Module cache
@@ -2026,11 +2038,7 @@ impl LedgerManager {
             if let Some(ref hot_archive) = *ha {
                 let heap = hot_archive.estimate_heap_bytes();
                 let mmap = hot_archive.mmap_bytes();
-                components.push(ComponentMemory::new(
-                    "hot_archive_heap",
-                    heap as u64,
-                    0,
-                ));
+                components.push(ComponentMemory::new("hot_archive_heap", heap as u64, 0));
                 components.push(ComponentMemory::new_non_heap(
                     "hot_archive_mmap",
                     mmap as u64,
@@ -2078,9 +2086,8 @@ impl LedgerManager {
             key: _cd.key.clone(),
             durability: _cd.durability,
         });
-        let key_hash = Hash256::hash_xdr(&data_key).map_err(|e| {
-            LedgerError::Internal(format!("Failed to hash LedgerKey: {}", e))
-        })?;
+        let key_hash = Hash256::hash_xdr(&data_key)
+            .map_err(|e| LedgerError::Internal(format!("Failed to hash LedgerKey: {}", e)))?;
         let ttl_key = stellar_xdr::curr::LedgerKeyTtl {
             key_hash: stellar_xdr::curr::Hash(key_hash.0),
         };
@@ -2141,8 +2148,7 @@ impl LedgerManager {
                                         .into(),
                                 );
                                 if seen_hashes.insert(hash) {
-                                    if new_cache
-                                        .add_contract(cc.code.as_slice(), protocol_version)
+                                    if new_cache.add_contract(cc.code.as_slice(), protocol_version)
                                     {
                                         compiled += 1;
                                     }
@@ -2289,92 +2295,99 @@ impl<'a> LedgerCloseContext<'a> {
         // 1. CONFIG_SETTING_CONTRACT_MAX_SIZE_BYTES
         // Parity: NetworkConfig.cpp:44-58 initialMaxContractSizeEntry
         // MinimumSorobanNetworkConfig::MAX_CONTRACT_SIZE = 2000
-        self.delta.record_create(make_entry(
-            ConfigSettingEntry::ContractMaxSizeBytes(2_000),
-        ))?;
+        self.delta
+            .record_create(make_entry(ConfigSettingEntry::ContractMaxSizeBytes(2_000)))?;
 
         // 2. CONFIG_SETTING_CONTRACT_DATA_KEY_SIZE_BYTES
         // Parity: NetworkConfig.cpp:60-74 initialMaxContractDataKeySizeEntry
         // MinimumSorobanNetworkConfig::MAX_CONTRACT_DATA_KEY_SIZE_BYTES = 200
-        self.delta.record_create(make_entry(
-            ConfigSettingEntry::ContractDataKeySizeBytes(200),
-        ))?;
+        self.delta
+            .record_create(make_entry(ConfigSettingEntry::ContractDataKeySizeBytes(
+                200,
+            )))?;
 
         // 3. CONFIG_SETTING_CONTRACT_DATA_ENTRY_SIZE_BYTES
         // Parity: NetworkConfig.cpp:76-90 initialMaxContractDataEntrySizeEntry
         // MinimumSorobanNetworkConfig::MAX_CONTRACT_DATA_ENTRY_SIZE_BYTES = 2000
-        self.delta.record_create(make_entry(
-            ConfigSettingEntry::ContractDataEntrySizeBytes(2_000),
-        ))?;
+        self.delta
+            .record_create(make_entry(ConfigSettingEntry::ContractDataEntrySizeBytes(
+                2_000,
+            )))?;
 
         // 4. CONFIG_SETTING_CONTRACT_COMPUTE_V0
         // Parity: NetworkConfig.cpp:92-116 initialContractComputeSettingsEntry
-        self.delta.record_create(make_entry(
-            ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
-                // TX_MAX_INSTRUCTIONS = MinimumSorobanNetworkConfig::TX_MAX_INSTRUCTIONS = 2_500_000
-                ledger_max_instructions: 2_500_000, // LEDGER_MAX_INSTRUCTIONS = TX_MAX_INSTRUCTIONS
-                tx_max_instructions: 2_500_000,
-                fee_rate_per_instructions_increment: 100,
-                tx_memory_limit: 2_000_000, // MEMORY_LIMIT = MinimumSorobanNetworkConfig::MEMORY_LIMIT
-            }),
-        ))?;
+        self.delta
+            .record_create(make_entry(ConfigSettingEntry::ContractComputeV0(
+                ConfigSettingContractComputeV0 {
+                    // TX_MAX_INSTRUCTIONS = MinimumSorobanNetworkConfig::TX_MAX_INSTRUCTIONS = 2_500_000
+                    ledger_max_instructions: 2_500_000, // LEDGER_MAX_INSTRUCTIONS = TX_MAX_INSTRUCTIONS
+                    tx_max_instructions: 2_500_000,
+                    fee_rate_per_instructions_increment: 100,
+                    tx_memory_limit: 2_000_000, // MEMORY_LIMIT = MinimumSorobanNetworkConfig::MEMORY_LIMIT
+                },
+            )))?;
 
         // 5. CONFIG_SETTING_CONTRACT_LEDGER_COST_V0
         // Parity: NetworkConfig.cpp:118-175 initialContractLedgerAccessSettingsEntry
-        self.delta.record_create(make_entry(
-            ConfigSettingEntry::ContractLedgerCostV0(ConfigSettingContractLedgerCostV0 {
-                ledger_max_disk_read_entries: 3,      // LEDGER_MAX_READ_LEDGER_ENTRIES = TX_MAX
-                ledger_max_disk_read_bytes: 3_200,    // LEDGER_MAX_READ_BYTES = TX_MAX
-                ledger_max_write_ledger_entries: 2,    // TX_MAX_WRITE_LEDGER_ENTRIES
-                ledger_max_write_bytes: 3_200,         // TX_MAX_WRITE_BYTES
-                tx_max_disk_read_entries: 3,
-                tx_max_disk_read_bytes: 3_200,
-                tx_max_write_ledger_entries: 2,
-                tx_max_write_bytes: 3_200,
-                fee_disk_read_ledger_entry: 5_000,
-                fee_write_ledger_entry: 20_000,
-                fee_disk_read1_kb: 1_000,
-                soroban_state_target_size_bytes: 30 * 1024 * 1024 * 1024_i64, // 30 GB
-                rent_fee1_kb_soroban_state_size_low: 1_000,
-                rent_fee1_kb_soroban_state_size_high: 10_000,
-                soroban_state_rent_fee_growth_factor: 1,
-            }),
-        ))?;
+        self.delta
+            .record_create(make_entry(ConfigSettingEntry::ContractLedgerCostV0(
+                ConfigSettingContractLedgerCostV0 {
+                    ledger_max_disk_read_entries: 3, // LEDGER_MAX_READ_LEDGER_ENTRIES = TX_MAX
+                    ledger_max_disk_read_bytes: 3_200, // LEDGER_MAX_READ_BYTES = TX_MAX
+                    ledger_max_write_ledger_entries: 2, // TX_MAX_WRITE_LEDGER_ENTRIES
+                    ledger_max_write_bytes: 3_200,   // TX_MAX_WRITE_BYTES
+                    tx_max_disk_read_entries: 3,
+                    tx_max_disk_read_bytes: 3_200,
+                    tx_max_write_ledger_entries: 2,
+                    tx_max_write_bytes: 3_200,
+                    fee_disk_read_ledger_entry: 5_000,
+                    fee_write_ledger_entry: 20_000,
+                    fee_disk_read1_kb: 1_000,
+                    soroban_state_target_size_bytes: 30 * 1024 * 1024 * 1024_i64, // 30 GB
+                    rent_fee1_kb_soroban_state_size_low: 1_000,
+                    rent_fee1_kb_soroban_state_size_high: 10_000,
+                    soroban_state_rent_fee_growth_factor: 1,
+                },
+            )))?;
 
         // 6. CONFIG_SETTING_CONTRACT_HISTORICAL_DATA_V0
         // Parity: NetworkConfig.cpp:177-186 initialContractHistoricalDataSettingsEntry
-        self.delta.record_create(make_entry(
-            ConfigSettingEntry::ContractHistoricalDataV0(ConfigSettingContractHistoricalDataV0 {
-                fee_historical1_kb: 100,
-            }),
-        ))?;
+        self.delta
+            .record_create(make_entry(ConfigSettingEntry::ContractHistoricalDataV0(
+                ConfigSettingContractHistoricalDataV0 {
+                    fee_historical1_kb: 100,
+                },
+            )))?;
 
         // 7. CONFIG_SETTING_CONTRACT_EVENTS_V0
         // Parity: NetworkConfig.cpp:188-205 initialContractEventsSettingsEntry
-        self.delta.record_create(make_entry(
-            ConfigSettingEntry::ContractEventsV0(ConfigSettingContractEventsV0 {
-                tx_max_contract_events_size_bytes: 200, // MinimumSorobanNetworkConfig
-                fee_contract_events1_kb: 200,
-            }),
-        ))?;
+        self.delta
+            .record_create(make_entry(ConfigSettingEntry::ContractEventsV0(
+                ConfigSettingContractEventsV0 {
+                    tx_max_contract_events_size_bytes: 200, // MinimumSorobanNetworkConfig
+                    fee_contract_events1_kb: 200,
+                },
+            )))?;
 
         // 8. CONFIG_SETTING_CONTRACT_BANDWIDTH_V0
         // Parity: NetworkConfig.cpp:207-227 initialContractBandwidthSettingsEntry
-        self.delta.record_create(make_entry(
-            ConfigSettingEntry::ContractBandwidthV0(ConfigSettingContractBandwidthV0 {
-                ledger_max_txs_size_bytes: 10_000, // TX_MAX_SIZE_BYTES = LEDGER_MAX
-                tx_max_size_bytes: 10_000,
-                fee_tx_size1_kb: 2_000,
-            }),
-        ))?;
+        self.delta
+            .record_create(make_entry(ConfigSettingEntry::ContractBandwidthV0(
+                ConfigSettingContractBandwidthV0 {
+                    ledger_max_txs_size_bytes: 10_000, // TX_MAX_SIZE_BYTES = LEDGER_MAX
+                    tx_max_size_bytes: 10_000,
+                    fee_tx_size1_kb: 2_000,
+                },
+            )))?;
 
         // 9. CONFIG_SETTING_CONTRACT_EXECUTION_LANES
         // Parity: NetworkConfig.cpp:229-243 initialContractExecutionLanesSettingsEntry
-        self.delta.record_create(make_entry(
-            ConfigSettingEntry::ContractExecutionLanes(ConfigSettingContractExecutionLanesV0 {
-                ledger_max_tx_count: 1,
-            }),
-        ))?;
+        self.delta
+            .record_create(make_entry(ConfigSettingEntry::ContractExecutionLanes(
+                ConfigSettingContractExecutionLanesV0 {
+                    ledger_max_tx_count: 1,
+                },
+            )))?;
 
         // 10. CONFIG_SETTING_CONTRACT_COST_PARAMS_CPU_INSTRUCTIONS
         // Parity: NetworkConfig.cpp:246-338 initialCpuCostParamsEntryForV20
@@ -2400,45 +2413,49 @@ impl<'a> LedgerCloseContext<'a> {
 
         // 12. CONFIG_SETTING_STATE_ARCHIVAL
         // Parity: NetworkConfig.cpp:632-685 initialStateArchivalSettings
-        self.delta.record_create(make_entry(
-            ConfigSettingEntry::StateArchival(StateArchivalSettings {
-                max_entry_ttl: 1_054_080,                   // MAXIMUM_ENTRY_LIFETIME (61 days)
-                min_persistent_ttl: 4_096,                  // Live until level 6
-                min_temporary_ttl: 16,
-                persistent_rent_rate_denominator: 252_480,
-                temp_rent_rate_denominator: 2_524_800,
-                max_entries_to_archive: 100,
-                live_soroban_state_size_window_sample_size: 30,
-                live_soroban_state_size_window_sample_period: 64,
-                eviction_scan_size: 100_000,                // 100 kb
-                starting_eviction_scan_level: 6,
-            }),
-        ))?;
+        self.delta
+            .record_create(make_entry(ConfigSettingEntry::StateArchival(
+                StateArchivalSettings {
+                    max_entry_ttl: 1_054_080,  // MAXIMUM_ENTRY_LIFETIME (61 days)
+                    min_persistent_ttl: 4_096, // Live until level 6
+                    min_temporary_ttl: 16,
+                    persistent_rent_rate_denominator: 252_480,
+                    temp_rent_rate_denominator: 2_524_800,
+                    max_entries_to_archive: 100,
+                    live_soroban_state_size_window_sample_size: 30,
+                    live_soroban_state_size_window_sample_period: 64,
+                    eviction_scan_size: 100_000, // 100 kb
+                    starting_eviction_scan_level: 6,
+                },
+            )))?;
 
         // 13. CONFIG_SETTING_LIVE_SOROBAN_STATE_SIZE_WINDOW
         // Parity: NetworkConfig.cpp:1110-1126 initialliveSorobanStateSizeWindow
         // Populates 30-entry window with copies of current bucket list size.
-        let bl_size = self.manager.bucket_list.read().sum_bucket_entry_counters().total_size();
+        let bl_size = self
+            .manager
+            .bucket_list
+            .read()
+            .sum_bucket_entry_counters()
+            .total_size();
         let window: Vec<u64> = vec![bl_size; 30]; // BUCKET_LIST_SIZE_WINDOW_SAMPLE_SIZE = 30
-        self.delta.record_create(make_entry(
-            ConfigSettingEntry::LiveSorobanStateSizeWindow(
+        self.delta
+            .record_create(make_entry(ConfigSettingEntry::LiveSorobanStateSizeWindow(
                 window.try_into().map_err(|_| {
-                    LedgerError::Internal(
-                        "Failed to create state size window".to_string(),
-                    )
+                    LedgerError::Internal("Failed to create state size window".to_string())
                 })?,
-            ),
-        ))?;
+            )))?;
 
         // 14. CONFIG_SETTING_EVICTION_ITERATOR
         // Parity: NetworkConfig.cpp:1128-1139 initialEvictionIterator
-        self.delta.record_create(make_entry(
-            ConfigSettingEntry::EvictionIterator(EvictionIterator {
-                bucket_list_level: 6, // STARTING_EVICTION_SCAN_LEVEL
-                is_curr_bucket: true,
-                bucket_file_offset: 0,
-            }),
-        ))?;
+        self.delta
+            .record_create(make_entry(ConfigSettingEntry::EvictionIterator(
+                EvictionIterator {
+                    bucket_list_level: 6, // STARTING_EVICTION_SCAN_LEVEL
+                    is_curr_bucket: true,
+                    bucket_file_offset: 0,
+                },
+            )))?;
 
         tracing::info!(
             ledger_seq = self.close_data.ledger_seq,
@@ -2460,29 +2477,29 @@ impl<'a> LedgerCloseContext<'a> {
         };
         // Indices 0..=22 (ChaCha20DrawBytes)
         vec![
-            e(4, 0),           // 0: WasmInsnExec
-            e(434, 16),        // 1: MemAlloc
-            e(42, 16),         // 2: MemCpy
-            e(44, 16),         // 3: MemCmp
-            e(310, 0),         // 4: DispatchHostFunction
-            e(61, 0),          // 5: VisitObject
-            e(230, 29),        // 6: ValSer
-            e(59052, 4001),    // 7: ValDeser
-            e(3738, 7012),     // 8: ComputeSha256Hash
-            e(40253, 0),       // 9: ComputeEd25519PubKey
-            e(377524, 4068),   // 10: VerifyEd25519Sig
-            e(451626, 45405),  // 11: VmInstantiation
-            e(451626, 45405),  // 12: VmCachedInstantiation
-            e(1948, 0),        // 13: InvokeVmFunction
-            e(3766, 5969),     // 14: ComputeKeccak256Hash
-            e(710, 0),         // 15: DecodeEcdsaCurve256Sig
-            e(2315295, 0),     // 16: RecoverEcdsaSecp256k1Key
-            e(4404, 0),        // 17: Int256AddSub
-            e(4947, 0),        // 18: Int256Mul
-            e(4911, 0),        // 19: Int256Div
-            e(4286, 0),        // 20: Int256Pow
-            e(913, 0),         // 21: Int256Shift
-            e(1058, 501),      // 22: ChaCha20DrawBytes
+            e(4, 0),          // 0: WasmInsnExec
+            e(434, 16),       // 1: MemAlloc
+            e(42, 16),        // 2: MemCpy
+            e(44, 16),        // 3: MemCmp
+            e(310, 0),        // 4: DispatchHostFunction
+            e(61, 0),         // 5: VisitObject
+            e(230, 29),       // 6: ValSer
+            e(59052, 4001),   // 7: ValDeser
+            e(3738, 7012),    // 8: ComputeSha256Hash
+            e(40253, 0),      // 9: ComputeEd25519PubKey
+            e(377524, 4068),  // 10: VerifyEd25519Sig
+            e(451626, 45405), // 11: VmInstantiation
+            e(451626, 45405), // 12: VmCachedInstantiation
+            e(1948, 0),       // 13: InvokeVmFunction
+            e(3766, 5969),    // 14: ComputeKeccak256Hash
+            e(710, 0),        // 15: DecodeEcdsaCurve256Sig
+            e(2315295, 0),    // 16: RecoverEcdsaSecp256k1Key
+            e(4404, 0),       // 17: Int256AddSub
+            e(4947, 0),       // 18: Int256Mul
+            e(4911, 0),       // 19: Int256Div
+            e(4286, 0),       // 20: Int256Pow
+            e(913, 0),        // 21: Int256Shift
+            e(1058, 501),     // 22: ChaCha20DrawBytes
         ]
     }
 
@@ -2498,29 +2515,29 @@ impl<'a> LedgerCloseContext<'a> {
         };
         // Indices 0..=22 (ChaCha20DrawBytes)
         vec![
-            e(0, 0),           // 0: WasmInsnExec
-            e(16, 128),        // 1: MemAlloc
-            e(0, 0),           // 2: MemCpy
-            e(0, 0),           // 3: MemCmp
-            e(0, 0),           // 4: DispatchHostFunction
-            e(0, 0),           // 5: VisitObject
-            e(242, 384),       // 6: ValSer
-            e(0, 384),         // 7: ValDeser
-            e(0, 0),           // 8: ComputeSha256Hash
-            e(0, 0),           // 9: ComputeEd25519PubKey
-            e(0, 0),           // 10: VerifyEd25519Sig
-            e(130065, 5064),   // 11: VmInstantiation
-            e(130065, 5064),   // 12: VmCachedInstantiation
-            e(14, 0),          // 13: InvokeVmFunction
-            e(0, 0),           // 14: ComputeKeccak256Hash
-            e(0, 0),           // 15: DecodeEcdsaCurve256Sig
-            e(181, 0),         // 16: RecoverEcdsaSecp256k1Key
-            e(99, 0),          // 17: Int256AddSub
-            e(99, 0),          // 18: Int256Mul
-            e(99, 0),          // 19: Int256Div
-            e(99, 0),          // 20: Int256Pow
-            e(99, 0),          // 21: Int256Shift
-            e(0, 0),           // 22: ChaCha20DrawBytes
+            e(0, 0),         // 0: WasmInsnExec
+            e(16, 128),      // 1: MemAlloc
+            e(0, 0),         // 2: MemCpy
+            e(0, 0),         // 3: MemCmp
+            e(0, 0),         // 4: DispatchHostFunction
+            e(0, 0),         // 5: VisitObject
+            e(242, 384),     // 6: ValSer
+            e(0, 384),       // 7: ValDeser
+            e(0, 0),         // 8: ComputeSha256Hash
+            e(0, 0),         // 9: ComputeEd25519PubKey
+            e(0, 0),         // 10: VerifyEd25519Sig
+            e(130065, 5064), // 11: VmInstantiation
+            e(130065, 5064), // 12: VmCachedInstantiation
+            e(14, 0),        // 13: InvokeVmFunction
+            e(0, 0),         // 14: ComputeKeccak256Hash
+            e(0, 0),         // 15: DecodeEcdsaCurve256Sig
+            e(181, 0),       // 16: RecoverEcdsaSecp256k1Key
+            e(99, 0),        // 17: Int256AddSub
+            e(99, 0),        // 18: Int256Mul
+            e(99, 0),        // 19: Int256Div
+            e(99, 0),        // 20: Int256Pow
+            e(99, 0),        // 21: Int256Shift
+            e(0, 0),         // 22: ChaCha20DrawBytes
         ]
     }
 
@@ -2563,30 +2580,30 @@ impl<'a> LedgerCloseContext<'a> {
         cpu_params.resize(NEW_SIZE, make_entry(0, 0));
 
         // Updated existing entry:
-        cpu_params[12] = make_entry(41142, 634);          // VmCachedInstantiation
-        // New entries (indices 23..=44):
-        cpu_params[23] = make_entry(73077, 25410);         // ParseWasmInstructions
-        cpu_params[24] = make_entry(0, 540752);            // ParseWasmFunctions
-        cpu_params[25] = make_entry(0, 176363);            // ParseWasmGlobals
-        cpu_params[26] = make_entry(0, 29989);             // ParseWasmTableEntries
-        cpu_params[27] = make_entry(0, 1061449);           // ParseWasmTypes
-        cpu_params[28] = make_entry(0, 237336);            // ParseWasmDataSegments
-        cpu_params[29] = make_entry(0, 328476);            // ParseWasmElemSegments
-        cpu_params[30] = make_entry(0, 701845);            // ParseWasmImports
-        cpu_params[31] = make_entry(0, 429383);            // ParseWasmExports
-        cpu_params[32] = make_entry(0, 28);                // ParseWasmDataSegmentBytes
-        cpu_params[33] = make_entry(43030, 0);             // InstantiateWasmInstructions
-        cpu_params[34] = make_entry(0, 7556);              // InstantiateWasmFunctions
-        cpu_params[35] = make_entry(0, 10711);             // InstantiateWasmGlobals
-        cpu_params[36] = make_entry(0, 3300);              // InstantiateWasmTableEntries
-        cpu_params[37] = make_entry(0, 0);                 // InstantiateWasmTypes
-        cpu_params[38] = make_entry(0, 23038);             // InstantiateWasmDataSegments
-        cpu_params[39] = make_entry(0, 42488);             // InstantiateWasmElemSegments
-        cpu_params[40] = make_entry(0, 828974);            // InstantiateWasmImports
-        cpu_params[41] = make_entry(0, 297100);            // InstantiateWasmExports
-        cpu_params[42] = make_entry(0, 14);                // InstantiateWasmDataSegmentBytes
-        cpu_params[43] = make_entry(1882, 0);              // Sec1DecodePointUncompressed
-        cpu_params[44] = make_entry(3000906, 0);           // VerifyEcdsaSecp256r1Sig
+        cpu_params[12] = make_entry(41142, 634); // VmCachedInstantiation
+                                                 // New entries (indices 23..=44):
+        cpu_params[23] = make_entry(73077, 25410); // ParseWasmInstructions
+        cpu_params[24] = make_entry(0, 540752); // ParseWasmFunctions
+        cpu_params[25] = make_entry(0, 176363); // ParseWasmGlobals
+        cpu_params[26] = make_entry(0, 29989); // ParseWasmTableEntries
+        cpu_params[27] = make_entry(0, 1061449); // ParseWasmTypes
+        cpu_params[28] = make_entry(0, 237336); // ParseWasmDataSegments
+        cpu_params[29] = make_entry(0, 328476); // ParseWasmElemSegments
+        cpu_params[30] = make_entry(0, 701845); // ParseWasmImports
+        cpu_params[31] = make_entry(0, 429383); // ParseWasmExports
+        cpu_params[32] = make_entry(0, 28); // ParseWasmDataSegmentBytes
+        cpu_params[33] = make_entry(43030, 0); // InstantiateWasmInstructions
+        cpu_params[34] = make_entry(0, 7556); // InstantiateWasmFunctions
+        cpu_params[35] = make_entry(0, 10711); // InstantiateWasmGlobals
+        cpu_params[36] = make_entry(0, 3300); // InstantiateWasmTableEntries
+        cpu_params[37] = make_entry(0, 0); // InstantiateWasmTypes
+        cpu_params[38] = make_entry(0, 23038); // InstantiateWasmDataSegments
+        cpu_params[39] = make_entry(0, 42488); // InstantiateWasmElemSegments
+        cpu_params[40] = make_entry(0, 828974); // InstantiateWasmImports
+        cpu_params[41] = make_entry(0, 297100); // InstantiateWasmExports
+        cpu_params[42] = make_entry(0, 14); // InstantiateWasmDataSegmentBytes
+        cpu_params[43] = make_entry(1882, 0); // Sec1DecodePointUncompressed
+        cpu_params[44] = make_entry(3000906, 0); // VerifyEcdsaSecp256r1Sig
 
         let new_cpu_entry = LedgerEntry {
             last_modified_ledger_seq: self.close_data.ledger_seq,
@@ -2623,37 +2640,39 @@ impl<'a> LedgerCloseContext<'a> {
         mem_params.resize(NEW_SIZE, make_entry(0, 0));
 
         // Updated existing entry:
-        mem_params[12] = make_entry(69472, 1217);          // VmCachedInstantiation
-        // New entries (indices 23..=44):
-        mem_params[23] = make_entry(17564, 6457);          // ParseWasmInstructions
-        mem_params[24] = make_entry(0, 47464);             // ParseWasmFunctions
-        mem_params[25] = make_entry(0, 13420);             // ParseWasmGlobals
-        mem_params[26] = make_entry(0, 6285);              // ParseWasmTableEntries
-        mem_params[27] = make_entry(0, 64670);             // ParseWasmTypes
-        mem_params[28] = make_entry(0, 29074);             // ParseWasmDataSegments
-        mem_params[29] = make_entry(0, 48095);             // ParseWasmElemSegments
-        mem_params[30] = make_entry(0, 103229);            // ParseWasmImports
-        mem_params[31] = make_entry(0, 36394);             // ParseWasmExports
-        mem_params[32] = make_entry(0, 257);               // ParseWasmDataSegmentBytes
-        mem_params[33] = make_entry(70704, 0);             // InstantiateWasmInstructions
-        mem_params[34] = make_entry(0, 14613);             // InstantiateWasmFunctions
-        mem_params[35] = make_entry(0, 6833);              // InstantiateWasmGlobals
-        mem_params[36] = make_entry(0, 1025);              // InstantiateWasmTableEntries
-        mem_params[37] = make_entry(0, 0);                 // InstantiateWasmTypes
-        mem_params[38] = make_entry(0, 129632);            // InstantiateWasmDataSegments
-        mem_params[39] = make_entry(0, 13665);             // InstantiateWasmElemSegments
-        mem_params[40] = make_entry(0, 97637);             // InstantiateWasmImports
-        mem_params[41] = make_entry(0, 9176);              // InstantiateWasmExports
-        mem_params[42] = make_entry(0, 126);               // InstantiateWasmDataSegmentBytes
-        mem_params[43] = make_entry(0, 0);                 // Sec1DecodePointUncompressed
-        mem_params[44] = make_entry(0, 0);                 // VerifyEcdsaSecp256r1Sig
+        mem_params[12] = make_entry(69472, 1217); // VmCachedInstantiation
+                                                  // New entries (indices 23..=44):
+        mem_params[23] = make_entry(17564, 6457); // ParseWasmInstructions
+        mem_params[24] = make_entry(0, 47464); // ParseWasmFunctions
+        mem_params[25] = make_entry(0, 13420); // ParseWasmGlobals
+        mem_params[26] = make_entry(0, 6285); // ParseWasmTableEntries
+        mem_params[27] = make_entry(0, 64670); // ParseWasmTypes
+        mem_params[28] = make_entry(0, 29074); // ParseWasmDataSegments
+        mem_params[29] = make_entry(0, 48095); // ParseWasmElemSegments
+        mem_params[30] = make_entry(0, 103229); // ParseWasmImports
+        mem_params[31] = make_entry(0, 36394); // ParseWasmExports
+        mem_params[32] = make_entry(0, 257); // ParseWasmDataSegmentBytes
+        mem_params[33] = make_entry(70704, 0); // InstantiateWasmInstructions
+        mem_params[34] = make_entry(0, 14613); // InstantiateWasmFunctions
+        mem_params[35] = make_entry(0, 6833); // InstantiateWasmGlobals
+        mem_params[36] = make_entry(0, 1025); // InstantiateWasmTableEntries
+        mem_params[37] = make_entry(0, 0); // InstantiateWasmTypes
+        mem_params[38] = make_entry(0, 129632); // InstantiateWasmDataSegments
+        mem_params[39] = make_entry(0, 13665); // InstantiateWasmElemSegments
+        mem_params[40] = make_entry(0, 97637); // InstantiateWasmImports
+        mem_params[41] = make_entry(0, 9176); // InstantiateWasmExports
+        mem_params[42] = make_entry(0, 126); // InstantiateWasmDataSegmentBytes
+        mem_params[43] = make_entry(0, 0); // Sec1DecodePointUncompressed
+        mem_params[44] = make_entry(0, 0); // VerifyEcdsaSecp256r1Sig
 
         let new_mem_entry = LedgerEntry {
             last_modified_ledger_seq: self.close_data.ledger_seq,
             data: LedgerEntryData::ConfigSetting(
                 ConfigSettingEntry::ContractCostParamsMemoryBytes(ContractCostParams(
                     mem_params.try_into().map_err(|_| {
-                        LedgerError::Internal("Failed to convert V21 memory cost params".to_string())
+                        LedgerError::Internal(
+                            "Failed to convert V21 memory cost params".to_string(),
+                        )
                     })?,
                 )),
             ),
@@ -2708,31 +2727,31 @@ impl<'a> LedgerCloseContext<'a> {
         cpu_params.resize(NEW_SIZE, make_entry(0, 0));
 
         // New BLS12-381 entries (indices 45..=69):
-        cpu_params[45] = make_entry(661, 0);               // Bls12381EncodeFp
-        cpu_params[46] = make_entry(985, 0);               // Bls12381DecodeFp
-        cpu_params[47] = make_entry(1934, 0);              // Bls12381G1CheckPointOnCurve
-        cpu_params[48] = make_entry(730510, 0);            // Bls12381G1CheckPointInSubgroup
-        cpu_params[49] = make_entry(5921, 0);              // Bls12381G2CheckPointOnCurve
-        cpu_params[50] = make_entry(1057822, 0);           // Bls12381G2CheckPointInSubgroup
-        cpu_params[51] = make_entry(92642, 0);             // Bls12381G1ProjectiveToAffine
-        cpu_params[52] = make_entry(100742, 0);            // Bls12381G2ProjectiveToAffine
-        cpu_params[53] = make_entry(7689, 0);              // Bls12381G1Add
-        cpu_params[54] = make_entry(2458985, 0);           // Bls12381G1Mul
-        cpu_params[55] = make_entry(2426722, 96397671);    // Bls12381G1Msm
-        cpu_params[56] = make_entry(1541554, 0);           // Bls12381MapFpToG1
-        cpu_params[57] = make_entry(3211191, 6713);        // Bls12381HashToG1
-        cpu_params[58] = make_entry(25207, 0);             // Bls12381G2Add
-        cpu_params[59] = make_entry(7873219, 0);           // Bls12381G2Mul
-        cpu_params[60] = make_entry(8035968, 309667335);   // Bls12381G2Msm
-        cpu_params[61] = make_entry(2420202, 0);           // Bls12381MapFp2ToG2
-        cpu_params[62] = make_entry(7050564, 6797);        // Bls12381HashToG2
-        cpu_params[63] = make_entry(10558948, 632860943);  // Bls12381Pairing
-        cpu_params[64] = make_entry(1994, 0);              // Bls12381FrFromU256
-        cpu_params[65] = make_entry(1155, 0);              // Bls12381FrToU256
-        cpu_params[66] = make_entry(74, 0);                // Bls12381FrAddSub
-        cpu_params[67] = make_entry(332, 0);               // Bls12381FrMul
-        cpu_params[68] = make_entry(691, 74558);           // Bls12381FrPow
-        cpu_params[69] = make_entry(35421, 0);             // Bls12381FrInv
+        cpu_params[45] = make_entry(661, 0); // Bls12381EncodeFp
+        cpu_params[46] = make_entry(985, 0); // Bls12381DecodeFp
+        cpu_params[47] = make_entry(1934, 0); // Bls12381G1CheckPointOnCurve
+        cpu_params[48] = make_entry(730510, 0); // Bls12381G1CheckPointInSubgroup
+        cpu_params[49] = make_entry(5921, 0); // Bls12381G2CheckPointOnCurve
+        cpu_params[50] = make_entry(1057822, 0); // Bls12381G2CheckPointInSubgroup
+        cpu_params[51] = make_entry(92642, 0); // Bls12381G1ProjectiveToAffine
+        cpu_params[52] = make_entry(100742, 0); // Bls12381G2ProjectiveToAffine
+        cpu_params[53] = make_entry(7689, 0); // Bls12381G1Add
+        cpu_params[54] = make_entry(2458985, 0); // Bls12381G1Mul
+        cpu_params[55] = make_entry(2426722, 96397671); // Bls12381G1Msm
+        cpu_params[56] = make_entry(1541554, 0); // Bls12381MapFpToG1
+        cpu_params[57] = make_entry(3211191, 6713); // Bls12381HashToG1
+        cpu_params[58] = make_entry(25207, 0); // Bls12381G2Add
+        cpu_params[59] = make_entry(7873219, 0); // Bls12381G2Mul
+        cpu_params[60] = make_entry(8035968, 309667335); // Bls12381G2Msm
+        cpu_params[61] = make_entry(2420202, 0); // Bls12381MapFp2ToG2
+        cpu_params[62] = make_entry(7050564, 6797); // Bls12381HashToG2
+        cpu_params[63] = make_entry(10558948, 632860943); // Bls12381Pairing
+        cpu_params[64] = make_entry(1994, 0); // Bls12381FrFromU256
+        cpu_params[65] = make_entry(1155, 0); // Bls12381FrToU256
+        cpu_params[66] = make_entry(74, 0); // Bls12381FrAddSub
+        cpu_params[67] = make_entry(332, 0); // Bls12381FrMul
+        cpu_params[68] = make_entry(691, 74558); // Bls12381FrPow
+        cpu_params[69] = make_entry(35421, 0); // Bls12381FrInv
 
         let new_cpu_entry = LedgerEntry {
             last_modified_ledger_seq: self.close_data.ledger_seq,
@@ -2769,38 +2788,40 @@ impl<'a> LedgerCloseContext<'a> {
         mem_params.resize(NEW_SIZE, make_entry(0, 0));
 
         // New BLS12-381 entries (indices 45..=69):
-        mem_params[45] = make_entry(0, 0);                 // Bls12381EncodeFp
-        mem_params[46] = make_entry(0, 0);                 // Bls12381DecodeFp
-        mem_params[47] = make_entry(0, 0);                 // Bls12381G1CheckPointOnCurve
-        mem_params[48] = make_entry(0, 0);                 // Bls12381G1CheckPointInSubgroup
-        mem_params[49] = make_entry(0, 0);                 // Bls12381G2CheckPointOnCurve
-        mem_params[50] = make_entry(0, 0);                 // Bls12381G2CheckPointInSubgroup
-        mem_params[51] = make_entry(0, 0);                 // Bls12381G1ProjectiveToAffine
-        mem_params[52] = make_entry(0, 0);                 // Bls12381G2ProjectiveToAffine
-        mem_params[53] = make_entry(0, 0);                 // Bls12381G1Add
-        mem_params[54] = make_entry(0, 0);                 // Bls12381G1Mul
-        mem_params[55] = make_entry(109494, 354667);       // Bls12381G1Msm
-        mem_params[56] = make_entry(5552, 0);              // Bls12381MapFpToG1
-        mem_params[57] = make_entry(9424, 0);              // Bls12381HashToG1
-        mem_params[58] = make_entry(0, 0);                 // Bls12381G2Add
-        mem_params[59] = make_entry(0, 0);                 // Bls12381G2Mul
-        mem_params[60] = make_entry(219654, 354667);       // Bls12381G2Msm
-        mem_params[61] = make_entry(3344, 0);              // Bls12381MapFp2ToG2
-        mem_params[62] = make_entry(6816, 0);              // Bls12381HashToG2
-        mem_params[63] = make_entry(2204, 9340474);        // Bls12381Pairing
-        mem_params[64] = make_entry(0, 0);                 // Bls12381FrFromU256
-        mem_params[65] = make_entry(248, 0);               // Bls12381FrToU256
-        mem_params[66] = make_entry(0, 0);                 // Bls12381FrAddSub
-        mem_params[67] = make_entry(0, 0);                 // Bls12381FrMul
-        mem_params[68] = make_entry(0, 128);               // Bls12381FrPow
-        mem_params[69] = make_entry(0, 0);                 // Bls12381FrInv
+        mem_params[45] = make_entry(0, 0); // Bls12381EncodeFp
+        mem_params[46] = make_entry(0, 0); // Bls12381DecodeFp
+        mem_params[47] = make_entry(0, 0); // Bls12381G1CheckPointOnCurve
+        mem_params[48] = make_entry(0, 0); // Bls12381G1CheckPointInSubgroup
+        mem_params[49] = make_entry(0, 0); // Bls12381G2CheckPointOnCurve
+        mem_params[50] = make_entry(0, 0); // Bls12381G2CheckPointInSubgroup
+        mem_params[51] = make_entry(0, 0); // Bls12381G1ProjectiveToAffine
+        mem_params[52] = make_entry(0, 0); // Bls12381G2ProjectiveToAffine
+        mem_params[53] = make_entry(0, 0); // Bls12381G1Add
+        mem_params[54] = make_entry(0, 0); // Bls12381G1Mul
+        mem_params[55] = make_entry(109494, 354667); // Bls12381G1Msm
+        mem_params[56] = make_entry(5552, 0); // Bls12381MapFpToG1
+        mem_params[57] = make_entry(9424, 0); // Bls12381HashToG1
+        mem_params[58] = make_entry(0, 0); // Bls12381G2Add
+        mem_params[59] = make_entry(0, 0); // Bls12381G2Mul
+        mem_params[60] = make_entry(219654, 354667); // Bls12381G2Msm
+        mem_params[61] = make_entry(3344, 0); // Bls12381MapFp2ToG2
+        mem_params[62] = make_entry(6816, 0); // Bls12381HashToG2
+        mem_params[63] = make_entry(2204, 9340474); // Bls12381Pairing
+        mem_params[64] = make_entry(0, 0); // Bls12381FrFromU256
+        mem_params[65] = make_entry(248, 0); // Bls12381FrToU256
+        mem_params[66] = make_entry(0, 0); // Bls12381FrAddSub
+        mem_params[67] = make_entry(0, 0); // Bls12381FrMul
+        mem_params[68] = make_entry(0, 128); // Bls12381FrPow
+        mem_params[69] = make_entry(0, 0); // Bls12381FrInv
 
         let new_mem_entry = LedgerEntry {
             last_modified_ledger_seq: self.close_data.ledger_seq,
             data: LedgerEntryData::ConfigSetting(
                 ConfigSettingEntry::ContractCostParamsMemoryBytes(ContractCostParams(
                     mem_params.try_into().map_err(|_| {
-                        LedgerError::Internal("Failed to convert V22 memory cost params".to_string())
+                        LedgerError::Internal(
+                            "Failed to convert V22 memory cost params".to_string(),
+                        )
                     })?,
                 )),
             ),
@@ -2947,9 +2968,9 @@ impl<'a> LedgerCloseContext<'a> {
         let archival_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
             config_setting_id: ConfigSettingId::StateArchival,
         });
-        let archival_entry = self.load_entry(&archival_key)?.ok_or_else(|| {
-            LedgerError::Internal("StateArchival entry not found".to_string())
-        })?;
+        let archival_entry = self
+            .load_entry(&archival_key)?
+            .ok_or_else(|| LedgerError::Internal("StateArchival entry not found".to_string()))?;
 
         if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(ref settings)) =
             archival_entry.data
@@ -3271,12 +3292,7 @@ impl<'a> LedgerCloseContext<'a> {
                 self.prev_header.ledger_version,
                 self.manager.network_id,
             );
-            TransactionExecutor::new(
-                &ctx,
-                id_pool,
-                soroban_config.clone(),
-                classic_events,
-            )
+            TransactionExecutor::new(&ctx, id_pool, soroban_config.clone(), classic_events)
         });
 
         if is_new_executor {
@@ -3315,129 +3331,134 @@ impl<'a> LedgerCloseContext<'a> {
         let executor_setup_us = executor_setup_start.elapsed().as_micros() as u64;
 
         let mut fee_pre_deduct_us: u64 = 0;
-        let mut tx_set_result =
-            if has_parallel
-                && protocol_version_starts_from(
-                    self.prev_header.ledger_version,
-                    PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION,
-                )
-            {
-                let phase = prepared.soroban_phase.as_ref().unwrap();
-                let classic_txs = &prepared.classic_txs;
+        let mut tx_set_result = if has_parallel
+            && protocol_version_starts_from(
+                self.prev_header.ledger_version,
+                PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION,
+            ) {
+            let phase = prepared.soroban_phase.as_ref().unwrap();
+            let classic_txs = &prepared.classic_txs;
 
-                // Pre-deduct ALL fees (classic + Soroban) in a single pass before
-                // any transaction body executes. This matches stellar-core's
-                // processFeesSeqNums() which processes all phases' fees in order
-                // before any transaction applies.
-                let fee_pre_deduct_start = std::time::Instant::now();
-                let (classic_pre_charged, soroban_pre_charged, total_fee_pool) =
-                    pre_deduct_all_fees_on_delta(
-                        classic_txs,
-                        phase,
-                        self.prev_header.base_fee,
-                        self.manager.network_id,
-                        self.close_data.ledger_seq,
-                        &mut self.delta,
-                        &self.snapshot,
-                    )?;
-                self.delta.record_fee_pool_delta(total_fee_pool);
-
-                // Pre-load fee-deducted account entries from the delta into the
-                // classic executor so classic TXs see ALL fee deductions (including
-                // Soroban fees on shared accounts).
-                for entry in self.delta.current_entries() {
-                    if matches!(entry.data, stellar_xdr::curr::LedgerEntryData::Account(_)) {
-                        executor_ref.state_mut().load_entry(entry);
-                    }
-                }
-
-                fee_pre_deduct_us = fee_pre_deduct_start.elapsed().as_micros() as u64;
-
-                // Execute classic phase (fees already deducted on delta).
-                let classic_start = std::time::Instant::now();
-                let mut classic_result = if classic_txs.is_empty() {
-                    TxSetResult {
-                        results: Vec::new(),
-                        tx_results: Vec::new(),
-                        tx_result_metas: Vec::new(),
-                        id_pool: self.snapshot.header().id_pool,
-                        hot_archive_restored_keys: Vec::new(),
-                    }
-                } else {
-                    run_transactions_on_executor(crate::execution::RunTransactionsParams {
-                        executor: executor_ref,
-                        snapshot: &self.snapshot,
-                        transactions: classic_txs,
-                        base_fee: self.prev_header.base_fee,
-                        soroban_base_prng_seed: soroban_base_prng_seed.0,
-                        deduct_fee: false,
-                        delta: &mut self.delta,
-                        external_pre_charged: Some(&classic_pre_charged),
-                    })?
-                };
-                self.timing_classic_exec_us = classic_start.elapsed().as_micros() as u64;
-
-                // Execute Soroban parallel phase (fees already deducted on delta).
-                let soroban_start = std::time::Instant::now();
-                let ledger_context = LedgerContext::new(
-                    self.close_data.ledger_seq,
-                    self.close_data.close_time,
-                    self.prev_header.base_fee,
-                    self.prev_header.base_reserve,
-                    self.prev_header.ledger_version,
-                    self.manager.network_id,
-                );
-                let soroban_result = execute_soroban_parallel_phase(
-                    &self.snapshot,
+            // Pre-deduct ALL fees (classic + Soroban) in a single pass before
+            // any transaction body executes. This matches stellar-core's
+            // processFeesSeqNums() which processes all phases' fees in order
+            // before any transaction applies.
+            let fee_pre_deduct_start = std::time::Instant::now();
+            let (classic_pre_charged, soroban_pre_charged, total_fee_pool) =
+                pre_deduct_all_fees_on_delta(
+                    classic_txs,
                     phase,
-                    classic_txs.len(),
-                    &ledger_context,
+                    self.prev_header.base_fee,
+                    self.manager.network_id,
+                    self.close_data.ledger_seq,
                     &mut self.delta,
-                    SorobanContext {
-                        config: soroban_config,
-                        base_prng_seed: soroban_base_prng_seed.0,
-                        classic_events,
-                        module_cache,
-                        hot_archive,
-                        runtime_handle: self.runtime_handle.clone(),
-                        soroban_state: Some(self.manager.soroban_state.clone()),
-                        offer_store: Some(self.manager.offer_store.clone()),
-                        emit_soroban_tx_meta_ext_v1: self.manager.config.emit_soroban_tx_meta_ext_v1,
-                        enable_soroban_diagnostic_events: self.manager.config.enable_soroban_diagnostic_events,
-                    },
-                    Some(soroban_pre_charged),
+                    &self.snapshot,
                 )?;
-                self.timing_soroban_exec_us = soroban_start.elapsed().as_micros() as u64;
+            self.delta.record_fee_pool_delta(total_fee_pool);
 
-                // Combine results: classic first, then Soroban.
-                classic_result.results.extend(soroban_result.results);
-                classic_result.tx_results.extend(soroban_result.tx_results);
-                classic_result.tx_result_metas.extend(soroban_result.tx_result_metas);
-                classic_result.id_pool = classic_result.id_pool.max(soroban_result.id_pool);
-                classic_result.hot_archive_restored_keys.extend(soroban_result.hot_archive_restored_keys);
+            // Pre-load fee-deducted account entries from the delta into the
+            // classic executor so classic TXs see ALL fee deductions (including
+            // Soroban fees on shared accounts).
+            for entry in self.delta.current_entries() {
+                if matches!(entry.data, stellar_xdr::curr::LedgerEntryData::Account(_)) {
+                    executor_ref.state_mut().load_entry(entry);
+                }
+            }
 
-                tracing::debug!(
-                    ledger_seq = self.close_data.ledger_seq,
-                    classic_tx_count = classic_txs.len(),
-                    soroban_stages = phase.stages.len(),
-                    soroban_clusters = phase.stages.iter().map(|s| s.len()).sum::<usize>(),
-                    "Executed parallel Soroban phase"
-                );
+            fee_pre_deduct_us = fee_pre_deduct_start.elapsed().as_micros() as u64;
 
-                classic_result
+            // Execute classic phase (fees already deducted on delta).
+            let classic_start = std::time::Instant::now();
+            let mut classic_result = if classic_txs.is_empty() {
+                TxSetResult {
+                    results: Vec::new(),
+                    tx_results: Vec::new(),
+                    tx_result_metas: Vec::new(),
+                    id_pool: self.snapshot.header().id_pool,
+                    hot_archive_restored_keys: Vec::new(),
+                }
             } else {
-                // Sequential path: run all transactions on the persistent executor.
                 run_transactions_on_executor(crate::execution::RunTransactionsParams {
                     executor: executor_ref,
                     snapshot: &self.snapshot,
-                    transactions: &prepared.all_txs,
+                    transactions: classic_txs,
                     base_fee: self.prev_header.base_fee,
                     soroban_base_prng_seed: soroban_base_prng_seed.0,
-                    deduct_fee: true,
+                    deduct_fee: false,
                     delta: &mut self.delta,
-                    external_pre_charged: None,
+                    external_pre_charged: Some(&classic_pre_charged),
                 })?
             };
+            self.timing_classic_exec_us = classic_start.elapsed().as_micros() as u64;
+
+            // Execute Soroban parallel phase (fees already deducted on delta).
+            let soroban_start = std::time::Instant::now();
+            let ledger_context = LedgerContext::new(
+                self.close_data.ledger_seq,
+                self.close_data.close_time,
+                self.prev_header.base_fee,
+                self.prev_header.base_reserve,
+                self.prev_header.ledger_version,
+                self.manager.network_id,
+            );
+            let soroban_result = execute_soroban_parallel_phase(
+                &self.snapshot,
+                phase,
+                classic_txs.len(),
+                &ledger_context,
+                &mut self.delta,
+                SorobanContext {
+                    config: soroban_config,
+                    base_prng_seed: soroban_base_prng_seed.0,
+                    classic_events,
+                    module_cache,
+                    hot_archive,
+                    runtime_handle: self.runtime_handle.clone(),
+                    soroban_state: Some(self.manager.soroban_state.clone()),
+                    offer_store: Some(self.manager.offer_store.clone()),
+                    emit_soroban_tx_meta_ext_v1: self.manager.config.emit_soroban_tx_meta_ext_v1,
+                    enable_soroban_diagnostic_events: self
+                        .manager
+                        .config
+                        .enable_soroban_diagnostic_events,
+                },
+                Some(soroban_pre_charged),
+            )?;
+            self.timing_soroban_exec_us = soroban_start.elapsed().as_micros() as u64;
+
+            // Combine results: classic first, then Soroban.
+            classic_result.results.extend(soroban_result.results);
+            classic_result.tx_results.extend(soroban_result.tx_results);
+            classic_result
+                .tx_result_metas
+                .extend(soroban_result.tx_result_metas);
+            classic_result.id_pool = classic_result.id_pool.max(soroban_result.id_pool);
+            classic_result
+                .hot_archive_restored_keys
+                .extend(soroban_result.hot_archive_restored_keys);
+
+            tracing::debug!(
+                ledger_seq = self.close_data.ledger_seq,
+                classic_tx_count = classic_txs.len(),
+                soroban_stages = phase.stages.len(),
+                soroban_clusters = phase.stages.iter().map(|s| s.len()).sum::<usize>(),
+                "Executed parallel Soroban phase"
+            );
+
+            classic_result
+        } else {
+            // Sequential path: run all transactions on the persistent executor.
+            run_transactions_on_executor(crate::execution::RunTransactionsParams {
+                executor: executor_ref,
+                snapshot: &self.snapshot,
+                transactions: &prepared.all_txs,
+                base_fee: self.prev_header.base_fee,
+                soroban_base_prng_seed: soroban_base_prng_seed.0,
+                deduct_fee: true,
+                delta: &mut self.delta,
+                external_pre_charged: None,
+            })?
+        };
 
         // Store the executor back for reuse on the next ledger close
         *self.manager.executor.lock() = executor;
@@ -3470,7 +3491,11 @@ impl<'a> LedgerCloseContext<'a> {
         // Update stats
         let tx_count = tx_set_result.results.len();
         let success_count = tx_set_result.results.iter().filter(|r| r.success).count();
-        let op_count: usize = tx_set_result.results.iter().map(|r| r.operation_results.len()).sum();
+        let op_count: usize = tx_set_result
+            .results
+            .iter()
+            .map(|r| r.operation_results.len())
+            .sum();
         let fees_collected: i64 = tx_set_result.results.iter().map(|r| r.fee_charged).sum();
 
         self.stats
@@ -3479,12 +3504,29 @@ impl<'a> LedgerCloseContext<'a> {
 
         // Collect per-transaction perf data and aggregate sub-phase timings
         let mut agg_op_type_timings: HashMap<henyey_tx::OperationType, (u64, u32)> = HashMap::new();
-        let (mut agg_validation_us, mut agg_fee_seq_us, mut agg_footprint_us, mut agg_ops_us, mut agg_meta_build_us) = (0u64, 0u64, 0u64, 0u64, 0u64);
-        let (mut agg_val_account_load_us, mut agg_val_tx_hash_us, mut agg_val_ed25519_us, mut agg_val_other_us) = (0u64, 0u64, 0u64, 0u64);
-        let (mut agg_fee_deduct_us, mut agg_op_sig_check_us, mut agg_signer_removal_us, mut agg_seq_bump_us) = (0u64, 0u64, 0u64, 0u64);
+        let (
+            mut agg_validation_us,
+            mut agg_fee_seq_us,
+            mut agg_footprint_us,
+            mut agg_ops_us,
+            mut agg_meta_build_us,
+        ) = (0u64, 0u64, 0u64, 0u64, 0u64);
+        let (
+            mut agg_val_account_load_us,
+            mut agg_val_tx_hash_us,
+            mut agg_val_ed25519_us,
+            mut agg_val_other_us,
+        ) = (0u64, 0u64, 0u64, 0u64);
+        let (
+            mut agg_fee_deduct_us,
+            mut agg_op_sig_check_us,
+            mut agg_signer_removal_us,
+            mut agg_seq_bump_us,
+        ) = (0u64, 0u64, 0u64, 0u64);
         for (i, result) in tx_set_result.results.iter().enumerate() {
             let hash_hex = if i < self.tx_results.len() {
-                Hash256::from_bytes(self.tx_results[i].transaction_hash.0).to_hex()[..16].to_string()
+                Hash256::from_bytes(self.tx_results[i].transaction_hash.0).to_hex()[..16]
+                    .to_string()
             } else {
                 String::new()
             };
@@ -3578,7 +3620,9 @@ impl<'a> LedgerCloseContext<'a> {
         prev_version: u32,
         protocol_version: u32,
     ) -> Result<(bool, bool, Vec<UpgradeEntryMeta>)> {
-        use stellar_xdr::curr::{LedgerEntryChange, LedgerEntryChanges, LedgerUpgrade, Limits, WriteXdr};
+        use stellar_xdr::curr::{
+            LedgerEntryChange, LedgerEntryChanges, LedgerUpgrade, Limits, WriteXdr,
+        };
 
         // Parity: Upgrades.cpp:1229-1242 applyVersionUpgrade
         // Version upgrades may create/modify config setting entries in the
@@ -3653,9 +3697,7 @@ impl<'a> LedgerCloseContext<'a> {
                 && self.manager.network_id().is_mainnet()
             {
                 self.delta.record_fee_pool_delta(31_879_035);
-                tracing::info!(
-                    "Applied V24 mainnet fee pool correction: +31879035 stroops"
-                );
+                tracing::info!("Applied V24 mainnet fee pool correction: +31879035 stroops");
             }
             // Extract changes made during version upgrade side effects
             let mut changes: Vec<LedgerEntryChange> = Vec::new();
@@ -3697,7 +3739,9 @@ impl<'a> LedgerCloseContext<'a> {
         // this is not an issue in practice.
         let reserve_changes = if let Some(new_reserve) = self.upgrade_ctx.base_reserve_upgrade() {
             let did_reserve_increase = new_reserve > self.prev_header.base_reserve;
-            if protocol_version_starts_from(protocol_version, ProtocolVersion::V10) && did_reserve_increase {
+            if protocol_version_starts_from(protocol_version, ProtocolVersion::V10)
+                && did_reserve_increase
+            {
                 let delta_before = self.delta.num_changes();
                 crate::prepare_liabilities::prepare_liabilities(
                     &self.snapshot,
@@ -3780,18 +3824,15 @@ impl<'a> LedgerCloseContext<'a> {
                 LedgerUpgrade::Version(_) => version_changes.clone(),
                 LedgerUpgrade::Config(key) => {
                     let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
-                    per_config_changes.remove(&key_bytes).unwrap_or_else(|| {
-                        LedgerEntryChanges(VecM::default())
-                    })
+                    per_config_changes
+                        .remove(&key_bytes)
+                        .unwrap_or_else(|| LedgerEntryChanges(VecM::default()))
                 }
                 LedgerUpgrade::MaxSorobanTxSetSize(_) => max_soroban_changes.clone(),
                 LedgerUpgrade::BaseReserve(_) => reserve_changes.clone(),
                 _ => LedgerEntryChanges(VecM::default()),
             };
-            upgrades_meta.push(UpgradeEntryMeta {
-                upgrade,
-                changes,
-            });
+            upgrades_meta.push(UpgradeEntryMeta { upgrade, changes });
         }
 
         // Parity: Upgrades.cpp:1238-1242 and 1449-1453
@@ -3799,8 +3840,8 @@ impl<'a> LedgerCloseContext<'a> {
         // 1. After version upgrade to V23+ (recompute with potentially new cost params)
         // 2. After config upgrade that changes ContractCostParamsMemoryBytes
         // It recomputes contract code sizes in-memory and overwrites all window entries.
-        let version_upgrade_triggers_state_size =
-            prev_version != protocol_version && protocol_version_starts_from(protocol_version, ProtocolVersion::V23);
+        let version_upgrade_triggers_state_size = prev_version != protocol_version
+            && protocol_version_starts_from(protocol_version, ProtocolVersion::V23);
         if (config_memory_cost_params_changed
             || version_upgrade_memory_cost_changed
             || version_upgrade_triggers_state_size)
@@ -3833,10 +3874,7 @@ impl<'a> LedgerCloseContext<'a> {
 
             // Update all window entries with the new total size
             // Parity: NetworkConfig.cpp:2165 updateRecomputedSorobanStateSize
-            if protocol_version_starts_from(
-                protocol_version,
-                ProtocolVersion::V23,
-            ) {
+            if protocol_version_starts_from(protocol_version, ProtocolVersion::V23) {
                 let new_size = self.manager.soroban_state.read().total_size();
                 let window_key = stellar_xdr::curr::LedgerKey::ConfigSetting(
                     stellar_xdr::curr::LedgerKeyConfigSetting {
@@ -3915,7 +3953,11 @@ impl<'a> LedgerCloseContext<'a> {
             }
         }
 
-        Ok((config_state_archival_changed, config_memory_cost_params_changed, upgrades_meta))
+        Ok((
+            config_state_archival_changed,
+            config_memory_cost_params_changed,
+            upgrades_meta,
+        ))
     }
 
     /// Create the new ledger header and compute its hash.
@@ -4118,21 +4160,21 @@ impl<'a> LedgerCloseContext<'a> {
         // Parity: In stellar-core, eviction runs after config upgrades (sealLedgerTxnAndStoreInBucketsAndDB),
         // so it reads the post-upgrade StateArchival settings. We use load_state_archival_settings()
         // which checks the delta first (containing any upgrade changes) before the snapshot.
-        let eviction_settings = if protocol_version_starts_from(protocol_version, ProtocolVersion::V23)
-        {
-            tracing::debug!(
-                ledger_seq = self.close_data.ledger_seq,
-                "Loading state archival settings"
-            );
-            let settings = self.load_state_archival_settings().unwrap_or_default();
-            tracing::debug!(
-                ledger_seq = self.close_data.ledger_seq,
-                "Loaded state archival settings"
-            );
-            Some(settings)
-        } else {
-            None
-        };
+        let eviction_settings =
+            if protocol_version_starts_from(protocol_version, ProtocolVersion::V23) {
+                tracing::debug!(
+                    ledger_seq = self.close_data.ledger_seq,
+                    "Loading state archival settings"
+                );
+                let settings = self.load_state_archival_settings().unwrap_or_default();
+                tracing::debug!(
+                    ledger_seq = self.close_data.ledger_seq,
+                    "Loaded state archival settings"
+                );
+                Some(settings)
+            } else {
+                None
+            };
 
         // Categorize delta entries for bucket list update (single pass) before acquiring write lock.
         // Drains entries from the delta (moving instead of cloning), saving ~50K clone operations.
@@ -4156,7 +4198,16 @@ impl<'a> LedgerCloseContext<'a> {
             ledger_seq = self.close_data.ledger_seq,
             "Acquiring bucket list write lock"
         );
-        let (bucket_list_hash, bucket_lock_wait_us, eviction_us, soroban_state_us, add_batch_us, hot_archive_us, bg_eviction_data, evicted_meta_keys) = {
+        let (
+            bucket_list_hash,
+            bucket_lock_wait_us,
+            eviction_us,
+            soroban_state_us,
+            add_batch_us,
+            hot_archive_us,
+            bg_eviction_data,
+            evicted_meta_keys,
+        ) = {
             let lock_wait_start = std::time::Instant::now();
             let mut bucket_list = self.manager.bucket_list.write();
             let bucket_lock_wait_us = lock_wait_start.elapsed().as_micros() as u64;
@@ -4302,7 +4353,8 @@ impl<'a> LedgerCloseContext<'a> {
                                     .unwrap_or_else(|| {
                                         tracing::debug!(
                                             ledger_seq = self.close_data.ledger_seq,
-                                            starting_level = eviction_settings.starting_eviction_scan_level,
+                                            starting_level =
+                                                eviction_settings.starting_eviction_scan_level,
                                             "Creating new EvictionIterator (no entry found)"
                                         );
                                         EvictionIterator::new(
@@ -4642,7 +4694,8 @@ impl<'a> LedgerCloseContext<'a> {
 
             // For Protocol 23+, update hot archive and combine bucket list hashes
             let hot_archive_start = std::time::Instant::now();
-            let final_hash = if protocol_version_starts_from(protocol_version, ProtocolVersion::V23) {
+            let final_hash = if protocol_version_starts_from(protocol_version, ProtocolVersion::V23)
+            {
                 let mut hot_archive_guard = self.manager.hot_archive_bucket_list.write();
                 if let Some(ref mut hot_archive) = *hot_archive_guard {
                     // Advance hot archive through any skipped ledgers (same as live bucket list)
@@ -4696,24 +4749,31 @@ impl<'a> LedgerCloseContext<'a> {
             let hot_archive_us = hot_archive_start.elapsed().as_micros() as u64;
 
             // Prepare data for background eviction scan (snapshot while we hold the lock)
-            let bg_eviction_data = if protocol_version_starts_from(
-                protocol_version,
-                ProtocolVersion::V23,
-            ) {
-                eviction_settings.map(|settings| {
-                    let snapshot =
-                        BucketListSnapshot::new(&bucket_list, self.prev_header.clone());
-                    let iter = load_eviction_iterator_from_bucket_list(&bucket_list)
-                        .unwrap_or_else(|| {
-                            EvictionIterator::new(settings.starting_eviction_scan_level)
-                        });
-                    (snapshot, iter, settings)
-                })
-            } else {
-                None
-            };
+            let bg_eviction_data =
+                if protocol_version_starts_from(protocol_version, ProtocolVersion::V23) {
+                    eviction_settings.map(|settings| {
+                        let snapshot =
+                            BucketListSnapshot::new(&bucket_list, self.prev_header.clone());
+                        let iter = load_eviction_iterator_from_bucket_list(&bucket_list)
+                            .unwrap_or_else(|| {
+                                EvictionIterator::new(settings.starting_eviction_scan_level)
+                            });
+                        (snapshot, iter, settings)
+                    })
+                } else {
+                    None
+                };
 
-            (final_hash, bucket_lock_wait_us, eviction_us, soroban_state_us, add_batch_us, hot_archive_us, bg_eviction_data, evicted_meta_keys)
+            (
+                final_hash,
+                bucket_lock_wait_us,
+                eviction_us,
+                soroban_state_us,
+                add_batch_us,
+                hot_archive_us,
+                bg_eviction_data,
+                evicted_meta_keys,
+            )
         };
 
         // Start background eviction scan for the next ledger.
@@ -4742,13 +4802,21 @@ impl<'a> LedgerCloseContext<'a> {
         let header_us = header_start.elapsed().as_micros() as u64;
 
         // Record stats (counts were already computed during categorize_for_bucket_update)
-        self.stats
-            .record_entry_changes(bucket_created_count, bucket_updated_count, bucket_deleted_count);
+        self.stats.record_entry_changes(
+            bucket_created_count,
+            bucket_updated_count,
+            bucket_deleted_count,
+        );
 
         // Commit to manager
         let commit_close_start = std::time::Instant::now();
-        self.manager
-            .commit_close(offer_pool_changes, new_header.clone(), header_hash, delta_has_offers, delta_has_pool_share_trustlines)?;
+        self.manager.commit_close(
+            offer_pool_changes,
+            new_header.clone(),
+            header_hash,
+            delta_has_offers,
+            delta_has_pool_share_trustlines,
+        )?;
         let commit_close_us = commit_close_start.elapsed().as_micros() as u64;
 
         // If protocol upgraded to a new major version, rebuild the module cache.
@@ -4823,32 +4891,33 @@ impl<'a> LedgerCloseContext<'a> {
 
         // Compute average Soroban state size from the LiveSorobanStateSizeWindow.
         // Parity: NetworkConfig.cpp:1812 — average of all window entries.
-        let avg_soroban_state_size = if protocol_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION {
-            let bl = self.manager.bucket_list.read();
-            let window_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-                config_setting_id: ConfigSettingId::LiveSorobanStateSizeWindow,
-            });
-            bl.get(&window_key)
-                .ok()
-                .flatten()
-                .and_then(|entry| {
-                    if let LedgerEntryData::ConfigSetting(
-                        ConfigSettingEntry::LiveSorobanStateSizeWindow(window),
-                    ) = &entry.data
-                    {
-                        if window.is_empty() {
-                            return Some(0u64);
+        let avg_soroban_state_size =
+            if protocol_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION {
+                let bl = self.manager.bucket_list.read();
+                let window_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+                    config_setting_id: ConfigSettingId::LiveSorobanStateSizeWindow,
+                });
+                bl.get(&window_key)
+                    .ok()
+                    .flatten()
+                    .and_then(|entry| {
+                        if let LedgerEntryData::ConfigSetting(
+                            ConfigSettingEntry::LiveSorobanStateSizeWindow(window),
+                        ) = &entry.data
+                        {
+                            if window.is_empty() {
+                                return Some(0u64);
+                            }
+                            let sum: u64 = window.iter().copied().sum();
+                            Some(sum / window.len() as u64)
+                        } else {
+                            None
                         }
-                        let sum: u64 = window.iter().copied().sum();
-                        Some(sum / window.len() as u64)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(0)
-        } else {
-            0
-        };
+                    })
+                    .unwrap_or(0)
+            } else {
+                0
+            };
 
         let meta_start = std::time::Instant::now();
         // Move tx_set and scp_history out of close_data to avoid cloning 50K envelopes
@@ -4972,9 +5041,7 @@ struct LedgerCloseMetaInputs {
     soroban_fee_write_1kb: i64,
 }
 
-fn build_ledger_close_meta(
-    inputs: LedgerCloseMetaInputs,
-) -> LedgerCloseMeta {
+fn build_ledger_close_meta(inputs: LedgerCloseMetaInputs) -> LedgerCloseMeta {
     let LedgerCloseMetaInputs {
         tx_set_variant,
         scp_history,
@@ -5055,8 +5122,8 @@ mod tests {
     use super::*;
     use stellar_xdr::curr::{
         Asset, ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint,
-        LedgerScpMessages, OfferEntry, OfferEntryExt, Price, ScAddress, ScpHistoryEntry,
-        ScpHistoryEntryV0, ScVal, TransactionSet, TtlEntry, WriteXdr,
+        LedgerScpMessages, OfferEntry, OfferEntryExt, Price, ScAddress, ScVal, ScpHistoryEntry,
+        ScpHistoryEntryV0, TransactionSet, TtlEntry, WriteXdr,
     };
 
     // Note: These tests require proper mocking of BucketManager and Database
@@ -5129,8 +5196,15 @@ mod tests {
         let mut bl = BucketList::new();
         let offer1 = make_offer_entry(1, [1u8; 32]);
         let offer2 = make_offer_entry(2, [2u8; 32]);
-        bl.add_batch(1, TEST_PROTOCOL, BucketListType::Live, vec![offer1, offer2], vec![], vec![])
-            .unwrap();
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![offer1, offer2],
+            vec![],
+            vec![],
+        )
+        .unwrap();
 
         let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
         assert_eq!(result.offers.len(), 2);
@@ -5143,8 +5217,15 @@ mod tests {
         let mut bl = BucketList::new();
         let cd1 = make_contract_data_entry([10u8; 32]);
         let cd2 = make_contract_data_entry([20u8; 32]);
-        bl.add_batch(1, TEST_PROTOCOL, BucketListType::Live, vec![cd1, cd2], vec![], vec![])
-            .unwrap();
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![cd1, cd2],
+            vec![],
+            vec![],
+        )
+        .unwrap();
 
         let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
         assert_eq!(result.soroban_state.contract_data_count(), 2);
@@ -5154,8 +5235,15 @@ mod tests {
     fn test_scan_ttl_entries_from_bucket_list() {
         let mut bl = BucketList::new();
         let ttl = make_ttl_entry([30u8; 32], 1000);
-        bl.add_batch(1, TEST_PROTOCOL, BucketListType::Live, vec![ttl], vec![], vec![])
-            .unwrap();
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![ttl],
+            vec![],
+            vec![],
+        )
+        .unwrap();
 
         let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
         // TTL may or may not be added depending on whether it has a matching contract entry;
@@ -5171,8 +5259,12 @@ mod tests {
         let ttl = make_ttl_entry([30u8; 32], 500);
 
         bl.add_batch(
-            1, TEST_PROTOCOL, BucketListType::Live,
-            vec![offer, cd, ttl], vec![], vec![],
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![offer, cd, ttl],
+            vec![],
+            vec![],
         )
         .unwrap();
 
@@ -5188,18 +5280,35 @@ mod tests {
         // The dead entry should shadow the live one.
         let mut bl = BucketList::new();
         let offer = make_offer_entry(99, [5u8; 32]);
-        bl.add_batch(1, TEST_PROTOCOL, BucketListType::Live, vec![offer], vec![], vec![])
-            .unwrap();
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![offer],
+            vec![],
+            vec![],
+        )
+        .unwrap();
 
         let dead_key = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
             seller_id: make_account_id([5u8; 32]),
             offer_id: 99,
         });
-        bl.add_batch(2, TEST_PROTOCOL, BucketListType::Live, vec![], vec![], vec![dead_key])
-            .unwrap();
+        bl.add_batch(
+            2,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![],
+            vec![],
+            vec![dead_key],
+        )
+        .unwrap();
 
         let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
-        assert!(result.offers.is_empty(), "dead entry should shadow the live offer");
+        assert!(
+            result.offers.is_empty(),
+            "dead entry should shadow the live offer"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5210,16 +5319,30 @@ mod tests {
 
         // Add offer at ledger 1 (will be in a higher level after more adds)
         let old_offer = make_offer_entry(1, [1u8; 32]);
-        bl.add_batch(1, TEST_PROTOCOL, BucketListType::Live, vec![old_offer], vec![], vec![])
-            .unwrap();
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![old_offer],
+            vec![],
+            vec![],
+        )
+        .unwrap();
 
         // Modify the same offer at ledger 2 (more recent → lower level)
         let mut new_offer = make_offer_entry(1, [1u8; 32]);
         if let LedgerEntryData::Offer(ref mut o) = new_offer.data {
             o.amount = 9999;
         }
-        bl.add_batch(2, TEST_PROTOCOL, BucketListType::Live, vec![], vec![new_offer.clone()], vec![])
-            .unwrap();
+        bl.add_batch(
+            2,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![],
+            vec![new_offer.clone()],
+            vec![],
+        )
+        .unwrap();
 
         let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
         assert_eq!(result.offers.len(), 1);
@@ -5244,14 +5367,22 @@ mod tests {
                 b
             });
             bl.add_batch(
-                (i + 1) as u32, TEST_PROTOCOL, BucketListType::Live,
-                vec![offer], vec![], vec![],
+                (i + 1) as u32,
+                TEST_PROTOCOL,
+                BucketListType::Live,
+                vec![offer],
+                vec![],
+                vec![],
             )
             .unwrap();
         }
 
         let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
-        assert_eq!(result.offers.len(), num_offers, "all offers should be found");
+        assert_eq!(
+            result.offers.len(),
+            num_offers,
+            "all offers should be found"
+        );
     }
 
     #[test]
@@ -5263,8 +5394,12 @@ mod tests {
         let offer = make_offer_entry(1, [1u8; 32]);
         let cd = make_contract_data_entry([10u8; 32]);
         bl.add_batch(
-            1, pre_soroban_protocol, BucketListType::Live,
-            vec![offer, cd], vec![], vec![],
+            1,
+            pre_soroban_protocol,
+            BucketListType::Live,
+            vec![offer, cd],
+            vec![],
+            vec![],
         )
         .unwrap();
 
@@ -5323,7 +5458,10 @@ mod tests {
         let result = scan_single_level(&curr, &snap, true, &mc, TEST_PROTOCOL);
 
         // The dead entry shadows the live one → no entries in result
-        assert!(result.entries.is_empty(), "dead entry should shadow live entry in snap");
+        assert!(
+            result.entries.is_empty(),
+            "dead entry should shadow live entry in snap"
+        );
     }
 
     #[test]
@@ -5353,12 +5491,7 @@ mod tests {
             dead_ttl_keys: HashSet::new(),
         };
 
-        let result = merge_level_results(
-            vec![level0, level1],
-            None,
-            TEST_PROTOCOL,
-            &None,
-        );
+        let result = merge_level_results(vec![level0, level1], None, TEST_PROTOCOL, &None);
 
         assert_eq!(result.offers.len(), 1);
         if let LedgerEntryData::Offer(ref o) = result.offers[&1].data {
@@ -5437,8 +5570,15 @@ mod tests {
         let mut bl = BucketList::new();
         let seller_bytes = [7u8; 32];
         let offer = make_offer_entry(10, seller_bytes);
-        bl.add_batch(1, TEST_PROTOCOL, BucketListType::Live, vec![offer], vec![], vec![])
-            .unwrap();
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![offer],
+            vec![],
+            vec![],
+        )
+        .unwrap();
 
         let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
         assert_eq!(result.offers.len(), 1);
@@ -5458,8 +5598,12 @@ mod tests {
                 b
             });
             bl.add_batch(
-                (i + 1) as u32, TEST_PROTOCOL, BucketListType::Live,
-                vec![offer], vec![], vec![],
+                (i + 1) as u32,
+                TEST_PROTOCOL,
+                BucketListType::Live,
+                vec![offer],
+                vec![],
+                vec![],
             )
             .unwrap();
         }
@@ -5469,7 +5613,10 @@ mod tests {
 
         assert_eq!(result1.offers.len(), result2.offers.len());
         for (id, entry) in &result1.offers {
-            assert!(result2.offers.contains_key(id), "parallel result missing offer {id}");
+            assert!(
+                result2.offers.contains_key(id),
+                "parallel result missing offer {id}"
+            );
             if let (LedgerEntryData::Offer(ref o1), LedgerEntryData::Offer(ref o2)) =
                 (&entry.data, &result2.offers[id].data)
             {
@@ -5483,18 +5630,35 @@ mod tests {
         // Dead-key shadowing test with scan_thread_count=1 (exercises the sequential path).
         let mut bl = BucketList::new();
         let offer = make_offer_entry(77, [7u8; 32]);
-        bl.add_batch(1, TEST_PROTOCOL, BucketListType::Live, vec![offer], vec![], vec![])
-            .unwrap();
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![offer],
+            vec![],
+            vec![],
+        )
+        .unwrap();
 
         let dead_key = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
             seller_id: make_account_id([7u8; 32]),
             offer_id: 77,
         });
-        bl.add_batch(2, TEST_PROTOCOL, BucketListType::Live, vec![], vec![], vec![dead_key])
-            .unwrap();
+        bl.add_batch(
+            2,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![],
+            vec![],
+            vec![dead_key],
+        )
+        .unwrap();
 
         let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
-        assert!(result.offers.is_empty(), "dead entry should shadow live offer (thread_count=1)");
+        assert!(
+            result.offers.is_empty(),
+            "dead entry should shadow live offer (thread_count=1)"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5734,10 +5898,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let manager = LedgerManager::new(
-            "Test SDF Network ; September 2015".to_string(),
-            config,
-        );
+        let manager = LedgerManager::new("Test SDF Network ; September 2015".to_string(), config);
 
         // Before initialize, bucket list has no config
         assert!(manager.bucket_list.read().bucket_list_db_config().is_none());
@@ -5771,10 +5932,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let manager = LedgerManager::new(
-            "Test SDF Network ; September 2015".to_string(),
-            config,
-        );
+        let manager = LedgerManager::new("Test SDF Network ; September 2015".to_string(), config);
 
         // Initialize
         manager
@@ -5788,7 +5946,12 @@ mod tests {
 
         // Verify config is set
         assert_eq!(
-            manager.bucket_list.read().bucket_list_db_config().unwrap().memory_for_caching_mb,
+            manager
+                .bucket_list
+                .read()
+                .bucket_list_db_config()
+                .unwrap()
+                .memory_for_caching_mb,
             128
         );
 
@@ -5807,7 +5970,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            manager.bucket_list.read().bucket_list_db_config().unwrap().memory_for_caching_mb,
+            manager
+                .bucket_list
+                .read()
+                .bucket_list_db_config()
+                .unwrap()
+                .memory_for_caching_mb,
             128
         );
     }
@@ -5873,10 +6041,7 @@ mod tests {
         );
 
         // Simulate storing a pending scan
-        let snapshot = BucketListSnapshot::new(
-            &BucketList::default(),
-            create_genesis_header(),
-        );
+        let snapshot = BucketListSnapshot::new(&BucketList::default(), create_genesis_header());
         let settings = StateArchivalSettings::default();
         let iter = EvictionIterator::new(settings.starting_eviction_scan_level);
         let settings_clone = settings.clone();
@@ -5913,13 +6078,11 @@ mod tests {
             hash_bytes[0] = i;
             let code_entry = LedgerEntry {
                 last_modified_ledger_seq: 1,
-                data: LedgerEntryData::ContractCode(
-                    stellar_xdr::curr::ContractCodeEntry {
-                        ext: stellar_xdr::curr::ContractCodeEntryExt::V0,
-                        hash: Hash(hash_bytes),
-                        code: vec![0u8; 50].try_into().unwrap(),
-                    },
-                ),
+                data: LedgerEntryData::ContractCode(stellar_xdr::curr::ContractCodeEntry {
+                    ext: stellar_xdr::curr::ContractCodeEntryExt::V0,
+                    hash: Hash(hash_bytes),
+                    code: vec![0u8; 50].try_into().unwrap(),
+                }),
                 ext: LedgerEntryExt::V0,
             };
             let code_key = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
@@ -5948,8 +6111,15 @@ mod tests {
             entries.push(ttl_entry);
         }
 
-        bl.add_batch(1, TEST_PROTOCOL, BucketListType::Live, entries, vec![], vec![])
-            .unwrap();
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            entries,
+            vec![],
+            vec![],
+        )
+        .unwrap();
 
         let snapshot = BucketListSnapshot::new(&bl, create_genesis_header());
         let settings = StateArchivalSettings {
@@ -5964,9 +6134,8 @@ mod tests {
             bucket_file_offset: 0,
         };
 
-        let handle = std::thread::spawn(move || {
-            snapshot.scan_for_eviction_incremental(iter, 5, &settings)
-        });
+        let handle =
+            std::thread::spawn(move || snapshot.scan_for_eviction_incremental(iter, 5, &settings));
 
         let result = handle.join().expect("thread should not panic").unwrap();
         assert_eq!(result.candidates.len(), 3, "Should find 3 expired entries");
@@ -5979,10 +6148,7 @@ mod tests {
     ///
     /// The returned context has an empty snapshot and delta at the given ledger_seq.
     /// The manager is initialized with an empty bucket list.
-    fn make_test_close_context(
-        manager: &LedgerManager,
-        ledger_seq: u32,
-    ) -> LedgerCloseContext<'_> {
+    fn make_test_close_context(manager: &LedgerManager, ledger_seq: u32) -> LedgerCloseContext<'_> {
         let header = create_genesis_header();
         let header_hash = crate::compute_header_hash(&header).expect("hash");
         let snapshot = SnapshotHandle::new(crate::snapshot::LedgerSnapshot::empty(0));
@@ -6078,22 +6244,17 @@ mod tests {
         }
 
         // 2. ContractDataKeySizeBytes
-        let entry = get_config_setting_from_delta(
-            &ctx.delta,
-            ConfigSettingId::ContractDataKeySizeBytes,
-        );
+        let entry =
+            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractDataKeySizeBytes);
         assert!(entry.is_some(), "ContractDataKeySizeBytes should exist");
 
         // 3. ContractDataEntrySizeBytes
-        let entry = get_config_setting_from_delta(
-            &ctx.delta,
-            ConfigSettingId::ContractDataEntrySizeBytes,
-        );
+        let entry =
+            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractDataEntrySizeBytes);
         assert!(entry.is_some(), "ContractDataEntrySizeBytes should exist");
 
         // 4. ContractComputeV0
-        let entry =
-            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractComputeV0);
+        let entry = get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractComputeV0);
         assert!(entry.is_some(), "ContractComputeV0 should exist");
         if let Some(ConfigSettingEntry::ContractComputeV0(ref compute)) = entry {
             assert_eq!(compute.tx_max_instructions, 2_500_000);
@@ -6114,16 +6275,12 @@ mod tests {
 
         // 6-9. Historical data, events, bandwidth, execution lanes
         assert!(
-            get_config_setting_from_delta(
-                &ctx.delta,
-                ConfigSettingId::ContractHistoricalDataV0
-            )
-            .is_some(),
+            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractHistoricalDataV0)
+                .is_some(),
             "ContractHistoricalDataV0 should exist"
         );
         assert!(
-            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractEventsV0)
-                .is_some(),
+            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractEventsV0).is_some(),
             "ContractEventsV0 should exist"
         );
         assert!(
@@ -6132,11 +6289,8 @@ mod tests {
             "ContractBandwidthV0 should exist"
         );
         assert!(
-            get_config_setting_from_delta(
-                &ctx.delta,
-                ConfigSettingId::ContractExecutionLanes
-            )
-            .is_some(),
+            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractExecutionLanes)
+                .is_some(),
             "ContractExecutionLanes should exist"
         );
 
@@ -6168,8 +6322,7 @@ mod tests {
         }
 
         // 12. StateArchival
-        let archival =
-            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::StateArchival);
+        let archival = get_config_setting_from_delta(&ctx.delta, ConfigSettingId::StateArchival);
         assert!(archival.is_some(), "StateArchival should exist");
         if let Some(ConfigSettingEntry::StateArchival(ref sa)) = archival {
             assert_eq!(sa.max_entry_ttl, 1_054_080);
@@ -6179,18 +6332,15 @@ mod tests {
         }
 
         // 13. LiveSorobanStateSizeWindow (30-entry window)
-        let window = get_config_setting_from_delta(
-            &ctx.delta,
-            ConfigSettingId::LiveSorobanStateSizeWindow,
-        );
+        let window =
+            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::LiveSorobanStateSizeWindow);
         assert!(window.is_some(), "LiveSorobanStateSizeWindow should exist");
         if let Some(ConfigSettingEntry::LiveSorobanStateSizeWindow(ref w)) = window {
             assert_eq!(w.len(), 30, "Window should have 30 entries");
         }
 
         // 14. EvictionIterator
-        let eviction =
-            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::EvictionIterator);
+        let eviction = get_config_setting_from_delta(&ctx.delta, ConfigSettingId::EvictionIterator);
         assert!(eviction.is_some(), "EvictionIterator should exist");
         if let Some(ConfigSettingEntry::EvictionIterator(ref ei)) = eviction {
             assert_eq!(ei.bucket_list_level, 6);
@@ -6354,21 +6504,15 @@ mod tests {
         ctx.create_and_update_ledger_entries_for_v23().expect("V23");
 
         // 1. ContractParallelComputeV0
-        let parallel = get_config_setting_from_delta(
-            &ctx.delta,
-            ConfigSettingId::ContractParallelComputeV0,
-        );
-        assert!(
-            parallel.is_some(),
-            "ContractParallelComputeV0 should exist"
-        );
+        let parallel =
+            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractParallelComputeV0);
+        assert!(parallel.is_some(), "ContractParallelComputeV0 should exist");
         if let Some(ConfigSettingEntry::ContractParallelComputeV0(ref p)) = parallel {
             assert_eq!(p.ledger_max_dependent_tx_clusters, 1);
         }
 
         // 2. ScpTiming
-        let timing =
-            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ScpTiming);
+        let timing = get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ScpTiming);
         assert!(timing.is_some(), "ScpTiming should exist");
         if let Some(ConfigSettingEntry::ScpTiming(ref t)) = timing {
             assert_eq!(t.ledger_target_close_time_milliseconds, 5000);
@@ -6376,10 +6520,8 @@ mod tests {
         }
 
         // 3. ContractLedgerCostExtV0
-        let ext = get_config_setting_from_delta(
-            &ctx.delta,
-            ConfigSettingId::ContractLedgerCostExtV0,
-        );
+        let ext =
+            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractLedgerCostExtV0);
         assert!(ext.is_some(), "ContractLedgerCostExtV0 should exist");
         if let Some(ConfigSettingEntry::ContractLedgerCostExtV0(ref e)) = ext {
             // tx_max_footprint_entries should match the V0 tx_max_disk_read_entries
@@ -6388,10 +6530,7 @@ mod tests {
         }
 
         // 4. Verify rent cost params were updated
-        let cost = get_config_setting_from_delta(
-            &ctx.delta,
-            ConfigSettingId::ContractLedgerCostV0,
-        );
+        let cost = get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractLedgerCostV0);
         if let Some(ConfigSettingEntry::ContractLedgerCostV0(ref c)) = cost {
             assert_eq!(c.soroban_state_target_size_bytes, 3_000_000_000);
             assert_eq!(c.rent_fee1_kb_soroban_state_size_low, -17_000);
@@ -6400,8 +6539,7 @@ mod tests {
             panic!("ContractLedgerCostV0 not found or wrong type after V23 upgrade");
         }
 
-        let archival =
-            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::StateArchival);
+        let archival = get_config_setting_from_delta(&ctx.delta, ConfigSettingId::StateArchival);
         if let Some(ConfigSettingEntry::StateArchival(ref sa)) = archival {
             assert_eq!(sa.persistent_rent_rate_denominator, 1_215);
             assert_eq!(sa.temp_rent_rate_denominator, 2_430);

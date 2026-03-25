@@ -110,12 +110,15 @@ impl std::str::FromStr for CatchupMode {
             _ => {
                 // Try to parse as "recent:N"
                 if let Some(count) = s.strip_prefix("recent:") {
-                    let n: u32 = count
-                        .parse()
-                        .map_err(|_| ParseCatchupModeError(format!("Invalid recent count: {}", count)))?;
+                    let n: u32 = count.parse().map_err(|_| {
+                        ParseCatchupModeError(format!("Invalid recent count: {}", count))
+                    })?;
                     Ok(Self::Recent(n))
                 } else {
-                    Err(ParseCatchupModeError(format!("Unknown catchup mode: {}", s)))
+                    Err(ParseCatchupModeError(format!(
+                        "Unknown catchup mode: {}",
+                        s
+                    )))
                 }
             }
         }
@@ -198,12 +201,7 @@ impl CatchupRange {
             lcl,
             GENESIS_LEDGER_SEQ
         );
-        assert!(
-            target > lcl,
-            "target {} must be > lcl {}",
-            target,
-            lcl
-        );
+        assert!(target > lcl, "target {} must be > lcl {}", target, lcl);
         assert!(
             target > GENESIS_LEDGER_SEQ,
             "target {} must be > genesis {}",
@@ -226,7 +224,9 @@ impl CatchupRange {
         // (the network advances faster than the bucket download completes).
         const MINIMAL_BUCKET_DOWNLOAD_THRESHOLD: u32 = 10_000;
         if lcl > GENESIS_LEDGER_SEQ {
-            if mode != CatchupMode::Minimal || full_replay_count <= MINIMAL_BUCKET_DOWNLOAD_THRESHOLD {
+            if mode != CatchupMode::Minimal
+                || full_replay_count <= MINIMAL_BUCKET_DOWNLOAD_THRESHOLD
+            {
                 let replay = LedgerRange::new(lcl + 1, full_replay_count);
                 return Self::replay_only(replay);
             }
@@ -301,7 +301,10 @@ impl CatchupRange {
     ///
     /// Panics if `apply_buckets()` is false.
     pub fn bucket_apply_ledger(&self) -> u32 {
-        assert!(self.apply_buckets, "bucket_apply_ledger called when apply_buckets is false");
+        assert!(
+            self.apply_buckets,
+            "bucket_apply_ledger called when apply_buckets is false"
+        );
         self.apply_buckets_at_ledger
     }
 

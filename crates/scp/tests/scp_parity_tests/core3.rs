@@ -387,4 +387,3 @@ fn test_core3_node_without_self_quorum_timeout() {
         Some(&b2),
     );
 }
-

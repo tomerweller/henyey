@@ -263,10 +263,7 @@ impl Maintainer {
         if let Some(retention_window) = self.config.rpc_retention_window {
             let rpc_lmin = lcl.saturating_sub(retention_window);
 
-            match self
-                .database
-                .delete_old_events(rpc_lmin, self.config.count)
-            {
+            match self.database.delete_old_events(rpc_lmin, self.config.count) {
                 Ok(deleted) => {
                     if deleted > 0 {
                         debug!(deleted = deleted, "Deleted old contract events");
@@ -431,20 +428,12 @@ mod tests {
         // If qmin is 128 and checkpoint_frequency() is 64, lmin should be 64
         let freq = checkpoint_frequency();
         let qmin = 128u32;
-        let lmin = if qmin >= freq {
-            qmin - freq
-        } else {
-            0
-        };
+        let lmin = if qmin >= freq { qmin - freq } else { 0 };
         assert_eq!(lmin, 64);
 
         // If qmin is 32 (less than checkpoint frequency), lmin should be 0
         let qmin = 32u32;
-        let lmin = if qmin >= freq {
-            qmin - freq
-        } else {
-            0
-        };
+        let lmin = if qmin >= freq { qmin - freq } else { 0 };
         assert_eq!(lmin, 0);
     }
 

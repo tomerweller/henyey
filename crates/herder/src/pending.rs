@@ -19,11 +19,11 @@
 //! - **Per-Slot Limits**: Prevents memory exhaustion by limiting envelopes per slot
 
 use dashmap::DashMap;
+use henyey_common::Hash256;
+use henyey_scp::SlotIndex;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
-use henyey_common::Hash256;
-use henyey_scp::SlotIndex;
 use stellar_xdr::curr::ScpEnvelope;
 
 /// Configuration for pending envelope management.

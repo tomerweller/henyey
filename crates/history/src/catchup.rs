@@ -54,22 +54,21 @@ use crate::{
     replay::ReplayConfig,
     verify, CatchupOutput, CatchupResult, HistoryError, Result,
 };
-use std::collections::HashMap;
-use std::sync::Arc;
 use henyey_bucket::{Bucket, BucketList, BucketManager, HasNextState, HotArchiveBucketList};
 use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 use henyey_common::{Hash256, NetworkId};
 use henyey_db::Database;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use henyey_ledger::{LedgerCloseData, LedgerManager, TransactionSetVariant};
-use stellar_xdr::curr::LedgerCloseMeta;
 use henyey_tx::TransactionFrame;
+use stellar_xdr::curr::LedgerCloseMeta;
 use stellar_xdr::curr::{
-    GeneralizedTransactionSet, LedgerHeader, LedgerHeaderHistoryEntry,
-    LedgerUpgrade, Limits, ReadXdr,
-    ScpHistoryEntry, TransactionHistoryEntry, TransactionHistoryEntryExt,
-    TransactionHistoryResultEntry, TransactionHistoryResultEntryExt,
-    TransactionResultPair, TransactionResultSet, TransactionSet, TransactionSetV1, WriteXdr,
+    GeneralizedTransactionSet, LedgerHeader, LedgerHeaderHistoryEntry, LedgerUpgrade, Limits,
+    ReadXdr, ScpHistoryEntry, TransactionHistoryEntry, TransactionHistoryEntryExt,
+    TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionResultPair,
+    TransactionResultSet, TransactionSet, TransactionSetV1, WriteXdr,
 };
 use tracing::{debug, info, warn};
 
@@ -102,7 +101,9 @@ fn rss_mb() -> Option<u64> {
 /// 3. No runtime → create a temporary single-threaded runtime
 fn block_on_async<F, T>(future: F) -> std::result::Result<T, henyey_bucket::BucketError>
 where
-    F: std::future::Future<Output = std::result::Result<T, henyey_bucket::BucketError>> + Send + 'static,
+    F: std::future::Future<Output = std::result::Result<T, henyey_bucket::BucketError>>
+        + Send
+        + 'static,
     T: Send + 'static,
 {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -126,9 +127,7 @@ where
             })
             .join()
             .map_err(|_| {
-                henyey_bucket::BucketError::NotFound(
-                    "bucket download thread panicked".to_string(),
-                )
+                henyey_bucket::BucketError::NotFound("bucket download thread panicked".to_string())
             })?
         }
     } else {
@@ -136,10 +135,7 @@ where
             .enable_all()
             .build()
             .map_err(|e| {
-                henyey_bucket::BucketError::NotFound(format!(
-                    "failed to build runtime: {}",
-                    e
-                ))
+                henyey_bucket::BucketError::NotFound(format!("failed to build runtime: {}", e))
             })?;
         rt.block_on(future)
     }
@@ -154,10 +150,7 @@ async fn download_bucket_from_archives(
         match archive.get_bucket(&hash).await {
             Ok(data) => return Ok(data),
             Err(e) => {
-                warn!(
-                    "Failed to download bucket {} from archive: {}",
-                    hash, e
-                );
+                warn!("Failed to download bucket {} from archive: {}", hash, e);
                 continue;
             }
         }
@@ -524,7 +517,12 @@ impl CatchupManager {
             ledger_manager.reset();
         }
         ledger_manager
-            .initialize(bucket_list, hot_archive_bucket_list, checkpoint_header.clone(), checkpoint_hash)
+            .initialize(
+                bucket_list,
+                hot_archive_bucket_list,
+                checkpoint_header.clone(),
+                checkpoint_hash,
+            )
             .map_err(|e| {
                 HistoryError::CatchupFailed(format!("Failed to initialize ledger manager: {}", e))
             })?;
@@ -560,7 +558,8 @@ impl CatchupManager {
             (checkpoint_header, checkpoint_hash, 0)
         } else {
             let ledgers_applied = target - checkpoint_seq;
-            self.replay_via_close_ledger(ledger_manager, &ledger_data).await?;
+            self.replay_via_close_ledger(ledger_manager, &ledger_data)
+                .await?;
 
             // Get the final header from the ledger manager (already at target state)
             let final_header = ledger_manager.current_header();
@@ -695,9 +694,17 @@ impl CatchupManager {
                 ledger_manager.reset();
             }
             ledger_manager
-                .initialize(bucket_list, hot_archive_bucket_list, checkpoint_header, checkpoint_hash)
+                .initialize(
+                    bucket_list,
+                    hot_archive_bucket_list,
+                    checkpoint_header,
+                    checkpoint_hash,
+                )
                 .map_err(|e| {
-                    HistoryError::CatchupFailed(format!("Failed to initialize ledger manager: {}", e))
+                    HistoryError::CatchupFailed(format!(
+                        "Failed to initialize ledger manager: {}",
+                        e
+                    ))
                 })?;
 
             bucket_apply_at
@@ -715,7 +722,12 @@ impl CatchupManager {
                         );
                         let (header, hash) = self.download_checkpoint_header(lcl).await?;
                         ledger_manager
-                            .initialize(state.bucket_list, state.hot_archive_bucket_list, header, hash)
+                            .initialize(
+                                state.bucket_list,
+                                state.hot_archive_bucket_list,
+                                header,
+                                hash,
+                            )
                             .map_err(|e| {
                                 HistoryError::CatchupFailed(format!(
                                     "Failed to initialize ledger manager from existing state: {}",
@@ -755,7 +767,9 @@ impl CatchupManager {
             );
 
             let download_from_checkpoint = replay_first - 1;
-            let ledger_data = self.download_ledger_data(download_from_checkpoint, target).await?;
+            let ledger_data = self
+                .download_ledger_data(download_from_checkpoint, target)
+                .await?;
 
             // Verify the header chain
             self.update_progress(CatchupStatus::Verifying, 5, "Verifying header chain");
@@ -771,7 +785,8 @@ impl CatchupManager {
 
             // Replay ledgers via close_ledger
             self.update_progress(CatchupStatus::Replaying, 6, "Replaying ledgers");
-            self.replay_via_close_ledger(ledger_manager, &ledger_data).await?;
+            self.replay_via_close_ledger(ledger_manager, &ledger_data)
+                .await?;
 
             let network_id = NetworkId(ledger_manager.network_id().0);
             self.persist_ledger_history(&ledger_data, &network_id)?;
@@ -853,7 +868,9 @@ impl CatchupManager {
         self.progress.buckets_total = bucket_hashes.len() as u32;
         for (idx, hash) in bucket_hashes.iter().enumerate() {
             if !hash.is_zero() && *hash != empty_bucket_hash {
-                let bucket_path = data.bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
+                let bucket_path = data
+                    .bucket_dir
+                    .join(format!("{}.bucket.xdr", hash.to_hex()));
                 if !bucket_path.exists() {
                     return Err(HistoryError::BucketNotFound(*hash));
                 }
@@ -868,7 +885,9 @@ impl CatchupManager {
                 if hash.is_zero() || *hash == empty_bucket_hash {
                     continue;
                 }
-                let src = data.bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
+                let src = data
+                    .bucket_dir
+                    .join(format!("{}.bucket.xdr", hash.to_hex()));
                 let dst = bucket_mgr_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
                 if src.exists() && !dst.exists() {
                     std::fs::copy(&src, &dst).map_err(|e| {
@@ -917,7 +936,12 @@ impl CatchupManager {
             ledger_manager.reset();
         }
         ledger_manager
-            .initialize(bucket_list, hot_archive_bucket_list, checkpoint_header.clone(), checkpoint_hash)
+            .initialize(
+                bucket_list,
+                hot_archive_bucket_list,
+                checkpoint_header.clone(),
+                checkpoint_hash,
+            )
             .map_err(|e| {
                 HistoryError::CatchupFailed(format!("Failed to initialize ledger manager: {}", e))
             })?;
@@ -977,7 +1001,8 @@ impl CatchupManager {
             (checkpoint_header, checkpoint_hash, 0)
         } else {
             let ledgers_applied = target - checkpoint_seq;
-            self.replay_via_close_ledger(ledger_manager, &ledger_data).await?;
+            self.replay_via_close_ledger(ledger_manager, &ledger_data)
+                .await?;
 
             let final_header = ledger_manager.current_header();
             let final_hash = ledger_manager.current_header_hash();
@@ -1033,8 +1058,7 @@ impl CatchupManager {
 
         // Hot archive merges are small — run synchronously.
         {
-            let load_hot_bucket_for_merge =
-                load_disk_backed_hot_archive_bucket_closure(bucket_dir);
+            let load_hot_bucket_for_merge = load_disk_backed_hot_archive_bucket_closure(bucket_dir);
             hot_archive_bucket_list
                 .restart_merges_from_has(
                     checkpoint_seq,
@@ -1400,7 +1424,10 @@ impl CatchupManager {
         let mut bucket_list =
             BucketList::restore_from_has(&live_hash_pairs, &live_next_states, load_bucket)
                 .map_err(|e| {
-                    HistoryError::CatchupFailed(format!("Failed to restore live bucket list: {}", e))
+                    HistoryError::CatchupFailed(format!(
+                        "Failed to restore live bucket list: {}",
+                        e
+                    ))
                 })?;
         bucket_list.set_bucket_dir(bucket_dir.to_path_buf());
 
@@ -1411,7 +1438,10 @@ impl CatchupManager {
             bucket_list.stats().total_entries
         );
         if let Some(mb) = rss_mb() {
-            info!("apply_buckets AFTER live bucket list restore — RSS {} MB", mb);
+            info!(
+                "apply_buckets AFTER live bucket list restore — RSS {} MB",
+                mb
+            );
         }
 
         // Build hot archive next states (even if no hot archive buckets, for return value)
@@ -1465,7 +1495,8 @@ impl CatchupManager {
                     }
 
                     // Check if we have the XDR data in the pre-downloaded cache
-                    let bucket_path = bucket_dir_clone.join(format!("{}.bucket.xdr", hash.to_hex()));
+                    let bucket_path =
+                        bucket_dir_clone.join(format!("{}.bucket.xdr", hash.to_hex()));
 
                     let xdr_data: Option<Vec<u8>> = if let Some(data) = {
                         let mut preloaded = preloaded_buckets.lock().unwrap();

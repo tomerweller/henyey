@@ -147,10 +147,7 @@ mod tests {
         assert_eq!(obj.len(), 1, "top-level should only have 'metrics'");
 
         let metrics = value["metrics"].as_object().unwrap();
-        let expected_counters = [
-            "peer.peer.count",
-            "herder.pending.transactions",
-        ];
+        let expected_counters = ["peer.peer.count", "herder.pending.transactions"];
         for name in &expected_counters {
             let metric = &metrics[*name];
             assert_eq!(metric["type"], "counter", "{name} should be a counter");
@@ -214,10 +211,7 @@ mod tests {
         assert_eq!(meter["type"], "meter");
         let rate_fields = ["mean_rate", "1_min_rate", "5_min_rate", "15_min_rate"];
         for field in &rate_fields {
-            assert!(
-                meter.get(*field).is_some(),
-                "meter must have '{field}'"
-            );
+            assert!(meter.get(*field).is_some(), "meter must have '{field}'");
         }
     }
 }

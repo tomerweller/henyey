@@ -72,11 +72,7 @@ pub fn canonical_bucket_filename(hash: &Hash256) -> String {
 /// Generate a unique temporary file path in the given directory.
 pub(crate) fn temp_merge_path(bucket_dir: &Path) -> PathBuf {
     let id = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    bucket_dir.join(format!(
-        "merge-tmp-{}-{}.xdr",
-        std::process::id(),
-        id
-    ))
+    bucket_dir.join(format!("merge-tmp-{}-{}.xdr", std::process::id(), id))
 }
 
 /// Promote a temporary merge output file to its permanent canonical path.
@@ -328,8 +324,10 @@ impl BucketManager {
         live_entries: Vec<LedgerEntry>,
         dead_entries: Vec<LedgerKey>,
     ) -> Result<Arc<Bucket>> {
-        let mut entries: Vec<BucketEntry> =
-            live_entries.into_iter().map(BucketEntry::Liveentry).collect();
+        let mut entries: Vec<BucketEntry> = live_entries
+            .into_iter()
+            .map(BucketEntry::Liveentry)
+            .collect();
 
         entries.extend(dead_entries.into_iter().map(BucketEntry::Deadentry));
 
@@ -375,10 +373,9 @@ impl BucketManager {
             );
 
             // Try loading a persisted index first (skips both file-scanning passes)
-            if let Some(disk_index) = self.try_load_index_for_bucket(
-                hash,
-                crate::index::DEFAULT_PAGE_SIZE,
-            )? {
+            if let Some(disk_index) =
+                self.try_load_index_for_bucket(hash, crate::index::DEFAULT_PAGE_SIZE)?
+            {
                 let entry_count = disk_index.counters().total() as usize;
                 let live_index = crate::index::LiveBucketIndex::Disk(disk_index);
                 tracing::debug!(
@@ -397,8 +394,7 @@ impl BucketManager {
                 let bucket = Bucket::from_xdr_file_disk_backed(&xdr_path)?;
 
                 // Save index for next time (only for DiskIndex, not InMemoryIndex)
-                if let Some(crate::index::LiveBucketIndex::Disk(ref disk_idx)) =
-                    bucket.live_index()
+                if let Some(crate::index::LiveBucketIndex::Disk(ref disk_idx)) = bucket.live_index()
                 {
                     if let Err(e) = self.save_index_for_bucket(hash, disk_idx) {
                         tracing::warn!(
@@ -534,12 +530,8 @@ impl BucketManager {
         }
 
         // Promote temp file to canonical path and load as disk-backed bucket
-        let bucket = promote_temp_to_canonical(
-            &temp_path,
-            &self.bucket_dir,
-            &hash,
-            "BucketManager::merge",
-        )?;
+        let bucket =
+            promote_temp_to_canonical(&temp_path, &self.bucket_dir, &hash, "BucketManager::merge")?;
 
         // Persist the index for next time (only for DiskIndex, not InMemoryIndex)
         if let Some(crate::index::LiveBucketIndex::Disk(ref disk_idx)) = bucket.live_index() {
@@ -701,8 +693,7 @@ impl BucketManager {
 
         // Clean up merge map entries whose outputs are no longer retained
         {
-            let keep_hash_set: std::collections::HashSet<Hash256> =
-                keep.iter().copied().collect();
+            let keep_hash_set: std::collections::HashSet<Hash256> = keep.iter().copied().collect();
             let mut merge_map = self.finished_merges.write().unwrap();
             merge_map.retain_outputs(&keep_hash_set);
         }
@@ -1399,8 +1390,8 @@ pub struct BucketManagerStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::BucketEntry; // Re-import to shadow XDR's BucketEntry
     use crate::future_bucket::MergeKey;
+    use crate::BucketEntry; // Re-import to shadow XDR's BucketEntry
     use stellar_xdr::curr::*;
     use tempfile::TempDir;
 
@@ -1617,10 +1608,14 @@ mod tests {
 
         // Create two buckets - older has entry1, newer has entry2
         let bucket1 = manager
-            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [1u8; 32], 100,
+            ))])
             .unwrap();
         let bucket2 = manager
-            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([2u8; 32], 200))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [2u8; 32], 200,
+            ))])
             .unwrap();
 
         // Load complete state (bucket1 is older, bucket2 is newer)
@@ -1637,12 +1632,16 @@ mod tests {
 
         // Create older bucket with initial entry
         let bucket1 = manager
-            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [1u8; 32], 100,
+            ))])
             .unwrap();
 
         // Create newer bucket with updated entry
         let bucket2 = manager
-            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 500))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [1u8; 32], 500,
+            ))])
             .unwrap();
 
         // Load complete state - newer entry should win
@@ -1664,7 +1663,9 @@ mod tests {
 
         // Create older bucket with entry
         let bucket1 = manager
-            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [1u8; 32], 100,
+            ))])
             .unwrap();
 
         // Create newer bucket with deletion
@@ -1721,7 +1722,9 @@ mod tests {
         let (_temp_dir, manager) = create_manager();
 
         let bucket = manager
-            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [1u8; 32], 100,
+            ))])
             .unwrap();
 
         let nonexistent = Hash256::hash(b"does not exist");
@@ -1738,7 +1741,9 @@ mod tests {
         let (_temp_dir, manager) = create_manager();
 
         let bucket = manager
-            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [1u8; 32], 100,
+            ))])
             .unwrap();
 
         // Verify hash matches
@@ -1754,7 +1759,9 @@ mod tests {
         let temp_dir2 = TempDir::new().unwrap();
         let manager2 = BucketManager::new(temp_dir2.path().to_path_buf()).unwrap();
         let bucket = manager2
-            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [1u8; 32], 100,
+            ))])
             .unwrap();
 
         let bucket_xdr = manager2.export_bucket(&bucket.hash()).unwrap();
@@ -1868,12 +1875,13 @@ mod tests {
         let referenced = std::collections::HashSet::new();
 
         // Run cleanup
-        let deleted = manager
-            .cleanup_unreferenced_files(&referenced)
-            .unwrap();
+        let deleted = manager.cleanup_unreferenced_files(&referenced).unwrap();
 
         // The previous process file should be deleted (1 file deleted)
-        assert_eq!(deleted, 1, "Should delete exactly one file (from previous process)");
+        assert_eq!(
+            deleted, 1,
+            "Should delete exactly one file (from previous process)"
+        );
 
         // Current process file should still exist
         assert!(
@@ -1913,9 +1921,7 @@ mod tests {
         referenced.insert(referenced_file.clone());
 
         // Run cleanup
-        let deleted = manager
-            .cleanup_unreferenced_files(&referenced)
-            .unwrap();
+        let deleted = manager.cleanup_unreferenced_files(&referenced).unwrap();
 
         assert_eq!(deleted, 1, "Should delete exactly one unreferenced file");
         assert!(
@@ -1973,13 +1979,19 @@ mod tests {
 
         // Create 3 buckets
         let b1 = manager
-            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [1u8; 32], 100,
+            ))])
             .unwrap();
         let b2 = manager
-            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([2u8; 32], 200))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [2u8; 32], 200,
+            ))])
             .unwrap();
         let b3 = manager
-            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([3u8; 32], 300))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [3u8; 32], 300,
+            ))])
             .unwrap();
 
         let h1 = b1.hash();
@@ -2031,7 +2043,9 @@ mod tests {
         let (_temp_dir, manager) = create_manager();
 
         let bucket = manager
-            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [1u8; 32], 100,
+            ))])
             .unwrap();
         let hash = bucket.hash();
 
@@ -2052,7 +2066,9 @@ mod tests {
         let (_temp_dir, manager) = create_manager();
 
         let bucket = manager
-            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [1u8; 32], 100,
+            ))])
             .unwrap();
         let hash = bucket.hash();
 
@@ -2077,10 +2093,14 @@ mod tests {
 
         // Create two buckets and merge them
         let old = manager
-            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [1u8; 32], 100,
+            ))])
             .unwrap();
         let new = manager
-            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([2u8; 32], 200))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [2u8; 32], 200,
+            ))])
             .unwrap();
 
         let merged = manager.merge(&old, &new, 25).unwrap();
@@ -2098,10 +2118,14 @@ mod tests {
         let (_temp_dir, manager) = create_manager();
 
         let old = manager
-            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [1u8; 32], 100,
+            ))])
             .unwrap();
         let new = manager
-            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([2u8; 32], 200))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [2u8; 32], 200,
+            ))])
             .unwrap();
 
         // First merge creates a valid canonical file.
@@ -2130,10 +2154,14 @@ mod tests {
         let (_temp_dir, manager) = create_manager();
 
         let old = manager
-            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [1u8; 32], 100,
+            ))])
             .unwrap();
         let new = manager
-            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([2u8; 32], 200))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [2u8; 32], 200,
+            ))])
             .unwrap();
         let old_hash = old.hash();
         let new_hash = new.hash();
@@ -2165,10 +2193,14 @@ mod tests {
         let (_temp_dir, manager) = create_manager();
 
         let old = manager
-            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [1u8; 32], 100,
+            ))])
             .unwrap();
         let new = manager
-            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([2u8; 32], 200))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [2u8; 32], 200,
+            ))])
             .unwrap();
         let result = manager.merge(&old, &new, 25).unwrap();
 
@@ -2180,9 +2212,7 @@ mod tests {
             .record_merge(merge_key.clone(), result.hash());
 
         // Retain only the input buckets (not the merged output)
-        manager
-            .retain_buckets(&[old.hash(), new.hash()])
-            .unwrap();
+        manager.retain_buckets(&[old.hash(), new.hash()]).unwrap();
 
         // Merge map entry should be cleaned up since the output was deleted
         let output = manager

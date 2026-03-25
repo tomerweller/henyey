@@ -8,7 +8,7 @@ use stellar_xdr::curr::{LedgerEntry, LedgerKey, Limits, ReadXdr, WriteXdr};
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
-use crate::util::{self, XdrFormat, ttl_key_for_ledger_key};
+use crate::util::{self, ttl_key_for_ledger_key, XdrFormat};
 
 /// Maximum number of ledger entry keys allowed per request.
 const MAX_KEYS: usize = 200;
@@ -29,9 +29,10 @@ pub async fn handle(
     }
 
     if keys_array.len() > MAX_KEYS {
-        return Err(JsonRpcError::invalid_params(
-            format!("too many keys: max {} allowed", MAX_KEYS),
-        ));
+        return Err(JsonRpcError::invalid_params(format!(
+            "too many keys: max {} allowed",
+            MAX_KEYS
+        )));
     }
 
     // Decode base64 XDR keys, keeping the original base64 strings
@@ -40,11 +41,12 @@ pub async fn handle(
         let key_str = key_val
             .as_str()
             .ok_or_else(|| JsonRpcError::invalid_params(format!("keys[{}] must be a string", i)))?;
-        let key_bytes = BASE64
-            .decode(key_str)
-            .map_err(|e| JsonRpcError::invalid_params(format!("keys[{}]: invalid base64: {}", i, e)))?;
-        let key = LedgerKey::from_xdr(&key_bytes, Limits::none())
-            .map_err(|e| JsonRpcError::invalid_params(format!("keys[{}]: invalid XDR: {}", i, e)))?;
+        let key_bytes = BASE64.decode(key_str).map_err(|e| {
+            JsonRpcError::invalid_params(format!("keys[{}]: invalid base64: {}", i, e))
+        })?;
+        let key = LedgerKey::from_xdr(&key_bytes, Limits::none()).map_err(|e| {
+            JsonRpcError::invalid_params(format!("keys[{}]: invalid XDR: {}", i, e))
+        })?;
         ledger_keys.push((key_str.to_string(), key));
     }
 
@@ -76,7 +78,9 @@ pub async fn handle(
             // Data XDR — upstream uses "xdr" for base64, "dataJson" for JSON
             match format {
                 XdrFormat::Base64 => {
-                    let bytes = entry.data.to_xdr(Limits::none())
+                    let bytes = entry
+                        .data
+                        .to_xdr(Limits::none())
                         .map_err(|e| JsonRpcError::internal(format!("XDR encode error: {e}")))?;
                     obj.insert("xdr".into(), json!(BASE64.encode(&bytes)));
                 }
@@ -85,7 +89,10 @@ pub async fn handle(
                 }
             }
 
-            obj.insert("lastModifiedLedgerSeq".into(), json!(entry.last_modified_ledger_seq));
+            obj.insert(
+                "lastModifiedLedgerSeq".into(),
+                json!(entry.last_modified_ledger_seq),
+            );
 
             // Ext field — upstream uses "extXdr" / "extJson"
             util::insert_xdr_field(&mut obj, "ext", &entry.ext, format)?;

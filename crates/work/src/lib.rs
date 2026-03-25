@@ -382,10 +382,7 @@ impl WorkWithCallback {
     /// * `work` - The underlying work item to execute.
     /// * `callback` - A function called after the work completes, receiving
     ///   the outcome and execution context.
-    pub fn new(
-        work: Box<dyn Work + Send>,
-        callback: Arc<WorkCallback>,
-    ) -> Self {
+    pub fn new(work: Box<dyn Work + Send>, callback: Arc<WorkCallback>) -> Self {
         Self { work, callback }
     }
 }
@@ -1077,8 +1074,8 @@ impl WorkScheduler {
     fn handle_completion(&mut self, completion: WorkCompletion) -> CompletionAction {
         let id = completion.id;
         let attempt = completion.attempt;
-        let cancelled = completion.cancelled
-            || matches!(self.states.get(&id), Some(WorkState::Cancelled));
+        let cancelled =
+            completion.cancelled || matches!(self.states.get(&id), Some(WorkState::Cancelled));
 
         // Always restore the work item and record timing, regardless of outcome.
         self.finalize_entry(id, completion.work);
@@ -1103,10 +1100,7 @@ impl WorkScheduler {
                     self.fail_or_cancel(id, WorkState::Cancelled, attempt);
                     return CompletionAction::None;
                 }
-                let no_retries = self
-                    .entries
-                    .get(&id)
-                    .is_some_and(|e| e.retries_left == 0);
+                let no_retries = self.entries.get(&id).is_some_and(|e| e.retries_left == 0);
                 if no_retries {
                     self.fail_or_cancel(id, WorkState::Failed, attempt);
                     return CompletionAction::None;

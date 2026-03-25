@@ -298,8 +298,8 @@ async fn test_catchup_replay_bucket_hash_verification() {
     let archive = HistoryArchive::new(&base_url).expect("archive");
 
     let bucket_dir = tempfile::tempdir().expect("bucket dir");
-    let bucket_manager = henyey_bucket::BucketManager::new(bucket_dir.path().to_path_buf())
-        .expect("bucket manager");
+    let bucket_manager =
+        henyey_bucket::BucketManager::new(bucket_dir.path().to_path_buf()).expect("bucket manager");
     let db = Database::open_in_memory().expect("db");
 
     let ledger_manager = henyey_ledger::LedgerManager::new(
@@ -337,7 +337,10 @@ async fn test_catchup_replay_bucket_hash_verification() {
         ..Default::default()
     });
 
-    let output = manager.catchup_to_ledger(target, &ledger_manager).await.expect("catchup");
+    let output = manager
+        .catchup_to_ledger(target, &ledger_manager)
+        .await
+        .expect("catchup");
 
     assert_eq!(output.result.ledger_seq, target);
     assert_eq!(output.result.ledgers_applied, 1);

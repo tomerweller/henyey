@@ -455,18 +455,12 @@ mod tests {
 
     #[test]
     fn test_retry_a_few_is_5() {
-        assert_eq!(
-            RETRY_A_FEW, 5,
-            "CATCHUP_SPEC §9.1: RETRY_A_FEW must be 5"
-        );
+        assert_eq!(RETRY_A_FEW, 5, "CATCHUP_SPEC §9.1: RETRY_A_FEW must be 5");
     }
 
     #[test]
     fn test_retry_a_lot_is_32() {
-        assert_eq!(
-            RETRY_A_LOT, 32,
-            "CATCHUP_SPEC §9.1: RETRY_A_LOT must be 32"
-        );
+        assert_eq!(RETRY_A_LOT, 32, "CATCHUP_SPEC §9.1: RETRY_A_LOT must be 32");
     }
 
     #[test]

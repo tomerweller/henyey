@@ -48,10 +48,10 @@ use crate::{
     checkpoint::is_checkpoint_ledger,
     paths, verify, HistoryError, Result,
 };
-use std::path::{Path, PathBuf};
 use henyey_bucket::{BucketList, PendingMergeState};
 use henyey_common::Hash256;
 use henyey_ledger::TransactionSetVariant;
+use std::path::{Path, PathBuf};
 use stellar_xdr::curr::{
     LedgerHeaderHistoryEntry, TransactionHistoryEntry, TransactionHistoryEntryExt,
     TransactionHistoryResultEntry, WriteXdr,
@@ -400,12 +400,7 @@ impl PublishManager {
     /// Uses RFC 5531 record-marked format: each XDR item is prefixed with a
     /// 4-byte big-endian length with the high bit set ("last fragment" flag).
     /// This matches stellar-core's `XDROutputFileStream::writeOne`.
-    fn write_xdr_gz<T: WriteXdr>(
-        &self,
-        path: &Path,
-        items: &[T],
-        label: &str,
-    ) -> Result<()> {
+    fn write_xdr_gz<T: WriteXdr>(&self, path: &Path, items: &[T], label: &str) -> Result<()> {
         use flate2::write::GzEncoder;
         use flate2::Compression;
         use std::io::Write;
@@ -434,11 +429,7 @@ impl PublishManager {
     /// it directly — this preserves the exact record-marked format and avoids
     /// re-serialization. For in-memory-only buckets, we serialize entries with
     /// RFC 5531 record marks.
-    fn write_bucket_from_entries(
-        &self,
-        path: &Path,
-        bucket: &henyey_bucket::Bucket,
-    ) -> Result<()> {
+    fn write_bucket_from_entries(&self, path: &Path, bucket: &henyey_bucket::Bucket) -> Result<()> {
         use flate2::write::GzEncoder;
         use flate2::Compression;
         use std::io::{Read, Write};
@@ -474,9 +465,9 @@ impl PublishManager {
         } else {
             // Fallback: serialize entries with RFC 5531 record marks
             for entry in bucket.iter() {
-                let xdr = entry
-                    .to_xdr(stellar_xdr::curr::Limits::none())
-                    .map_err(|e: stellar_xdr::curr::Error| HistoryError::VerificationFailed(e.to_string()))?;
+                let xdr = entry.to_xdr(stellar_xdr::curr::Limits::none()).map_err(
+                    |e: stellar_xdr::curr::Error| HistoryError::VerificationFailed(e.to_string()),
+                )?;
                 let marked_len = (xdr.len() as u32) | 0x8000_0000;
                 encoder.write_all(&marked_len.to_be_bytes())?;
                 encoder.write_all(&xdr)?;

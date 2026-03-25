@@ -228,9 +228,7 @@ impl App {
         network_id: NetworkId,
     ) -> Vec<henyey_db::EventRecord> {
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-        use stellar_xdr::curr::{
-            ContractEvent, ContractEventType, Limits, TransactionResultCode,
-        };
+        use stellar_xdr::curr::{ContractEvent, ContractEventType, Limits, TransactionResultCode};
 
         let mut all_events = Vec::new();
 
@@ -285,9 +283,8 @@ impl App {
 
             for (event_index, (op_index, event)) in contract_events.iter().enumerate() {
                 // Compute TOID-based event ID
-                let toid = ((ledger_seq as u64) << 32)
-                    | ((tx_index as u64) << 12)
-                    | (*op_index as u64);
+                let toid =
+                    ((ledger_seq as u64) << 32) | ((tx_index as u64) << 12) | (*op_index as u64);
                 let event_id = format!("{:019}-{:010}", toid, event_index);
 
                 // Event type
@@ -298,20 +295,17 @@ impl App {
                 };
 
                 // Contract ID
-                let contract_id = event.contract_id.as_ref().map(|h| {
-                    stellar_strkey::Contract(h.0.clone().into()).to_string()
-                });
+                let contract_id = event
+                    .contract_id
+                    .as_ref()
+                    .map(|h| stellar_strkey::Contract(h.0.clone().into()).to_string());
 
                 // Extract topics
                 let topics: Vec<String> = match &event.body {
                     stellar_xdr::curr::ContractEventBody::V0(body) => body
                         .topics
                         .iter()
-                        .filter_map(|t| {
-                            t.to_xdr(Limits::none())
-                                .ok()
-                                .map(|b| BASE64.encode(&b))
-                        })
+                        .filter_map(|t| t.to_xdr(Limits::none()).ok().map(|b| BASE64.encode(&b)))
                         .collect(),
                 };
 
@@ -349,9 +343,9 @@ impl App {
     /// state is available (fresh node or corrupt state).
     pub async fn load_last_known_ledger(&self) -> anyhow::Result<bool> {
         // Step 1: Read LCL sequence from DB
-        let lcl_seq = self.db.with_connection(|conn| {
-            conn.get_last_closed_ledger()
-        })?;
+        let lcl_seq = self
+            .db
+            .with_connection(|conn| conn.get_last_closed_ledger())?;
         let Some(lcl_seq) = lcl_seq else {
             tracing::debug!("No last closed ledger in DB, cannot restore from disk");
             return Ok(false);
@@ -369,9 +363,9 @@ impl App {
         self.restore_checkpoint(lcl_seq);
 
         // Step 2: Read HAS JSON from DB
-        let has_json = self.db.with_connection(|conn| {
-            conn.get_state(state_keys::HISTORY_ARCHIVE_STATE)
-        })?;
+        let has_json = self
+            .db
+            .with_connection(|conn| conn.get_state(state_keys::HISTORY_ARCHIVE_STATE))?;
         let Some(has_json) = has_json else {
             tracing::warn!(lcl_seq, "LCL found but no HAS in DB, cannot restore");
             return Ok(false);
@@ -396,7 +390,9 @@ impl App {
         );
 
         // Step 4: Load ledger header from DB
-        let header = self.db.get_ledger_header(lcl_seq)?
+        let header = self
+            .db
+            .get_ledger_header(lcl_seq)?
             .ok_or_else(|| anyhow::anyhow!("LCL header missing from DB at seq {}", lcl_seq))?;
 
         // Compute header hash (we don't store it separately)
@@ -406,7 +402,8 @@ impl App {
         // Step 5: Verify essential bucket files exist on disk.
         // We only require curr/snap hashes — pending merge outputs (next.output)
         // are optional; if missing we'll discard the pending merge state.
-        let mut essential_hashes: Vec<Hash256> = has.bucket_hash_pairs()
+        let mut essential_hashes: Vec<Hash256> = has
+            .bucket_hash_pairs()
             .iter()
             .flat_map(|(curr, snap)| [*curr, *snap])
             .filter(|h| !h.is_zero())
@@ -482,21 +479,20 @@ impl App {
             let arc = bucket_manager.load_bucket(hash)?;
             Ok(Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone()))
         };
-        let mut bucket_list = BucketList::restore_from_has_parallel(
-            &live_hash_pairs,
-            &live_next_states,
-            load_bucket,
-        ).map_err(|e| anyhow::anyhow!("Failed to restore live bucket list: {}", e))?;
+        let mut bucket_list =
+            BucketList::restore_from_has_parallel(&live_hash_pairs, &live_next_states, load_bucket)
+                .map_err(|e| anyhow::anyhow!("Failed to restore live bucket list: {}", e))?;
         bucket_list.set_bucket_dir(bucket_dir.clone());
         bucket_list.set_ledger_seq(lcl_seq);
 
         // Step 6b: Extract Arc<Bucket> pairs before starting merges.
         // The scan thread owns these Arc clones independently of bucket_list.
-        let level_pairs: Vec<(Arc<henyey_bucket::Bucket>, Arc<henyey_bucket::Bucket>)> = bucket_list
-            .levels()
-            .iter()
-            .map(|l| (l.curr.clone(), l.snap.clone()))
-            .collect();
+        let level_pairs: Vec<(Arc<henyey_bucket::Bucket>, Arc<henyey_bucket::Bucket>)> =
+            bucket_list
+                .levels()
+                .iter()
+                .map(|l| (l.curr.clone(), l.snap.clone()))
+                .collect();
         let protocol_version = header.ledger_version;
         let scan_thread_count = self.config.buckets.scan_thread_count;
 
@@ -514,19 +510,22 @@ impl App {
         // Safe to hold &mut bucket_list while scan thread has Arc clones.
         {
             let bucket_dir_for_merge = bucket_dir.clone();
-            let load_bucket_for_merge = |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::Bucket> {
-                if hash.is_zero() {
-                    return Ok(henyey_bucket::Bucket::empty());
-                }
-                let bucket_path = bucket_dir_for_merge.join(format!("{}.bucket.xdr", hash.to_hex()));
-                if bucket_path.exists() {
-                    henyey_bucket::Bucket::from_xdr_file_disk_backed(&bucket_path)
-                } else {
-                    Err(henyey_bucket::BucketError::NotFound(format!(
-                        "bucket {} not found on disk", hash.to_hex()
-                    )))
-                }
-            };
+            let load_bucket_for_merge =
+                |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::Bucket> {
+                    if hash.is_zero() {
+                        return Ok(henyey_bucket::Bucket::empty());
+                    }
+                    let bucket_path =
+                        bucket_dir_for_merge.join(format!("{}.bucket.xdr", hash.to_hex()));
+                    if bucket_path.exists() {
+                        henyey_bucket::Bucket::from_xdr_file_disk_backed(&bucket_path)
+                    } else {
+                        Err(henyey_bucket::BucketError::NotFound(format!(
+                            "bucket {} not found on disk",
+                            hash.to_hex()
+                        )))
+                    }
+                };
             bucket_list
                 .restart_merges_from_has(
                     lcl_seq,
@@ -558,19 +557,21 @@ impl App {
                 .collect();
 
             let bucket_manager = self.bucket_manager.clone();
-            let load_hot = |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::HotArchiveBucket> {
-                bucket_manager.load_hot_archive_bucket(hash)
-            };
+            let load_hot =
+                |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::HotArchiveBucket> {
+                    bucket_manager.load_hot_archive_bucket(hash)
+                };
             let mut hot_bl = HotArchiveBucketList::restore_from_has_parallel(
                 &hot_hash_pairs,
                 &hot_next_states,
                 load_hot,
-            ).map_err(|e| anyhow::anyhow!("Failed to restore hot archive: {}", e))?;
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to restore hot archive: {}", e))?;
 
             let bucket_manager = self.bucket_manager.clone();
-            let load_hot_for_merge = move |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::HotArchiveBucket> {
-                bucket_manager.load_hot_archive_bucket(hash)
-            };
+            let load_hot_for_merge = move |hash: &Hash256| -> henyey_bucket::Result<
+                henyey_bucket::HotArchiveBucket,
+            > { bucket_manager.load_hot_archive_bucket(hash) };
             let hot_next_states_ref = hot_next_states.clone();
             hot_bl
                 .restart_merges_from_has(
@@ -605,7 +606,13 @@ impl App {
             self.ledger_manager.reset();
         }
         self.ledger_manager
-            .initialize_with_precomputed_caches(bucket_list, hot_archive, header.clone(), header_hash, cache_data)
+            .initialize_with_precomputed_caches(
+                bucket_list,
+                hot_archive,
+                header.clone(),
+                header_hash,
+                cache_data,
+            )
             .map_err(|e| anyhow::anyhow!("Failed to initialize ledger manager from disk: {}", e))?;
 
         tracing::info!(
@@ -659,9 +666,7 @@ impl App {
             "Restoring checkpoint state on startup"
         );
 
-        let mut builder = henyey_history::checkpoint_builder::CheckpointBuilder::new(
-            publish_dir,
-        );
+        let mut builder = henyey_history::checkpoint_builder::CheckpointBuilder::new(publish_dir);
 
         // Phase 1: Clean up partial/corrupt dirty files
         if let Err(e) = builder.cleanup(lcl) {
@@ -739,11 +744,9 @@ impl App {
             Ok(std::sync::Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone()))
         };
 
-        let mut bucket_list = BucketList::restore_from_has_parallel(
-            &live_hash_pairs,
-            &live_next_states,
-            load_bucket,
-        ).map_err(|e| anyhow::anyhow!("Failed to restore live bucket list: {}", e))?;
+        let mut bucket_list =
+            BucketList::restore_from_has_parallel(&live_hash_pairs, &live_next_states, load_bucket)
+                .map_err(|e| anyhow::anyhow!("Failed to restore live bucket list: {}", e))?;
 
         let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
         bucket_list.set_bucket_dir(bucket_dir.clone());
@@ -754,19 +757,21 @@ impl App {
         // AssumeStateWork -> assumeState() -> restartMerges().
         {
             let protocol_version = header.ledger_version;
-            let load_bucket_for_merge = |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::Bucket> {
-                if hash.is_zero() {
-                    return Ok(henyey_bucket::Bucket::empty());
-                }
-                let bucket_path = bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
-                if bucket_path.exists() {
-                    henyey_bucket::Bucket::from_xdr_file_disk_backed(&bucket_path)
-                } else {
-                    Err(henyey_bucket::BucketError::NotFound(format!(
-                        "bucket {} not found on disk", hash.to_hex()
-                    )))
-                }
-            };
+            let load_bucket_for_merge =
+                |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::Bucket> {
+                    if hash.is_zero() {
+                        return Ok(henyey_bucket::Bucket::empty());
+                    }
+                    let bucket_path = bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
+                    if bucket_path.exists() {
+                        henyey_bucket::Bucket::from_xdr_file_disk_backed(&bucket_path)
+                    } else {
+                        Err(henyey_bucket::BucketError::NotFound(format!(
+                            "bucket {} not found on disk",
+                            hash.to_hex()
+                        )))
+                    }
+                };
             bucket_list
                 .restart_merges_from_has(
                     lcl_seq,
@@ -798,20 +803,24 @@ impl App {
                 .collect();
 
             let bucket_manager = self.bucket_manager.clone();
-            let load_hot = |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::HotArchiveBucket> {
-                bucket_manager.load_hot_archive_bucket(hash)
-            };
+            let load_hot =
+                |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::HotArchiveBucket> {
+                    bucket_manager.load_hot_archive_bucket(hash)
+                };
 
             let mut hot_bl = HotArchiveBucketList::restore_from_has_parallel(
                 &hot_hash_pairs,
                 &hot_next_states,
                 load_hot,
-            ).map_err(|e| anyhow::anyhow!("Failed to restore hot archive: {}", e))?;
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to restore hot archive: {}", e))?;
 
             {
                 let protocol_version = header.ledger_version;
                 let bucket_manager = self.bucket_manager.clone();
-                let load_hot_for_merge = move |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::HotArchiveBucket> {
+                let load_hot_for_merge = move |hash: &Hash256| -> henyey_bucket::Result<
+                    henyey_bucket::HotArchiveBucket,
+                > {
                     bucket_manager.load_hot_archive_bucket(hash)
                 };
                 hot_bl
@@ -846,21 +855,27 @@ impl App {
     ///
     /// This matches stellar-core's approach for Case 1 catchup: the
     /// persisted HAS is the source of truth, not the live bucket list objects.
-    pub(super) async fn rebuild_bucket_lists_from_has(&self) -> anyhow::Result<ExistingBucketState> {
+    pub(super) async fn rebuild_bucket_lists_from_has(
+        &self,
+    ) -> anyhow::Result<ExistingBucketState> {
         // Read persisted HAS from DB
-        let has_json = self.db.with_connection(|conn| {
-            conn.get_state(state_keys::HISTORY_ARCHIVE_STATE)
-        })?;
+        let has_json = self
+            .db
+            .with_connection(|conn| conn.get_state(state_keys::HISTORY_ARCHIVE_STATE))?;
         let has_json = has_json.ok_or_else(|| anyhow::anyhow!("No persisted HAS in database"))?;
         let has = HistoryArchiveState::from_json(&has_json)
             .map_err(|e| anyhow::anyhow!("Failed to parse persisted HAS: {}", e))?;
 
         let lcl_seq = has.current_ledger;
 
-        let header = self.db.get_ledger_header(lcl_seq)?
+        let header = self
+            .db
+            .get_ledger_header(lcl_seq)?
             .ok_or_else(|| anyhow::anyhow!("LCL header missing from DB at seq {}", lcl_seq))?;
 
-        let (bucket_list, hot_archive) = self.reconstruct_bucket_lists(&has, &header, lcl_seq).await?;
+        let (bucket_list, hot_archive) = self
+            .reconstruct_bucket_lists(&has, &header, lcl_seq)
+            .await?;
 
         let network_id = NetworkId(self.network_id());
 
@@ -1161,7 +1176,10 @@ impl App {
         }
     }
 
-    pub(super) async fn attach_tx_set_by_hash(&self, tx_set: &henyey_herder::TransactionSet) -> bool {
+    pub(super) async fn attach_tx_set_by_hash(
+        &self,
+        tx_set: &henyey_herder::TransactionSet,
+    ) -> bool {
         let mut buffer = self.syncing_ledgers.write().await;
         for (slot, entry) in buffer.iter_mut() {
             if entry.tx_set.is_none() && entry.tx_set_hash == tx_set.hash {
@@ -1271,8 +1289,7 @@ impl App {
                     return None;
                 }
                 None => {
-                    let is_externalized =
-                        self.herder.get_externalized(next_seq as u64).is_some();
+                    let is_externalized = self.herder.get_externalized(next_seq as u64).is_some();
                     if is_externalized {
                         tracing::debug!(
                             next_seq,
@@ -1280,8 +1297,7 @@ impl App {
                             "Next slot externalized but not yet in syncing_ledgers buffer"
                         );
                     } else {
-                        let latest =
-                            self.herder.latest_externalized_slot().unwrap_or(0);
+                        let latest = self.herder.latest_externalized_slot().unwrap_or(0);
                         if latest > next_seq as u64 {
                             tracing::debug!(
                                 next_seq,
@@ -1395,10 +1411,7 @@ impl App {
     pub(super) async fn handle_close_complete(
         &self,
         pending: PendingLedgerClose,
-        join_result: Result<
-            std::result::Result<LedgerCloseResult, String>,
-            tokio::task::JoinError,
-        >,
+        join_result: Result<std::result::Result<LedgerCloseResult, String>, tokio::task::JoinError>,
     ) -> bool {
         self.set_applying_ledger(false);
 
@@ -1481,8 +1494,9 @@ impl App {
         if let Some(ref meta) = result.meta {
             match meta.to_xdr(stellar_xdr::curr::Limits::none()) {
                 Ok(meta_xdr) => {
-                    if let Err(err) =
-                        self.db.store_ledger_close_meta(pending.ledger_seq, &meta_xdr)
+                    if let Err(err) = self
+                        .db
+                        .store_ledger_close_meta(pending.ledger_seq, &meta_xdr)
                     {
                         tracing::warn!(
                             error = %err,

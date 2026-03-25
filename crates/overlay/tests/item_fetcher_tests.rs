@@ -1,8 +1,8 @@
 //! Integration tests for ItemFetcher functionality.
 
+use henyey_overlay::{ItemFetcher, ItemFetcherConfig, ItemType, PeerId};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use henyey_overlay::{ItemFetcher, ItemFetcherConfig, ItemType, PeerId};
 use stellar_xdr::curr::{
     Hash, NodeId as XdrNodeId, PublicKey, ScpEnvelope, ScpNomination, ScpStatement,
     ScpStatementPledges, Signature, Uint256,

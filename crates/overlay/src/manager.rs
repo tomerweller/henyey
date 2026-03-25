@@ -39,12 +39,13 @@ use crate::{
     flood::{compute_message_hash, FloodGate, FloodGateStats},
     flow_control::{msg_body_size, FlowControl, FlowControlConfig, ScpQueueCallback},
     peer::{Peer, PeerInfo, PeerStats, PeerStatsSnapshot},
-    peer_manager::{PeerManager, StoredPeerType, BackOffUpdate},
+    peer_manager::{BackOffUpdate, PeerManager, StoredPeerType},
     LocalNode, OverlayConfig, OverlayError, PeerAddress, PeerEvent, PeerId, PeerType, Result,
 };
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use rand::seq::SliceRandom;
+use sha2::Digest;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -56,7 +57,6 @@ use stellar_xdr::curr::{
 };
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
-use sha2::Digest;
 use tracing::{debug, error, info, trace, warn};
 
 /// Maximum length for error messages sent to peers, matching the XDR
@@ -109,9 +109,7 @@ async fn resolve_peer_list(peers: &[PeerAddress]) -> (Vec<PeerAddress>, bool) {
         }
 
         // Resolve hostname to IP address.
-        let lookup_result = tokio::net::lookup_host(
-            (peer.host.as_str(), peer.port)
-        ).await;
+        let lookup_result = tokio::net::lookup_host((peer.host.as_str(), peer.port)).await;
         match lookup_result {
             Ok(addrs) => {
                 // Take the first IPv4 address, matching stellar-core behavior.
@@ -327,16 +325,14 @@ fn log_fetch_message(message: &StellarMessage, peer_id: &PeerId, ping: &mut Ping
             );
         }
         StellarMessage::GeneralizedTxSet(ts) => {
-            let hash = henyey_common::Hash256::hash_xdr(ts)
-                .unwrap_or(henyey_common::Hash256::ZERO);
+            let hash = henyey_common::Hash256::hash_xdr(ts).unwrap_or(henyey_common::Hash256::ZERO);
             debug!(
                 "OVERLAY: Received GeneralizedTxSet from {} hash={}",
                 peer_id, hash
             );
         }
         StellarMessage::ScpQuorumset(qs) => {
-            let hash =
-                henyey_common::Hash256::hash_xdr(qs).unwrap_or(henyey_common::Hash256::ZERO);
+            let hash = henyey_common::Hash256::hash_xdr(qs).unwrap_or(henyey_common::Hash256::ZERO);
             ping.check_response(&Uint256(hash.0), peer_id);
             debug!(
                 "OVERLAY: Received ScpQuorumset from {} hash={}",
@@ -347,7 +343,9 @@ fn log_fetch_message(message: &StellarMessage, peer_id: &PeerId, ping: &mut Ping
             ping.check_response(&dh.req_hash, peer_id);
             debug!(
                 "OVERLAY: Received DontHave from {} type={:?} hash={}",
-                peer_id, dh.type_, hex::encode(dh.req_hash.0)
+                peer_id,
+                dh.type_,
+                hex::encode(dh.req_hash.0)
             );
         }
         StellarMessage::GetTxSet(hash) => {
@@ -812,7 +810,10 @@ impl OverlayManager {
             if let Err(e) = pm.remove_peers_with_many_failures(REALLY_DEAD_NUM_FAILURES_CUTOFF) {
                 warn!("Failed to purge dead peers: {}", e);
             } else {
-                info!("Purged dead peers (>= {} failures)", REALLY_DEAD_NUM_FAILURES_CUTOFF);
+                info!(
+                    "Purged dead peers (>= {} failures)",
+                    REALLY_DEAD_NUM_FAILURES_CUTOFF
+                );
             }
         }
 
@@ -873,7 +874,10 @@ impl OverlayManager {
 
     /// Start the connection listener.
     async fn start_listener(&mut self) -> Result<()> {
-        let listener = self.connection_factory.bind(self.config.listen_port).await?;
+        let listener = self
+            .connection_factory
+            .bind(self.config.listen_port)
+            .await?;
         info!("Listening on port {}", self.config.listen_port);
 
         let shared = self.shared_state();
@@ -1090,7 +1094,10 @@ impl OverlayManager {
                                     let mut kp = known_peers.write();
                                     // Merge resolved known peers (add new, keep existing).
                                     for addr in &result.known {
-                                        if !kp.iter().any(|p| p.host == addr.host && p.port == addr.port) {
+                                        if !kp
+                                            .iter()
+                                            .any(|p| p.host == addr.host && p.port == addr.port)
+                                        {
                                             kp.push(addr.clone());
                                         }
                                     }
@@ -1283,8 +1290,7 @@ impl OverlayManager {
         // Matches stellar-core's Peer::recvAuth() → sendSendMore().
         {
             let config = FlowControlConfig::default();
-            let (initial_flood_msgs, initial_flood_bytes) =
-                Self::initial_send_more_grant(&config);
+            let (initial_flood_msgs, initial_flood_bytes) = Self::initial_send_more_grant(&config);
             if let Err(e) = peer
                 .send_more_extended(initial_flood_msgs, initial_flood_bytes)
                 .await
@@ -1325,7 +1331,10 @@ impl OverlayManager {
 
         loop {
             if !running.load(Ordering::Relaxed) {
-                info!("Peer {} loop exiting: overlay shutting down (total_msgs={}, scp_msgs={})", peer_id, total_messages, scp_messages);
+                info!(
+                    "Peer {} loop exiting: overlay shutting down (total_msgs={}, scp_msgs={})",
+                    peer_id, total_messages, scp_messages
+                );
                 break;
             }
 
@@ -1763,7 +1772,11 @@ impl OverlayManager {
         let Some(entry) = self.peers.get(peer_id) else {
             return false;
         };
-        let _ = entry.value().outbound_tx.send(OutboundMessage::Shutdown).await;
+        let _ = entry
+            .value()
+            .outbound_tx
+            .send(OutboundMessage::Shutdown)
+            .await;
         true
     }
 
@@ -1771,7 +1784,11 @@ impl OverlayManager {
     pub async fn ban_peer(&self, peer_id: PeerId) {
         self.banned_peers.write().insert(peer_id.clone());
         if let Some(entry) = self.peers.get(&peer_id) {
-            let _ = entry.value().outbound_tx.send(OutboundMessage::Shutdown).await;
+            let _ = entry
+                .value()
+                .outbound_tx
+                .send(OutboundMessage::Shutdown)
+                .await;
         }
     }
 
@@ -1792,7 +1809,11 @@ impl OverlayManager {
             .get(peer_id)
             .ok_or_else(|| OverlayError::PeerNotFound(peer_id.to_string()))?;
 
-        entry.value().outbound_tx.send(OutboundMessage::Send(message)).await
+        entry
+            .value()
+            .outbound_tx
+            .send(OutboundMessage::Send(message))
+            .await
             .map_err(|_| OverlayError::ChannelSend)
     }
 
@@ -1804,7 +1825,10 @@ impl OverlayManager {
             .get(peer_id)
             .ok_or_else(|| OverlayError::PeerNotFound(peer_id.to_string()))?;
 
-        entry.value().outbound_tx.try_send(OutboundMessage::Send(message))
+        entry
+            .value()
+            .outbound_tx
+            .try_send(OutboundMessage::Send(message))
             .map_err(|_| OverlayError::ChannelSend)
     }
 
@@ -1898,7 +1922,10 @@ impl OverlayManager {
         }
 
         if let Some((peer_id, _)) = youngest {
-            info!("Evicting non-preferred peer {} to make room for preferred peer", peer_id);
+            info!(
+                "Evicting non-preferred peer {} to make room for preferred peer",
+                peer_id
+            );
             if let Some(entry) = peers.get(&peer_id) {
                 send_error_and_drop(
                     &peer_id,
@@ -2029,19 +2056,24 @@ impl OverlayManager {
             Ok(connection) => connection,
             Err(e) => {
                 pool.release_pending();
-                shared.send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound)).await;
+                shared
+                    .send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
+                    .await;
                 return Err(e);
             }
         };
 
-        let peer = match Peer::connect_with_connection(addr, connection, local_node, timeout_secs).await {
-            Ok(peer) => peer,
-            Err(e) => {
-                pool.release_pending();
-                shared.send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound)).await;
-                return Err(e);
-            }
-        };
+        let peer =
+            match Peer::connect_with_connection(addr, connection, local_node, timeout_secs).await {
+                Ok(peer) => peer,
+                Err(e) => {
+                    pool.release_pending();
+                    shared
+                        .send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
+                        .await;
+                    return Err(e);
+                }
+            };
 
         let peer_id = peer.id().clone();
         if shared.banned_peers.read().contains(&peer_id) {
@@ -2059,9 +2091,10 @@ impl OverlayManager {
         info!("Connected to peer: {} at {}", peer_id, addr);
 
         let peer_info = peer.info().clone();
-        let (outbound_rx, flow_control) =
-            Self::register_peer(&peer, &peer_id, peer_info, &shared);
-        shared.send_peer_event(PeerEvent::Connected(addr.clone(), PeerType::Outbound)).await;
+        let (outbound_rx, flow_control) = Self::register_peer(&peer, &peer_id, peer_info, &shared);
+        shared
+            .send_peer_event(PeerEvent::Connected(addr.clone(), PeerType::Outbound))
+            .await;
 
         // NOTE: Do NOT send PEERS to outbound peers (peers we connected to).
         // In stellar-core, only the acceptor (REMOTE_CALLED_US) sends PEERS during recvAuth().
@@ -2072,7 +2105,14 @@ impl OverlayManager {
         let shared_clone = shared.clone();
         let pool_clone = Arc::clone(&pool);
         let handle = tokio::spawn(async move {
-            Self::run_peer_loop(peer_id_clone.clone(), peer, outbound_rx, flow_control, shared_clone.clone()).await;
+            Self::run_peer_loop(
+                peer_id_clone.clone(),
+                peer,
+                outbound_rx,
+                flow_control,
+                shared_clone.clone(),
+            )
+            .await;
             shared_clone.cleanup_peer(&peer_id_clone);
             pool_clone.release_authenticated();
         });
@@ -2122,9 +2162,9 @@ impl OverlayManager {
                 for entry in peer_info_cache.iter() {
                     if entry.value().direction == ConnectionDirection::Inbound {
                         if let Some(peer_handle) = peers.get(entry.key()) {
-                            let _ = peer_handle.outbound_tx.try_send(
-                                OutboundMessage::Send(message.clone()),
-                            );
+                            let _ = peer_handle
+                                .outbound_tx
+                                .try_send(OutboundMessage::Send(message.clone()));
                         }
                     }
                 }
@@ -2334,9 +2374,10 @@ impl OverlayManager {
         for entry in self.peers.iter() {
             // Update each peer's FlowControl byte capacity
             entry.value().flow_control.handle_tx_size_increase(increase);
-            let _ = entry.value().outbound_tx.try_send(
-                OutboundMessage::Send(send_more.clone()),
-            );
+            let _ = entry
+                .value()
+                .outbound_tx
+                .try_send(OutboundMessage::Send(send_more.clone()));
         }
 
         debug!(
@@ -2465,9 +2506,10 @@ impl OverlayManager {
         // Check if we're already connected to this address
         // (We check by address, not by peer ID since we don't know it yet)
         let target_addr = addr.to_socket_addr();
-        let already_connected = self.peer_info_cache.iter().any(|entry| {
-            entry.value().address.to_string() == target_addr
-        });
+        let already_connected = self
+            .peer_info_cache
+            .iter()
+            .any(|entry| entry.value().address.to_string() == target_addr);
         if already_connected {
             self.outbound_pool.release_pending();
             debug!("Already connected to {}", addr);
@@ -2488,7 +2530,14 @@ impl OverlayManager {
         let peer_handle = tokio::spawn(async move {
             match connection_factory.connect(&addr, connect_timeout).await {
                 Ok(connection) => {
-                    match Peer::connect_with_connection(&addr, connection, local_node, connect_timeout).await {
+                    match Peer::connect_with_connection(
+                        &addr,
+                        connection,
+                        local_node,
+                        connect_timeout,
+                    )
+                    .await
+                    {
                         Ok(peer) => {
                             let peer_id = peer.id().clone();
                             info!("Connected to discovered peer: {} at {}", peer_id, addr);
@@ -2496,7 +2545,12 @@ impl OverlayManager {
                             // Handshake succeeded: promote from pending to authenticated
                             pool.mark_authenticated();
 
-                            shared.send_peer_event(PeerEvent::Connected(addr.clone(), PeerType::Outbound)).await;
+                            shared
+                                .send_peer_event(PeerEvent::Connected(
+                                    addr.clone(),
+                                    PeerType::Outbound,
+                                ))
+                                .await;
 
                             let peer_info = peer.info().clone();
                             let (outbound_rx, flow_control) =
@@ -2505,8 +2559,14 @@ impl OverlayManager {
                             // NOTE: Do NOT send PEERS to outbound peers — see Peer.cpp:1225-1230.
 
                             // Run peer loop (peer is moved, not locked)
-                            Self::run_peer_loop(peer_id.clone(), peer, outbound_rx, flow_control, shared.clone())
-                                .await;
+                            Self::run_peer_loop(
+                                peer_id.clone(),
+                                peer,
+                                outbound_rx,
+                                flow_control,
+                                shared.clone(),
+                            )
+                            .await;
 
                             // Cleanup
                             shared.cleanup_peer(&peer_id);
@@ -2514,14 +2574,21 @@ impl OverlayManager {
                         }
                         Err(e) => {
                             debug!("Failed to connect to discovered peer {}: {}", addr, e);
-                            shared.send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound)).await;
+                            shared
+                                .send_peer_event(PeerEvent::Failed(
+                                    addr.clone(),
+                                    PeerType::Outbound,
+                                ))
+                                .await;
                             pool.release_pending();
                         }
                     }
                 }
                 Err(e) => {
                     debug!("Failed to connect to discovered peer {}: {}", addr, e);
-                    shared.send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound)).await;
+                    shared
+                        .send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
+                        .await;
                     pool.release_pending();
                 }
             }
@@ -2585,7 +2652,11 @@ impl OverlayManager {
         }
 
         // Send shutdown to all peer tasks via their channels
-        let senders: Vec<_> = self.peers.iter().map(|e| e.value().outbound_tx.clone()).collect();
+        let senders: Vec<_> = self
+            .peers
+            .iter()
+            .map(|e| e.value().outbound_tx.clone())
+            .collect();
         for tx in senders {
             let _ = tx.send(OutboundMessage::Shutdown).await;
         }
@@ -2676,11 +2747,17 @@ mod tests {
 
         // First call should return Some
         let rx = manager.subscribe_fetch_responses().await;
-        assert!(rx.is_some(), "first subscribe_fetch_responses() should return Some");
+        assert!(
+            rx.is_some(),
+            "first subscribe_fetch_responses() should return Some"
+        );
 
         // Second call should return None (already taken)
         let rx2 = manager.subscribe_fetch_responses().await;
-        assert!(rx2.is_none(), "second subscribe_fetch_responses() should return None");
+        assert!(
+            rx2.is_none(),
+            "second subscribe_fetch_responses() should return None"
+        );
     }
 
     #[tokio::test]
@@ -2745,8 +2822,16 @@ mod tests {
         // - PEER_STRAGGLER_TIMEOUT = 120 (Config.cpp:259)
         // - RECURRENT_TIMER_PERIOD = 5s (Peer.cpp:374)
         // - REALLY_DEAD_NUM_FAILURES_CUTOFF = 120 (Config.h:711)
-        assert_eq!(Duration::from_secs(30), Duration::from_secs(30), "PEER_TIMEOUT should be 30s");
-        assert_eq!(Duration::from_secs(120), Duration::from_secs(120), "PEER_STRAGGLER_TIMEOUT should be 120s");
+        assert_eq!(
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            "PEER_TIMEOUT should be 30s"
+        );
+        assert_eq!(
+            Duration::from_secs(120),
+            Duration::from_secs(120),
+            "PEER_STRAGGLER_TIMEOUT should be 120s"
+        );
     }
 
     #[test]
@@ -2806,20 +2891,25 @@ mod tests {
         let future = now + Duration::from_secs(6);
         let would_timeout_without_ping = future.duration_since(last_read) >= peer_timeout
             && future.duration_since(last_write_no_ping) >= peer_timeout;
-        assert!(would_timeout_without_ping, "without ping, peer would time out");
+        assert!(
+            would_timeout_without_ping,
+            "without ping, peer would time out"
+        );
 
         // With ping at 15s: last_write was refreshed at that point.
         let last_write_with_ping = now - Duration::from_secs(10); // ping sent 10s ago
         let would_timeout_with_ping = future.duration_since(last_read) >= peer_timeout
             && future.duration_since(last_write_with_ping) >= peer_timeout;
-        assert!(!would_timeout_with_ping, "ping refreshes last_write, preventing idle timeout");
+        assert!(
+            !would_timeout_with_ping,
+            "ping refreshes last_write, preventing idle timeout"
+        );
     }
 
     #[tokio::test]
     async fn test_start_purges_dead_peers_g6() {
         // G6: On startup, purge peers with >= 120 failures from the peer database.
         use crate::peer_manager::PeerManager;
-
 
         let pm = Arc::new(PeerManager::new_in_memory());
 
@@ -2832,7 +2922,8 @@ mod tests {
 
         // Give dead peer 120 failures
         for _ in 0..120 {
-            pm.update_backoff(&dead_addr, crate::peer_manager::BackOffUpdate::Increase).unwrap();
+            pm.update_backoff(&dead_addr, crate::peer_manager::BackOffUpdate::Increase)
+                .unwrap();
         }
         assert_eq!(pm.peer_count(), 2);
 
@@ -2884,7 +2975,7 @@ mod tests {
         assert_eq!(known_record.num_failures, 0);
         assert!(
             known_record.peer_type == StoredPeerType::Outbound
-            || known_record.peer_type == StoredPeerType::Preferred
+                || known_record.peer_type == StoredPeerType::Preferred
         );
 
         // Preferred peer should be stored as Preferred with 0 failures
@@ -2972,13 +3063,19 @@ mod tests {
                 assert_eq!(err.code, ErrorCode::Load);
                 assert_eq!(err.msg.to_string(), "test message");
             }
-            other => panic!("expected Send(ErrorMsg), got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected Send(ErrorMsg), got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
 
         // Second message should be shutdown
         match rx.recv().await.unwrap() {
             OutboundMessage::Shutdown => {}
-            other => panic!("expected Shutdown, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected Shutdown, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 
@@ -2993,7 +3090,10 @@ mod tests {
 
         // Different nanos should produce different hash
         let hash3 = compute_ping_hash(2_000_000_000);
-        assert_ne!(hash1.0, hash3.0, "different nanos should produce different hash");
+        assert_ne!(
+            hash1.0, hash3.0,
+            "different nanos should produce different hash"
+        );
     }
 
     /// Verify that DontHave response matching correctly identifies
@@ -3047,19 +3147,21 @@ mod tests {
 
     #[test]
     fn test_should_skip_generic_routing() {
-        assert!(should_skip_generic_routing(&StellarMessage::Hello(Default::default())));
-        assert!(should_skip_generic_routing(&StellarMessage::Auth(stellar_xdr::curr::Auth {
-            flags: 200,
-        })));
+        assert!(should_skip_generic_routing(&StellarMessage::Hello(
+            Default::default()
+        )));
+        assert!(should_skip_generic_routing(&StellarMessage::Auth(
+            stellar_xdr::curr::Auth { flags: 200 }
+        )));
         assert!(should_skip_generic_routing(&StellarMessage::SendMore(
             stellar_xdr::curr::SendMore { num_messages: 1 }
         )));
-        assert!(should_skip_generic_routing(&StellarMessage::SendMoreExtended(
-            stellar_xdr::curr::SendMoreExtended {
+        assert!(should_skip_generic_routing(
+            &StellarMessage::SendMoreExtended(stellar_xdr::curr::SendMoreExtended {
                 num_messages: 1,
                 num_bytes: 1,
-            }
-        )));
+            })
+        ));
         assert!(!should_skip_generic_routing(&StellarMessage::Peers(
             stellar_xdr::curr::VecM::default()
         )));
@@ -3128,12 +3230,15 @@ mod tests {
             &peers,
             &info_cache,
             &[],
-            8, // max_outbound = 8 (full)
+            8,    // max_outbound = 8 (full)
             true, // tracking = true
             &mut last_reconnect,
         );
         assert!(!dropped, "should not drop when tracking");
-        assert!(last_reconnect.is_none(), "timer should be cleared when tracking");
+        assert!(
+            last_reconnect.is_none(),
+            "timer should be cleared when tracking"
+        );
     }
 
     #[test]
@@ -3280,7 +3385,10 @@ mod tests {
             false,
             &mut last_reconnect,
         );
-        assert!(!dropped, "should not drop when outbound not full (inbound don't count)");
+        assert!(
+            !dropped,
+            "should not drop when outbound not full (inbound don't count)"
+        );
     }
 
     #[test]
@@ -3300,7 +3408,10 @@ mod tests {
             &mut last_reconnect,
         );
         assert!(!dropped);
-        assert!(last_reconnect.is_none(), "timer should be cleared when back in sync");
+        assert!(
+            last_reconnect.is_none(),
+            "timer should be cleared when back in sync"
+        );
     }
 
     // ---- G7 tests: DNS re-resolution ----
@@ -3324,12 +3435,16 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_peer_list_bad_hostname() {
         // An unresolvable hostname should set errors=true but not panic.
-        let peers = vec![
-            PeerAddress::new("this-does-not-exist-at-all.invalid", 11625),
-        ];
+        let peers = vec![PeerAddress::new(
+            "this-does-not-exist-at-all.invalid",
+            11625,
+        )];
         let (resolved, errors) = resolve_peer_list(&peers).await;
         assert!(errors, "unresolvable hostname should set errors flag");
-        assert!(resolved.is_empty(), "failed hostname should not produce a result");
+        assert!(
+            resolved.is_empty(),
+            "failed hostname should not produce a result"
+        );
     }
 
     #[tokio::test]
@@ -3376,7 +3491,11 @@ mod tests {
 
         // 61st failure: retry_count 60→61, 610s > 600s → give up on retries.
         let (delay, backoff, retry_count) = compute_dns_backoff_delay(true, 60, true);
-        assert_eq!(delay, Duration::from_secs(600), "should cap at PEER_IP_RESOLVE_DELAY");
+        assert_eq!(
+            delay,
+            Duration::from_secs(600),
+            "should cap at PEER_IP_RESOLVE_DELAY"
+        );
         assert!(!backoff, "should give up on retries");
         assert_eq!(retry_count, 61);
     }
@@ -3531,8 +3650,7 @@ mod tests {
         assert!(PEER_IP_RESOLVE_RETRY_DELAY < PEER_IP_RESOLVE_DELAY);
         // Maximum retries before giving up:
         // retries = PEER_IP_RESOLVE_DELAY / PEER_IP_RESOLVE_RETRY_DELAY = 60
-        let max_retries =
-            PEER_IP_RESOLVE_DELAY.as_secs() / PEER_IP_RESOLVE_RETRY_DELAY.as_secs();
+        let max_retries = PEER_IP_RESOLVE_DELAY.as_secs() / PEER_IP_RESOLVE_RETRY_DELAY.as_secs();
         assert_eq!(max_retries, 60);
     }
 

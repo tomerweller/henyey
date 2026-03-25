@@ -113,13 +113,10 @@ async fn fee_window_poller(
             window_latest + 1
         };
 
-        let metas = match app
-            .database()
-            .with_connection(|conn| {
-                use henyey_db::LedgerCloseMetaQueries;
-                conn.load_ledger_close_metas_in_range(start, current_ledger + 1, retention)
-            })
-        {
+        let metas = match app.database().with_connection(|conn| {
+            use henyey_db::LedgerCloseMetaQueries;
+            conn.load_ledger_close_metas_in_range(start, current_ledger + 1, retention)
+        }) {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to load LCMs for fee window");
@@ -282,10 +279,7 @@ mod tests {
 
     #[test]
     fn test_response_error_serialization() {
-        let resp = JsonRpcResponse::error(
-            json!(1),
-            JsonRpcError::method_not_found("foo"),
-        );
+        let resp = JsonRpcResponse::error(json!(1), JsonRpcError::method_not_found("foo"));
         let serialized = serde_json::to_string(&resp).unwrap();
         assert!(serialized.contains("\"error\""));
         assert!(!serialized.contains("\"result\""));

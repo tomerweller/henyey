@@ -238,7 +238,11 @@ impl App {
         }
     }
 
-    pub(super) async fn process_ping_response(&self, peer_id: &henyey_overlay::PeerId, hash: [u8; 32]) {
+    pub(super) async fn process_ping_response(
+        &self,
+        peer_id: &henyey_overlay::PeerId,
+        hash: [u8; 32],
+    ) {
         let hash = Hash256::from_bytes(hash);
         let info = {
             let mut inflight = self.ping_inflight.write().await;

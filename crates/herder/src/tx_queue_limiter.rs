@@ -290,7 +290,8 @@ impl TxQueueLimiter {
         ledger_version: u32,
         broadcast_seed: u64,
     ) -> (bool, i64) {
-        let frame = TransactionFrame::from_owned_with_network(new_tx.envelope.clone(), self.network_id);
+        let frame =
+            TransactionFrame::from_owned_with_network(new_tx.envelope.clone(), self.network_id);
         assert_eq!(
             frame.is_soroban(),
             self.is_soroban,
@@ -298,7 +299,8 @@ impl TxQueueLimiter {
         );
 
         if let Some(old) = old_tx {
-            let old_frame = TransactionFrame::from_owned_with_network(old.envelope.clone(), self.network_id);
+            let old_frame =
+                TransactionFrame::from_owned_with_network(old.envelope.clone(), self.network_id);
             assert_eq!(
                 old_frame.is_soroban(),
                 frame.is_soroban(),
@@ -348,7 +350,8 @@ impl TxQueueLimiter {
 
         // Calculate old tx discount for replace-by-fee
         let old_tx_discount = old_tx.map(|old| {
-            let old_frame = TransactionFrame::from_owned_with_network(old.envelope.clone(), self.network_id);
+            let old_frame =
+                TransactionFrame::from_owned_with_network(old.envelope.clone(), self.network_id);
             self.lane_config
                 .as_ref()
                 .map(|c| c.tx_resources(&old_frame, ledger_version))
@@ -390,7 +393,8 @@ impl TxQueueLimiter {
     ) where
         F: FnMut(&QueuedTransaction),
     {
-        let frame = TransactionFrame::from_owned_with_network(tx_to_fit.envelope.clone(), self.network_id);
+        let frame =
+            TransactionFrame::from_owned_with_network(tx_to_fit.envelope.clone(), self.network_id);
         let tx_to_fit_lane = self
             .lane_config
             .as_ref()
@@ -404,7 +408,8 @@ impl TxQueueLimiter {
             .unwrap_or_else(|| Resource::new(vec![tx_to_fit.op_count as i64]));
 
         for (tx, evicted_due_to_lane_limit) in txs_to_evict {
-            let evict_frame = TransactionFrame::from_owned_with_network(tx.envelope.clone(), self.network_id);
+            let evict_frame =
+                TransactionFrame::from_owned_with_network(tx.envelope.clone(), self.network_id);
             let evict_lane = self
                 .lane_config
                 .as_ref()

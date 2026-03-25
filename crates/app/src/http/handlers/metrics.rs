@@ -2,11 +2,7 @@
 
 use std::sync::Arc;
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse};
 
 use super::super::types::MetricsResponse;
 use super::super::ServerState;

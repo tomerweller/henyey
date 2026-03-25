@@ -42,10 +42,10 @@
 //! at each level. The first match is returned (newer entries shadow older).
 //! Dead entries (tombstones) shadow live entries, returning None.
 
+use henyey_common::protocol::MIN_SOROBAN_PROTOCOL_VERSION;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use henyey_common::protocol::MIN_SOROBAN_PROTOCOL_VERSION;
 use stellar_xdr::curr::{
     BucketListType, BucketMetadata, BucketMetadataExt, LedgerEntry, LedgerKey, Limits,
     StateArchivalSettings, WriteXdr,
@@ -55,23 +55,23 @@ use tokio::sync::oneshot;
 use henyey_common::{BucketListDbConfig, Hash256};
 
 use crate::bucket::Bucket;
+use crate::cache::CacheStats;
 use crate::entry::{
     get_ttl_key, is_persistent_entry, is_soroban_entry, is_temporary_entry, is_ttl_expired,
     BucketEntry, BucketEntryExt,
 };
-use crate::cache::CacheStats;
-use crate::future_bucket::MergeKey;
-use crate::index::BucketEntryCounters;
 use crate::eviction::{
     update_starting_eviction_iterator, EvictionCandidate, EvictionIterator, EvictionIteratorExt,
     EvictionResult,
 };
+use crate::future_bucket::MergeKey;
+use crate::index::BucketEntryCounters;
 use crate::live_iterator::LiveEntriesIterator;
 use crate::manager::{canonical_bucket_filename, promote_temp_to_canonical, temp_merge_path};
 use crate::merge::{
     merge_buckets_to_file, merge_buckets_to_file_with_counters,
-    merge_buckets_with_options_and_shadows,
-    merge_buckets_with_options_and_shadows_and_counters, merge_in_memory,
+    merge_buckets_with_options_and_shadows, merge_buckets_with_options_and_shadows_and_counters,
+    merge_in_memory,
 };
 use crate::merge_map::BucketMergeMap;
 use crate::metrics::MergeCounters;
@@ -374,7 +374,11 @@ impl AsyncMergeHandle {
         // 3. Integrates with tokio's shutdown handling
         tokio::task::spawn_blocking(move || {
             let start = std::time::Instant::now();
-            tracing::debug!(level, disk_backed = bucket_dir.is_some(), "Background merge started");
+            tracing::debug!(
+                level,
+                disk_backed = bucket_dir.is_some(),
+                "Background merge started"
+            );
 
             let counters_ref = counters.as_deref();
 
@@ -396,12 +400,7 @@ impl AsyncMergeHandle {
                             let _ = std::fs::remove_file(&temp_path);
                             Ok(Bucket::empty())
                         } else {
-                            promote_temp_to_canonical(
-                                &temp_path,
-                                &dir,
-                                &hash,
-                                "start_merge",
-                            )
+                            promote_temp_to_canonical(&temp_path, &dir, &hash, "start_merge")
                         }
                     }
                     Err(e) => {
@@ -1238,9 +1237,10 @@ impl BucketList {
     /// Returns an iterator of (level_index, level_hash, curr_hash, snap_hash).
     /// This is useful for debugging bucket list hash mismatches.
     pub fn level_hashes(&self) -> impl Iterator<Item = (usize, Hash256, Hash256, Hash256)> + '_ {
-        self.levels.iter().enumerate().map(|(idx, level)| {
-            (idx, level.hash(), level.curr.hash(), level.snap.hash())
-        })
+        self.levels
+            .iter()
+            .enumerate()
+            .map(|(idx, level)| (idx, level.hash(), level.curr.hash(), level.snap.hash()))
     }
 
     /// Set the BucketListDB config for per-bucket cache initialization.
@@ -1864,16 +1864,17 @@ impl BucketList {
                 let keep_dead = Self::keep_tombstone_entries(i);
                 let normalize_init = false; // Never normalize INIT to LIVE during merges
                 let use_empty_curr = Self::should_merge_with_empty_curr(ledger_seq, i);
-                let shadow_buckets = if protocol_version_is_before(protocol_version, ProtocolVersion::V12) {
-                    let mut shadows = Vec::new();
-                    for level in self.levels.iter().take(i - 1) {
-                        shadows.push((*level.curr).clone());
-                        shadows.push((*level.snap).clone());
-                    }
-                    shadows
-                } else {
-                    Vec::new()
-                };
+                let shadow_buckets =
+                    if protocol_version_is_before(protocol_version, ProtocolVersion::V12) {
+                        let mut shadows = Vec::new();
+                        for level in self.levels.iter().take(i - 1) {
+                            shadows.push((*level.curr).clone());
+                            shadows.push((*level.snap).clone());
+                        }
+                        shadows
+                    } else {
+                        Vec::new()
+                    };
                 self.levels[i].prepare_with_normalization(
                     protocol_version,
                     Arc::clone(&spilling_snap),
@@ -2146,10 +2147,8 @@ impl BucketList {
         }
 
         // Convert flat array to (curr, snap) pairs
-        let pairs: Vec<(Hash256, Hash256)> = hashes
-            .chunks(2)
-            .map(|chunk| (chunk[0], chunk[1]))
-            .collect();
+        let pairs: Vec<(Hash256, Hash256)> =
+            hashes.chunks(2).map(|chunk| (chunk[0], chunk[1])).collect();
 
         // Use default next states (all state=0, no pending merges)
         let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
@@ -2876,15 +2875,14 @@ impl BucketList {
             };
 
             // Scan entries in this bucket (byte-limited only, no entry count limit)
-            let (_entries_scanned, bytes_used, finished_bucket) = self
-                .scan_bucket_region(
-                    bucket,
-                    &mut iter,
-                    bytes_remaining,
-                    current_ledger,
-                    &mut result.candidates,
-                    &mut seen_keys,
-                )?;
+            let (_entries_scanned, bytes_used, finished_bucket) = self.scan_bucket_region(
+                bucket,
+                &mut iter,
+                bytes_remaining,
+                current_ledger,
+                &mut result.candidates,
+                &mut seen_keys,
+            )?;
 
             result.bytes_scanned += bytes_used;
 
@@ -3341,7 +3339,19 @@ mod tests {
         .unwrap();
 
         level
-            .prepare_with_normalization(TEST_PROTOCOL, Arc::new(incoming), &[], MergeContext { keep_dead_entries: false, normalize_init: true, use_empty_curr: false, bucket_dir: None, merge_map: None, merge_counters: None })
+            .prepare_with_normalization(
+                TEST_PROTOCOL,
+                Arc::new(incoming),
+                &[],
+                MergeContext {
+                    keep_dead_entries: false,
+                    normalize_init: true,
+                    use_empty_curr: false,
+                    bucket_dir: None,
+                    merge_map: None,
+                    merge_counters: None,
+                },
+            )
             .unwrap();
         let _ = level.commit();
 
@@ -4117,7 +4127,10 @@ mod tests {
 
         // Step 2: Corrupt the permanent file that was just created.
         let permanent_path = bucket_dir.join(canonical_bucket_filename(&expected_hash));
-        assert!(permanent_path.exists(), "permanent file must exist after first merge");
+        assert!(
+            permanent_path.exists(),
+            "permanent file must exist after first merge"
+        );
         std::fs::write(&permanent_path, b"").unwrap(); // truncate to zero bytes
         assert_eq!(
             std::fs::metadata(&permanent_path).unwrap().len(),
@@ -4162,8 +4175,7 @@ mod tests {
             "merge must not return SHA-256(empty) when permanent file is corrupt"
         );
         assert_eq!(
-            result_hash,
-            expected_hash,
+            result_hash, expected_hash,
             "merge must return the same hash as the first (uncorrupted) run"
         );
 
@@ -4186,9 +4198,9 @@ mod tests {
             buckets.into_iter().map(|b| (b.hash(), b)).collect();
         let map = std::sync::Arc::new(map);
         move |hash: &Hash256| {
-            map.get(hash)
-                .cloned()
-                .ok_or_else(|| BucketError::Serialization(format!("bucket not found: {}", hash.to_hex())))
+            map.get(hash).cloned().ok_or_else(|| {
+                BucketError::Serialization(format!("bucket not found: {}", hash.to_hex()))
+            })
         }
     }
 
@@ -4217,10 +4229,16 @@ mod tests {
         assert_eq!(bl.levels().len(), BUCKET_LIST_LEVELS);
 
         let key1 = make_account_key([1u8; 32]);
-        assert!(bl.get(&key1).unwrap().is_some(), "entry1 should be found after parallel restore");
+        assert!(
+            bl.get(&key1).unwrap().is_some(),
+            "entry1 should be found after parallel restore"
+        );
 
         let key2 = make_account_key([2u8; 32]);
-        assert!(bl.get(&key2).unwrap().is_some(), "entry2 should be found after parallel restore");
+        assert!(
+            bl.get(&key2).unwrap().is_some(),
+            "entry2 should be found after parallel restore"
+        );
 
         // Level 2 should be empty
         assert!(bl.levels()[2].curr.is_empty());
@@ -4234,7 +4252,8 @@ mod tests {
         let entry_curr = make_account_entry([1u8; 32], 100);
         let entry_out = make_account_entry([9u8; 32], 999);
 
-        let bucket_curr = Bucket::from_entries(vec![BucketListEntry::Liveentry(entry_curr)]).unwrap();
+        let bucket_curr =
+            Bucket::from_entries(vec![BucketListEntry::Liveentry(entry_curr)]).unwrap();
         let bucket_out = Bucket::from_entries(vec![BucketListEntry::Liveentry(entry_out)]).unwrap();
 
         let hc = bucket_curr.hash();
@@ -4260,7 +4279,11 @@ mod tests {
         );
         // Other levels have no next
         for i in 1..BUCKET_LIST_LEVELS {
-            assert!(bl.levels()[i].next.is_none(), "level {} should have no next", i);
+            assert!(
+                bl.levels()[i].next.is_none(),
+                "level {} should have no next",
+                i
+            );
         }
     }
 
@@ -4280,7 +4303,11 @@ mod tests {
         let bl = BucketList::restore_from_has_parallel(&hashes, &next_states, loader).unwrap();
 
         for i in 0..BUCKET_LIST_LEVELS {
-            assert!(bl.levels()[i].next.is_none(), "level {} should have no next for CLEAR state", i);
+            assert!(
+                bl.levels()[i].next.is_none(),
+                "level {} should have no next for CLEAR state",
+                i
+            );
         }
     }
 
@@ -4288,12 +4315,18 @@ mod tests {
     fn test_restore_from_has_parallel_matches_sequential() {
         // restore_from_has_parallel must produce results identical to restore_from_has
         // for the same inputs: same entries retrievable, same level.next presence.
-        let entries: Vec<LedgerEntry> = (1u8..=4).map(|i| make_account_entry([i; 32], i as i64 * 100)).collect();
+        let entries: Vec<LedgerEntry> = (1u8..=4)
+            .map(|i| make_account_entry([i; 32], i as i64 * 100))
+            .collect();
 
-        let b0c = Bucket::from_entries(vec![BucketListEntry::Liveentry(entries[0].clone())]).unwrap();
-        let b0s = Bucket::from_entries(vec![BucketListEntry::Liveentry(entries[1].clone())]).unwrap();
-        let b2c = Bucket::from_entries(vec![BucketListEntry::Liveentry(entries[2].clone())]).unwrap();
-        let bout = Bucket::from_entries(vec![BucketListEntry::Liveentry(entries[3].clone())]).unwrap();
+        let b0c =
+            Bucket::from_entries(vec![BucketListEntry::Liveentry(entries[0].clone())]).unwrap();
+        let b0s =
+            Bucket::from_entries(vec![BucketListEntry::Liveentry(entries[1].clone())]).unwrap();
+        let b2c =
+            Bucket::from_entries(vec![BucketListEntry::Liveentry(entries[2].clone())]).unwrap();
+        let bout =
+            Bucket::from_entries(vec![BucketListEntry::Liveentry(entries[3].clone())]).unwrap();
 
         let h0c = b0c.hash();
         let h0s = b0s.hash();
@@ -4316,10 +4349,12 @@ mod tests {
         let all_buckets = vec![b0c, b0s, b2c, bout];
 
         let loader_seq = make_loader(all_buckets.clone());
-        let bl_seq = BucketList::restore_from_has(&hashes, &next_states, |h| loader_seq(h)).unwrap();
+        let bl_seq =
+            BucketList::restore_from_has(&hashes, &next_states, |h| loader_seq(h)).unwrap();
 
         let loader_par = make_loader(all_buckets);
-        let bl_par = BucketList::restore_from_has_parallel(&hashes, &next_states, loader_par).unwrap();
+        let bl_par =
+            BucketList::restore_from_has_parallel(&hashes, &next_states, loader_par).unwrap();
 
         // All entries should be reachable from both
         for i in 1u8..=4 {
@@ -4351,11 +4386,9 @@ mod tests {
         let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
         let too_short = vec![(Hash256::ZERO, Hash256::ZERO); 5]; // < BUCKET_LIST_LEVELS
 
-        let result = BucketList::restore_from_has_parallel(
-            &too_short,
-            &next_states,
-            |_| unreachable!("should not call loader"),
-        );
+        let result = BucketList::restore_from_has_parallel(&too_short, &next_states, |_| {
+            unreachable!("should not call loader")
+        });
         assert!(result.is_err(), "should return error for wrong level count");
     }
 

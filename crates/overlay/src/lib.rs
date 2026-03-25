@@ -657,7 +657,10 @@ mod tests {
         // G2: stellar-core Peer::getIOTimeout() returns 2s for unauthenticated
         // peers (during handshake). The default auth_timeout_secs must be 2.
         let config = OverlayConfig::default();
-        assert_eq!(config.auth_timeout_secs, 2, "auth_timeout_secs should be 2s matching stellar-core getIOTimeout()");
+        assert_eq!(
+            config.auth_timeout_secs, 2,
+            "auth_timeout_secs should be 2s matching stellar-core getIOTimeout()"
+        );
     }
 
     #[test]

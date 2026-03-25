@@ -48,10 +48,7 @@ pub(crate) fn build_compat_router(state: Arc<CompatServerState>) -> Router {
         .route("/tx", get(handlers::tx::compat_tx_handler))
         .route("/peers", get(handlers::peers::compat_peers_handler))
         .route("/metrics", get(handlers::metrics::compat_metrics_handler))
-        .route(
-            "/testacc",
-            get(handlers::testacc::compat_testacc_handler),
-        )
+        .route("/testacc", get(handlers::testacc::compat_testacc_handler))
         .route(
             "/sorobaninfo",
             get(handlers::plaintext::compat_sorobaninfo_handler),
@@ -82,7 +79,10 @@ pub(crate) fn build_compat_router(state: Arc<CompatServerState>) -> Router {
         .route("/bans", get(handlers::plaintext::compat_bans_handler))
         .route("/quorum", get(handlers::plaintext::compat_quorum_handler))
         .route("/scp", get(handlers::plaintext::compat_scp_handler))
-        .route("/upgrades", get(handlers::plaintext::compat_upgrades_handler))
+        .route(
+            "/upgrades",
+            get(handlers::plaintext::compat_upgrades_handler),
+        )
         .route(
             "/self-check",
             get(handlers::plaintext::compat_self_check_handler),
@@ -117,10 +117,8 @@ pub(crate) fn build_compat_router(state: Arc<CompatServerState>) -> Router {
         "/generateload",
         get(handlers::plaintext::compat_generateload_handler),
     );
-    router.layer(
-            ServiceBuilder::new()
-                .layer(CatchPanicLayer::custom(safe_router_panic_handler)),
-        )
+    router
+        .layer(ServiceBuilder::new().layer(CatchPanicLayer::custom(safe_router_panic_handler)))
         .with_state(state)
 }
 
@@ -128,9 +126,7 @@ pub(crate) fn build_compat_router(state: Arc<CompatServerState>) -> Router {
 ///
 /// Matches stellar-core's `safeRouter` behavior: on exception/panic, return
 /// `{"exception": "<message>"}`.
-fn safe_router_panic_handler(
-    _err: Box<dyn std::any::Any + Send + 'static>,
-) -> Response {
+fn safe_router_panic_handler(_err: Box<dyn std::any::Any + Send + 'static>) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         axum::Json(serde_json::json!({"exception": "generic"})),
@@ -167,9 +163,7 @@ impl CompatServer {
         runner: Box<dyn crate::http::handlers::generateload::LoadGenRunner>,
     ) {
         self.loadgen_state = Some(Arc::new(
-            crate::http::handlers::generateload::GenerateLoadState {
-                runner,
-            },
+            crate::http::handlers::generateload::GenerateLoadState { runner },
         ));
     }
 

@@ -319,7 +319,11 @@ impl CachedCdpDataLake {
         let cache_path = if date_partition.is_empty() {
             cache_dir.as_ref().join("cdp").join(network)
         } else {
-            cache_dir.as_ref().join("cdp").join(network).join(date_partition)
+            cache_dir
+                .as_ref()
+                .join("cdp")
+                .join(network)
+                .join(date_partition)
         };
         std::fs::create_dir_all(&cache_path)?;
 
@@ -511,10 +515,11 @@ impl CachedCdpDataLake {
     pub fn cache_stats(&self) -> CacheStats {
         let (entries, size_bytes) = std::fs::read_dir(&self.cache_dir)
             .map(|dir| {
-                dir.filter_map(|e| e.ok()).fold((0usize, 0u64), |(count, size), entry| {
-                    let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                    (count + 1, size + file_size)
-                })
+                dir.filter_map(|e| e.ok())
+                    .fold((0usize, 0u64), |(count, size), entry| {
+                        let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                        (count + 1, size + file_size)
+                    })
             })
             .unwrap_or((0, 0));
 
@@ -803,34 +808,30 @@ pub fn extract_transaction_processing(
             }
             result
         }
-        LedgerCloseMeta::V1(v1) => {
-            extract_generalized_tx_processing(
-                &v1.tx_set,
-                v1.tx_processing.iter().map(|tp| TxProcessingFields {
-                    tx_hash: tp.result.transaction_hash.clone(),
-                    result: tp.result.clone(),
-                    meta: tp.tx_apply_processing.clone(),
-                    fee_meta: tp.fee_processing.clone(),
-                    post_fee_meta: stellar_xdr::curr::LedgerEntryChanges::default(),
-                }),
-                network_id,
-                "V1",
-            )
-        }
-        LedgerCloseMeta::V2(v2) => {
-            extract_generalized_tx_processing(
-                &v2.tx_set,
-                v2.tx_processing.iter().map(|tp| TxProcessingFields {
-                    tx_hash: tp.result.transaction_hash.clone(),
-                    result: tp.result.clone(),
-                    meta: tp.tx_apply_processing.clone(),
-                    fee_meta: tp.fee_processing.clone(),
-                    post_fee_meta: tp.post_tx_apply_fee_processing.clone(),
-                }),
-                network_id,
-                "V2",
-            )
-        }
+        LedgerCloseMeta::V1(v1) => extract_generalized_tx_processing(
+            &v1.tx_set,
+            v1.tx_processing.iter().map(|tp| TxProcessingFields {
+                tx_hash: tp.result.transaction_hash.clone(),
+                result: tp.result.clone(),
+                meta: tp.tx_apply_processing.clone(),
+                fee_meta: tp.fee_processing.clone(),
+                post_fee_meta: stellar_xdr::curr::LedgerEntryChanges::default(),
+            }),
+            network_id,
+            "V1",
+        ),
+        LedgerCloseMeta::V2(v2) => extract_generalized_tx_processing(
+            &v2.tx_set,
+            v2.tx_processing.iter().map(|tp| TxProcessingFields {
+                tx_hash: tp.result.transaction_hash.clone(),
+                result: tp.result.clone(),
+                meta: tp.tx_apply_processing.clone(),
+                fee_meta: tp.fee_processing.clone(),
+                post_fee_meta: tp.post_tx_apply_fee_processing.clone(),
+            }),
+            network_id,
+            "V2",
+        ),
     }
 }
 
@@ -912,9 +913,7 @@ pub fn extract_transaction_results(
 ///
 /// Returns either a Classic TransactionSet (V0) or Generalized set (V1/V2).
 /// This is useful for passing to `close_ledger` when replaying from CDP.
-pub fn extract_transaction_set(
-    meta: &LedgerCloseMeta,
-) -> henyey_ledger::TransactionSetVariant {
+pub fn extract_transaction_set(meta: &LedgerCloseMeta) -> henyey_ledger::TransactionSetVariant {
     use henyey_ledger::TransactionSetVariant;
     match meta {
         LedgerCloseMeta::V0(v0) => TransactionSetVariant::Classic(v0.tx_set.clone()),

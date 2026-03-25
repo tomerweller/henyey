@@ -148,9 +148,10 @@ pub(crate) async fn compat_quorum_handler(
 ) -> impl IntoResponse {
     // stellar-core returns the local quorum set hash. We compute it from
     // the local quorum set if available.
-    let hash = state.app.local_quorum_set().map(|qs| {
-        henyey_scp::hash_quorum_set(&qs).to_hex()
-    });
+    let hash = state
+        .app
+        .local_quorum_set()
+        .map(|qs| henyey_scp::hash_quorum_set(&qs).to_hex());
     Json(serde_json::json!({
         "quorum": hash.unwrap_or_default()
     }))
@@ -215,11 +216,12 @@ pub(crate) async fn compat_upgrades_handler(
         if let Some(key_str) = params.get("configupgradesetkey") {
             // configupgradesetkey is a base64-encoded ConfigUpgradeSetKey XDR
             use base64::{engine::general_purpose::STANDARD, Engine};
-            use stellar_xdr::curr::{ConfigUpgradeSetKey, ReadXdr, Limits};
+            use stellar_xdr::curr::{ConfigUpgradeSetKey, Limits, ReadXdr};
             if let Ok(bytes) = STANDARD.decode(key_str) {
                 if let Ok(key) = ConfigUpgradeSetKey::from_xdr(&bytes, Limits::none()) {
-                    upgrade_params.config_upgrade_set_key =
-                        Some(henyey_herder::upgrades::ConfigUpgradeSetKeyJson::from_xdr(&key));
+                    upgrade_params.config_upgrade_set_key = Some(
+                        henyey_herder::upgrades::ConfigUpgradeSetKeyJson::from_xdr(&key),
+                    );
                 }
             }
         }
@@ -227,19 +229,22 @@ pub(crate) async fn compat_upgrades_handler(
         match state.app.set_upgrade_parameters(upgrade_params) {
             Ok(()) => Json(serde_json::json!({
                 "status": "ok"
-            })).into_response(),
+            }))
+            .into_response(),
             Err(e) => Json(serde_json::json!({
                 "status": "error",
                 "error": e
-            })).into_response(),
+            }))
+            .into_response(),
         }
     } else if mode == "clear" {
-        let _ = state.app.set_upgrade_parameters(
-            henyey_herder::upgrades::UpgradeParameters::default(),
-        );
+        let _ = state
+            .app
+            .set_upgrade_parameters(henyey_herder::upgrades::UpgradeParameters::default());
         Json(serde_json::json!({
             "status": "ok"
-        })).into_response()
+        }))
+        .into_response()
     } else {
         // Default: return current state + proposed upgrades
         let (version, base_fee, base_reserve, max_tx_set_size) = state.app.current_upgrade_state();
@@ -258,7 +263,8 @@ pub(crate) async fn compat_upgrades_handler(
                 "basereserve": runtime_params.base_reserve,
                 "maxtxsetsize": runtime_params.max_tx_set_size,
             }
-        })).into_response()
+        }))
+        .into_response()
     }
 }
 
@@ -386,7 +392,20 @@ fn parse_iso8601_to_unix(s: &str) -> Option<u64> {
     for y in 1970..year {
         days += if is_leap_year(y) { 366 } else { 365 };
     }
-    let month_days = [31, 28 + if is_leap_year(year) { 1 } else { 0 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let month_days = [
+        31,
+        28 + if is_leap_year(year) { 1 } else { 0 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     for m in 0..(month.saturating_sub(1) as usize) {
         days += month_days.get(m).copied().unwrap_or(30) as i64;
     }

@@ -34,17 +34,17 @@
 //! endpoints for monitoring and control. See the [`http`](crate::http) module
 //! for full endpoint documentation.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::future::Future;
 
 use serde::Serialize;
 use tokio::signal;
 use tokio::sync::broadcast;
 
 use crate::app::{App, AppState, CatchupTarget};
-use crate::config::AppConfig;
 use crate::compat_http::CompatServer;
+use crate::config::AppConfig;
 use crate::http::{QueryServer, StatusServer};
 
 /// Node running mode determining behavior and consensus participation.
@@ -110,9 +110,8 @@ pub struct RunOptions {
 }
 
 /// Callback type for spawning extra servers alongside the main node.
-pub type ExtraServerSpawner = Arc<
-    dyn Fn(&Arc<App>) -> Vec<tokio::task::JoinHandle<()>> + Send + Sync,
->;
+pub type ExtraServerSpawner =
+    Arc<dyn Fn(&Arc<App>) -> Vec<tokio::task::JoinHandle<()>> + Send + Sync>;
 
 impl std::fmt::Debug for RunOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -344,7 +343,10 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
         match app.load_last_known_ledger().await {
             Ok(true) => {
                 let (seq, _hash, _close_time, _protocol) = app.ledger_info();
-                tracing::info!(lcl_seq = seq, "Restored state from disk, skipping full catchup");
+                tracing::info!(
+                    lcl_seq = seq,
+                    "Restored state from disk, skipping full catchup"
+                );
                 app.set_state(AppState::Synced).await;
                 app.set_current_ledger(seq).await;
             }
@@ -392,7 +394,8 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
             // Run catchup using mode from config
             let catchup_mode = app.config().catchup.to_mode();
             tracing::info!(?catchup_mode, "Starting catchup with configured mode");
-            app.catchup_with_mode(CatchupTarget::Current, catchup_mode).await?;
+            app.catchup_with_mode(CatchupTarget::Current, catchup_mode)
+                .await?;
 
             // Wait for SCP state request to complete
             let _ = scp_request_handle.await;

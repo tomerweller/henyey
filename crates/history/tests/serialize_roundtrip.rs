@@ -1,5 +1,5 @@
-use serde_json::{Map, Value};
 use henyey_history::archive_state::HistoryArchiveState;
+use serde_json::{Map, Value};
 
 fn normalize_json(value: Value) -> Value {
     match value {

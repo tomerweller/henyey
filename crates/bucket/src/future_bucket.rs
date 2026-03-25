@@ -27,8 +27,8 @@
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
-use serde::{Deserialize, Serialize};
 use henyey_common::Hash256;
+use serde::{Deserialize, Serialize};
 
 use crate::bucket::Bucket;
 use crate::merge::merge_buckets_with_options;
@@ -726,8 +726,7 @@ mod tests {
         let entry2 = make_account_entry([2u8; 32], 200);
         let entry3 = make_account_entry([3u8; 32], 300);
 
-        let bucket1 =
-            Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry1)]).unwrap());
+        let bucket1 = Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry1)]).unwrap());
         let bucket2 = Arc::new(
             Bucket::from_entries(vec![
                 BucketEntry::Liveentry(entry2),
@@ -740,13 +739,7 @@ mod tests {
         let b2_hash = bucket2.hash();
 
         // Start a merge (enters LiveInputs state)
-        let mut fb = FutureBucket::start_merge(
-            bucket1.clone(),
-            bucket2.clone(),
-            25,
-            true,
-            false,
-        );
+        let mut fb = FutureBucket::start_merge(bucket1.clone(), bucket2.clone(), 25, true, false);
         assert_eq!(fb.state(), FutureBucketState::LiveInputs);
 
         // Resolve the original merge to get the expected result
@@ -806,18 +799,10 @@ mod tests {
         let entry1 = make_account_entry([1u8; 32], 100);
         let entry2 = make_account_entry([2u8; 32], 200);
 
-        let bucket1 =
-            Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry1)]).unwrap());
-        let bucket2 =
-            Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry2)]).unwrap());
+        let bucket1 = Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry1)]).unwrap());
+        let bucket2 = Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry2)]).unwrap());
 
-        let mut fb = FutureBucket::start_merge(
-            bucket1.clone(),
-            bucket2.clone(),
-            25,
-            true,
-            false,
-        );
+        let mut fb = FutureBucket::start_merge(bucket1.clone(), bucket2.clone(), 25, true, false);
         let result = fb.resolve().await.unwrap();
         let result_hash = result.hash();
 
@@ -909,8 +894,7 @@ mod tests {
         let entry2 = make_account_entry([2u8; 32], 200);
         let entry3 = make_account_entry([3u8; 32], 300);
 
-        let bucket1 =
-            Bucket::from_entries(vec![BucketEntry::Liveentry(entry1.clone())]).unwrap();
+        let bucket1 = Bucket::from_entries(vec![BucketEntry::Liveentry(entry1.clone())]).unwrap();
         let bucket2 = Bucket::from_entries(vec![
             BucketEntry::Liveentry(entry2.clone()),
             BucketEntry::Liveentry(entry3.clone()),
@@ -963,14 +947,8 @@ mod tests {
         .unwrap();
 
         // Re-merge to get the output bucket
-        let re_merged = crate::merge::merge_buckets_with_options(
-            &b1_new,
-            &b2_new,
-            true,
-            25,
-            false,
-        )
-        .unwrap();
+        let re_merged =
+            crate::merge::merge_buckets_with_options(&b1_new, &b2_new, true, 25, false).unwrap();
 
         // Verify re-merged has same hash as original
         assert_eq!(re_merged.hash(), merged_hash);
@@ -1003,10 +981,8 @@ mod tests {
         let entry1 = make_account_entry([1u8; 32], 100);
         let entry2 = make_account_entry([2u8; 32], 200);
 
-        let bucket1 =
-            Bucket::from_entries(vec![BucketEntry::Liveentry(entry1)]).unwrap();
-        let bucket2 =
-            Bucket::from_entries(vec![BucketEntry::Liveentry(entry2)]).unwrap();
+        let bucket1 = Bucket::from_entries(vec![BucketEntry::Liveentry(entry1)]).unwrap();
+        let bucket2 = Bucket::from_entries(vec![BucketEntry::Liveentry(entry2)]).unwrap();
 
         let b1_hash = bucket1.hash();
         let b2_hash = bucket2.hash();

@@ -20,11 +20,11 @@
 //!   overwhelming the node during traffic spikes.
 
 use dashmap::DashMap;
+use henyey_common::Hash256;
 use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use henyey_common::Hash256;
 use stellar_xdr::curr::StellarMessage;
 use tracing::{debug, trace};
 

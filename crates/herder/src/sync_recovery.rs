@@ -479,7 +479,6 @@ mod tests {
         fn set_applying(&self, applying: bool) {
             self.is_applying.store(applying, Ordering::SeqCst);
         }
-
     }
 
     impl SyncRecoveryCallback for TestCallback {

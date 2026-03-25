@@ -1368,4 +1368,3 @@ fn test_ballot_core5_confirm_vblocking_via_externalize_higher() {
 }
 
 // ===========================================================================
-

@@ -20,17 +20,17 @@ use henyey_herder::TxQueueResult;
 use henyey_tx::TxResultCode;
 use stellar_xdr::curr::{
     AccountId, Asset, ContractDataDurability, ContractId, ContractIdPreimage,
-    ContractIdPreimageFromAddress, Hash, LedgerKey,
-    LedgerKeyContractData, Memo, MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions,
-    PublicKey, ScAddress, ScVal, SequenceNumber, Transaction,
-    TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, VecM, CreateAccountOp,
+    ContractIdPreimageFromAddress, CreateAccountOp, Hash, LedgerKey, LedgerKeyContractData, Memo,
+    MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions, PublicKey, ScAddress, ScVal,
+    SequenceNumber, Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope,
+    Uint256, VecM,
 };
 use tracing::{debug, info, warn};
 
 use crate::loadgen_soroban::{
     compute_contract_id, contract_code_key, contract_instance_key, make_account_address,
-    make_contract_address, make_u32, make_u64, BatchTransfer, ContractInvocation,
-    SacTransfer, SorobanTxBuilder,
+    make_contract_address, make_u32, make_u64, BatchTransfer, ContractInvocation, SacTransfer,
+    SorobanTxBuilder,
 };
 
 // ---------------------------------------------------------------------------
@@ -164,7 +164,6 @@ pub struct GeneratedLoadConfig {
     pub spike_size: u32,
 
     // --- Soroban-specific fields ---
-
     /// Number of contract instances to deploy (for `SorobanInvokeSetup`).
     pub n_instances: u32,
     /// Number of Wasm blobs to upload (for `SorobanInvokeSetup`).
@@ -179,7 +178,6 @@ pub struct GeneratedLoadConfig {
     pub mix_invoke_weight: u32,
 
     // --- Legacy simple-mode fields (backward compat) ---
-
     /// Account names for simple step_plan mode.
     pub accounts: Vec<String>,
     /// Transactions per step in simple mode.
@@ -333,8 +331,7 @@ impl TxGenerator {
                 let network_id = NetworkId::from_passphrase(&self.network_passphrase);
                 let sk = SecretKey::from_seed(network_id.as_bytes());
                 let pk = sk.public_key();
-                let aid =
-                    AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(*pk.as_bytes())));
+                let aid = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(*pk.as_bytes())));
                 let seq = self
                     .app
                     .load_account_sequence(&aid)
@@ -460,9 +457,8 @@ impl TxGenerator {
             self.pick_account_pair(n_accounts, offset, ledger_num, source_account_id);
 
         let dest_account = self.find_account(dest_id, ledger_num);
-        let dest_muxed = MuxedAccount::Ed25519(Uint256(
-            *dest_account.secret_key.public_key().as_bytes(),
-        ));
+        let dest_muxed =
+            MuxedAccount::Ed25519(Uint256(*dest_account.secret_key.public_key().as_bytes()));
 
         let payment_op = Operation {
             source_account: None,
@@ -474,7 +470,8 @@ impl TxGenerator {
         };
 
         let fee = self.generate_fee(max_fee_rate, 1, source_account_id);
-        let envelope = self.create_transaction_frame(source_id, vec![payment_op], fee, ledger_num)?;
+        let envelope =
+            self.create_transaction_frame(source_id, vec![payment_op], fee, ledger_num)?;
         Ok((source_id, envelope))
     }
 
@@ -492,8 +489,7 @@ impl TxGenerator {
         let source = self.find_account(source_id, ledger_num);
         let seq = source.next_sequence_number();
         let secret = source.secret_key.clone();
-        let source_muxed =
-            MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes()));
+        let source_muxed = MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes()));
 
         let tx = Transaction {
             source_account: source_muxed,
@@ -541,7 +537,8 @@ impl TxGenerator {
         inclusion_fee: u32,
     ) -> anyhow::Result<(u64, TransactionEnvelope)> {
         let wasm_size = DEFAULT_WASM_SIZE;
-        let wasm = SorobanTxBuilder::random_wasm(wasm_size, deterministic_rand(account_id, ledger_num));
+        let wasm =
+            SorobanTxBuilder::random_wasm(wasm_size, deterministic_rand(account_id, ledger_num));
         let source = self.find_account(account_id, ledger_num);
         let seq = source.next_sequence_number();
         let sk = source.secret_key.clone();
@@ -815,7 +812,6 @@ pub struct LoadGenerator {
     stopped: bool,
 
     // --- Soroban persistent state (survives across runs, reset by `reset_soroban_state()`) ---
-
     /// WASM code ledger key (set during `SorobanInvokeSetup` upload phase).
     code_key: Option<LedgerKey>,
     /// Contract instance ledger keys (set during `SorobanInvokeSetup` deploy phase).
@@ -891,8 +887,7 @@ impl LoadGenerator {
 
         // Populate accounts_available
         for i in 0..config.n_accounts {
-            self.accounts_available
-                .insert((i + config.offset) as u64);
+            self.accounts_available.insert((i + config.offset) as u64);
         }
 
         // Build contract_instances for invoke modes (round-robin assignment)
@@ -947,10 +942,7 @@ impl LoadGenerator {
     /// For `SorobanInvokeSetup`, this implements a two-phase approach:
     /// - Phase 1: Upload WASM (n_txs = n_wasms)
     /// - Phase 2: Deploy contract instances (n_txs = n_instances)
-    pub async fn generate_load(
-        &mut self,
-        config: &mut GeneratedLoadConfig,
-    ) -> LoadResult {
+    pub async fn generate_load(&mut self, config: &mut GeneratedLoadConfig) -> LoadResult {
         self.start(config);
 
         let step_duration = Duration::from_millis(STEP_MSECS);
@@ -988,10 +980,7 @@ impl LoadGenerator {
             let txs_this_step = self.get_tx_per_step(config);
 
             // Cleanup accounts once per second
-            let elapsed_secs = self
-                .start_time
-                .map(|t| t.elapsed().as_secs())
-                .unwrap_or(0);
+            let elapsed_secs = self.start_time.map(|t| t.elapsed().as_secs()).unwrap_or(0);
             if elapsed_secs != self.last_second {
                 self.last_second = elapsed_secs;
                 self.cleanup_accounts();
@@ -1064,10 +1053,7 @@ impl LoadGenerator {
             }
 
             // Pick deterministically using size-based index
-            let idx = deterministic_rand(
-                self.total_submitted as u64,
-                ledger_num,
-            ) as usize
+            let idx = deterministic_rand(self.total_submitted as u64, ledger_num) as usize
                 % self.accounts_available.len();
 
             let id = *self
@@ -1163,9 +1149,7 @@ impl LoadGenerator {
                     if config.skip_low_fee_txs =>
                 {
                     // Roll back sequence number and skip
-                    if let Some(account) =
-                        self.tx_generator.accounts.get_mut(&source_account_id)
-                    {
+                    if let Some(account) = self.tx_generator.accounts.get_mut(&source_account_id) {
                         account.sequence_number -= 1;
                     }
                     return false;
@@ -1190,22 +1174,18 @@ impl LoadGenerator {
         ledger_num: u32,
     ) -> anyhow::Result<(u64, TransactionEnvelope)> {
         match config.mode {
-            LoadGenMode::Pay => {
-                self.tx_generator.payment_transaction(
-                    config.n_accounts,
-                    config.offset,
-                    ledger_num,
-                    source_account_id,
-                    config.max_fee_rate,
-                )
-            }
-            LoadGenMode::SorobanUpload => {
-                self.tx_generator.soroban_random_wasm_transaction(
-                    ledger_num,
-                    source_account_id,
-                    DEFAULT_SOROBAN_INCLUSION_FEE,
-                )
-            }
+            LoadGenMode::Pay => self.tx_generator.payment_transaction(
+                config.n_accounts,
+                config.offset,
+                ledger_num,
+                source_account_id,
+                config.max_fee_rate,
+            ),
+            LoadGenMode::SorobanUpload => self.tx_generator.soroban_random_wasm_transaction(
+                ledger_num,
+                source_account_id,
+                DEFAULT_SOROBAN_INCLUSION_FEE,
+            ),
             LoadGenMode::SorobanInvokeSetup => {
                 if config.n_wasms > 0 {
                     // Phase 1: Upload the loadgen WASM
@@ -1229,8 +1209,7 @@ impl LoadGenerator {
                     let wasm_hash = SorobanTxBuilder::loadgen_wasm_hash();
                     let salt = Uint256(
                         Hash256::hash(
-                            &deterministic_rand(source_account_id, ledger_num)
-                                .to_le_bytes(),
+                            &deterministic_rand(source_account_id, ledger_num).to_le_bytes(),
                         )
                         .0,
                     );
@@ -1243,7 +1222,9 @@ impl LoadGenerator {
                     );
                     if result.is_ok() {
                         // Compute the contract ID and store the instance key
-                        let source_account = self.tx_generator.get_account(source_account_id)
+                        let source_account = self
+                            .tx_generator
+                            .get_account(source_account_id)
                             .expect("source account must exist");
                         let source_pk = source_account.account_id.clone();
                         let preimage = ContractIdPreimage::Address(ContractIdPreimageFromAddress {
@@ -1260,7 +1241,9 @@ impl LoadGenerator {
                 }
             }
             LoadGenMode::SorobanInvoke => {
-                let instance = self.contract_instances.get(&source_account_id)
+                let instance = self
+                    .contract_instances
+                    .get(&source_account_id)
                     .expect("contract instance must be assigned for SorobanInvoke")
                     .clone();
                 self.tx_generator.invoke_soroban_load_transaction(
@@ -1271,11 +1254,7 @@ impl LoadGenerator {
                 )
             }
             LoadGenMode::MixedClassicSoroban => {
-                self.create_mixed_classic_soroban_transaction(
-                    config,
-                    source_account_id,
-                    ledger_num,
-                )
+                self.create_mixed_classic_soroban_transaction(config, source_account_id, ledger_num)
             }
         }
     }
@@ -1319,7 +1298,9 @@ impl LoadGenerator {
             )
         } else {
             // SorobanInvoke mode
-            let instance = self.contract_instances.get(&source_account_id)
+            let instance = self
+                .contract_instances
+                .get(&source_account_id)
                 .expect("contract instance must be assigned for mixed invoke")
                 .clone();
             self.tx_generator.invoke_soroban_load_transaction(
@@ -1529,9 +1510,7 @@ pub struct LoadReport {
 ///
 /// Not cryptographic — just needs to produce varied but repeatable values.
 fn deterministic_rand(a: u64, b: u32) -> u64 {
-    let hash = Hash256::hash(
-        &[a.to_le_bytes().as_slice(), b.to_le_bytes().as_slice()].concat(),
-    );
+    let hash = Hash256::hash(&[a.to_le_bytes().as_slice(), b.to_le_bytes().as_slice()].concat());
     u64::from_le_bytes(hash.0[..8].try_into().unwrap())
 }
 

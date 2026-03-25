@@ -310,7 +310,8 @@ impl Default for AppBuilder {
 /// [`App::handle_close_complete`] once the blocking close finishes.
 pub(super) struct PendingLedgerClose {
     /// Join handle for the `spawn_blocking` task.
-    pub handle: tokio::task::JoinHandle<std::result::Result<henyey_ledger::LedgerCloseResult, String>>,
+    pub handle:
+        tokio::task::JoinHandle<std::result::Result<henyey_ledger::LedgerCloseResult, String>>,
     /// Sequence number being closed.
     pub ledger_seq: u32,
     /// The transaction set used for closing.
@@ -676,9 +677,7 @@ pub(super) fn extract_txs_from_generalized(
                 TransactionPhase::V0(components) => components
                     .iter()
                     .flat_map(|component| match component {
-                        TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) => {
-                            comp.txs.to_vec()
-                        }
+                        TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) => comp.txs.to_vec(),
                     })
                     .collect::<Vec<_>>(),
                 TransactionPhase::V1(parallel) => parallel

@@ -1038,4 +1038,3 @@ fn test_nomination_core5_v1_dead_timeout_v3_becomes_top() {
     // stellar-core line 3344: no envelopes emitted
     assert_eq!(scp.envs_len(), 0);
 }
-

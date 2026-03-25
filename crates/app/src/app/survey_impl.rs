@@ -102,8 +102,7 @@ impl App {
             }
         }
 
-        let self_peer =
-            henyey_overlay::PeerId::from_bytes(*self.keypair.public_key().as_bytes());
+        let self_peer = henyey_overlay::PeerId::from_bytes(*self.keypair.public_key().as_bytes());
         let mut reporting = self.survey_reporting.write().await;
         if reporting.peers.contains(&peer_id) || peer_id == self_peer {
             return false;
@@ -614,12 +613,10 @@ impl App {
         };
 
         if let Some(overlay) = self.overlay().await {
-            if let Err(e) = overlay
-                .try_send_to(
-                    peer_id,
-                    StellarMessage::TimeSlicedSurveyResponse(signed_response),
-                )
-            {
+            if let Err(e) = overlay.try_send_to(
+                peer_id,
+                StellarMessage::TimeSlicedSurveyResponse(signed_response),
+            ) {
                 tracing::debug!(peer = %peer_id, error = %e, "Failed to send survey response");
             }
         }

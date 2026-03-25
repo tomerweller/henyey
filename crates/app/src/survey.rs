@@ -40,8 +40,8 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
 use henyey_overlay::{PeerId, PeerSnapshot};
+use serde::Serialize;
 use stellar_xdr::curr::{
     NodeId, PeerStats, SurveyMessageCommandType, SurveyRequestMessage, SurveyResponseMessage,
     TimeSlicedNodeData, TimeSlicedPeerData, TimeSlicedPeerDataList, TimeSlicedSurveyRequestMessage,

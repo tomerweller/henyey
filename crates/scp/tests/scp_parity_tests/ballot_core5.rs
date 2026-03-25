@@ -971,4 +971,3 @@ fn test_ballot_core5_timeout_stay_locked_on_h() {
         panic!("expected PREPARE envelope after bump");
     }
 }
-

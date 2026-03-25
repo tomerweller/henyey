@@ -122,6 +122,7 @@ pub mod error;
 // Re-export main types at crate root
 pub use archive::HistoryArchive;
 pub use archive_state::HistoryArchiveState;
+pub use archive_state::MAX_HISTORY_ARCHIVE_BUCKET_SIZE;
 pub use catchup::{
     CatchupManager, CatchupOptions, CatchupProgress, CatchupStatus, CheckpointData,
     ExistingBucketState, LedgerData,
@@ -133,24 +134,24 @@ pub use cdp::{
 };
 pub use checkpoint::{
     checkpoint_containing, checkpoint_frequency, first_ledger_in_checkpoint_containing,
-    is_checkpoint_ledger, last_ledger_before_checkpoint_containing,
-    latest_checkpoint_before_or_at, ledger_to_trigger_catchup, size_of_checkpoint_containing,
-    CHECKPOINT_FREQUENCY,
+    is_checkpoint_ledger, last_ledger_before_checkpoint_containing, latest_checkpoint_before_or_at,
+    ledger_to_trigger_catchup, size_of_checkpoint_containing, CHECKPOINT_FREQUENCY,
 };
-pub use paths::{set_checkpoint_frequency, ACCELERATED_CHECKPOINT_FREQUENCY, DEFAULT_CHECKPOINT_FREQUENCY};
 pub use download::DownloadConfig;
 pub use error::HistoryError;
 pub use paths::{
     bucket_path, checkpoint_ledger, checkpoint_path, checkpoint_path_dirty, dirty_to_final_path,
     final_to_dirty_path, is_dirty_path,
 };
+pub use paths::{
+    set_checkpoint_frequency, ACCELERATED_CHECKPOINT_FREQUENCY, DEFAULT_CHECKPOINT_FREQUENCY,
+};
+pub use publish::build_history_archive_state;
 pub use publish_queue::{
     PublishQueue, PublishQueueStats, PUBLISH_QUEUE_MAX_SIZE, PUBLISH_QUEUE_UNBLOCK_APPLICATION,
 };
-pub use publish::build_history_archive_state;
 pub use remote_archive::{RemoteArchive, RemoteArchiveConfig};
 pub use replay::{ReplayConfig, ReplayedLedgerState};
-pub use archive_state::MAX_HISTORY_ARCHIVE_BUCKET_SIZE;
 pub use verify::{
     compute_header_hash, verify_bucket_hash, verify_chain_anchors, verify_has_passphrase,
     verify_header_chain, verify_tx_result_ordering, ChainTrustAnchors,
@@ -238,7 +239,10 @@ impl HistoryManager {
         fallback_err: HistoryError,
     ) -> Result<T>
     where
-        F: Fn(&'a HistoryArchive) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>>,
+        F: Fn(
+            &'a HistoryArchive,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>>,
     {
         for archive in &self.archives {
             match op(archive).await {

@@ -16,25 +16,25 @@ use henyey_common::{Hash256, NetworkId};
 use henyey_crypto::SecretKey;
 use henyey_overlay::{ConnectionFactory, LoopbackConnectionFactory, TcpConnectionFactory};
 use stellar_xdr::curr::{
-    AccountId, Asset, CreateAccountOp, Memo, MuxedAccount, Operation,
-    OperationBody, Preconditions, PublicKey, SequenceNumber,
-    Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, VecM,
+    AccountId, Asset, CreateAccountOp, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
+    PublicKey, SequenceNumber, Transaction, TransactionEnvelope, TransactionExt,
+    TransactionV1Envelope, Uint256, VecM,
 };
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
 
-mod loopback;
 mod loadgen;
+mod loopback;
 use loadgen::deterministic_seed;
 use loopback::LoopbackNetwork;
-mod loadgen_soroban;
 mod applyload;
+mod loadgen_soroban;
+pub use applyload::{ApplyLoad, ApplyLoadConfig, ApplyLoadMode, Histogram};
 pub use loadgen::{
     GeneratedLoadConfig, GeneratedTransaction, LoadGenMode, LoadGenerator, LoadReport, LoadResult,
     LoadStep, TestAccount, TxGenerator,
 };
 pub use loadgen_soroban::{BatchTransfer, ContractInvocation, SacTransfer, SorobanTxBuilder};
-pub use applyload::{ApplyLoad, ApplyLoadConfig, ApplyLoadMode, Histogram};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SimulationMode {
@@ -113,7 +113,10 @@ impl std::fmt::Debug for Simulation {
             .field("network_passphrase", &self.network_passphrase)
             .field("nodes", &self.nodes.keys().collect::<Vec<_>>())
             .field("app_specs", &self.app_specs.keys().collect::<Vec<_>>())
-            .field("running_apps", &self.running_apps.keys().collect::<Vec<_>>())
+            .field(
+                "running_apps",
+                &self.running_apps.keys().collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -186,15 +189,18 @@ impl Simulation {
         &mut self,
         threshold_percent: u32,
         mut adjuster: F,
-    )
-    where
+    ) where
         F: FnMut(&str, QuorumSetConfig) -> QuorumSetConfig,
     {
         let mut ids: Vec<String> = self.nodes.keys().cloned().collect();
         ids.sort();
         let validators: Vec<String> = ids
             .iter()
-            .filter_map(|id| self.nodes.get(id).map(|n| n.secret_key.public_key().to_strkey()))
+            .filter_map(|id| {
+                self.nodes
+                    .get(id)
+                    .map(|n| n.secret_key.public_key().to_strkey())
+            })
             .collect();
 
         let quorum_set = QuorumSetConfig {
@@ -446,8 +452,7 @@ impl Simulation {
     /// Matches stellar-core `Simulation::dropConnection(initiator, acceptor)`.
     pub async fn drop_connection(&self, initiator: &str, acceptor: &str) -> anyhow::Result<()> {
         let acceptor_secret = self.secret_for_node(acceptor)?;
-        let peer_id =
-            henyey_overlay::PeerId::from_bytes(*acceptor_secret.public_key().as_bytes());
+        let peer_id = henyey_overlay::PeerId::from_bytes(*acceptor_secret.public_key().as_bytes());
         let initiator_app = self
             .running_apps
             .get(initiator)
@@ -503,7 +508,9 @@ impl Simulation {
     }
 
     pub fn app_task_finished(&self, node_id: &str) -> Option<bool> {
-        self.running_apps.get(node_id).map(|n| n.handle.is_finished())
+        self.running_apps
+            .get(node_id)
+            .map(|n| n.handle.is_finished())
     }
 
     pub async fn app_task_status(&self, node_id: &str) -> Option<Result<(), String>> {
@@ -516,11 +523,7 @@ impl Simulation {
         Some(node.app.simulation_debug_stats().await)
     }
 
-    pub async fn wait_for_app_connectivity(
-        &self,
-        min_peers: usize,
-        timeout: Duration,
-    ) -> bool {
+    pub async fn wait_for_app_connectivity(&self, min_peers: usize, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         while tokio::time::Instant::now() < deadline {
             let mut connected = true;
@@ -792,7 +795,11 @@ impl Simulation {
         self.app_specs
             .get(node_id)
             .map(|spec| spec.secret_key.public_key().to_strkey())
-            .or_else(|| self.nodes.get(node_id).map(|n| n.secret_key.public_key().to_strkey()))
+            .or_else(|| {
+                self.nodes
+                    .get(node_id)
+                    .map(|n| n.secret_key.public_key().to_strkey())
+            })
     }
 
     pub fn secret_for_test(&self, node_id: &str) -> Option<SecretKey> {
@@ -865,7 +872,8 @@ impl Simulation {
             if self.app_account_sequences.contains_key(&node_id) {
                 continue;
             }
-            let tx = self.build_create_account_tx(&node_id, starting_balance, self.root_sequence)?;
+            let tx =
+                self.build_create_account_tx(&node_id, starting_balance, self.root_sequence)?;
             let result = self.submit_transaction_to_network(tx).await;
             if matches!(result, henyey_herder::TxQueueResult::Added) {
                 submitted += 1;
@@ -927,7 +935,9 @@ impl Simulation {
                 tracing::info!(lcl_seq = seq, "Restored restarted node from disk");
             }
             Ok(false) => {
-                tracing::warn!("No persisted state for restarted node, falling back to genesis bootstrap");
+                tracing::warn!(
+                    "No persisted state for restarted node, falling back to genesis bootstrap"
+                );
                 app.bootstrap_from_db().await?;
             }
             Err(e) => {
@@ -1010,11 +1020,7 @@ impl Simulation {
         .await
     }
 
-    fn known_peers_for(
-        &self,
-        node_id: &str,
-        port_map: &HashMap<String, u16>,
-    ) -> Vec<String> {
+    fn known_peers_for(&self, node_id: &str, port_map: &HashMap<String, u16>) -> Vec<String> {
         self.loopback
             .links()
             .into_iter()
@@ -1113,7 +1119,9 @@ impl Simulation {
 
     fn destination_for_node(&self, node_id: &str) -> anyhow::Result<MuxedAccount> {
         let secret = self.secret_for_node(node_id)?;
-        Ok(MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())))
+        Ok(MuxedAccount::Ed25519(Uint256(
+            *secret.public_key().as_bytes(),
+        )))
     }
 
     fn account_id_for_node(&self, node_id: &str) -> anyhow::Result<AccountId> {
@@ -1220,7 +1228,10 @@ impl Topologies {
             let sk = SecretKey::from_seed(&seed.0);
             sim.add_node(id.clone(), sk);
             sim.add_pending_connection(id, format!("node{}", branch % 4));
-            sim.add_pending_connection(format!("branch{}", branch), format!("node{}", (branch + 1) % 4));
+            sim.add_pending_connection(
+                format!("branch{}", branch),
+                format!("node{}", (branch + 1) % 4),
+            );
         }
         sim
     }
@@ -1299,11 +1310,7 @@ impl Topologies {
     /// Matches stellar-core `Topologies::separate(n, watchers, mode)` overload
     /// which adds extra (non-validator) nodes that connect to the first validator
     /// partition.
-    pub fn separate_with_watchers(
-        n: usize,
-        watchers: usize,
-        mode: SimulationMode,
-    ) -> Simulation {
+    pub fn separate_with_watchers(n: usize, watchers: usize, mode: SimulationMode) -> Simulation {
         let mut sim = Simulation::new(mode);
 
         // Create validator nodes in two partitions.
@@ -1343,7 +1350,10 @@ impl Topologies {
     }
 }
 
-pub fn initialize_genesis_ledger(config: &AppConfig, network_passphrase: &str) -> anyhow::Result<()> {
+pub fn initialize_genesis_ledger(
+    config: &AppConfig,
+    network_passphrase: &str,
+) -> anyhow::Result<()> {
     use henyey_bucket::BucketList;
     use henyey_db::queries::{BucketListQueries, HistoryQueries, LedgerQueries, StateQueries};
     use henyey_db::schema::state_keys;
@@ -1364,7 +1374,9 @@ pub fn initialize_genesis_ledger(config: &AppConfig, network_passphrase: &str) -
     let network_id = NetworkId::from_passphrase(network_passphrase);
     let root_secret = SecretKey::from_seed(network_id.as_bytes());
     let root_public = root_secret.public_key();
-    let root_account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(*root_public.as_bytes())));
+    let root_account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+        *root_public.as_bytes(),
+    )));
 
     let total_coins: i64 = 1_000_000_000_000_000_000;
 
@@ -1404,9 +1416,7 @@ pub fn initialize_genesis_ledger(config: &AppConfig, network_passphrase: &str) -
         let seed = deterministic_seed(&name);
         let secret = SecretKey::from_seed(&seed);
         let public = secret.public_key();
-        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
-            *public.as_bytes(),
-        )));
+        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(*public.as_bytes())));
 
         genesis_entries.push(LedgerEntry {
             last_modified_ledger_seq: 1,
@@ -1465,13 +1475,9 @@ pub fn initialize_genesis_ledger(config: &AppConfig, network_passphrase: &str) -
     };
     calculate_skip_values(&mut header);
     let header_xdr = header.to_xdr(Limits::none())?;
-    let has = build_history_archive_state(
-        1,
-        &bucket_list,
-        None,
-        Some(network_passphrase.to_string()),
-    )
-    .map_err(|e| anyhow::anyhow!("Failed to build HAS: {}", e))?;
+    let has =
+        build_history_archive_state(1, &bucket_list, None, Some(network_passphrase.to_string()))
+            .map_err(|e| anyhow::anyhow!("Failed to build HAS: {}", e))?;
     let has_json = has.to_json()?;
     let bucket_levels: Vec<(Hash256, Hash256)> = bucket_list
         .levels()

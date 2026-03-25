@@ -139,7 +139,9 @@ pub(crate) async fn ledger_handler(State(state): State<Arc<ServerState>>) -> Jso
     })
 }
 
-pub(crate) async fn upgrades_handler(State(state): State<Arc<ServerState>>) -> Json<UpgradesResponse> {
+pub(crate) async fn upgrades_handler(
+    State(state): State<Arc<ServerState>>,
+) -> Json<UpgradesResponse> {
     let (protocol_version, base_fee, base_reserve, max_tx_set_size) =
         state.app.current_upgrade_state();
     let proposed = state
@@ -191,7 +193,9 @@ pub(crate) async fn quorum_handler(State(state): State<Arc<ServerState>>) -> Jso
     Json(QuorumResponse { local })
 }
 
-pub(crate) fn quorum_set_response(quorum_set: &stellar_xdr::curr::ScpQuorumSet) -> QuorumSetResponse {
+pub(crate) fn quorum_set_response(
+    quorum_set: &stellar_xdr::curr::ScpQuorumSet,
+) -> QuorumSetResponse {
     use henyey_scp::hash_quorum_set;
 
     let hash = hash_quorum_set(quorum_set).to_hex();

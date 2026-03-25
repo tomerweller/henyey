@@ -70,7 +70,8 @@ pub async fn handle(
     // Look up ledger close times for the events
     let mut event_json: Vec<serde_json::Value> = Vec::with_capacity(events.len());
     for event in &events {
-        let close_time = format_unix_timestamp_utc(util::ledger_close_time(&ctx.app, event.ledger_seq));
+        let close_time =
+            format_unix_timestamp_utc(util::ledger_close_time(&ctx.app, event.ledger_seq));
 
         let event_type_str = match event.event_type {
             0 => "contract",
@@ -195,8 +196,10 @@ fn parse_event_filters(
                             MAX_TOPIC_SEGMENTS
                         )));
                     }
-                    let alt_strings: Vec<String> =
-                        alternatives.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+                    let alt_strings: Vec<String> = alternatives
+                        .iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect();
                     // ** means "match all remaining positions" — stop adding further filters
                     if alt_strings.iter().any(|s| s == "**") {
                         break;
@@ -237,8 +240,9 @@ fn insert_event_fields(
             for t in topics {
                 let bytes = BASE64.decode(t).unwrap_or_default();
                 if let Ok(scval) = ScVal::from_xdr(&bytes, Limits::none()) {
-                    let jv = serde_json::to_value(&scval)
-                        .map_err(|e| JsonRpcError::internal(format!("JSON serialize error: {e}")))?;
+                    let jv = serde_json::to_value(&scval).map_err(|e| {
+                        JsonRpcError::internal(format!("JSON serialize error: {e}"))
+                    })?;
                     topic_json.push(jv);
                 }
             }

@@ -33,7 +33,9 @@ impl ConnectionFactory for LoopbackConnectionFactory {
             let registry = self.registry.lock().await;
             registry.listeners.get(&port).cloned()
         }
-        .ok_or_else(|| OverlayError::ConnectionFailed(format!("loopback listener not found: {}", addr)))?;
+        .ok_or_else(|| {
+            OverlayError::ConnectionFailed(format!("loopback listener not found: {}", addr))
+        })?;
 
         let (client, server) = duplex(1024 * 1024);
         let outbound = Connection::from_io(
@@ -41,16 +43,12 @@ impl ConnectionFactory for LoopbackConnectionFactory {
             Self::socket_addr(port),
             ConnectionDirection::Outbound,
         )?;
-        let inbound = Connection::from_io(
-            server,
-            Self::socket_addr(0),
-            ConnectionDirection::Inbound,
-        )?;
+        let inbound =
+            Connection::from_io(server, Self::socket_addr(0), ConnectionDirection::Inbound)?;
 
-        sender
-            .send(inbound)
-            .await
-            .map_err(|_| OverlayError::ConnectionFailed(format!("loopback listener dropped: {}", addr)))?;
+        sender.send(inbound).await.map_err(|_| {
+            OverlayError::ConnectionFailed(format!("loopback listener dropped: {}", addr))
+        })?;
 
         Ok(outbound)
     }

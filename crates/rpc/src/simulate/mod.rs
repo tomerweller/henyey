@@ -71,7 +71,14 @@ struct InvokeResponseContext<'a> {
 /// Extract the Soroban operation, source account, and optional footprint from the envelope.
 fn extract_soroban_op(
     tx_env: &TransactionEnvelope,
-) -> Result<(stellar_xdr::curr::AccountId, SorobanOp, stellar_xdr::curr::Memo), JsonRpcError> {
+) -> Result<
+    (
+        stellar_xdr::curr::AccountId,
+        SorobanOp,
+        stellar_xdr::curr::Memo,
+    ),
+    JsonRpcError,
+> {
     let (source, ops, ext, memo) = match tx_env {
         TransactionEnvelope::Tx(tx) => (
             &tx.tx.source_account,
@@ -80,7 +87,9 @@ fn extract_soroban_op(
             &tx.tx.memo,
         ),
         TransactionEnvelope::TxV0(_) => {
-            return Err(JsonRpcError::invalid_params("v0 transactions not supported"));
+            return Err(JsonRpcError::invalid_params(
+                "v0 transactions not supported",
+            ));
         }
         TransactionEnvelope::TxFeeBump(fb) => match &fb.tx.inner_tx {
             stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => (
@@ -153,16 +162,12 @@ fn validate_memo(memo: &stellar_xdr::curr::Memo) -> Result<(), JsonRpcError> {
 
 fn muxed_to_account_id(source: &stellar_xdr::curr::MuxedAccount) -> stellar_xdr::curr::AccountId {
     match source {
-        stellar_xdr::curr::MuxedAccount::Ed25519(key) => {
-            stellar_xdr::curr::AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                key.clone(),
-            ))
-        }
-        stellar_xdr::curr::MuxedAccount::MuxedEd25519(muxed) => {
-            stellar_xdr::curr::AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                muxed.ed25519.clone(),
-            ))
-        }
+        stellar_xdr::curr::MuxedAccount::Ed25519(key) => stellar_xdr::curr::AccountId(
+            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key.clone()),
+        ),
+        stellar_xdr::curr::MuxedAccount::MuxedEd25519(muxed) => stellar_xdr::curr::AccountId(
+            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(muxed.ed25519.clone()),
+        ),
     }
 }
 
@@ -180,9 +185,7 @@ fn extract_footprint_keys(
         }
     };
     let footprint = &soroban_data.resources.footprint;
-    let mut keys = Vec::with_capacity(
-        footprint.read_only.len() + footprint.read_write.len(),
-    );
+    let mut keys = Vec::with_capacity(footprint.read_only.len() + footprint.read_write.len());
     keys.extend(footprint.read_only.iter().cloned());
     keys.extend(footprint.read_write.iter().cloned());
     Ok(keys)
@@ -261,10 +264,7 @@ pub async fn handle(
         SorobanOp::InvokeHostFunction { host_fn, auth } => {
             // Validate and resolve authMode
             if !auth_mode_str.is_empty()
-                && !matches!(
-                    auth_mode_str,
-                    "enforce" | "record" | "record_allow_nonroot"
-                )
+                && !matches!(auth_mode_str, "enforce" | "record" | "record_allow_nonroot")
             {
                 return Err(JsonRpcError::invalid_params(format!(
                     "unsupported authMode: '{}' (allowed: enforce, record, record_allow_nonroot)",
@@ -511,9 +511,10 @@ fn extract_modified_entries(
         };
 
         // Get state after: decode from encoded_new_value
-        let state_after = change.encoded_new_value.as_ref().and_then(|v| {
-            stellar_xdr::curr::LedgerEntry::from_xdr(v, Limits::none()).ok()
-        });
+        let state_after = change
+            .encoded_new_value
+            .as_ref()
+            .and_then(|v| stellar_xdr::curr::LedgerEntry::from_xdr(v, Limits::none()).ok());
 
         // Skip entries where both before and after are None (no diff)
         if state_before.is_none() && state_after.is_none() {
@@ -571,7 +572,10 @@ fn simulate_extend_ttl_op(
         };
 
         let current_live_until = live_until.ok_or_else(|| {
-            format!("missing TTL for key that must have TTL: {:?}", key.discriminant())
+            format!(
+                "missing TTL for key that must have TTL: {:?}",
+                key.discriminant()
+            )
         })?;
 
         // Skip entries that don't need extension
@@ -687,7 +691,10 @@ fn simulate_restore_op(
             .ok_or_else(|| format!("missing entry to restore for key {:?}", key.discriminant()))?;
 
         let current_live_until = live_until.ok_or_else(|| {
-            format!("missing TTL for key that must have TTL: {:?}", key.discriminant())
+            format!(
+                "missing TTL for key that must have TTL: {:?}",
+                key.discriminant()
+            )
         })?;
 
         // Skip entries that are still live (not expired)
@@ -779,11 +786,7 @@ fn build_invoke_response(
     // Estimate the transaction size for fee computation
     let op = OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
         host_function: ctx.host_fn.clone(),
-        auth: sim_result
-            .auth
-            .clone()
-            .try_into()
-            .unwrap_or_default(),
+        auth: sim_result.auth.clone().try_into().unwrap_or_default(),
     });
     let tx_size = estimate_tx_size_for_op(&op, &adjusted_resources);
 
@@ -1135,10 +1138,7 @@ fn adjust_resources(resources: &mut SorobanResources, instruction_leeway: u32) {
 ///
 /// Mirrors soroban-simulation: builds a max-size synthetic envelope with
 /// 20 signatures and full preconditions, then applies the tx_size adjustment.
-fn estimate_tx_size_for_op(
-    operation: &OperationBody,
-    resources: &SorobanResources,
-) -> u32 {
+fn estimate_tx_size_for_op(operation: &OperationBody, resources: &SorobanResources) -> u32 {
     use stellar_xdr::curr::*;
 
     let soroban_data = SorobanTransactionData {
@@ -1266,7 +1266,9 @@ fn compute_invoke_resource_fee(
     tx_size: u32,
     restored_entry_count: u32,
 ) -> i64 {
-    use soroban_host::fees::{compute_rent_fee, compute_transaction_resource_fee, TransactionResources};
+    use soroban_host::fees::{
+        compute_rent_fee, compute_transaction_resource_fee, TransactionResources,
+    };
 
     // Compute disk_read_entries the same way as upstream soroban-simulation:
     // only non-Soroban entries (accounts, trustlines etc.) count, since Soroban
@@ -1298,8 +1300,7 @@ fn compute_invoke_resource_fee(
     };
 
     let fee_config = build_fee_config(soroban_info);
-    let (non_refundable, refundable) =
-        compute_transaction_resource_fee(&tx_resources, &fee_config);
+    let (non_refundable, refundable) = compute_transaction_resource_fee(&tx_resources, &fee_config);
 
     let rent_fee = compute_rent_fee(
         rent_changes,
@@ -1329,7 +1330,9 @@ fn compute_resource_fee_with_rent(
     contract_events_size: u32,
     tx_size: u32,
 ) -> i64 {
-    use soroban_host::fees::{compute_rent_fee, compute_transaction_resource_fee, TransactionResources};
+    use soroban_host::fees::{
+        compute_rent_fee, compute_transaction_resource_fee, TransactionResources,
+    };
 
     let tx_resources = TransactionResources {
         instructions: resources.instructions,
@@ -1345,8 +1348,7 @@ fn compute_resource_fee_with_rent(
     let fee_config = build_fee_config(soroban_info);
     let rent_fee_config = build_rent_fee_config(soroban_info);
 
-    let (non_refundable, refundable) =
-        compute_transaction_resource_fee(&tx_resources, &fee_config);
+    let (non_refundable, refundable) = compute_transaction_resource_fee(&tx_resources, &fee_config);
 
     let rent_fee = compute_rent_fee(rent_changes, &rent_fee_config, current_ledger_seq);
 
@@ -1941,8 +1943,14 @@ mod tests {
             resource_fee: 0,
         };
         insert_sim_xdr_field(&mut obj, "transactionData", &data, XdrFormat::Base64).unwrap();
-        assert!(obj.contains_key("transactionData"), "base64 mode should use unsuffixed key");
-        assert!(!obj.contains_key("transactionDataXdr"), "should NOT have Xdr suffix");
+        assert!(
+            obj.contains_key("transactionData"),
+            "base64 mode should use unsuffixed key"
+        );
+        assert!(
+            !obj.contains_key("transactionDataXdr"),
+            "should NOT have Xdr suffix"
+        );
     }
 
     #[test]
@@ -1962,8 +1970,14 @@ mod tests {
             resource_fee: 0,
         };
         insert_sim_xdr_field(&mut obj, "transactionData", &data, XdrFormat::Json).unwrap();
-        assert!(obj.contains_key("transactionDataJson"), "json mode should have Json suffix");
-        assert!(!obj.contains_key("transactionData"), "should NOT have unsuffixed key in JSON mode");
+        assert!(
+            obj.contains_key("transactionDataJson"),
+            "json mode should have Json suffix"
+        );
+        assert!(
+            !obj.contains_key("transactionData"),
+            "should NOT have unsuffixed key in JSON mode"
+        );
     }
 
     #[test]
@@ -1971,7 +1985,10 @@ mod tests {
         let mut obj = serde_json::Map::new();
         let events: Vec<DiagnosticEvent> = vec![];
         insert_sim_xdr_array_field(&mut obj, "events", &events, XdrFormat::Base64).unwrap();
-        assert!(obj.contains_key("events"), "base64 mode should use unsuffixed key");
+        assert!(
+            obj.contains_key("events"),
+            "base64 mode should use unsuffixed key"
+        );
         assert!(!obj.contains_key("eventsXdr"), "should NOT have Xdr suffix");
     }
 
@@ -1980,8 +1997,14 @@ mod tests {
         let mut obj = serde_json::Map::new();
         let events: Vec<DiagnosticEvent> = vec![];
         insert_sim_xdr_array_field(&mut obj, "events", &events, XdrFormat::Json).unwrap();
-        assert!(obj.contains_key("eventsJson"), "json mode should have Json suffix");
-        assert!(!obj.contains_key("events"), "should NOT have unsuffixed key in JSON mode");
+        assert!(
+            obj.contains_key("eventsJson"),
+            "json mode should have Json suffix"
+        );
+        assert!(
+            !obj.contains_key("events"),
+            "should NOT have unsuffixed key in JSON mode"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2163,33 +2186,26 @@ mod tests {
             vec![],
         );
         let info = test_soroban_network_info();
-        let fee = compute_invoke_resource_fee(
-            &resources, &[], &info, 100, 0, 1000, 0,
-        );
+        let fee = compute_invoke_resource_fee(&resources, &[], &info, 100, 0, 1000, 0);
         // Fee should be > 0
         assert!(fee > 0);
         // The fee with only 1 disk read entry should be less than with 2
-        let resources2 = test_soroban_resources(
-            vec![test_account_key(1), test_account_key(2)],
-            vec![],
-        );
-        let fee2 = compute_invoke_resource_fee(
-            &resources2, &[], &info, 100, 0, 1000, 0,
-        );
+        let resources2 =
+            test_soroban_resources(vec![test_account_key(1), test_account_key(2)], vec![]);
+        let fee2 = compute_invoke_resource_fee(&resources2, &[], &info, 100, 0, 1000, 0);
         // 2 account entries = 2 disk reads, should cost more
-        assert!(fee2 > fee, "2 account entries should cost more than 1 account + 1 contract");
+        assert!(
+            fee2 > fee,
+            "2 account entries should cost more than 1 account + 1 contract"
+        );
     }
 
     #[test]
     fn test_disk_read_entries_includes_restored() {
         let resources = test_soroban_resources(vec![], vec![]);
         let info = test_soroban_network_info();
-        let fee_no_restore = compute_invoke_resource_fee(
-            &resources, &[], &info, 100, 0, 1000, 0,
-        );
-        let fee_with_restore = compute_invoke_resource_fee(
-            &resources, &[], &info, 100, 0, 1000, 3,
-        );
+        let fee_no_restore = compute_invoke_resource_fee(&resources, &[], &info, 100, 0, 1000, 0);
+        let fee_with_restore = compute_invoke_resource_fee(&resources, &[], &info, 100, 0, 1000, 3);
         // 3 restored entries should add disk read cost
         assert!(fee_with_restore > fee_no_restore);
     }
@@ -2202,9 +2218,7 @@ mod tests {
             vec![test_contract_data_key(0xCC)],
         );
         let info = test_soroban_network_info();
-        let fee = compute_invoke_resource_fee(
-            &resources, &[], &info, 100, 0, 1000, 1,
-        );
+        let fee = compute_invoke_resource_fee(&resources, &[], &info, 100, 0, 1000, 1);
         assert!(fee > 0);
     }
 
@@ -2225,9 +2239,7 @@ mod tests {
             new_live_until_ledger: 200,
         }];
 
-        let fee = compute_invoke_resource_fee(
-            &resources, &rent_changes, &info, 50, 0, 1000, 0,
-        );
+        let fee = compute_invoke_resource_fee(&resources, &rent_changes, &info, 50, 0, 1000, 0);
         // Fee should be positive and include rent
         assert!(fee > 0);
     }
@@ -2250,7 +2262,10 @@ mod tests {
         let size = estimate_tx_size_for_op(&op, &resources);
         assert!(size > 0);
         // Reasonable: a minimal invoke tx with 20 sigs + preconditions should be > 1000 bytes
-        assert!(size > 1000, "estimate should include 20 sigs overhead, got {size}");
+        assert!(
+            size > 1000,
+            "estimate should include 20 sigs overhead, got {size}"
+        );
     }
 
     #[test]

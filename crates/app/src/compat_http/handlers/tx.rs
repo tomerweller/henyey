@@ -174,7 +174,10 @@ mod tests {
 
         assert_eq!(obj.len(), 1, "PENDING response should only have 'status'");
         assert_eq!(value["status"], "PENDING");
-        assert!(obj.get("error").is_none(), "error should be absent for PENDING");
+        assert!(
+            obj.get("error").is_none(),
+            "error should be absent for PENDING"
+        );
         assert!(
             obj.get("diagnostic_events").is_none(),
             "diagnostic_events should be absent for PENDING"
@@ -193,7 +196,11 @@ mod tests {
         let value = serde_json::to_value(&response).unwrap();
         let obj = value.as_object().unwrap();
 
-        assert_eq!(obj.len(), 2, "ERROR response should have 'status' and 'error'");
+        assert_eq!(
+            obj.len(),
+            2,
+            "ERROR response should have 'status' and 'error'"
+        );
         assert_eq!(value["status"], "ERROR");
         assert!(value["error"].is_string(), "error must be a string");
         assert!(
@@ -223,7 +230,13 @@ mod tests {
     /// Verify all valid status strings.
     #[test]
     fn test_tx_response_all_status_strings() {
-        for status in ["PENDING", "DUPLICATE", "ERROR", "TRY_AGAIN_LATER", "FILTERED"] {
+        for status in [
+            "PENDING",
+            "DUPLICATE",
+            "ERROR",
+            "TRY_AGAIN_LATER",
+            "FILTERED",
+        ] {
             let response = CompatTxResponse {
                 status: status.into(),
                 error: None,

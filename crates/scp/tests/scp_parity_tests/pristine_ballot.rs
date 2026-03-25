@@ -677,4 +677,3 @@ fn test_ballot_pristine_confirm_vblocking_via_externalize() {
 }
 
 // ===========================================================================
-

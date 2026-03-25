@@ -117,8 +117,8 @@ pub mod snapshot;
 
 pub use bucket::Bucket;
 pub use bucket_list::{
-    BucketLevel, BucketList, BucketListStats, HasNextState, PendingMergeState,
-    BUCKET_LIST_LEVELS, HAS_NEXT_STATE_CLEAR, HAS_NEXT_STATE_OUTPUT,
+    BucketLevel, BucketList, BucketListStats, HasNextState, PendingMergeState, BUCKET_LIST_LEVELS,
+    HAS_NEXT_STATE_CLEAR, HAS_NEXT_STATE_OUTPUT,
 };
 
 // ============================================================================
@@ -156,8 +156,8 @@ pub use error::BucketError;
 pub use eviction::{
     bucket_update_period, default_state_archival_settings, level_half, level_should_spill,
     level_size, update_starting_eviction_iterator, EvictionCandidate, EvictionIterator,
-    EvictionIteratorExt, EvictionResult, ResolvedEviction,
-    DEFAULT_EVICTION_SCAN_SIZE, DEFAULT_MAX_ENTRIES_TO_ARCHIVE, DEFAULT_STARTING_EVICTION_SCAN_LEVEL,
+    EvictionIteratorExt, EvictionResult, ResolvedEviction, DEFAULT_EVICTION_SCAN_SIZE,
+    DEFAULT_MAX_ENTRIES_TO_ARCHIVE, DEFAULT_STARTING_EVICTION_SCAN_LEVEL,
 };
 
 // ============================================================================
@@ -188,8 +188,7 @@ pub use future_bucket::{FutureBucket, FutureBucketSnapshot, FutureBucketState, M
 
 pub use hot_archive::{
     is_hot_archive_tombstone, merge_hot_archive_buckets, HotArchiveBucket, HotArchiveBucketLevel,
-    HotArchiveBucketList, HotArchiveBucketListStats,
-    HOT_ARCHIVE_BUCKET_LIST_LEVELS,
+    HotArchiveBucketList, HotArchiveBucketListStats, HOT_ARCHIVE_BUCKET_LIST_LEVELS,
 };
 
 // ============================================================================
@@ -216,8 +215,8 @@ pub use index::{
 // ============================================================================
 
 pub use index_persistence::{
-    cleanup_orphaned_indexes, delete_index, index_path_for_bucket, load_disk_index, save_disk_index,
-    BUCKET_INDEX_VERSION,
+    cleanup_orphaned_indexes, delete_index, index_path_for_bucket, load_disk_index,
+    save_disk_index, BUCKET_INDEX_VERSION,
 };
 
 // ============================================================================

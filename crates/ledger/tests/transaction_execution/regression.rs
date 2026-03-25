@@ -97,20 +97,9 @@ fn test_soroban_refund_event_after_all_txs() {
         emit_classic_events: true,
         backfill_stellar_asset_events: false,
     };
-    let context = henyey_tx::LedgerContext::new(
-        1,
-        1_000,
-        100,
-        5_000_000,
-        25,
-        network_id,
-    );
-    let mut executor = TransactionExecutor::new(
-        &context,
-        0,
-        SorobanConfig::default(),
-        classic_events,
-    );
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor =
+        TransactionExecutor::new(&context, 0, SorobanConfig::default(), classic_events);
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
         .expect("execute");
@@ -151,14 +140,7 @@ fn test_apply_ledger_entry_changes_updates_module_cache() {
     let module_cache = PersistentModuleCache::new_for_protocol(25).expect("create cache");
 
     // Create executor with module cache
-    let context = henyey_tx::LedgerContext::new(
-        1,
-        1_000,
-        100,
-        5_000_000,
-        25,
-        network_id,
-    );
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
     let mut executor = TransactionExecutor::new(
         &context,
         0,
@@ -386,14 +368,7 @@ fn test_set_options_loads_signer_sponsor_accounts() {
         env.signatures = vec![decorated].try_into().unwrap();
     }
 
-    let context = henyey_tx::LedgerContext::new(
-        1,
-        1_000,
-        100,
-        5_000_000,
-        25,
-        network_id,
-    );
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
     let mut executor = TransactionExecutor::new(
         &context,
         0,
@@ -459,10 +434,10 @@ fn test_set_options_loads_signer_sponsor_accounts() {
 /// to TransactionExecutor::set_hot_archive().
 #[test]
 fn test_execute_transaction_set_accepts_hot_archive_parameter() {
-    use std::sync::Arc;
     use henyey_bucket::HotArchiveBucketList;
     use henyey_ledger::execution::execute_transaction_set;
     use henyey_ledger::{LedgerDelta, SorobanContext};
+    use std::sync::Arc;
 
     let secret = SecretKey::from_seed(&[99u8; 32]);
     let account_id: AccountId = (&secret.public_key()).into();
@@ -535,7 +510,7 @@ fn test_execute_transaction_set_accepts_hot_archive_parameter() {
             runtime_handle: None,
             emit_soroban_tx_meta_ext_v1: false,
             soroban_state: None,
-                    offer_store: None,
+            offer_store: None,
             enable_soroban_diagnostic_events: false,
         },
     );
@@ -546,7 +521,11 @@ fn test_execute_transaction_set_accepts_hot_archive_parameter() {
     // to TransactionExecutor without panicking or erroring.
     let tx_set_result =
         result.expect("execute_transaction_set should succeed with hot_archive parameter");
-    assert_eq!(tx_set_result.results.len(), 1, "Should have one transaction result");
+    assert_eq!(
+        tx_set_result.results.len(),
+        1,
+        "Should have one transaction result"
+    );
     // We don't assert success here because that depends on many factors -
     // the key test is that the API correctly accepts and processes the hot_archive parameter.
 }
@@ -815,7 +794,8 @@ fn build_extend_ttl_tx(
     let source_id: AccountId = (&secret.public_key()).into();
 
     // Account entry
-    let (source_key, source_entry) = create_account_entry(source_id.clone(), seq_num - 1, 20_000_000);
+    let (source_key, source_entry) =
+        create_account_entry(source_id.clone(), seq_num - 1, 20_000_000);
 
     // Contract code entry
     let code_hash = Hash(code_hash_bytes);
@@ -907,17 +887,15 @@ fn build_extend_ttl_tx(
 #[tokio::test(flavor = "multi_thread")]
 async fn test_parallel_soroban_multi_cluster_execution() {
     use henyey_ledger::{
-        execute_soroban_parallel_phase, LedgerDelta, SorobanContext, SorobanPhaseStructure,
-        SnapshotBuilder, SnapshotHandle,
+        execute_soroban_parallel_phase, LedgerDelta, SnapshotBuilder, SnapshotHandle,
+        SorobanContext, SorobanPhaseStructure,
     };
 
     let network_id = NetworkId::testnet();
 
     // Build two independent Soroban TXs that touch different contract codes.
-    let (tx1, entries1) =
-        build_extend_ttl_tx([33u8; 32], 2, [9u8; 32], 100, &network_id);
-    let (tx2, entries2) =
-        build_extend_ttl_tx([44u8; 32], 2, [10u8; 32], 200, &network_id);
+    let (tx1, entries1) = build_extend_ttl_tx([33u8; 32], 2, [9u8; 32], 100, &network_id);
+    let (tx2, entries2) = build_extend_ttl_tx([44u8; 32], 2, [10u8; 32], 200, &network_id);
 
     // Build snapshot with all entries
     let mut builder = SnapshotBuilder::new(1);
@@ -937,39 +915,43 @@ async fn test_parallel_soroban_multi_cluster_execution() {
 
     let mut delta = LedgerDelta::new(1);
     let context = henyey_tx::LedgerContext::new(
-        1,          // ledger_seq
-        1_000,      // close_time
-        100,        // base_fee
-        5_000_000,  // base_reserve
-        25,         // protocol_version
+        1,         // ledger_seq
+        1_000,     // close_time
+        100,       // base_fee
+        5_000_000, // base_reserve
+        25,        // protocol_version
         network_id,
     );
     let result = execute_soroban_parallel_phase(
-            &snapshot,
-            &phase,
-            0, // no classic TXs in test
-            &context,
-            &mut delta,
-            SorobanContext {
-                config: SorobanConfig::default(),
-                base_prng_seed: [0u8; 32],
-                classic_events: ClassicEventConfig::default(),
-                module_cache: None,
-                hot_archive: None,
-                runtime_handle: None,
+        &snapshot,
+        &phase,
+        0, // no classic TXs in test
+        &context,
+        &mut delta,
+        SorobanContext {
+            config: SorobanConfig::default(),
+            base_prng_seed: [0u8; 32],
+            classic_events: ClassicEventConfig::default(),
+            module_cache: None,
+            hot_archive: None,
+            runtime_handle: None,
             soroban_state: None,
-                    offer_store: None,
+            offer_store: None,
             emit_soroban_tx_meta_ext_v1: false,
             enable_soroban_diagnostic_events: false,
-            },
-            None,
-        )
-        .expect("execute parallel phase");
+        },
+        None,
+    )
+    .expect("execute parallel phase");
 
     // Both TXs should have executed.
     assert_eq!(result.results.len(), 2, "expected 2 execution results");
     assert_eq!(result.tx_results.len(), 2, "expected 2 TX result pairs");
-    assert_eq!(result.tx_result_metas.len(), 2, "expected 2 TX result metas");
+    assert_eq!(
+        result.tx_result_metas.len(),
+        2,
+        "expected 2 TX result metas"
+    );
 
     // Both should succeed.
     assert!(result.results[0].success, "TX1 should succeed");
@@ -990,16 +972,14 @@ async fn test_parallel_soroban_multi_cluster_execution() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_parallel_soroban_matches_sequential() {
     use henyey_ledger::{
-        execute_soroban_parallel_phase, LedgerDelta, SorobanContext, SorobanPhaseStructure,
-        SnapshotBuilder, SnapshotHandle,
+        execute_soroban_parallel_phase, LedgerDelta, SnapshotBuilder, SnapshotHandle,
+        SorobanContext, SorobanPhaseStructure,
     };
 
     let network_id = NetworkId::testnet();
 
-    let (tx1, entries1) =
-        build_extend_ttl_tx([33u8; 32], 2, [9u8; 32], 100, &network_id);
-    let (tx2, entries2) =
-        build_extend_ttl_tx([44u8; 32], 2, [10u8; 32], 200, &network_id);
+    let (tx1, entries1) = build_extend_ttl_tx([33u8; 32], 2, [9u8; 32], 100, &network_id);
+    let (tx2, entries2) = build_extend_ttl_tx([44u8; 32], 2, [10u8; 32], 200, &network_id);
 
     // Build snapshot with all entries.
     let mut builder = SnapshotBuilder::new(1);
@@ -1009,11 +989,11 @@ async fn test_parallel_soroban_matches_sequential() {
     let snapshot = SnapshotHandle::new(builder.build_with_default_header());
 
     let context = henyey_tx::LedgerContext::new(
-        1,          // ledger_seq
-        1_000,      // close_time
-        100,        // base_fee
-        5_000_000,  // base_reserve
-        25,         // protocol_version
+        1,         // ledger_seq
+        1_000,     // close_time
+        100,       // base_fee
+        5_000_000, // base_reserve
+        25,        // protocol_version
         network_id,
     );
 
@@ -1027,26 +1007,26 @@ async fn test_parallel_soroban_matches_sequential() {
     };
     let mut parallel_delta = LedgerDelta::new(1);
     let par = execute_soroban_parallel_phase(
-            &snapshot,
-            &parallel_phase,
-            0, // no classic TXs in test
-            &context,
-            &mut parallel_delta,
-            SorobanContext {
-                config: SorobanConfig::default(),
-                base_prng_seed: [0u8; 32],
-                classic_events: ClassicEventConfig::default(),
-                module_cache: None,
-                hot_archive: None,
-                runtime_handle: None,
+        &snapshot,
+        &parallel_phase,
+        0, // no classic TXs in test
+        &context,
+        &mut parallel_delta,
+        SorobanContext {
+            config: SorobanConfig::default(),
+            base_prng_seed: [0u8; 32],
+            classic_events: ClassicEventConfig::default(),
+            module_cache: None,
+            hot_archive: None,
+            runtime_handle: None,
             soroban_state: None,
-                    offer_store: None,
+            offer_store: None,
             emit_soroban_tx_meta_ext_v1: false,
             enable_soroban_diagnostic_events: false,
-            },
-            None,
-        )
-        .expect("parallel");
+        },
+        None,
+    )
+    .expect("parallel");
 
     // Run with 2 stages of 1 cluster each (sequential path — each stage has ≤1 cluster).
     let sequential_phase = SorobanPhaseStructure {
@@ -1058,38 +1038,59 @@ async fn test_parallel_soroban_matches_sequential() {
     };
     let mut sequential_delta = LedgerDelta::new(1);
     let seq = execute_soroban_parallel_phase(
-            &snapshot,
-            &sequential_phase,
-            0, // no classic TXs in test
-            &context,
-            &mut sequential_delta,
-            SorobanContext {
-                config: SorobanConfig::default(),
-                base_prng_seed: [0u8; 32],
-                classic_events: ClassicEventConfig::default(),
-                module_cache: None,
-                hot_archive: None,
-                runtime_handle: None,
+        &snapshot,
+        &sequential_phase,
+        0, // no classic TXs in test
+        &context,
+        &mut sequential_delta,
+        SorobanContext {
+            config: SorobanConfig::default(),
+            base_prng_seed: [0u8; 32],
+            classic_events: ClassicEventConfig::default(),
+            module_cache: None,
+            hot_archive: None,
+            runtime_handle: None,
             soroban_state: None,
-                    offer_store: None,
+            offer_store: None,
             emit_soroban_tx_meta_ext_v1: false,
             enable_soroban_diagnostic_events: false,
-            },
-            None,
-        )
-        .expect("sequential");
+        },
+        None,
+    )
+    .expect("sequential");
 
     // Results should match.
     assert_eq!(par.results.len(), seq.results.len(), "result count");
     for i in 0..par.results.len() {
-        assert_eq!(par.results[i].success, seq.results[i].success, "success[{i}]");
-        assert_eq!(par.results[i].fee_charged, seq.results[i].fee_charged, "fee_charged[{i}]");
-        assert_eq!(par.results[i].fee_refund, seq.results[i].fee_refund, "fee_refund[{i}]");
+        assert_eq!(
+            par.results[i].success, seq.results[i].success,
+            "success[{i}]"
+        );
+        assert_eq!(
+            par.results[i].fee_charged, seq.results[i].fee_charged,
+            "fee_charged[{i}]"
+        );
+        assert_eq!(
+            par.results[i].fee_refund, seq.results[i].fee_refund,
+            "fee_refund[{i}]"
+        );
     }
-    assert_eq!(par.tx_results.len(), seq.tx_results.len(), "tx_results count");
-    assert_eq!(par.tx_result_metas.len(), seq.tx_result_metas.len(), "metas count");
+    assert_eq!(
+        par.tx_results.len(),
+        seq.tx_results.len(),
+        "tx_results count"
+    );
+    assert_eq!(
+        par.tx_result_metas.len(),
+        seq.tx_result_metas.len(),
+        "metas count"
+    );
     assert_eq!(par.id_pool, seq.id_pool, "id_pool");
-    assert_eq!(par.hot_archive_restored_keys.len(), seq.hot_archive_restored_keys.len(), "restored keys");
+    assert_eq!(
+        par.hot_archive_restored_keys.len(),
+        seq.hot_archive_restored_keys.len(),
+        "restored keys"
+    );
 
     // Fee pool deltas should match.
     assert_eq!(
@@ -1110,16 +1111,14 @@ async fn test_parallel_soroban_matches_sequential() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_parallel_soroban_deterministic() {
     use henyey_ledger::{
-        execute_soroban_parallel_phase, LedgerDelta, SorobanContext, SorobanPhaseStructure,
-        SnapshotBuilder, SnapshotHandle,
+        execute_soroban_parallel_phase, LedgerDelta, SnapshotBuilder, SnapshotHandle,
+        SorobanContext, SorobanPhaseStructure,
     };
 
     let network_id = NetworkId::testnet();
 
-    let (tx1, entries1) =
-        build_extend_ttl_tx([33u8; 32], 2, [9u8; 32], 100, &network_id);
-    let (tx2, entries2) =
-        build_extend_ttl_tx([44u8; 32], 2, [10u8; 32], 200, &network_id);
+    let (tx1, entries1) = build_extend_ttl_tx([33u8; 32], 2, [9u8; 32], 100, &network_id);
+    let (tx2, entries2) = build_extend_ttl_tx([44u8; 32], 2, [10u8; 32], 200, &network_id);
 
     let mut builder = SnapshotBuilder::new(1);
     for (key, entry) in entries1.into_iter().chain(entries2.into_iter()) {
@@ -1139,35 +1138,34 @@ async fn test_parallel_soroban_deterministic() {
     let mut prev_fee_delta = None;
     let mut prev_num_changes = None;
     let mut prev_results: Option<Vec<(bool, i64, i64)>> = None;
-    let context = henyey_tx::LedgerContext::new(
-        1, 1_000, 100, 5_000_000, 25, network_id,
-    );
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
 
     for run in 0..5 {
         let mut delta = LedgerDelta::new(1);
         let result = execute_soroban_parallel_phase(
-                &snapshot,
-                &phase,
-                0, // no classic TXs in test
-                &context,
-                &mut delta,
-                SorobanContext {
-                    config: SorobanConfig::default(),
-                    base_prng_seed: [0u8; 32],
-                    classic_events: ClassicEventConfig::default(),
-                    module_cache: None,
-                    hot_archive: None,
-                    runtime_handle: None,
-            soroban_state: None,
-                    offer_store: None,
-            emit_soroban_tx_meta_ext_v1: false,
-            enable_soroban_diagnostic_events: false,
-                },
-                None,
-            )
-            .expect("execute");
+            &snapshot,
+            &phase,
+            0, // no classic TXs in test
+            &context,
+            &mut delta,
+            SorobanContext {
+                config: SorobanConfig::default(),
+                base_prng_seed: [0u8; 32],
+                classic_events: ClassicEventConfig::default(),
+                module_cache: None,
+                hot_archive: None,
+                runtime_handle: None,
+                soroban_state: None,
+                offer_store: None,
+                emit_soroban_tx_meta_ext_v1: false,
+                enable_soroban_diagnostic_events: false,
+            },
+            None,
+        )
+        .expect("execute");
 
-        let result_tuples: Vec<(bool, i64, i64)> = result.results
+        let result_tuples: Vec<(bool, i64, i64)> = result
+            .results
             .iter()
             .map(|r| (r.success, r.fee_charged, r.fee_refund))
             .collect();
@@ -1176,10 +1174,18 @@ async fn test_parallel_soroban_deterministic() {
             assert_eq!(&result_tuples, prev, "results differ on run {run}");
         }
         if let Some(prev) = prev_fee_delta {
-            assert_eq!(delta.fee_pool_delta(), prev, "fee delta differs on run {run}");
+            assert_eq!(
+                delta.fee_pool_delta(),
+                prev,
+                "fee delta differs on run {run}"
+            );
         }
         if let Some(prev) = prev_num_changes {
-            assert_eq!(delta.num_changes(), prev, "num changes differs on run {run}");
+            assert_eq!(
+                delta.num_changes(),
+                prev,
+                "num changes differs on run {run}"
+            );
         }
 
         prev_results = Some(result_tuples);
@@ -1194,8 +1200,8 @@ async fn test_parallel_soroban_deterministic() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_parallel_soroban_from_spawn_blocking() {
     use henyey_ledger::{
-        execute_soroban_parallel_phase, LedgerDelta, SorobanContext, SorobanPhaseStructure,
-        SnapshotBuilder, SnapshotHandle,
+        execute_soroban_parallel_phase, LedgerDelta, SnapshotBuilder, SnapshotHandle,
+        SorobanContext, SorobanPhaseStructure,
     };
 
     let network_id = NetworkId::testnet();
@@ -1224,35 +1230,28 @@ async fn test_parallel_soroban_from_spawn_blocking() {
     // This exercises the Handle::block_on path (not block_in_place).
     let outer_result = tokio::task::spawn_blocking(move || {
         let mut delta = LedgerDelta::new(1);
-        let context = henyey_tx::LedgerContext::new(
-            1,
-            1_000,
-            100,
-            5_000_000,
-            25,
-            network_id,
-        );
+        let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
         let result = execute_soroban_parallel_phase(
-                &snapshot,
-                &phase,
-                0, // no classic TXs in test
-                &context,
-                &mut delta,
-                SorobanContext {
-                    config: SorobanConfig::default(),
-                    base_prng_seed: [0u8; 32],
-                    classic_events: ClassicEventConfig::default(),
-                    module_cache: None,
-                    hot_archive: None,
-                    runtime_handle: Some(handle),
-                    soroban_state: None,
-                    offer_store: None,
-                    emit_soroban_tx_meta_ext_v1: false,
-                    enable_soroban_diagnostic_events: false,
-                },
-                None,
-            )
-            .expect("execute parallel phase from spawn_blocking");
+            &snapshot,
+            &phase,
+            0, // no classic TXs in test
+            &context,
+            &mut delta,
+            SorobanContext {
+                config: SorobanConfig::default(),
+                base_prng_seed: [0u8; 32],
+                classic_events: ClassicEventConfig::default(),
+                module_cache: None,
+                hot_archive: None,
+                runtime_handle: Some(handle),
+                soroban_state: None,
+                offer_store: None,
+                emit_soroban_tx_meta_ext_v1: false,
+                enable_soroban_diagnostic_events: false,
+            },
+            None,
+        )
+        .expect("execute parallel phase from spawn_blocking");
 
         (result, delta)
     })
@@ -1262,7 +1261,11 @@ async fn test_parallel_soroban_from_spawn_blocking() {
     let (result, delta) = outer_result;
     assert_eq!(result.results.len(), 2, "expected 2 execution results");
     assert_eq!(result.tx_results.len(), 2, "expected 2 TX result pairs");
-    assert_eq!(result.tx_result_metas.len(), 2, "expected 2 TX result metas");
+    assert_eq!(
+        result.tx_result_metas.len(),
+        2,
+        "expected 2 TX result metas"
+    );
     assert!(result.results[0].success, "TX1 should succeed");
     assert!(result.results[1].success, "TX2 should succeed");
     assert!(delta.num_changes() > 0, "delta should have changes");
@@ -1273,8 +1276,8 @@ async fn test_parallel_soroban_from_spawn_blocking() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_parallel_soroban_spawn_blocking_matches_worker() {
     use henyey_ledger::{
-        execute_soroban_parallel_phase, LedgerDelta, SorobanContext, SorobanPhaseStructure,
-        SnapshotBuilder, SnapshotHandle,
+        execute_soroban_parallel_phase, LedgerDelta, SnapshotBuilder, SnapshotHandle,
+        SorobanContext, SorobanPhaseStructure,
     };
 
     let network_id = NetworkId::testnet();
@@ -1298,14 +1301,7 @@ async fn test_parallel_soroban_spawn_blocking_matches_worker() {
 
     // Run with None (block_in_place path, on worker thread).
     let mut delta_worker = LedgerDelta::new(1);
-    let context = henyey_tx::LedgerContext::new(
-        1,
-        1_000,
-        100,
-        5_000_000,
-        25,
-        network_id,
-    );
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
     let worker_result = execute_soroban_parallel_phase(
         &snapshot,
         &phase,
@@ -1321,7 +1317,7 @@ async fn test_parallel_soroban_spawn_blocking_matches_worker() {
             runtime_handle: None,
             emit_soroban_tx_meta_ext_v1: false,
             soroban_state: None,
-                    offer_store: None,
+            offer_store: None,
             enable_soroban_diagnostic_events: false,
         },
         None,
@@ -1341,51 +1337,53 @@ async fn test_parallel_soroban_spawn_blocking_matches_worker() {
     });
     let phase2 = phase.clone();
 
-    let (blocking_result, delta_blocking) =
-        tokio::task::spawn_blocking(move || {
-            let mut delta = LedgerDelta::new(1);
-            let context = henyey_tx::LedgerContext::new(
-                1,
-                1_000,
-                100,
-                5_000_000,
-                25,
-                network_id,
-            );
-            let result = execute_soroban_parallel_phase(
-                &snapshot2,
-                &phase2,
-                0, // no classic TXs in test
-                &context,
-                &mut delta,
-                SorobanContext {
-                    config: SorobanConfig::default(),
-                    base_prng_seed: [0u8; 32],
-                    classic_events: ClassicEventConfig::default(),
-                    module_cache: None,
-                    hot_archive: None,
-                    runtime_handle: Some(handle),
-                    soroban_state: None,
-                    offer_store: None,
-                    emit_soroban_tx_meta_ext_v1: false,
-                    enable_soroban_diagnostic_events: false,
-                },
-                None,
-            )
-            .expect("spawn_blocking path");
-            (result, delta)
-        })
-        .await
-        .expect("spawn_blocking task");
+    let (blocking_result, delta_blocking) = tokio::task::spawn_blocking(move || {
+        let mut delta = LedgerDelta::new(1);
+        let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+        let result = execute_soroban_parallel_phase(
+            &snapshot2,
+            &phase2,
+            0, // no classic TXs in test
+            &context,
+            &mut delta,
+            SorobanContext {
+                config: SorobanConfig::default(),
+                base_prng_seed: [0u8; 32],
+                classic_events: ClassicEventConfig::default(),
+                module_cache: None,
+                hot_archive: None,
+                runtime_handle: Some(handle),
+                soroban_state: None,
+                offer_store: None,
+                emit_soroban_tx_meta_ext_v1: false,
+                enable_soroban_diagnostic_events: false,
+            },
+            None,
+        )
+        .expect("spawn_blocking path");
+        (result, delta)
+    })
+    .await
+    .expect("spawn_blocking task");
 
     // Both paths should produce identical results.
     assert_eq!(worker_result.results.len(), blocking_result.results.len());
-    for (w, b) in worker_result.results.iter().zip(blocking_result.results.iter()) {
+    for (w, b) in worker_result
+        .results
+        .iter()
+        .zip(blocking_result.results.iter())
+    {
         assert_eq!(w.success, b.success);
         assert_eq!(w.fee_charged, b.fee_charged);
     }
-    assert_eq!(worker_result.tx_results.len(), blocking_result.tx_results.len());
-    assert_eq!(delta_worker.fee_pool_delta(), delta_blocking.fee_pool_delta());
+    assert_eq!(
+        worker_result.tx_results.len(),
+        blocking_result.tx_results.len()
+    );
+    assert_eq!(
+        delta_worker.fee_pool_delta(),
+        delta_blocking.fee_pool_delta()
+    );
     assert_eq!(delta_worker.num_changes(), delta_blocking.num_changes());
 }
 
@@ -1440,9 +1438,9 @@ fn test_cross_tx_deleted_trustline_not_reloaded() {
     let (tl_key, tl_entry) = create_trustline_entry(
         source_id.clone(),
         tl_asset.clone(),
-        0,          // balance = 0 (required for deletion)
-        1_000_000,  // limit
-        1, // AUTHORIZED_FLAG
+        0,         // balance = 0 (required for deletion)
+        1_000_000, // limit
+        1,         // AUTHORIZED_FLAG
     );
 
     let snapshot = SnapshotBuilder::new(1)
@@ -1453,14 +1451,7 @@ fn test_cross_tx_deleted_trustline_not_reloaded() {
     let snapshot = SnapshotHandle::new(snapshot);
 
     let network_id = NetworkId::testnet();
-    let context = henyey_tx::LedgerContext::new(
-        1,
-        1_000,
-        100,
-        5_000_000,
-        25,
-        network_id,
-    );
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
     let mut executor = TransactionExecutor::new(
         &context,
         0,
@@ -1519,8 +1510,14 @@ fn test_cross_tx_deleted_trustline_not_reloaded() {
     );
 
     // Verify num_sub_entries decremented to 0
-    let account = executor.state().get_account(&source_id).expect("source account");
-    assert_eq!(account.num_sub_entries, 0, "num_sub_entries should be 0 after trustline deletion");
+    let account = executor
+        .state()
+        .get_account(&source_id)
+        .expect("source account");
+    assert_eq!(
+        account.num_sub_entries, 0,
+        "num_sub_entries should be 0 after trustline deletion"
+    );
 
     // Snapshot delta before TX2 (simulates ledger execution flow between transactions)
     executor.state_mut().snapshot_delta();
@@ -1591,7 +1588,10 @@ fn test_cross_tx_deleted_trustline_not_reloaded() {
     }
 
     // Verify num_sub_entries is still 0 (not decremented to -1/underflow)
-    let account = executor.state().get_account(&source_id).expect("source account");
+    let account = executor
+        .state()
+        .get_account(&source_id)
+        .expect("source account");
     assert_eq!(
         account.num_sub_entries, 0,
         "num_sub_entries should remain 0 (not underflow)"
@@ -1640,13 +1640,11 @@ fn test_advance_to_ledger_preserving_offers() {
     let (issuer_key, issuer_entry) = create_account_entry(issuer_id.clone(), 1, 100_000_000);
 
     // Offer owner A: sells 50 XLM for USD
-    let (owner_a_key, mut owner_a_entry) =
-        create_account_entry(owner_a_id.clone(), 1, 500_000_000);
+    let (owner_a_key, mut owner_a_entry) = create_account_entry(owner_a_id.clone(), 1, 500_000_000);
     set_account_liabilities(&mut owner_a_entry, 50_000_000, 0);
 
     // Offer owner B: sells 30 XLM for USD
-    let (owner_b_key, mut owner_b_entry) =
-        create_account_entry(owner_b_id.clone(), 1, 500_000_000);
+    let (owner_b_key, mut owner_b_entry) = create_account_entry(owner_b_id.clone(), 1, 500_000_000);
     set_account_liabilities(&mut owner_b_entry, 30_000_000, 0);
 
     // Source needs USD trustline
@@ -1791,10 +1789,7 @@ fn test_advance_to_ledger_preserving_offers() {
         Some(OperationResult::OpInner(OperationResultTr::PathPaymentStrictSend(
             PathPaymentStrictSendResult::Success(success),
         ))) => {
-            assert!(
-                !success.offers.is_empty(),
-                "Should have crossed offer A"
-            );
+            assert!(!success.offers.is_empty(), "Should have crossed offer A");
         }
         other => panic!("Unexpected TX1 result: {:?}", other),
     }
@@ -1815,13 +1810,19 @@ fn test_advance_to_ledger_preserving_offers() {
 
     // Verify offer A is NOT in the executor's state (it was consumed in ledger 1)
     assert!(
-        executor.state().get_offer(&owner_a_id, offer_a_id).is_none(),
+        executor
+            .state()
+            .get_offer(&owner_a_id, offer_a_id)
+            .is_none(),
         "Offer A should be gone after being fully crossed in ledger 1"
     );
 
     // Verify offer B IS still in the executor's state (it was not touched in ledger 1)
     assert!(
-        executor.state().get_offer(&owner_b_id, offer_b_id).is_some(),
+        executor
+            .state()
+            .get_offer(&owner_b_id, offer_b_id)
+            .is_some(),
         "Offer B should be preserved across ledger advance"
     );
 
@@ -1877,10 +1878,7 @@ fn test_advance_to_ledger_preserving_offers() {
         Some(OperationResult::OpInner(OperationResultTr::PathPaymentStrictSend(
             PathPaymentStrictSendResult::Success(success),
         ))) => {
-            assert!(
-                !success.offers.is_empty(),
-                "Should have crossed offer B"
-            );
+            assert!(!success.offers.is_empty(), "Should have crossed offer B");
         }
         other => panic!("Unexpected TX2 result: {:?}", other),
     }
@@ -1975,14 +1973,7 @@ fn test_internal_error_maps_to_tx_internal_error() {
 
     let network_id = NetworkId::testnet();
 
-    let context = henyey_tx::LedgerContext::new(
-        1,
-        1_000,
-        100,
-        5_000_000,
-        25,
-        network_id,
-    );
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
     let mut executor = TransactionExecutor::new(
         &context,
         0,
@@ -2030,7 +2021,10 @@ fn test_internal_error_maps_to_tx_internal_error() {
         .expect("execute_transaction should not return Err");
 
     // The transaction should fail with InternalError (not NotSupported)
-    assert!(!result.success, "TX should fail due to liabilities underflow");
+    assert!(
+        !result.success,
+        "TX should fail due to liabilities underflow"
+    );
     assert_eq!(
         result.failure,
         Some(ExecutionFailure::TxInternalError),
@@ -2075,11 +2069,9 @@ fn test_create_account_sponsor_low_reserve_before_underfunded() {
     let ops: Vec<Operation> = vec![
         // Op 0: sponsor begins sponsoring
         Operation {
-            source_account: Some(MuxedAccount::Ed25519(
-                match &sponsor_id.0 {
-                    PublicKey::PublicKeyTypeEd25519(k) => k.clone(),
-                },
-            )),
+            source_account: Some(MuxedAccount::Ed25519(match &sponsor_id.0 {
+                PublicKey::PublicKeyTypeEd25519(k) => k.clone(),
+            })),
             body: OperationBody::BeginSponsoringFutureReserves(
                 stellar_xdr::curr::BeginSponsoringFutureReservesOp {
                     sponsored_id: dest_id.clone(),
@@ -2118,14 +2110,7 @@ fn test_create_account_sponsor_low_reserve_before_underfunded() {
         env.signatures = vec![source_sig, sponsor_sig].try_into().unwrap();
     }
 
-    let context = henyey_tx::LedgerContext::new(
-        1,
-        1_000,
-        100,
-        5_000_000,
-        25,
-        network_id,
-    );
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
     let mut executor = TransactionExecutor::new(
         &context,
         0,
@@ -2269,7 +2254,10 @@ fn test_clawback_claimable_balance_not_issuer_error_code() {
         .expect("execute");
 
     // The TX should fail (op fails)
-    assert!(!result.success, "TX should fail because source is not issuer");
+    assert!(
+        !result.success,
+        "TX should fail because source is not issuer"
+    );
 
     // The op result MUST be NotIssuer (not NotClawbackEnabled)
     match &result.operation_results[0] {
@@ -2280,10 +2268,7 @@ fn test_clawback_claimable_balance_not_issuer_error_code() {
                 r
             );
         }
-        other => panic!(
-            "Expected ClawbackClaimableBalance result, got {:?}",
-            other
-        ),
+        other => panic!("Expected ClawbackClaimableBalance result, got {:?}", other),
     }
 }
 
@@ -2368,14 +2353,8 @@ fn test_classic_fees_deducted_upfront_before_tx_execution() {
         tx_set.push((std::sync::Arc::new(envelope), None));
     }
 
-    let context = henyey_tx::LedgerContext::new(
-        2,
-        1_000,
-        base_fee,
-        base_reserve as u32,
-        25,
-        network_id,
-    );
+    let context =
+        henyey_tx::LedgerContext::new(2, 1_000, base_fee, base_reserve as u32, 25, network_id);
     let mut delta = LedgerDelta::new(2);
     let soroban = SorobanContext {
         config: SorobanConfig::default(),
@@ -2384,19 +2363,14 @@ fn test_classic_fees_deducted_upfront_before_tx_execution() {
         module_cache: None,
         hot_archive: None,
         runtime_handle: None,
-            soroban_state: None,
-                    offer_store: None,
-            emit_soroban_tx_meta_ext_v1: false,
-            enable_soroban_diagnostic_events: false,
+        soroban_state: None,
+        offer_store: None,
+        emit_soroban_tx_meta_ext_v1: false,
+        enable_soroban_diagnostic_events: false,
     };
 
     let result = execute_transaction_set_with_fee_mode(
-        &snapshot,
-        &tx_set,
-        &context,
-        &mut delta,
-        soroban,
-        true,
+        &snapshot, &tx_set, &context, &mut delta, soroban, true,
     )
     .expect("execute tx set");
 
@@ -2733,8 +2707,7 @@ fn test_set_trust_line_flags_redeems_pool_shares_loaded_from_snapshot() {
          before VE-02 fix, pool share TL was not loaded from snapshot"
     );
     assert_eq!(
-        cb_count,
-        2,
+        cb_count, 2,
         "exactly 2 claimable balances should be created (one per pool asset)"
     );
 }
@@ -2850,7 +2823,10 @@ fn test_fee_bump_charges_outer_fee_when_inner_auth_fails_at_apply() {
     let result1 = executor
         .execute_transaction(&snapshot, &env1, 100, None)
         .expect("execute tx1");
-    assert!(result1.success, "TX1 (SetOptions remove signer) should succeed");
+    assert!(
+        result1.success,
+        "TX1 (SetOptions remove signer) should succeed"
+    );
 
     // TX2: fee-bump wrapping an inner tx signed by signer_secret (now removed by TX1).
     let payment_op = Operation {
@@ -2905,7 +2881,10 @@ fn test_fee_bump_charges_outer_fee_when_inner_auth_fails_at_apply() {
         .expect("execute tx2");
 
     // The inner tx's signer was removed by TX1, so inner auth fails at apply time.
-    assert!(!result2.success, "fee-bump should fail (inner auth invalid)");
+    assert!(
+        !result2.success,
+        "fee-bump should fail (inner auth invalid)"
+    );
     assert_eq!(
         result2.failure,
         Some(ExecutionFailure::TxBadAuth),
@@ -2970,9 +2949,7 @@ fn test_op_source_merged_in_prior_tx_returns_bad_auth() {
 
     // ===== TX1: merge op_source into dest =====
     // The AccountMerge op has op_source as its explicit source.
-    let op_source_muxed = MuxedAccount::Ed25519(Uint256(
-        *op_source_secret.public_key().as_bytes(),
-    ));
+    let op_source_muxed = MuxedAccount::Ed25519(Uint256(*op_source_secret.public_key().as_bytes()));
     let dest_muxed = MuxedAccount::Ed25519(match &dest_id.0 {
         PublicKey::PublicKeyTypeEd25519(k) => k.clone(),
     });
@@ -3104,10 +3081,8 @@ fn test_pre_auth_tx_signer_checked_before_removal() {
 
     // Source account: master_weight=1, all thresholds=0 (so SetOptions passes at low=0).
     // Needs enough balance for 2 TXs' fees + payment + reserve for 1 sub-entry (the signer).
-    let (source_key, source_entry) =
-        create_account_entry(source_id.clone(), 100, 100_000_000);
-    let (dest_key, dest_entry) =
-        create_account_entry(dest_id.clone(), 1, 10_000_000);
+    let (source_key, source_entry) = create_account_entry(source_id.clone(), 100, 100_000_000);
+    let (dest_key, dest_entry) = create_account_entry(dest_id.clone(), 1, 10_000_000);
 
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
@@ -3223,8 +3198,10 @@ fn test_pre_auth_tx_signer_checked_before_removal() {
     }
 
     // Execute both TXs in a single ledger.
-    let tx_set: Vec<(std::sync::Arc<TransactionEnvelope>, Option<u32>)> =
-        vec![(std::sync::Arc::new(tx1_envelope), None), (std::sync::Arc::new(tx2_envelope), None)];
+    let tx_set: Vec<(std::sync::Arc<TransactionEnvelope>, Option<u32>)> = vec![
+        (std::sync::Arc::new(tx1_envelope), None),
+        (std::sync::Arc::new(tx2_envelope), None),
+    ];
 
     let context = henyey_tx::LedgerContext::new(
         2,     // ledger_seq
@@ -3242,19 +3219,14 @@ fn test_pre_auth_tx_signer_checked_before_removal() {
         module_cache: None,
         hot_archive: None,
         runtime_handle: None,
-            soroban_state: None,
-                    offer_store: None,
-            emit_soroban_tx_meta_ext_v1: false,
-            enable_soroban_diagnostic_events: false,
+        soroban_state: None,
+        offer_store: None,
+        emit_soroban_tx_meta_ext_v1: false,
+        enable_soroban_diagnostic_events: false,
     };
 
     let result = execute_transaction_set_with_fee_mode(
-        &snapshot,
-        &tx_set,
-        &context,
-        &mut delta,
-        soroban,
-        true,
+        &snapshot, &tx_set, &context, &mut delta, soroban, true,
     )
     .expect("execute tx set");
 
@@ -3714,7 +3686,9 @@ fn test_pre_charged_fee_override_on_validation_failure() {
         SorobanConfig::default(),
         ClassicEventConfig::default(),
     );
-    executor.load_orderbook_offers(&snapshot).expect("load offers");
+    executor
+        .load_orderbook_offers(&snapshot)
+        .expect("load offers");
 
     let pre_charged_fee: i64 = 100;
     let pre_charged = vec![PreChargedFee {
@@ -3820,12 +3794,8 @@ fn test_single_op_tx_failure_rolls_back_without_per_op_savepoint() {
         backfill_stellar_asset_events: false,
     };
     let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
-    let mut executor = TransactionExecutor::new(
-        &context,
-        0,
-        SorobanConfig::default(),
-        classic_events,
-    );
+    let mut executor =
+        TransactionExecutor::new(&context, 0, SorobanConfig::default(), classic_events);
 
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)

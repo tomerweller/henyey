@@ -17,9 +17,7 @@ use henyey_bucket::{
     get_ttl_key, get_ttl_live_until, is_persistent_key, is_soroban_key, BucketSnapshotManager,
     SearchableBucketListSnapshot, SearchableHotArchiveBucketListSnapshot,
 };
-use stellar_xdr::curr::{
-    HotArchiveBucketEntry, LedgerEntry, LedgerKey, Limits, ReadXdr, WriteXdr,
-};
+use stellar_xdr::curr::{HotArchiveBucketEntry, LedgerEntry, LedgerKey, Limits, ReadXdr, WriteXdr};
 
 use crate::http::types::query::{
     GetLedgerEntryRawResponse, GetLedgerEntryResponse, LedgerEntryResult, LedgerEntryState,
@@ -188,11 +186,9 @@ pub(crate) async fn getledgerentryraw_handler(
     let entry_results: Vec<RawEntryResult> = entries
         .iter()
         .filter_map(|e| {
-            e.to_xdr(Limits::none())
-                .ok()
-                .map(|bytes| RawEntryResult {
-                    entry: BASE64.encode(&bytes),
-                })
+            e.to_xdr(Limits::none()).ok().map(|bytes| RawEntryResult {
+                entry: BASE64.encode(&bytes),
+            })
         })
         .collect();
 
@@ -296,10 +292,11 @@ pub(crate) async fn getledgerentry_handler(
     let ledger_seq = params.ledger_seq.unwrap_or_else(|| live_bl.ledger_seq());
 
     // ── Pass 1: Load all keys from live bucket list ──────────────────
-    let live_entries = match load_from_live(&live_bl, &keys, ledger_seq, params.ledger_seq.is_some()) {
-        Ok(entries) => entries,
-        Err(resp) => return resp.into_response(),
-    };
+    let live_entries =
+        match load_from_live(&live_bl, &keys, ledger_seq, params.ledger_seq.is_some()) {
+            Ok(entries) => entries,
+            Err(resp) => return resp.into_response(),
+        };
 
     // Build a set of keys that were found live.
     let live_entry_map: HashMap<Vec<u8>, &LedgerEntry> = live_entries
@@ -331,7 +328,12 @@ pub(crate) async fn getledgerentry_handler(
         .collect();
 
     let archived_entries = if !hot_archive_keys.is_empty() {
-        load_from_hot_archive(&hot_archive_bl, &hot_archive_keys, ledger_seq, params.ledger_seq.is_some())
+        load_from_hot_archive(
+            &hot_archive_bl,
+            &hot_archive_keys,
+            ledger_seq,
+            params.ledger_seq.is_some(),
+        )
     } else {
         Vec::new()
     };
@@ -520,7 +522,8 @@ fn load_from_hot_archive(
     historical: bool,
 ) -> Vec<HotArchiveBucketEntry> {
     if historical {
-        bl.load_keys_from_ledger(keys, ledger_seq).unwrap_or_default()
+        bl.load_keys_from_ledger(keys, ledger_seq)
+            .unwrap_or_default()
     } else {
         bl.load_keys(keys)
     }
@@ -550,8 +553,10 @@ mod tests {
     #[test]
     fn test_parse_form_query_params_decodes_percent_encoded_equals() {
         // stellar-rpc sends base64 padding as %3D
-        let params =
-            parse_form_query_params(b"key=AAAAAAAAAABzdv3ojkzWHMD7KUoXhrPx0GH18vHKV0ZfqpMiEblG1g%3D%3D").unwrap();
+        let params = parse_form_query_params(
+            b"key=AAAAAAAAAABzdv3ojkzWHMD7KUoXhrPx0GH18vHKV0ZfqpMiEblG1g%3D%3D",
+        )
+        .unwrap();
         assert_eq!(
             params.keys,
             vec!["AAAAAAAAAABzdv3ojkzWHMD7KUoXhrPx0GH18vHKV0ZfqpMiEblG1g=="]

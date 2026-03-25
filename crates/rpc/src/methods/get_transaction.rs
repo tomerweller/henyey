@@ -50,7 +50,10 @@ pub async fn handle(
             let mut obj = serde_json::Map::new();
             obj.insert("status".into(), json!(status));
             obj.insert("latestLedger".into(), json!(ledger.num));
-            obj.insert("latestLedgerCloseTime".into(), json!(ledger.close_time.to_string()));
+            obj.insert(
+                "latestLedgerCloseTime".into(),
+                json!(ledger.close_time.to_string()),
+            );
             obj.insert("oldestLedger".into(), json!(oldest));
             obj.insert("oldestLedgerCloseTime".into(), json!(oldest_close_time));
             obj.insert("ledger".into(), json!(record.ledger_seq));
@@ -60,20 +63,29 @@ pub async fn handle(
 
             // Envelope XDR
             util::insert_raw_xdr_field::<TransactionEnvelope>(
-                &mut obj, "envelope", &record.body, format,
+                &mut obj,
+                "envelope",
+                &record.body,
+                format,
             )?;
 
             // Result XDR — extract TransactionResult from the stored TransactionResultPair
-            let result_bytes = util::extract_result_xdr(&record.result)
-                .unwrap_or_else(|| record.result.clone());
+            let result_bytes =
+                util::extract_result_xdr(&record.result).unwrap_or_else(|| record.result.clone());
             util::insert_raw_xdr_field::<TransactionResult>(
-                &mut obj, "result", &result_bytes, format,
+                &mut obj,
+                "result",
+                &result_bytes,
+                format,
             )?;
 
             // Result meta XDR
             if let Some(ref meta_bytes) = record.meta {
                 util::insert_raw_xdr_field::<TransactionMeta>(
-                    &mut obj, "resultMeta", meta_bytes, format,
+                    &mut obj,
+                    "resultMeta",
+                    meta_bytes,
+                    format,
                 )?;
             }
 

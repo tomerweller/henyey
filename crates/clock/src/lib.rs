@@ -3,8 +3,8 @@
 use std::time::{Duration, Instant, SystemTime};
 
 use futures::future::BoxFuture;
-use futures::stream::BoxStream;
 use futures::stream::unfold;
+use futures::stream::BoxStream;
 
 pub trait Clock: Send + Sync + 'static {
     fn now(&self) -> Instant;

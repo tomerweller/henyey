@@ -29,11 +29,7 @@ async fn run_core7_fault_schedule() -> (Simulation, Vec<Hash256>) {
     );
 
     // Temporary hard drops on a subset of links.
-    let dropped_edges = [
-        ("node0", "node1"),
-        ("node2", "node3"),
-        ("node4", "node5"),
-    ];
+    let dropped_edges = [("node0", "node1"), ("node2", "node3"), ("node4", "node5")];
     for (a, b) in dropped_edges {
         sim.set_drop_prob(a, b, 1.0);
     }

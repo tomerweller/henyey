@@ -29,8 +29,7 @@ use crate::{
         ScErrorCode, ScErrorType, ScVal, SorobanAuthorizationEntry, SorobanResources, TtlEntry,
         WriteXdr,
     },
-    DiagnosticLevel, Error, Host, HostError, LedgerInfo, MeteredOrdMap,
-    DEFAULT_XDR_RW_LIMITS,
+    DiagnosticLevel, Error, Host, HostError, LedgerInfo, MeteredOrdMap, DEFAULT_XDR_RW_LIMITS,
 };
 use crate::{ledger_info::get_key_durability, ModuleCache};
 use crate::{storage::EntryWithLiveUntil, vm::wasm_module_memory_cost};

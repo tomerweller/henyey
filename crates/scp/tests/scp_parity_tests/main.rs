@@ -956,12 +956,11 @@ fn nodes_all_pledge_to_commit(scp: &TestSCP, x_value: &Value, qs_hash: Hash256) 
     );
 }
 
-
 mod ballot_core5;
 pub(crate) use ballot_core5::setup_confirm_prepared_a2;
-mod nomination;
 mod ballot_deep;
-mod ballot_z_branch;
-mod pristine_ballot;
 mod ballot_scenarios;
+mod ballot_z_branch;
 mod core3;
+mod nomination;
+mod pristine_ballot;

@@ -518,7 +518,10 @@ async fn test_init_dead_annihilation() {
     );
 
     // Verify live_entries doesn't include the deleted entry
-    let live: Vec<_> = bl.live_entries_iter().collect::<std::result::Result<Vec<_>, _>>().unwrap();
+    let live: Vec<_> = bl
+        .live_entries_iter()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
     let has_key = live.iter().any(|e| {
         if let LedgerEntryData::Account(a) = &e.data {
             a.account_id
@@ -914,7 +917,7 @@ async fn test_eviction_scan_incremental() {
     // Create settings for incremental scan
     let settings = StateArchivalSettings {
         starting_eviction_scan_level: 0,
-        eviction_scan_size: 10_000, // Scan 10KB at a time
+        eviction_scan_size: 10_000,   // Scan 10KB at a time
         max_entries_to_archive: 1000, // Default limit
         ..Default::default()
     };
@@ -1205,8 +1208,15 @@ async fn test_snapshot_eviction_scan_respects_extended_ttl() {
     .unwrap();
 
     // Advance and extend the TTL
-    bl.add_batch(2, TEST_PROTOCOL, BucketListType::Live, vec![], vec![], vec![])
-        .unwrap();
+    bl.add_batch(
+        2,
+        TEST_PROTOCOL,
+        BucketListType::Live,
+        vec![],
+        vec![],
+        vec![],
+    )
+    .unwrap();
 
     let extended_ttl = 20; // Now expires at ledger 20
     let updated_ttl = make_ttl_entry(&code_key, extended_ttl, 3);
@@ -1365,7 +1375,11 @@ async fn test_snapshot_eviction_scan_temporary_entries() {
         .unwrap();
 
     // Should find all 5 expired entries (3 temporary + 2 persistent)
-    assert_eq!(result.candidates.len(), 5, "Should find all 5 expired entries");
+    assert_eq!(
+        result.candidates.len(),
+        5,
+        "Should find all 5 expired entries"
+    );
 
     let temp_count = result.candidates.iter().filter(|c| c.is_temporary).count();
     let persistent_count = result.candidates.iter().filter(|c| !c.is_temporary).count();
@@ -1634,8 +1648,15 @@ async fn test_scan_for_entries_of_types_basic() {
         make_contract_data_entry(4, ContractDataDurability::Persistent, 1),
     ];
 
-    bl.add_batch(1, TEST_PROTOCOL, BucketListType::Live, entries, vec![], vec![])
-        .unwrap();
+    bl.add_batch(
+        1,
+        TEST_PROTOCOL,
+        BucketListType::Live,
+        entries,
+        vec![],
+        vec![],
+    )
+    .unwrap();
 
     // Scan for Offer + ContractCode — should find exactly 2 entries
     let mut found_types = Vec::new();
@@ -1655,7 +1676,10 @@ async fn test_scan_for_entries_of_types_basic() {
 
     assert_eq!(found_types.len(), 2, "Should find exactly 2 entries");
     assert!(found_types.contains(&"Offer"), "Should find Offer");
-    assert!(found_types.contains(&"ContractCode"), "Should find ContractCode");
+    assert!(
+        found_types.contains(&"ContractCode"),
+        "Should find ContractCode"
+    );
 }
 
 /// Test that scan_for_entries_of_types deduplicates entries that appear in
@@ -1749,21 +1773,22 @@ async fn test_scan_for_entries_of_types_excludes_dead_and_unmatched() {
 
     // Scan for Offer + Account — dead offer should NOT appear, account should
     let mut found = Vec::new();
-    bl.scan_for_entries_of_types(
-        &[LedgerEntryType::Offer, LedgerEntryType::Account],
-        |be| {
-            if let BucketEntry::Liveentry(entry) | BucketEntry::Initentry(entry) = be {
-                match &entry.data {
-                    LedgerEntryData::Offer(_) => found.push("Offer"),
-                    LedgerEntryData::Account(_) => found.push("Account"),
-                    _ => {}
-                }
+    bl.scan_for_entries_of_types(&[LedgerEntryType::Offer, LedgerEntryType::Account], |be| {
+        if let BucketEntry::Liveentry(entry) | BucketEntry::Initentry(entry) = be {
+            match &entry.data {
+                LedgerEntryData::Offer(_) => found.push("Offer"),
+                LedgerEntryData::Account(_) => found.push("Account"),
+                _ => {}
             }
-            true
-        },
-    );
+        }
+        true
+    });
 
-    assert_eq!(found, vec!["Account"], "Only Account should remain (offer is dead)");
+    assert_eq!(
+        found,
+        vec!["Account"],
+        "Only Account should remain (offer is dead)"
+    );
 }
 
 /// Test that scan_for_entries_of_types with a single type produces the same
@@ -1851,7 +1876,10 @@ async fn test_scan_for_entries_of_types_early_termination() {
     );
 
     assert!(!completed, "Should return false when stopped early");
-    assert_eq!(count, 1, "Should have processed exactly 1 entry before stopping");
+    assert_eq!(
+        count, 1,
+        "Should have processed exactly 1 entry before stopping"
+    );
 }
 
 /// Test scan_for_entries_of_types with all four Soroban types combined,

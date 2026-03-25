@@ -238,14 +238,8 @@ fn test_classic_queue_limit_eviction() {
     let low_hash = full_hash(&low);
     let high_hash = full_hash(&high);
 
-    assert_eq!(
-        queue.try_add(low),
-        henyey_herder::TxQueueResult::Added
-    );
-    assert_eq!(
-        queue.try_add(high),
-        henyey_herder::TxQueueResult::Added
-    );
+    assert_eq!(queue.try_add(low), henyey_herder::TxQueueResult::Added);
+    assert_eq!(queue.try_add(high), henyey_herder::TxQueueResult::Added);
     assert!(!queue.contains(&low_hash));
     assert!(queue.contains(&high_hash));
 }
@@ -268,14 +262,8 @@ fn test_dex_queue_limit_eviction() {
     let low_hash = full_hash(&dex_low);
     let high_hash = full_hash(&dex_high);
 
-    assert_eq!(
-        queue.try_add(dex_low),
-        henyey_herder::TxQueueResult::Added
-    );
-    assert_eq!(
-        queue.try_add(dex_high),
-        henyey_herder::TxQueueResult::Added
-    );
+    assert_eq!(queue.try_add(dex_low), henyey_herder::TxQueueResult::Added);
+    assert_eq!(queue.try_add(dex_high), henyey_herder::TxQueueResult::Added);
     assert!(!queue.contains(&low_hash));
     assert!(queue.contains(&high_hash));
 }
@@ -300,14 +288,8 @@ fn test_soroban_queue_limit_eviction() {
     let low_hash = full_hash(&low_fee);
     let high_hash = full_hash(&high_fee);
 
-    assert_eq!(
-        queue.try_add(low_fee),
-        henyey_herder::TxQueueResult::Added
-    );
-    assert_eq!(
-        queue.try_add(high_fee),
-        henyey_herder::TxQueueResult::Added
-    );
+    assert_eq!(queue.try_add(low_fee), henyey_herder::TxQueueResult::Added);
+    assert_eq!(queue.try_add(high_fee), henyey_herder::TxQueueResult::Added);
     assert!(!queue.contains(&low_hash));
     assert!(queue.contains(&high_hash));
 }

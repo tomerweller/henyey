@@ -763,10 +763,7 @@ impl Bucket {
             }
             BucketStorage::DiskBacked { disk_bucket } => {
                 let index_bytes = disk_bucket.index_heap_bytes();
-                let cache_bytes = disk_bucket
-                    .cache()
-                    .map(|c| c.size_bytes())
-                    .unwrap_or(0);
+                let cache_bytes = disk_bucket.cache().map(|c| c.size_bytes()).unwrap_or(0);
                 index_bytes + cache_bytes
             }
         }

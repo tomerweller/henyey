@@ -25,7 +25,6 @@ use stellar_xdr::curr::{LedgerEntry, LedgerEntryData, LedgerKey};
 
 use crate::entry::BucketEntry;
 
-
 // ============================================================================
 // Cache Entry
 // ============================================================================
@@ -62,7 +61,9 @@ impl CacheEntry {
 
         // Add estimated size of contained data
         let data_size = match entry {
-            BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => Self::estimate_ledger_entry_size(e),
+            BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => {
+                Self::estimate_ledger_entry_size(e)
+            }
             BucketEntry::Deadentry(_) => 64, // LedgerKey is relatively small
             BucketEntry::Metaentry(_) => 32,
         };
@@ -387,7 +388,6 @@ impl RandomEvictionCache {
         inner.misses = 0;
     }
 }
-
 
 impl std::fmt::Debug for RandomEvictionCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

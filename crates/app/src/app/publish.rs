@@ -52,7 +52,10 @@ impl App {
 
         tracing::info!(checkpoint, "Publishing checkpoint to history archive");
 
-        match self.publish_single_checkpoint(checkpoint, &command_archives).await {
+        match self
+            .publish_single_checkpoint(checkpoint, &command_archives)
+            .await
+        {
             Ok(()) => {
                 if let Err(e) = self.db.remove_publish(checkpoint) {
                     tracing::warn!(checkpoint, error = %e, "Failed to dequeue published checkpoint");
@@ -147,10 +150,7 @@ impl App {
         let has: henyey_history::HistoryArchiveState = serde_json::from_str(&has_json)?;
 
         // Build checkpoint files in a temp directory
-        let publish_dir = std::env::temp_dir().join(format!(
-            "henyey-publish-{}",
-            checkpoint
-        ));
+        let publish_dir = std::env::temp_dir().join(format!("henyey-publish-{}", checkpoint));
         if publish_dir.exists() {
             std::fs::remove_dir_all(&publish_dir)?;
         }
@@ -163,7 +163,14 @@ impl App {
         };
         let manager = PublishManager::new(publish_config);
         manager
-            .publish_checkpoint(checkpoint, &headers, &tx_entries, &tx_results, &bucket_list, Some(&has))
+            .publish_checkpoint(
+                checkpoint,
+                &headers,
+                &tx_entries,
+                &tx_results,
+                &bucket_list,
+                Some(&has),
+            )
             .await?;
 
         // Write hot archive bucket files if the HAS includes them.
@@ -199,7 +206,9 @@ impl App {
                         let mut buf = [0u8; 64 * 1024];
                         loop {
                             let n = src_file.read(&mut buf)?;
-                            if n == 0 { break; }
+                            if n == 0 {
+                                break;
+                            }
                             encoder.write_all(&buf[..n])?;
                         }
                         encoder.finish()?;
@@ -251,8 +260,8 @@ impl App {
         start_ledger: u32,
         checkpoint: u32,
     ) -> anyhow::Result<Vec<stellar_xdr::curr::ScpHistoryEntry>> {
-        use std::collections::HashSet;
         use henyey_common::Hash256;
+        use std::collections::HashSet;
         use stellar_xdr::curr::{LedgerScpMessages, ScpHistoryEntry, ScpHistoryEntryV0};
 
         let mut entries = Vec::new();
@@ -299,9 +308,7 @@ impl App {
 }
 
 /// Extract the quorum set hash from an SCP statement.
-fn scp_quorum_set_hash(
-    statement: &stellar_xdr::curr::ScpStatement,
-) -> stellar_xdr::curr::Hash {
+fn scp_quorum_set_hash(statement: &stellar_xdr::curr::ScpStatement) -> stellar_xdr::curr::Hash {
     match &statement.pledges {
         stellar_xdr::curr::ScpStatementPledges::Nominate(nom) => nom.quorum_set_hash.clone(),
         stellar_xdr::curr::ScpStatementPledges::Prepare(prep) => prep.quorum_set_hash.clone(),
@@ -320,8 +327,8 @@ fn write_scp_history_file(
 ) -> anyhow::Result<()> {
     use flate2::write::GzEncoder;
     use flate2::Compression;
-    use std::io::Write;
     use henyey_history::paths::checkpoint_path;
+    use std::io::Write;
     use stellar_xdr::curr::Limits;
 
     let path = base_dir.join(checkpoint_path("scp", checkpoint, "xdr.gz"));

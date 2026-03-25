@@ -150,8 +150,10 @@ impl FeeBumpFrame {
             },
             _ => unreachable!("FeeBumpFrame always contains a fee bump transaction"),
         };
-        let inner_frame =
-            TransactionFrame::from_owned_with_network(TransactionEnvelope::Tx(inner_envelope), *network_id);
+        let inner_frame = TransactionFrame::from_owned_with_network(
+            TransactionEnvelope::Tx(inner_envelope),
+            *network_id,
+        );
 
         Ok(Self {
             frame: TransactionFrame::from_owned_with_network(envelope, *network_id),
@@ -178,8 +180,10 @@ impl FeeBumpFrame {
             },
             _ => unreachable!("FeeBumpFrame always contains a fee bump transaction"),
         };
-        let inner_frame =
-            TransactionFrame::from_owned_with_network(TransactionEnvelope::Tx(inner_envelope), *network_id);
+        let inner_frame = TransactionFrame::from_owned_with_network(
+            TransactionEnvelope::Tx(inner_envelope),
+            *network_id,
+        );
 
         Ok(Self {
             frame,

@@ -636,24 +636,19 @@ pub fn stages_to_xdr_phase(
                     // 1. Sort transactions within each cluster by hash.
                     // Pre-compute hashes to avoid redundant XDR serialization
                     // during comparisons (O(N log N) comparisons → O(N) hashes).
-                    cluster.sort_by_cached_key(|tx| {
-                        Hash256::hash_xdr(tx).unwrap_or_default().0
-                    });
+                    cluster.sort_by_cached_key(|tx| Hash256::hash_xdr(tx).unwrap_or_default().0);
                     cluster
                 })
                 .collect();
             // 2. Sort clusters within each stage by first-TX hash
-            sorted_clusters.sort_by_cached_key(|cluster| {
-                Hash256::hash_xdr(&cluster[0]).unwrap_or_default().0
-            });
+            sorted_clusters
+                .sort_by_cached_key(|cluster| Hash256::hash_xdr(&cluster[0]).unwrap_or_default().0);
             sorted_clusters
         })
         .collect();
 
     // 3. Sort stages by first-TX-of-first-cluster hash
-    sorted_stages.sort_by_cached_key(|stage| {
-        Hash256::hash_xdr(&stage[0][0]).unwrap_or_default().0
-    });
+    sorted_stages.sort_by_cached_key(|stage| Hash256::hash_xdr(&stage[0][0]).unwrap_or_default().0);
 
     let execution_stages: Vec<ParallelTxExecutionStage> = sorted_stages
         .into_iter()
@@ -724,9 +719,7 @@ pub fn build_two_phase_tx_set(
         let component =
             TxSetComponent::TxsetCompTxsMaybeDiscountedFee(TxSetComponentTxsMaybeDiscountedFee {
                 base_fee: None,
-                txs: classic_txs
-                    .try_into()
-                    .unwrap_or_default(),
+                txs: classic_txs.try_into().unwrap_or_default(),
             });
         TransactionPhase::V0(vec![component].try_into().unwrap_or_default())
     };
@@ -1253,10 +1246,7 @@ mod stages_to_xdr_phase_tests {
         let tx3 = make_soroban_tx(3, 1, vec![], vec![contract_key(3)], 1000);
         let tx4 = make_soroban_tx(4, 1, vec![], vec![contract_key(4)], 1000);
 
-        let stages = vec![
-            vec![vec![tx1, tx2], vec![tx3]],
-            vec![vec![tx4]],
-        ];
+        let stages = vec![vec![vec![tx1, tx2], vec![tx3]], vec![vec![tx4]]];
         let phase = stages_to_xdr_phase(stages, Some(200));
 
         match phase {
@@ -1334,12 +1324,8 @@ mod stages_to_xdr_phase_tests {
         let phase2 = stages_to_xdr_phase(stages2, Some(100));
 
         // Both phases should produce the same XDR
-        let xdr1 = phase1
-            .to_xdr(stellar_xdr::curr::Limits::none())
-            .unwrap();
-        let xdr2 = phase2
-            .to_xdr(stellar_xdr::curr::Limits::none())
-            .unwrap();
+        let xdr1 = phase1.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
+        let xdr2 = phase2.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
         assert_eq!(xdr1, xdr2, "stages_to_xdr_phase should be idempotent");
     }
 }

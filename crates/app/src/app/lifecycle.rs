@@ -62,7 +62,7 @@ impl App {
                 drop(tx);
                 rx
             }
-         };
+        };
 
         // Get dedicated SCP message receiver (never drops messages)
         let scp_message_rx = {
@@ -935,9 +935,9 @@ impl App {
                         if let Some(tx_set_hash) = tx_set_hash {
                             let peer = msg.from_peer.clone();
                             if let Some(overlay) = self.overlay().await {
-                                let request = StellarMessage::GetTxSet(
-                                    stellar_xdr::curr::Uint256(tx_set_hash.0),
-                                );
+                                let request = StellarMessage::GetTxSet(stellar_xdr::curr::Uint256(
+                                    tx_set_hash.0,
+                                ));
                                 if let Err(e) = overlay.try_send_to(&peer, request) {
                                     tracing::debug!(
                                         peer = %peer,
@@ -1019,12 +1019,12 @@ impl App {
                     let hash = Hash256::from_bytes(dont_have.req_hash.0);
                     let mut map = self.tx_set_dont_have.write().await;
                     map.entry(hash).or_default().insert(msg.from_peer.clone());
-                    
+
                     // Check if all connected peers have reported DontHave for this tx_set
                     let dont_have_count = map.get(&hash).map(|s| s.len()).unwrap_or(0);
                     let peer_count = self.get_peer_count().await;
                     let all_peers_dont_have = dont_have_count >= peer_count && peer_count > 0;
-                    
+
                     if self.herder.needs_tx_set(&hash) {
                         if all_peers_dont_have {
                             // All peers don't have this tx_set - log but DON'T trigger catchup.
@@ -1034,7 +1034,8 @@ impl App {
                             // because catchup targets checkpoints, leaving gaps that also
                             // get DontHave responses.
                             // Only log once per hash to avoid spam during recovery.
-                            let already_warned = self.tx_set_exhausted_warned.read().await.contains(&hash);
+                            let already_warned =
+                                self.tx_set_exhausted_warned.read().await.contains(&hash);
                             if !already_warned {
                                 self.tx_set_exhausted_warned.write().await.insert(hash);
                                 tracing::info!(
@@ -1105,8 +1106,9 @@ impl App {
 
             StellarMessage::TxSet(tx_set) => {
                 // Compute hash for logging
-                let xdr_bytes = stellar_xdr::curr::WriteXdr::to_xdr(&tx_set, stellar_xdr::curr::Limits::none())
-                    .unwrap_or_default();
+                let xdr_bytes =
+                    stellar_xdr::curr::WriteXdr::to_xdr(&tx_set, stellar_xdr::curr::Limits::none())
+                        .unwrap_or_default();
                 let computed_hash = henyey_common::Hash256::hash(&xdr_bytes);
                 tracing::info!(
                     peer = %msg.from_peer,
@@ -1120,8 +1122,11 @@ impl App {
 
             StellarMessage::GeneralizedTxSet(gen_tx_set) => {
                 // Compute hash for logging
-                let xdr_bytes = stellar_xdr::curr::WriteXdr::to_xdr(&gen_tx_set, stellar_xdr::curr::Limits::none())
-                    .unwrap_or_default();
+                let xdr_bytes = stellar_xdr::curr::WriteXdr::to_xdr(
+                    &gen_tx_set,
+                    stellar_xdr::curr::Limits::none(),
+                )
+                .unwrap_or_default();
                 let computed_hash = henyey_common::Hash256::hash(&xdr_bytes);
                 tracing::debug!(
                     peer = %msg.from_peer,
@@ -1233,7 +1238,9 @@ impl App {
                 Err(arc) => {
                     // Other references still exist; just drop and let the
                     // OverlayManager's Drop impl clean up.
-                    tracing::warn!("Overlay still has outstanding references at shutdown, dropping");
+                    tracing::warn!(
+                        "Overlay still has outstanding references at shutdown, dropping"
+                    );
                     drop(arc);
                 }
             }

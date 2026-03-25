@@ -509,9 +509,7 @@ impl Peer {
         let auth_msg = self.auth.wrap_unauthenticated(message);
         self.connection.send(auth_msg).await?;
         self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
-        self.stats
-            .bytes_sent
-            .fetch_add(size, Ordering::Relaxed);
+        self.stats.bytes_sent.fetch_add(size, Ordering::Relaxed);
         Ok(())
     }
 
@@ -521,9 +519,7 @@ impl Peer {
         let auth_msg = self.auth.wrap_auth_message(message)?;
         self.connection.send(auth_msg).await?;
         self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
-        self.stats
-            .bytes_sent
-            .fetch_add(size, Ordering::Relaxed);
+        self.stats.bytes_sent.fetch_add(size, Ordering::Relaxed);
         Ok(())
     }
 
@@ -542,9 +538,7 @@ impl Peer {
         let auth_msg = self.auth.wrap_message(message)?;
         self.connection.send(auth_msg).await?;
         self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
-        self.stats
-            .bytes_sent
-            .fetch_add(size, Ordering::Relaxed);
+        self.stats.bytes_sent.fetch_add(size, Ordering::Relaxed);
 
         Ok(())
     }

@@ -4,8 +4,8 @@
 //! archives, supporting operations like fetching the archive state, downloading
 //! ledger headers, transactions, and buckets.
 
-use reqwest::Client;
 use henyey_common::Hash256;
+use reqwest::Client;
 use stellar_xdr::curr::{
     LedgerHeaderHistoryEntry, ScpHistoryEntry, TransactionHistoryEntry,
     TransactionHistoryResultEntry,

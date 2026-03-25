@@ -262,7 +262,11 @@ pub async fn run_catchup(
 }
 
 /// Print information before starting catchup.
-fn print_catchup_info(options: &CatchupOptions, target: &CatchupTarget, effective_mode: CatchupMode) {
+fn print_catchup_info(
+    options: &CatchupOptions,
+    target: &CatchupTarget,
+    effective_mode: CatchupMode,
+) {
     println!("Catchup Configuration:");
     println!("  Target: {:?}", target);
     println!("  Mode: {}", effective_mode);
@@ -510,21 +514,30 @@ mod tests {
     fn test_parse_target_with_mode_recent() {
         let parsed = parse_target_with_mode("1000000/100").unwrap();
         assert!(matches!(parsed.target, CatchupTarget::Ledger(1000000)));
-        assert!(matches!(parsed.mode_from_target, Some(CatchupMode::Recent(100))));
+        assert!(matches!(
+            parsed.mode_from_target,
+            Some(CatchupMode::Recent(100))
+        ));
     }
 
     #[test]
     fn test_parse_target_with_mode_complete() {
         let parsed = parse_target_with_mode("1000000/max").unwrap();
         assert!(matches!(parsed.target, CatchupTarget::Ledger(1000000)));
-        assert!(matches!(parsed.mode_from_target, Some(CatchupMode::Complete)));
+        assert!(matches!(
+            parsed.mode_from_target,
+            Some(CatchupMode::Complete)
+        ));
     }
 
     #[test]
     fn test_parse_target_with_mode_minimal() {
         let parsed = parse_target_with_mode("1000000/0").unwrap();
         assert!(matches!(parsed.target, CatchupTarget::Ledger(1000000)));
-        assert!(matches!(parsed.mode_from_target, Some(CatchupMode::Minimal)));
+        assert!(matches!(
+            parsed.mode_from_target,
+            Some(CatchupMode::Minimal)
+        ));
     }
 
     #[test]

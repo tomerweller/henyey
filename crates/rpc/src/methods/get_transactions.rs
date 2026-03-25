@@ -127,20 +127,24 @@ pub async fn handle(
 
         // Envelope XDR
         util::insert_raw_xdr_field::<TransactionEnvelope>(
-            &mut obj, "envelope", &record.body, format,
+            &mut obj,
+            "envelope",
+            &record.body,
+            format,
         )?;
 
         // Result XDR
-        let result_bytes = util::extract_result_xdr(&record.result)
-            .unwrap_or_else(|| record.result.clone());
-        util::insert_raw_xdr_field::<TransactionResult>(
-            &mut obj, "result", &result_bytes, format,
-        )?;
+        let result_bytes =
+            util::extract_result_xdr(&record.result).unwrap_or_else(|| record.result.clone());
+        util::insert_raw_xdr_field::<TransactionResult>(&mut obj, "result", &result_bytes, format)?;
 
         // Result meta XDR
         if let Some(ref meta_bytes) = record.meta {
             util::insert_raw_xdr_field::<TransactionMeta>(
-                &mut obj, "resultMeta", meta_bytes, format,
+                &mut obj,
+                "resultMeta",
+                meta_bytes,
+                format,
             )?;
         }
 
@@ -161,4 +165,3 @@ pub async fn handle(
         "cursor": last_cursor
     }))
 }
-

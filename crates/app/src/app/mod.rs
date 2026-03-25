@@ -53,18 +53,17 @@ use tokio::sync::RwLock;
 
 use henyey_bucket::BucketManager;
 use henyey_bucket::{
-    BucketList, BucketListSnapshot, BucketSnapshotManager, HasNextState,
-    HotArchiveBucketList, HotArchiveBucketListSnapshot,
+    BucketList, BucketListSnapshot, BucketSnapshotManager, HasNextState, HotArchiveBucketList,
+    HotArchiveBucketListSnapshot,
 };
+use henyey_clock::{Clock, RealClock};
 use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 use henyey_common::{deterministic_seed, Hash256, NetworkId};
-use henyey_clock::{Clock, RealClock};
-use henyey_db::{
-    BucketListQueries, EventQueries, HistoryQueries, LedgerQueries, PublishQueueQueries,
-    ScpQueries,
-};
 use henyey_db::queries::StateQueries;
 use henyey_db::schema::state_keys;
+use henyey_db::{
+    BucketListQueries, EventQueries, HistoryQueries, LedgerQueries, PublishQueueQueries, ScpQueries,
+};
 use henyey_herder::{
     drift_tracker::CloseTimeDriftTracker,
     flow_control::compute_max_tx_size,
@@ -72,10 +71,9 @@ use henyey_herder::{
     EnvelopeState, Herder, HerderCallback, HerderConfig, HerderStats, TxQueueConfig,
 };
 use henyey_history::{
-    checkpoint_containing, checkpoint_frequency, is_checkpoint_ledger,
+    build_history_archive_state, checkpoint_containing, checkpoint_frequency, is_checkpoint_ledger,
     latest_checkpoint_before_or_at, CatchupManager, CatchupMode, CatchupOutput, CheckpointData,
     ExistingBucketState, HistoryArchive, HistoryArchiveState, GENESIS_LEDGER_SEQ,
-    build_history_archive_state,
 };
 use henyey_historywork::{
     build_checkpoint_data, get_progress, HistoryWorkBuilder, HistoryWorkState,
@@ -86,8 +84,7 @@ use henyey_ledger::{
 };
 use henyey_overlay::{
     ConnectionDirection, ConnectionFactory, LocalNode, OverlayConfig as OverlayManagerConfig,
-    OverlayManager, OverlayMessage, PeerAddress, PeerId, PeerSnapshot,
-    TcpConnectionFactory,
+    OverlayManager, OverlayMessage, PeerAddress, PeerId, PeerSnapshot, TcpConnectionFactory,
 };
 use henyey_scp::hash_quorum_set;
 use henyey_tx::TransactionFrame;
@@ -110,9 +107,7 @@ use crate::config::AppConfig;
 use crate::logging::CatchupProgress;
 use crate::meta_stream::{MetaStreamError, MetaStreamManager};
 use crate::survey::{SurveyDataManager, SurveyMessageLimiter};
-use henyey_ledger::{
-    close_time as ledger_close_time, compute_header_hash, verify_header_chain,
-};
+use henyey_ledger::{close_time as ledger_close_time, compute_header_hash, verify_header_chain};
 use stellar_xdr::curr::TransactionEnvelope;
 
 const TIME_SLICED_PEERS_MAX: usize = 25;
@@ -175,11 +170,11 @@ mod survey_impl;
 mod tx_flooding;
 mod types;
 
+use types::*;
 pub use types::{
     AppBuilder, AppInfo, AppState, CatchupResult, CatchupTarget, LedgerSummary, ScpSlotSnapshot,
     SelfCheckResult, SimulationDebugStats, SurveyPeerReport, SurveyReport,
 };
-use types::*;
 
 /// The main application struct coordinating all Stellar Core subsystems.
 ///
@@ -339,8 +334,7 @@ pub struct App {
     /// Ephemeral survey encryption secrets keyed by nonce.
     survey_secrets: RwLock<HashMap<u32, [u8; 32]>>,
     /// Survey responses keyed by nonce.
-    survey_results:
-        RwLock<HashMap<u32, HashMap<henyey_overlay::PeerId, TopologyResponseBodyV2>>>,
+    survey_results: RwLock<HashMap<u32, HashMap<henyey_overlay::PeerId, TopologyResponseBodyV2>>>,
     /// Survey message limiter for rate limiting and deduplication.
     survey_limiter: RwLock<SurveyMessageLimiter>,
     /// Survey throttle timeout between survey runs.
@@ -415,20 +409,13 @@ impl App {
             Arc::new(RealClock),
             Arc::new(TcpConnectionFactory),
         )
-            .await
+        .await
     }
 
     /// Create a new application instance with an injected clock.
-    pub async fn new_with_clock(
-        config: AppConfig,
-        clock: Arc<dyn Clock>,
-    ) -> anyhow::Result<Self> {
-        Self::new_with_clock_and_connection_factory(
-            config,
-            clock,
-            Arc::new(TcpConnectionFactory),
-        )
-        .await
+    pub async fn new_with_clock(config: AppConfig, clock: Arc<dyn Clock>) -> anyhow::Result<Self> {
+        Self::new_with_clock_and_connection_factory(config, clock, Arc::new(TcpConnectionFactory))
+            .await
     }
 
     /// Create a new application instance with injected clock and overlay factory.
@@ -508,8 +495,7 @@ impl App {
         // Starts empty; snapshots are populated after ledger state is restored
         // and updated after each ledger close.
         let num_historical = config.query.snapshot_ledgers;
-        let bucket_snapshot_manager =
-            Arc::new(BucketSnapshotManager::empty(num_historical));
+        let bucket_snapshot_manager = Arc::new(BucketSnapshotManager::empty(num_historical));
 
         // Initialize ledger manager
         let mut ledger_manager = LedgerManager::new(
@@ -521,18 +507,15 @@ impl App {
                 bucket_list_db: config.buckets.bucket_list_db.clone(),
                 emit_ledger_close_meta_ext_v1: config.metadata.emit_ledger_close_meta_ext_v1,
                 emit_soroban_tx_meta_ext_v1: config.metadata.emit_soroban_tx_meta_ext_v1,
-                enable_soroban_diagnostic_events: config
-                    .diagnostics
-                    .soroban_diagnostic_events,
+                enable_soroban_diagnostic_events: config.diagnostics.soroban_diagnostic_events,
                 scan_thread_count: config.buckets.scan_thread_count,
             },
         );
 
         // Wire merge map from BucketManager into LedgerManager for merge deduplication.
         // This enables reuse of previously computed merge results across restarts.
-        let finished_merges = Arc::new(std::sync::RwLock::new(
-            henyey_bucket::BucketMergeMap::new(),
-        ));
+        let finished_merges =
+            Arc::new(std::sync::RwLock::new(henyey_bucket::BucketMergeMap::new()));
         ledger_manager.set_merge_map(finished_merges);
 
         let ledger_manager = Arc::new(ledger_manager);
@@ -543,9 +526,10 @@ impl App {
         let herder_config = HerderConfig {
             max_pending_transactions: 1000,
             is_validator: config.node.is_validator,
-            ledger_close_time: config.testing.ledger_close_time.unwrap_or(
-                if config.testing.accelerate_time { 1 } else { 5 }
-            ),
+            ledger_close_time: config
+                .testing
+                .ledger_close_time
+                .unwrap_or(if config.testing.accelerate_time { 1 } else { 5 }),
             node_public_key: keypair.public_key(),
             network_id: config.network_id(),
             max_externalized_slots: freq as usize * 2,
@@ -582,24 +566,23 @@ impl App {
         }
 
         // Initialize metadata stream if configured
-        let meta_stream = if config.metadata.output_stream.is_some()
-            || config.metadata.debug_ledgers > 0
-        {
-            match MetaStreamManager::new(&config.metadata, &bucket_dir) {
-                Ok(ms) => {
-                    if ms.is_streaming() {
-                        tracing::info!("Metadata output stream initialized");
+        let meta_stream =
+            if config.metadata.output_stream.is_some() || config.metadata.debug_ledgers > 0 {
+                match MetaStreamManager::new(&config.metadata, &bucket_dir) {
+                    Ok(ms) => {
+                        if ms.is_streaming() {
+                            tracing::info!("Metadata output stream initialized");
+                        }
+                        Some(ms)
                     }
-                    Some(ms)
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to initialize metadata stream");
+                        return Err(e.into());
+                    }
                 }
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to initialize metadata stream");
-                    return Err(e.into());
-                }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         // Create shutdown channel
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
@@ -686,7 +669,9 @@ impl App {
             recovery_attempts_without_progress: AtomicU64::new(0),
             recovery_baseline_ledger: AtomicU64::new(0),
             lost_sync_count: AtomicU64::new(0),
-            max_tx_size_bytes: AtomicU32::new(henyey_herder::flow_control::MAX_CLASSIC_TX_SIZE_BYTES),
+            max_tx_size_bytes: AtomicU32::new(
+                henyey_herder::flow_control::MAX_CLASSIC_TX_SIZE_BYTES,
+            ),
             ping_counter: AtomicU64::new(0),
             ping_inflight: RwLock::new(HashMap::new()),
             peer_ping_inflight: RwLock::new(HashMap::new()),
@@ -735,10 +720,7 @@ impl App {
         Ok(())
     }
 
-    fn ensure_network_passphrase(
-        db: &henyey_db::Database,
-        passphrase: &str,
-    ) -> anyhow::Result<()> {
+    fn ensure_network_passphrase(db: &henyey_db::Database, passphrase: &str) -> anyhow::Result<()> {
         let stored = db.get_network_passphrase()?;
         if let Some(existing) = stored {
             if existing != passphrase {
@@ -904,10 +886,7 @@ impl App {
         use henyey_db::schema::state_keys;
         self.db
             .with_connection(|conn| {
-                Ok(conn
-                    .get_state(state_keys::FORCE_SCP)?
-                    .as_deref()
-                    == Some("true"))
+                Ok(conn.get_state(state_keys::FORCE_SCP)?.as_deref() == Some("true"))
             })
             .unwrap_or(false)
     }
@@ -916,9 +895,9 @@ impl App {
     pub fn clear_force_scp(&self) {
         use henyey_db::queries::StateQueries;
         use henyey_db::schema::state_keys;
-        let _ = self.db.with_connection(|conn| {
-            conn.delete_state(state_keys::FORCE_SCP)
-        });
+        let _ = self
+            .db
+            .with_connection(|conn| conn.delete_state(state_keys::FORCE_SCP));
     }
 
     /// Bootstrap the node from genesis state stored in the database.
@@ -934,16 +913,18 @@ impl App {
         use henyey_db::queries::LedgerQueries;
         use henyey_ledger::compute_header_hash;
         use stellar_xdr::curr::{
-            AccountEntry, AccountEntryExt, AccountId, BucketListType, LedgerEntry,
-            LedgerEntryData, LedgerEntryExt, PublicKey, SequenceNumber, Thresholds, Uint256, VecM,
+            AccountEntry, AccountEntryExt, AccountId, BucketListType, LedgerEntry, LedgerEntryData,
+            LedgerEntryExt, PublicKey, SequenceNumber, Thresholds, Uint256, VecM,
         };
 
         // Read LCL header from DB
         let (lcl_seq, header) = self.db.with_connection(|conn| {
-            let lcl_seq = conn.get_last_closed_ledger()?
+            let lcl_seq = conn
+                .get_last_closed_ledger()?
                 .ok_or_else(|| henyey_db::DbError::Integrity("No LCL in DB".to_string()))?;
-            let header = conn.load_ledger_header(lcl_seq)?
-                .ok_or_else(|| henyey_db::DbError::Integrity(format!("No header for LCL {}", lcl_seq)))?;
+            let header = conn.load_ledger_header(lcl_seq)?.ok_or_else(|| {
+                henyey_db::DbError::Integrity(format!("No header for LCL {}", lcl_seq))
+            })?;
             Ok((lcl_seq, header))
         })?;
 
@@ -995,9 +976,7 @@ impl App {
             let seed = deterministic_seed(&name);
             let secret = henyey_crypto::SecretKey::from_seed(&seed);
             let public = secret.public_key();
-            let acct_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
-                *public.as_bytes(),
-            )));
+            let acct_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(*public.as_bytes())));
             genesis_entries.push(LedgerEntry {
                 last_modified_ledger_seq: 1,
                 data: LedgerEntryData::Account(AccountEntry {
@@ -1021,19 +1000,20 @@ impl App {
 
         let mut bucket_list = BucketList::new();
         bucket_list.set_bucket_dir(bucket_dir.clone());
-        bucket_list.add_batch(
-            1, 0, BucketListType::Live,
-            genesis_entries, vec![], vec![],
-        ).map_err(|e| anyhow::anyhow!("Failed to create genesis bucket list: {}", e))?;
+        bucket_list
+            .add_batch(1, 0, BucketListType::Live, genesis_entries, vec![], vec![])
+            .map_err(|e| anyhow::anyhow!("Failed to create genesis bucket list: {}", e))?;
 
         // Persist all non-empty buckets to disk so they're available for
         // history publishing and restart recovery.
         for level in bucket_list.levels() {
             for bucket in [&level.curr, &level.snap] {
                 if bucket.backing_file_path().is_none() && !bucket.hash().is_zero() {
-                    let path = bucket_dir.join(henyey_bucket::canonical_bucket_filename(&bucket.hash()));
+                    let path =
+                        bucket_dir.join(henyey_bucket::canonical_bucket_filename(&bucket.hash()));
                     if !path.exists() {
-                        bucket.save_to_xdr_file(&path)
+                        bucket
+                            .save_to_xdr_file(&path)
                             .map_err(|e| anyhow::anyhow!("Failed to save genesis bucket: {}", e))?;
                     }
                 }
@@ -1046,17 +1026,22 @@ impl App {
         if computed_hash != expected_hash {
             anyhow::bail!(
                 "Genesis bucket list hash mismatch: computed {} vs header {}",
-                computed_hash, expected_hash
+                computed_hash,
+                expected_hash
             );
         }
 
         // Initialize LedgerManager
         let hot_archive = HotArchiveBucketList::new();
-        self.ledger_manager.initialize(bucket_list, hot_archive, header, header_hash)
+        self.ledger_manager
+            .initialize(bucket_list, hot_archive, header, header_hash)
             .map_err(|e| anyhow::anyhow!("Failed to initialize LedgerManager: {}", e))?;
 
         let (seq, _hash, _close_time, _protocol) = self.ledger_info();
-        tracing::info!(lcl_seq = seq, "Bootstrapped from genesis state via force-scp");
+        tracing::info!(
+            lcl_seq = seq,
+            "Bootstrapped from genesis state via force-scp"
+        );
 
         self.set_state(AppState::Synced).await;
         self.set_current_ledger(lcl_seq).await;
@@ -1119,7 +1104,9 @@ impl App {
         let header = self.ledger_manager.current_header();
         let hash = self.ledger_manager.current_header_hash();
         let close_time = ledger_close_time(&header);
-        let now = self.clock.system_now()
+        let now = self
+            .clock
+            .system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
@@ -1155,12 +1142,16 @@ impl App {
     /// Returns `tracking_consensus_close_time + ledger_close_time` (seconds).
     /// Used by simulation to predict when the next close should occur.
     pub fn expected_ledger_close_time(&self) -> u64 {
-        self.herder.tracking_consensus_close_time()
-            + self.herder.ledger_close_time() as u64
+        self.herder.tracking_consensus_close_time() + self.herder.ledger_close_time() as u64
     }
 
     pub async fn peer_count(&self) -> usize {
-        self.overlay.read().await.as_ref().map(|o| o.peer_count()).unwrap_or(0)
+        self.overlay
+            .read()
+            .await
+            .as_ref()
+            .map(|o| o.peer_count())
+            .unwrap_or(0)
     }
 
     pub async fn add_peer(&self, addr: henyey_overlay::PeerAddress) -> anyhow::Result<bool> {
@@ -1182,10 +1173,7 @@ impl App {
     ///
     /// Returns `None` if the account does not exist.
     /// Used by the simulation LoadGenerator to refresh cached sequence numbers.
-    pub fn load_account_sequence(
-        &self,
-        account_id: &stellar_xdr::curr::AccountId,
-    ) -> Option<i64> {
+    pub fn load_account_sequence(&self, account_id: &stellar_xdr::curr::AccountId) -> Option<i64> {
         let snapshot = self.ledger_manager.create_snapshot().ok()?;
         let account = snapshot.get_account(account_id).ok()??;
         Some(account.seq_num.0)
@@ -1217,10 +1205,7 @@ impl App {
     /// herder's transaction queue.
     ///
     /// Matches stellar-core `Herder::sourceAccountPending()`.
-    pub fn source_account_pending(
-        &self,
-        account_id: &stellar_xdr::curr::AccountId,
-    ) -> bool {
+    pub fn source_account_pending(&self, account_id: &stellar_xdr::curr::AccountId) -> bool {
         self.herder.source_account_pending(account_id)
     }
 
@@ -1395,9 +1380,7 @@ impl App {
             is_v_blocking: self.herder.is_v_blocking(quorum_slot),
             slot_is_nominating: slot_state.as_ref().map(|s| s.is_nominating),
             slot_is_externalized: slot_state.as_ref().map(|s| s.is_externalized),
-            slot_ballot_phase: slot_state
-                .as_ref()
-                .map(|s| format!("{:?}", s.ballot_phase)),
+            slot_ballot_phase: slot_state.as_ref().map(|s| format!("{:?}", s.ballot_phase)),
             slot_ballot_round: slot_state.as_ref().and_then(|s| s.ballot_round),
             nomination_timeout_fires: self.nomination_timeout_fires.load(Ordering::Relaxed),
             ballot_timeout_fires: self.ballot_timeout_fires.load(Ordering::Relaxed),
@@ -1444,9 +1427,11 @@ impl App {
         let lcl = ledger_seq;
 
         // Get minimum queued publish checkpoint if available
-        let min_queued = self.db.load_publish_queue(Some(1)).ok().and_then(|queue| {
-            queue.first().copied()
-        });
+        let min_queued = self
+            .db
+            .load_publish_queue(Some(1))
+            .ok()
+            .and_then(|queue| queue.first().copied());
 
         // Calculate the minimum ledger we need to keep
         let qmin = min_queued.unwrap_or(lcl).min(lcl);
@@ -1745,9 +1730,10 @@ impl HerderCallback for App {
         if success {
             Ok(header_hash.unwrap())
         } else {
-            Err(henyey_herder::HerderError::Internal(
-                format!("Failed to close ledger {}", ledger_seq),
-            ))
+            Err(henyey_herder::HerderError::Internal(format!(
+                "Failed to close ledger {}",
+                ledger_seq
+            )))
         }
     }
 
@@ -1774,8 +1760,7 @@ impl SyncRecoveryCallback for App {
         tracing::warn!("Lost sync with network - transitioning to syncing state");
         self.lost_sync_count.fetch_add(1, Ordering::Relaxed);
         // Update herder state to syncing
-        self.herder
-            .set_state(henyey_herder::HerderState::Syncing);
+        self.herder.set_state(henyey_herder::HerderState::Syncing);
     }
 
     fn on_out_of_sync_recovery(&self) {
@@ -1954,7 +1939,8 @@ impl App {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        self.last_event_loop_tick_ms.store(now_ms, Ordering::Relaxed);
+        self.last_event_loop_tick_ms
+            .store(now_ms, Ordering::Relaxed);
     }
 
     /// Start a std::thread watchdog that monitors event loop liveness.
@@ -2008,8 +1994,7 @@ impl App {
                             let mut states: std::collections::HashMap<String, u32> =
                                 std::collections::HashMap::new();
                             for entry in entries.flatten() {
-                                let status_path =
-                                    format!("{}/status", entry.path().display());
+                                let status_path = format!("{}/status", entry.path().display());
                                 if let Ok(status) = std::fs::read_to_string(&status_path) {
                                     let state = status
                                         .lines()
@@ -2549,18 +2534,11 @@ mod tests {
         let app = App::new(config).await.unwrap();
 
         // Initially in Booting state
-        assert_eq!(
-            app.herder.state(),
-            henyey_herder::HerderState::Booting
-        );
+        assert_eq!(app.herder.state(), henyey_herder::HerderState::Booting);
 
         // Can set to Syncing
-        app.herder
-            .set_state(henyey_herder::HerderState::Syncing);
-        assert_eq!(
-            app.herder.state(),
-            henyey_herder::HerderState::Syncing
-        );
+        app.herder.set_state(henyey_herder::HerderState::Syncing);
+        assert_eq!(app.herder.state(), henyey_herder::HerderState::Syncing);
     }
 
     #[tokio::test]
@@ -2591,7 +2569,10 @@ mod tests {
 
         // No buffered ledgers → should return None.
         let pending = app.try_start_ledger_close().await;
-        assert!(pending.is_none(), "should return None with no buffered ledgers");
+        assert!(
+            pending.is_none(),
+            "should return None with no buffered ledgers"
+        );
     }
 
     #[tokio::test]
@@ -2653,9 +2634,7 @@ mod tests {
 
         // Simulate a failed close result.
         let pending = PendingLedgerClose {
-            handle: tokio::task::spawn_blocking(|| {
-                Err("simulated error".to_string())
-            }),
+            handle: tokio::task::spawn_blocking(|| Err("simulated error".to_string())),
             ledger_seq: 1,
             tx_set: henyey_herder::TransactionSet {
                 hash: henyey_common::Hash256::ZERO,
@@ -2663,12 +2642,10 @@ mod tests {
                 transactions: Vec::new(),
                 generalized_tx_set: None,
             },
-            tx_set_variant: TransactionSetVariant::Classic(
-                stellar_xdr::curr::TransactionSet {
-                    previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                    txs: stellar_xdr::curr::VecM::default(),
-                },
-            ),
+            tx_set_variant: TransactionSetVariant::Classic(stellar_xdr::curr::TransactionSet {
+                previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                txs: stellar_xdr::curr::VecM::default(),
+            }),
             close_time: 1,
         };
 
@@ -2706,12 +2683,10 @@ mod tests {
                 transactions: Vec::new(),
                 generalized_tx_set: None,
             },
-            tx_set_variant: TransactionSetVariant::Classic(
-                stellar_xdr::curr::TransactionSet {
-                    previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                    txs: stellar_xdr::curr::VecM::default(),
-                },
-            ),
+            tx_set_variant: TransactionSetVariant::Classic(stellar_xdr::curr::TransactionSet {
+                previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                txs: stellar_xdr::curr::VecM::default(),
+            }),
             close_time: 1,
         };
 
@@ -2755,9 +2730,9 @@ mod tests {
 
         // Simulate a hash mismatch error.
         let pending = PendingLedgerClose {
-            handle: tokio::task::spawn_blocking(|| {
-                Err("previous ledger hash mismatch".to_string())
-            }),
+            handle: tokio::task::spawn_blocking(
+                || Err("previous ledger hash mismatch".to_string()),
+            ),
             ledger_seq: 1,
             tx_set: henyey_herder::TransactionSet {
                 hash: henyey_common::Hash256::ZERO,
@@ -2765,12 +2740,10 @@ mod tests {
                 transactions: Vec::new(),
                 generalized_tx_set: None,
             },
-            tx_set_variant: TransactionSetVariant::Classic(
-                stellar_xdr::curr::TransactionSet {
-                    previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                    txs: stellar_xdr::curr::VecM::default(),
-                },
-            ),
+            tx_set_variant: TransactionSetVariant::Classic(stellar_xdr::curr::TransactionSet {
+                previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                txs: stellar_xdr::curr::VecM::default(),
+            }),
             close_time: 1,
         };
 
@@ -2943,14 +2916,26 @@ mod tests {
                     _ => break,
                 }
             }
-            assert_eq!(evicted, 2, "should evict 2 consecutive entries without tx_sets");
+            assert_eq!(
+                evicted, 2,
+                "should evict 2 consecutive entries without tx_sets"
+            );
         }
 
         let buffer = app.syncing_ledgers.read().await;
         assert_eq!(buffer.len(), 1, "only entry with tx_set should remain");
-        assert!(buffer.contains_key(&102), "entry 102 (with tx_set) should be kept");
-        assert!(!buffer.contains_key(&100), "entry 100 (no tx_set) should be evicted");
-        assert!(!buffer.contains_key(&101), "entry 101 (no tx_set) should be evicted");
+        assert!(
+            buffer.contains_key(&102),
+            "entry 102 (with tx_set) should be kept"
+        );
+        assert!(
+            !buffer.contains_key(&100),
+            "entry 100 (no tx_set) should be evicted"
+        );
+        assert!(
+            !buffer.contains_key(&101),
+            "entry 101 (no tx_set) should be evicted"
+        );
     }
 
     #[tokio::test]
@@ -2968,16 +2953,22 @@ mod tests {
         {
             let mut dont_have = app.tx_set_dont_have.write().await;
             let hash = Hash256::from_bytes([1u8; 32]);
-            dont_have.insert(hash, HashSet::from([henyey_overlay::PeerId::from_bytes([1u8; 32])]));
+            dont_have.insert(
+                hash,
+                HashSet::from([henyey_overlay::PeerId::from_bytes([1u8; 32])]),
+            );
         }
         {
             let mut last_request = app.tx_set_last_request.write().await;
             let hash = Hash256::from_bytes([1u8; 32]);
-            last_request.insert(hash, TxSetRequestState {
-                last_request: Instant::now(),
-                first_requested: Instant::now(),
-                next_peer_offset: 3,
-            });
+            last_request.insert(
+                hash,
+                TxSetRequestState {
+                    last_request: Instant::now(),
+                    first_requested: Instant::now(),
+                    next_peer_offset: 3,
+                },
+            );
         }
         {
             let mut warned = app.tx_set_exhausted_warned.write().await;
@@ -3020,20 +3011,24 @@ mod tests {
         use stellar_xdr::curr::StellarMessage;
 
         let test_messages = vec![
-            (StellarMessage::GeneralizedTxSet(
-                stellar_xdr::curr::GeneralizedTransactionSet::V1(
+            (
+                StellarMessage::GeneralizedTxSet(stellar_xdr::curr::GeneralizedTransactionSet::V1(
                     stellar_xdr::curr::TransactionSetV1 {
                         previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
                         phases: vec![].try_into().unwrap(),
                     },
-                ),
-            ), true, "GeneralizedTxSet"),
-            (StellarMessage::DontHave(
-                stellar_xdr::curr::DontHave {
+                )),
+                true,
+                "GeneralizedTxSet",
+            ),
+            (
+                StellarMessage::DontHave(stellar_xdr::curr::DontHave {
                     type_: stellar_xdr::curr::MessageType::TxSet,
                     req_hash: stellar_xdr::curr::Uint256([0u8; 32]),
-                },
-            ), true, "DontHave"),
+                }),
+                true,
+                "DontHave",
+            ),
         ];
 
         for (msg, should_skip, label) in test_messages {
@@ -3044,7 +3039,11 @@ mod tests {
                     | StellarMessage::DontHave(_)
                     | StellarMessage::ScpQuorumset(_)
             );
-            assert_eq!(is_fetch_response, should_skip, "{} should be skipped={}", label, should_skip);
+            assert_eq!(
+                is_fetch_response, should_skip,
+                "{} should be skipped={}",
+                label, should_skip
+            );
         }
     }
 
@@ -3090,10 +3089,7 @@ mod tests {
             buffer.contains_key(&61193741),
             "first entry (current_ledger+1) must survive"
         );
-        assert!(
-            buffer.contains_key(&61193797),
-            "last entry must survive"
-        );
+        assert!(buffer.contains_key(&61193797), "last entry must survive");
     }
 
     #[test]
@@ -3133,10 +3129,7 @@ mod tests {
             buffer.contains_key(&256),
             "entry at checkpoint boundary should survive"
         );
-        assert!(
-            buffer.contains_key(&280),
-            "last entry should survive"
-        );
+        assert!(buffer.contains_key(&280), "last entry should survive");
     }
 
     #[test]
@@ -3218,16 +3211,22 @@ mod tests {
         {
             let mut dont_have = app.tx_set_dont_have.write().await;
             let hash = Hash256::from_bytes([2u8; 32]);
-            dont_have.insert(hash, HashSet::from([henyey_overlay::PeerId::from_bytes([2u8; 32])]));
+            dont_have.insert(
+                hash,
+                HashSet::from([henyey_overlay::PeerId::from_bytes([2u8; 32])]),
+            );
         }
         {
             let mut last_req = app.tx_set_last_request.write().await;
             let hash = Hash256::from_bytes([2u8; 32]);
-            last_req.insert(hash, TxSetRequestState {
-                last_request: Instant::now(),
-                first_requested: Instant::now(),
-                next_peer_offset: 1,
-            });
+            last_req.insert(
+                hash,
+                TxSetRequestState {
+                    last_request: Instant::now(),
+                    first_requested: Instant::now(),
+                    next_peer_offset: 1,
+                },
+            );
         }
         {
             let mut warned = app.tx_set_exhausted_warned.write().await;
@@ -3296,16 +3295,22 @@ mod tests {
         {
             let mut dont_have = app.tx_set_dont_have.write().await;
             let hash = Hash256::from_bytes([3u8; 32]);
-            dont_have.insert(hash, HashSet::from([henyey_overlay::PeerId::from_bytes([3u8; 32])]));
+            dont_have.insert(
+                hash,
+                HashSet::from([henyey_overlay::PeerId::from_bytes([3u8; 32])]),
+            );
         }
         {
             let mut last_req = app.tx_set_last_request.write().await;
             let hash = Hash256::from_bytes([3u8; 32]);
-            last_req.insert(hash, TxSetRequestState {
-                last_request: Instant::now(),
-                first_requested: Instant::now(),
-                next_peer_offset: 5,
-            });
+            last_req.insert(
+                hash,
+                TxSetRequestState {
+                    last_request: Instant::now(),
+                    first_requested: Instant::now(),
+                    next_peer_offset: 5,
+                },
+            );
         }
         {
             let mut warned = app.tx_set_exhausted_warned.write().await;
@@ -3348,14 +3353,14 @@ mod tests {
 
         let cases: Vec<(u64, u32, bool)> = vec![
             // (latest_ext, current_ledger, should_skip)
-            (100, 100, true),   // gap=0: fully caught up
-            (100, 99,  true),   // gap=1: one ledger behind
-            (100, 88,  true),   // gap=12: exactly at threshold
-            (100, 87,  false),  // gap=13: one past threshold
-            (100, 50,  false),  // gap=50: far behind
-            (100, 0,   false),  // gap=100: very far behind
-            (0,   0,   true),   // gap=0: both at zero (startup)
-            (5,   10,  true),   // gap=0 (saturating_sub): current > latest
+            (100, 100, true), // gap=0: fully caught up
+            (100, 99, true),  // gap=1: one ledger behind
+            (100, 88, true),  // gap=12: exactly at threshold
+            (100, 87, false), // gap=13: one past threshold
+            (100, 50, false), // gap=50: far behind
+            (100, 0, false),  // gap=100: very far behind
+            (0, 0, true),     // gap=0: both at zero (startup)
+            (5, 10, true),    // gap=0 (saturating_sub): current > latest
         ];
 
         for (latest_ext, current_ledger, should_skip) in cases {
@@ -3378,11 +3383,8 @@ mod tests {
         let current_ledger = 129u32;
         let latest_externalized = 127u64;
 
-        let (iter_start, advance_to) = App::externalized_iteration_window(
-            last_processed,
-            current_ledger,
-            latest_externalized,
-        );
+        let (iter_start, advance_to) =
+            App::externalized_iteration_window(last_processed, current_ledger, latest_externalized);
 
         assert_eq!(iter_start, last_processed + 1);
         assert_eq!(advance_to, last_processed);
@@ -3396,11 +3398,8 @@ mod tests {
         let current_ledger = 110u32;
         let latest_externalized = 150u64; // gap from last_processed is 50 > 12
 
-        let (iter_start, advance_to) = App::externalized_iteration_window(
-            last_processed,
-            current_ledger,
-            latest_externalized,
-        );
+        let (iter_start, advance_to) =
+            App::externalized_iteration_window(last_processed, current_ledger, latest_externalized);
 
         let expected_skip_to = latest_externalized.saturating_sub(TX_SET_REQUEST_WINDOW);
         assert_eq!(iter_start, expected_skip_to + 1);
@@ -3429,14 +3428,10 @@ mod tests {
         // 1) target checkpoint unpublished, but next EXTERNALIZE missing.
         // 2) target checkpoint published, regardless of cache state.
         assert!(!App::should_skip_externalized_catchup_cooldown(
-            191,
-            180,
-            false,
+            191, 180, false,
         ));
         assert!(!App::should_skip_externalized_catchup_cooldown(
-            127,
-            180,
-            true,
+            127, 180, true,
         ));
     }
 
@@ -3453,15 +3448,15 @@ mod tests {
         // With first_buffered > current_ledger + 1 and gap < CHECKPOINT_FREQUENCY,
         // should compute a valid target
         if let Some(t) = target {
-            assert!(t > current_ledger, "target must advance past current_ledger");
+            assert!(
+                t > current_ledger,
+                "target must advance past current_ledger"
+            );
             assert!(t < first_buffered, "target must be before first_buffered");
         }
         // If None, compute_catchup_target_for_timeout should provide a fallback
-        let timeout_target = App::compute_catchup_target_for_timeout(
-            last_buffered,
-            first_buffered,
-            current_ledger,
-        );
+        let timeout_target =
+            App::compute_catchup_target_for_timeout(last_buffered, first_buffered, current_ledger);
         // For a small gap like this, we should get first_buffered - 1 as target
         assert_eq!(timeout_target, Some(first_buffered - 1));
     }

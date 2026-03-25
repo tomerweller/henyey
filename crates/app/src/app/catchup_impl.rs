@@ -114,57 +114,61 @@ impl App {
         //
         // Slow path: if the ledger manager is NOT initialized (e.g., first
         // startup with existing DB), fall back to rebuilding from persisted HAS.
-        let (existing_state, override_lcl) =
-            if current > GENESIS_LEDGER_SEQ {
-                if self.ledger_manager.is_initialized() {
-                    // Fast path: clone from live ledger manager.
-                    // Must resolve async merges first — structure-based restart_merges
-                    // creates PendingMerge::Async handles, and BucketLevel::clone()
-                    // drops unresolved async merges.
-                    self.ledger_manager.resolve_pending_bucket_merges();
-                    let bucket_list = self.ledger_manager.bucket_list().clone();
-                    let hot_archive = self.ledger_manager.hot_archive_bucket_list()
-                        .clone()
-                        .unwrap_or_default();
-                    let header = self.ledger_manager.current_header();
-                    let network_id = NetworkId(self.network_id());
+        let (existing_state, override_lcl) = if current > GENESIS_LEDGER_SEQ {
+            if self.ledger_manager.is_initialized() {
+                // Fast path: clone from live ledger manager.
+                // Must resolve async merges first — structure-based restart_merges
+                // creates PendingMerge::Async handles, and BucketLevel::clone()
+                // drops unresolved async merges.
+                self.ledger_manager.resolve_pending_bucket_merges();
+                let bucket_list = self.ledger_manager.bucket_list().clone();
+                let hot_archive = self
+                    .ledger_manager
+                    .hot_archive_bucket_list()
+                    .clone()
+                    .unwrap_or_default();
+                let header = self.ledger_manager.current_header();
+                let network_id = NetworkId(self.network_id());
 
-                    tracing::info!(
-                        current_lcl = current,
-                        target_ledger,
-                        bucket_list_hash = %bucket_list.hash().to_hex(),
-                        "Cloned bucket lists from ledger manager for replay-only catchup"
-                    );
+                tracing::info!(
+                    current_lcl = current,
+                    target_ledger,
+                    bucket_list_hash = %bucket_list.hash().to_hex(),
+                    "Cloned bucket lists from ledger manager for replay-only catchup"
+                );
 
-                    (Some(ExistingBucketState {
+                (
+                    Some(ExistingBucketState {
                         bucket_list,
                         hot_archive_bucket_list: hot_archive,
                         header,
                         network_id,
-                    }), Some(current))
-                } else {
-                    // Slow path: rebuild from persisted HAS
-                    match self.rebuild_bucket_lists_from_has().await {
-                        Ok(state) => {
-                            tracing::info!(
+                    }),
+                    Some(current),
+                )
+            } else {
+                // Slow path: rebuild from persisted HAS
+                match self.rebuild_bucket_lists_from_has().await {
+                    Ok(state) => {
+                        tracing::info!(
                                 current_lcl = current,
                                 target_ledger,
                                 "Rebuilt bucket lists from persisted HAS for replay-only catchup (Case 1)"
                             );
-                            (Some(state), Some(current))
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "Failed to rebuild bucket lists from HAS, falling back to full catchup"
-                            );
-                            (None, None)
-                        }
+                        (Some(state), Some(current))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to rebuild bucket lists from HAS, falling back to full catchup"
+                        );
+                        (None, None)
                     }
                 }
-            } else {
-                (None, None)
-            };
+            }
+        } else {
+            (None, None)
+        };
         // Run catchup work
         let output = self
             .run_catchup_work(
@@ -215,7 +219,9 @@ impl App {
                 .map_err(|e| anyhow::anyhow!("Failed to serialize HAS after catchup: {}", e))?;
             let header_xdr = final_header
                 .to_xdr(stellar_xdr::curr::Limits::none())
-                .map_err(|e| anyhow::anyhow!("Failed to serialize header XDR after catchup: {}", e))?;
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to serialize header XDR after catchup: {}", e)
+                })?;
 
             self.db.transaction(|conn| {
                 conn.store_ledger_header(&final_header, &header_xdr)?;
@@ -299,10 +305,7 @@ impl App {
                 let empty_refs = std::collections::HashSet::new();
                 if let Ok(deleted) = bm.cleanup_unreferenced_files(&empty_refs) {
                     if deleted > 0 {
-                        tracing::info!(
-                            deleted,
-                            "Cleaned up merge temp files from previous runs"
-                        );
+                        tracing::info!(deleted, "Cleaned up merge temp files from previous runs");
                     }
                 }
             })
@@ -423,7 +426,10 @@ impl App {
         // while the main loop is still closing buffered ledgers.
         *self.last_catchup_completed_at.write().await = Some(self.clock.now());
 
-        let final_ledger = self.get_current_ledger().await.unwrap_or(output.result.ledger_seq);
+        let final_ledger = self
+            .get_current_ledger()
+            .await
+            .unwrap_or(output.result.ledger_seq);
         Ok(CatchupResult {
             ledger_seq: final_ledger,
             ledger_hash: output.result.ledger_hash,
@@ -479,12 +485,13 @@ impl App {
                             );
                             // Round down to the latest completed checkpoint
                             let checkpoint =
-                                henyey_history::checkpoint::latest_checkpoint_before_or_at(
-                                    ledger,
-                                )
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!("No checkpoint available for ledger {}", ledger)
-                                })?;
+                                henyey_history::checkpoint::latest_checkpoint_before_or_at(ledger)
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "No checkpoint available for ledger {}",
+                                            ledger
+                                        )
+                                    })?;
                             return Ok(checkpoint);
                         }
                         Err(e) => {
@@ -569,7 +576,10 @@ impl App {
                     .await
                 {
                     Ok(data) => {
-                        tracing::info!(checkpoint_seq, "Using historywork for checkpoint downloads");
+                        tracing::info!(
+                            checkpoint_seq,
+                            "Using historywork for checkpoint downloads"
+                        );
                         Some(data)
                     }
                     Err(err) => {
@@ -644,13 +654,23 @@ impl App {
             Some(data) => {
                 // With checkpoint data, use direct method (minimal mode behavior)
                 catchup_manager
-                    .catchup_to_ledger_with_checkpoint_data(target_ledger, data, &self.ledger_manager)
+                    .catchup_to_ledger_with_checkpoint_data(
+                        target_ledger,
+                        data,
+                        &self.ledger_manager,
+                    )
                     .await
             }
             None => {
                 // Use mode-aware catchup
                 catchup_manager
-                    .catchup_to_ledger_with_mode(target_ledger, mode, lcl, existing_state, &self.ledger_manager)
+                    .catchup_to_ledger_with_mode(
+                        target_ledger,
+                        mode,
+                        lcl,
+                        existing_state,
+                        &self.ledger_manager,
+                    )
                     .await
             }
         }
@@ -708,12 +728,8 @@ impl App {
             event_tx: None,
         });
         let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
-        let builder = HistoryWorkBuilder::new(
-            archive,
-            checkpoint_seq,
-            Arc::clone(&state),
-            bucket_dir,
-        );
+        let builder =
+            HistoryWorkBuilder::new(archive, checkpoint_seq, Arc::clone(&state), bucket_dir);
         let ids = builder.register(&mut scheduler);
 
         let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
@@ -834,10 +850,8 @@ impl App {
         &self,
         mut message_rx: tokio::sync::mpsc::UnboundedReceiver<OverlayMessage>,
     ) {
-        use stellar_xdr::curr::{
-            Limits, ScpStatementPledges, WriteXdr,
-        };
         use std::collections::HashSet;
+        use stellar_xdr::curr::{Limits, ScpStatementPledges, WriteXdr};
 
         let mut cached_tx_sets = 0u32;
         let mut requested_tx_sets = 0u32;
@@ -850,14 +864,13 @@ impl App {
             match msg.message {
                 StellarMessage::GeneralizedTxSet(gen_tx_set) => {
                     // Compute hash as SHA-256 of XDR-encoded GeneralizedTransactionSet
-                    let xdr_bytes =
-                        match gen_tx_set.to_xdr(stellar_xdr::curr::Limits::none()) {
-                            Ok(bytes) => bytes,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "Failed to encode GeneralizedTxSet to XDR");
-                                continue;
-                            }
-                        };
+                    let xdr_bytes = match gen_tx_set.to_xdr(stellar_xdr::curr::Limits::none()) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Failed to encode GeneralizedTxSet to XDR");
+                            continue;
+                        }
+                    };
                     let hash = henyey_common::Hash256::hash(&xdr_bytes);
 
                     // Extract transactions from the GeneralizedTxSet
@@ -884,9 +897,7 @@ impl App {
 
                 StellarMessage::ScpMessage(envelope) => {
                     // For EXTERNALIZE messages, extract tx_set_hash, record, and request
-                    if let ScpStatementPledges::Externalize(ext) =
-                        &envelope.statement.pledges
-                    {
+                    if let ScpStatementPledges::Externalize(ext) = &envelope.statement.pledges {
                         let slot = envelope.statement.slot_index;
                         let value = ext.commit.value.clone();
 
@@ -906,7 +917,8 @@ impl App {
 
                         // Validate close-time: reject messages with stale or future close times.
                         // This prevents accepting EXTERNALIZE from pre-reset eras or other networks.
-                        let lcl_close_time = self.ledger_manager.current_header().scp_value.close_time.0;
+                        let lcl_close_time =
+                            self.ledger_manager.current_header().scp_value.close_time.0;
                         let scp_driver = self.herder.scp_driver();
                         if !scp_driver.check_close_time(slot, lcl_close_time, sv.close_time.0) {
                             tracing::debug!(
@@ -940,10 +952,7 @@ impl App {
                         // All validations passed - record this externalized slot
                         scp_driver.record_externalized(slot, value);
                         recorded_externalized += 1;
-                        tracing::debug!(
-                            slot,
-                            "Recorded externalized slot during catchup"
-                        );
+                        tracing::debug!(slot, "Recorded externalized slot during catchup");
 
                         let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
 
@@ -952,9 +961,7 @@ impl App {
                             && !requested_hashes.contains(&tx_set_hash)
                         {
                             // Register as pending and send GetTxSet request
-                            self.herder
-                                .scp_driver()
-                                .request_tx_set(tx_set_hash, slot);
+                            self.herder.scp_driver().request_tx_set(tx_set_hash, slot);
 
                             // Track that we've requested this hash to avoid duplicate broadcasts
                             requested_hashes.insert(tx_set_hash);
@@ -966,7 +973,10 @@ impl App {
                             // getting the tx_set before any single peer evicts it.
                             let overlay = self.overlay().await;
                             if let Some(overlay) = overlay {
-                                match overlay.request_tx_set(&stellar_xdr::curr::Uint256(tx_set_hash.0)).await {
+                                match overlay
+                                    .request_tx_set(&stellar_xdr::curr::Uint256(tx_set_hash.0))
+                                    .await
+                                {
                                     Ok(peer_count) => {
                                         requested_tx_sets += 1;
                                         tracing::debug!(
@@ -1022,8 +1032,7 @@ impl App {
             .read()
             .await
             .map(|t| t.elapsed().as_secs());
-        let recently_skipped = cooldown_elapsed
-            .is_some_and(|s| s < EVALUATION_COOLDOWN_SECS);
+        let recently_skipped = cooldown_elapsed.is_some_and(|s| s < EVALUATION_COOLDOWN_SECS);
         if recently_skipped {
             tracing::debug!(
                 cooldown_elapsed = ?cooldown_elapsed,
@@ -1213,9 +1222,7 @@ impl App {
                         // on both caused the stuck timer to reset every time
                         // first_buffered shifted, preventing catchup from ever
                         // triggering (Problem 9).
-                        Some(state)
-                            if state.current_ledger == current_ledger =>
-                        {
+                        Some(state) if state.current_ledger == current_ledger => {
                             // Update first_buffered to track the current value
                             state.first_buffered = first_buffered;
                             let elapsed = state.stuck_start.elapsed().as_secs();
@@ -1241,7 +1248,9 @@ impl App {
                                 .last_catchup_completed_at
                                 .read()
                                 .await
-                                .is_some_and(|t| t.elapsed().as_secs() < POST_CATCHUP_RECOVERY_WINDOW_SECS);
+                                .is_some_and(|t| {
+                                    t.elapsed().as_secs() < POST_CATCHUP_RECOVERY_WINDOW_SECS
+                                });
 
                             // When recently caught up, prefer recovery over catchup.
                             // The next checkpoint won't be published to archives for
@@ -1510,7 +1519,8 @@ impl App {
 
         self.catchup_in_progress.store(false, Ordering::SeqCst);
 
-        self.handle_catchup_result(catchup_result, true, "Buffered").await;
+        self.handle_catchup_result(catchup_result, true, "Buffered")
+            .await;
     }
 
     /// Process the result of a catchup operation: update state, bootstrap herder,
@@ -1664,7 +1674,9 @@ impl App {
                     //    peers (recent enough to still be cached)
                     {
                         let current_ledger = *self.current_ledger.read().await;
-                        let latest_ext = self.herder.latest_externalized_slot()
+                        let latest_ext = self
+                            .herder
+                            .latest_externalized_slot()
                             .unwrap_or(current_ledger as u64);
                         *self.last_processed_slot.write().await = current_ledger as u64;
                         tracing::info!(
@@ -1884,7 +1896,8 @@ impl App {
 
         self.catchup_in_progress.store(false, Ordering::SeqCst);
 
-        self.handle_catchup_result(catchup_result, false, "Externalized").await;
+        self.handle_catchup_result(catchup_result, false, "Externalized")
+            .await;
     }
 
     pub(super) fn buffered_catchup_target(

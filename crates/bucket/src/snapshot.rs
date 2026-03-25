@@ -43,12 +43,12 @@
 use crate::{
     bucket_list::BUCKET_LIST_LEVELS,
     entry::{
-        get_ttl_key, is_soroban_entry, is_temporary_entry, is_ttl_expired,
-        ledger_entry_data_type, ledger_key_type,
+        get_ttl_key, is_soroban_entry, is_temporary_entry, is_ttl_expired, ledger_entry_data_type,
+        ledger_key_type,
     },
     eviction::{
-        update_starting_eviction_iterator, EvictionCandidate, EvictionIterator, EvictionIteratorExt,
-        EvictionResult,
+        update_starting_eviction_iterator, EvictionCandidate, EvictionIterator,
+        EvictionIteratorExt, EvictionResult,
     },
     index::LiveBucketIndex,
     Bucket, BucketEntry, BucketEntryExt, BucketLevel, BucketList, HotArchiveBucket,
@@ -219,11 +219,7 @@ impl HotArchiveBucketSnapshot {
     /// Returns `HotArchiveBucketEntry` variants:
     /// - `Archived(LedgerEntry)` — entry is in the archive
     /// - `Live(LedgerKey)` — entry was restored (not in archive)
-    pub fn load_keys(
-        &self,
-        keys: &mut Vec<LedgerKey>,
-        result: &mut Vec<HotArchiveBucketEntry>,
-    ) {
+    pub fn load_keys(&self, keys: &mut Vec<LedgerKey>, result: &mut Vec<HotArchiveBucketEntry>) {
         keys.retain(|key| {
             if let Ok(Some(entry)) = self.bucket.get(key) {
                 match &entry {
@@ -349,7 +345,10 @@ impl BucketListSnapshot {
         let key_bytes = key.to_xdr(Limits::none()).ok()?;
         for level in &self.levels {
             for bucket in [&level.curr, &level.snap] {
-                if let Some(entry) = bucket.get_result_by_key_bytes(key, &key_bytes).ok().flatten()
+                if let Some(entry) = bucket
+                    .get_result_by_key_bytes(key, &key_bytes)
+                    .ok()
+                    .flatten()
                 {
                     match entry {
                         BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => return Some(e),
@@ -382,7 +381,9 @@ impl BucketListSnapshot {
             for bucket in [&level.curr, &level.snap] {
                 if let Some(entry) = bucket.get_result_by_key_bytes(key, &key_bytes)? {
                     match entry {
-                        BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => return Ok(Some(e)),
+                        BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => {
+                            return Ok(Some(e))
+                        }
                         BucketEntry::Deadentry(_) => return Ok(None),
                         BucketEntry::Metaentry(_) => continue,
                     }
@@ -420,10 +421,7 @@ impl BucketListSnapshot {
             .iter()
             .map(|k| {
                 let bytes = k.to_xdr(Limits::none()).map_err(|e| {
-                    crate::BucketError::Serialization(format!(
-                        "Failed to serialize key: {}",
-                        e
-                    ))
+                    crate::BucketError::Serialization(format!("Failed to serialize key: {}", e))
                 })?;
                 Ok((*k, bytes))
             })
@@ -1814,15 +1812,33 @@ mod tests {
             .unwrap();
 
         // Verify bucket list itself reflects the mutations
-        assert!(bucket_list.get(&key_a).unwrap().is_none(), "A should be deleted from live bucket list");
-        assert!(bucket_list.get(&key_b).unwrap().is_some(), "B should exist in live bucket list");
+        assert!(
+            bucket_list.get(&key_a).unwrap().is_none(),
+            "A should be deleted from live bucket list"
+        );
+        assert!(
+            bucket_list.get(&key_b).unwrap().is_some(),
+            "B should exist in live bucket list"
+        );
 
         // Verify snapshot is isolated — still sees old state
-        assert!(snapshot.get(&key_a).is_some(), "snapshot should still see entry A");
-        assert!(snapshot.get(&key_b).is_none(), "snapshot should not see entry B");
+        assert!(
+            snapshot.get(&key_a).is_some(),
+            "snapshot should still see entry A"
+        );
+        assert!(
+            snapshot.get(&key_b).is_none(),
+            "snapshot should not see entry B"
+        );
 
         // Same via get_result
-        assert!(snapshot.get_result(&key_a).unwrap().is_some(), "get_result should still return entry A");
-        assert!(snapshot.get_result(&key_b).unwrap().is_none(), "get_result should not return entry B");
+        assert!(
+            snapshot.get_result(&key_a).unwrap().is_some(),
+            "get_result should still return entry A"
+        );
+        assert!(
+            snapshot.get_result(&key_b).unwrap().is_none(),
+            "get_result should not return entry B"
+        );
     }
 }

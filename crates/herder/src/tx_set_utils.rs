@@ -158,8 +158,12 @@ pub fn get_invalid_tx_list(
     //
     // When both offsets are 0 (post-close validation), this simplifies to
     // a single validation with the exact close time.
-    let upper_close_time = ctx.close_time.saturating_add(close_time_bounds.upper_bound_offset);
-    let lower_close_time = ctx.close_time.saturating_add(close_time_bounds.lower_bound_offset);
+    let upper_close_time = ctx
+        .close_time
+        .saturating_add(close_time_bounds.upper_bound_offset);
+    let lower_close_time = ctx
+        .close_time
+        .saturating_add(close_time_bounds.lower_bound_offset);
 
     let upper_ledger_ctx = ctx.to_ledger_context(upper_close_time);
     // Only build lower context if offsets differ (optimization for common case).
@@ -654,11 +658,7 @@ mod tests {
         // Edge case: LCL at u32::MAX should not overflow
         let ctx =
             TxSetValidationContext::new(u32::MAX, 1000, 100, 5_000_000, 21, NetworkId::testnet());
-        assert_eq!(
-            ctx.next_ledger_seq,
-            u32::MAX,
-            "should saturate at u32::MAX"
-        );
+        assert_eq!(ctx.next_ledger_seq, u32::MAX, "should saturate at u32::MAX");
     }
 
     // --- remove_txs tests ---
