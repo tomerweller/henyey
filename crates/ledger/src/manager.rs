@@ -4687,35 +4687,52 @@ impl<'a> LedgerCloseContext<'a> {
 
             let live_hash = bucket_list.hash();
 
-            // For Protocol 23+, update hot archive and combine bucket list hashes
+            // Update hot archive and compute final bucket list hash.
+            //
+            // stellar-core gates addHotArchiveBatch() behind `initialLedgerVers`
+            // (the protocol version BEFORE upgrades), not the upgraded version.
+            // This means on the upgrade ledger (e.g., protocol 0→25), the hot
+            // archive is NOT updated even though the final hash combines live
+            // and hot archive hashes. The hot archive stays pristine/empty.
+            //
+            // For the hash combination (snapshotLedger), stellar-core uses the
+            // upgraded version (currentHeader.ledgerVersion). So on the upgrade
+            // ledger, it combines the live hash with the empty hot archive hash.
             let hot_archive_start = std::time::Instant::now();
             let final_hash = if protocol_version_starts_from(protocol_version, ProtocolVersion::V23)
             {
-                let mut hot_archive_guard = self.manager.hot_archive_bucket_list.write();
-                if let Some(ref mut hot_archive) = *hot_archive_guard {
-                    // Advance hot archive through any skipped ledgers (same as live bucket list)
-                    let current_hot_ledger = hot_archive.ledger_seq();
-                    if current_hot_ledger < self.close_data.ledger_seq - 1 {
-                        tracing::debug!(
-                            current_hot_ledger = current_hot_ledger,
-                            target_ledger = self.close_data.ledger_seq,
-                            skipped_count = self.close_data.ledger_seq - current_hot_ledger - 1,
-                            "Advancing hot archive bucket list through empty ledgers"
-                        );
-                        hot_archive
-                            .advance_to_ledger(self.close_data.ledger_seq, protocol_version)?;
+                // Gate hot archive add_batch behind prev_version (initial protocol),
+                // matching stellar-core's initialLedgerVers check.
+                if protocol_version_starts_from(prev_version, ProtocolVersion::V23) {
+                    let mut hot_archive_guard = self.manager.hot_archive_bucket_list.write();
+                    if let Some(ref mut hot_archive) = *hot_archive_guard {
+                        // Advance hot archive through any skipped ledgers
+                        let current_hot_ledger = hot_archive.ledger_seq();
+                        if current_hot_ledger < self.close_data.ledger_seq - 1 {
+                            tracing::debug!(
+                                current_hot_ledger = current_hot_ledger,
+                                target_ledger = self.close_data.ledger_seq,
+                                skipped_count = self.close_data.ledger_seq - current_hot_ledger - 1,
+                                "Advancing hot archive bucket list through empty ledgers"
+                            );
+                            hot_archive
+                                .advance_to_ledger(self.close_data.ledger_seq, protocol_version)?;
+                        }
+
+                        // Add archived entries to hot archive bucket list
+                        hot_archive.add_batch(
+                            self.close_data.ledger_seq,
+                            protocol_version,
+                            archived_entries,
+                            std::mem::take(&mut self.hot_archive_restored_keys),
+                        )?;
                     }
+                }
 
-                    // Add archived entries to hot archive bucket list
-                    // Must call add_batch even with empty entries to maintain spill consistency
-                    // restored_keys contains entries restored via RestoreFootprint or InvokeHostFunction
-                    hot_archive.add_batch(
-                        self.close_data.ledger_seq,
-                        protocol_version,
-                        archived_entries,
-                        std::mem::take(&mut self.hot_archive_restored_keys),
-                    )?;
-
+                // Combine live and hot archive hashes (using upgraded version,
+                // matching stellar-core's snapshotLedger)
+                let hot_archive_guard = self.manager.hot_archive_bucket_list.read();
+                if let Some(ref hot_archive) = *hot_archive_guard {
                     use sha2::{Digest, Sha256};
                     let hot_hash = hot_archive.hash();
 
@@ -4725,16 +4742,13 @@ impl<'a> LedgerCloseContext<'a> {
                     let result = hasher.finalize();
                     let mut bytes = [0u8; 32];
                     bytes.copy_from_slice(&result);
-                    let combined_hash = Hash256::from_bytes(bytes);
-                    combined_hash
+                    Hash256::from_bytes(bytes)
                 } else {
-                    // No hot archive bucket list available, use live hash only
-                    // This shouldn't happen for Protocol 23+ but fall back gracefully
                     tracing::warn!(
                         ledger_seq = self.close_data.ledger_seq,
                         protocol_version = protocol_version,
                         live_hash = %live_hash.to_hex(),
-                        "HOT ARCHIVE IS NONE for Protocol 23+! Using live hash only - this WILL cause hash mismatch!"
+                        "HOT ARCHIVE IS NONE for Protocol 23+! Using live hash only"
                     );
                     live_hash
                 }
