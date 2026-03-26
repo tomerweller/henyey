@@ -906,11 +906,34 @@ impl App {
                             let current_ledger = *self.current_ledger.read().await as u64;
                             if slot > current_ledger + 1 {
                                 self.sync_recovery_pending.store(true, Ordering::SeqCst);
+                                // If the gap is large, fast-track to catchup
+                                if slot > current_ledger + 2 {
+                                    self.recovery_attempts_without_progress
+                                        .store(RECOVERY_ESCALATION_CATCHUP, Ordering::SeqCst);
+                                }
                             }
                         }
                     }
                     EnvelopeState::Pending => {
                         tracing::debug!(slot, tracking, "SCP envelope buffered for future slot");
+                        // If we receive a Pending EXTERNALIZE for a slot far ahead of
+                        // our current ledger, the network has moved on without us.
+                        // Immediately escalate recovery to trigger catchup rather than
+                        // waiting 60+ seconds for the normal escalation path.
+                        if is_externalize {
+                            let current_ledger = *self.current_ledger.read().await as u64;
+                            if slot > current_ledger + 2 {
+                                tracing::info!(
+                                    slot,
+                                    current_ledger,
+                                    gap = slot - current_ledger,
+                                    "Pending EXTERNALIZE far ahead — fast-tracking catchup"
+                                );
+                                self.recovery_attempts_without_progress
+                                    .store(RECOVERY_ESCALATION_CATCHUP, Ordering::SeqCst);
+                                self.sync_recovery_pending.store(true, Ordering::SeqCst);
+                            }
+                        }
                     }
                     EnvelopeState::Duplicate => {
                         // Expected, ignore silently
