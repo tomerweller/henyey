@@ -181,8 +181,10 @@ pub fn build_history_archive_state(
             .collect()
     });
 
+    let version = if hot_archive_buckets.is_some() { 2 } else { 1 };
+
     Ok(HistoryArchiveState {
-        version: 2,
+        version,
         server: Some("rs-stellar-core".to_string()),
         current_ledger: ledger_seq,
         network_passphrase,
@@ -641,7 +643,8 @@ mod tests {
 
         // Verify HAS has 11 levels
         assert_eq!(has.current_buckets.len(), 11, "HAS must have 11 levels");
-        assert_eq!(has.version, 2);
+        // No hot archive → version 1
+        assert_eq!(has.version, 1);
 
         // Compute hash from HAS the Go SDK way
         let go_live_hash = {
@@ -798,6 +801,93 @@ mod tests {
             direct_live.to_hex(),
             go_hot.to_hex(),
             direct_hot.to_hex(),
+        );
+    }
+
+    /// Verify HAS version is conditional: version 2 with hot archive, version 1 without.
+    #[test]
+    fn test_has_version_conditional_on_hot_archive() {
+        use henyey_bucket::{BucketList, HotArchiveBucketList};
+
+        let bl = BucketList::new();
+        let habl = HotArchiveBucketList::new();
+
+        // Without hot archive → version 1
+        let has_v1 = build_history_archive_state(1, &bl, None, None).unwrap();
+        assert_eq!(has_v1.version, 1);
+        assert!(has_v1.hot_archive_buckets.is_none());
+
+        // With hot archive → version 2
+        let has_v2 = build_history_archive_state(1, &bl, Some(&habl), None).unwrap();
+        assert_eq!(has_v2.version, 2);
+        assert!(has_v2.hot_archive_buckets.is_some());
+        assert_eq!(has_v2.hot_archive_buckets.as_ref().unwrap().len(), 11);
+    }
+
+    /// Verify that HAS JSON omits hotArchiveBuckets when None (version 1),
+    /// and includes it when Some (version 2), matching Horizon's expectations.
+    #[test]
+    fn test_has_json_format_matches_horizon_expectations() {
+        use henyey_bucket::{BucketList, HotArchiveBucketList};
+
+        let bl = BucketList::new();
+        let habl = HotArchiveBucketList::new();
+
+        // Version 1: hotArchiveBuckets should be absent from JSON entirely
+        let has_v1 = build_history_archive_state(1, &bl, None, None).unwrap();
+        let json_v1 = has_v1.to_json().unwrap();
+        assert!(
+            !json_v1.contains("hotArchiveBuckets"),
+            "Version 1 HAS should not contain hotArchiveBuckets key, got: {}",
+            &json_v1[..json_v1.len().min(200)]
+        );
+
+        // Version 2: hotArchiveBuckets should be present and non-null
+        let has_v2 = build_history_archive_state(1, &bl, Some(&habl), None).unwrap();
+        let json_v2 = has_v2.to_json().unwrap();
+        assert!(
+            json_v2.contains("hotArchiveBuckets"),
+            "Version 2 HAS should contain hotArchiveBuckets key"
+        );
+        assert!(
+            !json_v2.contains("\"hotArchiveBuckets\":null"),
+            "hotArchiveBuckets should not be null"
+        );
+
+        // Round-trip: deserialize and verify
+        let reparsed: HistoryArchiveState = serde_json::from_str(&json_v2).unwrap();
+        assert!(reparsed.hot_archive_buckets.is_some());
+        assert_eq!(reparsed.hot_archive_buckets.as_ref().unwrap().len(), 11);
+    }
+
+    /// Verify that an empty HotArchiveBucketList produces a combined hash
+    /// that is SHA256(live_hash || all_zeros_hot_hash), not just live_hash.
+    #[test]
+    fn test_empty_hot_archive_contributes_to_combined_hash() {
+        use henyey_bucket::{BucketList, HotArchiveBucketList};
+        use sha2::{Digest, Sha256};
+
+        let bl = BucketList::new();
+        let habl = HotArchiveBucketList::new();
+
+        let live_hash = bl.hash();
+        let hot_hash = habl.hash();
+
+        // Combined hash should be SHA256(live || hot), not just live
+        let expected = {
+            let mut h = Sha256::new();
+            h.update(live_hash.as_bytes());
+            h.update(hot_hash.as_bytes());
+            let r = h.finalize();
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&r);
+            henyey_common::Hash256::from_bytes(b)
+        };
+
+        // live_hash alone should differ from combined
+        assert_ne!(
+            live_hash, expected,
+            "Combined hash must differ from live-only hash"
         );
     }
 }

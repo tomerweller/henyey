@@ -231,7 +231,7 @@ pub struct HistoryArchiveState {
     pub current_buckets: Vec<HASBucketLevel>,
 
     /// Hot archive buckets (for hot archive state, if present).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hot_archive_buckets: Option<Vec<HASBucketLevel>>,
 }
 

@@ -1025,7 +1025,7 @@ impl LedgerManager {
 
         Self {
             bucket_list: Arc::new(RwLock::new(BucketList::default())),
-            hot_archive_bucket_list: Arc::new(RwLock::new(None)),
+            hot_archive_bucket_list: Arc::new(RwLock::new(Some(HotArchiveBucketList::new()))),
             network_id,
             state: RwLock::new(LedgerState {
                 header: create_genesis_header(),
@@ -1350,7 +1350,7 @@ impl LedgerManager {
 
         // Clear bucket lists
         *self.bucket_list.write() = BucketList::default();
-        *self.hot_archive_bucket_list.write() = None;
+        *self.hot_archive_bucket_list.write() = Some(HotArchiveBucketList::new());
 
         // Explicitly drop old module cache to release memory
         let _ = self.module_cache.write().take();
@@ -4755,13 +4755,7 @@ impl<'a> LedgerCloseContext<'a> {
                     bytes.copy_from_slice(&result);
                     Hash256::from_bytes(bytes)
                 } else {
-                    tracing::warn!(
-                        ledger_seq = self.close_data.ledger_seq,
-                        protocol_version = protocol_version,
-                        live_hash = %live_hash.to_hex(),
-                        "HOT ARCHIVE IS NONE for Protocol 23+! Using live hash only"
-                    );
-                    live_hash
+                    unreachable!("HotArchiveBucketList is always initialized")
                 }
             } else {
                 live_hash
