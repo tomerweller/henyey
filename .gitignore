@@ -50,4 +50,5 @@ testnet.lock
 .claude/*.local.md
 .opencode/*
 !.opencode/commands/
+.serena/
 local-data
