@@ -577,6 +577,47 @@ mod tests {
     }
 
     #[test]
+    fn test_recent_from_genesis_large_count() {
+        // Recent mode from genesis where count >= full_replay_count.
+        // The lcl > GENESIS guard on Case 2 prevents a full replay from
+        // genesis; should fall through to bucket-apply.
+        let range = CatchupRange::calculate(1, 63, CatchupMode::Recent(100));
+        assert!(
+            range.apply_buckets(),
+            "Recent with large count from genesis should bucket-apply, not replay"
+        );
+        assert!(!range.replay_ledgers());
+        assert_eq!(range.bucket_apply_ledger(), 63);
+    }
+
+    #[test]
+    fn test_recent_from_genesis_non_checkpoint_target() {
+        // Recent mode from genesis to a non-checkpoint target in the first
+        // checkpoint. No HAS available, so falls back to replay from genesis
+        // (only valid for very small networks < 63 ledgers).
+        let range = CatchupRange::calculate(1, 50, CatchupMode::Recent(40));
+        // target_start = 50 - 40 + 1 = 11, first_in_checkpoint(11) = 1 <= GENESIS
+        // lcl == GENESIS, target is not a checkpoint -> fallback replay
+        assert!(!range.apply_buckets());
+        assert!(range.replay_ledgers());
+        assert_eq!(range.replay_first(), 2);
+    }
+
+    #[test]
+    fn test_case4_lcl_past_genesis_target_in_first_checkpoint() {
+        // Case 4: lcl > GENESIS, target in first checkpoint.
+        // Should do a full replay (not bucket-apply) since we already have
+        // post-upgrade state.
+        let range = CatchupRange::calculate(2, 50, CatchupMode::Recent(10));
+        // target_start = 50 - 10 + 1 = 41, first_in_checkpoint(41) = 1 <= GENESIS
+        // lcl > GENESIS -> Case 4 returns replay_only
+        assert!(!range.apply_buckets());
+        assert!(range.replay_ledgers());
+        assert_eq!(range.replay_first(), 3);
+        assert_eq!(range.replay_count(), 48); // 50 - 2 = 48
+    }
+
+    #[test]
     fn test_recent_128_current_ledger() {
         // Typical "recent:128" catchup to a recent ledger
         let target = 843007; // A checkpoint ledger

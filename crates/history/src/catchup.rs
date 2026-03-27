@@ -541,6 +541,19 @@ impl CatchupManager {
         let (final_header, final_hash, ledgers_applied) = if checkpoint_seq >= target {
             // No replay needed — target is exactly at checkpoint.
             self.persist_header_only(&checkpoint_header)?;
+
+            // Emit synthetic LedgerCloseMeta for the bucket-applied ledger.
+            // Captive core consumers (stellar-rpc, horizon) need at least one
+            // frame on fd:3 to know core is initialized.
+            if let Some(ref callback) = self.meta_callback {
+                let meta = build_bucket_apply_meta(&checkpoint_header, checkpoint_hash);
+                info!(
+                    "Emitting synthetic LedgerCloseMeta for bucket-applied ledger {}",
+                    checkpoint_header.ledger_seq
+                );
+                callback(meta);
+            }
+
             (checkpoint_header, checkpoint_hash, 0)
         } else {
             let (header, hash, applied) = self
@@ -934,6 +947,19 @@ impl CatchupManager {
         // Matches stellar-core's DownloadApplyTxsWork(RETRY_A_FEW).
         let (final_header, final_hash, ledgers_applied) = if target == checkpoint_seq {
             self.persist_header_only(&checkpoint_header)?;
+
+            // Emit synthetic LedgerCloseMeta for the bucket-applied ledger.
+            // Captive core consumers (stellar-rpc, horizon) need at least one
+            // frame on fd:3 to know core is initialized.
+            if let Some(ref callback) = self.meta_callback {
+                let meta = build_bucket_apply_meta(&checkpoint_header, checkpoint_hash);
+                info!(
+                    "Emitting synthetic LedgerCloseMeta for bucket-applied ledger {}",
+                    checkpoint_header.ledger_seq
+                );
+                callback(meta);
+            }
+
             (checkpoint_header, checkpoint_hash, 0)
         } else {
             let (header, hash, applied) = self
