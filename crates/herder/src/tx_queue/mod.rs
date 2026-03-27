@@ -1367,32 +1367,59 @@ impl TransactionQueue {
         TxQueueResult::Added
     }
 
+    /// Drop a queued transaction from account_states, releasing fees and
+    /// cleaning up empty entries.
+    ///
+    /// Mirrors stellar-core's `dropTransaction()` + `releaseFeeMaybeEraseAccountState()`.
+    /// The caller must have already removed the transaction from `by_hash`.
+    fn drop_transaction(
+        account_states: &mut HashMap<Vec<u8>, AccountState>,
+        queued: &QueuedTransaction,
+    ) {
+        let seq_source = account_key(&queued.envelope);
+        let fee_source = fee_source_key(&queued.envelope);
+
+        // Clear the pending transaction on the seq-source account.
+        if let Some(state) = account_states.get_mut(&seq_source) {
+            if state.transaction.as_ref().map(|t| &t.hash) == Some(&queued.hash) {
+                state.transaction = None;
+                state.age = 0;
+            }
+        }
+
+        // Release fees on the fee-source account.
+        if let Some(fee_state) = account_states.get_mut(&fee_source) {
+            fee_state.total_fees = fee_state.total_fees.saturating_sub(queued.total_fee as i64);
+        }
+
+        // Remove empty account state entries.
+        if account_states
+            .get(&seq_source)
+            .map_or(false, |s| s.is_empty())
+        {
+            account_states.remove(&seq_source);
+        }
+        if seq_source != fee_source
+            && account_states
+                .get(&fee_source)
+                .map_or(false, |s| s.is_empty())
+        {
+            account_states.remove(&fee_source);
+        }
+    }
+
     /// Remove transactions that were applied in a ledger.
     ///
-    /// Removes each transaction from `by_hash` and clears the corresponding
-    /// `account_states` entry so that subsequent transactions from the same
-    /// source account are not rejected with `TryAgainLater`.
+    /// Removes each transaction from `by_hash` and fully cleans up the
+    /// corresponding `account_states` entry (transaction, fees, empty entries)
+    /// so that subsequent transactions from the same source account are not
+    /// rejected with `TryAgainLater`.
     pub fn remove_applied_by_hash(&self, tx_hashes: &[Hash256]) {
         let mut by_hash = self.by_hash.write();
         let mut account_states = self.account_states.write();
         for hash in tx_hashes {
             if let Some(removed) = by_hash.remove(hash) {
-                // Clear account state so the next tx from this account is accepted.
-                let seq_source_id = henyey_tx::muxed_to_account_id(
-                    &henyey_tx::TransactionFrame::from_owned_with_network(
-                        removed.envelope.clone(),
-                        self.config.network_id,
-                    )
-                    .inner_source_account(),
-                );
-                let seq_source_key = account_key_from_account_id(&seq_source_id);
-                if let Some(state) = account_states.get_mut(&seq_source_key) {
-                    // Only clear if the pending tx matches the one we removed.
-                    if state.transaction.as_ref().map(|t| &t.hash) == Some(hash) {
-                        state.transaction = None;
-                        state.age = 0;
-                    }
-                }
+                Self::drop_transaction(&mut account_states, &removed);
             }
         }
         // Keep in seen to prevent re-adding
@@ -1431,8 +1458,20 @@ impl TransactionQueue {
     /// Clear expired transactions.
     pub fn evict_expired(&self) {
         let mut by_hash = self.by_hash.write();
+        let mut account_states = self.account_states.write();
         let max_age = self.config.max_age_secs;
-        by_hash.retain(|_, tx| !tx.is_expired(max_age));
+        // Collect expired transactions, then remove them so account_states
+        // are properly cleaned up (fee release + empty entry removal).
+        let expired_hashes: Vec<Hash256> = by_hash
+            .iter()
+            .filter(|(_, tx)| tx.is_expired(max_age))
+            .map(|(hash, _)| *hash)
+            .collect();
+        for hash in &expired_hashes {
+            if let Some(removed) = by_hash.remove(hash) {
+                Self::drop_transaction(&mut account_states, &removed);
+            }
+        }
 
         // Mirror stellar-core: clear eviction thresholds after aging to avoid
         // carrying stale min-fee requirements.
@@ -1442,6 +1481,7 @@ impl TransactionQueue {
     /// Clear all transactions.
     pub fn clear(&self) {
         self.by_hash.write().clear();
+        self.account_states.write().clear();
         // Don't clear seen - prevents replay
     }
 
@@ -1472,10 +1512,14 @@ impl TransactionQueue {
             }
         }
 
-        // Also remove from the queue if present
+        // Also remove from the queue if present, cleaning up account_states.
+        // Mirrors stellar-core's ban() which calls dropTransaction().
         let mut by_hash = self.by_hash.write();
+        let mut account_states = self.account_states.write();
         for hash in tx_hashes {
-            by_hash.remove(hash);
+            if let Some(removed) = by_hash.remove(hash) {
+                Self::drop_transaction(&mut account_states, &removed);
+            }
         }
     }
 
@@ -3693,6 +3737,97 @@ mod tests {
         queue.remove_applied_by_hash(&[hash]);
         assert!(!queue.contains(&hash));
         assert_eq!(queue.len(), 0);
+    }
+
+    /// After remove_applied_by_hash, the account_states entry must be fully
+    /// cleaned up (transaction cleared, fees released, empty entry removed)
+    /// so the account can immediately submit a new transaction.
+    #[test]
+    fn test_remove_applied_by_hash_clears_account_state() {
+        let queue = TransactionQueue::with_defaults();
+
+        let mut tx = make_test_envelope(200, 1);
+        set_source(&mut tx, 50);
+        let hash = full_hash(&tx);
+
+        assert_eq!(queue.try_add(tx.clone()), TxQueueResult::Added);
+        // Verify account_state was created
+        assert!(queue.account_states.read().contains_key(&account_key(&tx)));
+
+        queue.remove_applied_by_hash(&[hash]);
+
+        // Account state should be fully cleaned up (empty entry removed)
+        assert!(
+            !queue.account_states.read().contains_key(&account_key(&tx)),
+            "empty account_state entry should be removed"
+        );
+    }
+
+    /// After remove_applied_by_hash, a new transaction from the same source
+    /// must be accepted (not rejected with TryAgainLater).
+    #[test]
+    fn test_remove_applied_by_hash_allows_new_tx_from_same_account() {
+        let queue = TransactionQueue::with_defaults();
+
+        let mut tx1 = make_test_envelope(200, 1);
+        set_source(&mut tx1, 60);
+        let hash1 = full_hash(&tx1);
+
+        assert_eq!(queue.try_add(tx1), TxQueueResult::Added);
+        queue.remove_applied_by_hash(&[hash1]);
+
+        // A new tx from the same account should be accepted
+        let mut tx2 = make_test_envelope(300, 1);
+        set_source(&mut tx2, 60);
+        assert_eq!(
+            queue.try_add(tx2),
+            TxQueueResult::Added,
+            "new tx from same account should not get TryAgainLater"
+        );
+    }
+
+    /// ban() must clean up account_states (transaction, fees, empty entries)
+    /// so the account can submit new transactions after the ban expires.
+    #[test]
+    fn test_ban_clears_account_state() {
+        let queue = TransactionQueue::with_defaults();
+
+        let mut tx = make_test_envelope(200, 1);
+        set_source(&mut tx, 70);
+        let hash = full_hash(&tx);
+
+        assert_eq!(queue.try_add(tx.clone()), TxQueueResult::Added);
+        assert!(queue.account_states.read().contains_key(&account_key(&tx)));
+
+        queue.ban(&[hash]);
+
+        // Transaction should be removed from queue
+        assert!(!queue.contains(&hash));
+        // Account state should be fully cleaned up
+        assert!(
+            !queue.account_states.read().contains_key(&account_key(&tx)),
+            "ban() should clean up account_states"
+        );
+    }
+
+    /// clear() must also clear account_states.
+    #[test]
+    fn test_clear_clears_account_states() {
+        let queue = TransactionQueue::with_defaults();
+
+        let mut tx = make_test_envelope(200, 1);
+        set_source(&mut tx, 80);
+
+        assert_eq!(queue.try_add(tx), TxQueueResult::Added);
+        assert!(!queue.account_states.read().is_empty());
+
+        queue.clear();
+
+        assert_eq!(queue.len(), 0);
+        assert!(
+            queue.account_states.read().is_empty(),
+            "clear() should also clear account_states"
+        );
     }
 
     #[test]
