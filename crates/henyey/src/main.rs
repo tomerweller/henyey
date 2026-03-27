@@ -5638,4 +5638,83 @@ mod tests {
         .unwrap();
         assert_eq!(parsed, entry);
     }
+
+    #[test]
+    fn test_genesis_bucket_files_persisted_to_disk() {
+        // Regression test for commit 26a4275: genesis bucket files must be
+        // written to disk so that `load_last_known_ledger` can restore state
+        // on restart (matching stellar-core's startNewLedger behavior).
+        use tempfile::TempDir;
+
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        let passphrase = "Standalone Network ; February 2017";
+        let tmp = TempDir::new().unwrap();
+        let bucket_dir = tmp.path().join("buckets");
+
+        initialize_genesis_ledger(&db, Some(&bucket_dir), passphrase, 0).unwrap();
+
+        // The bucket directory should have been created
+        assert!(bucket_dir.exists(), "bucket directory should be created");
+
+        // There should be at least one .bucket.xdr file (the root account
+        // produces non-empty bucket entries at level 0)
+        let bucket_files: Vec<_> = std::fs::read_dir(&bucket_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path().extension().map_or(false, |ext| ext == "xdr")
+                    && e.path().to_string_lossy().contains(".bucket.xdr")
+            })
+            .collect();
+
+        assert!(
+            !bucket_files.is_empty(),
+            "at least one genesis bucket file should be persisted"
+        );
+
+        // Each file should have non-zero size and a valid filename pattern
+        for entry in &bucket_files {
+            let size = entry.metadata().unwrap().len();
+            assert!(
+                size > 0,
+                "bucket file should not be empty: {:?}",
+                entry.path()
+            );
+
+            let name = entry.file_name().to_string_lossy().to_string();
+            // Filename format: <64-hex-chars>.bucket.xdr
+            assert!(
+                name.ends_with(".bucket.xdr"),
+                "unexpected filename: {}",
+                name
+            );
+            let hex_part = &name[..name.len() - ".bucket.xdr".len()];
+            assert_eq!(hex_part.len(), 64, "hash should be 64 hex chars: {}", name);
+            assert!(
+                hex_part.chars().all(|c| c.is_ascii_hexdigit()),
+                "hash should be hex: {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_genesis_bucket_files_not_written_without_bucket_dir() {
+        // When bucket_dir is None, no bucket files should be written (in-memory only).
+        // This is the existing behavior for tests that don't need on-disk persistence.
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        let passphrase = "Standalone Network ; February 2017";
+
+        // Should succeed without error even with no bucket_dir
+        initialize_genesis_ledger(&db, None, passphrase, 0).unwrap();
+
+        // Verify genesis ledger was still created correctly
+        db.with_connection(|conn| {
+            use henyey_db::queries::StateQueries;
+            let lcl = conn.get_last_closed_ledger().unwrap();
+            assert_eq!(lcl, Some(1));
+            Ok(())
+        })
+        .unwrap();
+    }
 }
