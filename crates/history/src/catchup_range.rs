@@ -212,6 +212,19 @@ impl CatchupRange {
         let count = mode.count();
         let full_replay_count = target - lcl;
 
+        // Case 0: Complete mode from genesis — replay all ledgers.
+        //
+        // CATCHUP_COMPLETE=true consumers (galexie) need metadata for every
+        // ledger from genesis. Bucket-apply would only produce a single
+        // synthetic meta for the checkpoint ledger, but the Go SDK expects
+        // sequential metadata starting from ledger 2. stellar-core handles
+        // this identically: CatchupRange with count=UINT32_MAX from genesis
+        // always yields full replay (CatchupRange.cpp Case 2).
+        if mode == CatchupMode::Complete && lcl == GENESIS_LEDGER_SEQ {
+            let replay = LedgerRange::new(lcl + 1, full_replay_count);
+            return Self::replay_only(replay);
+        }
+
         // Case 1: LCL is past genesis — replay from LCL+1, unless the gap is large enough
         // to justify a fresh checkpoint download.
         //
@@ -514,17 +527,29 @@ mod tests {
 
     #[test]
     fn test_complete_from_genesis_to_checkpoint() {
-        // Quickstart captive core scenario: CATCHUP_COMPLETE from genesis to a
-        // checkpoint. Must use bucket-apply, NOT replay from genesis, because
-        // replaying through protocol upgrades from genesis (0→25) produces
-        // different state hashes than the live validator.
-        //
-        // With accelerated checkpoint frequency (8): checkpoints at 7, 15, 23...
-        // Use default frequency (64): checkpoints at 63, 127, 191...
+        // CATCHUP_COMPLETE from genesis: must replay all ledgers so captive
+        // core consumers (galexie) receive metadata for every ledger from
+        // genesis. stellar-core handles this identically (CatchupRange.cpp
+        // Case 2: count=UINT32_MAX >= full_replay_count → replay_only).
         let range = CatchupRange::calculate(1, 63, CatchupMode::Complete);
         assert!(
+            !range.apply_buckets(),
+            "Complete mode from genesis must replay, not bucket-apply"
+        );
+        assert!(range.replay_ledgers());
+        assert_eq!(range.replay_first(), 2);
+        assert_eq!(range.replay_count(), 62);
+    }
+
+    #[test]
+    fn test_minimal_from_genesis_to_checkpoint() {
+        // Minimal mode from genesis to a checkpoint should use bucket-apply
+        // (no replay). Replaying through protocol upgrades from genesis
+        // produces different state hashes than the live network.
+        let range = CatchupRange::calculate(1, 63, CatchupMode::Minimal);
+        assert!(
             range.apply_buckets(),
-            "should use bucket-apply, not replay from genesis"
+            "Minimal mode from genesis should use bucket-apply"
         );
         assert!(!range.replay_ledgers());
         assert_eq!(range.bucket_apply_ledger(), 63);
