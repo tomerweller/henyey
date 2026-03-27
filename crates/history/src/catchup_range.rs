@@ -633,4 +633,33 @@ mod tests {
         assert_eq!(range.replay_first(), 842880);
         assert_eq!(range.replay_count(), 128); // 843007 - 842879 = 128
     }
+
+    #[test]
+    fn test_minimal_genesis_large_non_checkpoint_target() {
+        // Minimal mode from genesis to a large non-checkpoint target.
+        // count=0 → target_start = 10001 (past first checkpoint).
+        // Falls through to Case 5: bucket-apply at prior checkpoint, then replay.
+        let range = CatchupRange::calculate(1, 10000, CatchupMode::Minimal);
+        assert!(range.apply_buckets());
+        assert!(range.replay_ledgers());
+        // checkpoint_start(10001) = 9984, apply_buckets_at = 9983
+        assert_eq!(range.bucket_apply_ledger(), 9983);
+        assert_eq!(range.replay_first(), 9984);
+        assert_eq!(range.replay_count(), 17); // 10000 - 9983 = 17
+    }
+
+    #[test]
+    fn test_minimal_large_gap_non_checkpoint_target() {
+        // Minimal mode from a non-genesis LCL with a gap > 10_000 to a
+        // non-checkpoint target. Falls through Case 1 (large gap) into
+        // Case 5: bucket-apply at the prior checkpoint, then replay.
+        let range = CatchupRange::calculate(50000, 70000, CatchupMode::Minimal);
+        assert!(range.apply_buckets());
+        assert!(range.replay_ledgers());
+        // target_start = 70001, checkpoint_start(70001) = 69952
+        // apply_buckets_at = 69951
+        assert_eq!(range.bucket_apply_ledger(), 69951);
+        assert_eq!(range.replay_first(), 69952);
+        assert_eq!(range.replay_count(), 49); // 70000 - 69951 = 49
+    }
 }
