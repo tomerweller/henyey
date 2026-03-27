@@ -96,15 +96,22 @@ The binary is at `./target/release/henyey`.
 ## Test
 
 ```bash
-# Run all tests
+# Unit and integration tests
 cargo test --all
+
+# Lint (required by CI)
+cargo clippy --all -- -D warnings
 
 # Run tests for a specific crate
 cargo test -p henyey-scp
 
-# Run with output
-cargo test --all -- --nocapture
+# Local Docker integration tests (matches CI quickstart workflow)
+./scripts/quickstart-local.sh                         # core + rpc + horizon
+./scripts/quickstart-local.sh --enable core,galexie   # galexie test
+./scripts/quickstart-local.sh --enable core           # fastest (~5s)
 ```
+
+See [docs/testing.md](docs/testing.md) for the full testing guide including CI pipeline details, debugging failures, and the test matrix.
 
 ## Run
 
@@ -255,6 +262,30 @@ stellar-rpc injects additional keys (`DATABASE`, `HTTP_PORT`, `NETWORK_PASSPHRAS
 
 The [stellar/quickstart](https://github.com/stellar/docker-stellar-core-horizon) Docker image bundles stellar-core, Horizon, and stellar-rpc into a single container. Henyey can replace stellar-core inside this container with no changes to quickstart itself.
 
+### Quick Start
+
+The fastest way to run the full stack locally:
+
+```bash
+# Build + start core, RPC, and Horizon on a local standalone network
+./scripts/quickstart-local.sh
+
+# Core only (fastest, ~5s to healthy)
+./scripts/quickstart-local.sh --enable core
+
+# Skip rebuild (reuse last binary)
+./scripts/quickstart-local.sh --no-build
+
+# Keep container alive for debugging
+./scripts/quickstart-local.sh --no-test --keep
+```
+
+This builds a release binary, creates a thin Docker overlay image (`Dockerfile.quickstart-local`), starts the quickstart container, waits for health, and runs sanity tests automatically.
+
+See [docs/testing.md](docs/testing.md) for the full testing guide including all flags, Makefile shortcuts, port mappings, and debugging tips.
+
+### Container Architecture
+
 The container runs up to three stellar-core instances simultaneously (testnet mode uses all three; local mode uses the node + RPC captive core):
 
 | Instance | HTTP Port | Peer Port | Purpose |
@@ -263,58 +294,22 @@ The container runs up to three stellar-core instances simultaneously (testnet mo
 | Horizon captive core | 11726 | 11725 | Ingestion for Horizon |
 | RPC captive core | 11826 | 11825 | Ingestion for stellar-rpc |
 
-### Build the Image
+### Manual Build
 
-1. Build a release binary (requires a Linux x86_64 target):
+If you need to build the Docker image manually (e.g. for custom base images or cross-compilation):
 
 ```bash
+# 1. Build release binary
 cargo build --release
-```
 
-2. Create a `Dockerfile`:
+# 2. Build overlay image
+docker build -f Dockerfile.quickstart-local -t henyey-quickstart:local .
 
-```dockerfile
-FROM stellar/quickstart:testing
-
-COPY henyey /usr/bin/henyey
-RUN chmod +x /usr/bin/henyey
-RUN mv /usr/bin/stellar-core /usr/bin/stellar-core.orig && \
-    ln -s /usr/bin/henyey /usr/bin/stellar-core
-```
-
-3. Build the image (from the directory containing the Dockerfile):
-
-```bash
-cp ./target/release/henyey .
-docker build -t henyey-quickstart .
-```
-
-### Run the Container
-
-```bash
+# 3. Run
 docker run -d --name henyey-quickstart \
-  -p 8000:8000 \
-  -p 8003:8003 \
-  henyey-quickstart --testnet
+  -p 8000:8000 -p 11626:11626 -p 11726:11726 -p 11826:11826 \
+  henyey-quickstart:local
 ```
-
-Port 8000 exposes Horizon and port 8003 exposes stellar-rpc.
-
-### Verify Health
-
-Wait a few minutes for catchup to complete, then check the services:
-
-```bash
-# Check stellar-rpc health
-curl -s -X POST http://localhost:8003/soroban/rpc \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | python3 -m json.tool
-
-# Check Horizon root
-curl -s http://localhost:8000/ | python3 -m json.tool
-```
-
-stellar-rpc should report `"status": "healthy"` and Horizon should return the network root with the current ledger sequence.
 
 ### Local Network Mode
 
@@ -323,7 +318,7 @@ Run a standalone single-node network from genesis — no external peers, no catc
 ```bash
 docker run -d --name henyey-local \
   -p 8000:8000 \
-  henyey-quickstart --local --limits default
+  henyey-quickstart:local --local --limits default
 ```
 
 The container creates a standalone network with:
