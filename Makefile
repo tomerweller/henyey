@@ -7,7 +7,7 @@
 
 PREFIX ?= /usr/local
 
-.PHONY: all install clean
+.PHONY: all install clean quickstart-build quickstart-local quickstart-logs quickstart-stop
 
 all:
 	cargo build --release -p henyey
@@ -18,3 +18,17 @@ install: all
 
 clean:
 	cargo clean
+
+# ── Local quickstart testing ─────────────────────────────────────────────────
+
+quickstart-build: all
+	docker build -f Dockerfile.quickstart-local -t henyey-quickstart:local .
+
+quickstart-local:
+	./scripts/quickstart-local.sh
+
+quickstart-logs:
+	docker logs -f henyey-quickstart
+
+quickstart-stop:
+	docker stop henyey-quickstart && docker rm henyey-quickstart

@@ -199,7 +199,16 @@ impl UpgradeParameters {
     }
 
     /// Check if the upgrade has expired at the given time.
+    ///
+    /// `upgrade_time == 0` means "apply immediately" (from HTTP
+    /// `upgradetime=1970-01-01T00:00:00Z`). These never expire because
+    /// in an async runtime, `remove_upgrades` (called on every ledger
+    /// close) can race with the upgrade being proposed — clearing the
+    /// params before they're ever included in an SCP value.
     pub fn is_expired(&self, current_time: u64) -> bool {
+        if self.upgrade_time == 0 {
+            return false;
+        }
         current_time > self.upgrade_time + self.expiration_seconds()
     }
 

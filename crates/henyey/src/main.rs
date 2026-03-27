@@ -1003,7 +1003,10 @@ fn init_logging(cli: &Cli) -> anyhow::Result<()> {
 }
 
 fn create_parent_dir(path: &Path) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent)?;
     }
     Ok(())

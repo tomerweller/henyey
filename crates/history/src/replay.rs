@@ -164,8 +164,10 @@ fn run_eviction_scan(
         .chain(context.dead_entries.iter().cloned())
         .collect();
 
-    let resolved =
-        eviction_result.resolve(context.eviction_settings.max_entries_to_archive, &modified_keys);
+    let resolved = eviction_result.resolve(
+        context.eviction_settings.max_entries_to_archive,
+        &modified_keys,
+    );
 
     Ok(EvictionScanResult {
         evicted_keys: resolved.evicted_keys,

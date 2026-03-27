@@ -128,53 +128,8 @@ impl App {
 
         // --- Escalation: after many failed attempts, force catchup ---
         if attempts >= RECOVERY_ESCALATION_CATCHUP {
-            // Fatal-failure guard (spec §13.3): block further catchup after a
-            // verification/integrity failure.
-            if self.catchup_fatal_failure.load(Ordering::SeqCst) {
-                tracing::warn!(
-                    "Recovery escalation blocked: previous fatal catchup failure — \
-                     manual intervention required"
-                );
-                return;
-            }
-
-            tracing::warn!(
-                current_ledger,
-                latest_externalized,
-                gap,
-                attempts,
-                "Recovery stalled for too long — forcing catchup"
-            );
-            // Clear all stale state
-            {
-                let mut buffer = self.syncing_ledgers.write().await;
-                buffer.clear();
-            }
-            self.herder.clear_pending_tx_sets();
-            self.reset_tx_set_tracking().await;
-            // Reset the counter so we don't immediately re-escalate after catchup
-            self.recovery_attempts_without_progress
-                .store(0, Ordering::SeqCst);
-
-            // Guard against concurrent catchup
-            if !self.catchup_in_progress.swap(true, Ordering::SeqCst) {
-                self.set_state(AppState::CatchingUp).await;
-                self.herder.set_state(henyey_herder::HerderState::Syncing);
-
-                let catchup_message_handle = self.start_catchup_message_caching_from_self().await;
-
-                self.set_phase(14); // 14 = catchup_running
-                let catchup_result = self.catchup(CatchupTarget::Current).await;
-                self.set_phase(5); // 5 = back in consensus_tick
-
-                if let Some(handle) = catchup_message_handle {
-                    handle.abort();
-                }
-                self.catchup_in_progress.store(false, Ordering::SeqCst);
-
-                self.handle_catchup_result(catchup_result, true, "RecoveryEscalation")
-                    .await;
-            }
+            self.trigger_recovery_catchup(current_ledger, latest_externalized, gap, attempts)
+                .await;
             return;
         }
 
@@ -230,6 +185,35 @@ impl App {
                 );
                 // Fall through to the SCP state request below
             } else if attempts < RECOVERY_ESCALATION_SCP_REQUEST {
+                // Fast-track: If we're receiving SCP messages but none result in
+                // externalization, the tx_sets for our slots are gone from peers'
+                // caches (~60s window). Waiting the full 6 escalation cycles is
+                // futile — skip straight to catchup after 1 recovery cycle.
+                // This is critical for captive-core following a standalone
+                // validator in quickstart/local mode where the validator closes
+                // ledgers every second.
+                let scp_total = self.scp_messages_received.load(Ordering::Relaxed);
+                if attempts >= 1 && scp_total > 0 && gap == 0 {
+                    tracing::warn!(
+                        current_ledger,
+                        latest_externalized,
+                        gap,
+                        attempts,
+                        scp_total,
+                        "Receiving SCP messages but no externalization — \
+                         tx_sets evicted from peers, fast-tracking catchup"
+                    );
+                    // Jump directly to catchup instead of waiting 6 cycles
+                    self.trigger_recovery_catchup(
+                        current_ledger,
+                        latest_externalized,
+                        gap,
+                        attempts,
+                    )
+                    .await;
+                    return;
+                }
+
                 tracing::info!(
                     current_ledger,
                     latest_externalized,
@@ -671,6 +655,99 @@ impl App {
             if let Some(timeout) = self.herder.get_ballot_timeout(slot) {
                 timeouts.next_ballot = Some(now + timeout);
             }
+        }
+    }
+
+    /// Trigger a recovery catchup: clear stale state and run catchup to current.
+    ///
+    /// Used by both the normal escalation path (after RECOVERY_ESCALATION_CATCHUP
+    /// attempts) and the fast-track path (when SCP messages arrive but tx_sets
+    /// are evicted from peers' caches).
+    async fn trigger_recovery_catchup(
+        &self,
+        current_ledger: u32,
+        latest_externalized: u64,
+        gap: u64,
+        attempts: u64,
+    ) {
+        // Fatal-failure guard (spec §13.3): block further catchup after a
+        // verification/integrity failure.
+        if self.catchup_fatal_failure.load(Ordering::SeqCst) {
+            tracing::warn!(
+                "Recovery escalation blocked: previous fatal catchup failure — \
+                 manual intervention required"
+            );
+            return;
+        }
+
+        tracing::warn!(
+            current_ledger,
+            latest_externalized,
+            gap,
+            attempts,
+            "Recovery stalled for too long — forcing catchup"
+        );
+        // Clear all stale state
+        {
+            let mut buffer = self.syncing_ledgers.write().await;
+            buffer.clear();
+        }
+        self.herder.clear_pending_tx_sets();
+        self.reset_tx_set_tracking().await;
+        // Invalidate the archive checkpoint cache so CatchupTarget::Current
+        // queries the archive for the freshest checkpoint. In local mode
+        // (1 ledger/sec, checkpoints every 8 ledgers), a 60s-stale cache
+        // returns a checkpoint ~60 ledgers behind the validator, causing
+        // catchup to be a no-op when the captive core is already past it.
+        {
+            let mut cache = self.cached_archive_checkpoint.write().await;
+            *cache = None;
+        }
+        // Reset the counter so we don't immediately re-escalate after catchup
+        self.recovery_attempts_without_progress
+            .store(0, Ordering::SeqCst);
+
+        // Guard against concurrent catchup
+        if !self.catchup_in_progress.swap(true, Ordering::SeqCst) {
+            self.set_state(AppState::CatchingUp).await;
+            self.herder.set_state(henyey_herder::HerderState::Syncing);
+
+            let catchup_message_handle = self.start_catchup_message_caching_from_self().await;
+
+            self.set_phase(14); // 14 = catchup_running
+            let catchup_result = self.catchup(CatchupTarget::Current).await;
+            self.set_phase(5); // 5 = back in consensus_tick
+
+            if let Some(handle) = catchup_message_handle {
+                handle.abort();
+            }
+            self.catchup_in_progress.store(false, Ordering::SeqCst);
+
+            // Check if catchup actually made progress before deciding whether
+            // to pre-arm the next recovery tick.
+            let made_progress = catchup_result
+                .as_ref()
+                .map(|r| r.ledgers_replayed > 0 || r.buckets_applied > 0)
+                .unwrap_or(false);
+
+            self.handle_catchup_result(catchup_result, true, "RecoveryEscalation")
+                .await;
+
+            if made_progress {
+                // Catchup advanced the ledger — pre-arm recovery so the main
+                // event loop checks again on the next tick instead of waiting
+                // 35s for the sync recovery manager's stuck timeout. This
+                // creates a tight catchup loop: catchup → check → catchup →
+                // ... until the captive core is close enough to follow the
+                // validator via SCP.
+                self.recovery_attempts_without_progress
+                    .store(1, Ordering::SeqCst);
+                self.sync_recovery_pending.store(true, Ordering::SeqCst);
+            }
+            // If catchup was a no-op (already at/past target, waiting for next
+            // checkpoint), don't pre-arm. Let the sync recovery manager's
+            // normal 10s tick handle the next check, avoiding a tight loop of
+            // skipped catchup attempts.
         }
     }
 }

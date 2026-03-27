@@ -65,8 +65,9 @@ use henyey_ledger::{LedgerCloseData, LedgerManager, TransactionSetVariant};
 use henyey_tx::TransactionFrame;
 use stellar_xdr::curr::LedgerCloseMeta;
 use stellar_xdr::curr::{
-    GeneralizedTransactionSet, LedgerHeader, LedgerHeaderHistoryEntry, LedgerUpgrade, Limits,
-    ReadXdr, ScpHistoryEntry, TransactionHistoryEntry, TransactionHistoryEntryExt,
+    GeneralizedTransactionSet, Hash, LedgerCloseMetaExt, LedgerCloseMetaV2, LedgerHeader,
+    LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt, LedgerUpgrade, Limits, ReadXdr,
+    ScpHistoryEntry, TransactionHistoryEntry, TransactionHistoryEntryExt,
     TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionResultPair,
     TransactionResultSet, TransactionSet, TransactionSetV1, WriteXdr,
 };
@@ -734,6 +735,20 @@ impl CatchupManager {
             );
             let (header, hash) = self.download_checkpoint_header(checkpoint_seq).await?;
             self.persist_header_only(&header)?;
+
+            // Emit synthetic LedgerCloseMeta for the bucket-applied ledger.
+            // Captive core consumers (stellar-rpc, horizon) read metadata from
+            // fd:3 and need at least one frame to know the core is initialized.
+            // Without this, the Go SDK times out and kills the process.
+            if let Some(ref callback) = self.meta_callback {
+                let meta = build_bucket_apply_meta(&header, hash);
+                info!(
+                    "Emitting synthetic LedgerCloseMeta for bucket-applied ledger {}",
+                    header.ledger_seq
+                );
+                callback(meta);
+            }
+
             (header, hash, 0)
         } else {
             let (header, hash, applied) = self
@@ -2449,6 +2464,32 @@ fn load_disk_backed_hot_archive_bucket_closure(
             )))
         }
     }
+}
+
+/// Build a minimal `LedgerCloseMeta` for a bucket-applied ledger (no replay).
+///
+/// When catchup applies buckets directly to a checkpoint (replay_count == 0),
+/// captive core consumers (stellar-rpc, horizon) still need at least one
+/// metadata frame on fd:3 to know the core is initialized. This constructs
+/// a V2 meta with the checkpoint header and empty transaction/upgrade data.
+fn build_bucket_apply_meta(header: &LedgerHeader, hash: Hash256) -> LedgerCloseMeta {
+    LedgerCloseMeta::V2(LedgerCloseMetaV2 {
+        ext: LedgerCloseMetaExt::V0,
+        ledger_header: LedgerHeaderHistoryEntry {
+            hash: Hash(hash.0),
+            header: header.clone(),
+            ext: LedgerHeaderHistoryEntryExt::V0,
+        },
+        tx_set: GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: header.previous_ledger_hash.clone(),
+            phases: Default::default(),
+        }),
+        tx_processing: Default::default(),
+        upgrades_processing: Default::default(),
+        scp_info: Default::default(),
+        total_byte_size_of_live_soroban_state: 0,
+        evicted_keys: Default::default(),
+    })
 }
 
 #[cfg(test)]

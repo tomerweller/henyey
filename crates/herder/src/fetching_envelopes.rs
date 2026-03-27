@@ -473,9 +473,11 @@ impl FetchingEnvelopes {
         self.tx_set_cache
             .retain(|_, (slot, _)| *slot > keep_after_slot);
 
-        // Clear quorum_set_cache entirely - quorum sets are small and not needed
-        // for applying buffered ledgers (they're only needed for SCP validation)
-        self.quorum_set_cache.clear();
+        // Keep quorum_set_cache — quorum sets are small, don't have slot-based
+        // relevance, and are needed by check_dependencies() to determine if
+        // envelopes arriving after trim are ready. Clearing them causes
+        // EXTERNALIZE envelopes to be stuck in fetching state even after
+        // their tx_set arrives, because the quorum set dependency appears unmet.
 
         // Clear fetchers - pending requests for old slots are stale
         self.tx_set_fetcher.clear();
@@ -945,10 +947,11 @@ mod tests {
             "tx_set for slot 100 should be removed (boundary)"
         );
 
-        // Verify quorum_set_cache is cleared
+        // Verify quorum_set_cache is preserved (needed by check_dependencies
+        // for envelopes arriving after trim)
         assert!(
-            !fetching.has_quorum_set(&qs_hash),
-            "quorum sets should be cleared"
+            fetching.has_quorum_set(&qs_hash),
+            "quorum sets should be preserved after trim"
         );
     }
 

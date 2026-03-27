@@ -1,0 +1,5 @@
+# Thin overlay: replace stellar-core in quickstart:testing with local henyey binary.
+# Build: docker build -f Dockerfile.quickstart-local -t henyey-quickstart:local .
+FROM stellar/quickstart:testing
+COPY henyey-binary /usr/bin/henyey
+RUN ln -sf /usr/bin/henyey /usr/bin/stellar-core

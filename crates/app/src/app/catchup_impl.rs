@@ -114,7 +114,15 @@ impl App {
         //
         // Slow path: if the ledger manager is NOT initialized (e.g., first
         // startup with existing DB), fall back to rebuilding from persisted HAS.
-        let (existing_state, override_lcl) = if current >= GENESIS_LEDGER_SEQ {
+        // If a previous catchup failed with a hash mismatch, force a full
+        // bucket-apply catchup to rebuild state from the archive instead of
+        // replaying from the (possibly corrupt/diverged) local state.
+        let force_full = self.catchup_needs_full_reset.swap(false, Ordering::SeqCst);
+        if force_full {
+            tracing::warn!("Previous catchup failed — forcing full bucket-apply catchup");
+        }
+
+        let (existing_state, override_lcl) = if current >= GENESIS_LEDGER_SEQ && !force_full {
             if self.ledger_manager.is_initialized() {
                 // Fast path: clone from live ledger manager.
                 // Must resolve async merges first — structure-based restart_merges
@@ -1751,6 +1759,17 @@ impl App {
                     self.catchup_fatal_failure.store(true, Ordering::SeqCst);
                 } else {
                     tracing::error!(error = %err, "{} catchup failed", label);
+                    // If the error mentions hash mismatch, the local state
+                    // diverged from the archive (e.g., missed a protocol
+                    // upgrade). Flag the next catchup to do a full
+                    // bucket-apply to rebuild state from scratch.
+                    let err_str = err.to_string();
+                    if err_str.contains("hash mismatch") || err_str.contains("Hash mismatch") {
+                        tracing::warn!(
+                            "Hash mismatch detected — next catchup will use full bucket-apply"
+                        );
+                        self.catchup_needs_full_reset.store(true, Ordering::SeqCst);
+                    }
                 }
                 // Restore operational state so the node can continue
                 // participating in consensus. Without this, the node stays

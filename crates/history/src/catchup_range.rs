@@ -237,8 +237,16 @@ impl CatchupRange {
         // full_replay covers from lcl+1 to target in both situations.
         let full_replay = LedgerRange::new(lcl + 1, full_replay_count);
 
-        // Case 2: count >= full replay count, do full replay
-        if count >= full_replay_count {
+        // Case 2: count >= full replay count — full replay from current state.
+        //
+        // When lcl == genesis, prefer bucket-apply over full replay. Replaying
+        // through protocol upgrades from genesis (e.g. 0→25) produces different
+        // state hashes than the live network because `apply_upgrades_to_delta`
+        // creates intermediate config entries that differ from the validator's
+        // live upgrade path. stellar-core handles this the same way: online
+        // catchup always involves a bucket-apply step, never raw replay from
+        // genesis.
+        if count >= full_replay_count && lcl > GENESIS_LEDGER_SEQ {
             return Self::replay_only(full_replay);
         }
 
@@ -252,7 +260,24 @@ impl CatchupRange {
         let first_in_checkpoint = first_ledger_in_checkpoint_containing(target_start);
 
         // Case 4: target start is in first checkpoint, full replay
-        if first_in_checkpoint <= GENESIS_LEDGER_SEQ {
+        // (only when we already have post-upgrade state from a prior catchup)
+        if first_in_checkpoint <= GENESIS_LEDGER_SEQ && lcl > GENESIS_LEDGER_SEQ {
+            return Self::replay_only(full_replay);
+        }
+
+        // Case 4b: target start is in first checkpoint AND lcl is genesis.
+        // We can't replay from genesis (protocol upgrade hashes won't match),
+        // and there's no earlier checkpoint to apply buckets from. If the target
+        // is a checkpoint, do bucket-apply there. Otherwise, find the nearest
+        // checkpoint at or after target to apply buckets, then there's nothing
+        // to replay (the target is before that checkpoint).
+        if first_in_checkpoint <= GENESIS_LEDGER_SEQ && lcl == GENESIS_LEDGER_SEQ {
+            if is_checkpoint_ledger(target) {
+                return Self::buckets_only(target);
+            }
+            // Target is before the first checkpoint. No HAS is available yet.
+            // Fall back to replay from genesis — this only happens when the
+            // network has fewer ledgers than a single checkpoint period.
             return Self::replay_only(full_replay);
         }
 
@@ -485,6 +510,45 @@ mod tests {
         assert_eq!(range.bucket_apply_ledger(), 127);
         assert_eq!(range.replay_first(), 128);
         assert_eq!(range.replay_count(), 73); // 200 - 127 = 73
+    }
+
+    #[test]
+    fn test_complete_from_genesis_to_checkpoint() {
+        // Quickstart captive core scenario: CATCHUP_COMPLETE from genesis to a
+        // checkpoint. Must use bucket-apply, NOT replay from genesis, because
+        // replaying through protocol upgrades from genesis (0→25) produces
+        // different state hashes than the live validator.
+        //
+        // With accelerated checkpoint frequency (8): checkpoints at 7, 15, 23...
+        // Use default frequency (64): checkpoints at 63, 127, 191...
+        let range = CatchupRange::calculate(1, 63, CatchupMode::Complete);
+        assert!(
+            range.apply_buckets(),
+            "should use bucket-apply, not replay from genesis"
+        );
+        assert!(!range.replay_ledgers());
+        assert_eq!(range.bucket_apply_ledger(), 63);
+    }
+
+    #[test]
+    fn test_complete_from_genesis_non_checkpoint() {
+        // Complete mode from genesis to a non-checkpoint target. No HAS is
+        // available, so we must replay from genesis (fallback).
+        let range = CatchupRange::calculate(1, 100, CatchupMode::Complete);
+        assert!(!range.apply_buckets());
+        assert!(range.replay_ledgers());
+        assert_eq!(range.replay_first(), 2);
+        assert_eq!(range.replay_count(), 99);
+    }
+
+    #[test]
+    fn test_complete_from_non_genesis() {
+        // Complete mode from a non-genesis LCL should still replay.
+        let range = CatchupRange::calculate(50, 100, CatchupMode::Complete);
+        assert!(!range.apply_buckets());
+        assert!(range.replay_ledgers());
+        assert_eq!(range.replay_first(), 51);
+        assert_eq!(range.replay_count(), 50);
     }
 
     #[test]

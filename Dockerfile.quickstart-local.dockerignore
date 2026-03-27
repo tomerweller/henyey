@@ -1,0 +1,3 @@
+# Only include the release binary for the quickstart overlay build.
+*
+!henyey-binary
