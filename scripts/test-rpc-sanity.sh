@@ -411,8 +411,10 @@ JSONEOF
     fail "getTransactions" "no transactions returned"
   fi
 
-  # Pagination test: limit=1, then use cursor
-  START=$((TX_LEDGER - 1))
+  # Pagination test: limit=1, then use cursor.
+  # Use the oldest ledger (not TX_LEDGER-1) so that genesis upgrade TXs are in
+  # range, guaranteeing multiple TXs for a meaningful second-page test.
+  START="${HEALTH_OLDEST_LEDGER:-$((TX_LEDGER - 1))}"
   if [[ $START -lt 1 ]]; then START=1; fi
   PARAMS_PAGE1=$(cat <<JSONEOF
 {
