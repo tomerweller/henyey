@@ -1030,15 +1030,15 @@ impl Herder {
                 self.advance_tracking_slot(slot);
 
                 return EnvelopeState::Valid;
-            } else if lcl.is_some_and(|l| slot > l && slot < current_slot) {
-                // Gap slot: strictly between LCL and tracking_slot (not the tracking
-                // slot itself). This happens when we fast-forwarded tracking_slot but
-                // haven't closed the intermediate ledgers. Accept EXTERNALIZE from
-                // trusted validators to fill the gap.
-                // Note: slot == current_slot must NOT enter this path — those
-                // EXTERNALIZE messages must be processed through normal SCP so the
-                // ballot protocol emits our own EXTERNALIZE envelope to the network
-                // (required for crawlers like StellarBeat to see us as validating).
+            } else if lcl.is_some_and(|l| slot > l && slot <= current_slot) {
+                // Gap slot: between LCL and tracking_slot (inclusive).
+                // This happens when we fast-forwarded tracking_slot but haven't
+                // closed the intermediate ledgers. Accept EXTERNALIZE from trusted
+                // validators to fill the gap.
+                // Note: slot == current_slot is included here intentionally.
+                // Routing it through normal SCP would advance tracking one-at-a-time,
+                // preventing the quorum tracker from accumulating enough senders per
+                // slot → heard_from_quorum stays false → recovery loop.
                 let sender = &envelope.statement.node_id;
                 let in_quorum = self
                     .quorum_tracker
