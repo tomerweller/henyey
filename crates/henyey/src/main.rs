@@ -3809,6 +3809,10 @@ async fn cmd_verify_execution(
         LedgerManagerConfig {
             validate_bucket_hash: true,
             bucket_list_db: config.buckets.bucket_list_db.clone(),
+            // Use single-threaded scan to reduce peak memory during initialization.
+            // Verify-execution runs on memory-constrained CI runners where concurrent
+            // level scans would cause OOM.
+            scan_thread_count: 1,
             ..Default::default()
         },
     );

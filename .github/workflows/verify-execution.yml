@@ -25,9 +25,17 @@ env:
 jobs:
   verify:
     name: Verify Execution
-    runs-on: ubuntu-latest-4-cores
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
+      - name: Create swap file
+        run: |
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          echo "Swap enabled: $(swapon --show)"
+
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
