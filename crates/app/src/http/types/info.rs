@@ -13,7 +13,7 @@ pub struct RootResponse {
 /// Response for the /info endpoint.
 #[derive(Serialize)]
 pub struct InfoResponse {
-    /// Build version string (e.g. "henyey-v0.1.0").
+    /// Build version string (e.g. "henyey-v25.0.0-alpha.1").
     pub build: String,
     /// Protocol version of the current ledger.
     pub protocol_version: u32,

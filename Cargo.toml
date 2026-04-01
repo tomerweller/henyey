@@ -23,7 +23,7 @@ members = [
 # They are referenced as workspace dependencies with version pins below.
 
 [workspace.package]
-version = "0.1.0"
+version = "25.0.0-alpha.1"
 edition = "2021"
 authors = ["Stellar Contributors"]
 license = "Apache-2.0"

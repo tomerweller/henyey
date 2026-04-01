@@ -23,7 +23,7 @@ use super::super::ServerState;
 pub(crate) async fn root_handler() -> Json<RootResponse> {
     Json(RootResponse {
         name: "henyey".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: henyey_common::version::build_version_string(env!("CARGO_PKG_VERSION")),
         endpoints: vec![
             "/info".to_string(),
             "/status".to_string(),
@@ -65,7 +65,7 @@ pub(crate) async fn info_handler(State(state): State<Arc<ServerState>>) -> Json<
     let (pending_count, authenticated_count) = state.app.peer_counts().await;
 
     Json(InfoResponse {
-        build: format!("henyey-{}", info.version),
+        build: henyey_common::version::build_version_string(&info.version),
         protocol_version: ledger.version,
         state: format!("{}", app_state),
         started_on: state.started_on.clone(),

@@ -273,7 +273,7 @@ impl Default for OverlayConfig {
             flood_ttl_secs: 300,
             listen_enabled: true,
             is_validator: true,
-            version_string: VERSION_STRING.to_string(),
+            version_string: henyey_common::version::build_version_string(env!("CARGO_PKG_VERSION")),
             peer_event_tx: None,
             peer_manager: None,
         }
@@ -569,8 +569,7 @@ pub struct LocalNode {
     pub listening_port: u16,
 }
 
-const VERSION_STRING: &str = "henyey 0.0.1";
-const LEDGER_VERSION: u32 = 25;
+const LEDGER_VERSION: u32 = henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION;
 const OVERLAY_VERSION: u32 = 39;
 const OVERLAY_MIN_VERSION: u32 = 38;
 const DEFAULT_LISTENING_PORT: u16 = 11625;
@@ -583,12 +582,22 @@ impl LocalNode {
         Self {
             secret_key,
             network_id,
-            version_string: VERSION_STRING.to_string(),
+            version_string: henyey_common::version::build_version_string(env!("CARGO_PKG_VERSION")),
             ledger_version: LEDGER_VERSION,
             overlay_version: OVERLAY_VERSION,
             overlay_min_version: OVERLAY_MIN_VERSION,
             listening_port: DEFAULT_LISTENING_PORT,
         }
+    }
+
+    /// Set the version string to include a commit hash for P2P identification.
+    ///
+    /// Called at startup when the commit hash is available from build metadata.
+    pub fn set_commit_hash(&mut self, commit_hash: &str) {
+        self.version_string = henyey_common::version::build_version_string_full(
+            env!("CARGO_PKG_VERSION"),
+            commit_hash,
+        );
     }
 
     /// Creates a new local node configured for the Stellar testnet.

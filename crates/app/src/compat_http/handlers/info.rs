@@ -35,7 +35,7 @@ pub(crate) async fn compat_info_handler(
     };
 
     let info = CompatInfoResponse {
-        build: format!("henyey-v{}", env!("CARGO_PKG_VERSION")),
+        build: henyey_common::version::build_version_string(env!("CARGO_PKG_VERSION")),
         protocol_version: app.config().network.max_protocol_version,
         state: state_str.to_string(),
         started_on: state.started_on.clone(),
@@ -126,7 +126,7 @@ mod tests {
     fn test_info_response_shape_synced() {
         let wrapper = CompatInfoWrapper {
             info: CompatInfoResponse {
-                build: "henyey-v0.1.0".into(),
+                build: henyey_common::version::build_version_string(env!("CARGO_PKG_VERSION")),
                 protocol_version: 25,
                 state: "Synced!".into(),
                 started_on: "2026-01-15T12:00:00Z".into(),
@@ -214,7 +214,7 @@ mod tests {
     fn test_info_response_flags_present_when_set() {
         let wrapper = CompatInfoWrapper {
             info: CompatInfoResponse {
-                build: "henyey-v0.1.0".into(),
+                build: henyey_common::version::build_version_string(env!("CARGO_PKG_VERSION")),
                 protocol_version: 25,
                 state: "Booting".into(),
                 started_on: "2026-01-15T12:00:00Z".into(),
@@ -248,7 +248,7 @@ mod tests {
     fn test_info_response_booting_empty_status() {
         let wrapper = CompatInfoWrapper {
             info: CompatInfoResponse {
-                build: "henyey-v0.1.0".into(),
+                build: henyey_common::version::build_version_string(env!("CARGO_PKG_VERSION")),
                 protocol_version: 25,
                 state: "Booting".into(),
                 started_on: "2026-01-15T12:00:00Z".into(),
@@ -286,7 +286,7 @@ mod tests {
     fn test_info_response_no_unexpected_keys() {
         let wrapper = CompatInfoWrapper {
             info: CompatInfoResponse {
-                build: "henyey-v0.1.0".into(),
+                build: henyey_common::version::build_version_string(env!("CARGO_PKG_VERSION")),
                 protocol_version: 25,
                 state: "Synced!".into(),
                 started_on: "2026-01-15T12:00:00Z".into(),

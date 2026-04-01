@@ -209,7 +209,11 @@ pub struct AppInfo {
 
 impl std::fmt::Display for AppInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "henyey {}", self.version)?;
+        writeln!(
+            f,
+            "{}",
+            henyey_common::version::build_version_string(&self.version)
+        )?;
         if !self.commit_hash.is_empty() {
             writeln!(f, "  Commit:     {}", self.commit_hash)?;
         }

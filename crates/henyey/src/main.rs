@@ -345,7 +345,7 @@ mod loadgen_runner {
 
 /// Pure Rust implementation of Stellar Core
 #[derive(Parser)]
-#[command(name = "rs-stellar-core")]
+#[command(name = "henyey")]
 #[command(author, version, about, long_about = None)]
 struct Cli {
     /// Path to configuration file
@@ -778,6 +778,9 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Enforce: major version == CURRENT_LEDGER_PROTOCOL_VERSION.
+    henyey_common::version::check_version_protocol_invariant(env!("CARGO_PKG_VERSION"));
+
     let cli = Cli::parse();
 
     // Handle commands that must run before logging/config initialization
@@ -1916,11 +1919,12 @@ async fn cmd_upgrade_db(config: AppConfig) -> anyhow::Result<()> {
 ///
 /// Prints version info in a format compatible with stellar-core's `version` output.
 /// stellar-rpc parses this output for:
-/// - First line: build version string (e.g., "v25.0.1" or "henyey-v0.1.0")
+/// - First line: build version string (e.g., "henyey-v25.0.0-alpha.1")
 /// - Line matching "ledger protocol version: N": protocol version number
 fn cmd_version() {
     use henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION;
-    println!("henyey-v{}", env!("CARGO_PKG_VERSION"));
+    use henyey_common::version::build_version_string;
+    println!("{}", build_version_string(env!("CARGO_PKG_VERSION")));
     println!("ledger protocol version: {CURRENT_LEDGER_PROTOCOL_VERSION}");
 }
 
@@ -2098,7 +2102,7 @@ fn cmd_offline_info(config: AppConfig) -> anyhow::Result<()> {
 
     let response = serde_json::json!({
         "info": {
-            "build": format!("henyey-v{}", env!("CARGO_PKG_VERSION")),
+            "build": henyey_common::version::build_version_string(env!("CARGO_PKG_VERSION")),
             "protocol_version": CURRENT_LEDGER_PROTOCOL_VERSION,
             "state": "Booting",
             "ledger": ledger,
@@ -2138,7 +2142,10 @@ async fn cmd_info(config: AppConfig) -> anyhow::Result<()> {
         Err(e) => {
             tracing::debug!(error = %e, "Could not initialize app, showing basic info");
 
-            println!("rs-stellar-core {}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "{}",
+                henyey_common::version::build_version_string(env!("CARGO_PKG_VERSION"))
+            );
             println!();
             println!("Configuration:");
             println!("  Network: {}", config.network.passphrase);
