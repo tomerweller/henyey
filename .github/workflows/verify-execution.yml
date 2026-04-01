@@ -1,0 +1,91 @@
+name: Verify Execution (Mainnet)
+
+on:
+  schedule:
+    # Daily at 06:00 UTC
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      from:
+        description: "Start ledger sequence (omit for latest 1000)"
+        required: false
+        type: string
+      to:
+        description: "End ledger sequence (omit for latest checkpoint)"
+        required: false
+        type: string
+
+concurrency:
+  group: verify-execution
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify Execution
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          key: release
+
+      - name: Build (release)
+        run: cargo build --release -p henyey
+
+      - name: Compute ledger range
+        id: range
+        run: |
+          if [[ -n "${{ inputs.from }}" && -n "${{ inputs.to }}" ]]; then
+            echo "from=${{ inputs.from }}" >> "$GITHUB_OUTPUT"
+            echo "to=${{ inputs.to }}" >> "$GITHUB_OUTPUT"
+            echo "Using manual range: ${{ inputs.from }} - ${{ inputs.to }}"
+            exit 0
+          fi
+
+          # Fetch the latest checkpoint from the mainnet history archive
+          HAS=$(curl -sf https://history.stellar.org/prd/core-live/core_live_001/.well-known/stellar-history.json)
+          CURRENT=$(echo "$HAS" | jq -r '.currentLedger')
+
+          if [[ -z "$CURRENT" || "$CURRENT" == "null" ]]; then
+            echo "::error::Failed to fetch current ledger from history archive"
+            exit 1
+          fi
+
+          # Round down to nearest checkpoint boundary (multiple of 64)
+          TO=$(( (CURRENT / 64) * 64 ))
+          FROM=$(( TO - 1000 ))
+
+          # Ensure FROM is on a checkpoint boundary for clean initialization
+          FROM=$(( (FROM / 64) * 64 ))
+
+          echo "from=${FROM}" >> "$GITHUB_OUTPUT"
+          echo "to=${TO}" >> "$GITHUB_OUTPUT"
+          echo "Latest archive ledger: ${CURRENT}"
+          echo "Verify range: ${FROM} - ${TO} ($(( TO - FROM )) ledgers)"
+
+      - name: Run verify-execution
+        run: |
+          ./target/release/henyey --mainnet verify-execution \
+            --from ${{ steps.range.outputs.from }} \
+            --to ${{ steps.range.outputs.to }} \
+            --stop-on-error \
+            --show-diff \
+            --quiet \
+            --no-cache
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Verify Execution (Mainnet)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Range:** ${{ steps.range.outputs.from }} - ${{ steps.range.outputs.to }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Ledgers:** $(( ${{ steps.range.outputs.to }} - ${{ steps.range.outputs.from }} ))" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Status:** ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
