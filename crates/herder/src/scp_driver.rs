@@ -1468,6 +1468,63 @@ impl ScpDriver {
             .map_err(|_| HerderError::Scp(henyey_scp::ScpError::SignatureVerificationFailed))
     }
 
+    /// Construct and broadcast an EXTERNALIZE envelope for a slot that was
+    /// fast-forwarded (not processed through full SCP ballot protocol).
+    ///
+    /// This is needed so that network crawlers (e.g. StellarBeat/OBSRVR) see
+    /// the node emitting EXTERNALIZE for recent slots and mark it as validating.
+    /// The fast-forward path records the externalized value but doesn't create
+    /// or emit an SCP envelope — this method fills that gap.
+    pub fn emit_externalize_for_slot(&self, slot: SlotIndex, value: &Value) {
+        if self.secret_key.is_none() {
+            return; // Not a validator — nothing to emit
+        }
+        let quorum_set = match self.local_quorum_set.read().as_ref() {
+            Some(qs) => qs.clone(),
+            None => return,
+        };
+
+        let qs_hash = hash_quorum_set(&quorum_set);
+
+        // Build the EXTERNALIZE statement.
+        // Use counter=u32::MAX to match force_externalize's ballot.
+        let commit = stellar_xdr::curr::ScpBallot {
+            counter: u32::MAX,
+            value: value.clone(),
+        };
+        let ext = stellar_xdr::curr::ScpStatementExternalize {
+            commit,
+            n_h: u32::MAX,
+            commit_quorum_set_hash: qs_hash.into(),
+        };
+
+        let node_id = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256(*self.config.node_id.as_bytes()),
+        ));
+
+        let statement = ScpStatement {
+            node_id,
+            slot_index: slot,
+            pledges: stellar_xdr::curr::ScpStatementPledges::Externalize(ext),
+        };
+
+        // Sign it
+        let signature = match self.sign_envelope(&statement) {
+            Some(sig) => sig,
+            None => return,
+        };
+
+        let envelope = ScpEnvelope {
+            statement,
+            signature: stellar_xdr::curr::Signature(
+                signature.as_bytes().to_vec().try_into().unwrap_or_default(),
+            ),
+        };
+
+        // Broadcast
+        self.emit(envelope);
+    }
+
     /// Record an externalized value.
     pub fn record_externalized(&self, slot: SlotIndex, value: Value) {
         // Parse the StellarValue and extract stellar_value_ext for logging
