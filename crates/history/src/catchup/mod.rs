@@ -371,6 +371,115 @@ impl CatchupManager {
         );
     }
 
+    /// Apply buckets from a HAS, restart merges, persist the bucket list snapshot,
+    /// and initialize the LedgerManager at the checkpoint state.
+    ///
+    /// This is the shared "bucket apply → init ledger manager" pipeline used by
+    /// all catchup variants that need to rebuild state from buckets.
+    async fn apply_buckets_and_init_ledger_manager(
+        &mut self,
+        has: &HistoryArchiveState,
+        buckets: &[(Hash256, Vec<u8>)],
+        checkpoint_seq: u32,
+        checkpoint_header: LedgerHeader,
+        checkpoint_hash: Hash256,
+        ledger_manager: &LedgerManager,
+    ) -> Result<()> {
+        self.update_progress(
+            CatchupStatus::ApplyingBuckets,
+            3,
+            "Applying buckets to build initial state",
+        );
+        let (mut bucket_list, mut hot_archive_bucket_list, live_next_states, hot_next_states) =
+            self.apply_buckets(has, buckets).await?;
+
+        self.restart_merges(
+            &mut bucket_list,
+            &mut hot_archive_bucket_list,
+            checkpoint_seq,
+            &live_next_states,
+            &hot_next_states,
+        )
+        .await?;
+
+        self.persist_bucket_list_snapshot(checkpoint_seq, &bucket_list)?;
+
+        if ledger_manager.is_initialized() {
+            ledger_manager.reset();
+        }
+        ledger_manager
+            .initialize(
+                bucket_list,
+                hot_archive_bucket_list,
+                checkpoint_header,
+                checkpoint_hash,
+            )
+            .map_err(|e| {
+                HistoryError::CatchupFailed(format!("Failed to initialize ledger manager: {}", e))
+            })?;
+
+        Ok(())
+    }
+
+    /// Shared tail of every catchup variant: either replay ledgers or emit
+    /// synthetic bucket-apply meta, then build the final [`CatchupOutput`].
+    ///
+    /// # Arguments
+    ///
+    /// * `target` — target ledger the caller wants to reach.
+    /// * `checkpoint_seq` — the checkpoint at which buckets were applied.
+    /// * `checkpoint_header` / `checkpoint_hash` — header at `checkpoint_seq`.
+    /// * `buckets_downloaded` — count for the output struct.
+    /// * `ledger_manager` — used by the replay path.
+    async fn replay_and_finish(
+        &mut self,
+        target: u32,
+        checkpoint_seq: u32,
+        checkpoint_header: &LedgerHeader,
+        checkpoint_hash: Hash256,
+        buckets_downloaded: u32,
+        ledger_manager: &LedgerManager,
+    ) -> Result<CatchupOutput> {
+        let (final_header, final_hash, ledgers_applied) = if checkpoint_seq >= target {
+            // No replay needed — target is exactly at checkpoint.
+            self.persist_header_only(checkpoint_header)?;
+
+            // Emit synthetic LedgerCloseMeta for the bucket-applied ledger.
+            // Captive core consumers (stellar-rpc, horizon) need at least one
+            // frame on fd:3 to know core is initialized.
+            let meta =
+                build_bucket_apply_meta(checkpoint_header, checkpoint_hash, self.emit_meta_ext_v1);
+            info!(
+                "Emitting synthetic LedgerCloseMeta for bucket-applied ledger {}",
+                checkpoint_header.ledger_seq
+            );
+            self.emit_meta(checkpoint_header.ledger_seq, meta);
+
+            (checkpoint_header.clone(), checkpoint_hash, 0)
+        } else {
+            let (header, hash, applied) = self
+                .download_verify_and_replay_with_retry(target, ledger_manager)
+                .await?;
+            (header, hash, applied)
+        };
+
+        self.update_progress(CatchupStatus::Completed, 7, "Catchup completed");
+
+        info!(
+            "Catchup completed: ledger {}, hash {}, {} ledgers replayed",
+            final_header.ledger_seq, final_hash, ledgers_applied
+        );
+
+        Ok(CatchupOutput {
+            result: CatchupResult {
+                ledger_seq: final_header.ledger_seq,
+                ledger_hash: final_hash,
+                ledgers_applied,
+                buckets_downloaded,
+            },
+        })
+    }
+
     /// Catch up to a specific target ledger.
     ///
     /// This is the main entry point for the catchup process. It will:
@@ -437,86 +546,30 @@ impl CatchupManager {
         self.progress.buckets_total = buckets_total;
         let buckets = self.download_buckets(&bucket_hashes).await?;
 
-        // Step 4: Apply buckets to build initial state
-        self.update_progress(
-            CatchupStatus::ApplyingBuckets,
-            3,
-            "Applying buckets to build initial state",
-        );
-        let (mut bucket_list, mut hot_archive_bucket_list, live_next_states, hot_next_states) =
-            self.apply_buckets(&has, &buckets).await?;
-
-        // Restart merges.
-        self.restart_merges(
-            &mut bucket_list,
-            &mut hot_archive_bucket_list,
-            checkpoint_seq,
-            &live_next_states,
-            &hot_next_states,
-        )
-        .await?;
-
-        self.persist_bucket_list_snapshot(checkpoint_seq, &bucket_list)?;
-
-        // Initialize the LedgerManager at the checkpoint state.
+        // Steps 4-5: Apply buckets and initialize LedgerManager
         let (checkpoint_header, checkpoint_hash) =
             self.download_checkpoint_header(checkpoint_seq).await?;
 
-        if ledger_manager.is_initialized() {
-            ledger_manager.reset();
-        }
-        ledger_manager
-            .initialize(
-                bucket_list,
-                hot_archive_bucket_list,
-                checkpoint_header.clone(),
-                checkpoint_hash,
-            )
-            .map_err(|e| {
-                HistoryError::CatchupFailed(format!("Failed to initialize ledger manager: {}", e))
-            })?;
+        self.apply_buckets_and_init_ledger_manager(
+            &has,
+            &buckets,
+            checkpoint_seq,
+            checkpoint_header.clone(),
+            checkpoint_hash,
+            ledger_manager,
+        )
+        .await?;
 
-        // Steps 5-7: Download, verify, and replay ledgers with retry.
-        // Matches stellar-core's DownloadApplyTxsWork(RETRY_A_FEW).
-        let (final_header, final_hash, ledgers_applied) = if checkpoint_seq >= target {
-            // No replay needed — target is exactly at checkpoint.
-            self.persist_header_only(&checkpoint_header)?;
-
-            // Emit synthetic LedgerCloseMeta for the bucket-applied ledger.
-            // Captive core consumers (stellar-rpc, horizon) need at least one
-            // frame on fd:3 to know core is initialized.
-            let meta =
-                build_bucket_apply_meta(&checkpoint_header, checkpoint_hash, self.emit_meta_ext_v1);
-            info!(
-                "Emitting synthetic LedgerCloseMeta for bucket-applied ledger {}",
-                checkpoint_header.ledger_seq
-            );
-            self.emit_meta(checkpoint_header.ledger_seq, meta);
-
-            (checkpoint_header, checkpoint_hash, 0)
-        } else {
-            let (header, hash, applied) = self
-                .download_verify_and_replay_with_retry(target, ledger_manager)
-                .await?;
-            (header, hash, applied)
-        };
-
-        // Complete!
-        self.update_progress(CatchupStatus::Completed, 7, "Catchup completed");
-
-        info!(
-            "Catchup completed: ledger {}, hash {}",
-            final_header.ledger_seq, final_hash
-        );
-
-        Ok(CatchupOutput {
-            result: CatchupResult {
-                ledger_seq: final_header.ledger_seq,
-                ledger_hash: final_hash,
-                ledgers_applied,
-                buckets_downloaded: buckets_total,
-            },
-        })
+        // Steps 6-7: Replay ledgers (or emit synthetic meta) and finish.
+        self.replay_and_finish(
+            target,
+            checkpoint_seq,
+            &checkpoint_header,
+            checkpoint_hash,
+            buckets_total,
+            ledger_manager,
+        )
+        .await
     }
 
     /// Catch up to a target ledger with a specific catchup mode.
@@ -594,47 +647,19 @@ impl CatchupManager {
             self.progress.buckets_total = bucket_hashes.len() as u32;
             let buckets = self.download_buckets(&bucket_hashes).await?;
 
-            // Apply buckets
-            self.update_progress(
-                CatchupStatus::ApplyingBuckets,
-                3,
-                "Applying buckets to build initial state",
-            );
-            let (mut bucket_list, mut hot_archive_bucket_list, live_next_states, hot_next_states) =
-                self.apply_buckets(&has, &buckets).await?;
-
-            // Restart merges.
-            self.restart_merges(
-                &mut bucket_list,
-                &mut hot_archive_bucket_list,
-                bucket_apply_at,
-                &live_next_states,
-                &hot_next_states,
-            )
-            .await?;
-
-            self.persist_bucket_list_snapshot(bucket_apply_at, &bucket_list)?;
-
-            // Initialize the LedgerManager at the checkpoint state.
+            // Apply buckets and initialize LedgerManager
             let (checkpoint_header, checkpoint_hash) =
                 self.download_checkpoint_header(bucket_apply_at).await?;
 
-            if ledger_manager.is_initialized() {
-                ledger_manager.reset();
-            }
-            ledger_manager
-                .initialize(
-                    bucket_list,
-                    hot_archive_bucket_list,
-                    checkpoint_header,
-                    checkpoint_hash,
-                )
-                .map_err(|e| {
-                    HistoryError::CatchupFailed(format!(
-                        "Failed to initialize ledger manager: {}",
-                        e
-                    ))
-                })?;
+            self.apply_buckets_and_init_ledger_manager(
+                &has,
+                &buckets,
+                bucket_apply_at,
+                checkpoint_header,
+                checkpoint_hash,
+                ledger_manager,
+            )
+            .await?;
 
             bucket_apply_at
         } else {
@@ -677,52 +702,22 @@ impl CatchupManager {
 
         // Download, verify, and replay ledgers with retry.
         // Matches stellar-core's DownloadApplyTxsWork(RETRY_A_FEW).
-        let replay_count = range.replay_count();
-
-        let (final_header, final_hash, ledgers_applied) = if replay_count == 0 {
-            // No replay needed - target is exactly at checkpoint
+        if range.replay_count() == 0 {
             info!(
                 "Catching up to checkpoint {} (no ledgers to replay)",
                 checkpoint_seq
             );
-            let (header, hash) = self.download_checkpoint_header(checkpoint_seq).await?;
-            self.persist_header_only(&header)?;
-
-            // Emit synthetic LedgerCloseMeta for the bucket-applied ledger.
-            // Captive core consumers (stellar-rpc, horizon) read metadata from
-            // fd:3 and need at least one frame to know the core is initialized.
-            // Without this, the Go SDK times out and kills the process.
-            let meta = build_bucket_apply_meta(&header, hash, self.emit_meta_ext_v1);
-            info!(
-                "Emitting synthetic LedgerCloseMeta for bucket-applied ledger {}",
-                header.ledger_seq
-            );
-            self.emit_meta(header.ledger_seq, meta);
-
-            (header, hash, 0)
-        } else {
-            let (header, hash, applied) = self
-                .download_verify_and_replay_with_retry(target, ledger_manager)
-                .await?;
-            (header, hash, applied)
-        };
-
-        // Complete!
-        self.update_progress(CatchupStatus::Completed, 7, "Catchup completed");
-
-        info!(
-            "Catchup completed: ledger {}, hash {}, {} ledgers replayed",
-            final_header.ledger_seq, final_hash, ledgers_applied
-        );
-
-        Ok(CatchupOutput {
-            result: CatchupResult {
-                ledger_seq: final_header.ledger_seq,
-                ledger_hash: final_hash,
-                ledgers_applied,
-                buckets_downloaded: self.progress.buckets_total,
-            },
-        })
+        }
+        let (header, hash) = self.download_checkpoint_header(checkpoint_seq).await?;
+        self.replay_and_finish(
+            target,
+            checkpoint_seq,
+            &header,
+            hash,
+            self.progress.buckets_total,
+            ledger_manager,
+        )
+        .await
     }
 
     /// Catch up to a target ledger using pre-downloaded checkpoint data.
@@ -772,7 +767,8 @@ impl CatchupManager {
         );
         let bucket_hashes = data.has.unique_bucket_hashes();
         let empty_bucket_hash = Hash256::hash(&[]);
-        self.progress.buckets_total = bucket_hashes.len() as u32;
+        let buckets_downloaded = bucket_hashes.len() as u32;
+        self.progress.buckets_total = buckets_downloaded;
         for (idx, hash) in bucket_hashes.iter().enumerate() {
             if !hash.is_zero() && *hash != empty_bucket_hash {
                 let bucket_path = data
@@ -813,45 +809,19 @@ impl CatchupManager {
             self.persist_scp_history_entries(&data.scp_history)?;
         }
 
-        // Step 5: Apply buckets to build initial state
-        // Buckets are loaded lazily from disk — no in-memory bucket data needed.
-        self.update_progress(
-            CatchupStatus::ApplyingBuckets,
-            3,
-            "Applying buckets to build initial state",
-        );
-        let (mut bucket_list, mut hot_archive_bucket_list, live_next_states, hot_next_states) =
-            self.apply_buckets(&data.has, &[]).await?;
-
-        // Restart merges.
-        self.restart_merges(
-            &mut bucket_list,
-            &mut hot_archive_bucket_list,
-            checkpoint_seq,
-            &live_next_states,
-            &hot_next_states,
-        )
-        .await?;
-
-        self.persist_bucket_list_snapshot(checkpoint_seq, &bucket_list)?;
-
-        // Initialize the LedgerManager at the checkpoint state.
+        // Step 5: Apply buckets and initialize LedgerManager
         let (checkpoint_header, checkpoint_hash) =
             checkpoint_header_from_headers(checkpoint_seq, &data.headers)?;
 
-        if ledger_manager.is_initialized() {
-            ledger_manager.reset();
-        }
-        ledger_manager
-            .initialize(
-                bucket_list,
-                hot_archive_bucket_list,
-                checkpoint_header.clone(),
-                checkpoint_hash,
-            )
-            .map_err(|e| {
-                HistoryError::CatchupFailed(format!("Failed to initialize ledger manager: {}", e))
-            })?;
+        self.apply_buckets_and_init_ledger_manager(
+            &data.has,
+            &[],
+            checkpoint_seq,
+            checkpoint_header.clone(),
+            checkpoint_hash,
+            ledger_manager,
+        )
+        .await?;
 
         // Step 6: Build ledger data from checkpoint files
         self.update_progress(
@@ -880,40 +850,17 @@ impl CatchupManager {
                 verify::verify_tx_result_set(header, &xdr)?;
             }
         }
-        // Steps 6-7: Download, verify, and replay ledgers with retry.
-        // Matches stellar-core's DownloadApplyTxsWork(RETRY_A_FEW).
-        let (final_header, final_hash, ledgers_applied) = if target == checkpoint_seq {
-            self.persist_header_only(&checkpoint_header)?;
 
-            // Emit synthetic LedgerCloseMeta for the bucket-applied ledger.
-            // Captive core consumers (stellar-rpc, horizon) need at least one
-            // frame on fd:3 to know core is initialized.
-            let meta =
-                build_bucket_apply_meta(&checkpoint_header, checkpoint_hash, self.emit_meta_ext_v1);
-            info!(
-                "Emitting synthetic LedgerCloseMeta for bucket-applied ledger {}",
-                checkpoint_header.ledger_seq
-            );
-            self.emit_meta(checkpoint_header.ledger_seq, meta);
-
-            (checkpoint_header, checkpoint_hash, 0)
-        } else {
-            let (header, hash, applied) = self
-                .download_verify_and_replay_with_retry(target, ledger_manager)
-                .await?;
-            (header, hash, applied)
-        };
-
-        self.update_progress(CatchupStatus::Completed, 7, "Catchup completed");
-
-        Ok(CatchupOutput {
-            result: CatchupResult {
-                ledger_seq: final_header.ledger_seq,
-                ledger_hash: final_hash,
-                ledgers_applied,
-                buckets_downloaded: bucket_hashes.len() as u32,
-            },
-        })
+        // Steps 6-7: Replay ledgers (or emit synthetic meta) and finish.
+        self.replay_and_finish(
+            target,
+            checkpoint_seq,
+            &checkpoint_header,
+            checkpoint_hash,
+            buckets_downloaded,
+            ledger_manager,
+        )
+        .await
     }
 }
 
