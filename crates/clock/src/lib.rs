@@ -18,10 +18,13 @@ pub trait Clock: Send + Sync + 'static {
     }
 
     fn interval(&self, period: Duration) -> BoxStream<'static, ()> {
-        Box::pin(unfold(tokio::time::interval(period), |mut interval| async move {
-            interval.tick().await;
-            Some(((), interval))
-        }))
+        Box::pin(unfold(
+            tokio::time::interval(period),
+            |mut interval| async move {
+                interval.tick().await;
+                Some(((), interval))
+            },
+        ))
     }
 }
 

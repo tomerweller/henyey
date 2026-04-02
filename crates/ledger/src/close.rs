@@ -518,7 +518,13 @@ fn collect_component_txs<'a>(
         let stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(component) =
             component;
         let base_fee = base_fee_to_u32(component.base_fee);
-        txs.extend(component.txs.iter().cloned().map(|tx| (Arc::new(tx), base_fee)));
+        txs.extend(
+            component
+                .txs
+                .iter()
+                .cloned()
+                .map(|tx| (Arc::new(tx), base_fee)),
+        );
     }
     txs
 }

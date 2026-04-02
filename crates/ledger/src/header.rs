@@ -140,7 +140,11 @@ pub fn skip_list_target_seq(current_seq: u32, skip_index: usize) -> Option<u32> 
 
     fn round_back(current_seq: u32, interval: u32) -> u32 {
         let rem = current_seq % interval;
-        if rem == 0 { interval } else { rem }
+        if rem == 0 {
+            interval
+        } else {
+            rem
+        }
     }
 
     let delta = match skip_index {
