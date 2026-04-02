@@ -126,6 +126,30 @@ impl Resource {
         Self::make_empty(NUM_SOROBAN_TX_RESOURCES)
     }
 
+    /// Creates a Soroban resource vector from named ledger-level limits.
+    ///
+    /// This constructor uses the canonical [`ResourceType`] ordering internally,
+    /// preventing ordering mistakes that can arise from a raw `vec![]` literal.
+    pub fn soroban_ledger_limits(
+        tx_count: i64,
+        instructions: i64,
+        tx_size_bytes: i64,
+        read_bytes: i64,
+        write_bytes: i64,
+        read_ledger_entries: i64,
+        write_ledger_entries: i64,
+    ) -> Self {
+        let mut r = Self::make_empty_soroban();
+        r.set_val(ResourceType::Operations, tx_count);
+        r.set_val(ResourceType::Instructions, instructions);
+        r.set_val(ResourceType::TxByteSize, tx_size_bytes);
+        r.set_val(ResourceType::DiskReadBytes, read_bytes);
+        r.set_val(ResourceType::WriteBytes, write_bytes);
+        r.set_val(ResourceType::ReadLedgerEntries, read_ledger_entries);
+        r.set_val(ResourceType::WriteLedgerEntries, write_ledger_entries);
+        r
+    }
+
     /// Returns `true` if all resource values are zero.
     pub fn is_zero(&self) -> bool {
         self.values.iter().all(|v| *v == 0)

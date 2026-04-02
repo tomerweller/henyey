@@ -4025,6 +4025,65 @@ mod tests {
         assert_eq!(eff, dynamic_limit);
     }
 
+    /// Regression: soroban_ledger_limits() produces the canonical ResourceType ordering
+    /// so that position [2] is TxByteSize (not ReadLedgerEntries). A misordering
+    /// causes Soroban transactions to be rejected with QueueFull when their
+    /// byte size exceeds the tiny read-entry count (e.g. 6).
+    #[test]
+    fn test_soroban_ledger_limits_ordering_matches_tx_resources() {
+        use henyey_common::ResourceType;
+
+        let limit = Resource::soroban_ledger_limits(
+            2,         // tx_count
+            5_000_000, // instructions
+            20_000,    // tx_size_bytes
+            6_400,     // read_bytes
+            6_400,     // write_bytes
+            6,         // read_ledger_entries
+            4,         // write_ledger_entries
+        );
+
+        // Verify each position matches the canonical ResourceType index.
+        assert_eq!(limit.get_val(ResourceType::Operations), 2);
+        assert_eq!(limit.get_val(ResourceType::Instructions), 5_000_000);
+        assert_eq!(limit.get_val(ResourceType::TxByteSize), 20_000);
+        assert_eq!(limit.get_val(ResourceType::DiskReadBytes), 6_400);
+        assert_eq!(limit.get_val(ResourceType::WriteBytes), 6_400);
+        assert_eq!(limit.get_val(ResourceType::ReadLedgerEntries), 6);
+        assert_eq!(limit.get_val(ResourceType::WriteLedgerEntries), 4);
+    }
+
+    /// Regression: a Soroban tx whose byte size exceeds the initial min
+    /// read-ledger-entries limit (6) should still be admitted when the
+    /// dynamic resource limits (with correct ordering) allow it.
+    #[test]
+    fn test_soroban_tx_admitted_with_restrictive_initial_limits() {
+        // Simulate the initial Soroban limits on a fresh protocol 25 network
+        // multiplied by POOL_LEDGER_MULTIPLIER (2).
+        let limit = Resource::soroban_ledger_limits(
+            2,         // 1 * 2 tx_count
+            5_000_000, // 2_500_000 * 2 instructions
+            20_000,    // 10_000 * 2 tx_size_bytes
+            6_400,     // 3_200 * 2 read_bytes
+            6_400,     // 3_200 * 2 write_bytes
+            6,         // 3 * 2 read_ledger_entries
+            4,         // 2 * 2 write_ledger_entries
+        );
+
+        let queue = TransactionQueue::with_defaults();
+        queue.update_soroban_resource_limits(limit);
+
+        // A Soroban tx with modest resources that fit within limits.
+        // The tx XDR is a few hundred bytes — within 20,000 byte limit.
+        // With the old misordered resource vector, position [2] was
+        // read_ledger_entries (= 6), so any tx with byte size > 6
+        // was rejected as QueueFull.
+        let mut tx = make_soroban_envelope(1000);
+        set_source(&mut tx, 50);
+        let result = queue.try_add(tx);
+        assert_eq!(result, TxQueueResult::Added);
+    }
+
     /// ban() must clean up account_states (transaction, fees, empty entries)
     /// so the account can submit new transactions after the ban expires.
     #[test]

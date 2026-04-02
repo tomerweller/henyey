@@ -1659,15 +1659,15 @@ impl App {
         // Update dynamic Soroban resource limits for queue admission.
         if let Some(info) = self.soroban_network_info() {
             let m = POOL_LEDGER_MULTIPLIER as i64;
-            let soroban_limit = henyey_common::Resource::new(vec![
+            let soroban_limit = henyey_common::Resource::soroban_ledger_limits(
                 info.ledger_max_tx_count as i64 * m,
                 info.ledger_max_instructions * m,
-                info.ledger_max_read_ledger_entries as i64 * m,
-                info.ledger_max_read_bytes as i64 * m,
-                info.ledger_max_write_ledger_entries as i64 * m,
-                info.ledger_max_write_bytes as i64 * m,
                 info.ledger_max_tx_size_bytes as i64 * m,
-            ]);
+                info.ledger_max_read_bytes as i64 * m,
+                info.ledger_max_write_bytes as i64 * m,
+                info.ledger_max_read_ledger_entries as i64 * m,
+                info.ledger_max_write_ledger_entries as i64 * m,
+            );
             self.herder
                 .tx_queue()
                 .update_soroban_resource_limits(soroban_limit);
