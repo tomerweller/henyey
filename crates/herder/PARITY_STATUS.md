@@ -87,7 +87,7 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `setUpgrades()` | _(not implemented)_ | None |
 | `getUpgradesJson()` | _(not implemented)_ | None |
 | `setFilteredAccounts()` | _(not implemented)_ | None |
-| `forceSCPStateIntoSyncWithLastClosedLedger()` | `force_externalize()` | Full |
+| `forceSCPStateIntoSyncWithLastClosedLedger()` | EXTERNALIZE flows through `scp.receive_envelope()` | Full |
 | `makeStellarValue()` | `scp_driver.make_stellar_value()` | Full |
 | `getJsonInfo()` | `json_api.rs` structures | Partial |
 | `getJsonQuorumInfo()` | `json_api.rs` structures | Partial |

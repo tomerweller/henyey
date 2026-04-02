@@ -1581,9 +1581,7 @@ impl App {
     }
 
     pub fn scp_slot_snapshots(&self, limit: usize) -> Vec<ScpSlotSnapshot> {
-        let Some(scp) = self.herder.scp() else {
-            return Vec::new();
-        };
+        let scp = self.herder.scp();
         let (ledger_seq, _, _, _) = self.ledger_info();
         let latest_slot = self
             .herder

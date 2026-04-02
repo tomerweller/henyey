@@ -53,7 +53,7 @@ use stellar_xdr::curr::{
 
 use crate::error::HerderError;
 use crate::fetching_envelopes::{FetchingEnvelopes, FetchingStats};
-use crate::herder_utils::to_short_string;
+
 use crate::pending::{PendingConfig, PendingEnvelopes, PendingResult, PendingStats};
 use crate::quorum_tracker::{QuorumTracker, SlotQuorumTracker};
 use crate::scp_driver::{HerderScpCallback, ScpDriver, ScpDriverConfig};
@@ -251,7 +251,9 @@ pub struct Herder {
     /// SCP driver for consensus callbacks.
     scp_driver: Arc<ScpDriver>,
     /// SCP consensus protocol instance.
-    scp: Option<SCP<HerderScpCallback>>,
+    /// Always created — observers run SCP with `is_validator: false` (same as stellar-core),
+    /// which means `fully_validated` is false on slots and `send_latest_envelope` won't emit.
+    scp: SCP<HerderScpCallback>,
     /// Current tracking slot (ledger sequence as u64).
     tracking_slot: RwLock<u64>,
     /// Consensus close time for the tracking slot.
@@ -315,24 +317,29 @@ impl Herder {
             fetching_envelopes.cache_quorum_set(qs_hash, quorum_set.clone());
         }
 
-        // Create SCP instance for validators with a secret key.
+        // Always create SCP instance — stellar-core does the same even for watchers.
+        // Observers run SCP with is_validator=false, which sets fully_validated=false
+        // on slots so they never emit their own envelopes.
         let node_id = node_id_from_public_key(&config.node_public_key);
-        let scp = if secret_key.is_some() && config.is_validator {
-            if let Some(ref quorum_set) = config.local_quorum_set {
-                let callback = HerderScpCallback::new(Arc::clone(&scp_driver));
-                Some(SCP::new(
-                    node_id.clone(),
-                    true, // is_validator
-                    quorum_set.clone(),
-                    Arc::new(callback),
-                ))
-            } else {
-                warn!("Validator mode requested but no quorum set configured");
-                None
-            }
-        } else {
-            None
-        };
+        let is_validator = secret_key.is_some() && config.is_validator;
+        let quorum_set = config
+            .local_quorum_set
+            .clone()
+            .unwrap_or_else(|| ScpQuorumSet {
+                threshold: 0,
+                validators: vec![].try_into().unwrap(),
+                inner_sets: vec![].try_into().unwrap(),
+            });
+        if is_validator && config.local_quorum_set.is_none() {
+            warn!("Validator mode requested but no quorum set configured");
+        }
+        let callback = HerderScpCallback::new(Arc::clone(&scp_driver));
+        let scp = SCP::new(
+            node_id.clone(),
+            is_validator,
+            quorum_set,
+            Arc::new(callback),
+        );
 
         let slot_quorum_tracker =
             SlotQuorumTracker::new(config.local_quorum_set.clone(), max_slots);
@@ -653,9 +660,7 @@ impl Herder {
                 .clear_slots_below(purge_slot);
 
             // Purge SCP state
-            if let Some(ref scp) = self.scp {
-                scp.purge_slots(purge_slot.saturating_sub(1), None);
-            }
+            self.scp.purge_slots(purge_slot.saturating_sub(1), None);
 
             // Purge externalized values and pending tx set requests
             self.scp_driver.purge_slots_below(purge_slot);
@@ -934,166 +939,19 @@ impl Herder {
             .write()
             .record_envelope(slot, envelope.statement.node_id.clone());
 
-        // Special handling for EXTERNALIZE messages - they can fast-forward our state
-        // even if from future slots, as they represent network consensus
+        // Pre-fetch tx sets from EXTERNALIZE envelopes immediately so they're
+        // available by the time SCP processes the envelope (after pending buffering).
         if let stellar_xdr::curr::ScpStatementPledges::Externalize(ext) =
             &envelope.statement.pledges
         {
-            // Extract value and tx_set_hash upfront before any potential move
-            let value = ext.commit.value.clone();
-            let sv = match StellarValue::from_xdr(&value.0, Limits::none()) {
-                Ok(sv) => sv,
-                Err(_) => {
-                    warn!(slot, "Failed to parse StellarValue from EXTERNALIZE");
-                    return EnvelopeState::Invalid;
+            if let Ok(sv) = StellarValue::from_xdr(&ext.commit.value.0, Limits::none()) {
+                let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
+                // Only request tx sets for slots we haven't already closed via catchup
+                if lcl.map_or(true, |l| slot > l) {
+                    if self.scp_driver.request_tx_set(tx_set_hash, slot) {
+                        debug!(slot, hash = %tx_set_hash, "Requesting tx set from EXTERNALIZE");
+                    }
                 }
-            };
-            let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
-            debug!(
-                slot,
-                sender = %to_short_string(&envelope.statement.node_id),
-                tx_set = %tx_set_hash,
-                "Received EXTERNALIZE message"
-            );
-
-            // Only request tx sets for slots we haven't already closed via catchup
-            if lcl.map_or(true, |l| slot > l) {
-                // Request this tx set immediately - don't wait for ledger close
-                if self.scp_driver.request_tx_set(tx_set_hash, slot) {
-                    debug!(slot, hash = %tx_set_hash, "Immediately requesting tx set from EXTERNALIZE");
-                }
-            }
-
-            if slot > current_slot {
-                // Security check 1: Validate sender is in our transitive quorum
-                // This prevents accepting EXTERNALIZE messages from nodes we don't trust
-                let sender = &envelope.statement.node_id;
-                let in_quorum = self
-                    .quorum_tracker
-                    .read()
-                    .is_node_definitely_in_quorum(sender);
-                if !in_quorum {
-                    debug!(
-                        slot,
-                        current_slot,
-                        sender = ?sender,
-                        "Rejecting EXTERNALIZE from node not in quorum"
-                    );
-                    return EnvelopeState::Invalid;
-                }
-
-                // stellar-core has no max distance check for EXTERNALIZE.
-                // The quorum check above is sufficient to prevent untrusted fast-forwards.
-
-                // CRITICAL: Don't externalize without the tx_set!
-                // Like stellar-core, we must wait until the tx_set is available before
-                // recording externalization. Otherwise we create buffered ledgers that can
-                // never close (no tx_set to apply).
-                if let Some(state) = self.buffer_envelope_until_tx_set(slot, &tx_set_hash, envelope)
-                {
-                    return state;
-                }
-
-                // Parity: only fast-forward if the slot is ahead of the LCL.
-                // After catchup, LCL may have jumped ahead of the tracking slot,
-                // so an EXTERNALIZE for a slot already closed should be ignored.
-                if lcl.is_some_and(|l| slot <= l) {
-                    debug!(
-                        slot,
-                        lcl = lcl.unwrap_or(0),
-                        "Ignoring EXTERNALIZE for slot already closed"
-                    );
-                    return EnvelopeState::Valid;
-                }
-
-                // Fast-forward to this slot using the externalized value
-                debug!(
-                    slot,
-                    current_slot, "Fast-forwarding using EXTERNALIZE from network"
-                );
-
-                self.scp_driver.record_externalized(slot, value.clone());
-                self.scp_driver
-                    .cleanup_externalized(self.config.max_externalized_slots);
-
-                // Inform the SCP library about this externalization so that
-                // subsequent envelopes for this slot are properly validated.
-                if let Some(ref scp) = self.scp {
-                    scp.force_externalize(slot, value.clone());
-                }
-
-                // Broadcast an EXTERNALIZE envelope so network crawlers
-                // (StellarBeat/OBSRVR) see us as validating.  The fast-forward
-                // path skips the SCP ballot protocol, so no envelope is
-                // emitted automatically — we construct and sign one here.
-                if self.is_validator() {
-                    self.scp_driver.emit_externalize_for_slot(slot, &value);
-                }
-
-                // Store for reference
-                *self.prev_value.write() = value;
-
-                // Advance tracking slot
-                self.advance_tracking_slot(slot);
-
-                return EnvelopeState::Valid;
-            } else if lcl.is_some_and(|l| slot > l && slot <= current_slot) {
-                // Gap slot: between LCL and tracking_slot (inclusive).
-                // This happens when we fast-forwarded tracking_slot but haven't
-                // closed the intermediate ledgers. Accept EXTERNALIZE from trusted
-                // validators to fill the gap.
-                let sender = &envelope.statement.node_id;
-                let in_quorum = self
-                    .quorum_tracker
-                    .read()
-                    .is_node_definitely_in_quorum(sender);
-                if !in_quorum {
-                    debug!(
-                        slot,
-                        current_slot,
-                        lcl = lcl.unwrap_or(0),
-                        sender = ?sender,
-                        "Rejecting gap slot EXTERNALIZE from node not in quorum"
-                    );
-                    return EnvelopeState::Invalid;
-                }
-
-                // Request the tx_set for this gap slot so we can close it
-                let is_new = self.scp_driver.request_tx_set(tx_set_hash, slot);
-                if is_new {
-                    info!(slot, hash = %tx_set_hash, "Requesting tx set for gap slot");
-                }
-
-                // CRITICAL: Don't externalize without the tx_set!
-                // Like stellar-core, we must wait until the tx_set is available.
-                if let Some(state) = self.buffer_envelope_until_tx_set(slot, &tx_set_hash, envelope)
-                {
-                    return state;
-                }
-
-                // Record this externalization so we can close the gap ledger
-                debug!(
-                    slot,
-                    current_slot,
-                    lcl = lcl.unwrap_or(0),
-                    "Accepting EXTERNALIZE for gap slot from trusted validator"
-                );
-
-                self.scp_driver.record_externalized(slot, value.clone());
-
-                // Inform the SCP library about this externalization
-                if let Some(ref scp) = self.scp {
-                    scp.force_externalize(slot, value.clone());
-                }
-
-                // Broadcast EXTERNALIZE for the tracking slot so crawlers
-                // see us as validating.  Only emit for the current tracking
-                // slot (not older gap slots) to match real-time consensus.
-                if self.is_validator() && slot == current_slot {
-                    self.scp_driver.emit_externalize_for_slot(slot, &value);
-                }
-
-                return EnvelopeState::Valid;
             }
         }
 
@@ -1141,33 +999,6 @@ impl Herder {
 
         // Process the envelope - it's for current slot or a recent slot within the window
         self.process_scp_envelope(envelope)
-    }
-
-    /// Buffer an EXTERNALIZE envelope until its tx_set is available.
-    ///
-    /// Returns `Some(state)` if the envelope was buffered/rejected (caller should return),
-    /// or `None` if the tx_set is available and processing can continue.
-    fn buffer_envelope_until_tx_set(
-        &self,
-        slot: u64,
-        tx_set_hash: &Hash256,
-        envelope: ScpEnvelope,
-    ) -> Option<EnvelopeState> {
-        if self.scp_driver.has_tx_set(tx_set_hash) {
-            return None; // tx_set available, continue processing
-        }
-
-        debug!(slot, hash = %tx_set_hash, "EXTERNALIZE waiting for tx_set");
-        use crate::fetching_envelopes::RecvResult;
-        match self.fetching_envelopes.recv_envelope(envelope) {
-            RecvResult::Ready => {
-                debug!(slot, "EXTERNALIZE ready after fetching check");
-                None // tx_set was in fetching cache
-            }
-            RecvResult::Fetching => Some(EnvelopeState::Fetching),
-            RecvResult::AlreadyProcessed => Some(EnvelopeState::Duplicate),
-            RecvResult::Discarded => Some(EnvelopeState::Invalid),
-        }
     }
 
     /// Process an SCP envelope (internal).
@@ -1238,75 +1069,55 @@ impl Herder {
     }
 
     /// Process an SCP envelope after confirming tx sets are available.
+    ///
+    /// All nodes (validators and observers) process through SCP. Observers have
+    /// `fully_validated = false` on slots, so SCP won't emit their own envelopes
+    /// (matching stellar-core watcher behavior).
     fn process_scp_envelope_with_tx_set(&self, envelope: ScpEnvelope) -> EnvelopeState {
         let slot = envelope.statement.slot_index;
 
-        // If we have SCP (validator mode), process through consensus
-        if let Some(ref scp) = self.scp {
-            let result = scp.receive_envelope(envelope.clone());
+        let result = self.scp.receive_envelope(envelope.clone());
 
-            match result {
-                henyey_scp::EnvelopeState::Invalid => {
-                    return EnvelopeState::Invalid;
+        match result {
+            henyey_scp::EnvelopeState::Invalid => {
+                return EnvelopeState::Invalid;
+            }
+            henyey_scp::EnvelopeState::Valid => {
+                // Valid but not new
+                return EnvelopeState::Duplicate;
+            }
+            henyey_scp::EnvelopeState::ValidNew => {
+                if self.heard_from_quorum(slot) {
+                    debug!(slot, "Heard from quorum");
                 }
-                henyey_scp::EnvelopeState::Valid => {
-                    // Valid but not new
-                    return EnvelopeState::Duplicate;
-                }
-                henyey_scp::EnvelopeState::ValidNew => {
-                    if self.heard_from_quorum(slot) {
-                        debug!(slot, "Heard from quorum");
-                    }
-                    // Check if this slot is now externalized
-                    if scp.is_slot_externalized(slot) {
-                        if let Some(value) = scp.get_externalized_value(slot) {
-                            info!(slot, "Slot externalized via SCP consensus");
+                // Check if this slot is now externalized
+                if self.scp.is_slot_externalized(slot) {
+                    if let Some(value) = self.scp.get_externalized_value(slot) {
+                        info!(slot, "Slot externalized via SCP consensus");
 
-                            // Request the tx_set so we can close this ledger.
-                            // During rapid catch-up the node may externalize
-                            // via SCP without having participated in NOMINATE
-                            // /PREPARE, so the tx_set might not be cached.
-                            if let Ok(sv) = StellarValue::from_xdr(&value.0, Limits::none()) {
-                                let tx_set_hash = sv.tx_set_hash;
-                                self.scp_driver.request_tx_set(tx_set_hash.into(), slot);
-                            }
-
-                            self.scp_driver.record_externalized(slot, value.clone());
-                            self.scp_driver
-                                .cleanup_externalized(self.config.max_externalized_slots);
-
-                            // Store for next round's priority calculation
-                            *self.prev_value.write() = value;
-
-                            // Advance tracking slot
-                            self.advance_tracking_slot(slot);
+                        // Request the tx_set so we can close this ledger.
+                        // During rapid catch-up the node may externalize
+                        // via SCP without having participated in NOMINATE
+                        // /PREPARE, so the tx_set might not be cached.
+                        if let Ok(sv) = StellarValue::from_xdr(&value.0, Limits::none()) {
+                            let tx_set_hash = sv.tx_set_hash;
+                            self.scp_driver.request_tx_set(tx_set_hash.into(), slot);
                         }
+
+                        self.scp_driver.record_externalized(slot, value.clone());
+                        self.scp_driver
+                            .cleanup_externalized(self.config.max_externalized_slots);
+
+                        // Store for next round's priority calculation
+                        *self.prev_value.write() = value;
+
+                        // Advance tracking slot
+                        self.advance_tracking_slot(slot);
                     }
-                    return EnvelopeState::Valid;
                 }
+                return EnvelopeState::Valid;
             }
         }
-
-        // Non-validator mode: just track externalized values from network
-        if let stellar_xdr::curr::ScpStatementPledges::Externalize(ext) =
-            &envelope.statement.pledges
-        {
-            if self.heard_from_quorum(slot) {
-                debug!(slot, "Heard from quorum (observer)");
-            }
-            let value = ext.commit.value.clone();
-            self.scp_driver.record_externalized(slot, value.clone());
-            self.scp_driver
-                .cleanup_externalized(self.config.max_externalized_slots);
-
-            // Store for reference
-            *self.prev_value.write() = value;
-
-            // Advance tracking slot
-            self.advance_tracking_slot(slot);
-        }
-
-        EnvelopeState::Valid
     }
 
     /// Advance tracking slot after externalization.
@@ -1407,10 +1218,9 @@ impl Herder {
             return Err(HerderError::NotValidating);
         }
 
-        let scp = match &self.scp {
-            Some(scp) => scp,
-            None => return Err(HerderError::NotValidating),
-        };
+        if !self.is_validator() {
+            return Err(HerderError::NotValidating);
+        }
 
         let slot = ledger_seq as u64;
         tracing::debug!("Triggering consensus for ledger {}", ledger_seq);
@@ -1542,7 +1352,7 @@ impl Herder {
         let prev_value = self.prev_value.read().clone();
 
         // Start SCP nomination
-        if scp.nominate(slot, value, &prev_value) {
+        if self.scp.nominate(slot, value, &prev_value) {
             info!(slot, "Started SCP nomination for ledger");
         } else {
             debug!(
@@ -1552,7 +1362,7 @@ impl Herder {
         }
 
         // For solo validators (1-of-1 quorum), the nomination→ballot→externalization
-        // happens synchronously within scp.nominate(). Check if the slot was
+        // happens synchronously within self.scp.nominate(). Check if the slot was
         // externalized and advance tracking state accordingly.
         if self.scp_driver.latest_externalized_slot() == Some(slot) {
             if let Some(ext) = self.scp_driver.get_externalized(slot) {
@@ -1579,9 +1389,9 @@ impl Herder {
         self.scp_driver.set_envelope_sender(sender);
     }
 
-    /// Get the SCP instance (if validator).
-    pub fn scp(&self) -> Option<&SCP<HerderScpCallback>> {
-        self.scp.as_ref()
+    /// Get the SCP instance.
+    pub fn scp(&self) -> &SCP<HerderScpCallback> {
+        &self.scp
     }
 
     /// Check if a ledger close is ready and return the close info.
@@ -1656,9 +1466,7 @@ impl Herder {
             .cleanup_old_pending_slots(slot.saturating_add(1));
 
         // Clean up old SCP state
-        if let Some(ref scp) = self.scp {
-            scp.purge_slots(slot.saturating_sub(10), None);
-        }
+        self.scp.purge_slots(slot.saturating_sub(10), None);
 
         // Clean up old fetching envelopes and cached tx sets (keep a small buffer)
         // Keep the current slot and 2 slots back for any late envelopes
@@ -1674,14 +1482,15 @@ impl Herder {
     /// Called when the nomination timer expires. Re-nominates with the same
     /// value to try to make progress.
     pub fn handle_nomination_timeout(&self, slot: SlotIndex) {
-        if let Some(ref scp) = self.scp {
-            let prev_value = self.prev_value.read().clone();
-            let value = self.create_nomination_value(slot);
+        if !self.is_validator() {
+            return; // Observers don't nominate
+        }
+        let prev_value = self.prev_value.read().clone();
+        let value = self.create_nomination_value(slot);
 
-            if let Some(value) = value {
-                if scp.nominate_timeout(slot, value, &prev_value) {
-                    debug!(slot, "Re-nominated after timeout");
-                }
+        if let Some(value) = value {
+            if self.scp.nominate_timeout(slot, value, &prev_value) {
+                debug!(slot, "Re-nominated after timeout");
             }
         }
     }
@@ -1691,20 +1500,19 @@ impl Herder {
     /// Called when the ballot timer expires. Bumps the ballot counter to
     /// try to make progress.
     pub fn handle_ballot_timeout(&self, slot: SlotIndex) {
-        if let Some(ref scp) = self.scp {
-            if scp.bump_ballot(slot) {
-                debug!(slot, "Bumped ballot after timeout");
-            }
+        if !self.is_validator() {
+            return; // Observers don't participate in balloting
+        }
+        if self.scp.bump_ballot(slot) {
+            debug!(slot, "Bumped ballot after timeout");
         }
     }
 
     /// Get the current nomination timeout.
     pub fn get_nomination_timeout(&self, slot: SlotIndex) -> Option<std::time::Duration> {
-        if let Some(ref scp) = self.scp {
-            if let Some(state) = scp.get_slot_state(slot) {
-                if state.is_nominating {
-                    return Some(scp.get_nomination_timeout(state.nomination_round));
-                }
+        if let Some(state) = self.scp.get_slot_state(slot) {
+            if state.is_nominating {
+                return Some(self.scp.get_nomination_timeout(state.nomination_round));
             }
         }
         None
@@ -1712,14 +1520,12 @@ impl Herder {
 
     /// Get the current ballot timeout.
     pub fn get_ballot_timeout(&self, slot: SlotIndex) -> Option<std::time::Duration> {
-        if let Some(ref scp) = self.scp {
-            if let Some(state) = scp.get_slot_state(slot) {
-                if let Some(round) = state.ballot_round {
-                    if state.heard_from_quorum
-                        && !matches!(state.ballot_phase, BallotPhase::Externalize)
-                    {
-                        return Some(scp.get_ballot_timeout(round));
-                    }
+        if let Some(state) = self.scp.get_slot_state(slot) {
+            if let Some(round) = state.ballot_round {
+                if state.heard_from_quorum
+                    && !matches!(state.ballot_phase, BallotPhase::Externalize)
+                {
+                    return Some(self.scp.get_ballot_timeout(round));
                 }
             }
         }
@@ -1905,11 +1711,7 @@ impl Herder {
     /// Returns SCP envelopes for slots starting from `from_slot`, along with
     /// our local quorum set if configured.
     pub fn get_scp_state(&self, from_slot: u64) -> (Vec<ScpEnvelope>, Option<ScpQuorumSet>) {
-        let envelopes = if let Some(ref scp) = self.scp {
-            scp.get_scp_state(from_slot)
-        } else {
-            vec![]
-        };
+        let envelopes = self.scp.get_scp_state(from_slot);
 
         let quorum_set = self.scp_driver.get_local_quorum_set();
 
@@ -1918,15 +1720,11 @@ impl Herder {
 
     /// Get all SCP envelopes recorded for a slot.
     pub fn get_scp_envelopes(&self, slot: u64) -> Vec<ScpEnvelope> {
-        if let Some(ref scp) = self.scp {
-            scp.get_slot_envelopes(slot)
-        } else {
-            Vec::new()
-        }
+        self.scp.get_slot_envelopes(slot)
     }
 
     pub fn get_slot_state(&self, slot: u64) -> Option<henyey_scp::SlotState> {
-        self.scp.as_ref().and_then(|scp| scp.get_slot_state(slot))
+        self.scp.get_slot_state(slot)
     }
 
     /// Get the local quorum set if configured.
@@ -2485,221 +2283,211 @@ mod tests {
     // When not tracking, stellar-core accepts EXTERNALIZE for any slot (maxLedgerSeq = uint32::max).
 
     /// Creates a signed EXTERNALIZE envelope for testing.
-    fn make_signed_externalize_envelope(slot: u64, herder: &Herder) -> ScpEnvelope {
-        let secret = SecretKey::from_seed(&[1u8; 32]);
-        let public = secret.public_key();
-
-        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256(*public.as_bytes()),
-        ));
-
-        // Create a minimal valid StellarValue for the externalized value
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let stellar_value = stellar_xdr::curr::StellarValue {
-            tx_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
-            close_time: stellar_xdr::curr::TimePoint(now),
-            upgrades: vec![].try_into().unwrap(),
-            ext: stellar_xdr::curr::StellarValueExt::Basic,
-        };
-        let value_bytes = stellar_value.to_xdr(Limits::none()).unwrap();
-
-        let statement = ScpStatement {
-            node_id: node_id.clone(),
-            slot_index: slot,
-            pledges: ScpStatementPledges::Externalize(ScpStatementExternalize {
-                commit: ScpBallot {
-                    counter: 1,
-                    value: Value(value_bytes.try_into().unwrap()),
-                },
-                n_h: 1,
-                commit_quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
-            }),
-        };
-
-        // Sign the statement
-        let statement_bytes = statement.to_xdr(Limits::none()).unwrap();
-        let mut data = herder.scp_driver.network_id().0.to_vec();
-        data.extend_from_slice(&1i32.to_be_bytes()); // ENVELOPE_TYPE_SCP = 1
-        data.extend_from_slice(&statement_bytes);
-
-        let signature = secret.sign(&data);
-        let sig_bytes: Vec<u8> = signature.as_bytes().to_vec();
-
-        ScpEnvelope {
-            statement,
-            signature: XdrSignature(sig_bytes.try_into().unwrap()),
-        }
-    }
-
     #[test]
     fn test_externalize_rejected_when_node_not_in_quorum() {
-        let herder = make_test_herder();
+        // An EXTERNALIZE from a node not in quorum is processed by SCP but
+        // won't cause externalization. SCP accepts the individual envelope
+        // (EXTERNALIZE uses a singleton quorum for the sender) but the local
+        // node's quorum set is not satisfied, so no externalization occurs.
+        let local_secret = SecretKey::from_seed(&[7u8; 32]);
+        let local_public = local_secret.public_key();
+        let local_node_id = node_id_from_public_key(&local_public);
+
+        // Unknown sender (not in quorum)
+        let unknown_secret = SecretKey::from_seed(&[99u8; 32]);
+
+        // Quorum set only includes local node
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![local_node_id.clone()].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: local_public,
+            local_quorum_set: Some(quorum_set.clone()),
+            ..HerderConfig::default()
+        };
+
+        let herder = Herder::with_secret_key(config, local_secret.clone());
         herder.start_syncing();
         herder.bootstrap(100);
 
-        // Create an EXTERNALIZE envelope from a node that is NOT in our quorum
-        // (the test herder has no quorum set configured, so no nodes are in quorum)
-        let envelope = make_signed_externalize_envelope(105, &herder);
+        herder
+            .quorum_tracker
+            .write()
+            .expand(&local_node_id, quorum_set);
 
+        let tracking = herder.tracking_slot(); // 101
+
+        // Create a signed EXTERNALIZE from the unknown node
+        let envelope = make_signed_externalize_from(tracking, &herder, &unknown_secret);
         let result = herder.receive_scp_envelope(envelope);
 
-        // Should be rejected because sender is not in our transitive quorum
-        assert_eq!(result, EnvelopeState::Invalid);
+        // SCP accepts the envelope (EXTERNALIZE uses singleton quorum for the
+        // sender) but it should NOT cause externalization because the unknown
+        // node is not in our quorum set.
+        assert!(
+            result != EnvelopeState::Invalid,
+            "SCP should accept the EXTERNALIZE envelope itself"
+        );
+        assert_eq!(
+            herder.tracking_slot(),
+            tracking,
+            "tracking slot should NOT advance — unknown node not in quorum"
+        );
+        assert!(
+            herder.latest_externalized_slot().is_none()
+                || herder.latest_externalized_slot() != Some(tracking),
+            "slot should NOT be externalized from a non-quorum node"
+        );
     }
 
     #[test]
     fn test_externalize_accepted_for_far_future_slot() {
-        // When tracking, stellar-core applies LEDGER_VALIDITY_BRACKET to limit how far
-        // ahead we accept messages. This test verifies EXTERNALIZE within the
-        // bracket is accepted, and that it advances our tracking slot.
-        let secret = SecretKey::from_seed(&[1u8; 32]);
-        let public = secret.public_key();
-        let test_node_id = node_id_from_public_key(&public);
+        // Future EXTERNALIZE envelopes are now buffered in PendingEnvelopes
+        // (matching stellar-core behavior where all envelope types go through
+        // the same pending→SCP pipeline). This test verifies that a future-slot
+        // EXTERNALIZE is buffered, not immediately processed.
+        let local_secret = SecretKey::from_seed(&[7u8; 32]);
+        let local_public = local_secret.public_key();
+        let local_node_id = node_id_from_public_key(&local_public);
+
+        let other_secret = SecretKey::from_seed(&[1u8; 32]);
+        let other_public = other_secret.public_key();
+        let other_node_id = node_id_from_public_key(&other_public);
 
         let quorum_set = ScpQuorumSet {
             threshold: 1,
-            validators: vec![test_node_id.clone()].try_into().unwrap(),
+            validators: vec![local_node_id.clone(), other_node_id.clone()]
+                .try_into()
+                .unwrap(),
             inner_sets: vec![].try_into().unwrap(),
         };
 
         let config = HerderConfig {
-            local_quorum_set: Some(quorum_set),
+            is_validator: true,
+            node_public_key: local_public,
+            local_quorum_set: Some(quorum_set.clone()),
             ..HerderConfig::default()
         };
-        let herder = Herder::new(config);
+
+        let herder = Herder::with_secret_key(config, local_secret);
         herder.start_syncing();
         herder.bootstrap(100);
 
-        // Add the test node to the quorum tracker
-        let test_qs = ScpQuorumSet {
-            threshold: 1,
-            validators: vec![test_node_id.clone()].try_into().unwrap(),
-            inner_sets: vec![].try_into().unwrap(),
-        };
-        herder.quorum_tracker.write().expand(&test_node_id, test_qs);
+        herder
+            .quorum_tracker
+            .write()
+            .expand(&other_node_id, quorum_set);
 
-        // Create an EXTERNALIZE envelope within the validity bracket
-        // next_consensus_ledger_index() = 100, bracket = 100, so max = 200
-        let future_slot = 195;
-        let envelope = make_signed_externalize_envelope(future_slot, &herder);
+        let tracking = herder.tracking_slot(); // 101
 
-        // Cache a dummy tx_set so the EXTERNALIZE handler can find it
-        let dummy_tx_set = TransactionSet {
-            hash: Hash256([0u8; 32]),
-            previous_ledger_hash: Hash256::ZERO,
-            transactions: vec![],
-            generalized_tx_set: None,
-        };
-        herder.cache_tx_set(dummy_tx_set);
-
+        // An EXTERNALIZE for a future slot within the pending buffer distance
+        let future_slot = tracking + 5;
+        let envelope = make_signed_externalize_from(future_slot, &herder, &other_secret);
         let result = herder.receive_scp_envelope(envelope);
 
-        // Should be accepted — within LEDGER_VALIDITY_BRACKET
-        assert_eq!(result, EnvelopeState::Valid);
-        // Tracking slot should have advanced
-        assert_eq!(herder.tracking_slot(), future_slot + 1);
+        // Should be buffered in PendingEnvelopes (not immediately processed)
+        assert_eq!(result, EnvelopeState::Pending);
+        // Tracking slot should NOT have advanced (envelope is buffered)
+        assert_eq!(herder.tracking_slot(), tracking);
     }
 
     #[test]
     fn test_externalize_accepted_when_within_distance_and_in_quorum() {
-        // Create a herder with a quorum set that includes our test node
-        let secret = SecretKey::from_seed(&[1u8; 32]);
-        let public = secret.public_key();
-        let test_node_id = node_id_from_public_key(&public);
+        // When an EXTERNALIZE arrives for the current tracking slot from
+        // a node in quorum with a valid signed value, SCP should accept it,
+        // externalize the slot, and advance tracking.
+        let local_secret = SecretKey::from_seed(&[7u8; 32]);
+        let local_public = local_secret.public_key();
+        let local_node_id = node_id_from_public_key(&local_public);
+
+        let other_secret = SecretKey::from_seed(&[1u8; 32]);
+        let other_public = other_secret.public_key();
+        let other_node_id = node_id_from_public_key(&other_public);
 
         let quorum_set = ScpQuorumSet {
             threshold: 1,
-            validators: vec![test_node_id.clone()].try_into().unwrap(),
+            validators: vec![local_node_id.clone(), other_node_id.clone()]
+                .try_into()
+                .unwrap(),
             inner_sets: vec![].try_into().unwrap(),
         };
 
         let config = HerderConfig {
-            local_quorum_set: Some(quorum_set),
+            is_validator: true,
+            node_public_key: local_public,
+            local_quorum_set: Some(quorum_set.clone()),
             ..HerderConfig::default()
         };
-        let herder = Herder::new(config);
+
+        let herder = Herder::with_secret_key(config, local_secret);
         herder.start_syncing();
         herder.bootstrap(100);
 
-        // Add the test node to the quorum tracker
-        let test_qs = ScpQuorumSet {
-            threshold: 1,
-            validators: vec![test_node_id.clone()].try_into().unwrap(),
-            inner_sets: vec![].try_into().unwrap(),
-        };
-        herder.quorum_tracker.write().expand(&test_node_id, test_qs);
+        herder
+            .quorum_tracker
+            .write()
+            .expand(&other_node_id, quorum_set);
 
-        // Create an EXTERNALIZE envelope for a slot within acceptable distance
-        let acceptable_slot = 100 + 50; // 150, well within MAX_EXTERNALIZE_SLOT_DISTANCE
-        let envelope = make_signed_externalize_envelope(acceptable_slot, &herder);
+        let tracking = herder.tracking_slot(); // 101
 
-        // Cache a dummy tx_set with the hash used in make_signed_externalize_envelope ([0u8; 32])
-        // The EXTERNALIZE handler requires the tx_set to be available before accepting the envelope
-        let dummy_tx_set = TransactionSet {
-            hash: Hash256([0u8; 32]),
-            previous_ledger_hash: Hash256::ZERO,
-            transactions: vec![],
-            generalized_tx_set: None,
-        };
-        herder.cache_tx_set(dummy_tx_set);
-
+        // Create a properly signed EXTERNALIZE for the current tracking slot
+        let envelope = make_signed_externalize_from(tracking, &herder, &other_secret);
         let result = herder.receive_scp_envelope(envelope);
 
-        // Should be accepted and cause fast-forward
+        // Should be accepted and cause externalization through SCP
         assert_eq!(result, EnvelopeState::Valid);
-        // Tracking slot should have advanced (to slot + 1, since EXTERNALIZE completes that slot)
-        assert_eq!(herder.tracking_slot(), acceptable_slot + 1);
+        // Tracking slot should have advanced
+        assert_eq!(herder.tracking_slot(), tracking + 1);
     }
 
     #[test]
     fn test_externalize_transitions_syncing_to_tracking() {
-        // Matches stellar-core behavior: setTrackingSCPState(slotIndex, b, true)
-        // always transitions to HERDER_TRACKING_NETWORK_STATE on externalization,
-        // even if the herder was previously in SYNCING state.
-        let secret = SecretKey::from_seed(&[1u8; 32]);
-        let public = secret.public_key();
-        let test_node_id = node_id_from_public_key(&public);
+        // Matches stellar-core behavior: externalization always transitions
+        // to HERDER_TRACKING_NETWORK_STATE, even from SYNCING state.
+        let local_secret = SecretKey::from_seed(&[7u8; 32]);
+        let local_public = local_secret.public_key();
+        let local_node_id = node_id_from_public_key(&local_public);
+
+        let other_secret = SecretKey::from_seed(&[1u8; 32]);
+        let other_public = other_secret.public_key();
+        let other_node_id = node_id_from_public_key(&other_public);
 
         let quorum_set = ScpQuorumSet {
             threshold: 1,
-            validators: vec![test_node_id.clone()].try_into().unwrap(),
+            validators: vec![local_node_id.clone(), other_node_id.clone()]
+                .try_into()
+                .unwrap(),
             inner_sets: vec![].try_into().unwrap(),
         };
 
         let config = HerderConfig {
-            local_quorum_set: Some(quorum_set),
+            is_validator: true,
+            node_public_key: local_public,
+            local_quorum_set: Some(quorum_set.clone()),
             ..HerderConfig::default()
         };
-        let herder = Herder::new(config);
+
+        let herder = Herder::with_secret_key(config, local_secret);
         herder.start_syncing();
         herder.bootstrap(100);
 
-        // Add the test node to the quorum tracker
-        let test_qs = ScpQuorumSet {
-            threshold: 1,
-            validators: vec![test_node_id.clone()].try_into().unwrap(),
-            inner_sets: vec![].try_into().unwrap(),
-        };
-        herder.quorum_tracker.write().expand(&test_node_id, test_qs);
+        herder
+            .quorum_tracker
+            .write()
+            .expand(&other_node_id, quorum_set);
 
         // Simulate losing sync: force herder back to Syncing
         herder.set_state(HerderState::Syncing);
         assert_eq!(herder.state(), HerderState::Syncing);
 
-        // Cache a dummy tx_set so the EXTERNALIZE handler can find it
-        let dummy_tx_set = TransactionSet {
-            hash: Hash256([0u8; 32]),
-            previous_ledger_hash: Hash256::ZERO,
-            transactions: vec![],
-            generalized_tx_set: None,
-        };
-        herder.cache_tx_set(dummy_tx_set);
+        let tracking = herder.tracking_slot(); // 101
 
         // Process an EXTERNALIZE — should transition back to Tracking
-        let envelope = make_signed_externalize_envelope(105, &herder);
+        let envelope = make_signed_externalize_from(tracking, &herder, &other_secret);
         let result = herder.receive_scp_envelope(envelope);
 
         assert_eq!(result, EnvelopeState::Valid);
@@ -2713,14 +2501,13 @@ mod tests {
     #[test]
     fn test_nomination_timeout_requires_started() {
         let (herder, secret) = make_validator_herder();
-        let scp = herder.scp().expect("validator scp");
         let slot = 1u64;
 
         assert!(herder.get_nomination_timeout(slot).is_none());
 
         let value = make_valid_value_with_cached_tx_set(&herder, &secret);
         let prev_value = value.clone();
-        assert!(scp.nominate(slot, value, &prev_value));
+        assert!(herder.scp().nominate(slot, value, &prev_value));
 
         assert!(herder.get_nomination_timeout(slot).is_some());
     }
@@ -2761,14 +2548,13 @@ mod tests {
 
         let herder = Herder::with_secret_key(config, secret_for_herder);
         let secret = SecretKey::from_seed(&seed);
-        let scp = herder.scp().expect("validator scp");
         let slot = 1u64;
 
         assert!(herder.get_ballot_timeout(slot).is_none());
 
         // Create a valid value and start ballot protocol via bump_state
         let value = make_valid_value_with_cached_tx_set(&herder, &secret);
-        assert!(scp.bump_state(slot, value.clone(), 1));
+        assert!(herder.scp().bump_state(slot, value.clone(), 1));
 
         // Ballot started but no quorum heard yet (only local node's PREPARE)
         assert!(
@@ -2796,7 +2582,7 @@ mod tests {
             pledges: ScpStatementPledges::Prepare(prepare),
         };
         let env = sign_statement(&statement, &herder, &other_secret);
-        scp.receive_envelope(env);
+        herder.scp().receive_envelope(env);
 
         // Now we should have heard from quorum (local + other = 2, threshold = 2)
         assert!(herder.get_ballot_timeout(slot).is_some());
@@ -2814,11 +2600,10 @@ mod tests {
     #[test]
     fn test_ballot_timeout_none_when_externalized() {
         let (herder, secret) = make_validator_herder();
-        let scp = herder.scp().expect("validator scp");
         let slot = 1u64;
 
         let value = make_valid_value_with_cached_tx_set(&herder, &secret);
-        scp.force_externalize(slot, value);
+        herder.scp().force_externalize(slot, value);
 
         assert!(herder.get_ballot_timeout(slot).is_none());
     }
@@ -3183,9 +2968,8 @@ mod tests {
         assert_eq!(result, EnvelopeState::Valid);
 
         // SCP should have externalized the slot internally
-        let scp = herder.scp().expect("validator has scp");
         assert!(
-            scp.is_slot_externalized(tracking),
+            herder.scp().is_slot_externalized(tracking),
             "SCP should externalize when receiving valid EXTERNALIZE"
         );
 
