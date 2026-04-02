@@ -72,7 +72,7 @@ use henyey_herder::{
 };
 use henyey_history::{
     build_history_archive_state, checkpoint_containing, checkpoint_frequency, is_checkpoint_ledger,
-    latest_checkpoint_before_or_at, CatchupManager, CatchupMode, CatchupOutput, CheckpointData,
+    latest_checkpoint_before_or_at, CatchupManager, CatchupMode, CheckpointData,
     ExistingBucketState, HistoryArchive, HistoryArchiveState, GENESIS_LEDGER_SEQ,
 };
 use henyey_historywork::{

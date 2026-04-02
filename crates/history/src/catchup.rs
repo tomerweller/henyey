@@ -52,7 +52,7 @@ use crate::{
     catchup_range::{CatchupMode, CatchupRange},
     checkpoint,
     replay::ReplayConfig,
-    verify, CatchupOutput, CatchupResult, HistoryError, Result,
+    verify, CatchupResult, HistoryError, Result,
 };
 use henyey_bucket::{Bucket, BucketList, BucketManager, HasNextState, HotArchiveBucketList};
 use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
@@ -492,12 +492,12 @@ impl CatchupManager {
     ///
     /// # Returns
     ///
-    /// A `CatchupOutput` containing the bucket list, header, and summary information.
+    /// A `CatchupResult` containing summary information.
     pub async fn catchup_to_ledger(
         &mut self,
         target: u32,
         ledger_manager: &LedgerManager,
-    ) -> Result<CatchupOutput> {
+    ) -> Result<CatchupResult> {
         info!("Starting catchup to ledger {}", target);
         self.progress.target_ledger = target;
 
@@ -617,13 +617,11 @@ impl CatchupManager {
             final_header.ledger_seq, final_hash
         );
 
-        Ok(CatchupOutput {
-            result: CatchupResult {
-                ledger_seq: final_header.ledger_seq,
-                ledger_hash: final_hash,
-                ledgers_applied,
-                buckets_downloaded: buckets_total,
-            },
+        Ok(CatchupResult {
+            ledger_seq: final_header.ledger_seq,
+            ledger_hash: final_hash,
+            ledgers_applied,
+            buckets_downloaded: buckets_total,
         })
     }
 
@@ -643,7 +641,7 @@ impl CatchupManager {
     ///
     /// # Returns
     ///
-    /// A `CatchupOutput` containing the bucket list, header, and summary information.
+    /// A `CatchupResult` containing summary information.
     pub async fn catchup_to_ledger_with_mode(
         &mut self,
         target: u32,
@@ -651,7 +649,7 @@ impl CatchupManager {
         lcl: u32,
         existing_state: Option<ExistingBucketState>,
         ledger_manager: &LedgerManager,
-    ) -> Result<CatchupOutput> {
+    ) -> Result<CatchupResult> {
         info!(
             "Starting catchup to ledger {} with mode {:?}, lcl={}",
             target, mode, lcl
@@ -823,13 +821,11 @@ impl CatchupManager {
             final_header.ledger_seq, final_hash, ledgers_applied
         );
 
-        Ok(CatchupOutput {
-            result: CatchupResult {
-                ledger_seq: final_header.ledger_seq,
-                ledger_hash: final_hash,
-                ledgers_applied,
-                buckets_downloaded: self.progress.buckets_total,
-            },
+        Ok(CatchupResult {
+            ledger_seq: final_header.ledger_seq,
+            ledger_hash: final_hash,
+            ledgers_applied,
+            buckets_downloaded: self.progress.buckets_total,
         })
     }
 
@@ -839,7 +835,7 @@ impl CatchupManager {
         target: u32,
         data: CheckpointData,
         ledger_manager: &LedgerManager,
-    ) -> Result<CatchupOutput> {
+    ) -> Result<CatchupResult> {
         info!("Starting catchup to ledger {} with checkpoint data", target);
         self.progress.target_ledger = target;
 
@@ -1014,13 +1010,11 @@ impl CatchupManager {
 
         self.update_progress(CatchupStatus::Completed, 7, "Catchup completed");
 
-        Ok(CatchupOutput {
-            result: CatchupResult {
-                ledger_seq: final_header.ledger_seq,
-                ledger_hash: final_hash,
-                ledgers_applied,
-                buckets_downloaded: bucket_hashes.len() as u32,
-            },
+        Ok(CatchupResult {
+            ledger_seq: final_header.ledger_seq,
+            ledger_hash: final_hash,
+            ledgers_applied,
+            buckets_downloaded: bucket_hashes.len() as u32,
         })
     }
 
