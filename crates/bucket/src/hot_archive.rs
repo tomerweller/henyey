@@ -39,7 +39,8 @@ use henyey_common::Hash256;
 
 use crate::bucket_list::{
     bl_keep_tombstone_entries, bl_level_half, bl_level_should_spill, bl_round_down,
-    bl_should_merge_with_empty_curr, HasNextState, HAS_NEXT_STATE_INPUTS, HAS_NEXT_STATE_OUTPUT,
+    bl_should_merge_with_empty_curr, BucketListStats, HasNextState, HAS_NEXT_STATE_INPUTS,
+    HAS_NEXT_STATE_OUTPUT,
 };
 use crate::{BucketError, Result};
 use henyey_common::protocol::{
@@ -1166,7 +1167,7 @@ impl HotArchiveBucketList {
     }
 
     /// Get statistics about the bucket list.
-    pub fn stats(&self) -> HotArchiveBucketListStats {
+    pub fn stats(&self) -> BucketListStats {
         let mut total_entries = 0;
         let mut total_buckets = 0;
 
@@ -1181,7 +1182,7 @@ impl HotArchiveBucketList {
             }
         }
 
-        HotArchiveBucketListStats {
+        BucketListStats {
             num_levels: HOT_ARCHIVE_BUCKET_LIST_LEVELS,
             total_entries,
             total_buckets,
@@ -1630,17 +1631,6 @@ impl std::fmt::Debug for HotArchiveBucketList {
             .field("stats", &self.stats())
             .finish()
     }
-}
-
-/// Statistics about a HotArchiveBucketList.
-#[derive(Debug, Clone)]
-pub struct HotArchiveBucketListStats {
-    /// Number of levels.
-    pub num_levels: usize,
-    /// Total number of entries.
-    pub total_entries: usize,
-    /// Total number of non-empty buckets.
-    pub total_buckets: usize,
 }
 
 /// Extract key bytes from a hot archive bucket entry.

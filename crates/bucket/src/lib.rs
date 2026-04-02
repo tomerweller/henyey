@@ -188,7 +188,7 @@ pub use future_bucket::{FutureBucket, FutureBucketSnapshot, FutureBucketState, M
 
 pub use hot_archive::{
     is_hot_archive_tombstone, merge_hot_archive_buckets, HotArchiveBucket, HotArchiveBucketLevel,
-    HotArchiveBucketList, HotArchiveBucketListStats, HOT_ARCHIVE_BUCKET_LIST_LEVELS,
+    HotArchiveBucketList, HOT_ARCHIVE_BUCKET_LIST_LEVELS,
 };
 
 // ============================================================================
