@@ -58,7 +58,7 @@ use henyey_bucket::{
 };
 use henyey_clock::{Clock, RealClock};
 use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
-use henyey_common::{deterministic_seed, Hash256, NetworkId};
+use henyey_common::{Hash256, NetworkId};
 use henyey_db::queries::StateQueries;
 use henyey_db::schema::state_keys;
 use henyey_db::{
@@ -68,7 +68,7 @@ use henyey_herder::{
     drift_tracker::CloseTimeDriftTracker,
     flow_control::compute_max_tx_size,
     sync_recovery::{SyncRecoveryCallback, SyncRecoveryHandle, SyncRecoveryManager},
-    EnvelopeState, Herder, HerderCallback, HerderConfig, HerderStats, TxQueueConfig,
+    EnvelopeState, Herder, HerderConfig, HerderStats, TxQueueConfig,
 };
 use henyey_history::{
     build_history_archive_state, checkpoint_containing, checkpoint_frequency, is_checkpoint_ledger,
@@ -91,16 +91,15 @@ use henyey_tx::TransactionFrame;
 use henyey_work::{WorkScheduler, WorkSchedulerConfig, WorkState};
 use stellar_xdr::curr::{
     Curve25519Public, DontHave, EncryptedBody, FloodAdvert, FloodDemand, Hash, LedgerCloseMeta,
-    LedgerScpMessages, LedgerUpgrade, MessageType, ReadXdr, ScpEnvelope, ScpHistoryEntry,
-    ScpHistoryEntryV0, ScpStatementPledges, SignedTimeSlicedSurveyResponseMessage, StellarMessage,
-    StellarValue, StellarValueExt, SurveyMessageCommandType, SurveyRequestMessage,
-    SurveyResponseBody, SurveyResponseMessage, TimeSlicedPeerDataList,
-    TimeSlicedSurveyRequestMessage, TimeSlicedSurveyResponseMessage,
+    LedgerScpMessages, MessageType, ReadXdr, ScpEnvelope, ScpHistoryEntry, ScpHistoryEntryV0,
+    ScpStatementPledges, SignedTimeSlicedSurveyResponseMessage, StellarMessage, StellarValue,
+    SurveyMessageCommandType, SurveyRequestMessage, SurveyResponseBody, SurveyResponseMessage,
+    TimeSlicedPeerDataList, TimeSlicedSurveyRequestMessage, TimeSlicedSurveyResponseMessage,
     TimeSlicedSurveyStartCollectingMessage, TimeSlicedSurveyStopCollectingMessage,
     TopologyResponseBodyV2, TransactionHistoryEntry, TransactionHistoryEntryExt,
     TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionMeta,
     TransactionResultPair, TransactionResultSet, TransactionSet, TxAdvertVector, TxDemandVector,
-    UpgradeType, VecM, WriteXdr,
+    VecM, WriteXdr,
 };
 use x25519_dalek::{PublicKey as CurvePublicKey, StaticSecret as CurveSecretKey};
 
@@ -161,7 +160,9 @@ const POST_CATCHUP_RECOVERY_WINDOW_SECS: u64 = 300;
 /// recovery will never succeed. 3 attempts × 10s interval = 30s before fallback.
 const MAX_POST_CATCHUP_RECOVERY_ATTEMPTS: u32 = 3;
 
+mod bootstrap;
 mod catchup_impl;
+mod close;
 mod consensus;
 mod ledger_close;
 mod lifecycle;
@@ -170,6 +171,7 @@ mod publish;
 mod survey_impl;
 mod tx_flooding;
 mod types;
+mod upgrades;
 
 use types::*;
 pub use types::{
@@ -841,116 +843,6 @@ impl App {
         }
     }
 
-    /// Build genesis ledger entries (root account + optional test accounts).
-    ///
-    /// Mirrors the account creation logic in `initialize_genesis_ledger`.
-    fn build_genesis_entries(
-        passphrase: &str,
-        test_account_count: u32,
-        total_coins: i64,
-    ) -> Vec<stellar_xdr::curr::LedgerEntry> {
-        use stellar_xdr::curr::{
-            AccountEntry, AccountEntryExt, AccountId, LedgerEntry, LedgerEntryData, LedgerEntryExt,
-            PublicKey, SequenceNumber, Thresholds, Uint256, VecM,
-        };
-
-        let network_id = NetworkId::from_passphrase(passphrase);
-        let root_secret = henyey_crypto::SecretKey::from_seed(network_id.as_bytes());
-        let root_public = root_secret.public_key();
-        let root_account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
-            *root_public.as_bytes(),
-        )));
-
-        let (root_balance, test_balance) = if test_account_count > 0 {
-            let total_accounts = test_account_count as i64 + 1;
-            let base = total_coins / total_accounts;
-            let remainder = total_coins % total_accounts;
-            (base + remainder, base)
-        } else {
-            (total_coins, 0i64)
-        };
-
-        let make_entry = |account_id: AccountId, balance: i64| -> LedgerEntry {
-            LedgerEntry {
-                last_modified_ledger_seq: 1,
-                data: LedgerEntryData::Account(AccountEntry {
-                    account_id,
-                    balance,
-                    seq_num: SequenceNumber(0),
-                    num_sub_entries: 0,
-                    inflation_dest: None,
-                    flags: 0,
-                    home_domain: stellar_xdr::curr::String32::default(),
-                    thresholds: Thresholds([1, 0, 0, 0]),
-                    signers: VecM::default(),
-                    ext: AccountEntryExt::V0,
-                }),
-                ext: LedgerEntryExt::V0,
-            }
-        };
-
-        let mut entries = vec![make_entry(root_account_id, root_balance)];
-
-        for i in 0..test_account_count {
-            let name = format!("TestAccount-{}", i);
-            let seed = deterministic_seed(&name);
-            let secret = henyey_crypto::SecretKey::from_seed(&seed);
-            let public = secret.public_key();
-            let acct_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(*public.as_bytes())));
-            entries.push(make_entry(acct_id, test_balance));
-        }
-
-        entries
-    }
-
-    /// Create the genesis bucket list and persist non-empty buckets to disk.
-    ///
-    /// Verifies the computed bucket list hash matches the expected header hash.
-    fn create_genesis_bucket_list(
-        bucket_dir: &std::path::Path,
-        genesis_entries: Vec<stellar_xdr::curr::LedgerEntry>,
-        header: &stellar_xdr::curr::LedgerHeader,
-    ) -> anyhow::Result<BucketList> {
-        use stellar_xdr::curr::BucketListType;
-
-        std::fs::create_dir_all(bucket_dir)?;
-
-        let mut bucket_list = BucketList::new();
-        bucket_list.set_bucket_dir(bucket_dir.to_path_buf());
-        bucket_list
-            .add_batch(1, 0, BucketListType::Live, genesis_entries, vec![], vec![])
-            .map_err(|e| anyhow::anyhow!("Failed to create genesis bucket list: {}", e))?;
-
-        // Persist all non-empty buckets to disk so they're available for
-        // history publishing and restart recovery.
-        for level in bucket_list.levels() {
-            for bucket in [&level.curr, &level.snap] {
-                if bucket.backing_file_path().is_none() && !bucket.hash().is_zero() {
-                    let path =
-                        bucket_dir.join(henyey_bucket::canonical_bucket_filename(&bucket.hash()));
-                    if !path.exists() {
-                        bucket
-                            .save_to_xdr_file(&path)
-                            .map_err(|e| anyhow::anyhow!("Failed to save genesis bucket: {}", e))?;
-                    }
-                }
-            }
-        }
-
-        // Verify hash matches
-        let computed_hash = bucket_list.hash();
-        let expected_hash = henyey_common::Hash256::from_bytes(header.bucket_list_hash.0);
-        if computed_hash != expected_hash {
-            anyhow::bail!(
-                "Genesis bucket list hash mismatch: computed {} vs header {}",
-                computed_hash,
-                expected_hash
-            );
-        }
-
-        Ok(bucket_list)
-    }
-
     /// Get the application configuration.
     pub fn config(&self) -> &AppConfig {
         &self.config
@@ -1066,58 +958,6 @@ impl App {
         let _ = self
             .db
             .with_connection(|conn| conn.delete_state(state_keys::FORCE_SCP));
-    }
-
-    /// Bootstrap the node from genesis state stored in the database.
-    ///
-    /// Used by the force-scp flow for standalone single-node networks.
-    /// Reads the genesis ledger header from the DB, recreates the bucket list
-    /// with the root account entry (and test accounts if configured), and
-    /// initializes the LedgerManager.
-    pub async fn bootstrap_from_db(&self) -> anyhow::Result<()> {
-        use henyey_bucket::HotArchiveBucketList;
-        use henyey_db::queries::LedgerQueries;
-        use henyey_ledger::compute_header_hash;
-
-        // Read LCL header from DB
-        let (lcl_seq, header) = self.db.with_connection(|conn| {
-            let lcl_seq = conn
-                .get_last_closed_ledger()?
-                .ok_or_else(|| henyey_db::DbError::Integrity("No LCL in DB".to_string()))?;
-            let header = conn.load_ledger_header(lcl_seq)?.ok_or_else(|| {
-                henyey_db::DbError::Integrity(format!("No header for LCL {}", lcl_seq))
-            })?;
-            Ok((lcl_seq, header))
-        })?;
-
-        let header_hash = compute_header_hash(&header)
-            .map_err(|e| anyhow::anyhow!("Failed to compute header hash: {}", e))?;
-
-        let genesis_entries = Self::build_genesis_entries(
-            &self.config.network.passphrase,
-            self.config.testing.genesis_test_account_count,
-            header.total_coins,
-        );
-
-        let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
-        let bucket_list = Self::create_genesis_bucket_list(&bucket_dir, genesis_entries, &header)?;
-
-        // Initialize LedgerManager
-        let hot_archive = HotArchiveBucketList::new();
-        self.ledger_manager
-            .initialize(bucket_list, hot_archive, header, header_hash)
-            .map_err(|e| anyhow::anyhow!("Failed to initialize LedgerManager: {}", e))?;
-
-        let (seq, _hash, _close_time, _protocol) = self.ledger_info();
-        tracing::info!(
-            lcl_seq = seq,
-            "Bootstrapped from genesis state via force-scp"
-        );
-
-        self.set_state(AppState::Synced).await;
-        self.set_current_ledger(lcl_seq).await;
-
-        Ok(())
     }
 
     /// Get the database.
@@ -1292,33 +1132,6 @@ impl App {
 
     pub fn request_out_of_sync_recovery(&self) {
         self.sync_recovery_pending.store(true, Ordering::SeqCst);
-    }
-
-    pub fn current_upgrade_state(&self) -> (u32, u32, u32, u32) {
-        let header = self.ledger_manager.current_header();
-        (
-            header.ledger_version,
-            header.base_fee,
-            header.base_reserve,
-            header.max_tx_set_size,
-        )
-    }
-
-    pub fn proposed_upgrades(&self) -> Vec<LedgerUpgrade> {
-        self.config.upgrades.to_ledger_upgrades()
-    }
-
-    /// Set runtime upgrade parameters (from HTTP `/upgrades?mode=set`).
-    pub fn set_upgrade_parameters(
-        &self,
-        params: henyey_herder::upgrades::UpgradeParameters,
-    ) -> std::result::Result<(), String> {
-        self.herder.set_upgrade_parameters(params)
-    }
-
-    /// Get current runtime upgrade parameters.
-    pub fn runtime_upgrade_parameters(&self) -> henyey_herder::upgrades::UpgradeParameters {
-        self.herder.upgrade_parameters()
     }
 
     /// Get Soroban network configuration information.
@@ -1606,34 +1419,6 @@ impl App {
         });
     }
 
-    /// Get a ConfigUpgradeSet from the ledger by its key.
-    ///
-    /// Looks up the temporary ledger entry containing the ConfigUpgradeSet
-    /// that corresponds to the given ConfigUpgradeSetKey.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The ConfigUpgradeSetKey identifying the upgrade set
-    ///
-    /// # Returns
-    ///
-    /// * `Some(json)` - The ConfigUpgradeSet as a JSON-serializable value
-    /// * `None` - The upgrade set was not found or is invalid
-    pub fn get_config_upgrade_set(
-        &self,
-        key: &stellar_xdr::curr::ConfigUpgradeSetKey,
-    ) -> Option<serde_json::Value> {
-        let frame = self.ledger_manager.get_config_upgrade_set(key)?;
-        let upgrade_set = frame.to_xdr();
-
-        // Convert to JSON-serializable format
-        Some(serde_json::json!({
-            "updated_entry": upgrade_set.updated_entry.iter().map(|entry| {
-                format!("{:?}", entry)
-            }).collect::<Vec<_>>()
-        }))
-    }
-
     pub fn scp_slot_snapshots(&self, limit: usize) -> Vec<ScpSlotSnapshot> {
         let scp = self.herder.scp();
         let (ledger_seq, _, _, _) = self.ledger_info();
@@ -1733,167 +1518,6 @@ impl App {
     /// Return the local quorum set if configured.
     pub fn local_quorum_set(&self) -> Option<stellar_xdr::curr::ScpQuorumSet> {
         self.herder.local_quorum_set()
-    }
-}
-
-/// Implementation of HerderCallback for App.
-///
-/// This enables the herder to trigger ledger closes through the app.
-#[async_trait::async_trait]
-impl HerderCallback for App {
-    async fn close_ledger(
-        &self,
-        ledger_seq: u32,
-        tx_set: henyey_herder::TransactionSet,
-        close_time: u64,
-        upgrades: Vec<UpgradeType>,
-        stellar_value_ext: StellarValueExt,
-    ) -> henyey_herder::Result<henyey_common::Hash256> {
-        let tx_summary = tx_set.summary();
-        tracing::info!(
-            ledger_seq,
-            tx_count = tx_set.transactions.len(),
-            close_time,
-            summary = %tx_summary,
-            "Closing ledger"
-        );
-
-        // Get the previous ledger hash
-        let prev_hash = tx_set.previous_ledger_hash;
-
-        // Create the transaction set
-        let tx_set_variant = if let Some(gen_tx_set) = tx_set.generalized_tx_set.clone() {
-            TransactionSetVariant::Generalized(gen_tx_set)
-        } else {
-            TransactionSetVariant::Classic(TransactionSet {
-                previous_ledger_hash: Hash::from(prev_hash),
-                txs: tx_set.transactions.clone().try_into().map_err(|_| {
-                    henyey_herder::HerderError::Internal("Failed to create tx set".into())
-                })?,
-            })
-        };
-
-        // Create close data
-        let decoded_upgrades = decode_upgrades(upgrades);
-        let mut close_data =
-            LedgerCloseData::new(ledger_seq, tx_set_variant.clone(), close_time, prev_hash)
-                .with_stellar_value_ext(stellar_value_ext);
-        if !decoded_upgrades.is_empty() {
-            close_data = close_data.with_upgrades(decoded_upgrades);
-        }
-        if let Some(entry) = self.build_scp_history_entry(ledger_seq) {
-            close_data = close_data.with_scp_history(vec![entry]);
-        }
-
-        // Close the ledger on a blocking thread (yields the tokio worker).
-        let lm = self.ledger_manager.clone();
-        let runtime_handle = tokio::runtime::Handle::current();
-        self.set_applying_ledger(true);
-
-        let join_handle = tokio::task::spawn_blocking(move || {
-            lm.close_ledger(close_data, Some(runtime_handle))
-                .map_err(|e| e.to_string())
-        });
-
-        let mut pending = PendingLedgerClose {
-            handle: join_handle,
-            ledger_seq,
-            tx_set,
-            tx_set_variant,
-            close_time,
-            upgrades: Vec::new(),
-        };
-
-        let join_result = (&mut pending.handle).await;
-
-        // Extract header hash before passing ownership to handle_close_complete.
-        let header_hash = match &join_result {
-            Ok(Ok(result)) => Some(result.header_hash),
-            _ => None,
-        };
-
-        let success = self.handle_close_complete(pending, join_result).await;
-
-        if success {
-            Ok(header_hash.unwrap())
-        } else {
-            Err(henyey_herder::HerderError::Internal(format!(
-                "Failed to close ledger {}",
-                ledger_seq
-            )))
-        }
-    }
-
-    async fn validate_tx_set(&self, _tx_set_hash: &henyey_common::Hash256) -> bool {
-        // For now, accept all transaction sets
-        // In a full implementation, this would:
-        // 1. Check we have the tx set locally
-        // 2. Validate all transactions are valid
-        // 3. Check the tx set hash matches
-        true
-    }
-
-    async fn broadcast_scp_message(&self, envelope: ScpEnvelope) {
-        let slot = envelope.statement.slot_index;
-        // Send through the channel to be picked up by the main loop
-        if let Err(e) = self.scp_envelope_tx.try_send(envelope) {
-            tracing::warn!(slot, error = %e, "Failed to queue SCP envelope for broadcast");
-        }
-    }
-}
-
-impl SyncRecoveryCallback for App {
-    fn on_lost_sync(&self) {
-        tracing::warn!("Lost sync with network - transitioning to syncing state");
-        self.lost_sync_count.fetch_add(1, Ordering::Relaxed);
-        // Update herder state to syncing
-        self.herder.set_state(henyey_herder::HerderState::Syncing);
-    }
-
-    fn on_out_of_sync_recovery(&self) {
-        tracing::info!("SyncRecoveryManager triggered out-of-sync recovery");
-        // Set flag so the main event loop will trigger recovery and buffered catchup.
-        // The main loop checks this flag and calls maybe_start_buffered_catchup()
-        // which handles the actual recovery logic including timeout-based catchup.
-        self.sync_recovery_pending.store(true, Ordering::SeqCst);
-    }
-
-    fn is_applying_ledger(&self) -> bool {
-        self.is_applying_ledger.load(Ordering::Relaxed)
-    }
-
-    fn is_tracking(&self) -> bool {
-        self.herder.is_tracking()
-    }
-
-    fn get_v_blocking_slots(&self) -> Vec<henyey_scp::SlotIndex> {
-        // Return slots where we've received v-blocking messages
-        // For now, return the tracking slot range
-        let tracking = self.herder.tracking_slot();
-        if tracking > 0 {
-            vec![tracking]
-        } else {
-            vec![]
-        }
-    }
-
-    fn purge_slots_below(&self, slot: henyey_scp::SlotIndex) {
-        tracing::debug!(slot, "Purging SCP slots below");
-        self.herder.purge_slots_below(slot);
-    }
-
-    fn broadcast_latest_messages(&self, from_slot: henyey_scp::SlotIndex) {
-        tracing::debug!(from_slot, "Broadcasting latest SCP messages");
-        // Get and broadcast latest messages for the slot
-        if let Some(messages) = self.herder.get_latest_messages(from_slot) {
-            for envelope in messages {
-                let _ = self.scp_envelope_tx.try_send(envelope);
-            }
-        }
-    }
-
-    fn request_scp_state_from_peers(&self) {
-        self.request_scp_state_sync();
     }
 }
 
@@ -2117,6 +1741,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stellar_xdr::curr::StellarValueExt;
     use tempfile;
 
     #[tokio::test]
