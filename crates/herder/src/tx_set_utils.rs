@@ -26,8 +26,10 @@ use crate::tx_queue::FeeBalanceProvider;
 /// The lower bound is `closeTime + lowerOffset` and the upper bound is
 /// `closeTime + upperOffset`.
 ///
-/// For post-ledger-close validation (where the close time is known exactly),
-/// both offsets should be 0.
+/// For post-ledger-close queue cleanup, use `with_offsets(0, upper_bound)`
+/// where `upper_bound` is computed like stellar-core's
+/// `getUpperBoundCloseTimeOffset()` to avoid prematurely banning transactions
+/// whose `max_time` may still be valid for the next ledger.
 #[derive(Debug, Clone, Copy)]
 pub struct CloseTimeBounds {
     /// Offset added to close time for the lower bound check (min_time validation).

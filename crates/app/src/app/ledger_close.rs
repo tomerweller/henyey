@@ -1685,12 +1685,33 @@ impl App {
         // Post-close invalidation: re-validate remaining queued txs against
         // updated ledger state. Mirrors stellar-core updateQueue:
         // getInvalidTxList → ban.
+        //
+        // Uses a permissive upper-bound close-time offset so we only ban
+        // transactions that would be invalid even under a generous future
+        // close time.  Matches stellar-core's getUpperBoundCloseTimeOffset:
+        //   offset = expectedCloseTime * EXPECTED_CLOSE_TIME_MULT + drift
+        // where drift = max(0, wallClock − lastCloseTime).
         {
             let pending_envs = self.herder.tx_queue().pending_envelopes();
             if !pending_envs.is_empty() {
+                let last_close_time = result.header.scp_value.close_time.0;
+
+                // Compute upper-bound close-time offset (stellar-core parity).
+                const EXPECTED_CLOSE_TIME_MULT: u64 = 2;
+                let expected_close_secs = self.target_ledger_close_time() as u64;
+                let wall_now = self
+                    .clock
+                    .system_now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let close_time_drift = wall_now.saturating_sub(last_close_time);
+                let upper_bound_offset =
+                    expected_close_secs * EXPECTED_CLOSE_TIME_MULT + close_time_drift;
+
                 let ctx = TxSetValidationContext {
                     next_ledger_seq: pending.ledger_seq + 1,
-                    close_time: result.header.scp_value.close_time.0,
+                    close_time: last_close_time,
                     base_fee: result.header.base_fee,
                     base_reserve: result.header.base_reserve,
                     protocol_version: result.header.ledger_version,
@@ -1700,7 +1721,7 @@ impl App {
                 let invalid = get_invalid_tx_list(
                     &pending_envs,
                     &ctx,
-                    &CloseTimeBounds::exact(),
+                    &CloseTimeBounds::with_offsets(0, upper_bound_offset),
                     fee_provider.as_deref(),
                 );
                 if !invalid.is_empty() {
