@@ -104,8 +104,6 @@ pub struct TxQueueLimiter {
     lane_config: Option<Box<dyn SurgePricingLaneConfig + Send + Sync>>,
     /// Transaction queue for flood ordering (highest fee first)
     txs_to_flood: Option<SurgePricingPriorityQueue>,
-    /// Lane configuration for flood queue
-    flood_lane_config: Option<Box<dyn SurgePricingLaneConfig + Send + Sync>>,
     /// Maximum evicted inclusion fee per lane (fee, ops)
     lane_evicted_inclusion_fee: Vec<(i64, u32)>,
     /// Network ID for transaction hashing
@@ -166,7 +164,6 @@ impl TxQueueLimiter {
             txs: None,
             lane_config: None,
             txs_to_flood: None,
-            flood_lane_config: None,
             lane_evicted_inclusion_fee: Vec::new(),
             network_id,
         }
@@ -202,7 +199,6 @@ impl TxQueueLimiter {
     pub fn reset_best_fee_txs(&mut self, _ledger_version: u32, seed: u64) {
         // For flood queue, we want highest priority first (different seed for tie-breaking)
         self.txs_to_flood = Some(self.make_queue(seed));
-        self.flood_lane_config = Some(self.lane_config());
     }
 
     /// Reset eviction state tracking.
