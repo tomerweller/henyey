@@ -2063,11 +2063,12 @@ mod tests {
     use stellar_xdr::curr::{
         AccountId, AlphaNum4, Asset, AssetCode4, ContractExecutable, ContractIdPreimage,
         ContractIdPreimageFromAddress, CreateAccountOp, CreateContractArgs, DecoratedSignature,
-        Duration, Hash, HostFunction, InvokeContractArgs, InvokeHostFunctionOp, LedgerFootprint,
-        ManageSellOfferOp, Memo, MuxedAccount, MuxedAccountMed25519, Operation, OperationBody,
-        PaymentOp, Preconditions, PreconditionsV2, Price, PublicKey, ScAddress, ScSymbol, ScVal,
-        SequenceNumber, Signature as XdrSignature, SignatureHint, SignerKey, SorobanResources,
-        SorobanTransactionData, SorobanTransactionDataExt, StringM, Transaction,
+        Duration, FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
+        FeeBumpTransactionInnerTx, Hash, HostFunction, InvokeContractArgs, InvokeHostFunctionOp,
+        LedgerFootprint, ManageSellOfferOp, Memo, MuxedAccount, MuxedAccountMed25519, Operation,
+        OperationBody, PaymentOp, Preconditions, PreconditionsV2, Price, PublicKey, ScAddress,
+        ScSymbol, ScVal, SequenceNumber, Signature as XdrSignature, SignatureHint, SignerKey,
+        SorobanResources, SorobanTransactionData, SorobanTransactionDataExt, StringM, Transaction,
         TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, VecM,
     };
 
@@ -3905,6 +3906,94 @@ mod tests {
         assert!(
             queue.contains(&queued_hash),
             "queued tx with seq=10 should NOT be removed when applied tx has seq=5"
+        );
+        assert_eq!(queue.len(), 1);
+    }
+
+    /// Helper: wrap a regular envelope in a fee-bump with a different fee source.
+    fn make_fee_bump_envelope(
+        inner: TransactionV1Envelope,
+        fee_source_seed: u8,
+        outer_fee: i64,
+    ) -> TransactionEnvelope {
+        let fee_source = MuxedAccount::Ed25519(Uint256([fee_source_seed; 32]));
+        TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: FeeBumpTransaction {
+                fee_source,
+                fee: outer_fee,
+                inner_tx: FeeBumpTransactionInnerTx::Tx(inner),
+                ext: FeeBumpTransactionExt::V0,
+            },
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        })
+    }
+
+    /// Fee-bump removal: remove_applied uses inner source for sequence matching
+    /// and outer source (fee_source) for fee release.
+    #[test]
+    fn test_remove_applied_fee_bump_uses_inner_source() {
+        let queue = TransactionQueue::with_defaults();
+
+        // Queue a regular tx from inner_source (seed 50) with seq=1.
+        let mut queued_tx = make_test_envelope(200, 1);
+        set_source(&mut queued_tx, 50);
+        assert_eq!(queue.try_add(queued_tx.clone()), TxQueueResult::Added);
+        let queued_hash = full_hash(&queued_tx);
+        assert!(queue.contains(&queued_hash));
+
+        // Build a fee-bump applied tx: inner_source = seed 50 (same account),
+        // fee_source = seed 99 (different account), inner seq = 5.
+        let mut inner = match make_test_envelope(100, 1) {
+            TransactionEnvelope::Tx(env) => env,
+            _ => panic!("expected Tx"),
+        };
+        inner.tx.source_account = MuxedAccount::Ed25519(Uint256([50; 32]));
+        inner.tx.seq_num = SequenceNumber(5);
+        let applied_fee_bump = make_fee_bump_envelope(inner, 99, 500);
+
+        // remove_applied should match by inner source (seed 50) and drop the
+        // queued tx because its seq(1) <= applied seq(5).
+        queue.remove_applied(&[(applied_fee_bump, 5)]);
+
+        assert!(
+            !queue.contains(&queued_hash),
+            "fee-bump remove_applied should match by inner source account"
+        );
+        assert_eq!(queue.len(), 0);
+    }
+
+    /// Fee-bump removal should NOT match against the outer fee source.
+    #[test]
+    fn test_remove_applied_fee_bump_does_not_match_fee_source() {
+        let queue = TransactionQueue::with_defaults();
+
+        // Queue a tx from account seed 99 (the fee source of the fee-bump).
+        let mut queued_tx = make_test_envelope(200, 1);
+        set_source(&mut queued_tx, 99);
+        assert_eq!(queue.try_add(queued_tx.clone()), TxQueueResult::Added);
+        let queued_hash = full_hash(&queued_tx);
+
+        // Build a fee-bump: inner_source = seed 50, fee_source = seed 99.
+        let mut inner = match make_test_envelope(100, 1) {
+            TransactionEnvelope::Tx(env) => env,
+            _ => panic!("expected Tx"),
+        };
+        inner.tx.source_account = MuxedAccount::Ed25519(Uint256([50; 32]));
+        inner.tx.seq_num = SequenceNumber(5);
+        let applied_fee_bump = make_fee_bump_envelope(inner, 99, 500);
+
+        queue.remove_applied(&[(applied_fee_bump, 5)]);
+
+        // Queued tx from account 99 should NOT be removed — the fee-bump's
+        // inner source is 50, not 99.
+        assert!(
+            queue.contains(&queued_hash),
+            "fee-bump remove_applied should not match by outer fee source"
         );
         assert_eq!(queue.len(), 1);
     }
