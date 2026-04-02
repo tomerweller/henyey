@@ -273,7 +273,7 @@ Corresponds to: `TransactionQueue.h`
 | `removeApplied()` | `remove_applied()` | Full |
 | `ban()` | `ban()` | Full |
 | `shift()` | `shift()` | Full |
-| `rebroadcast()` | `TxBroadcastManager` | Full |
+| `rebroadcast()` | `TxBroadcastManager` | Partial — module exists but not called after ledger close |
 | `shutdown()` | _(not implemented)_ | None |
 | `isBanned()` | `is_banned()` | Full |
 | `getTx()` | `get_tx()` | Full |
@@ -529,7 +529,7 @@ Features not yet implemented. These ARE counted against parity %.
 ### Test Gaps
 
 - **HerderTests**: Missing integration tests for full envelope processing flow, ledger close lifecycle, out-of-sync recovery, quorum map reanalysis, and upgrade scheduling
-- **TransactionQueue**: Missing tests for arbitrage damping, filtered-account overrides, and full rebroadcast behavior
+- **TransactionQueue**: Missing tests for arbitrage damping, filtered-account overrides, and full rebroadcast behavior. Note: `rebroadcast()` exists in `TxBroadcastManager` but is not called after ledger close (`updateTransactionQueue` in stellar-core calls `queue.rebroadcast()` after `ban()`)
 - **TxSet**: Missing `ApplicableTxSetFrame` validation tests, phase ordering tests, and history-tx-set construction tests
 - **Upgrades**: Missing ledger-integrated upgrade application tests, config upgrade set tests, and nomination-timeout stripping behavior
 - **QuorumIntersection**: Entirely missing (not implemented)
