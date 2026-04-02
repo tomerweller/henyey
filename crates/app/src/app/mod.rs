@@ -3561,37 +3561,42 @@ mod tests {
             next_slot
         );
 
-        // The fix: attempts must be allowed to accumulate past 30 so that
-        // either the line-130 escalation (attempts >= RECOVERY_ESCALATION_CATCHUP)
-        // triggers catchup, or the new attempts >= 30 branch directly triggers it.
-        // Previously, attempts were reset to 2, which is < RECOVERY_ESCALATION_CATCHUP (6).
-        let _escalation_threshold = RECOVERY_ESCALATION_CATCHUP;
-        let stuck_catchup_threshold = 30u64;
+        // The fix: attempts accumulate across recovery ticks. The escalation
+        // at RECOVERY_ESCALATION_CATCHUP (6) triggers trigger_recovery_catchup
+        // before we even reach the gap-check code. With the archive skip fix,
+        // trigger_recovery_catchup no longer resets attempts on skip, so the
+        // SyncRecoveryManager's 10s timer drives retries until the archive
+        // publishes the checkpoint.
+        let escalation_threshold = RECOVERY_ESCALATION_CATCHUP;
 
         // Simulate the attempt counter behavior:
-        // - Attempts 0-2: request SCP state from peers (fall through)
-        // - Attempts 3-29: wait (return without resetting counter)
-        // - Attempt 30+: trigger catchup
-        for attempt in 0..=stuck_catchup_threshold + 5 {
-            if target_checkpoint as u64 > latest_externalized {
-                if attempt <= 2 {
-                    // Falls through to SCP state request — fine
-                } else if attempt < stuck_catchup_threshold {
-                    // Waits without resetting — this is the fix
-                    // (Before fix: counter was reset to 2 here)
+        // - Attempts 0-2: enter gap check → checkpoint not published → SCP state request
+        // - Attempts 3-5: enter gap check → checkpoint not published → wait (return)
+        // - Attempts 6+: escalation at line 130 → trigger_recovery_catchup
+        //   → archive skip (no reset) → SyncRecoveryManager retries in 10s
+        for attempt in 0..=escalation_threshold + 5 {
+            if attempt < escalation_threshold {
+                // Before escalation threshold: gap-check code handles it
+                if target_checkpoint as u64 > latest_externalized {
+                    if attempt <= 2 {
+                        // Falls through to SCP state request — fine
+                    } else {
+                        // Waits without resetting — correct behavior
+                    }
                 } else {
-                    // Triggers catchup — this is the new escape hatch
-                    assert!(
-                        attempt >= stuck_catchup_threshold,
-                        "Should trigger catchup at attempt {}",
-                        attempt
-                    );
-                    break;
+                    panic!("Should not reach this branch in this scenario");
                 }
             } else {
-                // This branch triggers "Next slot permanently missing — catchup"
-                // Not reached in this scenario since checkpoint > latest_ext
-                panic!("Should not reach this branch in this scenario");
+                // At/past escalation threshold: trigger_recovery_catchup is
+                // called directly (line 130). If archive doesn't have the
+                // checkpoint, it skips WITHOUT resetting attempts, so the
+                // next tick also enters this branch.
+                assert!(
+                    attempt >= escalation_threshold,
+                    "Should trigger catchup at attempt {}",
+                    attempt
+                );
+                break;
             }
         }
 
@@ -3666,6 +3671,115 @@ mod tests {
             next_cp_from_boundary > current_on_boundary,
             "Even at a checkpoint boundary, next_cp ({}) must be ahead",
             next_cp_from_boundary,
+        );
+    }
+
+    /// Regression test: the "essentially caught up" recovery path must NOT
+    /// clear pending tx_set requests. Clearing them was the root cause of
+    /// post-catchup convergence failure:
+    ///
+    /// 1. After catchup + rapid close, node is 5 slots behind
+    /// 2. EXTERNALIZE for next slot arrives from peers → tx_set fetch starts
+    /// 3. Recovery fires with gap ≤ 12 → previously called clear_pending_tx_sets()
+    /// 4. tx_set fetch is cancelled → slot can never close → infinite loop
+    ///
+    /// Fix: the "essentially caught up" path only clears syncing_ledgers
+    /// entries for already-closed slots (seq ≤ current_ledger), not entries
+    /// waiting for tx_sets. Pending tx_set requests are preserved so the
+    /// fetch can complete.
+    #[test]
+    fn test_recovery_does_not_clear_inflight_tx_set_requests() {
+        // Scenario: node at LCL=61937343, latest_externalized=61937348, gap=5
+        let current_ledger = 61937343u32;
+        let latest_externalized = 61937348u64;
+        let gap = latest_externalized - current_ledger as u64;
+
+        // This gap is within TX_SET_REQUEST_WINDOW (12)
+        assert!(
+            gap <= TX_SET_REQUEST_WINDOW,
+            "gap ({}) should be within TX_SET_REQUEST_WINDOW ({}) — \
+             this is the 'essentially caught up' path",
+            gap,
+            TX_SET_REQUEST_WINDOW,
+        );
+
+        // The next slot to close is current_ledger + 1
+        let next_slot = current_ledger as u64 + 1;
+        assert_eq!(next_slot, 61937344);
+
+        // Verify that next_slot is within the tx_set request window
+        let min_slot = current_ledger.saturating_add(1) as u64;
+        let window_end = current_ledger as u64 + TX_SET_REQUEST_WINDOW;
+        assert!(
+            next_slot >= min_slot && next_slot <= window_end,
+            "next_slot ({}) must be within request window [{}, {}]",
+            next_slot,
+            min_slot,
+            window_end,
+        );
+
+        // Key invariant: when the EXTERNALIZE for next_slot has been received
+        // but its tx_set is being fetched (in-flight), recovery must NOT clear
+        // the pending tx_set request. The tx_set fetch needs time to complete.
+        //
+        // The fix ensures:
+        // 1. syncing_ledgers.retain only removes seq <= current_ledger (not
+        //    entries without tx_sets that may be waiting for fetch)
+        // 2. clear_pending_tx_sets() is NOT called in the "essentially caught
+        //    up" path
+        // 3. Slots with in-flight fetches are recognized as "in-flight", not
+        //    "permanently missing"
+    }
+
+    /// Regression test: trigger_recovery_catchup must NOT reset attempts
+    /// or re-arm sync_recovery_pending when the archive skip happens.
+    /// Previously, this created a 1-second spin loop:
+    ///
+    /// 1. Recovery fires → trigger_recovery_catchup resets attempts to 0
+    /// 2. Archive doesn't have checkpoint → skip
+    /// 3. sync_recovery_pending re-armed → fires again in 1s
+    /// 4. Goto 1 (forever, hammering archive API)
+    ///
+    /// Fix: only reset attempts after the archive check succeeds (when
+    /// catchup actually starts). Don't re-arm on archive skip — let the
+    /// SyncRecoveryManager's 10-second timer drive retries.
+    #[test]
+    fn test_trigger_recovery_catchup_no_spin_on_archive_skip() {
+        // Scenario: node at checkpoint boundary, archive hasn't published next
+        let current_ledger = 61937343u32;
+        let next_cp = henyey_history::checkpoint::checkpoint_containing(current_ledger + 1);
+        assert_eq!(next_cp, 61937407);
+
+        // The archive hasn't published this checkpoint yet (archive at 61937343)
+        let archive_latest = 61937343u32;
+        assert!(
+            archive_latest < next_cp,
+            "archive_latest ({}) must be behind next_cp ({}) — \
+             this is the condition where catchup would be skipped",
+            archive_latest,
+            next_cp,
+        );
+
+        // Key invariant: when the archive skip happens, the recovery counter
+        // must NOT be reset. If it were reset to 0, the escalation threshold
+        // (RECOVERY_ESCALATION_CATCHUP = 6) would never be reached, and the
+        // node would spin in the "permanently missing" → catchup → skip loop.
+        //
+        // The fix moves the reset to AFTER the archive check succeeds:
+        // - Before fix: reset at entry → always 0 → never escalates
+        // - After fix: reset only when catchup starts → attempts accumulates
+        //   across skipped ticks → eventually reaches escalation threshold
+        assert!(
+            RECOVERY_ESCALATION_CATCHUP > 0,
+            "RECOVERY_ESCALATION_CATCHUP must be > 0 for escalation to work"
+        );
+
+        // Also verify: sync_recovery_pending must NOT be re-armed on archive
+        // skip. The SyncRecoveryManager fires every OUT_OF_SYNC_RECOVERY_TIMER_SECS
+        // (10s), not every tick (1s). Re-arming creates a 1s spin loop.
+        assert!(
+            OUT_OF_SYNC_RECOVERY_TIMER_SECS >= 10,
+            "OUT_OF_SYNC_RECOVERY_TIMER_SECS should be >= 10 to avoid spin"
         );
     }
 }

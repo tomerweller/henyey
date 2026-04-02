@@ -1706,6 +1706,15 @@ impl Herder {
         self.scp_driver.find_missing_slots_in_range(from, to)
     }
 
+    /// Check if a slot has EXTERNALIZE envelopes in-flight (waiting for tx_set).
+    ///
+    /// Returns true if the envelope was received but is stuck in fetching
+    /// state because the tx_set hasn't arrived yet. This is distinct from
+    /// "missing" — the envelope exists, just can't be processed yet.
+    pub fn has_fetching_envelopes_for_slot(&self, slot: u64) -> bool {
+        self.fetching_envelopes.has_fetching_for_slot(slot)
+    }
+
     /// Get SCP state envelopes for responding to peers.
     ///
     /// Returns SCP envelopes for slots starting from `from_slot`, along with

@@ -531,6 +531,14 @@ impl FetchingEnvelopes {
             .sum()
     }
 
+    /// Check if a slot has envelopes currently being fetched (waiting for tx_set).
+    pub fn has_fetching_for_slot(&self, slot: SlotIndex) -> bool {
+        self.slots
+            .get(&slot)
+            .map(|entry| !entry.value().fetching.is_empty())
+            .unwrap_or(false)
+    }
+
     /// Check if we have a cached TxSet.
     pub fn has_tx_set(&self, hash: &Hash256) -> bool {
         self.tx_set_cache.contains_key(hash)
