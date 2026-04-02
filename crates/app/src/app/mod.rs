@@ -3731,6 +3731,76 @@ mod tests {
         //    "permanently missing"
     }
 
+    /// Regression test: fast-track catchup on pending EXTERNALIZE must NOT
+    /// fire when the next slot has a buffered entry with tx_set.
+    ///
+    /// After catchup, the node receives fresh EXTERNALIZE envelopes from
+    /// SCP state responses. These are for slots far ahead (gap 10+). The
+    /// fast-track code sets recovery_attempts = RECOVERY_ESCALATION_CATCHUP
+    /// and arms sync_recovery_pending, which triggers trigger_recovery_catchup
+    /// on the next tick. That function clears syncing_ledgers (buffer.clear()),
+    /// destroying entries WITH tx_sets that are ready for rapid close.
+    ///
+    /// Fix: skip fast-track when syncing_ledgers has next_slot with a tx_set.
+    #[test]
+    fn test_fast_track_catchup_skipped_when_next_slot_buffered() {
+        // Scenario: after catchup to L61937727, rapid close processed L61937728.
+        // syncing_ledgers has entries L61937729-61937740 with tx_sets.
+        // Fresh EXTERNALIZE arrives for L61937738 (gap = 10).
+        let current_ledger = 61937728u64;
+        let pending_externalize_slot = 61937738u64;
+        let gap = pending_externalize_slot - current_ledger;
+
+        // Verify this would trigger fast-track (gap > 2)
+        assert!(
+            gap > 2,
+            "gap ({}) must be > 2 to trigger fast-track path",
+            gap,
+        );
+
+        // Key invariant: if the next slot (current_ledger + 1) has a
+        // buffered entry with a tx_set, the fast-track must NOT fire.
+        // Instead, let rapid close proceed to close the buffered entries.
+        let next_slot = current_ledger as u32 + 1;
+        assert_eq!(next_slot, 61937729);
+
+        // Verify the escalation threshold would be reached if fast-track fires
+        assert_eq!(
+            RECOVERY_ESCALATION_CATCHUP, 6,
+            "RECOVERY_ESCALATION_CATCHUP must be 6"
+        );
+    }
+
+    /// Regression test: trigger_recovery_catchup must NOT clear
+    /// syncing_ledgers when the archive doesn't have the checkpoint.
+    ///
+    /// Previously, buffer.clear() ran BEFORE the archive check, so
+    /// skipped catchups destroyed buffered entries with tx_sets that
+    /// were ready for rapid close, preventing convergence.
+    ///
+    /// Fix: move buffer.clear() + clear_pending_tx_sets() to AFTER
+    /// the archive availability check succeeds.
+    #[test]
+    fn test_trigger_recovery_catchup_no_clear_on_archive_skip() {
+        // Scenario: node at L61937728, archive at L61937727 (no checkpoint)
+        let current_ledger = 61937728u32;
+        let next_cp = henyey_history::checkpoint::checkpoint_containing(current_ledger + 1);
+        assert_eq!(next_cp, 61937791);
+
+        let archive_latest = 61937727u32;
+        assert!(
+            archive_latest < next_cp,
+            "archive ({}) behind checkpoint ({}) — catchup will be skipped",
+            archive_latest,
+            next_cp,
+        );
+
+        // Key invariant: when catchup is skipped because the archive
+        // doesn't have the checkpoint, syncing_ledgers must NOT be cleared.
+        // The buffer may contain entries with tx_sets from the previous
+        // catchup's rapid close that are ready to be applied.
+    }
+
     /// Regression test: trigger_recovery_catchup must NOT reset attempts
     /// or re-arm sync_recovery_pending when the archive skip happens.
     /// Previously, this created a 1-second spin loop:

@@ -712,13 +712,6 @@ impl App {
             attempts,
             "Recovery stalled for too long — forcing catchup"
         );
-        // Clear all stale state
-        {
-            let mut buffer = self.syncing_ledgers.write().await;
-            buffer.clear();
-        }
-        self.herder.clear_pending_tx_sets();
-        self.reset_tx_set_tracking().await;
         // Invalidate the archive checkpoint cache so CatchupTarget::Current
         // queries the archive for the freshest checkpoint. In local mode
         // (1 ledger/sec, checkpoints every 8 ledgers), a 60s-stale cache
@@ -751,6 +744,18 @@ impl App {
                 // the main event loop checks the flag every tick.
                 return;
             }
+
+            // Archive has the checkpoint — clear stale state NOW, right
+            // before we actually start catchup. Previously this was done
+            // before the archive check, so skipped catchups destroyed the
+            // syncing_ledgers buffer (with tx_sets ready for rapid close),
+            // preventing post-catchup convergence.
+            {
+                let mut buffer = self.syncing_ledgers.write().await;
+                buffer.clear();
+            }
+            self.herder.clear_pending_tx_sets();
+            self.reset_tx_set_tracking().await;
 
             // Archive has the checkpoint — reset attempts now that we're
             // actually starting catchup. Previously this was done before

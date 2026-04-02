@@ -1015,8 +1015,6 @@ impl Herder {
         );
 
         // Check if we have the tx sets needed for this envelope.
-        // This is critical: we must not let SCP externalize until we have the tx set,
-        // otherwise we'll be stuck unable to close the ledger.
         let tx_set_hashes = crate::herder_utils::get_tx_set_hashes_from_envelope(&envelope);
         let mut missing_tx_sets = Vec::new();
         for hash in &tx_set_hashes {
@@ -1026,7 +1024,42 @@ impl Herder {
         }
 
         if !missing_tx_sets.is_empty() {
-            // Buffer this envelope until we get the tx set
+            let is_externalize = matches!(
+                envelope.statement.pledges,
+                stellar_xdr::curr::ScpStatementPledges::Externalize(_)
+            );
+
+            // EXTERNALIZE envelopes are processed through SCP even without
+            // the tx_set. Matching stellar-core: SCP consensus (slot
+            // externalization, tracking slot advance) does NOT require the
+            // tx_set. The tx_set is only needed later when the application
+            // layer closes the ledger.
+            //
+            // Without this, after catchup the node receives EXTERNALIZE
+            // from peers but blocks them from SCP because the tx_set is
+            // missing (expired from peers' caches). The tracking slot
+            // stays frozen at LCL+1, the node can't participate in
+            // real-time consensus for the current network slot, and it
+            // enters a checkpoint cycling loop.
+            //
+            // For non-EXTERNALIZE envelopes (NOMINATE, PREPARE, CONFIRM),
+            // we still require the tx_set before processing — these need
+            // the tx_set for value validation during the ballot protocol.
+            if is_externalize {
+                // Register pending tx_set requests
+                for hash in &missing_tx_sets {
+                    self.scp_driver.request_tx_set(*hash, slot);
+                }
+                // Process through SCP to allow externalization + tracking advance
+                let result = self.process_scp_envelope_with_tx_set(envelope);
+                // If the slot externalized without the tx_set, the ledger
+                // close path will wait for the tx_set to arrive before
+                // actually closing. This is safe because check_ledger_close
+                // checks tx_set availability independently.
+                return result;
+            }
+
+            // Non-EXTERNALIZE: buffer until tx_set arrives
             debug!(
                 slot,
                 missing_count = missing_tx_sets.len(),

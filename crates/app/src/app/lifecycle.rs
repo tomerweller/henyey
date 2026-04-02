@@ -944,18 +944,43 @@ impl App {
                         // our current ledger, the network has moved on without us.
                         // Immediately escalate recovery to trigger catchup rather than
                         // waiting 60+ seconds for the normal escalation path.
+                        //
+                        // IMPORTANT: Only fast-track if the next slot (current_ledger+1)
+                        // is NOT in syncing_ledgers. After catchup, the node has buffered
+                        // entries with tx_sets ready for rapid close. Fresh EXTERNALIZE
+                        // envelopes from SCP state responses are always far ahead (gap 10+),
+                        // and fast-tracking would destroy the buffer via
+                        // trigger_recovery_catchup → buffer.clear(), preventing convergence.
                         if is_externalize {
                             let current_ledger = *self.current_ledger.read().await as u64;
                             if slot > current_ledger + 2 {
-                                tracing::info!(
-                                    slot,
-                                    current_ledger,
-                                    gap = slot - current_ledger,
-                                    "Pending EXTERNALIZE far ahead — fast-tracking catchup"
-                                );
-                                self.recovery_attempts_without_progress
-                                    .store(RECOVERY_ESCALATION_CATCHUP, Ordering::SeqCst);
-                                self.sync_recovery_pending.store(true, Ordering::SeqCst);
+                                let next_slot = current_ledger as u32 + 1;
+                                let have_next = self
+                                    .syncing_ledgers
+                                    .read()
+                                    .await
+                                    .get(&next_slot)
+                                    .map(|info| info.tx_set.is_some())
+                                    .unwrap_or(false);
+                                if have_next {
+                                    tracing::debug!(
+                                        slot,
+                                        current_ledger,
+                                        gap = slot - current_ledger,
+                                        "Pending EXTERNALIZE far ahead but next slot buffered — \
+                                         letting rapid close proceed"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        slot,
+                                        current_ledger,
+                                        gap = slot - current_ledger,
+                                        "Pending EXTERNALIZE far ahead — fast-tracking catchup"
+                                    );
+                                    self.recovery_attempts_without_progress
+                                        .store(RECOVERY_ESCALATION_CATCHUP, Ordering::SeqCst);
+                                    self.sync_recovery_pending.store(true, Ordering::SeqCst);
+                                }
                             }
                         }
                     }
