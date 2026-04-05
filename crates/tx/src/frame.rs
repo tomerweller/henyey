@@ -231,11 +231,20 @@ impl TransactionFrame {
         // V0 stores raw public key bytes, V1 uses MuxedAccount
         let source_account = MuxedAccount::Ed25519(v0.source_account_ed25519.clone());
 
+        // Map V0 time_bounds to V1 Preconditions to preserve them in the
+        // signature payload.  stellar-core hashes V0 transactions directly
+        // (including time bounds); dropping them here would produce a
+        // different hash and break signature verification.
+        let cond = match &v0.time_bounds {
+            Some(tb) => Preconditions::Time(tb.clone()),
+            None => Preconditions::None,
+        };
+
         Ok(Transaction {
             source_account,
             fee: v0.fee,
             seq_num: v0.seq_num.clone(),
-            cond: Preconditions::None,
+            cond,
             memo: v0.memo.clone(),
             operations: v0.operations.clone(),
             ext: TransactionExt::V0,
@@ -1745,5 +1754,84 @@ mod tests {
         );
         let frame = TransactionFrame::from_owned(env);
         assert!(!frame.validate_host_fn());
+    }
+
+    /// AUDIT-C6: V0 transaction time bounds must be preserved in signature hash.
+    ///
+    /// stellar-core hashes V0 transactions by serializing the V0 XDR directly
+    /// (with network ID + ENVELOPE_TYPE_TX + 0 + v0.tx fields), preserving time
+    /// bounds. When henyey converts V0→V1 for hashing, it must map the V0
+    /// time_bounds into Preconditions::Time, not discard them as
+    /// Preconditions::None.
+    ///
+    /// Bug: v0_to_v1_transaction hardcoded cond: Preconditions::None, dropping
+    /// time bounds from the signature payload.
+    #[test]
+    fn test_audit_c6_v0_time_bounds_preserved_in_signature_hash() {
+        let time_bounds = TimeBounds {
+            min_time: TimePoint(1000),
+            max_time: TimePoint(2000),
+        };
+
+        // Create V0 tx with time bounds
+        let v0_envelope = TransactionEnvelope::TxV0(TransactionV0Envelope {
+            tx: TransactionV0 {
+                source_account_ed25519: Uint256([0u8; 32]),
+                fee: 100,
+                seq_num: SequenceNumber(1),
+                time_bounds: Some(time_bounds.clone()),
+                memo: Memo::None,
+                operations: vec![Operation {
+                    source_account: None,
+                    body: OperationBody::Payment(PaymentOp {
+                        destination: MuxedAccount::Ed25519(Uint256([1u8; 32])),
+                        asset: Asset::Native,
+                        amount: 1000,
+                    }),
+                }]
+                .try_into()
+                .unwrap(),
+                ext: TransactionV0Ext::V0,
+            },
+            signatures: vec![].try_into().unwrap(),
+        });
+
+        // Create equivalent V1 tx with the SAME time bounds
+        let v1_envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: MuxedAccount::Ed25519(Uint256([0u8; 32])),
+                fee: 100,
+                seq_num: SequenceNumber(1),
+                cond: Preconditions::Time(time_bounds),
+                memo: Memo::None,
+                operations: vec![Operation {
+                    source_account: None,
+                    body: OperationBody::Payment(PaymentOp {
+                        destination: MuxedAccount::Ed25519(Uint256([1u8; 32])),
+                        asset: Asset::Native,
+                        amount: 1000,
+                    }),
+                }]
+                .try_into()
+                .unwrap(),
+                ext: TransactionExt::V0,
+            },
+            signatures: vec![].try_into().unwrap(),
+        });
+
+        let v0_frame = TransactionFrame::from_owned(v0_envelope);
+        let v1_frame = TransactionFrame::from_owned(v1_envelope);
+        let network = NetworkId::testnet();
+
+        // Both should produce the same hash — the V0→V1 conversion must
+        // preserve time bounds so the signature payload is identical.
+        let v0_hash = v0_frame.hash(&network).unwrap();
+        let v1_hash = v1_frame.hash(&network).unwrap();
+
+        assert_eq!(
+            v0_hash, v1_hash,
+            "V0 tx with time bounds must hash identically to equivalent V1 tx \
+             (time bounds must not be dropped during V0→V1 conversion)"
+        );
     }
 }
