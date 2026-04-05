@@ -111,7 +111,10 @@ pub fn config_to_quorum_set(config: &QuorumSetConfig) -> Result<ScpQuorumSet, Qu
     let threshold = if total == 0 {
         0
     } else {
-        ((threshold_percent as usize * total) / 100).max(1) as u32
+        // Ceiling division: ensures threshold is never below the configured
+        // percentage. Floor division would weaken BFT guarantees (e.g., 67%
+        // of 4 validators would give 2 instead of 3).
+        (threshold_percent as usize * total).div_ceil(100).max(1) as u32
     };
 
     // Validate threshold
@@ -338,7 +341,7 @@ mod tests {
 
         let qs = config_to_quorum_set(&config).unwrap();
         assert_eq!(qs.validators.len(), 3);
-        assert_eq!(qs.threshold, 2); // 67% of 3 = 2.01 -> 2
+        assert_eq!(qs.threshold, 3); // 67% of 3 = 2.01 -> ceil -> 3
     }
 
     #[test]
@@ -371,5 +374,31 @@ mod tests {
         use henyey_common::config::ThresholdPercent;
         let threshold: ThresholdPercent = 150.into();
         assert_eq!(threshold.value(), 100);
+    }
+
+    #[test]
+    fn test_audit_c3_ceiling_threshold_calculation() {
+        // Regression test for AUDIT-C3: threshold calculation must use
+        // ceiling division, not floor, to prevent weakening BFT guarantees.
+        //
+        // With 4 validators at 67%, floor gives 2 (50% = not BFT safe),
+        // ceiling gives 3 (75% = BFT safe, matching stellar-core).
+        let config = QuorumSetConfig {
+            threshold_percent: 67.into(),
+            validators: vec![
+                "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+                "0000000000000000000000000000000000000000000000000000000000000002".to_string(),
+                "0000000000000000000000000000000000000000000000000000000000000003".to_string(),
+                "0000000000000000000000000000000000000000000000000000000000000004".to_string(),
+            ],
+            inner_sets: Vec::new(),
+        };
+
+        let qs = config_to_quorum_set(&config).unwrap();
+        // 67% of 4 = 2.68 → must be 3 (ceiling), not 2 (floor)
+        assert_eq!(
+            qs.threshold, 3,
+            "67% of 4 validators must produce threshold=3 (ceiling), not 2 (floor)"
+        );
     }
 }
