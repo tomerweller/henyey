@@ -2316,7 +2316,13 @@ impl LedgerManager {
             return None;
         }
         let snapshot = self.create_snapshot().ok()?;
-        load_soroban_network_info(&snapshot)
+        match load_soroban_network_info(&snapshot) {
+            Ok(info) => info,
+            Err(e) => {
+                tracing::warn!(error = ?e, "Failed to load Soroban network info");
+                None
+            }
+        }
     }
 
     /// Rebuild the module cache for a new protocol version.
@@ -3452,10 +3458,18 @@ impl LedgerCloseContext<'_> {
             return Ok(vec![]);
         }
 
-        // Load SorobanConfig from ledger ConfigSettingEntry for accurate Soroban execution
+        // Load SorobanConfig from ledger ConfigSettingEntry for accurate Soroban execution.
+        // Only loaded for protocol >= 20 (Soroban protocol), matching stellar-core's guard
+        // in LedgerManagerImpl which only calls loadFromLedger for Soroban protocol versions.
         let config_load_start = std::time::Instant::now();
-        let soroban_config =
-            crate::execution::load_soroban_config(&self.snapshot, self.prev_header.ledger_version);
+        let soroban_config = if protocol_version_starts_from(
+            self.prev_header.ledger_version,
+            ProtocolVersion::V20,
+        ) {
+            crate::execution::load_soroban_config(&self.snapshot, self.prev_header.ledger_version)?
+        } else {
+            henyey_tx::soroban::SorobanConfig::default()
+        };
         // Cache fee_write_1kb for LedgerCloseMetaExtV1 (set during commit phase).
         // This is stellar-core's feeRent1KB() / sorobanFeeWrite1KB.
         self.soroban_fee_write_1kb = soroban_config.rent_fee_config.fee_per_write_1kb;

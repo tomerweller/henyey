@@ -7,23 +7,27 @@
 use super::*;
 
 /// Load a ConfigSettingEntry from the snapshot by ID.
+///
+/// Returns `Ok(Some(entry))` if the setting exists, `Ok(None)` if it genuinely
+/// doesn't exist (e.g., pre-Soroban protocol), and `Err` if an I/O error
+/// occurred during lookup. This matches stellar-core's behavior where I/O
+/// errors are never silently swallowed.
 pub(crate) fn load_config_setting(
     snapshot: &SnapshotHandle,
     id: ConfigSettingId,
-) -> Option<ConfigSettingEntry> {
+) -> Result<Option<ConfigSettingEntry>> {
     let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
         config_setting_id: id,
     });
-    match snapshot.get_entry(&key) {
-        Ok(Some(entry)) => {
+    match snapshot.get_entry(&key)? {
+        Some(entry) => {
             if let LedgerEntryData::ConfigSetting(config) = entry.data {
-                Some(config)
+                Ok(Some(config))
             } else {
-                None
+                Ok(None)
             }
         }
-        Ok(None) => None,
-        Err(_) => None,
+        None => Ok(None),
     }
 }
 
@@ -31,7 +35,9 @@ pub(crate) fn load_config_setting(
 ///
 /// This loads the cost parameters and limits from the ledger state,
 /// which are required for accurate Soroban transaction execution.
-/// If any required settings are missing, returns a default config.
+/// Returns an error if any required settings are missing or if an I/O
+/// error occurs during lookup. This matches stellar-core's behavior
+/// where missing config settings trigger `releaseAssertOrThrow` (fatal).
 ///
 /// The `protocol_version` parameter is used to determine which fee to use
 /// for `fee_per_write_1kb` in the FeeConfiguration:
@@ -39,46 +45,70 @@ pub(crate) fn load_config_setting(
 /// - For protocol < 23: uses the computed `fee_per_rent_1kb` (state-size based)
 ///
 /// This matches stellar-core's `rustBridgeFeeConfiguration()` behavior.
-pub fn load_soroban_config(snapshot: &SnapshotHandle, protocol_version: u32) -> SorobanConfig {
+pub fn load_soroban_config(
+    snapshot: &SnapshotHandle,
+    protocol_version: u32,
+) -> Result<SorobanConfig> {
+    // Helper: extract a required config setting, returning an error if missing.
+    // This matches stellar-core's `releaseAssertOrThrow(lsle)` pattern where
+    // a missing required config entry is a fatal invariant violation.
+    fn require_setting(
+        setting: Option<ConfigSettingEntry>,
+        id: ConfigSettingId,
+    ) -> Result<ConfigSettingEntry> {
+        setting.ok_or_else(|| {
+            LedgerError::Internal(format!(
+                "load_soroban_config: required config setting {:?} not found in ledger",
+                id
+            ))
+        })
+    }
+
     // Load CPU cost params
-    let cpu_cost_params =
-        load_config_setting(snapshot, ConfigSettingId::ContractCostParamsCpuInstructions)
-            .and_then(|cs| {
-                if let ConfigSettingEntry::ContractCostParamsCpuInstructions(params) = cs {
-                    Some(params)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| ContractCostParams(vec![].try_into().unwrap_or_default()));
+    let cpu_cost_params = {
+        let id = ConfigSettingId::ContractCostParamsCpuInstructions;
+        let cs = require_setting(load_config_setting(snapshot, id)?, id)?;
+        if let ConfigSettingEntry::ContractCostParamsCpuInstructions(params) = cs {
+            params
+        } else {
+            return Err(LedgerError::Internal(format!(
+                "load_soroban_config: unexpected variant for {:?}",
+                id
+            )));
+        }
+    };
 
     // Load memory cost params
-    let mem_cost_params =
-        load_config_setting(snapshot, ConfigSettingId::ContractCostParamsMemoryBytes)
-            .and_then(|cs| {
-                if let ConfigSettingEntry::ContractCostParamsMemoryBytes(params) = cs {
-                    Some(params)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| ContractCostParams(vec![].try_into().unwrap_or_default()));
+    let mem_cost_params = {
+        let id = ConfigSettingId::ContractCostParamsMemoryBytes;
+        let cs = require_setting(load_config_setting(snapshot, id)?, id)?;
+        if let ConfigSettingEntry::ContractCostParamsMemoryBytes(params) = cs {
+            params
+        } else {
+            return Err(LedgerError::Internal(format!(
+                "load_soroban_config: unexpected variant for {:?}",
+                id
+            )));
+        }
+    };
 
     // Load compute limits and fee rate per instructions
-    let (tx_max_instructions, tx_max_memory_bytes, fee_per_instruction_increment) =
-        load_config_setting(snapshot, ConfigSettingId::ContractComputeV0)
-            .and_then(|cs| {
-                if let ConfigSettingEntry::ContractComputeV0(compute) = cs {
-                    Some((
-                        compute.tx_max_instructions as u64,
-                        compute.tx_memory_limit as u64,
-                        compute.fee_rate_per_instructions_increment,
-                    ))
-                } else {
-                    None
-                }
-            })
-            .unwrap_or((100_000_000, 40 * 1024 * 1024, 0)); // Default limits
+    let (tx_max_instructions, tx_max_memory_bytes, fee_per_instruction_increment) = {
+        let id = ConfigSettingId::ContractComputeV0;
+        let cs = require_setting(load_config_setting(snapshot, id)?, id)?;
+        if let ConfigSettingEntry::ContractComputeV0(compute) = cs {
+            (
+                compute.tx_max_instructions as u64,
+                compute.tx_memory_limit as u64,
+                compute.fee_rate_per_instructions_increment,
+            )
+        } else {
+            return Err(LedgerError::Internal(format!(
+                "load_soroban_config: unexpected variant for {:?}",
+                id
+            )));
+        }
+    };
 
     // Load ledger cost settings
     let (
@@ -89,91 +119,111 @@ pub fn load_soroban_config(snapshot: &SnapshotHandle, protocol_version: u32) -> 
         rent_fee_1kb_state_size_low,
         rent_fee_1kb_state_size_high,
         soroban_state_rent_fee_growth_factor,
-    ) = load_config_setting(snapshot, ConfigSettingId::ContractLedgerCostV0)
-        .and_then(|cs| {
-            if let ConfigSettingEntry::ContractLedgerCostV0(cost) = cs {
-                Some((
-                    cost.fee_disk_read_ledger_entry,
-                    cost.fee_write_ledger_entry,
-                    cost.fee_disk_read1_kb,
-                    cost.soroban_state_target_size_bytes,
-                    cost.rent_fee1_kb_soroban_state_size_low,
-                    cost.rent_fee1_kb_soroban_state_size_high,
-                    cost.soroban_state_rent_fee_growth_factor,
-                ))
-            } else {
-                None
+    ) = {
+        let id = ConfigSettingId::ContractLedgerCostV0;
+        let cs = require_setting(load_config_setting(snapshot, id)?, id)?;
+        if let ConfigSettingEntry::ContractLedgerCostV0(cost) = cs {
+            (
+                cost.fee_disk_read_ledger_entry,
+                cost.fee_write_ledger_entry,
+                cost.fee_disk_read1_kb,
+                cost.soroban_state_target_size_bytes,
+                cost.rent_fee1_kb_soroban_state_size_low,
+                cost.rent_fee1_kb_soroban_state_size_high,
+                cost.soroban_state_rent_fee_growth_factor,
+            )
+        } else {
+            return Err(LedgerError::Internal(format!(
+                "load_soroban_config: unexpected variant for {:?}",
+                id
+            )));
+        }
+    };
+
+    // Load fee_write_1kb from extended cost settings (Protocol 23+).
+    // For protocol < 23, this setting may not exist, so we use 0 as the default.
+    let fee_write_1kb = {
+        let id = ConfigSettingId::ContractLedgerCostExtV0;
+        match load_config_setting(snapshot, id)? {
+            Some(ConfigSettingEntry::ContractLedgerCostExtV0(ext)) => ext.fee_write1_kb,
+            Some(_) => {
+                return Err(LedgerError::Internal(format!(
+                    "load_soroban_config: unexpected variant for {:?}",
+                    id
+                )));
             }
-        })
-        .unwrap_or((0, 0, 0, 0, 0, 0, 0));
+            None => 0, // Not available pre-Protocol 23
+        }
+    };
 
-    let fee_write_1kb = load_config_setting(snapshot, ConfigSettingId::ContractLedgerCostExtV0)
-        .and_then(|cs| {
-            if let ConfigSettingEntry::ContractLedgerCostExtV0(ext) = cs {
-                Some(ext.fee_write1_kb)
-            } else {
-                None
-            }
-        })
-        .unwrap_or(0);
+    let fee_historical_1kb = {
+        let id = ConfigSettingId::ContractHistoricalDataV0;
+        let cs = require_setting(load_config_setting(snapshot, id)?, id)?;
+        if let ConfigSettingEntry::ContractHistoricalDataV0(hist) = cs {
+            hist.fee_historical1_kb
+        } else {
+            return Err(LedgerError::Internal(format!(
+                "load_soroban_config: unexpected variant for {:?}",
+                id
+            )));
+        }
+    };
 
-    let fee_historical_1kb =
-        load_config_setting(snapshot, ConfigSettingId::ContractHistoricalDataV0)
-            .and_then(|cs| {
-                if let ConfigSettingEntry::ContractHistoricalDataV0(hist) = cs {
-                    Some(hist.fee_historical1_kb)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(0);
+    let (tx_max_contract_events_size_bytes, fee_contract_events_1kb) = {
+        let id = ConfigSettingId::ContractEventsV0;
+        let cs = require_setting(load_config_setting(snapshot, id)?, id)?;
+        if let ConfigSettingEntry::ContractEventsV0(events) = cs {
+            (
+                events.tx_max_contract_events_size_bytes,
+                events.fee_contract_events1_kb,
+            )
+        } else {
+            return Err(LedgerError::Internal(format!(
+                "load_soroban_config: unexpected variant for {:?}",
+                id
+            )));
+        }
+    };
 
-    let (tx_max_contract_events_size_bytes, fee_contract_events_1kb) =
-        load_config_setting(snapshot, ConfigSettingId::ContractEventsV0)
-            .and_then(|cs| {
-                if let ConfigSettingEntry::ContractEventsV0(events) = cs {
-                    Some((
-                        events.tx_max_contract_events_size_bytes,
-                        events.fee_contract_events1_kb,
-                    ))
-                } else {
-                    None
-                }
-            })
-            .unwrap_or((0, 0));
-
-    let fee_tx_size_1kb = load_config_setting(snapshot, ConfigSettingId::ContractBandwidthV0)
-        .and_then(|cs| {
-            if let ConfigSettingEntry::ContractBandwidthV0(bandwidth) = cs {
-                Some(bandwidth.fee_tx_size1_kb)
-            } else {
-                None
-            }
-        })
-        .unwrap_or(0);
+    let fee_tx_size_1kb = {
+        let id = ConfigSettingId::ContractBandwidthV0;
+        let cs = require_setting(load_config_setting(snapshot, id)?, id)?;
+        if let ConfigSettingEntry::ContractBandwidthV0(bandwidth) = cs {
+            bandwidth.fee_tx_size1_kb
+        } else {
+            return Err(LedgerError::Internal(format!(
+                "load_soroban_config: unexpected variant for {:?}",
+                id
+            )));
+        }
+    };
 
     // Load contract size limits for entry validation (validateContractLedgerEntry)
-    let max_contract_size_bytes =
-        load_config_setting(snapshot, ConfigSettingId::ContractMaxSizeBytes)
-            .and_then(|cs| {
-                if let ConfigSettingEntry::ContractMaxSizeBytes(size) = cs {
-                    Some(size)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(64 * 1024); // 64 KB default
+    let max_contract_size_bytes = {
+        let id = ConfigSettingId::ContractMaxSizeBytes;
+        let cs = require_setting(load_config_setting(snapshot, id)?, id)?;
+        if let ConfigSettingEntry::ContractMaxSizeBytes(size) = cs {
+            size
+        } else {
+            return Err(LedgerError::Internal(format!(
+                "load_soroban_config: unexpected variant for {:?}",
+                id
+            )));
+        }
+    };
 
-    let max_contract_data_entry_size_bytes =
-        load_config_setting(snapshot, ConfigSettingId::ContractDataEntrySizeBytes)
-            .and_then(|cs| {
-                if let ConfigSettingEntry::ContractDataEntrySizeBytes(size) = cs {
-                    Some(size)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(64 * 1024); // 64 KB default
+    let max_contract_data_entry_size_bytes = {
+        let id = ConfigSettingId::ContractDataEntrySizeBytes;
+        let cs = require_setting(load_config_setting(snapshot, id)?, id)?;
+        if let ConfigSettingEntry::ContractDataEntrySizeBytes(size) = cs {
+            size
+        } else {
+            return Err(LedgerError::Internal(format!(
+                "load_soroban_config: unexpected variant for {:?}",
+                id
+            )));
+        }
+    };
 
     // Load state archival TTL settings
     let (
@@ -182,48 +232,53 @@ pub fn load_soroban_config(snapshot: &SnapshotHandle, protocol_version: u32) -> 
         max_entry_ttl,
         persistent_rent_rate_denominator,
         temp_rent_rate_denominator,
-    ) = load_config_setting(snapshot, ConfigSettingId::StateArchival)
-        .and_then(|cs| {
-            if let ConfigSettingEntry::StateArchival(archival) = cs {
-                tracing::debug!(
-                    min_temp_ttl = archival.min_temporary_ttl,
-                    min_persistent_ttl = archival.min_persistent_ttl,
-                    max_entry_ttl = archival.max_entry_ttl,
-                    persistent_rent_rate_denominator = archival.persistent_rent_rate_denominator,
-                    temp_rent_rate_denominator = archival.temp_rent_rate_denominator,
-                    "load_soroban_config: StateArchival settings from ledger"
-                );
-                Some((
-                    archival.min_temporary_ttl,
-                    archival.min_persistent_ttl,
-                    archival.max_entry_ttl,
-                    archival.persistent_rent_rate_denominator,
-                    archival.temp_rent_rate_denominator,
-                ))
-            } else {
-                None
-            }
-        })
-        .unwrap_or((16, 120960, 6312000, 0, 0)); // Default TTL values
+    ) = {
+        let id = ConfigSettingId::StateArchival;
+        let cs = require_setting(load_config_setting(snapshot, id)?, id)?;
+        if let ConfigSettingEntry::StateArchival(archival) = cs {
+            tracing::debug!(
+                min_temp_ttl = archival.min_temporary_ttl,
+                min_persistent_ttl = archival.min_persistent_ttl,
+                max_entry_ttl = archival.max_entry_ttl,
+                persistent_rent_rate_denominator = archival.persistent_rent_rate_denominator,
+                temp_rent_rate_denominator = archival.temp_rent_rate_denominator,
+                "load_soroban_config: StateArchival settings from ledger"
+            );
+            (
+                archival.min_temporary_ttl,
+                archival.min_persistent_ttl,
+                archival.max_entry_ttl,
+                archival.persistent_rent_rate_denominator,
+                archival.temp_rent_rate_denominator,
+            )
+        } else {
+            return Err(LedgerError::Internal(format!(
+                "load_soroban_config: unexpected variant for {:?}",
+                id
+            )));
+        }
+    };
 
-    let average_soroban_state_size =
-        load_config_setting(snapshot, ConfigSettingId::LiveSorobanStateSizeWindow)
-            .and_then(|cs| {
-                if let ConfigSettingEntry::LiveSorobanStateSizeWindow(window) = cs {
-                    if window.is_empty() {
-                        None
-                    } else {
-                        let mut sum: u64 = 0;
-                        for size in window.iter() {
-                            sum = sum.saturating_add(*size);
-                        }
-                        Some((sum / window.len() as u64) as i64)
-                    }
-                } else {
-                    None
+    let average_soroban_state_size = {
+        let id = ConfigSettingId::LiveSorobanStateSizeWindow;
+        let cs = require_setting(load_config_setting(snapshot, id)?, id)?;
+        if let ConfigSettingEntry::LiveSorobanStateSizeWindow(window) = cs {
+            if window.is_empty() {
+                0i64
+            } else {
+                let mut sum: u64 = 0;
+                for size in window.iter() {
+                    sum = sum.saturating_add(*size);
                 }
-            })
-            .unwrap_or(0);
+                (sum / window.len() as u64) as i64
+            }
+        } else {
+            return Err(LedgerError::Internal(format!(
+                "load_soroban_config: unexpected variant for {:?}",
+                id
+            )));
+        }
+    };
 
     let rent_write_config = RentWriteFeeConfiguration {
         state_target_size_bytes: soroban_state_target_size_bytes,
@@ -310,32 +365,37 @@ pub fn load_soroban_config(snapshot: &SnapshotHandle, protocol_version: u32) -> 
         );
     }
 
-    config
+    Ok(config)
 }
 
 /// Load SorobanNetworkInfo from the ledger's ConfigSettingEntry entries.
 ///
 /// This loads all the configuration settings needed for the /sorobaninfo endpoint,
 /// matching the "basic" format from stellar-core.
-pub(crate) fn load_soroban_network_info(snapshot: &SnapshotHandle) -> Option<SorobanNetworkInfo> {
+pub(crate) fn load_soroban_network_info(
+    snapshot: &SnapshotHandle,
+) -> Result<Option<SorobanNetworkInfo>> {
     // Check if we have any Soroban config (indicates protocol 20+)
-    let compute_v0 = load_config_setting(snapshot, ConfigSettingId::ContractComputeV0)?;
+    let compute_v0 = match load_config_setting(snapshot, ConfigSettingId::ContractComputeV0)? {
+        Some(cs) => cs,
+        None => return Ok(None),
+    };
 
     let mut info = SorobanNetworkInfo::default();
 
     // Load contract size limits
     if let Some(ConfigSettingEntry::ContractDataKeySizeBytes(size)) =
-        load_config_setting(snapshot, ConfigSettingId::ContractDataKeySizeBytes)
+        load_config_setting(snapshot, ConfigSettingId::ContractDataKeySizeBytes)?
     {
         info.max_contract_data_key_size = size;
     }
     if let Some(ConfigSettingEntry::ContractDataEntrySizeBytes(size)) =
-        load_config_setting(snapshot, ConfigSettingId::ContractDataEntrySizeBytes)
+        load_config_setting(snapshot, ConfigSettingId::ContractDataEntrySizeBytes)?
     {
         info.max_contract_data_entry_size = size;
     }
     if let Some(ConfigSettingEntry::ContractMaxSizeBytes(size)) =
-        load_config_setting(snapshot, ConfigSettingId::ContractMaxSizeBytes)
+        load_config_setting(snapshot, ConfigSettingId::ContractMaxSizeBytes)?
     {
         info.max_contract_size = size;
     }
@@ -350,7 +410,7 @@ pub(crate) fn load_soroban_network_info(snapshot: &SnapshotHandle) -> Option<Sor
 
     // Load ledger access settings
     if let Some(ConfigSettingEntry::ContractLedgerCostV0(cost)) =
-        load_config_setting(snapshot, ConfigSettingId::ContractLedgerCostV0)
+        load_config_setting(snapshot, ConfigSettingId::ContractLedgerCostV0)?
     {
         info.ledger_max_read_ledger_entries = cost.ledger_max_disk_read_entries;
         info.ledger_max_read_bytes = cost.ledger_max_disk_read_bytes;
@@ -371,21 +431,21 @@ pub(crate) fn load_soroban_network_info(snapshot: &SnapshotHandle) -> Option<Sor
 
     // Load fee_write_1kb from extended cost settings
     if let Some(ConfigSettingEntry::ContractLedgerCostExtV0(ext)) =
-        load_config_setting(snapshot, ConfigSettingId::ContractLedgerCostExtV0)
+        load_config_setting(snapshot, ConfigSettingId::ContractLedgerCostExtV0)?
     {
         info.fee_write_1kb = ext.fee_write1_kb;
     }
 
     // Load historical data settings
     if let Some(ConfigSettingEntry::ContractHistoricalDataV0(hist)) =
-        load_config_setting(snapshot, ConfigSettingId::ContractHistoricalDataV0)
+        load_config_setting(snapshot, ConfigSettingId::ContractHistoricalDataV0)?
     {
         info.fee_historical_1kb = hist.fee_historical1_kb;
     }
 
     // Load contract events settings
     if let Some(ConfigSettingEntry::ContractEventsV0(events)) =
-        load_config_setting(snapshot, ConfigSettingId::ContractEventsV0)
+        load_config_setting(snapshot, ConfigSettingId::ContractEventsV0)?
     {
         info.tx_max_contract_events_size_bytes = events.tx_max_contract_events_size_bytes;
         info.fee_contract_events_size_1kb = events.fee_contract_events1_kb;
@@ -393,7 +453,7 @@ pub(crate) fn load_soroban_network_info(snapshot: &SnapshotHandle) -> Option<Sor
 
     // Load bandwidth settings
     if let Some(ConfigSettingEntry::ContractBandwidthV0(bandwidth)) =
-        load_config_setting(snapshot, ConfigSettingId::ContractBandwidthV0)
+        load_config_setting(snapshot, ConfigSettingId::ContractBandwidthV0)?
     {
         info.ledger_max_tx_size_bytes = bandwidth.ledger_max_txs_size_bytes;
         info.tx_max_size_bytes = bandwidth.tx_max_size_bytes;
@@ -402,14 +462,14 @@ pub(crate) fn load_soroban_network_info(snapshot: &SnapshotHandle) -> Option<Sor
 
     // Load execution lanes settings for ledger tx count
     if let Some(ConfigSettingEntry::ContractExecutionLanes(lanes)) =
-        load_config_setting(snapshot, ConfigSettingId::ContractExecutionLanes)
+        load_config_setting(snapshot, ConfigSettingId::ContractExecutionLanes)?
     {
         info.ledger_max_tx_count = lanes.ledger_max_tx_count;
     }
 
     // Load state archival settings
     if let Some(ConfigSettingEntry::StateArchival(archival)) =
-        load_config_setting(snapshot, ConfigSettingId::StateArchival)
+        load_config_setting(snapshot, ConfigSettingId::StateArchival)?
     {
         info.max_entry_ttl = archival.max_entry_ttl;
         info.min_temporary_ttl = archival.min_temporary_ttl;
@@ -425,7 +485,7 @@ pub(crate) fn load_soroban_network_info(snapshot: &SnapshotHandle) -> Option<Sor
 
     // Load average bucket list size from live window
     if let Some(ConfigSettingEntry::LiveSorobanStateSizeWindow(window)) =
-        load_config_setting(snapshot, ConfigSettingId::LiveSorobanStateSizeWindow)
+        load_config_setting(snapshot, ConfigSettingId::LiveSorobanStateSizeWindow)?
     {
         if !window.is_empty() {
             let mut sum: u64 = 0;
@@ -438,7 +498,7 @@ pub(crate) fn load_soroban_network_info(snapshot: &SnapshotHandle) -> Option<Sor
 
     // Load SCP timing settings (Protocol 23+)
     if let Some(ConfigSettingEntry::ScpTiming(timing)) =
-        load_config_setting(snapshot, ConfigSettingId::ScpTiming)
+        load_config_setting(snapshot, ConfigSettingId::ScpTiming)?
     {
         info.nomination_timeout_initial_ms = timing.nomination_timeout_initial_milliseconds;
         info.nomination_timeout_increment_ms = timing.nomination_timeout_increment_milliseconds;
@@ -446,7 +506,7 @@ pub(crate) fn load_soroban_network_info(snapshot: &SnapshotHandle) -> Option<Sor
         info.ballot_timeout_increment_ms = timing.ballot_timeout_increment_milliseconds;
     }
 
-    Some(info)
+    Ok(Some(info))
 }
 
 pub(crate) fn compute_soroban_resource_fee(
@@ -460,4 +520,84 @@ pub(crate) fn compute_soroban_resource_fee(
         &resources,
         &config.fee_config,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::LedgerSnapshot;
+
+    /// Regression test for AUDIT-C11: load_config_setting must propagate I/O errors,
+    /// not silently swallow them and return None.
+    #[test]
+    fn test_audit_c11_load_config_setting_propagates_io_errors() {
+        // Create a snapshot with a lookup function that always returns an error
+        // (simulating a bucket list I/O failure).
+        let error_lookup: crate::EntryLookupFn = std::sync::Arc::new(|_key: &LedgerKey| {
+            Err(LedgerError::Internal("simulated I/O error".to_string()))
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), error_lookup);
+
+        // Before the fix, this would return Ok(None) — silently swallowing the error.
+        // After the fix, it must return Err.
+        let result = load_config_setting(&snapshot, ConfigSettingId::ContractComputeV0);
+        assert!(
+            result.is_err(),
+            "load_config_setting should propagate I/O errors, not swallow them"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("simulated I/O error"),
+            "Error should contain the original I/O error message, got: {}",
+            err_msg
+        );
+    }
+
+    /// Regression test for AUDIT-C11: load_soroban_config must return Err when
+    /// required config settings are missing, not silently fall back to defaults.
+    #[test]
+    fn test_audit_c11_load_soroban_config_errors_on_missing_settings() {
+        // Create an empty snapshot with no config settings.
+        // The lookup returns Ok(None) for everything (entry not found).
+        let empty_lookup: crate::EntryLookupFn = std::sync::Arc::new(|_key: &LedgerKey| Ok(None));
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), empty_lookup);
+
+        // Before the fix, this would return a SorobanConfig with hardcoded defaults.
+        // After the fix, it must return Err because required settings are missing.
+        let result = load_soroban_config(&snapshot, 21);
+        assert!(
+            result.is_err(),
+            "load_soroban_config should error when required settings are missing, \
+             not silently fall back to defaults"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("required config setting"),
+            "Error should mention missing required setting, got: {}",
+            err_msg
+        );
+    }
+
+    /// Regression test for AUDIT-C11: load_soroban_config must propagate I/O errors
+    /// from underlying load_config_setting calls.
+    #[test]
+    fn test_audit_c11_load_soroban_config_propagates_io_errors() {
+        // Create a snapshot where lookups fail with I/O errors.
+        let error_lookup: crate::EntryLookupFn = std::sync::Arc::new(|_key: &LedgerKey| {
+            Err(LedgerError::Internal("disk read failed".to_string()))
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), error_lookup);
+
+        let result = load_soroban_config(&snapshot, 21);
+        assert!(
+            result.is_err(),
+            "load_soroban_config should propagate I/O errors from load_config_setting"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("disk read failed"),
+            "Error should contain the original I/O error, got: {}",
+            err_msg
+        );
+    }
 }

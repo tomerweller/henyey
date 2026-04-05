@@ -155,6 +155,10 @@ pub enum HistoryError {
         stderr: String,
     },
 
+    /// Ledger error from the ledger crate.
+    #[error("ledger error: {0}")]
+    Ledger(#[from] henyey_ledger::LedgerError),
+
     /// Archive already initialized.
     #[error("archive already initialized: {0}")]
     ArchiveAlreadyInitialized(String),

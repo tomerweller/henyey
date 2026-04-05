@@ -15,7 +15,7 @@ use henyey_ledger::{
     prepend_fee_event, EntryChange, LedgerDelta, LedgerError, LedgerSnapshot, SnapshotHandle,
     TransactionSetVariant,
 };
-use henyey_tx::{muxed_to_account_id, LedgerContext, TransactionFrame};
+use henyey_tx::{muxed_to_account_id, soroban::SorobanConfig, LedgerContext, TransactionFrame};
 use sha2::{Digest, Sha256};
 use stellar_xdr::curr::{
     BucketListType, ConfigSettingEntry, ConfigSettingId, LedgerEntry, LedgerEntryData,
@@ -569,8 +569,19 @@ pub fn replay_ledger_with_execution(
 
     let mut delta = LedgerDelta::new(header.ledger_seq);
     let transactions = tx_set.transactions_with_base_fee();
-    // Load SorobanConfig from ledger ConfigSettingEntry for accurate Soroban execution
-    let soroban_config = load_soroban_config(&snapshot, header.ledger_version);
+    // Load SorobanConfig from ledger ConfigSettingEntry for accurate Soroban execution.
+    // Only loaded for protocol >= 20 (Soroban protocol) with non-empty tx sets,
+    // matching stellar-core's guard in LedgerManagerImpl which only calls
+    // loadFromLedger for Soroban protocol versions. With an empty tx set, config
+    // settings may not exist (e.g., empty bucket list in tests).
+    let soroban_config =
+        if protocol_version_starts_from(header.ledger_version, ProtocolVersion::V20)
+            && !transactions.is_empty()
+        {
+            load_soroban_config(&snapshot, header.ledger_version)?
+        } else {
+            SorobanConfig::default()
+        };
     // Save cost params before soroban_config is moved into execute_transaction_set
     let cpu_cost_params = soroban_config.cpu_cost_params.clone();
     let mem_cost_params = soroban_config.mem_cost_params.clone();
