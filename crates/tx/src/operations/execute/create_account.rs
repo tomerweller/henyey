@@ -21,6 +21,12 @@ pub fn execute_create_account(
     let sponsor = state.active_sponsor_for(&op.destination);
     let account_multiplier = 2i64;
 
+    // Reject negative starting balance. Matches stellar-core's doCheckValid:
+    // startingBalance < 0 returns MALFORMED (minStartingBalance = 0 for protocol >= 14).
+    if op.starting_balance < 0 {
+        return Ok(make_result(CreateAccountResultCode::Malformed));
+    }
+
     // Check destination doesn't already exist (matches upstream doApply)
     if state.get_account(&op.destination).is_some() {
         return Ok(make_result(CreateAccountResultCode::AlreadyExist));
@@ -474,9 +480,9 @@ mod tests {
         }
     }
 
-    /// Test CreateAccount with negative starting balance returns LowReserve.
+    /// Test CreateAccount with negative starting balance returns Malformed.
     ///
-    /// Negative balance is less than minimum reserve, so returns LowReserve.
+    /// stellar-core rejects startingBalance < 0 as MALFORMED in doCheckValid.
     #[test]
     fn test_create_account_negative_balance() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
@@ -496,10 +502,9 @@ mod tests {
 
         match result {
             OperationResult::OpInner(OperationResultTr::CreateAccount(r)) => {
-                // Negative balance < min_balance, so returns LowReserve
                 assert!(
-                    matches!(r, CreateAccountResult::LowReserve),
-                    "Expected LowReserve for negative balance, got {:?}",
+                    matches!(r, CreateAccountResult::Malformed),
+                    "Expected Malformed for negative balance, got {:?}",
                     r
                 );
             }
@@ -612,6 +617,44 @@ mod tests {
                 assert!(
                     matches!(r, CreateAccountResult::Underfunded),
                     "Source-as-sponsor should be Underfunded due to increased min balance, got {:?}",
+                    r
+                );
+            }
+            other => panic!("Unexpected result: {:?}", other),
+        }
+    }
+
+    /// Regression test for AUDIT-C5: negative starting_balance must be rejected
+    /// as Malformed, not silently processed. In the sponsored path, a negative
+    /// starting_balance would pass the sponsor reserve check and the underfunded
+    /// check (negative < balance), and the deduction becomes an addition to the
+    /// source balance, effectively minting tokens.
+    #[test]
+    fn test_audit_c5_negative_starting_balance_malformed() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(30);
+        let dest_id = create_test_account_id(31);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        // Sponsored path: source sponsors the new account
+        state.push_sponsorship(source_id.clone(), dest_id.clone());
+
+        let op = CreateAccountOp {
+            destination: dest_id,
+            starting_balance: -1_000_000,
+        };
+
+        let result = execute_create_account(&op, &source_id, &mut state, &context).unwrap();
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::CreateAccount(r)) => {
+                // stellar-core returns MALFORMED for startingBalance < 0
+                assert!(
+                    matches!(r, CreateAccountResult::Malformed),
+                    "Negative starting_balance must be Malformed, got {:?}",
                     r
                 );
             }
