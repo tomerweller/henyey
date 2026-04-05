@@ -378,9 +378,7 @@ impl Peer {
             .ok_or_else(|| OverlayError::PeerDisconnected("no Hello received".to_string()))?;
         debug!("Received frame with {} bytes", frame.raw_len);
 
-        let message = self
-            .auth
-            .unwrap_message(frame.message, frame.is_authenticated)?;
+        let message = self.auth.unwrap_message(frame.message)?;
 
         match message {
             StellarMessage::Hello(peer_hello) => {
@@ -414,9 +412,7 @@ impl Peer {
             .await?
             .ok_or_else(|| OverlayError::PeerDisconnected("no Auth received".to_string()))?;
 
-        let message = self
-            .auth
-            .unwrap_message(frame.message, frame.is_authenticated)?;
+        let message = self.auth.unwrap_message(frame.message)?;
 
         match message {
             StellarMessage::Auth(ref auth) => {
@@ -562,9 +558,7 @@ impl Peer {
             .bytes_received
             .fetch_add(frame.raw_len as u64, Ordering::Relaxed);
 
-        let message = self
-            .auth
-            .unwrap_message(frame.message, frame.is_authenticated)?;
+        let message = self.auth.unwrap_message(frame.message)?;
         let msg_type = helpers::message_type_name(&message);
         trace!("Received {} from {}", msg_type, self.info.peer_id);
 
@@ -590,9 +584,7 @@ impl Peer {
             .bytes_received
             .fetch_add(frame.raw_len as u64, Ordering::Relaxed);
 
-        let message = self
-            .auth
-            .unwrap_message(frame.message, frame.is_authenticated)?;
+        let message = self.auth.unwrap_message(frame.message)?;
 
         Ok(Some(message))
     }

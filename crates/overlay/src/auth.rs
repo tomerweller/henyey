@@ -592,43 +592,37 @@ impl AuthContext {
     /// Unwraps and verifies a received message.
     ///
     /// Checks the sequence number and MAC to ensure the message is authentic
-    /// and has not been replayed.
+    /// and has not been replayed. MAC verification is gated on the receiver's
+    /// own authentication state (not a wire flag) to prevent attackers from
+    /// bypassing MAC checks by manipulating the length prefix.
     ///
     /// # Arguments
     ///
     /// * `auth_msg` - The authenticated message wrapper from the wire
-    /// * `message_is_authenticated` - Whether bit 31 was set in the length prefix,
-    ///   indicating the message has a valid MAC. During handshake (Hello/Auth),
-    ///   this is false and the MAC field contains zeros.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The sequence number doesn't match the expected value
     /// - The MAC verification fails
-    pub fn unwrap_message(
-        &mut self,
-        auth_msg: AuthenticatedMessage,
-        message_is_authenticated: bool,
-    ) -> Result<StellarMessage> {
+    pub fn unwrap_message(&mut self, auth_msg: AuthenticatedMessage) -> Result<StellarMessage> {
         match auth_msg {
             AuthenticatedMessage::V0(v0) => {
                 let msg_type = crate::codec::helpers::message_type_name(&v0.message);
                 tracing::debug!(
-                    "unwrap_message: seq={}, is_auth={}, msg_is_auth={}, expected_seq={}, type={}",
+                    "unwrap_message: seq={}, is_auth={}, expected_seq={}, type={}",
                     v0.sequence,
                     self.is_authenticated(),
-                    message_is_authenticated,
                     self.recv_sequence,
                     msg_type
                 );
 
-                // Only verify sequence and MAC when:
-                // 1. We're past the handshake phase (self.is_authenticated())
-                // 2. The message actually has a MAC (bit 31 set in length prefix)
-                // 3. Not an ERROR message (errors can use sequence 0 and skip MAC)
+                // Gate MAC verification on the receiver's own auth state,
+                // NOT on a wire flag. This matches stellar-core's
+                // `getState(guard) >= GOT_HELLO` check in Peer.cpp.
+                // Error messages are exempt (they can use sequence 0 and skip MAC).
                 let is_error = matches!(v0.message, StellarMessage::ErrorMsg(_));
-                if self.is_authenticated() && message_is_authenticated && !is_error {
+                if self.is_authenticated() && !is_error {
                     // Verify sequence number
                     if v0.sequence != self.recv_sequence {
                         return Err(OverlayError::AuthenticationFailed(format!(
@@ -811,7 +805,7 @@ mod tests {
         let wrapped = ctx_a.wrap_message(msg.clone()).unwrap();
 
         // message_is_authenticated=true → MAC should be verified
-        let unwrapped = ctx_b.unwrap_message(wrapped, true).unwrap();
+        let unwrapped = ctx_b.unwrap_message(wrapped).unwrap();
         assert!(matches!(unwrapped, StellarMessage::Peers(_)));
     }
 
@@ -832,7 +826,7 @@ mod tests {
             }
         };
 
-        let result = ctx_b.unwrap_message(tampered, true);
+        let result = ctx_b.unwrap_message(tampered);
         assert!(
             result.is_err(),
             "tampered MAC should be rejected when is_authenticated=true"
@@ -845,29 +839,36 @@ mod tests {
 
     #[test]
     fn test_unwrap_skips_mac_when_not_authenticated_g14() {
-        // During handshake (bit 31 clear), MAC is not checked.
-        // This is the Hello/Auth path.
-        let (mut _ctx_a, mut ctx_b) = complete_handshake();
+        // Before handshake completes, MAC is not checked because
+        // the receiver's auth state is not yet authenticated.
+        // This is the correct behavior matching stellar-core's
+        // `getState(guard) >= GOT_HELLO` check.
+        let secret = SecretKey::generate();
+        let node = LocalNode::new_testnet(secret);
+        let mut ctx = AuthContext::new(node, true);
 
-        // Create a message with garbage MAC but message_is_authenticated=false
+        assert!(!ctx.is_authenticated());
+
+        // Create a message with garbage MAC
         let msg = AuthenticatedMessage::V0(AuthenticatedMessageV0 {
             sequence: 0,
             message: StellarMessage::Hello(Default::default()),
             mac: HmacSha256Mac { mac: [0xAA; 32] }, // garbage MAC
         });
 
-        // message_is_authenticated=false → MAC should NOT be verified
-        let result = ctx_b.unwrap_message(msg, false);
+        // Pre-auth: MAC should not be verified because ctx is not authenticated
+        let result = ctx.unwrap_message(msg);
         assert!(
             result.is_ok(),
-            "MAC check should be skipped when is_authenticated=false"
+            "MAC check should be skipped before authentication is complete"
         );
     }
 
     #[test]
     fn test_unwrap_skips_mac_before_authentication_g14() {
-        // Before handshake completes, even if is_authenticated=true,
-        // MAC is not verified (ctx.is_authenticated() is false).
+        // Before handshake completes (ctx.is_authenticated() == false),
+        // MAC verification is skipped regardless, since the receiver's
+        // own auth state gates the check.
         let secret = SecretKey::generate();
         let node = LocalNode::new_testnet(secret);
         let mut ctx = AuthContext::new(node, true);
@@ -880,8 +881,8 @@ mod tests {
             mac: HmacSha256Mac { mac: [0xBB; 32] }, // garbage MAC
         });
 
-        // Even with message_is_authenticated=true, pre-auth messages aren't checked
-        let result = ctx.unwrap_message(msg, true);
+        // Pre-auth messages should not be MAC-checked
+        let result = ctx.unwrap_message(msg);
         assert!(
             result.is_ok(),
             "pre-auth messages should not be MAC-checked"
@@ -904,7 +905,7 @@ mod tests {
             }
         };
 
-        let result = ctx_b.unwrap_message(tampered, true);
+        let result = ctx_b.unwrap_message(tampered);
         assert!(result.is_err(), "wrong sequence should be rejected");
         match result {
             Err(OverlayError::AuthenticationFailed(msg)) => {
@@ -936,7 +937,7 @@ mod tests {
         });
 
         // Error messages should bypass MAC check
-        let result = ctx_b.unwrap_message(msg, true);
+        let result = ctx_b.unwrap_message(msg);
         assert!(
             result.is_ok(),
             "error messages should skip MAC verification"
@@ -964,9 +965,43 @@ mod tests {
                 }
             }
 
-            let unwrapped = ctx_b.unwrap_message(wrapped, true).unwrap();
+            let unwrapped = ctx_b.unwrap_message(wrapped).unwrap();
             assert!(matches!(unwrapped, StellarMessage::Peers(_)));
         }
+    }
+
+    #[test]
+    fn test_audit_c1_mac_bypass_rejected() {
+        // Regression test for AUDIT-C1: An attacker clears bit 31 in the
+        // length prefix to set message_is_authenticated=false, attempting
+        // to bypass MAC verification on an authenticated connection.
+        //
+        // After handshake, MAC verification must be gated on the receiver's
+        // own auth state (self.is_authenticated()), NOT the wire flag.
+        // A forged message with garbage MAC must be rejected even when the
+        // wire flag says "not authenticated".
+        let (mut ctx_a, mut ctx_b) = complete_handshake();
+
+        // ctx_a wraps a legitimate message (this advances send sequence)
+        let msg = StellarMessage::Peers(xdr::VecM::default());
+        let wrapped = ctx_a.wrap_message(msg).unwrap();
+
+        // Tamper: replace the MAC with garbage, simulating an attacker-crafted message
+        let tampered = match wrapped {
+            AuthenticatedMessage::V0(mut v0) => {
+                v0.mac = HmacSha256Mac { mac: [0xFF; 32] };
+                AuthenticatedMessage::V0(v0)
+            }
+        };
+
+        // The attacker clears bit 31, so message_is_authenticated=false.
+        // The current buggy code will skip MAC verification and accept this.
+        // The fixed code must reject it because ctx_b.is_authenticated() is true.
+        let result = ctx_b.unwrap_message(tampered);
+        assert!(
+            result.is_err(),
+            "MAC verification must not be bypassed by clearing the wire auth flag"
+        );
     }
 
     // ── OVERLAY_SPEC §4.2: Auth state transitions ─────────────────────
