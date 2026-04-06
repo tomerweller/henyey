@@ -13,7 +13,7 @@ use stellar_xdr::curr::{
     ClaimClaimableBalanceOp, ClaimPredicate, Claimant, ClawbackClaimableBalanceOp, ClawbackOp,
     CreateAccountOp, CreateClaimableBalanceOp, CreatePassiveSellOfferOp, ExtendFootprintTtlOp,
     InvokeHostFunctionOp, LiquidityPoolDepositOp, LiquidityPoolWithdrawOp, ManageBuyOfferOp,
-    ManageDataOp, ManageSellOfferOp, MuxedAccount, Operation, OperationBody, OperationType,
+    ManageDataOp, ManageSellOfferOp, Operation, OperationBody, OperationType,
     PathPaymentStrictReceiveOp, PathPaymentStrictSendOp, PaymentOp, RestoreFootprintOp,
     SetOptionsOp, SetTrustLineFlagsOp,
 };
@@ -447,21 +447,11 @@ fn validate_restore_footprint(
     Ok(())
 }
 
-/// Get the source account for an operation.
-///
-/// If the operation has an explicit source, use that.
-/// Otherwise, the transaction source is used.
-pub fn get_operation_source<'a>(
-    op: &'a Operation,
-    tx_source: &'a MuxedAccount,
-) -> &'a MuxedAccount {
-    op.source_account.as_ref().unwrap_or(tx_source)
-}
-
 // Re-export ThresholdLevel from henyey_common so downstream users can still
 // access it via `henyey_tx::ThresholdLevel`.
 pub use henyey_common::ThresholdLevel;
 
+#[cfg(test)]
 /// Get the threshold level required for an operation.
 ///
 /// This determines how much signer weight is needed to authorize the operation,
@@ -509,6 +499,7 @@ pub fn get_threshold_level(op: &Operation) -> ThresholdLevel {
     }
 }
 
+#[cfg(test)]
 /// Get the needed weight for an operation from the source account.
 ///
 /// Looks up the threshold value from the account's `thresholds` array
