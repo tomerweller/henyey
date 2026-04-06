@@ -24,6 +24,16 @@ use super::PeerHandle;
 use parking_lot::RwLock;
 use tokio::task::JoinHandle;
 
+/// Buffer size for the per-peer outbound message channel.
+///
+/// This channel queues messages waiting to be sent to a specific peer.
+/// 256 provides enough headroom for bursts without excessive memory use.
+const OUTBOUND_MESSAGE_CHANNEL_SIZE: usize = 256;
+
+/// Delay in milliseconds between successive connection attempts when
+/// filling outbound slots, to avoid overwhelming the network stack.
+const CONNECTION_ATTEMPT_DELAY_MS: u64 = 50;
+
 /// Prune completed JoinHandles from the vec, then push the new one.
 /// This prevents unbounded growth of the peer_handles vector.
 fn push_peer_handle(handles: &RwLock<Vec<JoinHandle<()>>>, handle: JoinHandle<()>) {
@@ -44,7 +54,7 @@ impl OverlayManager {
         shared: &SharedPeerState,
     ) -> std::result::Result<(mpsc::Receiver<OutboundMessage>, Arc<FlowControl>), OverlayError>
     {
-        let (outbound_tx, outbound_rx) = mpsc::channel(256);
+        let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_MESSAGE_CHANNEL_SIZE);
         let stats = peer.stats();
         let flow_control = Arc::new(FlowControl::with_scp_callback(
             FlowControlConfig::default(),
@@ -425,7 +435,7 @@ impl OverlayManager {
                 }
             }
             // Small delay between connection attempts
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(CONNECTION_ATTEMPT_DELAY_MS)).await;
         }
         added
     }

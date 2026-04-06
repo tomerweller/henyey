@@ -25,7 +25,7 @@ use crate::{
     auth::AuthContext,
     codec::helpers,
     connection::{Connection, ConnectionDirection},
-    flow_control::msg_body_size,
+    flow_control::{msg_body_size, FlowControlConfig},
     LocalNode, OverlayError, PeerAddress, PeerId, Result,
 };
 use std::net::SocketAddr;
@@ -34,6 +34,19 @@ use std::sync::Arc;
 use std::time::Instant;
 use stellar_xdr::curr::{Auth, Hello, StellarMessage};
 use tracing::{debug, info, trace, warn};
+
+/// Auth flag value indicating flow control with byte-level capacity is enabled.
+///
+/// Defined in the XDR spec as `AUTH_MSG_FLAG_FLOW_CONTROL_BYTES_REQUESTED = 200`.
+/// Both peers must set this flag in their Auth message to enable byte-based
+/// flow control (as opposed to the legacy message-only mode).
+const AUTH_MSG_FLAG_FLOW_CONTROL_BYTES_REQUESTED: i32 = 200;
+
+/// Initial byte-level flood reading capacity sent in the first
+/// `SendMoreExtended` message after authentication.
+///
+/// Matches stellar-core `INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES` (300 000).
+const INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES: u32 = 300_000;
 
 /// Current state of a peer connection.
 ///
@@ -334,11 +347,11 @@ impl Peer {
             self.info.peer_id, self.info.address, handshake_ms
         );
 
-        // Send SEND_MORE_EXTENDED to enable flow control
-        // Match stellar-core defaults: PEER_FLOOD_READING_CAPACITY=200, fcBytes=300000
+        // Send SEND_MORE_EXTENDED to enable flow control.
+        // Matches stellar-core Peer::recvAuth() → sendSendMore().
         let send_more = StellarMessage::SendMoreExtended(stellar_xdr::curr::SendMoreExtended {
-            num_messages: 200,
-            num_bytes: 300_000,
+            num_messages: FlowControlConfig::default().peer_flood_reading_capacity as u32,
+            num_bytes: INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES,
         });
         self.send(send_more).await?;
         debug!("Sent SEND_MORE_EXTENDED to {}", self.info.peer_id);
@@ -396,8 +409,9 @@ impl Peer {
 
     /// Send AUTH message (authenticated with MAC, sequence 0).
     async fn send_auth_msg(&mut self) -> Result<()> {
-        // AUTH_MSG_FLAG_FLOW_CONTROL_BYTES_REQUESTED = 200 to enable flow control
-        let auth_msg = StellarMessage::Auth(Auth { flags: 200 });
+        let auth_msg = StellarMessage::Auth(Auth {
+            flags: AUTH_MSG_FLAG_FLOW_CONTROL_BYTES_REQUESTED,
+        });
         self.send_auth(auth_msg).await?;
         self.auth.auth_sent();
         debug!("Auth sent to {}", self.connection.remote_addr());
@@ -416,8 +430,7 @@ impl Peer {
 
         match message {
             StellarMessage::Auth(ref auth) => {
-                // Validate AUTH_MSG_FLAG_FLOW_CONTROL_BYTES_REQUESTED (200)
-                if auth.flags != 200 {
+                if auth.flags != AUTH_MSG_FLAG_FLOW_CONTROL_BYTES_REQUESTED {
                     return Err(OverlayError::InvalidMessage(format!(
                         "Auth message missing flow control flag, got flags={}",
                         auth.flags

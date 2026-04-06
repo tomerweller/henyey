@@ -46,6 +46,15 @@ pub(super) const PEER_IP_RESOLVE_RETRY_DELAY: Duration = Duration::from_secs(10)
 /// Delay before retrying a failed outbound connection attempt.
 const OUTBOUND_CONNECT_RETRY_DELAY: Duration = Duration::from_secs(10);
 
+/// Brief delay after evicting a peer for a preferred peer, to let the
+/// connection pool settle before checking available slots.
+const EVICTION_SETTLE_DELAY_MS: u64 = 100;
+
+/// Interval between peer advertisement broadcasts (30 seconds).
+///
+/// Controls how often this node sends its peer list to connected peers.
+const PEER_ADVERTISER_INTERVAL_SECS: u64 = 30;
+
 /// Result of a background DNS resolution of configured peers.
 struct ResolvedPeers {
     /// Successfully resolved known peers (hostname → IP:port).
@@ -365,7 +374,7 @@ impl OverlayManager {
                     preferred_peers,
                 );
                 if evicted {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tokio::time::sleep(Duration::from_millis(EVICTION_SETTLE_DELAY_MS)).await;
                 }
                 if !pool.try_reserve() {
                     debug!("Outbound peer limit reached (even after eviction attempt)");
@@ -623,7 +632,8 @@ impl OverlayManager {
         let mut shutdown_rx = self.shutdown_tx.as_ref().unwrap().subscribe();
 
         let handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(PEER_ADVERTISER_INTERVAL_SECS));
 
             loop {
                 tokio::select! {

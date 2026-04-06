@@ -24,6 +24,11 @@ use tracing::{debug, info, trace, warn};
 /// `string msg<100>` constraint in the `Error` struct.
 const MAX_ERROR_MESSAGE_LEN: usize = 100;
 
+/// Number of 1-second ticks between ping attempts.
+///
+/// Matches stellar-core `RECURRENT_TIMER_PERIOD` (5 seconds).
+const PING_INTERVAL_TICKS: u32 = 5;
+
 /// Truncate an error message to fit within the XDR `string msg<100>` limit.
 ///
 /// If the message exceeds 100 bytes it is truncated at a valid UTF-8 boundary
@@ -681,7 +686,7 @@ impl OverlayManager {
                     }
 
                     ticks_since_ping += 1;
-                    if ticks_since_ping >= 5 {
+                    if ticks_since_ping >= PING_INTERVAL_TICKS {
                         ticks_since_ping = 0;
                         if Self::maybe_send_ping(&mut peer, &peer_id, &mut ping).await {
                             last_write = Instant::now();

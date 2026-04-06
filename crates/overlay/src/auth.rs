@@ -107,12 +107,14 @@ impl AuthCertExt for AuthCert {
         let ephemeral_public = X25519PublicKey::from(ephemeral_secret);
         let pubkey = *ephemeral_public.as_bytes();
 
-        // Expiration: 1 hour from now
+        // Expiration: 1 hour from now.
+        // Matches stellar-core `expirationLimit` in PeerAuth.cpp.
+        const AUTH_CERT_EXPIRATION_SECS: u64 = 3600;
         let expiration = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs()
-            + 3600;
+            + AUTH_CERT_EXPIRATION_SECS;
 
         // Sign: network_id || ENVELOPE_TYPE_AUTH || expiration || pubkey
         let sig = sign_cert(local_node, expiration, &pubkey);

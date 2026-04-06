@@ -66,6 +66,23 @@ use tracing::{debug, error, info, trace};
 /// Prevents unbounded growth from PEERS messages sent by remote nodes.
 const MAX_KNOWN_PEERS: usize = 1000;
 
+/// Buffer size for the broadcast channel carrying non-critical overlay
+/// messages (TX floods, etc.). SCP and fetch-response messages bypass
+/// this channel via dedicated mpsc channels, so the broadcast channel
+/// only carries remaining message types. 4096 provides headroom for
+/// mainnet traffic bursts from multiple peers.
+const BROADCAST_CHANNEL_SIZE: usize = 4096;
+
+/// Buffer size for the dedicated fetch-response mpsc channel
+/// (GetTxSet / GetScpQuorumSet replies).
+const FETCH_RESPONSE_CHANNEL_SIZE: usize = 4096;
+
+/// Maximum number of peer addresses included in a single PEERS message.
+///
+/// Matches stellar-core's limit of 50 addresses per Peers message
+/// (see `Peer::recvPeers` in Peer.cpp).
+const MAX_PEERS_PER_MESSAGE: usize = 50;
+
 /// An overlay message received from a peer, ready for dispatch to subscribers.
 #[derive(Clone)]
 pub struct OverlayMessage {
@@ -346,11 +363,10 @@ impl OverlayManager {
         // Broadcast channel for non-critical overlay messages (TX floods, etc.).
         // SCP and fetch-response messages bypass this channel via dedicated mpsc
         // channels, so the broadcast channel only carries remaining message types.
-        // 4096 provides headroom for mainnet traffic bursts from multiple peers.
-        let (message_tx, _) = broadcast::channel(4096);
+        let (message_tx, _) = broadcast::channel(BROADCAST_CHANNEL_SIZE);
         let (shutdown_tx, _) = broadcast::channel(1);
         let (scp_message_tx, scp_message_rx) = mpsc::unbounded_channel();
-        let (fetch_response_tx, fetch_response_rx) = mpsc::channel(4096);
+        let (fetch_response_tx, fetch_response_rx) = mpsc::channel(FETCH_RESPONSE_CHANNEL_SIZE);
 
         Ok(Self {
             config: config.clone(),
@@ -653,7 +669,6 @@ impl OverlayManager {
     ) -> Option<StellarMessage> {
         let mut peers = Vec::new();
         let mut unique = HashSet::new();
-        const MAX_PEERS_PER_MESSAGE: usize = 50;
         let mut ordered_outbound: Vec<&PeerAddress> = outbound.iter().collect();
         let mut ordered_inbound: Vec<&PeerAddress> = inbound.iter().collect();
         ordered_outbound.shuffle(&mut rand::thread_rng());

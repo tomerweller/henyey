@@ -47,19 +47,33 @@ pub trait ScpQueueCallback: Send + Sync {
 }
 
 /// Configuration for flow control.
+///
+/// Default values match stellar-core Config.cpp defaults:
+/// - `PEER_FLOOD_READING_CAPACITY = 200`
+/// - `PEER_READING_CAPACITY = 201`
+/// - `FLOW_CONTROL_SEND_MORE_BATCH_SIZE = 40`
+/// - `FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES = 100_000` (initial default)
 #[derive(Debug, Clone)]
 pub struct FlowControlConfig {
     /// Maximum flood messages we can process before sending SEND_MORE.
+    ///
+    /// stellar-core: `PEER_FLOOD_READING_CAPACITY` (default 200).
     pub peer_flood_reading_capacity: u64,
     /// Maximum total messages we can process before sending SEND_MORE.
+    ///
+    /// stellar-core: `PEER_READING_CAPACITY` (default 201).
     pub peer_reading_capacity: u64,
     /// Batch size for flood messages before requesting more.
+    ///
+    /// stellar-core: `FLOW_CONTROL_SEND_MORE_BATCH_SIZE` (default 40).
     pub flow_control_send_more_batch_size: u64,
-    /// Maximum bytes in outbound transaction queue.
+    /// Maximum bytes in outbound transaction queue (3 MB).
     pub outbound_tx_queue_byte_limit: usize,
     /// Maximum operations in a transaction set (used for queue limits).
     pub max_tx_set_size_ops: u32,
     /// Byte batch size for flood messages.
+    ///
+    /// stellar-core: `INITIAL_FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES` (default 100 000).
     pub flow_control_bytes_batch_size: u64,
 }
 
