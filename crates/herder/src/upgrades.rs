@@ -174,7 +174,7 @@ impl UpgradeParameters {
     pub fn from_now(offset: Duration) -> Self {
         let upgrade_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
+            .expect("system clock before UNIX epoch")
             .as_secs()
             + offset.as_secs();
         Self::new(upgrade_time)

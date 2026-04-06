@@ -592,8 +592,8 @@ impl ScpDriver {
         // Check closeTime (not too far in future)
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .expect("system clock before UNIX epoch")
+            .as_secs();
         if close_time > now + self.config.max_time_drift {
             trace!(
                 "Close time {} too far in future (now: {}, max_slip: {})",

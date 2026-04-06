@@ -1706,7 +1706,7 @@ impl App {
                     .clock
                     .system_now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
+                    .expect("system clock before UNIX epoch")
                     .as_secs();
                 let close_time_drift = wall_now.saturating_sub(last_close_time);
                 let upper_bound_offset =

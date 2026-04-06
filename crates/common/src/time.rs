@@ -70,7 +70,7 @@ pub fn current_timestamp_ms() -> u64 {
 fn duration_since_unix_epoch() -> Duration {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
+        .expect("system clock before UNIX epoch")
 }
 
 /// Converts a Unix timestamp (seconds since 1970) to a [`SystemTime`].
