@@ -161,7 +161,9 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
     // per source account so that MergeOpFrame::isSeqnumTooFar can prevent
     // merges that would allow sequence-number reuse after account re-creation.
     // Matches stellar-core processFeesSeqNums (LedgerManagerImpl.cpp).
-    if deduct_fee {
+    // This runs regardless of deduct_fee because the external pre-charged path
+    // (parallel Soroban) also needs AccountMerge protection.
+    {
         let mut merge_seen = false;
         let mut acc_to_max_seq: HashMap<AccountId, i64> = HashMap::new();
         for (tx, _) in transactions.iter() {
@@ -211,6 +213,16 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
         let tx_prng_seed = sub_sha256(&soroban_base_prng_seed, tx_index as u32);
         // Execute with deduct_fee=false — fees were already pre-deducted above
         // (when deduct_fee=true) or not needed (when deduct_fee=false from caller).
+        // When fees were pre-charged, use the should_apply flag from fee
+        // pre-deduction: if the fee source had insufficient balance,
+        // should_apply=false and the executor will skip the operation body.
+        // This matches stellar-core's parallelApply which checks
+        // txResult.isSuccess() before executing ops.
+        let should_apply = if has_pre_charged {
+            pre_fee_results[tx_index].should_apply
+        } else {
+            true
+        };
         let mut result = executor.execute_transaction_with_arc(
             snapshot,
             TransactionExecutionRequest {
@@ -219,7 +231,7 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
                 soroban_prng_seed: Some(tx_prng_seed),
                 deduct_fee: false,
                 fee_source_pre_state: None,
-                should_apply: true,
+                should_apply,
             },
         )?;
 

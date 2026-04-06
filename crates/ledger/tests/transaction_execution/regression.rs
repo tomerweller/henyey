@@ -3736,6 +3736,102 @@ fn test_pre_charged_fee_override_on_validation_failure() {
     );
 }
 
+/// Regression test for AUDIT-577 Finding 1: run_transactions_on_executor hard-codes
+/// should_apply=true when using external pre-charged fees. When a classic TX has
+/// insufficient fees (should_apply=false from pre-deduction), the operation body must
+/// NOT execute. stellar-core's parallelApply checks txResult.isSuccess() and returns
+/// early without applying ops when fee validation failed.
+#[test]
+fn test_audit_577_pre_charged_should_apply_false_skips_body() {
+    use henyey_ledger::execution::{run_transactions_on_executor, PreChargedFee};
+    use henyey_ledger::LedgerDelta;
+
+    let secret = SecretKey::from_seed(&[77u8; 32]);
+    let source_id: AccountId = (&secret.public_key()).into();
+    // Give source enough balance for the TX to succeed IF it were applied.
+    let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 100_000_000);
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let network_id = NetworkId::testnet();
+    let base_fee: u32 = 100;
+    let base_reserve: u32 = 5_000_000;
+
+    // Build a valid CreateAccount TX that would succeed normally.
+    let dest = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([88u8; 32])));
+    let op = Operation {
+        source_account: None,
+        body: OperationBody::CreateAccount(CreateAccountOp {
+            destination: dest.clone(),
+            starting_balance: 10_000_000,
+        }),
+    };
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: base_fee,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    let sig = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![sig].try_into().unwrap();
+    }
+
+    let context = henyey_tx::LedgerContext::new(2, 1_000, base_fee, base_reserve, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+    executor
+        .load_orderbook_offers(&snapshot)
+        .expect("load offers");
+
+    // Pre-charge with should_apply=false (simulates insufficient fee balance).
+    let pre_charged = vec![PreChargedFee {
+        charged_fee: 50, // Less than computed fee — insufficient
+        should_apply: false,
+        fee_changes: LedgerEntryChanges(vec![].try_into().unwrap()),
+    }];
+
+    let transactions = vec![(std::sync::Arc::new(envelope), None)];
+    let mut delta = LedgerDelta::new(2);
+
+    let result = run_transactions_on_executor(henyey_ledger::execution::RunTransactionsParams {
+        executor: &mut executor,
+        snapshot: &snapshot,
+        transactions: &transactions,
+        base_fee,
+        soroban_base_prng_seed: [0u8; 32],
+        deduct_fee: false,
+        delta: &mut delta,
+        external_pre_charged: Some(&pre_charged),
+    })
+    .expect("run_transactions_on_executor");
+
+    // TX body must NOT have been applied — destination account must not exist.
+    assert!(
+        !result.results[0].success,
+        "TX with should_apply=false must not succeed"
+    );
+    // The destination account must not have been created.
+    assert!(
+        executor.state().get_account(&dest).is_none(),
+        "destination account must not exist when should_apply=false"
+    );
+}
+
 /// Regression test for the single-op savepoint skip optimization.
 ///
 /// When a transaction has exactly one operation, the per-operation savepoint is
