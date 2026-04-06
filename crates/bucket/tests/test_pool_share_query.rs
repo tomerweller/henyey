@@ -177,7 +177,8 @@ async fn test_load_pool_share_trustlines_by_account_and_asset() {
 
     // Query for pool share trustlines with asset_to_search
     let result = searchable
-        .load_pool_share_trustlines_by_account_and_asset(&account_to_search, &asset_to_search);
+        .load_pool_share_trustlines_by_account_and_asset(&account_to_search, &asset_to_search)
+        .unwrap();
 
     // Should return trustlines for pool1 and pool2 (which contain asset_to_search)
     // but NOT pool3 (which doesn't contain asset_to_search)
@@ -235,8 +236,9 @@ async fn test_load_pool_share_trustlines_no_match() {
     // Query should return empty since:
     // 1. The pool doesn't contain asset_to_search
     // 2. account_id doesn't have any trustlines anyway
-    let result =
-        searchable.load_pool_share_trustlines_by_account_and_asset(&account_id, &asset_to_search);
+    let result = searchable
+        .load_pool_share_trustlines_by_account_and_asset(&account_id, &asset_to_search)
+        .unwrap();
     assert!(result.is_empty());
 }
 
@@ -269,8 +271,9 @@ async fn test_load_pool_share_trustlines_deleted_pool() {
 
     // Verify trustline is found
     let searchable = create_searchable_snapshot(&bucket_list);
-    let result =
-        searchable.load_pool_share_trustlines_by_account_and_asset(&account_id, &asset_to_search);
+    let result = searchable
+        .load_pool_share_trustlines_by_account_and_asset(&account_id, &asset_to_search)
+        .unwrap();
     assert_eq!(result.len(), 1);
 
     // Delete the pool
@@ -291,8 +294,9 @@ async fn test_load_pool_share_trustlines_deleted_pool() {
 
     // Now the query should return empty (pool is deleted)
     let searchable = create_searchable_snapshot(&bucket_list);
-    let result =
-        searchable.load_pool_share_trustlines_by_account_and_asset(&account_id, &asset_to_search);
+    let result = searchable
+        .load_pool_share_trustlines_by_account_and_asset(&account_id, &asset_to_search)
+        .unwrap();
     assert!(result.is_empty());
 }
 
@@ -343,8 +347,9 @@ async fn test_load_pool_share_trustlines_multi_version() {
         .unwrap();
 
     let searchable = create_searchable_snapshot(&bucket_list);
-    let result =
-        searchable.load_pool_share_trustlines_by_account_and_asset(&account_id, &asset_to_search);
+    let result = searchable
+        .load_pool_share_trustlines_by_account_and_asset(&account_id, &asset_to_search)
+        .unwrap();
 
     assert_eq!(result.len(), 1);
 
@@ -429,11 +434,13 @@ async fn test_load_trustlines_for_account() {
     let searchable = create_searchable_snapshot(&bucket_list);
 
     // Load trustlines for account_id
-    let result = searchable.load_trustlines_for_account(&account_id);
+    let result = searchable.load_trustlines_for_account(&account_id).unwrap();
     assert_eq!(result.len(), 2);
 
     // Load trustlines for other_account
-    let result = searchable.load_trustlines_for_account(&other_account);
+    let result = searchable
+        .load_trustlines_for_account(&other_account)
+        .unwrap();
     assert_eq!(result.len(), 1);
 }
 
@@ -464,8 +471,9 @@ async fn test_load_pool_share_trustlines_asset_in_b_position() {
         .unwrap();
 
     let searchable = create_searchable_snapshot(&bucket_list);
-    let result =
-        searchable.load_pool_share_trustlines_by_account_and_asset(&account_id, &asset_to_search);
+    let result = searchable
+        .load_pool_share_trustlines_by_account_and_asset(&account_id, &asset_to_search)
+        .unwrap();
 
     // Should find the trustline even though asset_to_search is in asset_b position
     assert_eq!(result.len(), 1);

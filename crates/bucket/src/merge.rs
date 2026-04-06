@@ -93,21 +93,39 @@ fn record_entry_type(counters: Option<&MergeCounters>, entry: &BucketEntry) {
 /// * `counters` - Optional merge counters for metrics
 /// * `emit` - Callback for each merged entry to include in output
 fn two_pointer_merge(
-    old_iter: impl Iterator<Item = BucketEntry>,
-    new_iter: impl Iterator<Item = BucketEntry>,
+    old_iter: impl Iterator<Item = Result<BucketEntry>>,
+    new_iter: impl Iterator<Item = Result<BucketEntry>>,
     keep_dead_entries: bool,
     normalize_init_entries: bool,
     counters: Option<&MergeCounters>,
     mut emit: impl FnMut(BucketEntry) -> Result<()>,
 ) -> Result<()> {
-    // Filter out metadata from both iterators
-    let mut old_iter = old_iter.filter(|e| !e.is_metadata()).peekable();
-    let mut new_iter = new_iter.filter(|e| !e.is_metadata()).peekable();
+    // Filter out metadata from both iterators, propagating errors
+    let mut old_iter = old_iter
+        .map(|r| r.map(|e| (e.is_metadata(), e)))
+        .filter_map(|r| match r {
+            Ok((true, _)) => None,
+            Ok((false, e)) => Some(Ok(e)),
+            Err(e) => Some(Err(e)),
+        })
+        .peekable();
+    let mut new_iter = new_iter
+        .map(|r| r.map(|e| (e.is_metadata(), e)))
+        .filter_map(|r| match r {
+            Ok((true, _)) => None,
+            Ok((false, e)) => Some(Ok(e)),
+            Err(e) => Some(Err(e)),
+        })
+        .peekable();
 
     loop {
-        // Check what's available from both sides
-        let has_old = old_iter.peek().is_some();
-        let has_new = new_iter.peek().is_some();
+        // Check what's available from both sides, checking for errors
+        // We need to handle the case where peek returns Some(Err)
+        let old_peeked = old_iter.peek();
+        let new_peeked = new_iter.peek();
+
+        let has_old = old_peeked.is_some();
+        let has_new = new_peeked.is_some();
 
         if !has_old && !has_new {
             break;
@@ -115,7 +133,7 @@ fn two_pointer_merge(
 
         if !has_new {
             // Drain remaining old entries
-            let entry = old_iter.next().unwrap();
+            let entry = old_iter.next().unwrap()?;
             if should_keep_entry(&entry, keep_dead_entries) {
                 record_entry_type(counters, &entry);
                 emit(entry)?;
@@ -125,7 +143,7 @@ fn two_pointer_merge(
 
         if !has_old {
             // Drain remaining new entries
-            let entry = new_iter.next().unwrap();
+            let entry = new_iter.next().unwrap()?;
             if should_keep_entry(&entry, keep_dead_entries) {
                 let entry = maybe_normalize_entry(entry, normalize_init_entries);
                 record_entry_type(counters, &entry);
@@ -134,21 +152,30 @@ fn two_pointer_merge(
             continue;
         }
 
-        // Both sides have entries — compare keys
-        let old_key = old_iter.peek().unwrap().key();
-        let new_key = new_iter.peek().unwrap().key();
+        // Both sides have entries — compare keys.
+        // We need to check for errors before comparing.
+        // If either side has an Err, propagate it immediately.
+        if old_iter.peek().unwrap().is_err() {
+            return Err(old_iter.next().unwrap().unwrap_err());
+        }
+        if new_iter.peek().unwrap().is_err() {
+            return Err(new_iter.next().unwrap().unwrap_err());
+        }
+
+        let old_key = old_iter.peek().unwrap().as_ref().unwrap().key();
+        let new_key = new_iter.peek().unwrap().as_ref().unwrap().key();
 
         match (old_key, new_key) {
             (Some(ref ok), Some(ref nk)) => match compare_keys(ok, nk) {
                 Ordering::Less => {
-                    let entry = old_iter.next().unwrap();
+                    let entry = old_iter.next().unwrap()?;
                     if should_keep_entry(&entry, keep_dead_entries) {
                         record_entry_type(counters, &entry);
                         emit(entry)?;
                     }
                 }
                 Ordering::Greater => {
-                    let entry = new_iter.next().unwrap();
+                    let entry = new_iter.next().unwrap()?;
                     if should_keep_entry(&entry, keep_dead_entries) {
                         let entry = maybe_normalize_entry(entry, normalize_init_entries);
                         record_entry_type(counters, &entry);
@@ -156,8 +183,8 @@ fn two_pointer_merge(
                     }
                 }
                 Ordering::Equal => {
-                    let old_entry = old_iter.next().unwrap();
-                    let new_entry = new_iter.next().unwrap();
+                    let old_entry = old_iter.next().unwrap()?;
+                    let new_entry = new_iter.next().unwrap()?;
                     if let Some(merged_entry) = merge_entries(
                         &old_entry,
                         &new_entry,
@@ -295,14 +322,14 @@ fn merge_with_shadows_impl(
     // Use streaming merge: iterate one entry at a time from each bucket.
     // For in-memory buckets this iterates over the slice; for disk-backed
     // buckets this streams from disk via BufReader (O(1) memory per input).
-    let mut old_iter = old_bucket.iter();
-    let mut new_iter = new_bucket.iter();
+    let mut old_iter = old_bucket.iter()?;
+    let mut new_iter = new_bucket.iter()?;
 
     // Extract metadata from the first entries of each bucket.
     let mut old_meta: Option<BucketMetadata> = None;
     let mut new_meta: Option<BucketMetadata> = None;
-    let old_first = advance_skip_metadata(&mut old_iter, &mut old_meta);
-    let new_first = advance_skip_metadata(&mut new_iter, &mut new_meta);
+    let old_first = advance_skip_metadata(&mut old_iter, &mut old_meta)?;
+    let new_first = advance_skip_metadata(&mut new_iter, &mut new_meta)?;
 
     tracing::trace!(
         old_hash = %old_bucket.hash(),
@@ -320,8 +347,10 @@ fn merge_with_shadows_impl(
     // Create shadow cursors for inline shadow checking.
     // For protocol >= 12 (V12, shadows removed), shadow_buckets is always
     // empty, so no cursors are created.
-    let mut shadow_cursors: Vec<ShadowCursor<'_>> =
-        shadow_buckets.iter().map(ShadowCursor::new).collect();
+    let mut shadow_cursors: Vec<ShadowCursor<'_>> = shadow_buckets
+        .iter()
+        .map(ShadowCursor::new)
+        .collect::<Result<Vec<_>>>()?;
 
     if let Some(ref meta) = output_meta {
         merged.push(meta.clone());
@@ -329,8 +358,8 @@ fn merge_with_shadows_impl(
 
     // Chain the already-consumed first entry with the rest of the iterator
     two_pointer_merge(
-        old_first.into_iter().chain(old_iter),
-        new_first.into_iter().chain(new_iter),
+        old_first.into_iter().map(Ok).chain(old_iter),
+        new_first.into_iter().map(Ok).chain(new_iter),
         keep_dead_entries,
         normalize_init_entries,
         counters,
@@ -341,8 +370,7 @@ fn merge_with_shadows_impl(
                 keep_shadowed_lifecycle_entries,
                 &mut merged,
                 counters,
-            );
-            Ok(())
+            )
         },
     )?;
 
@@ -421,13 +449,13 @@ pub fn merge_buckets_to_file_with_counters(
         return Ok((Hash256::ZERO, 0));
     }
 
-    let mut old_iter = old_bucket.iter();
-    let mut new_iter = new_bucket.iter();
+    let mut old_iter = old_bucket.iter()?;
+    let mut new_iter = new_bucket.iter()?;
 
     let mut old_meta: Option<BucketMetadata> = None;
     let mut new_meta: Option<BucketMetadata> = None;
-    let old_first = advance_skip_metadata(&mut old_iter, &mut old_meta);
-    let new_first = advance_skip_metadata(&mut new_iter, &mut new_meta);
+    let old_first = advance_skip_metadata(&mut old_iter, &mut old_meta)?;
+    let new_first = advance_skip_metadata(&mut new_iter, &mut new_meta)?;
 
     let (_, output_meta) =
         build_output_metadata(old_meta.as_ref(), new_meta.as_ref(), max_protocol_version)?;
@@ -468,8 +496,8 @@ pub fn merge_buckets_to_file_with_counters(
 
     // Two-pointer merge using shared implementation
     two_pointer_merge(
-        old_first.into_iter().chain(old_iter),
-        new_first.into_iter().chain(new_iter),
+        old_first.into_iter().map(Ok).chain(old_iter),
+        new_first.into_iter().map(Ok).chain(new_iter),
         keep_dead_entries,
         normalize_init_entries,
         counters,
@@ -498,15 +526,16 @@ pub fn merge_buckets_to_file_with_counters(
 fn advance_skip_metadata(
     iter: &mut BucketIter<'_>,
     meta_out: &mut Option<BucketMetadata>,
-) -> Option<BucketEntry> {
-    for entry in iter.by_ref() {
+) -> Result<Option<BucketEntry>> {
+    for entry_result in iter.by_ref() {
+        let entry = entry_result?;
         if let BucketEntry::Metaentry(m) = &entry {
             *meta_out = Some(m.clone());
             continue;
         }
-        return Some(entry);
+        return Ok(Some(entry));
     }
-    None
+    Ok(None)
 }
 
 /// Merge two buckets using in-memory entries (level 0 optimization).
@@ -648,8 +677,8 @@ pub fn merge_in_memory(
     // Two-pointer merge using shared implementation
     // Convert slice iteration to iterators (metadata filtered by two_pointer_merge)
     two_pointer_merge(
-        old_entries.iter().cloned(),
-        new_entries.iter().cloned(),
+        old_entries.iter().cloned().map(Ok),
+        new_entries.iter().cloned().map(Ok),
         keep_dead_entries,
         normalize_init_entries,
         None, // no counters for in-memory merge
@@ -763,49 +792,55 @@ struct ShadowCursor<'a> {
 }
 
 impl<'a> ShadowCursor<'a> {
-    fn new(bucket: &'a Bucket) -> Self {
-        let mut iter = bucket.iter();
-        let current = next_non_meta(&mut iter);
-        Self { iter, current }
+    fn new(bucket: &'a Bucket) -> Result<Self> {
+        let mut iter = bucket.iter()?;
+        let current = next_non_meta(&mut iter)?;
+        Ok(Self { iter, current })
     }
 
-    fn advance_to_key_or_after(&mut self, key: &LedgerKey) -> bool {
+    fn advance_to_key_or_after(&mut self, key: &LedgerKey) -> Result<bool> {
         loop {
             let Some(entry) = self.current.as_ref() else {
-                return false;
+                return Ok(false);
             };
             let Some(entry_key) = entry.key() else {
-                self.current = next_non_meta(&mut self.iter);
+                self.current = next_non_meta(&mut self.iter)?;
                 continue;
             };
 
             match compare_keys(&entry_key, key) {
                 Ordering::Less => {
-                    self.current = next_non_meta(&mut self.iter);
+                    self.current = next_non_meta(&mut self.iter)?;
                 }
-                Ordering::Equal => return true,
-                Ordering::Greater => return false,
+                Ordering::Equal => return Ok(true),
+                Ordering::Greater => return Ok(false),
             }
         }
     }
 }
 
-fn next_non_meta(iter: &mut BucketIter<'_>) -> Option<BucketEntry> {
-    iter.by_ref().find(|entry| !entry.is_metadata())
+fn next_non_meta(iter: &mut BucketIter<'_>) -> Result<Option<BucketEntry>> {
+    for entry_result in iter.by_ref() {
+        let entry = entry_result?;
+        if !entry.is_metadata() {
+            return Ok(Some(entry));
+        }
+    }
+    Ok(None)
 }
 
-fn is_shadowed(entry: &BucketEntry, cursors: &mut [ShadowCursor<'_>]) -> bool {
+fn is_shadowed(entry: &BucketEntry, cursors: &mut [ShadowCursor<'_>]) -> Result<bool> {
     let Some(key) = entry.key() else {
-        return false;
+        return Ok(false);
     };
 
     for cursor in cursors.iter_mut() {
-        if cursor.advance_to_key_or_after(&key) {
-            return true;
+        if cursor.advance_to_key_or_after(&key)? {
+            return Ok(true);
         }
     }
 
-    false
+    Ok(false)
 }
 
 /// Emit an entry to the output, checking shadows inline.
@@ -822,18 +857,19 @@ fn maybe_put(
     keep_shadowed_lifecycle_entries: bool,
     output: &mut Vec<BucketEntry>,
     counters: Option<&MergeCounters>,
-) {
+) -> Result<()> {
     if !shadow_cursors.is_empty() {
         if keep_shadowed_lifecycle_entries && (entry.is_init() || entry.is_dead()) {
             // Lifecycle entries (INIT/DEAD) are preserved even when shadowed
-        } else if is_shadowed(&entry, shadow_cursors) {
+        } else if is_shadowed(&entry, shadow_cursors)? {
             if let Some(c) = counters {
                 c.record_shadowed();
             }
-            return;
+            return Ok(());
         }
     }
     output.push(entry);
+    Ok(())
 }
 
 /// Check if an entry should be kept in the merged output.
@@ -973,15 +1009,14 @@ impl MergeIterator {
         new_bucket: &Bucket,
         keep_dead_entries: bool,
         max_protocol_version: u32,
-    ) -> Self {
+    ) -> Result<Self> {
         // Collect entries - works for both in-memory and disk-backed buckets
-        let old_entries: Vec<BucketEntry> = old_bucket.iter().collect();
-        let new_entries: Vec<BucketEntry> = new_bucket.iter().collect();
+        let old_entries: Vec<BucketEntry> = old_bucket.iter()?.collect::<Result<Vec<_>>>()?;
+        let new_entries: Vec<BucketEntry> = new_bucket.iter()?.collect::<Result<Vec<_>>>()?;
         let old_meta = extract_metadata(&old_entries);
         let new_meta = extract_metadata(&new_entries);
         let (_, output_metadata) =
-            build_output_metadata(old_meta.as_ref(), new_meta.as_ref(), max_protocol_version)
-                .unwrap_or((0, None));
+            build_output_metadata(old_meta.as_ref(), new_meta.as_ref(), max_protocol_version)?;
 
         let mut merged_entries = Vec::with_capacity(old_entries.len() + new_entries.len());
 
@@ -993,8 +1028,8 @@ impl MergeIterator {
         // Use shared two-pointer merge with normalize_init_entries=true
         // (MergeIterator always normalizes for backward compatibility)
         two_pointer_merge(
-            old_entries.into_iter(),
-            new_entries.into_iter(),
+            old_entries.into_iter().map(Ok),
+            new_entries.into_iter().map(Ok),
             keep_dead_entries,
             true, // normalize_init_entries
             None, // no counters
@@ -1002,13 +1037,12 @@ impl MergeIterator {
                 merged_entries.push(entry);
                 Ok(())
             },
-        )
-        .expect("in-memory merge should not fail");
+        )?;
 
-        Self {
+        Ok(Self {
             merged_entries,
             idx: 0,
-        }
+        })
     }
 }
 
@@ -1283,7 +1317,7 @@ mod tests {
         let old_bucket = Bucket::from_entries(old_entries).unwrap();
         let new_bucket = Bucket::from_entries(new_entries).unwrap();
 
-        let iter = MergeIterator::new(&old_bucket, &new_bucket, true, 0);
+        let iter = MergeIterator::new(&old_bucket, &new_bucket, true, 0).unwrap();
         let merged: Vec<_> = iter.collect();
 
         assert_eq!(merged.len(), 3);
@@ -1710,7 +1744,7 @@ mod tests {
         let merged = merge_in_memory(&old_bucket, &new_bucket, 25).unwrap();
 
         // The output metadata should use 25 (max_protocol_version), NOT 20 (max of inputs)
-        let merged_entries: Vec<_> = merged.iter().collect();
+        let merged_entries: Vec<_> = merged.iter().unwrap().map(|e| e.unwrap()).collect();
         let meta_entry = merged_entries
             .iter()
             .find(|e| e.is_metadata())
@@ -1757,7 +1791,7 @@ mod tests {
         let merged = merge_buckets(&old_bucket, &new_bucket, true, 25).unwrap();
 
         // The output metadata should use max(18, 22) = 22, NOT 25
-        let merged_entries: Vec<_> = merged.iter().collect();
+        let merged_entries: Vec<_> = merged.iter().unwrap().map(|e| e.unwrap()).collect();
         let meta_entry = merged_entries
             .iter()
             .find(|e| e.is_metadata())
@@ -1808,14 +1842,16 @@ mod tests {
 
         // Disk merge: uses max(old, new) = max(22, 22) = 22
         let merged_disk = merge_buckets(&old_bucket_disk, &new_bucket_disk, true, max_pv).unwrap();
-        let disk_meta = merged_disk
+        let disk_entries: Vec<_> = merged_disk.iter().unwrap().map(|e| e.unwrap()).collect();
+        let disk_meta = disk_entries
             .iter()
             .find(|e| e.is_metadata())
             .expect("disk merged should have meta");
 
         // In-memory merge: uses max_protocol_version = 25 directly
         let merged_mem = merge_in_memory(&old_bucket_mem, &new_bucket_mem, max_pv).unwrap();
-        let mem_meta = merged_mem
+        let mem_entries: Vec<_> = merged_mem.iter().unwrap().map(|e| e.unwrap()).collect();
+        let mem_meta = mem_entries
             .iter()
             .find(|e| e.is_metadata())
             .expect("mem merged should have meta");
@@ -2175,7 +2211,7 @@ mod tests {
         .unwrap();
 
         // No metadata in output
-        let has_metadata = merged.iter().any(|e| e.is_metadata());
+        let has_metadata = merged.iter().unwrap().any(|e| e.unwrap().is_metadata());
         assert!(
             !has_metadata,
             "Pre-protocol-11 merge should NOT produce METAENTRY"
@@ -2244,7 +2280,7 @@ mod tests {
         )
         .unwrap();
 
-        let has_metadata = merged.iter().any(|e| e.is_metadata());
+        let has_metadata = merged.iter().unwrap().any(|e| e.unwrap().is_metadata());
         assert!(
             has_metadata,
             "Protocol-11+ merge should produce METAENTRY when inputs have metadata"
@@ -2263,7 +2299,7 @@ mod tests {
         let merged =
             merge_in_memory(&old_bucket, &new_bucket, ProtocolVersion::V10.as_u32()).unwrap();
 
-        let has_metadata = merged.iter().any(|e| e.is_metadata());
+        let has_metadata = merged.iter().unwrap().any(|e| e.unwrap().is_metadata());
         assert!(
             !has_metadata,
             "In-memory merge with pre-protocol-11 should NOT produce metadata"

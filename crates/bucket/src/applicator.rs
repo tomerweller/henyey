@@ -307,14 +307,15 @@ impl BucketApplicator {
         // Load entries if needed
         if self.cached_entries.is_none() && self.bucket.is_disk_backed() {
             // For disk-backed buckets, collect entries into memory
-            let entries: Vec<BucketEntry> = self.bucket.iter().collect();
+            let entries: Vec<BucketEntry> =
+                self.bucket.iter()?.collect::<crate::Result<Vec<_>>>()?;
             self.cached_entries = Some(entries);
         }
 
         let entries: Vec<BucketEntry> = if let Some(ref cached) = self.cached_entries {
             cached.clone()
         } else {
-            self.bucket.iter().collect()
+            self.bucket.iter()?.collect::<crate::Result<Vec<_>>>()?
         };
 
         let end = std::cmp::min(self.current_offset + self.chunk_size, entries.len());

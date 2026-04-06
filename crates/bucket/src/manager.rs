@@ -786,7 +786,8 @@ impl BucketManager {
 
             let bucket = self.load_bucket(hash)?;
 
-            for entry in bucket.iter() {
+            for entry_result in bucket.iter()? {
+                let entry = entry_result?;
                 match entry {
                     crate::BucketEntry::Liveentry(ref ledger_entry)
                     | crate::BucketEntry::Initentry(ref ledger_entry) => {
@@ -887,7 +888,8 @@ impl BucketManager {
 
             let bucket = self.load_bucket(hash)?;
 
-            for entry in bucket.iter() {
+            for entry_result in bucket.iter()? {
+                let entry = entry_result?;
                 match entry {
                     crate::BucketEntry::Liveentry(ref ledger_entry)
                     | crate::BucketEntry::Initentry(ref ledger_entry) => {

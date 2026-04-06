@@ -915,7 +915,7 @@ impl BucketLevel {
         // for the next merge, try to enable them
         let merged = if !merged.has_in_memory_entries() {
             // Get entries and create bucket with in-memory optimization
-            let entries: Vec<BucketEntry> = merged.iter().collect();
+            let entries: Vec<BucketEntry> = merged.iter()?.collect::<crate::Result<Vec<_>>>()?;
             Bucket::from_sorted_entries_with_in_memory(entries)?
         } else {
             merged
@@ -1493,7 +1493,7 @@ impl BucketList {
         &self,
         entry_type: stellar_xdr::curr::LedgerEntryType,
         callback: F,
-    ) -> bool
+    ) -> Result<bool>
     where
         F: FnMut(&BucketEntry) -> bool,
     {
@@ -1524,7 +1524,7 @@ impl BucketList {
         &self,
         entry_types: &[stellar_xdr::curr::LedgerEntryType],
         mut callback: F,
-    ) -> bool
+    ) -> Result<bool>
     where
         F: FnMut(&BucketEntry) -> bool,
     {
@@ -1536,7 +1536,8 @@ impl BucketList {
 
         for level in &self.levels {
             for bucket in [&*level.curr, &*level.snap] {
-                for entry in bucket.iter() {
+                for entry_result in bucket.iter()? {
+                    let entry = entry_result?;
                     if let Some(key) = entry.key() {
                         if seen_keys.contains(&key) {
                             continue;
@@ -1554,14 +1555,14 @@ impl BucketList {
                             seen_keys.insert(key);
 
                             if !entry.is_dead() && !callback(&entry) {
-                                return false;
+                                return Ok(false);
                             }
                         }
                     }
                 }
             }
         }
-        true
+        Ok(true)
     }
 
     /// Return all live entries as of the current bucket list state.
@@ -1586,7 +1587,8 @@ impl BucketList {
             let buckets: [&Bucket; 2] = [&*level.curr, &*level.snap];
 
             for bucket in buckets {
-                for entry in bucket.iter() {
+                for entry_result in bucket.iter()? {
+                    let entry = entry_result?;
                     match entry {
                         BucketEntry::Liveentry(live) | BucketEntry::Initentry(live) => {
                             let key = henyey_common::entry_to_key(&live);
@@ -2743,7 +2745,8 @@ impl BucketList {
         // Iterate through all levels from shallowest (newest) to deepest (oldest)
         for level in &self.levels {
             for bucket in [&level.curr, &level.snap] {
-                for entry in bucket.iter() {
+                for entry_result in bucket.iter()? {
+                    let entry = entry_result?;
                     // Only process LIVE and INIT entries (not DEAD or Metadata)
                     let live_entry = match entry {
                         BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => e,
@@ -2957,7 +2960,8 @@ impl BucketList {
         // to start_offset and reads record sizes from record marks (no XDR
         // re-serialization). For in-memory buckets it computes sizes on the fly
         // (acceptable since in-memory buckets are small).
-        for (entry, entry_size) in bucket.iter_from_offset_with_sizes(start_offset) {
+        for result in bucket.iter_from_offset_with_sizes(start_offset)? {
+            let (entry, entry_size) = result?;
             bytes_used += entry_size;
             entries_scanned += 1;
 
@@ -3356,7 +3360,8 @@ mod tests {
         let _ = level.commit();
 
         let mut saw_live = false;
-        for entry in level.curr.iter() {
+        for entry_result in level.curr.iter().unwrap() {
+            let entry = entry_result.unwrap();
             match entry {
                 BucketListEntry::Liveentry(live) => {
                     saw_live = true;
@@ -3377,7 +3382,8 @@ mod tests {
             merge_buckets_with_options(&Bucket::empty(), &bucket, false, TEST_PROTOCOL, true)
                 .unwrap();
         let mut has_non_meta = false;
-        for entry in merged.iter() {
+        for entry_result in merged.iter().unwrap() {
+            let entry = entry_result.unwrap();
             if !entry.is_metadata() {
                 has_non_meta = true;
                 break;
@@ -3727,7 +3733,12 @@ mod tests {
 
         // Level 0 curr should have entries (1 data entry + potentially metadata)
         let level0 = &bl.levels()[0];
-        let level0_curr_data: usize = level0.curr.iter().filter(|e| !e.is_metadata()).count();
+        let level0_curr_data: usize = level0
+            .curr
+            .iter()
+            .unwrap()
+            .filter(|e| !e.as_ref().unwrap().is_metadata())
+            .count();
         assert_eq!(
             level0_curr_data, 1,
             "Level 0 curr should have exactly 1 data entry at ledger 1"
@@ -3822,12 +3833,14 @@ mod tests {
             // Count total non-metadata entries across all levels
             let mut total_data_entries: usize = 0;
             for level in bl.levels() {
-                for entry in level.curr.iter() {
+                for entry_result in level.curr.iter().unwrap() {
+                    let entry = entry_result.unwrap();
                     if !entry.is_metadata() {
                         total_data_entries += 1;
                     }
                 }
-                for entry in level.snap.iter() {
+                for entry_result in level.snap.iter().unwrap() {
+                    let entry = entry_result.unwrap();
                     if !entry.is_metadata() {
                         total_data_entries += 1;
                     }
@@ -3870,13 +3883,15 @@ mod tests {
         // Check that entries at each level have reasonable lastModifiedLedgerSeq ranges
         for (level_idx, level) in bl.levels().iter().enumerate() {
             let mut curr_ledgers: Vec<u32> = Vec::new();
-            for entry in level.curr.iter() {
+            for entry_result in level.curr.iter().unwrap() {
+                let entry = entry_result.unwrap();
                 if let Some(le) = entry.as_ledger_entry() {
                     curr_ledgers.push(le.last_modified_ledger_seq);
                 }
             }
             let mut snap_ledgers: Vec<u32> = Vec::new();
-            for entry in level.snap.iter() {
+            for entry_result in level.snap.iter().unwrap() {
+                let entry = entry_result.unwrap();
                 if let Some(le) = entry.as_ledger_entry() {
                     snap_ledgers.push(le.last_modified_ledger_seq);
                 }

@@ -637,7 +637,8 @@ impl App {
         // Step 6f: Join cache scan (should already be done since scan ~32s < merges ~60s).
         let cache_data = scan_handle
             .await
-            .map_err(|e| anyhow::anyhow!("Cache scan thread panicked: {:?}", e))?;
+            .map_err(|e| anyhow::anyhow!("Cache scan thread panicked: {:?}", e))?
+            .map_err(|e| anyhow::anyhow!("Cache scan failed: {:?}", e))?;
 
         henyey_ledger::log_startup_memory("after_cache_scan_and_merges");
 

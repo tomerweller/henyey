@@ -281,12 +281,13 @@ fn scan_single_level(
     soroban_enabled: bool,
     module_cache: &Option<Arc<PersistentModuleCache>>,
     protocol_version: u32,
-) -> LevelScanResult {
+) -> Result<LevelScanResult> {
     let mut scanner = LevelScanner::new();
 
     // Scan curr first, then snap (curr shadows snap within a level)
     for bucket in [curr, snap] {
-        for entry in bucket.iter() {
+        for entry_result in bucket.iter()? {
+            let entry = entry_result?;
             let key = match entry.key() {
                 Some(k) => k,
                 None => continue, // metadata
@@ -310,7 +311,7 @@ fn scan_single_level(
         }
     }
 
-    scanner.into_result()
+    Ok(scanner.into_result())
 }
 
 /// Merge per-level scan results into a single `CacheInitResult`.
@@ -452,7 +453,7 @@ fn scan_and_merge_streaming(
     soroban_enabled: bool,
     rent_config: &Option<crate::soroban_state::SorobanRentConfig>,
     module_cache: Option<PersistentModuleCache>,
-) -> CacheInitResult {
+) -> Result<CacheInitResult> {
     let module_cache_arc = module_cache.map(Arc::new);
 
     let mut soroban_state = crate::soroban_state::InMemorySorobanState::new();
@@ -475,7 +476,8 @@ fn scan_and_merge_streaming(
 
         // Scan curr first, then snap (curr shadows snap within a level)
         for bucket in [curr.as_ref(), snap.as_ref()] {
-            for entry in bucket.iter() {
+            for entry_result in bucket.iter()? {
+                let entry = entry_result?;
                 let key = match entry.key() {
                     Some(k) => k,
                     None => continue, // metadata
@@ -620,12 +622,12 @@ fn scan_and_merge_streaming(
     let module_cache = module_cache_arc
         .map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|arc| PersistentModuleCache::clone(&arc)));
 
-    CacheInitResult {
+    Ok(CacheInitResult {
         offers: mem_offers,
         pool_share_tl_account_index,
         module_cache,
         soroban_state,
-    }
+    })
 }
 
 /// Bounded-parallel scan-and-merge: up to `scan_thread_count` threads scan levels
@@ -646,7 +648,7 @@ fn scan_and_merge(
     rent_config: &Option<crate::soroban_state::SorobanRentConfig>,
     module_cache: Option<PersistentModuleCache>,
     scan_thread_count: usize,
-) -> CacheInitResult {
+) -> Result<CacheInitResult> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
 
@@ -696,7 +698,9 @@ fn scan_and_merge(
     let next_claim = AtomicUsize::new(0);
     let next_claim_ref = &next_claim;
     let sorted_ref = &sorted_indices[..];
-    let (tx, rx) = mpsc::channel::<(usize, LevelScanResult)>();
+    let (tx, rx) = mpsc::channel::<Result<(usize, LevelScanResult)>>();
+
+    let mut scan_error: Option<LedgerError> = None;
 
     std::thread::scope(|s| {
         for _ in 0..num_workers {
@@ -713,14 +717,21 @@ fn scan_and_merge(
                     let level_start = std::time::Instant::now();
                     let result =
                         scan_single_level(curr, snap, soroban_enabled, &mc_clone, protocol_version);
-                    info!(
-                        level = idx,
-                        entries = result.entries.len(),
-                        ttls = result.ttl_entries.len(),
-                        elapsed_ms = level_start.elapsed().as_millis() as u64,
-                        "scan_bucket_list_for_caches: level scan complete"
-                    );
-                    if worker_tx.send((idx, result)).is_err() {
+                    match &result {
+                        Ok(r) => {
+                            info!(
+                                level = idx,
+                                entries = r.entries.len(),
+                                ttls = r.ttl_entries.len(),
+                                elapsed_ms = level_start.elapsed().as_millis() as u64,
+                                "scan_bucket_list_for_caches: level scan complete"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(level = idx, error = %e, "scan_bucket_list_for_caches: level scan failed");
+                        }
+                    }
+                    if worker_tx.send(result.map(|r| (idx, r))).is_err() {
                         break; // receiver dropped (shouldn't happen)
                     }
                 }
@@ -734,7 +745,14 @@ fn scan_and_merge(
         let mut next_merge_idx = 0usize;
 
         for _ in 0..num_levels {
-            let (idx, result) = rx.recv().expect("worker thread panicked");
+            let received = rx.recv().expect("worker thread panicked");
+            let (idx, result) = match received {
+                Ok(pair) => pair,
+                Err(e) => {
+                    scan_error = Some(e);
+                    return;
+                }
+            };
             pending.insert(idx, result);
             while let Some(result) = pending.remove(&next_merge_idx) {
                 // --- merge this level into accumulators, then drop raw result ---
@@ -812,6 +830,10 @@ fn scan_and_merge(
         }
     });
 
+    if let Some(e) = scan_error {
+        return Err(e);
+    }
+
     info!(
         offer_count,
         code_count,
@@ -824,12 +846,12 @@ fn scan_and_merge(
     let module_cache = module_cache_arc
         .map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|arc| PersistentModuleCache::clone(&arc)));
 
-    CacheInitResult {
+    Ok(CacheInitResult {
         offers: mem_offers,
         pool_share_tl_account_index,
         module_cache,
         soroban_state,
-    }
+    })
 }
 
 /// Scan a bucket list and extract all cache data.
@@ -840,7 +862,7 @@ fn scan_bucket_list_for_caches(
     bucket_list: &BucketList,
     protocol_version: u32,
     scan_thread_count: usize,
-) -> CacheInitResult {
+) -> Result<CacheInitResult> {
     let level_pairs: Vec<(Arc<henyey_bucket::Bucket>, Arc<henyey_bucket::Bucket>)> = bucket_list
         .levels()
         .iter()
@@ -954,7 +976,7 @@ pub fn scan_level_pairs_for_caches(
     level_pairs: Vec<(Arc<henyey_bucket::Bucket>, Arc<henyey_bucket::Bucket>)>,
     protocol_version: u32,
     scan_thread_count: usize,
-) -> CacheInitResult {
+) -> Result<CacheInitResult> {
     use henyey_common::MIN_SOROBAN_PROTOCOL_VERSION;
 
     let cache_init_start = std::time::Instant::now();
@@ -987,7 +1009,7 @@ pub fn scan_level_pairs_for_caches(
         &rent_config,
         module_cache,
         scan_thread_count,
-    );
+    )?;
 
     let scan_elapsed = cache_init_start.elapsed();
     info!(
@@ -995,7 +1017,7 @@ pub fn scan_level_pairs_for_caches(
         "scan_bucket_list_for_caches: complete"
     );
 
-    result
+    Ok(result)
 }
 
 /// Load the EvictionIterator from the bucket list's ConfigSettingEntry.
@@ -1623,7 +1645,7 @@ impl LedgerManager {
             &bucket_list,
             protocol_version,
             self.config.scan_thread_count,
-        );
+        )?;
         crate::memory_report::log_startup_memory("after_cache_scan");
 
         // Initialize per-bucket caches for all DiskIndex buckets.
@@ -2356,7 +2378,21 @@ impl LedgerManager {
         // curr shadows snap. Dead entries shadow live entries at higher levels.
         for level in bucket_list.levels() {
             for bucket in [level.curr.as_ref(), level.snap.as_ref()] {
-                for entry in bucket.iter() {
+                let iter = match bucket.iter() {
+                    Ok(it) => it,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to iterate bucket during module cache rebuild");
+                        continue;
+                    }
+                };
+                for entry_result in iter {
+                    let entry = match entry_result {
+                        Ok(e) => e,
+                        Err(e) => {
+                            tracing::error!(error = %e, "Failed to read bucket entry during module cache rebuild");
+                            continue;
+                        }
+                    };
                     match &entry {
                         henyey_bucket::BucketEntry::Liveentry(le)
                         | henyey_bucket::BucketEntry::Initentry(le) => {
@@ -5445,7 +5481,7 @@ mod tests {
     #[test]
     fn test_scan_empty_bucket_list() {
         let bl = BucketList::new();
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2).unwrap();
         assert!(result.offers.is_empty());
         assert!(result.soroban_state.is_empty());
     }
@@ -5465,7 +5501,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2).unwrap();
         assert_eq!(result.offers.len(), 2);
         assert!(result.offers.contains_key(&1));
         assert!(result.offers.contains_key(&2));
@@ -5486,7 +5522,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2).unwrap();
         assert_eq!(result.soroban_state.contract_data_count(), 2);
     }
 
@@ -5504,7 +5540,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2).unwrap();
         // TTL may or may not be added depending on whether it has a matching contract entry;
         // the important thing is no panic during parallel scan.
         assert!(result.soroban_state.contract_data_count() == 0);
@@ -5527,7 +5563,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2).unwrap();
         assert_eq!(result.offers.len(), 1);
         assert!(result.offers.contains_key(&42));
         assert_eq!(result.soroban_state.contract_data_count(), 1);
@@ -5563,7 +5599,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2).unwrap();
         assert!(
             result.offers.is_empty(),
             "dead entry should shadow the live offer"
@@ -5603,7 +5639,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2).unwrap();
         assert_eq!(result.offers.len(), 1);
         // The newer version (amount=9999) should win
         if let LedgerEntryData::Offer(ref o) = result.offers[&1].data {
@@ -5636,7 +5672,7 @@ mod tests {
             .unwrap();
         }
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2).unwrap();
         assert_eq!(
             result.offers.len(),
             num_offers,
@@ -5662,7 +5698,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, pre_soroban_protocol, 2);
+        let result = scan_bucket_list_for_caches(&bl, pre_soroban_protocol, 2).unwrap();
         assert_eq!(result.offers.len(), 1);
         assert_eq!(result.soroban_state.contract_data_count(), 0);
         assert!(result.module_cache.is_none());
@@ -5685,7 +5721,7 @@ mod tests {
         let snap = Bucket::from_entries(vec![BucketEntry::Liveentry(entry_v1.clone())]).unwrap();
 
         let mc: Option<Arc<PersistentModuleCache>> = None;
-        let result = scan_single_level(&curr, &snap, true, &mc, TEST_PROTOCOL);
+        let result = scan_single_level(&curr, &snap, true, &mc, TEST_PROTOCOL).unwrap();
 
         assert_eq!(result.entries.len(), 1);
         let key = result.entries.keys().next().unwrap();
@@ -5714,7 +5750,7 @@ mod tests {
         let snap = Bucket::from_entries(vec![BucketEntry::Liveentry(entry)]).unwrap();
 
         let mc: Option<Arc<PersistentModuleCache>> = None;
-        let result = scan_single_level(&curr, &snap, true, &mc, TEST_PROTOCOL);
+        let result = scan_single_level(&curr, &snap, true, &mc, TEST_PROTOCOL).unwrap();
 
         // The dead entry shadows the live one → no entries in result
         assert!(
@@ -5839,7 +5875,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2).unwrap();
         assert_eq!(result.offers.len(), 1);
         assert!(result.offers.contains_key(&10));
     }
@@ -5867,8 +5903,8 @@ mod tests {
             .unwrap();
         }
 
-        let result1 = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
-        let result2 = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
+        let result1 = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1).unwrap();
+        let result2 = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2).unwrap();
 
         assert_eq!(result1.offers.len(), result2.offers.len());
         for (id, entry) in &result1.offers {
@@ -5913,7 +5949,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1).unwrap();
         assert!(
             result.offers.is_empty(),
             "dead entry should shadow live offer (thread_count=1)"
@@ -5942,7 +5978,7 @@ mod tests {
         }
 
         // Scan via the BucketList reference path
-        let expected = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
+        let expected = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2).unwrap();
 
         // Extract pairs and scan via scan_level_pairs_for_caches
         let level_pairs: Vec<(Arc<henyey_bucket::Bucket>, Arc<henyey_bucket::Bucket>)> = bl
@@ -5950,7 +5986,7 @@ mod tests {
             .iter()
             .map(|l| (l.curr.clone(), l.snap.clone()))
             .collect();
-        let actual = scan_level_pairs_for_caches(level_pairs, TEST_PROTOCOL, 2);
+        let actual = scan_level_pairs_for_caches(level_pairs, TEST_PROTOCOL, 2).unwrap();
 
         assert_eq!(
             actual.offers.len(),
@@ -5979,7 +6015,7 @@ mod tests {
     #[test]
     fn test_streaming_scan_empty_bucket_list() {
         let bl = BucketList::new();
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1).unwrap();
         assert!(result.offers.is_empty());
         assert!(result.soroban_state.is_empty());
     }
@@ -5999,7 +6035,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1).unwrap();
         assert_eq!(result.offers.len(), 2);
         assert!(result.offers.contains_key(&1));
         assert!(result.offers.contains_key(&2));
@@ -6020,7 +6056,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1).unwrap();
         assert_eq!(result.soroban_state.contract_data_count(), 2);
     }
 
@@ -6040,7 +6076,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1).unwrap();
         assert_eq!(
             result.soroban_state.contract_data_count(),
             2,
@@ -6064,7 +6100,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1).unwrap();
         assert_eq!(result.offers.len(), 1);
         assert_eq!(result.soroban_state.contract_data_count(), 1);
         assert!(
@@ -6102,7 +6138,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1).unwrap();
         assert!(
             result.offers.is_empty(),
             "dead entry should shadow the live offer"
@@ -6138,7 +6174,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1).unwrap();
         assert_eq!(result.offers.len(), 1);
         // The newer version (amount=9999) should win
         if let LedgerEntryData::Offer(ref o) = result.offers[&1].data {
@@ -6164,7 +6200,7 @@ mod tests {
             .unwrap();
         }
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1).unwrap();
         assert_eq!(result.offers.len(), 20);
     }
 
@@ -6184,7 +6220,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, pre_soroban_protocol, 1);
+        let result = scan_bucket_list_for_caches(&bl, pre_soroban_protocol, 1).unwrap();
         // Offers should still be scanned even without Soroban
         assert_eq!(result.offers.len(), 1);
         // Contract data should not be scanned when Soroban is disabled
@@ -6222,7 +6258,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1).unwrap();
         assert_eq!(result.offers.len(), 1, "should have exactly one offer");
         if let LedgerEntryData::Offer(ref o) = result.offers[&1].data {
             assert_eq!(
@@ -6267,7 +6303,7 @@ mod tests {
             .unwrap();
         }
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1).unwrap();
         // Should have exactly 1 offer (all were for offer_id=1)
         assert_eq!(result.offers.len(), 1);
         // The newest version (amount=8000) should win
@@ -6308,7 +6344,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1).unwrap();
         assert!(
             result
                 .pool_share_tl_account_index
@@ -6338,7 +6374,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1).unwrap();
         // Config settings are loaded into soroban_state
         assert!(
             !result.soroban_state.is_empty(),
@@ -6391,8 +6427,8 @@ mod tests {
     #[test]
     fn test_streaming_vs_parallel_empty() {
         let bl = BucketList::new();
-        let streaming = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
-        let parallel = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
+        let streaming = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1).unwrap();
+        let parallel = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2).unwrap();
         assert_cache_init_results_equivalent(&streaming, &parallel, "empty");
     }
 
@@ -6411,8 +6447,8 @@ mod tests {
             )
             .unwrap();
         }
-        let streaming = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
-        let parallel = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
+        let streaming = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1).unwrap();
+        let parallel = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2).unwrap();
         assert_cache_init_results_equivalent(&streaming, &parallel, "offers_only");
     }
 
@@ -6433,8 +6469,8 @@ mod tests {
             )
             .unwrap();
         }
-        let streaming = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
-        let parallel = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
+        let streaming = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1).unwrap();
+        let parallel = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2).unwrap();
         assert_cache_init_results_equivalent(&streaming, &parallel, "mixed_types");
     }
 
@@ -6472,8 +6508,8 @@ mod tests {
             vec![dead2, dead4],
         )
         .unwrap();
-        let streaming = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
-        let parallel = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
+        let streaming = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1).unwrap();
+        let parallel = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2).unwrap();
         assert_cache_init_results_equivalent(&streaming, &parallel, "with_dead_entries");
     }
 
@@ -6509,8 +6545,8 @@ mod tests {
             )
             .unwrap();
         }
-        let streaming = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
-        let parallel = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
+        let streaming = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1).unwrap();
+        let parallel = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2).unwrap();
         assert_cache_init_results_equivalent(&streaming, &parallel, "cross_level_overwrites");
     }
 

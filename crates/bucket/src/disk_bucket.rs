@@ -871,7 +871,10 @@ impl Iterator for DiskBucketIter {
             }
         } else {
             use stellar_xdr::curr::{Limited, ReadXdr};
-            // For raw XDR format, use the XDR streaming reader
+            // For raw XDR format, use the XDR streaming reader.
+            // Note: For raw XDR (no record marks), EOF is signaled by a read
+            // error (UnexpectedEof). We distinguish this from real errors by
+            // checking the error kind.
             let mut limited = Limited::new(&mut self.reader, Limits::none());
 
             match stellar_xdr::curr::BucketEntry::read_xdr(&mut limited) {
@@ -880,7 +883,15 @@ impl Iterator for DiskBucketIter {
                     self.position = self.reader.stream_position().unwrap_or(self.file_len);
                     Some(Ok(xdr_entry))
                 }
-                Err(_) => None,
+                Err(stellar_xdr::curr::Error::Io(ref io_err))
+                    if io_err.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    // Clean EOF — end of raw XDR stream
+                    None
+                }
+                Err(e) => Some(Err(BucketError::Serialization(format!(
+                    "Failed to parse raw XDR bucket entry: {e}"
+                )))),
             }
         }
     }

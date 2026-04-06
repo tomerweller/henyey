@@ -591,7 +591,8 @@ impl BucketListSnapshot {
 
         let start_offset = iter.bucket_file_offset;
 
-        for (entry, entry_size) in bucket.iter_from_offset_with_sizes(start_offset) {
+        for result in bucket.iter_from_offset_with_sizes(start_offset)? {
+            let (entry, entry_size) = result?;
             bytes_used += entry_size;
             entries_scanned += 1;
 
@@ -824,7 +825,11 @@ impl SearchableBucketListSnapshot {
     ///     true // continue iteration
     /// });
     /// ```
-    pub fn scan_for_entries_of_type<F>(&self, entry_type: LedgerEntryType, mut callback: F) -> bool
+    pub fn scan_for_entries_of_type<F>(
+        &self,
+        entry_type: LedgerEntryType,
+        mut callback: F,
+    ) -> crate::Result<bool>
     where
         F: FnMut(&BucketEntry) -> bool,
     {
@@ -836,7 +841,8 @@ impl SearchableBucketListSnapshot {
             // Process buckets in order (newer to older): curr then snap
             for bucket in [&level.curr, &level.snap] {
                 // Iterate through all entries in the bucket
-                for bucket_entry in bucket.raw_bucket().iter() {
+                for entry_result in bucket.raw_bucket().iter()? {
+                    let bucket_entry = entry_result?;
                     // Check if this entry matches the requested type
                     if let Some(key) = bucket_entry.key() {
                         // Skip if we've already seen a newer version of this key
@@ -858,14 +864,14 @@ impl SearchableBucketListSnapshot {
 
                             // Skip dead entries for callback
                             if !bucket_entry.is_dead() && !callback(&bucket_entry) {
-                                return false;
+                                return Ok(false);
                             }
                         }
                     }
                 }
             }
         }
-        true
+        Ok(true)
     }
 
     /// Finds inflation winners from the bucket list.
@@ -890,7 +896,7 @@ impl SearchableBucketListSnapshot {
         &self,
         max_winners: usize,
         min_balance: i64,
-    ) -> Vec<InflationWinner> {
+    ) -> crate::Result<Vec<InflationWinner>> {
         use std::collections::HashMap;
 
         // Track seen accounts to avoid double-counting across bucket levels
@@ -902,7 +908,8 @@ impl SearchableBucketListSnapshot {
         // Scan all account entries
         for level in &self.snapshot.levels {
             for bucket in [&level.curr, &level.snap] {
-                for bucket_entry in bucket.raw_bucket().iter() {
+                for entry_result in bucket.raw_bucket().iter()? {
+                    let bucket_entry = entry_result?;
                     match &bucket_entry {
                         BucketEntry::Liveentry(entry) | BucketEntry::Initentry(entry) => {
                             if let LedgerEntryData::Account(account) = &entry.data {
@@ -950,7 +957,7 @@ impl SearchableBucketListSnapshot {
         // Truncate to max_winners
         winners.truncate(max_winners);
 
-        winners
+        Ok(winners)
     }
 
     /// Loads pool share trustlines for an account and asset.
@@ -979,12 +986,12 @@ impl SearchableBucketListSnapshot {
         &self,
         account_id: &AccountId,
         asset: &Asset,
-    ) -> Vec<LedgerEntry> {
+    ) -> crate::Result<Vec<LedgerEntry>> {
         // First, find all pool IDs containing the asset
-        let pool_ids = self.collect_pool_ids_for_asset(asset);
+        let pool_ids = self.collect_pool_ids_for_asset(asset)?;
 
         if pool_ids.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // Build trustline keys for each pool
@@ -999,20 +1006,21 @@ impl SearchableBucketListSnapshot {
             .collect();
 
         // Load the trustlines
-        self.snapshot.load_keys(&trustline_keys)
+        Ok(self.snapshot.load_keys(&trustline_keys))
     }
 
     /// Collects all pool IDs that contain a given asset.
     ///
     /// Scans all liquidity pool entries to find pools where either asset_a
     /// or asset_b matches the given asset.
-    fn collect_pool_ids_for_asset(&self, asset: &Asset) -> Vec<PoolId> {
+    fn collect_pool_ids_for_asset(&self, asset: &Asset) -> crate::Result<Vec<PoolId>> {
         let mut pool_ids = Vec::new();
         let mut seen_pools: HashSet<PoolId> = HashSet::new();
 
         for level in &self.snapshot.levels {
             for bucket in [&level.curr, &level.snap] {
-                for bucket_entry in bucket.raw_bucket().iter() {
+                for entry_result in bucket.raw_bucket().iter()? {
+                    let bucket_entry = entry_result?;
                     match &bucket_entry {
                         BucketEntry::Liveentry(entry) | BucketEntry::Initentry(entry) => {
                             if let LedgerEntryData::LiquidityPool(pool) = &entry.data {
@@ -1043,20 +1051,24 @@ impl SearchableBucketListSnapshot {
             }
         }
 
-        pool_ids
+        Ok(pool_ids)
     }
 
     /// Loads all trustline entries for an account.
     ///
     /// Scans the bucket list for all trustline entries belonging to the
     /// given account.
-    pub fn load_trustlines_for_account(&self, account_id: &AccountId) -> Vec<LedgerEntry> {
+    pub fn load_trustlines_for_account(
+        &self,
+        account_id: &AccountId,
+    ) -> crate::Result<Vec<LedgerEntry>> {
         let mut trustlines = Vec::new();
         let mut seen_keys: HashSet<LedgerKey> = HashSet::new();
 
         for level in &self.snapshot.levels {
             for bucket in [&level.curr, &level.snap] {
-                for bucket_entry in bucket.raw_bucket().iter() {
+                for entry_result in bucket.raw_bucket().iter()? {
+                    let bucket_entry = entry_result?;
                     match &bucket_entry {
                         BucketEntry::Liveentry(entry) | BucketEntry::Initentry(entry) => {
                             if let LedgerEntryData::Trustline(tl) = &entry.data {
@@ -1085,7 +1097,7 @@ impl SearchableBucketListSnapshot {
             }
         }
 
-        trustlines
+        Ok(trustlines)
     }
 }
 
@@ -1569,18 +1581,22 @@ mod tests {
 
         // Count account entries
         let mut count = 0;
-        searchable.scan_for_entries_of_type(LedgerEntryType::Account, |_| {
-            count += 1;
-            true // continue
-        });
+        searchable
+            .scan_for_entries_of_type(LedgerEntryType::Account, |_| {
+                count += 1;
+                true // continue
+            })
+            .unwrap();
         assert_eq!(count, 5);
 
         // Test early termination
         let mut count = 0;
-        let completed = searchable.scan_for_entries_of_type(LedgerEntryType::Account, |_| {
-            count += 1;
-            count < 3 // stop after 3
-        });
+        let completed = searchable
+            .scan_for_entries_of_type(LedgerEntryType::Account, |_| {
+                count += 1;
+                count < 3 // stop after 3
+            })
+            .unwrap();
         assert!(!completed);
         assert_eq!(count, 3);
     }
@@ -1650,7 +1666,7 @@ mod tests {
         let searchable = SearchableBucketListSnapshot::new(snapshot, BTreeMap::new());
 
         // Load inflation winners
-        let winners = searchable.load_inflation_winners(10, 0);
+        let winners = searchable.load_inflation_winners(10, 0).unwrap();
 
         // Should have one winner with total votes = 1B + 2B + 3B = 6B
         assert_eq!(winners.len(), 1);
@@ -1720,14 +1736,14 @@ mod tests {
 
         // With min_balance=500, only dest2 should qualify (account 1 is below
         // the 100 XLM vote counting threshold so its votes aren't counted at all)
-        let winners = searchable.load_inflation_winners(10, 500);
+        let winners = searchable.load_inflation_winners(10, 500).unwrap();
         assert_eq!(winners.len(), 1);
         assert_eq!(winners[0].account_id, dest2);
         assert_eq!(winners[0].votes, 2_000_000_000);
 
         // With min_balance=0, only dest2 qualifies — account 1 is below the
         // hardcoded 100 XLM threshold and its votes are not counted.
-        let winners = searchable.load_inflation_winners(10, 0);
+        let winners = searchable.load_inflation_winners(10, 0).unwrap();
         assert_eq!(winners.len(), 1);
         assert_eq!(winners[0].account_id, dest2);
         assert_eq!(winners[0].votes, 2_000_000_000);

@@ -110,7 +110,7 @@ impl<'a> LiveEntriesIterator<'a> {
     ///
     /// The iterator starts at level 0 curr and proceeds through all levels.
     pub fn new(bucket_list: &'a BucketList) -> Self {
-        let mut iter = Self {
+        Self {
             levels: bucket_list.levels(),
             current_level: 0,
             current_phase: 0,
@@ -118,11 +118,7 @@ impl<'a> LiveEntriesIterator<'a> {
             seen_keys: HashSet::new(),
             entries_yielded: 0,
             entries_skipped: 0,
-        };
-
-        // Initialize with the first non-empty bucket
-        iter.advance_to_next_bucket();
-        iter
+        }
     }
 
     /// Get the number of entries yielded so far.
@@ -157,19 +153,19 @@ impl<'a> LiveEntriesIterator<'a> {
     /// Advance to the next non-empty bucket.
     ///
     /// Returns true if a bucket was found, false if iteration is complete.
-    fn advance_to_next_bucket(&mut self) -> bool {
+    fn advance_to_next_bucket(&mut self) -> Result<bool> {
         loop {
             // Check if we've exhausted all levels
             if self.current_level >= self.levels.len() {
                 self.bucket_iter = None;
-                return false;
+                return Ok(false);
             }
 
             // Try current position
             if let Some(bucket) = self.current_bucket() {
                 if !bucket.is_empty() {
-                    self.bucket_iter = Some(bucket.iter());
-                    return true;
+                    self.bucket_iter = Some(bucket.iter()?);
+                    return Ok(true);
                 }
             }
 
@@ -203,15 +199,23 @@ impl Iterator for LiveEntriesIterator<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             // If we don't have a bucket iterator, try to get one
-            if self.bucket_iter.is_none() && !self.advance_to_next_bucket() {
-                return None; // No more buckets
+            if self.bucket_iter.is_none() {
+                match self.advance_to_next_bucket() {
+                    Ok(true) => {}
+                    Ok(false) => return None,
+                    Err(e) => return Some(Err(e)),
+                }
             }
 
             // Try to get the next entry from the current bucket
             let iter = self.bucket_iter.as_mut()?;
 
             match iter.next() {
-                Some(entry) => {
+                Some(entry_result) => {
+                    let entry = match entry_result {
+                        Ok(e) => e,
+                        Err(e) => return Some(Err(e)),
+                    };
                     match entry {
                         BucketEntry::Liveentry(ref e) | BucketEntry::Initentry(ref e) => {
                             // Get the key for this entry

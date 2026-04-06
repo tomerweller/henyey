@@ -466,7 +466,12 @@ impl PublishManager {
             }
         } else {
             // Fallback: serialize entries with RFC 5531 record marks
-            for entry in bucket.iter() {
+            for entry_result in bucket
+                .iter()
+                .map_err(|e| HistoryError::VerificationFailed(e.to_string()))?
+            {
+                let entry =
+                    entry_result.map_err(|e| HistoryError::VerificationFailed(e.to_string()))?;
                 let xdr = entry.to_xdr(stellar_xdr::curr::Limits::none()).map_err(
                     |e: stellar_xdr::curr::Error| HistoryError::VerificationFailed(e.to_string()),
                 )?;

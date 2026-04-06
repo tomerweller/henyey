@@ -1672,7 +1672,8 @@ async fn test_scan_for_entries_of_types_basic() {
             }
             true
         },
-    );
+    )
+    .unwrap();
 
     assert_eq!(found_types.len(), 2, "Should find exactly 2 entries");
     assert!(found_types.contains(&"Offer"), "Should find Offer");
@@ -1725,7 +1726,8 @@ async fn test_scan_for_entries_of_types_deduplication() {
             }
             true
         },
-    );
+    )
+    .unwrap();
 
     assert_eq!(offer_count, 1, "Offer should be deduped to 1");
     assert_eq!(code_count, 1, "ContractCode should appear once");
@@ -1782,7 +1784,8 @@ async fn test_scan_for_entries_of_types_excludes_dead_and_unmatched() {
             }
         }
         true
-    });
+    })
+    .unwrap();
 
     assert_eq!(
         found,
@@ -1823,7 +1826,8 @@ async fn test_scan_for_entries_of_types_matches_single_type_variant() {
             }
         }
         true
-    });
+    })
+    .unwrap();
 
     // Collect results from multi-type scan (with only Offer)
     let mut multi_type_offers = Vec::new();
@@ -1834,7 +1838,8 @@ async fn test_scan_for_entries_of_types_matches_single_type_variant() {
             }
         }
         true
-    });
+    })
+    .unwrap();
 
     single_type_offers.sort();
     multi_type_offers.sort();
@@ -1867,13 +1872,15 @@ async fn test_scan_for_entries_of_types_early_termination() {
 
     // Stop after finding the first entry
     let mut count = 0u32;
-    let completed = bl.scan_for_entries_of_types(
-        &[LedgerEntryType::Offer, LedgerEntryType::ContractCode],
-        |_be| {
-            count += 1;
-            false // stop immediately
-        },
-    );
+    let completed = bl
+        .scan_for_entries_of_types(
+            &[LedgerEntryType::Offer, LedgerEntryType::ContractCode],
+            |_be| {
+                count += 1;
+                false // stop immediately
+            },
+        )
+        .unwrap();
 
     assert!(!completed, "Should return false when stopped early");
     assert_eq!(
@@ -1934,7 +1941,8 @@ async fn test_scan_for_entries_of_types_soroban_combined() {
             }
             true
         },
-    );
+    )
+    .unwrap();
 
     assert_eq!(code_count, 1, "Should find 1 ContractCode");
     assert_eq!(data_count, 1, "Should find 1 ContractData");

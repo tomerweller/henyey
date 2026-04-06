@@ -790,23 +790,13 @@ impl Bucket {
     ///
     /// For in-memory buckets, this is efficient. For disk-backed buckets,
     /// this reads entries from disk sequentially.
-    pub fn iter(&self) -> BucketIter<'_> {
+    ///
+    /// Returns an error if the disk-backed bucket file cannot be opened.
+    pub fn iter(&self) -> Result<BucketIter<'_>> {
         match &self.storage {
-            BucketStorage::InMemory { entries, .. } => BucketIter::InMemory(entries.iter()),
+            BucketStorage::InMemory { entries, .. } => Ok(BucketIter::InMemory(entries.iter())),
             BucketStorage::DiskBacked { disk_bucket } => {
-                // For disk-backed, we create an iterator that reads from disk
-                match disk_bucket.iter() {
-                    Ok(iter) => BucketIter::DiskBacked(iter),
-                    Err(e) => {
-                        tracing::warn!(
-                            hash = %self.hash,
-                            file_path = ?disk_bucket.file_path(),
-                            error = %e,
-                            "Failed to create disk bucket iterator, returning empty iterator"
-                        );
-                        BucketIter::Empty
-                    }
-                }
+                Ok(BucketIter::DiskBacked(disk_bucket.iter()?))
             }
         }
     }
@@ -821,22 +811,19 @@ impl Bucket {
     ///
     /// Each item is `(BucketEntry, record_size)` where `record_size` is the total
     /// bytes this entry occupies on disk.
-    pub fn iter_from_offset_with_sizes(&self, start_offset: u64) -> BucketOffsetIter<'_> {
+    pub fn iter_from_offset_with_sizes(&self, start_offset: u64) -> Result<BucketOffsetIter<'_>> {
         match &self.storage {
             BucketStorage::InMemory { entries, .. } => {
-                BucketOffsetIter::InMemory(InMemoryOffsetIter {
+                Ok(BucketOffsetIter::InMemory(InMemoryOffsetIter {
                     entries,
                     index: 0,
                     current_offset: 0,
                     start_offset,
-                })
+                }))
             }
-            BucketStorage::DiskBacked { disk_bucket } => {
-                match disk_bucket.iter_from_offset_with_sizes(start_offset) {
-                    Ok(iter) => BucketOffsetIter::DiskBacked(iter),
-                    Err(_) => BucketOffsetIter::Empty,
-                }
-            }
+            BucketStorage::DiskBacked { disk_bucket } => Ok(BucketOffsetIter::DiskBacked(
+                disk_bucket.iter_from_offset_with_sizes(start_offset)?,
+            )),
         }
     }
 
@@ -911,8 +898,9 @@ impl Bucket {
 
     /// Get the protocol version from bucket metadata, if present.
     pub fn protocol_version(&self) -> Option<u32> {
-        for entry in self.iter() {
-            if let BucketEntry::Metaentry(meta) = entry {
+        let iter = self.iter().ok()?;
+        for entry_result in iter {
+            if let Ok(BucketEntry::Metaentry(meta)) = entry_result {
                 return Some(meta.ledger_version);
             }
         }
@@ -1068,17 +1056,17 @@ pub enum BucketIter<'a> {
     InMemory(std::slice::Iter<'a, BucketEntry>),
     /// Iterating over disk-backed entries (reads from disk sequentially).
     DiskBacked(crate::disk_bucket::DiskBucketIter),
-    /// Empty iterator (used for error recovery).
+    /// Empty iterator (no entries).
     Empty,
 }
 
 impl Iterator for BucketIter<'_> {
-    type Item = BucketEntry;
+    type Item = Result<BucketEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            BucketIter::InMemory(iter) => iter.next().cloned(),
-            BucketIter::DiskBacked(iter) => iter.next().and_then(|r| r.ok()),
+            BucketIter::InMemory(iter) => iter.next().cloned().map(Ok),
+            BucketIter::DiskBacked(iter) => iter.next(),
             BucketIter::Empty => None,
         }
     }
@@ -1109,7 +1097,7 @@ pub struct InMemoryOffsetIter<'a> {
 
 impl Iterator for BucketOffsetIter<'_> {
     /// (entry, total_record_size)
-    type Item = (BucketEntry, u64);
+    type Item = Result<(BucketEntry, u64)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
@@ -1121,7 +1109,11 @@ impl Iterator for BucketOffsetIter<'_> {
                     // Compute the on-disk record size: 4-byte mark + XDR bytes
                     let entry_size = match entry.to_xdr_bytes() {
                         Ok(bytes) => bytes.len() as u64 + 4,
-                        Err(_) => continue,
+                        Err(e) => {
+                            return Some(Err(BucketError::Serialization(format!(
+                                "Failed to serialize entry for size calculation: {e}"
+                            ))))
+                        }
                     };
 
                     let entry_end = iter.current_offset + entry_size;
@@ -1131,11 +1123,11 @@ impl Iterator for BucketOffsetIter<'_> {
                     }
 
                     iter.current_offset = entry_end;
-                    return Some((entry.clone(), entry_size));
+                    return Some(Ok((entry.clone(), entry_size)));
                 }
                 None
             }
-            BucketOffsetIter::DiskBacked(iter) => iter.next().and_then(|r| r.ok()),
+            BucketOffsetIter::DiskBacked(iter) => iter.next(),
             BucketOffsetIter::Empty => None,
         }
     }
@@ -1216,7 +1208,7 @@ mod tests {
         assert_eq!(bucket.len(), 2);
 
         // Entries should be sorted
-        let entries: Vec<_> = bucket.iter().collect();
+        let entries: Vec<_> = bucket.iter().unwrap().map(|e| e.unwrap()).collect();
         if let BucketEntry::Liveentry(entry) = &entries[0] {
             if let LedgerEntryData::Account(account) = &entry.data {
                 assert_eq!(account.balance, 100);
@@ -1332,7 +1324,7 @@ mod tests {
         let bucket1 = Bucket::from_entries(entries).unwrap();
 
         // Extract entries and create a new bucket
-        let extracted: Vec<BucketEntry> = bucket1.iter().collect();
+        let extracted: Vec<BucketEntry> = bucket1.iter().unwrap().map(|e| e.unwrap()).collect();
         let bucket2 = Bucket::from_entries(extracted).unwrap();
 
         // Hashes should match
@@ -1373,7 +1365,7 @@ mod tests {
         assert!(disk_bucket.is_disk_backed());
 
         // Extract entries via iter() and create a new bucket
-        let extracted: Vec<BucketEntry> = disk_bucket.iter().collect();
+        let extracted: Vec<BucketEntry> = disk_bucket.iter().unwrap().map(|e| e.unwrap()).collect();
         let recreated = Bucket::from_entries(extracted).unwrap();
 
         // Hashes should match after roundtrip
@@ -1411,7 +1403,7 @@ mod tests {
         assert_eq!(disk_bucket.hash(), original_hash);
 
         // Roundtrip via entries
-        let extracted: Vec<BucketEntry> = disk_bucket.iter().collect();
+        let extracted: Vec<BucketEntry> = disk_bucket.iter().unwrap().map(|e| e.unwrap()).collect();
 
         // Verify metadata is first
         assert!(extracted[0].is_metadata(), "Metadata should be first entry");
@@ -1479,7 +1471,7 @@ mod tests {
         );
 
         // Extract entries and create new in-memory bucket
-        let extracted: Vec<_> = disk_bucket.iter().collect();
+        let extracted: Vec<_> = disk_bucket.iter().unwrap().map(|e| e.unwrap()).collect();
         let inmemory = Bucket::from_sorted_entries(extracted).unwrap();
 
         // Get XDR from in-memory bucket (serializes entries)
@@ -1505,7 +1497,7 @@ mod tests {
         let bucket1 = Bucket::from_entries(entries).unwrap();
 
         // Extract entries (in sorted order from bucket1)
-        let sorted: Vec<_> = bucket1.iter().collect();
+        let sorted: Vec<_> = bucket1.iter().unwrap().map(|e| e.unwrap()).collect();
 
         // Create bucket from sorted entries (should NOT re-sort)
         let bucket2 = Bucket::from_sorted_entries(sorted).unwrap();
@@ -1535,7 +1527,7 @@ mod tests {
         assert_eq!(disk_bucket.hash(), original_hash);
 
         // Extract entries (already in sorted order)
-        let extracted: Vec<_> = disk_bucket.iter().collect();
+        let extracted: Vec<_> = disk_bucket.iter().unwrap().map(|e| e.unwrap()).collect();
 
         // Use from_sorted_entries instead of from_entries
         let recreated = Bucket::from_sorted_entries(extracted).unwrap();
@@ -1604,7 +1596,7 @@ mod tests {
 
         // Create bucket (will sort entries)
         let bucket = Bucket::from_entries(entries).unwrap();
-        let sorted_entries: Vec<_> = bucket.iter().collect();
+        let sorted_entries: Vec<_> = bucket.iter().unwrap().map(|e| e.unwrap()).collect();
 
         // Verify ordering: Account (type 0) < Trustline (type 1) < Offer (type 2)
         assert!(sorted_entries[0].is_live());
@@ -1638,7 +1630,7 @@ mod tests {
         }
 
         // Roundtrip test
-        let extracted: Vec<_> = bucket.iter().collect();
+        let extracted: Vec<_> = bucket.iter().unwrap().map(|e| e.unwrap()).collect();
         let recreated = Bucket::from_entries(extracted).unwrap();
         assert_eq!(
             recreated.hash(),
@@ -1715,5 +1707,43 @@ mod tests {
             empty_hash_hex,
             "zero-byte file must hash to SHA-256(empty)"
         );
+    }
+
+    /// Regression test for AUDIT-BC1: BucketIter must propagate I/O errors
+    /// instead of silently stopping iteration.
+    ///
+    /// Previously, DiskBucketIter returned `Result<BucketEntry>` but BucketIter
+    /// stripped the error with `.ok()`, silently terminating iteration on I/O
+    /// errors. This meant a truncated or corrupted bucket file would produce a
+    /// partial merge, yielding incorrect bucket hashes and consensus divergence.
+    ///
+    /// After the fix, BucketIter yields `Result<BucketEntry>`, ensuring I/O
+    /// errors propagate to callers (merge, eviction, applicator, etc.).
+    #[test]
+    fn test_bucket_iter_yields_result_items() {
+        // Verify in-memory bucket iteration yields Ok items
+        let entry = make_live_entry(make_account_entry([1u8; 32], 100));
+        let bucket = Bucket::from_entries(vec![entry.clone()]).unwrap();
+        let mut iter = bucket.iter().unwrap();
+
+        // First item should be Ok
+        let first = iter.next();
+        assert!(first.is_some(), "Should have an entry");
+        let first = first.unwrap();
+        assert!(first.is_ok(), "In-memory entries should always be Ok");
+
+        // Next should be None (end of iteration)
+        assert!(iter.next().is_none());
+    }
+
+    /// Regression test: verify that the iterator Item type is Result<BucketEntry>
+    /// at compile time. This test would fail to compile if the type were changed
+    /// back to plain BucketEntry.
+    #[test]
+    fn test_bucket_iter_item_is_result() {
+        let bucket = Bucket::empty();
+        let iter = bucket.iter().unwrap();
+        // This line verifies the type at compile time
+        let _items: Vec<crate::Result<BucketEntry>> = iter.collect();
     }
 }
