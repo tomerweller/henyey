@@ -23,15 +23,17 @@ use tracing::{debug, info, warn};
 use super::PeerHandle;
 
 impl OverlayManager {
-    /// Create a PeerHandle (outbound channel + FlowControl) and register
-    /// the peer in the shared maps. Returns the receiver and FlowControl
-    /// needed by `run_peer_loop`.
+    /// Create a PeerHandle (outbound channel + FlowControl) and atomically
+    /// register the peer in the shared maps. Returns the receiver and
+    /// FlowControl needed by `run_peer_loop`, or `Err` if a peer with the
+    /// same ID is already registered (TOCTOU-safe via `DashMap::entry`).
     pub(super) fn register_peer(
         peer: &Peer,
         peer_id: &PeerId,
         peer_info: PeerInfo,
         shared: &SharedPeerState,
-    ) -> (mpsc::Receiver<OutboundMessage>, Arc<FlowControl>) {
+    ) -> std::result::Result<(mpsc::Receiver<OutboundMessage>, Arc<FlowControl>), OverlayError>
+    {
         let (outbound_tx, outbound_rx) = mpsc::channel(256);
         let stats = peer.stats();
         let flow_control = Arc::new(FlowControl::with_scp_callback(
@@ -44,12 +46,24 @@ impl OverlayManager {
             stats,
             flow_control: Arc::clone(&flow_control),
         };
-        shared.peers.insert(peer_id.clone(), peer_handle);
+
+        // Atomic check-and-insert: prevents TOCTOU race where two concurrent
+        // tasks both pass the earlier `contains_key` check and both try to
+        // register the same PeerId.
+        use dashmap::mapref::entry::Entry;
+        match shared.peers.entry(peer_id.clone()) {
+            Entry::Occupied(_) => {
+                return Err(OverlayError::AlreadyConnected);
+            }
+            Entry::Vacant(e) => {
+                e.insert(peer_handle);
+            }
+        }
         shared.peer_info_cache.insert(peer_id.clone(), peer_info);
         shared
             .added_authenticated_peers
             .fetch_add(1, Ordering::Relaxed);
-        (outbound_rx, flow_control)
+        Ok((outbound_rx, flow_control))
     }
 
     /// Send a PEERS advertisement to a newly accepted inbound peer.
@@ -132,7 +146,16 @@ impl OverlayManager {
             ))
             .await;
 
-        let (outbound_rx, flow_control) = Self::register_peer(&peer, &peer_id, peer_info, &shared);
+        let (outbound_rx, flow_control) =
+            match Self::register_peer(&peer, &peer_id, peer_info, &shared) {
+                Ok(result) => result,
+                Err(_) => {
+                    debug!("Rejected duplicate inbound peer {} (race)", peer_id);
+                    peer.close().await;
+                    pool.release_authenticated();
+                    return;
+                }
+            };
 
         Self::run_peer_loop(
             peer_id.clone(),
@@ -285,7 +308,15 @@ impl OverlayManager {
             .await;
 
         let peer_info = peer.info().clone();
-        let (outbound_rx, flow_control) = Self::register_peer(&peer, &peer_id, peer_info, &shared);
+        let (outbound_rx, flow_control) =
+            match Self::register_peer(&peer, &peer_id, peer_info, &shared) {
+                Ok(result) => result,
+                Err(_) => {
+                    debug!("Rejected duplicate discovered peer {} (race)", peer_id);
+                    pool.release_authenticated();
+                    return;
+                }
+            };
 
         // NOTE: Do NOT send PEERS to outbound peers — see Peer.cpp:1225-1230.
 
@@ -440,7 +471,14 @@ pub(super) async fn connect_outbound_inner(
 
     let peer_info = peer.info().clone();
     let (outbound_rx, flow_control) =
-        OverlayManager::register_peer(&peer, &peer_id, peer_info, &shared);
+        match OverlayManager::register_peer(&peer, &peer_id, peer_info, &shared) {
+            Ok(result) => result,
+            Err(e) => {
+                debug!("Rejected duplicate peer {} (race)", peer_id);
+                pool.release_authenticated();
+                return Err(e);
+            }
+        };
     shared
         .send_peer_event(PeerEvent::Connected(addr.clone(), PeerType::Outbound))
         .await;
