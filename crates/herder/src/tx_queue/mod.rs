@@ -761,6 +761,17 @@ impl TransactionQueue {
             return Err(TxResultCode::TxSorobanInvalid);
         }
 
+        // Validate Soroban resource fee does not exceed full transaction fee.
+        // stellar-core TransactionFrame.cpp:1376 — commonValidPreSeqNum:
+        //   if (validateResourceFee && sorobanData.resourceFee > getFullFee())
+        // For non-fee-bump Soroban txs, resource_fee must not exceed total_fee.
+        if !frame.is_fee_bump()
+            && frame.is_soroban()
+            && frame.declared_soroban_resource_fee() > frame.total_fee()
+        {
+            return Err(TxResultCode::TxSorobanInvalid);
+        }
+
         // Build ledger context once for time-bound and signature validation.
         let ledger_ctx = LedgerContext::new(
             ctx.ledger_seq,
@@ -4932,6 +4943,42 @@ mod tests {
         );
         set_source(&mut envelope, 123);
 
+        assert_eq!(queue.try_add(envelope), TxQueueResult::Added);
+    }
+
+    /// Soroban transaction with resource_fee > total_fee is rejected as TxSorobanInvalid.
+    /// Regression test for AUDIT-H19.
+    #[test]
+    fn test_soroban_resource_fee_exceeds_total_fee_rejected() {
+        let queue = TransactionQueue::with_defaults();
+        // Create a soroban tx with fee=200 and resource_fee=500 (exceeds total)
+        let mut envelope = make_soroban_envelope_with_resources(200, 100);
+        if let TransactionEnvelope::Tx(ref mut env) = envelope {
+            if let TransactionExt::V1(ref mut data) = env.tx.ext {
+                data.resource_fee = 500; // > total_fee (200)
+            }
+        }
+        set_source(&mut envelope, 130);
+
+        match queue.try_add(envelope) {
+            TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxSorobanInvalid)) => {}
+            other => panic!("expected Invalid(TxSorobanInvalid), got {:?}", other),
+        }
+    }
+
+    /// Soroban transaction with resource_fee == total_fee is valid (inclusion_fee = 0).
+    #[test]
+    fn test_soroban_resource_fee_equals_total_fee_accepted() {
+        let queue = TransactionQueue::with_defaults();
+        let mut envelope = make_soroban_envelope_with_resources(500, 100);
+        if let TransactionEnvelope::Tx(ref mut env) = envelope {
+            if let TransactionExt::V1(ref mut data) = env.tx.ext {
+                data.resource_fee = 500; // == total_fee
+            }
+        }
+        set_source(&mut envelope, 131);
+
+        // Should be accepted (inclusion_fee = 0, which is valid)
         assert_eq!(queue.try_add(envelope), TxQueueResult::Added);
     }
 

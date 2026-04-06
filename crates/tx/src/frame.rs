@@ -343,6 +343,11 @@ impl TransactionFrame {
     }
 
     /// Get the inclusion fee (total fee minus Soroban resource fee).
+    ///
+    /// For non-fee-bump Soroban transactions, the caller MUST validate that
+    /// `declared_soroban_resource_fee() <= total_fee()` before relying on this
+    /// value for fee arithmetic.  A negative result is possible for fee-bump
+    /// inner transactions (p23+) where the outer envelope covers the shortfall.
     pub fn inclusion_fee(&self) -> i64 {
         if self.is_soroban() {
             let resource_fee = self.declared_soroban_resource_fee();
@@ -1067,6 +1072,21 @@ mod tests {
         let frame = TransactionFrame::from_owned(envelope);
         assert_eq!(frame.declared_soroban_resource_fee(), 150);
         assert_eq!(frame.inclusion_fee(), 750);
+    }
+
+    /// When resource_fee > total_fee, inclusion_fee returns a negative value.
+    /// This is only valid for fee-bump inner transactions (p23+); non-fee-bump
+    /// Soroban transactions must be rejected before reaching this point.
+    /// Regression test for AUDIT-H19.
+    #[test]
+    fn test_inclusion_fee_negative_when_resource_fee_exceeds_total() {
+        // Create a Soroban tx with resource_fee=500, total_fee=200
+        let envelope = create_soroban_transaction_with_fees(500, 200);
+        let frame = TransactionFrame::from_owned(envelope);
+        assert_eq!(frame.declared_soroban_resource_fee(), 500);
+        assert_eq!(frame.total_fee(), 200);
+        // inclusion_fee = 200 - 500 = -300 (negative, must be caught by validation)
+        assert_eq!(frame.inclusion_fee(), -300);
     }
 
     /// Test TransactionFrame::with_network creates frame with network ID.
