@@ -285,15 +285,9 @@ impl SnapshotHandle {
 
     /// Create a new handle with a lookup function for entries not in cache.
     pub fn with_lookup(snapshot: LedgerSnapshot, lookup_fn: EntryLookupFn) -> Self {
-        Self {
-            inner: Arc::new(snapshot),
-            lookup_fn: Some(lookup_fn),
-            entries_fn: None,
-            batch_lookup_fn: None,
-            offers_by_account_asset_fn: None,
-            pool_share_tls_by_account_fn: None,
-            prefetch_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
-        }
+        let mut handle = Self::new(snapshot);
+        handle.lookup_fn = Some(lookup_fn);
+        handle
     }
 
     /// Create a new handle with lookup functions for entries and full scans.
@@ -302,15 +296,10 @@ impl SnapshotHandle {
         lookup_fn: EntryLookupFn,
         entries_fn: EntriesLookupFn,
     ) -> Self {
-        Self {
-            inner: Arc::new(snapshot),
-            lookup_fn: Some(lookup_fn),
-            entries_fn: Some(entries_fn),
-            batch_lookup_fn: None,
-            offers_by_account_asset_fn: None,
-            pool_share_tls_by_account_fn: None,
-            prefetch_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
-        }
+        let mut handle = Self::new(snapshot);
+        handle.lookup_fn = Some(lookup_fn);
+        handle.entries_fn = Some(entries_fn);
+        handle
     }
 
     /// Set the lookup function.
