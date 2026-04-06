@@ -655,15 +655,19 @@ pub fn stages_to_xdr_phase(
         .map(|stage| {
             let clusters: Vec<DependentTxCluster> = stage
                 .into_iter()
-                .map(|cluster| DependentTxCluster(cluster.try_into().unwrap_or_default()))
+                .map(|cluster| {
+                    DependentTxCluster(cluster.try_into().expect("cluster exceeds XDR VecM limit"))
+                })
                 .collect();
-            ParallelTxExecutionStage(clusters.try_into().unwrap_or_default())
+            ParallelTxExecutionStage(clusters.try_into().expect("stage exceeds XDR VecM limit"))
         })
         .collect();
 
     TransactionPhase::V1(ParallelTxsComponent {
         base_fee,
-        execution_stages: execution_stages.try_into().unwrap_or_default(),
+        execution_stages: execution_stages
+            .try_into()
+            .expect("execution_stages exceeds XDR VecM limit"),
     })
 }
 
@@ -681,15 +685,19 @@ fn stages_to_xdr_phase_unsorted(
         .map(|stage| {
             let clusters: Vec<DependentTxCluster> = stage
                 .into_iter()
-                .map(|cluster| DependentTxCluster(cluster.try_into().unwrap_or_default()))
+                .map(|cluster| {
+                    DependentTxCluster(cluster.try_into().expect("cluster exceeds XDR VecM limit"))
+                })
                 .collect();
-            ParallelTxExecutionStage(clusters.try_into().unwrap_or_default())
+            ParallelTxExecutionStage(clusters.try_into().expect("stage exceeds XDR VecM limit"))
         })
         .collect();
 
     TransactionPhase::V1(ParallelTxsComponent {
         base_fee,
-        execution_stages: execution_stages.try_into().unwrap_or_default(),
+        execution_stages: execution_stages
+            .try_into()
+            .expect("execution_stages exceeds XDR VecM limit"),
     })
 }
 
@@ -719,9 +727,15 @@ pub fn build_two_phase_tx_set(
         let component =
             TxSetComponent::TxsetCompTxsMaybeDiscountedFee(TxSetComponentTxsMaybeDiscountedFee {
                 base_fee: None,
-                txs: classic_txs.try_into().unwrap_or_default(),
+                txs: classic_txs
+                    .try_into()
+                    .expect("classic txs exceeds XDR VecM limit"),
             });
-        TransactionPhase::V0(vec![component].try_into().unwrap_or_default())
+        TransactionPhase::V0(
+            vec![component]
+                .try_into()
+                .expect("classic phase exceeds XDR VecM limit"),
+        )
     };
 
     // Soroban V1 phase: round-robin TXs into N clusters in a single stage.
@@ -754,7 +768,7 @@ pub fn build_two_phase_tx_set(
         previous_ledger_hash: Hash(previous_ledger_hash.0),
         phases: vec![classic_phase, soroban_phase]
             .try_into()
-            .unwrap_or_default(),
+            .expect("phases exceeds XDR VecM limit"),
     })
 }
 
