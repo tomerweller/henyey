@@ -316,9 +316,11 @@ impl TransactionFrame {
             TransactionEnvelope::TxV0(env) => env.tx.fee,
             TransactionEnvelope::Tx(env) => env.tx.fee,
             TransactionEnvelope::TxFeeBump(env) => {
-                // For fee bump, the outer fee is the total fee
-                // Convert i64 to u32 safely
-                env.tx.fee.min(u32::MAX as i64) as u32
+                // For fee bump, the outer fee is the total fee (i64).
+                // Negative fees are rejected during validation (XDRProvidesValidFee).
+                // Clamp to u32 range for compatibility.
+                u32::try_from(env.tx.fee.max(0).min(u32::MAX as i64))
+                    .expect("fee clamped to u32 range")
             }
         }
     }
