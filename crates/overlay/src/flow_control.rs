@@ -206,24 +206,46 @@ impl FlowControlCapacity {
         }
     }
 
-    fn lock_local_capacity(&mut self, msg: &StellarMessage) -> bool {
+    /// Check if local capacity is sufficient for this message (read-only).
+    ///
+    /// Mirrors stellar-core's `FlowControlCapacity::canLockLocalCapacity`.
+    fn can_lock_local_capacity(&self, msg: &StellarMessage) -> bool {
         let msg_resources = self.get_msg_resource_count(msg);
 
-        if let Some(ref mut total) = self.capacity.total_capacity {
-            if *total < msg_resources {
+        if let Some(total) = self.capacity.total_capacity {
+            if total < msg_resources {
                 return false;
             }
-            *total -= msg_resources;
         }
 
         if is_flow_controlled_message(msg) {
             if self.capacity.flood_capacity < msg_resources {
                 return false;
             }
-            self.capacity.flood_capacity -= msg_resources;
         }
 
         true
+    }
+
+    /// Deduct local capacity for this message. Caller MUST check
+    /// `can_lock_local_capacity` first — panics if capacity is insufficient.
+    ///
+    /// Mirrors stellar-core's `FlowControlCapacity::lockLocalCapacity`.
+    fn lock_local_capacity(&mut self, msg: &StellarMessage) {
+        assert!(
+            self.can_lock_local_capacity(msg),
+            "lock_local_capacity called without sufficient capacity"
+        );
+
+        let msg_resources = self.get_msg_resource_count(msg);
+
+        if let Some(ref mut total) = self.capacity.total_capacity {
+            *total -= msg_resources;
+        }
+
+        if is_flow_controlled_message(msg) {
+            self.capacity.flood_capacity -= msg_resources;
+        }
     }
 
     fn release_local_capacity(&mut self, msg: &StellarMessage) -> u64 {
@@ -738,12 +760,25 @@ impl FlowControl {
 
     /// Begin processing a received message.
     ///
-    /// Locks local capacity. Returns false if we don't have capacity to process this message.
+    /// Checks both message and byte capacity before locking either.
+    /// Returns false if we don't have capacity to process this message.
+    ///
+    /// Mirrors stellar-core's `FlowControl::beginMessageProcessing`
+    /// (FlowControl.cpp:274-290): check both capacities first, then lock
+    /// both unconditionally. This avoids leaking one capacity when the
+    /// other check fails.
     pub fn begin_message_processing(&self, msg: &StellarMessage) -> bool {
         let mut state = self.state.lock().unwrap();
 
-        state.message_capacity.lock_local_capacity(msg)
-            && state.byte_capacity.lock_local_capacity(msg)
+        if !state.message_capacity.can_lock_local_capacity(msg)
+            || !state.byte_capacity.can_lock_local_capacity(msg)
+        {
+            return false;
+        }
+
+        state.message_capacity.lock_local_capacity(msg);
+        state.byte_capacity.lock_local_capacity(msg);
+        true
     }
 
     /// End processing a received message.
@@ -1450,6 +1485,78 @@ mod tests {
         assert_eq!(
             initial_stats.local_flood_capacity, final_stats.local_flood_capacity,
             "capacity should be fully restored after finish"
+        );
+    }
+
+    /// Regression test for AUDIT-H9: when byte capacity is exhausted but
+    /// message capacity is available, a failed `begin_message_processing`
+    /// must not leak message capacity.
+    ///
+    /// Before the fix, `lock_local_capacity` both checked and deducted in
+    /// one call: message_capacity was deducted first, then byte_capacity
+    /// check failed, but message_capacity was never rolled back.
+    #[test]
+    fn test_begin_message_processing_no_capacity_leak_on_byte_failure() {
+        // Set byte capacity to 1 byte — any real tx message is larger than
+        // 1 byte, so byte capacity will always reject.
+        let config = FlowControlConfig {
+            flow_control_bytes_batch_size: 1,
+            ..FlowControlConfig::default()
+        };
+        let fc = FlowControl::new(config);
+        let tx = make_tx_message();
+
+        let before = fc.get_stats();
+        assert!(
+            before.local_flood_capacity > 0,
+            "precondition: message flood capacity should be available"
+        );
+
+        // This should fail because byte capacity (1) < tx byte size.
+        let accepted = fc.begin_message_processing(&tx);
+        assert!(
+            !accepted,
+            "should be rejected due to insufficient byte capacity"
+        );
+
+        let after = fc.get_stats();
+        assert_eq!(
+            before.local_flood_capacity, after.local_flood_capacity,
+            "AUDIT-H9: message flood capacity must not leak when byte capacity check fails"
+        );
+        assert_eq!(
+            before.local_total_capacity, after.local_total_capacity,
+            "AUDIT-H9: message total capacity must not leak when byte capacity check fails"
+        );
+    }
+
+    /// Symmetric test: when message capacity is exhausted but byte capacity
+    /// is available, a failed `begin_message_processing` must not leak byte
+    /// capacity.
+    #[test]
+    fn test_begin_message_processing_no_capacity_leak_on_message_failure() {
+        // Set message capacity to 0 flood messages — will always reject.
+        let config = FlowControlConfig {
+            peer_flood_reading_capacity: 0,
+            peer_reading_capacity: 1,
+            ..FlowControlConfig::default()
+        };
+        let fc = FlowControl::new(config);
+        let tx = make_tx_message();
+
+        let before = fc.get_stats();
+
+        // This should fail because flood_capacity (0) < 1 (message cost).
+        let accepted = fc.begin_message_processing(&tx);
+        assert!(
+            !accepted,
+            "should be rejected due to insufficient message flood capacity"
+        );
+
+        let after = fc.get_stats();
+        assert_eq!(
+            before.local_flood_bytes_capacity, after.local_flood_bytes_capacity,
+            "AUDIT-H9: byte flood capacity must not leak when message capacity check fails"
         );
     }
 }
