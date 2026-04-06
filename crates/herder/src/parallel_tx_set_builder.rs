@@ -384,7 +384,8 @@ fn bin_pack_clusters(
 
 /// Serialize a LedgerKey to bytes for use as a HashMap key.
 fn ledger_key_bytes(key: &LedgerKey) -> Vec<u8> {
-    key.to_xdr(Limits::none()).unwrap_or_default()
+    key.to_xdr(Limits::none())
+        .expect("LedgerKey XDR serialization should never fail")
 }
 
 /// Detect footprint conflicts between Soroban transactions.
