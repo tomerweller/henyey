@@ -266,4 +266,41 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_all_inner_failure_codes_map_to_distinct_variants() {
+        // Same structural check as above but for failure_code_to_inner_result.
+        // Catches copy-paste errors in the inner result mapping.
+        let codes = [
+            TransactionResultCode::TxMalformed,
+            TransactionResultCode::TxMissingOperation,
+            TransactionResultCode::TxBadAuth,
+            TransactionResultCode::TxBadAuthExtra,
+            TransactionResultCode::TxBadMinSeqAgeOrGap,
+            TransactionResultCode::TxTooEarly,
+            TransactionResultCode::TxTooLate,
+            TransactionResultCode::TxBadSeq,
+            TransactionResultCode::TxInsufficientFee,
+            TransactionResultCode::TxInsufficientBalance,
+            TransactionResultCode::TxNoAccount,
+            TransactionResultCode::TxNotSupported,
+            TransactionResultCode::TxInternalError,
+            TransactionResultCode::TxBadSponsorship,
+            TransactionResultCode::TxSorobanInvalid,
+        ];
+
+        for (i, code_a) in codes.iter().enumerate() {
+            for code_b in codes.iter().skip(i + 1) {
+                let result_a = failure_code_to_inner_result(code_a, &[]);
+                let result_b = failure_code_to_inner_result(code_b, &[]);
+                let disc_a = std::mem::discriminant(&result_a);
+                let disc_b = std::mem::discriminant(&result_b);
+                assert_ne!(
+                    disc_a, disc_b,
+                    "Distinct failure codes {:?} and {:?} map to the same inner result variant",
+                    code_a, code_b
+                );
+            }
+        }
+    }
 }
