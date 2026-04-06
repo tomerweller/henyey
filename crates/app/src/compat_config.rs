@@ -276,11 +276,15 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     if let Some(validators) = table.get("VALIDATORS").and_then(|v| v.as_array()) {
         let mut validator_keys = Vec::new();
         let mut validator_addresses = Vec::new();
-        for val in validators {
+        for (i, val) in validators.iter().enumerate() {
             if let Some(val_table) = val.as_table() {
-                if let Some(key) = val_table.get("PUBLIC_KEY").and_then(|v| v.as_str()) {
-                    validator_keys.push(key.to_string());
-                }
+                let key = val_table
+                    .get("PUBLIC_KEY")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("[[VALIDATORS]] entry {} missing or invalid PUBLIC_KEY", i)
+                    })?;
+                validator_keys.push(key.to_string());
                 // Extract ADDRESS for peer discovery (e.g., "core-testnet1.stellar.org")
                 if let Some(addr) = val_table.get("ADDRESS").and_then(|v| v.as_str()) {
                     let peer_addr = if addr.contains(':') {
@@ -332,23 +336,19 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
                 if let Some(s) = v.as_str() {
                     if s == "$self" {
                         // "$self" refers to the node's own key — resolve it from NODE_SEED
-                        if let Some(ref seed_str) = config.node.node_seed {
-                            match henyey_crypto::SecretKey::from_strkey(seed_str) {
-                                Ok(secret) => {
-                                    keys.push(secret.public_key().to_strkey());
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "Cannot resolve $self in [QUORUM_SET]: invalid NODE_SEED"
-                                    );
-                                }
-                            }
-                        } else {
-                            tracing::warn!(
+                        let seed_str = config.node.node_seed.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!(
                                 "Cannot resolve $self in [QUORUM_SET]: NODE_SEED not set"
-                            );
-                        }
+                            )
+                        })?;
+                        let secret =
+                            henyey_crypto::SecretKey::from_strkey(seed_str).map_err(|e| {
+                                anyhow::anyhow!(
+                                    "Cannot resolve $self in [QUORUM_SET]: invalid NODE_SEED: {}",
+                                    e
+                                )
+                            })?;
+                        keys.push(secret.public_key().to_strkey());
                     } else {
                         keys.push(s.to_string());
                     }
@@ -749,6 +749,43 @@ mod tests {
         assert_eq!(config.node.quorum_set.validators[0], expected_pubkey);
         // THRESHOLD_PERCENT=100 should be applied (not silently dropped to default 67)
         assert_eq!(config.node.quorum_set.threshold_percent, 100);
+    }
+
+    #[test]
+    fn test_quorum_set_self_without_node_seed_fails() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Standalone Network ; February 2017"
+            [QUORUM_SET]
+            THRESHOLD_PERCENT = 100
+            VALIDATORS = ["$self"]
+            "#,
+        )
+        .unwrap();
+
+        let result = translate_stellar_core_config(&core_toml);
+        assert!(result.is_err(), "Should fail when $self cannot be resolved");
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("NODE_SEED not set"));
+    }
+
+    #[test]
+    fn test_validators_missing_public_key_fails() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Standalone Network ; February 2017"
+            [[VALIDATORS]]
+            NAME = "test"
+            ADDRESS = "core-testnet1.stellar.org"
+            "#,
+        )
+        .unwrap();
+
+        let result = translate_stellar_core_config(&core_toml);
+        assert!(result.is_err(), "Should fail when PUBLIC_KEY is missing");
+        assert!(result.unwrap_err().to_string().contains("PUBLIC_KEY"));
     }
 
     #[test]
