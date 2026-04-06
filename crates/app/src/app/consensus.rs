@@ -40,8 +40,8 @@ impl App {
                 .clock
                 .system_now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+                .expect("system clock before UNIX epoch")
+                .as_secs();
             if let Ok(mut tracker) = self.drift_tracker.lock() {
                 tracker.record_local_close_time(next_slot, local_time);
             }

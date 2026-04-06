@@ -747,8 +747,8 @@ impl Herder {
     fn check_envelope_close_time(&self, envelope: &ScpEnvelope, enforce_recent: bool) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .expect("system clock before UNIX epoch")
+            .as_secs();
 
         // Compute close-time cutoff for recency check
         let ct_cutoff = if enforce_recent {
@@ -1304,8 +1304,8 @@ impl Herder {
             .unwrap_or(0);
         let mut close_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .expect("system clock before UNIX epoch")
+            .as_secs();
         if close_time <= lcl_close_time {
             close_time = lcl_close_time + 1;
         }
@@ -1608,8 +1608,8 @@ impl Herder {
         // Create StellarValue with the GeneralizedTransactionSet hash
         let close_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .expect("system clock before UNIX epoch")
+            .as_secs();
 
         let upgrades: Vec<UpgradeType> = self
             .config
