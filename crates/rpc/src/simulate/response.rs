@@ -136,20 +136,13 @@ pub(super) fn build_invoke_response(
 
         // return value
         if let Some(rv) = &return_value {
-            util::insert_xdr_field(&mut result_obj, "xdr_val", rv, ctx.format)?;
-            // Upstream uses "xdr" for base64, "xdrJson" for JSON
-            match ctx.format {
-                XdrFormat::Base64 => {
-                    if let Some(val) = result_obj.remove("xdr_valXdr") {
-                        result_obj.insert("xdr".into(), val);
-                    }
-                }
-                XdrFormat::Json => {
-                    if let Some(val) = result_obj.remove("xdr_valJson") {
-                        result_obj.insert("xdrJson".into(), val);
-                    }
-                }
-            }
+            util::insert_xdr_field_styled(
+                &mut result_obj,
+                "xdr",
+                rv,
+                ctx.format,
+                util::XdrKeyStyle::Unsuffixed,
+            )?;
         }
 
         obj.insert(

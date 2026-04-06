@@ -1,3 +1,5 @@
+//! Bucket list snapshot adapter for Soroban simulation.
+
 use std::rc::Rc;
 
 use henyey_bucket::SearchableBucketListSnapshot;

@@ -1,3 +1,5 @@
+//! Shared response building for getTransaction and getTransactions.
+
 use serde_json::json;
 use stellar_xdr::curr::{TransactionEnvelope, TransactionMeta, TransactionResult};
 
