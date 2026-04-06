@@ -531,24 +531,12 @@ pub fn refund_soroban_fee(
     };
 
     // Apply the refund using addBalance semantics (stellar-core TransactionUtils.cpp:561-592).
-    // 1. Check overflow: i64::MAX - balance < refund
-    if i64::MAX - account.balance < refund {
-        // Overflow, skip refund
-        return Ok(0);
-    }
-    let new_balance = account.balance + refund;
-    // 2. Check buying liabilities: new_balance > i64::MAX - buying_liabilities
-    let buying_liabilities = match &account.ext {
-        stellar_xdr::curr::AccountEntryExt::V0 => 0,
-        stellar_xdr::curr::AccountEntryExt::V1(v1) => v1.liabilities.buying,
-    };
-    if new_balance > i64::MAX - buying_liabilities {
-        // Liabilities in the way of the refund, just skip (matches stellar-core)
+    if !henyey_common::asset::try_add_account_balance(account, refund) {
+        // Overflow or buying liabilities violated, skip refund (matches stellar-core)
         return Ok(0);
     }
 
     let actual_refund = refund;
-    account.balance = new_balance;
     ctx.subtract_from_fee_pool(actual_refund);
 
     // Emit fee refund event if event manager provided

@@ -1300,12 +1300,17 @@ impl LedgerStateManager {
     /// In stellar-core, fee refunds are NOT separate meta changes - they're
     /// incorporated into the final account balance of the existing update.
     /// This method finds the most recent update to the account and adds the refund.
+    /// Uses stellar-core `addBalance` semantics: skips the refund on overflow
+    /// or buying-liabilities violation (TransactionUtils.cpp:561-592).
     pub fn apply_refund_to_delta(&mut self, account_id: &AccountId, refund: i64) {
+        use henyey_common::asset::try_add_account_balance;
+
         // Find the most recent update to this account in the delta and add the refund
         self.delta.apply_refund_to_account(account_id, refund);
         // Also update the in-memory account state (without recording a new delta)
         if let Some(acc) = self.accounts.get_mut(account_id) {
-            acc.balance += refund;
+            // Silently skip if overflow or buying liabilities violated
+            let _ = try_add_account_balance(acc, refund);
         }
     }
 

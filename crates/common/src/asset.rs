@@ -364,6 +364,38 @@ pub fn add_balance(balance: i64, delta: i64, max_balance: i64) -> Option<i64> {
     Some(balance + delta)
 }
 
+/// Try to add `delta` to an account's balance, respecting overflow and buying
+/// liabilities exactly as stellar-core's `addBalance` does
+/// (TransactionUtils.cpp:561-592).
+///
+/// Returns `true` and mutates `acc.balance` if the add is valid.
+/// Returns `false` and leaves `acc` unchanged otherwise.
+///
+/// Checks:
+/// 1. `balance + delta` must not overflow `i64::MAX` or go negative.
+/// 2. `new_balance` must not exceed `i64::MAX - buying_liabilities`.
+pub fn try_add_account_balance(acc: &mut stellar_xdr::curr::AccountEntry, delta: i64) -> bool {
+    use stellar_xdr::curr::AccountEntryExt;
+
+    // 1. Overflow / underflow check via add_balance
+    let new_balance = match add_balance(acc.balance, delta, i64::MAX) {
+        Some(b) => b,
+        None => return false,
+    };
+
+    // 2. Buying liabilities check (protocol v10+, but we always have it)
+    let buying_liabilities = match &acc.ext {
+        AccountEntryExt::V0 => 0,
+        AccountEntryExt::V1(v1) => v1.liabilities.buying,
+    };
+    if new_balance > i64::MAX - buying_liabilities {
+        return false;
+    }
+
+    acc.balance = new_balance;
+    true
+}
+
 // ============================================================================
 // Bucket Entry Utilities
 // ============================================================================

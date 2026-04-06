@@ -475,7 +475,11 @@ impl LedgerDelta {
     /// This is used by parallel Soroban execution where cluster deltas have been merged
     /// into the main delta, and fee refunds need to be applied post-execution.
     /// Modifies the account's balance in-place within the existing change entry.
+    /// Uses stellar-core `addBalance` semantics: skips the refund on overflow
+    /// or buying-liabilities violation (TransactionUtils.cpp:561-592).
     pub fn apply_refund_to_account(&mut self, account_id: &AccountId, refund: i64) -> Result<()> {
+        use henyey_common::asset::try_add_account_balance;
+
         let key = LedgerKey::Account(LedgerKeyAccount {
             account_id: account_id.clone(),
         });
@@ -484,14 +488,16 @@ impl LedgerDelta {
             match change {
                 EntryChange::Created(ref mut entry) => {
                     if let LedgerEntryData::Account(ref mut acc) = entry.data {
-                        acc.balance += refund;
+                        // Silently skip if overflow or buying liabilities violated
+                        let _ = try_add_account_balance(acc, refund);
                     }
                 }
                 EntryChange::Updated {
                     ref mut current, ..
                 } => {
                     if let LedgerEntryData::Account(ref mut acc) = current.data {
-                        acc.balance += refund;
+                        // Silently skip if overflow or buying liabilities violated
+                        let _ = try_add_account_balance(acc, refund);
                     }
                 }
                 EntryChange::Deleted { .. } => {}
@@ -1666,6 +1672,125 @@ mod tests {
         // No entries in delta - refund is a no-op
         delta.apply_refund_to_account(&account_id, 100).unwrap();
         assert!(delta.is_empty());
+    }
+
+    /// Refund that would overflow i64 is silently skipped (matching stellar-core addBalance).
+    /// Regression test for AUDIT-H18.
+    #[test]
+    fn test_apply_refund_overflow_updated() {
+        let mut delta = LedgerDelta::new(1);
+        let original = create_test_account_with_balance(1, i64::MAX - 10);
+        let updated = create_test_account_with_balance(1, i64::MAX - 10);
+
+        delta
+            .record_update(original.clone(), updated.clone())
+            .unwrap();
+
+        let account_id = if let LedgerEntryData::Account(ref acc) = original.data {
+            acc.account_id.clone()
+        } else {
+            panic!("expected account");
+        };
+        // Refund of 100 would overflow i64::MAX - 10 + 100 > i64::MAX
+        delta.apply_refund_to_account(&account_id, 100).unwrap();
+
+        let changes: Vec<_> = delta.changes().collect();
+        if let LedgerEntryData::Account(ref acc) = changes[0].current_entry().unwrap().data {
+            assert_eq!(
+                acc.balance,
+                i64::MAX - 10,
+                "Refund should be skipped when it would overflow i64"
+            );
+        } else {
+            panic!("expected account entry");
+        }
+    }
+
+    /// Refund that would overflow i64 is silently skipped on created accounts.
+    /// Regression test for AUDIT-H18.
+    #[test]
+    fn test_apply_refund_overflow_created() {
+        let mut delta = LedgerDelta::new(1);
+        let entry = create_test_account_with_balance(1, i64::MAX - 5);
+
+        delta.record_create(entry.clone()).unwrap();
+
+        let account_id = if let LedgerEntryData::Account(ref acc) = entry.data {
+            acc.account_id.clone()
+        } else {
+            panic!("expected account");
+        };
+        // Refund of 10 would overflow: i64::MAX - 5 + 10 > i64::MAX
+        delta.apply_refund_to_account(&account_id, 10).unwrap();
+
+        let changes: Vec<_> = delta.changes().collect();
+        if let LedgerEntryData::Account(ref acc) = changes[0].current_entry().unwrap().data {
+            assert_eq!(
+                acc.balance,
+                i64::MAX - 5,
+                "Refund should be skipped on created account when it would overflow"
+            );
+        } else {
+            panic!("expected account entry");
+        }
+    }
+
+    /// Refund that violates buying liabilities is skipped.
+    /// Regression test for AUDIT-H18.
+    #[test]
+    fn test_apply_refund_buying_liabilities() {
+        use stellar_xdr::curr::{AccountEntryExtensionV1, AccountEntryExtensionV1Ext, Liabilities};
+
+        let mut delta = LedgerDelta::new(1);
+
+        let mut key = [0u8; 32];
+        key[0] = 1;
+        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(key)));
+
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: account_id.clone(),
+                balance: i64::MAX - 1000,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: stellar_xdr::curr::String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: stellar_xdr::curr::VecM::default(),
+                ext: AccountEntryExt::V1(AccountEntryExtensionV1 {
+                    liabilities: Liabilities {
+                        buying: 500,
+                        selling: 0,
+                    },
+                    ext: AccountEntryExtensionV1Ext::V0,
+                }),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        let original = entry.clone();
+        let updated = entry.clone();
+
+        delta
+            .record_update(original.clone(), updated.clone())
+            .unwrap();
+
+        // Refund of 550: new_balance = (MAX-1000) + 550 = MAX-450
+        // buying_liabilities = 500, MAX - 500 = MAX-500
+        // MAX-450 > MAX-500 => true => refund should be skipped
+        delta.apply_refund_to_account(&account_id, 550).unwrap();
+
+        let changes: Vec<_> = delta.changes().collect();
+        if let LedgerEntryData::Account(ref acc) = changes[0].current_entry().unwrap().data {
+            assert_eq!(
+                acc.balance,
+                i64::MAX - 1000,
+                "Refund should be skipped when new balance exceeds i64::MAX - buying_liabilities"
+            );
+        } else {
+            panic!("expected account entry");
+        }
     }
 
     // =========================================================================
