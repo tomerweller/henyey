@@ -282,8 +282,15 @@ pub mod helpers {
     /// Computes the SHA-256 hash of a message for flood tracking.
     ///
     /// The hash is computed over the XDR-encoded message bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the message cannot be XDR-serialized (should never happen
+    /// for valid `StellarMessage` values).
     pub fn message_hash(message: &StellarMessage) -> henyey_common::Hash256 {
-        let bytes = message.to_xdr(Limits::none()).unwrap_or_default();
+        let bytes = message
+            .to_xdr(Limits::none())
+            .expect("StellarMessage XDR serialization must not fail");
         henyey_common::Hash256::hash(&bytes)
     }
 
