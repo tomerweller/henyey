@@ -180,10 +180,8 @@ impl TransactionExecutor {
             }
 
             // Validate that Soroban resource fee does not exceed the full transaction fee.
-            // stellar-core TransactionFrame.cpp:1376 — commonValidPreSeqNum:
-            //   if (validateResourceFee && sorobanData.resourceFee > getFullFee())
-            //       txResult.setInnermostError(txSOROBAN_INVALID);
-            // For p23+, validateResourceFee = chargeFee, which is true for non-fee-bump txs.
+            // Parity: stellar-core TransactionFrame.cpp commonValidPreSeqNum —
+            // for p23+ non-fee-bump txs, rejects when sorobanData.resourceFee > getFullFee().
             // Fee-bump inner txs skip this check (handled by the fee-bump branch above).
             if frame.is_soroban() && frame.declared_soroban_resource_fee() > frame.total_fee() {
                 return Ok(Err(pre_seq_fail(

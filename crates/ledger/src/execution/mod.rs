@@ -276,8 +276,8 @@ impl RefundableFeeTracker {
         self.consumed_rent_fee = self.consumed_rent_fee.saturating_add(rent_fee);
 
         // First check: rent fee alone must not exceed max refundable fee.
-        // This matches stellar-core's consumeRefundableSorobanResources which checks
-        // if (mMaximumRefundableFee < mConsumedRentFee) before computing events fee.
+        // Parity: stellar-core SorobanTxData::consumeRefundableSorobanResources —
+        // checks consumed rent fee against max before computing events fee.
         if self.consumed_rent_fee > self.max_refundable_fee {
             tracing::debug!(
                 consumed_rent_fee = self.consumed_rent_fee,
