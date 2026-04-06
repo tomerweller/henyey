@@ -226,14 +226,17 @@ fn insert_event_fields(
     match format {
         XdrFormat::Base64 => {
             // value: base64 of the ScVal data from the event body
-            let value = extract_event_value_b64(event_xdr_b64);
+            let value = extract_event_value(event_xdr_b64)
+                .and_then(|v| v.to_xdr(Limits::none()).ok())
+                .map(|b| BASE64.encode(&b))
+                .unwrap_or_default();
             obj.insert("value".into(), json!(value));
             // topic: array of base64-encoded topic ScVals (already stored as base64)
             obj.insert("topic".into(), json!(topics));
         }
         XdrFormat::Json => {
             // value: JSON representation of the ScVal
-            if let Some(val) = extract_event_value_scval(event_xdr_b64) {
+            if let Some(val) = extract_event_value(event_xdr_b64) {
                 let json_val = serde_json::to_value(&val)
                     .map_err(|e| JsonRpcError::internal(format!("JSON serialize error: {e}")))?;
                 obj.insert("valueJson".into(), json_val);
@@ -255,30 +258,8 @@ fn insert_event_fields(
     Ok(())
 }
 
-/// Extract the value XDR (base64) from a ContractEvent's body.
-fn extract_event_value_b64(event_xdr_b64: &str) -> String {
-    let bytes = match BASE64.decode(event_xdr_b64) {
-        Ok(b) => b,
-        Err(_) => return String::new(),
-    };
-
-    let event = match ContractEvent::from_xdr(&bytes, Limits::none()) {
-        Ok(e) => e,
-        Err(_) => return String::new(),
-    };
-
-    match event.body {
-        ContractEventBody::V0(body) => body
-            .data
-            .to_xdr(Limits::none())
-            .ok()
-            .map(|b| BASE64.encode(&b))
-            .unwrap_or_default(),
-    }
-}
-
 /// Extract the value ScVal from a ContractEvent's body.
-fn extract_event_value_scval(event_xdr_b64: &str) -> Option<ScVal> {
+fn extract_event_value(event_xdr_b64: &str) -> Option<ScVal> {
     let bytes = BASE64.decode(event_xdr_b64).ok()?;
     let event = ContractEvent::from_xdr(&bytes, Limits::none()).ok()?;
     match event.body {
