@@ -377,9 +377,11 @@ fn compare_signer_keys(a: &SignerKey, b: &SignerKey) -> std::cmp::Ordering {
         (SignerKey::Ed25519(a_key), SignerKey::Ed25519(b_key)) => a_key.0.cmp(&b_key.0),
         (SignerKey::PreAuthTx(a_key), SignerKey::PreAuthTx(b_key)) => a_key.0.cmp(&b_key.0),
         (SignerKey::HashX(a_key), SignerKey::HashX(b_key)) => a_key.0.cmp(&b_key.0),
-        (SignerKey::Ed25519SignedPayload(a_key), SignerKey::Ed25519SignedPayload(b_key)) => {
-            a_key.ed25519.0.cmp(&b_key.ed25519.0)
-        }
+        (SignerKey::Ed25519SignedPayload(a_key), SignerKey::Ed25519SignedPayload(b_key)) => a_key
+            .ed25519
+            .0
+            .cmp(&b_key.ed25519.0)
+            .then_with(|| a_key.payload.as_slice().cmp(b_key.payload.as_slice())),
         // Different types: order by discriminant
         (a, b) => {
             let a_disc = signer_key_discriminant(a);
@@ -1377,6 +1379,101 @@ mod tests {
     /// Test SetOptions set master weight to 0 (disable master key).
     ///
     /// C++ Reference: SetOptionsTests.cpp - "master weight zero" test section
+    /// Test that Ed25519SignedPayload signers are sorted by both ed25519 key AND payload.
+    /// Regression test for AUDIT-708: compare_signer_keys only compared ed25519,
+    /// ignoring the payload field. This causes a different signer ordering than
+    /// stellar-core, which is consensus-critical since account XDR feeds ledger hashes.
+    #[test]
+    fn test_audit_708_signed_payload_signer_sort_includes_payload() {
+        // Two Ed25519SignedPayload signers with the same ed25519 key but different payloads.
+        // payload_a < payload_b lexicographically, so stellar-core orders [payload_a, payload_b].
+        let ed25519_key = Uint256([5u8; 32]);
+        let payload_a = BytesM::try_from(vec![0x01, 0x02]).unwrap();
+        let payload_b = BytesM::try_from(vec![0x01, 0x03]).unwrap();
+
+        let key_a = SignerKey::Ed25519SignedPayload(SignerKeyEd25519SignedPayload {
+            ed25519: ed25519_key.clone(),
+            payload: payload_a.clone(),
+        });
+        let key_b = SignerKey::Ed25519SignedPayload(SignerKeyEd25519SignedPayload {
+            ed25519: ed25519_key.clone(),
+            payload: payload_b.clone(),
+        });
+
+        // With same ed25519 key, payload_a (0x01,0x02) < payload_b (0x01,0x03)
+        // So key_a should sort before key_b.
+        assert_eq!(
+            compare_signer_keys(&key_a, &key_b),
+            std::cmp::Ordering::Less,
+            "key with smaller payload should sort first"
+        );
+        assert_eq!(
+            compare_signer_keys(&key_b, &key_a),
+            std::cmp::Ordering::Greater,
+            "key with larger payload should sort after"
+        );
+
+        // Also verify that adding them in reverse order produces correct sorted order
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source_id = create_test_account_id(200);
+        state.create_account(create_test_account(source_id.clone(), 1_000_000_000));
+
+        // Add payload_b first
+        let op = SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: None,
+            set_flags: None,
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: Some(Signer {
+                key: key_b.clone(),
+                weight: 1,
+            }),
+        };
+        let result = execute_set_options(&op, &source_id, &mut state, &context);
+        assert!(matches!(
+            result.unwrap(),
+            OperationResult::OpInner(OperationResultTr::SetOptions(SetOptionsResult::Success))
+        ));
+
+        // Add payload_a second
+        let op = SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: None,
+            set_flags: None,
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: Some(Signer {
+                key: key_a.clone(),
+                weight: 1,
+            }),
+        };
+        let result = execute_set_options(&op, &source_id, &mut state, &context);
+        assert!(matches!(
+            result.unwrap(),
+            OperationResult::OpInner(OperationResultTr::SetOptions(SetOptionsResult::Success))
+        ));
+
+        // Verify signers are sorted: key_a (smaller payload) should be first
+        let account = state.get_account(&source_id).unwrap();
+        assert_eq!(account.signers.len(), 2);
+        assert_eq!(
+            account.signers[0].key, key_a,
+            "signer with smaller payload should be first"
+        );
+        assert_eq!(
+            account.signers[1].key, key_b,
+            "signer with larger payload should be second"
+        );
+    }
+
     #[test]
     fn test_set_options_master_weight_zero() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
