@@ -157,27 +157,19 @@ impl HotArchiveLookupImpl {
 }
 
 impl henyey_tx::soroban::HotArchiveLookup for HotArchiveLookupImpl {
-    fn get(&self, key: &LedgerKey) -> Option<LedgerEntry> {
+    fn get(
+        &self,
+        key: &LedgerKey,
+    ) -> std::result::Result<Option<LedgerEntry>, Box<dyn std::error::Error + Send + Sync>> {
         // Use the hot archive bucket list's get method
         let guard = self.hot_archive.read();
         let hot_archive = match guard.as_ref() {
             Some(ha) => ha,
             None => {
-                return None;
+                return Ok(None);
             }
         };
-        match hot_archive.get(key) {
-            Ok(Some(entry)) => Some(entry),
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!(
-                    error = ?e,
-                    key_type = ?std::mem::discriminant(key),
-                    "Hot archive lookup failed"
-                );
-                None
-            }
-        }
+        Ok(hot_archive.get(key)?)
     }
 }
 

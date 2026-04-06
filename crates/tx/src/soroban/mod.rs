@@ -195,9 +195,17 @@ pub fn compute_key_hash(key: &LedgerKey) -> Hash {
 pub trait HotArchiveLookup: Send + Sync {
     /// Look up an entry in the hot archive.
     ///
-    /// Returns `Some(entry)` if the key exists in the hot archive as an `Archived` entry.
-    /// Returns `None` if the key is not found or exists as a `Live` marker (restored).
-    fn get(&self, key: &LedgerKey) -> Option<LedgerEntry>;
+    /// Returns `Ok(Some(entry))` if the key exists in the hot archive as an `Archived` entry.
+    /// Returns `Ok(None)` if the key is not found or exists as a `Live` marker (restored).
+    /// Returns `Err` if an I/O or deserialization error occurs during lookup.
+    ///
+    /// Errors must be propagated, not silently swallowed. A transient I/O error on one
+    /// validator but not another would cause disagreement on entry existence and different
+    /// ledger hashes — a consensus split.
+    fn get(
+        &self,
+        key: &LedgerKey,
+    ) -> std::result::Result<Option<LedgerEntry>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// A no-op implementation of HotArchiveLookup that always returns None.
@@ -208,8 +216,11 @@ pub trait HotArchiveLookup: Send + Sync {
 pub struct NoHotArchive;
 
 impl HotArchiveLookup for NoHotArchive {
-    fn get(&self, _key: &LedgerKey) -> Option<LedgerEntry> {
-        None
+    fn get(
+        &self,
+        _key: &LedgerKey,
+    ) -> std::result::Result<Option<LedgerEntry>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(None)
     }
 }
 
@@ -244,28 +255,28 @@ mod tests {
         }
     }
 
-    /// Test NoHotArchive always returns None.
+    /// Test NoHotArchive always returns Ok(None).
     #[test]
     fn test_no_hot_archive_get() {
         let archive = NoHotArchive;
         let key = test_contract_data_key();
-        assert!(archive.get(&key).is_none());
+        assert!(archive.get(&key).unwrap().is_none());
     }
 
-    /// Test NoHotArchive returns None for various key types.
+    /// Test NoHotArchive returns Ok(None) for various key types.
     #[test]
     fn test_no_hot_archive_different_keys() {
         let archive = NoHotArchive;
 
         // Contract data key
         let contract_key = test_contract_data_key();
-        assert!(archive.get(&contract_key).is_none());
+        assert!(archive.get(&contract_key).unwrap().is_none());
 
         // Account key
         let account_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
             account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
         });
-        assert!(archive.get(&account_key).is_none());
+        assert!(archive.get(&account_key).unwrap().is_none());
     }
 
     /// Test a custom HotArchiveLookup implementation.
@@ -278,11 +289,14 @@ mod tests {
         }
 
         impl HotArchiveLookup for TestHotArchive {
-            fn get(&self, key: &LedgerKey) -> Option<LedgerEntry> {
+            fn get(
+                &self,
+                key: &LedgerKey,
+            ) -> std::result::Result<Option<LedgerEntry>, Box<dyn std::error::Error + Send + Sync>>
+            {
                 let key_bytes =
-                    stellar_xdr::curr::WriteXdr::to_xdr(key, stellar_xdr::curr::Limits::none())
-                        .ok()?;
-                self.entries.get(&key_bytes).cloned()
+                    stellar_xdr::curr::WriteXdr::to_xdr(key, stellar_xdr::curr::Limits::none())?;
+                Ok(self.entries.get(&key_bytes).cloned())
             }
         }
 
@@ -296,7 +310,7 @@ mod tests {
         let archive = TestHotArchive { entries };
 
         // Key that exists
-        let result = archive.get(&key);
+        let result = archive.get(&key).unwrap();
         assert!(result.is_some());
         assert_eq!(result.unwrap().last_modified_ledger_seq, 100);
 
@@ -306,7 +320,7 @@ mod tests {
             key: ScVal::Void,
             durability: ContractDataDurability::Persistent,
         });
-        assert!(archive.get(&other_key).is_none());
+        assert!(archive.get(&other_key).unwrap().is_none());
     }
 
     /// Test trait object usage for HotArchiveLookup.
@@ -314,7 +328,7 @@ mod tests {
     fn test_hot_archive_trait_object() {
         let archive: Box<dyn HotArchiveLookup> = Box::new(NoHotArchive);
         let key = test_contract_data_key();
-        assert!(archive.get(&key).is_none());
+        assert!(archive.get(&key).unwrap().is_none());
     }
 
     /// Test NoHotArchive is Send + Sync (required by trait bounds).
@@ -322,5 +336,39 @@ mod tests {
     fn test_no_hot_archive_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<NoHotArchive>();
+    }
+
+    /// Regression test for AUDIT-C12: hot archive lookup errors must propagate,
+    /// not be silently swallowed. If errors are swallowed, a transient I/O error
+    /// on one validator would cause it to report "entry not found" while others
+    /// report "entry found", leading to a consensus split on the resulting ledger hash.
+    #[test]
+    fn test_hot_archive_error_propagates_not_swallowed() {
+        struct FailingHotArchive;
+
+        impl HotArchiveLookup for FailingHotArchive {
+            fn get(
+                &self,
+                _key: &LedgerKey,
+            ) -> std::result::Result<Option<LedgerEntry>, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Err("simulated I/O error during hot archive lookup".into())
+            }
+        }
+
+        let archive = FailingHotArchive;
+        let key = test_contract_data_key();
+
+        // The error must propagate — previously this would have returned None,
+        // silently hiding the I/O failure.
+        let result = archive.get(&key);
+        assert!(result.is_err(), "I/O errors must not be silently swallowed");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("simulated I/O error"),
+            "Error message must be preserved"
+        );
     }
 }

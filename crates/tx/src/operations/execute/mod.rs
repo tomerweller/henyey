@@ -970,7 +970,11 @@ pub fn execute_operation_with_soroban(
                         //   - old_live_until_ledger = 0
                         // This is different from expired entries where we use the actual old size.
                         if let Some(ha) = soroban.hot_archive {
-                            if let Some(entry) = ha.get(key) {
+                            if let Some(entry) = ha.get(key).map_err(|e| {
+                                TxError::Internal(format!(
+                                    "hot archive lookup failed during restore: {e}"
+                                ))
+                            })? {
                                 let (is_persistent, is_code_entry) = rent_classification(key);
                                 snapshots.push(RentSnapshot {
                                     key: key.clone(),

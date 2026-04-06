@@ -322,7 +322,13 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
         // This handles the case where the entry was evicted from the live bucket list
         // and is now in the hot archive, waiting to be restored.
         if let Some(hot_archive) = self.hot_archive {
-            if let Some(archived_entry) = hot_archive.get(key.as_ref()) {
+            if let Some(archived_entry) = hot_archive.get(key.as_ref()).map_err(|e| {
+                tracing::error!(error = ?e, "Hot archive lookup failed during restore");
+                HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
+                    soroban_env_host25::xdr::ScErrorType::Storage,
+                    soroban_env_host25::xdr::ScErrorCode::InternalError,
+                ))
+            })? {
                 tracing::debug!(
                     key_type = ?std::mem::discriminant(key.as_ref()),
                     "P25: Found archived entry in hot archive bucket list"

@@ -225,7 +225,7 @@ use super::{OperationExecutionResult, SorobanOperationMeta};
 use crate::soroban::{PersistentModuleCache, SorobanConfig, SorobanContext};
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
-use crate::Result;
+use crate::{Result, TxError};
 
 /// Execute an InvokeHostFunction operation.
 ///
@@ -322,7 +322,7 @@ fn execute_contract_invocation(
         context.sequence,
         hot_archive,
         ttl_key_cache,
-    ) {
+    )? {
         return Ok(OperationExecutionResult::new(make_result(
             InvokeHostFunctionResultCode::EntryArchived,
             Hash([0u8; 32]),
@@ -1094,7 +1094,7 @@ fn footprint_has_unrestored_archived_entries(
     current_ledger: u32,
     hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
-) -> bool {
+) -> crate::Result<bool> {
     let mut archived_rw = std::collections::HashSet::new();
     if let stellar_xdr::curr::SorobanTransactionDataExt::V1(resources_ext) = ext {
         for index in resources_ext.archived_soroban_entries.iter() {
@@ -1102,22 +1102,22 @@ fn footprint_has_unrestored_archived_entries(
         }
     }
 
-    if footprint.read_only.iter().any(|key| {
-        is_archived_contract_entry(state, key, current_ledger, hot_archive, ttl_key_cache)
-    }) {
-        return true;
+    for key in footprint.read_only.iter() {
+        if is_archived_contract_entry(state, key, current_ledger, hot_archive, ttl_key_cache)? {
+            return Ok(true);
+        }
     }
 
     for (index, key) in footprint.read_write.iter().enumerate() {
-        if !is_archived_contract_entry(state, key, current_ledger, hot_archive, ttl_key_cache) {
+        if !is_archived_contract_entry(state, key, current_ledger, hot_archive, ttl_key_cache)? {
             continue;
         }
         if !archived_rw.contains(&index) {
-            return true;
+            return Ok(true);
         }
     }
 
-    false
+    Ok(false)
 }
 
 /// Check if a footprint entry refers to an archived (evicted) contract entry.
@@ -1134,7 +1134,7 @@ fn is_archived_contract_entry(
     current_ledger: u32,
     hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
-) -> bool {
+) -> crate::Result<bool> {
     // Only persistent Soroban entries can be "archived".
     // Temporary entries just disappear when expired.
     let is_persistent_soroban = match key {
@@ -1145,7 +1145,7 @@ fn is_archived_contract_entry(
         _ => false,
     };
     if !is_persistent_soroban {
-        return false;
+        return Ok(false);
     }
 
     // Check if the entry exists in live state with an expired TTL.
@@ -1160,21 +1160,25 @@ fn is_archived_contract_entry(
     if entry_in_live {
         // Entry is in live state — check its TTL
         let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
-        return match state.get_ttl(&key_hash) {
+        return Ok(match state.get_ttl(&key_hash) {
             Some(ttl) => ttl.live_until_ledger_seq < current_ledger,
             None => true, // No TTL → treat as archived
-        };
+        });
     }
 
     // Entry not in live state — check hot archive (P23+ fallback).
     // Parity: InvokeHostFunctionOpFrame.cpp:413-445
     if let Some(archive) = hot_archive {
-        if archive.get(key).is_some() {
-            return true;
+        if archive
+            .get(key)
+            .map_err(|e| TxError::Internal(format!("hot archive lookup failed: {e}")))?
+            .is_some()
+        {
+            return Ok(true);
         }
     }
 
-    false
+    Ok(false)
 }
 
 /// Create an OperationResult from an InvokeHostFunctionResultCode.
