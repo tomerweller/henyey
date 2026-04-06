@@ -22,7 +22,7 @@ use crate::Result;
 /// 1. Check if it's time for inflation (weekly)
 /// 2. Calculate inflation pool
 /// 3. Distribute to accounts that have received votes
-pub fn execute_inflation(
+pub(crate) fn execute_inflation(
     source: &AccountId,
     state: &mut LedgerStateManager,
     _context: &LedgerContext,

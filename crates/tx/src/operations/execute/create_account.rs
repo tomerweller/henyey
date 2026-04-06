@@ -12,7 +12,7 @@ use crate::validation::LedgerContext;
 use crate::{Result, TxError};
 
 /// Execute a CreateAccount operation.
-pub fn execute_create_account(
+pub(crate) fn execute_create_account(
     op: &CreateAccountOp,
     source: &AccountId,
     state: &mut LedgerStateManager,

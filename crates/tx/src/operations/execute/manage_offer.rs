@@ -31,7 +31,7 @@ use crate::{Result, TxError};
 /// Execute a ManageSellOffer operation.
 ///
 /// This operation creates, updates, or deletes an offer to sell one asset for another.
-pub fn execute_manage_sell_offer(
+pub(crate) fn execute_manage_sell_offer(
     op: &ManageSellOfferOp,
     source: &AccountId,
     state: &mut LedgerStateManager,
@@ -485,7 +485,7 @@ fn execute_manage_offer(
 /// Execute a ManageBuyOffer operation.
 ///
 /// This operation creates, updates, or deletes an offer to buy one asset with another.
-pub fn execute_manage_buy_offer(
+pub(crate) fn execute_manage_buy_offer(
     op: &ManageBuyOfferOp,
     source: &AccountId,
     state: &mut LedgerStateManager,
@@ -522,7 +522,7 @@ pub fn execute_manage_buy_offer(
 /// Execute a CreatePassiveSellOffer operation.
 ///
 /// This operation creates a passive sell offer that doesn't cross existing offers.
-pub fn execute_create_passive_sell_offer(
+pub(crate) fn execute_create_passive_sell_offer(
     op: &CreatePassiveSellOfferOp,
     source: &AccountId,
     state: &mut LedgerStateManager,

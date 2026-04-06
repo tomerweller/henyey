@@ -197,7 +197,7 @@ pub fn adjust_offer_amount(
     Ok(res.num_wheat_received)
 }
 
-pub fn exchange_v10(
+pub(crate) fn exchange_v10(
     price: Price,
     max_wheat_send: i64,
     max_wheat_receive: i64,

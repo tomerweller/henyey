@@ -26,7 +26,7 @@ use crate::{Result, TxError};
 ///
 /// Note: The sponsored account does NOT need to exist at this point - it may be
 /// created by a later operation in the same transaction (e.g., CreateAccount).
-pub fn execute_begin_sponsoring_future_reserves(
+pub(crate) fn execute_begin_sponsoring_future_reserves(
     op: &BeginSponsoringFutureReservesOp,
     source: &AccountId,
     state: &mut LedgerStateManager,
@@ -75,7 +75,7 @@ pub fn execute_begin_sponsoring_future_reserves(
 /// BeginSponsoringFutureReserves.
 ///
 /// Note: In a full implementation, this would pop from the sponsorship stack.
-pub fn execute_end_sponsoring_future_reserves(
+pub(crate) fn execute_end_sponsoring_future_reserves(
     source: &AccountId,
     state: &mut LedgerStateManager,
     _context: &LedgerContext,
@@ -102,7 +102,7 @@ pub fn execute_end_sponsoring_future_reserves(
 ///
 /// This operation revokes sponsorship of a ledger entry, transferring
 /// the reserve responsibility back to the entry owner.
-pub fn execute_revoke_sponsorship(
+pub(crate) fn execute_revoke_sponsorship(
     op: &RevokeSponsorshipOp,
     source: &AccountId,
     state: &mut LedgerStateManager,

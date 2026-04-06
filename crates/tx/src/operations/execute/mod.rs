@@ -383,33 +383,10 @@ mod set_options;
 mod sponsorship;
 mod trust_flags;
 
-pub use account_merge::execute_account_merge;
-pub use bump_sequence::execute_bump_sequence;
-pub use change_trust::execute_change_trust;
-pub use claimable_balance::{execute_claim_claimable_balance, execute_create_claimable_balance};
-pub use clawback::{execute_clawback, execute_clawback_claimable_balance};
-pub use create_account::execute_create_account;
-pub use extend_footprint_ttl::execute_extend_footprint_ttl;
-pub use inflation::execute_inflation;
-pub use invoke_host_function::execute_invoke_host_function;
-pub use liquidity_pool::{execute_liquidity_pool_deposit, execute_liquidity_pool_withdraw};
-pub use manage_data::execute_manage_data;
-pub use manage_offer::{
-    execute_create_passive_sell_offer, execute_manage_buy_offer, execute_manage_sell_offer,
-};
 pub use offer_exchange::{
-    adjust_offer_amount, exchange_v10, exchange_v10_without_price_error_thresholds, ExchangeError,
+    adjust_offer_amount, exchange_v10_without_price_error_thresholds, ExchangeError,
     ExchangeResult, RoundingType,
 };
-pub use path_payment::{execute_path_payment_strict_receive, execute_path_payment_strict_send};
-pub use payment::execute_payment;
-pub use restore_footprint::execute_restore_footprint;
-pub use set_options::execute_set_options;
-pub use sponsorship::{
-    execute_begin_sponsoring_future_reserves, execute_end_sponsoring_future_reserves,
-    execute_revoke_sponsorship,
-};
-pub use trust_flags::{execute_allow_trust, execute_set_trust_line_flags};
 
 /// Execute a single operation.
 ///
@@ -767,7 +744,8 @@ fn compute_rent_fee_by_protocol(
     fee
 }
 
-pub fn execute_operation(
+#[cfg(test)]
+pub(crate) fn execute_operation(
     op: &Operation,
     source_account_id: &AccountId,
     state: &mut LedgerStateManager,

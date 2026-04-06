@@ -27,7 +27,7 @@ use crate::Result;
 /// A sell offer of `amount` at `price` creates:
 /// - selling_liability = amount (in the selling asset)
 /// - buying_liability  = amount converted at price (in the buying asset)
-pub fn offer_liabilities_sell(amount: i64, price: &Price) -> Result<(i64, i64)> {
+pub(super) fn offer_liabilities_sell(amount: i64, price: &Price) -> Result<(i64, i64)> {
     let res = exchange_v10_without_price_error_thresholds(
         price.clone(),
         amount,
@@ -47,7 +47,7 @@ pub fn offer_liabilities_sell(amount: i64, price: &Price) -> Result<(i64, i64)> 
 ///
 /// When `reserve_subentry` is true, the minimum balance calculation includes
 /// one additional sub-entry (used when creating a new offer alongside the sell).
-pub fn can_sell_at_most(
+pub(super) fn can_sell_at_most(
     source: &AccountId,
     asset: &Asset,
     state: &LedgerStateManager,
@@ -88,7 +88,7 @@ pub fn can_sell_at_most(
 /// 1. Remove the offer from state
 /// 2. If sponsored, update sponsor/sponsored counts
 /// 3. Decrement the seller's num_sub_entries
-pub fn delete_offer_with_sponsorship(
+pub(super) fn delete_offer_with_sponsorship(
     seller: &AccountId,
     offer_id: i64,
     state: &mut LedgerStateManager,
@@ -122,7 +122,7 @@ pub fn delete_offer_with_sponsorship(
 /// 6. Record a ClaimAtom in the offer trail
 ///
 /// Returns `(wheat_received, sheep_sent, wheat_stays)`.
-pub fn cross_offer_v10(
+pub(super) fn cross_offer_v10(
     offer: &OfferEntry,
     max_wheat_receive: i64,
     max_sheep_send: i64,

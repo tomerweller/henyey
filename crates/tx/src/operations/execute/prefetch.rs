@@ -67,7 +67,7 @@ fn insert_asset_trustline(keys: &mut HashSet<LedgerKey>, id: &AccountId, asset: 
 // Per-operation prefetch key functions
 // ---------------------------------------------------------------------------
 
-pub fn prefetch_keys_create_account(
+fn prefetch_keys_create_account(
     op: &CreateAccountOp,
     _source: &AccountId,
     keys: &mut HashSet<LedgerKey>,
@@ -75,14 +75,14 @@ pub fn prefetch_keys_create_account(
     keys.insert(account_key(&op.destination));
 }
 
-pub fn prefetch_keys_payment(op: &PaymentOp, source: &AccountId, keys: &mut HashSet<LedgerKey>) {
+fn prefetch_keys_payment(op: &PaymentOp, source: &AccountId, keys: &mut HashSet<LedgerKey>) {
     let dest = muxed_to_account_id(&op.destination);
     keys.insert(account_key(&dest));
     insert_asset_trustline(keys, source, &op.asset);
     insert_asset_trustline(keys, &dest, &op.asset);
 }
 
-pub fn prefetch_keys_path_payment_strict_receive(
+fn prefetch_keys_path_payment_strict_receive(
     op: &PathPaymentStrictReceiveOp,
     source: &AccountId,
     keys: &mut HashSet<LedgerKey>,
@@ -93,7 +93,7 @@ pub fn prefetch_keys_path_payment_strict_receive(
     insert_asset_trustline(keys, &dest, &op.dest_asset);
 }
 
-pub fn prefetch_keys_path_payment_strict_send(
+fn prefetch_keys_path_payment_strict_send(
     op: &PathPaymentStrictSendOp,
     source: &AccountId,
     keys: &mut HashSet<LedgerKey>,
@@ -104,7 +104,7 @@ pub fn prefetch_keys_path_payment_strict_send(
     insert_asset_trustline(keys, &dest, &op.dest_asset);
 }
 
-pub fn prefetch_keys_manage_sell_offer(
+fn prefetch_keys_manage_sell_offer(
     op: &ManageSellOfferOp,
     source: &AccountId,
     keys: &mut HashSet<LedgerKey>,
@@ -116,7 +116,7 @@ pub fn prefetch_keys_manage_sell_offer(
     insert_asset_trustline(keys, source, &op.buying);
 }
 
-pub fn prefetch_keys_manage_buy_offer(
+fn prefetch_keys_manage_buy_offer(
     op: &ManageBuyOfferOp,
     source: &AccountId,
     keys: &mut HashSet<LedgerKey>,
@@ -128,7 +128,7 @@ pub fn prefetch_keys_manage_buy_offer(
     insert_asset_trustline(keys, source, &op.buying);
 }
 
-pub fn prefetch_keys_create_passive_sell_offer(
+fn prefetch_keys_create_passive_sell_offer(
     op: &CreatePassiveSellOfferOp,
     source: &AccountId,
     keys: &mut HashSet<LedgerKey>,
@@ -137,7 +137,7 @@ pub fn prefetch_keys_create_passive_sell_offer(
     insert_asset_trustline(keys, source, &op.buying);
 }
 
-pub fn prefetch_keys_change_trust(
+fn prefetch_keys_change_trust(
     op: &ChangeTrustOp,
     source: &AccountId,
     keys: &mut HashSet<LedgerKey>,
@@ -167,11 +167,7 @@ pub fn prefetch_keys_change_trust(
     }
 }
 
-pub fn prefetch_keys_allow_trust(
-    op: &AllowTrustOp,
-    source: &AccountId,
-    keys: &mut HashSet<LedgerKey>,
-) {
+fn prefetch_keys_allow_trust(op: &AllowTrustOp, source: &AccountId, keys: &mut HashSet<LedgerKey>) {
     keys.insert(account_key(&op.trustor));
     // Build the trustline asset from the AllowTrust asset code + source (issuer)
     let tl_asset = match &op.asset {
@@ -191,7 +187,7 @@ pub fn prefetch_keys_allow_trust(
     keys.insert(trustline_key(&op.trustor, &tl_asset));
 }
 
-pub fn prefetch_keys_set_trust_line_flags(
+fn prefetch_keys_set_trust_line_flags(
     op: &SetTrustLineFlagsOp,
     _source: &AccountId,
     keys: &mut HashSet<LedgerKey>,
@@ -200,7 +196,7 @@ pub fn prefetch_keys_set_trust_line_flags(
     insert_asset_trustline(keys, &op.trustor, &op.asset);
 }
 
-pub fn prefetch_keys_account_merge(
+fn prefetch_keys_account_merge(
     dest: &MuxedAccount,
     _source: &AccountId,
     keys: &mut HashSet<LedgerKey>,
@@ -209,15 +205,11 @@ pub fn prefetch_keys_account_merge(
     keys.insert(account_key(&dest_id));
 }
 
-pub fn prefetch_keys_manage_data(
-    op: &ManageDataOp,
-    source: &AccountId,
-    keys: &mut HashSet<LedgerKey>,
-) {
+fn prefetch_keys_manage_data(op: &ManageDataOp, source: &AccountId, keys: &mut HashSet<LedgerKey>) {
     keys.insert(data_key(source, &op.data_name));
 }
 
-pub fn prefetch_keys_claim_claimable_balance(
+fn prefetch_keys_claim_claimable_balance(
     op: &ClaimClaimableBalanceOp,
     _source: &AccountId,
     keys: &mut HashSet<LedgerKey>,
@@ -225,7 +217,7 @@ pub fn prefetch_keys_claim_claimable_balance(
     keys.insert(claimable_balance_key(&op.balance_id));
 }
 
-pub fn prefetch_keys_create_claimable_balance(
+fn prefetch_keys_create_claimable_balance(
     op: &CreateClaimableBalanceOp,
     source: &AccountId,
     keys: &mut HashSet<LedgerKey>,
@@ -233,12 +225,12 @@ pub fn prefetch_keys_create_claimable_balance(
     insert_asset_trustline(keys, source, &op.asset);
 }
 
-pub fn prefetch_keys_clawback(op: &ClawbackOp, _source: &AccountId, keys: &mut HashSet<LedgerKey>) {
+fn prefetch_keys_clawback(op: &ClawbackOp, _source: &AccountId, keys: &mut HashSet<LedgerKey>) {
     let from = muxed_to_account_id(&op.from);
     insert_asset_trustline(keys, &from, &op.asset);
 }
 
-pub fn prefetch_keys_clawback_claimable_balance(
+fn prefetch_keys_clawback_claimable_balance(
     op: &ClawbackClaimableBalanceOp,
     _source: &AccountId,
     keys: &mut HashSet<LedgerKey>,
@@ -246,7 +238,7 @@ pub fn prefetch_keys_clawback_claimable_balance(
     keys.insert(claimable_balance_key(&op.balance_id));
 }
 
-pub fn prefetch_keys_liquidity_pool_deposit(
+fn prefetch_keys_liquidity_pool_deposit(
     op: &LiquidityPoolDepositOp,
     _source: &AccountId,
     keys: &mut HashSet<LedgerKey>,
@@ -258,7 +250,7 @@ pub fn prefetch_keys_liquidity_pool_deposit(
     ));
 }
 
-pub fn prefetch_keys_liquidity_pool_withdraw(
+fn prefetch_keys_liquidity_pool_withdraw(
     op: &LiquidityPoolWithdrawOp,
     _source: &AccountId,
     keys: &mut HashSet<LedgerKey>,
@@ -270,7 +262,7 @@ pub fn prefetch_keys_liquidity_pool_withdraw(
     ));
 }
 
-pub fn prefetch_keys_begin_sponsoring(
+fn prefetch_keys_begin_sponsoring(
     op: &BeginSponsoringFutureReservesOp,
     _source: &AccountId,
     keys: &mut HashSet<LedgerKey>,

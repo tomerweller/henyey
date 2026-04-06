@@ -31,7 +31,7 @@ use crate::Result;
 /// # Returns
 ///
 /// Returns the operation result indicating success or a specific failure reason.
-pub fn execute_payment(
+pub(crate) fn execute_payment(
     op: &PaymentOp,
     source: &AccountId,
     state: &mut LedgerStateManager,

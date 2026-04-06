@@ -27,7 +27,7 @@ use crate::{Result, TxError};
 ///
 /// This operation sends at most `send_max` of `send_asset` to receive exactly
 /// `dest_amount` of `dest_asset` at the destination.
-pub fn execute_path_payment_strict_receive(
+pub(crate) fn execute_path_payment_strict_receive(
     op: &PathPaymentStrictReceiveOp,
     source: &AccountId,
     state: &mut LedgerStateManager,
@@ -174,7 +174,7 @@ pub fn execute_path_payment_strict_receive(
 ///
 /// This operation sends exactly `send_amount` of `send_asset` to receive at least
 /// `dest_min` of `dest_asset` at the destination.
-pub fn execute_path_payment_strict_send(
+pub(crate) fn execute_path_payment_strict_send(
     op: &PathPaymentStrictSendOp,
     source: &AccountId,
     state: &mut LedgerStateManager,

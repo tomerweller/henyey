@@ -28,7 +28,7 @@ const TRUSTLINE_AUTH_FLAGS: u32 = AUTHORIZED_FLAG | AUTHORIZED_TO_MAINTAIN_LIABI
 ///
 /// This operation sets the authorized flag on a trustline. It has been
 /// deprecated in favor of SetTrustLineFlags but is still supported.
-pub fn execute_allow_trust(
+pub(crate) fn execute_allow_trust(
     op: &AllowTrustOp,
     source: &AccountId,
     tx_source_id: &AccountId,
@@ -136,7 +136,7 @@ pub fn execute_allow_trust(
 /// Execute a SetTrustLineFlags operation.
 ///
 /// This operation sets or clears specific flags on a trustline.
-pub fn execute_set_trust_line_flags(
+pub(crate) fn execute_set_trust_line_flags(
     op: &SetTrustLineFlagsOp,
     source: &AccountId,
     tx_source_id: &AccountId,

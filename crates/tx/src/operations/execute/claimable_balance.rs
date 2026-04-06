@@ -39,7 +39,7 @@ use crate::{Result, TxError};
 /// # Returns
 ///
 /// Returns the operation result indicating success or a specific failure reason.
-pub fn execute_create_claimable_balance(
+pub(crate) fn execute_create_claimable_balance(
     op: &CreateClaimableBalanceOp,
     source: &AccountId,
     tx_source: &AccountId,
@@ -274,7 +274,7 @@ pub fn execute_create_claimable_balance(
 /// # Returns
 ///
 /// Returns the operation result indicating success or a specific failure reason.
-pub fn execute_claim_claimable_balance(
+pub(crate) fn execute_claim_claimable_balance(
     op: &ClaimClaimableBalanceOp,
     source: &AccountId,
     state: &mut LedgerStateManager,

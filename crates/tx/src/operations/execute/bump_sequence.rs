@@ -10,7 +10,7 @@ use crate::validation::LedgerContext;
 use crate::{Result, TxError};
 
 /// Execute a BumpSequence operation.
-pub fn execute_bump_sequence(
+pub(crate) fn execute_bump_sequence(
     op: &BumpSequenceOp,
     source: &AccountId,
     state: &mut LedgerStateManager,

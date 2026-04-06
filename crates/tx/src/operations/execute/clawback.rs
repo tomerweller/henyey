@@ -23,7 +23,7 @@ use crate::Result;
 /// This operation claws back an amount of an asset from an account's trustline.
 /// The source account must be the issuer of the asset and the trustline must have
 /// the TRUSTLINE_CLAWBACK_ENABLED flag set.
-pub fn execute_clawback(
+pub(crate) fn execute_clawback(
     op: &ClawbackOp,
     source: &AccountId,
     state: &mut LedgerStateManager,
@@ -98,7 +98,7 @@ pub fn execute_clawback(
 /// This operation claws back an entire claimable balance.
 /// The source account must be the issuer of the asset in the claimable balance
 /// and must have the AUTH_CLAWBACK_ENABLED flag set.
-pub fn execute_clawback_claimable_balance(
+pub(crate) fn execute_clawback_claimable_balance(
     op: &ClawbackClaimableBalanceOp,
     source: &AccountId,
     state: &mut LedgerStateManager,

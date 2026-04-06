@@ -23,7 +23,7 @@ const MAX_DATA_VALUE_LENGTH: usize = 64;
 ///
 /// This operation creates, updates, or removes a data entry. Setting the value
 /// to None removes the entry.
-pub fn execute_manage_data(
+pub(crate) fn execute_manage_data(
     op: &ManageDataOp,
     source: &AccountId,
     state: &mut LedgerStateManager,

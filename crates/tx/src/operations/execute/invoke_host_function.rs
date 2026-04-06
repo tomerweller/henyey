@@ -246,7 +246,7 @@ use crate::{Result, TxError};
 ///
 /// Returns the operation result with the function's return value on success,
 /// or a specific failure reason.
-pub fn execute_invoke_host_function(
+pub(crate) fn execute_invoke_host_function(
     op: &InvokeHostFunctionOp,
     source: &AccountId,
     state: &mut LedgerStateManager,

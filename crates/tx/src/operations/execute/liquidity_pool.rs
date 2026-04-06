@@ -23,7 +23,7 @@ use crate::Result;
 ///
 /// This operation deposits assets into a liquidity pool in exchange for
 /// pool shares.
-pub fn execute_liquidity_pool_deposit(
+pub(crate) fn execute_liquidity_pool_deposit(
     op: &LiquidityPoolDepositOp,
     source: &AccountId,
     state: &mut LedgerStateManager,
@@ -212,7 +212,7 @@ pub fn execute_liquidity_pool_deposit(
 ///
 /// This operation withdraws assets from a liquidity pool by redeeming
 /// pool shares.
-pub fn execute_liquidity_pool_withdraw(
+pub(crate) fn execute_liquidity_pool_withdraw(
     op: &LiquidityPoolWithdrawOp,
     source: &AccountId,
     state: &mut LedgerStateManager,

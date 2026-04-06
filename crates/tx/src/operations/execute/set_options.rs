@@ -37,7 +37,7 @@ const MAX_SIGNERS: usize = 20;
 /// # Returns
 ///
 /// Returns the operation result indicating success or a specific failure reason.
-pub fn execute_set_options(
+pub(crate) fn execute_set_options(
     op: &SetOptionsOp,
     source: &AccountId,
     state: &mut LedgerStateManager,

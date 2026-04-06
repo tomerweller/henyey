@@ -26,7 +26,7 @@ const MAX_ENTRY_TTL: u32 = 6_312_000; // ~1 year at 5-second ledger close
 /// - Skips entries whose TTL already meets or exceeds the target
 /// - Tracks accumulated read bytes and fails with ResourceLimitExceeded
 ///   if disk_read_bytes limit is exceeded
-pub fn execute_extend_footprint_ttl(
+pub(crate) fn execute_extend_footprint_ttl(
     op: &ExtendFootprintTtlOp,
     _source: &AccountId,
     state: &mut LedgerStateManager,

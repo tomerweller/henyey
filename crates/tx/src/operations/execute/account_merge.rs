@@ -13,7 +13,7 @@ use crate::validation::LedgerContext;
 use crate::{Result, TxError};
 
 /// Execute an AccountMerge operation.
-pub fn execute_account_merge(
+pub(crate) fn execute_account_merge(
     dest: &MuxedAccount,
     source: &AccountId,
     state: &mut LedgerStateManager,

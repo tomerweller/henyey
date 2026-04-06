@@ -51,7 +51,7 @@ pub struct RestoreFootprintResources<'a> {
 /// # Returns
 ///
 /// Returns the operation result indicating success or a specific failure reason.
-pub fn execute_restore_footprint(
+pub(crate) fn execute_restore_footprint(
     _op: &RestoreFootprintOp,
     _source: &AccountId,
     state: &mut LedgerStateManager,

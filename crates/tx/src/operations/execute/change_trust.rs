@@ -18,7 +18,7 @@ use crate::validation::LedgerContext;
 use crate::{Result, TxError};
 // SECURITY: transaction framework handles rollback on operation failure; side effects are reverted
 /// Execute a ChangeTrust operation.
-pub fn execute_change_trust(
+pub(crate) fn execute_change_trust(
     op: &ChangeTrustOp,
     source: &AccountId,
     state: &mut LedgerStateManager,
