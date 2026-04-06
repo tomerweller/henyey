@@ -379,7 +379,7 @@ impl TransactionExecutor {
                 // This matches stellar-core's loadAccountWithoutRecord() call.
                 if let Some(ref inflation_dest) = op_data.inflation_dest {
                     if inflation_dest != &op_source {
-                        self.load_account(snapshot, inflation_dest)?;
+                        self.load_account_without_record(snapshot, inflation_dest)?;
                     }
                 }
 
