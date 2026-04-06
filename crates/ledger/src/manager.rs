@@ -1225,7 +1225,7 @@ pub struct LedgerManager {
     ///
     /// The executor's offer cache (~911K entries on mainnet) is expensive to
     /// rebuild from scratch (~2.7s per ledger). By persisting the executor
-    /// across ledger closes and calling `advance_to_ledger_preserving_offers`,
+    /// across ledger closes and calling `advance_to_ledger`,
     /// offers are maintained incrementally while non-offer entries are cleared
     /// and reloaded from the authoritative bucket list.
     ///
@@ -3468,7 +3468,7 @@ impl LedgerCloseContext<'_> {
     /// offers from the in-memory offer store on every ledger (~2.7s on mainnet).
     /// On the first call after initialization (or reset), a new executor is
     /// created and offers are loaded once. On subsequent calls, the executor is
-    /// advanced via `advance_to_ledger_preserving_offers` which clears non-offer
+    /// advanced via `advance_to_ledger` which clears non-offer
     /// cached entries while keeping the offer index intact.
     fn apply_transactions(&mut self) -> Result<Vec<TransactionExecutionResult>> {
         use henyey_common::protocol::PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION;
@@ -3571,7 +3571,7 @@ impl LedgerCloseContext<'_> {
             }
         } else {
             // Subsequent ledgers: advance the executor, preserving offers
-            executor_ref.advance_to_ledger_preserving_offers(
+            executor_ref.advance_to_ledger(
                 self.close_data.ledger_seq,
                 self.close_data.close_time,
                 self.prev_header.base_reserve,

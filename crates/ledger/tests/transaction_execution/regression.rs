@@ -1598,22 +1598,22 @@ fn test_cross_tx_deleted_trustline_not_reloaded() {
     );
 }
 
-/// Regression test for executor reuse across ledger closes via advance_to_ledger_preserving_offers.
+/// Regression test for executor reuse across ledger closes via advance_to_ledger.
 ///
 /// When the executor is reused across ledger boundaries, offers must be preserved
 /// correctly: offers consumed in ledger N must not reappear in ledger N+1, and
 /// surviving offers must remain available for matching.
 ///
-/// This test exercises the `advance_to_ledger_preserving_offers` path that avoids
+/// This test exercises the `advance_to_ledger` path that avoids
 /// reloading ~911K offers from the bucket list on every ledger close.
 ///
 /// The test flow:
 /// 1. Ledger 1: Load offers, execute a path payment that fully crosses offer A
-/// 2. advance_to_ledger_preserving_offers(ledger 2)
+/// 2. advance_to_ledger(ledger 2)
 /// 3. Ledger 2: Verify offer A is gone; execute a path payment that crosses offer B
 ///    (which survived from ledger 1)
 #[test]
-fn test_advance_to_ledger_preserving_offers() {
+fn test_advance_to_ledger() {
     // Accounts
     let source_secret = SecretKey::from_seed(&[220u8; 32]);
     let source_id: AccountId = (&source_secret.public_key()).into();
@@ -1799,7 +1799,7 @@ fn test_advance_to_ledger_preserving_offers() {
 
     // ===== ADVANCE TO LEDGER 2 =====
     // This is the key operation under test: preserving offers across ledger boundaries
-    executor.advance_to_ledger_preserving_offers(
+    executor.advance_to_ledger(
         2,         // new ledger_seq
         2_000,     // new close_time
         5_000_000, // base_reserve
@@ -1829,7 +1829,7 @@ fn test_advance_to_ledger_preserving_offers() {
     // ===== LEDGER 2: Path payment that crosses offer B =====
     // This verifies the preserved offer B is actually usable for matching.
     //
-    // After advance_to_ledger_preserving_offers, non-offer entries (accounts,
+    // After advance_to_ledger, non-offer entries (accounts,
     // trustlines) are cleared and will be reloaded from the snapshot. The
     // snapshot still has the original source account with seq_num=1, so TX2
     // must use seq_num=2 (the next valid seq for the reloaded state).

@@ -673,9 +673,16 @@ impl TransactionExecutor {
         }
     }
 
-    /// Advance to a new ledger, preserving the current state.
-    /// This is useful for replaying multiple consecutive ledgers without
-    /// losing state changes between them.
+    /// Advance to a new ledger, clearing cached entries but preserving offers.
+    ///
+    /// Offers are expensive to reload (~911K entries on mainnet, ~2.7s per ledger).
+    /// The executor's offer cache is maintained correctly across ledgers because:
+    /// 1. TX execution modifies offers directly in state (create/update/delete)
+    /// 2. At the end of a ledger, state.offers reflects the correct post-ledger state
+    /// 3. The in-memory offer store (LedgerManager) is also updated incrementally
+    ///
+    /// Non-offer entries are still cleared to reload from the bucket list, which
+    /// may have been updated with authoritative CDP metadata.
     ///
     /// Note: id_pool is NOT reset here because:
     /// 1. The executor's internal id_pool evolves correctly as transactions execute
@@ -690,36 +697,6 @@ impl TransactionExecutor {
         base_reserve: u32,
         protocol_version: u32,
         _id_pool: u64, // Intentionally unused - see note above
-        soroban_config: SorobanConfig,
-    ) {
-        self.ledger_seq = ledger_seq;
-        self.close_time = close_time;
-        self.base_reserve = base_reserve;
-        self.protocol_version = protocol_version;
-        self.soroban_config = soroban_config;
-        // Do NOT reset id_pool - it should continue from where it was
-        self.state.set_ledger_seq(ledger_seq);
-        // Note: loaded_accounts cache is preserved - this is intentional because
-        // accounts that were loaded/created in previous ledgers remain valid
-    }
-
-    /// Advance to a new ledger, clearing cached entries but preserving offers.
-    ///
-    /// Offers are expensive to reload (~911K entries on mainnet, ~2.7s per ledger).
-    /// The executor's offer cache is maintained correctly across ledgers because:
-    /// 1. TX execution modifies offers directly in state (create/update/delete)
-    /// 2. At the end of a ledger, state.offers reflects the correct post-ledger state
-    /// 3. The in-memory offer store (LedgerManager) is also updated incrementally
-    ///
-    /// Non-offer entries are still cleared to reload from the bucket list, which
-    /// may have been updated with authoritative CDP metadata.
-    pub fn advance_to_ledger_preserving_offers(
-        &mut self,
-        ledger_seq: u32,
-        close_time: u64,
-        base_reserve: u32,
-        protocol_version: u32,
-        _id_pool: u64,
         soroban_config: SorobanConfig,
     ) {
         self.ledger_seq = ledger_seq;
