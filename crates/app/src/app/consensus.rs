@@ -539,8 +539,15 @@ impl App {
     ) {
         let hash = henyey_scp::hash_quorum_set(&quorum_set);
 
-        // Get the node_ids that were waiting for this quorum set
+        // Get the node_ids that were waiting for this quorum set.
+        // Reject unsolicited quorum sets — matching stellar-core's
+        // PendingEnvelopes::recvSCPQuorumSet which checks
+        // getLastSeenSlotIndex(hash) != 0 before accepting.
         let node_ids = self.herder.get_pending_quorum_set_node_ids(&hash);
+        if node_ids.is_empty() {
+            tracing::debug!(%hash, "Ignoring unsolicited quorum set (no pending requests)");
+            return;
+        }
 
         if let Err(err) = self.db.store_scp_quorum_set(
             &hash,
@@ -550,14 +557,9 @@ impl App {
             tracing::warn!(error = %err, "Failed to store quorum set");
         }
 
-        // Store for all node_ids that use this quorum set
-        if node_ids.is_empty() {
-            tracing::debug!(%hash, "Received quorum set with no pending requests");
-        } else {
-            for node_id in &node_ids {
-                tracing::debug!(%hash, node_id = ?node_id, "Storing quorum set for node");
-                self.herder.store_quorum_set(node_id, quorum_set.clone());
-            }
+        for node_id in &node_ids {
+            tracing::debug!(%hash, node_id = ?node_id, "Storing quorum set for node");
+            self.herder.store_quorum_set(node_id, quorum_set.clone());
         }
 
         self.herder.clear_quorum_set_request(&hash);
