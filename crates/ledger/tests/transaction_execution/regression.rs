@@ -3832,6 +3832,124 @@ fn test_audit_577_pre_charged_should_apply_false_skips_body() {
     );
 }
 
+/// Regression test for AUDIT-577 Finding 2: MAX_SEQ_NUM_TO_APPLY was only
+/// populated when deduct_fee=true. The external pre-charged path (parallel
+/// Soroban) passes deduct_fee=false, so AccountMerge protection was missing.
+///
+/// When a TX's sequence number is at or above starting_seq (ledger_seq << 32),
+/// AccountMerge must be blocked with SeqnumTooFar. Before the fix, the
+/// MAX_SEQ_NUM_TO_APPLY map was empty in the pre-charged path, so the merge
+/// would incorrectly succeed.
+#[test]
+fn test_audit_577_max_seq_num_to_apply_with_pre_charged() {
+    use henyey_ledger::execution::{run_transactions_on_executor, PreChargedFee};
+    use henyey_ledger::LedgerDelta;
+    use stellar_xdr::curr::AccountMergeResult;
+
+    let ledger_seq: u32 = 2;
+    let starting_seq: i64 = (ledger_seq as i64) << 32; // 8589934592
+
+    let secret = SecretKey::from_seed(&[78u8; 32]);
+    let source_id: AccountId = (&secret.public_key()).into();
+    // Source account with seq_num = starting_seq so the TX seq_num
+    // (starting_seq + 1) passes the sequence-number check.
+    // TX seq_num = starting_seq + 1 >= starting_seq triggers SeqnumTooFar.
+    let (source_key, source_entry) =
+        create_account_entry(source_id.clone(), starting_seq, 100_000_000);
+
+    // Destination for the merge.
+    let dest_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([89u8; 32])));
+    let (dest_key, dest_entry) = create_account_entry(dest_id.clone(), 1, 50_000_000);
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .add_entry(dest_key, dest_entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let network_id = NetworkId::testnet();
+    let base_fee: u32 = 100;
+    let base_reserve: u32 = 5_000_000;
+
+    // Build an AccountMerge TX with seq_num = starting_seq.
+    let op = Operation {
+        source_account: None,
+        body: OperationBody::AccountMerge(MuxedAccount::Ed25519(Uint256([89u8; 32]))),
+    };
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: base_fee,
+        seq_num: SequenceNumber(starting_seq + 1),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    let sig = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![sig].try_into().unwrap();
+    }
+
+    let context =
+        henyey_tx::LedgerContext::new(ledger_seq, 1_000, base_fee, base_reserve, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+    executor
+        .load_orderbook_offers(&snapshot)
+        .expect("load offers");
+
+    // Pre-charge with should_apply=true and deduct_fee=false (the parallel path).
+    let pre_charged = vec![PreChargedFee {
+        charged_fee: 100,
+        should_apply: true,
+        fee_changes: LedgerEntryChanges(vec![].try_into().unwrap()),
+    }];
+
+    let transactions = vec![(std::sync::Arc::new(envelope), None)];
+    let mut delta = LedgerDelta::new(ledger_seq);
+
+    let result = run_transactions_on_executor(henyey_ledger::execution::RunTransactionsParams {
+        executor: &mut executor,
+        snapshot: &snapshot,
+        transactions: &transactions,
+        base_fee,
+        soroban_base_prng_seed: [0u8; 32],
+        deduct_fee: false,
+        delta: &mut delta,
+        external_pre_charged: Some(&pre_charged),
+    })
+    .expect("run_transactions_on_executor");
+
+    // The TX must fail because MAX_SEQ_NUM_TO_APPLY blocks the merge.
+    assert!(
+        !result.results[0].success,
+        "AccountMerge must fail when TX seq_num >= starting_seq"
+    );
+
+    // Verify the operation result is SeqnumTooFar specifically.
+    let op_result = &result.results[0].operation_results[0];
+    match op_result {
+        OperationResult::OpInner(OperationResultTr::AccountMerge(
+            AccountMergeResult::SeqnumTooFar,
+        )) => {} // expected
+        other => panic!("Expected AccountMerge::SeqnumTooFar, got {:?}", other),
+    }
+
+    // Source account must still exist (merge was blocked).
+    assert!(
+        executor.state().get_account(&source_id).is_some(),
+        "source account must still exist when merge is blocked by MAX_SEQ_NUM_TO_APPLY"
+    );
+}
+
 /// Regression test for the single-op savepoint skip optimization.
 ///
 /// When a transaction has exactly one operation, the per-operation savepoint is
