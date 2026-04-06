@@ -212,13 +212,19 @@ impl FlowControlConfig {
         let new_max = new_tx_max_size_bytes.saturating_add(self.extra_buffer);
         let new_max = std::cmp::max(self.max_classic_tx_size, new_max);
 
-        if new_max > self.max_tx_size {
-            let diff = new_max - self.max_tx_size;
-            self.max_tx_size = new_max;
-            diff
+        // Only report an increase for flow control capacity adjustment
+        let diff = if new_max > self.max_tx_size {
+            new_max - self.max_tx_size
         } else {
             0
-        }
+        };
+
+        // Always update max_tx_size to reflect the current config, including
+        // decreases. Matches stellar-core HerderImpl::maybeHandleUpgrade():
+        //   mMaxTxSize = std::max(getMaxClassicTxSize(), maybeNewMaxTxSize);
+        self.max_tx_size = new_max;
+
+        diff
     }
 
     /// Check if a transaction is within size limits.
@@ -337,14 +343,38 @@ mod tests {
             500_000 + FLOW_CONTROL_BYTES_EXTRA_BUFFER
         );
 
-        // No change (decrease is clamped)
+        // Decrease: diff is 0 but max_tx_size updates to reflect current config.
+        // 10_000 + buffer < classic limit, so max_tx_size = classic limit.
         let diff = config.update_for_soroban(10_000);
         assert_eq!(diff, 0);
-        // Max stays at the higher value
+        assert_eq!(config.max_tx_size, MAX_CLASSIC_TX_SIZE_BYTES);
+    }
+
+    #[test]
+    fn test_audit_471_soroban_decrease_updates_max_tx_size() {
+        // stellar-core always updates mMaxTxSize to max(classicTxSize, newSorobanMax)
+        // even on decreases. Verify henyey matches: after a decrease, max_tx_size
+        // should reflect the lower value, not stay at the old higher value.
+        let mut config = FlowControlConfig::default();
+
+        // First: increase to 500_000 + buffer
+        let diff = config.update_for_soroban(500_000);
+        assert!(diff > 0);
+        let high_max = config.max_tx_size;
+        assert_eq!(high_max, 500_000 + FLOW_CONTROL_BYTES_EXTRA_BUFFER);
+
+        // Now: decrease to 200_000 + buffer. diff should be 0 (only increases
+        // are propagated to flow control capacity), but max_tx_size should update.
+        let diff = config.update_for_soroban(200_000);
+        assert_eq!(diff, 0);
+        // Per stellar-core: mMaxTxSize = max(classicTxSize, 200_000 + buffer)
         assert_eq!(
             config.max_tx_size,
-            500_000 + FLOW_CONTROL_BYTES_EXTRA_BUFFER
+            200_000 + FLOW_CONTROL_BYTES_EXTRA_BUFFER
         );
+
+        // Transactions above the new limit should be rejected
+        assert!(!config.is_tx_size_valid(200_000 + FLOW_CONTROL_BYTES_EXTRA_BUFFER + 1));
     }
 
     #[test]
