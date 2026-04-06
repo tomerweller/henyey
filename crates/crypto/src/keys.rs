@@ -64,14 +64,17 @@ impl PublicKey {
 
     /// Verifies an Ed25519 signature over a message.
     ///
+    /// Uses `verify_strict` to reject small-order and mixed-order public key
+    /// points, matching stellar-core's libsodium / dalek behavior
+    /// (see stellar-core/src/rust/src/ed25519_verify.rs:39).
+    ///
     /// # Errors
     ///
     /// Returns [`CryptoError::InvalidSignature`] if verification fails.
     pub fn verify(&self, message: &[u8], signature: &Signature) -> Result<(), CryptoError> {
-        use ed25519_dalek::Verifier;
         let sig = ed25519_dalek::Signature::from_bytes(&signature.0);
         self.0
-            .verify(message, &sig)
+            .verify_strict(message, &sig)
             .map_err(|_| CryptoError::InvalidSignature)
     }
 
