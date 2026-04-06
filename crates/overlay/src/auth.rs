@@ -639,11 +639,10 @@ impl AuthContext {
 
                     let expected_mac = self.compute_mac(recv_key, v0.sequence, &v0.message)?;
                     tracing::debug!(
-                        "MAC verification: seq={}, expected={:02x?}, got={:02x?}, key={:02x?}",
+                        "MAC verification: seq={}, expected={:02x?}, got={:02x?}",
                         v0.sequence,
                         &expected_mac.mac[..8],
                         &v0.mac.mac[..8],
-                        &recv_key.key[..8]
                     );
                     // Spec: OVERLAY_SPEC §3.4 — MAC comparison MUST be constant-time
                     // to prevent timing side-channel attacks.
