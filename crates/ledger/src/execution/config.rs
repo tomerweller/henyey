@@ -31,6 +31,32 @@ pub(crate) fn load_config_setting(
     }
 }
 
+/// Load a required config setting and extract a specific variant.
+///
+/// Reduces the repeated pattern of:
+/// 1. `load_config_setting(snapshot, id)?`
+/// 2. `require_setting(result, id)?`
+/// 3. `if let ConfigSettingEntry::Variant(val) = cs { val } else { return Err(...) }`
+macro_rules! load_config {
+    ($snapshot:expr, $id:expr, $variant:ident) => {{
+        let id = $id;
+        let cs = load_config_setting($snapshot, id)?.ok_or_else(|| {
+            LedgerError::Internal(format!(
+                "load_soroban_config: required config setting {:?} not found in ledger",
+                id
+            ))
+        })?;
+        if let ConfigSettingEntry::$variant(val) = cs {
+            val
+        } else {
+            return Err(LedgerError::Internal(format!(
+                "load_soroban_config: unexpected variant for {:?}",
+                id
+            )));
+        }
+    }};
+}
+
 /// Load SorobanConfig from the ledger's ConfigSettingEntry entries.
 ///
 /// This loads the cost parameters and limits from the ledger state,
@@ -49,68 +75,38 @@ pub fn load_soroban_config(
     snapshot: &SnapshotHandle,
     protocol_version: u32,
 ) -> Result<SorobanConfig> {
-    // Helper: extract a required config setting, returning an error if missing.
-    // This matches stellar-core's `releaseAssertOrThrow(lsle)` pattern where
-    // a missing required config entry is a fatal invariant violation.
-    fn require_setting(
-        setting: Option<ConfigSettingEntry>,
-        id: ConfigSettingId,
-    ) -> Result<ConfigSettingEntry> {
-        setting.ok_or_else(|| {
-            LedgerError::Internal(format!(
-                "load_soroban_config: required config setting {:?} not found in ledger",
-                id
-            ))
-        })
-    }
-
     // Load CPU cost params
-    let cpu_cost_params = {
-        let id = ConfigSettingId::ContractCostParamsCpuInstructions;
-        let cs = require_setting(load_config_setting(snapshot, id)?, id)?;
-        if let ConfigSettingEntry::ContractCostParamsCpuInstructions(params) = cs {
-            params
-        } else {
-            return Err(LedgerError::Internal(format!(
-                "load_soroban_config: unexpected variant for {:?}",
-                id
-            )));
-        }
-    };
+    let cpu_cost_params = load_config!(
+        snapshot,
+        ConfigSettingId::ContractCostParamsCpuInstructions,
+        ContractCostParamsCpuInstructions
+    );
 
     // Load memory cost params
-    let mem_cost_params = {
-        let id = ConfigSettingId::ContractCostParamsMemoryBytes;
-        let cs = require_setting(load_config_setting(snapshot, id)?, id)?;
-        if let ConfigSettingEntry::ContractCostParamsMemoryBytes(params) = cs {
-            params
-        } else {
-            return Err(LedgerError::Internal(format!(
-                "load_soroban_config: unexpected variant for {:?}",
-                id
-            )));
-        }
-    };
+    let mem_cost_params = load_config!(
+        snapshot,
+        ConfigSettingId::ContractCostParamsMemoryBytes,
+        ContractCostParamsMemoryBytes
+    );
 
     // Load compute limits and fee rate per instructions
-    let (tx_max_instructions, tx_max_memory_bytes, fee_per_instruction_increment) = {
-        let id = ConfigSettingId::ContractComputeV0;
-        let cs = require_setting(load_config_setting(snapshot, id)?, id)?;
-        if let ConfigSettingEntry::ContractComputeV0(compute) = cs {
-            (
-                compute.tx_max_instructions as u64,
-                compute.tx_memory_limit as u64,
-                compute.fee_rate_per_instructions_increment,
-            )
-        } else {
-            return Err(LedgerError::Internal(format!(
-                "load_soroban_config: unexpected variant for {:?}",
-                id
-            )));
-        }
-    };
+    let compute = load_config!(
+        snapshot,
+        ConfigSettingId::ContractComputeV0,
+        ContractComputeV0
+    );
+    let (tx_max_instructions, tx_max_memory_bytes, fee_per_instruction_increment) = (
+        compute.tx_max_instructions as u64,
+        compute.tx_memory_limit as u64,
+        compute.fee_rate_per_instructions_increment,
+    );
 
     // Load ledger cost settings
+    let cost = load_config!(
+        snapshot,
+        ConfigSettingId::ContractLedgerCostV0,
+        ContractLedgerCostV0
+    );
     let (
         fee_disk_read_ledger_entry,
         fee_write_ledger_entry,
@@ -119,26 +115,15 @@ pub fn load_soroban_config(
         rent_fee_1kb_state_size_low,
         rent_fee_1kb_state_size_high,
         soroban_state_rent_fee_growth_factor,
-    ) = {
-        let id = ConfigSettingId::ContractLedgerCostV0;
-        let cs = require_setting(load_config_setting(snapshot, id)?, id)?;
-        if let ConfigSettingEntry::ContractLedgerCostV0(cost) = cs {
-            (
-                cost.fee_disk_read_ledger_entry,
-                cost.fee_write_ledger_entry,
-                cost.fee_disk_read1_kb,
-                cost.soroban_state_target_size_bytes,
-                cost.rent_fee1_kb_soroban_state_size_low,
-                cost.rent_fee1_kb_soroban_state_size_high,
-                cost.soroban_state_rent_fee_growth_factor,
-            )
-        } else {
-            return Err(LedgerError::Internal(format!(
-                "load_soroban_config: unexpected variant for {:?}",
-                id
-            )));
-        }
-    };
+    ) = (
+        cost.fee_disk_read_ledger_entry,
+        cost.fee_write_ledger_entry,
+        cost.fee_disk_read1_kb,
+        cost.soroban_state_target_size_bytes,
+        cost.rent_fee1_kb_soroban_state_size_low,
+        cost.rent_fee1_kb_soroban_state_size_high,
+        cost.soroban_state_rent_fee_growth_factor,
+    );
 
     // Load fee_write_1kb from extended cost settings (Protocol 23+).
     // For protocol < 23, this setting may not exist, so we use 0 as the default.
@@ -157,126 +142,86 @@ pub fn load_soroban_config(
     };
 
     let fee_historical_1kb = {
-        let id = ConfigSettingId::ContractHistoricalDataV0;
-        let cs = require_setting(load_config_setting(snapshot, id)?, id)?;
-        if let ConfigSettingEntry::ContractHistoricalDataV0(hist) = cs {
-            hist.fee_historical1_kb
-        } else {
-            return Err(LedgerError::Internal(format!(
-                "load_soroban_config: unexpected variant for {:?}",
-                id
-            )));
-        }
+        let hist = load_config!(
+            snapshot,
+            ConfigSettingId::ContractHistoricalDataV0,
+            ContractHistoricalDataV0
+        );
+        hist.fee_historical1_kb
     };
 
     let (tx_max_contract_events_size_bytes, fee_contract_events_1kb) = {
-        let id = ConfigSettingId::ContractEventsV0;
-        let cs = require_setting(load_config_setting(snapshot, id)?, id)?;
-        if let ConfigSettingEntry::ContractEventsV0(events) = cs {
-            (
-                events.tx_max_contract_events_size_bytes,
-                events.fee_contract_events1_kb,
-            )
-        } else {
-            return Err(LedgerError::Internal(format!(
-                "load_soroban_config: unexpected variant for {:?}",
-                id
-            )));
-        }
+        let events = load_config!(
+            snapshot,
+            ConfigSettingId::ContractEventsV0,
+            ContractEventsV0
+        );
+        (
+            events.tx_max_contract_events_size_bytes,
+            events.fee_contract_events1_kb,
+        )
     };
 
     let fee_tx_size_1kb = {
-        let id = ConfigSettingId::ContractBandwidthV0;
-        let cs = require_setting(load_config_setting(snapshot, id)?, id)?;
-        if let ConfigSettingEntry::ContractBandwidthV0(bandwidth) = cs {
-            bandwidth.fee_tx_size1_kb
-        } else {
-            return Err(LedgerError::Internal(format!(
-                "load_soroban_config: unexpected variant for {:?}",
-                id
-            )));
-        }
+        let bandwidth = load_config!(
+            snapshot,
+            ConfigSettingId::ContractBandwidthV0,
+            ContractBandwidthV0
+        );
+        bandwidth.fee_tx_size1_kb
     };
 
     // Load contract size limits for entry validation (validateContractLedgerEntry)
-    let max_contract_size_bytes = {
-        let id = ConfigSettingId::ContractMaxSizeBytes;
-        let cs = require_setting(load_config_setting(snapshot, id)?, id)?;
-        if let ConfigSettingEntry::ContractMaxSizeBytes(size) = cs {
-            size
-        } else {
-            return Err(LedgerError::Internal(format!(
-                "load_soroban_config: unexpected variant for {:?}",
-                id
-            )));
-        }
-    };
+    let max_contract_size_bytes = load_config!(
+        snapshot,
+        ConfigSettingId::ContractMaxSizeBytes,
+        ContractMaxSizeBytes
+    );
 
-    let max_contract_data_entry_size_bytes = {
-        let id = ConfigSettingId::ContractDataEntrySizeBytes;
-        let cs = require_setting(load_config_setting(snapshot, id)?, id)?;
-        if let ConfigSettingEntry::ContractDataEntrySizeBytes(size) = cs {
-            size
-        } else {
-            return Err(LedgerError::Internal(format!(
-                "load_soroban_config: unexpected variant for {:?}",
-                id
-            )));
-        }
-    };
+    let max_contract_data_entry_size_bytes = load_config!(
+        snapshot,
+        ConfigSettingId::ContractDataEntrySizeBytes,
+        ContractDataEntrySizeBytes
+    );
 
     // Load state archival TTL settings
+    let archival = load_config!(snapshot, ConfigSettingId::StateArchival, StateArchival);
+    tracing::debug!(
+        min_temp_ttl = archival.min_temporary_ttl,
+        min_persistent_ttl = archival.min_persistent_ttl,
+        max_entry_ttl = archival.max_entry_ttl,
+        persistent_rent_rate_denominator = archival.persistent_rent_rate_denominator,
+        temp_rent_rate_denominator = archival.temp_rent_rate_denominator,
+        "load_soroban_config: StateArchival settings from ledger"
+    );
     let (
         min_temp_entry_ttl,
         min_persistent_entry_ttl,
         max_entry_ttl,
         persistent_rent_rate_denominator,
         temp_rent_rate_denominator,
-    ) = {
-        let id = ConfigSettingId::StateArchival;
-        let cs = require_setting(load_config_setting(snapshot, id)?, id)?;
-        if let ConfigSettingEntry::StateArchival(archival) = cs {
-            tracing::debug!(
-                min_temp_ttl = archival.min_temporary_ttl,
-                min_persistent_ttl = archival.min_persistent_ttl,
-                max_entry_ttl = archival.max_entry_ttl,
-                persistent_rent_rate_denominator = archival.persistent_rent_rate_denominator,
-                temp_rent_rate_denominator = archival.temp_rent_rate_denominator,
-                "load_soroban_config: StateArchival settings from ledger"
-            );
-            (
-                archival.min_temporary_ttl,
-                archival.min_persistent_ttl,
-                archival.max_entry_ttl,
-                archival.persistent_rent_rate_denominator,
-                archival.temp_rent_rate_denominator,
-            )
-        } else {
-            return Err(LedgerError::Internal(format!(
-                "load_soroban_config: unexpected variant for {:?}",
-                id
-            )));
-        }
-    };
+    ) = (
+        archival.min_temporary_ttl,
+        archival.min_persistent_ttl,
+        archival.max_entry_ttl,
+        archival.persistent_rent_rate_denominator,
+        archival.temp_rent_rate_denominator,
+    );
 
     let average_soroban_state_size = {
-        let id = ConfigSettingId::LiveSorobanStateSizeWindow;
-        let cs = require_setting(load_config_setting(snapshot, id)?, id)?;
-        if let ConfigSettingEntry::LiveSorobanStateSizeWindow(window) = cs {
-            if window.is_empty() {
-                0i64
-            } else {
-                let mut sum: u64 = 0;
-                for size in window.iter() {
-                    sum = sum.saturating_add(*size);
-                }
-                (sum / window.len() as u64) as i64
-            }
+        let window = load_config!(
+            snapshot,
+            ConfigSettingId::LiveSorobanStateSizeWindow,
+            LiveSorobanStateSizeWindow
+        );
+        if window.is_empty() {
+            0i64
         } else {
-            return Err(LedgerError::Internal(format!(
-                "load_soroban_config: unexpected variant for {:?}",
-                id
-            )));
+            let mut sum: u64 = 0;
+            for size in window.iter() {
+                sum = sum.saturating_add(*size);
+            }
+            (sum / window.len() as u64) as i64
         }
     };
 
