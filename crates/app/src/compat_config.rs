@@ -359,8 +359,21 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
                 config.node.quorum_set.validators = keys;
             }
         }
-        // THRESHOLD_PERCENT is accepted but not used — henyey computes
-        // threshold from the validator count automatically.
+        // Parse THRESHOLD_PERCENT and apply it to the quorum set config.
+        // stellar-core default is 67 if not specified.
+        if let Some(tp) = qs_table
+            .get("THRESHOLD_PERCENT")
+            .and_then(|v| v.as_integer())
+        {
+            if (1..=100).contains(&tp) {
+                config.node.quorum_set.threshold_percent = tp as u32;
+            } else {
+                tracing::warn!(
+                    threshold_percent = tp,
+                    "THRESHOLD_PERCENT must be between 1 and 100, using default"
+                );
+            }
+        }
     }
 
     // --- Testing keys ---
@@ -734,6 +747,43 @@ mod tests {
         .public_key()
         .to_strkey();
         assert_eq!(config.node.quorum_set.validators[0], expected_pubkey);
+        // THRESHOLD_PERCENT=100 should be applied (not silently dropped to default 67)
+        assert_eq!(config.node.quorum_set.threshold_percent, 100);
+    }
+
+    #[test]
+    fn test_old_style_quorum_set_threshold_percent() {
+        // With THRESHOLD_PERCENT=100 and 1 validator, both 100% and 67% produce threshold=1.
+        // But the config value itself must be 100, not the default 67.
+        // Use a 2-validator setup with THRESHOLD_PERCENT=100 to make the threshold observable:
+        // - 100%: threshold = (2*100)/100 = 2
+        // - 67% (default): threshold = (2*67)/100 = 1 — WRONG
+        let key2 = henyey_crypto::SecretKey::from_seed(&[2u8; 32])
+            .public_key()
+            .to_strkey();
+        let core_toml: toml::Value = toml::from_str(&format!(
+            r#"
+            NETWORK_PASSPHRASE = "Standalone Network ; February 2017"
+            NODE_SEED = "SDQVDISRYN2JXBS7ICL7QJAEKB3HWBJFP2QECXG7GZICAHBK4UNJCWK2 self"
+            NODE_IS_VALIDATOR = true
+            UNSAFE_QUORUM = true
+            FAILURE_SAFETY = 0
+            [QUORUM_SET]
+            THRESHOLD_PERCENT = 100
+            VALIDATORS = ["$self", "{}"]
+            "#,
+            key2
+        ))
+        .unwrap();
+
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        assert_eq!(config.node.quorum_set.threshold_percent, 100);
+        assert_eq!(config.node.quorum_set.validators.len(), 2);
+
+        // Verify to_xdr produces correct threshold
+        let xdr_qs = config.node.quorum_set.to_xdr().unwrap();
+        // 100% of 2 validators = threshold 2
+        assert_eq!(xdr_qs.threshold, 2);
     }
 
     #[test]
