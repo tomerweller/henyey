@@ -1056,7 +1056,11 @@ impl LedgerCloseResult {
     /// Get the transaction result set.
     pub fn tx_result_set(&self) -> TransactionResultSet {
         TransactionResultSet {
-            results: self.tx_results.clone().try_into().unwrap_or_default(),
+            results: self
+                .tx_results
+                .clone()
+                .try_into()
+                .expect("tx results must fit XDR bounds"),
         }
     }
 
@@ -1232,7 +1236,9 @@ impl UpgradeContext {
             memory_cost_params_changed |= memory_cost;
 
             // Store changes keyed by serialized ConfigUpgradeSetKey for later matching
-            let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
+            let key_bytes = key
+                .to_xdr(Limits::none())
+                .expect("ConfigUpgradeSetKey XDR serialization must not fail");
             per_upgrade_changes.insert(key_bytes, entry_changes);
 
             tracing::info!(
@@ -1353,7 +1359,11 @@ impl UpgradeContext {
             LedgerEntryChange::State(previous),
             LedgerEntryChange::Updated(updated),
         ];
-        Ok(LedgerEntryChanges(changes.try_into().unwrap_or_default()))
+        Ok(LedgerEntryChanges(
+            changes
+                .try_into()
+                .expect("ledger entry changes must fit XDR bounds"),
+        ))
     }
 }
 

@@ -893,7 +893,11 @@ pub(super) fn build_entry_changes_with_hot_archive(
         }
     }
 
-    LedgerEntryChanges(changes.try_into().unwrap_or_default())
+    LedgerEntryChanges(
+        changes
+            .try_into()
+            .expect("ledger entry changes must fit XDR bounds"),
+    )
 }
 
 pub(super) fn empty_entry_changes() -> LedgerEntryChanges {
@@ -920,7 +924,9 @@ pub(super) fn build_transaction_meta(parts: TransactionMetaParts) -> Transaction
         .map(|(changes, events)| OperationMetaV2 {
             ext: ExtensionPoint::V0,
             changes,
-            events: events.try_into().unwrap_or_default(),
+            events: events
+                .try_into()
+                .expect("operation events must fit XDR bounds"),
         })
         .collect();
 
@@ -966,11 +972,18 @@ pub(super) fn build_transaction_meta(parts: TransactionMetaParts) -> Transaction
     TransactionMeta::V4(TransactionMetaV4 {
         ext: ExtensionPoint::V0,
         tx_changes_before: parts.tx_changes_before,
-        operations: operations.try_into().unwrap_or_default(),
+        operations: operations
+            .try_into()
+            .expect("operations must fit XDR bounds"),
         tx_changes_after: empty_entry_changes(),
         soroban_meta,
-        events: parts.tx_events.try_into().unwrap_or_default(),
-        diagnostic_events: filtered_diagnostics.try_into().unwrap_or_default(),
+        events: parts
+            .tx_events
+            .try_into()
+            .expect("tx events must fit XDR bounds"),
+        diagnostic_events: filtered_diagnostics
+            .try_into()
+            .expect("diagnostic events must fit XDR bounds"),
     })
 }
 

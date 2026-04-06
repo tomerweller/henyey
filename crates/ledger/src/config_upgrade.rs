@@ -394,8 +394,11 @@ impl ConfigUpgradeSetFrame {
             self.maybe_update_state_size_window(snapshot, delta)?;
         }
 
-        let entry_changes =
-            stellar_xdr::curr::LedgerEntryChanges(changes.try_into().unwrap_or_default());
+        let entry_changes = stellar_xdr::curr::LedgerEntryChanges(
+            changes
+                .try_into()
+                .expect("config upgrade entry changes must fit XDR bounds"),
+        );
 
         Ok((
             state_archival_changed,
@@ -496,7 +499,9 @@ impl ConfigUpgradeSetFrame {
     /// Validate XDR structure.
     fn is_valid_xdr_static(upgrade_set: &ConfigUpgradeSet, key: &ConfigUpgradeSetKey) -> bool {
         // Check hash matches
-        let bytes = upgrade_set.to_xdr(Limits::none()).unwrap_or_default();
+        let bytes = upgrade_set
+            .to_xdr(Limits::none())
+            .expect("ConfigUpgradeSet XDR serialization must not fail");
         let computed_hash = Sha256::digest(&bytes);
         if &computed_hash[..] != key.content_hash.0 {
             debug!(
