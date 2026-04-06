@@ -1295,6 +1295,7 @@ impl UpgradeContext {
     }
 
     /// Check if there's a MaxSorobanTxSetSize upgrade.
+    // INVARIANT: MaxSorobanTxSetSize config always present after genesis ledger
     pub fn max_soroban_tx_set_size_upgrade(&self) -> Option<u32> {
         for upgrade in &self.upgrades {
             if let LedgerUpgrade::MaxSorobanTxSetSize(size) = upgrade {

@@ -158,6 +158,7 @@ impl SorobanStorage {
         self.code_entries.get(hash).and_then(|c| c.as_ref())
     }
 
+    // SECURITY: HashMap iteration in test helpers only; production path uses Vec with deterministic ordering
     /// Get all written entries.
     pub fn written_entries(&self) -> impl Iterator<Item = (&StorageKey, &Option<StorageEntry>)> {
         self.write_entries.iter()

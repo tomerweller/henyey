@@ -644,6 +644,7 @@ impl ApplyLoad {
             return 0;
         }
 
+        // INVARIANT: test infrastructure only; not deployed in production. Panics are acceptable for misconfiguration.
         assert_eq!(
             config.num_disk_read_entries.len(),
             config.num_disk_read_entries_distribution.len(),

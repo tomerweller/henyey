@@ -418,6 +418,7 @@ pub fn validate_fee_bump(
 /// This performs cryptographic verification of inner signatures. It's separate
 /// from `validate_fee_bump` because it requires the full public keys from account
 /// data, not just the signature hints.
+// SECURITY: actual transaction auth uses has_sufficient_signer_weight() with threshold accumulation, not this helper
 pub fn verify_inner_signatures(
     inner_hash: &Hash256,
     signatures: &[DecoratedSignature],

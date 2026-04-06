@@ -54,6 +54,7 @@ impl Work for GetHistoryArchiveStateWork {
         "get-history-archive-state"
     }
 
+    // SECURITY: checkpoint data validated by hash chain; content integrity verified before acceptance
     async fn run(&mut self, _ctx: &WorkContext) -> WorkOutcome {
         set_progress(&self.state, HistoryWorkStage::FetchHas, "fetching HAS").await;
         match self.archive.get_checkpoint_has(self.checkpoint).await {
@@ -235,6 +236,7 @@ impl Work for DownloadLedgerHeadersWork {
         "download-ledger-headers"
     }
 
+    // SECURITY: checkpoint data validated by hash chain; content integrity verified before acceptance
     async fn run(&mut self, _ctx: &WorkContext) -> WorkOutcome {
         set_progress(
             &self.state,

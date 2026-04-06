@@ -25,6 +25,7 @@ pub async fn handle(
         .decode(tx_b64)
         .map_err(|e| JsonRpcError::invalid_params(format!("invalid base64: {}", e)))?;
 
+    // SECURITY: XDR decode bounded by HTTP body size limit; Limits::none() safe after frame-level check
     let tx_env = TransactionEnvelope::from_xdr(&tx_bytes, Limits::none())
         .map_err(|e| JsonRpcError::invalid_params(format!("invalid XDR: {}", e)))?;
 

@@ -135,6 +135,7 @@ pub fn config_to_quorum_set(config: &QuorumSetConfig) -> Result<ScpQuorumSet, Qu
             .expect("inner sets exceed XDR maximum capacity"),
     };
 
+    // SECURITY: quorum config validated during node startup; runtime input is trusted
     // Validate the resulting quorum set
     if !is_valid_quorum_set(&qs) {
         return Err(QuorumConfigError::InvalidStructure(

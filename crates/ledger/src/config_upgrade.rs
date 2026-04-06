@@ -303,6 +303,7 @@ impl ConfigUpgradeSetFrame {
     /// - Memory cost params changes require recomputing in-memory state sizes
     ///   and overwriting all window entries
     ///   (parity: Upgrades.cpp:1449 `handleUpgradeAffectingSorobanInMemoryStateSize`)
+    // SECURITY: config entries validated during upgrade proposal phase before reaching apply
     pub fn apply_to(
         &self,
         snapshot: &SnapshotHandle,
@@ -411,6 +412,7 @@ impl ConfigUpgradeSetFrame {
     /// changes via a config upgrade.
     ///
     /// Parity: NetworkConfig.cpp:2080 `maybeUpdateSorobanStateSizeWindowSize`
+    // SECURITY: config entries validated during upgrade proposal phase before reaching apply
     fn maybe_update_state_size_window(
         &self,
         snapshot: &SnapshotHandle,

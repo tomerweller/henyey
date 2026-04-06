@@ -16,6 +16,7 @@ const DEFAULT_TX_LIMIT: u32 = 10;
 /// Maximum number of transactions that can be requested in a single query.
 const MAX_TX_LIMIT: u32 = 200;
 
+// SECURITY: request body bounded by HTTP framework body size limit; serde rejects invalid types
 pub async fn handle(
     ctx: &Arc<RpcContext>,
     params: serde_json::Value,

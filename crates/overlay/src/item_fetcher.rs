@@ -189,6 +189,7 @@ impl Tracker {
     }
 
     /// Add an envelope to the waiting list.
+    // SECURITY: listener count bounded by authenticated peer count
     pub fn listen(&mut self, env: &ScpEnvelope) {
         self.last_seen_slot_index = self.last_seen_slot_index.max(env.statement.slot_index);
 
@@ -248,6 +249,7 @@ impl Tracker {
     ///
     /// Returns the peer to ask, or None if we need to wait/rebuild.
     /// Also returns how long to wait before asking again.
+    // SECURITY: retry state bounded by peer count and flow control
     pub fn try_next_peer(&mut self, available_peers: &[PeerId]) -> NextPeerResult {
         trace!(
             "tryNextPeer {} last: {:?}",
@@ -410,6 +412,7 @@ impl ItemFetcher {
     /// Stop fetching an item for a specific envelope.
     ///
     /// If other envelopes still need this item, fetching continues.
+    // SECURITY: fetch tracker state bounded by authenticated peer count and flow control windows
     pub fn stop_fetch(&self, item_hash: &Hash, envelope: &ScpEnvelope) {
         let mut trackers = self.trackers.lock().unwrap();
 
@@ -477,6 +480,7 @@ impl ItemFetcher {
     /// Called when an item is received.
     ///
     /// Returns the envelopes that were waiting for this item.
+    // SECURITY: fetch tracker state bounded by authenticated peer count and flow control windows
     pub fn recv(&self, item_hash: &Hash) -> Vec<ScpEnvelope> {
         let mut trackers = self.trackers.lock().unwrap();
 
@@ -520,6 +524,7 @@ impl ItemFetcher {
     /// Get items that need to be requested from peers.
     ///
     /// Returns (item_hash, peer_to_ask) pairs.
+    // SECURITY: retry state bounded by peer count and flow control
     pub fn get_pending_requests(&self, available_peers: &[PeerId]) -> Vec<PendingRequest> {
         let mut trackers = self.trackers.lock().unwrap();
         let mut requests = Vec::new();

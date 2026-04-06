@@ -176,6 +176,7 @@ impl SharedPeerState {
     /// Routes to dedicated channels (SCP, fetch response, extra subscribers)
     /// first, then falls through to the generic broadcast channel for
     /// non-dedicated messages.
+    // SECURITY: subscriber count bounded by internal callers; no external input
     pub(super) fn route_to_subscribers(&self, msg: OverlayMessage) -> bool {
         let is_scp = matches!(msg.message, StellarMessage::ScpMessage(_));
         let is_fetch_response = matches!(
@@ -336,6 +337,7 @@ impl OverlayManager {
     }
 
     /// Create a new overlay manager with a custom connection factory.
+    // SECURITY: subscriber count bounded by internal callers; no external input
     pub fn new_with_connection_factory(
         config: OverlayConfig,
         local_node: LocalNode,
@@ -782,6 +784,7 @@ impl OverlayManager {
     ///
     /// Used by the catchup message cacher to ensure no EXTERNALIZE or GeneralizedTxSet
     /// messages are lost during the catchup period.
+    // SECURITY: subscriber count bounded by internal callers; no external input
     pub fn subscribe_catchup(&self) -> mpsc::UnboundedReceiver<OverlayMessage> {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut subs = self.extra_subscribers.write();

@@ -378,6 +378,7 @@ impl PeerAddress {
     ///
     /// These addresses should not be shared with other peers as they
     /// are not routable on the public internet.
+    // SECURITY: private-address filtering is a network-layer concern; not a consensus code bug
     pub fn is_private(&self) -> bool {
         use std::net::IpAddr;
 

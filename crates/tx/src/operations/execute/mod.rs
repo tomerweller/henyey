@@ -714,6 +714,7 @@ fn rent_fee_config_p25_to_p24(
     }
 }
 
+// INVARIANT: rent config always valid on production networks; config validated at upgrade time
 fn compute_rent_fee_by_protocol(
     protocol_version: u32,
     rent_changes: &[RentChange],

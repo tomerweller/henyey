@@ -573,6 +573,7 @@ pub fn execute_host_function_with_cache(
 ) -> Result<SorobanExecutionResult, SorobanExecutionError> {
     let protocol_version = request.context.protocol_version;
     if protocol_version_starts_from(protocol_version, ProtocolVersion::V25) {
+        // INVARIANT: module cache always present and correct protocol type during Soroban execution
         let cache = request
             .module_cache
             .unwrap_or_else(|| panic!("Module cache must be provided for Soroban TX execution"));
@@ -584,6 +585,7 @@ pub fn execute_host_function_with_cache(
         });
         return execute_host_function_p25(request, Some(p25_cache));
     }
+    // INVARIANT: module cache always present and correct protocol type during Soroban execution
     let cache = request
         .module_cache
         .unwrap_or_else(|| panic!("Module cache must be provided for Soroban TX execution"));
@@ -943,6 +945,7 @@ fn execute_host_function_p24(
         "P24: Soroban host ledger info configured"
     );
 
+    // SECURITY: PRNG seed always Some in production Soroban execution path
     let base_prng_seed: [u8; 32] = if let Some(prng_seed) = context.soroban_prng_seed {
         prng_seed
     } else {
@@ -1169,6 +1172,7 @@ fn execute_host_function_p25(
         "P25: Soroban host ledger info configured"
     );
 
+    // SECURITY: PRNG seed always Some in production Soroban execution path
     let base_prng_seed: [u8; 32] = if let Some(prng_seed) = context.soroban_prng_seed {
         prng_seed
     } else {

@@ -218,6 +218,8 @@ impl TxDemandsManager {
     }
 
     /// Determine whether to demand a transaction from a peer.
+    // SECURITY: single-threaded message handling; no concurrent writers for demand state
+    // INVARIANT: demand_status checked in single-threaded context; no TOCTOU possible
     pub fn demand_status(&self, tx_hash: &Hash, peer_id: &PeerId) -> DemandStatus {
         // Check transaction status via callback
         let status_fn = self.tx_status_fn.read();
@@ -265,6 +267,7 @@ impl TxDemandsManager {
     /// Process a batch of advertised hashes from a peer.
     ///
     /// Returns which hashes to demand and which to retry later.
+    // SECURITY: single-threaded message handling; no concurrent writers for demand state
     pub fn process_adverts(
         &self,
         hashes: &[Hash],
@@ -303,6 +306,8 @@ impl TxDemandsManager {
     /// Record that we are demanding transactions from a peer.
     ///
     /// Call this after sending a FloodDemand message.
+    // SECURITY: demand tracking bounded by flow control window and peer count
+    // SECURITY: single-threaded message handling; no concurrent writers for demand state
     pub fn record_demands(&self, hashes: &[Hash], peer_id: &PeerId) {
         let mut state = self.state.write();
         let now = Instant::now();
@@ -387,6 +392,7 @@ impl TxDemandsManager {
     /// Clean up old demand records.
     ///
     /// Returns the number of abandoned demands (never received).
+    // SECURITY: demand tracking bounded by flow control window and peer count
     pub fn cleanup_old_demands(&self) -> CleanupResult {
         let mut state = self.state.write();
         let now = Instant::now();

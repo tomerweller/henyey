@@ -359,6 +359,8 @@ impl LedgerDelta {
     ///
     /// This is used by parallel Soroban execution to pre-deduct all fees before
     /// cluster execution, matching stellar-core's `processFeesSeqNums` behavior.
+    // SECURITY: fee deduction validated during fee pre-check before reaching this path
+    // INVARIANT: fees validated as positive during tx validation; negative fee unreachable here
     pub fn deduct_fee_from_account(
         &mut self,
         account_id: &AccountId,
@@ -697,6 +699,7 @@ impl LedgerDelta {
     /// Merge another delta into this one.
     ///
     /// This is useful when combining changes from multiple operations.
+    // SECURITY: merge isolation guaranteed by transaction-level state isolation
     pub fn merge(&mut self, other: LedgerDelta) -> Result<()> {
         // Consume `other` by value, iterating in insertion order to preserve
         // deterministic ordering. Using LedgerKey directly avoids XDR

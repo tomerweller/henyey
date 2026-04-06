@@ -347,6 +347,7 @@ impl OverlayManager {
     ///
     /// This is used for peer discovery when we receive a Peers message.
     /// Returns true if a connection attempt was initiated.
+    // SECURITY: dial dedup and queue bounded by max_peer_count config + peer universe
     pub async fn add_peer(&self, addr: PeerAddress) -> Result<bool> {
         if !self.running.load(Ordering::Relaxed) {
             return Err(OverlayError::NotStarted);
@@ -403,6 +404,7 @@ impl OverlayManager {
     ///
     /// This is used for peer discovery when we receive a Peers message.
     /// Returns the number of connection attempts initiated.
+    // SECURITY: dial dedup and queue bounded by max_peer_count config + peer universe
     pub async fn add_peers(&self, addrs: Vec<PeerAddress>) -> usize {
         let mut added = 0;
         let target_outbound = self.config.target_outbound_peers;

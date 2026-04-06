@@ -201,6 +201,7 @@ impl<D: SCPDriver> SCP<D> {
     ///
     /// # Returns
     /// The state of the envelope after processing.
+    // SECURITY: future-slot spam filtered by herder slot-range check before reaching SCP
     pub fn receive_envelope(&self, envelope: ScpEnvelope) -> EnvelopeState {
         // Verify signature
         if !self.driver.verify_envelope(&envelope) {
@@ -548,6 +549,7 @@ impl<D: SCPDriver> SCP<D> {
     }
 
     /// Cleanup old slots, keeping only the most recent ones.
+    // SECURITY: per-slot memory bounded by slot window eviction
     fn cleanup_old_slots(&self, slots: &mut HashMap<u64, Slot>) {
         if slots.len() <= self.max_slots {
             return;

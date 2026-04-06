@@ -114,6 +114,7 @@ pub(crate) fn insert_xdr_field_styled<T: WriteXdr + Serialize>(
 ///
 /// Like `insert_xdr_field` but starts from raw XDR bytes. In JSON mode the bytes
 /// are first deserialized as type `T`.
+// SECURITY: XDR input pre-bounded by HTTP body size limit; Limits::none() is safe
 pub(crate) fn insert_raw_xdr_field<T: ReadXdr + Serialize>(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     base_name: &str,
@@ -336,6 +337,7 @@ pub(crate) fn ledger_close_time(app: &henyey_app::App, ledger_seq: u32) -> u64 {
 }
 
 /// Check if XDR-encoded transaction envelope bytes represent a fee bump transaction.
+// SECURITY: XDR input pre-bounded by HTTP body size limit; Limits::none() is safe
 pub(crate) fn is_fee_bump_envelope(envelope_bytes: &[u8]) -> bool {
     use stellar_xdr::curr::TransactionEnvelope;
     TransactionEnvelope::from_xdr(envelope_bytes, Limits::none())

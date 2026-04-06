@@ -149,6 +149,7 @@ impl BanManager {
     ///
     /// Time-limited bans are stored in memory only (not persisted to DB).
     /// If the node is already permanently banned, this is a no-op.
+    // SECURITY: ban store bounded by authenticated peer count (max_peer_count config)
     pub fn ban_node_for(&self, node_id: &PeerId, duration: Duration) {
         let mut cache = self.cache.write();
         if let Some(existing) = cache.get(node_id) {
@@ -166,6 +167,7 @@ impl BanManager {
     ///
     /// Called on peer disconnect. If `num_failures >= AUTO_BAN_FAILURE_THRESHOLD`,
     /// bans the peer for `AUTO_BAN_DURATION`. Returns `true` if a ban was applied.
+    // SECURITY: ban store bounded by authenticated peer count (max_peer_count config)
     pub fn maybe_auto_ban(&self, node_id: &PeerId, num_failures: u32) -> bool {
         if num_failures < AUTO_BAN_FAILURE_THRESHOLD {
             return false;
@@ -181,6 +183,7 @@ impl BanManager {
     ///
     /// Should be called periodically from the tick loop.
     /// Returns the number of bans that expired.
+    // SECURITY: ban store bounded by authenticated peer count (max_peer_count config)
     pub fn cleanup_expired_bans(&self) -> usize {
         let now = Instant::now();
         let mut cache = self.cache.write();

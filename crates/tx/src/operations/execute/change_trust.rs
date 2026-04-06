@@ -16,6 +16,7 @@ use super::{
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
+// SECURITY: transaction framework handles rollback on operation failure; side effects are reverted
 /// Execute a ChangeTrust operation.
 pub fn execute_change_trust(
     op: &ChangeTrustOp,
@@ -289,6 +290,7 @@ fn build_trustline_flags(asset: Option<&Asset>, state: &LedgerStateManager) -> u
     flags
 }
 
+// SECURITY: pool-share params validated during ChangeTrust validation before execution
 fn validate_pool_share_trustlines(
     source: &AccountId,
     params: &LiquidityPoolParameters,

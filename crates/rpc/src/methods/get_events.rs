@@ -15,6 +15,7 @@ const DEFAULT_EVENTS_LIMIT: u64 = 100;
 /// Maximum number of events that can be requested in a single query.
 const MAX_EVENTS_LIMIT: u64 = 10_000;
 
+// SECURITY: request body bounded by HTTP framework body size limit; serde rejects invalid types
 pub async fn handle(
     ctx: &Arc<RpcContext>,
     params: serde_json::Value,

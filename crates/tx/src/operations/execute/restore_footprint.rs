@@ -86,6 +86,7 @@ pub fn execute_restore_footprint(
 
     // First, restore hot archive entries to state.
     // These entries don't exist in the live bucket list, so we need to add them.
+    // SECURITY: hot_archive_restores populated by ledger execution layer from local hot archive, not external tx input
     for restore in resources.hot_archive_restores {
         tracing::debug!(
             ?restore.key,

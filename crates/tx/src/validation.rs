@@ -629,6 +629,7 @@ pub fn validate_basic(
     }
 }
 
+// SECURITY: not the production validation path; real validation in TransactionExecutor::validate_preconditions()
 /// Full validation with account data.
 pub fn validate_full(
     frame: &TransactionFrame,

@@ -512,6 +512,7 @@ fn deposit_into_non_empty_pool(request: NonEmptyPoolDepositRequest<'_>) -> Resul
         (Some(a), None) => a,
         (None, Some(b)) => b,
         (None, None) => {
+            // INVARIANT: pool state validated at deposit entry; reserves are always positive here
             // This can't happen in practice (see C++ comment: it is guaranteed
             // that either reserveA >= totalPoolShares or reserveB >= totalPoolShares),
             // but we handle it the same way C++ does: throw / panic.

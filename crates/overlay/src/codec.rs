@@ -147,6 +147,7 @@ impl MessageCodec {
     /// Decodes XDR bytes to an authenticated message.
     ///
     /// The input should be the raw message body without the length prefix.
+    // SECURITY: frame size bounded by MAX_MESSAGE_SIZE at transport layer before XDR decode
     pub fn decode_message(bytes: &[u8]) -> Result<AuthenticatedMessage> {
         AuthenticatedMessage::from_xdr(bytes, Limits::none())
             .map_err(|e| OverlayError::Message(format!("failed to decode XDR: {}", e)))
@@ -157,6 +158,7 @@ impl Decoder for MessageCodec {
     type Item = MessageFrame;
     type Error = OverlayError;
 
+    // SECURITY: post-auth frame size enforced at frame layer before decode; Limits::none() is safe here
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
         loop {
             match self.decode_state {

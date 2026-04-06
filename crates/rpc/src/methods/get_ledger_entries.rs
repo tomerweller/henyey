@@ -13,6 +13,7 @@ use crate::util::{self, ttl_key_for_ledger_key, XdrFormat};
 /// Maximum number of ledger entry keys allowed per request.
 const MAX_KEYS: usize = 200;
 
+// SECURITY: request body bounded by HTTP framework body size limit; serde rejects invalid types
 pub async fn handle(
     ctx: &Arc<RpcContext>,
     params: serde_json::Value,

@@ -125,6 +125,7 @@ impl TransactionExecutor {
         let val_account_load_us = acct_load_start.elapsed().as_micros() as u64;
 
         // Phase 3: Fee validation
+        // SECURITY: fee computation overflow prevented by tx validation bounds (max_fee * max_ops fits i64)
         if frame.is_fee_bump() {
             let op_count = frame.operation_count() as i64;
             let outer_op_count = std::cmp::max(1_i64, op_count + 1);

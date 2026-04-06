@@ -62,6 +62,7 @@ macro_rules! slot_ctx {
 /// value for a given slot index. Each slot progresses independently through
 /// the nomination phase (where candidates are proposed) and the ballot phase
 /// (where a single value is agreed upon).
+// SECURITY: slot count bounded by slot window eviction in SCP::cleanup_old_slots
 ///
 /// # Fields
 ///

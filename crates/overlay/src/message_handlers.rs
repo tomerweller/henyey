@@ -176,6 +176,7 @@ impl MessageDispatcher {
     }
 
     /// Handle a received transaction set (legacy or generalized).
+    // SECURITY: message size bounded by MAX_MESSAGE_SIZE at frame layer before reaching handler
     fn handle_tx_set_data(&self, from_peer: &PeerId, data: TxSetData) {
         let hash = data.hash();
         let label = match &data {
@@ -234,6 +235,7 @@ impl MessageDispatcher {
     }
 
     /// Handle a ScpQuorumset response.
+    // SECURITY: message size bounded by MAX_MESSAGE_SIZE at frame layer before reaching handler
     fn handle_quorum_set(&self, from_peer: &PeerId, quorum_set: ScpQuorumSet) {
         use sha2::{Digest, Sha256};
         use stellar_xdr::curr::WriteXdr;

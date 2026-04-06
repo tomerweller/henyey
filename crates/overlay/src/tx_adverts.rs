@@ -164,6 +164,7 @@ impl TxAdverts {
     }
 
     /// Queue up transaction hashes from a neighbour to try demanding.
+    // SECURITY: advert queue bounded by per-peer flow control window (MAX_HASH_COUNT)
     pub fn queue_incoming_advert(&self, tx_hashes: &[Hash], ledger_seq: u32) {
         let mut state = self.state.write();
 

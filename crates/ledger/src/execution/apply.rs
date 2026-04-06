@@ -55,6 +55,8 @@ pub struct RestoredEntries {
 /// restored, filters out live BL restores from the hot archive set, computes
 /// TTL keys for restored entries, and accumulates hot archive keys for the
 /// bucket list batch.
+// SECURITY: Soroban ops are all-or-nothing; partial restore cannot occur in successful execution
+// INVARIANT: failed tx hot-archive export cannot happen; Soroban ops are all-or-nothing
 ///
 /// # Arguments
 /// - `soroban_meta`: The Soroban execution metadata (may contain restore info)

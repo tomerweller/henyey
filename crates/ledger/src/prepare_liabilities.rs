@@ -526,6 +526,8 @@ fn is_authorized_to_maintain_liabilities_tl(tl: &TrustLineEntry) -> bool {
 /// (protocol >= V10).
 ///
 /// Parity: Upgrades.cpp:949-1127 `prepareLiabilities`
+// SECURITY: liability clearing only runs on offers that have corresponding liabilities
+// INVARIANT: offers always have corresponding liabilities after creation
 pub fn prepare_liabilities(
     snapshot: &SnapshotHandle,
     delta: &mut LedgerDelta,

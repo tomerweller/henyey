@@ -194,6 +194,7 @@ fn extract_footprint_keys(
 // Handler entry point
 // ---------------------------------------------------------------------------
 
+// SECURITY: simulation input bounded by HTTP body size limit and serde type validation
 pub async fn handle(
     ctx: &Arc<RpcContext>,
     params: serde_json::Value,

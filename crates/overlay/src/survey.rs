@@ -108,6 +108,7 @@ impl CollectingNodeData {
     }
 
     /// Record an SCP latency measurement.
+    // SECURITY: survey data collection bounded by survey lifetime and authenticated peer count
     pub fn record_scp_latency(&mut self, first_to_self_ms: u64, self_to_other_ms: u64) {
         self.scp_first_to_self_latencies_ms.push(first_to_self_ms);
         self.scp_self_to_other_latencies_ms.push(self_to_other_ms);
@@ -159,6 +160,7 @@ impl CollectingPeerData {
     }
 
     /// Record a latency measurement.
+    // SECURITY: survey data collection bounded by survey lifetime and authenticated peer count
     pub fn record_latency(&mut self, latency_ms: u64) {
         self.latencies_ms.push(latency_ms);
     }
@@ -666,6 +668,7 @@ impl SurveyManager {
     }
 
     /// Add a peer to the backlog of peers to survey.
+    // SECURITY: survey backlog bounded by peer universe size
     pub fn add_peer_to_backlog(&self, peer_id: PeerId) -> bool {
         // Lock order: peers_to_survey (A) then surveyed_peers (B).
         // Must match pop_peer_to_survey, reset, and stats to avoid ABBA deadlock.

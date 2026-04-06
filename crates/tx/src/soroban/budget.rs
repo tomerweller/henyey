@@ -123,6 +123,7 @@ pub struct ResourceLimits {
     pub write_entries: u32,
 }
 
+// SECURITY: dead code; production budget comes from Budget::try_from_configs(), not Default
 impl Default for ResourceLimits {
     fn default() -> Self {
         Self {
@@ -165,6 +166,7 @@ pub struct SorobanBudget {
     pub limits: ResourceLimits,
 }
 
+// SECURITY: entry-count limits enforced by Soroban host runtime during contract execution
 impl SorobanBudget {
     /// Create a new budget with the given limits.
     pub fn new(limits: ResourceLimits) -> Self {

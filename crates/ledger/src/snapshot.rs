@@ -341,6 +341,7 @@ impl SnapshotHandle {
     /// Look up all pool IDs for pool share trustlines owned by `account_id`.
     ///
     /// Returns an empty vec if no index is available.
+    // SECURITY: pool-share index always present in production snapshot; populated during initialization
     pub fn pool_share_tls_by_account(&self, account_id: &AccountId) -> Result<Vec<PoolId>> {
         if let Some(ref f) = self.pool_share_tls_by_account_fn {
             return f(account_id);

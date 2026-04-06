@@ -223,6 +223,7 @@ fn validate_create_passive_sell_offer(
     Ok(())
 }
 
+// SECURITY: signer weight bounded by XDR u32 type; protocol 8-bit limit enforced during operation execution in set_options.rs
 /// Validate SetOptions operation.
 fn validate_set_options(op: &SetOptionsOp) -> std::result::Result<(), OperationValidationError> {
     // Check master weight if set

@@ -522,6 +522,7 @@ impl TransactionFrame {
     }
 
     /// Get the Soroban transaction data (if present).
+    // SECURITY: Soroban transaction data validated during tx validation phase before execution
     pub fn soroban_data(&self) -> Option<&SorobanTransactionData> {
         match &self.inner_tx()?.ext {
             TransactionExt::V0 => None,

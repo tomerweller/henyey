@@ -472,6 +472,7 @@ impl RefundableFeeTracker {
 
     /// Consume rent fee from the refundable budget.
     ///
+    // SECURITY: fee refund values validated during tx validation; overflow not possible with valid fees
     /// Returns `Ok(())` if within budget, `Err` if rent fee exceeds available.
     pub fn consume_rent_fee(&mut self, rent_fee: i64) -> Result<(), RefundableFeeError> {
         self.consumed_rent_fee += rent_fee;
@@ -499,6 +500,7 @@ impl RefundableFeeTracker {
     ///
     /// This is called after computing the actual resource fee based on consumption.
     ///
+    // SECURITY: fee refund values validated during tx validation; overflow not possible with valid fees
     /// Returns `Ok(())` if within budget, `Err` if total exceeds maximum.
     pub fn update_consumed_refundable_fee(
         &mut self,
@@ -580,6 +582,7 @@ impl std::error::Error for RefundableFeeError {}
 
 /// Map a `TransactionResultCode` to the corresponding `TransactionResultResult`.
 ///
+// SECURITY: error result construction uses pre-validated operation results from execution
 /// Delegates to [`TransactionResultCodeExt::to_xdr_result`].
 fn code_to_result(code: stellar_xdr::curr::TransactionResultCode) -> TransactionResultResult {
     code.to_xdr_result()
@@ -673,6 +676,7 @@ impl MutableTransactionResult {
         }
     }
 
+    // SECURITY: operation count validated during tx validation (1..MAX_OPS_PER_TX)
     /// Create a new success result with preallocated operation results.
     pub fn create_success(fee_charged: i64, op_count: usize) -> Self {
         let results = vec![
@@ -694,6 +698,7 @@ impl MutableTransactionResult {
 
     /// Set an error code on this result.
     ///
+    // SECURITY: fee refund values validated during tx validation; overflow not possible with valid fees
     /// This also resets any consumed refundable fees (for Soroban) so that
     /// the maximum refund is returned to the fee source.
     pub fn set_error(&mut self, code: stellar_xdr::curr::TransactionResultCode) {

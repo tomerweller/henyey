@@ -329,6 +329,7 @@ impl FeeWindows {
 /// Extract classic and Soroban fees from a `LedgerCloseMeta`.
 ///
 /// Returns `(classic_fees, soroban_fees)` — vectors of per-transaction fee values.
+// SECURITY: input LCM data comes from locally-closed ledgers, not external input
 fn extract_fees_from_lcm(lcm: &LedgerCloseMeta) -> (Vec<u64>, Vec<u64>) {
     let mut classic_fees = Vec::new();
     let mut soroban_fees = Vec::new();

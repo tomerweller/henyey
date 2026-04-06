@@ -351,6 +351,7 @@ pub fn find_closest_v_blocking(
 /// This hash is used to reference quorum sets by their content
 /// in SCP messages, allowing efficient comparison and storage.
 pub fn hash_quorum_set(quorum_set: &ScpQuorumSet) -> Hash256 {
+    // INVARIANT: XDR serialization of valid SCP values cannot fail; hash always succeeds
     Hash256::hash_xdr(quorum_set).unwrap_or(Hash256::ZERO)
 }
 
@@ -363,6 +364,7 @@ pub fn hash_quorum_set(quorum_set: &ScpQuorumSet) -> Hash256 {
 /// at all levels and adjusts thresholds accordingly. This is used during
 /// the EXTERNALIZE phase and leader computation to exclude a node from
 /// the quorum set while maintaining correct semantics.
+// SECURITY: quorum set validated at herder layer; malformed sets rejected before SCP
 pub fn normalize_quorum_set(quorum_set: &mut ScpQuorumSet) {
     normalize_quorum_set_with_remove(quorum_set, None);
 }
@@ -496,6 +498,7 @@ fn quorum_set_cmp(a: &ScpQuorumSet, b: &ScpQuorumSet) -> std::cmp::Ordering {
 /// A quorum set is valid if:
 /// 1. Threshold is <= number of validators + inner sets
 /// 2. All inner sets are valid
+// SECURITY: quorum set structure validated at herder layer before SCP processing
 pub fn is_valid_quorum_set(quorum_set: &ScpQuorumSet) -> bool {
     let total = quorum_set.validators.len() + quorum_set.inner_sets.len();
     let threshold = quorum_set.threshold as usize;

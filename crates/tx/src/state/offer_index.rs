@@ -34,6 +34,7 @@ impl OfferDescriptor {
     /// # Panics
     ///
     /// Panics if the ledger entry does not contain an offer.
+    // INVARIANT: caller always passes Offer entries; non-offer entries never reach this function
     pub fn from_ledger_entry(entry: &LedgerEntry) -> Self {
         match &entry.data {
             LedgerEntryData::Offer(offer) => Self::from_offer(offer),

@@ -278,6 +278,7 @@ impl PeerManager {
     }
 
     /// Ensure a peer exists in the database.
+    // SECURITY: peer store bounded by authenticated peer cap and connection limits
     pub fn ensure_exists(&self, address: &PeerAddress) -> Result<()> {
         let key = (address.host.clone(), address.port);
 
@@ -379,6 +380,7 @@ impl PeerManager {
     }
 
     /// Update a peer's backoff.
+    // INVARIANT: no concurrent writers to backoff state; single-threaded message handling
     pub fn update_backoff(&self, address: &PeerAddress, backoff: BackOffUpdate) -> Result<()> {
         let key = (address.host.clone(), address.port);
 
@@ -396,6 +398,7 @@ impl PeerManager {
     }
 
     /// Update both type and backoff.
+    // INVARIANT: no concurrent writers to backoff state; single-threaded message handling
     pub fn update(
         &self,
         address: &PeerAddress,

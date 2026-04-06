@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::JsonRpcError;
 
 /// JSON-RPC 2.0 request envelope.
+// SECURITY: request deserialization bounded by HTTP framework body size limit (default 2MB)
 #[derive(Debug, Deserialize)]
 pub(crate) struct JsonRpcRequest {
     pub jsonrpc: String,

@@ -233,6 +233,7 @@ pub fn exchange_v10(
         } else {
             check_price_error_bound(price, res.num_wheat_received, res.num_sheep_send, true)?;
         }
+    // SECURITY: zero wheat_receive case handled by caller check; exchange_v10 relies on caller to not apply zero-trade
     } else if round == RoundingType::PathPaymentStrictSend {
         // For strict send: when wheat_received=0 and sheep_send=0, it means the offer
         // can't trade (e.g., adjusted_offer_amount=0 or severe rounding).
