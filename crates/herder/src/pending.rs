@@ -193,13 +193,13 @@ impl PendingEnvelopes {
             }
         }
 
-        // Add to pending
-        self.seen_hashes.insert(pending.hash, ());
-
+        // Add to pending — check per-slot capacity before inserting into seen_hashes
+        // to avoid ghost entries that would permanently poison dedup.
         let mut entry = self.slots.entry(slot).or_default();
         if entry.len() >= self.config.max_per_slot {
             return PendingResult::BufferFull;
         }
+        self.seen_hashes.insert(pending.hash, ());
         entry.push(pending);
 
         self.stats.write().added += 1;
@@ -450,5 +450,56 @@ mod tests {
         assert!(released.contains_key(&101));
         assert!(released.contains_key(&102));
         assert_eq!(pending.slot_count(), 1);
+    }
+
+    fn make_test_envelope_with_node(slot: SlotIndex, node_seed: u8) -> ScpEnvelope {
+        let node_id = XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([node_seed; 32])));
+        ScpEnvelope {
+            statement: ScpStatement {
+                node_id,
+                slot_index: slot,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: Hash([0u8; 32]),
+                    votes: vec![].try_into().unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
+            },
+            signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+        }
+    }
+
+    /// [AUDIT-XH7] When per-slot buffer is full, the envelope's hash must not
+    /// remain in seen_hashes. Otherwise the envelope is permanently rejected
+    /// as a "duplicate" even though it was never actually buffered.
+    #[test]
+    fn test_audit_xh7_buffer_full_does_not_poison_seen_hashes() {
+        let config = PendingConfig {
+            max_per_slot: 1, // Only allow 1 envelope per slot
+            ..Default::default()
+        };
+        let pending = PendingEnvelopes::new(config);
+        pending.set_current_slot(100);
+
+        // Fill the buffer for slot 101
+        let env1 = make_test_envelope_with_node(101, 1);
+        assert_eq!(pending.add(101, env1), PendingResult::Added);
+
+        // Try to add a second envelope — should be BufferFull
+        let env2 = make_test_envelope_with_node(101, 2);
+        assert_eq!(pending.add(101, env2.clone()), PendingResult::BufferFull);
+
+        // Release slot 101 to clear the buffer
+        pending.release(101);
+
+        // Now re-add the envelope that was previously rejected as BufferFull.
+        // Before fix: returns Duplicate (ghost entry in seen_hashes)
+        // After fix: returns Added
+        pending.set_current_slot(100); // Keep it eligible
+        let result = pending.add(101, env2);
+        assert_eq!(
+            result,
+            PendingResult::Added,
+            "Envelope rejected as BufferFull should not be permanently stuck in seen_hashes"
+        );
     }
 }
