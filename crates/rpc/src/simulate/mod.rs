@@ -236,11 +236,17 @@ where
 // Handler entry point
 // ---------------------------------------------------------------------------
 
-// SECURITY: simulation input bounded by HTTP body size limit and serde type validation
+// SECURITY: simulation input bounded by HTTP body size limit and serde type validation.
+// SECURITY: concurrent simulations bounded by semaphore (max_concurrent_simulations config).
 pub async fn handle(
     ctx: &Arc<RpcContext>,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, JsonRpcError> {
+    let _permit = ctx
+        .simulation_semaphore
+        .try_acquire()
+        .map_err(|_| JsonRpcError::server_busy("too many concurrent simulation requests"))?;
+
     let format = util::parse_format(&params)?;
 
     let tx_b64 = params
@@ -523,6 +529,30 @@ mod tests {
             key: ScVal::LedgerKeyContractInstance,
             durability: ContractDataDurability::Persistent,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // AUDIT-001: simulation concurrency limit
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_audit_001_simulation_semaphore_rejects_when_full() {
+        // Verify that try_acquire on a zero-permit semaphore returns Err,
+        // which is the mechanism used in handle() to reject excess requests.
+        let sem = tokio::sync::Semaphore::new(2);
+        let _p1 = sem.try_acquire().expect("first permit should succeed");
+        let _p2 = sem.try_acquire().expect("second permit should succeed");
+        assert!(
+            sem.try_acquire().is_err(),
+            "third acquire should fail when semaphore is full"
+        );
+    }
+
+    #[test]
+    fn test_audit_001_server_busy_error_code() {
+        let err = crate::error::JsonRpcError::server_busy("too many requests");
+        assert_eq!(err.code, crate::error::SERVER_BUSY);
+        assert!(err.message.contains("too many"));
     }
 
     // -----------------------------------------------------------------------

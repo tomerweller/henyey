@@ -31,12 +31,15 @@ impl RpcServer {
 
     /// Start the RPC server.
     pub async fn start(self) -> anyhow::Result<()> {
-        let retention = self.app.config().rpc.retention_window;
+        let rpc_config = &self.app.config().rpc;
+        let retention = rpc_config.retention_window;
+        let max_sims = rpc_config.max_concurrent_simulations.max(1) as usize;
         let fee_windows = Arc::new(FeeWindows::new(retention));
 
         let ctx = Arc::new(RpcContext {
             app: self.app.clone(),
             fee_windows: fee_windows.clone(),
+            simulation_semaphore: Arc::new(tokio::sync::Semaphore::new(max_sims)),
         });
 
         let mut shutdown_rx = self.app.subscribe_shutdown();

@@ -5,6 +5,8 @@ pub(crate) const INVALID_REQUEST: i32 = -32600;
 pub(crate) const METHOD_NOT_FOUND: i32 = -32601;
 pub(crate) const INVALID_PARAMS: i32 = -32602;
 pub(crate) const INTERNAL_ERROR: i32 = -32603;
+/// Server is overloaded / too many concurrent requests.
+pub(crate) const SERVER_BUSY: i32 = -32000;
 
 /// JSON-RPC 2.0 error object.
 #[derive(Debug, Clone, Serialize)]
@@ -38,5 +40,9 @@ impl JsonRpcError {
 
     pub(crate) fn internal(msg: impl Into<String>) -> Self {
         Self::new(INTERNAL_ERROR, msg)
+    }
+
+    pub(crate) fn server_busy(msg: impl Into<String>) -> Self {
+        Self::new(SERVER_BUSY, msg)
     }
 }

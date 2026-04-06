@@ -990,6 +990,11 @@ pub struct RpcConfig {
     /// Set to 0 to disable the latency check.
     #[serde(default = "default_max_healthy_ledger_latency")]
     pub max_healthy_ledger_latency_secs: u64,
+
+    /// Maximum number of concurrent `simulateTransaction` requests.
+    /// Limits CPU/memory pressure from Soroban host execution.
+    #[serde(default = "default_max_concurrent_simulations")]
+    pub max_concurrent_simulations: u32,
 }
 
 impl Default for RpcConfig {
@@ -999,6 +1004,7 @@ impl Default for RpcConfig {
             port: default_rpc_port(),
             retention_window: default_rpc_retention_window(),
             max_healthy_ledger_latency_secs: default_max_healthy_ledger_latency(),
+            max_concurrent_simulations: default_max_concurrent_simulations(),
         }
     }
 }
@@ -1013,6 +1019,10 @@ fn default_rpc_retention_window() -> u32 {
 
 fn default_max_healthy_ledger_latency() -> u64 {
     30
+}
+
+fn default_max_concurrent_simulations() -> u32 {
+    10
 }
 
 /// Build-time metadata populated by the binary crate's `build.rs`.
