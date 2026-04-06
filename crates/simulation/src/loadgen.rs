@@ -318,9 +318,9 @@ pub struct TxGenerator {
     /// Cached accounts: numeric ID → TestAccount.
     accounts: BTreeMap<u64, TestAccount>,
     /// Reference to the app (for DB lookups and fee queries).
-    app: Arc<App>,
+    pub(crate) app: Arc<App>,
     /// Network passphrase for transaction signing.
-    network_passphrase: String,
+    pub(crate) network_passphrase: String,
 }
 
 impl TxGenerator {
@@ -798,10 +798,6 @@ impl TxGenerator {
 pub struct LoadGenerator {
     /// Transaction generator with account cache.
     tx_generator: TxGenerator,
-    /// Reference to the app for submission.
-    app: Arc<App>,
-    /// Network passphrase (needed for Soroban contract ID computation).
-    network_passphrase: String,
     /// Accounts available for use (not currently in-flight).
     accounts_available: HashSet<u64>,
     /// Accounts currently referenced by pending transactions.
@@ -834,9 +830,7 @@ impl LoadGenerator {
     /// Create a new load generator for the given app.
     pub fn new(app: Arc<App>, network_passphrase: String) -> Self {
         Self {
-            tx_generator: TxGenerator::new(Arc::clone(&app), network_passphrase.clone()),
-            app,
-            network_passphrase,
+            tx_generator: TxGenerator::new(app, network_passphrase),
             accounts_available: HashSet::new(),
             accounts_in_use: HashSet::new(),
             total_submitted: 0,
@@ -993,7 +987,7 @@ impl LoadGenerator {
             }
 
             // Submit transactions for this step
-            let ledger_num = self.app.current_ledger_seq();
+            let ledger_num = self.tx_generator.app.current_ledger_seq();
             let mut submitted_this_step = 0i64;
             for _ in 0..txs_this_step {
                 if config.n_txs == 0 {
@@ -1072,8 +1066,12 @@ impl LoadGenerator {
             self.accounts_in_use.insert(id);
 
             // Check if account has pending txs
-            let account = self.tx_generator.find_account(id, ledger_num);
-            if !self.app.source_account_pending(&account.account_id) {
+            let account_id = self
+                .tx_generator
+                .find_account(id, ledger_num)
+                .account_id
+                .clone();
+            if !self.tx_generator.app.source_account_pending(&account_id) {
                 return Some(id);
             }
             // If pending, it stays in accounts_in_use and we try another
@@ -1089,7 +1087,11 @@ impl LoadGenerator {
         let mut to_return = Vec::new();
         for &id in &self.accounts_in_use {
             if let Some(account) = self.tx_generator.get_account(id) {
-                if !self.app.source_account_pending(&account.account_id) {
+                if !self
+                    .tx_generator
+                    .app
+                    .source_account_pending(&account.account_id)
+                {
                     to_return.push(id);
                 }
             } else {
@@ -1129,7 +1131,7 @@ impl LoadGenerator {
                 }
             };
 
-            let result = self.app.submit_transaction(envelope).await;
+            let result = self.tx_generator.app.submit_transaction(envelope).await;
 
             match result {
                 TxQueueResult::Added => return true,
@@ -1237,8 +1239,9 @@ impl LoadGenerator {
                             address: ScAddress::Account(source_pk),
                             salt: salt.clone(),
                         });
-                        let contract_id = compute_contract_id(&preimage, &self.network_passphrase)
-                            .expect("contract ID computation");
+                        let contract_id =
+                            compute_contract_id(&preimage, &self.tx_generator.network_passphrase)
+                                .expect("contract ID computation");
                         let instance_key = contract_instance_key(&contract_id);
                         self.contract_instance_keys.insert(instance_key);
                         config.n_instances = config.n_instances.saturating_sub(1);
@@ -1355,14 +1358,14 @@ impl LoadGenerator {
 
         // Check all contract instance keys
         for key in &self.contract_instance_keys {
-            if !self.app.has_ledger_entry(key) {
+            if !self.tx_generator.app.has_ledger_entry(key) {
                 missing.push(key.clone());
             }
         }
 
         // Check the WASM code key
         if let Some(ref code_key) = self.code_key {
-            if !self.app.has_ledger_entry(code_key) {
+            if !self.tx_generator.app.has_ledger_entry(code_key) {
                 missing.push(code_key.clone());
             }
         }
@@ -1407,7 +1410,11 @@ impl LoadGenerator {
             if id == ROOT_ACCOUNT_ID {
                 continue;
             }
-            if let Some(db_seq) = self.app.load_account_sequence(&account.account_id) {
+            if let Some(db_seq) = self
+                .tx_generator
+                .app
+                .load_account_sequence(&account.account_id)
+            {
                 if db_seq != account.sequence_number {
                     out_of_sync.push(id);
                 }
