@@ -95,7 +95,7 @@ async fn build_two_running_of_three(mode: SimulationMode) -> Simulation {
         .map(|id| sim.app_spec_public_key(id).expect("public key for node"))
         .collect();
     let quorum_set = QuorumSetConfig {
-        threshold_percent: 67,
+        threshold_percent: 66,
         validators,
         inner_sets: Vec::new(),
     };
@@ -377,7 +377,7 @@ async fn test_separate_app_simulation_stays_partitioned_over_tcp() {
 
 #[tokio::test]
 async fn test_core3_restart_rejoin_over_tcp() {
-    let mut sim = build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 67).await;
+    let mut sim = build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 66).await;
 
     let _ = sim
         .manual_close_all_app_nodes()
@@ -444,7 +444,7 @@ async fn test_core3_restart_rejoin_over_tcp() {
 #[tokio::test]
 async fn test_core3_restart_rejoin_over_loopback() {
     let mut sim =
-        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 67).await;
+        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 66).await;
 
     let _ = sim
         .manual_close_all_app_nodes()
