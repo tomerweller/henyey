@@ -255,9 +255,8 @@ pub(crate) fn validate_pagination(
     limit: Option<u32>,
     default_limit: u32,
     max_limit: u32,
-    oldest_ledger: u32,
-    latest_ledger: u32,
-) -> Result<(u32, Option<i64>, u32), JsonRpcError> {
+    lctx: &LedgerContext,
+) -> Result<(u32, Option<i64>, u32), crate::error::JsonRpcError> {
     // cursor and startLedger are mutually exclusive
     if cursor.is_some() && start_ledger.is_some() {
         return Err(JsonRpcError::invalid_params(
@@ -279,9 +278,10 @@ pub(crate) fn validate_pagination(
     let start = start_ledger
         .ok_or_else(|| JsonRpcError::invalid_params("startLedger or cursor is required"))?;
 
-    if start < oldest_ledger || start > latest_ledger {
+    if start < lctx.oldest_ledger || start > lctx.latest_ledger {
         return Err(JsonRpcError::invalid_params(format!(
-            "startLedger must be within [{oldest_ledger}, {latest_ledger}]"
+            "startLedger must be within [{}, {}]",
+            lctx.oldest_ledger, lctx.latest_ledger
         )));
     }
 
@@ -553,8 +553,14 @@ mod tests {
 
     #[test]
     fn test_validate_pagination_start_ledger() {
+        let lctx = LedgerContext {
+            latest_ledger: 100,
+            latest_close_time: 0,
+            oldest_ledger: 1,
+            oldest_close_time: 0,
+        };
         let (start, cursor, limit) =
-            validate_pagination(Some(10), None, None, 5, 200, 1, 100).unwrap();
+            validate_pagination(Some(10), None, None, 5, 200, &lctx).unwrap();
         assert_eq!(start, 10);
         assert!(cursor.is_none());
         assert_eq!(limit, 5); // default
@@ -562,10 +568,16 @@ mod tests {
 
     #[test]
     fn test_validate_pagination_cursor() {
+        let lctx = LedgerContext {
+            latest_ledger: 100,
+            latest_close_time: 0,
+            oldest_ledger: 1,
+            oldest_close_time: 0,
+        };
         let toid = toid_encode(50, 3, 0);
         let cursor_str = toid.to_string();
         let (start, cursor, limit) =
-            validate_pagination(None, Some(&cursor_str), Some(20), 5, 200, 1, 100).unwrap();
+            validate_pagination(None, Some(&cursor_str), Some(20), 5, 200, &lctx).unwrap();
         assert_eq!(start, 50);
         assert_eq!(cursor, Some(toid));
         assert_eq!(limit, 20);
@@ -573,34 +585,58 @@ mod tests {
 
     #[test]
     fn test_validate_pagination_mutual_exclusion() {
+        let lctx = LedgerContext {
+            latest_ledger: 100,
+            latest_close_time: 0,
+            oldest_ledger: 1,
+            oldest_close_time: 0,
+        };
         let toid = toid_encode(50, 3, 0);
         let cursor_str = toid.to_string();
-        let result = validate_pagination(Some(10), Some(&cursor_str), None, 5, 200, 1, 100);
+        let result = validate_pagination(Some(10), Some(&cursor_str), None, 5, 200, &lctx);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_validate_pagination_start_ledger_out_of_range() {
-        let result = validate_pagination(Some(200), None, None, 5, 200, 1, 100);
+        let lctx = LedgerContext {
+            latest_ledger: 100,
+            latest_close_time: 0,
+            oldest_ledger: 1,
+            oldest_close_time: 0,
+        };
+        let result = validate_pagination(Some(200), None, None, 5, 200, &lctx);
         assert!(result.is_err());
 
-        let result = validate_pagination(Some(0), None, None, 5, 200, 1, 100);
+        let result = validate_pagination(Some(0), None, None, 5, 200, &lctx);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_validate_pagination_limit_clamping() {
+        let lctx = LedgerContext {
+            latest_ledger: 100,
+            latest_close_time: 0,
+            oldest_ledger: 1,
+            oldest_close_time: 0,
+        };
         // Over max
-        let (_, _, limit) = validate_pagination(Some(10), None, Some(500), 5, 200, 1, 100).unwrap();
+        let (_, _, limit) = validate_pagination(Some(10), None, Some(500), 5, 200, &lctx).unwrap();
         assert_eq!(limit, 200);
         // Under min
-        let (_, _, limit) = validate_pagination(Some(10), None, Some(0), 5, 200, 1, 100).unwrap();
+        let (_, _, limit) = validate_pagination(Some(10), None, Some(0), 5, 200, &lctx).unwrap();
         assert_eq!(limit, 1);
     }
 
     #[test]
     fn test_validate_pagination_missing_both() {
-        let result = validate_pagination(None, None, None, 5, 200, 1, 100);
+        let lctx = LedgerContext {
+            latest_ledger: 100,
+            latest_close_time: 0,
+            oldest_ledger: 1,
+            oldest_close_time: 0,
+        };
+        let result = validate_pagination(None, None, None, 5, 200, &lctx);
         assert!(result.is_err());
     }
 

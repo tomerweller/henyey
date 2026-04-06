@@ -60,8 +60,7 @@ pub async fn handle(
         limit,
         DEFAULT_TX_LIMIT,
         MAX_TX_LIMIT,
-        lctx.oldest_ledger,
-        lctx.latest_ledger,
+        &lctx,
     )?;
 
     // Convert cursor to (start_ledger, start_tx_index) for the DB query
