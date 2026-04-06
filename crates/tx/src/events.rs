@@ -154,7 +154,7 @@ impl OpEventManager {
         source: &MuxedAccount,
         claim_atoms: &[stellar_xdr::curr::ClaimAtom],
     ) {
-        if !self.enabled {
+        if !self.enabled || self.finalized {
             return;
         }
         let source_addr = make_muxed_account_address(source);
@@ -225,7 +225,7 @@ impl OpEventManager {
         amount: i64,
         allow_muxed_id_or_memo: bool,
     ) {
-        if !self.enabled {
+        if !self.enabled || self.finalized {
             return;
         }
 
@@ -251,7 +251,7 @@ impl OpEventManager {
         amount: i64,
         allow_muxed_id_or_memo: bool,
     ) {
-        if !self.enabled {
+        if !self.enabled || self.finalized {
             return;
         }
         let contract_id = get_asset_contract_id(&self.network_id, asset);
