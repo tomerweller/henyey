@@ -726,7 +726,16 @@ impl FetchingEnvelopes {
                     .map(|v| v.0.as_slice())
                     .collect()
             }
-            ScpStatementPledges::Prepare(prep) => vec![prep.ballot.value.0.as_slice()],
+            ScpStatementPledges::Prepare(prep) => {
+                let mut vals = vec![prep.ballot.value.0.as_slice()];
+                if let Some(ref prepared) = prep.prepared {
+                    vals.push(prepared.value.0.as_slice());
+                }
+                if let Some(ref prepared_prime) = prep.prepared_prime {
+                    vals.push(prepared_prime.value.0.as_slice());
+                }
+                vals
+            }
             ScpStatementPledges::Confirm(conf) => vec![conf.ballot.value.0.as_slice()],
             ScpStatementPledges::Externalize(ext) => vec![ext.commit.value.0.as_slice()],
         };
@@ -793,7 +802,7 @@ mod tests {
     use super::*;
     use stellar_xdr::curr::{
         NodeId as XdrNodeId, PublicKey, ScpNomination, ScpStatement, ScpStatementPledges,
-        Signature, Uint256,
+        Signature, Uint256, WriteXdr,
     };
 
     fn make_test_envelope(slot: SlotIndex, node_seed: u8) -> ScpEnvelope {
@@ -1265,5 +1274,69 @@ mod tests {
         // No broadcast set — should not panic
         fetching.recv_envelope(make_test_envelope(100, 1));
         assert_eq!(fetching.ready_count(), 1);
+    }
+
+    /// [AUDIT-XH3] Prepare statements must validate all ballot fields, not just
+    /// the main ballot. The `prepared` and `prepared_prime` fields can contain
+    /// different StellarValues that also need the STELLAR_VALUE_SIGNED check.
+    #[test]
+    fn test_audit_xh3_prepare_validates_prepared_and_prepared_prime() {
+        use stellar_xdr::curr::{
+            ScpBallot, ScpStatementPrepare, StellarValue, StellarValueExt, Value,
+        };
+
+        // Create a signed StellarValue for the main ballot
+        let signed_sv = StellarValue {
+            tx_set_hash: Hash([1u8; 32]),
+            close_time: stellar_xdr::curr::TimePoint(1000),
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Signed(stellar_xdr::curr::LedgerCloseValueSignature {
+                node_id: XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
+                signature: Signature(vec![0u8; 64].try_into().unwrap()),
+            }),
+        };
+        let signed_bytes = signed_sv.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
+
+        // Create an unsigned (Basic) StellarValue for the prepared ballot
+        let unsigned_sv = StellarValue {
+            tx_set_hash: Hash([2u8; 32]),
+            close_time: stellar_xdr::curr::TimePoint(999),
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+        let unsigned_bytes = unsigned_sv
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .unwrap();
+
+        let node_id = XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
+
+        // Prepare envelope: main ballot is signed, but prepared ballot is unsigned
+        let envelope = ScpEnvelope {
+            statement: ScpStatement {
+                node_id,
+                slot_index: 100,
+                pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                    quorum_set_hash: Hash([1u8; 32]),
+                    ballot: ScpBallot {
+                        counter: 1,
+                        value: Value(signed_bytes.try_into().unwrap()),
+                    },
+                    prepared: Some(ScpBallot {
+                        counter: 1,
+                        value: Value(unsigned_bytes.try_into().unwrap()),
+                    }),
+                    prepared_prime: None,
+                    n_c: 0,
+                    n_h: 0,
+                }),
+            },
+            signature: Signature(vec![0u8; 64].try_into().unwrap()),
+        };
+
+        // The envelope should be rejected because prepared has an unsigned value
+        assert!(
+            !FetchingEnvelopes::check_stellar_value_signed(&envelope),
+            "Prepare with unsigned 'prepared' ballot should be rejected"
+        );
     }
 }
