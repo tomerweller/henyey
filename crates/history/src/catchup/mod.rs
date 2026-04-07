@@ -478,6 +478,28 @@ impl CatchupManager {
         })
     }
 
+    /// Verify the structure, checkpoint alignment, and (optionally) network
+    /// passphrase of a downloaded History Archive State.
+    fn verify_has(&self, has: &HistoryArchiveState, checkpoint_seq: u32) -> Result<()> {
+        verify::verify_has_structure(has)?;
+        verify::verify_has_checkpoint(has, checkpoint_seq)?;
+        if let Some(ref expected) = self.network_passphrase {
+            verify::verify_has_passphrase(has, expected)?;
+        }
+        Ok(())
+    }
+
+    /// Verify and persist SCP history entries.
+    ///
+    /// No-op when `entries` is empty.
+    fn verify_and_persist_scp_history(&self, entries: &[ScpHistoryEntry]) -> Result<()> {
+        if !entries.is_empty() {
+            verify::verify_scp_history_entries(entries)?;
+            self.persist_scp_history_entries(entries)?;
+        }
+        Ok(())
+    }
+
     /// Catch up to a specific target ledger.
     ///
     /// This is the main entry point for the catchup process. It will:
@@ -521,17 +543,10 @@ impl CatchupManager {
             "Downloading History Archive State",
         );
         let has = self.download_has(checkpoint_seq).await?;
-        verify::verify_has_structure(&has)?;
-        verify::verify_has_checkpoint(&has, checkpoint_seq)?;
-        if let Some(ref expected) = self.network_passphrase {
-            verify::verify_has_passphrase(&has, expected)?;
-        }
+        self.verify_has(&has, checkpoint_seq)?;
 
         let scp_history = self.download_scp_history(checkpoint_seq).await?;
-        if !scp_history.is_empty() {
-            verify::verify_scp_history_entries(&scp_history)?;
-            self.persist_scp_history_entries(&scp_history)?;
-        }
+        self.verify_and_persist_scp_history(&scp_history)?;
 
         // Step 3: Download all buckets referenced in the HAS
         self.update_progress(
@@ -623,17 +638,10 @@ impl CatchupManager {
                 "Downloading History Archive State",
             );
             let has = self.download_has(bucket_apply_at).await?;
-            verify::verify_has_structure(&has)?;
-            verify::verify_has_checkpoint(&has, bucket_apply_at)?;
-            if let Some(ref expected) = self.network_passphrase {
-                verify::verify_has_passphrase(&has, expected)?;
-            }
+            self.verify_has(&has, bucket_apply_at)?;
 
             let scp_history = self.download_scp_history(bucket_apply_at).await?;
-            if !scp_history.is_empty() {
-                verify::verify_scp_history_entries(&scp_history)?;
-                self.persist_scp_history_entries(&scp_history)?;
-            }
+            self.verify_and_persist_scp_history(&scp_history)?;
 
             // Download buckets
             self.update_progress(
@@ -749,11 +757,7 @@ impl CatchupManager {
             1,
             "Using provided History Archive State",
         );
-        verify::verify_has_structure(&data.has)?;
-        verify::verify_has_checkpoint(&data.has, checkpoint_seq)?;
-        if let Some(ref expected) = self.network_passphrase {
-            verify::verify_has_passphrase(&data.has, expected)?;
-        }
+        self.verify_has(&data.has, checkpoint_seq)?;
 
         // Step 3: Verify bucket files exist on disk
         // Hash verification was already performed at download time by DownloadBucketsWork.
@@ -798,10 +802,7 @@ impl CatchupManager {
         }
 
         // Step 4: Verify SCP history entries (if present)
-        if !data.scp_history.is_empty() {
-            verify::verify_scp_history_entries(&data.scp_history)?;
-            self.persist_scp_history_entries(&data.scp_history)?;
-        }
+        self.verify_and_persist_scp_history(&data.scp_history)?;
 
         // Step 5: Apply buckets and initialize LedgerManager
         let (checkpoint_header, checkpoint_hash) =
