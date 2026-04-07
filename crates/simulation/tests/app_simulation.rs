@@ -61,7 +61,10 @@ async fn wait_for_peer_count(sim: &Simulation, node_id: &str, expected: usize, t
 }
 
 async fn ensure_app_accounts_funded(sim: &mut Simulation, expected: usize) {
-    let mut ledger_target = sim.app("node0").map(|app| app.ledger_info().0).unwrap_or(1);
+    let mut ledger_target = sim
+        .app("node0")
+        .map(|app| app.ledger_info().ledger_seq)
+        .unwrap_or(1);
     let mut funded_total = 0usize;
     let mut rounds = 0usize;
     while funded_total < expected && rounds < 8 {
@@ -289,7 +292,12 @@ async fn test_pair_app_simulation_executes_generated_load_over_tcp() {
         .expect("submit generated load step");
     assert_eq!(submitted, 1);
 
-    let ledger_target = sim.app("node0").expect("node0 app exists").ledger_info().0 + 1;
+    let ledger_target = sim
+        .app("node0")
+        .expect("node0 app exists")
+        .ledger_info()
+        .ledger_seq
+        + 1;
     manual_close_until(&sim, ledger_target, Duration::from_secs(40)).await;
 
     sim.stop_all_nodes().await.expect("stop pair tcp load test");
@@ -309,7 +317,12 @@ async fn test_pair_app_simulation_executes_generated_load_over_loopback() {
         .expect("submit generated load step loopback");
     assert_eq!(submitted, 1);
 
-    let ledger_target = sim.app("node0").expect("node0 app exists").ledger_info().0 + 1;
+    let ledger_target = sim
+        .app("node0")
+        .expect("node0 app exists")
+        .ledger_info()
+        .ledger_seq
+        + 1;
     manual_close_until(&sim, ledger_target, Duration::from_secs(40)).await;
 
     sim.stop_all_nodes()

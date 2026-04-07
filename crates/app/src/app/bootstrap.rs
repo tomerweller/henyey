@@ -159,9 +159,9 @@ impl App {
             .initialize(bucket_list, hot_archive, header, header_hash)
             .map_err(|e| anyhow::anyhow!("Failed to initialize LedgerManager: {}", e))?;
 
-        let (seq, _hash, _close_time, _protocol) = self.ledger_info();
+        let info = self.ledger_info();
         tracing::info!(
-            lcl_seq = seq,
+            lcl_seq = info.ledger_seq,
             "Bootstrapped from genesis state via force-scp"
         );
 

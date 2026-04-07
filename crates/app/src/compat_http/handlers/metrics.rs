@@ -28,7 +28,7 @@ pub(crate) async fn compat_metrics_handler(
     State(state): State<Arc<CompatServerState>>,
 ) -> impl IntoResponse {
     let app = &state.app;
-    let (seq, _, _, protocol_version) = app.ledger_info();
+    let info = app.ledger_info();
     let (pending_count, authenticated_count) = app.peer_counts().await;
     let ledger_tx_count = app.ledger_tx_count();
 
@@ -36,7 +36,7 @@ pub(crate) async fn compat_metrics_handler(
         "metrics": {
             "ledger.ledger.close": {
                 "type": "timer",
-                "count": seq,
+                "count": info.ledger_seq,
                 "event_type": "calls",
                 "rate_unit": "second",
                 "mean_rate": 0.0,
@@ -90,11 +90,11 @@ pub(crate) async fn compat_metrics_handler(
             },
             "ledger.ledger.version": {
                 "type": "counter",
-                "count": protocol_version
+                "count": info.protocol_version
             },
             "scp.value.valid": {
                 "type": "meter",
-                "count": seq,
+                "count": info.ledger_seq,
                 "event_type": "events",
                 "rate_unit": "second",
                 "mean_rate": 0.0,

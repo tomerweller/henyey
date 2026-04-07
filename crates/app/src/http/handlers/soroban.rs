@@ -20,7 +20,7 @@ pub(crate) async fn sorobaninfo_handler(
 ) -> impl IntoResponse {
     let format = params.format.as_deref().unwrap_or("basic");
 
-    let (_, _, _, protocol_version) = state.app.ledger_info();
+    let protocol_version = state.app.ledger_info().protocol_version;
 
     match format {
         "basic" => {

@@ -182,8 +182,8 @@ mod upgrades;
 
 use types::*;
 pub use types::{
-    AppBuilder, AppInfo, AppState, CatchupResult, CatchupTarget, LedgerSummary, ScpSlotSnapshot,
-    SelfCheckResult, SimulationDebugStats, SurveyPeerReport, SurveyReport,
+    AppBuilder, AppInfo, AppState, CatchupResult, CatchupTarget, LedgerInfo, LedgerSummary,
+    ScpSlotSnapshot, SelfCheckResult, SimulationDebugStats, SurveyPeerReport, SurveyReport,
 };
 
 /// The main application struct coordinating all Stellar Core subsystems.
@@ -319,10 +319,8 @@ pub struct App {
     /// Time-sliced survey data manager.
     survey_data: RwLock<SurveyDataManager>,
 
-    /// Pending transaction hashes to advertise.
-    tx_advert_queue: RwLock<Vec<Hash256>>,
-    /// Deduplication set for pending tx adverts.
-    tx_advert_set: RwLock<HashSet<Hash256>>,
+    /// Pending transaction hashes to advertise (ordered + deduplicated).
+    tx_advert_queue: RwLock<TxAdvertQueue>,
 
     /// Per-peer advert tracking and queues for demand scheduling.
     tx_adverts_by_peer: RwLock<HashMap<henyey_overlay::PeerId, PeerTxAdverts>>,
@@ -624,8 +622,7 @@ impl App {
                 max_inbound_peers,
                 max_outbound_peers,
             )),
-            tx_advert_queue: RwLock::new(Vec::new()),
-            tx_advert_set: RwLock::new(HashSet::new()),
+            tx_advert_queue: RwLock::new(TxAdvertQueue::new()),
             tx_adverts_by_peer: RwLock::new(HashMap::new()),
             tx_demand_history: RwLock::new(HashMap::new()),
             tx_pending_demands: RwLock::new(VecDeque::new()),
@@ -1018,11 +1015,16 @@ impl App {
         self.config.network_id()
     }
 
-    pub fn ledger_info(&self) -> (u32, henyey_common::Hash256, u64, u32) {
+    pub fn ledger_info(&self) -> LedgerInfo {
         let header = self.ledger_manager.current_header();
         let hash = self.ledger_manager.current_header_hash();
         let close_time = ledger_close_time(&header);
-        (header.ledger_seq, hash, close_time, header.ledger_version)
+        LedgerInfo {
+            ledger_seq: header.ledger_seq,
+            hash,
+            close_time,
+            protocol_version: header.ledger_version,
+        }
     }
 
     /// Get a rich ledger summary with all header fields needed for the
@@ -1182,7 +1184,7 @@ impl App {
         }
 
         // Get the next ledger sequence
-        let (current_ledger, _, _, _) = self.ledger_info();
+        let current_ledger = self.ledger_info().ledger_seq;
         let next_ledger = current_ledger + 1;
 
         // Trigger the herder to close the next ledger
@@ -1277,7 +1279,7 @@ impl App {
 
     pub async fn simulation_debug_stats(&self) -> SimulationDebugStats {
         let herder_stats = self.herder.stats();
-        let current_ledger = self.ledger_info().0;
+        let current_ledger = self.ledger_info().ledger_seq;
         let quorum_slot = herder_stats
             .tracking_slot
             .max(current_ledger as u64 + 1)
@@ -1339,8 +1341,7 @@ impl App {
     ///
     /// * `count` - Maximum number of entries to delete per table
     pub fn perform_maintenance(&self, count: u32) {
-        let (ledger_seq, _, _, _) = self.ledger_info();
-        let lcl = ledger_seq;
+        let lcl = self.ledger_info().ledger_seq;
 
         // Get minimum queued publish checkpoint if available
         let min_queued = self
@@ -1437,7 +1438,7 @@ impl App {
 
     pub fn scp_slot_snapshots(&self, limit: usize) -> Vec<ScpSlotSnapshot> {
         let scp = self.herder.scp();
-        let (ledger_seq, _, _, _) = self.ledger_info();
+        let ledger_seq = self.ledger_info().ledger_seq;
         let latest_slot = self
             .herder
             .latest_externalized_slot()
@@ -1601,7 +1602,7 @@ impl App {
         // Provide ledger bounds via Arc<App>.
         let app = Arc::clone(self);
         let get_ledger_bounds = move || -> (u32, Option<u32>) {
-            let (lcl, _, _, _) = app.ledger_info();
+            let lcl = app.ledger_info().ledger_seq;
             let min_queued = app
                 .database()
                 .load_publish_queue(Some(1))

@@ -159,6 +159,22 @@ impl std::fmt::Display for CatchupResult {
     }
 }
 
+/// Core ledger identity: sequence, hash, close time, and protocol version.
+///
+/// A lightweight subset of [`LedgerSummary`] used by callers that only need
+/// the four most common header fields.
+#[derive(Debug, Clone)]
+pub struct LedgerInfo {
+    /// Current ledger sequence number.
+    pub ledger_seq: u32,
+    /// Hash of the current ledger header.
+    pub hash: henyey_common::Hash256,
+    /// Ledger close time (UNIX timestamp).
+    pub close_time: u64,
+    /// Protocol version.
+    pub protocol_version: u32,
+}
+
 /// Rich ledger header summary for the `/info` endpoint.
 #[derive(Debug, Clone)]
 pub struct LedgerSummary {
@@ -408,6 +424,46 @@ pub(super) enum ConsensusStuckAction {
     AttemptRecovery,
     /// Trigger catchup after timeout.
     TriggerCatchup,
+}
+
+/// Ordered, deduplicated queue of pending transaction hashes to advertise.
+///
+/// Combines insertion-order tracking (`queue`) with O(1) deduplication (`seen`)
+/// in a single type, replacing the prior separate `tx_advert_queue` + `tx_advert_set`
+/// fields that could drift out of sync.
+#[derive(Debug)]
+pub(super) struct TxAdvertQueue {
+    queue: Vec<Hash256>,
+    seen: HashSet<Hash256>,
+}
+
+impl TxAdvertQueue {
+    pub fn new() -> Self {
+        Self {
+            queue: Vec::new(),
+            seen: HashSet::new(),
+        }
+    }
+
+    /// Enqueue a hash if not already present. Returns true if inserted.
+    pub fn insert(&mut self, hash: Hash256) -> bool {
+        if self.seen.insert(hash) {
+            self.queue.push(hash);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Drain all hashes, resetting both the queue and the dedup set.
+    pub fn drain(&mut self) -> Vec<Hash256> {
+        self.seen.clear();
+        std::mem::take(&mut self.queue)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
 }
 
 #[derive(Debug)]

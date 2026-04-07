@@ -199,7 +199,7 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
 
     // Start the HTTP status server if enabled
     let http_handle = if http_enabled {
-        #[allow(unused_mut)]
+        #[cfg_attr(not(feature = "loadgen"), allow(unused_mut))]
         let mut status_server = StatusServer::new(http_port, app.clone());
         #[cfg(feature = "loadgen")]
         if let Some(ref factory) = options.loadgen_runner_factory {
@@ -220,7 +220,7 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
 
     // Start the stellar-core compatibility HTTP server if enabled
     let compat_handle = if compat_http_enabled {
-        #[allow(unused_mut)]
+        #[cfg_attr(not(feature = "loadgen"), allow(unused_mut))]
         let mut compat_server = CompatServer::new(compat_http_port, app.clone());
         #[cfg(feature = "loadgen")]
         if let Some(ref factory) = options.loadgen_runner_factory {
@@ -328,13 +328,13 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
     if !force_scp && !options.force_catchup {
         match app.load_last_known_ledger().await {
             Ok(true) => {
-                let (seq, _hash, _close_time, _protocol) = app.ledger_info();
+                let info = app.ledger_info();
                 tracing::info!(
-                    lcl_seq = seq,
+                    lcl_seq = info.ledger_seq,
                     "Restored state from disk, skipping full catchup"
                 );
                 app.set_state(AppState::Synced).await;
-                app.set_current_ledger(seq).await;
+                app.set_current_ledger(info.ledger_seq).await;
             }
             Ok(false) => {
                 tracing::debug!("No persisted state available, will check catchup");
@@ -432,7 +432,7 @@ async fn check_needs_catchup(app: &App, options: &RunOptions) -> anyhow::Result<
         return Ok(true);
     }
 
-    let (_seq, _hash, close_time, _protocol_version) = app.ledger_info();
+    let close_time = app.ledger_info().close_time;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -582,12 +582,12 @@ impl NodeRunner {
 
     /// Get the current node status.
     pub async fn status(&self) -> NodeStatus {
-        let (ledger_seq, ledger_hash, _close_time, _protocol_version) = self.app.ledger_info();
+        let info = self.app.ledger_info();
         let stats = self.app.herder_stats();
         let peer_count = self.app.peer_snapshots().await.len();
         NodeStatus {
-            ledger_seq,
-            ledger_hash: Some(ledger_hash.to_hex()),
+            ledger_seq: info.ledger_seq,
+            ledger_hash: Some(info.hash.to_hex()),
             peer_count,
             consensus_state: stats.state.to_string(),
             pending_tx_count: stats.pending_transactions,

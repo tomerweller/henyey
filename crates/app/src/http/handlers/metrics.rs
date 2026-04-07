@@ -10,7 +10,7 @@ use super::super::ServerState;
 pub(crate) async fn metrics_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
     let app_state = state.app.state().await;
     let uptime = state.start_time.elapsed().as_secs();
-    let (ledger_seq, _hash, _close_time, _protocol_version) = state.app.ledger_info();
+    let ledger_seq = state.app.ledger_info().ledger_seq;
     let peer_count = state.app.peer_snapshots().await.len();
     let pending_transactions = state.app.pending_transaction_count() as u64;
     let app_info = state.app.info();

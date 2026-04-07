@@ -417,7 +417,7 @@ impl Simulation {
     pub fn app_ledger_seq(&self, node_id: &str) -> Option<u32> {
         self.running_apps
             .get(node_id)
-            .map(|n| n.app.ledger_info().0)
+            .map(|n| n.app.ledger_info().ledger_seq)
     }
 
     pub fn app_latest_externalized_slot(&self, node_id: &str) -> Option<u64> {
@@ -568,7 +568,7 @@ impl Simulation {
         let seqs: Vec<u32> = self
             .running_apps
             .values()
-            .map(|n| n.app.ledger_info().0)
+            .map(|n| n.app.ledger_info().ledger_seq)
             .collect();
         seqs_within_spread(&seqs, ledger_seq, max_spread)
     }
@@ -902,8 +902,11 @@ impl Simulation {
         // and set state via restore_operational_state().
         match app.load_last_known_ledger().await {
             Ok(true) => {
-                let (seq, _hash, _close_time, _protocol) = app.ledger_info();
-                tracing::info!(lcl_seq = seq, "Restored restarted node from disk");
+                let info = app.ledger_info();
+                tracing::info!(
+                    lcl_seq = info.ledger_seq,
+                    "Restored restarted node from disk"
+                );
             }
             Ok(false) => {
                 tracing::warn!(

@@ -93,12 +93,12 @@ pub(crate) async fn info_handler(State(state): State<Arc<ServerState>>) -> Json<
 }
 
 pub(crate) async fn status_handler(State(state): State<Arc<ServerState>>) -> Json<NodeStatus> {
-    let (ledger_seq, ledger_hash, _close_time, _protocol_version) = state.app.ledger_info();
+    let info = state.app.ledger_info();
     let stats = state.app.herder_stats();
     let peer_count = state.app.peer_snapshots().await.len();
     Json(NodeStatus {
-        ledger_seq,
-        ledger_hash: Some(ledger_hash.to_hex()),
+        ledger_seq: info.ledger_seq,
+        ledger_hash: Some(info.hash.to_hex()),
         peer_count,
         consensus_state: stats.state.to_string(),
         pending_tx_count: stats.pending_transactions,
@@ -110,7 +110,7 @@ pub(crate) async fn status_handler(State(state): State<Arc<ServerState>>) -> Jso
 pub(crate) async fn health_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
     let app_state = state.app.state().await;
     let is_healthy = matches!(app_state, AppState::Synced | AppState::Validating);
-    let (ledger_seq, _hash, _close_time, _protocol_version) = state.app.ledger_info();
+    let ledger_seq = state.app.ledger_info().ledger_seq;
     let peer_count = state.app.peer_snapshots().await.len();
 
     let response = HealthResponse {
@@ -130,12 +130,12 @@ pub(crate) async fn health_handler(State(state): State<Arc<ServerState>>) -> imp
 }
 
 pub(crate) async fn ledger_handler(State(state): State<Arc<ServerState>>) -> Json<LedgerResponse> {
-    let (sequence, hash, close_time, protocol_version) = state.app.ledger_info();
+    let info = state.app.ledger_info();
     Json(LedgerResponse {
-        sequence,
-        hash: hash.to_hex(),
-        close_time,
-        protocol_version,
+        sequence: info.ledger_seq,
+        hash: info.hash.to_hex(),
+        close_time: info.close_time,
+        protocol_version: info.protocol_version,
     })
 }
 

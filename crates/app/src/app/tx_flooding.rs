@@ -20,15 +20,7 @@ impl App {
             return;
         };
 
-        let mut set = self.tx_advert_set.write().await;
-        if set.contains(&hash) {
-            return;
-        }
-        set.insert(hash);
-        drop(set);
-
-        let mut queue = self.tx_advert_queue.write().await;
-        queue.push(hash);
+        self.tx_advert_queue.write().await.insert(hash);
     }
 
     pub(super) async fn flush_tx_adverts(&self) {
@@ -37,12 +29,10 @@ impl App {
             if queue.is_empty() {
                 return;
             }
-            std::mem::take(&mut *queue)
+            queue.drain()
         };
 
         tracing::debug!(count = hashes.len(), "Flushing tx adverts");
-
-        self.tx_advert_set.write().await.clear();
 
         let Some(overlay) = self.overlay().await else {
             return;
