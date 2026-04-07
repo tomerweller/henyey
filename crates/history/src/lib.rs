@@ -136,20 +136,19 @@ pub use cdp::{
     CachedCdpDataLake, CdpDataLake,
 };
 pub use checkpoint::{
-    checkpoint_containing, checkpoint_frequency, first_ledger_in_checkpoint_containing,
-    is_checkpoint_ledger, last_ledger_before_checkpoint_containing, latest_checkpoint_before_or_at,
-    ledger_to_trigger_catchup, size_of_checkpoint_containing,
+    checkpoint_containing, checkpoint_frequency, checkpoint_ledger,
+    first_ledger_in_checkpoint_containing, is_checkpoint_ledger,
+    last_ledger_before_checkpoint_containing, latest_checkpoint_before_or_at,
+    ledger_to_trigger_catchup, set_checkpoint_frequency, size_of_checkpoint_containing,
+    ACCELERATED_CHECKPOINT_FREQUENCY, DEFAULT_CHECKPOINT_FREQUENCY,
 };
 pub use checkpoint_builder::write_record_marked_xdr;
 pub use compare::{compare_checkpoint, Category, CheckpointComparison, Mismatch};
 pub use download::DownloadConfig;
 pub use error::HistoryError;
 pub use paths::{
-    bucket_path, checkpoint_ledger, checkpoint_path, checkpoint_path_dirty, dirty_to_final_path,
-    final_to_dirty_path, is_dirty_path,
-};
-pub use paths::{
-    set_checkpoint_frequency, ACCELERATED_CHECKPOINT_FREQUENCY, DEFAULT_CHECKPOINT_FREQUENCY,
+    bucket_path, checkpoint_path, checkpoint_path_dirty, dirty_to_final_path, final_to_dirty_path,
+    is_dirty_path,
 };
 pub use publish::build_history_archive_state;
 pub use publish_queue::{

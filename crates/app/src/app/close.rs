@@ -104,15 +104,6 @@ impl HerderCallback for App {
         }
     }
 
-    async fn validate_tx_set(&self, _tx_set_hash: &henyey_common::Hash256) -> bool {
-        // For now, accept all transaction sets
-        // In a full implementation, this would:
-        // 1. Check we have the tx set locally
-        // 2. Validate all transactions are valid
-        // 3. Check the tx set hash matches
-        true
-    }
-
     async fn broadcast_scp_message(&self, envelope: ScpEnvelope) {
         let slot = envelope.statement.slot_index;
         // Send through the channel to be picked up by the main loop

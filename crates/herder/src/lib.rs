@@ -256,11 +256,6 @@ pub trait HerderCallback: Send + Sync {
         stellar_value_ext: stellar_xdr::curr::StellarValueExt,
     ) -> Result<henyey_common::Hash256>;
 
-    /// Called to validate a proposed transaction set before voting.
-    ///
-    /// Returns `true` if the transaction set is valid and should be voted for.
-    async fn validate_tx_set(&self, tx_set_hash: &henyey_common::Hash256) -> bool;
-
     /// Called when an SCP message should be broadcast to the network.
     ///
     /// The implementer should relay this envelope to connected peers.

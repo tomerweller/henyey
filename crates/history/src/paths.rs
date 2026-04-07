@@ -2,75 +2,13 @@
 //!
 //! History archives use a hierarchical path structure with hex-encoded
 //! ledger sequences for sharding across directories.
+//!
+//! Checkpoint math (frequency, rounding, boundary queries) lives in
+//! [`crate::checkpoint`]. This module uses those primitives to build
+//! archive URL paths.
 
-use std::sync::OnceLock;
-
+use crate::checkpoint::checkpoint_ledger;
 use henyey_common::Hash256;
-
-/// Default checkpoint frequency (production networks).
-pub const DEFAULT_CHECKPOINT_FREQUENCY: u32 = 64;
-
-/// Accelerated checkpoint frequency (for `ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING`).
-pub const ACCELERATED_CHECKPOINT_FREQUENCY: u32 = 8;
-
-/// Global checkpoint frequency, initialized once at startup.
-///
-/// Defaults to 64 for production networks. Set to 8 when
-/// `ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING=true`.
-static CHECKPOINT_FREQ: OnceLock<u32> = OnceLock::new();
-
-/// Set the global checkpoint frequency. Must be called once at startup before
-/// any checkpoint math is performed. Subsequent calls are ignored (first write wins).
-pub fn set_checkpoint_frequency(freq: u32) {
-    let _ = CHECKPOINT_FREQ.set(freq);
-}
-
-/// Get the current checkpoint frequency.
-#[inline]
-pub fn checkpoint_frequency() -> u32 {
-    *CHECKPOINT_FREQ
-        .get()
-        .unwrap_or(&DEFAULT_CHECKPOINT_FREQUENCY)
-}
-
-/// Calculate the checkpoint ledger for a given sequence.
-///
-/// Checkpoint ledgers are of the form `(n * 64) + 63`, i.e., 63, 127, 191, etc.
-/// This function rounds a ledger sequence to its corresponding checkpoint.
-///
-/// # Examples
-///
-/// ```
-/// use henyey_history::paths::checkpoint_ledger;
-///
-/// assert_eq!(checkpoint_ledger(0), 63);
-/// assert_eq!(checkpoint_ledger(63), 63);
-/// assert_eq!(checkpoint_ledger(64), 127);
-/// assert_eq!(checkpoint_ledger(127), 127);
-/// assert_eq!(checkpoint_ledger(128), 191);
-/// ```
-#[inline]
-pub fn checkpoint_ledger(seq: u32) -> u32 {
-    let freq = checkpoint_frequency();
-    (seq / freq) * freq + (freq - 1)
-}
-
-/// Check if a ledger sequence is a checkpoint ledger.
-///
-/// # Examples
-///
-/// ```
-/// use henyey_history::paths::is_checkpoint_ledger;
-///
-/// assert!(is_checkpoint_ledger(63));
-/// assert!(is_checkpoint_ledger(127));
-/// assert!(!is_checkpoint_ledger(64));
-/// assert!(!is_checkpoint_ledger(100));
-/// ```
-#[inline]
-pub fn is_checkpoint_ledger(seq: u32) -> bool {
-    (seq + 1) % checkpoint_frequency() == 0
-}
 
 /// Generate the path for a checkpoint file.
 ///
@@ -270,39 +208,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_checkpoint_ledger() {
-        // First checkpoint
-        assert_eq!(checkpoint_ledger(0), 63);
-        assert_eq!(checkpoint_ledger(1), 63);
-        assert_eq!(checkpoint_ledger(63), 63);
-
-        // Second checkpoint
-        assert_eq!(checkpoint_ledger(64), 127);
-        assert_eq!(checkpoint_ledger(100), 127);
-        assert_eq!(checkpoint_ledger(127), 127);
-
-        // Third checkpoint
-        assert_eq!(checkpoint_ledger(128), 191);
-        assert_eq!(checkpoint_ledger(191), 191);
-
-        // Large checkpoints
-        assert_eq!(checkpoint_ledger(1000000), 1000063);
-    }
-
-    #[test]
-    fn test_is_checkpoint_ledger() {
-        assert!(is_checkpoint_ledger(63));
-        assert!(is_checkpoint_ledger(127));
-        assert!(is_checkpoint_ledger(191));
-        assert!(is_checkpoint_ledger(1000063));
-
-        assert!(!is_checkpoint_ledger(0));
-        assert!(!is_checkpoint_ledger(64));
-        assert!(!is_checkpoint_ledger(100));
-        assert!(!is_checkpoint_ledger(1000000));
-    }
-
-    #[test]
     fn test_checkpoint_path() {
         // First checkpoint (ledger 63 = 0x3f)
         assert_eq!(
@@ -356,6 +261,16 @@ mod tests {
     #[test]
     fn test_root_has_path() {
         assert_eq!(root_has_path(), ".well-known/stellar-history.json");
+    }
+
+    #[test]
+    fn test_has_path() {
+        let path = has_path(127);
+        assert_eq!(path, "history/00/00/00/history-0000007f.json");
+
+        let path = has_path(0xaabbcc00 + 63);
+        assert!(path.starts_with("history/"));
+        assert!(path.ends_with(".json"));
     }
 
     #[test]

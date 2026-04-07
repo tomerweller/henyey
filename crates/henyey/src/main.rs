@@ -3545,6 +3545,33 @@ fn print_tx_result_diffs(
 ///
 /// 1. Restores bucket list state from a checkpoint before the test range
 /// 2. For each ledger, calls `close_ledger` with the transaction set from CDP
+/// Walk all `LedgerEntryChange` slices in a `TransactionMeta` (V3/V4).
+///
+/// Calls `f` once for `tx_changes_before`, once per operation's changes,
+/// and once for `tx_changes_after`. No-op for other meta versions.
+fn for_each_tx_meta_changes(
+    meta: &stellar_xdr::curr::TransactionMeta,
+    mut f: impl FnMut(&[stellar_xdr::curr::LedgerEntryChange]),
+) {
+    match meta {
+        stellar_xdr::curr::TransactionMeta::V3(v3) => {
+            f(&v3.tx_changes_before);
+            for op in v3.operations.iter() {
+                f(&op.changes);
+            }
+            f(&v3.tx_changes_after);
+        }
+        stellar_xdr::curr::TransactionMeta::V4(v4) => {
+            f(&v4.tx_changes_before);
+            for op in v4.operations.iter() {
+                f(&op.changes);
+            }
+            f(&v4.tx_changes_after);
+        }
+        _ => {}
+    }
+}
+
 /// 3. Compares the resulting `LedgerCloseResult` against CDP:
 ///    - Header hash
 ///    - Transaction result hash
@@ -4025,53 +4052,14 @@ async fn cmd_verify_execution(
                                     }
                                 }
                             }
-                            match tx_meta {
-                                stellar_xdr::curr::TransactionMeta::V3(v3) => {
-                                    count_changes(
-                                        &v3.tx_changes_before,
-                                        &mut cdp_creates,
-                                        &mut cdp_updates,
-                                        &mut cdp_deletes,
-                                    );
-                                    for op in v3.operations.iter() {
-                                        count_changes(
-                                            &op.changes,
-                                            &mut cdp_creates,
-                                            &mut cdp_updates,
-                                            &mut cdp_deletes,
-                                        );
-                                    }
-                                    count_changes(
-                                        &v3.tx_changes_after,
-                                        &mut cdp_creates,
-                                        &mut cdp_updates,
-                                        &mut cdp_deletes,
-                                    );
-                                }
-                                stellar_xdr::curr::TransactionMeta::V4(v4) => {
-                                    count_changes(
-                                        &v4.tx_changes_before,
-                                        &mut cdp_creates,
-                                        &mut cdp_updates,
-                                        &mut cdp_deletes,
-                                    );
-                                    for op in v4.operations.iter() {
-                                        count_changes(
-                                            &op.changes,
-                                            &mut cdp_creates,
-                                            &mut cdp_updates,
-                                            &mut cdp_deletes,
-                                        );
-                                    }
-                                    count_changes(
-                                        &v4.tx_changes_after,
-                                        &mut cdp_creates,
-                                        &mut cdp_updates,
-                                        &mut cdp_deletes,
-                                    );
-                                }
-                                _ => {}
-                            }
+                            for_each_tx_meta_changes(tx_meta, |changes| {
+                                count_changes(
+                                    changes,
+                                    &mut cdp_creates,
+                                    &mut cdp_updates,
+                                    &mut cdp_deletes,
+                                );
+                            });
                         }
 
                         // Extract upgrade meta entry counts
@@ -4211,23 +4199,9 @@ async fn cmd_verify_execution(
                                 Vec<u8>,
                                 stellar_xdr::curr::LedgerEntry,
                             >| {
-                                match meta {
-                                    stellar_xdr::curr::TransactionMeta::V3(v3) => {
-                                        coalesce_changes(&v3.tx_changes_before, map);
-                                        for op in v3.operations.iter() {
-                                            coalesce_changes(&op.changes, map);
-                                        }
-                                        coalesce_changes(&v3.tx_changes_after, map);
-                                    }
-                                    stellar_xdr::curr::TransactionMeta::V4(v4) => {
-                                        coalesce_changes(&v4.tx_changes_before, map);
-                                        for op in v4.operations.iter() {
-                                            coalesce_changes(&op.changes, map);
-                                        }
-                                        coalesce_changes(&v4.tx_changes_after, map);
-                                    }
-                                    _ => {}
-                                }
+                                for_each_tx_meta_changes(meta, |changes| {
+                                    coalesce_changes(changes, map);
+                                });
                             };
                             // Process ALL change sources from LCM tx_processing
                             match &lcm {
