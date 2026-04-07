@@ -207,7 +207,7 @@ pub(crate) fn execute_set_options(
             base_reserve,
         ) {
             Ok(delta) => delta,
-            Err(SignerUpdateError::OpResult(result)) => return Ok(result),
+            Err(SignerUpdateError::OpResult(result)) => return Ok(*result),
             Err(SignerUpdateError::Internal(e)) => return Err(e),
         }
     } else {
@@ -269,7 +269,7 @@ fn sponsorship_counts_for_account_entry(account: &AccountEntry) -> (i64, i64) {
 
 /// Error from signer update: either an operation result to return early, or an internal error.
 enum SignerUpdateError {
-    OpResult(OperationResult),
+    OpResult(Box<OperationResult>),
     Internal(TxError),
 }
 
@@ -290,9 +290,9 @@ fn apply_signer_update(
     let signer_key = &signer.key;
     let weight = signer.weight;
     if weight > u8::MAX as u32 {
-        return Err(SignerUpdateError::OpResult(make_result(
+        return Err(SignerUpdateError::OpResult(Box::new(make_result(
             SetOptionsResultCode::BadSigner,
-        )));
+        ))));
     }
 
     let is_self = match (signer_key, source) {
@@ -302,9 +302,9 @@ fn apply_signer_update(
         _ => false,
     };
     if is_self {
-        return Err(SignerUpdateError::OpResult(make_result(
+        return Err(SignerUpdateError::OpResult(Box::new(make_result(
             SetOptionsResultCode::BadSigner,
-        )));
+        ))));
     }
 
     if signer_key.discriminant() == SignerKeyType::Ed25519SignedPayload {
@@ -312,9 +312,9 @@ fn apply_signer_update(
             signer_key
         {
             if payload.as_vec().is_empty() {
-                return Err(SignerUpdateError::OpResult(make_result(
+                return Err(SignerUpdateError::OpResult(Box::new(make_result(
                     SetOptionsResultCode::BadSigner,
-                )));
+                ))));
             }
         }
     }
@@ -376,24 +376,24 @@ fn apply_signer_update(
         signers_changed = true;
     } else {
         if current_signer_count >= MAX_SIGNERS {
-            return Err(SignerUpdateError::OpResult(make_result(
+            return Err(SignerUpdateError::OpResult(Box::new(make_result(
                 SetOptionsResultCode::TooManySigners,
-            )));
+            ))));
         }
 
         if current_num_sub_entries >= ACCOUNT_SUBENTRY_LIMIT
             || current_num_sub_entries.saturating_add(1) > ACCOUNT_SUBENTRY_LIMIT
         {
-            return Err(SignerUpdateError::OpResult(
+            return Err(SignerUpdateError::OpResult(Box::new(
                 OperationResult::OpTooManySubentries,
-            ));
+            )));
         }
 
         if let Some((_, sponsor_balance, sponsor_min_balance)) = sponsor_info {
             if *sponsor_balance < *sponsor_min_balance {
-                return Err(SignerUpdateError::OpResult(make_result(
+                return Err(SignerUpdateError::OpResult(Box::new(make_result(
                     SetOptionsResultCode::LowReserve,
-                )));
+                ))));
             }
         } else {
             let num_sub_entries = current_num_sub_entries as i64 + 1;
@@ -407,9 +407,9 @@ fn apply_signer_update(
             let new_min_balance = effective_entries * base_reserve;
             let available = account_balance_after_liabilities(source_account);
             if available < new_min_balance {
-                return Err(SignerUpdateError::OpResult(make_result(
+                return Err(SignerUpdateError::OpResult(Box::new(make_result(
                     SetOptionsResultCode::LowReserve,
-                )));
+                ))));
             }
         }
 
