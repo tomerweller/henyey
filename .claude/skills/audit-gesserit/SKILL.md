@@ -15,8 +15,7 @@ Parse `$ARGUMENTS`:
 
 # Gesserit Security Audit
 
-Multi-stage adversarial security audit pipeline inspired by
-[stellar/gesserit](https://github.com/stellar/gesserit). Each finding passes
+Multi-stage adversarial security audit pipeline. Each finding passes
 through independent agents at every stage — hypothesis, review, PoC, final
 review, and publish — with fail/ as the rejection path at each gate.
 
