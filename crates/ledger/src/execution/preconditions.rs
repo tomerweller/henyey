@@ -425,6 +425,43 @@ impl TransactionExecutor {
             }
         }
 
+        // CAP-77: Frozen ledger key checks (Protocol 26+).
+        if henyey_common::protocol::protocol_version_starts_from(
+            self.protocol_version,
+            henyey_common::protocol::ProtocolVersion::V26,
+        ) && self.frozen_key_config.has_frozen_keys()
+        {
+            // Fee bump: check the fee source account separately.
+            // Parity: FeeBumpTransactionFrame::checkValid → accountKey(getFeeSourceID())
+            if is_fee_bump
+                && self
+                    .frozen_key_config
+                    .is_key_frozen(&henyey_tx::frozen_keys::account_key(&fee_source_id))
+                && !self.frozen_key_config.is_freeze_bypass_tx(&outer_hash.0)
+            {
+                return Ok(Err(fee_bump_outer_fail(
+                    TransactionResultCode::TxFrozenKeyAccessed,
+                    "Fee bump source account accesses frozen ledger key",
+                )));
+            }
+
+            // Inner TX: check source account, Soroban footprint, and operations.
+            // Parity: TransactionFrame::commonValidPreSeqNum → accessesFrozenKey
+            let soroban_footprint = frame.soroban_data().map(|d| &d.resources.footprint);
+            if henyey_tx::frozen_keys::accesses_frozen_key(
+                &frame.inner_source_account_id(),
+                frame.operations(),
+                soroban_footprint,
+                &self.frozen_key_config,
+            ) && !self.frozen_key_config.is_freeze_bypass_tx(&outer_hash.0)
+            {
+                return Ok(Err(post_seq_fail(
+                    TransactionResultCode::TxFrozenKeyAccessed,
+                    "Transaction accesses frozen ledger key",
+                )));
+            }
+        }
+
         let val_ed25519_us = ed25519_start.elapsed().as_micros() as u64;
         let val_sig_total_us = sig_start.elapsed().as_micros() as u64;
         let val_total_us = val_start.elapsed().as_micros() as u64;

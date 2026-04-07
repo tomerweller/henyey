@@ -3261,6 +3261,57 @@ impl LedgerCloseContext<'_> {
         Ok(())
     }
 
+    /// Update cost type parameters for Protocol 26.
+    ///
+    /// Parity: NetworkConfig.cpp updateCpuCostParamsEntryForV26 + updateMemCostParamsEntryForV26
+    /// Resizes cost params from 85 → 86 entries (adds Bn254G1Msm at index 85)
+    /// and updates BLS12-381 and BN254 cost type values.
+    fn update_cost_types_for_v26(&mut self) -> Result<()> {
+        // Cost type indices (from ContractCostType enum)
+        const BLS12381_G1_MSM: usize = 55;
+        const BLS12381_MAP_FP_TO_G1: usize = 56;
+        const BLS12381_HASH_TO_G1: usize = 57;
+        const BLS12381_G2_MSM: usize = 60;
+        const BLS12381_MAP_FP2_TO_G2: usize = 61;
+        const BLS12381_HASH_TO_G2: usize = 62;
+        const BN254_G2_CHECK_POINT_IN_SUBGROUP: usize = 74;
+        const BN254_G1_MSM: usize = 85;
+        const NEW_SIZE: usize = BN254_G1_MSM + 1; // 86
+
+        // CPU params: from NetworkConfig.cpp:635-694
+        let cpu_updates: &[(usize, i64, i64)] = &[
+            (BLS12381_G1_MSM, 2347584, 94135478),
+            (BLS12381_MAP_FP_TO_G1, 1020885, 0),
+            (BLS12381_HASH_TO_G1, 2638451, 6803),
+            (BLS12381_G2_MSM, 7663880, 298580871),
+            (BLS12381_MAP_FP2_TO_G2, 1856539, 0),
+            (BLS12381_HASH_TO_G2, 6315452, 7232),
+            (BN254_G2_CHECK_POINT_IN_SUBGROUP, 1706052, 0),
+            (BN254_G1_MSM, 1185193, 41568084),
+        ];
+
+        // Memory params: from NetworkConfig.cpp:1135-1190
+        let mem_updates: &[(usize, i64, i64)] = &[
+            (BLS12381_G1_MSM, 109494, 266603),
+            (BLS12381_MAP_FP_TO_G1, 2776, 0),
+            (BLS12381_HASH_TO_G1, 5896, 0),
+            (BLS12381_G2_MSM, 219654, 266603),
+            (BLS12381_MAP_FP2_TO_G2, 1672, 0),
+            (BLS12381_HASH_TO_G2, 3960, 0),
+            (BN254_G1_MSM, 73061, 229779),
+        ];
+
+        self.resize_and_update_cost_params(NEW_SIZE, cpu_updates, mem_updates)?;
+
+        tracing::info!(
+            ledger_seq = self.close_data.ledger_seq,
+            new_size = NEW_SIZE,
+            "Applied updateCostTypesForV26: updated BLS12-381/BN254 cost params and added Bn254G1Msm"
+        );
+
+        Ok(())
+    }
+
     /// Create initial CONFIG_SETTING entries for Protocol 26 (CAP-77 frozen ledger keys).
     ///
     /// Parity: NetworkConfig.cpp createLedgerEntriesForV26
@@ -3846,10 +3897,12 @@ impl LedgerCloseContext<'_> {
                 version_upgrade_memory_cost_changed = true;
             }
 
-            // Parity: NetworkConfig.cpp createLedgerEntriesForV26
-            // needUpgradeToVersion(V_26, prev, new) → create empty frozen key config entries
+            // Parity: NetworkConfig.cpp updateCostTypesForV26 + createLedgerEntriesForV26
+            // needUpgradeToVersion(V_26, prev, new) → update cost params + create frozen key entries
             if needs_upgrade_to_version(ProtocolVersion::V26, prev_version, protocol_version) {
+                self.update_cost_types_for_v26()?;
                 self.create_ledger_entries_for_v26()?;
+                version_upgrade_memory_cost_changed = true;
             }
 
             // Parity: Upgrades.cpp:1189-1193
@@ -7368,6 +7421,96 @@ mod tests {
             );
         } else {
             panic!("Memory cost params not found after full chain");
+        }
+    }
+
+    #[test]
+    fn test_full_chain_v20_through_v26_cost_params() {
+        // Test the full cost params chain including V26 updates
+        let manager = LedgerManager::new(
+            "Test SDF Network ; September 2015".to_string(),
+            LedgerManagerConfig {
+                validate_bucket_hash: false,
+                ..Default::default()
+            },
+        );
+        let bucket_list = henyey_bucket::BucketList::new();
+        let hot_archive_bucket_list = henyey_bucket::HotArchiveBucketList::new();
+        let header = create_genesis_header();
+        let header_hash = crate::compute_header_hash(&header).expect("hash");
+        manager
+            .initialize(bucket_list, hot_archive_bucket_list, header, header_hash)
+            .expect("init");
+
+        let mut ctx = make_test_close_context(&manager, 2);
+
+        // Full chain: V20 -> V21 -> V22 -> V23 -> V25 -> V26
+        ctx.create_ledger_entries_for_v20().expect("V20");
+        ctx.create_cost_types_for_v21().expect("V21");
+        ctx.create_cost_types_for_v22().expect("V22");
+        ctx.create_and_update_ledger_entries_for_v23().expect("V23");
+        ctx.create_cost_types_for_v25().expect("V25");
+        ctx.update_cost_types_for_v26().expect("V26");
+
+        // CPU cost params should have 86 entries (Bn254G1Msm at index 85)
+        let cpu = get_config_setting_from_delta(
+            &ctx.delta,
+            ConfigSettingId::ContractCostParamsCpuInstructions,
+        );
+        if let Some(ConfigSettingEntry::ContractCostParamsCpuInstructions(ref params)) = cpu {
+            assert_eq!(
+                params.0.len(),
+                86,
+                "V26 CPU cost params should have 86 entries"
+            );
+            // Verify V26-updated BLS12-381 values
+            assert_eq!(params.0[55].const_term, 2347584); // Bls12381G1Msm
+            assert_eq!(params.0[55].linear_term, 94135478);
+            assert_eq!(params.0[56].const_term, 1020885); // Bls12381MapFpToG1
+            assert_eq!(params.0[57].const_term, 2638451); // Bls12381HashToG1
+            assert_eq!(params.0[57].linear_term, 6803);
+            assert_eq!(params.0[60].const_term, 7663880); // Bls12381G2Msm
+            assert_eq!(params.0[60].linear_term, 298580871);
+            assert_eq!(params.0[61].const_term, 1856539); // Bls12381MapFp2ToG2
+            assert_eq!(params.0[62].const_term, 6315452); // Bls12381HashToG2
+            assert_eq!(params.0[62].linear_term, 7232);
+            // Verify V26-updated BN254 value
+            assert_eq!(params.0[74].const_term, 1706052); // Bn254G2CheckPointInSubgroup
+                                                          // Verify new Bn254G1Msm entry
+            assert_eq!(params.0[85].const_term, 1185193); // Bn254G1Msm
+            assert_eq!(params.0[85].linear_term, 41568084);
+            // Verify older entries are preserved
+            assert_eq!(params.0[0].const_term, 4); // WasmInsnExec (V20)
+            assert_eq!(params.0[84].const_term, 33151); // Bn254FrInv (V25)
+        } else {
+            panic!("CPU cost params not found after V26 upgrade");
+        }
+
+        // Memory cost params should also have 86 entries
+        let mem = get_config_setting_from_delta(
+            &ctx.delta,
+            ConfigSettingId::ContractCostParamsMemoryBytes,
+        );
+        if let Some(ConfigSettingEntry::ContractCostParamsMemoryBytes(ref params)) = mem {
+            assert_eq!(
+                params.0.len(),
+                86,
+                "V26 memory cost params should have 86 entries"
+            );
+            // Verify V26-updated memory values
+            assert_eq!(params.0[55].const_term, 109494); // Bls12381G1Msm
+            assert_eq!(params.0[55].linear_term, 266603);
+            assert_eq!(params.0[56].const_term, 2776); // Bls12381MapFpToG1
+            assert_eq!(params.0[57].const_term, 5896); // Bls12381HashToG1
+            assert_eq!(params.0[60].const_term, 219654); // Bls12381G2Msm
+            assert_eq!(params.0[60].linear_term, 266603);
+            assert_eq!(params.0[61].const_term, 1672); // Bls12381MapFp2ToG2
+            assert_eq!(params.0[62].const_term, 3960); // Bls12381HashToG2
+                                                       // Verify new Bn254G1Msm entry
+            assert_eq!(params.0[85].const_term, 73061); // Bn254G1Msm
+            assert_eq!(params.0[85].linear_term, 229779);
+        } else {
+            panic!("Memory cost params not found after V26 upgrade");
         }
     }
 

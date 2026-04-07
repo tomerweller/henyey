@@ -562,8 +562,8 @@ pub struct LocalNode {
 }
 
 const LEDGER_VERSION: u32 = henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION;
-const OVERLAY_VERSION: u32 = 39;
-const OVERLAY_MIN_VERSION: u32 = 38;
+const OVERLAY_VERSION: u32 = 40;
+const OVERLAY_MIN_VERSION: u32 = 39;
 const DEFAULT_LISTENING_PORT: u16 = 11625;
 
 impl LocalNode {

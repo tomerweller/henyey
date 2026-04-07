@@ -10,7 +10,9 @@ use stellar_xdr::curr::{
     SorobanTransactionData, SorobanTransactionDataExt, TtlEntry, WriteXdr,
 };
 
-use henyey_common::protocol::{protocol_version_is_before, ProtocolVersion};
+use henyey_common::protocol::{
+    protocol_version_is_before, protocol_version_starts_from, ProtocolVersion,
+};
 use henyey_common::xdr_encoded_len;
 
 /// Check if a ledger key is for a Soroban entry.
@@ -431,6 +433,7 @@ fn execute_contract_invocation(
                 &soroban_data.resources.footprint,
                 &hot_archive_restored_keys,
                 ttl_key_cache,
+                context.protocol_version,
             );
 
             // Compute result hash from success preimage (return value + events)
@@ -756,6 +759,7 @@ fn apply_soroban_storage_changes(
     footprint: &stellar_xdr::curr::LedgerFootprint,
     hot_archive_restored_keys: &std::collections::HashSet<LedgerKey>,
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
+    protocol_version: u32,
 ) {
     use std::collections::HashSet;
 
@@ -766,6 +770,10 @@ fn apply_soroban_storage_changes(
             created_and_modified_keys.insert(change.key.clone());
         }
     }
+
+    // Track truly created keys (entries that did not exist before this TX).
+    // This is used for CAP-73 validation below.
+    let mut created_keys: HashSet<LedgerKey> = HashSet::new();
 
     // Apply all storage changes from the host
     for change in changes.iter() {
@@ -778,7 +786,43 @@ fn apply_soroban_storage_changes(
             is_rent_related = change.is_rent_related,
             "Applying storage change"
         );
-        apply_soroban_storage_change(state, change, hot_archive_restored_keys, ttl_key_cache);
+        let was_created =
+            apply_soroban_storage_change(state, change, hot_archive_restored_keys, ttl_key_cache);
+        if was_created {
+            created_keys.insert(change.key.clone());
+        }
+    }
+
+    // CAP-73 validation: verify that newly created keys are of expected types.
+    // stellar-core: InvokeHostFunctionOpFrame::recordStorageChanges()
+    for key in &created_keys {
+        if is_soroban_key(key) {
+            // Soroban entries must have a corresponding TTL entry also created
+            let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
+            let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl { key_hash });
+            debug_assert!(
+                created_keys.contains(&ttl_key),
+                "Created Soroban entry {:?} missing TTL key",
+                key
+            );
+        } else if protocol_version_starts_from(protocol_version, ProtocolVersion::V26) {
+            // V26+: SAC can create Account and Trustline entries (CAP-73)
+            debug_assert!(
+                matches!(
+                    key,
+                    LedgerKey::Ttl(_) | LedgerKey::Account(_) | LedgerKey::Trustline(_)
+                ),
+                "Non-Soroban created key must be TTL, Account, or Trustline in V26+, got {:?}",
+                std::mem::discriminant(key)
+            );
+        } else {
+            // Pre-V26: only TTL keys should be created as non-Soroban entries
+            debug_assert!(
+                matches!(key, LedgerKey::Ttl(_)),
+                "Non-Soroban created key must be TTL in pre-V26, got {:?}",
+                std::mem::discriminant(key)
+            );
+        }
     }
 
     // stellar-core behavior: delete any read-write footprint entries that weren't
@@ -859,16 +903,21 @@ fn should_create_contract_entry(
     }
 }
 
+/// Returns `true` if the entry was newly created (not an update of an existing entry).
+/// This mirrors stellar-core's `upsertLedgerEntry()` return value.
 fn apply_soroban_storage_change(
     state: &mut LedgerStateManager,
     change: &crate::soroban::StorageChange,
     hot_archive_restored_keys: &std::collections::HashSet<LedgerKey>,
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
-) {
+) -> bool {
     // Check if this entry is being restored from the hot archive.
     // Hot archive restored entries must be recorded as INIT (created) in the bucket list delta,
     // not LIVE (updated), because they are being restored to the live bucket list.
     let is_hot_archive_restore = hot_archive_restored_keys.contains(&change.key);
+
+    // Track whether this entry was created (vs updated)
+    let mut was_created = false;
 
     if let Some(entry) = &change.new_entry {
         // Handle contract data and code entries.
@@ -881,6 +930,7 @@ fn apply_soroban_storage_change(
                     && key_already_created_in_delta(state.delta(), &change.key);
                 if should_create_contract_entry(exists, is_hot_archive_restore, already_in_delta) {
                     state.create_contract_data(cd.clone());
+                    was_created = true;
                 } else {
                     state.update_contract_data(cd.clone());
                 }
@@ -891,6 +941,7 @@ fn apply_soroban_storage_change(
                     && key_already_created_in_delta(state.delta(), &change.key);
                 if should_create_contract_entry(exists, is_hot_archive_restore, already_in_delta) {
                     state.create_contract_code(cc.clone());
+                    was_created = true;
                 } else {
                     state.update_contract_code(cc.clone());
                 }
@@ -903,6 +954,7 @@ fn apply_soroban_storage_change(
                     existing = exists,
                     "TTL emit: direct TTL entry"
                 );
+                was_created = !exists;
                 create_or_update_ttl(state, ttl.clone(), exists);
             }
             // SAC (Stellar Asset Contract) can modify Account and Trustline entries
@@ -911,6 +963,7 @@ fn apply_soroban_storage_change(
                     state.update_account(acc.clone());
                 } else {
                     state.create_account(acc.clone());
+                    was_created = true;
                 }
             }
             stellar_xdr::curr::LedgerEntryData::Trustline(tl) => {
@@ -921,6 +974,7 @@ fn apply_soroban_storage_change(
                     state.update_trustline(tl.clone());
                 } else {
                     state.create_trustline(tl.clone());
+                    was_created = true;
                 }
             }
             _ => {}
@@ -949,7 +1003,7 @@ fn apply_soroban_storage_change(
         if !matches!(entry.data, stellar_xdr::curr::LedgerEntryData::Ttl(_)) {
             if let Some(live_until) = change.live_until {
                 if live_until == 0 {
-                    return;
+                    return was_created;
                 }
                 let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, &change.key);
                 let existing_ttl = state.get_ttl(&key_hash);
@@ -1005,14 +1059,14 @@ fn apply_soroban_storage_change(
         }
     } else if let Some(live_until) = change.live_until {
         if live_until == 0 {
-            return;
+            return false;
         }
         // For hot archive read-only restores (new_entry=None), skip TTL INIT.
         // stellar-core's handleArchivedEntry creates DATA+TTL INIT then erases both
         // for read-only access → net: nothing in live BL.
         // HOT_ARCHIVE_LIVE tombstone is still added correctly via hot_archive_restored_keys.
         if is_hot_archive_restore {
-            return;
+            return false;
         }
         // TTL-only change: the data entry wasn't modified, but its TTL was bumped.
         // This happens when a contract reads an entry and its TTL gets auto-extended.
@@ -1085,6 +1139,7 @@ fn apply_soroban_storage_change(
             _ => {}
         }
     }
+    was_created
 }
 
 fn footprint_has_unrestored_archived_entries(
@@ -2505,6 +2560,7 @@ mod tests {
             &footprint,
             &hot_archive_restored_keys,
             None,
+            25,
         );
 
         // No TTL INIT should have been created (VE-05 fix).
@@ -2607,6 +2663,7 @@ mod tests {
             &footprint,
             &hot_archive_restored_keys,
             None,
+            25,
         );
 
         // KEY ASSERTION: no DEAD entry should be created.

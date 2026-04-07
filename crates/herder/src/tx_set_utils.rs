@@ -200,6 +200,33 @@ pub fn get_invalid_tx_list(
     close_time_bounds: &CloseTimeBounds,
     fee_balance_provider: Option<&dyn FeeBalanceProvider>,
 ) -> Vec<TransactionEnvelope> {
+    let mut account_fee_map: HashMap<AccountId, i64> = HashMap::new();
+    get_invalid_tx_list_with_fee_map(
+        txs,
+        ctx,
+        close_time_bounds,
+        fee_balance_provider,
+        &mut account_fee_map,
+    )
+}
+
+/// Returns the list of invalid transactions, using a shared fee-source map.
+///
+/// For Protocol 26+, the `account_fee_map` should be shared across both
+/// Classic and Soroban phases so that a fee source appearing in both phases
+/// has its total fees summed correctly.
+///
+/// # Parity
+///
+/// Mirrors `TxSetUtils::getInvalidTxListWithErrors()` in stellar-core,
+/// which accepts `accountFeeMap` by reference.
+pub fn get_invalid_tx_list_with_fee_map(
+    txs: &[TransactionEnvelope],
+    ctx: &TxSetValidationContext,
+    close_time_bounds: &CloseTimeBounds,
+    fee_balance_provider: Option<&dyn FeeBalanceProvider>,
+    account_fee_map: &mut HashMap<AccountId, i64>,
+) -> Vec<TransactionEnvelope> {
     let mut invalid_txs = Vec::new();
     let mut seen_invalid: HashSet<Hash256> = HashSet::new();
 
@@ -221,10 +248,6 @@ pub fn get_invalid_tx_list(
     let upper_ledger_ctx = ctx.to_ledger_context(upper_close_time);
     // Only build lower context if offsets differ (optimization for common case).
     let need_lower_check = lower_close_time != upper_close_time;
-
-    // --- Pass 1: per-transaction basic validation ---
-    // Also accumulate fees per fee source for valid transactions.
-    let mut account_fee_map: HashMap<AccountId, i64> = HashMap::new();
 
     for tx in txs {
         let frame = TransactionFrame::from_owned_with_network(tx.clone(), ctx.network_id);

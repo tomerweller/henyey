@@ -756,8 +756,10 @@ impl ConfigUpgradeSetFrame {
                 45 // VerifyEcdsaSecp256r1Sig(44) + 1
             } else if protocol_version_is_before(ledger_version, ProtocolVersion::V25) {
                 70 // Bls12381FrInv(69) + 1
-            } else {
+            } else if protocol_version_is_before(ledger_version, ProtocolVersion::V26) {
                 85 // Bn254FrInv(84) + 1
+            } else {
+                86 // Bn254G1Msm(85) + 1
             };
 
         if params.0.len() != expected_count {
