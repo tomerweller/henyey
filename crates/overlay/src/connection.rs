@@ -620,12 +620,24 @@ impl ConnectionPool {
     /// (OverlayManagerImpl.cpp:206): PEERS are already sent by this point,
     /// so crawlers get topology data even when rejected.
     pub fn try_promote_to_authenticated(&self) -> bool {
-        let authenticated = self.authenticated_count.load(Ordering::Relaxed);
-        if authenticated >= self.max_connections {
-            return false;
+        let mut current = self.authenticated_count.load(Ordering::Relaxed);
+        loop {
+            if current >= self.max_connections {
+                return false;
+            }
+            match self.authenticated_count.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.pending_count.fetch_sub(1, Ordering::Relaxed);
+                    return true;
+                }
+                Err(new) => current = new,
+            }
         }
-        self.mark_authenticated();
-        true
     }
 
     /// Returns the current number of connections (pending + authenticated).
