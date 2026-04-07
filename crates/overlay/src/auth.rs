@@ -1282,7 +1282,9 @@ mod tests {
 
         // Wrap an Auth message with a valid MAC
         let auth_msg = StellarMessage::Auth(xdr::Auth { flags: 200 });
-        let wrapped = ctx_a.wrap_auth_message(auth_msg).expect("wrap should succeed");
+        let wrapped = ctx_a
+            .wrap_auth_message(auth_msg)
+            .expect("wrap should succeed");
 
         // Corrupt every MAC byte
         let corrupted = match wrapped {

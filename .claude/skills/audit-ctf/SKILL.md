@@ -1,7 +1,7 @@
 ---
 name: audit-ctf
 description: CTF-style security audit on a crate or file, filing GitHub issues
-argument-hint: [--crate <name> | <file-path>] [--dry-run]
+argument-hint: "[--crate <name> | <file-path>] [--dry-run]"
 ---
 
 Parse `$ARGUMENTS`:

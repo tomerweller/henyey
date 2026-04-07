@@ -1,7 +1,7 @@
 ---
 name: audit-gesserit
 description: Multi-stage adversarial security audit with hypothesis, review, PoC, publish
-argument-hint: [--crate <name>] [--max-rounds N] [--max-cost N] [--no-hypothesis] [--no-poc] [--no-publish] [--dry-run] [--resume] [--promote <path>]
+argument-hint: "[--crate <name>] [--max-rounds N] [--max-cost N] [--no-hypothesis] [--no-poc] [--no-publish] [--dry-run] [--resume] [--promote <path>]"
 ---
 
 Parse `$ARGUMENTS`:

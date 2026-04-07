@@ -1,7 +1,7 @@
 ---
 name: security-fix-loop
 description: Process open security audit issues in severity order; validate, test, fix
-argument-hint: [--label <label>] [--dry-run]
+argument-hint: "[--label <label>] [--dry-run]"
 ---
 
 Parse `$ARGUMENTS`:
