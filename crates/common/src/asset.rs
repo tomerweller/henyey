@@ -297,8 +297,7 @@ pub fn is_issuer(acc: &AccountId, asset: &Asset) -> bool {
 }
 
 /// Check if an account is the issuer of a TrustLineAsset.
-#[allow(dead_code)] // Parity with stellar-core; not yet called in production
-pub(crate) fn is_trustline_asset_issuer(acc: &AccountId, asset: &TrustLineAsset) -> bool {
+pub fn is_trustline_asset_issuer(acc: &AccountId, asset: &TrustLineAsset) -> bool {
     get_trustline_asset_issuer(asset).is_ok_and(|issuer| issuer == acc)
 }
 

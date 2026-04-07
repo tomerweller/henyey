@@ -855,3 +855,396 @@ fn test_fee_bump_inner_signature_uses_low_threshold() {
         "fee-bump inner TX signature should use THRESHOLD_LOW, not THRESHOLD_MEDIUM"
     );
 }
+
+// ============================================================================
+// CAP-77: Frozen key precondition tests
+// ============================================================================
+
+/// Fee-bump with frozen outer (fee) source account must fail with TxFrozenKeyAccessed.
+#[test]
+fn test_fee_bump_outer_source_frozen_key_rejected() {
+    // Inner source
+    let inner_secret = SecretKey::from_seed(&[30u8; 32]);
+    let inner_account_id: AccountId = (&inner_secret.public_key()).into();
+
+    // Fee source (will be frozen)
+    let fee_secret = SecretKey::from_seed(&[31u8; 32]);
+    let fee_account_id: AccountId = (&fee_secret.public_key()).into();
+
+    // Set up both accounts in the snapshot
+    let (inner_key, inner_entry) = create_account_entry(inner_account_id.clone(), 1, 10_000_000);
+    let (fee_key, fee_entry) = create_account_entry(fee_account_id.clone(), 1, 10_000_000);
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(inner_key, inner_entry)
+        .add_entry(fee_key, fee_entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let destination = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([99u8; 32])));
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::CreateAccount(CreateAccountOp {
+            destination,
+            starting_balance: 1_000_000,
+        }),
+    };
+
+    let inner_tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*inner_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let inner_env = TransactionV1Envelope {
+        tx: inner_tx,
+        signatures: VecM::default(),
+    };
+
+    let fee_bump = FeeBumpTransaction {
+        fee_source: MuxedAccount::Ed25519(Uint256(*fee_secret.public_key().as_bytes())),
+        fee: 200,
+        inner_tx: FeeBumpTransactionInnerTx::Tx(inner_env),
+        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+        tx: fee_bump,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+
+    // Sign inner with inner secret
+    let inner_sig = sign_envelope(
+        &{
+            let TransactionEnvelope::TxFeeBump(ref fb) = envelope else {
+                panic!()
+            };
+            let FeeBumpTransactionInnerTx::Tx(ref inner) = fb.tx.inner_tx;
+            TransactionEnvelope::Tx(inner.clone())
+        },
+        &inner_secret,
+        &network_id,
+    );
+    if let TransactionEnvelope::TxFeeBump(ref mut fb) = envelope {
+        let FeeBumpTransactionInnerTx::Tx(ref mut inner) = fb.tx.inner_tx;
+        inner.signatures = vec![inner_sig].try_into().unwrap();
+    }
+
+    // Sign outer with fee source secret
+    let outer_sig = sign_envelope(&envelope, &fee_secret, &network_id);
+    if let TransactionEnvelope::TxFeeBump(ref mut fb) = envelope {
+        fb.signatures = vec![outer_sig].try_into().unwrap();
+    }
+
+    // Create frozen key config with the fee source account frozen
+    let fee_account_ledger_key = LedgerKey::Account(LedgerKeyAccount {
+        account_id: fee_account_id.clone(),
+    });
+    let frozen_key_bytes = fee_account_ledger_key
+        .to_xdr(stellar_xdr::curr::Limits::none())
+        .unwrap();
+
+    let mut context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 26, network_id);
+    context.frozen_key_config =
+        henyey_tx::frozen_keys::FrozenKeyConfig::new(vec![frozen_key_bytes], vec![]);
+
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert_eq!(
+        result.failure,
+        Some(TransactionResultCode::TxFrozenKeyAccessed),
+        "Fee-bump with frozen outer source should fail with TxFrozenKeyAccessed"
+    );
+    assert!(
+        result.fee_bump_outer_failure,
+        "Should be marked as fee bump outer failure"
+    );
+}
+
+/// Fee-bump with frozen outer source is allowed when the tx hash is in the bypass set.
+#[test]
+fn test_fee_bump_outer_source_frozen_bypass_allowed() {
+    // Inner source
+    let inner_secret = SecretKey::from_seed(&[40u8; 32]);
+    let inner_account_id: AccountId = (&inner_secret.public_key()).into();
+
+    // Fee source (will be frozen, but bypass hash matches)
+    let fee_secret = SecretKey::from_seed(&[41u8; 32]);
+    let fee_account_id: AccountId = (&fee_secret.public_key()).into();
+
+    let (inner_key, inner_entry) = create_account_entry(inner_account_id.clone(), 1, 10_000_000);
+    let (fee_key, fee_entry) = create_account_entry(fee_account_id.clone(), 1, 10_000_000);
+
+    let destination = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([98u8; 32])));
+    let (dest_key, dest_entry) = create_account_entry(destination.clone(), 0, 0);
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(inner_key, inner_entry)
+        .add_entry(fee_key, fee_entry)
+        .add_entry(dest_key, dest_entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+            destination: MuxedAccount::Ed25519(Uint256([98u8; 32])),
+            asset: stellar_xdr::curr::Asset::Native,
+            amount: 1_000_000,
+        }),
+    };
+
+    let inner_tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*inner_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let inner_env = TransactionV1Envelope {
+        tx: inner_tx,
+        signatures: VecM::default(),
+    };
+
+    let fee_bump = FeeBumpTransaction {
+        fee_source: MuxedAccount::Ed25519(Uint256(*fee_secret.public_key().as_bytes())),
+        fee: 200,
+        inner_tx: FeeBumpTransactionInnerTx::Tx(inner_env),
+        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+        tx: fee_bump,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+
+    // Sign inner
+    let inner_sig = sign_envelope(
+        &{
+            let TransactionEnvelope::TxFeeBump(ref fb) = envelope else {
+                panic!()
+            };
+            let FeeBumpTransactionInnerTx::Tx(ref inner) = fb.tx.inner_tx;
+            TransactionEnvelope::Tx(inner.clone())
+        },
+        &inner_secret,
+        &network_id,
+    );
+    if let TransactionEnvelope::TxFeeBump(ref mut fb) = envelope {
+        let FeeBumpTransactionInnerTx::Tx(ref mut inner) = fb.tx.inner_tx;
+        inner.signatures = vec![inner_sig].try_into().unwrap();
+    }
+
+    // Sign outer
+    let outer_sig = sign_envelope(&envelope, &fee_secret, &network_id);
+    if let TransactionEnvelope::TxFeeBump(ref mut fb) = envelope {
+        fb.signatures = vec![outer_sig].try_into().unwrap();
+    }
+
+    // Compute the outer tx hash (same as what precondition validation uses)
+    let frame = henyey_tx::TransactionFrame::from_owned_with_network(envelope.clone(), network_id);
+    let outer_hash = frame.hash(&network_id).expect("hash");
+
+    // Create frozen key config with fee source frozen, but bypass the tx hash
+    let fee_account_ledger_key = LedgerKey::Account(LedgerKeyAccount {
+        account_id: fee_account_id.clone(),
+    });
+    let frozen_key_bytes = fee_account_ledger_key
+        .to_xdr(stellar_xdr::curr::Limits::none())
+        .unwrap();
+
+    let mut context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 26, network_id);
+    context.frozen_key_config = henyey_tx::frozen_keys::FrozenKeyConfig::new(
+        vec![frozen_key_bytes],
+        vec![Hash(outer_hash.0)], // bypass this specific tx hash
+    );
+
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert_ne!(
+        result.failure,
+        Some(TransactionResultCode::TxFrozenKeyAccessed),
+        "Fee-bump with frozen outer source should be allowed when bypass hash matches"
+    );
+}
+
+/// Inner TX source frozen should fail with TxFrozenKeyAccessed (non-fee-bump case).
+#[test]
+fn test_inner_source_frozen_key_rejected() {
+    let secret = SecretKey::from_seed(&[50u8; 32]);
+    let account_id: AccountId = (&secret.public_key()).into();
+
+    let (key, entry) = create_account_entry(account_id.clone(), 1, 10_000_000);
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(key, entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let destination = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([97u8; 32])));
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::CreateAccount(CreateAccountOp {
+            destination,
+            starting_balance: 1_000_000,
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    // Freeze the source account
+    let account_ledger_key = LedgerKey::Account(LedgerKeyAccount {
+        account_id: account_id.clone(),
+    });
+    let frozen_key_bytes = account_ledger_key
+        .to_xdr(stellar_xdr::curr::Limits::none())
+        .unwrap();
+
+    let mut context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 26, network_id);
+    context.frozen_key_config =
+        henyey_tx::frozen_keys::FrozenKeyConfig::new(vec![frozen_key_bytes], vec![]);
+
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert_eq!(
+        result.failure,
+        Some(TransactionResultCode::TxFrozenKeyAccessed),
+        "Transaction with frozen source account should fail with TxFrozenKeyAccessed"
+    );
+}
+
+/// Inner TX source frozen should be allowed when bypass hash matches.
+#[test]
+fn test_inner_source_frozen_bypass_allowed() {
+    let secret = SecretKey::from_seed(&[60u8; 32]);
+    let account_id: AccountId = (&secret.public_key()).into();
+
+    let (key, entry) = create_account_entry(account_id.clone(), 1, 10_000_000);
+
+    let destination = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([96u8; 32])));
+    let (dest_key, dest_entry) = create_account_entry(destination.clone(), 0, 0);
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(key, entry)
+        .add_entry(dest_key, dest_entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+            destination: MuxedAccount::Ed25519(Uint256([96u8; 32])),
+            asset: stellar_xdr::curr::Asset::Native,
+            amount: 1_000_000,
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    // Compute the tx hash for the bypass set
+    let frame = henyey_tx::TransactionFrame::from_owned_with_network(envelope.clone(), network_id);
+    let tx_hash = frame.hash(&network_id).expect("hash");
+
+    // Freeze the source account but add the tx hash to the bypass set
+    let account_ledger_key = LedgerKey::Account(LedgerKeyAccount {
+        account_id: account_id.clone(),
+    });
+    let frozen_key_bytes = account_ledger_key
+        .to_xdr(stellar_xdr::curr::Limits::none())
+        .unwrap();
+
+    let mut context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 26, network_id);
+    context.frozen_key_config =
+        henyey_tx::frozen_keys::FrozenKeyConfig::new(vec![frozen_key_bytes], vec![Hash(tx_hash.0)]);
+
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert_ne!(
+        result.failure,
+        Some(TransactionResultCode::TxFrozenKeyAccessed),
+        "Transaction with frozen source should be allowed when bypass hash matches"
+    );
+}

@@ -27,9 +27,9 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use stellar_xdr::curr::{
     ConfigSettingEntry, ConfigSettingId, ConfigUpgradeSet, ConfigUpgradeSetKey,
-    ContractDataDurability, EncodedLedgerKey, FreezeBypassTxs, FrozenLedgerKeys, Hash, LedgerEntry,
-    LedgerEntryData, LedgerEntryExt, LedgerKey, LedgerKeyContractData, Limits, ReadXdr, ScAddress,
-    ScVal, WriteXdr,
+    ContractDataDurability, EncodedLedgerKey, FreezeBypassTxs, FrozenLedgerKeys,
+    FrozenLedgerKeysDelta, Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerKey,
+    LedgerKeyContractData, Limits, ReadXdr, ScAddress, ScVal, TrustLineAsset, WriteXdr,
 };
 use tracing::{debug, info, warn};
 
@@ -867,11 +867,21 @@ impl ConfigUpgradeSetFrame {
                     && ext.tx_max_footprint_entries >= min_config::TX_MAX_READ_LEDGER_ENTRIES
                     && ext.fee_write1_kb >= 0
             }
-            // CAP-77 frozen key config settings — always valid when present.
-            ConfigSettingEntry::FrozenLedgerKeys(_)
-            | ConfigSettingEntry::FrozenLedgerKeysDelta(_)
-            | ConfigSettingEntry::FreezeBypassTxs(_)
-            | ConfigSettingEntry::FreezeBypassTxsDelta(_) => true,
+            // CAP-77 frozen key config settings (Protocol 26+).
+            // Parity: NetworkConfig.cpp:1486-1572
+            ConfigSettingEntry::FrozenLedgerKeys(_) | ConfigSettingEntry::FreezeBypassTxs(_) => {
+                // The base entries are always structurally valid but require V26.
+                // (They cannot be directly upgraded — is_non_upgradeable blocks them.)
+                protocol_version_starts_from(ledger_version, ProtocolVersion::V26)
+            }
+            ConfigSettingEntry::FrozenLedgerKeysDelta(delta) => {
+                protocol_version_starts_from(ledger_version, ProtocolVersion::V26)
+                    && Self::is_valid_frozen_keys_delta(delta)
+            }
+            ConfigSettingEntry::FreezeBypassTxsDelta(_) => {
+                // Bypass tx delta is structurally validated only, matching upstream.
+                protocol_version_starts_from(ledger_version, ProtocolVersion::V26)
+            }
             ConfigSettingEntry::ScpTiming(timing) => {
                 protocol_version_starts_from(ledger_version, ProtocolVersion::V23)
                     && timing.ledger_target_close_time_milliseconds
@@ -896,6 +906,70 @@ impl ConfigUpgradeSetFrame {
                         <= max_config::BALLOT_TIMEOUT_INCREMENT_MILLISECONDS
             }
         }
+    }
+
+    /// Validate a FrozenLedgerKeysDelta entry.
+    ///
+    /// Each encoded key in keys_to_freeze and keys_to_unfreeze must:
+    /// - Decode as valid XDR
+    /// - Be one of ACCOUNT, TRUSTLINE, CONTRACT_DATA, CONTRACT_CODE
+    /// - For TRUSTLINE: not be a pool-share trustline, and not be an issuer trustline
+    ///
+    /// Parity: NetworkConfig.cpp:1492-1562
+    fn is_valid_frozen_keys_delta(delta: &FrozenLedgerKeysDelta) -> bool {
+        let validate_encoded_keys =
+            |encoded_keys: &[EncodedLedgerKey], key_set_name: &str| -> bool {
+                for encoded_key in encoded_keys {
+                    match LedgerKey::from_xdr(encoded_key.0.as_slice(), Limits::none()) {
+                        Ok(lk) => match &lk {
+                            LedgerKey::Account(_)
+                            | LedgerKey::ContractData(_)
+                            | LedgerKey::ContractCode(_) => {}
+                            LedgerKey::Trustline(tl) => {
+                                // Pool-share trustlines cannot be frozen.
+                                if matches!(tl.asset, TrustLineAsset::PoolShare(_)) {
+                                    warn!(
+                                        key_set = key_set_name,
+                                        "Rejecting frozen key delta: pool-share trustline"
+                                    );
+                                    return false;
+                                }
+                                // Issuer trustlines cannot be frozen.
+                                if henyey_common::asset::is_trustline_asset_issuer(
+                                    &tl.account_id,
+                                    &tl.asset,
+                                ) {
+                                    warn!(
+                                        key_set = key_set_name,
+                                        "Rejecting frozen key delta: issuer trustline"
+                                    );
+                                    return false;
+                                }
+                            }
+                            _ => {
+                                warn!(
+                                    key_set = key_set_name,
+                                    key_type = ?lk.discriminant(),
+                                    "Rejecting frozen key delta: unsupported key type"
+                                );
+                                return false;
+                            }
+                        },
+                        Err(e) => {
+                            warn!(
+                                key_set = key_set_name,
+                                error = %e,
+                                "Rejecting frozen key delta: failed to decode encoded ledger key"
+                            );
+                            return false;
+                        }
+                    }
+                }
+                true
+            };
+
+        validate_encoded_keys(&delta.keys_to_freeze, "keysToFreeze")
+            && validate_encoded_keys(&delta.keys_to_unfreeze, "keysToUnfreeze")
     }
 }
 
@@ -1237,6 +1311,280 @@ mod tests {
         assert!(
             !ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
             "Wrong count CPU cost params should be rejected"
+        );
+    }
+
+    // ========================================================================
+    // CAP-77: Frozen ledger key delta validation tests
+    // ========================================================================
+
+    /// Encode a LedgerKey to an EncodedLedgerKey for test construction.
+    fn encode_ledger_key(key: &LedgerKey) -> EncodedLedgerKey {
+        let bytes = key.to_xdr(Limits::none()).expect("XDR encode");
+        EncodedLedgerKey(bytes.try_into().expect("fits BytesM"))
+    }
+
+    /// Build a FrozenLedgerKeysDelta with the given keys_to_freeze and empty keys_to_unfreeze.
+    fn make_freeze_delta(keys_to_freeze: Vec<EncodedLedgerKey>) -> FrozenLedgerKeysDelta {
+        FrozenLedgerKeysDelta {
+            keys_to_freeze: keys_to_freeze.try_into().unwrap(),
+            keys_to_unfreeze: vec![].try_into().unwrap(),
+        }
+    }
+
+    /// Build a FrozenLedgerKeysDelta with the given keys_to_unfreeze and empty keys_to_freeze.
+    fn make_unfreeze_delta(keys_to_unfreeze: Vec<EncodedLedgerKey>) -> FrozenLedgerKeysDelta {
+        FrozenLedgerKeysDelta {
+            keys_to_freeze: vec![].try_into().unwrap(),
+            keys_to_unfreeze: keys_to_unfreeze.try_into().unwrap(),
+        }
+    }
+
+    fn test_account_id() -> stellar_xdr::curr::AccountId {
+        stellar_xdr::curr::AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256([42u8; 32]),
+        ))
+    }
+
+    fn test_issuer_id() -> stellar_xdr::curr::AccountId {
+        stellar_xdr::curr::AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256([99u8; 32]),
+        ))
+    }
+
+    #[test]
+    fn test_frozen_keys_delta_valid_account_key() {
+        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: test_account_id(),
+        });
+        let delta = make_freeze_delta(vec![encode_ledger_key(&key)]);
+        let entry = ConfigSettingEntry::FrozenLedgerKeysDelta(delta);
+        assert!(
+            ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 26),
+            "Account key should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_frozen_keys_delta_valid_contract_data_key() {
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(Hash([10u8; 32]))),
+            key: ScVal::U32(1),
+            durability: ContractDataDurability::Persistent,
+        });
+        let delta = make_freeze_delta(vec![encode_ledger_key(&key)]);
+        let entry = ConfigSettingEntry::FrozenLedgerKeysDelta(delta);
+        assert!(
+            ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 26),
+            "ContractData key should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_frozen_keys_delta_valid_contract_code_key() {
+        let key = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+            hash: Hash([20u8; 32]),
+        });
+        let delta = make_freeze_delta(vec![encode_ledger_key(&key)]);
+        let entry = ConfigSettingEntry::FrozenLedgerKeysDelta(delta);
+        assert!(
+            ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 26),
+            "ContractCode key should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_frozen_keys_delta_valid_trustline_key() {
+        use stellar_xdr::curr::{AlphaNum4, AssetCode4, LedgerKeyTrustLine};
+        let key = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: test_account_id(),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+                issuer: test_issuer_id(),
+            }),
+        });
+        let delta = make_freeze_delta(vec![encode_ledger_key(&key)]);
+        let entry = ConfigSettingEntry::FrozenLedgerKeysDelta(delta);
+        assert!(
+            ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 26),
+            "Non-issuer, non-pool-share trustline key should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_frozen_keys_delta_rejects_malformed_xdr() {
+        let bad_encoded = EncodedLedgerKey(vec![0xDE, 0xAD, 0xBE, 0xEF].try_into().unwrap());
+        let delta = make_freeze_delta(vec![bad_encoded]);
+        let entry = ConfigSettingEntry::FrozenLedgerKeysDelta(delta);
+        assert!(
+            !ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 26),
+            "Malformed XDR should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_frozen_keys_delta_rejects_unsupported_key_type_offer() {
+        let key = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+            seller_id: test_account_id(),
+            offer_id: 42,
+        });
+        let delta = make_freeze_delta(vec![encode_ledger_key(&key)]);
+        let entry = ConfigSettingEntry::FrozenLedgerKeysDelta(delta);
+        assert!(
+            !ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 26),
+            "Offer key type should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_frozen_keys_delta_rejects_unsupported_key_type_data() {
+        let key = LedgerKey::Data(stellar_xdr::curr::LedgerKeyData {
+            account_id: test_account_id(),
+            data_name: stellar_xdr::curr::String64(
+                stellar_xdr::curr::StringM::<64>::try_from("test").unwrap(),
+            ),
+        });
+        let delta = make_freeze_delta(vec![encode_ledger_key(&key)]);
+        let entry = ConfigSettingEntry::FrozenLedgerKeysDelta(delta);
+        assert!(
+            !ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 26),
+            "Data key type should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_freeze_bypass_delta_rejected_before_v26() {
+        let entry =
+            ConfigSettingEntry::FreezeBypassTxsDelta(stellar_xdr::curr::FreezeBypassTxsDelta {
+                add_txs: vec![].try_into().unwrap(),
+                remove_txs: vec![].try_into().unwrap(),
+            });
+        assert!(
+            !ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
+            "FreezeBypassTxsDelta should be rejected before protocol 26"
+        );
+    }
+
+    #[test]
+    fn test_freeze_bypass_base_entry_rejected_before_v26() {
+        let entry = ConfigSettingEntry::FreezeBypassTxs(FreezeBypassTxs {
+            tx_hashes: vec![].try_into().unwrap(),
+        });
+        assert!(
+            !ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
+            "FreezeBypassTxs should be rejected before protocol 26"
+        );
+    }
+
+    #[test]
+    fn test_frozen_keys_delta_rejects_pool_share_trustline() {
+        use stellar_xdr::curr::LedgerKeyTrustLine;
+        let key = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: test_account_id(),
+            asset: TrustLineAsset::PoolShare(stellar_xdr::curr::PoolId(Hash([50u8; 32]))),
+        });
+        let delta = make_freeze_delta(vec![encode_ledger_key(&key)]);
+        let entry = ConfigSettingEntry::FrozenLedgerKeysDelta(delta);
+        assert!(
+            !ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 26),
+            "Pool-share trustline should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_frozen_keys_delta_rejects_issuer_trustline() {
+        use stellar_xdr::curr::{AlphaNum4, AssetCode4, LedgerKeyTrustLine};
+        // Create a trustline where the account is the issuer of the asset
+        let issuer = test_issuer_id();
+        let key = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: issuer.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+                issuer,
+            }),
+        });
+        let delta = make_freeze_delta(vec![encode_ledger_key(&key)]);
+        let entry = ConfigSettingEntry::FrozenLedgerKeysDelta(delta);
+        assert!(
+            !ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 26),
+            "Issuer trustline should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_frozen_keys_delta_rejects_issuer_trustline_alphanum12() {
+        use stellar_xdr::curr::{AlphaNum12, AssetCode12, LedgerKeyTrustLine};
+        let issuer = test_issuer_id();
+        let key = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: issuer.clone(),
+            asset: TrustLineAsset::CreditAlphanum12(AlphaNum12 {
+                asset_code: AssetCode12(*b"LONGASSET\0\0\0"),
+                issuer,
+            }),
+        });
+        let delta = make_freeze_delta(vec![encode_ledger_key(&key)]);
+        let entry = ConfigSettingEntry::FrozenLedgerKeysDelta(delta);
+        assert!(
+            !ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 26),
+            "Issuer trustline (alphanum12) should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_frozen_keys_delta_validates_keys_to_unfreeze_too() {
+        // Bad key in keys_to_unfreeze should also be rejected
+        let bad_encoded = EncodedLedgerKey(vec![0xBA, 0xD0].try_into().unwrap());
+        let delta = make_unfreeze_delta(vec![bad_encoded]);
+        let entry = ConfigSettingEntry::FrozenLedgerKeysDelta(delta);
+        assert!(
+            !ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 26),
+            "Malformed key in keys_to_unfreeze should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_frozen_keys_delta_mixed_valid_and_invalid() {
+        use stellar_xdr::curr::LedgerKeyTrustLine;
+        // First key is valid (account), second is invalid (pool-share trustline)
+        let valid_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: test_account_id(),
+        });
+        let invalid_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: test_account_id(),
+            asset: TrustLineAsset::PoolShare(stellar_xdr::curr::PoolId(Hash([50u8; 32]))),
+        });
+        let delta = make_freeze_delta(vec![
+            encode_ledger_key(&valid_key),
+            encode_ledger_key(&invalid_key),
+        ]);
+        let entry = ConfigSettingEntry::FrozenLedgerKeysDelta(delta);
+        assert!(
+            !ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 26),
+            "Delta with any invalid key should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_frozen_keys_delta_rejected_before_v26() {
+        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: test_account_id(),
+        });
+        let delta = make_freeze_delta(vec![encode_ledger_key(&key)]);
+        let entry = ConfigSettingEntry::FrozenLedgerKeysDelta(delta);
+        assert!(
+            !ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
+            "FrozenLedgerKeysDelta should be rejected before protocol 26"
+        );
+    }
+
+    #[test]
+    fn test_frozen_keys_base_entry_rejected_before_v26() {
+        let entry = ConfigSettingEntry::FrozenLedgerKeys(FrozenLedgerKeys {
+            keys: vec![].try_into().unwrap(),
+        });
+        assert!(
+            !ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
+            "FrozenLedgerKeys should be rejected before protocol 26"
         );
     }
 }

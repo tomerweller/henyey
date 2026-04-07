@@ -38,6 +38,7 @@ use stellar_xdr::curr::{
     TimePoint, Transaction, TransactionEnvelope, TransactionEventStage, TransactionExt,
     TransactionMeta, TransactionResultCode, TransactionResultResult, TransactionV1Envelope,
     TrustLineAsset, TrustLineEntry, TrustLineEntryExt, TrustLineFlags, TtlEntry, Uint256, VecM,
+    WriteXdr,
 };
 
 fn create_account_entry_with_last_modified(
