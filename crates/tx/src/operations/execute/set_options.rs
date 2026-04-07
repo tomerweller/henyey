@@ -193,171 +193,26 @@ pub(crate) fn execute_set_options(
         source_account_mut.home_domain = home_domain.clone();
     }
 
-    let mut sponsor_delta: Option<(AccountId, i64)> = None;
-
     // Update signers
-    if let Some(ref signer) = op.signer {
-        let signer_key = &signer.key;
-        let weight = signer.weight;
-        if weight > u8::MAX as u32 {
-            return Ok(make_result(SetOptionsResultCode::BadSigner));
+    let sponsor_delta = if let Some(ref signer) = op.signer {
+        match apply_signer_update(
+            signer,
+            source,
+            source_account_mut,
+            sponsor_info.as_ref(),
+            current_signer_count,
+            current_num_sub_entries,
+            current_num_sponsoring,
+            current_num_sponsored,
+            base_reserve,
+        ) {
+            Ok(delta) => delta,
+            Err(SignerUpdateError::OpResult(result)) => return Ok(result),
+            Err(SignerUpdateError::Internal(e)) => return Err(e),
         }
-
-        let is_self = match (signer_key, source) {
-            (SignerKey::Ed25519(key), AccountId(PublicKey::PublicKeyTypeEd25519(account_key))) => {
-                key == account_key
-            }
-            _ => false,
-        };
-        if is_self {
-            return Ok(make_result(SetOptionsResultCode::BadSigner));
-        }
-
-        if signer_key.discriminant() == SignerKeyType::Ed25519SignedPayload {
-            if let SignerKey::Ed25519SignedPayload(SignerKeyEd25519SignedPayload {
-                payload, ..
-            }) = signer_key
-            {
-                if payload.as_vec().is_empty() {
-                    return Ok(make_result(SetOptionsResultCode::BadSigner));
-                }
-            }
-        }
-
-        let sponsor = sponsor_info.as_ref().map(|info| info.0.clone());
-        let mut signers_vec: Vec<Signer> = source_account_mut.signers.iter().cloned().collect();
-        let has_v2 = matches!(
-            source_account_mut.ext,
-            AccountEntryExt::V1(AccountEntryExtensionV1 {
-                ext: AccountEntryExtensionV1Ext::V2(_),
-                ..
-            })
-        );
-        let needs_sponsoring_ids = has_v2 || sponsor.is_some();
-        let mut sponsoring_ids: Vec<SponsorshipDescriptor> =
-            if let AccountEntryExt::V1(v1) = &source_account_mut.ext {
-                if let AccountEntryExtensionV1Ext::V2(v2) = &v1.ext {
-                    v2.signer_sponsoring_i_ds.iter().cloned().collect()
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            };
-        if needs_sponsoring_ids {
-            if sponsoring_ids.len() < signers_vec.len() {
-                sponsoring_ids.extend(
-                    std::iter::repeat(SponsorshipDescriptor(None))
-                        .take(signers_vec.len() - sponsoring_ids.len()),
-                );
-            } else if sponsoring_ids.len() > signers_vec.len() {
-                sponsoring_ids.truncate(signers_vec.len());
-            }
-        }
-
-        let existing_pos = signers_vec.iter().position(|s| &s.key == signer_key);
-        let mut num_sponsored_delta: i64 = 0;
-        let mut signers_changed = false;
-
-        if weight == 0 {
-            if let Some(pos) = existing_pos {
-                if needs_sponsoring_ids {
-                    if let Some(sponsor_id) = sponsoring_ids.get(pos).and_then(|id| id.0.clone()) {
-                        num_sponsored_delta -= 1;
-                        sponsor_delta = Some((sponsor_id, -1));
-                    }
-                    sponsoring_ids.remove(pos);
-                }
-                signers_vec.remove(pos);
-                signers_changed = true;
-
-                if source_account_mut.num_sub_entries > 0 {
-                    source_account_mut.num_sub_entries -= 1;
-                }
-            }
-        } else if let Some(pos) = existing_pos {
-            signers_vec[pos].weight = weight;
-            signers_changed = true;
-        } else {
-            if current_signer_count >= MAX_SIGNERS {
-                return Ok(make_result(SetOptionsResultCode::TooManySigners));
-            }
-
-            // Check subentries limit before adding new signer.
-            // Adding a signer increases num_sub_entries by 1.
-            if current_num_sub_entries >= ACCOUNT_SUBENTRY_LIMIT
-                || current_num_sub_entries.saturating_add(1) > ACCOUNT_SUBENTRY_LIMIT
-            {
-                return Ok(OperationResult::OpTooManySubentries);
-            }
-
-            if let Some((_, sponsor_balance, sponsor_min_balance)) = sponsor_info.as_ref() {
-                if *sponsor_balance < *sponsor_min_balance {
-                    return Ok(make_result(SetOptionsResultCode::LowReserve));
-                }
-            } else {
-                let num_sub_entries = current_num_sub_entries as i64 + 1;
-                let effective_entries =
-                    2 + num_sub_entries + current_num_sponsoring - current_num_sponsored;
-                if effective_entries < 0 {
-                    return Err(TxError::Internal(
-                        "unexpected account state while computing minimum balance".to_string(),
-                    ));
-                }
-                let new_min_balance = effective_entries * base_reserve;
-                let available = account_balance_after_liabilities(source_account_mut);
-                if available < new_min_balance {
-                    return Ok(make_result(SetOptionsResultCode::LowReserve));
-                }
-            }
-
-            let new_signer = Signer {
-                key: signer_key.clone(),
-                weight,
-            };
-            let new_sponsor_id = sponsor
-                .clone()
-                .map(|id| SponsorshipDescriptor(Some(id)))
-                .unwrap_or(SponsorshipDescriptor(None));
-
-            signers_vec.push(new_signer);
-            if needs_sponsoring_ids {
-                sponsoring_ids.push(new_sponsor_id);
-                let mut combined: Vec<(Signer, SponsorshipDescriptor)> =
-                    signers_vec.into_iter().zip(sponsoring_ids).collect();
-                combined.sort_by(|a, b| compare_signer_keys(&a.0.key, &b.0.key));
-                let (sorted_signers, sorted_sponsoring): (Vec<Signer>, Vec<SponsorshipDescriptor>) =
-                    combined.into_iter().unzip();
-                signers_vec = sorted_signers;
-                sponsoring_ids = sorted_sponsoring;
-            } else {
-                signers_vec.sort_by(|a, b| compare_signer_keys(&a.key, &b.key));
-            }
-            signers_changed = true;
-
-            if let Some(sponsor) = sponsor {
-                num_sponsored_delta += 1;
-                sponsor_delta = Some((sponsor, 1));
-            }
-
-            source_account_mut.num_sub_entries += 1;
-        }
-
-        if signers_changed {
-            source_account_mut.signers = signers_vec.try_into().unwrap_or_default();
-            if needs_sponsoring_ids || num_sponsored_delta != 0 {
-                let ext_v2 = ensure_account_ext_v2(source_account_mut);
-                let updated = ext_v2.num_sponsored as i64 + num_sponsored_delta;
-                if updated < 0 || updated > u32::MAX as i64 {
-                    return Err(TxError::Internal("num_sponsored out of range".to_string()));
-                }
-                ext_v2.num_sponsored = updated as u32;
-                if needs_sponsoring_ids {
-                    ext_v2.signer_sponsoring_i_ds = sponsoring_ids.try_into().unwrap_or_default();
-                }
-            }
-        }
-    }
+    } else {
+        None
+    };
 
     let _ = source_account_mut;
     if let Some((sponsor_id, delta)) = sponsor_delta {
@@ -410,6 +265,204 @@ fn sponsorship_counts_for_account_entry(account: &AccountEntry) -> (i64, i64) {
             }) => (*num_sponsoring as i64, *num_sponsored as i64),
         },
     }
+}
+
+/// Error from signer update: either an operation result to return early, or an internal error.
+enum SignerUpdateError {
+    OpResult(OperationResult),
+    Internal(TxError),
+}
+
+/// Apply a signer update (add, remove, or change weight) to the source account.
+/// Returns the sponsor delta to apply, or an error.
+#[allow(clippy::too_many_arguments)]
+fn apply_signer_update(
+    signer: &stellar_xdr::curr::Signer,
+    source: &AccountId,
+    source_account: &mut AccountEntry,
+    sponsor_info: Option<&(AccountId, i64, i64)>,
+    current_signer_count: usize,
+    current_num_sub_entries: u32,
+    current_num_sponsoring: i64,
+    current_num_sponsored: i64,
+    base_reserve: i64,
+) -> std::result::Result<Option<(AccountId, i64)>, SignerUpdateError> {
+    let signer_key = &signer.key;
+    let weight = signer.weight;
+    if weight > u8::MAX as u32 {
+        return Err(SignerUpdateError::OpResult(make_result(
+            SetOptionsResultCode::BadSigner,
+        )));
+    }
+
+    let is_self = match (signer_key, source) {
+        (SignerKey::Ed25519(key), AccountId(PublicKey::PublicKeyTypeEd25519(account_key))) => {
+            key == account_key
+        }
+        _ => false,
+    };
+    if is_self {
+        return Err(SignerUpdateError::OpResult(make_result(
+            SetOptionsResultCode::BadSigner,
+        )));
+    }
+
+    if signer_key.discriminant() == SignerKeyType::Ed25519SignedPayload {
+        if let SignerKey::Ed25519SignedPayload(SignerKeyEd25519SignedPayload { payload, .. }) =
+            signer_key
+        {
+            if payload.as_vec().is_empty() {
+                return Err(SignerUpdateError::OpResult(make_result(
+                    SetOptionsResultCode::BadSigner,
+                )));
+            }
+        }
+    }
+
+    let sponsor = sponsor_info.map(|info| info.0.clone());
+    let mut signers_vec: Vec<Signer> = source_account.signers.iter().cloned().collect();
+    let has_v2 = matches!(
+        source_account.ext,
+        AccountEntryExt::V1(AccountEntryExtensionV1 {
+            ext: AccountEntryExtensionV1Ext::V2(_),
+            ..
+        })
+    );
+    let needs_sponsoring_ids = has_v2 || sponsor.is_some();
+    let mut sponsoring_ids: Vec<SponsorshipDescriptor> =
+        if let AccountEntryExt::V1(v1) = &source_account.ext {
+            if let AccountEntryExtensionV1Ext::V2(v2) = &v1.ext {
+                v2.signer_sponsoring_i_ds.iter().cloned().collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+    if needs_sponsoring_ids {
+        if sponsoring_ids.len() < signers_vec.len() {
+            sponsoring_ids.extend(
+                std::iter::repeat(SponsorshipDescriptor(None))
+                    .take(signers_vec.len() - sponsoring_ids.len()),
+            );
+        } else if sponsoring_ids.len() > signers_vec.len() {
+            sponsoring_ids.truncate(signers_vec.len());
+        }
+    }
+
+    let existing_pos = signers_vec.iter().position(|s| &s.key == signer_key);
+    let mut num_sponsored_delta: i64 = 0;
+    let mut signers_changed = false;
+    let mut sponsor_delta: Option<(AccountId, i64)> = None;
+
+    if weight == 0 {
+        if let Some(pos) = existing_pos {
+            if needs_sponsoring_ids {
+                if let Some(sponsor_id) = sponsoring_ids.get(pos).and_then(|id| id.0.clone()) {
+                    num_sponsored_delta -= 1;
+                    sponsor_delta = Some((sponsor_id, -1));
+                }
+                sponsoring_ids.remove(pos);
+            }
+            signers_vec.remove(pos);
+            signers_changed = true;
+
+            if source_account.num_sub_entries > 0 {
+                source_account.num_sub_entries -= 1;
+            }
+        }
+    } else if let Some(pos) = existing_pos {
+        signers_vec[pos].weight = weight;
+        signers_changed = true;
+    } else {
+        if current_signer_count >= MAX_SIGNERS {
+            return Err(SignerUpdateError::OpResult(make_result(
+                SetOptionsResultCode::TooManySigners,
+            )));
+        }
+
+        if current_num_sub_entries >= ACCOUNT_SUBENTRY_LIMIT
+            || current_num_sub_entries.saturating_add(1) > ACCOUNT_SUBENTRY_LIMIT
+        {
+            return Err(SignerUpdateError::OpResult(
+                OperationResult::OpTooManySubentries,
+            ));
+        }
+
+        if let Some((_, sponsor_balance, sponsor_min_balance)) = sponsor_info {
+            if *sponsor_balance < *sponsor_min_balance {
+                return Err(SignerUpdateError::OpResult(make_result(
+                    SetOptionsResultCode::LowReserve,
+                )));
+            }
+        } else {
+            let num_sub_entries = current_num_sub_entries as i64 + 1;
+            let effective_entries =
+                2 + num_sub_entries + current_num_sponsoring - current_num_sponsored;
+            if effective_entries < 0 {
+                return Err(SignerUpdateError::Internal(TxError::Internal(
+                    "unexpected account state while computing minimum balance".to_string(),
+                )));
+            }
+            let new_min_balance = effective_entries * base_reserve;
+            let available = account_balance_after_liabilities(source_account);
+            if available < new_min_balance {
+                return Err(SignerUpdateError::OpResult(make_result(
+                    SetOptionsResultCode::LowReserve,
+                )));
+            }
+        }
+
+        let new_signer = Signer {
+            key: signer_key.clone(),
+            weight,
+        };
+        let new_sponsor_id = sponsor
+            .clone()
+            .map(|id| SponsorshipDescriptor(Some(id)))
+            .unwrap_or(SponsorshipDescriptor(None));
+
+        signers_vec.push(new_signer);
+        if needs_sponsoring_ids {
+            sponsoring_ids.push(new_sponsor_id);
+            let mut combined: Vec<(Signer, SponsorshipDescriptor)> =
+                signers_vec.into_iter().zip(sponsoring_ids).collect();
+            combined.sort_by(|a, b| compare_signer_keys(&a.0.key, &b.0.key));
+            let (sorted_signers, sorted_sponsoring): (Vec<Signer>, Vec<SponsorshipDescriptor>) =
+                combined.into_iter().unzip();
+            signers_vec = sorted_signers;
+            sponsoring_ids = sorted_sponsoring;
+        } else {
+            signers_vec.sort_by(|a, b| compare_signer_keys(&a.key, &b.key));
+        }
+        signers_changed = true;
+
+        if let Some(sponsor) = sponsor {
+            num_sponsored_delta += 1;
+            sponsor_delta = Some((sponsor, 1));
+        }
+
+        source_account.num_sub_entries += 1;
+    }
+
+    if signers_changed {
+        source_account.signers = signers_vec.try_into().unwrap_or_default();
+        if needs_sponsoring_ids || num_sponsored_delta != 0 {
+            let ext_v2 = ensure_account_ext_v2(source_account);
+            let updated = ext_v2.num_sponsored as i64 + num_sponsored_delta;
+            if updated < 0 || updated > u32::MAX as i64 {
+                return Err(SignerUpdateError::Internal(TxError::Internal(
+                    "num_sponsored out of range".to_string(),
+                )));
+            }
+            ext_v2.num_sponsored = updated as u32;
+            if needs_sponsoring_ids {
+                ext_v2.signer_sponsoring_i_ds = sponsoring_ids.try_into().unwrap_or_default();
+            }
+        }
+    }
+
+    Ok(sponsor_delta)
 }
 
 fn make_result(code: SetOptionsResultCode) -> OperationResult {
