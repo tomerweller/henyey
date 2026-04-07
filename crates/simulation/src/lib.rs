@@ -1356,11 +1356,8 @@ pub fn initialize_genesis_ledger(
     )));
 
     let total_coins: i64 = 1_000_000_000_000_000_000;
-    let genesis_entries = build_genesis_entries(
-        root_account_id,
-        total_coins,
-        genesis_test_account_count,
-    );
+    let genesis_entries =
+        build_genesis_entries(root_account_id, total_coins, genesis_test_account_count);
 
     let mut bucket_list = BucketList::new();
     bucket_list

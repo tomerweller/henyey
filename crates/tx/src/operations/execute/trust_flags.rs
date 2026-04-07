@@ -85,9 +85,15 @@ pub(crate) fn execute_allow_trust(
     }
 
     // Handle deauthorization: remove offers and redeem pool shares if revoking liabilities
-    if let Some(RemoveResult::LowReserve) =
-        handle_deauthorization(trustline.flags, new_flags, &op.trustor, &asset, tx_id, state, _context)?
-    {
+    if let Some(RemoveResult::LowReserve) = handle_deauthorization(
+        trustline.flags,
+        new_flags,
+        &op.trustor,
+        &asset,
+        tx_id,
+        state,
+        _context,
+    )? {
         return Ok(make_allow_trust_result(AllowTrustResultCode::LowReserve));
     }
 
@@ -199,9 +205,15 @@ pub(crate) fn execute_set_trust_line_flags(
     }
 
     // Handle deauthorization: remove offers and redeem pool shares if revoking liabilities
-    if let Some(RemoveResult::LowReserve) =
-        handle_deauthorization(trustline.flags, new_flags, &op.trustor, &op.asset, tx_id, state, _context)?
-    {
+    if let Some(RemoveResult::LowReserve) = handle_deauthorization(
+        trustline.flags,
+        new_flags,
+        &op.trustor,
+        &op.asset,
+        tx_id,
+        state,
+        _context,
+    )? {
         return Ok(make_set_flags_result(
             SetTrustLineFlagsResultCode::LowReserve,
         ));

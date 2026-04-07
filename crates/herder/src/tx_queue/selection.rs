@@ -484,7 +484,9 @@ fn build_classic_phase(
     has_dex_lane: bool,
     network_id: NetworkId,
 ) -> stellar_xdr::curr::TransactionPhase {
-    use stellar_xdr::curr::{TransactionPhase, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee};
+    use stellar_xdr::curr::{
+        TransactionPhase, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
+    };
 
     let mut classic_components: Vec<TxSetComponent> = Vec::new();
     if !classic_txs.is_empty() {

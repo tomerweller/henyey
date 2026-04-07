@@ -60,7 +60,12 @@ pub(crate) fn execute_change_trust(
     if op.limit == 0 {
         // Removing trustline
         if let Some(result) = remove_trustline(
-            source, &tl_asset, is_pool_share, pool_params, multiplier, state,
+            source,
+            &tl_asset,
+            is_pool_share,
+            pool_params,
+            multiplier,
+            state,
         )? {
             return Ok(result);
         }

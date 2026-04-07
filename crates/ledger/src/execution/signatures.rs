@@ -481,58 +481,40 @@ pub(super) fn default_success_op_result(op: &Operation) -> OperationResult {
             OperationResultTr::CreateAccount(CreateAccountResult::Success)
         }
         OperationBody::Payment(_) => OperationResultTr::Payment(PaymentResult::Success),
-        OperationBody::PathPaymentStrictReceive(_) => {
-            OperationResultTr::PathPaymentStrictReceive(
-                PathPaymentStrictReceiveResult::Success(
-                    PathPaymentStrictReceiveResultSuccess {
-                        offers: VecM::default(),
-                        last: zero_simple_payment_result(),
-                    },
-                ),
-            )
-        }
-        OperationBody::ManageSellOffer(_) => {
-            OperationResultTr::ManageSellOffer(ManageSellOfferResult::Success(
-                empty_offer_success_result(),
-            ))
-        }
-        OperationBody::CreatePassiveSellOffer(_) => {
-            OperationResultTr::CreatePassiveSellOffer(ManageSellOfferResult::Success(
-                empty_offer_success_result(),
-            ))
-        }
+        OperationBody::PathPaymentStrictReceive(_) => OperationResultTr::PathPaymentStrictReceive(
+            PathPaymentStrictReceiveResult::Success(PathPaymentStrictReceiveResultSuccess {
+                offers: VecM::default(),
+                last: zero_simple_payment_result(),
+            }),
+        ),
+        OperationBody::ManageSellOffer(_) => OperationResultTr::ManageSellOffer(
+            ManageSellOfferResult::Success(empty_offer_success_result()),
+        ),
+        OperationBody::CreatePassiveSellOffer(_) => OperationResultTr::CreatePassiveSellOffer(
+            ManageSellOfferResult::Success(empty_offer_success_result()),
+        ),
         OperationBody::SetOptions(_) => OperationResultTr::SetOptions(SetOptionsResult::Success),
-        OperationBody::ChangeTrust(_) => {
-            OperationResultTr::ChangeTrust(ChangeTrustResult::Success)
-        }
-        OperationBody::AllowTrust(_) => {
-            OperationResultTr::AllowTrust(AllowTrustResult::Success)
-        }
+        OperationBody::ChangeTrust(_) => OperationResultTr::ChangeTrust(ChangeTrustResult::Success),
+        OperationBody::AllowTrust(_) => OperationResultTr::AllowTrust(AllowTrustResult::Success),
         OperationBody::AccountMerge(_) => {
             OperationResultTr::AccountMerge(AccountMergeResult::Success(0))
         }
         OperationBody::Inflation => {
             OperationResultTr::Inflation(InflationResult::Success(VecM::default()))
         }
-        OperationBody::ManageData(_) => {
-            OperationResultTr::ManageData(ManageDataResult::Success)
-        }
+        OperationBody::ManageData(_) => OperationResultTr::ManageData(ManageDataResult::Success),
         OperationBody::BumpSequence(_) => {
             OperationResultTr::BumpSequence(BumpSequenceResult::Success)
         }
-        OperationBody::ManageBuyOffer(_) => {
-            OperationResultTr::ManageBuyOffer(ManageBuyOfferResult::Success(
-                empty_offer_success_result(),
-            ))
-        }
-        OperationBody::PathPaymentStrictSend(_) => {
-            OperationResultTr::PathPaymentStrictSend(PathPaymentStrictSendResult::Success(
-                PathPaymentStrictSendResultSuccess {
-                    offers: VecM::default(),
-                    last: zero_simple_payment_result(),
-                },
-            ))
-        }
+        OperationBody::ManageBuyOffer(_) => OperationResultTr::ManageBuyOffer(
+            ManageBuyOfferResult::Success(empty_offer_success_result()),
+        ),
+        OperationBody::PathPaymentStrictSend(_) => OperationResultTr::PathPaymentStrictSend(
+            PathPaymentStrictSendResult::Success(PathPaymentStrictSendResultSuccess {
+                offers: VecM::default(),
+                last: zero_simple_payment_result(),
+            }),
+        ),
         OperationBody::CreateClaimableBalance(_) => {
             OperationResultTr::CreateClaimableBalance(CreateClaimableBalanceResult::Success(
                 ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([0; 32])),
@@ -568,9 +550,7 @@ pub(super) fn default_success_op_result(op: &Operation) -> OperationResult {
             OperationResultTr::LiquidityPoolWithdraw(LiquidityPoolWithdrawResult::Success)
         }
         OperationBody::InvokeHostFunction(_) => {
-            OperationResultTr::InvokeHostFunction(InvokeHostFunctionResult::Success(Hash(
-                [0; 32],
-            )))
+            OperationResultTr::InvokeHostFunction(InvokeHostFunctionResult::Success(Hash([0; 32])))
         }
         OperationBody::ExtendFootprintTtl(_) => {
             OperationResultTr::ExtendFootprintTtl(ExtendFootprintTtlResult::Success)

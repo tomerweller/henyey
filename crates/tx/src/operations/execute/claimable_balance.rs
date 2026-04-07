@@ -463,9 +463,7 @@ fn update_predicate_for_apply(predicate: &mut ClaimPredicate, close_time: u64) {
 /// Validate CreateClaimableBalance operation parameters: non-empty claimants,
 /// positive amount, no duplicate destinations, and valid predicates.
 /// Returns `Some(result)` on validation failure, `None` if valid.
-fn validate_create_claimable_balance_op(
-    op: &CreateClaimableBalanceOp,
-) -> Option<OperationResult> {
+fn validate_create_claimable_balance_op(op: &CreateClaimableBalanceOp) -> Option<OperationResult> {
     if op.claimants.is_empty() || op.amount <= 0 {
         return Some(make_create_result(
             CreateClaimableBalanceResultCode::Malformed,
