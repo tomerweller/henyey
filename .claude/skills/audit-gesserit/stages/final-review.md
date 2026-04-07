@@ -16,6 +16,10 @@ Read the hypothesis file at: `{HYPOTHESIS_FILE}`
 
 This file contains: Hypothesis + Review + PoC sections.
 
+**Note**: If the PoC section shows `POC_SKIPPED (--no-poc flag)`, no test was
+run. You must perform thorough independent code analysis instead of test
+reproduction. Skip Step 3 and rely entirely on Steps 2 and 4.
+
 ## Procedure
 
 ### Step 1: Read the Full Finding
@@ -32,6 +36,9 @@ hypothesis or reviewer claim — verify everything independently:
 - Look for guards, validation, and defensive patterns
 
 ### Step 3: Reproduce the PoC
+
+**If the PoC section shows `POC_SKIPPED`**: Skip this step entirely. Proceed to
+Step 4, relying on independent code analysis for verification.
 
 If the PoC includes test code:
 1. Write the test to `crates/{CRATE}/tests/audit_poc_{NNN}_review.rs`
@@ -115,6 +122,9 @@ Write a success document to `ai-summary/success/{CRATE}/{SAME_FILENAME}`:
 - **Test file**: crates/{CRATE}/tests/audit_poc_{NNN}.rs
 - **Test name**: [test function name]
 - **How to run**: `cargo test -p henyey-{CRATE} --test audit_poc_{NNN} -- --nocapture`
+
+(If PoC was skipped, replace the above with a "Code Analysis" section
+documenting the independent trace that verifies the finding.)
 
 ### Test Body
 

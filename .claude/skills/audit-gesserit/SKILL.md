@@ -1,17 +1,26 @@
 ---
 name: audit-gesserit
 description: Multi-stage adversarial security audit pipeline with hypothesis generation, review, PoC, final review, and publish
-argument-hint: [--crate <name>] [--max-rounds N] [--no-hypothesis] [--no-poc] [--no-publish] [--dry-run] [--resume]
+argument-hint: [--crate <name>] [--max-rounds N] [--max-cost N] [--no-hypothesis] [--no-poc] [--no-publish] [--dry-run] [--resume] [--promote <path>]
 ---
 
 Parse `$ARGUMENTS`:
 - `--crate <name>`: Restrict to a single crate. Default: all crates by priority.
 - `--max-rounds N`: Maximum orchestrator iterations (default: 30).
+- `--max-cost N`: Maximum estimated cost in dollars (default: unlimited). The
+  orchestrator tracks cumulative agent spawns and stops when the budget is
+  exceeded. Cost estimates: opus agent ≈ $0.50–2.00, sonnet agent ≈ $0.10–0.30.
 - `--no-hypothesis`: Skip hypothesis generation; only process existing pipeline state.
 - `--no-poc`: Skip PoC stage; promote reviewed hypotheses directly to final review.
 - `--no-publish`: Skip publishing to GitHub issues.
 - `--dry-run`: Run full pipeline but print issues instead of filing them.
 - `--resume`: Resume from existing `ai-summary/` state instead of fresh start.
+- `--promote <path>`: Re-promote a finding from `fail/` back to `hypothesis/`
+  for re-evaluation. The path must be a file in `ai-summary/fail/{crate}/`
+  (not `summary.md`). The file is moved to `ai-summary/hypothesis/{crate}/`
+  with any prior Review/PoC/Final Review sections stripped. Exits after
+  promotion without entering the main loop (combine with `--resume` to then
+  process it).
 
 # Gesserit Security Audit
 
@@ -71,12 +80,29 @@ When `--crate` is specified, only that crate is targeted regardless of tier.
 
 ## Step 1: Initialization
 
-### 1a: Determine Target Crates
+### 1a: Handle `--promote` (if set)
 
-If `--crate` is specified, targets = just that crate.
+If `--promote <path>` is specified:
+1. Validate the path is a file in `ai-summary/fail/{crate}/` and is not
+   `summary.md`.
+2. Read the file. Strip everything after the first `---` separator that begins
+   a `## Review`, `## PoC`, or `## Final Review` section (keep only the
+   original hypothesis content).
+3. Move the stripped content to `ai-summary/hypothesis/{crate}/{filename}`.
+4. Delete the original fail file.
+5. Print: `Promoted: {path} → hypothesis/{crate}/{filename}`
+6. Exit. (Use `--resume` in a subsequent invocation to process it.)
+
+### 1b: Determine Target Crates
+
+If `--crate` is specified, targets = just that crate. **Validate** that the
+crate name exists in the Crate-to-Upstream Mapping table above and that
+`crates/{crate}/src/` exists on disk. If not, print an error listing the valid
+crate names and exit.
+
 Otherwise, targets = all crates from the priority tiers above.
 
-### 1b: Create Directory Structure
+### 1c: Create Directory Structure
 
 If `--resume` is NOT set, create the `ai-summary/` directory tree:
 
@@ -91,7 +117,7 @@ done
 If `--resume` IS set, verify that `ai-summary/` already exists. Read its
 current state.
 
-### 1c: Initialize Tracking
+### 1d: Initialize Tracking
 
 Use TaskCreate to create a top-level task for the audit run, and sub-tasks
 for tracking progress through the pipeline stages.
@@ -106,13 +132,15 @@ pocs_attempted = 0
 pocs_confirmed = 0
 pocs_rejected = 0
 findings_published = 0
+estimated_cost = 0.0  # cumulative estimated cost in dollars
 ```
 
 ---
 
 ## Step 2: Main Orchestrator Loop
 
-Repeat until no more work is available or `round >= max_rounds`:
+Repeat until no more work is available, `round >= max_rounds`, or
+`estimated_cost >= max_cost` (if set):
 
 ### 2a: Scan Pipeline State
 
@@ -145,13 +173,40 @@ oldest one and spawn a **final-review agent**.
 `--no-poc` is not set), pick the oldest one and spawn a **PoC agent**.
 
 If `--no-poc` IS set: Instead of spawning a PoC agent, copy the file from
-`reviewed/{crate}/` to `poc/{crate}/` directly (skip PoC, go to final review).
+`reviewed/{crate}/` to `poc/{crate}/` with a synthetic PoC-skipped section
+appended:
+
+```markdown
+
+---
+
+## PoC
+
+**Result**: POC_SKIPPED (--no-poc flag)
+**Date**: [today's date]
+
+No PoC was attempted. The final reviewer must perform independent code
+analysis to verify the finding instead of reproducing a test.
+```
+
+This ensures the final-review agent can detect the `--no-poc` path and
+adjust its procedure accordingly (code analysis instead of test reproduction).
 
 **Priority 5 — REVIEW**: If any files exist in `hypothesis/{crate}/`, pick the
-oldest one and spawn a **reviewer agent**.
+oldest one. **Before spawning**, validate the hypothesis file has the required
+sections (`## Expected Behavior`, `## Mechanism`, `## Attack Vector`,
+`## Target Code`). If any are missing, move the file directly to
+`fail/{crate}/` with an orchestrator note ("malformed hypothesis: missing
+section X") and increment `hypotheses_rejected`. Do NOT spawn a reviewer agent
+for malformed files. Then spawn a **reviewer agent** for the validated file.
 
 **Priority 6 — HYPOTHESIS**: If `--no-hypothesis` is not set and target crates
 have not been exhausted, spawn a **hypothesis agent** for the next target crate.
+
+**Backpressure**: Skip hypothesis generation for a crate if it has 10 or more
+unprocessed files across `hypothesis/{crate}/` + `reviewed/{crate}/` combined.
+This prevents hypothesis buildup when downstream stages can't keep up. The
+crate becomes eligible again once its backlog drops below 10.
 
 **Target crate selection for hypothesis**: Use weighted random selection from
 the priority tiers (60% high, 30% medium, 10% low). Within a tier, pick the
@@ -282,10 +337,11 @@ After the agent completes, detect the verdict by checking the filesystem:
 
 ### 2e: Update Progress
 
-Increment `round`. Print a one-line progress update:
+Increment `round`. Update `estimated_cost` based on the agent type spawned
+(opus ≈ $1.00, sonnet ≈ $0.20). Print a one-line progress update:
 
 ```
-Round N/M: [stage] [crate] [verdict] — H:X/Y/Z PoC:A/B/C Published:P
+Round N/M: [stage] [crate] [verdict] — H:X/Y/Z PoC:A/B/C Published:P Cost:~$C.CC
 ```
 
 Where H = generated/promoted/rejected, PoC = attempted/confirmed/rejected.
@@ -303,6 +359,11 @@ you MAY spawn up to 3 agents in parallel in a single message. Independent work:
 Do NOT parallelize:
 - Two agents for the same crate (state conflicts)
 - Review + PoC for the same hypothesis (sequential dependency)
+- Any two agents that may both write to the same `fail/{crate}/` directory
+  (e.g., a hypothesis agent for crate X that may self-reject + a reviewer for
+  crate X that may reject — both write to `fail/X/`). The one-agent-per-crate
+  rule covers this, but be especially careful: condensation for crate X counts
+  as "an agent for crate X" since it reads and deletes from `fail/X/`.
 
 ---
 
@@ -314,6 +375,7 @@ After the loop exits, print:
 ═══ Gesserit Audit Complete ═══
 Rounds:           N / M
 Target:           <crate name or "all crates">
+Estimated cost:   ~$C.CC
 
 Hypotheses:       X generated, Y promoted, Z rejected
 PoC attempts:     A total, B confirmed, C rejected
