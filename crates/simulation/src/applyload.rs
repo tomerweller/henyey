@@ -1209,89 +1209,7 @@ impl ApplyLoad {
         }
 
         let avg_time = total_time_ms / num_ledgers as f64;
-        let n = num_ledgers as f64;
-        warn!(
-            "  Total time: {:.2}ms for {} ledgers",
-            total_time_ms, num_ledgers
-        );
-        warn!(
-            "  Average total tx apply time per ledger: {:.2}ms",
-            avg_time
-        );
-        warn!(
-            "  PERF BREAKDOWN (avg ms/ledger over {} ledgers):",
-            num_ledgers
-        );
-        warn!(
-            "    begin_close:    {:.2}ms",
-            agg.begin_close_us as f64 / 1000.0 / n
-        );
-        warn!(
-            "    tx_apply:       prepare={:.2} config_load={:.2} executor_setup={:.2} fee_pre_deduct={:.2} post_exec={:.2}",
-            agg.prepare_us as f64 / 1000.0 / n,
-            agg.config_load_us as f64 / 1000.0 / n,
-            agg.executor_setup_us as f64 / 1000.0 / n,
-            agg.fee_pre_deduct_us as f64 / 1000.0 / n,
-            agg.post_exec_us as f64 / 1000.0 / n,
-        );
-        warn!(
-            "    classic_exec:   {:.2}ms",
-            agg.classic_exec_us as f64 / 1000.0 / n
-        );
-        warn!(
-            "    soroban_exec:   {:.2}ms",
-            agg.soroban_exec_us as f64 / 1000.0 / n
-        );
-        warn!(
-            "    commit:         setup={:.2} bucket_wait={:.2} eviction={:.2} soroban_state={:.2}",
-            agg.commit_setup_us as f64 / 1000.0 / n,
-            agg.bucket_lock_wait_us as f64 / 1000.0 / n,
-            agg.eviction_us as f64 / 1000.0 / n,
-            agg.soroban_state_us as f64 / 1000.0 / n,
-        );
-        warn!(
-            "    add_batch:      {:.2}ms",
-            agg.add_batch_us as f64 / 1000.0 / n
-        );
-        warn!(
-            "    hot_archive:    {:.2}ms",
-            agg.hot_archive_us as f64 / 1000.0 / n
-        );
-        warn!(
-            "    header_hash:    {:.2}ms",
-            agg.header_us as f64 / 1000.0 / n
-        );
-        warn!(
-            "    meta:           {:.2}ms",
-            agg.meta_us as f64 / 1000.0 / n
-        );
-        warn!(
-            "    commit_close:   {:.2}ms",
-            agg.commit_close_us as f64 / 1000.0 / n
-        );
-        let sum_us = agg.begin_close_us
-            + agg.prepare_us
-            + agg.config_load_us
-            + agg.executor_setup_us
-            + agg.fee_pre_deduct_us
-            + agg.post_exec_us
-            + agg.classic_exec_us
-            + agg.soroban_exec_us
-            + agg.commit_setup_us
-            + agg.bucket_lock_wait_us
-            + agg.eviction_us
-            + agg.soroban_state_us
-            + agg.add_batch_us
-            + agg.hot_archive_us
-            + agg.header_us
-            + agg.meta_us
-            + agg.commit_close_us;
-        warn!(
-            "    total (perf):   {:.2}ms (sum={:.2}ms, gap={:.2}ms)",
-            agg.total_us as f64 / 1000.0 / n,
-            sum_us as f64 / 1000.0 / n,
-            (agg.total_us - sum_us) as f64 / 1000.0 / n,
-        );
+        print_perf_breakdown(&agg, total_time_ms, num_ledgers);
 
         Ok(avg_time)
     }
@@ -1744,6 +1662,94 @@ impl ApplyLoad {
     pub fn tx_generator_mut(&mut self) -> &mut TxGenerator {
         &mut self.tx_gen
     }
+}
+
+/// Print a detailed performance breakdown for a benchmark run.
+fn print_perf_breakdown(agg: &LedgerClosePerf, total_time_ms: f64, num_ledgers: u32) {
+    let avg_time = total_time_ms / num_ledgers as f64;
+    let n = num_ledgers as f64;
+    warn!(
+        "  Total time: {:.2}ms for {} ledgers",
+        total_time_ms, num_ledgers
+    );
+    warn!(
+        "  Average total tx apply time per ledger: {:.2}ms",
+        avg_time
+    );
+    warn!(
+        "  PERF BREAKDOWN (avg ms/ledger over {} ledgers):",
+        num_ledgers
+    );
+    warn!(
+        "    begin_close:    {:.2}ms",
+        agg.begin_close_us as f64 / 1000.0 / n
+    );
+    warn!(
+        "    tx_apply:       prepare={:.2} config_load={:.2} executor_setup={:.2} fee_pre_deduct={:.2} post_exec={:.2}",
+        agg.prepare_us as f64 / 1000.0 / n,
+        agg.config_load_us as f64 / 1000.0 / n,
+        agg.executor_setup_us as f64 / 1000.0 / n,
+        agg.fee_pre_deduct_us as f64 / 1000.0 / n,
+        agg.post_exec_us as f64 / 1000.0 / n,
+    );
+    warn!(
+        "    classic_exec:   {:.2}ms",
+        agg.classic_exec_us as f64 / 1000.0 / n
+    );
+    warn!(
+        "    soroban_exec:   {:.2}ms",
+        agg.soroban_exec_us as f64 / 1000.0 / n
+    );
+    warn!(
+        "    commit:         setup={:.2} bucket_wait={:.2} eviction={:.2} soroban_state={:.2}",
+        agg.commit_setup_us as f64 / 1000.0 / n,
+        agg.bucket_lock_wait_us as f64 / 1000.0 / n,
+        agg.eviction_us as f64 / 1000.0 / n,
+        agg.soroban_state_us as f64 / 1000.0 / n,
+    );
+    warn!(
+        "    add_batch:      {:.2}ms",
+        agg.add_batch_us as f64 / 1000.0 / n
+    );
+    warn!(
+        "    hot_archive:    {:.2}ms",
+        agg.hot_archive_us as f64 / 1000.0 / n
+    );
+    warn!(
+        "    header_hash:    {:.2}ms",
+        agg.header_us as f64 / 1000.0 / n
+    );
+    warn!(
+        "    meta:           {:.2}ms",
+        agg.meta_us as f64 / 1000.0 / n
+    );
+    warn!(
+        "    commit_close:   {:.2}ms",
+        agg.commit_close_us as f64 / 1000.0 / n
+    );
+    let sum_us = agg.begin_close_us
+        + agg.prepare_us
+        + agg.config_load_us
+        + agg.executor_setup_us
+        + agg.fee_pre_deduct_us
+        + agg.post_exec_us
+        + agg.classic_exec_us
+        + agg.soroban_exec_us
+        + agg.commit_setup_us
+        + agg.bucket_lock_wait_us
+        + agg.eviction_us
+        + agg.soroban_state_us
+        + agg.add_batch_us
+        + agg.hot_archive_us
+        + agg.header_us
+        + agg.meta_us
+        + agg.commit_close_us;
+    warn!(
+        "    total (perf):   {:.2}ms (sum={:.2}ms, gap={:.2}ms)",
+        agg.total_us as f64 / 1000.0 / n,
+        sum_us as f64 / 1000.0 / n,
+        (agg.total_us - sum_us) as f64 / 1000.0 / n,
+    );
 }
 
 // ===========================================================================
