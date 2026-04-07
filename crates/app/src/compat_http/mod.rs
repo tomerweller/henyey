@@ -140,6 +140,7 @@ fn safe_router_panic_handler(_err: Box<dyn std::any::Any + Send + 'static>) -> R
 /// exact wire format for all HTTP endpoints.
 pub struct CompatServer {
     port: u16,
+    address: String,
     app: Arc<App>,
     #[cfg(feature = "loadgen")]
     loadgen_state: Option<Arc<crate::http::handlers::generateload::GenerateLoadState>>,
@@ -147,9 +148,10 @@ pub struct CompatServer {
 
 impl CompatServer {
     /// Create a new compatibility server.
-    pub fn new(port: u16, app: Arc<App>) -> Self {
+    pub fn new(port: u16, address: String, app: Arc<App>) -> Self {
         Self {
             port,
+            address,
             app,
             #[cfg(feature = "loadgen")]
             loadgen_state: None,
@@ -180,9 +182,9 @@ impl CompatServer {
         let mut shutdown_rx = self.app.subscribe_shutdown();
         let router = build_compat_router(state);
 
-        let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
+        let addr: SocketAddr = format!("{}:{}", self.address, self.port).parse()?;
         tracing::info!(
-            port = self.port,
+            %addr,
             "Starting stellar-core compatibility HTTP server"
         );
 

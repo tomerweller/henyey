@@ -147,6 +147,7 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
         config.compat_http = CompatHttpConfig {
             enabled: true,
             port,
+            ..CompatHttpConfig::default()
         };
     }
 

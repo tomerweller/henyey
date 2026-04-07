@@ -108,13 +108,14 @@ pub(crate) fn build_router(state: Arc<ServerState>) -> Router {
 /// Matches stellar-core's `QueryServer` behavior.
 pub struct QueryServer {
     port: u16,
+    address: String,
     app: Arc<App>,
 }
 
 impl QueryServer {
-    /// Create a new query server on the given port.
-    pub fn new(port: u16, app: Arc<App>) -> Self {
-        Self { port, app }
+    /// Create a new query server on the given port and address.
+    pub fn new(port: u16, address: String, app: Arc<App>) -> Self {
+        Self { port, address, app }
     }
 
     /// Build the query server router.
@@ -141,8 +142,8 @@ impl QueryServer {
 
         let router = Self::build_router(state);
 
-        let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
-        tracing::info!(port = self.port, "Starting HTTP query server");
+        let addr: SocketAddr = format!("{}:{}", self.address, self.port).parse()?;
+        tracing::info!(%addr, "Starting HTTP query server");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
         axum::serve(listener, router)
@@ -159,6 +160,7 @@ impl QueryServer {
 /// HTTP server for node status and control.
 pub struct StatusServer {
     port: u16,
+    address: String,
     app: Arc<App>,
     start_time: Instant,
     log_handle: Option<crate::logging::LogLevelHandle>,
@@ -168,9 +170,10 @@ pub struct StatusServer {
 
 impl StatusServer {
     /// Create a new status server.
-    pub fn new(port: u16, app: Arc<App>) -> Self {
+    pub fn new(port: u16, address: String, app: Arc<App>) -> Self {
         Self {
             port,
+            address,
             app,
             start_time: Instant::now(),
             log_handle: None,
@@ -182,11 +185,13 @@ impl StatusServer {
     /// Create a new status server with a log level handle for dynamic log changes.
     pub fn with_log_handle(
         port: u16,
+        address: String,
         app: Arc<App>,
         log_handle: crate::logging::LogLevelHandle,
     ) -> Self {
         Self {
             port,
+            address,
             app,
             start_time: Instant::now(),
             log_handle: Some(log_handle),
@@ -219,8 +224,8 @@ impl StatusServer {
 
         let router = build_router(state);
 
-        let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
-        tracing::info!(port = self.port, "Starting HTTP status server");
+        let addr: SocketAddr = format!("{}:{}", self.address, self.port).parse()?;
+        tracing::info!(%addr, "Starting HTTP status server");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
         axum::serve(listener, router)

@@ -179,9 +179,11 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
     // Store HTTP config before moving config
     let http_enabled = config.http.enabled;
     let http_port = config.http.port;
+    let http_address = config.http.address.clone();
     let query_port = config.query.port;
     let compat_http_enabled = config.compat_http.enabled;
     let compat_http_port = config.compat_http.port;
+    let compat_http_address = config.compat_http.address.clone();
 
     // Create the application
     let app = Arc::new(App::new(config).await?);
@@ -200,7 +202,7 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
     // Start the HTTP status server if enabled
     let http_handle = if http_enabled {
         #[cfg_attr(not(feature = "loadgen"), allow(unused_mut))]
-        let mut status_server = StatusServer::new(http_port, app.clone());
+        let mut status_server = StatusServer::new(http_port, http_address.clone(), app.clone());
         #[cfg(feature = "loadgen")]
         if let Some(ref factory) = options.loadgen_runner_factory {
             status_server.set_loadgen_runner(factory(app.clone()));
@@ -212,7 +214,7 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
 
     // Start the HTTP query server if configured
     let query_handle = if let Some(port) = query_port {
-        let query_server = QueryServer::new(port, app.clone());
+        let query_server = QueryServer::new(port, http_address.clone(), app.clone());
         Some(spawn_server("HTTP query server", query_server.start()))
     } else {
         None
@@ -221,7 +223,7 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
     // Start the stellar-core compatibility HTTP server if enabled
     let compat_handle = if compat_http_enabled {
         #[cfg_attr(not(feature = "loadgen"), allow(unused_mut))]
-        let mut compat_server = CompatServer::new(compat_http_port, app.clone());
+        let mut compat_server = CompatServer::new(compat_http_port, compat_http_address.clone(), app.clone());
         #[cfg(feature = "loadgen")]
         if let Some(ref factory) = options.loadgen_runner_factory {
             compat_server.set_loadgen_runner(factory(app.clone()));

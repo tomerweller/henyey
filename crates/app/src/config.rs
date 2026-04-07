@@ -911,6 +911,10 @@ pub struct CompatHttpConfig {
     /// Default 11626 matches stellar-core's `HTTP_PORT`.
     #[serde(default = "default_compat_http_port")]
     pub port: u16,
+
+    /// Address to bind the compatibility HTTP server to.
+    #[serde(default = "default_http_address")]
+    pub address: String,
 }
 
 impl Default for CompatHttpConfig {
@@ -918,6 +922,7 @@ impl Default for CompatHttpConfig {
         Self {
             enabled: false,
             port: default_compat_http_port(),
+            address: default_http_address(),
         }
     }
 }
@@ -1046,7 +1051,7 @@ fn default_http_port() -> u16 {
 }
 
 fn default_http_address() -> String {
-    "0.0.0.0".to_string()
+    "127.0.0.1".to_string()
 }
 
 // Default value functions
