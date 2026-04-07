@@ -1,3 +1,5 @@
+//! Transaction flooding: advertising, pulling, and broadcasting transactions across peers.
+
 use super::*;
 
 impl App {

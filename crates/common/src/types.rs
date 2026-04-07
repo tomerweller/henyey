@@ -291,6 +291,21 @@ pub fn deterministic_seed(name: &str) -> [u8; 32] {
     seed
 }
 
+/// Extract the quorum set hash from an SCP statement.
+///
+/// Different SCP pledge types store the quorum set hash in different fields:
+/// `Nominate`, `Prepare`, and `Confirm` use `quorum_set_hash`, while
+/// `Externalize` uses `commit_quorum_set_hash`.
+pub fn scp_quorum_set_hash(statement: &stellar_xdr::curr::ScpStatement) -> stellar_xdr::curr::Hash {
+    use stellar_xdr::curr::ScpStatementPledges;
+    match &statement.pledges {
+        ScpStatementPledges::Nominate(nom) => nom.quorum_set_hash.clone(),
+        ScpStatementPledges::Prepare(prep) => prep.quorum_set_hash.clone(),
+        ScpStatementPledges::Confirm(conf) => conf.quorum_set_hash.clone(),
+        ScpStatementPledges::Externalize(ext) => ext.commit_quorum_set_hash.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

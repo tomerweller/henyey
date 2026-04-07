@@ -199,109 +199,14 @@ impl Maintainer {
         let start = std::time::Instant::now();
         info!("Performing database maintenance");
 
-        // Get current ledger bounds
         let (lcl, min_queued) = (self.get_ledger_bounds)();
-
-        // Calculate the minimum ledger we need to keep
-        // We need to keep enough history to support checkpoint publishing
-        let qmin = min_queued.unwrap_or(lcl).min(lcl);
-        let lmin = qmin.saturating_sub(checkpoint_frequency());
-
-        debug!(
-            lcl = lcl,
-            min_queued = ?min_queued,
-            qmin = qmin,
-            trim_below = lmin,
-            "Trimming history"
+        run_maintenance(
+            &self.database,
+            lcl,
+            min_queued,
+            self.config.rpc_retention_window,
+            self.config.count,
         );
-
-        // Delete old SCP history
-        match self
-            .database
-            .delete_old_scp_entries(lmin, self.config.count)
-        {
-            Ok(deleted) => {
-                if deleted > 0 {
-                    debug!(deleted = deleted, "Deleted old SCP entries");
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to delete old SCP entries");
-            }
-        }
-
-        // Delete old ledger headers.
-        // When RPC retention is configured, use rpc_lmin directly so that
-        // oldest_ledger (MIN of ledgerheaders) tracks the retention window.
-        // Without RPC, fall back to the checkpoint-based lmin.
-        //
-        // Note: we intentionally ignore the publish queue for header pruning
-        // when RPC is active — a stale publish queue (e.g. put_enabled=false)
-        // must not prevent RPC data from being pruned.
-        let header_lmin = if let Some(retention_window) = self.config.rpc_retention_window {
-            lcl.saturating_sub(retention_window)
-        } else {
-            lmin
-        };
-        match self
-            .database
-            .delete_old_ledger_headers(header_lmin, self.config.count)
-        {
-            Ok(deleted) => {
-                if deleted > 0 {
-                    debug!(deleted = deleted, "Deleted old ledger headers");
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to delete old ledger headers");
-            }
-        }
-
-        // Clean up RPC-specific tables if retention window is configured.
-        // Events are RPC-only data and should be pruned at the RPC retention
-        // window, not the core checkpoint threshold.
-        if let Some(retention_window) = self.config.rpc_retention_window {
-            let rpc_lmin = lcl.saturating_sub(retention_window);
-
-            match self.database.delete_old_events(rpc_lmin, self.config.count) {
-                Ok(deleted) => {
-                    if deleted > 0 {
-                        debug!(deleted = deleted, "Deleted old contract events");
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to delete old events");
-                }
-            }
-
-            match self
-                .database
-                .delete_old_ledger_close_meta(rpc_lmin, self.config.count)
-            {
-                Ok(deleted) => {
-                    if deleted > 0 {
-                        debug!(deleted = deleted, "Deleted old ledger close meta");
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to delete old ledger close meta");
-                }
-            }
-
-            match self
-                .database
-                .delete_old_tx_history(rpc_lmin, self.config.count)
-            {
-                Ok(deleted) => {
-                    if deleted > 0 {
-                        debug!(deleted = deleted, "Deleted old tx history");
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to delete old tx history");
-                }
-            }
-        }
 
         let elapsed = start.elapsed();
         if elapsed > Duration::from_secs(10) {
@@ -320,44 +225,78 @@ impl Maintainer {
     /// This is useful for manual maintenance with a different batch size.
     pub fn perform_maintenance_with_count(&self, count: u32) {
         let (lcl, min_queued) = (self.get_ledger_bounds)();
-        let qmin = min_queued.unwrap_or(lcl).min(lcl);
-        let lmin = qmin.saturating_sub(checkpoint_frequency());
-
-        info!(
-            trim_below = lmin,
-            count = count,
-            "Performing manual maintenance"
+        run_maintenance(
+            &self.database,
+            lcl,
+            min_queued,
+            self.config.rpc_retention_window,
+            count,
         );
+    }
+}
 
-        if let Err(e) = self.database.delete_old_scp_entries(lmin, count) {
-            warn!(error = %e, "Failed to delete old SCP entries");
+/// Core maintenance logic shared between `App::perform_maintenance` and `Maintainer`.
+///
+/// Deletes old SCP history, ledger headers, and (if `rpc_retention_window` is set)
+/// RPC-specific tables (events, ledger close meta, tx history).
+///
+/// `header_lmin` is derived solely from the RPC retention window when RPC is active,
+/// intentionally ignoring the publish queue so that a stale publish queue does not
+/// prevent RPC data pruning.
+pub fn run_maintenance(
+    db: &henyey_db::Database,
+    lcl: u32,
+    min_queued: Option<u32>,
+    rpc_retention_window: Option<u32>,
+    count: u32,
+) {
+    let qmin = min_queued.unwrap_or(lcl).min(lcl);
+    let lmin = qmin.saturating_sub(checkpoint_frequency());
+
+    debug!(
+        lcl = lcl,
+        min_queued = ?min_queued,
+        trim_below = lmin,
+        count = count,
+        "Running maintenance"
+    );
+
+    // Delete old SCP history
+    if let Err(e) = db.delete_old_scp_entries(lmin, count) {
+        warn!(error = %e, "Failed to delete old SCP entries");
+    }
+
+    // Delete old ledger headers.
+    // When RPC retention is configured, use rpc_lmin directly so that
+    // oldest_ledger (MIN of ledgerheaders) tracks the retention window.
+    // Without RPC, fall back to the checkpoint-based lmin.
+    //
+    // Note: we intentionally ignore the publish queue for header pruning
+    // when RPC is active — a stale publish queue (e.g. put_enabled=false)
+    // must not prevent RPC data from being pruned.
+    let header_lmin = if let Some(retention_window) = rpc_retention_window {
+        lcl.saturating_sub(retention_window)
+    } else {
+        lmin
+    };
+    if let Err(e) = db.delete_old_ledger_headers(header_lmin, count) {
+        warn!(error = %e, "Failed to delete old ledger headers");
+    }
+
+    // Clean up RPC-specific tables if retention window is configured.
+    if let Some(retention_window) = rpc_retention_window {
+        let rpc_lmin = lcl.saturating_sub(retention_window);
+
+        if let Err(e) = db.delete_old_events(rpc_lmin, count) {
+            warn!(error = %e, "Failed to delete old events");
         }
 
-        let header_lmin = if let Some(retention_window) = self.config.rpc_retention_window {
-            lcl.saturating_sub(retention_window)
-        } else {
-            lmin
-        };
-        if let Err(e) = self.database.delete_old_ledger_headers(header_lmin, count) {
-            warn!(error = %e, "Failed to delete old ledger headers");
+        if let Err(e) = db.delete_old_ledger_close_meta(rpc_lmin, count) {
+            warn!(error = %e, "Failed to delete old ledger close meta");
         }
 
-        // Clean up RPC-specific tables if retention window is configured.
-        // Events are RPC-only data and belong in this block.
-        if let Some(retention_window) = self.config.rpc_retention_window {
-            let rpc_lmin = lcl.saturating_sub(retention_window);
-
-            if let Err(e) = self.database.delete_old_events(rpc_lmin, count) {
-                warn!(error = %e, "Failed to delete old events");
-            }
-
-            if let Err(e) = self.database.delete_old_ledger_close_meta(rpc_lmin, count) {
-                warn!(error = %e, "Failed to delete old ledger close meta");
-            }
-
-            if let Err(e) = self.database.delete_old_tx_history(rpc_lmin, count) {
-                warn!(error = %e, "Failed to delete old tx history");
-            }
+        if let Err(e) = db.delete_old_tx_history(rpc_lmin, count) {
+            warn!(error = %e, "Failed to delete old tx history");
         }
     }
 }

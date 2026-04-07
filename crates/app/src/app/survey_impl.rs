@@ -1,3 +1,5 @@
+//! Network survey: collecting and relaying topology survey data from peers.
+
 use super::*;
 
 impl App {

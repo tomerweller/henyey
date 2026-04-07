@@ -1,3 +1,5 @@
+//! SCP consensus: triggering rounds, out-of-sync recovery, and quorum set management.
+
 use super::*;
 
 impl App {
@@ -565,23 +567,6 @@ impl App {
         self.herder.clear_quorum_set_request(&hash);
     }
 
-    pub(super) fn scp_quorum_set_hash(statement: &stellar_xdr::curr::ScpStatement) -> Option<Hash> {
-        match &statement.pledges {
-            stellar_xdr::curr::ScpStatementPledges::Nominate(nom) => {
-                Some(nom.quorum_set_hash.clone())
-            }
-            stellar_xdr::curr::ScpStatementPledges::Prepare(prep) => {
-                Some(prep.quorum_set_hash.clone())
-            }
-            stellar_xdr::curr::ScpStatementPledges::Confirm(conf) => {
-                Some(conf.quorum_set_hash.clone())
-            }
-            stellar_xdr::curr::ScpStatementPledges::Externalize(ext) => {
-                Some(ext.commit_quorum_set_hash.clone())
-            }
-        }
-    }
-
     pub(super) fn build_scp_history_entry(&self, ledger_seq: u32) -> Option<ScpHistoryEntry> {
         let envelopes = self.herder.get_scp_envelopes(ledger_seq as u64);
         if envelopes.is_empty() {
@@ -590,9 +575,8 @@ impl App {
 
         let mut qset_hashes = HashSet::new();
         for envelope in &envelopes {
-            if let Some(hash) = Self::scp_quorum_set_hash(&envelope.statement) {
-                qset_hashes.insert(Hash256::from_bytes(hash.0));
-            }
+            let hash = henyey_common::scp_quorum_set_hash(&envelope.statement);
+            qset_hashes.insert(Hash256::from_bytes(hash.0));
         }
 
         let mut hashes = qset_hashes.into_iter().collect::<Vec<_>>();

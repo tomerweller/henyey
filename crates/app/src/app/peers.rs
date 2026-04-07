@@ -1,3 +1,5 @@
+//! Peer management: topology queries, peer info aggregation, and overlay statistics.
+
 use super::*;
 
 impl App {

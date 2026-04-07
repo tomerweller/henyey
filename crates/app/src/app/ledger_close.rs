@@ -1,3 +1,5 @@
+//! Ledger close pipeline: meta assembly, slot externalization, and buffered ledger application.
+
 use super::*;
 
 impl App {
@@ -57,13 +59,12 @@ impl App {
         let scp_envelopes = self.herder.get_scp_envelopes(header.ledger_seq as u64);
         let mut scp_quorum_sets = Vec::new();
         for envelope in &scp_envelopes {
-            if let Some(hash) = Self::scp_quorum_set_hash(&envelope.statement) {
-                let hash256 = Hash256::from_bytes(hash.0);
-                if let Some(qset) = self.herder.get_quorum_set_by_hash(&hash256) {
-                    scp_quorum_sets.push((hash256, qset));
-                } else {
-                    tracing::debug!(hash = %hash256.to_hex(), "Missing quorum set for SCP history");
-                }
+            let hash = henyey_common::scp_quorum_set_hash(&envelope.statement);
+            let hash256 = Hash256::from_bytes(hash.0);
+            if let Some(qset) = self.herder.get_quorum_set_by_hash(&hash256) {
+                scp_quorum_sets.push((hash256, qset));
+            } else {
+                tracing::debug!(hash = %hash256.to_hex(), "Missing quorum set for SCP history");
             }
         }
 

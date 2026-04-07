@@ -1,3 +1,5 @@
+//! Catchup logic: driving ledger replay from history archives to reach the network tip.
+
 use super::*;
 
 impl App {

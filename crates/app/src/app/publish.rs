@@ -1,3 +1,5 @@
+//! History publishing: SCP history assembly, checkpoint generation, and archive uploads.
+
 use super::*;
 
 impl App {
@@ -315,7 +317,7 @@ impl App {
 
             let mut qset_hashes = HashSet::new();
             for envelope in &envelopes {
-                let hash = scp_quorum_set_hash(&envelope.statement);
+                let hash = henyey_common::scp_quorum_set_hash(&envelope.statement);
                 qset_hashes.insert(Hash256::from_bytes(hash.0));
             }
 
@@ -346,18 +348,6 @@ impl App {
         }
 
         Ok(entries)
-    }
-}
-
-/// Extract the quorum set hash from an SCP statement.
-fn scp_quorum_set_hash(statement: &stellar_xdr::curr::ScpStatement) -> stellar_xdr::curr::Hash {
-    match &statement.pledges {
-        stellar_xdr::curr::ScpStatementPledges::Nominate(nom) => nom.quorum_set_hash.clone(),
-        stellar_xdr::curr::ScpStatementPledges::Prepare(prep) => prep.quorum_set_hash.clone(),
-        stellar_xdr::curr::ScpStatementPledges::Confirm(conf) => conf.quorum_set_hash.clone(),
-        stellar_xdr::curr::ScpStatementPledges::Externalize(ext) => {
-            ext.commit_quorum_set_hash.clone()
-        }
     }
 }
 

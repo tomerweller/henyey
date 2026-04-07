@@ -40,8 +40,8 @@ use henyey_common::Hash256;
 use henyey_crypto::Sha256Hasher;
 use henyey_ledger::TransactionSetVariant;
 use stellar_xdr::curr::{
-    LedgerHeader, LedgerHeaderHistoryEntry, Limits, ScpHistoryEntry, ScpStatement,
-    TransactionHistoryResultEntry, WriteXdr,
+    LedgerHeader, LedgerHeaderHistoryEntry, Limits, ScpHistoryEntry, TransactionHistoryResultEntry,
+    WriteXdr,
 };
 
 /// Optional trust anchors for ledger chain verification (spec §9.2).
@@ -464,14 +464,13 @@ pub fn verify_scp_history_entries(entries: &[ScpHistoryEntry]) -> Result<()> {
         }
 
         for envelope in v0.ledger_messages.messages.iter() {
-            if let Some(hash) = scp_quorum_set_hash(&envelope.statement) {
-                let hash256 = Hash256::from_bytes(hash.0);
-                if !qset_hashes.contains(&hash256) {
-                    return Err(HistoryError::VerificationFailed(format!(
-                        "missing quorum set {} in scp history",
-                        hash256.to_hex()
-                    )));
-                }
+            let hash = henyey_common::scp_quorum_set_hash(&envelope.statement);
+            let hash256 = Hash256::from_bytes(hash.0);
+            if !qset_hashes.contains(&hash256) {
+                return Err(HistoryError::VerificationFailed(format!(
+                    "missing quorum set {} in scp history",
+                    hash256.to_hex()
+                )));
             }
         }
     }
@@ -523,17 +522,6 @@ pub fn verify_tx_result_ordering(
     }
 
     Ok(())
-}
-
-fn scp_quorum_set_hash(statement: &ScpStatement) -> Option<stellar_xdr::curr::Hash> {
-    match &statement.pledges {
-        stellar_xdr::curr::ScpStatementPledges::Nominate(nom) => Some(nom.quorum_set_hash.clone()),
-        stellar_xdr::curr::ScpStatementPledges::Prepare(prep) => Some(prep.quorum_set_hash.clone()),
-        stellar_xdr::curr::ScpStatementPledges::Confirm(conf) => Some(conf.quorum_set_hash.clone()),
-        stellar_xdr::curr::ScpStatementPledges::Externalize(ext) => {
-            Some(ext.commit_quorum_set_hash.clone())
-        }
-    }
 }
 
 #[cfg(test)]

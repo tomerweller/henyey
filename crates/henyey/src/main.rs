@@ -1015,12 +1015,14 @@ async fn main() -> anyhow::Result<()> {
         } => {
             cmd_apply_load(
                 config,
-                &mode,
-                num_ledgers,
-                classic_txs_per_ledger,
-                clusters,
-                tx_count,
-                iterations,
+                ApplyLoadOptions {
+                    mode,
+                    num_ledgers,
+                    classic_txs_per_ledger,
+                    clusters,
+                    tx_count,
+                    iterations,
+                },
             )
             .await
         }
@@ -1687,18 +1689,20 @@ fn initialize_genesis_ledger(
 /// utilization.
 ///
 /// Matches stellar-core's `apply-load` CLI subcommand.
-async fn cmd_apply_load(
-    mut config: AppConfig,
-    mode_str: &str,
+/// Options for the `apply-load` benchmark command.
+struct ApplyLoadOptions {
+    mode: String,
     num_ledgers: u32,
     classic_txs_per_ledger: u32,
     clusters: u32,
     tx_count: u32,
     iterations: u32,
-) -> anyhow::Result<()> {
+}
+
+async fn cmd_apply_load(mut config: AppConfig, opts: ApplyLoadOptions) -> anyhow::Result<()> {
     use henyey_simulation::{ApplyLoad, ApplyLoadConfig, ApplyLoadMode};
 
-    let mode = match mode_str {
+    let mode = match opts.mode.as_str() {
         "ledger-limits" => ApplyLoadMode::LimitBased,
         "max-sac-tps" | "single-shot" => ApplyLoadMode::MaxSacTps,
         other => anyhow::bail!(
@@ -1706,7 +1710,7 @@ async fn cmd_apply_load(
             other
         ),
     };
-    let is_single_shot = mode_str == "single-shot";
+    let is_single_shot = opts.mode == "single-shot";
 
     // Configure for standalone benchmark operation.
     // The node never connects to peers or runs consensus — ApplyLoad
@@ -1741,18 +1745,18 @@ async fn cmd_apply_load(
     // Build the ApplyLoad configuration.
     let al_config = ApplyLoadConfig {
         num_ledgers: if is_single_shot {
-            iterations
+            opts.iterations
         } else {
-            num_ledgers
+            opts.num_ledgers
         },
-        classic_txs_per_ledger,
-        ledger_max_dependent_tx_clusters: clusters,
+        classic_txs_per_ledger: opts.classic_txs_per_ledger,
+        ledger_max_dependent_tx_clusters: opts.clusters,
         ..ApplyLoadConfig::default()
     };
 
     println!(
         "apply-load: mode={:?}, num_ledgers={}, classic_txs_per_ledger={}, clusters={}",
-        mode, num_ledgers, classic_txs_per_ledger, clusters
+        mode, opts.num_ledgers, opts.classic_txs_per_ledger, opts.clusters
     );
     println!();
 
@@ -1764,13 +1768,16 @@ async fn cmd_apply_load(
 
     match mode {
         ApplyLoadMode::LimitBased => {
-            println!("Running limit-based benchmark ({} ledgers)...", num_ledgers);
+            println!(
+                "Running limit-based benchmark ({} ledgers)...",
+                opts.num_ledgers
+            );
             println!();
 
             let start = std::time::Instant::now();
-            for i in 0..num_ledgers {
+            for i in 0..opts.num_ledgers {
                 harness.benchmark()?;
-                println!("  Ledger {}/{} closed", i + 1, num_ledgers);
+                println!("  Ledger {}/{} closed", i + 1, opts.num_ledgers);
             }
             let elapsed = start.elapsed();
 
@@ -1779,7 +1786,7 @@ async fn cmd_apply_load(
             println!("Total time: {:.2}s", elapsed.as_secs_f64());
             println!(
                 "Average close time: {:.2}ms",
-                elapsed.as_millis() as f64 / num_ledgers as f64
+                elapsed.as_millis() as f64 / opts.num_ledgers as f64
             );
             println!("Success rate: {:.1}%", harness.success_rate() * 100.0);
             println!();
@@ -1816,20 +1823,23 @@ async fn cmd_apply_load(
 
         ApplyLoadMode::MaxSacTps if is_single_shot => {
             // Round tx_count down to nearest multiple of clusters.
-            let txs = (tx_count / clusters) * clusters;
+            let txs = (opts.tx_count / opts.clusters) * opts.clusters;
             println!(
                 "Single-shot: closing {} ledgers with {} SAC TXs across {} clusters...",
-                iterations, txs, clusters
+                opts.iterations, txs, opts.clusters
             );
             println!();
 
             let avg_ms = harness.benchmark_sac_tps(txs)?;
 
             println!();
-            println!("=== Single-Shot Result ({} iterations) ===", iterations);
+            println!(
+                "=== Single-Shot Result ({} iterations) ===",
+                opts.iterations
+            );
             println!(
                 "TXs/ledger: {}, Clusters: {}, Avg close: {:.1}ms",
-                txs, clusters, avg_ms
+                txs, opts.clusters, avg_ms
             );
             println!("Average TPS: {:.0}", txs as f64 / (avg_ms / 1000.0));
             println!("Success rate: {:.1}%", harness.success_rate() * 100.0);
@@ -2805,7 +2815,7 @@ fn build_scp_history_entries(
 
         let mut qset_hashes = HashSet::new();
         for envelope in &envelopes {
-            let hash = scp_quorum_set_hash(&envelope.statement);
+            let hash = henyey_common::scp_quorum_set_hash(&envelope.statement);
             qset_hashes.insert(Hash256::from_bytes(hash.0));
         }
 
@@ -2878,20 +2888,6 @@ fn write_scp_history_file(
     }
     encoder.finish()?;
     Ok(())
-}
-
-/// Extracts the quorum set hash from an SCP statement.
-///
-/// Different SCP pledge types store the quorum set hash in different fields.
-fn scp_quorum_set_hash(statement: &stellar_xdr::curr::ScpStatement) -> stellar_xdr::curr::Hash {
-    match &statement.pledges {
-        stellar_xdr::curr::ScpStatementPledges::Nominate(nom) => nom.quorum_set_hash.clone(),
-        stellar_xdr::curr::ScpStatementPledges::Prepare(prep) => prep.quorum_set_hash.clone(),
-        stellar_xdr::curr::ScpStatementPledges::Confirm(conf) => conf.quorum_set_hash.clone(),
-        stellar_xdr::curr::ScpStatementPledges::Externalize(ext) => {
-            ext.commit_quorum_set_hash.clone()
-        }
-    }
 }
 
 /// Configuration for publishing to a remote archive via shell commands.

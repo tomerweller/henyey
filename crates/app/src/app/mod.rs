@@ -1030,17 +1030,16 @@ impl App {
     /// Get a rich ledger summary with all header fields needed for the
     /// `/info` endpoint.
     pub fn ledger_summary(&self) -> LedgerSummary {
+        let info = self.ledger_info();
         let header = self.ledger_manager.current_header();
-        let hash = self.ledger_manager.current_header_hash();
-        let close_time = ledger_close_time(&header);
         let now = self
             .clock
             .system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let age = if close_time > 0 {
-            now.saturating_sub(close_time)
+        let age = if info.close_time > 0 {
+            now.saturating_sub(info.close_time)
         } else {
             0
         };
@@ -1050,10 +1049,10 @@ impl App {
             stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
         };
         LedgerSummary {
-            num: header.ledger_seq,
-            hash,
-            close_time,
-            version: header.ledger_version,
+            num: info.ledger_seq,
+            hash: info.hash,
+            close_time: info.close_time,
+            version: info.protocol_version,
             base_fee: header.base_fee,
             base_reserve: header.base_reserve,
             max_tx_set_size: header.max_tx_set_size,
@@ -1350,56 +1349,20 @@ impl App {
             .ok()
             .and_then(|queue| queue.first().copied());
 
-        // Calculate the minimum ledger we need to keep
-        let qmin = min_queued.unwrap_or(lcl).min(lcl);
-        let lmin = qmin.saturating_sub(checkpoint_frequency());
+        let rpc_retention_window = if self.config.rpc.enabled {
+            Some(self.config.rpc.retention_window)
+        } else {
+            None
+        };
 
         tracing::info!(
-            trim_below = lmin,
             count = count,
             lcl = lcl,
             min_queued = ?min_queued,
             "Performing manual maintenance"
         );
 
-        // Delete old SCP history
-        if let Err(e) = self.db.delete_old_scp_entries(lmin, count) {
-            tracing::warn!(error = %e, "Failed to delete old SCP entries");
-        }
-
-        // Delete old ledger headers.
-        // When RPC is enabled, headers must be retained at least as long as
-        // the RPC data so that oldest_ledger (MIN of ledgerheaders) never
-        // reports a value newer than the actual oldest RPC data.
-        let header_lmin = if self.config.rpc.enabled {
-            let rpc_lmin = lcl.saturating_sub(self.config.rpc.retention_window);
-            lmin.min(rpc_lmin)
-        } else {
-            lmin
-        };
-        if let Err(e) = self.db.delete_old_ledger_headers(header_lmin, count) {
-            tracing::warn!(error = %e, "Failed to delete old ledger headers");
-        }
-
-        // Clean up RPC-specific tables if RPC is enabled.
-        // Events, ledger close meta, and tx history are all RPC-only data
-        // and should be pruned at the RPC retention window, not the core
-        // checkpoint threshold.
-        if self.config.rpc.enabled {
-            let rpc_lmin = lcl.saturating_sub(self.config.rpc.retention_window);
-
-            if let Err(e) = self.db.delete_old_events(rpc_lmin, count) {
-                tracing::warn!(error = %e, "Failed to delete old contract events");
-            }
-
-            if let Err(e) = self.db.delete_old_ledger_close_meta(rpc_lmin, count) {
-                tracing::warn!(error = %e, "Failed to delete old ledger close meta");
-            }
-
-            if let Err(e) = self.db.delete_old_tx_history(rpc_lmin, count) {
-                tracing::warn!(error = %e, "Failed to delete old tx history");
-            }
-        }
+        crate::maintainer::run_maintenance(&self.db, lcl, min_queued, rpc_retention_window, count);
     }
 
     /// Delete bucket files on disk that are no longer referenced by the live

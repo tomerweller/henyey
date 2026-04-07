@@ -1,3 +1,5 @@
+//! Application lifecycle: overlay message handling, periodic tick, and event loop orchestration.
+
 use super::*;
 
 impl App {
@@ -871,21 +873,20 @@ impl App {
                     _ => None,
                 };
 
-                if let Some(hash) = Self::scp_quorum_set_hash(&envelope.statement) {
-                    let hash256 = henyey_common::Hash256::from_bytes(hash.0);
-                    let sender_node_id = envelope.statement.node_id.clone();
-                    // Always call request_quorum_set to associate the quorum set with the node_id.
-                    // If we already have the quorum set by hash, it will be associated with this
-                    // node_id. If not, we'll create a pending request.
-                    if self.herder.request_quorum_set(hash256, sender_node_id) {
-                        // New pending request - need to fetch from network
-                        let peer = msg.from_peer.clone();
-                        if let Some(overlay) = self.overlay().await {
-                            let request =
-                                StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256(hash.0));
-                            if let Err(e) = overlay.try_send_to(&peer, request) {
-                                tracing::debug!(peer = %peer, error = %e, "Failed to request quorum set");
-                            }
+                let hash = henyey_common::scp_quorum_set_hash(&envelope.statement);
+                let hash256 = henyey_common::Hash256::from_bytes(hash.0);
+                let sender_node_id = envelope.statement.node_id.clone();
+                // Always call request_quorum_set to associate the quorum set with the node_id.
+                // If we already have the quorum set by hash, it will be associated with this
+                // node_id. If not, we'll create a pending request.
+                if self.herder.request_quorum_set(hash256, sender_node_id) {
+                    // New pending request - need to fetch from network
+                    let peer = msg.from_peer.clone();
+                    if let Some(overlay) = self.overlay().await {
+                        let request =
+                            StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256(hash.0));
+                        if let Err(e) = overlay.try_send_to(&peer, request) {
+                            tracing::debug!(peer = %peer, error = %e, "Failed to request quorum set");
                         }
                     }
                 }

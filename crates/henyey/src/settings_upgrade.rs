@@ -42,6 +42,16 @@ fn single_operation(body: OperationBody) -> VecM<Operation, 100> {
     .unwrap()
 }
 
+/// Outputs of `get_create_tx` needed by `get_invoke_tx`.
+struct ContractDeployment {
+    /// The contract code ledger key (for the WASM upload entry).
+    code_key: LedgerKey,
+    /// The contract instance ledger key.
+    source_ref_key: LedgerKey,
+    /// The deployed contract ID.
+    contract_id: Hash,
+}
+
 fn build_soroban_envelope(
     public_key: &Uint256,
     seq_num: i64,
@@ -158,7 +168,7 @@ fn get_create_tx(
     network_passphrase: &str,
     seq_num: i64,
     add_resource_fee: i64,
-) -> (TransactionEnvelope, LedgerKey, Hash) {
+) -> (TransactionEnvelope, ContractDeployment) {
     let wasm_hash = match contract_code_key {
         LedgerKey::ContractCode(k) => k.hash.clone(),
         _ => panic!("Expected ContractCode ledger key"),
@@ -241,15 +251,20 @@ fn get_create_tx(
         resources,
     );
 
-    (envelope, contract_source_ref_key, contract_id)
+    (
+        envelope,
+        ContractDeployment {
+            code_key: contract_code_key.clone(),
+            source_ref_key: contract_source_ref_key,
+            contract_id,
+        },
+    )
 }
 
 /// Build the invoke transaction (tx 4 of 4).
 fn get_invoke_tx(
     public_key: &Uint256,
-    contract_code_key: &LedgerKey,
-    contract_source_ref_key: &LedgerKey,
-    contract_id: &Hash,
+    deployment: &ContractDeployment,
     upgrade_set: &ConfigUpgradeSet,
     seq_num: i64,
     add_resource_fee: i64,
@@ -259,7 +274,7 @@ fn get_invoke_tx(
         .unwrap();
 
     // Build invoke contract args
-    let addr = ScAddress::Contract(ContractId(contract_id.clone()));
+    let addr = ScAddress::Contract(ContractId(deployment.contract_id.clone()));
 
     let function_name = ScSymbol("write".try_into().unwrap());
 
@@ -291,9 +306,12 @@ fn get_invoke_tx(
 
     let resources = SorobanResources {
         footprint: LedgerFootprint {
-            read_only: vec![contract_source_ref_key.clone(), contract_code_key.clone()]
-                .try_into()
-                .unwrap(),
+            read_only: vec![
+                deployment.source_ref_key.clone(),
+                deployment.code_key.clone(),
+            ]
+            .try_into()
+            .unwrap(),
             read_write: vec![upgrade_key].try_into().unwrap(),
         },
         instructions: 2_000_000,
@@ -319,7 +337,7 @@ fn get_invoke_tx(
     );
 
     let key = ConfigUpgradeSetKey {
-        contract_id: ContractId(contract_id.clone()),
+        contract_id: ContractId(deployment.contract_id.clone()),
         content_hash: Hash(upgrade_hash.0),
     };
 
@@ -410,7 +428,7 @@ pub fn run(params: &SettingsUpgradeParams<'_>) -> anyhow::Result<()> {
     // Note: stellar-core passes 0 for addResourceFee to getUploadTx
     let (mut upload_tx, contract_code_key) = get_upload_tx(&public_key, params.seq_num + 2);
 
-    let (mut create_tx, contract_source_ref_key, contract_id) = get_create_tx(
+    let (mut create_tx, deployment) = get_create_tx(
         &public_key,
         &contract_code_key,
         params.network_passphrase,
@@ -420,9 +438,7 @@ pub fn run(params: &SettingsUpgradeParams<'_>) -> anyhow::Result<()> {
 
     let (mut invoke_tx, upgrade_set_key) = get_invoke_tx(
         &public_key,
-        &contract_code_key,
-        &contract_source_ref_key,
-        &contract_id,
+        &deployment,
         &upgrade_set,
         params.seq_num + 4,
         params.add_resource_fee,
