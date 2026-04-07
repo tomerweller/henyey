@@ -337,28 +337,7 @@ impl BucketListSnapshot {
     /// Returns `None` immediately for OFFER keys (matching stellar-core's
     /// `LiveBucketIndex::typeNotSupported`).
     pub fn get(&self, key: &LedgerKey) -> Option<LedgerEntry> {
-        if LiveBucketIndex::type_not_supported(ledger_key_type(key)) {
-            return None;
-        }
-
-        use stellar_xdr::curr::{Limits, WriteXdr};
-        let key_bytes = key.to_xdr(Limits::none()).ok()?;
-        for level in &self.levels {
-            for bucket in [&level.curr, &level.snap] {
-                if let Some(entry) = bucket
-                    .get_result_by_key_bytes(key, &key_bytes)
-                    .ok()
-                    .flatten()
-                {
-                    match entry {
-                        BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => return Some(e),
-                        BucketEntry::Deadentry(_) => return None,
-                        BucketEntry::Metaentry(_) => continue,
-                    }
-                }
-            }
-        }
-        None
+        self.get_result(key).ok().flatten()
     }
 
     /// Looks up an entry by key in this snapshot, propagating errors.
