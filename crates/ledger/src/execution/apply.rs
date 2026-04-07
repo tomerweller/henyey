@@ -24,7 +24,7 @@ use super::result_mapping::*;
 use super::signatures::*;
 use super::{
     DeltaSlice, OperationExecutionRequest, PreApplyResult, PreApplySnapshot, RefundableFeeTracker,
-    TransactionExecutionResult, TransactionExecutor,
+    TransactionExecutionResult, TransactionExecutor, TxExecTimings,
 };
 
 pub(super) const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
@@ -740,24 +740,26 @@ impl TransactionExecutor {
                 });
                 keys
             },
-            op_type_timings,
-            exec_time_us: total_us,
-            validation_us,
-            fee_seq_us,
-            footprint_us,
-            ops_us,
-            meta_build_us: meta_us,
-            meta_commit_us: commit_phase_us,
-            meta_fee_refund_us: fee_refund_phase_us,
-            meta_build_phase_us,
-            val_account_load_us,
-            val_tx_hash_us,
-            val_ed25519_us,
-            val_other_us,
-            fee_deduct_us,
-            op_sig_check_us,
-            signer_removal_us,
-            seq_bump_us,
+            timings: TxExecTimings {
+                op_type_timings,
+                exec_time_us: total_us,
+                validation_us,
+                fee_seq_us,
+                footprint_us,
+                ops_us,
+                meta_build_us: meta_us,
+                meta_commit_us: commit_phase_us,
+                meta_fee_refund_us: fee_refund_phase_us,
+                meta_build_phase_us,
+                val_account_load_us,
+                val_tx_hash_us,
+                val_ed25519_us,
+                val_other_us,
+                fee_deduct_us,
+                op_sig_check_us,
+                signer_removal_us,
+                seq_bump_us,
+            },
             tx_hash,
             fee_bump_outer_failure: false,
         })

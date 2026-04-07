@@ -3713,25 +3713,25 @@ impl LedgerCloseContext<'_> {
                 hash_hex,
                 success: result.success,
                 op_count: result.operation_results.len(),
-                exec_us: result.exec_time_us,
+                exec_us: result.timings.exec_time_us,
                 is_soroban,
             });
             // Aggregate per-TX sub-phase timings
-            agg_validation_us += result.validation_us;
-            agg_fee_seq_us += result.fee_seq_us;
-            agg_footprint_us += result.footprint_us;
-            agg_ops_us += result.ops_us;
-            agg_meta_build_us += result.meta_build_us;
-            agg_val_account_load_us += result.val_account_load_us;
-            agg_val_tx_hash_us += result.val_tx_hash_us;
-            agg_val_ed25519_us += result.val_ed25519_us;
-            agg_val_other_us += result.val_other_us;
-            agg_fee_deduct_us += result.fee_deduct_us;
-            agg_op_sig_check_us += result.op_sig_check_us;
-            agg_signer_removal_us += result.signer_removal_us;
-            agg_seq_bump_us += result.seq_bump_us;
+            agg_validation_us += result.timings.validation_us;
+            agg_fee_seq_us += result.timings.fee_seq_us;
+            agg_footprint_us += result.timings.footprint_us;
+            agg_ops_us += result.timings.ops_us;
+            agg_meta_build_us += result.timings.meta_build_us;
+            agg_val_account_load_us += result.timings.val_account_load_us;
+            agg_val_tx_hash_us += result.timings.val_tx_hash_us;
+            agg_val_ed25519_us += result.timings.val_ed25519_us;
+            agg_val_other_us += result.timings.val_other_us;
+            agg_fee_deduct_us += result.timings.fee_deduct_us;
+            agg_op_sig_check_us += result.timings.op_sig_check_us;
+            agg_signer_removal_us += result.timings.signer_removal_us;
+            agg_seq_bump_us += result.timings.seq_bump_us;
             // Aggregate per-op-type timings across all TXs
-            for (op_type, (us, count)) in &result.op_type_timings {
+            for (op_type, (us, count)) in &result.timings.op_type_timings {
                 let entry = agg_op_type_timings.entry(*op_type).or_insert((0, 0));
                 entry.0 += us;
                 entry.1 += count;

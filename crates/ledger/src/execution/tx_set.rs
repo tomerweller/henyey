@@ -834,18 +834,18 @@ pub(super) fn execute_single_cluster(
             },
         )?;
         agg_execute_us += exec_start.elapsed().as_micros() as u64;
-        agg_validation_us += result.validation_us;
-        agg_fee_seq_us += result.fee_seq_us;
-        agg_footprint_us += result.footprint_us;
-        agg_ops_us += result.ops_us;
-        agg_meta_us += result.meta_build_us;
-        agg_val_account_load_us += result.val_account_load_us;
-        agg_val_tx_hash_us += result.val_tx_hash_us;
-        agg_val_ed25519_us += result.val_ed25519_us;
-        agg_val_other_us += result.val_other_us;
-        agg_meta_commit_us += result.meta_commit_us;
-        agg_meta_fee_refund_us += result.meta_fee_refund_us;
-        agg_meta_build_phase_us += result.meta_build_phase_us;
+        agg_validation_us += result.timings.validation_us;
+        agg_fee_seq_us += result.timings.fee_seq_us;
+        agg_footprint_us += result.timings.footprint_us;
+        agg_ops_us += result.timings.ops_us;
+        agg_meta_us += result.timings.meta_build_us;
+        agg_val_account_load_us += result.timings.val_account_load_us;
+        agg_val_tx_hash_us += result.timings.val_tx_hash_us;
+        agg_val_ed25519_us += result.timings.val_ed25519_us;
+        agg_val_other_us += result.timings.val_other_us;
+        agg_meta_commit_us += result.timings.meta_commit_us;
+        agg_meta_fee_refund_us += result.timings.meta_fee_refund_us;
+        agg_meta_build_phase_us += result.timings.meta_build_phase_us;
 
         // Override fee_charged and fee_changes from pre-deduction.
         // The executor computed fee_refund correctly (based on resource consumption),

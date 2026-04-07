@@ -335,6 +335,35 @@ impl RefundableFeeTracker {
     }
 }
 
+/// Profiling timings for transaction execution phases (all in microseconds).
+#[derive(Debug, Clone, Default)]
+pub struct TxExecTimings {
+    /// Per-operation-type timing: maps op type to (total_us, count).
+    pub op_type_timings: HashMap<OperationType, (u64, u32)>,
+    /// Total transaction execution time.
+    pub exec_time_us: u64,
+    /// Sub-phase timings.
+    pub validation_us: u64,
+    pub fee_seq_us: u64,
+    pub footprint_us: u64,
+    pub ops_us: u64,
+    // Validation sub-component timings
+    pub val_account_load_us: u64,
+    pub val_tx_hash_us: u64,
+    pub val_ed25519_us: u64,
+    pub val_other_us: u64,
+    // Fee/seq sub-component timings
+    pub fee_deduct_us: u64,
+    pub op_sig_check_us: u64,
+    pub signer_removal_us: u64,
+    pub seq_bump_us: u64,
+    pub meta_build_us: u64,
+    // Meta sub-component timings
+    pub meta_commit_us: u64,
+    pub meta_fee_refund_us: u64,
+    pub meta_build_phase_us: u64,
+}
+
 /// Result of executing a transaction.
 #[derive(Debug, Clone)]
 pub struct TransactionExecutionResult {
@@ -359,30 +388,8 @@ pub struct TransactionExecutionResult {
     /// Keys of entries restored from the hot archive (Protocol 23+).
     /// These should be passed to HotArchiveBucketList::add_batch as restored_keys.
     pub hot_archive_restored_keys: Vec<LedgerKey>,
-    /// Per-operation-type timing: maps op type to (total_us, count).
-    pub op_type_timings: HashMap<OperationType, (u64, u32)>,
-    /// Total transaction execution time in microseconds.
-    pub exec_time_us: u64,
-    /// Sub-phase timings (microseconds) for profiling.
-    pub validation_us: u64,
-    pub fee_seq_us: u64,
-    pub footprint_us: u64,
-    pub ops_us: u64,
-    // Validation sub-component timings (microseconds)
-    pub val_account_load_us: u64,
-    pub val_tx_hash_us: u64,
-    pub val_ed25519_us: u64,
-    pub val_other_us: u64,
-    // Fee/seq sub-component timings (microseconds)
-    pub fee_deduct_us: u64,
-    pub op_sig_check_us: u64,
-    pub signer_removal_us: u64,
-    pub seq_bump_us: u64,
-    pub meta_build_us: u64,
-    // Meta sub-component timings (microseconds)
-    pub meta_commit_us: u64,
-    pub meta_fee_refund_us: u64,
-    pub meta_build_phase_us: u64,
+    /// Profiling timings for execution phases.
+    pub timings: TxExecTimings,
     /// Cached transaction hash (computed during validation, reused in result building).
     pub tx_hash: Option<Hash256>,
     /// Whether this is a fee-bump outer-wrapper failure (e.g. fee source missing,
@@ -415,24 +422,7 @@ pub(super) fn failed_result(
         fee_changes: None,
         post_fee_changes: None,
         hot_archive_restored_keys: Vec::new(),
-        op_type_timings: HashMap::new(),
-        exec_time_us: 0,
-        validation_us: 0,
-        fee_seq_us: 0,
-        footprint_us: 0,
-        ops_us: 0,
-        meta_build_us: 0,
-        meta_commit_us: 0,
-        meta_fee_refund_us: 0,
-        meta_build_phase_us: 0,
-        val_account_load_us: 0,
-        val_tx_hash_us: 0,
-        val_ed25519_us: 0,
-        val_other_us: 0,
-        fee_deduct_us: 0,
-        op_sig_check_us: 0,
-        signer_removal_us: 0,
-        seq_bump_us: 0,
+        timings: TxExecTimings::default(),
         tx_hash: None,
         fee_bump_outer_failure: false,
     }
@@ -2168,24 +2158,26 @@ impl TransactionExecutor {
             fee_changes: Some(pre.fee_changes),
             post_fee_changes: Some(empty_entry_changes()),
             hot_archive_restored_keys: Vec::new(),
-            op_type_timings: HashMap::new(),
-            exec_time_us: total_us,
-            validation_us: pre.validation_us,
-            fee_seq_us: pre.fee_seq_us,
-            footprint_us: 0,
-            ops_us: 0,
-            meta_build_us: 0,
-            meta_commit_us: 0,
-            meta_fee_refund_us: 0,
-            meta_build_phase_us: 0,
-            val_account_load_us: pre.val_account_load_us,
-            val_tx_hash_us: pre.val_tx_hash_us,
-            val_ed25519_us: pre.val_ed25519_us,
-            val_other_us: pre.val_other_us,
-            fee_deduct_us: pre.fee_deduct_us,
-            op_sig_check_us: pre.op_sig_check_us,
-            signer_removal_us: pre.signer_removal_us,
-            seq_bump_us: pre.seq_bump_us,
+            timings: TxExecTimings {
+                op_type_timings: HashMap::new(),
+                exec_time_us: total_us,
+                validation_us: pre.validation_us,
+                fee_seq_us: pre.fee_seq_us,
+                footprint_us: 0,
+                ops_us: 0,
+                meta_build_us: 0,
+                meta_commit_us: 0,
+                meta_fee_refund_us: 0,
+                meta_build_phase_us: 0,
+                val_account_load_us: pre.val_account_load_us,
+                val_tx_hash_us: pre.val_tx_hash_us,
+                val_ed25519_us: pre.val_ed25519_us,
+                val_other_us: pre.val_other_us,
+                fee_deduct_us: pre.fee_deduct_us,
+                op_sig_check_us: pre.op_sig_check_us,
+                signer_removal_us: pre.signer_removal_us,
+                seq_bump_us: pre.seq_bump_us,
+            },
             tx_hash: pre.tx_hash,
             // TxInsufficientBalance from fee deduction is an outer failure for
             // fee-bump transactions (stellar-core's commonValid → setError).
