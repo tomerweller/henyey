@@ -90,8 +90,7 @@ impl TransactionQueue {
     ) -> (TransactionSet, stellar_xdr::curr::GeneralizedTransactionSet) {
         use stellar_xdr::curr::{
             DependentTxCluster, GeneralizedTransactionSet, ParallelTxExecutionStage,
-            ParallelTxsComponent, TransactionPhase, TxSetComponent,
-            TxSetComponentTxsMaybeDiscountedFee, VecM, WriteXdr,
+            ParallelTxsComponent, VecM, WriteXdr,
         };
 
         let SelectedTxs {
@@ -117,67 +116,14 @@ impl TransactionQueue {
 
         sort_txs_by_hash(&mut soroban_txs);
 
-        let mut classic_components: Vec<TxSetComponent> = Vec::new();
-        if !classic_txs.is_empty() {
-            let has_dex_lane = self.config.max_dex_ops.is_some();
-            let lane_count = if has_dex_lane { 2 } else { 1 };
-            let mut lowest_lane_fee = vec![i64::MAX; lane_count];
-            let mut lane_for_tx = Vec::with_capacity(classic_txs.len());
-
-            for tx in &classic_txs {
-                let frame = henyey_tx::TransactionFrame::from_owned_with_network(
-                    tx.clone(),
-                    self.config.network_id,
-                );
-                let lane = if has_dex_lane && frame.has_dex_operations() {
-                    crate::surge_pricing::DEX_LANE
-                } else {
-                    GENERIC_LANE
-                };
-                if let Some((per_op, _, _)) = envelope_fee_per_op(tx) {
-                    let lane_fee = &mut lowest_lane_fee[lane];
-                    let fee = per_op as i64;
-                    if fee < *lane_fee {
-                        *lane_fee = fee;
-                    }
-                }
-                lane_for_tx.push(lane);
-            }
-
-            let min_lane_fee = lowest_lane_fee
-                .iter()
-                .copied()
-                .filter(|fee| *fee != i64::MAX)
-                .min()
-                .unwrap_or(base_fee);
-            let mut lane_base_fee = vec![base_fee; lane_count];
-            if classic_limited {
-                lane_base_fee.fill(min_lane_fee);
-            }
-            if has_dex_lane && dex_limited {
-                let dex_fee = lowest_lane_fee[crate::surge_pricing::DEX_LANE];
-                if dex_fee != i64::MAX {
-                    lane_base_fee[crate::surge_pricing::DEX_LANE] = dex_fee;
-                }
-            }
-
-            let mut components_by_fee: BTreeMap<i64, Vec<TransactionEnvelope>> = BTreeMap::new();
-            for (tx, lane) in classic_txs.into_iter().zip(lane_for_tx.into_iter()) {
-                let fee = lane_base_fee[lane];
-                components_by_fee.entry(fee).or_default().push(tx);
-            }
-
-            for (fee, mut txs) in components_by_fee {
-                sort_txs_by_hash(&mut txs);
-                classic_components.push(TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
-                    TxSetComponentTxsMaybeDiscountedFee {
-                        base_fee: Some(fee),
-                        txs: txs.try_into().unwrap_or_default(),
-                    },
-                ));
-            }
-        }
-        let classic_phase = TransactionPhase::V0(classic_components.try_into().unwrap_or_default());
+        let classic_phase = build_classic_phase(
+            classic_txs,
+            classic_limited,
+            dex_limited,
+            base_fee,
+            self.config.max_dex_ops.is_some(),
+            self.config.network_id,
+        );
 
         let soroban_base_fee = if soroban_limited {
             soroban_txs
@@ -527,4 +473,75 @@ impl TransactionQueue {
 
         (classic_accounts, soroban_accounts)
     }
+}
+
+/// Build the classic transaction phase with lane-based fee components.
+fn build_classic_phase(
+    classic_txs: Vec<TransactionEnvelope>,
+    classic_limited: bool,
+    dex_limited: bool,
+    base_fee: i64,
+    has_dex_lane: bool,
+    network_id: NetworkId,
+) -> stellar_xdr::curr::TransactionPhase {
+    use stellar_xdr::curr::{TransactionPhase, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee};
+
+    let mut classic_components: Vec<TxSetComponent> = Vec::new();
+    if !classic_txs.is_empty() {
+        let lane_count = if has_dex_lane { 2 } else { 1 };
+        let mut lowest_lane_fee = vec![i64::MAX; lane_count];
+        let mut lane_for_tx = Vec::with_capacity(classic_txs.len());
+
+        for tx in &classic_txs {
+            let frame =
+                henyey_tx::TransactionFrame::from_owned_with_network(tx.clone(), network_id);
+            let lane = if has_dex_lane && frame.has_dex_operations() {
+                crate::surge_pricing::DEX_LANE
+            } else {
+                GENERIC_LANE
+            };
+            if let Some((per_op, _, _)) = envelope_fee_per_op(tx) {
+                let lane_fee = &mut lowest_lane_fee[lane];
+                let fee = per_op as i64;
+                if fee < *lane_fee {
+                    *lane_fee = fee;
+                }
+            }
+            lane_for_tx.push(lane);
+        }
+
+        let min_lane_fee = lowest_lane_fee
+            .iter()
+            .copied()
+            .filter(|fee| *fee != i64::MAX)
+            .min()
+            .unwrap_or(base_fee);
+        let mut lane_base_fee = vec![base_fee; lane_count];
+        if classic_limited {
+            lane_base_fee.fill(min_lane_fee);
+        }
+        if has_dex_lane && dex_limited {
+            let dex_fee = lowest_lane_fee[crate::surge_pricing::DEX_LANE];
+            if dex_fee != i64::MAX {
+                lane_base_fee[crate::surge_pricing::DEX_LANE] = dex_fee;
+            }
+        }
+
+        let mut components_by_fee: BTreeMap<i64, Vec<TransactionEnvelope>> = BTreeMap::new();
+        for (tx, lane) in classic_txs.into_iter().zip(lane_for_tx.into_iter()) {
+            let fee = lane_base_fee[lane];
+            components_by_fee.entry(fee).or_default().push(tx);
+        }
+
+        for (fee, mut txs) in components_by_fee {
+            sort_txs_by_hash(&mut txs);
+            classic_components.push(TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                TxSetComponentTxsMaybeDiscountedFee {
+                    base_fee: Some(fee),
+                    txs: txs.try_into().unwrap_or_default(),
+                },
+            ));
+        }
+    }
+    TransactionPhase::V0(classic_components.try_into().unwrap_or_default())
 }
