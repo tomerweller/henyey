@@ -57,7 +57,7 @@ use crate::fetching_envelopes::{FetchingEnvelopes, FetchingStats};
 
 use crate::pending::{PendingConfig, PendingEnvelopes, PendingResult, PendingStats};
 use crate::quorum_tracker::{QuorumTracker, SlotQuorumTracker};
-use crate::scp_driver::{HerderScpCallback, ScpDriver, ScpDriverConfig};
+use crate::scp_driver::{HerderScpCallback, ScpDriver, ScpDriverConfig, SharedTrackingState};
 use crate::state::HerderState;
 use crate::sync_recovery::LEDGER_VALIDITY_BRACKET;
 use crate::tx_queue::{
@@ -249,11 +249,8 @@ pub struct Herder {
     /// Always created — observers run SCP with `is_validator: false` (same as stellar-core),
     /// which means `fully_validated` is false on slots and `send_latest_envelope` won't emit.
     scp: SCP<HerderScpCallback>,
-    /// Current tracking slot (ledger sequence as u64).
-    tracking_slot: RwLock<u64>,
-    /// Consensus close time for the tracking slot.
-    /// Matches stellar-core `mTrackingSCP.mConsensusCloseTime`.
-    tracking_consensus_close_time: RwLock<u64>,
+    /// Shared tracking consensus state (also read by ScpDriver for value validation).
+    tracking_state: Arc<RwLock<SharedTrackingState>>,
     /// When we started tracking.
     tracking_started_at: RwLock<Option<Instant>>,
     /// Secret key for signing (if validator).
@@ -297,10 +294,21 @@ impl Herder {
             local_quorum_set: config.local_quorum_set.clone(),
         };
 
+        let tracking_state = Arc::new(RwLock::new(SharedTrackingState::default()));
+
         let scp_driver = Arc::new(if let Some(ref sk) = secret_key {
-            ScpDriver::with_secret_key(scp_driver_config, config.network_id, sk.clone())
+            ScpDriver::with_secret_key(
+                scp_driver_config,
+                config.network_id,
+                sk.clone(),
+                Arc::clone(&tracking_state),
+            )
         } else {
-            ScpDriver::new(scp_driver_config, config.network_id)
+            ScpDriver::new(
+                scp_driver_config,
+                config.network_id,
+                Arc::clone(&tracking_state),
+            )
         });
 
         let tx_queue = TransactionQueue::new(config.tx_queue_config.clone());
@@ -376,8 +384,7 @@ impl Herder {
             fetching_envelopes,
             scp_driver,
             scp,
-            tracking_slot: RwLock::new(0),
-            tracking_consensus_close_time: RwLock::new(0),
+            tracking_state,
             tracking_started_at: RwLock::new(None),
             secret_key,
             ledger_manager: RwLock::new(None),
@@ -437,13 +444,13 @@ impl Herder {
 
     /// Get the current tracking slot.
     pub fn tracking_slot(&self) -> u64 {
-        *self.tracking_slot.read()
+        self.tracking_state.read().consensus_index
     }
 
     /// Get the tracking consensus close time.
     /// Matches stellar-core `HerderImpl::trackingConsensusCloseTime()`.
     pub fn tracking_consensus_close_time(&self) -> u64 {
-        *self.tracking_consensus_close_time.read()
+        self.tracking_state.read().consensus_close_time
     }
 
     /// Get the next consensus ledger index.
@@ -679,11 +686,7 @@ impl Herder {
 
         debug!("Bootstrapping Herder at ledger {}", ledger_seq);
 
-        // Update tracking slot
-        *self.tracking_slot.write() = slot;
-        *self.tracking_started_at.write() = Some(Instant::now());
-
-        // Set tracking consensus close time from LCL if available
+        // Get tracking consensus close time from LCL if available
         // (matching stellar-core setTrackingSCPState which sets close time from externalized value)
         let close_time = self
             .ledger_manager
@@ -691,16 +694,21 @@ impl Herder {
             .as_ref()
             .map(|lm| lm.current_header().scp_value.close_time.0)
             .unwrap_or(0);
-        *self.tracking_consensus_close_time.write() = close_time;
+
+        // Update shared tracking state (immediately visible to ScpDriver)
+        {
+            let mut ts = self.tracking_state.write();
+            ts.is_tracking = true;
+            ts.consensus_index = slot;
+            ts.consensus_close_time = close_time;
+        }
+        *self.tracking_started_at.write() = Some(Instant::now());
 
         // Update pending envelopes current slot
         self.pending_envelopes.set_current_slot(slot);
 
         // Transition to tracking state
         *self.state.write() = HerderState::Tracking;
-
-        // Update ScpDriver with tracking state for close-time validation
-        self.scp_driver.set_tracking_state(true, slot, close_time);
 
         // Release any pending envelopes for this slot and previous
         let pending = self.pending_envelopes.release_up_to(slot);
@@ -1159,11 +1167,13 @@ impl Herder {
             .get_externalized_close_time(externalized_slot)
             .unwrap_or(0);
 
-        let mut tracking = self.tracking_slot.write();
-        if externalized_slot >= *tracking {
-            *tracking = externalized_slot + 1;
-            // Update tracking consensus close time (matching stellar-core setTrackingSCPState)
-            *self.tracking_consensus_close_time.write() = close_time;
+        let mut ts = self.tracking_state.write();
+        if externalized_slot >= ts.consensus_index {
+            ts.is_tracking = true;
+            ts.consensus_index = externalized_slot + 1;
+            ts.consensus_close_time = close_time;
+            drop(ts);
+
             self.pending_envelopes
                 .set_current_slot(externalized_slot + 1);
 
@@ -1182,12 +1192,7 @@ impl Herder {
                 }
             }
 
-            // Update ScpDriver with tracking state for close-time validation
-            self.scp_driver
-                .set_tracking_state(true, externalized_slot + 1, close_time);
-
             // Release any pending envelopes for the new slot
-            drop(tracking);
             let pending = self.pending_envelopes.release(externalized_slot + 1);
             for env in pending {
                 let _ = self.process_scp_envelope(env);
@@ -1837,7 +1842,7 @@ impl Herder {
 
         // Notify the fetching envelopes manager that this tx set is now available.
         // Use the slot from scp_driver, or tracking_slot as fallback.
-        let notify_slot = slot.unwrap_or_else(|| *self.tracking_slot.read());
+        let notify_slot = slot.unwrap_or_else(|| self.tracking_slot());
         self.fetching_envelopes.tx_set_available(hash, notify_slot);
 
         // Process any envelopes that became ready
@@ -1878,7 +1883,7 @@ impl Herder {
         self.scp_driver.cache_tx_set(tx_set);
 
         // Notify fetching envelopes and process any that become ready
-        let slot = *self.tracking_slot.read();
+        let slot = self.tracking_slot();
         self.fetching_envelopes.tx_set_available(hash, slot);
         self.process_ready_fetching_envelopes();
     }
@@ -2710,7 +2715,7 @@ mod tests {
             .as_secs();
         herder.bootstrap(100);
         // Set tracking consensus close time
-        *herder.tracking_consensus_close_time.write() = now;
+        herder.tracking_state.write().consensus_close_time = now;
 
         // After bootstrap(100): tracking_slot=100, LCL=99
         // check_envelope_close_time uses tracking_index = tracking_slot - 1 = 99

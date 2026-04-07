@@ -73,17 +73,27 @@ pub enum ValueValidation {
     Invalid,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct TrackingState {
-    index: u64,
-    close_time: u64,
+/// Shared tracking consensus state between Herder and ScpDriver.
+///
+/// This struct is the single source of truth for whether we are tracking
+/// the network and what the current consensus position is. It is shared
+/// via `Arc<RwLock<SharedTrackingState>>` to ensure Herder and ScpDriver
+/// always see consistent state without manual synchronization.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SharedTrackingState {
+    /// Whether we are in tracking state.
+    pub is_tracking: bool,
+    /// Next consensus ledger index (tracking_slot in Herder terms).
+    pub consensus_index: u64,
+    /// Consensus close time for the tracking slot.
+    pub consensus_close_time: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct ValueValidationContext {
     lcl_seq: u64,
     lcl_close_time: u64,
-    tracking: Option<TrackingState>,
+    tracking: Option<SharedTrackingState>,
 }
 
 /// Configuration for the SCP driver.
@@ -223,18 +233,17 @@ pub struct ScpDriver {
     local_quorum_set: RwLock<Option<ScpQuorumSet>>,
     /// Ledger manager for network configuration lookups.
     ledger_manager: RwLock<Option<Arc<LedgerManager>>>,
-    /// Whether we are in tracking state (matching stellar-core `mHerder.isTracking()`).
-    is_tracking: RwLock<bool>,
-    /// Next consensus ledger index (matches stellar-core `mHerder.nextConsensusLedgerIndex()`).
-    /// This is tracking_slot in Herder terms.
-    tracking_consensus_index: RwLock<u64>,
-    /// Tracking consensus close time (matches stellar-core `mHerder.trackingConsensusCloseTime()`).
-    tracking_consensus_close_time: RwLock<u64>,
+    /// Shared tracking consensus state (owned by Herder, read by ScpDriver).
+    tracking_state: Arc<RwLock<SharedTrackingState>>,
 }
 
 impl ScpDriver {
     /// Create a new SCP driver.
-    pub fn new(config: ScpDriverConfig, network_id: Hash256) -> Self {
+    pub(crate) fn new(
+        config: ScpDriverConfig,
+        network_id: Hash256,
+        tracking_state: Arc<RwLock<SharedTrackingState>>,
+    ) -> Self {
         let local_quorum_set = config.local_quorum_set.clone();
         let quorum_sets = DashMap::new();
         let quorum_sets_by_hash = DashMap::new();
@@ -258,19 +267,18 @@ impl ScpDriver {
             quorum_sets_by_hash,
             local_quorum_set: RwLock::new(local_quorum_set),
             ledger_manager: RwLock::new(None),
-            is_tracking: RwLock::new(false),
-            tracking_consensus_index: RwLock::new(0),
-            tracking_consensus_close_time: RwLock::new(0),
+            tracking_state,
         }
     }
 
     /// Create a new SCP driver with a secret key for signing.
-    pub fn with_secret_key(
+    pub(crate) fn with_secret_key(
         config: ScpDriverConfig,
         network_id: Hash256,
         secret_key: SecretKey,
+        tracking_state: Arc<RwLock<SharedTrackingState>>,
     ) -> Self {
-        let mut driver = Self::new(config, network_id);
+        let mut driver = Self::new(config, network_id, tracking_state);
         driver.secret_key = Some(secret_key);
         driver
     }
@@ -286,21 +294,6 @@ impl ScpDriver {
     /// Provide ledger manager access for network configuration lookups.
     pub fn set_ledger_manager(&self, manager: Arc<LedgerManager>) {
         *self.ledger_manager.write() = Some(manager);
-    }
-
-    /// Update the tracking consensus state from the Herder.
-    ///
-    /// Called by the Herder whenever tracking state changes (bootstrap, advance_tracking_slot).
-    /// This provides the ScpDriver with the state needed for stellar-core-parity close-time validation.
-    pub fn set_tracking_state(
-        &self,
-        is_tracking: bool,
-        consensus_index: u64,
-        consensus_close_time: u64,
-    ) {
-        *self.is_tracking.write() = is_tracking;
-        *self.tracking_consensus_index.write() = consensus_index;
-        *self.tracking_consensus_close_time.write() = consensus_close_time;
     }
 
     /// Cache a transaction set.
@@ -674,9 +667,10 @@ impl ScpDriver {
             return ValueValidation::MaybeValid;
         };
 
-        let TrackingState {
-            index: tracking_index,
-            close_time: tracking_close_time,
+        let SharedTrackingState {
+            consensus_index: tracking_index,
+            consensus_close_time: tracking_close_time,
+            ..
         } = tracking;
 
         // Check slotIndex against tracking state
@@ -796,15 +790,19 @@ impl ScpDriver {
                 } else {
                     (0, 0)
                 }
-            } else if *self.is_tracking.read() {
-                // When tracking but no ledger manager or externalized data (e.g., after
-                // bootstrap), derive the LCL from the tracking consensus index.
-                // tracking_consensus_index is the next slot to close, so LCL = index - 1.
-                let tracking_index = *self.tracking_consensus_index.read();
-                let tracking_close_time = *self.tracking_consensus_close_time.read();
-                (tracking_index.saturating_sub(1), tracking_close_time)
             } else {
-                (0, 0)
+                let ts = self.tracking_state.read();
+                if ts.is_tracking {
+                    // When tracking but no ledger manager or externalized data (e.g., after
+                    // bootstrap), derive the LCL from the tracking consensus index.
+                    // consensus_index is the next slot to close, so LCL = index - 1.
+                    (
+                        ts.consensus_index.saturating_sub(1),
+                        ts.consensus_close_time,
+                    )
+                } else {
+                    (0, 0)
+                }
             }
         };
 
@@ -861,14 +859,8 @@ impl ScpDriver {
             ValueValidation::Valid
         } else {
             // Past or future slot — partial validation
-            let tracking = if *self.is_tracking.read() {
-                Some(TrackingState {
-                    index: *self.tracking_consensus_index.read(),
-                    close_time: *self.tracking_consensus_close_time.read(),
-                })
-            } else {
-                None
-            };
+            let ts = *self.tracking_state.read();
+            let tracking = if ts.is_tracking { Some(ts) } else { None };
 
             self.validate_past_or_future_value(
                 slot_index,
@@ -1796,6 +1788,10 @@ mod cache_tests {
         }
     }
 
+    fn default_tracking() -> Arc<RwLock<SharedTrackingState>> {
+        Arc::new(RwLock::new(SharedTrackingState::default()))
+    }
+
     fn make_tx_set(seed: u8) -> TransactionSet {
         let prev_hash = Hash256::from_bytes([seed; 32]);
         TransactionSet::new(prev_hash, Vec::new())
@@ -1803,7 +1799,11 @@ mod cache_tests {
 
     #[test]
     fn test_cache_tx_set_evicts_oldest() {
-        let driver = ScpDriver::new(make_config(1), Hash256::hash(b"network"));
+        let driver = ScpDriver::new(
+            make_config(1),
+            Hash256::hash(b"network"),
+            default_tracking(),
+        );
         let first = make_tx_set(1);
         let second = make_tx_set(2);
 
@@ -1817,7 +1817,11 @@ mod cache_tests {
 
     #[test]
     fn test_request_and_receive_tx_set() {
-        let driver = ScpDriver::new(make_config(4), Hash256::hash(b"network"));
+        let driver = ScpDriver::new(
+            make_config(4),
+            Hash256::hash(b"network"),
+            default_tracking(),
+        );
         let tx_set = make_tx_set(3);
         let slot = 12u64;
 
@@ -1834,7 +1838,11 @@ mod cache_tests {
 
     #[test]
     fn test_receive_tx_set_rejects_mismatched_hash() {
-        let driver = ScpDriver::new(make_config(2), Hash256::hash(b"network"));
+        let driver = ScpDriver::new(
+            make_config(2),
+            Hash256::hash(b"network"),
+            default_tracking(),
+        );
         let tx_set = make_tx_set(4);
         let bad_hash = Hash256::from_bytes([9; 32]);
         let bad_set = TransactionSet::with_hash(tx_set.previous_ledger_hash, bad_hash, Vec::new());
@@ -1846,7 +1854,11 @@ mod cache_tests {
 
     #[test]
     fn test_cleanup_old_pending_slots() {
-        let driver = ScpDriver::new(make_config(4), Hash256::hash(b"network"));
+        let driver = ScpDriver::new(
+            make_config(4),
+            Hash256::hash(b"network"),
+            default_tracking(),
+        );
         let tx_set_a = make_tx_set(5);
         let tx_set_b = make_tx_set(6);
 
@@ -1862,7 +1874,11 @@ mod cache_tests {
 
     #[test]
     fn test_cleanup_pending_tx_sets_by_age() {
-        let driver = ScpDriver::new(make_config(4), Hash256::hash(b"network"));
+        let driver = ScpDriver::new(
+            make_config(4),
+            Hash256::hash(b"network"),
+            default_tracking(),
+        );
         let tx_set = make_tx_set(7);
         driver.request_tx_set(tx_set.hash, 20);
 
@@ -1889,7 +1905,7 @@ mod cache_tests {
             local_quorum_set: Some(quorum_set.clone()),
             ..make_config(4)
         };
-        let driver = ScpDriver::new(config, Hash256::hash(b"network"));
+        let driver = ScpDriver::new(config, Hash256::hash(b"network"), default_tracking());
 
         // Create a test node_id for the request
         let sender_node_id =
@@ -1922,7 +1938,11 @@ mod cache_tests {
 
     #[test]
     fn test_get_externalized_slots_in_range() {
-        let driver = ScpDriver::new(make_config(4), Hash256::hash(b"network"));
+        let driver = ScpDriver::new(
+            make_config(4),
+            Hash256::hash(b"network"),
+            default_tracking(),
+        );
 
         // Externalize some slots (manually insert into the map for testing)
         {
@@ -1952,7 +1972,11 @@ mod cache_tests {
 
     #[test]
     fn test_find_missing_slots_in_range() {
-        let driver = ScpDriver::new(make_config(4), Hash256::hash(b"network"));
+        let driver = ScpDriver::new(
+            make_config(4),
+            Hash256::hash(b"network"),
+            default_tracking(),
+        );
 
         // Externalize some slots with gaps
         {
@@ -1981,7 +2005,11 @@ mod cache_tests {
 
     #[test]
     fn test_trim_stale_caches_preserves_future_slots() {
-        let driver = ScpDriver::new(make_config(10), Hash256::hash(b"network"));
+        let driver = ScpDriver::new(
+            make_config(10),
+            Hash256::hash(b"network"),
+            default_tracking(),
+        );
 
         // Add pending tx_sets for various slots
         let tx_set_old = make_tx_set(1);
@@ -2027,7 +2055,11 @@ mod cache_tests {
 
     #[test]
     fn test_clear_pending_tx_sets_removes_all() {
-        let driver = ScpDriver::new(make_config(4), Hash256::hash(b"network"));
+        let driver = ScpDriver::new(
+            make_config(4),
+            Hash256::hash(b"network"),
+            default_tracking(),
+        );
         let tx_set_a = make_tx_set(10);
         let tx_set_b = make_tx_set(11);
         let tx_set_c = make_tx_set(12);
@@ -2044,7 +2076,11 @@ mod cache_tests {
 
     #[test]
     fn test_clear_pending_tx_sets_noop_when_empty() {
-        let driver = ScpDriver::new(make_config(4), Hash256::hash(b"network"));
+        let driver = ScpDriver::new(
+            make_config(4),
+            Hash256::hash(b"network"),
+            default_tracking(),
+        );
         assert!(driver.get_pending_tx_sets().is_empty());
 
         // Should not panic when called on empty map
@@ -2054,7 +2090,11 @@ mod cache_tests {
 
     #[test]
     fn test_clear_pending_tx_sets_does_not_affect_cache() {
-        let driver = ScpDriver::new(make_config(4), Hash256::hash(b"network"));
+        let driver = ScpDriver::new(
+            make_config(4),
+            Hash256::hash(b"network"),
+            default_tracking(),
+        );
         let tx_set = make_tx_set(20);
 
         // Request and then receive the tx_set (puts it in cache)
@@ -2124,10 +2164,12 @@ mod cache_tests {
             node_id: secret.public_key(),
             ..make_config(4)
         };
-        let driver = ScpDriver::new(config, network_id);
-
-        // Set tracking state: LCL is at slot 0, so slot 1 is LCL+1 (current ledger)
-        driver.set_tracking_state(true, 1, 1);
+        let tracking = Arc::new(RwLock::new(SharedTrackingState {
+            is_tracking: true,
+            consensus_index: 1,
+            consensus_close_time: 1,
+        }));
+        let driver = ScpDriver::new(config, network_id, tracking);
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2368,9 +2410,13 @@ mod tests {
         VecM,
     };
 
+    fn default_tracking() -> Arc<RwLock<SharedTrackingState>> {
+        Arc::new(RwLock::new(SharedTrackingState::default()))
+    }
+
     fn make_test_driver() -> ScpDriver {
         let config = ScpDriverConfig::default();
-        ScpDriver::new(config, Hash256::ZERO)
+        ScpDriver::new(config, Hash256::ZERO, default_tracking())
     }
 
     /// Create a test driver with a known secret key for signing.
@@ -2382,7 +2428,8 @@ mod tests {
             ..ScpDriverConfig::default()
         };
         let network_id = Hash256::ZERO;
-        let driver = ScpDriver::with_secret_key(config, network_id, secret_key.clone());
+        let driver =
+            ScpDriver::with_secret_key(config, network_id, secret_key.clone(), default_tracking());
         (driver, secret_key)
     }
 
@@ -3100,9 +3147,10 @@ mod tests {
                 ValueValidationContext {
                     lcl_seq: 100,
                     lcl_close_time: now - 50,
-                    tracking: Some(TrackingState {
-                        index: 200,
-                        close_time: now - 5,
+                    tracking: Some(SharedTrackingState {
+                        is_tracking: true,
+                        consensus_index: 200,
+                        consensus_close_time: now - 5,
                     }),
                 }
             ),
@@ -3126,9 +3174,10 @@ mod tests {
                 ValueValidationContext {
                     lcl_seq: 100,
                     lcl_close_time: now - 50,
-                    tracking: Some(TrackingState {
-                        index: 150,
-                        close_time: now - 5,
+                    tracking: Some(SharedTrackingState {
+                        is_tracking: true,
+                        consensus_index: 150,
+                        consensus_close_time: now - 5,
                     }),
                 }
             ),
@@ -3152,9 +3201,10 @@ mod tests {
                 ValueValidationContext {
                     lcl_seq: 100,
                     lcl_close_time: now - 50,
-                    tracking: Some(TrackingState {
-                        index: 150,
-                        close_time: now - 5,
+                    tracking: Some(SharedTrackingState {
+                        is_tracking: true,
+                        consensus_index: 150,
+                        consensus_close_time: now - 5,
                     }),
                 }
             ),
@@ -3168,9 +3218,10 @@ mod tests {
                 ValueValidationContext {
                     lcl_seq: 100,
                     lcl_close_time: now - 50,
-                    tracking: Some(TrackingState {
-                        index: 150,
-                        close_time: now - 5,
+                    tracking: Some(SharedTrackingState {
+                        is_tracking: true,
+                        consensus_index: 150,
+                        consensus_close_time: now - 5,
                     }),
                 }
             ),
@@ -3341,8 +3392,12 @@ mod compare_tx_sets_tests {
         ScpDriverConfig::default()
     }
 
+    fn default_tracking() -> Arc<RwLock<SharedTrackingState>> {
+        Arc::new(RwLock::new(SharedTrackingState::default()))
+    }
+
     fn make_driver() -> ScpDriver {
-        ScpDriver::new(make_config(), Hash256::ZERO)
+        ScpDriver::new(make_config(), Hash256::ZERO, default_tracking())
     }
 
     /// Create a simple transaction with a given fee and operation count.
