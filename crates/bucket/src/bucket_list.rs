@@ -71,7 +71,7 @@ use crate::manager::{canonical_bucket_filename, promote_temp_to_canonical, temp_
 use crate::merge::{
     merge_buckets_to_file, merge_buckets_to_file_with_counters,
     merge_buckets_with_options_and_shadows, merge_buckets_with_options_and_shadows_and_counters,
-    merge_in_memory,
+    merge_in_memory, MergeOptions,
 };
 use crate::merge_map::BucketMergeMap;
 use crate::metrics::MergeCounters;
@@ -390,10 +390,13 @@ impl AsyncMergeHandle {
                     &curr,
                     &snap,
                     &temp_path,
-                    keep_dead_entries,
-                    protocol_version,
-                    normalize_init,
-                    counters_ref,
+                    &MergeOptions {
+                        keep_dead_entries,
+                        max_protocol_version: protocol_version,
+                        normalize_init_entries: normalize_init,
+                        counters: counters_ref,
+                        ..Default::default()
+                    },
                 ) {
                     Ok((hash, entry_count)) => {
                         if entry_count == 0 {
@@ -413,11 +416,14 @@ impl AsyncMergeHandle {
                 merge_buckets_with_options_and_shadows_and_counters(
                     &curr,
                     &snap,
-                    keep_dead_entries,
-                    protocol_version,
-                    normalize_init,
-                    &shadow_buckets,
-                    counters_ref,
+                    &MergeOptions {
+                        keep_dead_entries,
+                        max_protocol_version: protocol_version,
+                        normalize_init_entries: normalize_init,
+                        shadow_buckets: &shadow_buckets,
+                        counters: counters_ref,
+                        ..Default::default()
+                    },
                 )
             };
 
@@ -826,11 +832,14 @@ impl BucketLevel {
             let merged = merge_buckets_with_options_and_shadows_and_counters(
                 &curr_for_merge,
                 &incoming,
-                ctx.keep_dead_entries,
-                protocol_version,
-                ctx.normalize_init,
-                shadow_buckets,
-                ctx.merge_counters.as_deref(),
+                &MergeOptions {
+                    keep_dead_entries: ctx.keep_dead_entries,
+                    max_protocol_version: protocol_version,
+                    normalize_init_entries: ctx.normalize_init,
+                    shadow_buckets,
+                    counters: ctx.merge_counters.as_deref(),
+                    ..Default::default()
+                },
             )?;
 
             tracing::debug!(

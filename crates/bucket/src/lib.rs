@@ -173,7 +173,7 @@ pub use manager::{canonical_bucket_filename, BucketManager, BucketManagerStats};
 pub use merge::{
     merge_buckets, merge_buckets_to_file, merge_buckets_to_file_with_counters,
     merge_buckets_with_options, merge_buckets_with_options_and_shadows_and_counters,
-    merge_in_memory, merge_multiple, MergeIterator,
+    merge_in_memory, merge_multiple, MergeIterator, MergeOptions,
 };
 
 // ============================================================================

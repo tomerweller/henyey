@@ -15,7 +15,7 @@ use stellar_xdr::curr::{
 
 use super::{
     ensure_account_liabilities, ensure_trustline_liabilities,
-    is_authorized_to_maintain_liabilities, issuer_for_asset, AUTHORIZED_FLAG,
+    is_authorized_to_maintain_liabilities, issuer_for_asset, TxIdentity, AUTHORIZED_FLAG,
     AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG, TRUSTLINE_CLAWBACK_ENABLED_FLAG,
 };
 use crate::state::LedgerStateManager;
@@ -31,9 +31,7 @@ const TRUSTLINE_AUTH_FLAGS: u32 = AUTHORIZED_FLAG | AUTHORIZED_TO_MAINTAIN_LIABI
 pub(crate) fn execute_allow_trust(
     op: &AllowTrustOp,
     source: &AccountId,
-    tx_source_id: &AccountId,
-    tx_seq: i64,
-    op_index: u32,
+    tx_id: &TxIdentity<'_>,
     state: &mut LedgerStateManager,
     _context: &LedgerContext,
 ) -> Result<OperationResult> {
@@ -111,12 +109,7 @@ pub(crate) fn execute_allow_trust(
         remove_offers_with_cleanup(state, &op.trustor, &asset);
 
         // Also redeem pool share trustlines (protocol >= 18)
-        let tx_id = super::TxIdentity {
-            source_id: tx_source_id,
-            seq: tx_seq,
-            op_index,
-        };
-        let result = redeem_pool_share_trustlines(state, _context, &op.trustor, &asset, &tx_id)?;
+        let result = redeem_pool_share_trustlines(state, _context, &op.trustor, &asset, tx_id)?;
         match result {
             RemoveResult::Success => {}
             RemoveResult::LowReserve => {
@@ -139,9 +132,7 @@ pub(crate) fn execute_allow_trust(
 pub(crate) fn execute_set_trust_line_flags(
     op: &SetTrustLineFlagsOp,
     source: &AccountId,
-    tx_source_id: &AccountId,
-    tx_seq: i64,
-    op_index: u32,
+    tx_id: &TxIdentity<'_>,
     state: &mut LedgerStateManager,
     _context: &LedgerContext,
 ) -> Result<OperationResult> {
@@ -246,12 +237,7 @@ pub(crate) fn execute_set_trust_line_flags(
         remove_offers_with_cleanup(state, &op.trustor, &op.asset);
 
         // Also redeem pool share trustlines (protocol >= 18)
-        let tx_id = super::TxIdentity {
-            source_id: tx_source_id,
-            seq: tx_seq,
-            op_index,
-        };
-        let result = redeem_pool_share_trustlines(state, _context, &op.trustor, &op.asset, &tx_id)?;
+        let result = redeem_pool_share_trustlines(state, _context, &op.trustor, &op.asset, tx_id)?;
         match result {
             RemoveResult::Success => {}
             RemoveResult::LowReserve => {
@@ -399,16 +385,14 @@ enum RemoveResult {
 /// Uses `ENVELOPE_TYPE_POOL_REVOKE_OP_ID` (different from regular claimable balance IDs
 /// which use `ENVELOPE_TYPE_OP_ID`).
 fn get_revoke_id(
-    tx_source_id: &AccountId,
-    tx_seq_num: i64,
-    op_index: u32,
+    tx_id: &TxIdentity<'_>,
     pool_id: &PoolId,
     asset: &Asset,
 ) -> Result<ClaimableBalanceId> {
     let preimage = HashIdPreimage::PoolRevokeOpId(HashIdPreimageRevokeId {
-        source_account: tx_source_id.clone(),
-        seq_num: SequenceNumber(tx_seq_num),
-        op_num: op_index,
+        source_account: tx_id.source_id.clone(),
+        seq_num: SequenceNumber(tx_id.seq),
+        op_num: tx_id.op_index,
         liquidity_pool_id: pool_id.clone(),
         asset: asset.clone(),
     });
@@ -586,7 +570,7 @@ fn redeem_into_claimable_balance(
     }
 
     // Create the claimable balance entry
-    let balance_id = get_revoke_id(tx_id.source_id, tx_id.seq, tx_id.op_index, pool_id, asset)?;
+    let balance_id = get_revoke_id(tx_id, pool_id, asset)?;
 
     let claimant = Claimant::ClaimantTypeV0(ClaimantV0 {
         destination: account_id.clone(),
@@ -896,7 +880,17 @@ mod tests {
             authorize: 1,
         };
 
-        let result = execute_allow_trust(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context);
+        let result = execute_allow_trust(
+            &op,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
+        );
         assert!(result.is_ok());
 
         // In protocol 16+, AllowTrust succeeds even without AUTH_REQUIRED
@@ -948,8 +942,18 @@ mod tests {
             authorize: 0,
         };
 
-        let result =
-            execute_allow_trust(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context).unwrap();
+        let result = execute_allow_trust(
+            &op,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
+        )
+        .unwrap();
         match result {
             OperationResult::OpInner(OperationResultTr::AllowTrust(r)) => {
                 assert!(matches!(r, AllowTrustResult::CantRevoke));
@@ -976,8 +980,18 @@ mod tests {
             authorize: 1,
         };
 
-        let result = execute_allow_trust(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context)
-            .expect("allow trust");
+        let result = execute_allow_trust(
+            &op,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
+        )
+        .expect("allow trust");
         match result {
             OperationResult::OpInner(OperationResultTr::AllowTrust(r)) => {
                 assert!(matches!(r, AllowTrustResult::SelfNotAllowed));
@@ -1021,9 +1035,18 @@ mod tests {
             set_flags: 0,
         };
 
-        let result =
-            execute_set_trust_line_flags(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context)
-                .unwrap();
+        let result = execute_set_trust_line_flags(
+            &op,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
+        )
+        .unwrap();
         match result {
             OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
                 assert!(matches!(r, SetTrustLineFlagsResult::CantRevoke));
@@ -1069,8 +1092,17 @@ mod tests {
             set_flags: AUTHORIZED_FLAG,
         };
 
-        let result =
-            execute_set_trust_line_flags(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context);
+        let result = execute_set_trust_line_flags(
+            &op,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
+        );
         assert!(result.is_ok());
 
         match result.unwrap() {
@@ -1140,8 +1172,17 @@ mod tests {
             set_flags: 0,
         };
 
-        let result =
-            execute_set_trust_line_flags(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context);
+        let result = execute_set_trust_line_flags(
+            &op,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
+        );
         assert!(result.is_ok());
 
         // Flush changes to delta
@@ -1216,7 +1257,17 @@ mod tests {
             authorize: 0, // Revoke
         };
 
-        let result = execute_allow_trust(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context);
+        let result = execute_allow_trust(
+            &op,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
+        );
         assert!(result.is_ok());
 
         // Flush changes to delta
@@ -1286,9 +1337,11 @@ mod tests {
         let result = execute_set_trust_line_flags(
             &op,
             &non_issuer_id,
-            &non_issuer_id,
-            1,
-            0,
+            &TxIdentity {
+                source_id: &non_issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
             &mut state,
             &context,
         )
@@ -1331,9 +1384,18 @@ mod tests {
             set_flags: TrustLineFlags::AuthorizedFlag as u32,
         };
 
-        let result =
-            execute_set_trust_line_flags(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context)
-                .unwrap();
+        let result = execute_set_trust_line_flags(
+            &op,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
+        )
+        .unwrap();
         match result {
             OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
                 assert!(
@@ -1368,8 +1430,18 @@ mod tests {
             authorize: 1,
         };
 
-        let result =
-            execute_allow_trust(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context).unwrap();
+        let result = execute_allow_trust(
+            &op,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
+        )
+        .unwrap();
         match result {
             OperationResult::OpInner(OperationResultTr::AllowTrust(r)) => {
                 assert!(
@@ -1410,9 +1482,18 @@ mod tests {
             set_flags: 0,
         };
 
-        let result =
-            execute_set_trust_line_flags(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context)
-                .unwrap();
+        let result = execute_set_trust_line_flags(
+            &op,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
+        )
+        .unwrap();
         match result {
             OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
                 // stellar-core checks AUTH_REVOCABLE before trustline existence,
@@ -1467,9 +1548,18 @@ mod tests {
             set_flags: TrustLineFlags::AuthorizedToMaintainLiabilitiesFlag as u32,
         };
 
-        let result =
-            execute_set_trust_line_flags(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context)
-                .unwrap();
+        let result = execute_set_trust_line_flags(
+            &op,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
+        )
+        .unwrap();
         match result {
             OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
                 assert!(
@@ -1635,9 +1725,11 @@ mod tests {
         let result = execute_set_trust_line_flags(
             &op,
             &issuer_id,
-            &tx_source_id,
-            tx_seq,
-            op_index,
+            &TxIdentity {
+                source_id: &tx_source_id,
+                seq: tx_seq,
+                op_index,
+            },
             &mut state,
             &context,
         )
@@ -1665,8 +1757,26 @@ mod tests {
         // Claimable balances should exist:
         // amount_a = floor(100 * 1000 / 500) = 200
         // amount_b = floor(100 * 2000 / 500) = 400
-        let cb_id_a = get_revoke_id(&tx_source_id, tx_seq, op_index, &pool_id, &asset_a).unwrap();
-        let cb_id_b = get_revoke_id(&tx_source_id, tx_seq, op_index, &pool_id, &asset_b).unwrap();
+        let cb_id_a = get_revoke_id(
+            &TxIdentity {
+                source_id: &tx_source_id,
+                seq: tx_seq,
+                op_index,
+            },
+            &pool_id,
+            &asset_a,
+        )
+        .unwrap();
+        let cb_id_b = get_revoke_id(
+            &TxIdentity {
+                source_id: &tx_source_id,
+                seq: tx_seq,
+                op_index,
+            },
+            &pool_id,
+            &asset_b,
+        )
+        .unwrap();
 
         let cb_a = state
             .get_claimable_balance(&cb_id_a)
@@ -1783,9 +1893,18 @@ mod tests {
             authorize: 0,
         };
 
-        let result =
-            execute_allow_trust(&op, &issuer_id, &tx_source_id, 1, 0, &mut state, &context)
-                .unwrap();
+        let result = execute_allow_trust(
+            &op,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &tx_source_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
+        )
+        .unwrap();
 
         match &result {
             OperationResult::OpInner(OperationResultTr::AllowTrust(r)) => {
@@ -1807,8 +1926,26 @@ mod tests {
             .is_none());
 
         // Claimable balances: floor(50*800/200)=200, floor(50*400/200)=100
-        let cb_id_a = get_revoke_id(&tx_source_id, 1, 0, &pool_id, &asset_a).unwrap();
-        let cb_id_b = get_revoke_id(&tx_source_id, 1, 0, &pool_id, &asset_b).unwrap();
+        let cb_id_a = get_revoke_id(
+            &TxIdentity {
+                source_id: &tx_source_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &pool_id,
+            &asset_a,
+        )
+        .unwrap();
+        let cb_id_b = get_revoke_id(
+            &TxIdentity {
+                source_id: &tx_source_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &pool_id,
+            &asset_b,
+        )
+        .unwrap();
 
         let cb_a = state
             .get_claimable_balance(&cb_id_a)
@@ -1905,9 +2042,18 @@ mod tests {
             set_flags: 0,
         };
 
-        let result =
-            execute_set_trust_line_flags(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context)
-                .unwrap();
+        let result = execute_set_trust_line_flags(
+            &op,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
+        )
+        .unwrap();
 
         match &result {
             OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
@@ -1929,8 +2075,26 @@ mod tests {
             .is_none());
 
         // No claimable balances should be created for zero balance
-        let cb_id_a = get_revoke_id(&issuer_id, 1, 0, &pool_id, &asset_a).unwrap();
-        let cb_id_b = get_revoke_id(&issuer_id, 1, 0, &pool_id, &asset_b).unwrap();
+        let cb_id_a = get_revoke_id(
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &pool_id,
+            &asset_a,
+        )
+        .unwrap();
+        let cb_id_b = get_revoke_id(
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &pool_id,
+            &asset_b,
+        )
+        .unwrap();
         assert!(state.get_claimable_balance(&cb_id_a).is_none());
         assert!(state.get_claimable_balance(&cb_id_b).is_none());
 
@@ -2011,9 +2175,18 @@ mod tests {
             set_flags: 0,
         };
 
-        let result =
-            execute_set_trust_line_flags(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context)
-                .unwrap();
+        let result = execute_set_trust_line_flags(
+            &op,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
+        )
+        .unwrap();
 
         match &result {
             OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
@@ -2027,14 +2200,32 @@ mod tests {
         }
 
         // Claimable balance for asset_a should exist (trustor is NOT issuer of A)
-        let cb_id_a = get_revoke_id(&issuer_id, 1, 0, &pool_id, &asset_a).unwrap();
+        let cb_id_a = get_revoke_id(
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &pool_id,
+            &asset_a,
+        )
+        .unwrap();
         let cb_a = state
             .get_claimable_balance(&cb_id_a)
             .expect("claimable balance for asset_a should exist");
         assert_eq!(cb_a.amount, 200); // floor(100 * 1000 / 500)
 
         // Claimable balance for asset_b should NOT exist (trustor IS issuer of B)
-        let cb_id_b = get_revoke_id(&issuer_id, 1, 0, &pool_id, &asset_b).unwrap();
+        let cb_id_b = get_revoke_id(
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &pool_id,
+            &asset_b,
+        )
+        .unwrap();
         assert!(
             state.get_claimable_balance(&cb_id_b).is_none(),
             "No claimable balance should be created when trustor is the asset issuer"
@@ -2155,9 +2346,18 @@ mod tests {
             set_flags: 0,
         };
 
-        let result =
-            execute_set_trust_line_flags(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context)
-                .unwrap();
+        let result = execute_set_trust_line_flags(
+            &op,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
+        )
+        .unwrap();
 
         match &result {
             OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
@@ -2189,21 +2389,48 @@ mod tests {
         // pool_id_mid (0x80), pool_id_high (0xFF).
         //
         // pool_id_low: amount_a = floor(50 * 300 / 100) = 150
-        let cb_low_a = get_revoke_id(&issuer_id, 1, 0, &pool_id_low, &asset_a).unwrap();
+        let cb_low_a = get_revoke_id(
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &pool_id_low,
+            &asset_a,
+        )
+        .unwrap();
         let cb = state
             .get_claimable_balance(&cb_low_a)
             .expect("claimable balance for pool_id_low asset_a should exist");
         assert_eq!(cb.amount, 150);
 
         // pool_id_mid: amount_a = floor(50 * 600 / 200) = 150
-        let cb_mid_a = get_revoke_id(&issuer_id, 1, 0, &pool_id_mid, &asset_a).unwrap();
+        let cb_mid_a = get_revoke_id(
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &pool_id_mid,
+            &asset_a,
+        )
+        .unwrap();
         let cb = state
             .get_claimable_balance(&cb_mid_a)
             .expect("claimable balance for pool_id_mid asset_a should exist");
         assert_eq!(cb.amount, 150);
 
         // pool_id_high: amount_a = floor(50 * 900 / 300) = 150
-        let cb_high_a = get_revoke_id(&issuer_id, 1, 0, &pool_id_high, &asset_a).unwrap();
+        let cb_high_a = get_revoke_id(
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &pool_id_high,
+            &asset_a,
+        )
+        .unwrap();
         let cb = state
             .get_claimable_balance(&cb_high_a)
             .expect("claimable balance for pool_id_high asset_a should exist");

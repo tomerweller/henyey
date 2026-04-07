@@ -18,7 +18,7 @@ use stellar_xdr::curr::{
 use super::{
     account_balance_after_liabilities, account_liabilities, add_account_balance,
     add_trustline_balance, is_trustline_authorized, trustline_balance_after_liabilities,
-    TRUSTLINE_CLAWBACK_ENABLED_FLAG,
+    TxIdentity, TRUSTLINE_CLAWBACK_ENABLED_FLAG,
 };
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
@@ -45,9 +45,7 @@ use crate::{Result, TxError};
 pub(crate) fn execute_create_claimable_balance(
     op: &CreateClaimableBalanceOp,
     source: &AccountId,
-    tx_source: &AccountId,
-    tx_seq: i64,
-    op_index: u32,
+    tx_id: &TxIdentity<'_>,
     state: &mut LedgerStateManager,
     context: &LedgerContext,
 ) -> Result<OperationResult> {
@@ -167,7 +165,7 @@ pub(crate) fn execute_create_claimable_balance(
     }
 
     // Generate the claimable balance ID
-    let balance_id = generate_claimable_balance_id(tx_source, tx_seq, op_index)?;
+    let balance_id = generate_claimable_balance_id(tx_id)?;
 
     // Deduct balance from source (matches stellar-core addBalance call)
     match &op.asset {
@@ -392,15 +390,11 @@ pub(crate) fn execute_claim_claimable_balance(
 }
 
 /// Generate a claimable balance ID.
-fn generate_claimable_balance_id(
-    tx_source: &AccountId,
-    tx_seq: i64,
-    op_index: u32,
-) -> Result<ClaimableBalanceId> {
+fn generate_claimable_balance_id(tx_id: &TxIdentity<'_>) -> Result<ClaimableBalanceId> {
     let preimage = HashIdPreimage::OpId(HashIdPreimageOperationId {
-        source_account: tx_source.clone(),
-        seq_num: SequenceNumber(tx_seq),
-        op_num: op_index,
+        source_account: tx_id.source_id.clone(),
+        seq_num: SequenceNumber(tx_id.seq),
+        op_num: tx_id.op_index,
     });
     let hash = henyey_common::Hash256::hash_xdr(&preimage)
         .map_err(|e| TxError::Internal(format!("claimable balance id hash error: {}", e)))?;
@@ -604,7 +598,15 @@ mod tests {
         };
 
         let result = execute_create_claimable_balance(
-            &op, &source_id, &source_id, 123, 0, &mut state, &context,
+            &op,
+            &source_id,
+            &TxIdentity {
+                source_id: &source_id,
+                seq: 123,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
         );
         assert!(result.is_ok());
 
@@ -638,14 +640,27 @@ mod tests {
         };
 
         let result = execute_create_claimable_balance(
-            &op, &source_id, &source_id, 123, 0, &mut state, &context,
+            &op,
+            &source_id,
+            &TxIdentity {
+                source_id: &source_id,
+                seq: 123,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
         );
         assert!(result.is_ok());
 
         match result.unwrap() {
             OperationResult::OpInner(OperationResultTr::CreateClaimableBalance(r)) => {
                 if let CreateClaimableBalanceResult::Success(balance_id) = r {
-                    let expected = generate_claimable_balance_id(&source_id, 123, 0).unwrap();
+                    let expected = generate_claimable_balance_id(&TxIdentity {
+                        source_id: &source_id,
+                        seq: 123,
+                        op_index: 0,
+                    })
+                    .unwrap();
                     assert_eq!(balance_id, expected);
                 } else {
                     panic!("unexpected result: {:?}", r);
@@ -680,7 +695,15 @@ mod tests {
         };
 
         let result = execute_create_claimable_balance(
-            &op, &source_id, &source_id, 123, 0, &mut state, &context,
+            &op,
+            &source_id,
+            &TxIdentity {
+                source_id: &source_id,
+                seq: 123,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
         )
         .expect("create claimable balance");
 
@@ -714,7 +737,15 @@ mod tests {
         };
 
         let result = execute_create_claimable_balance(
-            &op, &source_id, &source_id, 123, 0, &mut state, &context,
+            &op,
+            &source_id,
+            &TxIdentity {
+                source_id: &source_id,
+                seq: 123,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
         )
         .expect("create claimable balance");
 
@@ -749,7 +780,15 @@ mod tests {
         };
 
         let result = execute_create_claimable_balance(
-            &op, &source_id, &source_id, 123, 0, &mut state, &context,
+            &op,
+            &source_id,
+            &TxIdentity {
+                source_id: &source_id,
+                seq: 123,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
         )
         .expect("create claimable balance");
 
@@ -801,7 +840,15 @@ mod tests {
         };
 
         let result = execute_create_claimable_balance(
-            &op, &source_id, &source_id, 123, 0, &mut state, &context,
+            &op,
+            &source_id,
+            &TxIdentity {
+                source_id: &source_id,
+                seq: 123,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
         )
         .expect("create claimable balance");
 
@@ -849,7 +896,15 @@ mod tests {
         };
 
         let result = execute_create_claimable_balance(
-            &op, &source_id, &source_id, 123, 0, &mut state, &context,
+            &op,
+            &source_id,
+            &TxIdentity {
+                source_id: &source_id,
+                seq: 123,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
         )
         .expect("create claimable balance");
 
@@ -889,7 +944,15 @@ mod tests {
         };
 
         let result = execute_create_claimable_balance(
-            &op, &issuer_id, &issuer_id, 123, 0, &mut state, &context,
+            &op,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 123,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
         )
         .expect("create claimable balance");
 
@@ -946,7 +1009,15 @@ mod tests {
         };
 
         let result = execute_create_claimable_balance(
-            &op, &source_id, &source_id, 123, 0, &mut state, &context,
+            &op,
+            &source_id,
+            &TxIdentity {
+                source_id: &source_id,
+                seq: 123,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
         )
         .expect("create claimable balance");
 
@@ -1257,9 +1328,11 @@ mod tests {
         let result = execute_create_claimable_balance(
             &op,
             &op_source_id, // Operation source
-            &tx_source_id, // Transaction source (different)
-            123,
-            0,
+            &TxIdentity {
+                source_id: &tx_source_id,
+                seq: 123,
+                op_index: 0,
+            },
             &mut state,
             &context,
         );
@@ -1350,7 +1423,15 @@ mod tests {
         };
 
         let result = execute_create_claimable_balance(
-            &op, &source_id, &source_id, 123, 0, &mut state, &context,
+            &op,
+            &source_id,
+            &TxIdentity {
+                source_id: &source_id,
+                seq: 123,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
         )
         .expect("create claimable balance");
 
@@ -1403,7 +1484,15 @@ mod tests {
         };
 
         let result = execute_create_claimable_balance(
-            &op, &source_id, &source_id, 123, 0, &mut state, &context,
+            &op,
+            &source_id,
+            &TxIdentity {
+                source_id: &source_id,
+                seq: 123,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
         )
         .expect("create claimable balance");
 
@@ -1447,9 +1536,11 @@ mod tests {
         let create_result = execute_create_claimable_balance(
             &create_op,
             &creator_id,
-            &creator_id,
-            123,
-            0,
+            &TxIdentity {
+                source_id: &creator_id,
+                seq: 123,
+                op_index: 0,
+            },
             &mut state,
             &context,
         )
@@ -1520,9 +1611,11 @@ mod tests {
         let create_result = execute_create_claimable_balance(
             &create_op,
             &creator_id,
-            &creator_id,
-            123,
-            0,
+            &TxIdentity {
+                source_id: &creator_id,
+                seq: 123,
+                op_index: 0,
+            },
             &mut state,
             &context,
         )
@@ -1593,7 +1686,15 @@ mod tests {
 
         // This should succeed with 10 claimants
         let result = execute_create_claimable_balance(
-            &op, &source_id, &source_id, 123, 0, &mut state, &context,
+            &op,
+            &source_id,
+            &TxIdentity {
+                source_id: &source_id,
+                seq: 123,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
         );
         assert!(result.is_ok());
 
@@ -1667,9 +1768,11 @@ mod tests {
         let create_result = execute_create_claimable_balance(
             &create_op,
             &creator_id,
-            &creator_id,
-            123,
-            0,
+            &TxIdentity {
+                source_id: &creator_id,
+                seq: 123,
+                op_index: 0,
+            },
             &mut state,
             &context,
         )
@@ -2023,7 +2126,15 @@ mod tests {
         };
 
         let result = execute_create_claimable_balance(
-            &op, &source_id, &source_id, 123, 0, &mut state, &context,
+            &op,
+            &source_id,
+            &TxIdentity {
+                source_id: &source_id,
+                seq: 123,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
         )
         .unwrap();
 
@@ -2094,7 +2205,15 @@ mod tests {
         };
 
         let result = execute_create_claimable_balance(
-            &op, &source_id, &source_id, 123, 0, &mut state, &context,
+            &op,
+            &source_id,
+            &TxIdentity {
+                source_id: &source_id,
+                seq: 123,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
         )
         .unwrap();
 

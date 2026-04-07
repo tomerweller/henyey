@@ -1079,28 +1079,14 @@ pub fn execute_operation_with_soroban(
             manage_offer::execute_create_passive_sell_offer(op_data, &op_source, state, context)?,
         )),
         OperationBody::AllowTrust(op_data) => Ok(OperationExecutionResult::new(
-            trust_flags::execute_allow_trust(
-                op_data,
-                &op_source,
-                tx_id.source_id,
-                tx_id.seq,
-                tx_id.op_index,
-                state,
-                context,
-            )?,
+            trust_flags::execute_allow_trust(op_data, &op_source, &tx_id, state, context)?,
         )),
         OperationBody::Inflation => Ok(OperationExecutionResult::new(
             inflation::execute_inflation(&op_source, state, context)?,
         )),
         OperationBody::CreateClaimableBalance(op_data) => Ok(OperationExecutionResult::new(
             claimable_balance::execute_create_claimable_balance(
-                op_data,
-                &op_source,
-                tx_id.source_id,
-                tx_id.seq,
-                tx_id.op_index,
-                state,
-                context,
+                op_data, &op_source, &tx_id, state, context,
             )?,
         )),
         OperationBody::ClaimClaimableBalance(op_data) => Ok(OperationExecutionResult::new(
@@ -1126,15 +1112,7 @@ pub fn execute_operation_with_soroban(
             clawback::execute_clawback_claimable_balance(op_data, &op_source, state, context)?,
         )),
         OperationBody::SetTrustLineFlags(op_data) => Ok(OperationExecutionResult::new(
-            trust_flags::execute_set_trust_line_flags(
-                op_data,
-                &op_source,
-                tx_id.source_id,
-                tx_id.seq,
-                tx_id.op_index,
-                state,
-                context,
-            )?,
+            trust_flags::execute_set_trust_line_flags(op_data, &op_source, &tx_id, state, context)?,
         )),
         OperationBody::LiquidityPoolDeposit(op_data) => Ok(OperationExecutionResult::new(
             liquidity_pool::execute_liquidity_pool_deposit(op_data, &op_source, state, context)?,

@@ -54,13 +54,24 @@ use crate::entry::{compare_keys, BucketEntry, BucketEntryExt};
 use crate::metrics::{EntryCountType, MergeCounters};
 use crate::{protocol_version_starts_from, BucketError, ProtocolVersion, Result};
 
-struct MergeOptions<'a> {
-    keep_dead_entries: bool,
-    max_protocol_version: u32,
-    normalize_init_entries: bool,
-    shadow_buckets: &'a [Bucket],
-    keep_shadowed_lifecycle_entries: bool,
-    counters: Option<&'a MergeCounters>,
+/// Options controlling how two buckets are merged.
+///
+/// Groups the configuration flags that travel together through the merge wrapper chain:
+/// dead entry retention, protocol version, INIT normalization, shadow buckets, and counters.
+#[derive(Default)]
+pub struct MergeOptions<'a> {
+    /// Whether to retain DEAD entries in the output.
+    pub keep_dead_entries: bool,
+    /// Maximum protocol version governing merge semantics.
+    pub max_protocol_version: u32,
+    /// Convert INIT entries to LIVE (true when merging across level boundaries).
+    pub normalize_init_entries: bool,
+    /// Buckets whose entries shadow the merge output (pre-protocol-12 only).
+    pub shadow_buckets: &'a [Bucket],
+    /// Keep shadowed lifecycle entries (protocol-specific edge case).
+    pub keep_shadowed_lifecycle_entries: bool,
+    /// Optional merge counters for instrumentation.
+    pub counters: Option<&'a MergeCounters>,
 }
 
 /// Record an entry type in the merge counters.
@@ -424,22 +435,21 @@ pub fn merge_buckets_to_file(
         old_bucket,
         new_bucket,
         output_path,
-        keep_dead_entries,
-        max_protocol_version,
-        normalize_init_entries,
-        None,
+        &MergeOptions {
+            keep_dead_entries,
+            max_protocol_version,
+            normalize_init_entries,
+            ..Default::default()
+        },
     )
 }
 
-/// Merge two buckets to file with optional merge counters.
+/// Merge two buckets to file with merge options.
 pub fn merge_buckets_to_file_with_counters(
     old_bucket: &Bucket,
     new_bucket: &Bucket,
     output_path: &Path,
-    keep_dead_entries: bool,
-    max_protocol_version: u32,
-    normalize_init_entries: bool,
-    counters: Option<&MergeCounters>,
+    opts: &MergeOptions<'_>,
 ) -> Result<(Hash256, usize)> {
     use std::io::{BufWriter, Write};
 
@@ -457,8 +467,11 @@ pub fn merge_buckets_to_file_with_counters(
     let old_first = advance_skip_metadata(&mut old_iter, &mut old_meta)?;
     let new_first = advance_skip_metadata(&mut new_iter, &mut new_meta)?;
 
-    let (_, output_meta) =
-        build_output_metadata(old_meta.as_ref(), new_meta.as_ref(), max_protocol_version)?;
+    let (_, output_meta) = build_output_metadata(
+        old_meta.as_ref(),
+        new_meta.as_ref(),
+        opts.max_protocol_version,
+    )?;
 
     let file = File::create(output_path)?;
     let mut writer = BufWriter::new(file);
@@ -490,7 +503,7 @@ pub fn merge_buckets_to_file_with_counters(
 
     // Write metadata first
     if let Some(ref meta) = output_meta {
-        record_entry_type(counters, meta);
+        record_entry_type(opts.counters, meta);
         write_entry(meta, &mut writer, &mut hasher, &mut entry_count)?;
     }
 
@@ -498,9 +511,9 @@ pub fn merge_buckets_to_file_with_counters(
     two_pointer_merge(
         old_first.into_iter().map(Ok).chain(old_iter),
         new_first.into_iter().map(Ok).chain(new_iter),
-        keep_dead_entries,
-        normalize_init_entries,
-        counters,
+        opts.keep_dead_entries,
+        opts.normalize_init_entries,
+        opts.counters,
         |entry| write_entry(&entry, &mut writer, &mut hasher, &mut entry_count),
     )?;
 
@@ -733,11 +746,14 @@ pub fn merge_buckets_with_options_and_shadows(
     merge_buckets_with_options_and_shadows_and_counters(
         old_bucket,
         new_bucket,
-        keep_dead_entries,
-        max_protocol_version,
-        normalize_init_entries,
-        shadow_buckets,
-        None,
+        &MergeOptions {
+            keep_dead_entries,
+            max_protocol_version,
+            normalize_init_entries,
+            shadow_buckets,
+            counters: None,
+            ..Default::default()
+        },
     )
 }
 
@@ -745,43 +761,39 @@ pub fn merge_buckets_with_options_and_shadows(
 pub fn merge_buckets_with_options_and_shadows_and_counters(
     old_bucket: &Bucket,
     new_bucket: &Bucket,
-    keep_dead_entries: bool,
-    max_protocol_version: u32,
-    normalize_init_entries: bool,
-    shadow_buckets: &[Bucket],
-    counters: Option<&MergeCounters>,
+    opts: &MergeOptions<'_>,
 ) -> Result<Bucket> {
     // For protocol >= 12 (shadows removed), shadows are always
     // empty in practice. Pass empty slice to skip shadow cursor creation.
-    if shadow_buckets.is_empty()
-        || protocol_version_starts_from(max_protocol_version, ProtocolVersion::V12)
+    if opts.shadow_buckets.is_empty()
+        || protocol_version_starts_from(opts.max_protocol_version, ProtocolVersion::V12)
     {
         return merge_with_shadows_impl(
             old_bucket,
             new_bucket,
             MergeOptions {
-                keep_dead_entries,
-                max_protocol_version,
-                normalize_init_entries,
+                keep_dead_entries: opts.keep_dead_entries,
+                max_protocol_version: opts.max_protocol_version,
+                normalize_init_entries: opts.normalize_init_entries,
                 shadow_buckets: &[],
                 keep_shadowed_lifecycle_entries: false,
-                counters,
+                counters: opts.counters,
             },
         );
     }
 
     let keep_shadowed_lifecycle_entries =
-        protocol_version_starts_from(max_protocol_version, ProtocolVersion::V11);
+        protocol_version_starts_from(opts.max_protocol_version, ProtocolVersion::V11);
     merge_with_shadows_impl(
         old_bucket,
         new_bucket,
         MergeOptions {
-            keep_dead_entries,
-            max_protocol_version,
-            normalize_init_entries,
-            shadow_buckets,
+            keep_dead_entries: opts.keep_dead_entries,
+            max_protocol_version: opts.max_protocol_version,
+            normalize_init_entries: opts.normalize_init_entries,
+            shadow_buckets: opts.shadow_buckets,
             keep_shadowed_lifecycle_entries,
-            counters,
+            counters: opts.counters,
         },
     )
 }
@@ -2322,11 +2334,12 @@ mod tests {
         let _result = merge_buckets_with_options_and_shadows_and_counters(
             &old,
             &new,
-            true,
-            TEST_PROTOCOL,
-            false,
-            &[],
-            Some(&counters),
+            &MergeOptions {
+                keep_dead_entries: true,
+                max_protocol_version: TEST_PROTOCOL,
+                counters: Some(&counters),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -2350,11 +2363,11 @@ mod tests {
         let _result = merge_buckets_with_options_and_shadows_and_counters(
             &old,
             &new,
-            false,
-            TEST_PROTOCOL,
-            false,
-            &[],
-            Some(&counters),
+            &MergeOptions {
+                max_protocol_version: TEST_PROTOCOL,
+                counters: Some(&counters),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -2383,11 +2396,13 @@ mod tests {
         let _result = merge_buckets_with_options_and_shadows_and_counters(
             &old,
             &new,
-            true,
-            ProtocolVersion::V11.as_u32(),
-            false,
-            &[shadow_bucket],
-            Some(&counters),
+            &MergeOptions {
+                keep_dead_entries: true,
+                max_protocol_version: ProtocolVersion::V11.as_u32(),
+                shadow_buckets: &[shadow_bucket],
+                counters: Some(&counters),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -2424,10 +2439,12 @@ mod tests {
             &old,
             &new,
             &output_path,
-            true,
-            TEST_PROTOCOL,
-            false,
-            Some(&counters),
+            &MergeOptions {
+                keep_dead_entries: true,
+                max_protocol_version: TEST_PROTOCOL,
+                counters: Some(&counters),
+                ..Default::default()
+            },
         )
         .unwrap();
 
