@@ -582,13 +582,6 @@ impl App {
         }
     }
 
-    pub(super) fn tx_hash(
-        &self,
-        tx_env: &stellar_xdr::curr::TransactionEnvelope,
-    ) -> Option<Hash256> {
-        Hash256::hash_xdr(tx_env).ok()
-    }
-
     pub(super) fn build_scp_history_entry(&self, ledger_seq: u32) -> Option<ScpHistoryEntry> {
         let envelopes = self.herder.get_scp_envelopes(ledger_seq as u64);
         if envelopes.is_empty() {

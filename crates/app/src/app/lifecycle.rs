@@ -1027,7 +1027,7 @@ impl App {
             }
 
             StellarMessage::Transaction(tx_env) => {
-                let tx_hash = self.tx_hash(&tx_env);
+                let tx_hash = Hash256::hash_xdr(&tx_env).ok();
                 match self.herder.receive_transaction(tx_env.clone()) {
                     henyey_herder::TxQueueResult::Added => {
                         tracing::debug!(peer = %msg.from_peer, "Transaction added to queue");

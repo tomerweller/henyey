@@ -1584,7 +1584,7 @@ impl App {
                     | TransactionResultResult::TxFeeBumpInnerSuccess(_)
             );
             if !is_success {
-                if let Some(hash) = self.tx_hash(tx) {
+                if let Some(hash) = Hash256::hash_xdr(tx).ok() {
                     failed_hashes.push(hash);
                 }
             }

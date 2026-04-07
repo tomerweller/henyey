@@ -379,48 +379,43 @@ fn sign_tx(
     tx_hash
 }
 
+/// Parameters for the `get-settings-upgrade-txs` CLI command.
+pub struct SettingsUpgradeParams<'a> {
+    pub public_key_str: &'a str,
+    pub seq_num: i64,
+    pub network_passphrase: &'a str,
+    pub xdr_base64: &'a str,
+    pub sign_txs: bool,
+    pub add_resource_fee: i64,
+}
+
 /// Execute the `get-settings-upgrade-txs` command.
-///
-/// Arguments match stellar-core's CLI:
-/// - `public_key_str`: StrKey public key (G...)
-/// - `seq_num`: Current sequence number of the account
-/// - `network_passphrase`: Network passphrase string
-/// - `xdr_base64`: Base64-encoded `ConfigUpgradeSet` XDR
-/// - `sign_txs`: If true, read secret key from stdin and sign all transactions
-/// - `add_resource_fee`: Additional resource fee for all transactions
-pub fn run(
-    public_key_str: &str,
-    seq_num: i64,
-    network_passphrase: &str,
-    xdr_base64: &str,
-    sign_txs: bool,
-    add_resource_fee: i64,
-) -> anyhow::Result<()> {
+pub fn run(params: &SettingsUpgradeParams<'_>) -> anyhow::Result<()> {
     // Decode the ConfigUpgradeSet from base64 XDR
     let xdr_bytes = BASE64
-        .decode(xdr_base64)
+        .decode(params.xdr_base64)
         .map_err(|e| anyhow::anyhow!("Failed to decode base64 XDR: {}", e))?;
     let upgrade_set = ConfigUpgradeSet::from_xdr(&xdr_bytes, stellar_xdr::curr::Limits::none())
         .map_err(|e| anyhow::anyhow!("Failed to decode ConfigUpgradeSet XDR: {}", e))?;
 
     // Parse public key from StrKey
-    let pk = henyey_crypto::PublicKey::from_strkey(public_key_str)
+    let pk = henyey_crypto::PublicKey::from_strkey(params.public_key_str)
         .map_err(|e| anyhow::anyhow!("Failed to parse public key: {}", e))?;
     let public_key = Uint256(*pk.as_bytes());
 
     // Build the 4 transactions
     let (mut restore_tx, _restore_key) =
-        get_wasm_restore_tx(&public_key, seq_num + 1, add_resource_fee);
+        get_wasm_restore_tx(&public_key, params.seq_num + 1, params.add_resource_fee);
 
     // Note: stellar-core passes 0 for addResourceFee to getUploadTx
-    let (mut upload_tx, contract_code_key) = get_upload_tx(&public_key, seq_num + 2);
+    let (mut upload_tx, contract_code_key) = get_upload_tx(&public_key, params.seq_num + 2);
 
     let (mut create_tx, contract_source_ref_key, contract_id) = get_create_tx(
         &public_key,
         &contract_code_key,
-        network_passphrase,
-        seq_num + 3,
-        add_resource_fee,
+        params.network_passphrase,
+        params.seq_num + 3,
+        params.add_resource_fee,
     );
 
     let (mut invoke_tx, upgrade_set_key) = get_invoke_tx(
@@ -429,11 +424,11 @@ pub fn run(
         &contract_source_ref_key,
         &contract_id,
         &upgrade_set,
-        seq_num + 4,
-        add_resource_fee,
+        params.seq_num + 4,
+        params.add_resource_fee,
     );
 
-    if sign_txs {
+    if params.sign_txs {
         // Read secret key from stdin
         let secret_str = read_secret_from_stdin()?;
         let secret_key = SecretKey::from_strkey(&secret_str)
@@ -448,7 +443,7 @@ pub fn run(
         ];
 
         for tx in txs {
-            let tx_hash = sign_tx(tx, &secret_key, network_passphrase);
+            let tx_hash = sign_tx(tx, &secret_key, params.network_passphrase);
             let tx_bytes = tx.to_xdr(stellar_xdr::curr::Limits::none())?;
             println!("{}", BASE64.encode(&tx_bytes));
             println!("{}", hex::encode(tx_hash));
@@ -469,7 +464,7 @@ pub fn run(
             eprintln!("{}", label);
             let tx_bytes = txs[i].to_xdr(stellar_xdr::curr::Limits::none())?;
             println!("{}", BASE64.encode(&tx_bytes));
-            let tx_hash = compute_tx_hash(txs[i], network_passphrase);
+            let tx_hash = compute_tx_hash(txs[i], params.network_passphrase);
             println!("{}", hex::encode(tx_hash));
         }
     }

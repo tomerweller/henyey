@@ -164,6 +164,8 @@ impl SyncRecoveryCallback for App {
     }
 
     fn request_scp_state_from_peers(&self) {
-        self.request_scp_state_sync();
+        // Can't call async from sync callback, so just log the request.
+        // The main event loop's heartbeat will pick up stalled state and request SCP state.
+        tracing::debug!("Sync recovery requested SCP state - will be handled by main loop");
     }
 }

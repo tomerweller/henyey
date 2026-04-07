@@ -18,7 +18,6 @@ use stellar_xdr::curr::{
     Hash, LedgerUpgrade, ReadXdr, TopologyResponseBodyV2, TransactionEnvelope, UpgradeType,
 };
 
-use crate::config::AppConfig;
 use crate::survey::SurveyPhase;
 
 // ── Constants re-exported for sibling submodules ────────────────────────
@@ -274,53 +273,6 @@ pub struct SelfCheckResult {
     pub ok: bool,
     pub checked_ledgers: u32,
     pub last_checked_ledger: Option<u32>,
-}
-
-/// Application builder for more flexible initialization.
-pub struct AppBuilder {
-    config: Option<AppConfig>,
-    config_path: Option<std::path::PathBuf>,
-}
-
-impl AppBuilder {
-    /// Create a new application builder.
-    pub fn new() -> Self {
-        Self {
-            config: None,
-            config_path: None,
-        }
-    }
-
-    /// Use the given configuration.
-    pub fn with_config(mut self, config: AppConfig) -> Self {
-        self.config = Some(config);
-        self
-    }
-
-    /// Load configuration from a file.
-    pub fn with_config_file(mut self, path: impl AsRef<std::path::Path>) -> Self {
-        self.config_path = Some(path.as_ref().to_path_buf());
-        self
-    }
-
-    /// Build the application.
-    pub async fn build(self) -> anyhow::Result<super::App> {
-        let config = if let Some(config) = self.config {
-            config
-        } else if let Some(path) = self.config_path {
-            AppConfig::from_file_with_env(&path)?
-        } else {
-            AppConfig::default()
-        };
-
-        super::App::new(config).await
-    }
-}
-
-impl Default for AppBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 // ── Internal types ─────────────────────────────────────────────────────

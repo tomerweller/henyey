@@ -182,8 +182,8 @@ mod upgrades;
 
 use types::*;
 pub use types::{
-    AppBuilder, AppInfo, AppState, CatchupResult, CatchupTarget, LedgerInfo, LedgerSummary,
-    ScpSlotSnapshot, SelfCheckResult, SimulationDebugStats, SurveyPeerReport, SurveyReport,
+    AppInfo, AppState, CatchupResult, CatchupTarget, LedgerInfo, LedgerSummary, ScpSlotSnapshot,
+    SelfCheckResult, SimulationDebugStats, SurveyPeerReport, SurveyReport,
 };
 
 /// The main application struct coordinating all Stellar Core subsystems.
@@ -1539,13 +1539,6 @@ impl App {
 }
 
 impl App {
-    /// Synchronous version of request_scp_state_from_peers for use in callbacks.
-    fn request_scp_state_sync(&self) {
-        // We can't call async from sync callback, so we use a simple marker
-        // The main event loop's heartbeat will pick up stalled state and request
-        tracing::debug!("Sync recovery requested SCP state - will be handled by main loop");
-    }
-
     /// Start the sync recovery manager background task.
     ///
     /// This spawns a background task that monitors for consensus stuck conditions

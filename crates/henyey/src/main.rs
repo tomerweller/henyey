@@ -826,14 +826,14 @@ async fn main() -> anyhow::Result<()> {
             signtxs,
             add_resource_fee,
         } => {
-            return settings_upgrade::run(
-                public_key,
-                *seq_num,
+            return settings_upgrade::run(&settings_upgrade::SettingsUpgradeParams {
+                public_key_str: public_key,
+                seq_num: *seq_num,
                 network_passphrase,
                 xdr_base64,
-                *signtxs,
-                *add_resource_fee,
-            );
+                sign_txs: *signtxs,
+                add_resource_fee: *add_resource_fee,
+            });
         }
         _ => {}
     }
