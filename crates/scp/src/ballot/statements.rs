@@ -591,7 +591,10 @@ pub fn get_working_ballot(statement: &ScpStatement) -> Option<ScpBallot> {
     }
 }
 
-pub fn min_validation_level(left: ValidationLevel, right: ValidationLevel) -> ValidationLevel {
+pub(crate) fn min_validation_level(
+    left: ValidationLevel,
+    right: ValidationLevel,
+) -> ValidationLevel {
     match (left, right) {
         (ValidationLevel::Invalid, _) | (_, ValidationLevel::Invalid) => ValidationLevel::Invalid,
         (ValidationLevel::MaybeValid, _) | (_, ValidationLevel::MaybeValid) => {
@@ -603,7 +606,7 @@ pub fn min_validation_level(left: ValidationLevel, right: ValidationLevel) -> Va
 
 /// Compare two ballots.
 /// Returns Greater if a > b, Less if a < b, Equal if a == b.
-pub fn ballot_compare(a: &ScpBallot, b: &ScpBallot) -> std::cmp::Ordering {
+pub(crate) fn ballot_compare(a: &ScpBallot, b: &ScpBallot) -> std::cmp::Ordering {
     match a.counter.cmp(&b.counter) {
         Ordering::Equal => a.value.cmp(&b.value),
         other => other,
@@ -611,7 +614,7 @@ pub fn ballot_compare(a: &ScpBallot, b: &ScpBallot) -> std::cmp::Ordering {
 }
 
 /// Compare two optional ballots (None < Some).
-pub fn cmp_opt_ballot(a: &Option<ScpBallot>, b: &Option<ScpBallot>) -> std::cmp::Ordering {
+pub(crate) fn cmp_opt_ballot(a: &Option<ScpBallot>, b: &Option<ScpBallot>) -> std::cmp::Ordering {
     match (a, b) {
         (None, None) => Ordering::Equal,
         (None, Some(_)) => Ordering::Less,
@@ -621,7 +624,7 @@ pub fn cmp_opt_ballot(a: &Option<ScpBallot>, b: &Option<ScpBallot>) -> std::cmp:
 }
 
 /// Check if two ballots are compatible (same value).
-pub fn ballot_compatible(a: &ScpBallot, b: &ScpBallot) -> bool {
+pub(crate) fn ballot_compatible(a: &ScpBallot, b: &ScpBallot) -> bool {
     a.value == b.value
 }
 

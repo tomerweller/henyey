@@ -65,7 +65,8 @@ mod envelope;
 mod state_machine;
 mod statements;
 
-pub use statements::{ballot_compare, ballot_compatible, cmp_opt_ballot, get_working_ballot};
+pub use statements::get_working_ballot;
+pub(crate) use statements::{ballot_compare, ballot_compatible, cmp_opt_ballot};
 
 /// The ballot protocol progresses through these phases in order.
 /// Once in the Externalize phase, the slot has reached consensus
@@ -177,7 +178,7 @@ pub struct BallotProtocol {
 
 impl BallotProtocol {
     /// Create a new ballot protocol state.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             current_ballot: None,
             prepared: None,
@@ -232,14 +233,14 @@ impl BallotProtocol {
     ///
     /// Called by the Slot before invoking ballot protocol methods, so that
     /// `abandon_ballot` can use the composite candidate value.
-    pub fn set_composite_candidate(&mut self, value: Option<Value>) {
+    pub(crate) fn set_composite_candidate(&mut self, value: Option<Value>) {
         self.composite_candidate = value;
     }
 
     /// Check and clear the needs_stop_nomination flag.
     ///
     /// Returns true if nomination should be stopped (set by set_confirm_commit).
-    pub fn take_needs_stop_nomination(&mut self) -> bool {
+    pub(crate) fn take_needs_stop_nomination(&mut self) -> bool {
         let val = self.needs_stop_nomination;
         self.needs_stop_nomination = false;
         val
@@ -289,7 +290,7 @@ impl BallotProtocol {
     /// This is used when fast-forwarding via EXTERNALIZE messages from the network.
     /// It ensures that subsequent envelopes for this slot are properly validated
     /// against the externalized value.
-    pub fn force_externalize(&mut self, value: Value) {
+    pub(crate) fn force_externalize(&mut self, value: Value) {
         let ballot = ScpBallot {
             counter: u32::MAX, // Infinite ballot for externalize
             value: value.clone(),
@@ -604,7 +605,7 @@ impl BallotProtocol {
     /// # Returns
     /// True if state was successfully restored, false if the envelope is invalid
     /// for state restoration.
-    pub fn set_state_from_envelope(&mut self, envelope: &ScpEnvelope) -> bool {
+    pub(crate) fn set_state_from_envelope(&mut self, envelope: &ScpEnvelope) -> bool {
         let valid = match &envelope.statement.pledges {
             ScpStatementPledges::Prepare(prep) => {
                 self.current_ballot = Some(prep.ballot.clone());

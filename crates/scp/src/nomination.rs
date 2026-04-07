@@ -124,7 +124,7 @@ pub struct NominationProtocol {
 
 impl NominationProtocol {
     /// Create a new nomination protocol state.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             round: 0,
             votes: Vec::new(),
@@ -453,7 +453,7 @@ impl NominationProtocol {
     /// Matches stellar-core `stopNomination()` which sets `mNominationStarted = false`.
     /// This ensures `process_envelope` no longer does accept/ratify processing
     /// after nomination has been stopped.
-    pub fn stop(&mut self) {
+    pub(crate) fn stop(&mut self) {
         self.stopped = true;
         self.started = false;
     }
@@ -984,7 +984,7 @@ impl NominationProtocol {
     /// # Returns
     /// True if state was successfully restored, false if the envelope is invalid
     /// for state restoration or if nomination has already started.
-    pub fn set_state_from_envelope(&mut self, envelope: &ScpEnvelope) -> bool {
+    pub(crate) fn set_state_from_envelope(&mut self, envelope: &ScpEnvelope) -> bool {
         if self.started {
             // stellar-core throws here: "Cannot set state after nomination is started"
             return false;

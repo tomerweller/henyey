@@ -2701,6 +2701,14 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
             );
         }
 
+        // Build HAS once for all publish targets (same arguments, deterministic result)
+        let has = build_history_archive_state(
+            checkpoint,
+            &bucket_list,
+            None,
+            Some(config.network.passphrase.clone()),
+        )?;
+
         let command_publish_dir = if command_targets.is_empty() {
             None
         } else {
@@ -2736,15 +2744,7 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
                 )
                 .await?;
 
-            let has = build_history_archive_state(
-                checkpoint,
-                &bucket_list,
-                None,
-                Some(config.network.passphrase.clone()),
-            )?;
-            let root_path = publish_dir.join(root_has_path());
-            create_parent_dir(&root_path)?;
-            fs::write(&root_path, has.to_json()?)?;
+            write_root_has(&publish_dir, &has)?;
             Some(publish_dir)
         };
 
@@ -2770,15 +2770,7 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
                 )
                 .await?;
             write_scp_history_file(path, checkpoint, &scp_entries)?;
-            let has = build_history_archive_state(
-                checkpoint,
-                &bucket_list,
-                None,
-                Some(config.network.passphrase.clone()),
-            )?;
-            let root_path = path.join(root_has_path());
-            create_parent_dir(&root_path)?;
-            fs::write(&root_path, has.to_json()?)?;
+            write_root_has(path, &has)?;
             println!("OK ({})", url);
             published_any = true;
         }
@@ -2875,6 +2867,18 @@ fn build_scp_history_entries(
     }
 
     Ok(entries)
+}
+
+/// Write the root `HistoryArchiveState` JSON file into a directory.
+fn write_root_has(
+    dir: &std::path::Path,
+    has: &henyey_history::HistoryArchiveState,
+) -> anyhow::Result<()> {
+    use henyey_history::paths::root_has_path;
+    let root_path = dir.join(root_has_path());
+    create_parent_dir(&root_path)?;
+    std::fs::write(&root_path, has.to_json()?)?;
+    Ok(())
 }
 
 /// Writes SCP history entries to a gzip-compressed XDR file.

@@ -625,30 +625,35 @@ pub struct TransactionProcessingInfo {
     pub base_fee: Option<u32>,
 }
 
-/// Helper to build a map from transaction hash to per-component base fee.
+/// A transaction envelope paired with its per-component base fee from a `GeneralizedTransactionSet`.
 ///
-/// The `GeneralizedTransactionSet` can contain per-phase/per-component base fees
-/// that differ from `header.base_fee` during surge pricing.
-fn build_tx_hash_to_base_fee_map(
-    tx_set: &stellar_xdr::curr::GeneralizedTransactionSet,
-    network_id: &Hash,
-) -> std::collections::HashMap<Hash, Option<u32>> {
-    let mut map = std::collections::HashMap::new();
+/// The base fee may differ from `ledger_header.base_fee` during surge pricing.
+/// `None` means "use the ledger header's base_fee".
+struct TxWithBaseFee<'a> {
+    env: &'a stellar_xdr::curr::TransactionEnvelope,
+    base_fee: Option<u32>,
+}
 
+/// Visit every transaction in a `GeneralizedTransactionSet`, yielding each
+/// envelope paired with its per-component base fee.
+///
+/// This centralizes the deeply nested traversal of the GeneralizedTransactionSet
+/// structure (phases -> V0 components / V1 parallel stages -> clusters -> txs)
+/// so that consumers can operate on a flat iterator.
+fn visit_generalized_tx_set(
+    tx_set: &stellar_xdr::curr::GeneralizedTransactionSet,
+) -> Vec<TxWithBaseFee<'_>> {
     let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = tx_set;
+    let mut result = Vec::new();
+
     for phase in v1.phases.iter() {
         match phase {
             stellar_xdr::curr::TransactionPhase::V0(components) => {
                 for comp in components.iter() {
-                    match comp {
-                        stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) => {
-                            let base_fee = c.base_fee.and_then(|fee| u32::try_from(fee).ok());
-                            for env in c.txs.iter() {
-                                if let Some(hash) = compute_tx_hash(env, network_id) {
-                                    map.insert(hash, base_fee);
-                                }
-                            }
-                        }
+                    let stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) = comp;
+                    let base_fee = c.base_fee.and_then(|fee| u32::try_from(fee).ok());
+                    for env in c.txs.iter() {
+                        result.push(TxWithBaseFee { env, base_fee });
                     }
                 }
             }
@@ -657,9 +662,7 @@ fn build_tx_hash_to_base_fee_map(
                 for stage in parallel.execution_stages.iter() {
                     for cluster in stage.iter() {
                         for env in cluster.0.iter() {
-                            if let Some(hash) = compute_tx_hash(env, network_id) {
-                                map.insert(hash, base_fee);
-                            }
+                            result.push(TxWithBaseFee { env, base_fee });
                         }
                     }
                 }
@@ -667,7 +670,24 @@ fn build_tx_hash_to_base_fee_map(
         }
     }
 
-    map
+    result
+}
+
+/// Helper to build a map from transaction hash to per-component base fee.
+///
+/// The `GeneralizedTransactionSet` can contain per-phase/per-component base fees
+/// that differ from `header.base_fee` during surge pricing.
+fn build_tx_hash_to_base_fee_map(
+    tx_set: &stellar_xdr::curr::GeneralizedTransactionSet,
+    network_id: &Hash,
+) -> std::collections::HashMap<Hash, Option<u32>> {
+    visit_generalized_tx_set(tx_set)
+        .into_iter()
+        .filter_map(|t| {
+            let hash = compute_tx_hash(t.env, network_id)?;
+            Some((hash, t.base_fee))
+        })
+        .collect()
 }
 
 /// Compute the network-aware transaction hash.
@@ -873,33 +893,10 @@ pub fn extract_transaction_envelopes(
 fn extract_txs_from_generalized_set(
     tx_set: &stellar_xdr::curr::GeneralizedTransactionSet,
 ) -> Vec<stellar_xdr::curr::TransactionEnvelope> {
-    match tx_set {
-        stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) => {
-            v1.phases
-                .iter()
-                .flat_map(|phase| match phase {
-                    stellar_xdr::curr::TransactionPhase::V0(components) => components
-                        .iter()
-                        .flat_map(|c| match c {
-                            stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
-                                comp,
-                            ) => comp.txs.iter().cloned().collect::<Vec<_>>(),
-                        })
-                        .collect::<Vec<_>>(),
-                    stellar_xdr::curr::TransactionPhase::V1(parallel) => {
-                        // V1 phase contains parallel/Soroban transactions in execution_stages
-                        let mut txs = Vec::new();
-                        for stage in parallel.execution_stages.iter() {
-                            for cluster in stage.iter() {
-                                txs.extend(cluster.0.iter().cloned());
-                            }
-                        }
-                        txs
-                    }
-                })
-                .collect()
-        }
-    }
+    visit_generalized_tx_set(tx_set)
+        .into_iter()
+        .map(|t| t.env.clone())
+        .collect()
 }
 
 /// Extract transaction result pairs from LedgerCloseMeta.
