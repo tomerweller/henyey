@@ -349,23 +349,18 @@ impl Upgrades {
         }
 
         match upgrade {
-            LedgerUpgrade::Version(new_version) => {
-                self.params
-                    .protocol_version
-                    .map_or(false, |v| v == *new_version)
-            }
-            LedgerUpgrade::BaseFee(fee) => {
-                self.params.base_fee.map_or(false, |f| f == *fee)
-            }
+            LedgerUpgrade::Version(new_version) => self
+                .params
+                .protocol_version
+                .map_or(false, |v| v == *new_version),
+            LedgerUpgrade::BaseFee(fee) => self.params.base_fee.map_or(false, |f| f == *fee),
             LedgerUpgrade::MaxTxSetSize(size) => {
                 self.params.max_tx_set_size.map_or(false, |s| s == *size)
             }
             LedgerUpgrade::BaseReserve(reserve) => {
                 self.params.base_reserve.map_or(false, |r| r == *reserve)
             }
-            LedgerUpgrade::Flags(flags) => {
-                self.params.flags.map_or(false, |f| f == *flags)
-            }
+            LedgerUpgrade::Flags(flags) => self.params.flags.map_or(false, |f| f == *flags),
             LedgerUpgrade::Config(_key) => {
                 // Config upgrades require the node to have a config upgrade set key
                 // configured. Full consistency check (isConsistentWith) requires ledger
@@ -373,11 +368,10 @@ impl Upgrades {
                 // has a config upgrade key configured.
                 self.params.config_upgrade_set_key.is_some()
             }
-            LedgerUpgrade::MaxSorobanTxSetSize(size) => {
-                self.params
-                    .max_soroban_tx_set_size
-                    .map_or(false, |s| s == *size)
-            }
+            LedgerUpgrade::MaxSorobanTxSetSize(size) => self
+                .params
+                .max_soroban_tx_set_size
+                .map_or(false, |s| s == *size),
         }
     }
 

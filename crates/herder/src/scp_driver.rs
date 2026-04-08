@@ -1009,12 +1009,12 @@ impl ScpDriver {
                 let in_order = last_upgrade_type
                     .map(|prev| upgrade_type > prev)
                     .unwrap_or(true);
-                let valid_for_apply =
-                    Self::is_valid_upgrade_for_apply(&upgrade, current_version);
+                let valid_for_apply = Self::is_valid_upgrade_for_apply(&upgrade, current_version);
                 // Also check nomination validity (timing + parameter match)
-                let valid_for_nomination = if let Some(ref upgrades_arc) = *self.upgrades.read()
-                {
-                    upgrades_arc.read().is_valid_for_nomination(&upgrade, close_time)
+                let valid_for_nomination = if let Some(ref upgrades_arc) = *self.upgrades.read() {
+                    upgrades_arc
+                        .read()
+                        .is_valid_for_nomination(&upgrade, close_time)
                 } else {
                     true // No upgrade config — can't filter
                 };
@@ -2324,7 +2324,10 @@ impl SCPDriver for HerderScpCallback {
         // and upgrade checks for ALL statements (both nomination and ballot).
         // The `nomination` flag is forwarded to upgrade validation for additional
         // strictness during nomination (isValidForNomination).
-        match self.driver.validate_value_impl(slot_index, value, nomination) {
+        match self
+            .driver
+            .validate_value_impl(slot_index, value, nomination)
+        {
             ValueValidation::Valid => ValidationLevel::FullyValidated,
             ValueValidation::MaybeValid => ValidationLevel::MaybeValid,
             ValueValidation::Invalid => ValidationLevel::Invalid,
@@ -3484,12 +3487,11 @@ mod tests {
         );
 
         // Now wrap the same transactions in a generalized tx set
-        let component = TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
-            TxSetComponentTxsMaybeDiscountedFee {
+        let component =
+            TxSetComponent::TxsetCompTxsMaybeDiscountedFee(TxSetComponentTxsMaybeDiscountedFee {
                 txs: fee_priority_order.clone().try_into().unwrap(),
                 base_fee: Some(100),
-            },
-        );
+            });
         let gen = GeneralizedTransactionSet::V1(TransactionSetV1 {
             previous_ledger_hash: Hash([0u8; 32]),
             phases: vec![
@@ -3503,12 +3505,8 @@ mod tests {
             .unwrap(),
         });
         let gen_hash = Hash256::hash_xdr(&gen).unwrap();
-        let gen_set = TransactionSet::with_generalized(
-            Hash256::ZERO,
-            gen_hash,
-            fee_priority_order,
-            gen,
-        );
+        let gen_set =
+            TransactionSet::with_generalized(Hash256::ZERO, gen_hash, fee_priority_order, gen);
 
         // The generalized tx set has a generalized_tx_set field
         assert!(gen_set.generalized_tx_set.is_some());
@@ -3917,7 +3915,7 @@ mod compare_tx_sets_tests {
     /// Missing tx sets should be filtered out before comparison.
     #[test]
     fn test_audit_014_combine_candidates_filters_missing_tx_sets() {
-        use stellar_xdr::curr::{StellarValue, StellarValueExt, TimePoint, Limits, WriteXdr};
+        use stellar_xdr::curr::{Limits, StellarValue, StellarValueExt, TimePoint, WriteXdr};
 
         let driver = make_driver();
 
@@ -3948,7 +3946,10 @@ mod compare_tx_sets_tests {
         cache_tx_set(&driver, tx_set_b.clone());
         let full_result = driver.combine_candidates_impl(1, &values);
         let full_sv = StellarValue::from_xdr(&full_result.0, Limits::none()).unwrap();
-        assert_eq!(full_sv.tx_set_hash.0, tx_set_a.hash.0, "A should win with both cached");
+        assert_eq!(
+            full_sv.tx_set_hash.0, tx_set_a.hash.0,
+            "A should win with both cached"
+        );
 
         // Only B cached, A missing: A should be filtered out, B wins by default
         driver.tx_set_cache.clear();
