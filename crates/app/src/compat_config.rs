@@ -144,10 +144,19 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
             port,
             ..HttpConfig::default()
         };
+        // When PUBLIC_HTTP_PORT=true, bind to all interfaces (dual-stack) so that
+        // clients connecting via IPv4 or IPv6 localhost can reach the server.
+        // This matches stellar-core's behavior where PUBLIC_HTTP_PORT controls
+        // whether the HTTP port is accessible beyond localhost.
+        let address = if get_bool(table, "PUBLIC_HTTP_PORT").unwrap_or(false) {
+            "::".to_string()
+        } else {
+            "127.0.0.1".to_string()
+        };
         config.compat_http = CompatHttpConfig {
             enabled: true,
             port,
-            ..CompatHttpConfig::default()
+            address,
         };
     }
 
@@ -537,6 +546,8 @@ mod tests {
         // Compat HTTP should be auto-enabled on HTTP_PORT
         assert!(config.compat_http.enabled);
         assert_eq!(config.compat_http.port, 11626);
+        // Without PUBLIC_HTTP_PORT, should bind to localhost only
+        assert_eq!(config.compat_http.address, "127.0.0.1");
 
         // Native HTTP should be disabled to avoid port conflict
         assert!(!config.http.enabled);
@@ -906,6 +917,8 @@ mod tests {
         // Should not error on unknown keys
         let config = translate_stellar_core_config(&core_toml).unwrap();
         assert_eq!(config.compat_http.port, 11626);
+        // PUBLIC_HTTP_PORT=true should bind to all interfaces (dual-stack)
+        assert_eq!(config.compat_http.address, "::");
         // ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING should now be parsed
         assert!(config.testing.accelerate_time);
     }
@@ -1108,6 +1121,8 @@ mod tests {
         // --- HTTP / Compat ---
         assert!(config.compat_http.enabled);
         assert_eq!(config.compat_http.port, 11626);
+        // PUBLIC_HTTP_PORT=true → bind to dual-stack wildcard
+        assert_eq!(config.compat_http.address, "::");
         assert!(!config.http.enabled); // native HTTP disabled when compat is on
 
         // --- Overlay ---
