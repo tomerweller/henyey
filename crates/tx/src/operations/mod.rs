@@ -430,13 +430,10 @@ fn validate_invoke_host_function(
 
 /// Validate ExtendFootprintTtl operation.
 fn validate_extend_footprint_ttl(
-    op: &ExtendFootprintTtlOp,
+    _op: &ExtendFootprintTtlOp,
 ) -> std::result::Result<(), OperationValidationError> {
-    if op.extend_to == 0 {
-        return Err(OperationValidationError::InvalidSorobanData(
-            "extend_to must be positive".to_string(),
-        ));
-    }
+    // stellar-core does not reject extend_to=0 in doCheckValid;
+    // extend_to=0 is a valid no-op (target TTL <= any live entry's TTL).
     Ok(())
 }
 
