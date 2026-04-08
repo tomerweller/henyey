@@ -1145,17 +1145,33 @@ impl ScpDriver {
             return values[0].clone();
         }
 
+        // Parity: filter out candidates whose tx set is missing from cache.
+        // stellar-core crashes (releaseAssert(cTxSet)) if a tx set is missing
+        // during combineCandidates — we filter instead to be defensive.
+        decoded.retain(|sv| {
+            let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
+            if self.tx_set_cache.get(&tx_set_hash).is_some() {
+                true
+            } else {
+                warn!(
+                    "combine_candidates: tx set {} missing from cache, filtering out",
+                    tx_set_hash
+                );
+                false
+            }
+        });
+        if decoded.is_empty() {
+            return values[0].clone();
+        }
+
         // Parity: filter out candidates whose tx set has a different previousLedgerHash
         if let Some(ref lm) = *self.ledger_manager.read() {
             let lcl_hash = lm.current_header_hash();
             decoded.retain(|sv| {
                 let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
-                if let Some(tx_set) = self.tx_set_cache.get(&tx_set_hash) {
-                    tx_set.tx_set.previous_ledger_hash == lcl_hash
-                } else {
-                    // Can't verify — keep it
-                    true
-                }
+                // Safe to unwrap: we just filtered out missing tx sets above
+                let tx_set = self.tx_set_cache.get(&tx_set_hash).unwrap();
+                tx_set.tx_set.previous_ledger_hash == lcl_hash
             });
             if decoded.is_empty() {
                 // All candidates filtered out — fall back to first value
@@ -1267,41 +1283,51 @@ impl ScpDriver {
         b_hash: &Hash256,
         candidates_hash: &[u8; 32],
     ) -> std::cmp::Ordering {
-        let a_set = self.tx_set_cache.get(a_hash);
-        let b_set = self.tx_set_cache.get(b_hash);
+        // Parity: stellar-core releaseAssert(cTxSet) at HerderSCPDriver.cpp:780
+        // Tx sets must be in cache by the time we compare them.
+        let a_set = self.tx_set_cache.get(a_hash).unwrap_or_else(|| {
+            panic!(
+                "compare_tx_sets: tx set {} not in cache (parity: releaseAssert)",
+                a_hash
+            )
+        });
+        let b_set = self.tx_set_cache.get(b_hash).unwrap_or_else(|| {
+            panic!(
+                "compare_tx_sets: tx set {} not in cache (parity: releaseAssert)",
+                b_hash
+            )
+        });
 
-        if let (Some(a), Some(b)) = (a_set.as_ref(), b_set.as_ref()) {
-            // 1. Compare by number of operations (more is better)
-            let a_ops = Self::tx_set_num_ops(&a.tx_set);
-            let b_ops = Self::tx_set_num_ops(&b.tx_set);
-            let ops_cmp = a_ops.cmp(&b_ops);
-            if ops_cmp != std::cmp::Ordering::Equal {
-                return ops_cmp;
-            }
+        // 1. Compare by number of operations (more is better)
+        let a_ops = Self::tx_set_num_ops(&a_set.tx_set);
+        let b_ops = Self::tx_set_num_ops(&b_set.tx_set);
+        let ops_cmp = a_ops.cmp(&b_ops);
+        if ops_cmp != std::cmp::Ordering::Equal {
+            return ops_cmp;
+        }
 
-            // 2. Compare by total inclusion fees (higher is better)
-            let a_inclusion_fees = Self::tx_set_total_inclusion_fees(&a.tx_set);
-            let b_inclusion_fees = Self::tx_set_total_inclusion_fees(&b.tx_set);
-            let inclusion_fees_cmp = a_inclusion_fees.cmp(&b_inclusion_fees);
-            if inclusion_fees_cmp != std::cmp::Ordering::Equal {
-                return inclusion_fees_cmp;
-            }
+        // 2. Compare by total inclusion fees (higher is better)
+        let a_inclusion_fees = Self::tx_set_total_inclusion_fees(&a_set.tx_set);
+        let b_inclusion_fees = Self::tx_set_total_inclusion_fees(&b_set.tx_set);
+        let inclusion_fees_cmp = a_inclusion_fees.cmp(&b_inclusion_fees);
+        if inclusion_fees_cmp != std::cmp::Ordering::Equal {
+            return inclusion_fees_cmp;
+        }
 
-            // 3. Compare by total full fees (higher is better)
-            let a_fees = Self::tx_set_total_fees(&a.tx_set);
-            let b_fees = Self::tx_set_total_fees(&b.tx_set);
-            let fees_cmp = a_fees.cmp(&b_fees);
-            if fees_cmp != std::cmp::Ordering::Equal {
-                return fees_cmp;
-            }
+        // 3. Compare by total full fees (higher is better)
+        let a_fees = Self::tx_set_total_fees(&a_set.tx_set);
+        let b_fees = Self::tx_set_total_fees(&b_set.tx_set);
+        let fees_cmp = a_fees.cmp(&b_fees);
+        if fees_cmp != std::cmp::Ordering::Equal {
+            return fees_cmp;
+        }
 
-            // 4. Compare by encoded size (smaller is better — note reversed order)
-            let a_size = Self::tx_set_encoded_size(&a.tx_set);
-            let b_size = Self::tx_set_encoded_size(&b.tx_set);
-            let size_cmp = b_size.cmp(&a_size); // reversed: smaller is better
-            if size_cmp != std::cmp::Ordering::Equal {
-                return size_cmp;
-            }
+        // 4. Compare by encoded size (smaller is better — note reversed order)
+        let a_size = Self::tx_set_encoded_size(&a_set.tx_set);
+        let b_size = Self::tx_set_encoded_size(&b_set.tx_set);
+        let size_cmp = b_size.cmp(&a_size); // reversed: smaller is better
+        if size_cmp != std::cmp::Ordering::Equal {
+            return size_cmp;
         }
 
         // 5. XOR hash tiebreak
@@ -2893,12 +2919,21 @@ mod tests {
             .unwrap_or_default()
             .as_secs();
 
+        // Create and cache real tx sets so the cache filter keeps them
+        let tx_set_1 = TransactionSet::new(Hash256::ZERO, vec![]);
+        let hash_1 = tx_set_1.hash;
+        driver.cache_tx_set(tx_set_1);
+
+        let tx_set_2 = TransactionSet::new(Hash256::from_bytes([1u8; 32]), vec![]);
+        let hash_2 = tx_set_2.hash;
+        driver.cache_tx_set(tx_set_2);
+
         // Candidate 1: version upgrade
         let version = LedgerUpgrade::Version(25)
             .to_xdr(Limits::none())
             .expect("xdr");
         let sv1 = StellarValue {
-            tx_set_hash: stellar_xdr::curr::Hash([1u8; 32]),
+            tx_set_hash: stellar_xdr::curr::Hash(hash_1.0),
             close_time: TimePoint(now),
             upgrades: vec![UpgradeType(version.try_into().unwrap())]
                 .try_into()
@@ -2911,7 +2946,7 @@ mod tests {
             .to_xdr(Limits::none())
             .expect("xdr");
         let sv2 = StellarValue {
-            tx_set_hash: stellar_xdr::curr::Hash([2u8; 32]),
+            tx_set_hash: stellar_xdr::curr::Hash(hash_2.0),
             close_time: TimePoint(now),
             upgrades: vec![UpgradeType(base_fee.try_into().unwrap())]
                 .try_into()
@@ -2939,12 +2974,21 @@ mod tests {
             .unwrap_or_default()
             .as_secs();
 
+        // Create and cache real tx sets
+        let tx_set_1 = TransactionSet::new(Hash256::ZERO, vec![]);
+        let hash_1 = tx_set_1.hash;
+        driver.cache_tx_set(tx_set_1);
+
+        let tx_set_2 = TransactionSet::new(Hash256::from_bytes([1u8; 32]), vec![]);
+        let hash_2 = tx_set_2.hash;
+        driver.cache_tx_set(tx_set_2);
+
         // Candidate 1: version 24
         let v24 = LedgerUpgrade::Version(24)
             .to_xdr(Limits::none())
             .expect("xdr");
         let sv1 = StellarValue {
-            tx_set_hash: stellar_xdr::curr::Hash([1u8; 32]),
+            tx_set_hash: stellar_xdr::curr::Hash(hash_1.0),
             close_time: TimePoint(now),
             upgrades: vec![UpgradeType(v24.try_into().unwrap())]
                 .try_into()
@@ -2957,7 +3001,7 @@ mod tests {
             .to_xdr(Limits::none())
             .expect("xdr");
         let sv2 = StellarValue {
-            tx_set_hash: stellar_xdr::curr::Hash([2u8; 32]),
+            tx_set_hash: stellar_xdr::curr::Hash(hash_2.0),
             close_time: TimePoint(now),
             upgrades: vec![UpgradeType(v25.try_into().unwrap())]
                 .try_into()
@@ -3839,7 +3883,8 @@ mod compare_tx_sets_tests {
     }
 
     #[test]
-    fn test_compare_tx_sets_missing_set_falls_through_to_xor() {
+    #[should_panic(expected = "not in cache")]
+    fn test_compare_tx_sets_missing_set_panics() {
         let driver = make_driver();
         let candidates_hash = [0u8; 32];
 
@@ -3850,12 +3895,8 @@ mod compare_tx_sets_tests {
         // B is not cached (just a made-up hash)
         let hash_b = Hash256::from_bytes([99u8; 32]);
 
-        // When one or both sets are missing from cache, all 4 criteria are skipped
-        // and comparison goes straight to XOR tiebreak (criterion 5)
-        let result = driver.compare_tx_sets(&hash_a, &hash_b, &candidates_hash);
-        let a_xored = ScpDriver::xor_hash(&hash_a.0, &candidates_hash);
-        let b_xored = ScpDriver::xor_hash(&hash_b.0, &candidates_hash);
-        assert_eq!(result, a_xored.cmp(&b_xored));
+        // Parity: stellar-core releaseAssert(cTxSet) — must panic when tx set missing
+        let _ = driver.compare_tx_sets(&hash_a, &hash_b, &candidates_hash);
     }
 
     #[test]
@@ -3869,5 +3910,56 @@ mod compare_tx_sets_tests {
         // Comparing a set with itself should return Equal
         let result = driver.compare_tx_sets(&hash, &hash, &candidates_hash);
         assert_eq!(result, std::cmp::Ordering::Equal);
+    }
+
+    /// Regression test for AUDIT-014: combine_candidates_impl must not silently
+    /// degrade to XOR-only tiebreak when a tx set is missing from cache.
+    /// Missing tx sets should be filtered out before comparison.
+    #[test]
+    fn test_audit_014_combine_candidates_filters_missing_tx_sets() {
+        use stellar_xdr::curr::{StellarValue, StellarValueExt, TimePoint, Limits, WriteXdr};
+
+        let driver = make_driver();
+
+        // A has 5 ops (should win on criterion 1)
+        let tx_set_a = TransactionSet::new(Hash256::ZERO, vec![make_tx(1, 500, 5)]);
+        // B has 1 op
+        let tx_set_b = TransactionSet::new(Hash256::ZERO, vec![make_tx(2, 100, 1)]);
+
+        let sv_a = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set_a.hash.0),
+            close_time: TimePoint(1_700_000_000),
+            upgrades: Default::default(),
+            ext: StellarValueExt::Basic,
+        };
+        let sv_b = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set_b.hash.0),
+            close_time: TimePoint(1_700_000_000),
+            upgrades: Default::default(),
+            ext: StellarValueExt::Basic,
+        };
+
+        let val_a = Value(sv_a.to_xdr(Limits::none()).unwrap().try_into().unwrap());
+        let val_b = Value(sv_b.to_xdr(Limits::none()).unwrap().try_into().unwrap());
+        let values = vec![val_a.clone(), val_b.clone()];
+
+        // Both cached: A wins (5 ops > 1 op)
+        cache_tx_set(&driver, tx_set_a.clone());
+        cache_tx_set(&driver, tx_set_b.clone());
+        let full_result = driver.combine_candidates_impl(1, &values);
+        let full_sv = StellarValue::from_xdr(&full_result.0, Limits::none()).unwrap();
+        assert_eq!(full_sv.tx_set_hash.0, tx_set_a.hash.0, "A should win with both cached");
+
+        // Only B cached, A missing: A should be filtered out, B wins by default
+        driver.tx_set_cache.clear();
+        cache_tx_set(&driver, tx_set_b.clone());
+        let partial_result = driver.combine_candidates_impl(1, &values);
+        let partial_sv = StellarValue::from_xdr(&partial_result.0, Limits::none()).unwrap();
+        // The key assertion: with A missing from cache, the result should be B
+        // (not a silently degraded XOR tiebreak that might pick A)
+        assert_eq!(
+            partial_sv.tx_set_hash.0, tx_set_b.hash.0,
+            "AUDIT-014: Missing tx set A should be filtered out, B should win"
+        );
     }
 }
