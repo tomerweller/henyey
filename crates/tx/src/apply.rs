@@ -335,6 +335,18 @@ impl LedgerDelta {
                 }
             }
         }
+
+        // Also check created entries (account may have been merge+recreated
+        // within the same tx set). Matches stellar-core's loadAccount() which
+        // sees the current LedgerTxn state including recreated accounts.
+        for entry in self.created.iter_mut().rev() {
+            if let LedgerEntryData::Account(acc) = &mut entry.data {
+                if &acc.account_id == account_id {
+                    let _ = try_add_account_balance(acc, refund);
+                    return;
+                }
+            }
+        }
     }
 
     /// Capture the current vector lengths for savepoint support.
@@ -1204,5 +1216,53 @@ mod tests {
             }
             _ => panic!("Expected Data key"),
         }
+    }
+
+    /// Regression test for AUDIT-009: apply_refund_to_account must also search
+    /// created entries, not just updated. When an account is merge+recreated
+    /// within the same tx set, it exists only in `created`.
+    #[test]
+    fn test_audit_009_apply_refund_to_created_entry() {
+        let mut delta = LedgerDelta::new(100);
+
+        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([42u8; 32])));
+        let initial_balance: i64 = 100_000_000;
+
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: account_id.clone(),
+                balance: initial_balance,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        // Record as CREATED (not updated) — simulates merge+recreate
+        delta.record_create(entry);
+        assert_eq!(delta.created_entries().len(), 1);
+        assert_eq!(delta.updated_entries().len(), 0);
+
+        // Apply refund — must find the account in created entries
+        let refund: i64 = 500;
+        delta.apply_refund_to_account(&account_id, refund);
+
+        let balance = match &delta.created_entries()[0].data {
+            LedgerEntryData::Account(acc) => acc.balance,
+            _ => panic!("Expected account entry"),
+        };
+
+        assert_eq!(
+            balance,
+            initial_balance + refund,
+            "AUDIT-009: Refund must be applied to created entries"
+        );
     }
 }
