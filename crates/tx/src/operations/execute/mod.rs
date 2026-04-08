@@ -363,6 +363,9 @@ mod set_options;
 mod sponsorship;
 mod trust_flags;
 
+#[cfg(test)]
+mod parity;
+
 pub use offer_exchange::{
     adjust_offer_amount, exchange_v10_without_price_error_thresholds, ExchangeError,
     ExchangeResult, RoundingType,
