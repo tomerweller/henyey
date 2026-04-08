@@ -525,14 +525,13 @@ impl NominationProtocol {
                         modified = true;
                     }
                 }
-                ValidationLevel::MaybeValid => {
+                ValidationLevel::MaybeValid | ValidationLevel::Invalid => {
                     if let Some(extracted) = ctx.driver.extract_valid_value(ctx.slot_index, value) {
                         if Self::insert_unique(&mut self.votes, extracted) {
                             modified = true;
                         }
                     }
                 }
-                ValidationLevel::Invalid => {}
             }
         }
 
@@ -799,10 +798,9 @@ impl NominationProtocol {
                               best: &mut Option<(u64, Value)>| {
             let candidate = match ctx.driver.validate_value(ctx.slot_index, value, true) {
                 ValidationLevel::FullyValidated => Some(value.clone()),
-                ValidationLevel::MaybeValid => {
+                ValidationLevel::MaybeValid | ValidationLevel::Invalid => {
                     ctx.driver.extract_valid_value(ctx.slot_index, value)
                 }
-                ValidationLevel::Invalid => None,
             };
 
             if let Some(candidate) = candidate {
@@ -2266,5 +2264,111 @@ mod tests {
 
         // The local node should always be present (self-insert fallback).
         assert!(map.contains_key(&local_node));
+    }
+
+    /// Regression test for AUDIT-018 (#1090): extract_valid_value must be called
+    /// for Invalid validation level, not just MaybeValid.
+    ///
+    /// stellar-core (NominationProtocol.cpp:430-450) uses a two-branch if/else on
+    /// kFullyValidatedValue, so extractValidValue is called for BOTH kInvalidValue
+    /// and kMaybeValidValue. The Rust implementation had a three-way match that
+    /// skipped extraction for Invalid.
+    #[test]
+    fn test_extract_valid_value_called_for_invalid_validation() {
+        let node = make_node_id(1);
+        let leader = make_node_id(2);
+        let quorum_set = make_quorum_set(vec![node.clone(), leader.clone()], 1);
+        let driver = Arc::new(ParityMockDriver::new(quorum_set.clone()));
+        let mut nom = NominationProtocol::new();
+
+        let bad_value = make_value(&[99]); // value that validates as Invalid
+        let extracted = make_value(&[42]); // cleaned value from extract_valid_value
+        let prev = make_value(&[0]);
+
+        // Configure driver: validate_value returns Invalid, but extract_valid_value
+        // returns a cleaned value. This simulates a value with a bad signature but
+        // valid tx data — stellar-core extracts and votes for the cleaned value.
+        driver.set_validation_level(ValidationLevel::Invalid);
+        driver.set_extract_result(Some(extracted.clone()));
+
+        // Start nomination
+        nom.nominate(
+            &ctx!(&node, &quorum_set, &driver, 1),
+            make_value(&[1]),
+            &prev,
+            false,
+        );
+
+        // Create envelope from leader with bad_value in accepted
+        let env = make_nomination_envelope(
+            leader.clone(),
+            1,
+            &quorum_set,
+            vec![bad_value.clone()],
+            vec![bad_value.clone()],
+        );
+
+        nom.process_envelope(&env, &ctx!(&node, &quorum_set, &driver, 1));
+
+        // The extracted value should be in votes — extract_valid_value must be
+        // called even when validate_value returns Invalid.
+        assert!(
+            nom.votes().contains(&extracted),
+            "extract_valid_value should be called for Invalid validation level; \
+             extracted value {:?} should be in votes {:?}",
+            extracted,
+            nom.votes()
+        );
+    }
+
+    /// Regression test for AUDIT-018 (#1090): get_new_value_from_nomination must
+    /// call extract_valid_value for Invalid values, not just MaybeValid.
+    #[test]
+    fn test_get_new_value_from_nomination_extracts_invalid() {
+        let node = make_node_id(1);
+        let leader = make_node_id(2);
+        let quorum_set = make_quorum_set(vec![node.clone(), leader.clone()], 1);
+        let driver = Arc::new(ParityMockDriver::new(quorum_set.clone()));
+        let mut nom = NominationProtocol::new();
+
+        let bad_value = make_value(&[80]);
+        let extracted = make_value(&[55]);
+        let prev = make_value(&[0]);
+
+        // Set driver to return Invalid but extract a specific value
+        driver.set_validation_level(ValidationLevel::Invalid);
+        driver.set_extract_result(Some(extracted.clone()));
+
+        // Start nomination
+        nom.nominate(
+            &ctx!(&node, &quorum_set, &driver, 1),
+            make_value(&[1]),
+            &prev,
+            false,
+        );
+
+        // Check if leader is a round leader — if so, get_new_value_from_nomination
+        // will be called during process_envelope
+        let leaders = nom.get_round_leaders();
+        if leaders.contains(&leader) {
+            let env = make_nomination_envelope(
+                leader.clone(),
+                1,
+                &quorum_set,
+                vec![bad_value.clone()],
+                vec![bad_value.clone()],
+            );
+
+            nom.process_envelope(&env, &ctx!(&node, &quorum_set, &driver, 1));
+
+            // The extracted value should be adopted as a vote
+            assert!(
+                nom.votes().contains(&extracted),
+                "get_new_value_from_nomination should extract valid values from Invalid; \
+                 extracted {:?} not found in votes {:?}",
+                extracted,
+                nom.votes()
+            );
+        }
     }
 }
