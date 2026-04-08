@@ -546,57 +546,58 @@ fn test_state_size_window_resize_at_sample_ledger() {
 /// Regression test for AUDIT-025 (#1099).
 ///
 /// After a config upgrade changes `liveSorobanStateSizeWindowSamplePeriod`,
-/// henyey reads the **old** period from the bucket list (which hasn't been
-/// updated yet), while stellar-core reads the **new** period from LedgerTxn.
+/// the sample period must be read from eviction_settings (loaded from the
+/// delta, which contains post-upgrade values), NOT from bucket_list.get()
+/// (which returns the pre-upgrade value since add_batch hasn't run yet).
 ///
-/// This causes divergent `is_sample_ledger` decisions: a ledger that IS a
-/// sample ledger with the new period may NOT be one with the old period
-/// (or vice versa).
+/// Parity: stellar-core reads from LedgerTxn which includes the upgrade.
+///
+/// This test verifies the arithmetic: a ledger that IS a sample ledger
+/// with the new (post-upgrade) period may NOT be one with the old period.
+/// The fix in manager.rs ensures henyey uses the new period from
+/// eviction_settings rather than the stale bucket_list value.
 #[test]
 fn test_sample_period_read_from_stale_source() {
     let old_period = 64u32;
     let new_period = 32u32;
     let ledger_seq = 96u32;
 
-    // With old period: 96 % 64 = 32 ≠ 0 → NOT a sample ledger
-    // With new period: 96 % 32 = 0 → IS a sample ledger
+    // With old period (bucket_list, pre-upgrade): 96 % 64 = 32 != 0 -> NOT a sample ledger
+    // With new period (eviction_settings, post-upgrade): 96 % 32 = 0 -> IS a sample ledger
     let is_sample_old = old_period > 0 && ledger_seq % old_period == 0;
     let is_sample_new = new_period > 0 && ledger_seq % new_period == 0;
 
+    // The old (stale) period would incorrectly skip this sample ledger
     assert!(
         !is_sample_old,
-        "Ledger {} should NOT be a sample ledger with period {}",
+        "Ledger {} should NOT be a sample ledger with stale period {}",
         ledger_seq, old_period
     );
+    // The new (correct, from eviction_settings) period correctly identifies this as a sample
     assert!(
         is_sample_new,
-        "Ledger {} SHOULD be a sample ledger with period {}",
+        "Ledger {} SHOULD be a sample ledger with post-upgrade period {}",
         ledger_seq, new_period
     );
 
-    // In henyey, the sample period is read from the bucket list AFTER the
-    // delta has been drained (drain_categorization_for_bucket_update) but
-    // BEFORE add_batch. The bucket list still has the old period.
+    // After the fix: manager.rs reads sample_period from eviction_settings
+    // (loaded from delta which contains the upgrade), so it uses new_period (32)
+    // and correctly identifies ledger 96 as a sample ledger.
     //
-    // In stellar-core, the sample period is read from LedgerTxn which
-    // already includes the config upgrade's new period.
-    //
-    // This means henyey skips the window snapshot at ledger 96 because
-    // it thinks 96 is not a sample ledger (using old period 64), while
-    // stellar-core creates a window entry (using new period 32).
-
+    // Before the fix: manager.rs read from bucket_list.get() which still had
+    // old_period (64), causing it to skip the window snapshot at ledger 96.
     assert_ne!(
         is_sample_old, is_sample_new,
-        "AUDIT-025 (#1099): Stale sample period ({}) vs new period ({}) produce \n\
+        "AUDIT-025 (#1099): Post-upgrade period ({}) vs pre-upgrade period ({}) produce \n\
          different is_sample_ledger decisions for ledger {}. \n\
-         henyey reads from bucket_list.get() (old value) instead of the \n\
-         post-upgrade value in the delta/LedgerTxn.",
-        old_period, new_period, ledger_seq
+         The fix reads from eviction_settings (post-upgrade) instead of bucket_list (stale).",
+        new_period, old_period, ledger_seq
     );
 }
 
-/// Additional test: the reverse case — old period makes it a sample ledger,
-/// new period does not. This would create a spurious window snapshot.
+/// Reverse case for AUDIT-025: old period makes it a sample ledger,
+/// new period does not. Without the fix, this would create a spurious
+/// window snapshot using the stale bucket_list value.
 #[test]
 fn test_sample_period_stale_spurious_snapshot() {
     let old_period = 32u32;
@@ -606,15 +607,17 @@ fn test_sample_period_stale_spurious_snapshot() {
     let is_sample_old = old_period > 0 && ledger_seq % old_period == 0;
     let is_sample_new = new_period > 0 && ledger_seq % new_period == 0;
 
-    // Old: 96 % 32 = 0 → IS sample → henyey creates window entry
-    // New: 96 % 64 = 32 ≠ 0 → NOT sample → stellar-core skips
+    // Old (stale): 96 % 32 = 0 -> IS sample -> would create spurious window entry
+    // New (correct): 96 % 64 = 32 != 0 -> NOT sample -> correctly skipped
     assert!(is_sample_old);
     assert!(!is_sample_new);
 
+    // After the fix: eviction_settings has new_period (64), so ledger 96 is
+    // correctly NOT a sample ledger. No spurious window snapshot is created.
     assert_ne!(
         is_sample_old, is_sample_new,
-        "AUDIT-025 (#1099): Stale sample period ({}) creates a SPURIOUS window \n\
-         snapshot at ledger {} that stellar-core (using new period {}) would skip.",
+        "AUDIT-025 (#1099): Stale period ({}) would create a SPURIOUS window \n\
+         snapshot at ledger {} that the correct post-upgrade period ({}) would skip.",
         old_period, ledger_seq, new_period
     );
 }

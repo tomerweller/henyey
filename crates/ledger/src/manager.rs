@@ -4700,28 +4700,16 @@ impl LedgerCloseContext<'_> {
                 });
 
                 if !has_window_entry {
-                    // Check if this is a sample ledger before computing window entry
-                    // Sample period is typically 64 ledgers
-                    let archival_key = stellar_xdr::curr::LedgerKey::ConfigSetting(
-                        stellar_xdr::curr::LedgerKeyConfigSetting {
-                            config_setting_id: stellar_xdr::curr::ConfigSettingId::StateArchival,
-                        },
-                    );
-                    let sample_period = bucket_list
-                        .get(&archival_key)
-                        .ok()
-                        .flatten()
-                        .and_then(|e| {
-                            if let LedgerEntryData::ConfigSetting(
-                                stellar_xdr::curr::ConfigSettingEntry::StateArchival(archival),
-                            ) = e.data
-                            {
-                                Some(archival.live_soroban_state_size_window_sample_period)
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or(64); // Default to 64 if not found
+                    // Check if this is a sample ledger before computing window entry.
+                    // Use eviction_settings (loaded from delta at line ~4414, which
+                    // contains post-upgrade values) instead of bucket_list.get() which
+                    // returns the pre-upgrade period since add_batch hasn't run yet.
+                    // Parity: stellar-core reads from LedgerTxn (post-upgrade).
+                    // Fix for AUDIT-025 (#1099).
+                    let sample_period = eviction_settings
+                        .as_ref()
+                        .map(|s| s.live_soroban_state_size_window_sample_period)
+                        .unwrap_or(64);
 
                     // Only compute state size on sample ledgers
                     let is_sample_ledger =
