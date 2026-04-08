@@ -1804,7 +1804,7 @@ impl TransactionExecutor {
         base_fee: u32,
         soroban_prng_seed: Option<[u8; 32]>,
         deduct_fee: bool,
-        fee_source_pre_state: Option<LedgerEntry>,
+        _fee_source_pre_state: Option<LedgerEntry>,
     ) -> Result<std::result::Result<PreApplyResult, TransactionExecutionResult>> {
         let tx_timing_start = std::time::Instant::now();
 
@@ -1976,26 +1976,39 @@ impl TransactionExecutor {
 
         let tx_changes_before: LedgerEntryChanges;
 
-        // For fee bump transactions in two-phase mode, stellar-core's
-        // FeeBumpTransactionFrame::apply() ALWAYS calls removeOneTimeSignerKeyFromFeeSource()
-        // which loads the fee source account, generating a STATE/UPDATED pair even if
-        // the fee source equals the inner source. This happens BEFORE the inner transaction's
-        // sequence bump. We capture this to match stellar-core ordering.
-        let fee_bump_wrapper_changes = if !deduct_fee && frame.is_fee_bump() {
+        // For fee bump transactions, stellar-core's FeeBumpTransactionFrame::apply()
+        // ALWAYS calls removeOneTimeSignerKeyFromFeeSource() which removes any PreAuthTx
+        // signer matching the fee bump outer hash from the fee source account. This happens
+        // in both single-phase (deduct_fee=true) and two-phase (deduct_fee=false) modes.
+        //
+        // In two-phase mode, the STATE/UPDATED pair is captured in fee_bump_wrapper_changes
+        // for metadata. In single-phase mode, the signer removal still happens but the
+        // metadata changes are captured by the normal flush mechanism.
+        let fee_bump_wrapper_changes = if frame.is_fee_bump() {
             let fee_source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
                 account_id: fee_source_id.clone(),
             });
-            if let Some(fee_source_entry) = self.state.get_entry(&fee_source_key) {
-                // Both STATE and UPDATED use the same (current) state value.
-                // In stellar-core, the fee bump wrapper's tx_changes_before captures
-                // the fee source state AFTER fee processing (which happened in fee_meta).
-                // This is just for removeOneTimeSignerKeyFromFeeSource() which doesn't
-                // change the balance - hence STATE and UPDATED have the same value.
-                // We ignore fee_source_pre_state as it's not needed.
-                let _ = fee_source_pre_state; // Explicitly ignore the parameter
+            if let Some(fee_source_before) = self.state.get_entry(&fee_source_key) {
+                // Remove the PreAuthTx signer matching the fee bump outer hash from
+                // the fee source, matching stellar-core's removeOneTimeSignerKeyFromFeeSource().
+                let signer_key = stellar_xdr::curr::SignerKey::PreAuthTx(
+                    stellar_xdr::curr::Uint256(outer_hash.0),
+                );
+                self.state
+                    .remove_account_signer(&fee_source_id, &signer_key);
+                self.state.flush_modified_entries();
+
+                // Always capture the STATE/UPDATED pair. In stellar-core,
+                // removeOneTimeSignerKeyFromFeeSource() runs in its own LedgerTxn
+                // and pushes to txChangesBefore regardless of fee mode.
+                let fee_source_after = self
+                    .state
+                    .get_entry(&fee_source_key)
+                    .unwrap_or_else(|| fee_source_before.clone());
+
                 vec![
-                    LedgerEntryChange::State(fee_source_entry.clone()),
-                    LedgerEntryChange::Updated(fee_source_entry),
+                    LedgerEntryChange::State(fee_source_before),
+                    LedgerEntryChange::Updated(fee_source_after),
                 ]
             } else {
                 vec![]
@@ -2045,8 +2058,16 @@ impl TransactionExecutor {
         // Remove one-time (PreAuthTx) signers from all source accounts.
         // This must happen AFTER the signature check above so PreAuthTx signers
         // are still present when their weight is evaluated.
+        // For fee bump transactions, use the inner TX contents hash (not the outer
+        // fee bump hash), matching stellar-core's TransactionFrame::removeOneTimeSignerFromAllSourceAccounts()
+        // which is called on the inner transaction.
+        let signer_removal_hash = if frame.is_fee_bump() {
+            fee_bump_inner_hash(&frame, &self.network_id)?
+        } else {
+            outer_hash
+        };
         let (signer_changes, signer_created, signer_updated, signer_deleted, signer_removal_us) =
-            self.remove_one_time_signers_phase(&frame, &inner_source_id, &outer_hash);
+            self.remove_one_time_signers_phase(&frame, &inner_source_id, &signer_removal_hash);
 
         let (seq_changes, seq_created, seq_updated, seq_deleted, seq_bump_us) =
             self.bump_sequence_phase(&frame, &inner_source_id);
