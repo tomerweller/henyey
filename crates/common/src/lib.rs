@@ -47,6 +47,7 @@
 //! ```
 
 pub mod asset;
+pub mod checked_types;
 pub mod config;
 pub mod error;
 pub mod fs_utils;
