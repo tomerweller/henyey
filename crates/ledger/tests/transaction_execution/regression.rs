@@ -4143,8 +4143,7 @@ fn test_audit_005_fee_bump_pre_auth_signer_removed_from_fee_source() {
         ext: LedgerEntryExt::V0,
     };
 
-    let (inner_key, inner_entry) =
-        create_account_entry(inner_account_id.clone(), 1, 20_000_000);
+    let (inner_key, inner_entry) = create_account_entry(inner_account_id.clone(), 1, 20_000_000);
 
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(fee_key, fee_entry)
