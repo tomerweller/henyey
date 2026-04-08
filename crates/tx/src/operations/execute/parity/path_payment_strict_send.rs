@@ -331,13 +331,11 @@ fn test_path_payment_strict_send_line_full() {
     );
 }
 
-/// NoIssuer is unreachable in protocol 13+ (CAP-0017).
+/// Dead code: NoIssuer is unreachable in protocol 13+ (CAP-0017).
+/// check_issuer() always returns Ok(()). The variant exists in XDR but cannot be triggered.
 #[test]
-#[ignore]
-fn test_path_payment_strict_send_no_issuer() {
-    // TODO(#1126): Dead code path — check_issuer always returns Ok(()).
-    todo!()
-}
+#[ignore = "Dead code: CAP-0017 (protocol 13+) removed issuer existence checks"]
+fn test_path_payment_strict_send_no_issuer() {}
 
 /// TooFewOffers when no offers exist for a cross-asset path.
 #[test]
@@ -389,19 +387,158 @@ fn test_path_payment_strict_send_too_few_offers() {
     );
 }
 
-/// OfferCrossSelf requires DEX offer setup.
+/// PathPaymentStrictSend returns OfferCrossSelf when the path would cross
+/// the source's own offer in the DEX.
 #[test]
-#[ignore]
 fn test_path_payment_strict_send_offer_cross_self() {
-    // TODO(#1126): Requires source's own offer in the DEX.
-    todo!()
+    let mut state = LedgerStateManager::new(5_000_000, 100);
+    let context = create_test_context();
+
+    let source_id = create_test_account_id(0);
+    let dest_id = create_test_account_id(1);
+    let issuer_a = create_test_account_id(2);
+    let issuer_b = create_test_account_id(3);
+
+    state.create_account(create_test_account(source_id.clone(), 100_000_000));
+    state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+    state.create_account(create_test_account(issuer_a.clone(), 100_000_000));
+    state.create_account(create_test_account(issuer_b.clone(), 100_000_000));
+
+    let asset_a = create_test_asset(b"AAA\0", issuer_a.clone());
+    let asset_b = create_test_asset(b"BBB\0", issuer_b.clone());
+
+    state.create_trustline(create_test_trustline(
+        source_id.clone(),
+        create_test_trustline_asset(b"AAA\0", issuer_a.clone()),
+        100_000,
+        1_000_000,
+        TrustLineFlags::AuthorizedFlag as u32,
+    ));
+    state.create_trustline(create_test_trustline(
+        source_id.clone(),
+        create_test_trustline_asset(b"BBB\0", issuer_b.clone()),
+        100_000,
+        1_000_000,
+        TrustLineFlags::AuthorizedFlag as u32,
+    ));
+    state.create_trustline(create_test_trustline(
+        dest_id.clone(),
+        create_test_trustline_asset(b"BBB\0", issuer_b),
+        0,
+        1_000_000,
+        TrustLineFlags::AuthorizedFlag as u32,
+    ));
+
+    // Source's own offer: selling B for A. Path payment sends A→B crosses it.
+    state.create_offer(OfferEntry {
+        seller_id: source_id.clone(),
+        offer_id: 1,
+        selling: asset_b.clone(),
+        buying: asset_a.clone(),
+        amount: 10_000,
+        price: Price { n: 1, d: 1 },
+        flags: 0,
+        ext: OfferEntryExt::V0,
+    });
+
+    let op = PathPaymentStrictSendOp {
+        send_asset: asset_a,
+        send_amount: 100,
+        destination: MuxedAccount::Ed25519(Uint256([1; 32])),
+        dest_asset: asset_b,
+        dest_min: 1,
+        path: vec![].try_into().unwrap(),
+    };
+
+    let result = execute_path_payment_strict_send(&op, &source_id, &mut state, &context);
+    assert_op_result!(
+        result,
+        OperationResultTr::PathPaymentStrictSend(PathPaymentStrictSendResult::OfferCrossSelf)
+    );
 }
 
-/// UnderDestmin requires offers that convert at an unfavorable rate.
+/// PathPaymentStrictSend returns UnderDestmin when the received amount
+/// (after going through offers) is less than dest_min.
 #[test]
-#[ignore]
 fn test_path_payment_strict_send_under_destmin() {
-    // TODO(#1126): Requires offers in the DEX that convert at an unfavorable rate,
-    // causing the received amount to be below dest_min.
-    todo!()
+    let mut state = LedgerStateManager::new(5_000_000, 100);
+    let context = create_test_context();
+
+    let source_id = create_test_account_id(0);
+    let dest_id = create_test_account_id(1);
+    let seller_id = create_test_account_id(2);
+    let issuer_a = create_test_account_id(3);
+    let issuer_b = create_test_account_id(4);
+
+    state.create_account(create_test_account(source_id.clone(), 100_000_000));
+    state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+    state.create_account(create_test_account(seller_id.clone(), 100_000_000));
+    state.create_account(create_test_account(issuer_a.clone(), 100_000_000));
+    state.create_account(create_test_account(issuer_b.clone(), 100_000_000));
+
+    let asset_a = create_test_asset(b"AAA\0", issuer_a.clone());
+    let asset_b = create_test_asset(b"BBB\0", issuer_b.clone());
+
+    state.create_trustline(create_test_trustline(
+        source_id.clone(),
+        create_test_trustline_asset(b"AAA\0", issuer_a.clone()),
+        1_000_000,
+        10_000_000,
+        TrustLineFlags::AuthorizedFlag as u32,
+    ));
+    state.create_trustline(create_test_trustline(
+        dest_id.clone(),
+        create_test_trustline_asset(b"BBB\0", issuer_b.clone()),
+        0,
+        10_000_000,
+        TrustLineFlags::AuthorizedFlag as u32,
+    ));
+    // Seller has A trustline (buying A via offer)
+    state.create_trustline(create_trustline_with_liabilities(
+        seller_id.clone(),
+        create_test_trustline_asset(b"AAA\0", issuer_a),
+        0,
+        10_000_000,
+        TrustLineFlags::AuthorizedFlag as u32,
+        100_000, // buying liabilities — seller buys A
+        0,
+    ));
+    // Seller has B trustline (selling B via offer)
+    state.create_trustline(create_trustline_with_liabilities(
+        seller_id.clone(),
+        create_test_trustline_asset(b"BBB\0", issuer_b),
+        1_000_000,
+        10_000_000,
+        TrustLineFlags::AuthorizedFlag as u32,
+        0,      // buying liabilities
+        10_000, // selling liabilities matching offer amount
+    ));
+
+    // Seller offers B for A at price 10:1 (expensive: 10 A buys 1 B)
+    state.create_offer(OfferEntry {
+        seller_id: seller_id.clone(),
+        offer_id: 1,
+        selling: asset_b.clone(),
+        buying: asset_a.clone(),
+        amount: 10_000,
+        price: Price { n: 10, d: 1 },
+        flags: 0,
+        ext: OfferEntryExt::V0,
+    });
+
+    // Source sends exactly 100 A. At 10:1 rate, gets ~10 B. dest_min=1000 is way too high.
+    let op = PathPaymentStrictSendOp {
+        send_asset: asset_a,
+        send_amount: 100,
+        destination: MuxedAccount::Ed25519(Uint256([1; 32])),
+        dest_asset: asset_b,
+        dest_min: 1000,
+        path: vec![].try_into().unwrap(),
+    };
+
+    let result = execute_path_payment_strict_send(&op, &source_id, &mut state, &context);
+    assert_op_result!(
+        result,
+        OperationResultTr::PathPaymentStrictSend(PathPaymentStrictSendResult::UnderDestmin)
+    );
 }

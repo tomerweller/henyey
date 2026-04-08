@@ -46,28 +46,18 @@ fn test_allow_trust_malformed_source_not_found() {
     );
 }
 
-/// TrustNotRequired was returned in older protocols when the issuer didn't have
-/// AUTH_REQUIRED set. Since CAP-0035 (protocol 17+), this check was removed.
-/// The variant exists in XDR and make_allow_trust_result but is never triggered.
+/// Dead code: TrustNotRequired is unreachable in protocol 17+ (CAP-0035).
+/// The check was removed from execute_allow_trust. The variant exists in XDR
+/// and make_allow_trust_result but is never triggered.
 #[test]
-#[ignore]
-fn test_allow_trust_trust_not_required() {
-    // TODO(#1126): TrustNotRequired is unreachable in protocol 17+ (CAP-0035).
-    // The check was removed from execute_allow_trust. This code path cannot be
-    // triggered in the current implementation (protocol 24+).
-    todo!()
-}
+#[ignore = "Dead code: CAP-0035 (protocol 17+) removed TrustNotRequired check"]
+fn test_allow_trust_trust_not_required() {}
 
 /// LowReserve is returned when deauthorizing a trustline causes pool share
 /// redemption that fails due to insufficient reserve on the trustor's account.
+/// Requires: issuer with AUTH_REVOCABLE, trustor with pool share trustline,
+/// liquidity pool deposit, deauthorization triggering redemption, and the
+/// trustor having insufficient reserve for the redemption.
 #[test]
-#[ignore]
-fn test_allow_trust_low_reserve() {
-    // TODO(#1126): Requires complex setup:
-    // 1. Create issuer with AUTH_REVOCABLE
-    // 2. Create trustor with trustlines for two assets + a pool share trustline
-    // 3. Deposit into liquidity pool
-    // 4. Deauthorize one asset → triggers pool share redemption
-    // 5. Trustor must have insufficient reserve for the redemption
-    todo!()
-}
+#[ignore = "Complex setup: requires liquidity pool + deauthorization + reserve exhaustion"]
+fn test_allow_trust_low_reserve() {}

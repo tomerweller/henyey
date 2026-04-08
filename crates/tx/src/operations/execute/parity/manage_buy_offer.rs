@@ -5,19 +5,12 @@
 //! - `SellNoIssuer` — dead code in protocol 13+ (CAP-0017)
 //! - `BuyNoIssuer` — dead code in protocol 13+ (CAP-0017)
 
-/// SellNoIssuer is defined in XDR but unreachable in protocol 13+ (CAP-0017).
+/// Dead code: SellNoIssuer is unreachable in protocol 13+ (CAP-0017).
 #[test]
-#[ignore]
-fn test_manage_buy_offer_sell_no_issuer() {
-    // TODO(#1126): SellNoIssuer is unreachable in protocol 13+ (CAP-0017).
-    // ManageBuyOffer delegates to the same execute_manage_offer code path.
-    todo!()
-}
+#[ignore = "Dead code: CAP-0017 (protocol 13+) removed issuer existence checks"]
+fn test_manage_buy_offer_sell_no_issuer() {}
 
-/// BuyNoIssuer is defined in XDR but unreachable in protocol 13+ (CAP-0017).
+/// Dead code: BuyNoIssuer is unreachable in protocol 13+ (CAP-0017).
 #[test]
-#[ignore]
-fn test_manage_buy_offer_buy_no_issuer() {
-    // TODO(#1126): BuyNoIssuer is unreachable in protocol 13+ (CAP-0017).
-    todo!()
-}
+#[ignore = "Dead code: CAP-0017 (protocol 13+) removed issuer existence checks"]
+fn test_manage_buy_offer_buy_no_issuer() {}

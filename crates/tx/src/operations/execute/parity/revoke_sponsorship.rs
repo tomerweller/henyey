@@ -123,21 +123,90 @@ fn test_revoke_sponsorship_not_sponsor() {
 /// RevokeSponsorship returns OnlyTransferable for ClaimableBalance entries
 /// when there is no new sponsor to transfer to (will_be_sponsored=false).
 #[test]
-#[ignore]
 fn test_revoke_sponsorship_only_transferable() {
-    // TODO(#1126): Requires creating a ClaimableBalance entry in the ledger
-    // state with an entry sponsor, then calling revoke without a new sponsor.
-    // ClaimableBalance creation requires specific state setup not yet abstracted.
-    todo!()
+    let mut state = LedgerStateManager::new(5_000_000, 100);
+    let context = create_test_context();
+
+    let sponsor_id = create_test_account_id(0);
+    let claimant_id = create_test_account_id(1);
+
+    state.create_account(create_test_account_with_sponsorship(
+        sponsor_id.clone(),
+        100_000_000,
+        0, // num_sub_entries
+        0, // num_sponsored
+        1, // num_sponsoring (sponsors the CB)
+    ));
+    state.create_account(create_test_account(claimant_id.clone(), 100_000_000));
+
+    let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([50; 32]));
+    let cb_entry = ClaimableBalanceEntry {
+        balance_id: balance_id.clone(),
+        claimants: vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+            destination: claimant_id,
+            predicate: ClaimPredicate::Unconditional,
+        })]
+        .try_into()
+        .unwrap(),
+        asset: Asset::Native,
+        amount: 1_000_000,
+        ext: ClaimableBalanceEntryExt::V0,
+    };
+    state.create_claimable_balance(cb_entry);
+
+    let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+        balance_id: balance_id.clone(),
+    });
+    state.set_entry_sponsor(ledger_key.clone(), sponsor_id.clone());
+
+    let op = RevokeSponsorshipOp::LedgerEntry(ledger_key);
+
+    // Sponsor revokes with no new sponsor → OnlyTransferable for CB entries
+    let result = execute_revoke_sponsorship(&op, &sponsor_id, &mut state, &context);
+    assert_op_result!(
+        result,
+        OperationResultTr::RevokeSponsorship(RevokeSponsorshipResult::OnlyTransferable)
+    );
 }
 
 /// RevokeSponsorship returns Malformed for ClaimableBalance entries that have
-/// no entry sponsor set.
+/// no entry sponsor set (the code checks entry_sponsor() and returns Malformed if None).
 #[test]
-#[ignore]
 fn test_revoke_sponsorship_malformed() {
-    // TODO(#1126): Requires creating a ClaimableBalance entry without an entry
-    // sponsor. The code path: ClaimableBalance match arm checks entry_sponsor()
-    // and returns Malformed if None.
-    todo!()
+    let mut state = LedgerStateManager::new(5_000_000, 100);
+    let context = create_test_context();
+
+    let source_id = create_test_account_id(0);
+    let claimant_id = create_test_account_id(1);
+
+    state.create_account(create_test_account(source_id.clone(), 100_000_000));
+    state.create_account(create_test_account(claimant_id.clone(), 100_000_000));
+
+    let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([51; 32]));
+    let cb_entry = ClaimableBalanceEntry {
+        balance_id: balance_id.clone(),
+        claimants: vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+            destination: claimant_id,
+            predicate: ClaimPredicate::Unconditional,
+        })]
+        .try_into()
+        .unwrap(),
+        asset: Asset::Native,
+        amount: 1_000_000,
+        ext: ClaimableBalanceEntryExt::V0,
+    };
+    state.create_claimable_balance(cb_entry);
+
+    // NO entry sponsor set for this CB
+
+    let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+        balance_id: balance_id.clone(),
+    });
+    let op = RevokeSponsorshipOp::LedgerEntry(ledger_key);
+
+    let result = execute_revoke_sponsorship(&op, &source_id, &mut state, &context);
+    assert_op_result!(
+        result,
+        OperationResultTr::RevokeSponsorship(RevokeSponsorshipResult::Malformed)
+    );
 }
