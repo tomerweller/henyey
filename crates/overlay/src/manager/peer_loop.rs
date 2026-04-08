@@ -420,11 +420,11 @@ impl OverlayManager {
         }
 
         if helpers::is_handshake_message(message) {
-            debug!(
-                "Ignoring handshake message from authenticated peer {}",
+            warn!(
+                "Dropping peer {} for sending post-auth handshake message",
                 peer_id
             );
-            return Some(false);
+            return None; // drop peer, matching stellar-core
         }
 
         if should_skip_generic_routing(message) {
