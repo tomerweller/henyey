@@ -2249,18 +2249,12 @@ impl HerderScpCallback {
 }
 
 impl SCPDriver for HerderScpCallback {
-    fn validate_value(&self, slot_index: u64, value: &Value, nomination: bool) -> ValidationLevel {
-        // Parity: stellar-core's HerderSCPDriver::validateValue returns
-        // kFullyValidatedValue for ballot protocol (nomination=false).
-        // During the ballot protocol (PREPARE/CONFIRM/EXTERNALIZE), the
-        // value was already validated during nomination — re-validation
-        // would fail for future slots whose close times are ahead of our
-        // local state. This is critical for post-catchup convergence:
-        // EXTERNALIZE envelopes from the current network slot must be
-        // accepted without close-time or tx-set validation.
-        if !nomination {
-            return ValidationLevel::FullyValidated;
-        }
+    fn validate_value(&self, slot_index: u64, value: &Value, _nomination: bool) -> ValidationLevel {
+        // Always validate: stellar-core's validateValue() runs XDR deserialization,
+        // STELLAR_VALUE_SIGNED check, signature verification, close-time validation,
+        // and upgrade checks for ALL statements (both nomination and ballot).
+        // TODO: propagate `nomination` to check_upgrades_valid() — stellar-core uses
+        // it for additional strictness during nomination (isValidForNomination).
         match self.driver.validate_value_impl(slot_index, value) {
             ValueValidation::Valid => ValidationLevel::FullyValidated,
             ValueValidation::MaybeValid => ValidationLevel::MaybeValid,
@@ -3375,6 +3369,38 @@ mod tests {
         assert!(
             !ScpDriver::is_tx_set_well_formed(&tx_set),
             "Tx set with duplicate should not be well-formed"
+        );
+    }
+
+    /// Regression test for AUDIT-006: validate_value must not skip validation
+    /// during the ballot protocol (nomination=false). Previously, the callback
+    /// returned FullyValidated immediately when nomination=false, allowing
+    /// malformed or unsigned values to pass through unchecked.
+    #[test]
+    fn test_audit_006_validate_value_rejects_invalid_during_ballot() {
+        use henyey_scp::SCPDriver;
+
+        let driver = Arc::new(make_test_driver());
+        let callback = HerderScpCallback::new(driver);
+
+        // Garbage bytes that cannot decode as a StellarValue.
+        let garbage_value: Value = vec![0xDE, 0xAD, 0xBE, 0xEF].try_into().unwrap();
+
+        // During nomination: must reject invalid XDR.
+        let result_nom = callback.validate_value(1, &garbage_value, true);
+        assert_eq!(
+            result_nom,
+            ValidationLevel::Invalid,
+            "nomination=true must reject garbage"
+        );
+
+        // During ballot protocol: must ALSO reject invalid XDR.
+        // Before the fix, this returned FullyValidated.
+        let result_ballot = callback.validate_value(1, &garbage_value, false);
+        assert_eq!(
+            result_ballot,
+            ValidationLevel::Invalid,
+            "nomination=false must reject garbage (AUDIT-006)"
         );
     }
 }
