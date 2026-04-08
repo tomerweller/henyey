@@ -2276,4 +2276,69 @@ mod tests {
             other => panic!("unexpected result: {:?}", other),
         }
     }
+
+    /// CAP-77: ClaimClaimableBalance returns TrustlineFrozen when the claimant's
+    /// trustline for the claimable balance asset is frozen via FrozenKeyConfig.
+    #[test]
+    fn test_claim_claimable_balance_trustline_frozen() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+
+        let issuer_id = create_test_account_id(0);
+        let claimant_id = create_test_account_id(1);
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+        state.create_account(create_test_account(claimant_id.clone(), 100_000_000));
+
+        // Claimant has authorized trustline for USD
+        state.create_trustline(create_test_trustline(
+            claimant_id.clone(),
+            issuer_id.clone(),
+            true,
+            false,
+            0,
+        ));
+        state.get_account_mut(&claimant_id).unwrap().num_sub_entries += 1;
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id.clone(),
+        });
+
+        // Create claimable balance with claimant as valid recipient
+        let claimants = vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+            destination: claimant_id.clone(),
+            predicate: ClaimPredicate::Unconditional,
+        })];
+        let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([42u8; 32]));
+        let entry = ClaimableBalanceEntry {
+            balance_id: balance_id.clone(),
+            claimants: claimants.try_into().unwrap(),
+            asset: asset.clone(),
+            amount: 1000,
+            ext: ClaimableBalanceEntryExt::V0,
+        };
+        state.create_claimable_balance(entry);
+
+        // Freeze the claimant's USD trustline via CAP-77
+        let frozen_key = crate::frozen_keys::trustline_key(&claimant_id, &asset);
+        let frozen_bytes =
+            stellar_xdr::curr::WriteXdr::to_xdr(&frozen_key, Limits::none()).unwrap();
+
+        let mut context = create_test_context();
+        context.frozen_key_config =
+            crate::frozen_keys::FrozenKeyConfig::new(vec![frozen_bytes], vec![]);
+
+        let op = ClaimClaimableBalanceOp { balance_id };
+        let result =
+            execute_claim_claimable_balance(&op, &claimant_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ClaimClaimableBalance(r)) => {
+                assert!(
+                    matches!(r, ClaimClaimableBalanceResult::TrustlineFrozen),
+                    "Expected TrustlineFrozen, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
 }

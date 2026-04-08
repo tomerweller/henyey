@@ -2355,7 +2355,7 @@ mod tests {
             0,
         ));
 
-        // Trustline A: deauthorized (flags=0, no AUTHORIZED_FLAG)
+        // Trustline A: deauthorized (flags=0, no TrustLineFlags::AuthorizedFlag as u32)
         let trustline_a = TrustLineEntry {
             account_id: source_id.clone(),
             asset: TrustLineAsset::CreditAlphanum4(match &asset_a {
@@ -2408,6 +2408,206 @@ mod tests {
                 assert!(
                     matches!(r, LiquidityPoolDepositResult::NotAuthorized),
                     "Expected NotAuthorized, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    /// CAP-77: LiquidityPoolDeposit returns TrustlineFrozen when one of the
+    /// pool's asset trustlines is frozen via FrozenKeyConfig.
+    #[test]
+    fn test_liquidity_pool_deposit_trustline_frozen() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+
+        let source_id = create_test_account_id(0);
+        let issuer_a = create_test_account_id(1);
+        let issuer_b = create_test_account_id(2);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000, 0));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"AAA\0"),
+            issuer: issuer_a.clone(),
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"BBB\0"),
+            issuer: issuer_b.clone(),
+        });
+
+        // Source has authorized trustlines for both assets
+        state.create_trustline(TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"AAA\0"),
+                issuer: issuer_a,
+            }),
+            balance: 1_000_000,
+            limit: 10_000_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        });
+        state.create_trustline(TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"BBB\0"),
+                issuer: issuer_b,
+            }),
+            balance: 1_000_000,
+            limit: 10_000_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        });
+
+        // Create pool with reserves and shares
+        let pool_id = PoolId(Hash([99; 32]));
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            10_000,
+            10_000,
+            10_000,
+        ));
+
+        // Source has pool share trustline
+        let pool_share_asset = TrustLineAsset::PoolShare(pool_id.clone());
+        state.create_trustline(TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: pool_share_asset,
+            balance: 0,
+            limit: 10_000_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        });
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+
+        // Freeze source's trustline for asset_a via CAP-77
+        let frozen_key = crate::frozen_keys::trustline_key(&source_id, &asset_a);
+        let frozen_bytes =
+            stellar_xdr::curr::WriteXdr::to_xdr(&frozen_key, Limits::none()).unwrap();
+
+        let mut context = create_test_context();
+        context.frozen_key_config =
+            crate::frozen_keys::FrozenKeyConfig::new(vec![frozen_bytes], vec![]);
+
+        let op = LiquidityPoolDepositOp {
+            liquidity_pool_id: pool_id,
+            max_amount_a: 1000,
+            max_amount_b: 1000,
+            min_price: Price { n: 1, d: 2 },
+            max_price: Price { n: 2, d: 1 },
+        };
+
+        let result = execute_liquidity_pool_deposit(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolDeposit(r)) => {
+                assert!(
+                    matches!(r, LiquidityPoolDepositResult::TrustlineFrozen),
+                    "Expected TrustlineFrozen, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    /// CAP-77: LiquidityPoolWithdraw returns TrustlineFrozen when one of the
+    /// pool's asset trustlines is frozen via FrozenKeyConfig.
+    #[test]
+    fn test_liquidity_pool_withdraw_trustline_frozen() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+
+        let source_id = create_test_account_id(0);
+        let issuer_a = create_test_account_id(1);
+        let issuer_b = create_test_account_id(2);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000, 0));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"AAA\0"),
+            issuer: issuer_a.clone(),
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"BBB\0"),
+            issuer: issuer_b.clone(),
+        });
+
+        // Source has authorized trustlines for both assets
+        state.create_trustline(TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"AAA\0"),
+                issuer: issuer_a,
+            }),
+            balance: 0,
+            limit: 10_000_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        });
+        state.create_trustline(TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"BBB\0"),
+                issuer: issuer_b,
+            }),
+            balance: 0,
+            limit: 10_000_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        });
+
+        // Create pool with reserves and shares
+        let pool_id = PoolId(Hash([99; 32]));
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            10_000,
+            10_000,
+            10_000,
+        ));
+
+        // Source has pool share trustline with balance
+        let pool_share_asset = TrustLineAsset::PoolShare(pool_id.clone());
+        state.create_trustline(TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: pool_share_asset,
+            balance: 1_000,
+            limit: 10_000_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        });
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+
+        // Freeze source's trustline for asset_b via CAP-77
+        let frozen_key = crate::frozen_keys::trustline_key(&source_id, &asset_b);
+        let frozen_bytes =
+            stellar_xdr::curr::WriteXdr::to_xdr(&frozen_key, Limits::none()).unwrap();
+
+        let mut context = create_test_context();
+        context.frozen_key_config =
+            crate::frozen_keys::FrozenKeyConfig::new(vec![frozen_bytes], vec![]);
+
+        let op = LiquidityPoolWithdrawOp {
+            liquidity_pool_id: pool_id,
+            amount: 100,
+            min_amount_a: 0,
+            min_amount_b: 0,
+        };
+
+        let result =
+            execute_liquidity_pool_withdraw(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolWithdraw(r)) => {
+                assert!(
+                    matches!(r, LiquidityPoolWithdrawResult::TrustlineFrozen),
+                    "Expected TrustlineFrozen, got {:?}",
                     r
                 );
             }

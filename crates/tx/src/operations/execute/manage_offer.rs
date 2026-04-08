@@ -3295,4 +3295,277 @@ mod tests {
             other => panic!("unexpected: {:?}", other),
         }
     }
+
+    // ── ManageBuyOffer result code parity tests ──
+    // ManageBuyOffer delegates to execute_manage_offer and converts results
+    // via convert_sell_to_buy_result. These tests verify the conversion layer.
+
+    #[test]
+    fn test_manage_buy_offer_malformed_same_asset() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        let op = ManageBuyOfferOp {
+            selling: Asset::Native,
+            buying: Asset::Native, // Same as selling
+            buy_amount: 10_000_000,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        };
+
+        let result = execute_manage_buy_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageBuyOffer(r)) => {
+                assert!(
+                    matches!(r, ManageBuyOfferResult::Malformed),
+                    "Expected Malformed, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_manage_buy_offer_sell_no_trust() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let usd = create_asset(&issuer_id);
+
+        // Source has no trustline for USD (selling side)
+        let op = ManageBuyOfferOp {
+            selling: usd,
+            buying: Asset::Native,
+            buy_amount: 1000,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        };
+
+        let result = execute_manage_buy_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageBuyOffer(r)) => {
+                assert!(
+                    matches!(r, ManageBuyOfferResult::SellNoTrust),
+                    "Expected SellNoTrust, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_manage_buy_offer_not_found() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let usd = create_asset(&issuer_id);
+
+        // Create trustlines for both sides
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            1_000_000,
+            10_000_000,
+            AUTHORIZED_FLAG,
+        ));
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 1;
+
+        // Try to update a non-existent offer
+        let op = ManageBuyOfferOp {
+            selling: usd,
+            buying: Asset::Native,
+            buy_amount: 1000,
+            price: Price { n: 1, d: 1 },
+            offer_id: 999, // Non-existent
+        };
+
+        let result = execute_manage_buy_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageBuyOffer(r)) => {
+                assert!(
+                    matches!(r, ManageBuyOfferResult::NotFound),
+                    "Expected NotFound, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_manage_buy_offer_underfunded() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let usd = create_asset(&issuer_id);
+
+        // Source has trustline but zero balance
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            0, // zero balance
+            10_000_000,
+            AUTHORIZED_FLAG,
+        ));
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 1;
+
+        let op = ManageBuyOfferOp {
+            selling: usd,
+            buying: Asset::Native,
+            buy_amount: 1000,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        };
+
+        let result = execute_manage_buy_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageBuyOffer(r)) => {
+                assert!(
+                    matches!(r, ManageBuyOfferResult::Underfunded),
+                    "Expected Underfunded, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    // ── CreatePassiveSellOffer result code parity tests ──
+    // CreatePassiveSellOffer also delegates to execute_manage_offer with
+    // passive=true and amount >= 0 (no update/delete, always offer_id=0).
+
+    #[test]
+    fn test_create_passive_sell_offer_malformed_same_asset() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        let op = CreatePassiveSellOfferOp {
+            selling: Asset::Native,
+            buying: Asset::Native,
+            amount: 1000,
+            price: Price { n: 1, d: 1 },
+        };
+
+        let result =
+            execute_create_passive_sell_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
+                assert!(
+                    matches!(r, ManageSellOfferResult::Malformed),
+                    "Expected Malformed, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_create_passive_sell_offer_sell_no_trust() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let usd = create_asset(&issuer_id);
+
+        // No trustline for USD
+        let op = CreatePassiveSellOfferOp {
+            selling: usd,
+            buying: Asset::Native,
+            amount: 1000,
+            price: Price { n: 1, d: 1 },
+        };
+
+        let result =
+            execute_create_passive_sell_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
+                assert!(
+                    matches!(r, ManageSellOfferResult::SellNoTrust),
+                    "Expected SellNoTrust, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_create_passive_sell_offer_underfunded() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let usd = create_asset(&issuer_id);
+
+        // Zero-balance trustline
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            0,
+            10_000_000,
+            AUTHORIZED_FLAG,
+        ));
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 1;
+
+        let op = CreatePassiveSellOfferOp {
+            selling: usd,
+            buying: Asset::Native,
+            amount: 1000,
+            price: Price { n: 1, d: 1 },
+        };
+
+        let result =
+            execute_create_passive_sell_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
+                assert!(
+                    matches!(r, ManageSellOfferResult::Underfunded),
+                    "Expected Underfunded, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
 }
