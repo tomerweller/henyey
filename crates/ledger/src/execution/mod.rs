@@ -1727,10 +1727,8 @@ impl TransactionExecutor {
         // stellar-core: TransactionFrame.cpp:1797 — fee = std::min(acc.balance, fee)
         if let Some(acc) = self.state.get_account_mut(&fee_source_id) {
             fee = std::cmp::min(acc.balance, fee);
-            acc.balance = henyey_common::checked_types::CheckedAmount::new(acc.balance)
-                .checked_sub(fee)
-                .expect("fee underflow after capping to balance")
-                .value();
+            henyey_common::checked_types::sub_account_balance(acc, fee)
+                .expect("fee underflow after capping to balance");
         }
 
         // For protocol < 10, sequence bump happens during fee processing
@@ -1946,10 +1944,8 @@ impl TransactionExecutor {
             if let Some(acc) = self.state.get_account_mut(&fee_source_id) {
                 let old_balance = acc.balance;
                 let charged_fee = std::cmp::min(acc.balance, fee);
-                acc.balance = henyey_common::checked_types::CheckedAmount::new(acc.balance)
-                    .checked_sub(charged_fee)
-                    .expect("fee underflow after capping to balance")
-                    .value();
+                henyey_common::checked_types::sub_account_balance(acc, charged_fee)
+                    .expect("fee underflow after capping to balance");
                 fee = charged_fee;
                 tracing::debug!(
                     account = %account_id_to_strkey(&fee_source_id),

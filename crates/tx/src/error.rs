@@ -81,6 +81,10 @@ pub enum TxError {
     #[error("XDR error: {0}")]
     Xdr(#[from] stellar_xdr::curr::Error),
 
+    /// Checked arithmetic error (balance overflow, underflow, etc.).
+    #[error("balance error: {0}")]
+    Balance(#[from] henyey_common::checked_types::BalanceError),
+
     /// Internal error.
     #[error("internal error: {0}")]
     Internal(String),

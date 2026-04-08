@@ -101,6 +101,10 @@ pub enum LedgerError {
     #[error("snapshot error: {0}")]
     Snapshot(String),
 
+    /// Checked arithmetic error (balance overflow, underflow, etc.).
+    #[error("balance error: {0}")]
+    Balance(#[from] henyey_common::checked_types::BalanceError),
+
     /// Internal error (indicates a bug).
     ///
     /// These errors should not occur during normal operation and

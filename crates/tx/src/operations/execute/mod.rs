@@ -3,8 +3,17 @@
 //! This module provides the main entry point for executing Stellar operations.
 //! Each operation type has its own submodule with the specific execution logic.
 
-use henyey_common::checked_types::{BalanceError, CheckedAmount};
+use henyey_common::checked_types::CheckedAmount;
 use henyey_common::{protocol_version_is_before, protocol_version_starts_from, ProtocolVersion};
+
+// Re-export checked arithmetic helpers from henyey-common so submodules
+// can import them via `use super::add_account_balance` etc.
+pub(super) use henyey_common::checked_types::{
+    add_account_balance, add_pool_reserve, add_pool_shares, add_trustline_balance, dec_sub_entries,
+    inc_sub_entries, sub_account_balance, sub_trustline_balance,
+};
+// Re-export liability accessors used by submodules.
+pub(super) use henyey_common::checked_types::{account_liabilities, trustline_liabilities};
 use soroban_env_host24::xdr::ReadXdr as ReadXdrP24;
 use soroban_env_host_p24 as soroban_env_host24;
 use soroban_env_host_p25 as soroban_env_host25;
@@ -77,26 +86,6 @@ fn issuer_for_asset(asset: &Asset) -> Option<&AccountId> {
     }
 }
 
-fn account_liabilities(account: &AccountEntry) -> Liabilities {
-    match &account.ext {
-        AccountEntryExt::V0 => Liabilities {
-            buying: 0,
-            selling: 0,
-        },
-        AccountEntryExt::V1(v1) => v1.liabilities.clone(),
-    }
-}
-
-fn trustline_liabilities(trustline: &TrustLineEntry) -> Liabilities {
-    match &trustline.ext {
-        TrustLineEntryExt::V0 => Liabilities {
-            buying: 0,
-            selling: 0,
-        },
-        TrustLineEntryExt::V1(v1) => v1.liabilities.clone(),
-    }
-}
-
 /// Available native balance after selling liabilities, without accounting for
 /// minimum balance. Returns `account.balance - selling_liabilities`, clamped
 /// to zero. Used for sponsor reserve checks and other contexts where the caller
@@ -147,60 +136,6 @@ fn ensure_trustline_liabilities(trustline: &mut TrustLineEntry) -> &mut Liabilit
     }
 }
 
-/// Credit `delta` to an account's native balance.
-///
-/// Returns `BalanceError::Overflow` if the addition overflows, or
-/// `BalanceError::LiabilityViolation` if the new balance would violate
-/// the buying liability constraint.
-fn add_account_balance(
-    account: &mut AccountEntry,
-    delta: i64,
-) -> std::result::Result<(), BalanceError> {
-    let new_balance = CheckedAmount::new(account.balance)
-        .checked_add(delta)
-        .ok_or(BalanceError::Overflow)?;
-    // Buying liabilities: new_balance must not exceed i64::MAX - buying
-    let buying = account_liabilities(account).buying;
-    let ceiling = CheckedAmount::new(i64::MAX)
-        .checked_sub(buying)
-        .ok_or(BalanceError::Overflow)?;
-    if new_balance > ceiling {
-        return Err(BalanceError::LiabilityViolation);
-    }
-    account.balance = new_balance.value();
-    Ok(())
-}
-
-/// Credit `delta` to a trustline balance.
-///
-/// Returns `BalanceError::ExceedsLimit` if the new balance would exceed the
-/// trustline limit, or `BalanceError::LiabilityViolation` if it would violate
-/// the buying liability constraint.
-fn add_trustline_balance(
-    tl: &mut TrustLineEntry,
-    delta: i64,
-) -> std::result::Result<(), BalanceError> {
-    let headroom = CheckedAmount::new(tl.limit)
-        .checked_sub(tl.balance)
-        .ok_or(BalanceError::Overflow)?;
-    if delta > headroom.value() {
-        return Err(BalanceError::ExceedsLimit);
-    }
-    let new_balance = CheckedAmount::new(tl.balance)
-        .checked_add(delta)
-        .ok_or(BalanceError::Overflow)?;
-    // Buying liabilities: new_balance must not exceed limit - buying
-    let buying = trustline_liabilities(tl).buying;
-    let ceiling = CheckedAmount::new(tl.limit)
-        .checked_sub(buying)
-        .ok_or(BalanceError::Overflow)?;
-    if new_balance > ceiling {
-        return Err(BalanceError::LiabilityViolation);
-    }
-    tl.balance = new_balance.value();
-    Ok(())
-}
-
 /// Apply a balance delta (positive or negative) to an account or trustline.
 /// Used by offer settlement — no liability checks (those are handled separately
 /// by the offer machinery).
@@ -243,93 +178,6 @@ fn apply_balance_delta(
     }
     tl.balance = new_balance.value();
     Ok(())
-}
-
-/// Subtract `amount` from an account's native balance.
-///
-/// Used for debits (withdrawals, clawbacks, fee deductions) where the caller
-/// has already validated that the operation is permitted. No liability checks.
-pub(super) fn sub_account_balance(account: &mut AccountEntry, amount: i64) -> Result<()> {
-    let new_balance = CheckedAmount::new(account.balance)
-        .checked_sub(amount)
-        .ok_or_else(|| TxError::Internal("account balance underflow".into()))?;
-    if new_balance.is_negative() {
-        return Err(TxError::Internal(
-            "account balance would go negative".into(),
-        ));
-    }
-    account.balance = new_balance.value();
-    Ok(())
-}
-
-/// Subtract `amount` from a trustline balance.
-///
-/// Used for debits where the caller has already validated authorization.
-/// No liability or limit checks.
-pub(super) fn sub_trustline_balance(tl: &mut TrustLineEntry, amount: i64) -> Result<()> {
-    let new_balance = CheckedAmount::new(tl.balance)
-        .checked_sub(amount)
-        .ok_or_else(|| TxError::Internal("trustline balance underflow".into()))?;
-    if new_balance.is_negative() {
-        return Err(TxError::Internal(
-            "trustline balance would go negative".into(),
-        ));
-    }
-    tl.balance = new_balance.value();
-    Ok(())
-}
-
-/// Apply a checked delta to a pool reserve field.
-///
-/// Positive delta = deposit, negative delta = withdrawal. Returns error on
-/// overflow or if the result would be negative.
-pub(super) fn add_pool_reserve(reserve: &mut i64, delta: i64) -> Result<()> {
-    let new_val = CheckedAmount::new(*reserve)
-        .checked_add(delta)
-        .ok_or_else(|| TxError::Internal("pool reserve overflow".into()))?;
-    if new_val.is_negative() {
-        return Err(TxError::Internal("pool reserve would go negative".into()));
-    }
-    *reserve = new_val.value();
-    Ok(())
-}
-
-/// Apply a checked delta to total pool shares.
-///
-/// Positive delta = mint, negative delta = burn. Returns error on overflow
-/// or if the result would be negative.
-pub(super) fn add_pool_shares(shares: &mut i64, delta: i64) -> Result<()> {
-    let new_val = CheckedAmount::new(*shares)
-        .checked_add(delta)
-        .ok_or_else(|| TxError::Internal("pool shares overflow".into()))?;
-    if new_val.is_negative() {
-        return Err(TxError::Internal("pool shares would go negative".into()));
-    }
-    *shares = new_val.value();
-    Ok(())
-}
-
-/// Increment num_sub_entries by `n`.
-///
-/// Panics on overflow (matches stellar-core which asserts valid account state).
-pub(super) fn inc_sub_entries(account: &mut AccountEntry, n: u32) {
-    account.num_sub_entries = account
-        .num_sub_entries
-        .checked_add(n)
-        .expect("num_sub_entries overflow: too many sub-entries");
-}
-
-/// Decrement num_sub_entries by `n`.
-///
-/// Panics if the result would underflow (matches stellar-core which asserts
-/// valid account state). See #1121.
-pub(super) fn dec_sub_entries(account: &mut AccountEntry, n: u32) {
-    assert!(
-        account.num_sub_entries >= n,
-        "num_sub_entries underflow: cannot remove {n} sub-entries from account with {}",
-        account.num_sub_entries
-    );
-    account.num_sub_entries -= n;
 }
 
 /// Classify a ledger key for rent purposes: (is_persistent, is_code_entry).
