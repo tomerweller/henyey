@@ -355,7 +355,10 @@ fn charge_fee_to_account(
         });
     }
 
-    account.balance -= fee;
+    account.balance = henyey_common::checked_types::CheckedAmount::new(account.balance)
+        .checked_sub(fee)
+        .expect("balance underflow after validation")
+        .value();
     Ok(())
 }
 

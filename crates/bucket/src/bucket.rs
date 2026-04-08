@@ -882,8 +882,8 @@ impl Bucket {
     /// Get the protocol version from bucket metadata, if present.
     pub fn protocol_version(&self) -> Option<u32> {
         let iter = self.iter().ok()?;
-        for entry_result in iter {
-            if let Ok(BucketEntry::Metaentry(meta)) = entry_result {
+        for entry in iter.flatten() {
+            if let BucketEntry::Metaentry(meta) = entry {
                 return Some(meta.ledger_version);
             }
         }

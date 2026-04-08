@@ -313,10 +313,12 @@ impl LedgerStateManager {
         new_signers.remove(idx);
         account.signers = new_signers.try_into().unwrap_or_default();
 
-        // Decrement num_sub_entries
-        if account.num_sub_entries > 0 {
-            account.num_sub_entries -= 1;
-        }
+        // stellar-core: panics on underflow (invalid account state)
+        assert!(
+            account.num_sub_entries > 0,
+            "num_sub_entries underflow: cannot remove signer sub-entry from account with 0 sub-entries"
+        );
+        account.num_sub_entries -= 1;
 
         // Handle sponsorship cleanup if applicable
         // The signer sponsorship is stored in the account's extension

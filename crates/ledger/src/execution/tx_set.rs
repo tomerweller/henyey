@@ -647,7 +647,9 @@ pub(crate) fn pre_deduct_all_fees_on_delta(
 
         let (charged_fee, fee_changes) =
             delta.deduct_fee_from_account(&fee_source, computed_fee, snapshot, ledger_seq)?;
-        total_fee_pool += charged_fee;
+        total_fee_pool = total_fee_pool
+            .checked_add(charged_fee)
+            .expect("total_fee_pool overflow");
         classic_pre_charged.push(PreChargedFee {
             charged_fee,
             should_apply: charged_fee >= computed_fee,
@@ -680,7 +682,9 @@ pub(crate) fn pre_deduct_all_fees_on_delta(
                     snapshot,
                     ledger_seq,
                 )?;
-                total_fee_pool += charged_fee;
+                total_fee_pool = total_fee_pool
+                    .checked_add(charged_fee)
+                    .expect("total_fee_pool overflow");
                 soroban_pre_charged.push(PreChargedFee {
                     charged_fee,
                     should_apply: charged_fee >= computed_fee,

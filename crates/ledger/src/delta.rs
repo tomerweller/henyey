@@ -401,7 +401,10 @@ impl LedgerDelta {
         };
         let charged_fee = std::cmp::min(balance, fee);
         if let LedgerEntryData::Account(ref mut acc) = entry.data {
-            acc.balance -= charged_fee;
+            acc.balance = henyey_common::checked_types::CheckedAmount::new(acc.balance)
+                .checked_sub(charged_fee)
+                .expect("fee underflow after capping to balance")
+                .value();
         }
         // Stamp last_modified_ledger_seq to match stellar-core LedgerTxn behavior.
         if charged_fee > 0 {
@@ -438,7 +441,11 @@ impl LedgerDelta {
                 match change {
                     EntryChange::Created(ref mut e) => {
                         if let LedgerEntryData::Account(ref mut acc) = e.data {
-                            acc.balance -= charged_fee;
+                            acc.balance =
+                                henyey_common::checked_types::CheckedAmount::new(acc.balance)
+                                    .checked_sub(charged_fee)
+                                    .expect("fee underflow in delta Created entry")
+                                    .value();
                             // Re-add charged_fee to state_entry balance since Created
                             // doesn't have a previous.
                         }
