@@ -761,7 +761,8 @@ impl ScpDriver {
         }
 
         // Validate against local state (close time, tx set, etc.)
-        let result = self.validate_value_against_local_state(slot_index, &stellar_value);
+        let result =
+            self.validate_value_against_local_state(slot_index, &stellar_value, nomination);
         if result == ValueValidation::Invalid {
             return ValueValidation::Invalid;
         }
@@ -790,6 +791,7 @@ impl ScpDriver {
         &self,
         slot_index: SlotIndex,
         stellar_value: &StellarValue,
+        nomination: bool,
     ) -> ValueValidation {
         let close_time = stellar_value.close_time.0;
 
@@ -832,6 +834,20 @@ impl ScpDriver {
             // Check if we have the transaction set
             let tx_set_hash = Hash256::from_bytes(stellar_value.tx_set_hash.0);
             if !self.has_tx_set(&tx_set_hash) {
+                // During ballot protocol (nomination=false), EXTERNALIZE envelopes
+                // may arrive before the tx_set is fetched. In stellar-core,
+                // PendingEnvelopes buffers all envelopes until deps are fetched,
+                // so validateValue always has the tx_set. Our code sends
+                // EXTERNALIZE to SCP immediately for faster tracking advance
+                // (see process_scp_envelope). Return MaybeValid so SCP can
+                // still externalize the slot while the tx_set fetch completes.
+                if !nomination {
+                    debug!(
+                        "Missing transaction set during ballot protocol: {} (MaybeValid)",
+                        tx_set_hash
+                    );
+                    return ValueValidation::MaybeValid;
+                }
                 debug!("Missing transaction set: {}", tx_set_hash);
                 return ValueValidation::Invalid;
             }
@@ -982,7 +998,8 @@ impl ScpDriver {
 
         // Parity: only extract if fully validated against local state
         // (does NOT check STELLAR_VALUE_SIGNED or signature)
-        let result = self.validate_value_against_local_state(slot, &stellar_value);
+        // extractValidValue is called during nomination, so use nomination=true
+        let result = self.validate_value_against_local_state(slot, &stellar_value, true);
         if result != ValueValidation::Valid {
             return None;
         }
@@ -2225,7 +2242,10 @@ mod cache_tests {
     #[test]
     fn test_validate_value_returns_invalid_for_missing_tx_set() {
         // When validating a value for LCL+1 (current ledger) and the tx set is
-        // not cached, validate_value should return Invalid (matching stellar-core).
+        // not cached, validate_value should return Invalid during nomination
+        // (matching stellar-core). During ballot protocol (nomination=false),
+        // it returns MaybeValid because EXTERNALIZE envelopes may arrive
+        // before the tx_set is fetched.
         let secret = henyey_crypto::SecretKey::from_seed(&[42u8; 32]);
         let network_id = Hash256::hash(b"test-network");
 
@@ -2250,11 +2270,21 @@ mod cache_tests {
         // Create a signed value with a tx_set_hash that is NOT cached
         let value = make_signed_stellar_value(&network_id, &secret, tx_set_hash, now);
 
-        let result = driver.validate_value_impl(1, &value, false);
+        // During nomination: missing tx set should return Invalid
+        let result = driver.validate_value_impl(1, &value, true);
         assert_eq!(
             result,
             ValueValidation::Invalid,
-            "missing tx set for current ledger should return Invalid, not MaybeValid"
+            "missing tx set during nomination should return Invalid"
+        );
+
+        // During ballot protocol: missing tx set should return MaybeValid
+        // (EXTERNALIZE envelopes may arrive before the tx_set is fetched)
+        let result_ballot = driver.validate_value_impl(1, &value, false);
+        assert_eq!(
+            result_ballot,
+            ValueValidation::MaybeValid,
+            "missing tx set during ballot protocol should return MaybeValid"
         );
 
         // Now cache the tx set and re-validate — should pass the tx set check
@@ -3356,7 +3386,7 @@ mod tests {
         );
 
         // slot 1 == lcl_seq(0) + 1 -> current ledger path
-        let result = driver.validate_value_against_local_state(1, &sv);
+        let result = driver.validate_value_against_local_state(1, &sv, true);
         assert_eq!(result, ValueValidation::Valid);
     }
 
