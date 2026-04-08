@@ -620,16 +620,15 @@ fn test_sample_period_stale_spurious_snapshot() {
 
 /// Regression test for AUDIT-023 (#1096).
 ///
-/// `UpgradeContext::apply_config_upgrades()` silently continues when a config
-/// upgrade key is not found in the ledger (returns None from `make_from_key`),
-/// while stellar-core's `isValidForApply()` performs a full ledger lookup and
-/// rejects invalid keys during SCP nomination.
+/// Both validation and application paths must reject config upgrades with
+/// nonexistent keys:
 ///
-/// This test verifies that apply_config_upgrades gracefully handles a
-/// nonexistent config upgrade key, but documents that this is a gap —
-/// stellar-core would have rejected this value during SCP nomination.
+/// 1. `isValidForApply` (herder/scp_driver.rs) now loads the ConfigUpgradeSet
+///    from ledger state and validates it, matching stellar-core behavior.
+/// 2. `apply_config_upgrades` (close.rs) now returns an error (matching
+///    stellar-core's throw) instead of silently continuing.
 #[test]
-fn test_config_upgrade_nonexistent_key_silently_skipped() {
+fn test_config_upgrade_nonexistent_key_rejected() {
     let header = make_genesis_header(25);
     let header_hash = compute_header_hash(&header).expect("hash");
 
@@ -651,42 +650,25 @@ fn test_config_upgrade_nonexistent_key_silently_skipped() {
         "Nonexistent config upgrade key should not be loadable"
     );
 
-    // But apply_config_upgrades would just `continue` past this.
-    // In stellar-core, validateValue → isValidForApply would reject the
-    // entire StellarValue containing this upgrade key, preventing it from
-    // reaching the upgrade application path.
-    //
-    // This gap means a Byzantine validator could propose a bogus config
-    // upgrade key. stellar-core strips it during extractValidValue, but
-    // henyey might keep it, leading to different nomination candidates.
+    // Parity: stellar-core throws in applyTo (Upgrades.cpp:373) when the
+    // config upgrade set cannot be loaded. After AUDIT-023 fix,
+    // apply_config_upgrades returns an error instead of silently skipping.
     let mut ctx = UpgradeContext::new(25);
     ctx.add_upgrade(LedgerUpgrade::Config(bogus_key));
 
     let mut delta = LedgerDelta::new(1);
     let result = ctx.apply_config_upgrades(&handle, &mut delta, 1, 25);
 
-    // apply_config_upgrades succeeds (silently skips the bogus key)
     assert!(
-        result.is_ok(),
-        "apply_config_upgrades should succeed even with nonexistent key"
+        result.is_err(),
+        "apply_config_upgrades must error on nonexistent config upgrade key \
+         (parity: stellar-core throws in Upgrades::applyTo)"
     );
-
-    let result = result.unwrap();
+    let err = result.unwrap_err().to_string();
     assert!(
-        !result.state_archival_changed,
-        "No state archival changes from nonexistent config upgrade"
-    );
-    assert!(
-        !result.memory_cost_params_changed,
-        "No memory cost changes from nonexistent config upgrade"
-    );
-    assert_eq!(
-        delta.num_changes(),
-        0,
-        "AUDIT-023 (#1096): Nonexistent config upgrade key was silently skipped. \n\
-         stellar-core would have rejected this during SCP nomination via \n\
-         isValidForApply() which performs a full ledger lookup. The gap is in \n\
-         the herder's validateValue/extractValidValue path, not in apply_config_upgrades."
+        err.contains("Failed to retrieve valid config upgrade set"),
+        "Error message should indicate the config upgrade set was not found, got: {}",
+        err
     );
 }
 

@@ -118,4 +118,12 @@ pub enum LedgerError {
     /// for the requested operation.
     #[error("invalid entry: {0}")]
     InvalidEntry(String),
+
+    /// A ledger upgrade failed during application.
+    ///
+    /// This occurs when a config upgrade set cannot be loaded or validated
+    /// at apply time. Parity: stellar-core throws in this case because
+    /// the upgrade should have been validated during SCP consensus.
+    #[error("upgrade error: {0}")]
+    UpgradeError(String),
 }

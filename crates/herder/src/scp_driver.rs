@@ -1007,10 +1007,9 @@ impl ScpDriver {
         // Parity: strip invalid upgrades, keeping valid ones in order
         // Also validates each upgrade via isValid (apply + nomination)
         // stellar-core: extractValidValue calls isValid with nomination=true
-        let current_version = self
-            .ledger_manager
-            .read()
-            .as_ref()
+        let lm_guard = self.ledger_manager.read();
+        let lm_ref = lm_guard.as_ref().map(|lm| lm.as_ref());
+        let current_version = lm_ref
             .map(|lm| lm.current_header().ledger_version)
             .unwrap_or(0);
         let close_time = stellar_value.close_time.0;
@@ -1026,7 +1025,8 @@ impl ScpDriver {
                 let in_order = last_upgrade_type
                     .map(|prev| upgrade_type > prev)
                     .unwrap_or(true);
-                let valid_for_apply = Self::is_valid_upgrade_for_apply(&upgrade, current_version);
+                let valid_for_apply =
+                    Self::is_valid_upgrade_for_apply(&upgrade, current_version, lm_ref);
                 // Also check nomination validity (timing + parameter match)
                 let valid_for_nomination = if let Some(ref upgrades_arc) = *self.upgrades.read() {
                     upgrades_arc
@@ -1060,11 +1060,12 @@ impl ScpDriver {
     /// Parity: Upgrades.cpp `isValid` — calls `isValidForApply` always,
     /// and additionally `isValidForNomination` when `nomination=true`.
     fn check_upgrades_valid(&self, stellar_value: &StellarValue, nomination: bool) -> bool {
-        let current_version = if let Some(ref lm) = *self.ledger_manager.read() {
-            lm.current_header().ledger_version
-        } else {
-            return true; // No ledger manager — can't validate
+        let lm_guard = self.ledger_manager.read();
+        let lm_ref = match lm_guard.as_ref() {
+            Some(lm) => lm,
+            None => return true, // No ledger manager — can't validate
         };
+        let current_version = lm_ref.current_header().ledger_version;
 
         let close_time = stellar_value.close_time.0;
 
@@ -1076,7 +1077,7 @@ impl ScpDriver {
                 Ok(u) => u,
                 Err(_) => return false,
             };
-            if !Self::is_valid_upgrade_for_apply(&upgrade, current_version) {
+            if !Self::is_valid_upgrade_for_apply(&upgrade, current_version, Some(lm_ref)) {
                 debug!(?upgrade, "Invalid upgrade for apply");
                 return false;
             }
@@ -1095,8 +1096,17 @@ impl ScpDriver {
 
     /// Check if a single upgrade is valid for application to the ledger.
     ///
-    /// Parity: Upgrades.cpp `isValidForApply` (lines 543-616)
-    fn is_valid_upgrade_for_apply(upgrade: &LedgerUpgrade, current_version: u32) -> bool {
+    /// Parity: Upgrades.cpp `isValidForApply` (lines 543-623)
+    ///
+    /// For `LedgerUpgrade::Config`, stellar-core performs a full ledger lookup
+    /// via `ConfigUpgradeSetFrame::makeFromKey` and validates the loaded frame
+    /// via `isValidForApply()`. We mirror this by using
+    /// `LedgerManager::get_config_upgrade_set` when available.
+    fn is_valid_upgrade_for_apply(
+        upgrade: &LedgerUpgrade,
+        current_version: u32,
+        ledger_manager: Option<&LedgerManager>,
+    ) -> bool {
         match upgrade {
             LedgerUpgrade::Version(new_version) => {
                 // Must be strictly monotonic and within supported range
@@ -1112,11 +1122,43 @@ impl ScpDriver {
                 protocol_version_starts_from(current_version, ProtocolVersion::V18)
                     && (*flags & !MASK_LEDGER_HEADER_FLAGS) == 0
             }
-            LedgerUpgrade::Config(_) => {
+            LedgerUpgrade::Config(key) => {
                 // Config upgrades require Soroban protocol.
-                // Full validation would load the config set from ledger,
-                // but basic version check is the critical gate.
-                current_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION
+                if current_version < henyey_common::MIN_SOROBAN_PROTOCOL_VERSION {
+                    return false;
+                }
+                // Parity: stellar-core loads ConfigUpgradeSetFrame from ledger
+                // and validates it. Without a ledger manager we cannot perform
+                // this check, so we conservatively reject.
+                let Some(lm) = ledger_manager else {
+                    debug!("Config upgrade validation: no ledger manager available, rejecting");
+                    return false;
+                };
+                let Some(frame) = lm.get_config_upgrade_set(key) else {
+                    debug!(
+                        contract_id = ?key.contract_id,
+                        "Config upgrade key not found in ledger"
+                    );
+                    return false;
+                };
+                use henyey_ledger::ConfigUpgradeValidity;
+                match frame.is_valid_for_apply() {
+                    ConfigUpgradeValidity::Valid => true,
+                    ConfigUpgradeValidity::XdrInvalid => {
+                        debug!(
+                            contract_id = ?key.contract_id,
+                            "Config upgrade set has invalid XDR"
+                        );
+                        false
+                    }
+                    ConfigUpgradeValidity::Invalid => {
+                        debug!(
+                            contract_id = ?key.contract_id,
+                            "Config upgrade set is invalid"
+                        );
+                        false
+                    }
+                }
             }
             LedgerUpgrade::MaxSorobanTxSetSize(_) => {
                 current_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION
@@ -3679,6 +3721,91 @@ mod tests {
         assert!(
             driver.check_upgrades_valid(&sv, true),
             "Without ledger manager, nomination check should pass (can't validate)"
+        );
+    }
+
+    /// Regression test for AUDIT-023 (#1096).
+    ///
+    /// Config upgrades with nonexistent keys must be rejected by
+    /// `check_upgrades_valid` when a LedgerManager is available.
+    /// stellar-core's `isValidForApply` performs a ledger lookup via
+    /// `ConfigUpgradeSetFrame::makeFromKey` and rejects unknown keys.
+    #[test]
+    fn test_audit_023_config_upgrade_nonexistent_key_rejected() {
+        use henyey_bucket::{BucketList, HotArchiveBucketList};
+        use henyey_ledger::{compute_header_hash, LedgerManagerConfig};
+        use stellar_xdr::curr::{
+            ConfigUpgradeSetKey, ContractId, Hash, LedgerHeader, LedgerHeaderExt, StellarValueExt,
+            TimePoint, VecM,
+        };
+
+        // Set up a LedgerManager with protocol 25
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = henyey_ledger::LedgerManager::new("Test Network".to_string(), config);
+        let header = LedgerHeader {
+            ledger_version: 25,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(0),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 1,
+            total_coins: 1_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 100,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            BucketList::new(),
+            HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+
+        let (driver, _) = make_test_driver_with_key();
+        driver.set_ledger_manager(Arc::new(lm));
+
+        // Create a Config upgrade with a bogus key that doesn't exist in ledger
+        let bogus_key = ConfigUpgradeSetKey {
+            contract_id: ContractId(Hash([0xDE; 32])),
+            content_hash: Hash([0xAD; 32]),
+        };
+        let upgrade = LedgerUpgrade::Config(bogus_key);
+        let upgrade_bytes = upgrade.to_xdr(Limits::none()).unwrap();
+        let upgrade_type = UpgradeType(upgrade_bytes.try_into().unwrap());
+
+        let sv = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash([0; 32]),
+            close_time: TimePoint(100),
+            upgrades: vec![upgrade_type].try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+
+        // AUDIT-023: check_upgrades_valid MUST reject Config upgrades with
+        // nonexistent keys. stellar-core rejects this in isValidForApply via
+        // ConfigUpgradeSetFrame::makeFromKey returning nullptr.
+        assert!(
+            !driver.check_upgrades_valid(&sv, false),
+            "Config upgrade with nonexistent key must be rejected when LedgerManager is available"
         );
     }
 }

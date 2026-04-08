@@ -68,6 +68,7 @@ fn base_fee_to_u32(fee: Option<i64>) -> Option<u32> {
 }
 
 /// Result of applying config upgrades during ledger close.
+#[derive(Debug)]
 pub struct ConfigUpgradeResult {
     /// Whether state archival settings changed (requires eviction scan resize).
     pub state_archival_changed: bool,
@@ -1218,7 +1219,10 @@ impl UpgradeContext {
         let mut per_upgrade_changes = HashMap::new();
 
         for key in self.config_upgrade_keys() {
-            // Load the upgrade set from the ledger
+            // Load the upgrade set from the ledger.
+            // Parity: stellar-core (Upgrades.cpp:366-374) throws if the config
+            // upgrade set cannot be loaded or is invalid at apply time, since
+            // isValidForApply should have already filtered it during SCP.
             let frame = match ConfigUpgradeSetFrame::make_from_key(
                 snapshot,
                 &key,
@@ -1227,30 +1231,21 @@ impl UpgradeContext {
             ) {
                 Some(f) => f,
                 None => {
-                    tracing::warn!(
-                        contract_id = ?key.contract_id,
-                        "Config upgrade set not found or expired"
-                    );
-                    continue;
+                    return Err(LedgerError::UpgradeError(format!(
+                        "Failed to retrieve valid config upgrade set for {:?}",
+                        key.contract_id
+                    )));
                 }
             };
 
             // Validate the upgrade
             match frame.is_valid_for_apply() {
                 ConfigUpgradeValidity::Valid => {}
-                ConfigUpgradeValidity::XdrInvalid => {
-                    tracing::warn!(
-                        contract_id = ?key.contract_id,
-                        "Config upgrade set has invalid XDR"
-                    );
-                    continue;
-                }
-                ConfigUpgradeValidity::Invalid => {
-                    tracing::warn!(
-                        contract_id = ?key.contract_id,
-                        "Config upgrade set is invalid"
-                    );
-                    continue;
+                ConfigUpgradeValidity::XdrInvalid | ConfigUpgradeValidity::Invalid => {
+                    return Err(LedgerError::UpgradeError(format!(
+                        "Config upgrade set is no longer valid for {:?}",
+                        key.contract_id
+                    )));
                 }
             }
 
