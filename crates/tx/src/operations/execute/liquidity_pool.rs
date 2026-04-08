@@ -5,7 +5,7 @@
 //! - LiquidityPoolWithdraw
 
 use stellar_xdr::curr::{
-    AccountFlags, AccountId, Asset, LiquidityPoolDepositOp, LiquidityPoolDepositResult,
+    AccountId, Asset, LiquidityPoolDepositOp, LiquidityPoolDepositResult,
     LiquidityPoolDepositResultCode, LiquidityPoolWithdrawOp, LiquidityPoolWithdrawResult,
     LiquidityPoolWithdrawResultCode, OperationResult, OperationResultTr, Price, TrustLineAsset,
 };
@@ -393,10 +393,12 @@ fn resolve_deposit_asset(
             }
         };
 
-    if is_auth_required(asset, state)
-        && trustline
-            .map(|tl| !is_trustline_authorized(tl.flags))
-            .unwrap_or(false)
+    // Check trustline authorization unconditionally, matching stellar-core's
+    // LiquidityPoolDepositOpFrame.cpp:269 which checks tlA.isAuthorized()
+    // on the trustline's own flags without gating on the issuer's account flags.
+    if trustline
+        .map(|tl| !is_trustline_authorized(tl.flags))
+        .unwrap_or(false)
     {
         return Err(LiquidityPoolDepositResultCode::NotAuthorized);
     }
@@ -439,18 +441,6 @@ fn debit_asset(
         tl.balance -= amount;
     }
     Ok(())
-}
-
-fn is_auth_required(asset: &Asset, state: &LedgerStateManager) -> bool {
-    let issuer = match asset {
-        Asset::Native => return false,
-        Asset::CreditAlphanum4(a) => &a.issuer,
-        Asset::CreditAlphanum12(a) => &a.issuer,
-    };
-    state
-        .get_account(issuer)
-        .map(|account| account.flags & (AccountFlags::RequiredFlag as u32) != 0)
-        .unwrap_or(false)
 }
 
 fn available_native_balance(
@@ -2107,6 +2097,103 @@ mod tests {
                 // But in this case we expect Success since all limits are i64::MAX.
                 panic!("Expected Success, got {:?}", other);
             }
+        }
+    }
+
+    /// Regression test for AUDIT-010: Deposit auth check bypassed when issuer lacks AUTH_REQUIRED.
+    ///
+    /// stellar-core checks trustline authorization unconditionally via tlA.isAuthorized().
+    /// Henyey was gating the check behind is_auth_required() which checked the issuer's
+    /// account flags, allowing deposits with deauthorized trustlines when the issuer had
+    /// cleared AUTH_REQUIRED.
+    #[test]
+    fn test_audit_010_deposit_deauthorized_trustline_without_auth_required() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_a = create_test_account_id(1);
+        let issuer_b = create_test_account_id(2);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 0));
+        // Issuer A has NO AUTH_REQUIRED flag (flags=0).
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000, 0));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_a,
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: issuer_b,
+        });
+        let pool_id = PoolId(Hash([1u8; 32]));
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            0,
+            0,
+            0,
+        ));
+
+        // Trustline A: deauthorized (flags=0, no AUTHORIZED_FLAG)
+        let trustline_a = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_a {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 1_000,
+            limit: 10_000,
+            flags: 0, // deauthorized!
+            ext: TrustLineEntryExt::V0,
+        };
+        // Trustline B: authorized
+        let trustline_b = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_b {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 1_000,
+            limit: 10_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        let pool_share_tl = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 0,
+            limit: 10_000,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        };
+        state.create_trustline(trustline_a);
+        state.create_trustline(trustline_b);
+        state.create_trustline(pool_share_tl);
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+
+        let op = LiquidityPoolDepositOp {
+            liquidity_pool_id: pool_id,
+            max_amount_a: 100,
+            max_amount_b: 100,
+            min_price: Price { n: 1, d: 1 },
+            max_price: Price { n: 1, d: 1 },
+        };
+
+        // Must reject with NotAuthorized even though issuer lacks AUTH_REQUIRED,
+        // because the trustline itself is deauthorized (flags=0).
+        let result = execute_liquidity_pool_deposit(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolDeposit(r)) => {
+                assert!(
+                    matches!(r, LiquidityPoolDepositResult::NotAuthorized),
+                    "Expected NotAuthorized, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
         }
     }
 }
