@@ -1575,6 +1575,19 @@ impl Herder {
             }
         }
 
+        // Sort upgrades by type to match stellar-core's deterministic ordering
+        // (VERSION=0, BASE_FEE=1, MAX_TX_SET_SIZE=2, BASE_RESERVE=3, FLAGS=4,
+        // CONFIG=5, MAX_SOROBAN_TX_SET_SIZE=6).
+        upgrade_list.sort_by_key(|u| match u {
+            LedgerUpgrade::Version(_) => 0u32,
+            LedgerUpgrade::BaseFee(_) => 1,
+            LedgerUpgrade::MaxTxSetSize(_) => 2,
+            LedgerUpgrade::BaseReserve(_) => 3,
+            LedgerUpgrade::Flags(_) => 4,
+            LedgerUpgrade::Config(_) => 5,
+            LedgerUpgrade::MaxSorobanTxSetSize(_) => 6,
+        });
+
         let upgrades: Vec<UpgradeType> = upgrade_list
             .iter()
             .filter_map(|upgrade| upgrade.to_xdr(Limits::none()).ok())
@@ -2873,6 +2886,98 @@ mod tests {
             found_reserve,
             "Should have found BaseReserve(5000000) upgrade"
         );
+    }
+
+    /// Regression test for AUDIT-028: upgrades must be ordered by type
+    /// (VERSION < BASE_FEE < MAX_TX_SET_SIZE < BASE_RESERVE < FLAGS < CONFIG
+    /// < MAX_SOROBAN_TX_SET_SIZE) to match stellar-core's deterministic ordering.
+    #[tokio::test]
+    async fn test_audit_028_nomination_upgrades_ordered_by_type() {
+        let seed = [7u8; 32];
+        let secret = SecretKey::from_seed(&seed);
+        let public = secret.public_key();
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: public.clone(),
+            local_quorum_set: Some(stellar_xdr::curr::ScpQuorumSet {
+                threshold: 1,
+                validators: vec![stellar_xdr::curr::NodeId(
+                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+                        *public.as_bytes(),
+                    )),
+                )]
+                .try_into()
+                .unwrap(),
+                inner_sets: vec![].try_into().unwrap(),
+            }),
+            // Set upgrades in REVERSE of canonical order
+            proposed_upgrades: vec![
+                LedgerUpgrade::Flags(1),
+                LedgerUpgrade::BaseFee(200),
+                LedgerUpgrade::Version(25),
+            ],
+            ..Default::default()
+        };
+        // Also set runtime upgrades that would append BaseReserve after Flags
+        let herder = Herder::with_secret_key(config, secret);
+        let upgrade_params = crate::upgrades::UpgradeParameters {
+            upgrade_time: 0,
+            base_reserve: Some(5_000_000),
+            ..Default::default()
+        };
+        herder
+            .set_upgrade_parameters(upgrade_params)
+            .expect("set_upgrade_parameters should succeed");
+
+        herder.bootstrap(1);
+
+        let result = herder.trigger_next_ledger(2).await;
+        assert!(
+            result.is_ok(),
+            "trigger_next_ledger failed: {:?}",
+            result.err()
+        );
+
+        let externalized = herder.scp_driver.get_externalized(2);
+        assert!(externalized.is_some(), "slot 2 should be externalized");
+
+        let ext = externalized.unwrap();
+        let sv = StellarValue::from_xdr(&ext.value, Limits::none()).expect("parse StellarValue");
+
+        let upgrades: Vec<LedgerUpgrade> = sv
+            .upgrades
+            .iter()
+            .filter_map(|b| LedgerUpgrade::from_xdr(&b.0, Limits::none()).ok())
+            .collect();
+
+        assert!(
+            upgrades.len() >= 3,
+            "expected at least 3 upgrades, got {}",
+            upgrades.len()
+        );
+
+        // Verify ordering: each upgrade type must have a lower index than the next
+        let order = |u: &LedgerUpgrade| -> u32 {
+            match u {
+                LedgerUpgrade::Version(_) => 0,
+                LedgerUpgrade::BaseFee(_) => 1,
+                LedgerUpgrade::MaxTxSetSize(_) => 2,
+                LedgerUpgrade::BaseReserve(_) => 3,
+                LedgerUpgrade::Flags(_) => 4,
+                LedgerUpgrade::Config(_) => 5,
+                LedgerUpgrade::MaxSorobanTxSetSize(_) => 6,
+            }
+        };
+        for w in upgrades.windows(2) {
+            assert!(
+                order(&w[0]) < order(&w[1]),
+                "upgrades out of order: {:?} (order {}) should precede {:?} (order {})",
+                w[0],
+                order(&w[0]),
+                w[1],
+                order(&w[1]),
+            );
+        }
     }
 
     /// Regression test for Task 7: genesis-adjacent close-time relaxation.
