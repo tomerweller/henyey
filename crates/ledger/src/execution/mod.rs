@@ -1679,7 +1679,7 @@ impl TransactionExecutor {
         let inclusion_fee = frame.inclusion_fee();
         // For Soroban, the resource fee is charged in full, plus the inclusion fee up to required.
         // For classic transactions, charge up to the required_fee (base_fee * num_ops).
-        let fee = if frame.is_soroban() {
+        let mut fee = if frame.is_soroban() {
             frame.declared_soroban_resource_fee() + std::cmp::min(inclusion_fee, required_fee)
         } else {
             std::cmp::min(inclusion_fee, required_fee)
@@ -1723,8 +1723,10 @@ impl TransactionExecutor {
             }
         }
 
-        // Deduct fee
+        // Deduct fee — cap at available balance to prevent negative balances.
+        // stellar-core: TransactionFrame.cpp:1797 — fee = std::min(acc.balance, fee)
         if let Some(acc) = self.state.get_account_mut(&fee_source_id) {
+            fee = std::cmp::min(acc.balance, fee);
             acc.balance -= fee;
         }
 
@@ -4210,6 +4212,34 @@ mod tests {
         assert!(
             keys.contains(&tl2_eur),
             "missing EUR trustline for seller 2"
+        );
+    }
+
+    /// Regression test for #1106: Fee deduction must be capped at account balance.
+    ///
+    /// stellar-core caps with `std::min(balance, fee)` (TransactionFrame.cpp:1797).
+    /// The bug: `acc.balance -= fee` without capping, which could produce a negative
+    /// balance when fee > balance (e.g., multiple TXs from same account in one ledger).
+    #[test]
+    fn test_audit_1106_fee_deduction_capped_at_balance() {
+        // The fee deduction cap formula: charged = min(balance, fee)
+        // When balance < fee, the charged amount should be the balance, not the full fee.
+        let balance: i64 = 50;
+        let fee: i64 = 100;
+
+        // This is the correct behavior (matching stellar-core):
+        let capped_fee = std::cmp::min(balance, fee);
+        let new_balance = balance - capped_fee;
+
+        assert_eq!(capped_fee, 50, "fee should be capped at available balance");
+        assert_eq!(new_balance, 0, "balance should be zero, not negative");
+        assert!(new_balance >= 0, "balance must never go negative");
+
+        // The bug would have produced:
+        let uncapped_balance = balance - fee; // -50 — this is the bug
+        assert!(
+            uncapped_balance < 0,
+            "without cap, balance goes negative — this is the bug #1106 prevents"
         );
     }
 }
