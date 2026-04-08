@@ -152,7 +152,10 @@ fn ensure_trustline_liabilities(trustline: &mut TrustLineEntry) -> &mut Liabilit
 /// Returns `BalanceError::Overflow` if the addition overflows, or
 /// `BalanceError::LiabilityViolation` if the new balance would violate
 /// the buying liability constraint.
-fn add_account_balance(account: &mut AccountEntry, delta: i64) -> std::result::Result<(), BalanceError> {
+fn add_account_balance(
+    account: &mut AccountEntry,
+    delta: i64,
+) -> std::result::Result<(), BalanceError> {
     let new_balance = CheckedAmount::new(account.balance)
         .checked_add(delta)
         .ok_or(BalanceError::Overflow)?;
@@ -173,7 +176,10 @@ fn add_account_balance(account: &mut AccountEntry, delta: i64) -> std::result::R
 /// Returns `BalanceError::ExceedsLimit` if the new balance would exceed the
 /// trustline limit, or `BalanceError::LiabilityViolation` if it would violate
 /// the buying liability constraint.
-fn add_trustline_balance(tl: &mut TrustLineEntry, delta: i64) -> std::result::Result<(), BalanceError> {
+fn add_trustline_balance(
+    tl: &mut TrustLineEntry,
+    delta: i64,
+) -> std::result::Result<(), BalanceError> {
     let headroom = CheckedAmount::new(tl.limit)
         .checked_sub(tl.balance)
         .ok_or(BalanceError::Overflow)?;

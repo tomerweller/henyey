@@ -683,7 +683,10 @@ fn big_divide(a: i64, b: i64, c: i64, round: Round) -> Result<i64> {
 /// Checked variant of big_divide that returns None on overflow.
 /// stellar-core: numeric.cpp — bigDivide returns false on overflow, asserts C > 0.
 fn big_divide_checked(a: i64, b: i64, c: i64, round: Round) -> Option<i64> {
-    assert!(c > 0, "big_divide_checked: denominator must be positive (got {c})");
+    assert!(
+        c > 0,
+        "big_divide_checked: denominator must be positive (got {c})"
+    );
     let numerator = (a as i128) * (b as i128);
     let denominator = c as i128;
     let result = match round {

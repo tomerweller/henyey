@@ -245,7 +245,10 @@ mod tests {
     #[test]
     fn test_checked_amount_checked_mul() {
         let a = CheckedAmount::new(1_000_000);
-        assert_eq!(a.checked_mul(1_000_000), Some(CheckedAmount::new(1_000_000_000_000)));
+        assert_eq!(
+            a.checked_mul(1_000_000),
+            Some(CheckedAmount::new(1_000_000_000_000))
+        );
     }
 
     #[test]
