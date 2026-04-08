@@ -659,10 +659,9 @@ enum Round {
     Up,
 }
 
+/// stellar-core: numeric.cpp:19 — asserts C > 0, aborts on zero/negative denominator.
 fn big_divide(a: i64, b: i64, c: i64, round: Round) -> Result<i64> {
-    if c == 0 {
-        return Ok(0);
-    }
+    assert!(c > 0, "big_divide: denominator must be positive (got {c})");
     let numerator = (a as i128) * (b as i128);
     let denominator = c as i128;
     let result = match round {
@@ -681,12 +680,10 @@ fn big_divide(a: i64, b: i64, c: i64, round: Round) -> Result<i64> {
     Ok(result as i64)
 }
 
-/// Checked variant of big_divide that returns None on overflow instead of Ok(0).
-/// Matches stellar-core's bigDivide which returns false on overflow.
+/// Checked variant of big_divide that returns None on overflow.
+/// stellar-core: numeric.cpp — bigDivide returns false on overflow, asserts C > 0.
 fn big_divide_checked(a: i64, b: i64, c: i64, round: Round) -> Option<i64> {
-    if c == 0 {
-        return Some(0);
-    }
+    assert!(c > 0, "big_divide_checked: denominator must be positive (got {c})");
     let numerator = (a as i128) * (b as i128);
     let denominator = c as i128;
     let result = match round {
