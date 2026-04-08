@@ -124,8 +124,10 @@ fn validate_ledger_pagination(
         let seq: u32 = c
             .parse()
             .map_err(|_| JsonRpcError::invalid_params(format!("invalid cursor: {c}")))?;
-        // Start from cursor + 1 (cursor is the last seen ledger)
-        return Ok((seq + 1, limit));
+        let start = seq
+            .checked_add(1)
+            .ok_or_else(|| JsonRpcError::invalid_params(format!("cursor overflow: {c}")))?;
+        return Ok((start, limit));
     }
 
     let start = start_ledger
@@ -138,4 +140,31 @@ fn validate_ledger_pagination(
     }
 
     Ok((start, limit))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_audit_024_cursor_u32_max_overflow() {
+        // cursor = u32::MAX should fail with overflow, not wrap to 0
+        let result = validate_ledger_pagination(None, Some("4294967295"), Some(10), 1, 100);
+        assert!(result.is_err(), "u32::MAX cursor must not wrap to 0");
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("cursor overflow"),
+            "expected cursor overflow error, got: {}",
+            err.message,
+        );
+    }
+
+    #[test]
+    fn test_cursor_normal_value() {
+        let result = validate_ledger_pagination(None, Some("50"), Some(10), 1, 100);
+        assert!(result.is_ok());
+        let (start, limit) = result.unwrap();
+        assert_eq!(start, 51);
+        assert_eq!(limit, 10);
+    }
 }
