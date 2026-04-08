@@ -726,4 +726,29 @@ mod tests {
              doApplyFromV14 (CreateAccountOpFrame.cpp:120)."
         );
     }
+
+    /// Tests that a negative starting_balance is rejected as Malformed.
+    /// stellar-core: CreateAccountOpFrame::doCheckValid rejects starting_balance < 0
+    #[test]
+    fn test_create_account_malformed_negative_starting_balance() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        let op = CreateAccountOp {
+            destination: dest_id,
+            starting_balance: -1,
+        };
+
+        let result = execute_create_account(&op, &source_id, &mut state, &context);
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            make_result(CreateAccountResultCode::Malformed)
+        );
+    }
 }

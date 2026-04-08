@@ -90,16 +90,39 @@ pub(crate) fn execute_set_options(
         }
     }
 
+    // Validate home domain string: stellar-core's doCheckValid calls isStringValid()
+    // which rejects bytes outside printable ASCII range (0x20-0x7E).
+    // Reference: SetOptionsOpFrame.cpp doCheckValid()
+    if let Some(ref home_domain) = op.home_domain {
+        if !home_domain
+            .as_vec()
+            .iter()
+            .all(|b| b.is_ascii() && !b.is_ascii_control())
+        {
+            return Ok(make_result(SetOptionsResultCode::InvalidHomeDomain));
+        }
+    }
+
     // Get source account
     let source_account = require_source_account(state, source)?;
+
+    let current_flags = source_account.flags;
+
+    // Validate inflation destination: checked BEFORE immutable flag constraint.
+    // stellar-core's doApply calls loadAccountWithoutRecord(inflationDest) first,
+    // returning SET_OPTIONS_INVALID_INFLATION before any auth flag checks.
+    // Reference: SetOptionsOpFrame.cpp doApply()
+    if let Some(ref inflation_dest) = op.inflation_dest {
+        if inflation_dest != source && state.get_account(inflation_dest).is_none() {
+            return Ok(make_result(SetOptionsResultCode::InvalidInflation));
+        }
+    }
 
     // Check flag consistency
     let auth_flags_mask = AccountFlags::RequiredFlag as u32
         | AccountFlags::RevocableFlag as u32
         | AccountFlags::ImmutableFlag as u32
         | AccountFlags::ClawbackEnabledFlag as u32;
-
-    let current_flags = source_account.flags;
 
     // If account is immutable, can only clear flags (not set new ones)
     if current_flags & (AccountFlags::ImmutableFlag as u32) != 0 {
@@ -146,16 +169,6 @@ pub(crate) fn execute_set_options(
     };
     let (current_num_sponsoring, current_num_sponsored) =
         sponsorship_counts_for_account_entry(source_account);
-
-    // Validate inflation destination: if specified and not the source account itself,
-    // the destination account must exist on the ledger.
-    // This matches stellar-core's SetOptionsOpFrame::doApply() which calls
-    // loadAccountWithoutRecord() and returns SET_OPTIONS_INVALID_INFLATION if not found.
-    if let Some(ref inflation_dest) = op.inflation_dest {
-        if inflation_dest != source && state.get_account(inflation_dest).is_none() {
-            return Ok(make_result(SetOptionsResultCode::InvalidInflation));
-        }
-    }
 
     // Now apply changes to the account
     let source_account_mut = state
@@ -1556,5 +1569,119 @@ mod tests {
         // Verify master weight is 0
         let account = state.get_account(&source_id).unwrap();
         assert_eq!(account.thresholds.0[0], 0, "Master weight should be 0");
+    }
+
+    /// Test SetOptions AuthRevocableRequired: setting clawback without revocable.
+    /// stellar-core: SetOptionsOpFrame::doApply checks accountFlagClawbackIsValid
+    #[test]
+    fn test_set_options_auth_revocable_required() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(50);
+        // Account has no flags set
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        // Try to set clawback without revocable → AuthRevocableRequired
+        let op = SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: None,
+            set_flags: Some(AccountFlags::ClawbackEnabledFlag as u32),
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: None,
+        };
+
+        let result = execute_set_options(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::SetOptions(r)) => {
+                assert!(
+                    matches!(r, SetOptionsResult::AuthRevocableRequired),
+                    "Expected AuthRevocableRequired, got {:?}",
+                    r
+                );
+            }
+            other => panic!("expected SetOptions result, got {:?}", other),
+        }
+    }
+
+    /// AUDIT-1109: Home domain with control characters should return InvalidHomeDomain.
+    /// stellar-core: SetOptionsOpFrame::doCheckValid calls isStringValid() which rejects
+    /// bytes outside 0x20-0x7E.
+    #[test]
+    fn test_set_options_invalid_home_domain_control_chars() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(51);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        // Home domain with control character (tab)
+        let op = SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: None,
+            set_flags: None,
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: Some(String32::try_from(b"bad\tdomain".to_vec()).unwrap()),
+            signer: None,
+        };
+
+        let result = execute_set_options(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::SetOptions(r)) => {
+                assert!(
+                    matches!(r, SetOptionsResult::InvalidHomeDomain),
+                    "AUDIT-1109: Home domain with control chars should be InvalidHomeDomain, got {:?}",
+                    r
+                );
+            }
+            other => panic!("expected SetOptions result, got {:?}", other),
+        }
+    }
+
+    /// AUDIT-1111: When both inflation dest is invalid AND account is immutable,
+    /// stellar-core returns InvalidInflation first (checks inflation before immutable flag
+    /// auth checks). Henyey must match this ordering.
+    #[test]
+    fn test_set_options_inflation_checked_before_cant_change() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(52);
+        let mut source_account = create_test_account(source_id.clone(), 100_000_000);
+        source_account.flags = AccountFlags::ImmutableFlag as u32;
+        state.create_account(source_account);
+
+        // Both invalid inflation (nonexistent dest) AND set auth flags (blocked by immutable)
+        let nonexistent_id = create_test_account_id(253);
+        let op = SetOptionsOp {
+            inflation_dest: Some(nonexistent_id),
+            clear_flags: None,
+            set_flags: Some(AccountFlags::RequiredFlag as u32),
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: None,
+        };
+
+        let result = execute_set_options(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::SetOptions(r)) => {
+                assert!(
+                    matches!(r, SetOptionsResult::InvalidInflation),
+                    "AUDIT-1111: InvalidInflation should be checked before CantChange, got {:?}",
+                    r
+                );
+            }
+            other => panic!("expected SetOptions result, got {:?}", other),
+        }
     }
 }

@@ -3224,4 +3224,14 @@ mod tests {
             "AUDIT-011: Frozen offer must survive when price filter would stop first"
         );
     }
+
+    /// SellNoIssuer is unreachable since protocol 13+ (CAP-0017 removed issuer checks).
+    #[test]
+    #[ignore = "SellNoIssuer is unreachable since protocol 13+ (CAP-0017)"]
+    fn test_manage_sell_offer_sell_no_issuer() {}
+
+    /// BuyNoIssuer is unreachable since protocol 13+ (CAP-0017 removed issuer checks).
+    #[test]
+    #[ignore = "BuyNoIssuer is unreachable since protocol 13+ (CAP-0017)"]
+    fn test_manage_sell_offer_buy_no_issuer() {}
 }

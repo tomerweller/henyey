@@ -1095,6 +1095,29 @@ mod tests {
         }
     }
 
+    fn create_test_account_with_liabilities(
+        account_id: AccountId,
+        balance: i64,
+        buying: i64,
+        selling: i64,
+    ) -> AccountEntry {
+        AccountEntry {
+            account_id,
+            balance,
+            seq_num: SequenceNumber(1),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: vec![].try_into().unwrap(),
+            ext: AccountEntryExt::V1(AccountEntryExtensionV1 {
+                liabilities: Liabilities { buying, selling },
+                ext: AccountEntryExtensionV1Ext::V0,
+            }),
+        }
+    }
+
     fn create_test_context() -> LedgerContext {
         LedgerContext::testnet(1, 1000)
     }
@@ -2014,4 +2037,351 @@ mod tests {
 
         assert_eq!(result.unwrap(), ConvertResult::CrossedTooMany);
     }
+
+    /// Test PathPaymentStrictReceive TooFewOffers: non-native path with no offers in orderbook.
+    /// stellar-core: PathPaymentStrictReceiveOpFrame::doApply returns TOO_FEW_OFFERS
+    /// when conversion finds no matching offers.
+    #[test]
+    fn test_path_payment_strict_receive_too_few_offers() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(90);
+        let dest_id = create_test_account_id(91);
+        let issuer_id = create_test_account_id(92);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let usd = create_asset(&issuer_id);
+        let tl_asset = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+            issuer: issuer_id.clone(),
+        });
+
+        // Both have trustlines with balances
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            tl_asset.clone(),
+            10_000,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+        state.create_trustline(create_test_trustline(
+            dest_id.clone(),
+            tl_asset,
+            0,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        // Send native -> receive USD with no offers in the orderbook
+        let op = PathPaymentStrictReceiveOp {
+            send_asset: Asset::Native,
+            send_max: 10_000,
+            destination: create_test_muxed_account(91),
+            dest_asset: usd,
+            dest_amount: 100,
+            path: vec![].try_into().unwrap(),
+        };
+
+        let result =
+            execute_path_payment_strict_receive(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::PathPaymentStrictReceive(r)) => {
+                assert!(
+                    matches!(r, PathPaymentStrictReceiveResult::TooFewOffers),
+                    "Expected TooFewOffers, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test PathPaymentStrictReceive OfferCrossSelf: source has an offer in the orderbook
+    /// that would be crossed by their own path payment.
+    /// stellar-core: PathPaymentStrictReceiveOpFrame::doApply returns OFFER_CROSS_SELF
+    #[test]
+    fn test_path_payment_strict_receive_offer_cross_self() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(93);
+        let dest_id = create_test_account_id(94);
+        let issuer_id = create_test_account_id(95);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let usd = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+            issuer: issuer_id.clone(),
+        });
+        let tl_usd = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+            issuer: issuer_id.clone(),
+        });
+
+        // Source and dest have USD trustlines
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            tl_usd.clone(),
+            10_000,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+        state.create_trustline(create_test_trustline(
+            dest_id.clone(),
+            tl_usd,
+            0,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        // Source has an offer selling USD for XLM
+        state.create_offer(OfferEntry {
+            seller_id: source_id.clone(),
+            offer_id: 1,
+            selling: usd.clone(),
+            buying: Asset::Native,
+            amount: 10_000,
+            price: Price { n: 1, d: 1 },
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        });
+
+        // Path payment: source sends XLM, dest receives USD.
+        // The orderbook has source's own offer selling USD for XLM, which would cross.
+        let op = PathPaymentStrictReceiveOp {
+            send_asset: Asset::Native,
+            send_max: 10_000,
+            destination: create_test_muxed_account(94),
+            dest_asset: usd,
+            dest_amount: 100,
+            path: vec![].try_into().unwrap(),
+        };
+
+        let result =
+            execute_path_payment_strict_receive(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::PathPaymentStrictReceive(r)) => {
+                assert!(
+                    matches!(r, PathPaymentStrictReceiveResult::OfferCrossSelf),
+                    "Expected OfferCrossSelf, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test PathPaymentStrictReceive OverSendmax: path requires more than send_max.
+    /// stellar-core: PathPaymentStrictReceiveOpFrame::doApply returns OVER_SENDMAX
+    #[test]
+    fn test_path_payment_strict_receive_over_sendmax() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(96);
+        let dest_id = create_test_account_id(97);
+        let issuer_id = create_test_account_id(98);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let usd = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+            issuer: issuer_id.clone(),
+        });
+        let tl_usd = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+            issuer: issuer_id.clone(),
+        });
+
+        // Source and dest have USD trustlines
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            tl_usd.clone(),
+            100_000,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+        state.create_trustline(create_test_trustline(
+            dest_id.clone(),
+            tl_usd,
+            0,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        // Third party has an offer selling USD for XLM at expensive price (10:1)
+        // buying_liab = 10_000 * 10 = 100_000 XLM (native buying liabilities)
+        let maker_id = create_test_account_id(99);
+        state.create_account(create_test_account_with_liabilities(
+            maker_id.clone(),
+            100_000_000,
+            100_000, // buying liabilities for XLM
+            0,
+        ));
+        let tl_usd_maker = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+            issuer: issuer_id.clone(),
+        });
+        // Maker's trustline: selling_liabilities = 10_000 (matches offer amount)
+        state.create_trustline(create_test_trustline_with_liabilities(
+            maker_id.clone(),
+            tl_usd_maker,
+            100_000,
+            1_000_000,
+            AUTHORIZED_FLAG,
+            0,
+            10_000, // selling liabilities matching the offer
+        ));
+        state.create_offer(OfferEntry {
+            seller_id: maker_id,
+            offer_id: 1,
+            selling: usd.clone(),
+            buying: Asset::Native,
+            amount: 10_000,
+            price: Price { n: 10, d: 1 }, // Wants 10 XLM per 1 USD
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        });
+
+        // Source sends XLM with low send_max, wants 1000 USD
+        // At 10:1 price, needs 10,000 XLM but send_max is only 100
+        let op = PathPaymentStrictReceiveOp {
+            send_asset: Asset::Native,
+            send_max: 100,
+            destination: create_test_muxed_account(97),
+            dest_asset: usd,
+            dest_amount: 1000,
+            path: vec![].try_into().unwrap(),
+        };
+
+        let result =
+            execute_path_payment_strict_receive(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::PathPaymentStrictReceive(r)) => {
+                assert!(
+                    matches!(r, PathPaymentStrictReceiveResult::OverSendmax),
+                    "Expected OverSendmax, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test PathPaymentStrictSend UnderDestmin: received amount below dest_min.
+    /// stellar-core: PathPaymentStrictSendOpFrame::doApply returns UNDER_DESTMIN
+    #[test]
+    fn test_path_payment_strict_send_under_destmin() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(100);
+        let dest_id = create_test_account_id(101);
+        let issuer_id = create_test_account_id(102);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let usd = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+            issuer: issuer_id.clone(),
+        });
+        let tl_usd = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+            issuer: issuer_id.clone(),
+        });
+
+        // Both have USD trustlines
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            tl_usd.clone(),
+            100_000,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+        state.create_trustline(create_test_trustline(
+            dest_id.clone(),
+            tl_usd,
+            0,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        // Offer: selling USD for XLM at 10:1 (expensive for buyer)
+        // buying_liab = 10_000 * 10 = 100_000 XLM (native buying liabilities)
+        let maker_id = create_test_account_id(103);
+        state.create_account(create_test_account_with_liabilities(
+            maker_id.clone(),
+            100_000_000,
+            100_000, // buying liabilities for XLM
+            0,
+        ));
+        let tl_usd_maker = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+            issuer: issuer_id.clone(),
+        });
+        // Maker's trustline: selling_liabilities = 10_000 (matches offer amount)
+        state.create_trustline(create_test_trustline_with_liabilities(
+            maker_id.clone(),
+            tl_usd_maker,
+            100_000,
+            1_000_000,
+            AUTHORIZED_FLAG,
+            0,
+            10_000, // selling liabilities matching the offer
+        ));
+        state.create_offer(OfferEntry {
+            seller_id: maker_id,
+            offer_id: 1,
+            selling: usd.clone(),
+            buying: Asset::Native,
+            amount: 10_000,
+            price: Price { n: 10, d: 1 }, // Wants 10 XLM per 1 USD
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        });
+
+        // Source sends 100 XLM, expects at least 100 USD, but at 10:1 gets only ~10 USD
+        let op = PathPaymentStrictSendOp {
+            send_asset: Asset::Native,
+            send_amount: 100,
+            destination: create_test_muxed_account(101),
+            dest_asset: usd,
+            dest_min: 100, // Wants at least 100 USD
+            path: vec![].try_into().unwrap(),
+        };
+
+        let result =
+            execute_path_payment_strict_send(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::PathPaymentStrictSend(r)) => {
+                assert!(
+                    matches!(r, PathPaymentStrictSendResult::UnderDestmin),
+                    "Expected UnderDestmin, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// NoIssuer is unreachable since protocol 13+ (CAP-0017 removed issuer checks).
+    #[test]
+    #[ignore = "NoIssuer is unreachable since protocol 13+ (CAP-0017)"]
+    fn test_path_payment_strict_receive_no_issuer() {}
+
+    /// NoIssuer is unreachable since protocol 13+ (CAP-0017 removed issuer checks).
+    #[test]
+    #[ignore = "NoIssuer is unreachable since protocol 13+ (CAP-0017)"]
+    fn test_path_payment_strict_send_no_issuer() {}
 }

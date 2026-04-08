@@ -7,7 +7,8 @@
 use stellar_xdr::curr::{
     AccountId, Asset, ClaimableBalanceFlags, ClawbackClaimableBalanceOp,
     ClawbackClaimableBalanceResult, ClawbackClaimableBalanceResultCode, ClawbackOp, ClawbackResult,
-    ClawbackResultCode, LedgerKey, LedgerKeyClaimableBalance, OperationResult, OperationResultTr,
+    ClawbackResultCode, LedgerKey, LedgerKeyClaimableBalance, MuxedAccount, OperationResult,
+    OperationResultTr,
 };
 
 use super::is_asset_valid;
@@ -30,11 +31,17 @@ pub(crate) fn execute_clawback(
     state: &mut LedgerStateManager,
     _context: &LedgerContext,
 ) -> Result<OperationResult> {
-    // Cannot clawback from self (stellar-core doCheckValid checks this first)
-    let from_account_id = muxed_to_account_id(&op.from);
-    if &from_account_id == source {
+    // Cannot clawback from self (stellar-core doCheckValid checks this first).
+    // stellar-core compares the full MuxedAccount XDR values, so a MuxedEd25519
+    // with the same base key as the source Ed25519 is NOT considered "self".
+    let source_as_muxed = MuxedAccount::Ed25519(match source.0 {
+        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref k) => k.clone(),
+    });
+    if op.from == source_as_muxed {
         return Ok(make_clawback_result(ClawbackResultCode::Malformed));
     }
+
+    let from_account_id = muxed_to_account_id(&op.from);
 
     // Validate amount
     if op.amount <= 0 {
@@ -1061,5 +1068,235 @@ mod tests {
             tl.balance, 400,
             "Balance should equal selling liabilities after max clawback"
         );
+    }
+
+    /// Test ClawbackClaimableBalance succeeds when issuer claws back a claimable
+    /// balance with the CLAWBACK_ENABLED flag set.
+    #[test]
+    fn test_clawback_claimable_balance_success() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(60);
+        let holder_id = create_test_account_id(61);
+
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AccountFlags::ClawbackEnabledFlag as u32,
+        ));
+        state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
+
+        let asset = create_asset(&issuer_id);
+        let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([1u8; 32]));
+
+        let claimant = Claimant::ClaimantTypeV0(ClaimantV0 {
+            destination: holder_id.clone(),
+            predicate: ClaimPredicate::Unconditional,
+        });
+
+        let cb_entry = ClaimableBalanceEntry {
+            balance_id: balance_id.clone(),
+            claimants: vec![claimant].try_into().unwrap(),
+            asset: asset.clone(),
+            amount: 500,
+            ext: ClaimableBalanceEntryExt::V1(ClaimableBalanceEntryExtensionV1 {
+                flags: ClaimableBalanceFlags::ClaimableBalanceClawbackEnabledFlag as u32,
+                ext: ClaimableBalanceEntryExtensionV1Ext::V0,
+            }),
+        };
+        state.create_claimable_balance(cb_entry);
+
+        let op = ClawbackClaimableBalanceOp {
+            balance_id: balance_id.clone(),
+        };
+
+        let result =
+            execute_clawback_claimable_balance(&op, &issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ClawbackClaimableBalance(r)) => {
+                assert!(
+                    matches!(r, ClawbackClaimableBalanceResult::Success),
+                    "Expected Success, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+
+        // Verify the claimable balance was deleted
+        assert!(
+            state.get_claimable_balance(&balance_id).is_none(),
+            "Claimable balance should be deleted after clawback"
+        );
+    }
+
+    /// Test ClawbackClaimableBalance returns NotIssuer when source is not the
+    /// issuer of the asset in the claimable balance.
+    #[test]
+    fn test_clawback_claimable_balance_not_issuer() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(62);
+        let non_issuer_id = create_test_account_id(63);
+        let holder_id = create_test_account_id(64);
+
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AccountFlags::ClawbackEnabledFlag as u32,
+        ));
+        state.create_account(create_test_account(
+            non_issuer_id.clone(),
+            100_000_000,
+            AccountFlags::ClawbackEnabledFlag as u32,
+        ));
+        state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
+
+        let asset = create_asset(&issuer_id); // issued by issuer_id
+        let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([2u8; 32]));
+
+        let claimant = Claimant::ClaimantTypeV0(ClaimantV0 {
+            destination: holder_id.clone(),
+            predicate: ClaimPredicate::Unconditional,
+        });
+
+        let cb_entry = ClaimableBalanceEntry {
+            balance_id: balance_id.clone(),
+            claimants: vec![claimant].try_into().unwrap(),
+            asset: asset.clone(),
+            amount: 500,
+            ext: ClaimableBalanceEntryExt::V1(ClaimableBalanceEntryExtensionV1 {
+                flags: ClaimableBalanceFlags::ClaimableBalanceClawbackEnabledFlag as u32,
+                ext: ClaimableBalanceEntryExtensionV1Ext::V0,
+            }),
+        };
+        state.create_claimable_balance(cb_entry);
+
+        // non_issuer_id tries to clawback — should fail with NotIssuer
+        let op = ClawbackClaimableBalanceOp {
+            balance_id: balance_id.clone(),
+        };
+
+        let result =
+            execute_clawback_claimable_balance(&op, &non_issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ClawbackClaimableBalance(r)) => {
+                assert!(
+                    matches!(r, ClawbackClaimableBalanceResult::NotIssuer),
+                    "Expected NotIssuer, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test ClawbackClaimableBalance returns NotClawbackEnabled when the
+    /// claimable balance entry does not have the CLAWBACK_ENABLED flag.
+    #[test]
+    fn test_clawback_claimable_balance_not_clawback_enabled() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(65);
+        let holder_id = create_test_account_id(66);
+
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AccountFlags::ClawbackEnabledFlag as u32,
+        ));
+        state.create_account(create_test_account(holder_id.clone(), 100_000_000, 0));
+
+        let asset = create_asset(&issuer_id);
+        let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([3u8; 32]));
+
+        let claimant = Claimant::ClaimantTypeV0(ClaimantV0 {
+            destination: holder_id.clone(),
+            predicate: ClaimPredicate::Unconditional,
+        });
+
+        // No clawback flag on the claimable balance (V0 ext = no flags)
+        let cb_entry = ClaimableBalanceEntry {
+            balance_id: balance_id.clone(),
+            claimants: vec![claimant].try_into().unwrap(),
+            asset: asset.clone(),
+            amount: 500,
+            ext: ClaimableBalanceEntryExt::V0,
+        };
+        state.create_claimable_balance(cb_entry);
+
+        let op = ClawbackClaimableBalanceOp {
+            balance_id: balance_id.clone(),
+        };
+
+        let result =
+            execute_clawback_claimable_balance(&op, &issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ClawbackClaimableBalance(r)) => {
+                assert!(
+                    matches!(r, ClawbackClaimableBalanceResult::NotClawbackEnabled),
+                    "Expected NotClawbackEnabled, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Test that a muxed self-clawback (same base key, different MuxedAccount
+    /// discriminant) is NOT rejected as Malformed.
+    ///
+    /// Bug #1102: The old code compared `muxed_to_account_id(&op.from) == source`,
+    /// which strips the MuxedAccount discriminant. stellar-core compares the full
+    /// MuxedAccount XDR values, so `MuxedEd25519(key, id)` != `Ed25519(key)`.
+    /// A muxed "self" should proceed to trustline lookup and return NoTrust
+    /// (since the issuer has no trustline for their own asset).
+    #[test]
+    fn test_clawback_muxed_self_not_malformed() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(70);
+
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AccountFlags::ClawbackEnabledFlag as u32,
+        ));
+
+        let asset = create_asset(&issuer_id);
+
+        // Build a MuxedEd25519 from with the same base key as issuer but with
+        // a mux ID — this is a different MuxedAccount discriminant.
+        let issuer_key = match issuer_id.0 {
+            PublicKey::PublicKeyTypeEd25519(ref k) => k.clone(),
+        };
+        let muxed_from = MuxedAccount::MuxedEd25519(MuxedAccountMed25519 {
+            id: 12345,
+            ed25519: issuer_key,
+        });
+
+        let op = ClawbackOp {
+            asset,
+            from: muxed_from,
+            amount: 100,
+        };
+
+        // Should NOT be Malformed — should proceed past self-check.
+        // Since issuer has no trustline, the result should be NoTrust.
+        let result = execute_clawback(&op, &issuer_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Clawback(r)) => {
+                assert!(
+                    matches!(r, ClawbackResult::NoTrust),
+                    "Expected NoTrust for muxed self-clawback (bug #1102 fix), got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
     }
 }

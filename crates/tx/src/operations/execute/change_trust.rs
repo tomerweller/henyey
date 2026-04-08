@@ -16,6 +16,7 @@ use super::{
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
+use henyey_common::asset::is_change_trust_asset_valid;
 // SECURITY: transaction framework handles rollback on operation failure; side effects are reverted
 /// Execute a ChangeTrust operation.
 pub(crate) fn execute_change_trust(
@@ -26,6 +27,13 @@ pub(crate) fn execute_change_trust(
 ) -> Result<OperationResult> {
     // Validate limit
     if op.limit < 0 {
+        return Ok(make_result(ChangeTrustResultCode::Malformed));
+    }
+
+    // Validate asset: stellar-core's doCheckValid calls isChangeTrustAssetValid()
+    // which checks pool share fee == 30, assetA < assetB ordering, and individual
+    // asset code validity. Reference: ChangeTrustOpFrame.cpp doCheckValid()
+    if !is_change_trust_asset_valid(&op.line, context.protocol_version) {
         return Ok(make_result(ChangeTrustResultCode::Malformed));
     }
 
@@ -964,11 +972,11 @@ mod tests {
         state.create_account(create_test_account(issuer_b.clone(), 100_000_000));
 
         let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
-            asset_code: AssetCode4(*b"USD\0"),
+            asset_code: AssetCode4(*b"EUR\0"),
             issuer: issuer_a,
         });
         let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
-            asset_code: AssetCode4(*b"EUR\0"),
+            asset_code: AssetCode4(*b"USD\0"),
             issuer: issuer_b,
         });
 
@@ -1073,11 +1081,11 @@ mod tests {
         state.create_account(create_test_account(issuer_b.clone(), 100_000_000));
 
         let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
-            asset_code: AssetCode4(*b"USD\0"),
+            asset_code: AssetCode4(*b"EUR\0"),
             issuer: issuer_a,
         });
         let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
-            asset_code: AssetCode4(*b"EUR\0"),
+            asset_code: AssetCode4(*b"USD\0"),
             issuer: issuer_b,
         });
 
@@ -1146,11 +1154,11 @@ mod tests {
         state.create_account(create_test_account(issuer_b.clone(), 100_000_000));
 
         let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
-            asset_code: AssetCode4(*b"USD\0"),
+            asset_code: AssetCode4(*b"EUR\0"),
             issuer: issuer_a,
         });
         let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
-            asset_code: AssetCode4(*b"EUR\0"),
+            asset_code: AssetCode4(*b"USD\0"),
             issuer: issuer_b,
         });
 
@@ -1591,11 +1599,11 @@ mod tests {
         state.create_account(create_test_account(issuer_b.clone(), 100_000_000));
 
         let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
-            asset_code: AssetCode4(*b"USD\0"),
+            asset_code: AssetCode4(*b"EUR\0"),
             issuer: issuer_a,
         });
         let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
-            asset_code: AssetCode4(*b"EUR\0"),
+            asset_code: AssetCode4(*b"USD\0"),
             issuer: issuer_b,
         });
 
@@ -1787,6 +1795,250 @@ mod tests {
                 );
             }
             other => panic!("Expected ChangeTrust(NoIssuer), got {:?}", other),
+        }
+    }
+
+    /// SelfNotAllowed is not produced in protocol 24+ (returns Malformed instead).
+    #[test]
+    #[ignore = "SelfNotAllowed not produced in protocol 24+ (Malformed returned instead)"]
+    fn test_change_trust_self_not_allowed() {}
+
+    /// Test ChangeTrust TrustLineMissing: creating a pool share trustline when
+    /// underlying asset trustline doesn't exist.
+    /// stellar-core: ChangeTrustOpFrame::doApply returns TRUST_LINE_MISSING
+    #[test]
+    fn test_change_trust_pool_share_trust_line_missing() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(90);
+        let issuer_a = create_test_account_id(91);
+        let issuer_b = create_test_account_id(92);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000));
+
+        // Must respect XDR ordering: EUR < USD
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: issuer_a,
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_b,
+        });
+
+        // Source has trustline for asset A but NOT asset B
+        state.create_trustline(TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_a {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 0,
+            limit: 10_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        });
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 1;
+
+        let params = LiquidityPoolParameters::LiquidityPoolConstantProduct(
+            LiquidityPoolConstantProductParameters {
+                asset_a,
+                asset_b,
+                fee: LIQUIDITY_POOL_FEE_V18,
+            },
+        );
+        let op = ChangeTrustOp {
+            line: ChangeTrustAsset::PoolShare(params),
+            limit: 1_000,
+        };
+
+        let result = execute_change_trust(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ChangeTrust(r)) => {
+                assert!(
+                    matches!(r, ChangeTrustResult::TrustLineMissing),
+                    "Expected TrustLineMissing, got {:?}",
+                    r
+                );
+            }
+            other => panic!("Expected ChangeTrust result, got {:?}", other),
+        }
+    }
+
+    /// Test ChangeTrust NotAuthMaintainLiabilities: creating a pool share trustline when
+    /// underlying asset trustline is not authorized to maintain liabilities.
+    /// stellar-core: ChangeTrustOpFrame::doApply returns NOT_AUTH_MAINTAIN_LIABILITIES
+    #[test]
+    fn test_change_trust_pool_share_not_auth_maintain_liabilities() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(93);
+        let issuer_a = create_test_account_id(94);
+        let issuer_b = create_test_account_id(95);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000));
+
+        // Must respect XDR ordering: EUR < USD
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: issuer_a,
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_b,
+        });
+
+        // Source has trustline for asset A (authorized) and B (not authorized at all)
+        state.create_trustline(TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_a {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 0,
+            limit: 10_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        });
+        // Asset B trustline has NO authorization flags
+        state.create_trustline(TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_b {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 0,
+            limit: 10_000,
+            flags: 0, // Not authorized
+            ext: TrustLineEntryExt::V0,
+        });
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 2;
+
+        let params = LiquidityPoolParameters::LiquidityPoolConstantProduct(
+            LiquidityPoolConstantProductParameters {
+                asset_a,
+                asset_b,
+                fee: LIQUIDITY_POOL_FEE_V18,
+            },
+        );
+        let op = ChangeTrustOp {
+            line: ChangeTrustAsset::PoolShare(params),
+            limit: 1_000,
+        };
+
+        let result = execute_change_trust(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ChangeTrust(r)) => {
+                assert!(
+                    matches!(r, ChangeTrustResult::NotAuthMaintainLiabilities),
+                    "Expected NotAuthMaintainLiabilities, got {:?}",
+                    r
+                );
+            }
+            other => panic!("Expected ChangeTrust result, got {:?}", other),
+        }
+    }
+
+    /// AUDIT-1114: Pool share parameter validation missing. ChangeTrust should reject
+    /// pool share with wrong fee, wrong asset ordering, or invalid asset codes.
+    /// stellar-core: ChangeTrustOpFrame::doCheckValid calls isChangeTrustAssetValid
+    #[test]
+    fn test_change_trust_pool_share_malformed_wrong_fee() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(96);
+        let issuer_a = create_test_account_id(97);
+        let issuer_b = create_test_account_id(98);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_a,
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: issuer_b,
+        });
+
+        // Wrong fee (should be LIQUIDITY_POOL_FEE_V18 = 30)
+        let params = LiquidityPoolParameters::LiquidityPoolConstantProduct(
+            LiquidityPoolConstantProductParameters {
+                asset_a,
+                asset_b,
+                fee: 100, // Wrong fee
+            },
+        );
+        let op = ChangeTrustOp {
+            line: ChangeTrustAsset::PoolShare(params),
+            limit: 1_000,
+        };
+
+        let result = execute_change_trust(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ChangeTrust(r)) => {
+                assert!(
+                    matches!(r, ChangeTrustResult::Malformed),
+                    "AUDIT-1114: Pool share with wrong fee should be Malformed, got {:?}",
+                    r
+                );
+            }
+            other => panic!("Expected ChangeTrust result, got {:?}", other),
+        }
+    }
+
+    /// AUDIT-1114: Pool share with wrong asset ordering should be Malformed.
+    #[test]
+    fn test_change_trust_pool_share_malformed_wrong_asset_order() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(100);
+        let issuer_a = create_test_account_id(101);
+        let issuer_b = create_test_account_id(102);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000));
+
+        // Correct ordering would be EUR < USD, but we intentionally reverse them
+        let asset_eur = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: issuer_a,
+        });
+        let asset_usd = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_b,
+        });
+
+        // Wrong ordering: USD as asset_a, EUR as asset_b (should be EUR < USD)
+        let params = LiquidityPoolParameters::LiquidityPoolConstantProduct(
+            LiquidityPoolConstantProductParameters {
+                asset_a: asset_usd, // Wrong! USD > EUR
+                asset_b: asset_eur, // Wrong!
+                fee: LIQUIDITY_POOL_FEE_V18,
+            },
+        );
+        let op = ChangeTrustOp {
+            line: ChangeTrustAsset::PoolShare(params),
+            limit: 1_000,
+        };
+
+        let result = execute_change_trust(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ChangeTrust(r)) => {
+                assert!(
+                    matches!(r, ChangeTrustResult::Malformed),
+                    "AUDIT-1114: Pool share with wrong asset order should be Malformed, got {:?}",
+                    r
+                );
+            }
+            other => panic!("Expected ChangeTrust result, got {:?}", other),
         }
     }
 }

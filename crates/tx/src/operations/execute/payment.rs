@@ -1454,4 +1454,13 @@ mod tests {
             _ => panic!("Unexpected result type"),
         }
     }
+
+    /// NoIssuer is unreachable since protocol 13+ (CAP-0017 removed issuer checks).
+    /// This test documents that the code path is dead for protocol 24+.
+    #[test]
+    #[ignore = "NoIssuer is unreachable since protocol 13+ (CAP-0017)"]
+    fn test_payment_no_issuer() {
+        // NoIssuer would require check_issuer() to fail, but it's a no-op since protocol 13.
+        // PaymentResult::NoIssuer is defined in XDR but never produced.
+    }
 }

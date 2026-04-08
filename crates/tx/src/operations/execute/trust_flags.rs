@@ -36,6 +36,12 @@ pub(crate) fn execute_allow_trust(
     state: &mut LedgerStateManager,
     _context: &LedgerContext,
 ) -> Result<OperationResult> {
+    // Validate authorize value (matches stellar-core doCheckValid ordering).
+    // Valid values: 0, AUTHORIZED_FLAG (1), AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG (2).
+    if op.authorize > AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG {
+        return Ok(make_allow_trust_result(AllowTrustResultCode::Malformed));
+    }
+
     // Check source account exists (the issuer)
     // NOTE: stellar-core loads the source account in a nested LedgerTxn (ltxSource)
     // that gets rolled back, so the source account access is NOT recorded in the
@@ -106,6 +112,14 @@ pub(crate) fn execute_allow_trust(
     Ok(make_allow_trust_result(AllowTrustResultCode::Success))
 }
 
+/// Valid mask for set_flags: only AUTHORIZED and AUTHORIZED_TO_MAINTAIN_LIABILITIES are allowed.
+const VALID_SET_FLAGS_MASK: u32 = AUTHORIZED_FLAG | AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG;
+
+/// Valid mask for clear_flags: AUTHORIZED, AUTHORIZED_TO_MAINTAIN_LIABILITIES, and
+/// TRUSTLINE_CLAWBACK_ENABLED are allowed.
+const VALID_CLEAR_FLAGS_MASK: u32 =
+    AUTHORIZED_FLAG | AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG | TRUSTLINE_CLAWBACK_ENABLED_FLAG;
+
 /// Execute a SetTrustLineFlags operation.
 ///
 /// This operation sets or clears specific flags on a trustline.
@@ -116,6 +130,46 @@ pub(crate) fn execute_set_trust_line_flags(
     state: &mut LedgerStateManager,
     _context: &LedgerContext,
 ) -> Result<OperationResult> {
+    // --- doCheckValid checks (before any state access) ---
+
+    // Self-trust modification not allowed
+    if &op.trustor == source {
+        return Ok(make_set_flags_result(
+            SetTrustLineFlagsResultCode::Malformed,
+        ));
+    }
+
+    // set_flags must only contain valid flag bits (AUTHORIZED | AUTHORIZED_TO_MAINTAIN_LIABILITIES)
+    // In particular, TRUSTLINE_CLAWBACK_ENABLED_FLAG cannot be set via this operation.
+    if (op.set_flags & !VALID_SET_FLAGS_MASK) != 0 {
+        return Ok(make_set_flags_result(
+            SetTrustLineFlagsResultCode::Malformed,
+        ));
+    }
+
+    // clear_flags must only contain valid flag bits (AUTHORIZED | AUTHORIZED_TO_MAINTAIN_LIABILITIES | CLAWBACK_ENABLED)
+    if (op.clear_flags & !VALID_CLEAR_FLAGS_MASK) != 0 {
+        return Ok(make_set_flags_result(
+            SetTrustLineFlagsResultCode::Malformed,
+        ));
+    }
+
+    // Cannot set both AUTHORIZED and AUTHORIZED_TO_MAINTAIN_LIABILITIES
+    if (op.set_flags & AUTHORIZED_FLAG != 0)
+        && (op.set_flags & AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG != 0)
+    {
+        return Ok(make_set_flags_result(
+            SetTrustLineFlagsResultCode::Malformed,
+        ));
+    }
+
+    // Cannot clear and set the same flag
+    if (op.set_flags & op.clear_flags) != 0 {
+        return Ok(make_set_flags_result(
+            SetTrustLineFlagsResultCode::Malformed,
+        ));
+    }
+
     // Check source account exists (the issuer)
     // NOTE: stellar-core loads the source account in a nested LedgerTxn (ltxSource)
     // that gets rolled back, so the source account access is NOT recorded in the
@@ -176,22 +230,6 @@ pub(crate) fn execute_set_trust_line_flags(
             ));
         }
     };
-
-    // Cannot set both AUTHORIZED and AUTHORIZED_TO_MAINTAIN_LIABILITIES
-    if (op.set_flags & AUTHORIZED_FLAG != 0)
-        && (op.set_flags & AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG != 0)
-    {
-        return Ok(make_set_flags_result(
-            SetTrustLineFlagsResultCode::Malformed,
-        ));
-    }
-
-    // Cannot clear and set the same flag
-    if (op.set_flags & op.clear_flags) != 0 {
-        return Ok(make_set_flags_result(
-            SetTrustLineFlagsResultCode::Malformed,
-        ));
-    }
 
     // Calculate new flags: apply clear first, then set
     let mut new_flags = trustline.flags;
@@ -1583,6 +1621,192 @@ mod tests {
         }
     }
 
+    /// Bug #1095: SetTrustLineFlags must reject trustor == source (self-trust modification).
+    ///
+    /// C++ Reference: SetTrustLineFlagsOpFrame::doCheckValid - "mSetTrustLineFlags.trustor == getSourceID()"
+    #[test]
+    fn test_set_trust_line_flags_malformed_self_trust() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(90);
+
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000, 0));
+
+        // Issuer tries to set flags on their own trustline (trustor == source)
+        let asset = create_asset(&issuer_id);
+        let op = SetTrustLineFlagsOp {
+            trustor: issuer_id.clone(), // same as source
+            asset,
+            clear_flags: 0,
+            set_flags: AUTHORIZED_FLAG,
+        };
+
+        let result = execute_set_trust_line_flags(
+            &op,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
+        )
+        .unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
+                assert!(
+                    matches!(r, SetTrustLineFlagsResult::Malformed),
+                    "Expected Malformed for self-trust, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Bug #1095: SetTrustLineFlags must reject TRUSTLINE_CLAWBACK_ENABLED_FLAG in set_flags.
+    /// Clawback can only be cleared, never set via this operation.
+    ///
+    /// C++ Reference: SetTrustLineFlagsOpFrame::doCheckValid - "!trustLineFlagIsValid"
+    #[test]
+    fn test_set_trust_line_flags_malformed_clawback_in_set_flags() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(91);
+        let trustor_id = create_test_account_id(92);
+
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(trustor_id.clone(), 100_000_000, 0));
+
+        let asset = create_asset(&issuer_id);
+        let op = SetTrustLineFlagsOp {
+            trustor: trustor_id.clone(),
+            asset,
+            clear_flags: 0,
+            set_flags: TRUSTLINE_CLAWBACK_ENABLED_FLAG, // Cannot set clawback via this op
+        };
+
+        let result = execute_set_trust_line_flags(
+            &op,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
+        )
+        .unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
+                assert!(
+                    matches!(r, SetTrustLineFlagsResult::Malformed),
+                    "Expected Malformed for clawback in set_flags, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// SetTrustLineFlags must reject set_flags with bits outside the valid mask.
+    ///
+    /// C++ Reference: SetTrustLineFlagsOpFrame::doCheckValid - "!trustLineFlagIsValid"
+    #[test]
+    fn test_set_trust_line_flags_malformed_invalid_set_flags_bits() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(93);
+        let trustor_id = create_test_account_id(94);
+
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(trustor_id.clone(), 100_000_000, 0));
+
+        let asset = create_asset(&issuer_id);
+        // Use a high bit (0x8) that is not in the valid set_flags mask
+        let op = SetTrustLineFlagsOp {
+            trustor: trustor_id.clone(),
+            asset,
+            clear_flags: 0,
+            set_flags: 0x8, // bit outside AUTHORIZED | AUTHORIZED_TO_MAINTAIN_LIABILITIES
+        };
+
+        let result = execute_set_trust_line_flags(
+            &op,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
+        )
+        .unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
+                assert!(
+                    matches!(r, SetTrustLineFlagsResult::Malformed),
+                    "Expected Malformed for invalid set_flags bits, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// SetTrustLineFlags must reject clear_flags with bits outside the valid mask.
+    ///
+    /// C++ Reference: SetTrustLineFlagsOpFrame::doCheckValid - "!trustLineFlagMaskCheckIsValid"
+    #[test]
+    fn test_set_trust_line_flags_malformed_invalid_clear_flags_bits() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(95);
+        let trustor_id = create_test_account_id(96);
+
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(trustor_id.clone(), 100_000_000, 0));
+
+        let asset = create_asset(&issuer_id);
+        // Use a high bit (0x8) that is not in the valid clear_flags mask (0x7)
+        let op = SetTrustLineFlagsOp {
+            trustor: trustor_id.clone(),
+            asset,
+            clear_flags: 0x8, // bit outside AUTHORIZED | AUTHORIZED_TO_MAINTAIN_LIABILITIES | CLAWBACK_ENABLED
+            set_flags: 0,
+        };
+
+        let result = execute_set_trust_line_flags(
+            &op,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
+        )
+        .unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
+                assert!(
+                    matches!(r, SetTrustLineFlagsResult::Malformed),
+                    "Expected Malformed for invalid clear_flags bits, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
     // --- T-02 regression tests: pool share trustline redemption on deauthorize ---
 
     fn create_pool_entry(
@@ -2446,5 +2670,221 @@ mod tests {
             .get_claimable_balance(&cb_high_a)
             .expect("claimable balance for pool_id_high asset_a should exist");
         assert_eq!(cb.amount, 150);
+    }
+
+    /// Bug #1101: authorize value > AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG (2)
+    /// should be rejected as Malformed. stellar-core validates this in doCheckValid
+    /// before any other checks.
+    #[test]
+    fn test_allow_trust_malformed_invalid_authorize_value() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(90);
+        let trustor_id = create_test_account_id(91);
+
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AccountFlags::RequiredFlag as u32,
+        ));
+
+        // authorize = 3 is invalid (only 0, 1, 2 are valid)
+        let op = AllowTrustOp {
+            trustor: trustor_id.clone(),
+            asset: AssetCode::CreditAlphanum4(AssetCode4([b'U', b'S', b'D', b'C'])),
+            authorize: 3,
+        };
+
+        let result = execute_allow_trust(
+            &op,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
+        )
+        .unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::AllowTrust(r)) => {
+                assert!(
+                    matches!(r, AllowTrustResult::Malformed),
+                    "Expected Malformed for authorize=3, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+
+        // Also test with a large value
+        let op_large = AllowTrustOp {
+            trustor: trustor_id.clone(),
+            asset: AssetCode::CreditAlphanum4(AssetCode4([b'U', b'S', b'D', b'C'])),
+            authorize: 255,
+        };
+
+        let result = execute_allow_trust(
+            &op_large,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
+        )
+        .unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::AllowTrust(r)) => {
+                assert!(
+                    matches!(r, AllowTrustResult::Malformed),
+                    "Expected Malformed for authorize=255, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    /// AllowTrust with authorize=0 (full revocation) that triggers pool share
+    /// trustline redemption returns LowReserve when the sponsoring account for
+    /// the claimable balance cannot cover the reserve.
+    ///
+    /// This test places the sponsoring account in a sponsorship sandwich where
+    /// the sandwich sponsor does not exist, causing the claimable balance
+    /// creation to fail with LowReserve.
+    #[test]
+    fn test_allow_trust_low_reserve() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(92);
+        let trustor_id = create_test_account_id(93);
+        let other_issuer_id = create_test_account_id(94);
+        let ghost_sponsor_id = create_test_account_id(95); // does not exist in state
+
+        // Issuer needs AUTH_REQUIRED | AUTH_REVOCABLE
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AccountFlags::RequiredFlag as u32 | AccountFlags::RevocableFlag as u32,
+        ));
+        state.create_account(create_test_account(trustor_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(other_issuer_id.clone(), 100_000_000, 0));
+        // ghost_sponsor_id is NOT created — it doesn't exist
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"AAA\0"),
+            issuer: issuer_id.clone(),
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"BBB\0"),
+            issuer: other_issuer_id.clone(),
+        });
+
+        let pool_id = PoolId(Hash([92u8; 32]));
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            1000,
+            2000,
+            500,
+            1,
+        ));
+
+        // Asset trustlines
+        state.create_trustline(create_trustline_v2(
+            trustor_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"AAA\0"),
+                issuer: issuer_id.clone(),
+            }),
+            5000,
+            100_000,
+            AUTHORIZED_FLAG,
+            1,
+        ));
+        state.create_trustline(create_trustline_v2(
+            trustor_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"BBB\0"),
+                issuer: other_issuer_id.clone(),
+            }),
+            5000,
+            100_000,
+            AUTHORIZED_FLAG,
+            1,
+        ));
+
+        // Pool share trustline with non-zero balance so claimable balances are needed
+        state.create_trustline(TrustLineEntry {
+            account_id: trustor_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 100,
+            limit: i64::MAX,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        });
+
+        if let Some(acct) = state.get_account_mut(&trustor_id) {
+            acct.num_sub_entries += 4;
+        }
+
+        // Push a sponsorship sandwich: the trustor is sponsored by the ghost
+        // (non-existent) account. When redeem_into_claimable_balance looks up
+        // active_sponsor_for(cb_sponsoring_acc_id) and finds the ghost sponsor,
+        // it will try to load the ghost sponsor account, find it missing, and
+        // return LowReserve.
+        state.push_sponsorship(ghost_sponsor_id.clone(), trustor_id.clone());
+
+        let op = AllowTrustOp {
+            trustor: trustor_id.clone(),
+            asset: AssetCode::CreditAlphanum4(AssetCode4(*b"AAA\0")),
+            authorize: 0,
+        };
+
+        let result = execute_allow_trust(
+            &op,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
+        )
+        .unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::AllowTrust(r)) => {
+                assert!(
+                    matches!(r, AllowTrustResult::LowReserve),
+                    "Expected LowReserve, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    /// AUTH_REQUIRED (TrustNotRequired) is dead code for protocol 24+.
+    /// stellar-core removed the AUTH_REQUIRED check from AllowTrust in protocol 16
+    /// (CAP-0035). Since henyey only supports protocol 24+, this code path
+    /// is unreachable in production. This test is ignored as documentation.
+    #[test]
+    #[ignore]
+    fn test_allow_trust_trust_not_required() {
+        // In stellar-core < protocol 16, AllowTrust would return TrustNotRequired
+        // if the issuer did not have the AUTH_REQUIRED flag set. This check was
+        // removed in protocol 16 (CAP-0035), and since henyey only supports
+        // protocol 24+, the TrustNotRequired result code is dead code.
+        //
+        // The existing test_allow_trust_no_auth_required test above demonstrates
+        // that AllowTrust succeeds even without AUTH_REQUIRED in protocol 24+.
     }
 }
