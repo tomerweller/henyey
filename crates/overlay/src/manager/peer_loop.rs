@@ -687,6 +687,9 @@ impl OverlayManager {
                                         peer_id, err.code, err.msg.to_string()
                                     );
                                 }
+                                // Parity: stellar-core's recvError() unconditionally
+                                // calls drop() — ErrorMsg is terminal.
+                                break;
                             }
 
                             // Flow control: RAII guard locks capacity on creation,
