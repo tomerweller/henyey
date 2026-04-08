@@ -4083,4 +4083,14 @@ mod tests {
             other => panic!("unexpected: {:?}", other),
         }
     }
+
+    /// Dead code: SellNoIssuer is unreachable in protocol 13+ (CAP-0017).
+    #[test]
+    #[ignore = "Dead code: CAP-0017 (protocol 13+) removed issuer existence checks"]
+    fn test_manage_buy_offer_sell_no_issuer() {}
+
+    /// Dead code: BuyNoIssuer is unreachable in protocol 13+ (CAP-0017).
+    #[test]
+    #[ignore = "Dead code: CAP-0017 (protocol 13+) removed issuer existence checks"]
+    fn test_manage_buy_offer_buy_no_issuer() {}
 }

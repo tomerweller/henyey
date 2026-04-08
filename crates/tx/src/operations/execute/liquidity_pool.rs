@@ -2614,4 +2614,64 @@ mod tests {
             other => panic!("unexpected result: {:?}", other),
         }
     }
+
+    /// LiquidityPoolDeposit returns Malformed when max_amount_a is zero.
+    #[test]
+    fn test_liquidity_pool_deposit_malformed_zero_amount() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 0));
+
+        let op = LiquidityPoolDepositOp {
+            liquidity_pool_id: PoolId(Hash([0; 32])),
+            max_amount_a: 0, // Invalid
+            max_amount_b: 1000,
+            min_price: Price { n: 1, d: 1 },
+            max_price: Price { n: 1, d: 1 },
+        };
+
+        let result = execute_liquidity_pool_deposit(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolDeposit(r)) => {
+                assert!(
+                    matches!(r, LiquidityPoolDepositResult::Malformed),
+                    "Expected Malformed, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    /// LiquidityPoolDeposit returns Malformed when min_price > max_price.
+    #[test]
+    fn test_liquidity_pool_deposit_malformed_min_exceeds_max_price() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 0));
+
+        let op = LiquidityPoolDepositOp {
+            liquidity_pool_id: PoolId(Hash([0; 32])),
+            max_amount_a: 1000,
+            max_amount_b: 1000,
+            min_price: Price { n: 2, d: 1 }, // 2.0
+            max_price: Price { n: 1, d: 1 }, // 1.0 -- less than min
+        };
+
+        let result = execute_liquidity_pool_deposit(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolDeposit(r)) => {
+                assert!(
+                    matches!(r, LiquidityPoolDepositResult::Malformed),
+                    "Expected Malformed, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
 }

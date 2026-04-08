@@ -1095,7 +1095,9 @@ fn make_strict_send_result_with_asset(
 mod tests {
     use super::super::AUTHORIZED_FLAG;
     use super::*;
-    use crate::test_utils::create_test_account_id;
+    use crate::test_utils::{
+        create_test_account_id, create_test_asset, create_test_trustline_asset,
+    };
     use stellar_xdr::curr::*;
 
     fn create_test_muxed_account(seed: u8) -> MuxedAccount {
@@ -2510,5 +2512,569 @@ mod tests {
                 PathPaymentStrictSendResult::Malformed
             ))
         ));
+    }
+
+    // ---- Inlined parity tests: PathPaymentStrictReceive ----
+
+    /// PathPaymentStrictReceive returns SrcNotAuthorized when the source has a
+    /// trustline for the send asset but it is not authorized.
+    #[test]
+    fn test_path_payment_strict_receive_src_not_authorized() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+        let issuer_id = create_test_account_id(2);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let asset = create_test_asset(b"USD\0", issuer_id.clone());
+        let tl_asset = create_test_trustline_asset(b"USD\0", issuer_id.clone());
+
+        // Source has trustline but NOT authorized (flags=0)
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            tl_asset.clone(),
+            500,
+            1_000_000,
+            0, // Not authorized
+        ));
+
+        // Dest has authorized trustline
+        state.create_trustline(create_test_trustline(
+            dest_id.clone(),
+            tl_asset,
+            0,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        let op = PathPaymentStrictReceiveOp {
+            send_asset: asset.clone(),
+            send_max: 500,
+            destination: MuxedAccount::Ed25519(Uint256([1; 32])),
+            dest_asset: asset,
+            dest_amount: 100,
+            path: vec![].try_into().unwrap(),
+        };
+
+        let result =
+            execute_path_payment_strict_receive(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::PathPaymentStrictReceive(r)) => {
+                assert!(
+                    matches!(r, PathPaymentStrictReceiveResult::SrcNotAuthorized),
+                    "Expected SrcNotAuthorized, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    // ---- Inlined parity tests: PathPaymentStrictSend ----
+
+    /// PathPaymentStrictSend succeeds for a direct same-asset payment.
+    #[test]
+    fn test_path_payment_strict_send_success() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 50_000_000));
+
+        let op = PathPaymentStrictSendOp {
+            send_asset: Asset::Native,
+            send_amount: 1_000_000,
+            destination: MuxedAccount::Ed25519(Uint256([1; 32])),
+            dest_asset: Asset::Native,
+            dest_min: 1_000_000,
+            path: vec![].try_into().unwrap(),
+        };
+
+        let result =
+            execute_path_payment_strict_send(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::PathPaymentStrictSend(
+                PathPaymentStrictSendResult::Success(_),
+            )) => {} // OK
+            other => panic!("expected Success, got {:?}", other),
+        }
+    }
+
+    /// PathPaymentStrictSend returns Underfunded when source doesn't have enough native balance.
+    #[test]
+    fn test_path_payment_strict_send_underfunded() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+
+        // Source has only minimum balance (10M), no available balance to send
+        state.create_account(create_test_account(source_id.clone(), 10_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 50_000_000));
+
+        let op = PathPaymentStrictSendOp {
+            send_asset: Asset::Native,
+            send_amount: 5_000_000,
+            destination: MuxedAccount::Ed25519(Uint256([1; 32])),
+            dest_asset: Asset::Native,
+            dest_min: 5_000_000,
+            path: vec![].try_into().unwrap(),
+        };
+
+        let result =
+            execute_path_payment_strict_send(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::PathPaymentStrictSend(r)) => {
+                assert!(
+                    matches!(r, PathPaymentStrictSendResult::Underfunded),
+                    "Expected Underfunded, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    /// PathPaymentStrictSend returns SrcNoTrust when source has no trustline for the send asset.
+    #[test]
+    fn test_path_payment_strict_send_src_no_trust() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+        let issuer_id = create_test_account_id(2);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let asset = create_test_asset(b"USD\0", issuer_id.clone());
+        let tl_asset = create_test_trustline_asset(b"USD\0", issuer_id);
+
+        // Dest has trustline, source does NOT
+        state.create_trustline(create_test_trustline(
+            dest_id.clone(),
+            tl_asset,
+            0,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        let op = PathPaymentStrictSendOp {
+            send_asset: asset.clone(),
+            send_amount: 100,
+            destination: MuxedAccount::Ed25519(Uint256([1; 32])),
+            dest_asset: asset,
+            dest_min: 100,
+            path: vec![].try_into().unwrap(),
+        };
+
+        let result =
+            execute_path_payment_strict_send(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::PathPaymentStrictSend(r)) => {
+                assert!(
+                    matches!(r, PathPaymentStrictSendResult::SrcNoTrust),
+                    "Expected SrcNoTrust, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    /// PathPaymentStrictSend returns SrcNotAuthorized when source trustline is not authorized.
+    #[test]
+    fn test_path_payment_strict_send_src_not_authorized() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+        let issuer_id = create_test_account_id(2);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let asset = create_test_asset(b"USD\0", issuer_id.clone());
+        let tl_asset = create_test_trustline_asset(b"USD\0", issuer_id);
+
+        // Source trustline NOT authorized
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            tl_asset.clone(),
+            500,
+            1_000_000,
+            0, // Not authorized
+        ));
+        state.create_trustline(create_test_trustline(
+            dest_id.clone(),
+            tl_asset,
+            0,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        let op = PathPaymentStrictSendOp {
+            send_asset: asset.clone(),
+            send_amount: 100,
+            destination: MuxedAccount::Ed25519(Uint256([1; 32])),
+            dest_asset: asset,
+            dest_min: 100,
+            path: vec![].try_into().unwrap(),
+        };
+
+        let result =
+            execute_path_payment_strict_send(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::PathPaymentStrictSend(r)) => {
+                assert!(
+                    matches!(r, PathPaymentStrictSendResult::SrcNotAuthorized),
+                    "Expected SrcNotAuthorized, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    /// PathPaymentStrictSend returns NoDestination when the dest account doesn't exist.
+    #[test]
+    fn test_path_payment_strict_send_no_destination() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        // dest NOT created
+
+        let op = PathPaymentStrictSendOp {
+            send_asset: Asset::Native,
+            send_amount: 1_000_000,
+            destination: MuxedAccount::Ed25519(Uint256([99; 32])), // doesn't exist
+            dest_asset: Asset::Native,
+            dest_min: 1_000_000,
+            path: vec![].try_into().unwrap(),
+        };
+
+        let result =
+            execute_path_payment_strict_send(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::PathPaymentStrictSend(r)) => {
+                assert!(
+                    matches!(r, PathPaymentStrictSendResult::NoDestination),
+                    "Expected NoDestination, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    /// PathPaymentStrictSend returns NoTrust when dest has no trustline for credit asset.
+    #[test]
+    fn test_path_payment_strict_send_no_trust() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+        let issuer_id = create_test_account_id(2);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let asset = create_test_asset(b"USD\0", issuer_id.clone());
+        let tl_asset = create_test_trustline_asset(b"USD\0", issuer_id);
+
+        // Source has trustline, dest does NOT
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            tl_asset,
+            500,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        let op = PathPaymentStrictSendOp {
+            send_asset: asset.clone(),
+            send_amount: 100,
+            destination: MuxedAccount::Ed25519(Uint256([1; 32])),
+            dest_asset: asset,
+            dest_min: 100,
+            path: vec![].try_into().unwrap(),
+        };
+
+        let result =
+            execute_path_payment_strict_send(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::PathPaymentStrictSend(r)) => {
+                assert!(
+                    matches!(r, PathPaymentStrictSendResult::NoTrust),
+                    "Expected NoTrust, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    /// PathPaymentStrictSend returns NotAuthorized when dest trustline is not authorized.
+    #[test]
+    fn test_path_payment_strict_send_not_authorized() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+        let issuer_id = create_test_account_id(2);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let asset = create_test_asset(b"USD\0", issuer_id.clone());
+        let tl_asset = create_test_trustline_asset(b"USD\0", issuer_id);
+
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            tl_asset.clone(),
+            500,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+        // Dest trustline NOT authorized
+        state.create_trustline(create_test_trustline(
+            dest_id.clone(),
+            tl_asset,
+            0,
+            1_000_000,
+            0, // Not authorized
+        ));
+
+        let op = PathPaymentStrictSendOp {
+            send_asset: asset.clone(),
+            send_amount: 100,
+            destination: MuxedAccount::Ed25519(Uint256([1; 32])),
+            dest_asset: asset,
+            dest_min: 100,
+            path: vec![].try_into().unwrap(),
+        };
+
+        let result =
+            execute_path_payment_strict_send(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::PathPaymentStrictSend(r)) => {
+                assert!(
+                    matches!(r, PathPaymentStrictSendResult::NotAuthorized),
+                    "Expected NotAuthorized, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    /// PathPaymentStrictSend returns LineFull when dest trustline can't hold the amount.
+    #[test]
+    fn test_path_payment_strict_send_line_full() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+        let issuer_id = create_test_account_id(2);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let asset = create_test_asset(b"USD\0", issuer_id.clone());
+        let tl_asset = create_test_trustline_asset(b"USD\0", issuer_id);
+
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            tl_asset.clone(),
+            10_000,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+        // Dest trustline is nearly full (limit=1000, balance=999)
+        state.create_trustline(create_test_trustline(
+            dest_id.clone(),
+            tl_asset,
+            999,
+            1_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        let op = PathPaymentStrictSendOp {
+            send_asset: asset.clone(),
+            send_amount: 100,
+            destination: MuxedAccount::Ed25519(Uint256([1; 32])),
+            dest_asset: asset,
+            dest_min: 100,
+            path: vec![].try_into().unwrap(),
+        };
+
+        let result =
+            execute_path_payment_strict_send(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::PathPaymentStrictSend(r)) => {
+                assert!(
+                    matches!(r, PathPaymentStrictSendResult::LineFull),
+                    "Expected LineFull, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    /// TooFewOffers when no offers exist for a cross-asset strict send path.
+    #[test]
+    fn test_path_payment_strict_send_too_few_offers() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+        let issuer_a = create_test_account_id(2);
+        let issuer_b = create_test_account_id(3);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000));
+
+        let asset_a = create_test_asset(b"AAA\0", issuer_a.clone());
+        let asset_b = create_test_asset(b"BBB\0", issuer_b.clone());
+
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            create_test_trustline_asset(b"AAA\0", issuer_a),
+            10_000,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+        state.create_trustline(create_test_trustline(
+            dest_id.clone(),
+            create_test_trustline_asset(b"BBB\0", issuer_b),
+            0,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        let op = PathPaymentStrictSendOp {
+            send_asset: asset_a,
+            send_amount: 100,
+            destination: MuxedAccount::Ed25519(Uint256([1; 32])),
+            dest_asset: asset_b,
+            dest_min: 1,
+            path: vec![].try_into().unwrap(),
+        };
+
+        let result =
+            execute_path_payment_strict_send(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::PathPaymentStrictSend(r)) => {
+                assert!(
+                    matches!(r, PathPaymentStrictSendResult::TooFewOffers),
+                    "Expected TooFewOffers, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    /// PathPaymentStrictSend returns OfferCrossSelf when the path would cross
+    /// the source's own offer in the DEX.
+    #[test]
+    fn test_path_payment_strict_send_offer_cross_self() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+        let issuer_a = create_test_account_id(2);
+        let issuer_b = create_test_account_id(3);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000));
+
+        let asset_a = create_test_asset(b"AAA\0", issuer_a.clone());
+        let asset_b = create_test_asset(b"BBB\0", issuer_b.clone());
+
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            create_test_trustline_asset(b"AAA\0", issuer_a.clone()),
+            100_000,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            create_test_trustline_asset(b"BBB\0", issuer_b.clone()),
+            100_000,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+        state.create_trustline(create_test_trustline(
+            dest_id.clone(),
+            create_test_trustline_asset(b"BBB\0", issuer_b),
+            0,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        // Source's own offer: selling B for A. Path payment sends A→B crosses it.
+        state.create_offer(OfferEntry {
+            seller_id: source_id.clone(),
+            offer_id: 1,
+            selling: asset_b.clone(),
+            buying: asset_a.clone(),
+            amount: 10_000,
+            price: Price { n: 1, d: 1 },
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        });
+
+        let op = PathPaymentStrictSendOp {
+            send_asset: asset_a,
+            send_amount: 100,
+            destination: MuxedAccount::Ed25519(Uint256([1; 32])),
+            dest_asset: asset_b,
+            dest_min: 1,
+            path: vec![].try_into().unwrap(),
+        };
+
+        let result =
+            execute_path_payment_strict_send(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::PathPaymentStrictSend(r)) => {
+                assert!(
+                    matches!(r, PathPaymentStrictSendResult::OfferCrossSelf),
+                    "Expected OfferCrossSelf, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
     }
 }

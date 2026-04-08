@@ -2887,4 +2887,41 @@ mod tests {
         // The existing test_allow_trust_no_auth_required test above demonstrates
         // that AllowTrust succeeds even without AUTH_REQUIRED in protocol 24+.
     }
+
+    /// AllowTrust returns Malformed when the source (issuer) account doesn't exist.
+    #[test]
+    fn test_allow_trust_malformed_source_not_found() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(80);
+        let trustor_id = create_test_account_id(81);
+
+        // source_id NOT created in state
+        state.create_account(create_test_account(trustor_id.clone(), 100_000_000, 0));
+
+        let op = AllowTrustOp {
+            trustor: trustor_id,
+            asset: AssetCode::CreditAlphanum4(AssetCode4(*b"USD\0")),
+            authorize: TrustLineFlags::AuthorizedFlag as u32,
+        };
+
+        let tx_id = TxIdentity {
+            source_id: &source_id,
+            seq: 0,
+            op_index: 0,
+        };
+
+        let result = execute_allow_trust(&op, &source_id, &tx_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::AllowTrust(r)) => {
+                assert!(
+                    matches!(r, AllowTrustResult::Malformed),
+                    "Expected Malformed, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
 }

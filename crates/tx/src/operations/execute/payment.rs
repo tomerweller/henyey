@@ -114,7 +114,9 @@ fn make_result(code: PaymentResultCode) -> OperationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::create_test_account_id;
+    use crate::test_utils::{
+        create_test_account_id, create_test_asset, create_test_trustline_asset,
+    };
     use stellar_xdr::curr::*;
 
     const AUTHORIZED_FLAG: u32 = 0x1; // TrustLineFlags::AuthorizedFlag
@@ -1462,5 +1464,51 @@ mod tests {
     fn test_payment_no_issuer() {
         // NoIssuer would require check_issuer() to fail, but it's a no-op since protocol 13.
         // PaymentResult::NoIssuer is defined in XDR but never produced.
+    }
+
+    /// Payment of a credit asset fails with `SrcNoTrust` when the source account
+    /// has no trustline for the asset being sent, even though the destination does.
+    #[test]
+    fn test_payment_src_no_trust() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(1);
+        let dest_id = create_test_account_id(2);
+        let issuer_id = create_test_account_id(3);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let asset = create_test_asset(b"USD\0", issuer_id.clone());
+        let tl_asset = create_test_trustline_asset(b"USD\0", issuer_id);
+
+        // Destination has an authorized trustline; source does NOT.
+        state.create_trustline(create_test_trustline(
+            dest_id,
+            tl_asset,
+            0,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        let op = PaymentOp {
+            destination: MuxedAccount::Ed25519(Uint256([2; 32])),
+            asset,
+            amount: 100,
+        };
+
+        let result = execute_payment(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::Payment(r)) => {
+                assert!(
+                    matches!(r, PaymentResult::SrcNoTrust),
+                    "Expected SrcNoTrust, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
     }
 }

@@ -477,7 +477,10 @@ fn set_signer_sponsor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::create_test_account_id;
+    use crate::test_utils::{
+        create_test_account_id, create_test_account_with_sponsorship, create_test_trustline,
+        create_test_trustline_asset,
+    };
     use stellar_xdr::curr::*;
 
     fn create_test_account(account_id: AccountId, balance: i64) -> AccountEntry {
@@ -1331,6 +1334,238 @@ mod tests {
                 );
             }
             _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// BeginSponsoring returns Recursive when the source account is already being sponsored.
+    #[test]
+    fn test_begin_sponsoring_recursive_source_already_sponsored() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let account_a = create_test_account_id(50);
+        let account_b = create_test_account_id(51);
+        let account_c = create_test_account_id(52);
+
+        state.create_account(create_test_account(account_a.clone(), 100_000_000));
+        state.create_account(create_test_account(account_b.clone(), 100_000_000));
+        state.create_account(create_test_account(account_c.clone(), 100_000_000));
+
+        // C sponsors A — so A is_sponsored
+        state.push_sponsorship(account_c.clone(), account_a.clone());
+
+        // Now A tries to sponsor B. Since A is_sponsored, this is recursive.
+        let op = BeginSponsoringFutureReservesOp {
+            sponsored_id: account_b.clone(),
+        };
+
+        let result =
+            execute_begin_sponsoring_future_reserves(&op, &account_a, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::BeginSponsoringFutureReserves(r)) => {
+                assert!(
+                    matches!(r, BeginSponsoringFutureReservesResult::Recursive),
+                    "Expected Recursive, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    /// BeginSponsoring returns Recursive when the sponsored account is already sponsoring someone.
+    #[test]
+    fn test_begin_sponsoring_recursive_sponsored_already_sponsoring() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let account_a = create_test_account_id(53);
+        let account_b = create_test_account_id(54);
+        let account_c = create_test_account_id(55);
+
+        state.create_account(create_test_account(account_a.clone(), 100_000_000));
+        state.create_account(create_test_account(account_b.clone(), 100_000_000));
+        state.create_account(create_test_account(account_c.clone(), 100_000_000));
+
+        // B sponsors C — so B is_sponsoring
+        state.push_sponsorship(account_b.clone(), account_c.clone());
+
+        // A tries to sponsor B. Since B is_sponsoring, this is recursive.
+        let op = BeginSponsoringFutureReservesOp {
+            sponsored_id: account_b.clone(),
+        };
+
+        let result =
+            execute_begin_sponsoring_future_reserves(&op, &account_a, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::BeginSponsoringFutureReserves(r)) => {
+                assert!(
+                    matches!(r, BeginSponsoringFutureReservesResult::Recursive),
+                    "Expected Recursive, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    /// RevokeSponsorship succeeds when the sponsor revokes a trustline sponsorship
+    /// and the owner has enough balance to cover the reserve.
+    #[test]
+    fn test_revoke_sponsorship_success() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let sponsor_id = create_test_account_id(60);
+        let owner_id = create_test_account_id(61);
+        let issuer_id = create_test_account_id(62);
+
+        state.create_account(create_test_account_with_sponsorship(
+            sponsor_id.clone(),
+            100_000_000,
+            0, // num_sub_entries
+            0, // num_sponsored
+            1, // num_sponsoring (sponsors owner's trustline)
+        ));
+        state.create_account(create_test_account_with_sponsorship(
+            owner_id.clone(),
+            100_000_000,
+            1, // num_sub_entries (the trustline)
+            1, // num_sponsored (trustline is sponsored)
+            0, // num_sponsoring
+        ));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let tl_asset = create_test_trustline_asset(b"USD\0", issuer_id);
+
+        state.create_trustline(create_test_trustline(
+            owner_id.clone(),
+            tl_asset.clone(),
+            0,
+            1_000_000,
+            TrustLineFlags::AuthorizedFlag as u32,
+        ));
+
+        let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: owner_id.clone(),
+            asset: tl_asset,
+        });
+        state.set_entry_sponsor(ledger_key.clone(), sponsor_id.clone());
+
+        let op = RevokeSponsorshipOp::LedgerEntry(ledger_key);
+
+        let result = execute_revoke_sponsorship(&op, &sponsor_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::RevokeSponsorship(r)) => {
+                assert!(
+                    matches!(r, RevokeSponsorshipResult::Success),
+                    "Expected Success, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    /// RevokeSponsorship returns OnlyTransferable for ClaimableBalance entries
+    /// when there is no new sponsor to transfer to.
+    #[test]
+    fn test_revoke_sponsorship_only_transferable() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let sponsor_id = create_test_account_id(63);
+        let claimant_id = create_test_account_id(64);
+
+        state.create_account(create_test_account_with_sponsorship(
+            sponsor_id.clone(),
+            100_000_000,
+            0, // num_sub_entries
+            0, // num_sponsored
+            1, // num_sponsoring (sponsors the CB)
+        ));
+        state.create_account(create_test_account(claimant_id.clone(), 100_000_000));
+
+        let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([50; 32]));
+        let cb_entry = ClaimableBalanceEntry {
+            balance_id: balance_id.clone(),
+            claimants: vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+                destination: claimant_id,
+                predicate: ClaimPredicate::Unconditional,
+            })]
+            .try_into()
+            .unwrap(),
+            asset: Asset::Native,
+            amount: 1_000_000,
+            ext: ClaimableBalanceEntryExt::V0,
+        };
+        state.create_claimable_balance(cb_entry);
+
+        let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+            balance_id: balance_id.clone(),
+        });
+        state.set_entry_sponsor(ledger_key.clone(), sponsor_id.clone());
+
+        let op = RevokeSponsorshipOp::LedgerEntry(ledger_key);
+
+        let result = execute_revoke_sponsorship(&op, &sponsor_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::RevokeSponsorship(r)) => {
+                assert!(
+                    matches!(r, RevokeSponsorshipResult::OnlyTransferable),
+                    "Expected OnlyTransferable, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    /// RevokeSponsorship returns Malformed for ClaimableBalance entries that have
+    /// no entry sponsor set.
+    #[test]
+    fn test_revoke_sponsorship_malformed_cb_no_sponsor() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(65);
+        let claimant_id = create_test_account_id(66);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(claimant_id.clone(), 100_000_000));
+
+        let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([51; 32]));
+        let cb_entry = ClaimableBalanceEntry {
+            balance_id: balance_id.clone(),
+            claimants: vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+                destination: claimant_id,
+                predicate: ClaimPredicate::Unconditional,
+            })]
+            .try_into()
+            .unwrap(),
+            asset: Asset::Native,
+            amount: 1_000_000,
+            ext: ClaimableBalanceEntryExt::V0,
+        };
+        state.create_claimable_balance(cb_entry);
+
+        // NO entry sponsor set
+
+        let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+            balance_id: balance_id.clone(),
+        });
+        let op = RevokeSponsorshipOp::LedgerEntry(ledger_key);
+
+        let result = execute_revoke_sponsorship(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::RevokeSponsorship(r)) => {
+                assert!(
+                    matches!(r, RevokeSponsorshipResult::Malformed),
+                    "Expected Malformed, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
         }
     }
 }

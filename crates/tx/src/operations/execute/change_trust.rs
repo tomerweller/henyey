@@ -546,7 +546,9 @@ fn make_result(code: ChangeTrustResultCode) -> OperationResult {
 mod tests {
     use super::*;
     use crate::operations::execute::manage_offer::execute_manage_sell_offer;
-    use crate::test_utils::create_test_account_id;
+    use crate::test_utils::{
+        create_test_account_id, create_test_asset, create_test_trustline_asset,
+    };
     use henyey_common::LIQUIDITY_POOL_FEE_V18;
     use sha2::{Digest, Sha256};
     use stellar_xdr::curr::*;
@@ -2035,6 +2037,105 @@ mod tests {
                 assert!(
                     matches!(r, ChangeTrustResult::Malformed),
                     "AUDIT-1114: Pool share with wrong asset order should be Malformed, got {:?}",
+                    r
+                );
+            }
+            other => panic!("Expected ChangeTrust result, got {:?}", other),
+        }
+    }
+
+    /// ChangeTrust returns InvalidLimit (not TrustLineMissing) when trying to
+    /// remove a trustline that doesn't exist (limit=0 with no existing trustline).
+    /// The TrustLineMissing variant exists in XDR but is not used by this implementation.
+    #[test]
+    fn test_change_trust_remove_nonexistent_returns_invalid_limit() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let op = ChangeTrustOp {
+            line: ChangeTrustAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: issuer_id,
+            }),
+            limit: 0, // Remove a trustline that doesn't exist
+        };
+
+        let result = execute_change_trust(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ChangeTrust(r)) => {
+                assert!(
+                    matches!(r, ChangeTrustResult::InvalidLimit),
+                    "Expected InvalidLimit, got {:?}",
+                    r
+                );
+            }
+            other => panic!("Expected ChangeTrust result, got {:?}", other),
+        }
+    }
+
+    /// ChangeTrust returns NotAuthMaintainLiabilities when creating a pool share
+    /// trustline and one of the underlying asset trustlines is not authorized
+    /// (lacks both AUTHORIZED_FLAG and AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG).
+    #[test]
+    fn test_change_trust_not_auth_maintain_liabilities() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_a = create_test_account_id(1);
+        let issuer_b = create_test_account_id(2);
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000));
+
+        let asset_a = create_test_asset(b"AAA\0", issuer_a.clone());
+        let asset_b = create_test_asset(b"BBB\0", issuer_b.clone());
+
+        // Source has trustline for asset A — authorized
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            create_test_trustline_asset(b"AAA\0", issuer_a),
+            0,
+            1_000_000,
+            TrustLineFlags::AuthorizedFlag as u32,
+        ));
+
+        // Source has trustline for asset B — NOT authorized (flags=0)
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            create_test_trustline_asset(b"BBB\0", issuer_b),
+            0,
+            1_000_000,
+            0, // Not authorized
+        ));
+
+        // Try to create a pool share trustline for the A/B pool
+        let pool_params = LiquidityPoolParameters::LiquidityPoolConstantProduct(
+            LiquidityPoolConstantProductParameters {
+                asset_a,
+                asset_b,
+                fee: LIQUIDITY_POOL_FEE_V18,
+            },
+        );
+
+        let op = ChangeTrustOp {
+            line: ChangeTrustAsset::PoolShare(pool_params),
+            limit: 1_000_000,
+        };
+
+        let result = execute_change_trust(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ChangeTrust(r)) => {
+                assert!(
+                    matches!(r, ChangeTrustResult::NotAuthMaintainLiabilities),
+                    "Expected NotAuthMaintainLiabilities, got {:?}",
                     r
                 );
             }
