@@ -264,7 +264,8 @@ pub struct Herder {
     /// Transitive quorum tracker for the current quorum map.
     quorum_tracker: RwLock<QuorumTracker>,
     /// Runtime-mutable upgrade scheduling (set via HTTP `/upgrades?mode=set`).
-    runtime_upgrades: RwLock<Upgrades>,
+    /// Shared with ScpDriver for nomination validation.
+    runtime_upgrades: Arc<RwLock<Upgrades>>,
     /// Count of transactions dropped due to queue full since last ledger close.
     queue_full_count: AtomicU64,
 }
@@ -376,6 +377,9 @@ impl Herder {
             );
         }
 
+        let runtime_upgrades = Arc::new(RwLock::new(Upgrades::default()));
+        scp_driver.set_upgrades(Arc::clone(&runtime_upgrades));
+
         Self {
             config,
             state: RwLock::new(HerderState::Booting),
@@ -391,7 +395,7 @@ impl Herder {
             prev_value: RwLock::new(Value::default()),
             slot_quorum_tracker: RwLock::new(slot_quorum_tracker),
             quorum_tracker: RwLock::new(quorum_tracker),
-            runtime_upgrades: RwLock::new(Upgrades::default()),
+            runtime_upgrades,
             queue_full_count: AtomicU64::new(0),
         }
     }

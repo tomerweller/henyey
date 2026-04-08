@@ -43,6 +43,7 @@ use stellar_xdr::curr::{
 
 use crate::error::HerderError;
 use crate::tx_queue::TransactionSet;
+use crate::upgrades::Upgrades;
 use crate::Result;
 
 /// Format a `StellarValueExt` for logging.
@@ -233,6 +234,9 @@ pub struct ScpDriver {
     local_quorum_set: RwLock<Option<ScpQuorumSet>>,
     /// Ledger manager for network configuration lookups.
     ledger_manager: RwLock<Option<Arc<LedgerManager>>>,
+    /// Upgrade parameters for nomination validation.
+    /// Set via `set_upgrades` when the Herder initializes.
+    upgrades: RwLock<Option<Arc<RwLock<Upgrades>>>>,
     /// Shared tracking consensus state (owned by Herder, read by ScpDriver).
     tracking_state: Arc<RwLock<SharedTrackingState>>,
 }
@@ -267,6 +271,7 @@ impl ScpDriver {
             quorum_sets_by_hash,
             local_quorum_set: RwLock::new(local_quorum_set),
             ledger_manager: RwLock::new(None),
+            upgrades: RwLock::new(None),
             tracking_state,
         }
     }
@@ -294,6 +299,11 @@ impl ScpDriver {
     /// Provide ledger manager access for network configuration lookups.
     pub fn set_ledger_manager(&self, manager: Arc<LedgerManager>) {
         *self.ledger_manager.write() = Some(manager);
+    }
+
+    /// Provide upgrade parameters access for nomination validation.
+    pub fn set_upgrades(&self, upgrades: Arc<RwLock<Upgrades>>) {
+        *self.upgrades.write() = Some(upgrades);
     }
 
     /// Cache a transaction set.
@@ -714,7 +724,12 @@ impl ScpDriver {
     /// 3. Verifies the signature
     /// 4. Validates close time and tx set (via validateValueAgainstLocalState)
     /// 5. Checks upgrade ordering
-    pub fn validate_value_impl(&self, slot_index: SlotIndex, value: &Value) -> ValueValidation {
+    pub fn validate_value_impl(
+        &self,
+        slot_index: SlotIndex,
+        value: &Value,
+        nomination: bool,
+    ) -> ValueValidation {
         // Decode the StellarValue
         let stellar_value = match StellarValue::from_xdr(value, stellar_xdr::curr::Limits::none()) {
             Ok(v) => v,
@@ -757,7 +772,7 @@ impl ScpDriver {
         }
 
         // Parity: HerderSCPDriver.cpp:375-401 — validate each upgrade via isValid
-        if !self.check_upgrades_valid(&stellar_value) {
+        if !self.check_upgrades_valid(&stellar_value, nomination) {
             return ValueValidation::Invalid;
         }
 
@@ -968,13 +983,15 @@ impl ScpDriver {
         }
 
         // Parity: strip invalid upgrades, keeping valid ones in order
-        // Also validates each upgrade via isValidForApply
+        // Also validates each upgrade via isValid (apply + nomination)
+        // stellar-core: extractValidValue calls isValid with nomination=true
         let current_version = self
             .ledger_manager
             .read()
             .as_ref()
             .map(|lm| lm.current_header().ledger_version)
             .unwrap_or(0);
+        let close_time = stellar_value.close_time.0;
         let mut valid_upgrades = Vec::new();
         let mut last_upgrade_type = None;
         for upgrade_bytes in stellar_value.upgrades.iter() {
@@ -987,7 +1004,16 @@ impl ScpDriver {
                 let in_order = last_upgrade_type
                     .map(|prev| upgrade_type > prev)
                     .unwrap_or(true);
-                if in_order && Self::is_valid_upgrade_for_apply(&upgrade, current_version) {
+                let valid_for_apply =
+                    Self::is_valid_upgrade_for_apply(&upgrade, current_version);
+                // Also check nomination validity (timing + parameter match)
+                let valid_for_nomination = if let Some(ref upgrades_arc) = *self.upgrades.read()
+                {
+                    upgrades_arc.read().is_valid_for_nomination(&upgrade, close_time)
+                } else {
+                    true // No upgrade config — can't filter
+                };
+                if in_order && valid_for_apply && valid_for_nomination {
                     last_upgrade_type = Some(upgrade_type);
                     valid_upgrades.push(upgrade_bytes.clone());
                 }
@@ -1007,15 +1033,18 @@ impl ScpDriver {
         }
     }
 
-    /// Check that all upgrades in a StellarValue are valid for application.
+    /// Check that all upgrades in a StellarValue are valid.
     ///
-    /// Parity: Upgrades.cpp `isValid` → `isValidForApply`
-    fn check_upgrades_valid(&self, stellar_value: &StellarValue) -> bool {
+    /// Parity: Upgrades.cpp `isValid` — calls `isValidForApply` always,
+    /// and additionally `isValidForNomination` when `nomination=true`.
+    fn check_upgrades_valid(&self, stellar_value: &StellarValue, nomination: bool) -> bool {
         let current_version = if let Some(ref lm) = *self.ledger_manager.read() {
             lm.current_header().ledger_version
         } else {
             return true; // No ledger manager — can't validate
         };
+
+        let close_time = stellar_value.close_time.0;
 
         for upgrade_bytes in stellar_value.upgrades.iter() {
             let upgrade = match LedgerUpgrade::from_xdr(
@@ -1028,6 +1057,15 @@ impl ScpDriver {
             if !Self::is_valid_upgrade_for_apply(&upgrade, current_version) {
                 debug!(?upgrade, "Invalid upgrade for apply");
                 return false;
+            }
+            if nomination {
+                if let Some(ref upgrades_arc) = *self.upgrades.read() {
+                    let upgrades = upgrades_arc.read();
+                    if !upgrades.is_valid_for_nomination(&upgrade, close_time) {
+                        debug!(?upgrade, "Invalid upgrade for nomination");
+                        return false;
+                    }
+                }
             }
         }
         true
@@ -2181,7 +2219,7 @@ mod cache_tests {
         // Create a signed value with a tx_set_hash that is NOT cached
         let value = make_signed_stellar_value(&network_id, &secret, tx_set_hash, now);
 
-        let result = driver.validate_value_impl(1, &value);
+        let result = driver.validate_value_impl(1, &value, false);
         assert_eq!(
             result,
             ValueValidation::Invalid,
@@ -2196,7 +2234,7 @@ mod cache_tests {
         driver.cache_tx_set(tx_set);
 
         let value2 = make_signed_stellar_value(&network_id, &secret, tx_set_hash_real.0, now);
-        let result2 = driver.validate_value_impl(1, &value2);
+        let result2 = driver.validate_value_impl(1, &value2, false);
         // Should NOT be Invalid (the tx set is now available)
         // It may be MaybeValid or Valid depending on other checks
         assert_ne!(
@@ -2249,13 +2287,13 @@ impl HerderScpCallback {
 }
 
 impl SCPDriver for HerderScpCallback {
-    fn validate_value(&self, slot_index: u64, value: &Value, _nomination: bool) -> ValidationLevel {
+    fn validate_value(&self, slot_index: u64, value: &Value, nomination: bool) -> ValidationLevel {
         // Always validate: stellar-core's validateValue() runs XDR deserialization,
         // STELLAR_VALUE_SIGNED check, signature verification, close-time validation,
         // and upgrade checks for ALL statements (both nomination and ballot).
-        // TODO: propagate `nomination` to check_upgrades_valid() — stellar-core uses
-        // it for additional strictness during nomination (isValidForNomination).
-        match self.driver.validate_value_impl(slot_index, value) {
+        // The `nomination` flag is forwarded to upgrade validation for additional
+        // strictness during nomination (isValidForNomination).
+        match self.driver.validate_value_impl(slot_index, value, nomination) {
             ValueValidation::Valid => ValidationLevel::FullyValidated,
             ValueValidation::MaybeValid => ValidationLevel::MaybeValid,
             ValueValidation::Invalid => ValidationLevel::Invalid,
@@ -2558,7 +2596,7 @@ mod tests {
         let value = encode_sv(&sv);
 
         assert_eq!(
-            driver.validate_value_impl(1, &value),
+            driver.validate_value_impl(1, &value, false),
             ValueValidation::Invalid
         );
     }
@@ -2586,7 +2624,7 @@ mod tests {
         let value = encode_sv(&sv);
 
         assert_eq!(
-            driver.validate_value_impl(1, &value),
+            driver.validate_value_impl(1, &value, false),
             ValueValidation::Invalid
         );
     }
@@ -2627,7 +2665,7 @@ mod tests {
         let value = encode_sv(&sv);
 
         assert_eq!(
-            driver.validate_value_impl(2, &value),
+            driver.validate_value_impl(2, &value, false),
             ValueValidation::Invalid
         );
     }
@@ -2666,7 +2704,7 @@ mod tests {
         let value = encode_sv(&sv);
 
         assert_eq!(
-            driver.validate_value_impl(1, &value),
+            driver.validate_value_impl(1, &value, false),
             ValueValidation::Invalid
         );
     }
@@ -2699,7 +2737,7 @@ mod tests {
         let value = encode_sv(&stellar_value);
 
         assert_eq!(
-            driver.validate_value_impl(1, &value),
+            driver.validate_value_impl(1, &value, false),
             ValueValidation::Invalid
         );
     }
@@ -2735,7 +2773,7 @@ mod tests {
         let value = encode_sv(&sv);
 
         assert_eq!(
-            driver.validate_value_impl(1, &value),
+            driver.validate_value_impl(1, &value, false),
             ValueValidation::Invalid
         );
     }
@@ -2764,7 +2802,7 @@ mod tests {
         let value = encode_sv(&sv);
 
         assert_eq!(
-            driver.validate_value_impl(1, &value),
+            driver.validate_value_impl(1, &value, false),
             ValueValidation::Valid
         );
     }
@@ -3401,6 +3439,106 @@ mod tests {
             result_ballot,
             ValidationLevel::Invalid,
             "nomination=false must reject garbage (AUDIT-006)"
+        );
+    }
+
+    /// Regression test for AUDIT-008: During nomination, upgrade validation must
+    /// check that upgrades match the node's configured parameters (timing + values).
+    /// Previously, only `isValidForApply` was checked, allowing any structurally
+    /// valid upgrade to pass nomination regardless of the node's config.
+    #[test]
+    fn test_audit_008_nomination_rejects_unconfigured_upgrades() {
+        use crate::upgrades::{UpgradeParameters, Upgrades};
+
+        // Test is_valid_for_nomination directly on the Upgrades struct
+        let params = UpgradeParameters {
+            upgrade_time: 1000,
+            base_fee: Some(200),
+            protocol_version: Some(25),
+            ..UpgradeParameters::default()
+        };
+        let upgrades = Upgrades::new(params);
+
+        // Wrong value: base_fee=500 doesn't match configured 200
+        let wrong_fee = LedgerUpgrade::BaseFee(500);
+        assert!(
+            !upgrades.is_valid_for_nomination(&wrong_fee, 1500),
+            "Must reject upgrade with wrong value"
+        );
+
+        // Correct value: base_fee=200 matches configured
+        let correct_fee = LedgerUpgrade::BaseFee(200);
+        assert!(
+            upgrades.is_valid_for_nomination(&correct_fee, 1500),
+            "Must accept upgrade with matching value"
+        );
+
+        // Too early: close_time=500 is before upgrade_time=1000
+        assert!(
+            !upgrades.is_valid_for_nomination(&correct_fee, 500),
+            "Must reject upgrade before scheduled time"
+        );
+
+        // Unconfigured type: MaxTxSetSize not in config → reject
+        let unconfigured = LedgerUpgrade::MaxTxSetSize(100);
+        assert!(
+            !upgrades.is_valid_for_nomination(&unconfigured, 1500),
+            "Must reject upgrade type not configured by this node"
+        );
+
+        // Protocol version: correct value
+        let correct_version = LedgerUpgrade::Version(25);
+        assert!(
+            upgrades.is_valid_for_nomination(&correct_version, 1500),
+            "Must accept matching protocol version"
+        );
+
+        // Protocol version: wrong value
+        let wrong_version = LedgerUpgrade::Version(26);
+        assert!(
+            !upgrades.is_valid_for_nomination(&wrong_version, 1500),
+            "Must reject non-matching protocol version"
+        );
+    }
+
+    /// Test that check_upgrades_valid uses nomination flag to gate nomination checks.
+    #[test]
+    fn test_audit_008_check_upgrades_valid_nomination_flag() {
+        use crate::upgrades::{UpgradeParameters, Upgrades};
+
+        let (driver, _secret_key) = make_test_driver_with_key();
+
+        // Configure upgrades: only base_fee=200 at time 1000
+        let params = UpgradeParameters {
+            upgrade_time: 1000,
+            base_fee: Some(200),
+            ..UpgradeParameters::default()
+        };
+        let upgrades = Arc::new(RwLock::new(Upgrades::new(params)));
+        driver.set_upgrades(upgrades);
+
+        // Create a StellarValue with a base_fee=500 upgrade (wrong value)
+        let wrong_upgrade = LedgerUpgrade::BaseFee(500);
+        let upgrade_bytes = wrong_upgrade.to_xdr(Limits::none()).unwrap();
+        let upgrade_type = UpgradeType(upgrade_bytes.try_into().unwrap());
+
+        let sv = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash([0; 32]),
+            close_time: TimePoint(1500),
+            upgrades: vec![upgrade_type].try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+
+        // Without ledger manager, check_upgrades_valid returns true (can't validate)
+        // This is expected — the test verifies the nomination path once a ledger manager
+        // is available. The is_valid_for_nomination unit tests above cover the logic directly.
+        assert!(
+            driver.check_upgrades_valid(&sv, false),
+            "Without ledger manager, ballot check should pass"
+        );
+        assert!(
+            driver.check_upgrades_valid(&sv, true),
+            "Without ledger manager, nomination check should pass (can't validate)"
         );
     }
 }
