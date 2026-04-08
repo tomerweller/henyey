@@ -338,11 +338,13 @@ fn remove_offers_with_cleanup(
             let _ = state.update_num_sponsored(&offer.seller_id, -1);
         }
 
-        // Decrement the seller account's num_sub_entries
+        // stellar-core: panics on underflow (invalid account state)
         if let Some(account) = state.get_account_mut(&offer.seller_id) {
-            if account.num_sub_entries > 0 {
-                account.num_sub_entries -= 1;
-            }
+            assert!(
+                account.num_sub_entries > 0,
+                "num_sub_entries underflow: cannot remove sub-entry from account with 0 sub-entries"
+            );
+            account.num_sub_entries -= 1;
         }
     }
 }

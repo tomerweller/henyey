@@ -367,9 +367,12 @@ fn apply_signer_update(
             signers_vec.remove(pos);
             signers_changed = true;
 
-            if source_account.num_sub_entries > 0 {
-                source_account.num_sub_entries -= 1;
-            }
+            // stellar-core: panics on underflow (invalid account state)
+            assert!(
+                source_account.num_sub_entries > 0,
+                "num_sub_entries underflow: cannot remove sub-entry from account with 0 sub-entries"
+            );
+            source_account.num_sub_entries -= 1;
         }
     } else if let Some(pos) = existing_pos {
         signers_vec[pos].weight = weight;

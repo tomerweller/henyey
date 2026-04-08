@@ -442,10 +442,13 @@ fn execute_manage_offer(
                 state.remove_entry_sponsorship_and_update_counts(&ledger_key, source, 1)?;
             }
             state.delete_offer(source, offer_id);
+            // stellar-core: panics on underflow (invalid account state)
             if let Some(account) = state.get_account_mut(source) {
-                if account.num_sub_entries > 0 {
-                    account.num_sub_entries -= 1;
-                }
+                assert!(
+                    account.num_sub_entries > 0,
+                    "num_sub_entries underflow: cannot remove sub-entry from account with 0 sub-entries"
+                );
+                account.num_sub_entries -= 1;
             }
         } else {
             // New offer that was fully consumed during matching.

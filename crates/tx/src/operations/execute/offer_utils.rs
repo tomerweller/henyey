@@ -103,10 +103,13 @@ pub(super) fn delete_offer_with_sponsorship(
         state.update_num_sponsoring(&sponsor, -1)?;
         state.update_num_sponsored(seller, -1)?;
     }
+    // stellar-core: panics on underflow (invalid account state)
     if let Some(account) = state.get_account_mut(seller) {
-        if account.num_sub_entries > 0 {
-            account.num_sub_entries -= 1;
-        }
+        assert!(
+            account.num_sub_entries > 0,
+            "num_sub_entries underflow: cannot remove sub-entry from account with 0 sub-entries"
+        );
+        account.num_sub_entries -= 1;
     }
     Ok(())
 }
