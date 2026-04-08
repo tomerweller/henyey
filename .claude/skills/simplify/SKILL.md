@@ -38,6 +38,9 @@ would make it harder to verify parity. Signs of parity-driven structure:
 This filter applies most often to: LARGE MODULE, GOD FUNCTION, DEEP NESTING,
 LONG PARAMETER LIST, DUPLICATION, and MAGIC NUMBERS.
 
+**Exception**: The Idiom categories (C-STYLE MUTATION, C-STYLE OUTPUT PARAMETER,
+C-STYLE OPTION HANDLING) are exempt — always report them regardless of parity.
+
 ## Categories
 
 For each finding, classify it into exactly one category:
@@ -91,6 +94,31 @@ For each finding, classify it into exactly one category:
 15. **STALE COMMENTS** — comments that no longer match the code. Fix or remove.
 16. **COMMENTED-OUT CODE** — dead code left as comments. Remove (git preserves
     history).
+
+### Idiom (exempt from Parity Filter)
+
+These categories target C/C++ idioms carried over from stellar-core. They are
+**exempt from the Parity Filter** — always report them, even when the code
+structurally mirrors stellar-core. The goal is to make the Rust codebase
+idiomatically Rust, not a transliteration of C++.
+
+17. **C-STYLE MUTATION** — functions that take `&mut T` and return `bool` for
+    success/failure. The Rust idiom is `Result<(), E>` (or `Option<T>` when
+    there is no meaningful error context). Callers benefit from `?` propagation
+    instead of `if !func(...) { return error; }` chains.
+    *Example*: `add_account_balance(account: &mut AccountEntry, delta: i64) -> bool`
+    → `fn add_account_balance(account: &mut AccountEntry, delta: i64) -> Result<(), BalanceError>`.
+18. **C-STYLE OUTPUT PARAMETER** — functions that take `&mut Vec<T>` (or similar
+    containers) as output parameters instead of returning a collection. The Rust
+    idiom is to return the collected value, letting the caller decide how to
+    combine it.
+    *Example*: `collect_bucket_hashes(out: &mut Vec<Hash256>)`
+    → `fn collect_bucket_hashes() -> Vec<Hash256>`.
+19. **C-STYLE OPTION HANDLING** — manual `is_none()` / `is_some()` checks
+    followed by `.unwrap()` instead of pattern matching (`let Some(x) = … else`),
+    `match`, or combinators (`.map()`, `.and_then()`, `.ok_or()`). The
+    check-then-unwrap pattern risks panic if a future edit separates the check
+    from the unwrap.
 
 ## Ranking
 
