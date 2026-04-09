@@ -25,7 +25,6 @@ jobs:
 
   clippy:
     name: Clippy
-    needs: fmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,7 +36,6 @@ jobs:
 
   test:
     name: Test
-    needs: fmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -46,8 +44,7 @@ jobs:
       - run: cargo test --all
 
   build-release:
-    name: Build (release)
-    needs: fmt
+    name: Build (release-ci)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -55,5 +52,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-          key: release
-      - run: cargo build --release --all
+          key: release-ci
+      - run: cargo build --profile release-ci --all

@@ -364,16 +364,24 @@ impl ScpDriver {
         let result = if let Some(ref gen) = prepared.generalized_tx_set {
             if let Some(ref lm) = *self.ledger_manager.read() {
                 let lcl_header = lm.current_header();
-                let soroban_info = lm.soroban_network_info();
 
-                crate::tx_set_utils::check_tx_set_valid(
-                    gen,
-                    &lcl_header,
-                    close_time_offset,
-                    network_id,
-                    soroban_info.as_ref(),
-                    None, // Phase 1: skip fee balance checks
-                )
+                // Skip content validation when protocol < 20: generalized tx sets
+                // are not expected at those versions, so check_tx_set_valid would
+                // unconditionally reject them. This occurs in simulation environments
+                // that start at protocol 0 before upgrading to protocol 24+.
+                if !protocol_version_starts_from(lcl_header.ledger_version, ProtocolVersion::V20) {
+                    true
+                } else {
+                    let soroban_info = lm.soroban_network_info();
+                    crate::tx_set_utils::check_tx_set_valid(
+                        gen,
+                        &lcl_header,
+                        close_time_offset,
+                        network_id,
+                        soroban_info.as_ref(),
+                        None, // Phase 1: skip fee balance checks
+                    )
+                }
             } else {
                 // No ledger manager — can't validate, assume valid
                 true

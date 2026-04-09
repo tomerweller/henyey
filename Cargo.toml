@@ -155,6 +155,11 @@ lto = true
 codegen-units = 1
 panic = "abort"
 
+[profile.release-ci]
+inherits = "release"
+lto = false
+codegen-units = 8
+
 [profile.dev]
 # Faster builds in dev mode
 opt-level = 0
