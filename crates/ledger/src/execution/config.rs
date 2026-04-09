@@ -451,6 +451,13 @@ pub(crate) fn load_soroban_network_info(
         info.ballot_timeout_increment_ms = timing.ballot_timeout_increment_milliseconds;
     }
 
+    // Load parallel compute settings (Protocol 23+)
+    if let Some(ConfigSettingEntry::ContractParallelComputeV0(parallel)) =
+        load_config_setting(snapshot, ConfigSettingId::ContractParallelComputeV0)?
+    {
+        info.ledger_max_dependent_tx_clusters = parallel.ledger_max_dependent_tx_clusters;
+    }
+
     Ok(Some(info))
 }
 

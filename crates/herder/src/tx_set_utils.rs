@@ -11,9 +11,15 @@
 
 use std::collections::{HashMap, HashSet};
 
+use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 use henyey_common::{Hash256, NetworkId};
+use henyey_ledger::SorobanNetworkInfo;
 use henyey_tx::{validate_basic, LedgerContext, TransactionFrame};
-use stellar_xdr::curr::{AccountId, TransactionEnvelope};
+use stellar_xdr::curr::{
+    AccountId, GeneralizedTransactionSet, LedgerHeader, TransactionEnvelope, TransactionPhase,
+    TxSetComponent,
+};
+use tracing::debug;
 
 use crate::tx_queue::FeeBalanceProvider;
 
@@ -447,6 +453,511 @@ pub fn trim_invalid_two_phase(
     };
 
     (valid_classic, valid_soroban)
+}
+
+// ---------------------------------------------------------------------------
+// TX set content validation functions (AUDIT-033)
+// ---------------------------------------------------------------------------
+
+/// Check if a transaction envelope is a Soroban transaction.
+fn is_soroban_envelope(env: &TransactionEnvelope) -> bool {
+    let ops = match env {
+        TransactionEnvelope::TxV0(e) => &e.tx.operations,
+        TransactionEnvelope::Tx(e) => &e.tx.operations,
+        TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => &inner.tx.operations,
+        },
+    };
+    ops.iter().any(|op| {
+        matches!(
+            op.body,
+            stellar_xdr::curr::OperationBody::InvokeHostFunction(_)
+                | stellar_xdr::curr::OperationBody::ExtendFootprintTtl(_)
+                | stellar_xdr::curr::OperationBody::RestoreFootprint(_)
+        )
+    })
+}
+
+/// Extract `SorobanResources` from a transaction envelope (for Soroban TXs).
+fn envelope_soroban_resources(
+    env: &TransactionEnvelope,
+) -> Option<&stellar_xdr::curr::SorobanResources> {
+    let ext = match env {
+        TransactionEnvelope::Tx(e) => &e.tx.ext,
+        TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => &inner.tx.ext,
+        },
+        TransactionEnvelope::TxV0(_) => return None,
+    };
+    match ext {
+        stellar_xdr::curr::TransactionExt::V1(data) => Some(&data.resources),
+        _ => None,
+    }
+}
+
+/// Validate that component base fees and per-TX inclusion fees meet minimums.
+///
+/// Mirrors stellar-core's `checkFeeMap()` (TxSetFrame.cpp:722-751).
+///
+/// For V0 (sequential) phases: iterates components, checks each component's
+/// `base_fee` (if present) >= `lcl_base_fee`, and verifies each TX's inclusion
+/// fee >= the minimum inclusion fee for that component.
+///
+/// For V1 (parallel) phases: checks the phase-level `base_fee` >= `lcl_base_fee`,
+/// then verifies each TX's inclusion fee.
+pub(crate) fn check_fee_map(phase: &TransactionPhase, lcl_base_fee: u32) -> bool {
+    match phase {
+        TransactionPhase::V0(components) => {
+            for component in components.iter() {
+                let TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) = component;
+                if let Some(base_fee) = comp.base_fee {
+                    if (base_fee as u32) < lcl_base_fee {
+                        debug!(
+                            "Got bad txSet: component base fee {} < lcl base fee {}",
+                            base_fee, lcl_base_fee
+                        );
+                        return false;
+                    }
+                }
+                // Check each TX's inclusion fee meets the minimum
+                let component_base_fee = comp.base_fee;
+                for tx in comp.txs.iter() {
+                    let tx_inclusion_fee = inclusion_fee(tx, component_base_fee);
+                    let min_fee = get_min_inclusion_fee(tx, lcl_base_fee, component_base_fee);
+                    if tx_inclusion_fee < min_fee {
+                        debug!(
+                            "Got bad txSet: tx fee bid ({}) lower than base fee ({})",
+                            tx_inclusion_fee, min_fee
+                        );
+                        return false;
+                    }
+                }
+            }
+            true
+        }
+        TransactionPhase::V1(parallel) => {
+            if let Some(base_fee) = parallel.base_fee {
+                if (base_fee as u32) < lcl_base_fee {
+                    debug!(
+                        "Got bad txSet: parallel base fee {} < lcl base fee {}",
+                        base_fee, lcl_base_fee
+                    );
+                    return false;
+                }
+            }
+            let component_base_fee = parallel.base_fee;
+            for stage in parallel.execution_stages.iter() {
+                for cluster in stage.iter() {
+                    for tx in cluster.iter() {
+                        let tx_inclusion_fee = inclusion_fee(tx, component_base_fee);
+                        let min_fee = get_min_inclusion_fee(tx, lcl_base_fee, component_base_fee);
+                        if tx_inclusion_fee < min_fee {
+                            debug!(
+                                "Got bad txSet: tx fee bid ({}) lower than base fee ({})",
+                                tx_inclusion_fee, min_fee
+                            );
+                            return false;
+                        }
+                    }
+                }
+            }
+            true
+        }
+    }
+}
+
+/// Compute the minimum inclusion fee for a transaction.
+///
+/// Mirrors stellar-core's `getMinInclusionFee()` (TransactionUtils.cpp:1961-1971).
+/// effectiveBaseFee = max(header.baseFee, componentBaseFee)
+/// minFee = effectiveBaseFee * max(1, numOps)
+fn get_min_inclusion_fee(
+    env: &TransactionEnvelope,
+    lcl_base_fee: u32,
+    component_base_fee: Option<i64>,
+) -> i64 {
+    let effective_base_fee = match component_base_fee {
+        Some(bf) => std::cmp::max(lcl_base_fee as i64, bf),
+        None => lcl_base_fee as i64,
+    };
+    let num_ops = std::cmp::max(1, envelope_num_ops(env) as i64);
+    effective_base_fee.saturating_mul(num_ops)
+}
+
+/// Validate the classic (non-Soroban) transaction phase.
+///
+/// Mirrors stellar-core's `TxSetPhaseFrame::checkValidClassic()` (TxSetFrame.cpp:1802-1816).
+///
+/// - Rejects if the phase is V1 (parallel) — classic can only be V0/sequential
+/// - Counts total operations and verifies <= `max_tx_set_size`
+/// - Verifies all TXs are non-Soroban
+pub(crate) fn check_valid_classic(phase: &TransactionPhase, max_tx_set_size: u32) -> bool {
+    // Classic phase must not be parallel
+    if matches!(phase, TransactionPhase::V1(_)) {
+        debug!("Got bad txSet: classic phase can't be parallel");
+        return false;
+    }
+
+    let TransactionPhase::V0(components) = phase else {
+        return false;
+    };
+
+    let mut total_ops: u64 = 0;
+    for component in components.iter() {
+        let TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) = component;
+        for tx in comp.txs.iter() {
+            // Verify all TXs are non-Soroban
+            if is_soroban_envelope(tx) {
+                debug!("Got bad txSet: Soroban transaction found in classic phase");
+                return false;
+            }
+            total_ops += envelope_num_ops(tx) as u64;
+        }
+    }
+
+    if total_ops > max_tx_set_size as u64 {
+        debug!(
+            "Got bad txSet: too many classic ops {} > {}",
+            total_ops, max_tx_set_size
+        );
+        return false;
+    }
+
+    true
+}
+
+/// Validate the Soroban transaction phase.
+///
+/// Mirrors stellar-core's `TxSetPhaseFrame::checkValidSoroban()` (TxSetFrame.cpp:1819-1982).
+///
+/// Checks:
+/// 1. Parallel/sequential match against protocol version
+/// 2. Total resource aggregation <= ledger limits
+/// 3. All TXs are Soroban
+/// 4. If parallel: cluster count per stage <= `ledger_max_dependent_tx_clusters`
+/// 5. Sequential instruction limit: sum(max(cluster_instructions)) per stage <= ledger max
+/// 6. RW conflict detection between clusters within each stage
+pub(crate) fn check_valid_soroban(
+    phase: &TransactionPhase,
+    lcl_header: &LedgerHeader,
+    soroban_info: &SorobanNetworkInfo,
+) -> bool {
+    let protocol = lcl_header.ledger_version;
+    let need_parallel = protocol_version_starts_from(protocol, ProtocolVersion::V23);
+
+    let is_parallel = matches!(phase, TransactionPhase::V1(_));
+    if is_parallel != need_parallel {
+        debug!(
+            "Got bad txSet: Soroban phase parallel support mismatch; expected {}",
+            need_parallel
+        );
+        return false;
+    }
+
+    // Aggregate total resources across all TXs
+    let mut total_instructions: i64 = 0;
+    let mut total_read_entries: i64 = 0;
+    let mut total_read_bytes: i64 = 0;
+    let mut total_write_entries: i64 = 0;
+    let mut total_write_bytes: i64 = 0;
+
+    let all_txs = collect_phase_txs(phase);
+
+    for tx in &all_txs {
+        if !is_soroban_envelope(tx) {
+            debug!("Got bad txSet: non-Soroban transaction found in Soroban phase");
+            return false;
+        }
+        if let Some(resources) = envelope_soroban_resources(tx) {
+            total_instructions = total_instructions.saturating_add(resources.instructions as i64);
+            // read_only + read_write entries
+            total_read_entries = total_read_entries.saturating_add(
+                resources.footprint.read_only.len() as i64
+                    + resources.footprint.read_write.len() as i64,
+            );
+            total_read_bytes = total_read_bytes.saturating_add(resources.disk_read_bytes as i64);
+            total_write_entries =
+                total_write_entries.saturating_add(resources.footprint.read_write.len() as i64);
+            total_write_bytes = total_write_bytes.saturating_add(resources.write_bytes as i64);
+        }
+    }
+
+    // Check resource limits (skip instructions for parallel — handled below)
+    if !is_parallel && total_instructions > soroban_info.ledger_max_instructions {
+        debug!(
+            "Got bad txSet: Soroban instructions {} > ledger max {}",
+            total_instructions, soroban_info.ledger_max_instructions
+        );
+        return false;
+    }
+    if total_read_entries > soroban_info.ledger_max_read_ledger_entries as i64 {
+        debug!(
+            "Got bad txSet: Soroban read entries {} > ledger max {}",
+            total_read_entries, soroban_info.ledger_max_read_ledger_entries
+        );
+        return false;
+    }
+    if total_read_bytes > soroban_info.ledger_max_read_bytes as i64 {
+        debug!(
+            "Got bad txSet: Soroban read bytes {} > ledger max {}",
+            total_read_bytes, soroban_info.ledger_max_read_bytes
+        );
+        return false;
+    }
+    if total_write_entries > soroban_info.ledger_max_write_ledger_entries as i64 {
+        debug!(
+            "Got bad txSet: Soroban write entries {} > ledger max {}",
+            total_write_entries, soroban_info.ledger_max_write_ledger_entries
+        );
+        return false;
+    }
+    if total_write_bytes > soroban_info.ledger_max_write_bytes as i64 {
+        debug!(
+            "Got bad txSet: Soroban write bytes {} > ledger max {}",
+            total_write_bytes, soroban_info.ledger_max_write_bytes
+        );
+        return false;
+    }
+
+    // Sequential phase is done
+    if !is_parallel {
+        return true;
+    }
+
+    // Parallel-specific validation
+    let TransactionPhase::V1(parallel) = phase else {
+        return false;
+    };
+
+    // Check cluster count per stage
+    for stage in parallel.execution_stages.iter() {
+        if stage.len() as u32 > soroban_info.ledger_max_dependent_tx_clusters {
+            debug!(
+                "Got bad txSet: too many clusters in Soroban stage {} > {}",
+                stage.len(),
+                soroban_info.ledger_max_dependent_tx_clusters
+            );
+            return false;
+        }
+    }
+
+    // Sequential instruction limit: sum of max(cluster_instructions) per stage
+    let mut sequential_instructions: i64 = 0;
+    for stage in parallel.execution_stages.iter() {
+        let mut stage_max_instructions: i64 = 0;
+        for cluster in stage.iter() {
+            let mut cluster_instructions: i64 = 0;
+            for tx in cluster.iter() {
+                if let Some(resources) = envelope_soroban_resources(tx) {
+                    // Check overflow
+                    if cluster_instructions > i64::MAX - resources.instructions as i64 {
+                        debug!("Got bad txSet: Soroban sequential instructions overflow");
+                        return false;
+                    }
+                    cluster_instructions += resources.instructions as i64;
+                }
+            }
+            stage_max_instructions = std::cmp::max(stage_max_instructions, cluster_instructions);
+        }
+        if sequential_instructions > i64::MAX - stage_max_instructions {
+            debug!("Got bad txSet: Soroban total instructions overflow");
+            return false;
+        }
+        sequential_instructions += stage_max_instructions;
+    }
+    if sequential_instructions > soroban_info.ledger_max_instructions {
+        debug!(
+            "Got bad txSet: Soroban total instructions exceed limit: {} > {}",
+            sequential_instructions, soroban_info.ledger_max_instructions
+        );
+        return false;
+    }
+
+    // RW conflict detection between clusters within each stage
+    for stage in parallel.execution_stages.iter() {
+        let mut stage_read_only_keys: HashSet<Vec<u8>> = HashSet::new();
+        let mut stage_read_write_keys: HashSet<Vec<u8>> = HashSet::new();
+
+        for cluster in stage.iter() {
+            let mut cluster_read_only_keys: Vec<Vec<u8>> = Vec::new();
+            let mut cluster_read_write_keys: Vec<Vec<u8>> = Vec::new();
+
+            for tx in cluster.iter() {
+                if let Some(resources) = envelope_soroban_resources(tx) {
+                    for key in resources.footprint.read_only.iter() {
+                        let key_bytes = key_to_bytes(key);
+                        if stage_read_write_keys.contains(&key_bytes) {
+                            debug!(
+                                "Got bad txSet: cluster footprint conflicts with another cluster within stage"
+                            );
+                            return false;
+                        }
+                        cluster_read_only_keys.push(key_bytes);
+                    }
+                    for key in resources.footprint.read_write.iter() {
+                        let key_bytes = key_to_bytes(key);
+                        if stage_read_only_keys.contains(&key_bytes)
+                            || stage_read_write_keys.contains(&key_bytes)
+                        {
+                            debug!(
+                                "Got bad txSet: cluster footprint conflicts with another cluster within stage"
+                            );
+                            return false;
+                        }
+                        cluster_read_write_keys.push(key_bytes);
+                    }
+                }
+            }
+
+            stage_read_only_keys.extend(cluster_read_only_keys);
+            stage_read_write_keys.extend(cluster_read_write_keys);
+        }
+    }
+
+    true
+}
+
+/// Serialize a LedgerKey to bytes for use as a hash set key.
+fn key_to_bytes(key: &stellar_xdr::curr::LedgerKey) -> Vec<u8> {
+    use stellar_xdr::curr::{Limits, WriteXdr};
+    key.to_xdr(Limits::none()).unwrap_or_default()
+}
+
+/// Collect all transaction envelopes from a phase.
+fn collect_phase_txs(phase: &TransactionPhase) -> Vec<&TransactionEnvelope> {
+    let mut txs = Vec::new();
+    match phase {
+        TransactionPhase::V0(components) => {
+            for component in components.iter() {
+                let TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) = component;
+                for tx in comp.txs.iter() {
+                    txs.push(tx);
+                }
+            }
+        }
+        TransactionPhase::V1(parallel) => {
+            for stage in parallel.execution_stages.iter() {
+                for cluster in stage.iter() {
+                    for tx in cluster.iter() {
+                        txs.push(tx);
+                    }
+                }
+            }
+        }
+    }
+    txs
+}
+
+/// Orchestrate full TX set content validation.
+///
+/// Mirrors stellar-core's `ApplicableTxSetFrame::checkValidInternalWithResult()`
+/// (TxSetFrame.cpp:2107-2187) and per-phase `TxSetPhaseFrame::checkValidWithResult()`
+/// (TxSetFrame.cpp:1742-1799).
+///
+/// Performs:
+/// 1. Verify generalized vs legacy matches protocol version
+/// 2. For generalized sets: verify no duplicate source accounts across ALL phases
+/// 3. Per-phase: fee map validation, phase-type checks, phase-specific limits
+/// 4. Per-TX content validation (time bounds, fees) via `get_invalid_tx_list_with_fee_map`
+///
+/// For Phase 1, `fee_balance_provider` may be `None` to skip per-account balance checks.
+pub(crate) fn check_tx_set_valid(
+    gen_tx_set: &GeneralizedTransactionSet,
+    lcl_header: &LedgerHeader,
+    close_time_offset: u64,
+    network_id: NetworkId,
+    soroban_info: Option<&SorobanNetworkInfo>,
+    fee_balance_provider: Option<&dyn FeeBalanceProvider>,
+) -> bool {
+    let GeneralizedTransactionSet::V1(v1) = gen_tx_set;
+
+    // Verify generalized tx set is expected for this protocol
+    let need_generalized =
+        protocol_version_starts_from(lcl_header.ledger_version, ProtocolVersion::V20);
+    if !need_generalized {
+        debug!("Got bad txSet: generalized tx set not expected for protocol < 20");
+        return false;
+    }
+
+    // Generalized sets should always have 2 phases
+    if v1.phases.len() != 2 {
+        debug!("Got bad txSet: expected 2 phases, got {}", v1.phases.len());
+        return false;
+    }
+
+    // Cross-phase fee map handling (Protocol 26+)
+    let use_cross_phase_fee_map =
+        protocol_version_starts_from(lcl_header.ledger_version, ProtocolVersion::V26);
+
+    // Build validation context for per-TX checks
+    let ctx = TxSetValidationContext::new(
+        lcl_header.ledger_seq,
+        lcl_header.scp_value.close_time.0,
+        lcl_header.base_fee,
+        lcl_header.base_reserve,
+        lcl_header.ledger_version,
+        network_id,
+    );
+    let close_time_bounds = CloseTimeBounds::with_offsets(close_time_offset, close_time_offset);
+
+    let mut account_fee_map: HashMap<AccountId, i64> = HashMap::new();
+
+    for (phase_idx, phase) in v1.phases.iter().enumerate() {
+        if !use_cross_phase_fee_map {
+            account_fee_map.clear();
+        }
+
+        // 1. Check fee map
+        if !check_fee_map(phase, lcl_header.base_fee) {
+            return false;
+        }
+
+        let is_soroban = phase_idx == 1;
+
+        // 2. Verify phase TX types
+        let phase_txs = collect_phase_txs(phase);
+        for tx in &phase_txs {
+            if is_soroban_envelope(tx) != is_soroban {
+                debug!(
+                    "Got bad txSet: invalid phase {} transaction type",
+                    phase_idx
+                );
+                return false;
+            }
+        }
+
+        // 3. Phase-specific validation
+        if is_soroban {
+            if let Some(info) = soroban_info {
+                if !check_valid_soroban(phase, lcl_header, info) {
+                    return false;
+                }
+            }
+        } else if !check_valid_classic(phase, lcl_header.max_tx_set_size) {
+            return false;
+        }
+
+        // 4. Per-TX content validation (time bounds, fees, etc.)
+        let tx_envelopes: Vec<TransactionEnvelope> =
+            phase_txs.iter().map(|tx| (*tx).clone()).collect();
+        let invalid = get_invalid_tx_list_with_fee_map(
+            &tx_envelopes,
+            &ctx,
+            &close_time_bounds,
+            fee_balance_provider,
+            &mut account_fee_map,
+        );
+        if !invalid.is_empty() {
+            debug!(
+                "Got bad txSet: {} invalid transactions in phase {}",
+                invalid.len(),
+                phase_idx
+            );
+            return false;
+        }
+    }
+
+    true
 }
 
 #[cfg(test)]
@@ -1189,5 +1700,392 @@ mod tests {
         );
         assert_eq!(valid.len(), 1, "one tx should be valid");
         assert_eq!(invalid.len(), 1, "one tx should be invalid");
+    }
+
+    // --- AUDIT-033: check_fee_map tests ---
+
+    fn make_v0_phase_with_fee(
+        txs: Vec<TransactionEnvelope>,
+        base_fee: Option<i64>,
+    ) -> TransactionPhase {
+        use stellar_xdr::curr::{TxSetComponent, TxSetComponentTxsMaybeDiscountedFee};
+        TransactionPhase::V0(
+            vec![TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                TxSetComponentTxsMaybeDiscountedFee {
+                    base_fee,
+                    txs: txs.try_into().unwrap(),
+                },
+            )]
+            .try_into()
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_check_fee_map_valid_fees() {
+        // TX with fee=200, 1 op. lcl_base_fee=100. component base_fee=100.
+        // min_inclusion_fee = max(100, 100) * 1 = 100
+        // inclusion_fee = min(200, 1*100) = 100 >= 100 -> valid
+        let tx = make_valid_envelope(200, 1);
+        let phase = make_v0_phase_with_fee(vec![tx], Some(100));
+        assert!(check_fee_map(&phase, 100));
+    }
+
+    #[test]
+    fn test_check_fee_map_component_base_fee_too_low() {
+        let tx = make_valid_envelope(200, 1);
+        // base_fee=50 < lcl_base_fee=100
+        let phase = make_v0_phase_with_fee(vec![tx], Some(50));
+        assert!(!check_fee_map(&phase, 100));
+    }
+
+    #[test]
+    fn test_check_fee_map_tx_fee_bid_too_low() {
+        // TX with fee=50, 1 op. base_fee=100.
+        // inclusion_fee = min(50, 1*100) = 50
+        // min_inclusion_fee = max(100, 100) * 1 = 100
+        // 50 < 100 -> invalid
+        let tx = make_valid_envelope(50, 1);
+        let phase = make_v0_phase_with_fee(vec![tx], Some(100));
+        assert!(!check_fee_map(&phase, 100));
+    }
+
+    #[test]
+    fn test_check_fee_map_no_base_fee_valid() {
+        // No component base_fee. TX fee=200, 1 op.
+        // inclusion_fee = full_fee = 200
+        // min_inclusion_fee = max(100, _) * 1 = 100
+        // 200 >= 100 -> valid
+        let tx = make_valid_envelope(200, 1);
+        let phase = make_v0_phase_with_fee(vec![tx], None);
+        assert!(check_fee_map(&phase, 100));
+    }
+
+    // --- AUDIT-033: check_valid_classic tests ---
+
+    #[test]
+    fn test_check_valid_classic_within_limit() {
+        // 2 TXs with 1 op each, limit = 5
+        let tx1 = make_valid_envelope(100, 1);
+        let tx2 = make_valid_envelope(200, 2);
+        let phase = make_v0_phase_with_fee(vec![tx1, tx2], Some(100));
+        assert!(check_valid_classic(&phase, 5));
+    }
+
+    #[test]
+    fn test_check_valid_classic_over_limit() {
+        // 3 TXs with 1 op each, limit = 2
+        let tx1 = make_valid_envelope(100, 1);
+        let tx2 = make_valid_envelope(200, 2);
+        let tx3 = make_valid_envelope(300, 3);
+        let phase = make_v0_phase_with_fee(vec![tx1, tx2, tx3], Some(100));
+        assert!(!check_valid_classic(&phase, 2));
+    }
+
+    #[test]
+    fn test_check_valid_classic_rejects_parallel_phase() {
+        use stellar_xdr::curr::ParallelTxsComponent;
+        let phase = TransactionPhase::V1(ParallelTxsComponent {
+            base_fee: Some(100),
+            execution_stages: vec![].try_into().unwrap(),
+        });
+        assert!(!check_valid_classic(&phase, 100));
+    }
+
+    // --- AUDIT-033: check_valid_soroban tests ---
+
+    fn make_soroban_envelope(
+        instructions: u32,
+        read_bytes: u32,
+        write_bytes: u32,
+        read_only_keys: Vec<stellar_xdr::curr::LedgerKey>,
+        read_write_keys: Vec<stellar_xdr::curr::LedgerKey>,
+    ) -> TransactionEnvelope {
+        use stellar_xdr::curr::{
+            InvokeHostFunctionOp, LedgerFootprint, SorobanResources, SorobanTransactionData,
+            SorobanTransactionDataExt,
+        };
+
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: stellar_xdr::curr::HostFunction::InvokeContract(
+                    stellar_xdr::curr::InvokeContractArgs {
+                        contract_address: stellar_xdr::curr::ScAddress::Contract(
+                            stellar_xdr::curr::ContractId(stellar_xdr::curr::Hash([0u8; 32])),
+                        ),
+                        function_name: stellar_xdr::curr::ScSymbol("test".try_into().unwrap()),
+                        args: vec![].try_into().unwrap(),
+                    },
+                ),
+                auth: vec![].try_into().unwrap(),
+            }),
+        };
+
+        let footprint = LedgerFootprint {
+            read_only: read_only_keys.try_into().unwrap(),
+            read_write: read_write_keys.try_into().unwrap(),
+        };
+        let resources = SorobanResources {
+            footprint,
+            instructions,
+            disk_read_bytes: read_bytes,
+            write_bytes,
+        };
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources,
+            resource_fee: 1000,
+        };
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 10000,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: stellar_xdr::curr::TransactionExt::V1(soroban_data),
+        };
+
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        })
+    }
+
+    fn make_soroban_network_info() -> henyey_ledger::SorobanNetworkInfo {
+        henyey_ledger::SorobanNetworkInfo {
+            ledger_max_instructions: 1_000_000,
+            ledger_max_read_ledger_entries: 100,
+            ledger_max_read_bytes: 100_000,
+            ledger_max_write_ledger_entries: 50,
+            ledger_max_write_bytes: 50_000,
+            ledger_max_dependent_tx_clusters: 4,
+            ..Default::default()
+        }
+    }
+
+    fn make_soroban_lcl_header(protocol: u32) -> LedgerHeader {
+        use stellar_xdr::curr::{Hash, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint};
+        LedgerHeader {
+            ledger_version: protocol,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(1000),
+                upgrades: vec![].try_into().unwrap(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 100,
+            total_coins: 0,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5000000,
+            max_tx_set_size: 100,
+            skip_list: [Hash([0; 32]), Hash([0; 32]), Hash([0; 32]), Hash([0; 32])],
+            ext: LedgerHeaderExt::V0,
+        }
+    }
+
+    #[test]
+    fn test_check_valid_soroban_sequential_valid() {
+        let info = make_soroban_network_info();
+        // Protocol 22 (pre-parallel) requires sequential V0 phase
+        let header = make_soroban_lcl_header(22);
+        let tx = make_soroban_envelope(100_000, 1000, 500, vec![], vec![]);
+        let phase = make_v0_phase_with_fee(vec![tx], Some(100));
+        assert!(check_valid_soroban(&phase, &header, &info));
+    }
+
+    #[test]
+    fn test_check_valid_soroban_instructions_exceed_limit() {
+        let info = make_soroban_network_info();
+        let header = make_soroban_lcl_header(22);
+        // Instructions exceed ledger max (1,000,000)
+        let tx = make_soroban_envelope(2_000_000, 1000, 500, vec![], vec![]);
+        let phase = make_v0_phase_with_fee(vec![tx], Some(100));
+        assert!(!check_valid_soroban(&phase, &header, &info));
+    }
+
+    #[test]
+    fn test_check_valid_soroban_parallel_mismatch_protocol_22() {
+        use stellar_xdr::curr::ParallelTxsComponent;
+        let info = make_soroban_network_info();
+        let header = make_soroban_lcl_header(22);
+        // Protocol 22 should NOT have parallel phase
+        let phase = TransactionPhase::V1(ParallelTxsComponent {
+            base_fee: Some(100),
+            execution_stages: vec![].try_into().unwrap(),
+        });
+        assert!(!check_valid_soroban(&phase, &header, &info));
+    }
+
+    #[test]
+    fn test_check_valid_soroban_sequential_mismatch_protocol_23() {
+        let info = make_soroban_network_info();
+        let header = make_soroban_lcl_header(23);
+        // Protocol 23 requires parallel V1 phase, but we provide V0
+        let tx = make_soroban_envelope(100_000, 1000, 500, vec![], vec![]);
+        let phase = make_v0_phase_with_fee(vec![tx], Some(100));
+        assert!(!check_valid_soroban(&phase, &header, &info));
+    }
+
+    #[test]
+    fn test_check_valid_soroban_parallel_too_many_clusters() {
+        use stellar_xdr::curr::{
+            DependentTxCluster, ParallelTxExecutionStage, ParallelTxsComponent,
+        };
+        let mut info = make_soroban_network_info();
+        info.ledger_max_dependent_tx_clusters = 2; // Only allow 2 clusters per stage
+        let header = make_soroban_lcl_header(23);
+
+        let tx1 = make_soroban_envelope(100, 100, 100, vec![], vec![]);
+        let tx2 = make_soroban_envelope(100, 100, 100, vec![], vec![]);
+        let tx3 = make_soroban_envelope(100, 100, 100, vec![], vec![]);
+
+        // 3 clusters in one stage > limit of 2
+        let stage: ParallelTxExecutionStage = vec![
+            DependentTxCluster(vec![tx1].try_into().unwrap()),
+            DependentTxCluster(vec![tx2].try_into().unwrap()),
+            DependentTxCluster(vec![tx3].try_into().unwrap()),
+        ]
+        .try_into()
+        .unwrap();
+
+        let phase = TransactionPhase::V1(ParallelTxsComponent {
+            base_fee: Some(100),
+            execution_stages: vec![stage].try_into().unwrap(),
+        });
+        assert!(!check_valid_soroban(&phase, &header, &info));
+    }
+
+    #[test]
+    fn test_check_valid_soroban_parallel_sequential_instruction_limit() {
+        use stellar_xdr::curr::{
+            DependentTxCluster, ParallelTxExecutionStage, ParallelTxsComponent,
+        };
+        let mut info = make_soroban_network_info();
+        info.ledger_max_instructions = 1_000;
+        info.ledger_max_dependent_tx_clusters = 10;
+        let header = make_soroban_lcl_header(23);
+
+        // Stage 1: cluster with 600 instructions
+        // Stage 2: cluster with 500 instructions
+        // Sequential total = 600 + 500 = 1100 > 1000 limit
+        let tx1 = make_soroban_envelope(600, 100, 100, vec![], vec![]);
+        let tx2 = make_soroban_envelope(500, 100, 100, vec![], vec![]);
+
+        let stage1: ParallelTxExecutionStage =
+            vec![DependentTxCluster(vec![tx1].try_into().unwrap())]
+                .try_into()
+                .unwrap();
+        let stage2: ParallelTxExecutionStage =
+            vec![DependentTxCluster(vec![tx2].try_into().unwrap())]
+                .try_into()
+                .unwrap();
+
+        let phase = TransactionPhase::V1(ParallelTxsComponent {
+            base_fee: Some(100),
+            execution_stages: vec![stage1, stage2].try_into().unwrap(),
+        });
+        assert!(!check_valid_soroban(&phase, &header, &info));
+    }
+
+    #[test]
+    fn test_check_valid_soroban_parallel_rw_conflict() {
+        use stellar_xdr::curr::{
+            DependentTxCluster, LedgerKey, LedgerKeyAccount, ParallelTxExecutionStage,
+            ParallelTxsComponent,
+        };
+        let mut info = make_soroban_network_info();
+        info.ledger_max_instructions = 10_000_000;
+        info.ledger_max_dependent_tx_clusters = 10;
+        let header = make_soroban_lcl_header(23);
+
+        // Create a shared key
+        let shared_key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([99u8; 32]))),
+        });
+
+        // Two clusters in the same stage both writing to the same key
+        let tx1 = make_soroban_envelope(100, 100, 100, vec![], vec![shared_key.clone()]);
+        let tx2 = make_soroban_envelope(100, 100, 100, vec![], vec![shared_key.clone()]);
+
+        let stage: ParallelTxExecutionStage = vec![
+            DependentTxCluster(vec![tx1].try_into().unwrap()),
+            DependentTxCluster(vec![tx2].try_into().unwrap()),
+        ]
+        .try_into()
+        .unwrap();
+
+        let phase = TransactionPhase::V1(ParallelTxsComponent {
+            base_fee: Some(100),
+            execution_stages: vec![stage].try_into().unwrap(),
+        });
+        assert!(!check_valid_soroban(&phase, &header, &info));
+    }
+
+    #[test]
+    fn test_check_valid_soroban_parallel_no_conflict_different_keys() {
+        use stellar_xdr::curr::{
+            DependentTxCluster, LedgerKey, LedgerKeyAccount, ParallelTxExecutionStage,
+            ParallelTxsComponent,
+        };
+        let mut info = make_soroban_network_info();
+        info.ledger_max_instructions = 10_000_000;
+        info.ledger_max_dependent_tx_clusters = 10;
+        let header = make_soroban_lcl_header(23);
+
+        let key1 = LedgerKey::Account(LedgerKeyAccount {
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
+        });
+        let key2 = LedgerKey::Account(LedgerKeyAccount {
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
+        });
+
+        // Two clusters writing to different keys — no conflict
+        let tx1 = make_soroban_envelope(100, 100, 100, vec![], vec![key1]);
+        let tx2 = make_soroban_envelope(100, 100, 100, vec![], vec![key2]);
+
+        let stage: ParallelTxExecutionStage = vec![
+            DependentTxCluster(vec![tx1].try_into().unwrap()),
+            DependentTxCluster(vec![tx2].try_into().unwrap()),
+        ]
+        .try_into()
+        .unwrap();
+
+        let phase = TransactionPhase::V1(ParallelTxsComponent {
+            base_fee: Some(100),
+            execution_stages: vec![stage].try_into().unwrap(),
+        });
+        assert!(check_valid_soroban(&phase, &header, &info));
+    }
+
+    #[test]
+    fn test_check_valid_soroban_rejects_classic_tx_in_soroban_phase() {
+        let info = make_soroban_network_info();
+        let header = make_soroban_lcl_header(22);
+        // Classic TX in Soroban phase
+        let tx = make_valid_envelope(100, 1);
+        let phase = make_v0_phase_with_fee(vec![tx], Some(100));
+        assert!(!check_valid_soroban(&phase, &header, &info));
+    }
+
+    #[test]
+    fn test_check_valid_classic_rejects_soroban_tx() {
+        let tx = make_soroban_envelope(100, 100, 100, vec![], vec![]);
+        let phase = make_v0_phase_with_fee(vec![tx], Some(100));
+        assert!(!check_valid_classic(&phase, 100));
     }
 }

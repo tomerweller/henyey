@@ -32,7 +32,7 @@ use parking_lot::RwLock;
 use tracing::{debug, info, trace, warn};
 
 use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
-use henyey_common::Hash256;
+use henyey_common::{Hash256, NetworkId};
 use henyey_crypto::{PublicKey, SecretKey, Signature};
 use henyey_ledger::LedgerManager;
 use henyey_scp::{hash_quorum_set, SCPDriver, SlotIndex, ValidationLevel};
@@ -239,6 +239,9 @@ pub struct ScpDriver {
     upgrades: RwLock<Option<Arc<RwLock<Upgrades>>>>,
     /// Shared tracking consensus state (owned by Herder, read by ScpDriver).
     tracking_state: Arc<RwLock<SharedTrackingState>>,
+    /// Cache for tx set validity checks, keyed on (lcl_hash, tx_set_hash, close_time_offset).
+    /// Bounded to ~64 entries. Cleared on ledger close.
+    tx_set_valid_cache: DashMap<(Hash256, Hash256, u64), bool>,
 }
 
 impl ScpDriver {
@@ -273,6 +276,7 @@ impl ScpDriver {
             ledger_manager: RwLock::new(None),
             upgrades: RwLock::new(None),
             tracking_state,
+            tx_set_valid_cache: DashMap::new(),
         }
     }
 
@@ -304,6 +308,83 @@ impl ScpDriver {
     /// Provide upgrade parameters access for nomination validation.
     pub fn set_upgrades(&self, upgrades: Arc<RwLock<Upgrades>>) {
         *self.upgrades.write() = Some(upgrades);
+    }
+
+    /// Clear the tx set validity cache (call on ledger close).
+    pub fn clear_tx_set_valid_cache(&self) {
+        self.tx_set_valid_cache.clear();
+    }
+
+    /// Check and cache whether a transaction set is valid for application.
+    ///
+    /// Mirrors stellar-core's `HerderSCPDriver::checkAndCacheTxSetValid()`
+    /// (HerderSCPDriver.cpp:1419-1461).
+    ///
+    /// Performs:
+    /// 1. Cache lookup by (lcl_hash, tx_set_hash, close_time_offset)
+    /// 2. On miss: prepare_for_apply + check_tx_set_valid
+    /// 3. Cache and return result
+    fn check_and_cache_tx_set_valid(
+        &self,
+        tx_set: &crate::tx_queue::TransactionSet,
+        lcl_hash: Hash256,
+        close_time_offset: u64,
+    ) -> bool {
+        let cache_key = (lcl_hash, tx_set.hash, close_time_offset);
+
+        // Check cache
+        if let Some(cached) = self.tx_set_valid_cache.get(&cache_key) {
+            return *cached;
+        }
+
+        // Bound cache size
+        if self.tx_set_valid_cache.len() >= 64 {
+            // Evict an arbitrary entry
+            if let Some(entry) = self.tx_set_valid_cache.iter().next().map(|e| *e.key()) {
+                self.tx_set_valid_cache.remove(&entry);
+            }
+        }
+
+        let network_id = NetworkId(self.network_id);
+
+        // prepare_for_apply validates XDR structure, fees, sort order, dedup
+        let prepared = match tx_set.prepare_for_apply(network_id) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!(
+                    "check_and_cache_tx_set_valid: prepare_for_apply failed: {}",
+                    e
+                );
+                self.tx_set_valid_cache.insert(cache_key, false);
+                return false;
+            }
+        };
+
+        // For generalized tx sets, run full content validation
+        let result = if let Some(ref gen) = prepared.generalized_tx_set {
+            if let Some(ref lm) = *self.ledger_manager.read() {
+                let lcl_header = lm.current_header();
+                let soroban_info = lm.soroban_network_info();
+
+                crate::tx_set_utils::check_tx_set_valid(
+                    gen,
+                    &lcl_header,
+                    close_time_offset,
+                    network_id,
+                    soroban_info.as_ref(),
+                    None, // Phase 1: skip fee balance checks
+                )
+            } else {
+                // No ledger manager — can't validate, assume valid
+                true
+            }
+        } else {
+            // Legacy tx sets — already validated by prepare_for_apply
+            true
+        };
+
+        self.tx_set_valid_cache.insert(cache_key, result);
+        result
     }
 
     /// Cache a transaction set.
@@ -869,16 +950,19 @@ impl ScpDriver {
                 }
 
                 // Parity: check previousLedgerHash matches the LCL hash
-                if let Some(ref lm) = *self.ledger_manager.read() {
-                    let lcl_hash = lm.current_header_hash();
-                    if tx_set.tx_set.previous_ledger_hash != lcl_hash {
+                let lcl_hash = if let Some(ref lm) = *self.ledger_manager.read() {
+                    let hash = lm.current_header_hash();
+                    if tx_set.tx_set.previous_ledger_hash != hash {
                         debug!(
                             "Tx set previousLedgerHash mismatch: expected {}, got {}",
-                            lcl_hash, tx_set.tx_set.previous_ledger_hash
+                            hash, tx_set.tx_set.previous_ledger_hash
                         );
                         return ValueValidation::Invalid;
                     }
-                }
+                    Some(hash)
+                } else {
+                    None
+                };
 
                 // Parity: validate tx set is well-formed (sorted, no duplicates)
                 // For generalized tx sets, per-component sort order is validated
@@ -889,6 +973,20 @@ impl ScpDriver {
                 {
                     debug!("Legacy tx set is not well-formed (unsorted or has duplicates)");
                     return ValueValidation::Invalid;
+                }
+
+                // Parity: validate individual transaction content (AUDIT-033)
+                // Mirrors stellar-core's checkAndCacheTxSetValid()
+                if let Some(lcl_hash) = lcl_hash {
+                    let close_time_offset = close_time.saturating_sub(lcl_close_time);
+                    if !self.check_and_cache_tx_set_valid(
+                        &tx_set.tx_set,
+                        lcl_hash,
+                        close_time_offset,
+                    ) {
+                        debug!("Tx set content validation failed for slot {}", slot_index);
+                        return ValueValidation::Invalid;
+                    }
                 }
             }
 
@@ -1595,6 +1693,9 @@ impl ScpDriver {
     /// or emit an SCP envelope — this method fills that gap.
     /// Record an externalized value.
     pub fn record_externalized(&self, slot: SlotIndex, value: Value) {
+        // Clear the tx set validity cache on ledger externalization
+        self.clear_tx_set_valid_cache();
+
         // Parse the StellarValue and extract stellar_value_ext for logging
         let (tx_set_hash, close_time, stellar_value_ext_desc) =
             if let Ok(sv) = StellarValue::from_xdr(&value, stellar_xdr::curr::Limits::none()) {
