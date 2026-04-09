@@ -14,25 +14,24 @@
 //!             instead of closing ledger (N)
 //! - **#1096**: `isValidForApply` skips ledger state validation for config
 //!
-//! # Design: LedgerTxn unified reads
+//! # Design: CloseLedgerState unified reads
 //!
 //! stellar-core processes upgrades inside a single loop that reads from and
 //! writes to a **mutable** `LedgerTxn`. After each upgrade is applied, the
 //! next iteration sees the updated state (protocol version, config settings,
 //! TTL values, etc.).
 //!
-//! Henyey now mirrors this architecture via [`LedgerTxn`]: all reads during
-//! the upgrade loop resolve through current delta → committed chain → base
-//! snapshot, ensuring that each upgrade sees prior upgrades' changes. The
-//! `EntryReader` trait allows config loading and other read paths to be
-//! generic over `SnapshotHandle` (frozen state) and `LedgerTxn` (merged view).
+//! Henyey mirrors this via [`CloseLedgerState`]: all reads during the upgrade
+//! loop resolve through current delta → base snapshot, ensuring that each
+//! upgrade sees prior upgrades' changes. The `EntryReader` trait allows config
+//! loading and other read paths to be generic over `SnapshotHandle` (frozen
+//! state) and `CloseLedgerState` (merged view).
 
 use henyey_bucket::{BucketList, HotArchiveBucketList};
 use henyey_common::Hash256;
 use henyey_ledger::{
-    compute_header_hash, ConfigUpgradeSetFrame, LedgerCloseData, LedgerManager,
-    LedgerManagerConfig, LedgerTxn, SnapshotBuilder, SnapshotHandle, TransactionSetVariant,
-    UpgradeContext,
+    compute_header_hash, CloseLedgerState, ConfigUpgradeSetFrame, LedgerCloseData, LedgerManager,
+    LedgerManagerConfig, SnapshotBuilder, SnapshotHandle, TransactionSetVariant, UpgradeContext,
 };
 use stellar_xdr::curr::{
     ConfigSettingEntry, ConfigSettingId, ConfigUpgradeSet, ConfigUpgradeSetKey,
@@ -345,7 +344,7 @@ fn test_config_upgrade_sees_stale_protocol_version() {
 
     // Pass the post-upgrade version (25) explicitly to make_from_key.
     let closing_ledger_seq = snapshot_ledger + 1;
-    let ltx = LedgerTxn::begin(
+    let ltx = CloseLedgerState::begin(
         handle.clone(),
         header.clone(),
         header_hash,
@@ -416,7 +415,7 @@ fn test_config_upgrade_ttl_checked_against_snapshot_ledger_seq() {
 
     // make_from_key now uses closing_ledger (100) for TTL check.
     // Entry with live_until=99 is expired because 99 < 100.
-    let ltx = LedgerTxn::begin(handle.clone(), header.clone(), header_hash, closing_ledger);
+    let ltx = CloseLedgerState::begin(handle.clone(), header.clone(), header_hash, closing_ledger);
     let frame = ConfigUpgradeSetFrame::make_from_key(&ltx, &upgrade_key, closing_ledger, 25);
 
     assert!(
@@ -440,8 +439,8 @@ fn test_config_upgrade_ttl_checked_against_snapshot_ledger_seq() {
 /// operation that stellar-core performs.
 ///
 /// stellar-core flow:
-/// 1. Config upgrade resizes window in LedgerTxn
-/// 2. `maybeSnapshotSorobanStateSize` reads resized window from same LedgerTxn
+/// 1. Config upgrade resizes window in CloseLedgerState
+/// 2. `maybeSnapshotSorobanStateSize` reads resized window from same CloseLedgerState
 /// 3. Performs shift+push: `erase(begin); push_back(stateSize)`
 ///
 /// henyey flow:
@@ -636,7 +635,7 @@ fn test_config_upgrade_nonexistent_key_rejected() {
     };
 
     // make_from_key returns None — key doesn't exist in ledger
-    let ltx = LedgerTxn::begin(handle.clone(), header.clone(), header_hash, 1);
+    let ltx = CloseLedgerState::begin(handle.clone(), header.clone(), header_hash, 1);
     let frame = ConfigUpgradeSetFrame::make_from_key(&ltx, &bogus_key, 1, 25);
     assert!(
         frame.is_none(),
@@ -649,7 +648,7 @@ fn test_config_upgrade_nonexistent_key_rejected() {
     let mut ctx = UpgradeContext::new(25);
     ctx.add_upgrade(LedgerUpgrade::Config(bogus_key));
 
-    let mut ltx = LedgerTxn::begin(handle, header, header_hash, 1);
+    let mut ltx = CloseLedgerState::begin(handle, header, header_hash, 1);
     let result = ctx.apply_config_upgrades(&mut ltx, 1, 25);
 
     assert!(

@@ -31,9 +31,9 @@ use stellar_xdr::curr::{
     TransactionResultSet, TransactionSet, WriteXdr,
 };
 
+use crate::close_state::CloseLedgerState;
 use crate::config_upgrade::{ConfigUpgradeSetFrame, ConfigUpgradeValidity};
 use crate::error::LedgerError;
-use crate::ltx::LedgerTxn;
 
 /// A transaction paired with an optional per-component base fee override.
 pub type TxWithFee = (Arc<TransactionEnvelope>, Option<u32>);
@@ -1206,7 +1206,7 @@ impl UpgradeContext {
     /// - The delta update fails
     pub fn apply_config_upgrades(
         &self,
-        ltx: &mut LedgerTxn,
+        ltx: &mut CloseLedgerState,
         closing_ledger_seq: u32,
         protocol_version: u32,
     ) -> Result<ConfigUpgradeResult, LedgerError> {
@@ -1328,7 +1328,7 @@ impl UpgradeContext {
     /// Matches upstream `upgradeMaxSorobanTxSetSize()` in Upgrades.cpp.
     pub fn apply_max_soroban_tx_set_size(
         &self,
-        ltx: &mut LedgerTxn,
+        ltx: &mut CloseLedgerState,
         ledger_seq: u32,
     ) -> Result<stellar_xdr::curr::LedgerEntryChanges, LedgerError> {
         use stellar_xdr::curr::{

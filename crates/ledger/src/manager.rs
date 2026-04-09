@@ -30,6 +30,7 @@ use crate::{
     close::{
         LedgerCloseData, LedgerCloseResult, LedgerCloseStats, TransactionSetVariant, UpgradeContext,
     },
+    close_state::CloseLedgerState,
     delta::EntryChange,
     execution::{
         execute_soroban_parallel_phase, load_soroban_network_info, pre_deduct_all_fees_on_delta,
@@ -37,7 +38,6 @@ use crate::{
         TransactionExecutionResult, TransactionExecutor, TxSetResult,
     },
     header::{compute_header_hash, create_next_header, NextHeaderFields},
-    ltx::LedgerTxn,
     snapshot::{LedgerSnapshot, SnapshotHandle},
     LedgerError, Result,
 };
@@ -85,41 +85,6 @@ fn get_rss_bytes() -> u64 {
     {
         0
     }
-}
-
-/// Extract `LedgerEntryChanges` from a delta, starting from `skip` changes.
-///
-/// Used during upgrade meta capture: record the number of changes before an upgrade
-/// sub-phase, run the sub-phase, then extract only the new changes.
-fn extract_entry_changes(
-    delta: &crate::delta::LedgerDelta,
-    skip: usize,
-) -> stellar_xdr::curr::LedgerEntryChanges {
-    use stellar_xdr::curr::{LedgerEntryChange, LedgerEntryChanges, VecM};
-
-    let delta_after = delta.num_changes();
-    if delta_after <= skip {
-        return LedgerEntryChanges(VecM::default());
-    }
-
-    let mut changes: Vec<LedgerEntryChange> = Vec::new();
-    for change in delta.changes().skip(skip) {
-        match change {
-            crate::delta::EntryChange::Created(entry) => {
-                changes.push(LedgerEntryChange::Created(entry.clone()));
-            }
-            crate::delta::EntryChange::Updated { previous, current } => {
-                changes.push(LedgerEntryChange::State(previous.clone()));
-                changes.push(LedgerEntryChange::Updated(current.as_ref().clone()));
-            }
-            crate::delta::EntryChange::Deleted { previous } => {
-                let key = henyey_common::entry_to_key(previous);
-                changes.push(LedgerEntryChange::State(previous.clone()));
-                changes.push(LedgerEntryChange::Removed(key));
-            }
-        }
-    }
-    LedgerEntryChanges(changes.try_into().unwrap_or_default())
 }
 
 /// Secondary index type: account → set of pool_ids for pool share trustlines.
@@ -1924,8 +1889,8 @@ impl LedgerManager {
             upgrade_ctx.add_upgrade(upgrade.clone());
         }
 
-        // Create the root LedgerTxn for this close cycle.
-        let ltx = LedgerTxn::begin(
+        // Create the root CloseLedgerState for this close cycle.
+        let ltx = CloseLedgerState::begin(
             snapshot,
             state.header.clone(),
             state.header_hash,
@@ -2495,8 +2460,8 @@ impl LedgerManager {
         let snapshot = self.create_snapshot().ok()?;
         let closing_ledger_seq = snapshot.ledger_seq() + 1;
         let protocol_version = snapshot.header().ledger_version;
-        // Create a read-only LedgerTxn so make_from_key can use the unified read path.
-        let ltx = LedgerTxn::begin(
+        // Create a read-only CloseLedgerState so make_from_key can use the unified read path.
+        let ltx = CloseLedgerState::begin(
             snapshot.clone(),
             snapshot.header().clone(),
             *snapshot.snapshot().header_hash(),
@@ -2520,7 +2485,7 @@ struct LedgerCloseContext<'a> {
     close_data: LedgerCloseData,
     prev_header: LedgerHeader,
     prev_header_hash: Hash256,
-    ltx: LedgerTxn,
+    ltx: CloseLedgerState,
     stats: LedgerCloseStats,
     upgrade_ctx: UpgradeContext,
     id_pool: u64,
@@ -2552,16 +2517,16 @@ struct LedgerCloseContext<'a> {
 }
 
 impl LedgerCloseContext<'_> {
-    /// Load an entry through the LedgerTxn read path (current → committed → snapshot).
+    /// Load an entry through the CloseLedgerState read path (current delta → snapshot).
     fn load_entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
         self.ltx.get_entry(key)
     }
 
-    /// Load StateArchivalSettings through the LedgerTxn read path.
+    /// Load StateArchivalSettings through the CloseLedgerState read path.
     ///
     /// Parity: In stellar-core, the eviction scan runs after config upgrades are applied to the
-    /// LedgerTxn, so it sees the upgraded StateArchival settings. LedgerTxn's read path
-    /// (current → committed → snapshot) provides this automatically.
+    /// LedgerTxn, so it sees the upgraded StateArchival settings. CloseLedgerState's read path
+    /// (current delta → snapshot) provides this automatically.
     fn load_state_archival_settings(&self) -> Option<StateArchivalSettings> {
         let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
             config_setting_id: ConfigSettingId::StateArchival,
@@ -3908,9 +3873,8 @@ impl LedgerCloseContext<'_> {
         let mut version_upgrade_memory_cost_changed = false;
 
         // Capture changes from version upgrade side effects (cost types for V25).
-        // We record the delta state before and after to extract changes.
         let version_changes = if prev_version != protocol_version {
-            let delta_before = self.ltx.current_delta().num_changes();
+            let cp = self.ltx.change_checkpoint();
             // Parity: Upgrades.cpp:1189-1212
             // needUpgradeToVersion(V_20, prev, new) → createLedgerEntriesForV20
             if needs_upgrade_to_version(ProtocolVersion::V20, prev_version, protocol_version) {
@@ -3984,7 +3948,7 @@ impl LedgerCloseContext<'_> {
                 tracing::info!("Applied V24 mainnet fee pool correction: +31879035 stroops");
             }
             // Extract changes made during version upgrade side effects
-            extract_entry_changes(self.ltx.current_delta(), delta_before)
+            self.ltx.entry_changes_since(cp)
         } else {
             LedgerEntryChanges(VecM::default())
         };
@@ -3997,21 +3961,21 @@ impl LedgerCloseContext<'_> {
         // NOTE: The V10 version upgrade path above could theoretically also
         // trigger prepareLiabilities, but Henyey only supports protocol 24+,
         // so that path is never reached. If both were active, stellar-core
-        // would run prepareLiabilities twice (once per upgrade). With LedgerTxn,
+        // would run prepareLiabilities twice (once per upgrade). With CloseLedgerState,
         // both passes would see each other's changes through the read path.
         let reserve_changes = if let Some(new_reserve) = self.upgrade_ctx.base_reserve_upgrade() {
             let did_reserve_increase = new_reserve > self.prev_header.base_reserve;
             if protocol_version_starts_from(protocol_version, ProtocolVersion::V10)
                 && did_reserve_increase
             {
-                let delta_before = self.ltx.current_delta().num_changes();
+                let cp = self.ltx.change_checkpoint();
                 crate::prepare_liabilities::prepare_liabilities(
                     &mut self.ltx,
                     protocol_version,
                     new_reserve,
                     self.close_data.ledger_seq,
                 )?;
-                extract_entry_changes(self.ltx.current_delta(), delta_before)
+                self.ltx.entry_changes_since(cp)
             } else {
                 LedgerEntryChanges(VecM::default())
             }
@@ -4019,7 +3983,7 @@ impl LedgerCloseContext<'_> {
             LedgerEntryChanges(VecM::default())
         };
 
-        // Apply config upgrades through LedgerTxn BEFORE extracting entries for the bucket list.
+        // Apply config upgrades through CloseLedgerState BEFORE extracting entries for the bucket list.
         // In stellar-core, config upgrades are applied to the LedgerTxn before
         // getAllEntries() and addBatch(), so the upgraded ConfigSetting entries are included
         // in the bucket list update. We must do the same here.
@@ -4046,7 +4010,7 @@ impl LedgerCloseContext<'_> {
             );
         }
 
-        // Apply MaxSorobanTxSetSize upgrade through LedgerTxn (modifies CONFIG_SETTING entry).
+        // Apply MaxSorobanTxSetSize upgrade through CloseLedgerState (modifies CONFIG_SETTING entry).
         // Parity: Upgrades.cpp upgradeMaxSorobanTxSetSize()
         let max_soroban_changes = if self.upgrade_ctx.max_soroban_tx_set_size_upgrade().is_some() {
             self.upgrade_ctx
@@ -4086,7 +4050,7 @@ impl LedgerCloseContext<'_> {
             || version_upgrade_triggers_state_size)
             && protocol_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION
         {
-            // Load rent config through LedgerTxn (sees post-upgrade values).
+            // Load rent config through CloseLedgerState (sees post-upgrade values).
             let rent_config = self.load_rent_config_from_delta_or_snapshot();
 
             // Recompute contract code sizes with new cost params
@@ -4121,7 +4085,7 @@ impl LedgerCloseContext<'_> {
                     },
                 );
 
-                // Read the window through LedgerTxn (may have been resized by config upgrade).
+                // Read the window through CloseLedgerState (may have been resized by config upgrade).
                 // Parity: stellar-core reads from LedgerTxn which includes prior modifications.
                 let (window_vec_base, previous_entry) = match self.ltx.get_entry(&window_key)? {
                     Some(entry) => {
@@ -4186,9 +4150,8 @@ impl LedgerCloseContext<'_> {
         config_memory_cost_params_changed: bool,
     ) -> Result<(LedgerHeader, Hash256)> {
         // Log all inputs to create_next_header for debugging header mismatch
-        let total_coins =
-            self.prev_header.total_coins + self.ltx.current_delta().total_coins_delta();
-        let fee_pool = self.prev_header.fee_pool + self.ltx.current_delta().fee_pool_delta();
+        let total_coins = self.prev_header.total_coins + self.ltx.total_coins_delta();
+        let fee_pool = self.prev_header.fee_pool + self.ltx.fee_pool_delta();
         tracing::debug!(
             ledger_seq = self.close_data.ledger_seq,
             prev_header_hash = %self.prev_header_hash.to_hex(),
@@ -4198,10 +4161,10 @@ impl LedgerCloseContext<'_> {
             bucket_list_hash = %bucket_list_hash.to_hex(),
             tx_result_hash = %tx_result_hash.to_hex(),
             prev_total_coins = self.prev_header.total_coins,
-            total_coins_delta = self.ltx.current_delta().total_coins_delta(),
+            total_coins_delta = self.ltx.total_coins_delta(),
             total_coins = total_coins,
             prev_fee_pool = self.prev_header.fee_pool,
-            fee_pool_delta = self.ltx.current_delta().fee_pool_delta(),
+            fee_pool_delta = self.ltx.fee_pool_delta(),
             fee_pool = fee_pool,
             inflation_seq = self.prev_header.inflation_seq,
             prev_ledger_version = self.prev_header.ledger_version,
@@ -4380,7 +4343,7 @@ impl LedgerCloseContext<'_> {
         // The snapshot's lookup_fn tries to acquire a read lock on bucket_list, which would
         // deadlock if we're already holding the write lock.
         // Parity: In stellar-core, eviction runs after config upgrades (sealLedgerTxnAndStoreInBucketsAndDB),
-        // so it reads the post-upgrade StateArchival settings. LedgerTxn's read path
+        // so it reads the post-upgrade StateArchival settings. CloseLedgerState's read path
         // provides this automatically.
         // Gate on prev_version (initialLedgerVers) to match stellar-core: on the upgrade
         // ledger (e.g. protocol 0→25), eviction does NOT run.
@@ -4403,10 +4366,7 @@ impl LedgerCloseContext<'_> {
         // Categorize delta entries for bucket list update (single pass) before acquiring write lock.
         // Drains entries from the current delta (moving instead of cloning), saving ~50K clone operations.
         // Metadata (fee_pool_delta, total_coins_delta) is preserved for build_and_hash_header.
-        let cat = self
-            .ltx
-            .current_delta_mut()
-            .drain_categorization_for_bucket_update();
+        let cat = self.ltx.drain_for_bucket_update();
         let init_entries = cat.init_entries;
         let mut live_entries = cat.live_entries;
         let mut dead_entries = cat.dead_keys;
@@ -6938,7 +6898,7 @@ mod tests {
         let header_hash = crate::compute_header_hash(&header).expect("hash");
         let snapshot = SnapshotHandle::new(crate::snapshot::LedgerSnapshot::empty(0));
 
-        let ltx = LedgerTxn::begin(snapshot, header.clone(), header_hash, ledger_seq);
+        let ltx = CloseLedgerState::begin(snapshot, header.clone(), header_hash, ledger_seq);
 
         LedgerCloseContext {
             manager,

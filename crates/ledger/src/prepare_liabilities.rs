@@ -18,7 +18,7 @@
 //!
 //! Parity: Upgrades.cpp:949-1127 `prepareLiabilities`
 
-use crate::ltx::LedgerTxn;
+use crate::close_state::CloseLedgerState;
 use crate::{reserves, trustlines, LedgerError, Result};
 use henyey_common::asset::{add_balance, is_issuer};
 use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
@@ -122,7 +122,7 @@ fn get_available_balance_excluding_liabilities(
     account_id: &AccountId,
     asset: &Asset,
     balance_above_reserve: i64,
-    ltx: &LedgerTxn,
+    ltx: &CloseLedgerState,
 ) -> Result<i64> {
     if matches!(asset, Asset::Native) {
         return Ok(balance_above_reserve);
@@ -151,7 +151,7 @@ fn get_available_limit_excluding_liabilities(
     account_id: &AccountId,
     asset: &Asset,
     balance: i64,
-    ltx: &LedgerTxn,
+    ltx: &CloseLedgerState,
 ) -> Result<i64> {
     if matches!(asset, Asset::Native) {
         return Ok(i64::MAX - balance);
@@ -206,7 +206,7 @@ fn update_offer(
     liabilities: &mut BTreeMap<Asset, Liabilities>,
     initial_buying_liabilities: &BTreeMap<Asset, Option<i64>>,
     initial_selling_liabilities: &BTreeMap<Asset, Option<i64>>,
-    ltx: &LedgerTxn,
+    ltx: &CloseLedgerState,
 ) -> Result<UpdateOfferResult> {
     let seller_id = offer.seller_id.clone();
 
@@ -304,7 +304,7 @@ fn update_offer(
 fn erase_offer_with_possible_sponsorship(
     offer_entry: &LedgerEntry,
     account: &mut AccountEntry,
-    ltx: &mut LedgerTxn,
+    ltx: &mut CloseLedgerState,
     ledger_seq: u32,
 ) -> Result<Option<AccountId>> {
     let is_sponsored =
@@ -350,21 +350,21 @@ fn erase_offer_with_possible_sponsorship(
     Ok(sponsor_id)
 }
 
-/// Update `numSponsoring` on a sponsor account, loading from the LedgerTxn read path.
+/// Update `numSponsoring` on a sponsor account, loading from the CloseLedgerState read path.
 ///
 /// This handles the case where the sponsor account may not be the same as the
 /// offer owner, and may have already been modified in the delta.
 fn update_sponsor_num_sponsoring(
     sponsor_id: &AccountId,
     delta_val: i64,
-    ltx: &mut LedgerTxn,
+    ltx: &mut CloseLedgerState,
     ledger_seq: u32,
 ) -> Result<()> {
     let key = LedgerKey::Account(LedgerKeyAccount {
         account_id: sponsor_id.clone(),
     });
 
-    // Load the current version of the sponsor account through the LedgerTxn
+    // Load the current version of the sponsor account through the CloseLedgerState
     // read path (current delta → committed chain → snapshot).
     let entry = ltx.get_entry(&key)?.ok_or_else(|| {
         LedgerError::Internal(format!("sponsor account not found: {:?}", sponsor_id))
@@ -510,14 +510,14 @@ fn is_authorized_to_maintain_liabilities_tl(tl: &TrustLineEntry) -> bool {
 // SECURITY: liability clearing only runs on offers that have corresponding liabilities
 // INVARIANT: offers always have corresponding liabilities after creation
 pub fn prepare_liabilities(
-    ltx: &mut LedgerTxn,
+    ltx: &mut CloseLedgerState,
     protocol_version: u32,
     base_reserve: u32,
     ledger_seq: u32,
 ) -> Result<()> {
     tracing::info!("Starting prepareLiabilities");
 
-    // Step 1: Load all offers through the LedgerTxn merged read path
+    // Step 1: Load all offers through the CloseLedgerState merged read path
     // (current delta → committed chain → snapshot) and group by account.
     // Parity: ltx.loadAllOffers()
     let all_entries = ltx.all_offers()?;
@@ -569,7 +569,7 @@ pub fn prepare_liabilities(
             );
         }
 
-        // 3b: Load the account through the LedgerTxn read path.
+        // 3b: Load the account through the CloseLedgerState read path.
         // This automatically sees prior delta changes (e.g., sponsor adjustments
         // from processing a previous account's offers).
         let account_key = LedgerKey::Account(LedgerKeyAccount {
@@ -758,7 +758,7 @@ pub fn prepare_liabilities(
         }
 
         // 3h: If the account changed, record the update.
-        // The LedgerTxn delta's coalescing logic keeps the original previous
+        // The CloseLedgerState delta's coalescing logic keeps the original previous
         // and replaces the current with our updated entry.
         if account_mut != &account_before {
             changed_accounts.insert(account_key.clone());

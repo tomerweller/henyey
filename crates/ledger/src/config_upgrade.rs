@@ -33,8 +33,8 @@ use stellar_xdr::curr::{
 };
 use tracing::{debug, info, warn};
 
+use crate::close_state::CloseLedgerState;
 use crate::error::LedgerError;
-use crate::ltx::LedgerTxn;
 
 /// Validity of a configuration upgrade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,7 +150,7 @@ impl ConfigUpgradeSetFrame {
     /// - The value is not SCV_BYTES
     /// - The XDR cannot be decoded
     pub fn make_from_key(
-        ltx: &LedgerTxn,
+        ltx: &CloseLedgerState,
         key: &ConfigUpgradeSetKey,
         closing_ledger_seq: u32,
         protocol_version: u32,
@@ -315,7 +315,7 @@ impl ConfigUpgradeSetFrame {
     // SECURITY: config entries validated during upgrade proposal phase before reaching apply
     pub fn apply_to(
         &self,
-        ltx: &mut LedgerTxn,
+        ltx: &mut CloseLedgerState,
     ) -> Result<(bool, bool, stellar_xdr::curr::LedgerEntryChanges), LedgerError> {
         use stellar_xdr::curr::LedgerEntryChange;
 
@@ -346,7 +346,7 @@ impl ConfigUpgradeSetFrame {
             });
 
             // Load the current entry from the ledger (reads through the full
-            // LedgerTxn chain: current → committed → snapshot)
+            // CloseLedgerState chain: current → committed → snapshot)
             let current_entry = ltx.get_entry(&key).map_err(|e| {
                 LedgerError::Internal(format!(
                     "Failed to load config setting {:?}: {}",
@@ -440,7 +440,7 @@ impl ConfigUpgradeSetFrame {
     fn apply_frozen_keys_delta(
         &self,
         delta_entry: &ConfigSettingEntry,
-        ltx: &mut LedgerTxn,
+        ltx: &mut CloseLedgerState,
         changes: &mut Vec<stellar_xdr::curr::LedgerEntryChange>,
     ) -> Result<(), LedgerError> {
         use stellar_xdr::curr::LedgerEntryChange;
@@ -528,7 +528,7 @@ impl ConfigUpgradeSetFrame {
     fn apply_freeze_bypass_delta(
         &self,
         delta_entry: &ConfigSettingEntry,
-        ltx: &mut LedgerTxn,
+        ltx: &mut CloseLedgerState,
         changes: &mut Vec<stellar_xdr::curr::LedgerEntryChange>,
     ) -> Result<(), LedgerError> {
         use stellar_xdr::curr::LedgerEntryChange;
@@ -610,7 +610,10 @@ impl ConfigUpgradeSetFrame {
     ///
     /// Parity: NetworkConfig.cpp:2080 `maybeUpdateSorobanStateSizeWindowSize`
     // SECURITY: config entries validated during upgrade proposal phase before reaching apply
-    fn maybe_update_state_size_window(&self, ltx: &mut LedgerTxn) -> Result<(), LedgerError> {
+    fn maybe_update_state_size_window(
+        &self,
+        ltx: &mut CloseLedgerState,
+    ) -> Result<(), LedgerError> {
         // Get the new sample size from the upgrade set
         let new_sample_size = self
             .config_upgrade_set
@@ -629,7 +632,7 @@ impl ConfigUpgradeSetFrame {
             None => return Ok(()),
         };
 
-        // Load the current window from the LedgerTxn (sees prior config upgrades)
+        // Load the current window from the CloseLedgerState (sees prior config upgrades)
         let window_key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
             config_setting_id: ConfigSettingId::LiveSorobanStateSizeWindow,
         });
