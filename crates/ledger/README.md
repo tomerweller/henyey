@@ -13,6 +13,7 @@ graph TD
     SCP[Externalized SCP value]
     LCD[LedgerCloseData]
     LM[LedgerManager]
+    LTX[LedgerTxn]
     SNAP[SnapshotHandle]
     EXEC[TransactionExecutor]
     DELTA[LedgerDelta]
@@ -22,7 +23,9 @@ graph TD
 
     SCP --> LCD
     LCD --> LM
-    LM --> SNAP
+    LM --> LTX
+    LTX --> SNAP
+    LTX --> DELTA
     SNAP --> EXEC
     EXEC --> DELTA
     DELTA --> BL
@@ -42,6 +45,10 @@ graph TD
 | `TransactionSetVariant` | Classic or generalized transaction set, including canonical sorting helpers. |
 | `LedgerCloseResult` | Output of a successful close, including the new header, result pairs, optional meta, and perf stats. |
 | `LedgerCloseStats` | Aggregate counters for transaction execution and state changes during close. |
+| `LedgerTxn` | Transactional ledger wrapper that nests a `LedgerDelta` over a `SnapshotHandle`, supporting `child()`/`commit()`/`rollback()` for upgrade and liability phases. |
+| `LedgerTxnRestore` | RAII guard for auto-rollback on drop; returned by `LedgerTxn::child()`. |
+| `LedgerTxnFinal` | Final committed `LedgerTxn` state; provides `into_delta()` to extract the accumulated changes. |
+| `EntryReader` | Trait for generic ledger entry reads; implemented by `SnapshotHandle` and `LedgerTxn`. |
 | `LedgerDelta` | Per-ledger accumulator for creates, updates, deletes, fee-pool deltas, and coin deltas. |
 | `EntryChange` | Net effect for a single ledger key after delta coalescing. |
 | `LedgerSnapshot` | Immutable point-in-time ledger state used for validation and execution reads. |
@@ -115,6 +122,7 @@ assert!(available <= account.balance - min_balance);
 | `manager.rs` | `LedgerManager`, startup cache scans, bucket-list installation, and close/commit orchestration. |
 | `close.rs` | Ledger-close inputs and outputs, transaction-set preparation, upgrade context, and perf/stat structs. |
 | `delta.rs` | Change coalescing, fee deduction helpers, and bucket-update categorization. |
+| `ltx.rs` | `LedgerTxn` transactional wrapper with nested child/commit/rollback and merged read path. |
 | `snapshot.rs` | Immutable snapshots, lazy lookup handles, batch prefetch, and snapshot construction. |
 | `header.rs` | Header hashing, skip-list maintenance, chain verification, and next-header construction. |
 | `error.rs` | Crate-wide error enum. |
@@ -137,6 +145,10 @@ assert!(available <= account.balance - min_balance);
 
 `LedgerDelta` records the net effect per ledger key rather than every intermediate mutation. Create-then-delete annihilates to no change, delete-then-create becomes an update, and repeated updates preserve the original pre-state while replacing the final post-state. This mirrors stellar-core `LedgerTxn` merge semantics and keeps bucket-list output deterministic.
 
+### Transactional ledger access (LedgerTxn)
+
+`LedgerTxn` wraps a `LedgerDelta` over a `SnapshotHandle` and provides nested child/commit/rollback semantics. During ledger close, each upgrade and the liability-preparation step runs in a `child()` scope: reads walk current delta → committed parent chain → base snapshot, so every phase sees changes from prior committed phases. The `EntryReader` trait abstracts over `SnapshotHandle` and `LedgerTxn` so that config-loading functions work in both the close pipeline (via `LedgerTxn`) and the history replay path (via `SnapshotHandle`).
+
 ### Pre-deducted fees and staged execution
 
 The close pipeline can deduct fees before transaction bodies run, including across classic and Soroban phases. Parallel Soroban clusters then execute with isolated executors and merge back into the main delta, while preserving the fee and sequence-number behavior expected by stellar-core.
@@ -152,6 +164,7 @@ When Soroban restores entries from the live bucket list or hot archive, metadata
 | `manager.rs` | `src/ledger/LedgerManagerImpl.cpp`, `src/ledger/LedgerManagerImpl.h` |
 | `close.rs` | `src/ledger/LedgerCloseMetaFrame.cpp`, `src/ledger/LedgerCloseMetaFrame.h`, parts of `LedgerManagerImpl.cpp` |
 | `delta.rs` | `src/ledger/LedgerTxn.cpp`, `src/ledger/LedgerTxn.h` |
+| `ltx.rs` | `src/ledger/LedgerTxn.h`, `src/ledger/LedgerTxn.cpp` (nested transaction subset) |
 | `snapshot.rs` | `src/ledger/LedgerStateSnapshot.cpp`, `src/ledger/LedgerStateSnapshot.h` |
 | `header.rs` | `src/ledger/LedgerHeaderUtils.cpp`, `src/ledger/LedgerHeaderUtils.h`, bucket skip-list helpers |
 | `execution/mod.rs` | Transaction-apply path in `src/ledger/LedgerManagerImpl.cpp` plus `src/transactions/*` integration points |

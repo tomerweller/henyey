@@ -2319,11 +2319,7 @@ impl TransactionExecutor {
     }
 
     /// Apply all state changes to the delta.
-    pub fn apply_to_delta(
-        &self,
-        _snapshot: &SnapshotHandle,
-        delta: &mut LedgerDelta,
-    ) -> Result<()> {
+    pub fn apply_to_delta(&self, delta: &mut LedgerDelta) -> Result<()> {
         let state_delta = self.state.delta();
 
         // Apply changes in chronological order using change_order.

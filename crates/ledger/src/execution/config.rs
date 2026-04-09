@@ -6,20 +6,20 @@
 
 use super::*;
 
-/// Load a ConfigSettingEntry from the snapshot by ID.
+/// Load a ConfigSettingEntry by ID from any entry reader.
 ///
 /// Returns `Ok(Some(entry))` if the setting exists, `Ok(None)` if it genuinely
 /// doesn't exist (e.g., pre-Soroban protocol), and `Err` if an I/O error
 /// occurred during lookup. This matches stellar-core's behavior where I/O
 /// errors are never silently swallowed.
 pub(crate) fn load_config_setting(
-    snapshot: &SnapshotHandle,
+    reader: &impl crate::EntryReader,
     id: ConfigSettingId,
 ) -> Result<Option<ConfigSettingEntry>> {
     let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
         config_setting_id: id,
     });
-    match snapshot.get_entry(&key)? {
+    match reader.get_entry(&key)? {
         Some(entry) => {
             if let LedgerEntryData::ConfigSetting(config) = entry.data {
                 Ok(Some(config))
@@ -72,26 +72,26 @@ macro_rules! load_config {
 ///
 /// This matches stellar-core's `rustBridgeFeeConfiguration()` behavior.
 pub fn load_soroban_config(
-    snapshot: &SnapshotHandle,
+    reader: &impl crate::EntryReader,
     protocol_version: u32,
 ) -> Result<SorobanConfig> {
     // Load CPU cost params
     let cpu_cost_params = load_config!(
-        snapshot,
+        reader,
         ConfigSettingId::ContractCostParamsCpuInstructions,
         ContractCostParamsCpuInstructions
     );
 
     // Load memory cost params
     let mem_cost_params = load_config!(
-        snapshot,
+        reader,
         ConfigSettingId::ContractCostParamsMemoryBytes,
         ContractCostParamsMemoryBytes
     );
 
     // Load compute limits and fee rate per instructions
     let compute = load_config!(
-        snapshot,
+        reader,
         ConfigSettingId::ContractComputeV0,
         ContractComputeV0
     );
@@ -103,7 +103,7 @@ pub fn load_soroban_config(
 
     // Load ledger cost settings
     let cost = load_config!(
-        snapshot,
+        reader,
         ConfigSettingId::ContractLedgerCostV0,
         ContractLedgerCostV0
     );
@@ -129,7 +129,7 @@ pub fn load_soroban_config(
     // For protocol < 23, this setting may not exist, so we use 0 as the default.
     let fee_write_1kb = {
         let id = ConfigSettingId::ContractLedgerCostExtV0;
-        match load_config_setting(snapshot, id)? {
+        match load_config_setting(reader, id)? {
             Some(ConfigSettingEntry::ContractLedgerCostExtV0(ext)) => ext.fee_write1_kb,
             Some(_) => {
                 return Err(LedgerError::Internal(format!(
@@ -143,7 +143,7 @@ pub fn load_soroban_config(
 
     let fee_historical_1kb = {
         let hist = load_config!(
-            snapshot,
+            reader,
             ConfigSettingId::ContractHistoricalDataV0,
             ContractHistoricalDataV0
         );
@@ -151,11 +151,7 @@ pub fn load_soroban_config(
     };
 
     let (tx_max_contract_events_size_bytes, fee_contract_events_1kb) = {
-        let events = load_config!(
-            snapshot,
-            ConfigSettingId::ContractEventsV0,
-            ContractEventsV0
-        );
+        let events = load_config!(reader, ConfigSettingId::ContractEventsV0, ContractEventsV0);
         (
             events.tx_max_contract_events_size_bytes,
             events.fee_contract_events1_kb,
@@ -164,7 +160,7 @@ pub fn load_soroban_config(
 
     let fee_tx_size_1kb = {
         let bandwidth = load_config!(
-            snapshot,
+            reader,
             ConfigSettingId::ContractBandwidthV0,
             ContractBandwidthV0
         );
@@ -173,19 +169,19 @@ pub fn load_soroban_config(
 
     // Load contract size limits for entry validation (validateContractLedgerEntry)
     let max_contract_size_bytes = load_config!(
-        snapshot,
+        reader,
         ConfigSettingId::ContractMaxSizeBytes,
         ContractMaxSizeBytes
     );
 
     let max_contract_data_entry_size_bytes = load_config!(
-        snapshot,
+        reader,
         ConfigSettingId::ContractDataEntrySizeBytes,
         ContractDataEntrySizeBytes
     );
 
     // Load state archival TTL settings
-    let archival = load_config!(snapshot, ConfigSettingId::StateArchival, StateArchival);
+    let archival = load_config!(reader, ConfigSettingId::StateArchival, StateArchival);
     tracing::debug!(
         min_temp_ttl = archival.min_temporary_ttl,
         min_persistent_ttl = archival.min_persistent_ttl,
@@ -210,7 +206,7 @@ pub fn load_soroban_config(
 
     let average_soroban_state_size = {
         let window = load_config!(
-            snapshot,
+            reader,
             ConfigSettingId::LiveSorobanStateSizeWindow,
             LiveSorobanStateSizeWindow
         );
@@ -480,7 +476,7 @@ pub(crate) fn compute_soroban_resource_fee(
 /// CONFIG_SETTING_FREEZE_BYPASS_TXS. Returns empty config if settings don't exist
 /// (pre-P26 or not yet initialized).
 pub fn load_frozen_key_config(
-    snapshot: &SnapshotHandle,
+    reader: &impl crate::EntryReader,
     protocol_version: u32,
 ) -> Result<henyey_tx::frozen_keys::FrozenKeyConfig> {
     use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
@@ -490,7 +486,7 @@ pub fn load_frozen_key_config(
     }
 
     // Load frozen ledger keys
-    let frozen_key_bytes = match load_config_setting(snapshot, ConfigSettingId::FrozenLedgerKeys)? {
+    let frozen_key_bytes = match load_config_setting(reader, ConfigSettingId::FrozenLedgerKeys)? {
         Some(ConfigSettingEntry::FrozenLedgerKeys(fk)) => {
             fk.keys.iter().map(|k| k.0.to_vec()).collect()
         }
@@ -498,7 +494,7 @@ pub fn load_frozen_key_config(
     };
 
     // Load freeze bypass tx hashes
-    let bypass_tx_hashes = match load_config_setting(snapshot, ConfigSettingId::FreezeBypassTxs)? {
+    let bypass_tx_hashes = match load_config_setting(reader, ConfigSettingId::FreezeBypassTxs)? {
         Some(ConfigSettingEntry::FreezeBypassTxs(bt)) => bt.tx_hashes.to_vec(),
         _ => Vec::new(),
     };

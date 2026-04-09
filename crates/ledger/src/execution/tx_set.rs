@@ -335,7 +335,7 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
     executor.state_mut().flush_deferred_ro_ttl_bumps();
 
     // Apply all changes to the delta
-    executor.apply_to_delta(snapshot, delta)?;
+    executor.apply_to_delta(delta)?;
 
     // Add fees to fee pool.
     // When external_pre_charged is provided, the caller already recorded the
@@ -915,7 +915,7 @@ pub(super) fn execute_single_cluster(
     // Apply this cluster's state changes to a local delta.
     let apply_delta_start = std::time::Instant::now();
     let mut cluster_delta = LedgerDelta::new(context.sequence);
-    executor.apply_to_delta(snapshot, &mut cluster_delta)?;
+    executor.apply_to_delta(&mut cluster_delta)?;
     let apply_delta_us = apply_delta_start.elapsed().as_micros() as u64;
 
     let cluster_total_us = cluster_start.elapsed().as_micros() as u64;

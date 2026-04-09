@@ -18,8 +18,7 @@
 //!
 //! Parity: Upgrades.cpp:949-1127 `prepareLiabilities`
 
-use crate::delta::LedgerDelta;
-use crate::snapshot::SnapshotHandle;
+use crate::ltx::LedgerTxn;
 use crate::{reserves, trustlines, LedgerError, Result};
 use henyey_common::asset::{add_balance, is_issuer};
 use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
@@ -123,7 +122,7 @@ fn get_available_balance_excluding_liabilities(
     account_id: &AccountId,
     asset: &Asset,
     balance_above_reserve: i64,
-    snapshot: &SnapshotHandle,
+    ltx: &LedgerTxn,
 ) -> Result<i64> {
     if matches!(asset, Asset::Native) {
         return Ok(balance_above_reserve);
@@ -135,7 +134,7 @@ fn get_available_balance_excluding_liabilities(
 
     // Load the trustline to check authorization.
     let tl_key = make_trustline_key(account_id, asset);
-    if let Some(entry) = snapshot.get_entry(&tl_key)? {
+    if let Some(entry) = ltx.get_entry(&tl_key)? {
         if let LedgerEntryData::Trustline(ref tl) = entry.data {
             if is_authorized_to_maintain_liabilities_tl(tl) {
                 return Ok(tl.balance);
@@ -152,7 +151,7 @@ fn get_available_limit_excluding_liabilities(
     account_id: &AccountId,
     asset: &Asset,
     balance: i64,
-    snapshot: &SnapshotHandle,
+    ltx: &LedgerTxn,
 ) -> Result<i64> {
     if matches!(asset, Asset::Native) {
         return Ok(i64::MAX - balance);
@@ -163,7 +162,7 @@ fn get_available_limit_excluding_liabilities(
     }
 
     let tl_key = make_trustline_key(account_id, asset);
-    if let Some(entry) = snapshot.get_entry(&tl_key)? {
+    if let Some(entry) = ltx.get_entry(&tl_key)? {
         if let LedgerEntryData::Trustline(ref tl) = entry.data {
             if is_authorized_to_maintain_liabilities_tl(tl) {
                 return Ok(tl.limit - tl.balance);
@@ -207,7 +206,7 @@ fn update_offer(
     liabilities: &mut BTreeMap<Asset, Liabilities>,
     initial_buying_liabilities: &BTreeMap<Asset, Option<i64>>,
     initial_selling_liabilities: &BTreeMap<Asset, Option<i64>>,
-    snapshot: &SnapshotHandle,
+    ltx: &LedgerTxn,
 ) -> Result<UpdateOfferResult> {
     let seller_id = offer.seller_id.clone();
 
@@ -217,7 +216,7 @@ fn update_offer(
         balance_above_reserve,
         initial_selling_liabilities,
         |asset, eff_bal| {
-            get_available_balance_excluding_liabilities(&seller_id, asset, eff_bal, snapshot)
+            get_available_balance_excluding_liabilities(&seller_id, asset, eff_bal, ltx)
         },
     )?;
 
@@ -226,9 +225,7 @@ fn update_offer(
         &offer.buying,
         balance,
         initial_buying_liabilities,
-        |asset, eff_bal| {
-            get_available_limit_excluding_liabilities(&seller_id, asset, eff_bal, snapshot)
-        },
+        |asset, eff_bal| get_available_limit_excluding_liabilities(&seller_id, asset, eff_bal, ltx),
     )?;
 
     let mut erase = erase_sell || erase_buy;
@@ -307,8 +304,7 @@ fn update_offer(
 fn erase_offer_with_possible_sponsorship(
     offer_entry: &LedgerEntry,
     account: &mut AccountEntry,
-    snapshot: &SnapshotHandle,
-    delta: &mut LedgerDelta,
+    ltx: &mut LedgerTxn,
     ledger_seq: u32,
 ) -> Result<Option<AccountId>> {
     let is_sponsored =
@@ -345,7 +341,7 @@ fn erase_offer_with_possible_sponsorship(
 
         // Decrement numSponsoring on the sponsor account.
         // The sponsor may be different from the offer owner.
-        update_sponsor_num_sponsoring(sponsor, -1, snapshot, delta, ledger_seq)?;
+        update_sponsor_num_sponsoring(sponsor, -1, ltx, ledger_seq)?;
     } else {
         // Not sponsored: just decrement numSubEntries.
         account.num_sub_entries = account.num_sub_entries.saturating_sub(1);
@@ -354,36 +350,30 @@ fn erase_offer_with_possible_sponsorship(
     Ok(sponsor_id)
 }
 
-/// Update `numSponsoring` on a sponsor account, loading from snapshot/delta as needed.
+/// Update `numSponsoring` on a sponsor account, loading from the LedgerTxn read path.
 ///
 /// This handles the case where the sponsor account may not be the same as the
 /// offer owner, and may have already been modified in the delta.
 fn update_sponsor_num_sponsoring(
     sponsor_id: &AccountId,
     delta_val: i64,
-    snapshot: &SnapshotHandle,
-    delta: &mut LedgerDelta,
+    ltx: &mut LedgerTxn,
     ledger_seq: u32,
 ) -> Result<()> {
     let key = LedgerKey::Account(LedgerKeyAccount {
         account_id: sponsor_id.clone(),
     });
 
-    // Load the current version of the sponsor account: first from delta, then snapshot.
-    let (mut entry, previous) = if let Some(current) = delta.get_current_entry(&key) {
-        // Already in the delta — use it as both current and we'll update in place.
-        (current.clone(), None) // None means it's already tracked in delta
-    } else if let Some(entry) = snapshot.get_entry(&key)? {
-        let prev = entry.clone();
-        (entry, Some(prev))
-    } else {
-        return Err(LedgerError::Internal(format!(
-            "sponsor account not found: {:?}",
-            sponsor_id
-        )));
-    };
+    // Load the current version of the sponsor account through the LedgerTxn
+    // read path (current delta → committed chain → snapshot).
+    let entry = ltx.get_entry(&key)?.ok_or_else(|| {
+        LedgerError::Internal(format!("sponsor account not found: {:?}", sponsor_id))
+    })?;
 
-    if let LedgerEntryData::Account(ref mut acc) = entry.data {
+    let previous = entry.clone();
+    let mut updated = entry;
+
+    if let LedgerEntryData::Account(ref mut acc) = updated.data {
         let ext_v2 = ensure_account_ext_v2(acc);
         let new_val = ext_v2.num_sponsoring as i64 + delta_val;
         if new_val < 0 || new_val > u32::MAX as i64 {
@@ -394,17 +384,8 @@ fn update_sponsor_num_sponsoring(
         ext_v2.num_sponsoring = new_val as u32;
     }
 
-    entry.last_modified_ledger_seq = ledger_seq;
-
-    if let Some(prev) = previous {
-        // First time modifying this sponsor in the delta.
-        delta.record_update(prev, entry)?;
-    } else {
-        // Already in delta — update via record_update with a dummy previous.
-        // The delta's coalescing logic will keep the original previous.
-        let dummy_prev = entry.clone(); // record_update coalesces correctly
-        delta.record_update(dummy_prev, entry)?;
-    }
+    updated.last_modified_ledger_seq = ledger_seq;
+    ltx.record_update(previous, updated)?;
 
     Ok(())
 }
@@ -529,17 +510,17 @@ fn is_authorized_to_maintain_liabilities_tl(tl: &TrustLineEntry) -> bool {
 // SECURITY: liability clearing only runs on offers that have corresponding liabilities
 // INVARIANT: offers always have corresponding liabilities after creation
 pub fn prepare_liabilities(
-    snapshot: &SnapshotHandle,
-    delta: &mut LedgerDelta,
+    ltx: &mut LedgerTxn,
     protocol_version: u32,
     base_reserve: u32,
     ledger_seq: u32,
 ) -> Result<()> {
     tracing::info!("Starting prepareLiabilities");
 
-    // Step 1: Load all offers from the snapshot and group by account.
+    // Step 1: Load all offers through the LedgerTxn merged read path
+    // (current delta → committed chain → snapshot) and group by account.
     // Parity: ltx.loadAllOffers()
-    let all_entries = snapshot.all_entries()?;
+    let all_entries = ltx.all_offers()?;
     let mut offers_by_account: BTreeMap<AccountId, Vec<(LedgerEntry, OfferEntry)>> =
         BTreeMap::new();
 
@@ -560,7 +541,7 @@ pub fn prepare_liabilities(
     // Parity: getOfferAccountMinBalances
     let mut min_balance_map: HashMap<AccountId, i64> = HashMap::new();
     for account_id in offers_by_account.keys() {
-        let account = snapshot
+        let account = ltx
             .get_account(account_id)?
             .ok_or_else(|| LedgerError::Internal("account does not exist".to_string()))?;
         let min_balance = reserves::minimum_balance(&account, base_reserve);
@@ -588,22 +569,15 @@ pub fn prepare_liabilities(
             );
         }
 
-        // 3b: Load the account.
-        // We must load from delta first (the account may already have been
-        // modified as a sponsor when processing a previous account's offers),
-        // falling back to the snapshot.
+        // 3b: Load the account through the LedgerTxn read path.
+        // This automatically sees prior delta changes (e.g., sponsor adjustments
+        // from processing a previous account's offers).
         let account_key = LedgerKey::Account(LedgerKeyAccount {
             account_id: account_id.clone(),
         });
-        let (account_entry, _account_already_in_delta) =
-            if let Some(current) = delta.get_current_entry(&account_key) {
-                (current, true)
-            } else {
-                let entry = snapshot
-                    .get_entry(&account_key)?
-                    .ok_or_else(|| LedgerError::Internal("account does not exist".to_string()))?;
-                (entry, false)
-            };
+        let account_entry = ltx
+            .get_entry(&account_key)?
+            .ok_or_else(|| LedgerError::Internal("account does not exist".to_string()))?;
         let mut account_entry_current = account_entry.clone();
         let account_before = if let LedgerEntryData::Account(ref acc) = account_entry.data {
             acc.clone()
@@ -633,7 +607,7 @@ pub fn prepare_liabilities(
                 &mut new_liabilities,
                 &initial_buying_liabilities,
                 &initial_selling_liabilities,
-                snapshot,
+                ltx,
             )?;
 
             match res {
@@ -669,13 +643,8 @@ pub fn prepare_liabilities(
 
         // 3e: Erase offers (handling sponsorship).
         for offer_entry in &offers_to_erase {
-            let sponsor = erase_offer_with_possible_sponsorship(
-                offer_entry,
-                account_mut,
-                snapshot,
-                delta,
-                ledger_seq,
-            )?;
+            let sponsor =
+                erase_offer_with_possible_sponsorship(offer_entry, account_mut, ltx, ledger_seq)?;
 
             if let Some(ref sponsor_id) = sponsor {
                 // Track changed sponsor account.
@@ -685,16 +654,16 @@ pub fn prepare_liabilities(
                 changed_accounts.insert(sponsor_key);
             }
 
-            // Record the offer deletion in the delta.
-            delta.record_delete(offer_entry.clone())?;
+            // Record the offer deletion.
+            ltx.record_delete(offer_entry.clone())?;
         }
 
-        // 3f: Record updated offers in the delta.
+        // 3f: Record updated offers.
         for (original_entry, updated_offer) in &offers_to_update {
             let mut new_entry = original_entry.clone();
             new_entry.data = LedgerEntryData::Offer(updated_offer.clone());
             new_entry.last_modified_ledger_seq = ledger_seq;
-            delta.record_update(original_entry.clone(), new_entry)?;
+            ltx.record_update(original_entry.clone(), new_entry)?;
         }
 
         // 3g: Update liabilities on account and trustlines.
@@ -730,7 +699,7 @@ pub fn prepare_liabilities(
             } else {
                 // Update trustline liabilities for non-native assets.
                 let tl_key = make_trustline_key(account_id, asset);
-                let tl_entry = snapshot
+                let tl_entry = ltx
                     .get_entry(&tl_key)?
                     .ok_or_else(|| LedgerError::Internal("trustline not found".to_string()))?;
 
@@ -782,20 +751,19 @@ pub fn prepare_liabilities(
 
                     if delta_selling != 0 || delta_buying != 0 {
                         tl_entry_new.last_modified_ledger_seq = ledger_seq;
-                        delta.record_update(tl_entry.clone(), tl_entry_new)?;
+                        ltx.record_update(tl_entry.clone(), tl_entry_new)?;
                     }
                 }
             }
         }
 
         // 3h: If the account changed, record the update.
-        // When the account is already in the delta (from sponsor changes in a
-        // previous iteration), coalescing keeps the original previous and
-        // replaces the current with our updated entry.
+        // The LedgerTxn delta's coalescing logic keeps the original previous
+        // and replaces the current with our updated entry.
         if account_mut != &account_before {
             changed_accounts.insert(account_key.clone());
             account_entry_current.last_modified_ledger_seq = ledger_seq;
-            delta.record_update(account_entry.clone(), account_entry_current)?;
+            ltx.record_update(account_entry.clone(), account_entry_current)?;
         }
     }
 

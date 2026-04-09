@@ -3,7 +3,7 @@
 **Crate**: `henyey-ledger`
 **Upstream**: `stellar-core/src/ledger/`
 **Overall Parity**: 94%
-**Last Updated**: 2026-04-07
+**Last Updated**: 2026-04-09
 
 ## Summary
 
@@ -20,7 +20,7 @@
 | Offer Sorting / Comparison | Full | OfferDescriptor, AssetPair |
 | In-Memory Soroban State | Full | Contract data/code with TTL |
 | Config Upgrade Handling | Full | Validation, apply, protocol upgrade synthesis |
-| LedgerTxn Nested Transactions | Partial | Savepoints cover operation rollback |
+| LedgerTxn Nested Transactions | Full | `LedgerTxn` with child/commit/rollback; `EntryReader` trait for generic reads |
 | Parallel Apply / Threading | Partial | Parallel cluster execution via tokio; no ApplyState phase machine |
 | Soroban Metrics | None | No metrics collection |
 | Shared Module Cache | Partial | Single-threaded `rebuild_module_cache` + per-TX `PersistentModuleCache`; no multi-threaded compilation |
@@ -31,8 +31,8 @@
 |--------------------|-------------|-------|
 | `LedgerManager.h` / `LedgerManagerImpl.h` / `LedgerManagerImpl.cpp` | `manager.rs` | Core ledger manager |
 | `LedgerHeaderUtils.h` / `LedgerHeaderUtils.cpp` | `header.rs` | Header hash, skip list |
-| `LedgerTxn.h` / `LedgerTxn.cpp` | `delta.rs` | Change tracking replaces LedgerTxn |
-| `LedgerTxnImpl.h` | `delta.rs` | Impl details not needed |
+| `LedgerTxn.h` / `LedgerTxn.cpp` | `ltx.rs`, `delta.rs` | `LedgerTxn` nested transactions in `ltx.rs`; change tracking in `delta.rs` |
+| `LedgerTxnImpl.h` | `ltx.rs`, `delta.rs` | Nesting via move semantics in `ltx.rs` |
 | `LedgerTxnEntry.h` / `LedgerTxnEntry.cpp` | `delta.rs` | Entry handles simplified |
 | `LedgerTxnHeader.h` / `LedgerTxnHeader.cpp` | `delta.rs`, `snapshot.rs` | Header access via snapshot |
 | `LedgerStateSnapshot.h` / `LedgerStateSnapshot.cpp` | `snapshot.rs` | Read-only snapshots |
@@ -329,7 +329,7 @@ Features excluded by design. These are NOT counted against parity %.
 | `RestoredEntries` tracking (separate hot archive vs live BL maps) | Restorations tracked inline in execution |
 | `InternalLedgerEntry` / `InternalLedgerKey` (generalized types) | Simplified to direct `LedgerEntry`/`LedgerKey`; sponsorship/seqnum tracked differently |
 | `ThreadInvariant` class | Not needed; Rust ownership model provides thread safety |
-| `LedgerTxn` full nested transaction model | Delta+savepoint model covers all use cases in the execution pipeline |
+
 | `LedgerEntryScope.h` / `LedgerEntryScope.cpp` (scoped entry tracking) | Rust ownership/borrowing system provides compile-time scope safety without runtime checks |
 
 ## Gaps
@@ -352,8 +352,8 @@ Features not yet implemented. These ARE counted against parity %.
 
 1. **State Management Model**
    - **stellar-core**: Uses `LedgerTxn` with arbitrarily nested parent/child relationships for transactional isolation. Each nested transaction can be independently committed or rolled back. Entries have activation tracking (`EntryPtrState`) to prevent concurrent access. Uses `InternalLedgerEntry`/`InternalLedgerKey` generalized types that extend `LedgerEntry`/`LedgerKey` with sponsorship and sequence number tracking.
-   - **Rust**: Uses `LedgerDelta` with change coalescing and per-operation savepoints. Savepoints provide the same operation-level rollback isolation as stellar-core nested `LedgerTxn` for the execution loop. Works directly with `LedgerEntry`/`LedgerKey` XDR types.
-   - **Rationale**: The delta+savepoint model is simpler while covering the primary use case (per-operation rollback during transaction execution). General nesting is not needed by the current execution pipeline. The `InternalLedgerEntry` generalization is unnecessary because sponsorship tracking is handled inline during operation execution.
+   - **Rust**: Uses a two-layer model: `LedgerTxn` (`ltx.rs`) provides nested transactional reads during ledger close (current delta → committed chain → base snapshot), while `LedgerDelta` (`delta.rs`) provides change coalescing and per-operation savepoints for the execution loop. The `EntryReader` trait unifies read access across `SnapshotHandle` and `LedgerTxn`, allowing config loading and other read paths to work generically. Works directly with `LedgerEntry`/`LedgerKey` XDR types.
+   - **Rationale**: `LedgerTxn` ensures upgrade and liability preparation phases see each other's changes (eliminating stale-read bugs), while the execution layer uses `LedgerDelta` with savepoints for per-operation rollback. The `InternalLedgerEntry` generalization is unnecessary because sponsorship tracking is handled inline during operation execution.
 
 2. **Threading Model**
    - **stellar-core**: Multi-threaded with dedicated apply thread and parallel Soroban execution threads. Uses an `ApplyState` phase machine (SETTING_UP_STATE -> READY_TO_APPLY -> APPLYING -> COMMITTING) to coordinate thread access. `LedgerTxn` enforces same-thread invariant. `LedgerEntryScope` provides compile-time and runtime scope checking for entry access across threads. Transaction execution split into `preParallelApply` (sequential on primary thread) and `parallelApply` (on worker threads).
@@ -384,7 +384,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
-| LedgerTxn | 32 TEST_CASE / 254 SECTION | 39 #[test] in `delta.rs` | Rust tests focus on coalescing; nested txn tests not needed |
+| LedgerTxn | 32 TEST_CASE / 254 SECTION | 39 #[test] in `delta.rs`, 9 #[test] in `ltx.rs` | `delta.rs` covers coalescing; `ltx.rs` covers nested child/commit/rollback and merged reads |
 | Liabilities | 3 TEST_CASE / 37 SECTION | 42 #[test] in `lib.rs` | Good parity on reserve/liability tests |
 | Ledger Header | 3 TEST_CASE / 1 SECTION | 3 #[test] in `header.rs` | Covers hash, skip list, chain verify |
 | Ledger Close Meta | 3 TEST_CASE / 6 SECTION | 7 #[test] in `close.rs` | Covers tx set handling, ordering |
@@ -411,13 +411,13 @@ The ledger crate has been verified against testnet for ledger close correctness.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 138 |
+| Implemented (Full) | 139 |
 | Gaps (None + Partial) | 9 |
-| Intentional Omissions | 31 |
-| **Parity** | **138 / (138 + 9) = 94%** |
+| Intentional Omissions | 30 |
+| **Parity** | **139 / (139 + 9) = 94%** |
 
-The 138 implemented items cover: LedgerManager core operations (31, including `applySorobanStages`, `applySorobanStageClustersInParallel`, `applyThread`, `getModuleCache`), header utilities (8), delta/change tracking (13), close data (8), snapshots (8), execution pipeline (28, including `commonPreApply`/`preParallelApply`/`parallelApply` and all v20-v26 network-config synthesis paths), config upgrade (6), offer utilities (5), in-memory Soroban state (15), fee/reserve calculations (8), trustline utilities (7), module cache rebuild (1 — partial, not counted here).
+The 139 implemented items cover: LedgerManager core operations (31, including `applySorobanStages`, `applySorobanStageClustersInParallel`, `applyThread`, `getModuleCache`), header utilities (8), delta/change tracking (13), close data (8), snapshots (8), execution pipeline (28, including `commonPreApply`/`preParallelApply`/`parallelApply` and all v20-v26 network-config synthesis paths), config upgrade (6), offer utilities (5), in-memory Soroban state (15), fee/reserve calculations (8), trustline utilities (7), LedgerTxn nested transactions with `EntryReader` (1), module cache rebuild (1 — partial, not counted here).
 
 The 9 gap items include: timing utilities (2), metrics methods (2), ApplyState phase machine (1), multi-threaded module cache compilation (1 Partial), CompleteConstLedgerState (1 Partial), prefetch (1), and meta streaming (1).
 
-The 31 intentional omissions are primarily SQL backend features (LedgerTxnRoot, offer SQL, header SQL operations), debug tooling (P23HotArchiveBug, FlushAndRotateMetaDebugWork), deprecated functionality (inflation), C++ implementation artifacts (InternalLedgerEntry, EntryPtrState, ThreadInvariant, LedgerEntryScope), features handled by other crates (catchup, checkpoint ranges, app state machine), and architectural choices (LedgerTxn nested model replaced by delta+savepoint).
+The 30 intentional omissions are primarily SQL backend features (LedgerTxnRoot, offer SQL, header SQL operations), debug tooling (P23HotArchiveBug, FlushAndRotateMetaDebugWork), deprecated functionality (inflation), C++ implementation artifacts (InternalLedgerEntry, EntryPtrState, ThreadInvariant, LedgerEntryScope), features handled by other crates (catchup, checkpoint ranges, app state machine).

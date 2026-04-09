@@ -34,8 +34,8 @@ use crate::delta::{DeltaCategorization, EntryChange, LedgerDelta};
 use crate::snapshot::SnapshotHandle;
 use crate::{LedgerError, Result};
 use stellar_xdr::curr::{
-    AccountEntry, AccountId, ConfigSettingEntry, ConfigSettingId, LedgerEntry, LedgerEntryChange,
-    LedgerEntryChanges, LedgerEntryData, LedgerHeader, LedgerKey, LedgerKeyConfigSetting, VecM,
+    AccountEntry, AccountId, LedgerEntry, LedgerEntryChange, LedgerEntryChanges, LedgerEntryData,
+    LedgerHeader, LedgerKey, VecM,
 };
 
 /// A transactional view of ledger state during close.
@@ -249,23 +249,6 @@ impl LedgerTxn {
         }
     }
 
-    /// Load a config setting by ID.
-    pub fn get_config_setting(&self, id: ConfigSettingId) -> Result<Option<ConfigSettingEntry>> {
-        let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-            config_setting_id: id,
-        });
-        match self.get_entry(&key)? {
-            Some(entry) => {
-                if let LedgerEntryData::ConfigSetting(config) = entry.data {
-                    Ok(Some(config))
-                } else {
-                    Ok(None)
-                }
-            }
-            None => Ok(None),
-        }
-    }
-
     /// Access the ledger header (may have been updated by upgrades).
     pub fn header(&self) -> &LedgerHeader {
         &self.header
@@ -289,16 +272,6 @@ impl LedgerTxn {
     /// Access the underlying snapshot for parallel execution paths.
     pub fn snapshot(&self) -> &SnapshotHandle {
         &self.snapshot
-    }
-
-    /// Batch load entries from the snapshot (pass-through for prefetching).
-    pub fn load_entries(&self, keys: &[LedgerKey]) -> Result<Vec<LedgerEntry>> {
-        self.snapshot.load_entries(keys)
-    }
-
-    /// Prefetch entries into the snapshot cache (pass-through).
-    pub fn prefetch(&self, keys: &[LedgerKey]) -> Result<crate::snapshot::PrefetchStats> {
-        self.snapshot.prefetch(keys)
     }
 
     /// Merged enumeration of all offers: snapshot offers overlaid with delta changes.
@@ -399,53 +372,6 @@ impl LedgerTxn {
         account_id: &AccountId,
     ) -> Result<Vec<stellar_xdr::curr::PoolId>> {
         self.snapshot.pool_share_tls_by_account(account_id)
-    }
-
-    /// Get all current entries (Created + Updated) from the full delta chain.
-    ///
-    /// Used to build `PriorStageState` for parallel Soroban execution.
-    pub fn current_entries(&self) -> Vec<LedgerEntry> {
-        let mut entries = Vec::new();
-        // Gather from committed chain
-        for delta in &self.committed {
-            entries.extend(delta.current_entries());
-        }
-        // Gather from current
-        entries.extend(self.current.current_entries());
-        entries
-    }
-
-    /// Build [`PriorStageState`] from the current delta state.
-    pub fn prior_stage_state(&self) -> PriorStageState {
-        // Need to flatten all deltas for a coherent view
-        let mut entries = Vec::new();
-        let mut deleted_keys = Vec::new();
-
-        for delta in &self.committed {
-            for change in delta.changes() {
-                match change {
-                    EntryChange::Created(e) => entries.push(e.clone()),
-                    EntryChange::Updated { current, .. } => {
-                        entries.push(current.as_ref().clone());
-                    }
-                    EntryChange::Deleted { .. } => {
-                        deleted_keys.push(change.key());
-                    }
-                }
-            }
-        }
-        for change in self.current.changes() {
-            match change {
-                EntryChange::Created(e) => entries.push(e.clone()),
-                EntryChange::Updated { current, .. } => entries.push(current.as_ref().clone()),
-                EntryChange::Deleted { .. } => deleted_keys.push(change.key()),
-            }
-        }
-
-        PriorStageState {
-            entries,
-            deleted_keys,
-        }
     }
 
     // ------------------------------------------------------------------
@@ -673,18 +599,15 @@ impl LedgerTxn {
     }
 }
 
+impl crate::EntryReader for LedgerTxn {
+    fn get_entry(&self, key: &LedgerKey) -> crate::Result<Option<LedgerEntry>> {
+        LedgerTxn::get_entry(self, key)
+    }
+}
+
 /// Check if a ledger key is for an offer entry.
 fn is_offer_key(key: &LedgerKey) -> bool {
     matches!(key, LedgerKey::Offer(_))
-}
-
-/// State captured from prior stages for parallel Soroban execution.
-///
-/// This replaces the standalone `PriorStageState` struct in execution/mod.rs
-/// when reads are done through `LedgerTxn`.
-pub struct PriorStageState {
-    pub entries: Vec<LedgerEntry>,
-    pub deleted_keys: Vec<LedgerKey>,
 }
 
 #[cfg(test)]

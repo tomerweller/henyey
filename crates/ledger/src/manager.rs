@@ -3509,10 +3509,7 @@ impl LedgerCloseContext<'_> {
             self.prev_header.ledger_version,
             ProtocolVersion::V20,
         ) {
-            crate::execution::load_soroban_config(
-                self.ltx.snapshot(),
-                self.prev_header.ledger_version,
-            )?
+            crate::execution::load_soroban_config(&self.ltx, self.prev_header.ledger_version)?
         } else {
             henyey_tx::soroban::SorobanConfig::default()
         };
@@ -3520,10 +3517,8 @@ impl LedgerCloseContext<'_> {
         // This is stellar-core's feeRent1KB() / sorobanFeeWrite1KB.
         self.soroban_fee_write_1kb = soroban_config.rent_fee_config.fee_per_write_1kb;
         // Load frozen key configuration (CAP-77, Protocol 26+).
-        let frozen_key_config = crate::execution::load_frozen_key_config(
-            self.ltx.snapshot(),
-            self.prev_header.ledger_version,
-        )?;
+        let frozen_key_config =
+            crate::execution::load_frozen_key_config(&self.ltx, self.prev_header.ledger_version)?;
         // Use transaction set hash as base PRNG seed for Soroban execution
         let soroban_base_prng_seed = prepared.hash;
         let classic_events = ClassicEventConfig {
@@ -3970,10 +3965,8 @@ impl LedgerCloseContext<'_> {
             // should never be true in production. This is included for
             // completeness.
             if needs_upgrade_to_version(ProtocolVersion::V10, prev_version, protocol_version) {
-                let snap = self.ltx.snapshot().clone();
                 crate::prepare_liabilities::prepare_liabilities(
-                    &snap,
-                    self.ltx.current_delta_mut(),
+                    &mut self.ltx,
                     protocol_version,
                     self.prev_header.base_reserve,
                     self.close_data.ledger_seq,
@@ -4012,10 +4005,8 @@ impl LedgerCloseContext<'_> {
                 && did_reserve_increase
             {
                 let delta_before = self.ltx.current_delta().num_changes();
-                let snap = self.ltx.snapshot().clone();
                 crate::prepare_liabilities::prepare_liabilities(
-                    &snap,
-                    self.ltx.current_delta_mut(),
+                    &mut self.ltx,
                     protocol_version,
                     new_reserve,
                     self.close_data.ledger_seq,

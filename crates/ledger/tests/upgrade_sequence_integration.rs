@@ -14,23 +14,18 @@
 //!             instead of closing ledger (N)
 //! - **#1096**: `isValidForApply` skips ledger state validation for config
 //!
-//! # Design decision: mutable vs immutable state
+//! # Design: LedgerTxn unified reads
 //!
 //! stellar-core processes upgrades inside a single loop that reads from and
 //! writes to a **mutable** `LedgerTxn`. After each upgrade is applied, the
 //! next iteration sees the updated state (protocol version, config settings,
 //! TTL values, etc.).
 //!
-//! Henyey's architecture creates an **immutable** `SnapshotHandle` before the
-//! upgrade loop and writes to a separate `LedgerDelta`. Subsequent upgrades
-//! read from the stale snapshot for header fields (protocol version, ledger
-//! sequence) and for entries not yet in the delta. This divergence is the root
-//! cause of all Pattern 2 bugs.
-//!
-//! The correct fix is to ensure that every read inside the upgrade loop either:
-//! 1. Reads from the delta first (for entry data), or
-//! 2. Uses a post-upgrade value passed explicitly (for header fields like
-//!    protocol version and ledger sequence).
+//! Henyey now mirrors this architecture via [`LedgerTxn`]: all reads during
+//! the upgrade loop resolve through current delta → committed chain → base
+//! snapshot, ensuring that each upgrade sees prior upgrades' changes. The
+//! `EntryReader` trait allows config loading and other read paths to be
+//! generic over `SnapshotHandle` (frozen state) and `LedgerTxn` (merged view).
 
 use henyey_bucket::{BucketList, HotArchiveBucketList};
 use henyey_common::Hash256;

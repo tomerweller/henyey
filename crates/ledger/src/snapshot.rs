@@ -645,6 +645,12 @@ impl SnapshotBuilder {
     }
 }
 
+impl crate::EntryReader for SnapshotHandle {
+    fn get_entry(&self, key: &LedgerKey) -> crate::Result<Option<LedgerEntry>> {
+        SnapshotHandle::get_entry(self, key)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
