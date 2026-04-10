@@ -70,11 +70,16 @@ pub async fn handle(
         })
         .map_err(|e| JsonRpcError::internal(format!("database error: {}", e)))?;
 
-    // Look up ledger close times for the events
+    // Look up ledger close times for the events, caching per ledger_seq
+    // to avoid N+1 queries (each call decodes a full XDR header).
+    let mut close_time_cache: std::collections::HashMap<u32, u64> =
+        std::collections::HashMap::new();
     let mut event_json: Vec<serde_json::Value> = Vec::with_capacity(events.len());
     for event in &events {
-        let close_time =
-            format_unix_timestamp_utc(util::ledger_close_time(&ctx.app, event.ledger_seq));
+        let close_time_unix = *close_time_cache
+            .entry(event.ledger_seq)
+            .or_insert_with(|| util::ledger_close_time(&ctx.app, event.ledger_seq));
+        let close_time = format_unix_timestamp_utc(close_time_unix);
 
         let event_type_str = match ContractEventType::try_from(event.event_type) {
             Ok(ContractEventType::Contract) => "contract",
