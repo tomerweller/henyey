@@ -835,300 +835,327 @@ pub fn execute_operation_with_soroban(
         return Ok(OperationExecutionResult::new(OperationResult::OpNoAccount));
     }
 
-    match &op.body {
-        OperationBody::CreateAccount(op_data) => Ok(OperationExecutionResult::new(
-            create_account::execute_create_account(op_data, &op_source, state, context)?,
-        )),
-        OperationBody::Payment(op_data) => Ok(OperationExecutionResult::new(
-            payment::execute_payment(op_data, &op_source, state, context)?,
-        )),
-        OperationBody::ChangeTrust(op_data) => Ok(OperationExecutionResult::new(
-            change_trust::execute_change_trust(op_data, &op_source, state, context)?,
-        )),
-        OperationBody::ManageData(op_data) => Ok(OperationExecutionResult::new(
-            manage_data::execute_manage_data(op_data, &op_source, state, context)?,
-        )),
-        OperationBody::BumpSequence(op_data) => Ok(OperationExecutionResult::new(
-            bump_sequence::execute_bump_sequence(op_data, &op_source, state, context)?,
-        )),
-        OperationBody::AccountMerge(dest) => Ok(OperationExecutionResult::new(
-            account_merge::execute_account_merge(dest, &op_source, state, context)?,
-        )),
-        OperationBody::SetOptions(op_data) => Ok(OperationExecutionResult::new(
-            set_options::execute_set_options(op_data, &op_source, state, context)?,
-        )),
-        // Soroban operations
-        OperationBody::InvokeHostFunction(op_data) => {
-            invoke_host_function::execute_invoke_host_function(
-                op_data, &op_source, state, context, soroban,
-            )
-        }
-        OperationBody::ExtendFootprintTtl(op_data) => {
-            let default_config = SorobanConfig::default();
-            let config = soroban.config.unwrap_or(&default_config);
-            let snapshots = soroban
-                .soroban_data
-                .map(|data| {
-                    let mut keys = Vec::new();
-                    keys.extend(data.resources.footprint.read_only.iter().cloned());
-                    keys.extend(data.resources.footprint.read_write.iter().cloned());
-                    rent_snapshot_for_keys(
-                        &keys,
+    let result = (|| -> Result<OperationExecutionResult> {
+        match &op.body {
+            OperationBody::CreateAccount(op_data) => Ok(OperationExecutionResult::new(
+                create_account::execute_create_account(op_data, &op_source, state, context)?,
+            )),
+            OperationBody::Payment(op_data) => Ok(OperationExecutionResult::new(
+                payment::execute_payment(op_data, &op_source, state, context)?,
+            )),
+            OperationBody::ChangeTrust(op_data) => Ok(OperationExecutionResult::new(
+                change_trust::execute_change_trust(op_data, &op_source, state, context)?,
+            )),
+            OperationBody::ManageData(op_data) => Ok(OperationExecutionResult::new(
+                manage_data::execute_manage_data(op_data, &op_source, state, context)?,
+            )),
+            OperationBody::BumpSequence(op_data) => Ok(OperationExecutionResult::new(
+                bump_sequence::execute_bump_sequence(op_data, &op_source, state, context)?,
+            )),
+            OperationBody::AccountMerge(dest) => Ok(OperationExecutionResult::new(
+                account_merge::execute_account_merge(dest, &op_source, state, context)?,
+            )),
+            OperationBody::SetOptions(op_data) => Ok(OperationExecutionResult::new(
+                set_options::execute_set_options(op_data, &op_source, state, context)?,
+            )),
+            // Soroban operations
+            OperationBody::InvokeHostFunction(op_data) => {
+                invoke_host_function::execute_invoke_host_function(
+                    op_data, &op_source, state, context, soroban,
+                )
+            }
+            OperationBody::ExtendFootprintTtl(op_data) => {
+                let default_config = SorobanConfig::default();
+                let config = soroban.config.unwrap_or(&default_config);
+                let snapshots = soroban
+                    .soroban_data
+                    .map(|data| {
+                        let mut keys = Vec::new();
+                        keys.extend(data.resources.footprint.read_only.iter().cloned());
+                        keys.extend(data.resources.footprint.read_write.iter().cloned());
+                        rent_snapshot_for_keys(
+                            &keys,
+                            state,
+                            context.protocol_version,
+                            soroban
+                                .config
+                                .map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
+                            soroban.ttl_key_cache,
+                        )
+                    })
+                    .unwrap_or_default();
+                let result = extend_footprint_ttl::execute_extend_footprint_ttl(
+                    op_data,
+                    &op_source,
+                    state,
+                    context,
+                    soroban.soroban_data,
+                    soroban.ttl_key_cache,
+                    Some(&extend_footprint_ttl::ContractSizeLimits {
+                        max_contract_size_bytes: config.max_contract_size_bytes,
+                        max_contract_data_entry_size_bytes: config
+                            .max_contract_data_entry_size_bytes,
+                    }),
+                )?;
+                let mut exec = OperationExecutionResult::new(result);
+                if matches!(
+                    exec.result,
+                    OperationResult::OpInner(OperationResultTr::ExtendFootprintTtl(
+                        ExtendFootprintTtlResult::Success
+                    ))
+                ) {
+                    let rent_changes = rent_changes_from_snapshots(
+                        &snapshots,
                         state,
                         context.protocol_version,
                         soroban
                             .config
                             .map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
                         soroban.ttl_key_cache,
-                    )
-                })
-                .unwrap_or_default();
-            let result = extend_footprint_ttl::execute_extend_footprint_ttl(
-                op_data,
-                &op_source,
-                state,
-                context,
-                soroban.soroban_data,
-                soroban.ttl_key_cache,
-                Some(&extend_footprint_ttl::ContractSizeLimits {
-                    max_contract_size_bytes: config.max_contract_size_bytes,
-                    max_contract_data_entry_size_bytes: config.max_contract_data_entry_size_bytes,
-                }),
-            )?;
-            let mut exec = OperationExecutionResult::new(result);
-            if matches!(
-                exec.result,
-                OperationResult::OpInner(OperationResultTr::ExtendFootprintTtl(
-                    ExtendFootprintTtlResult::Success
-                ))
-            ) {
-                let rent_changes = rent_changes_from_snapshots(
-                    &snapshots,
-                    state,
-                    context.protocol_version,
-                    soroban
-                        .config
-                        .map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
-                    soroban.ttl_key_cache,
-                );
-                let rent_fee = compute_rent_fee_by_protocol(
-                    context.protocol_version,
-                    &rent_changes,
-                    &config.rent_fee_config,
-                    context.sequence,
-                );
-                exec.soroban_meta = Some(SorobanOperationMeta {
-                    events: Vec::new(),
-                    diagnostic_events: Vec::new(),
-                    return_value: None,
-                    event_size_bytes: 0,
-                    rent_fee,
-                    live_bucket_list_restores: Vec::new(),
-                    hot_archive_restores: Vec::new(),
-                    actual_restored_indices: Vec::new(),
-                });
+                    );
+                    let rent_fee = compute_rent_fee_by_protocol(
+                        context.protocol_version,
+                        &rent_changes,
+                        &config.rent_fee_config,
+                        context.sequence,
+                    );
+                    exec.soroban_meta = Some(SorobanOperationMeta {
+                        events: Vec::new(),
+                        diagnostic_events: Vec::new(),
+                        return_value: None,
+                        event_size_bytes: 0,
+                        rent_fee,
+                        live_bucket_list_restores: Vec::new(),
+                        hot_archive_restores: Vec::new(),
+                        actual_restored_indices: Vec::new(),
+                    });
+                }
+                Ok(exec)
             }
-            Ok(exec)
-        }
-        OperationBody::RestoreFootprint(op_data) => {
-            let default_config = SorobanConfig::default();
-            let config = soroban.config.unwrap_or(&default_config);
-            // For RestoreFootprint, we need to track which entries are ACTUALLY restored.
-            // stellar-core only computes rent for entries that need restoration (not already live).
-            //
-            // Per stellar-core RestoreFootprintOpFrame::doApply():
-            // 1. If TTL exists and isLive (TTL >= current_ledger) -> skip (already live)
-            // 2. If no TTL exists -> check hot archive
-            //    - If hot archive entry found -> include (restore from hot archive)
-            //    - If no hot archive entry -> skip (entry doesn't exist)
-            // 3. If TTL exists but expired (TTL < current_ledger) -> include (restore from live BL)
-            let mut snapshots = Vec::new();
-            let mut hot_archive_restores = Vec::new();
-            if let Some(data) = soroban.soroban_data {
-                for key in data.resources.footprint.read_write.iter() {
-                    // Only compute rent for entries that need restoration
-                    let key_hash =
-                        crate::soroban::get_or_compute_key_hash(soroban.ttl_key_cache, key);
-                    let current_ttl = state.get_ttl(&key_hash).map(|t| t.live_until_ledger_seq);
+            OperationBody::RestoreFootprint(op_data) => {
+                let default_config = SorobanConfig::default();
+                let config = soroban.config.unwrap_or(&default_config);
+                // For RestoreFootprint, we need to track which entries are ACTUALLY restored.
+                // stellar-core only computes rent for entries that need restoration (not already live).
+                //
+                // Per stellar-core RestoreFootprintOpFrame::doApply():
+                // 1. If TTL exists and isLive (TTL >= current_ledger) -> skip (already live)
+                // 2. If no TTL exists -> check hot archive
+                //    - If hot archive entry found -> include (restore from hot archive)
+                //    - If no hot archive entry -> skip (entry doesn't exist)
+                // 3. If TTL exists but expired (TTL < current_ledger) -> include (restore from live BL)
+                let mut snapshots = Vec::new();
+                let mut hot_archive_restores = Vec::new();
+                if let Some(data) = soroban.soroban_data {
+                    for key in data.resources.footprint.read_write.iter() {
+                        // Only compute rent for entries that need restoration
+                        let key_hash =
+                            crate::soroban::get_or_compute_key_hash(soroban.ttl_key_cache, key);
+                        let current_ttl = state.get_ttl(&key_hash).map(|t| t.live_until_ledger_seq);
 
-                    // Case 1: TTL exists and entry is live -> skip
-                    if let Some(ttl) = current_ttl {
-                        if ttl >= context.sequence {
-                            continue;
-                        }
-                        // Case 3: TTL exists but expired -> restore from live bucket list
-                        if let Some(entry) = state.get_entry(key) {
-                            let entry_xdr = entry
-                                .to_xdr(stellar_xdr::curr::Limits::none())
-                                .unwrap_or_default();
-                            let entry_size = entry_size_for_rent_by_protocol_with_cost_params(
-                                context.protocol_version,
-                                &entry,
-                                entry_xdr.len() as u32,
-                                soroban
-                                    .config
-                                    .map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
-                            );
-                            let (is_persistent, is_code_entry) = rent_classification(key);
-                            snapshots.push(RentSnapshot {
-                                key: key.clone(),
-                                is_persistent,
-                                is_code_entry,
-                                old_size_bytes: entry_size,
-                                old_live_until: ttl,
-                            });
-                        }
-                    } else {
-                        // Case 2: No TTL -> check hot archive
-                        // Per stellar-core createEntryRentChangeWithoutModification():
-                        // When entryLiveUntilLedger is std::nullopt (no previous TTL):
-                        //   - old_size_bytes = 0
-                        //   - old_live_until_ledger = 0
-                        // This is different from expired entries where we use the actual old size.
-                        if let Some(ha) = soroban.hot_archive {
-                            if let Some(entry) = ha.get(key).map_err(|e| {
-                                TxError::Internal(format!(
-                                    "hot archive lookup failed during restore: {e}"
-                                ))
-                            })? {
+                        // Case 1: TTL exists and entry is live -> skip
+                        if let Some(ttl) = current_ttl {
+                            if ttl >= context.sequence {
+                                continue;
+                            }
+                            // Case 3: TTL exists but expired -> restore from live bucket list
+                            if let Some(entry) = state.get_entry(key) {
+                                let entry_xdr = entry
+                                    .to_xdr(stellar_xdr::curr::Limits::none())
+                                    .unwrap_or_default();
+                                let entry_size = entry_size_for_rent_by_protocol_with_cost_params(
+                                    context.protocol_version,
+                                    &entry,
+                                    entry_xdr.len() as u32,
+                                    soroban
+                                        .config
+                                        .map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
+                                );
                                 let (is_persistent, is_code_entry) = rent_classification(key);
                                 snapshots.push(RentSnapshot {
                                     key: key.clone(),
                                     is_persistent,
                                     is_code_entry,
-                                    old_size_bytes: 0, // Hot archive entries: old_size_bytes = 0
-                                    old_live_until: 0, // Hot archive entries: old_live_until = 0
+                                    old_size_bytes: entry_size,
+                                    old_live_until: ttl,
                                 });
-                                // Track this entry for RESTORED metadata emission
-                                hot_archive_restores.push(HotArchiveRestore {
-                                    key: key.clone(),
-                                    entry: entry.clone(),
-                                });
+                            }
+                        } else {
+                            // Case 2: No TTL -> check hot archive
+                            // Per stellar-core createEntryRentChangeWithoutModification():
+                            // When entryLiveUntilLedger is std::nullopt (no previous TTL):
+                            //   - old_size_bytes = 0
+                            //   - old_live_until_ledger = 0
+                            // This is different from expired entries where we use the actual old size.
+                            if let Some(ha) = soroban.hot_archive {
+                                if let Some(entry) = ha.get(key).map_err(|e| {
+                                    TxError::Internal(format!(
+                                        "hot archive lookup failed during restore: {e}"
+                                    ))
+                                })? {
+                                    let (is_persistent, is_code_entry) = rent_classification(key);
+                                    snapshots.push(RentSnapshot {
+                                        key: key.clone(),
+                                        is_persistent,
+                                        is_code_entry,
+                                        old_size_bytes: 0, // Hot archive entries: old_size_bytes = 0
+                                        old_live_until: 0, // Hot archive entries: old_live_until = 0
+                                    });
+                                    // Track this entry for RESTORED metadata emission
+                                    hot_archive_restores.push(HotArchiveRestore {
+                                        key: key.clone(),
+                                        entry: entry.clone(),
+                                    });
+                                }
                             }
                         }
                     }
                 }
-            }
-            // Convert HotArchiveRestore to HotArchiveRestoreEntry for execute_restore_footprint
-            let ha_restore_entries: Vec<restore_footprint::HotArchiveRestoreEntry> =
-                hot_archive_restores
-                    .iter()
-                    .map(|r| restore_footprint::HotArchiveRestoreEntry {
-                        key: r.key.clone(),
-                        entry: r.entry.clone(),
-                    })
-                    .collect();
-            let result = restore_footprint::execute_restore_footprint(
-                op_data,
-                &op_source,
-                state,
-                context,
-                restore_footprint::RestoreFootprintResources {
-                    soroban_data: soroban.soroban_data,
-                    min_persistent_entry_ttl: config.min_persistent_entry_ttl,
-                    hot_archive_restores: &ha_restore_entries,
-                    ttl_key_cache: soroban.ttl_key_cache,
-                    size_limits: Some(extend_footprint_ttl::ContractSizeLimits {
-                        max_contract_size_bytes: config.max_contract_size_bytes,
-                        max_contract_data_entry_size_bytes: config
-                            .max_contract_data_entry_size_bytes,
-                    }),
-                },
-            )?;
-            let mut exec = OperationExecutionResult::new(result);
-            if matches!(
-                exec.result,
-                OperationResult::OpInner(OperationResultTr::RestoreFootprint(
-                    RestoreFootprintResult::Success
-                ))
-            ) {
-                let rent_changes = rent_changes_from_snapshots(
-                    &snapshots,
+                // Convert HotArchiveRestore to HotArchiveRestoreEntry for execute_restore_footprint
+                let ha_restore_entries: Vec<restore_footprint::HotArchiveRestoreEntry> =
+                    hot_archive_restores
+                        .iter()
+                        .map(|r| restore_footprint::HotArchiveRestoreEntry {
+                            key: r.key.clone(),
+                            entry: r.entry.clone(),
+                        })
+                        .collect();
+                let result = restore_footprint::execute_restore_footprint(
+                    op_data,
+                    &op_source,
                     state,
-                    context.protocol_version,
-                    soroban
-                        .config
-                        .map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
-                    soroban.ttl_key_cache,
-                );
-                let rent_fee = compute_rent_fee_by_protocol(
-                    context.protocol_version,
-                    &rent_changes,
-                    &config.rent_fee_config,
-                    context.sequence,
-                );
-                exec.soroban_meta = Some(SorobanOperationMeta {
-                    events: Vec::new(),
-                    diagnostic_events: Vec::new(),
-                    return_value: None,
-                    event_size_bytes: 0,
-                    rent_fee,
-                    live_bucket_list_restores: Vec::new(),
-                    hot_archive_restores,
-                    actual_restored_indices: Vec::new(),
-                });
+                    context,
+                    restore_footprint::RestoreFootprintResources {
+                        soroban_data: soroban.soroban_data,
+                        min_persistent_entry_ttl: config.min_persistent_entry_ttl,
+                        hot_archive_restores: &ha_restore_entries,
+                        ttl_key_cache: soroban.ttl_key_cache,
+                        size_limits: Some(extend_footprint_ttl::ContractSizeLimits {
+                            max_contract_size_bytes: config.max_contract_size_bytes,
+                            max_contract_data_entry_size_bytes: config
+                                .max_contract_data_entry_size_bytes,
+                        }),
+                    },
+                )?;
+                let mut exec = OperationExecutionResult::new(result);
+                if matches!(
+                    exec.result,
+                    OperationResult::OpInner(OperationResultTr::RestoreFootprint(
+                        RestoreFootprintResult::Success
+                    ))
+                ) {
+                    let rent_changes = rent_changes_from_snapshots(
+                        &snapshots,
+                        state,
+                        context.protocol_version,
+                        soroban
+                            .config
+                            .map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
+                        soroban.ttl_key_cache,
+                    );
+                    let rent_fee = compute_rent_fee_by_protocol(
+                        context.protocol_version,
+                        &rent_changes,
+                        &config.rent_fee_config,
+                        context.sequence,
+                    );
+                    exec.soroban_meta = Some(SorobanOperationMeta {
+                        events: Vec::new(),
+                        diagnostic_events: Vec::new(),
+                        return_value: None,
+                        event_size_bytes: 0,
+                        rent_fee,
+                        live_bucket_list_restores: Vec::new(),
+                        hot_archive_restores,
+                        actual_restored_indices: Vec::new(),
+                    });
+                }
+                Ok(exec)
             }
-            Ok(exec)
+            // DEX operations
+            OperationBody::PathPaymentStrictReceive(op_data) => Ok(OperationExecutionResult::new(
+                path_payment::execute_path_payment_strict_receive(
+                    op_data, &op_source, state, context,
+                )?,
+            )),
+            OperationBody::PathPaymentStrictSend(op_data) => Ok(OperationExecutionResult::new(
+                path_payment::execute_path_payment_strict_send(
+                    op_data, &op_source, state, context,
+                )?,
+            )),
+            OperationBody::ManageSellOffer(op_data) => Ok(OperationExecutionResult::new(
+                manage_offer::execute_manage_sell_offer(op_data, &op_source, state, context)?,
+            )),
+            OperationBody::ManageBuyOffer(op_data) => Ok(OperationExecutionResult::new(
+                manage_offer::execute_manage_buy_offer(op_data, &op_source, state, context)?,
+            )),
+            OperationBody::CreatePassiveSellOffer(op_data) => Ok(OperationExecutionResult::new(
+                manage_offer::execute_create_passive_sell_offer(
+                    op_data, &op_source, state, context,
+                )?,
+            )),
+            OperationBody::AllowTrust(op_data) => Ok(OperationExecutionResult::new(
+                trust_flags::execute_allow_trust(op_data, &op_source, &tx_id, state, context)?,
+            )),
+            OperationBody::Inflation => Ok(OperationExecutionResult::new(
+                inflation::execute_inflation(&op_source, state, context)?,
+            )),
+            OperationBody::CreateClaimableBalance(op_data) => Ok(OperationExecutionResult::new(
+                claimable_balance::execute_create_claimable_balance(
+                    op_data, &op_source, &tx_id, state, context,
+                )?,
+            )),
+            OperationBody::ClaimClaimableBalance(op_data) => Ok(OperationExecutionResult::new(
+                claimable_balance::execute_claim_claimable_balance(
+                    op_data, &op_source, state, context,
+                )?,
+            )),
+            OperationBody::BeginSponsoringFutureReserves(op_data) => {
+                Ok(OperationExecutionResult::new(
+                    sponsorship::execute_begin_sponsoring_future_reserves(
+                        op_data, &op_source, state, context,
+                    )?,
+                ))
+            }
+            OperationBody::EndSponsoringFutureReserves => Ok(OperationExecutionResult::new(
+                sponsorship::execute_end_sponsoring_future_reserves(&op_source, state, context)?,
+            )),
+            OperationBody::RevokeSponsorship(op_data) => Ok(OperationExecutionResult::new(
+                sponsorship::execute_revoke_sponsorship(op_data, &op_source, state, context)?,
+            )),
+            OperationBody::Clawback(op_data) => Ok(OperationExecutionResult::new(
+                clawback::execute_clawback(op_data, &op_source, state, context)?,
+            )),
+            OperationBody::ClawbackClaimableBalance(op_data) => Ok(OperationExecutionResult::new(
+                clawback::execute_clawback_claimable_balance(op_data, &op_source, state, context)?,
+            )),
+            OperationBody::SetTrustLineFlags(op_data) => Ok(OperationExecutionResult::new(
+                trust_flags::execute_set_trust_line_flags(
+                    op_data, &op_source, &tx_id, state, context,
+                )?,
+            )),
+            OperationBody::LiquidityPoolDeposit(op_data) => Ok(OperationExecutionResult::new(
+                liquidity_pool::execute_liquidity_pool_deposit(
+                    op_data, &op_source, state, context,
+                )?,
+            )),
+            OperationBody::LiquidityPoolWithdraw(op_data) => Ok(OperationExecutionResult::new(
+                liquidity_pool::execute_liquidity_pool_withdraw(
+                    op_data, &op_source, state, context,
+                )?,
+            )),
         }
-        // DEX operations
-        OperationBody::PathPaymentStrictReceive(op_data) => Ok(OperationExecutionResult::new(
-            path_payment::execute_path_payment_strict_receive(op_data, &op_source, state, context)?,
+    })();
+
+    // Convert TooManySponsoring errors to the proper operation result code.
+    // Mirrors stellar-core which returns opTOO_MANY_SPONSORING from sponsorship
+    // utility functions instead of escalating to txINTERNAL_ERROR.
+    result.or_else(|e| match e {
+        TxError::TooManySponsoring => Ok(OperationExecutionResult::new(
+            OperationResult::OpTooManySponsoring,
         )),
-        OperationBody::PathPaymentStrictSend(op_data) => Ok(OperationExecutionResult::new(
-            path_payment::execute_path_payment_strict_send(op_data, &op_source, state, context)?,
-        )),
-        OperationBody::ManageSellOffer(op_data) => Ok(OperationExecutionResult::new(
-            manage_offer::execute_manage_sell_offer(op_data, &op_source, state, context)?,
-        )),
-        OperationBody::ManageBuyOffer(op_data) => Ok(OperationExecutionResult::new(
-            manage_offer::execute_manage_buy_offer(op_data, &op_source, state, context)?,
-        )),
-        OperationBody::CreatePassiveSellOffer(op_data) => Ok(OperationExecutionResult::new(
-            manage_offer::execute_create_passive_sell_offer(op_data, &op_source, state, context)?,
-        )),
-        OperationBody::AllowTrust(op_data) => Ok(OperationExecutionResult::new(
-            trust_flags::execute_allow_trust(op_data, &op_source, &tx_id, state, context)?,
-        )),
-        OperationBody::Inflation => Ok(OperationExecutionResult::new(
-            inflation::execute_inflation(&op_source, state, context)?,
-        )),
-        OperationBody::CreateClaimableBalance(op_data) => Ok(OperationExecutionResult::new(
-            claimable_balance::execute_create_claimable_balance(
-                op_data, &op_source, &tx_id, state, context,
-            )?,
-        )),
-        OperationBody::ClaimClaimableBalance(op_data) => Ok(OperationExecutionResult::new(
-            claimable_balance::execute_claim_claimable_balance(
-                op_data, &op_source, state, context,
-            )?,
-        )),
-        OperationBody::BeginSponsoringFutureReserves(op_data) => Ok(OperationExecutionResult::new(
-            sponsorship::execute_begin_sponsoring_future_reserves(
-                op_data, &op_source, state, context,
-            )?,
-        )),
-        OperationBody::EndSponsoringFutureReserves => Ok(OperationExecutionResult::new(
-            sponsorship::execute_end_sponsoring_future_reserves(&op_source, state, context)?,
-        )),
-        OperationBody::RevokeSponsorship(op_data) => Ok(OperationExecutionResult::new(
-            sponsorship::execute_revoke_sponsorship(op_data, &op_source, state, context)?,
-        )),
-        OperationBody::Clawback(op_data) => Ok(OperationExecutionResult::new(
-            clawback::execute_clawback(op_data, &op_source, state, context)?,
-        )),
-        OperationBody::ClawbackClaimableBalance(op_data) => Ok(OperationExecutionResult::new(
-            clawback::execute_clawback_claimable_balance(op_data, &op_source, state, context)?,
-        )),
-        OperationBody::SetTrustLineFlags(op_data) => Ok(OperationExecutionResult::new(
-            trust_flags::execute_set_trust_line_flags(op_data, &op_source, &tx_id, state, context)?,
-        )),
-        OperationBody::LiquidityPoolDeposit(op_data) => Ok(OperationExecutionResult::new(
-            liquidity_pool::execute_liquidity_pool_deposit(op_data, &op_source, state, context)?,
-        )),
-        OperationBody::LiquidityPoolWithdraw(op_data) => Ok(OperationExecutionResult::new(
-            liquidity_pool::execute_liquidity_pool_withdraw(op_data, &op_source, state, context)?,
-        )),
-    }
+        other => Err(other),
+    })
 }
 
 #[cfg(test)]
@@ -1740,5 +1767,60 @@ mod tests {
             &mut state,
         );
         assert!(result.is_err());
+    }
+
+    /// Regression test for AUDIT-058: Sponsored ManageData when sponsor is at
+    /// num_sponsoring = u32::MAX should return OpTooManySponsoring, not
+    /// TxInternalError.
+    #[test]
+    fn test_audit_058_sponsored_manage_data_at_max_sponsoring() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source = create_test_account_id(1);
+        let sponsor = create_test_account_id(2);
+
+        // Create source account
+        let mut source_acct = create_test_account(source.clone(), 1_000_000_000);
+        source_acct.num_sub_entries = 0;
+        state.create_account(source_acct);
+
+        // Create sponsor account with num_sponsoring at u32::MAX
+        let mut sponsor_acct = create_test_account(sponsor.clone(), i64::MAX);
+        sponsor_acct.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+            liabilities: Liabilities {
+                buying: 0,
+                selling: 0,
+            },
+            ext: AccountEntryExtensionV1Ext::V2(AccountEntryExtensionV2 {
+                num_sponsoring: u32::MAX,
+                num_sponsored: 0,
+                signer_sponsoring_i_ds: vec![].try_into().unwrap(),
+                ext: AccountEntryExtensionV2Ext::V0,
+            }),
+        });
+        state.create_account(sponsor_acct);
+
+        // Set up sponsorship: sponsor is sponsoring source
+        state.push_sponsorship(sponsor.clone(), source.clone());
+
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::ManageData(ManageDataOp {
+                data_name: String64::try_from("test_key".as_bytes().to_vec()).unwrap(),
+                data_value: Some(vec![1, 2, 3].try_into().unwrap()),
+            }),
+        };
+
+        let result = execute_operation(&op, &source, &mut state, &context);
+        match &result {
+            Err(e) => panic!("Should not return Err (TxInternalError): {:?}", e),
+            Ok(r) => match &r.result {
+                OperationResult::OpTooManySponsoring => {
+                    // Correct: maps to opTOO_MANY_SPONSORING like stellar-core
+                }
+                other => panic!("Expected OpTooManySponsoring, got {:?}", other),
+            },
+        }
     }
 }

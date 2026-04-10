@@ -153,7 +153,7 @@ impl LedgerStateManager {
         let ext = ensure_account_ext_v2(account);
         let updated = ext.num_sponsored as i64 + multiplier;
         if updated < 0 || updated > u32::MAX as i64 {
-            return Err(TxError::Internal("num_sponsored out of range".to_string()));
+            return Err(TxError::TooManySponsoring);
         }
         ext.num_sponsored = updated as u32;
         self.update_num_sponsoring(sponsor, multiplier)?;
@@ -216,7 +216,7 @@ impl LedgerStateManager {
         let ext = ensure_account_ext_v2(account);
         let updated = ext.num_sponsoring as i64 + delta;
         if updated < 0 || updated > u32::MAX as i64 {
-            return Err(TxError::Internal("num_sponsoring out of range".to_string()));
+            return Err(TxError::TooManySponsoring);
         }
         ext.num_sponsoring = updated as u32;
         Ok(())
@@ -233,7 +233,7 @@ impl LedgerStateManager {
         let ext = ensure_account_ext_v2(account);
         let updated = ext.num_sponsored as i64 + delta;
         if updated < 0 || updated > u32::MAX as i64 {
-            return Err(TxError::Internal("num_sponsored out of range".to_string()));
+            return Err(TxError::TooManySponsoring);
         }
         ext.num_sponsored = updated as u32;
         Ok(())

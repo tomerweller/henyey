@@ -88,6 +88,11 @@ pub enum TxError {
     /// Internal error.
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// Sponsorship capacity exceeded (num_sponsoring or num_sponsored overflow).
+    /// Maps to opTOO_MANY_SPONSORING at the operation result level.
+    #[error("too many sponsoring")]
+    TooManySponsoring,
 }
 
 #[cfg(test)]
