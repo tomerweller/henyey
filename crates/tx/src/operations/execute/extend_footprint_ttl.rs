@@ -15,6 +15,55 @@ use crate::Result;
 /// Max TTL extension for entries (in ledgers).
 const MAX_ENTRY_TTL: u32 = 6_312_000; // ~1 year at 5-second ledger close
 
+/// Contract size limits passed from SorobanConfig for `validateContractLedgerEntry`.
+pub(crate) struct ContractSizeLimits {
+    pub max_contract_size_bytes: u32,
+    pub max_contract_data_entry_size_bytes: u32,
+}
+
+/// Validate that a contract ledger entry's serialized size does not exceed
+/// the network config limits.
+///
+/// Matches stellar-core `validateContractLedgerEntry()` in TransactionUtils.cpp:
+/// - CONTRACT_CODE: checked against maxContractSizeBytes
+/// - CONTRACT_DATA: checked against maxContractDataEntrySizeBytes
+pub(crate) fn validate_contract_ledger_entry(
+    key: &LedgerKey,
+    entry: &stellar_xdr::curr::LedgerEntry,
+    limits: &ContractSizeLimits,
+) -> bool {
+    let entry_size = entry
+        .to_xdr(stellar_xdr::curr::Limits::none())
+        .ok()
+        .map(|bytes| bytes.len() as u32)
+        .unwrap_or(0);
+
+    match key {
+        LedgerKey::ContractCode(_) => {
+            if limits.max_contract_size_bytes < entry_size {
+                tracing::warn!(
+                    entry_size,
+                    limit = limits.max_contract_size_bytes,
+                    "Contract code size exceeds network config maximum"
+                );
+                return false;
+            }
+        }
+        LedgerKey::ContractData(_) => {
+            if limits.max_contract_data_entry_size_bytes < entry_size {
+                tracing::warn!(
+                    entry_size,
+                    limit = limits.max_contract_data_entry_size_bytes,
+                    "Contract data size exceeds network config maximum"
+                );
+                return false;
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
 /// Execute an ExtendFootprintTtl operation.
 ///
 /// This operation extends the TTL of all entries in the transaction's footprint
@@ -33,6 +82,7 @@ pub(crate) fn execute_extend_footprint_ttl(
     context: &LedgerContext,
     soroban_data: Option<&SorobanTransactionData>,
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
+    size_limits: Option<&ContractSizeLimits>,
 ) -> Result<OperationResult> {
     // stellar-core only rejects extend_to > MAX_ENTRY_TTL - 1;
     // extend_to=0 is valid and results in a no-op (target TTL <= any live entry's TTL).
@@ -97,10 +147,20 @@ pub(crate) fn execute_extend_footprint_ttl(
 
         // The main entry must exist (TTL exists and is live => entry exists)
         // stellar-core: releaseAssertOrThrow(entryOpt)
-        let entry = state.get_entry(key);
-        if entry.is_none() {
-            // Should not happen if TTL is live, but be safe
-            continue;
+        let entry = match state.get_entry(key) {
+            None => continue,
+            Some(e) => e,
+        };
+
+        // Validate contract entry size against config limits.
+        // Matches stellar-core validateContractLedgerEntry() which rejects
+        // CONTRACT_CODE > maxContractSizeBytes and CONTRACT_DATA > maxContractDataEntrySizeBytes.
+        if let Some(limits) = size_limits {
+            if !validate_contract_ledger_entry(key, &entry, limits) {
+                return Ok(make_result(
+                    ExtendFootprintTtlResultCode::ResourceLimitExceeded,
+                ));
+            }
         }
 
         // Track read bytes and check limit
@@ -112,7 +172,8 @@ pub(crate) fn execute_extend_footprint_ttl(
         // accounting is handled at the cluster level instead.
         if context.protocol_version < 23 {
             let entry_size = entry
-                .and_then(|e| e.to_xdr(stellar_xdr::curr::Limits::none()).ok())
+                .to_xdr(stellar_xdr::curr::Limits::none())
+                .ok()
                 .map(|bytes| bytes.len() as u32)
                 .unwrap_or(0);
             accumulated_read_bytes = accumulated_read_bytes.saturating_add(entry_size);
@@ -194,6 +255,7 @@ mod tests {
             &context,
             Some(&soroban_data),
             None,
+            None,
         );
         assert!(result.is_ok());
 
@@ -221,7 +283,8 @@ mod tests {
         };
 
         // No Soroban data provided
-        let result = execute_extend_footprint_ttl(&op, &source, &mut state, &context, None, None);
+        let result =
+            execute_extend_footprint_ttl(&op, &source, &mut state, &context, None, None, None);
         assert!(result.is_ok());
 
         match result.unwrap() {
@@ -267,6 +330,7 @@ mod tests {
             &mut state,
             &context,
             Some(&soroban_data),
+            None,
             None,
         );
         assert!(result.is_ok());
@@ -315,6 +379,7 @@ mod tests {
             &context,
             Some(&soroban_data),
             None,
+            None,
         );
         assert!(result.is_ok());
 
@@ -357,6 +422,7 @@ mod tests {
             &mut state,
             &context,
             Some(&soroban_data),
+            None,
             None,
         );
         assert!(result.is_ok());
@@ -404,6 +470,7 @@ mod tests {
             &mut state,
             &context,
             Some(&soroban_data),
+            None,
             None,
         );
         assert!(result.is_ok());
@@ -455,6 +522,7 @@ mod tests {
             &mut state,
             &context,
             Some(&soroban_data),
+            None,
             None,
         );
         assert!(result.is_ok());
@@ -513,6 +581,7 @@ mod tests {
             &context,
             Some(&soroban_data),
             None,
+            None,
         );
         assert!(result.is_ok());
 
@@ -570,6 +639,7 @@ mod tests {
             &mut state,
             &context,
             Some(&soroban_data),
+            None,
             None,
         );
         assert!(result.is_ok());
@@ -650,6 +720,7 @@ mod tests {
             &context,
             Some(&soroban_data),
             None,
+            None,
         );
         assert!(result.is_ok());
 
@@ -722,6 +793,7 @@ mod tests {
             &mut state,
             &context,
             Some(&soroban_data),
+            None,
             None,
         );
         assert!(result.is_ok());
@@ -797,6 +869,7 @@ mod tests {
             &context,
             Some(&soroban_data),
             None,
+            None,
         );
         assert!(result.is_ok());
 
@@ -805,6 +878,121 @@ mod tests {
                 assert!(
                     matches!(r, ExtendFootprintTtlResult::ResourceLimitExceeded),
                     "Zero disk_read_bytes should reject any read, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Regression test for AUDIT-053: entries exceeding the lowered config size
+    /// limits must be rejected by extend_footprint_ttl.
+    #[test]
+    fn test_audit_053_extend_rejects_oversized_contract_data() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+
+        // Create a contract data entry
+        let contract_hash = Hash([42u8; 32]);
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(contract_hash.clone())),
+            key: ScVal::Bool(true),
+            durability: ContractDataDurability::Persistent,
+        });
+
+        let data = ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: ScAddress::Contract(ContractId(contract_hash)),
+            key: ScVal::Bool(true),
+            durability: ContractDataDurability::Persistent,
+            val: ScVal::Bytes(ScBytes(vec![0xAA; 2000].try_into().unwrap())),
+        };
+
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractData(data),
+            ext: LedgerEntryExt::V0,
+        };
+
+        state.create_contract_data(match &entry.data {
+            LedgerEntryData::ContractData(d) => d.clone(),
+            _ => unreachable!(),
+        });
+
+        // Compute entry size for the TTL
+        let key_hash = crate::soroban::compute_key_hash(&key);
+        state.create_ttl(TtlEntry {
+            key_hash,
+            live_until_ledger_seq: 999, // Live but needs extension
+        });
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![key.clone()].try_into().unwrap(),
+                    read_write: vec![].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 100_000,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let op = ExtendFootprintTtlOp {
+            ext: ExtensionPoint::V0,
+            extend_to: 5000,
+        };
+
+        // With a size limit below the entry size, should be rejected
+        let small_limits = ContractSizeLimits {
+            max_contract_size_bytes: 64 * 1024,
+            max_contract_data_entry_size_bytes: 100, // Way below actual entry size
+        };
+
+        let result = execute_extend_footprint_ttl(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            None,
+            Some(&small_limits),
+        );
+        assert!(result.is_ok());
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ExtendFootprintTtl(r)) => {
+                assert!(
+                    matches!(r, ExtendFootprintTtlResult::ResourceLimitExceeded),
+                    "Oversized contract data should be rejected, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+
+        // With adequate limits, should succeed
+        let big_limits = ContractSizeLimits {
+            max_contract_size_bytes: 64 * 1024,
+            max_contract_data_entry_size_bytes: 64 * 1024,
+        };
+        let result = execute_extend_footprint_ttl(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            None,
+            Some(&big_limits),
+        );
+        assert!(result.is_ok());
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ExtendFootprintTtl(r)) => {
+                assert!(
+                    matches!(r, ExtendFootprintTtlResult::Success),
+                    "Entry within limits should succeed, got {:?}",
                     r
                 );
             }

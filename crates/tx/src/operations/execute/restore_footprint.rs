@@ -31,6 +31,8 @@ pub struct RestoreFootprintResources<'a> {
     pub hot_archive_restores: &'a [HotArchiveRestoreEntry],
     /// Optional TTL key cache for hashing restored entries.
     pub ttl_key_cache: Option<&'a crate::soroban::TtlKeyCache>,
+    /// Contract size limits from SorobanConfig.
+    pub size_limits: Option<super::extend_footprint_ttl::ContractSizeLimits>,
 }
 
 /// Execute a RestoreFootprint operation.
@@ -106,6 +108,21 @@ pub(crate) fn execute_restore_footprint(
             .ok()
             .map(|bytes| bytes.len() as u32)
             .unwrap_or(0);
+
+        // Validate contract entry size against config limits before restoring.
+        // Matches stellar-core validateContractLedgerEntry() in RestoreFootprintOpFrame.
+        if let Some(ref limits) = resources.size_limits {
+            if !super::extend_footprint_ttl::validate_contract_ledger_entry(
+                &restore.key,
+                &restore.entry,
+                limits,
+            ) {
+                return Ok(make_result(
+                    RestoreFootprintResultCode::ResourceLimitExceeded,
+                ));
+            }
+        }
+
         accumulated_read_bytes = accumulated_read_bytes.saturating_add(entry_size);
         if accumulated_read_bytes > disk_read_bytes_limit {
             return Ok(make_result(
@@ -164,6 +181,7 @@ pub(crate) fn execute_restore_footprint(
             &mut accumulated_write_bytes,
             disk_read_bytes_limit,
             write_bytes_limit,
+            resources.size_limits.as_ref(),
         ) {
             return Ok(make_result(
                 RestoreFootprintResultCode::ResourceLimitExceeded,
@@ -199,6 +217,7 @@ fn restore_entry(
     accumulated_write_bytes: &mut u32,
     disk_read_bytes_limit: u32,
     write_bytes_limit: u32,
+    size_limits: Option<&super::extend_footprint_ttl::ContractSizeLimits>,
 ) -> std::result::Result<(), ()> {
     // Only contract data and contract code can be restored
     match key {
@@ -221,16 +240,29 @@ fn restore_entry(
             // Entry is archived or has no TTL entry
             // We need to check if the entry itself exists in state
             let entry = state.get_entry(key);
-            if entry.is_none() {
-                // Neither live nor archived entry exists; skip per stellar-core behavior.
-                return Ok(());
-            }
+            let entry = match entry {
+                None => {
+                    // Neither live nor archived entry exists; skip per stellar-core behavior.
+                    return Ok(());
+                }
+                Some(e) => e,
+            };
 
             // Track resource limits (stellar-core: checkResourceLimits)
             let entry_size = entry
-                .and_then(|e| e.to_xdr(Limits::none()).ok())
+                .to_xdr(Limits::none())
+                .ok()
                 .map(|bytes| bytes.len() as u32)
                 .unwrap_or(0);
+
+            // Validate contract entry size against config limits.
+            if let Some(limits) = size_limits {
+                if !super::extend_footprint_ttl::validate_contract_ledger_entry(key, &entry, limits)
+                {
+                    return Err(());
+                }
+            }
+
             *accumulated_read_bytes = accumulated_read_bytes.saturating_add(entry_size);
             if *accumulated_read_bytes > disk_read_bytes_limit {
                 return Err(());
@@ -306,6 +338,7 @@ mod tests {
                 min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
                 hot_archive_restores: &[], // No hot archive restores
                 ttl_key_cache: None,
+                size_limits: None,
             },
         );
         assert!(result.is_ok());
@@ -352,6 +385,7 @@ mod tests {
                 min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
                 hot_archive_restores: &[], // No hot archive restores
                 ttl_key_cache: None,
+                size_limits: None,
             },
         );
         assert!(result.is_ok());
@@ -402,6 +436,7 @@ mod tests {
                 min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
                 hot_archive_restores: &[], // No hot archive restores
                 ttl_key_cache: None,
+                size_limits: None,
             },
         );
         assert!(result.is_ok());
@@ -454,6 +489,7 @@ mod tests {
                 min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
                 hot_archive_restores: &[], // No hot archive restores
                 ttl_key_cache: None,
+                size_limits: None,
             },
         );
         assert!(result.is_ok());
@@ -507,6 +543,7 @@ mod tests {
                 min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
                 hot_archive_restores: &[],
                 ttl_key_cache: None,
+                size_limits: None,
             },
         );
         assert!(result.is_ok());
@@ -567,6 +604,7 @@ mod tests {
                 min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
                 hot_archive_restores: &[],
                 ttl_key_cache: None,
+                size_limits: None,
             },
         );
         assert!(result.is_ok());
@@ -627,6 +665,7 @@ mod tests {
                 min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
                 hot_archive_restores: &[],
                 ttl_key_cache: None,
+                size_limits: None,
             },
         );
         assert!(result.is_ok());
@@ -688,6 +727,7 @@ mod tests {
                 min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
                 hot_archive_restores: &[],
                 ttl_key_cache: None,
+                size_limits: None,
             },
         );
         assert!(result.is_ok());
@@ -766,6 +806,7 @@ mod tests {
                 min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
                 hot_archive_restores: &[],
                 ttl_key_cache: None,
+                size_limits: None,
             },
         );
         assert!(result.is_ok());
