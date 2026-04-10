@@ -1289,6 +1289,14 @@ impl<T> SnapshotPair<T> {
     }
 }
 
+/// Internal state protected by a single lock for atomicity.
+/// Matches stellar-core's single `mSnapshotMutex` that protects both
+/// live and hot-archive snapshots together.
+struct SnapshotState {
+    live: SnapshotPair<BucketListSnapshot>,
+    hot_archive: SnapshotPair<HotArchiveBucketListSnapshot>,
+}
+
 /// Manages bucket list snapshots for thread-safe concurrent access.
 ///
 /// This is the main entry point for obtaining snapshots of the bucket list.
@@ -1299,19 +1307,12 @@ impl<T> SnapshotPair<T> {
 ///
 /// # Thread Safety
 ///
-/// - `copy_searchable_*` methods acquire a read lock
-/// - `update_current_snapshot` acquires a write lock
-///
-/// Multiple threads can call `copy_searchable_*` concurrently, but
-/// `update_current_snapshot` blocks all readers until complete.
-///
-/// Live and hot archive snapshots are each protected by a single paired
-/// lock, ensuring atomicity between current and historical within each type.
+/// A single `RwLock` protects both live and hot-archive snapshots, matching
+/// stellar-core's `mSnapshotMutex`. This ensures `copy_live_and_hot_archive_snapshots`
+/// always returns a consistent pair from the same ledger.
 pub struct BucketSnapshotManager {
-    /// Live bucket list: current + historical under one lock
-    live: RwLock<SnapshotPair<BucketListSnapshot>>,
-    /// Hot archive bucket list: current + historical under one lock
-    hot_archive: RwLock<SnapshotPair<HotArchiveBucketListSnapshot>>,
+    /// Both live and hot-archive snapshots under a single lock.
+    state: RwLock<SnapshotState>,
     /// Maximum number of historical snapshots to retain
     num_historical_snapshots: u32,
 }
@@ -1330,8 +1331,10 @@ impl BucketSnapshotManager {
         num_historical_snapshots: u32,
     ) -> Self {
         Self {
-            live: RwLock::new(SnapshotPair::with_current(live_snapshot)),
-            hot_archive: RwLock::new(SnapshotPair::with_current(hot_archive_snapshot)),
+            state: RwLock::new(SnapshotState {
+                live: SnapshotPair::with_current(live_snapshot),
+                hot_archive: SnapshotPair::with_current(hot_archive_snapshot),
+            }),
             num_historical_snapshots,
         }
     }
@@ -1341,8 +1344,10 @@ impl BucketSnapshotManager {
     /// Use `update_current_snapshot` to set the initial snapshots.
     pub fn empty(num_historical_snapshots: u32) -> Self {
         Self {
-            live: RwLock::new(SnapshotPair::new()),
-            hot_archive: RwLock::new(SnapshotPair::new()),
+            state: RwLock::new(SnapshotState {
+                live: SnapshotPair::new(),
+                hot_archive: SnapshotPair::new(),
+            }),
             num_historical_snapshots,
         }
     }
@@ -1351,9 +1356,9 @@ impl BucketSnapshotManager {
     ///
     /// This method acquires a read lock and is safe to call from any thread.
     pub fn copy_searchable_live_snapshot(&self) -> Option<SearchableBucketListSnapshot> {
-        let pair = self.live.read();
-        let snapshot = pair.current.clone()?;
-        let historical = pair.historical.clone();
+        let state = self.state.read();
+        let snapshot = state.live.current.clone()?;
+        let historical = state.live.historical.clone();
         Some(SearchableBucketListSnapshot::new(snapshot, historical))
     }
 
@@ -1363,9 +1368,9 @@ impl BucketSnapshotManager {
     pub fn copy_searchable_hot_archive_snapshot(
         &self,
     ) -> Option<SearchableHotArchiveBucketListSnapshot> {
-        let pair = self.hot_archive.read();
-        let snapshot = pair.current.clone()?;
-        let historical = pair.historical.clone();
+        let state = self.state.read();
+        let snapshot = state.hot_archive.current.clone()?;
+        let historical = state.hot_archive.historical.clone();
         Some(SearchableHotArchiveBucketListSnapshot::new(
             snapshot, historical,
         ))
@@ -1375,19 +1380,18 @@ impl BucketSnapshotManager {
     ///
     /// This ensures both snapshots correspond to the same ledger state,
     /// which is important when querying both snapshot types together.
+    /// A single lock acquisition guarantees atomicity.
     pub fn copy_live_and_hot_archive_snapshots(
         &self,
     ) -> Option<(
         SearchableBucketListSnapshot,
         SearchableHotArchiveBucketListSnapshot,
     )> {
-        // Acquire both locks to ensure consistency
-        let live_pair = self.live.read();
-        let hot_pair = self.hot_archive.read();
-        let live = live_pair.current.clone()?;
-        let hot_archive = hot_pair.current.clone()?;
-        let live_historical = live_pair.historical.clone();
-        let hot_archive_historical = hot_pair.historical.clone();
+        let state = self.state.read();
+        let live = state.live.current.clone()?;
+        let hot_archive = state.hot_archive.current.clone()?;
+        let live_historical = state.live.historical.clone();
+        let hot_archive_historical = state.hot_archive.historical.clone();
 
         Some((
             SearchableBucketListSnapshot::new(live, live_historical),
@@ -1402,17 +1406,17 @@ impl BucketSnapshotManager {
         &self,
         snapshot: &mut Option<SearchableBucketListSnapshot>,
     ) -> bool {
-        let pair = self.live.read();
-        let needs_update = match (&pair.current, snapshot.as_ref()) {
+        let state = self.state.read();
+        let needs_update = match (&state.live.current, snapshot.as_ref()) {
             (Some(curr), Some(snap)) => curr.ledger_seq() > snap.ledger_seq(),
             (Some(_), None) => true,
             _ => false,
         };
 
         if needs_update {
-            let current = pair.current.clone();
-            let historical = pair.historical.clone();
-            drop(pair);
+            let current = state.live.current.clone();
+            let historical = state.live.historical.clone();
+            drop(state);
             *snapshot = current.map(|c| SearchableBucketListSnapshot::new(c, historical));
             true
         } else {
@@ -1432,86 +1436,78 @@ impl BucketSnapshotManager {
         live_snapshot: BucketListSnapshot,
         hot_archive_snapshot: HotArchiveBucketListSnapshot,
     ) {
+        let mut state = self.state.write();
+
         // Update live snapshot
-        {
-            let mut pair = self.live.write();
+        if self.num_historical_snapshots > 0 {
+            if let Some(prev) = state.live.current.take() {
+                let ledger_seq = prev.ledger_seq();
 
-            if self.num_historical_snapshots > 0 {
-                if let Some(prev) = pair.current.take() {
-                    let ledger_seq = prev.ledger_seq();
-
-                    // Remove oldest if at capacity
-                    if pair.historical.len() >= self.num_historical_snapshots as usize {
-                        if let Some(&oldest) = pair.historical.keys().next() {
-                            pair.historical.remove(&oldest);
-                        }
+                if state.live.historical.len() >= self.num_historical_snapshots as usize {
+                    if let Some(&oldest) = state.live.historical.keys().next() {
+                        state.live.historical.remove(&oldest);
                     }
-
-                    pair.historical.insert(ledger_seq, prev);
                 }
-            }
 
-            pair.current = Some(live_snapshot);
+                state.live.historical.insert(ledger_seq, prev);
+            }
         }
+
+        state.live.current = Some(live_snapshot);
 
         // Update hot archive snapshot
-        {
-            let mut pair = self.hot_archive.write();
+        if self.num_historical_snapshots > 0 {
+            if let Some(prev) = state.hot_archive.current.take() {
+                let ledger_seq = prev.ledger_seq();
 
-            if self.num_historical_snapshots > 0 {
-                if let Some(prev) = pair.current.take() {
-                    let ledger_seq = prev.ledger_seq();
-
-                    // Remove oldest if at capacity
-                    if pair.historical.len() >= self.num_historical_snapshots as usize {
-                        if let Some(&oldest) = pair.historical.keys().next() {
-                            pair.historical.remove(&oldest);
-                        }
+                if state.hot_archive.historical.len() >= self.num_historical_snapshots as usize {
+                    if let Some(&oldest) = state.hot_archive.historical.keys().next() {
+                        state.hot_archive.historical.remove(&oldest);
                     }
-
-                    pair.historical.insert(ledger_seq, prev);
                 }
-            }
 
-            pair.current = Some(hot_archive_snapshot);
+                state.hot_archive.historical.insert(ledger_seq, prev);
+            }
         }
+
+        state.hot_archive.current = Some(hot_archive_snapshot);
     }
 
     /// Returns the current ledger sequence, if a snapshot exists.
     pub fn current_ledger_seq(&self) -> Option<u32> {
-        self.live.read().current.as_ref().map(|s| s.ledger_seq())
+        self.state
+            .read()
+            .live
+            .current
+            .as_ref()
+            .map(|s| s.ledger_seq())
     }
 
     /// Returns the number of historical snapshots currently stored.
     pub fn historical_snapshot_count(&self) -> usize {
-        self.live.read().historical.len()
+        self.state.read().live.historical.len()
     }
 
     /// Returns all non-zero bucket hashes referenced by any snapshot
     /// (current and historical, live and hot archive).
     pub fn all_referenced_hashes(&self) -> Vec<henyey_common::Hash256> {
         let mut hashes = Vec::new();
+        let state = self.state.read();
 
-        // Live: current + historical (single lock)
-        {
-            let pair = self.live.read();
-            if let Some(ref snap) = pair.current {
-                hashes.extend(snap.all_referenced_hashes());
-            }
-            for snap in pair.historical.values() {
-                hashes.extend(snap.all_referenced_hashes());
-            }
+        // Live: current + historical
+        if let Some(ref snap) = state.live.current {
+            hashes.extend(snap.all_referenced_hashes());
+        }
+        for snap in state.live.historical.values() {
+            hashes.extend(snap.all_referenced_hashes());
         }
 
-        // Hot archive: current + historical (single lock)
-        {
-            let pair = self.hot_archive.read();
-            if let Some(ref snap) = pair.current {
-                hashes.extend(snap.all_referenced_hashes());
-            }
-            for snap in pair.historical.values() {
-                hashes.extend(snap.all_referenced_hashes());
-            }
+        // Hot archive: current + historical
+        if let Some(ref snap) = state.hot_archive.current {
+            hashes.extend(snap.all_referenced_hashes());
+        }
+        for snap in state.hot_archive.historical.values() {
+            hashes.extend(snap.all_referenced_hashes());
         }
 
         hashes
