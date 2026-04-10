@@ -43,28 +43,7 @@ const SECONDS_PER_BACKOFF: u64 = 10;
 /// Maximum backoff exponent.
 const MAX_BACKOFF_EXPONENT: u32 = 10;
 
-/// Peer type stored in the database.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i32)]
-pub enum StoredPeerType {
-    /// Peer connected to us.
-    Inbound = 0,
-    /// Peer we connected to.
-    Outbound = 1,
-    /// Preferred peer (always try to connect).
-    Preferred = 2,
-}
-
-impl StoredPeerType {
-    fn from_i32(value: i32) -> Self {
-        match value {
-            0 => Self::Inbound,
-            1 => Self::Outbound,
-            2 => Self::Preferred,
-            _ => Self::Inbound,
-        }
-    }
-}
+pub use henyey_common::StoredPeerType;
 
 /// Filter for querying peers.
 #[derive(Debug, Clone, Copy)]
@@ -264,14 +243,27 @@ impl PeerManager {
                     port: row.get::<_, i32>(1)? as u16,
                     next_attempt: row.get::<_, i64>(2)?,
                     num_failures: row.get::<_, i32>(3)? as u32,
-                    peer_type: StoredPeerType::from_i32(row.get::<_, i32>(4)?),
+                    peer_type: StoredPeerType::try_from(row.get::<_, i32>(4)?).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Integer,
+                            e.into(),
+                        )
+                    })?,
                 })
             })
             .map_err(|e| OverlayError::DatabaseError(format!("Failed to query peers: {}", e)))?;
 
         let mut cache = HashMap::new();
-        for record in rows.flatten() {
-            cache.insert((record.ip.clone(), record.port), record);
+        for result in rows {
+            match result {
+                Ok(record) => {
+                    cache.insert((record.ip.clone(), record.port), record);
+                }
+                Err(e) => {
+                    tracing::warn!("Skipping corrupt peer record: {e}");
+                }
+            }
         }
 
         Ok(cache)

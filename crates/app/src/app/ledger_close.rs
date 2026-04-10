@@ -237,9 +237,9 @@ impl App {
                     if code == TransactionResultCode::TxSuccess
                         || code == TransactionResultCode::TxFeeBumpInnerSuccess
                     {
-                        henyey_db::TX_STATUS_SUCCESS
+                        henyey_db::TxStatus::Success
                     } else {
-                        henyey_db::TX_STATUS_FAILED
+                        henyey_db::TxStatus::Failed
                     }
                 };
 
@@ -292,7 +292,7 @@ impl App {
         network_id: NetworkId,
     ) -> Vec<henyey_db::EventRecord> {
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-        use stellar_xdr::curr::{ContractEvent, ContractEventType, Limits, TransactionResultCode};
+        use stellar_xdr::curr::{ContractEvent, Limits, TransactionResultCode};
 
         let mut all_events = Vec::new();
 
@@ -352,11 +352,7 @@ impl App {
                 let event_id = format!("{:019}-{:010}", toid, event_index);
 
                 // Event type
-                let event_type = match event.type_ {
-                    ContractEventType::Contract => 0,
-                    ContractEventType::System => 1,
-                    ContractEventType::Diagnostic => 2,
-                };
+                let event_type = event.type_;
 
                 // Contract ID
                 let contract_id = event

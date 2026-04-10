@@ -147,7 +147,7 @@ impl Database {
         limit: usize,
         max_failures: u32,
         now: i64,
-        peer_type: Option<i32>,
+        peer_type: Option<henyey_common::StoredPeerType>,
     ) -> Result<Vec<(String, u16, queries::PeerRecord)>> {
         self.with_connection(|conn| {
             use queries::PeerQueries;
@@ -163,7 +163,7 @@ impl Database {
         limit: usize,
         max_failures: u32,
         now: i64,
-        inbound_type: i32,
+        inbound_type: henyey_common::StoredPeerType,
     ) -> Result<Vec<(String, u16, queries::PeerRecord)>> {
         self.with_connection(|conn| {
             use queries::PeerQueries;
@@ -179,7 +179,7 @@ impl Database {
         &self,
         limit: usize,
         max_failures: u32,
-        inbound_type: i32,
+        inbound_type: henyey_common::StoredPeerType,
     ) -> Result<Vec<(String, u16, queries::PeerRecord)>> {
         self.with_connection(|conn| {
             use queries::PeerQueries;
@@ -194,7 +194,7 @@ impl Database {
         &self,
         limit: usize,
         max_failures: u32,
-        peer_type: i32,
+        peer_type: henyey_common::StoredPeerType,
     ) -> Result<Vec<(String, u16, queries::PeerRecord)>> {
         self.with_connection(|conn| {
             use queries::PeerQueries;

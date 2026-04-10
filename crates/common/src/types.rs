@@ -6,6 +6,31 @@
 use sha2::{Digest, Sha256};
 use std::fmt;
 
+/// The type of a peer record as stored in the database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum StoredPeerType {
+    /// Peer connected to us.
+    Inbound = 0,
+    /// Peer we connected to.
+    Outbound = 1,
+    /// Preferred peer (always try to connect).
+    Preferred = 2,
+}
+
+impl TryFrom<i32> for StoredPeerType {
+    type Error = String;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Inbound),
+            1 => Ok(Self::Outbound),
+            2 => Ok(Self::Preferred),
+            _ => Err(format!("invalid stored peer type: {value}")),
+        }
+    }
+}
+
 /// A 32-byte SHA-256 hash.
 ///
 /// This is the canonical hash type used throughout Stellar for ledger hashes,

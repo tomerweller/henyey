@@ -27,8 +27,8 @@ pub async fn handle(
 
     // Parse optional status filter
     let status_filter = match params.get("status").and_then(|v| v.as_str()) {
-        Some("SUCCESS") => Some(henyey_db::TX_STATUS_SUCCESS),
-        Some("FAILED") => Some(henyey_db::TX_STATUS_FAILED),
+        Some("SUCCESS") => Some(henyey_db::TxStatus::Success),
+        Some("FAILED") => Some(henyey_db::TxStatus::Failed),
         Some(other) => {
             return Err(JsonRpcError::invalid_params(format!(
                 "invalid status filter: '{}' (allowed: SUCCESS, FAILED)",

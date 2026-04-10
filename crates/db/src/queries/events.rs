@@ -4,15 +4,9 @@
 //! used by the `getEvents` RPC endpoint.
 
 use rusqlite::{params, Connection};
+use stellar_xdr::curr::ContractEventType;
 
 use crate::error::DbError;
-
-/// Event type code for contract events.
-const EVENT_TYPE_CONTRACT: i32 = 0;
-/// Event type code for system events.
-const EVENT_TYPE_SYSTEM: i32 = 1;
-/// Event type code for diagnostic events.
-const EVENT_TYPE_DIAGNOSTIC: i32 = 2;
 
 /// A stored contract event record.
 #[derive(Debug, Clone)]
@@ -29,8 +23,8 @@ pub struct EventRecord {
     pub tx_hash: String,
     /// Contract ID (strkey C...), None for system events.
     pub contract_id: Option<String>,
-    /// Event type: 0=contract, 1=system, 2=diagnostic.
-    pub event_type: i32,
+    /// Event type (contract, system, or diagnostic).
+    pub event_type: ContractEventType,
     /// Base64 XDR of topic ScVals (up to 4).
     pub topics: Vec<String>,
     /// Base64 XDR of full ContractEvent.
@@ -84,7 +78,7 @@ impl EventQueries for Connection {
                 event.op_index,
                 event.tx_hash,
                 event.contract_id,
-                event.event_type,
+                event.event_type as i32,
                 topics.first().map(|s| s.as_str()),
                 topics.get(1).map(|s| s.as_str()),
                 topics.get(2).map(|s| s.as_str()),
@@ -114,10 +108,14 @@ impl EventQueries for Connection {
         // Event type filter
         if let Some(et) = params.event_type {
             let type_code = match et {
-                "contract" => EVENT_TYPE_CONTRACT,
-                "system" => EVENT_TYPE_SYSTEM,
-                "diagnostic" => EVENT_TYPE_DIAGNOSTIC,
-                _ => EVENT_TYPE_CONTRACT,
+                "contract" => ContractEventType::Contract as i32,
+                "system" => ContractEventType::System as i32,
+                "diagnostic" => ContractEventType::Diagnostic as i32,
+                other => {
+                    return Err(DbError::Integrity(format!(
+                        "unknown event type filter: {other}"
+                    )));
+                }
             };
             sql.push_str(" AND event_type = ?");
             param_values.push(Box::new(type_code));
@@ -212,7 +210,16 @@ impl EventQueries for Connection {
                 op_index: row.get(3)?,
                 tx_hash: row.get(4)?,
                 contract_id: row.get(5)?,
-                event_type: row.get(6)?,
+                event_type: {
+                    let raw: i32 = row.get(6)?;
+                    ContractEventType::try_from(raw).map_err(|_| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            6,
+                            rusqlite::types::Type::Integer,
+                            format!("invalid event type: {raw}").into(),
+                        )
+                    })?
+                },
                 topics,
                 event_xdr: row.get(11)?,
                 in_successful_contract_call: in_success != 0,
@@ -271,7 +278,7 @@ mod tests {
             op_index: index,
             tx_hash: "aabb".to_string(),
             contract_id: Some("CABC".to_string()),
-            event_type: EVENT_TYPE_CONTRACT,
+            event_type: ContractEventType::Contract,
             topics: vec!["t1".to_string()],
             event_xdr: "deadbeef".to_string(),
             in_successful_contract_call: true,
@@ -326,5 +333,43 @@ mod tests {
         let deleted = conn.delete_old_events(50, 1000).unwrap();
         assert_eq!(deleted, 0);
         assert_eq!(count_events(&conn), 6);
+    }
+
+    #[test]
+    fn test_invalid_event_type_errors() {
+        let conn = setup_db();
+        // Insert a row with an invalid event type directly via SQL
+        conn.execute(
+            "INSERT INTO events (id, ledgerseq, tx_index, op_index, tx_hash, contract_id, event_type, \
+             topic1, topic2, topic3, topic4, event_xdr, in_successful_contract_call) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL, ?9, ?10)",
+            params!["bad-1", 100u32, 0u32, 0u32, "aabb", "CABC", 99i32, "t1", "deadbeef", 1i32],
+        )
+        .unwrap();
+        let result = conn.query_events(&EventQueryParams {
+            start_ledger: 99,
+            end_ledger: Some(101),
+            event_type: None,
+            contract_ids: &[],
+            topics: &[],
+            cursor: None,
+            limit: 100,
+        });
+        assert!(result.is_err(), "should reject invalid event type from DB");
+    }
+
+    #[test]
+    fn test_unknown_event_type_filter_errors() {
+        let conn = setup_db();
+        let result = conn.query_events(&EventQueryParams {
+            start_ledger: 1,
+            end_ledger: Some(100),
+            event_type: Some("bogus"),
+            contract_ids: &[],
+            topics: &[],
+            cursor: None,
+            limit: 100,
+        });
+        assert!(result.is_err(), "should reject unknown event type filter");
     }
 }

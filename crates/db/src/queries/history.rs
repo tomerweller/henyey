@@ -17,9 +17,31 @@ use stellar_xdr::curr::{
 
 use crate::error::DbError;
 
-/// Transaction status values stored in the `status` column.
-pub const TX_STATUS_SUCCESS: i32 = 0;
-pub const TX_STATUS_FAILED: i32 = 1;
+/// Transaction status stored in the `status` column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum TxStatus {
+    Success = 0,
+    Failed = 1,
+}
+
+impl TxStatus {
+    pub fn as_i32(self) -> i32 {
+        self as i32
+    }
+}
+
+impl TryFrom<i32> for TxStatus {
+    type Error = DbError;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Success),
+            1 => Ok(Self::Failed),
+            _ => Err(DbError::Integrity(format!("invalid tx status: {value}"))),
+        }
+    }
+}
 
 /// A stored transaction record.
 ///
@@ -41,8 +63,8 @@ pub struct TxRecord {
     ///
     /// Contains ledger entry changes and other execution details.
     pub meta: Option<Vec<u8>>,
-    /// Transaction status: 0 = success, 1 = failed.
-    pub status: i32,
+    /// Transaction status: success or failed.
+    pub status: TxStatus,
 }
 
 /// Parameters for storing a transaction.
@@ -56,7 +78,7 @@ pub struct StoreTxParams<'a> {
     pub body: &'a [u8],
     pub result: &'a [u8],
     pub meta: Option<&'a [u8]>,
-    pub status: i32,
+    pub status: TxStatus,
 }
 
 /// Query trait for transaction history operations.
@@ -67,7 +89,6 @@ pub trait HistoryQueries {
     /// Stores a transaction in the history table.
     ///
     /// If a transaction with the same ID already exists, it is replaced.
-    /// `status` should be [`TX_STATUS_SUCCESS`] or [`TX_STATUS_FAILED`].
     fn store_transaction(&self, params: &StoreTxParams) -> Result<(), DbError>;
 
     /// Loads a transaction by its ID (hash).
@@ -140,7 +161,7 @@ pub trait HistoryQueries {
         start_tx_index: Option<u32>,
         end_ledger: u32,
         limit: u32,
-        status_filter: Option<i32>,
+        status_filter: Option<TxStatus>,
     ) -> Result<Vec<TxRecord>, DbError>;
 
     /// Deletes old transaction history entries with `ledgerseq <= max_ledger`.
@@ -166,7 +187,7 @@ impl HistoryQueries for Connection {
                 p.body,
                 p.result,
                 p.meta,
-                p.status
+                p.status.as_i32()
             ],
         )?;
         Ok(())
@@ -188,7 +209,13 @@ impl HistoryQueries for Connection {
                         body: row.get(2)?,
                         result: row.get(3)?,
                         meta: row.get(4)?,
-                        status: row.get(5)?,
+                        status: TxStatus::try_from(row.get::<_, i32>(5)?).map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                5,
+                                rusqlite::types::Type::Integer,
+                                Box::new(e),
+                            )
+                        })?,
                     })
                 },
             )
@@ -313,7 +340,7 @@ impl HistoryQueries for Connection {
         start_tx_index: Option<u32>,
         end_ledger: u32,
         limit: u32,
-        status_filter: Option<i32>,
+        status_filter: Option<TxStatus>,
     ) -> Result<Vec<TxRecord>, DbError> {
         let map_row = |row: &rusqlite::Row<'_>| {
             Ok(TxRecord {
@@ -323,7 +350,13 @@ impl HistoryQueries for Connection {
                 body: row.get(3)?,
                 result: row.get(4)?,
                 meta: row.get(5)?,
-                status: row.get(6)?,
+                status: TxStatus::try_from(row.get::<_, i32>(6)?).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Integer,
+                        Box::new(e),
+                    )
+                })?,
             })
         };
 
@@ -354,7 +387,7 @@ impl HistoryQueries for Connection {
 
         if let Some(status) = status_filter {
             conditions.push(format!("status = ?{}", bind_values.len() + 1));
-            bind_values.push(Box::new(status));
+            bind_values.push(Box::new(status.as_i32()));
         }
 
         let limit_idx = bind_values.len() + 1;
@@ -463,7 +496,7 @@ mod tests {
             body,
             result,
             meta: Some(meta),
-            status: TX_STATUS_SUCCESS,
+            status: TxStatus::Success,
         })
         .unwrap();
 
@@ -474,7 +507,7 @@ mod tests {
         assert_eq!(loaded.body, body.to_vec());
         assert_eq!(loaded.result, result.to_vec());
         assert_eq!(loaded.meta, Some(meta.to_vec()));
-        assert_eq!(loaded.status, TX_STATUS_SUCCESS);
+        assert_eq!(loaded.status, TxStatus::Success);
     }
 
     #[test]
@@ -491,7 +524,7 @@ mod tests {
             body,
             result,
             meta: None,
-            status: TX_STATUS_FAILED,
+            status: TxStatus::Failed,
         })
         .unwrap();
 
@@ -499,7 +532,7 @@ mod tests {
         assert_eq!(loaded.ledger_seq, 200);
         assert_eq!(loaded.tx_index, 5);
         assert!(loaded.meta.is_none());
-        assert_eq!(loaded.status, TX_STATUS_FAILED);
+        assert_eq!(loaded.status, TxStatus::Failed);
     }
 
     #[test]
@@ -521,7 +554,7 @@ mod tests {
             body: b"old_body",
             result: b"old_result",
             meta: None,
-            status: TX_STATUS_SUCCESS,
+            status: TxStatus::Success,
         })
         .unwrap();
 
@@ -533,7 +566,7 @@ mod tests {
             body: b"new_body",
             result: b"new_result",
             meta: Some(b"meta"),
-            status: TX_STATUS_FAILED,
+            status: TxStatus::Failed,
         })
         .unwrap();
 
@@ -541,7 +574,7 @@ mod tests {
         assert_eq!(loaded.body, b"new_body".to_vec());
         assert_eq!(loaded.result, b"new_result".to_vec());
         assert_eq!(loaded.meta, Some(b"meta".to_vec()));
-        assert_eq!(loaded.status, TX_STATUS_FAILED);
+        assert_eq!(loaded.status, TxStatus::Failed);
     }
 
     #[test]
@@ -790,5 +823,27 @@ mod tests {
         assert_eq!(loaded.ledger_seq, 456);
         assert_eq!(loaded.tx_result_set, entry.tx_result_set);
         assert_eq!(loaded.ext, entry.ext);
+    }
+
+    #[test]
+    fn test_invalid_tx_status_errors() {
+        let conn = setup_db();
+        // Insert a row with an invalid status value directly via SQL
+        conn.execute(
+            "INSERT INTO txhistory (txid, ledgerseq, txindex, txbody, txresult, txmeta, status) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "bad_tx",
+                100u32,
+                0u32,
+                b"body".to_vec(),
+                b"result".to_vec(),
+                b"meta".to_vec(),
+                99i32
+            ],
+        )
+        .unwrap();
+        let result = conn.load_transaction("bad_tx");
+        assert!(result.is_err(), "should reject invalid tx status");
     }
 }

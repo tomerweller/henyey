@@ -812,8 +812,8 @@ impl App {
                 let port = info.address.port();
                 match self.db.load_peer(&host, port) {
                     Ok(Some(record)) => {
-                        record.peer_type == PEER_TYPE_PREFERRED
-                            || record.peer_type == PEER_TYPE_OUTBOUND
+                        record.peer_type == StoredPeerType::Preferred
+                            || record.peer_type == StoredPeerType::Outbound
                     }
                     _ => false,
                 }
