@@ -50,7 +50,7 @@ impl BucketListSnapshotSource {
     /// Used for ExtendTTL and Restore simulation where we need access to
     /// archived/expired entries.
     pub(crate) fn get_unfiltered(&self, key: &LedgerKey) -> Option<(LedgerEntry, Option<u32>)> {
-        let live_until = get_entry_ttl(&self.snapshot, key);
+        let live_until = get_entry_ttl(&self.snapshot, key).ok()?;
         let mut entry = self.snapshot.load_result(key).ok()??;
         normalize_entry(&mut entry);
         Some((entry, live_until))
@@ -68,8 +68,15 @@ impl SnapshotSource for BucketListSnapshotSource {
             None => return Ok(None),
         };
 
+        let make_err = || {
+            HostError::from(soroban_host::Error::from_type_and_code(
+                soroban_host::xdr::ScErrorType::Storage,
+                soroban_host::xdr::ScErrorCode::InternalError,
+            ))
+        };
+
         // For contract data/code entries, we need to check TTL
-        let live_until = get_entry_ttl(&self.snapshot, &ws_key);
+        let live_until = get_entry_ttl(&self.snapshot, &ws_key).map_err(|_| make_err())?;
 
         // Check TTL expiration for contract entries
         if matches!(
@@ -97,23 +104,32 @@ impl SnapshotSource for BucketListSnapshotSource {
                 Ok(Some((Rc::new(p25_entry), live_until)))
             }
             Ok(None) => Ok(None),
-            Err(_) => Err(HostError::from(soroban_host::Error::from_type_and_code(
-                soroban_host::xdr::ScErrorType::Storage,
-                soroban_host::xdr::ScErrorCode::InternalError,
-            ))),
+            Err(_) => Err(make_err()),
         }
     }
 }
 
 /// Get the TTL (live_until_ledger) for a ledger entry from the bucket list.
-fn get_entry_ttl(snapshot: &SearchableBucketListSnapshot, key: &LedgerKey) -> Option<u32> {
-    let ttl_key = ttl_key_for_ledger_key(key)?;
+///
+/// Returns `Ok(None)` if the entry has no TTL key or the TTL entry is not found.
+/// Returns `Err` on I/O or deserialization errors from disk-backed buckets.
+fn get_entry_ttl(
+    snapshot: &SearchableBucketListSnapshot,
+    key: &LedgerKey,
+) -> henyey_bucket::Result<Option<u32>> {
+    let ttl_key = match ttl_key_for_ledger_key(key) {
+        Some(k) => k,
+        None => return Ok(None),
+    };
 
-    // Look up the TTL entry
-    let ttl_entry = snapshot.load_result(&ttl_key).ok()??;
-    match ttl_entry.data {
-        stellar_xdr::curr::LedgerEntryData::Ttl(ttl_data) => Some(ttl_data.live_until_ledger_seq),
-        _ => None,
+    match snapshot.load_result(&ttl_key)? {
+        Some(entry) => match entry.data {
+            stellar_xdr::curr::LedgerEntryData::Ttl(ttl_data) => {
+                Ok(Some(ttl_data.live_until_ledger_seq))
+            }
+            _ => Ok(None),
+        },
+        None => Ok(None),
     }
 }
 

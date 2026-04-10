@@ -321,32 +321,35 @@ impl App {
                 hashes.extend(sm.all_referenced_hashes());
 
                 // Add DB HAS and publish queue references
-                if let Ok(extra) = db.with_connection(|conn| {
+                match db.with_connection(|conn| {
                     use henyey_db::queries::publish_queue::PublishQueueQueries;
                     use henyey_db::queries::StateQueries;
                     let mut extra_hashes = Vec::new();
 
-                    if let Ok(Some(has_json)) =
-                        conn.get_state(henyey_db::schema::state_keys::HISTORY_ARCHIVE_STATE)
+                    if let Some(has_json) =
+                        conn.get_state(henyey_db::schema::state_keys::HISTORY_ARCHIVE_STATE)?
                     {
                         if let Ok(has) = henyey_history::HistoryArchiveState::from_json(&has_json) {
                             extra_hashes.extend(has.all_bucket_hashes());
                         }
                     }
 
-                    if let Ok(entries) = conn.load_all_publish_has() {
-                        for has_json in entries {
-                            if let Ok(has) =
-                                henyey_history::HistoryArchiveState::from_json(&has_json)
-                            {
-                                extra_hashes.extend(has.all_bucket_hashes());
-                            }
+                    for has_json in conn.load_all_publish_has()? {
+                        if let Ok(has) = henyey_history::HistoryArchiveState::from_json(&has_json) {
+                            extra_hashes.extend(has.all_bucket_hashes());
                         }
                     }
 
                     Ok(extra_hashes)
                 }) {
-                    hashes.extend(extra);
+                    Ok(extra) => hashes.extend(extra),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Skipping bucket cleanup: failed to load DB references"
+                        );
+                        return;
+                    }
                 }
 
                 match bm.retain_buckets(&hashes) {

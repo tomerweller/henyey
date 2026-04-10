@@ -1423,31 +1423,37 @@ impl App {
             hashes.extend(sm.all_referenced_hashes());
 
             // Add bucket hashes from the DB-stored HAS and publish queue.
-            // Errors are non-fatal — worst case we keep extra files.
-            if let Ok(extra) = db.with_connection(|conn| {
+            // If DB access fails, skip cleanup entirely to avoid deleting
+            // still-referenced bucket files (fail-closed).
+            match db.with_connection(|conn| {
                 use henyey_db::queries::publish_queue::PublishQueueQueries;
                 use henyey_db::queries::StateQueries;
                 let mut extra_hashes = Vec::new();
 
                 // Stored authoritative HAS
-                if let Ok(Some(has_json)) = conn.get_state(state_keys::HISTORY_ARCHIVE_STATE) {
+                if let Some(has_json) = conn.get_state(state_keys::HISTORY_ARCHIVE_STATE)? {
                     if let Ok(has) = henyey_history::HistoryArchiveState::from_json(&has_json) {
                         extra_hashes.extend(has.all_bucket_hashes());
                     }
                 }
 
                 // Publish queue HAS entries
-                if let Ok(entries) = conn.load_all_publish_has() {
-                    for has_json in entries {
-                        if let Ok(has) = henyey_history::HistoryArchiveState::from_json(&has_json) {
-                            extra_hashes.extend(has.all_bucket_hashes());
-                        }
+                for has_json in conn.load_all_publish_has()? {
+                    if let Ok(has) = henyey_history::HistoryArchiveState::from_json(&has_json) {
+                        extra_hashes.extend(has.all_bucket_hashes());
                     }
                 }
 
                 Ok(extra_hashes)
             }) {
-                hashes.extend(extra);
+                Ok(extra) => hashes.extend(extra),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Skipping bucket cleanup: failed to load DB references"
+                    );
+                    return;
+                }
             }
 
             match bm.retain_buckets(&hashes) {

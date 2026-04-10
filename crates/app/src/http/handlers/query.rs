@@ -337,12 +337,15 @@ pub(crate) async fn getledgerentry_handler(
         .collect();
 
     let archived_entries = if !hot_archive_keys.is_empty() {
-        load_from_hot_archive(
+        match load_from_hot_archive(
             &hot_archive_bl,
             &hot_archive_keys,
             ledger_seq,
             params.ledger_seq.is_some(),
-        )
+        ) {
+            Ok(entries) => entries,
+            Err(resp) => return resp.into_response(),
+        }
     } else {
         Vec::new()
     };
@@ -534,12 +537,21 @@ fn load_from_hot_archive(
     keys: &[LedgerKey],
     ledger_seq: u32,
     historical: bool,
-) -> Vec<HotArchiveBucketEntry> {
+) -> Result<Vec<HotArchiveBucketEntry>, (StatusCode, Json<serde_json::Value>)> {
     if historical {
-        bl.load_keys_from_ledger(keys, ledger_seq)
-            .unwrap_or_default()
+        bl.load_keys_from_ledger(keys, ledger_seq).ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Ledger {} not available", ledger_seq)})),
+            )
+        })
     } else {
-        bl.load_keys(keys)
+        bl.load_keys_result(keys).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Hot archive read error: {}", e)})),
+            )
+        })
     }
 }
 
