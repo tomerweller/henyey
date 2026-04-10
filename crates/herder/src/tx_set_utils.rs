@@ -173,14 +173,16 @@ impl TxSetValidationContext {
 
     /// Build a `LedgerContext` from this validation context.
     fn to_ledger_context(&self, close_time: u64) -> LedgerContext {
-        LedgerContext::new(
+        let mut ctx = LedgerContext::new(
             self.next_ledger_seq,
             close_time,
             self.base_fee,
             self.base_reserve,
             self.protocol_version,
             self.network_id,
-        )
+        );
+        ctx.ledger_flags = self.ledger_flags;
+        ctx
     }
 }
 

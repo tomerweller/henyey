@@ -520,7 +520,10 @@ fn convert_with_offers_and_pools(
     amount_recv: &mut i64,
     max_offers_to_cross: i64,
 ) -> Result<ConvertResult> {
-    if params.round == RoundingType::Normal {
+    // Parity: stellar-core checks isPoolTradingDisabled before pool exchange
+    // (OfferExchange.cpp:1396). When the flag is set or rounding is Normal,
+    // fall back to order-book only.
+    if params.context.is_pool_trading_disabled() || params.round == RoundingType::Normal {
         return convert_with_offers(params, amount_send, amount_recv, max_offers_to_cross);
     }
 
@@ -3075,6 +3078,149 @@ mod tests {
                 );
             }
             other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    /// Regression test for AUDIT-011: When DISABLE_LIQUIDITY_POOL_TRADING_FLAG is set,
+    /// path payments must skip pool exchange and use order-book only.
+    #[test]
+    fn test_audit_011_pool_trading_disabled_flag_skips_pool_exchange() {
+        use sha2::Digest;
+        use stellar_xdr::curr::LedgerHeaderFlags;
+
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+        let issuer_a = create_test_account_id(10);
+        let issuer_b = create_test_account_id(20);
+
+        state.create_account(create_test_account(source_id.clone(), 1_000_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 1_000_000_000));
+        state.create_account(create_test_account(issuer_a.clone(), 1_000_000_000));
+        state.create_account(create_test_account(issuer_b.clone(), 1_000_000_000));
+
+        let asset_a = create_test_asset(b"AAA\0", issuer_a.clone());
+        let asset_b = create_test_asset(b"BBB\0", issuer_b.clone());
+
+        // Source trustlines
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            create_test_trustline_asset(b"AAA\0", issuer_a.clone()),
+            100_000,
+            i64::MAX,
+            AUTHORIZED_FLAG,
+        ));
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            create_test_trustline_asset(b"BBB\0", issuer_b.clone()),
+            100_000,
+            i64::MAX,
+            AUTHORIZED_FLAG,
+        ));
+
+        // Destination trustline
+        state.create_trustline(create_test_trustline(
+            dest_id.clone(),
+            create_test_trustline_asset(b"BBB\0", issuer_b.clone()),
+            0,
+            i64::MAX,
+            AUTHORIZED_FLAG,
+        ));
+
+        // Compute pool ID
+        let pool_params = LiquidityPoolConstantProductParameters {
+            asset_a: asset_a.clone(),
+            asset_b: asset_b.clone(),
+            fee: 30, // LIQUIDITY_POOL_FEE_V18
+        };
+        let pool_params_xdr = pool_params.to_xdr(Limits::none()).unwrap();
+        let pool_hash = stellar_xdr::curr::Hash(sha2::Sha256::digest(&pool_params_xdr).into());
+        let pool_id = PoolId(pool_hash);
+
+        // Create pool with good reserves (1:1 ratio)
+        state.create_liquidity_pool(LiquidityPoolEntry {
+            liquidity_pool_id: pool_id,
+            body: LiquidityPoolEntryBody::LiquidityPoolConstantProduct(
+                LiquidityPoolEntryConstantProduct {
+                    params: pool_params,
+                    reserve_a: 10_000,
+                    reserve_b: 10_000,
+                    total_pool_shares: 10_000,
+                    pool_shares_trust_line_count: 1,
+                },
+            ),
+        });
+
+        // Order-book offer: selling B for A at 1:1
+        let seller_id = create_test_account_id(50);
+        state.create_account(create_test_account(seller_id.clone(), 1_000_000_000));
+        // Seller A trustline needs buying_liabilities for incoming asset
+        state.create_trustline(create_test_trustline_with_liabilities(
+            seller_id.clone(),
+            create_test_trustline_asset(b"AAA\0", issuer_a),
+            0,
+            i64::MAX,
+            AUTHORIZED_FLAG,
+            10_000, // buying liabilities (matches offer amount)
+            0,
+        ));
+        // Seller B trustline needs selling_liabilities matching offer amount
+        state.create_trustline(crate::test_utils::create_trustline_with_liabilities(
+            seller_id.clone(),
+            create_test_trustline_asset(b"BBB\0", issuer_b),
+            100_000,
+            i64::MAX,
+            AUTHORIZED_FLAG,
+            0,      // buying liabilities
+            10_000, // selling liabilities (matches offer amount)
+        ));
+        state.create_offer(OfferEntry {
+            seller_id: seller_id.clone(),
+            offer_id: 1,
+            selling: asset_b.clone(),
+            buying: asset_a.clone(),
+            amount: 10_000,
+            price: Price { n: 1, d: 1 },
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        });
+
+        // Path payment strict receive: send A, receive B
+        let op = PathPaymentStrictReceiveOp {
+            send_asset: asset_a.clone(),
+            send_max: 1_000,
+            destination: MuxedAccount::Ed25519(Uint256([1; 32])),
+            dest_asset: asset_b.clone(),
+            dest_amount: 100,
+            path: vec![].try_into().unwrap(),
+        };
+
+        // With trading flag SET: pool should be skipped
+        let mut context = LedgerContext::testnet(100, 1000);
+        context.ledger_flags = LedgerHeaderFlags::TradingFlag as u32;
+
+        let result =
+            execute_path_payment_strict_receive(&op, &source_id, &mut state, &context).unwrap();
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::PathPaymentStrictReceive(
+                PathPaymentStrictReceiveResult::Success(success),
+            )) => {
+                // Verify NO liquidity pool claims — all should be order-book
+                for claim in success.offers.iter() {
+                    assert!(
+                        !matches!(claim, ClaimAtom::LiquidityPool(_)),
+                        "Pool exchange should be skipped when TradingFlag is set, \
+                         but found a LiquidityPool claim atom"
+                    );
+                }
+                assert!(
+                    !success.offers.is_empty(),
+                    "Should have at least one order-book claim"
+                );
+            }
+            other => panic!("Expected PathPaymentStrictReceive success, got {:?}", other),
         }
     }
 }

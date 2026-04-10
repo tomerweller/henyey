@@ -605,7 +605,7 @@ impl TransactionExecutor {
             close_time: context.close_time,
             base_reserve: context.base_reserve,
             protocol_version: context.protocol_version,
-            ledger_flags: 0,
+            ledger_flags: context.ledger_flags,
             network_id: context.network_id,
             state,
             loaded_accounts: HashMap::new(),

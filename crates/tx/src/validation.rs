@@ -86,6 +86,8 @@ pub struct LedgerContext {
     pub soroban_prng_seed: Option<[u8; 32]>,
     /// Frozen ledger keys configuration (CAP-77, Protocol 26+).
     pub frozen_key_config: crate::frozen_keys::FrozenKeyConfig,
+    /// Ledger header flags (LP disable flags, etc.). 0 when pre-v1 extension.
+    pub ledger_flags: u32,
 }
 
 impl LedgerContext {
@@ -107,6 +109,7 @@ impl LedgerContext {
             network_id,
             soroban_prng_seed: None,
             frozen_key_config: crate::frozen_keys::FrozenKeyConfig::empty(),
+            ledger_flags: 0,
         }
     }
 
@@ -129,6 +132,7 @@ impl LedgerContext {
             network_id,
             soroban_prng_seed: Some(soroban_prng_seed),
             frozen_key_config: crate::frozen_keys::FrozenKeyConfig::empty(),
+            ledger_flags: 0,
         }
     }
 
@@ -143,6 +147,7 @@ impl LedgerContext {
             network_id: NetworkId::testnet(),
             soroban_prng_seed: None,
             frozen_key_config: crate::frozen_keys::FrozenKeyConfig::empty(),
+            ledger_flags: 0,
         }
     }
 
@@ -157,7 +162,15 @@ impl LedgerContext {
             network_id: NetworkId::mainnet(),
             soroban_prng_seed: None,
             frozen_key_config: crate::frozen_keys::FrozenKeyConfig::empty(),
+            ledger_flags: 0,
         }
+    }
+
+    /// Whether liquidity pool trading is disabled by the ledger header flags.
+    /// Mirrors stellar-core's `isPoolTradingDisabled()`.
+    pub fn is_pool_trading_disabled(&self) -> bool {
+        use stellar_xdr::curr::LedgerHeaderFlags;
+        self.ledger_flags & (LedgerHeaderFlags::TradingFlag as u32) != 0
     }
 }
 
