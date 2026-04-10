@@ -147,6 +147,8 @@ impl TxSetTracker {
 
     /// Receive a parsed tx set from the network. Verifies hash integrity,
     /// removes from pending, caches it. Returns the slot it was needed for.
+    /// Only caches tx sets that were actually pending — unsolicited tx sets
+    /// are rejected to prevent cache poisoning (AUDIT-080).
     pub fn receive(&self, tx_set: TransactionSet) -> Option<u64> {
         let hash = tx_set.hash;
         if let Some(recomputed) = tx_set.recompute_hash() {
@@ -166,21 +168,23 @@ impl TxSetTracker {
         let pending = self.pending.remove(&hash);
         let slot = pending.map(|(_, p)| p.slot);
 
-        self.store(tx_set);
-
-        if let Some(s) = slot {
-            debug!(%hash, slot = s, "Received pending tx set");
+        if slot.is_some() {
+            // Only cache tx sets we actually requested.
+            self.store(tx_set);
         } else {
-            debug!(%hash, "Received tx set (not pending)");
+            debug!(%hash, "Ignoring unsolicited tx set (not pending)");
         }
 
         slot
     }
 
-    /// Get a cached parsed tx set, incrementing its request count.
+    /// Get a cached parsed tx set, refreshing its recency and incrementing
+    /// request count. Refreshing `cached_at` prevents actively-used entries
+    /// from being evicted by unsolicited cache churn (AUDIT-080).
     pub fn get(&self, hash: &Hash256) -> Option<TransactionSet> {
         self.cache.get_mut(hash).map(|mut entry| {
             entry.request_count += 1;
+            entry.cached_at = Instant::now();
             entry.tx_set.clone()
         })
     }
@@ -474,5 +478,75 @@ mod tests {
         let extra = Hash256::from_bytes([99; 32]);
         tracker.store_valid((lcl, extra, 0), true);
         assert_eq!(tracker.sizes().valid_cache, 64);
+    }
+
+    /// Regression test for AUDIT-080: unsolicited tx sets must not be cached.
+    /// A peer sending unsolicited tx sets should not be able to pollute or evict
+    /// entries from the cache.
+    #[test]
+    fn test_audit_080_unsolicited_tx_set_not_cached() {
+        let tracker = TxSetTracker::new(4);
+
+        // Register one pending tx set and receive it — should be cached
+        let wanted = make_tx_set(1);
+        let wanted_hash = wanted.hash;
+        tracker.request(wanted_hash, 100);
+        let slot = tracker.receive(wanted.clone());
+        assert_eq!(slot, Some(100));
+        assert!(tracker.is_cached(&wanted_hash));
+
+        // Send 10 unsolicited tx sets — none should be cached
+        for i in 10..20u8 {
+            let unsolicited = make_tx_set(i);
+            let unsolicited_hash = unsolicited.hash;
+            let slot = tracker.receive(unsolicited);
+            assert_eq!(slot, None, "unsolicited tx set should return None");
+            assert!(
+                !tracker.is_cached(&unsolicited_hash),
+                "unsolicited tx set should not be cached"
+            );
+        }
+
+        // The wanted tx set should still be in cache
+        assert!(
+            tracker.is_cached(&wanted_hash),
+            "wanted tx set should survive unsolicited churn"
+        );
+        assert_eq!(tracker.sizes().cache, 1);
+    }
+
+    /// Regression test for AUDIT-080: get() refreshes cached_at so actively-used
+    /// entries are not evicted by cache pressure.
+    #[test]
+    fn test_audit_080_get_refreshes_cached_at() {
+        let tracker = TxSetTracker::new(4);
+
+        // Fill cache to capacity with 4 entries
+        for i in 0..4u8 {
+            let ts = make_tx_set(i);
+            let hash = ts.hash;
+            tracker.request(hash, 100 + i as u64);
+            tracker.receive(ts);
+        }
+        assert_eq!(tracker.sizes().cache, 4);
+
+        // Access the first entry to refresh its cached_at
+        let first_hash = make_tx_set(0).hash;
+        assert!(tracker.get(&first_hash).is_some());
+
+        // Add a 5th entry — should evict the OLDEST (entry 1, not entry 0 which was refreshed)
+        let new_ts = make_tx_set(99);
+        let new_hash = new_ts.hash;
+        tracker.request(new_hash, 200);
+        tracker.receive(new_ts);
+        assert_eq!(tracker.sizes().cache, 4);
+
+        // Entry 0 should still be cached (was refreshed via get)
+        assert!(
+            tracker.is_cached(&first_hash),
+            "refreshed entry should survive eviction"
+        );
+        // The new entry should be cached
+        assert!(tracker.is_cached(&new_hash));
     }
 }
