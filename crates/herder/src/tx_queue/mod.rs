@@ -791,7 +791,7 @@ impl TransactionQueue {
     ) -> std::result::Result<(), henyey_tx::TxResultCode> {
         use henyey_tx::{
             validate_ledger_bounds, validate_signatures, validate_time_bounds, LedgerContext,
-            TransactionFrame, TxResultCode,
+            TransactionFrame, TxResultCode, ValidationError,
         };
 
         let frame =
@@ -819,9 +819,19 @@ impl TransactionQueue {
         // getUpperBoundCloseTimeOffset(app, closeTime) for the max_time check,
         // which accounts for drift since LCL + expected close time * 2.
         if self.config.validate_time_bounds {
-            // For min_time (too early) check: use lcl close_time directly (offset 0).
-            if validate_time_bounds(&frame, &ledger_ctx).is_err() {
-                return Err(TxResultCode::TxTooEarly);
+            // Check against LCL close time (no offset): catches min_time too
+            // early and max_time already expired.
+            match validate_time_bounds(&frame, &ledger_ctx) {
+                Err(ValidationError::TooEarly { .. }) => {
+                    return Err(TxResultCode::TxTooEarly);
+                }
+                Err(ValidationError::TooLate { .. }) => {
+                    return Err(TxResultCode::TxTooLate);
+                }
+                Err(_) => {
+                    return Err(TxResultCode::TxTooEarly);
+                }
+                Ok(()) => {}
             }
 
             // For max_time (too late) check: add upper bound offset.
@@ -4434,6 +4444,7 @@ mod tests {
     /// to catch these; Henyey was only checking against the stale lcl_close_time.
     #[test]
     fn test_audit_093_queue_rejects_expiring_tx() {
+        use henyey_tx::TxResultCode;
         use stellar_xdr::curr::TimeBounds;
 
         let lcl_close_time: u64 = 1_700_000_000;
@@ -4485,10 +4496,74 @@ mod tests {
             .unwrap(),
         });
 
-        // This tx should be rejected because max_time < lcl_close_time + upper_bound_offset.
+        // This tx should be rejected as TxTooLate because max_time < lcl_close_time + upper_bound_offset.
         assert!(
-            matches!(queue.try_add(envelope), TxQueueResult::Invalid(_)),
-            "tx with max_time expiring before next close should be rejected"
+            matches!(
+                queue.try_add(envelope),
+                TxQueueResult::Invalid(Some(TxResultCode::TxTooLate))
+            ),
+            "tx with max_time expiring before next close should be TxTooLate"
+        );
+    }
+
+    /// Verify that a transaction whose max_time has already passed (before LCL
+    /// close time) is rejected with TxTooLate, not TxTooEarly.
+    #[test]
+    fn test_queue_already_expired_tx_returns_too_late() {
+        use henyey_tx::TxResultCode;
+        use stellar_xdr::curr::TimeBounds;
+
+        let lcl_close_time: u64 = 1_700_000_000;
+        let config = TxQueueConfig {
+            validate_signatures: false,
+            validate_time_bounds: true,
+            expected_ledger_close_secs: 5,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+        queue.update_validation_context(100, lcl_close_time, 21, 100, 5_000_000, 0);
+
+        // max_time is before lcl_close_time — already expired.
+        let max_time = lcl_close_time - 1;
+
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let operations: Vec<Operation> = vec![Operation {
+            source_account: None,
+            body: OperationBody::CreateAccount(CreateAccountOp {
+                destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([255u8; 32]))),
+                starting_balance: 1000000000,
+            }),
+        }];
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 200,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::Time(TimeBounds {
+                min_time: stellar_xdr::curr::TimePoint(0),
+                max_time: stellar_xdr::curr::TimePoint(max_time),
+            }),
+            memo: Memo::None,
+            operations: operations.try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        });
+
+        assert!(
+            matches!(
+                queue.try_add(envelope),
+                TxQueueResult::Invalid(Some(TxResultCode::TxTooLate))
+            ),
+            "already-expired tx should be rejected with TxTooLate, not TxTooEarly"
         );
     }
 
