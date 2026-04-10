@@ -100,9 +100,9 @@ impl CatchupManager {
                             if code == TransactionResultCode::TxSuccess
                                 || code == TransactionResultCode::TxFeeBumpInnerSuccess
                             {
-                                henyey_db::TX_STATUS_SUCCESS
+                                henyey_db::TxStatus::Success
                             } else {
-                                henyey_db::TX_STATUS_FAILED
+                                henyey_db::TxStatus::Failed
                             }
                         };
 

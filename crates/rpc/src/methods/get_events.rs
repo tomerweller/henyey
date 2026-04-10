@@ -81,11 +81,10 @@ pub async fn handle(
             .or_insert_with(|| util::ledger_close_time(&ctx.app, event.ledger_seq));
         let close_time = format_unix_timestamp_utc(close_time_unix);
 
-        let event_type_str = match ContractEventType::try_from(event.event_type) {
-            Ok(ContractEventType::Contract) => "contract",
-            Ok(ContractEventType::System) => "system",
-            Ok(ContractEventType::Diagnostic) => "diagnostic",
-            Err(_) => "contract",
+        let event_type_str = match event.event_type {
+            ContractEventType::Contract => "contract",
+            ContractEventType::System => "system",
+            ContractEventType::Diagnostic => "diagnostic",
         };
 
         let mut obj = serde_json::Map::new();

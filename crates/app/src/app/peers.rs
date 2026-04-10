@@ -350,7 +350,7 @@ impl App {
             1000,
             self.config.overlay.peer_max_failures,
             now,
-            Some(PEER_TYPE_OUTBOUND),
+            Some(StoredPeerType::Outbound),
         )?;
         let mut addrs = Vec::new();
         for (host, port, _) in peers {
@@ -363,13 +363,13 @@ impl App {
         let now = current_epoch_seconds();
         for addr in &self.config.overlay.known_peers {
             if let Some(peer) = Self::parse_peer_address(addr) {
-                let record = henyey_db::queries::PeerRecord::new(now, 0, PEER_TYPE_OUTBOUND);
+                let record = henyey_db::queries::PeerRecord::new(now, 0, StoredPeerType::Outbound);
                 let _ = self.db.store_peer(&peer.host, peer.port, record);
             }
         }
         for addr in &self.config.overlay.preferred_peers {
             if let Some(peer) = Self::parse_peer_address(addr) {
-                let record = henyey_db::queries::PeerRecord::new(now, 0, PEER_TYPE_PREFERRED);
+                let record = henyey_db::queries::PeerRecord::new(now, 0, StoredPeerType::Preferred);
                 let _ = self.db.store_peer(&peer.host, peer.port, record);
             }
         }
@@ -379,7 +379,7 @@ impl App {
         let peers = self.db.load_random_peers_any_outbound_max_failures(
             1000,
             PEER_MAX_FAILURES_TO_SEND,
-            PEER_TYPE_INBOUND,
+            StoredPeerType::Inbound,
         )?;
         let mut addrs = Vec::new();
         for (host, port, _) in peers {
@@ -392,7 +392,7 @@ impl App {
         let peers = self.db.load_random_peers_by_type_max_failures(
             1000,
             PEER_MAX_FAILURES_TO_SEND,
-            PEER_TYPE_INBOUND,
+            StoredPeerType::Inbound,
         )?;
         let mut addrs = Vec::new();
         for (host, port, _) in peers {
@@ -408,7 +408,7 @@ impl App {
             if existing.is_some() {
                 continue;
             }
-            let record = henyey_db::queries::PeerRecord::new(now, 0, PEER_TYPE_OUTBOUND);
+            let record = henyey_db::queries::PeerRecord::new(now, 0, StoredPeerType::Outbound);
             if let Err(err) = self.db.store_peer(&peer.host, peer.port, record) {
                 tracing::debug!(peer = %peer, error = %err, "Failed to persist peer");
             }
@@ -468,7 +468,7 @@ impl App {
         }
         for addr in &self.config.overlay.preferred_peers {
             if let Some(peer) = Self::parse_peer_address(addr) {
-                self.upsert_peer_type(&peer, PEER_TYPE_PREFERRED);
+                self.upsert_peer_type(&peer, StoredPeerType::Preferred);
                 peers.push(peer);
             }
         }
@@ -507,7 +507,7 @@ impl App {
         peers
     }
 
-    fn upsert_peer_type(&self, peer: &PeerAddress, peer_type: i32) {
+    fn upsert_peer_type(&self, peer: &PeerAddress, peer_type: StoredPeerType) {
         let now = current_epoch_seconds();
         let existing = self.db.load_peer(&peer.host, peer.port).ok().flatten();
         let record = match existing {

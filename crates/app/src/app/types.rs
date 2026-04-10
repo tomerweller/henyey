@@ -20,11 +20,8 @@ use stellar_xdr::curr::{
 
 use crate::survey::SurveyPhase;
 
-// ── Constants re-exported for sibling submodules ────────────────────────
-
-pub(super) const PEER_TYPE_OUTBOUND: i32 = 1;
-pub(super) const PEER_TYPE_PREFERRED: i32 = 2;
-pub(super) const PEER_TYPE_INBOUND: i32 = 0;
+// ── Re-exported peer type enum ───────────────────────────────────────
+pub(super) use henyey_common::StoredPeerType;
 
 // ── Application state ──────────────────────────────────────────────────
 
@@ -752,20 +749,23 @@ pub(super) fn decode_upgrades(upgrades: Vec<UpgradeType>) -> Vec<LedgerUpgrade> 
         .collect()
 }
 
-/// Map a `PeerType` to a DB peer-type integer, preserving any existing
+/// Map a `PeerType` to a `StoredPeerType`, preserving any existing
 /// preferred or outbound classification.
-pub(super) fn map_peer_type(peer_type: henyey_overlay::PeerType, existing_type: i32) -> i32 {
+pub(super) fn map_peer_type(
+    peer_type: henyey_overlay::PeerType,
+    existing_type: StoredPeerType,
+) -> StoredPeerType {
     match peer_type {
         henyey_overlay::PeerType::Inbound => match existing_type {
-            PEER_TYPE_PREFERRED => PEER_TYPE_PREFERRED,
-            PEER_TYPE_OUTBOUND => PEER_TYPE_OUTBOUND,
-            _ => PEER_TYPE_INBOUND,
+            StoredPeerType::Preferred => StoredPeerType::Preferred,
+            StoredPeerType::Outbound => StoredPeerType::Outbound,
+            StoredPeerType::Inbound => StoredPeerType::Inbound,
         },
         henyey_overlay::PeerType::Outbound => {
-            if existing_type == PEER_TYPE_PREFERRED {
-                PEER_TYPE_PREFERRED
+            if existing_type == StoredPeerType::Preferred {
+                StoredPeerType::Preferred
             } else {
-                PEER_TYPE_OUTBOUND
+                StoredPeerType::Outbound
             }
         }
     }
@@ -776,7 +776,9 @@ pub(super) fn update_peer_record(db: &henyey_db::Database, event: henyey_overlay
     match event {
         henyey_overlay::PeerEvent::Connected(addr, peer_type) => {
             let existing = db.load_peer(&addr.host, addr.port).ok().flatten();
-            let existing_type = existing.map(|r| r.peer_type).unwrap_or(PEER_TYPE_INBOUND);
+            let existing_type = existing
+                .map(|r| r.peer_type)
+                .unwrap_or(StoredPeerType::Inbound);
             let mapped = map_peer_type(peer_type, existing_type);
             let record = henyey_db::queries::PeerRecord::new(now, 0, mapped);
             let _ = db.store_peer(&addr.host, addr.port, record);
@@ -787,7 +789,9 @@ pub(super) fn update_peer_record(db: &henyey_db::Database, event: henyey_overlay
             failures = failures.saturating_add(1);
             let backoff = compute_peer_backoff_secs(failures);
             let next_attempt = now.saturating_add(backoff);
-            let existing_type = existing.map(|r| r.peer_type).unwrap_or(PEER_TYPE_INBOUND);
+            let existing_type = existing
+                .map(|r| r.peer_type)
+                .unwrap_or(StoredPeerType::Inbound);
             let mapped = map_peer_type(peer_type, existing_type);
             let record = henyey_db::queries::PeerRecord::new(next_attempt, failures, mapped);
             let _ = db.store_peer(&addr.host, addr.port, record);
