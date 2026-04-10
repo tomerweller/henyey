@@ -301,16 +301,15 @@ pub mod helpers {
     /// Flood messages are propagated to all connected peers (except the sender)
     /// to ensure network-wide distribution.
     pub fn is_flood_message(message: &StellarMessage) -> bool {
+        // Matches stellar-core OverlayManager::isFloodMessage():
+        // only SCP, transaction, and pull-based flood control messages are flooded.
+        // Survey messages are NOT flooded — they are relayed point-to-point.
         matches!(
             message,
             StellarMessage::Transaction(_)
                 | StellarMessage::ScpMessage(_)
                 | StellarMessage::FloodAdvert(_)
                 | StellarMessage::FloodDemand(_)
-                | StellarMessage::TimeSlicedSurveyRequest(_)
-                | StellarMessage::TimeSlicedSurveyResponse(_)
-                | StellarMessage::TimeSlicedSurveyStartCollecting(_)
-                | StellarMessage::TimeSlicedSurveyStopCollecting(_)
         )
     }
 
