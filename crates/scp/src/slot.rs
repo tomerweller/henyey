@@ -444,6 +444,13 @@ impl Slot {
             return EnvelopeState::Invalid;
         }
 
+        // Reject stale ballot statements before validation to avoid
+        // redundant validate_value calls. Matches stellar-core which
+        // checks is_newer_statement before validateValues.
+        if self.ballot.is_stale_ballot_statement(&envelope.statement) {
+            return EnvelopeState::Invalid;
+        }
+
         let validation =
             self.ballot
                 .validate_statement_values(&envelope.statement, driver, self.slot_index);
@@ -624,6 +631,10 @@ impl Slot {
                 values.push(ext.commit.value.clone());
             }
         }
+
+        // Deduplicate: stellar-core uses std::set<Value> which deduplicates.
+        values.sort();
+        values.dedup();
 
         values
     }

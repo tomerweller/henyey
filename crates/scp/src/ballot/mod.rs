@@ -511,6 +511,19 @@ impl BallotProtocol {
         self.abandon_ballot(0, ctx)
     }
 
+    /// Check whether a ballot statement is stale (not newer than what we already have).
+    /// Used to skip validation for stale envelopes — matches stellar-core which
+    /// rejects stale envelopes before validateValues.
+    pub(crate) fn is_stale_ballot_statement(&self, statement: &ScpStatement) -> bool {
+        match &statement.pledges {
+            ScpStatementPledges::Prepare(_)
+            | ScpStatementPledges::Confirm(_)
+            | ScpStatementPledges::Externalize(_) => {}
+            _ => return true,
+        }
+        !self.is_newer_statement(&statement.node_id, statement)
+    }
+
     /// Process a ballot protocol envelope.
     pub(crate) fn process_envelope<D: SCPDriver>(
         &mut self,
